@@ -860,6 +860,9 @@ class RSMEffectiveGeometry:
     refinement: bool = False
     #: The calibration's recorded energy (its source energy where it refined one), for the Preview's 2 % warning.
     calibration_energy_eV: float | None = None
+    #: Where the circle directions came from, for Preview (decision 2); the directions themselves are in the
+    #: diffractometer and the fingerprint.
+    circle_directions: str | None = None
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
@@ -1178,6 +1181,9 @@ class RSMCalibrationGeometryReceipt:
     semantic_fingerprint: str
     receipt_fingerprint: str
     refinement: bool = True
+    #: The calibration's instrument record (``InstrumentGeometry.to_record()`` as canonical JSON) from the
+    #: partner's provenance, which gives every circle's direction (decision 2); None when it records none.
+    instrument_record: str | None = None
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
@@ -1185,6 +1191,7 @@ class RSMCalibrationGeometryReceipt:
         if (
             _claim is not _CALIBRATION_FACTORY
             or type(self.refinement) is not bool
+            or not (self.instrument_record is None or type(self.instrument_record) is str)
             or type(self.calibration) is not XuStitchCalibrationReceipt
             or self.project_root != self.calibration.project_root
             or self.byte_count != self.calibration.byte_count
@@ -1250,9 +1257,11 @@ def capture_rsm_calibration_geometry(
         )
     if type(refinement) is not bool:
         raise TypeError("RSM calibration refinement must be an exact bool")
+    record = _calibration_instrument_record(partner)
     fingerprint = analysis_canonical_fingerprint(
         "rsm-calibration-geometry-receipt-v1",
-        (calibration.fingerprint, calibration.semantic_fingerprint, calibration.raw_sha256, refinement),
+        (calibration.fingerprint, calibration.semantic_fingerprint, calibration.raw_sha256, refinement)
+        + (() if record is None else (record,)),
     )
     return RSMCalibrationGeometryReceipt(
         calibration,
@@ -1264,16 +1273,47 @@ def capture_rsm_calibration_geometry(
         calibration.semantic_fingerprint,
         fingerprint,
         refinement,
+        record,
         _claim=_CALIBRATION_FACTORY,
     )
 
 
+def _calibration_instrument_record(partner: Path) -> str | None:
+    """The instrument record a calibration carries (the calibration window saves its ``InstrumentGeometry``
+    in the partner's provenance, ``<name>.xu.json.provenance.json``) as canonical JSON; None when the calibration
+    records none (an older save). A record that is not a psic instrument, or a provenance that cannot be read, is
+    refused: RSM's circle directions come from it (decision 2)."""
+    from xrd_tools.session.instrument import InstrumentGeometry
+
+    provenance = partner.with_suffix(partner.suffix + ".provenance.json")
+    if not provenance.exists():
+        return None
+    try:
+        value = json.loads(provenance.read_text(encoding="utf-8"))
+        record = value.get("instrument_geometry") if isinstance(value, dict) else None
+        if record is None:
+            return None
+        geometry = InstrumentGeometry.from_record(dict(record))
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", f"{provenance.name}: its instrument record cannot be read ({error})")
+    if geometry.geometry != "psic":
+        _refuse("RSM_CALIBRATION_UNSUPPORTED",
+                f"{provenance.name} records a {geometry.geometry} instrument; RSM needs psic's six circles")
+    return json.dumps(geometry.to_record(), sort_keys=True, separators=(",", ":"))
+
+
 def revalidate_rsm_geometry_source(receipt) -> bytes:
-    """Revalidate whichever geometry source a request binds (asset or calibration partner)."""
+    """Revalidate whichever geometry source a request binds (asset or calibration partner, with the instrument
+    record its provenance carries)."""
 
     if type(receipt) is RSMCalibrationGeometryReceipt:
         from xrd_tools.analysis.xu_stitch_calibration import revalidate_xu_stitch_calibration
-        return revalidate_xu_stitch_calibration(receipt.calibration)
+        content = revalidate_xu_stitch_calibration(receipt.calibration)
+        partner = Path(receipt.project_root) / receipt.resolved_relative_path
+        if _calibration_instrument_record(partner) != receipt.instrument_record:
+            _refuse("RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH",
+                    "the calibration's instrument record no longer matches its receipt")
+        return content
     return revalidate_rsm_geometry_asset(receipt)
 
 
@@ -1423,6 +1463,29 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
         hxrd_q=tuple(float(item) for item in xu_value["surface_normal_reference"]),
         hxrd_geometry=xu_value["geometry"],
     )
+    # Decision 2 (the maintainer, 2026-10-01: "Xu provides a way to specify the actual circle directions on the
+    # instrument. Shouldn't that be used?"): every circle's direction is the calibration's instrument record's,
+    # sample and detector circles alike; the partner's detector circles must already be the record's (its fit was
+    # made in them). Without a record, psic's standard directions, as the partner carries them.
+    directions = "psic's standard (the calibration records no instrument)"
+    if receipt.instrument_record is not None:
+        from xrd_tools.session.instrument import InstrumentGeometry
+
+        record = InstrumentGeometry.from_record(json.loads(receipt.instrument_record))
+        axes = dict(record.circle_axes())
+        sample = tuple(axes[role] for role in _PSIC_ROLES[:4])
+        detector_axes = tuple(axes[role] for role in _PSIC_ROLES[4:])
+        if detector_axes != tuple(xu_value["detector_axes"]):
+            _refuse(
+                "RSM_CALIBRATION_UNSUPPORTED",
+                f"the calibration's xrayutilities file turns nu and del as {list(xu_value['detector_axes'])} but its "
+                f"instrument record as {list(detector_axes)}: save the calibration again with the record",
+            )
+        diffractometer = replace(diffractometer, sample_circles=sample, detector_circles=detector_axes)
+        reversed_roles = [role for role in _PSIC_ROLES if role in record.reversed_circles]
+        directions = ("the calibration's instrument record: psic, "
+                      + ("every circle as psic's standard" if not reversed_roles
+                         else "reversed " + ", ".join(reversed_roles)))
     for name in ("qconv_kwargs", "hxrd_kwargs", "ang2q_kwargs"):
         object.__setattr__(
             diffractometer, name, MappingProxyType(dict(getattr(diffractometer, name))),
@@ -1482,6 +1545,7 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
         energy_offset_eV=energy_offset,
         refinement=receipt.refinement,
         calibration_energy_eV=calibration_energy,
+        circle_directions=directions,
         _claim=_EFFECTIVE_FACTORY,
     )
 

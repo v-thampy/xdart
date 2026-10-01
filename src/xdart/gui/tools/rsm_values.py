@@ -1587,6 +1587,8 @@ class RSMToolPreflightSummaryV2:
     #: A calibration-sourced geometry (AUD-9 stage 2b C7b): (refinement applied, the energy offset in eV, the
     #: calibration's recorded energy in eV). None for the canonical asset.
     calibration: tuple[bool, float, float] | None = None
+    #: where the circle directions came from (decision 2): a calibration's instrument record, or psic's standard
+    circle_directions: str | None = None
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -2041,6 +2043,7 @@ def prepare_rsm_tool_v2(
             else (request.preflight.effective_geometry.refinement,
                   request.preflight.effective_geometry.energy_offset_eV,
                   request.preflight.effective_geometry.calibration_energy_eV)),
+        circle_directions=request.preflight.effective_geometry.circle_directions,
         _claim=_PREFLIGHT_V2_FACTORY,
     )
     return RSMToolPreflightV2(
@@ -2109,6 +2112,7 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
         *(() if summary.calibration is None else (
             "Geometry: the calibration on the Calibration row, refinement "
             + ("on (its del/nu offsets, mount and energy offset)" if summary.calibration[0] else "off"),)),
+        *(() if summary.circle_directions is None else (f"Circle directions: {summary.circle_directions}",)),
         f"Asset raw: {summary.geometry_asset_raw_sha256}",
         f"Asset semantic: {summary.geometry_asset_semantic_fingerprint}",
         f"Asset receipt: {summary.geometry_asset_receipt_fingerprint}",

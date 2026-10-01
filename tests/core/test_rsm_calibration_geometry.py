@@ -523,3 +523,51 @@ def test_rsm_checks_its_flat_against_the_calibrations_mask_and_the_run_recapture
         if Path(form.output_path).exists():
             Path(form.output_path).unlink()
     assert result.terminal.disposition is ModuleDisposition.COMMITTED
+
+
+def _with_record(pyfai: Path, reversed_circles) -> None:
+    """The instrument record the calibration window saves in the partner's provenance."""
+    from xrd_tools.session.instrument import InstrumentGeometry
+    record = InstrumentGeometry("psic", reversed_circles=tuple(reversed_circles)).to_record()
+    partner = pyfai.with_suffix(".xu.json")
+    partner.with_suffix(partner.suffix + ".provenance.json").write_text(json.dumps({"instrument_geometry": record}))
+
+
+def test_the_calibrations_instrument_record_gives_every_circle_its_direction(tmp_path):
+    """Decision 2 (the maintainer: "Xu provides a way to specify the actual circle directions on the instrument.
+    Shouldn't that be used?"): the sample circles turn as the calibration's instrument record says, the detector
+    circles as the record and the partner agree. Without a record, psic's standard directions, as before."""
+    pyfai = _write_partner(tmp_path, rotation=0, cch=(4.0, 6.0))
+    plain = lower_rsm_effective_geometry(capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path))
+    assert plain.diffractometer_projection.sample_circles == ("x+", "z-", "y+", "z-")
+    assert plain.circle_directions == "psic's standard (the calibration records no instrument)"
+    _with_record(pyfai, ("mu", "chi"))
+    receipt = capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path)
+    effective = lower_rsm_effective_geometry(receipt)
+    assert effective.diffractometer_projection.sample_circles == ("x-", "z-", "y-", "z-")
+    assert effective.diffractometer_projection.detector_circles == ("x+", "z-")
+    assert effective.circle_directions == "the calibration's instrument record: psic, reversed mu, chi"
+    assert effective.fingerprint != plain.fingerprint
+
+
+def test_a_record_whose_detector_circles_the_partner_was_not_fitted_in_is_refused(tmp_path):
+    """A version-2 partner's arm is fitted in psic's standard detector directions: a record reversing nu cannot
+    be its instrument."""
+    pyfai = _write_partner(tmp_path, rotation=0, cch=(4.0, 6.0))
+    _with_record(pyfai, ("mu", "chi", "nu"))  # the 17-2 record
+    receipt = capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path)
+    with pytest.raises(RSMGeometryAssetRefused) as refused:
+        lower_rsm_effective_geometry(receipt)
+    assert refused.value.code == "RSM_CALIBRATION_UNSUPPORTED" and "save the calibration again" in str(refused.value)
+
+
+def test_a_record_changed_after_preview_is_refused_at_the_run(tmp_path):
+    from xrd_tools.analysis.rsm_geometry_asset import revalidate_rsm_geometry_source
+    pyfai = _write_partner(tmp_path, rotation=0, cch=(4.0, 6.0))
+    _with_record(pyfai, ("mu",))
+    receipt = capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path)
+    revalidate_rsm_geometry_source(receipt)
+    _with_record(pyfai, ("mu", "chi"))
+    with pytest.raises(RSMGeometryAssetRefused) as refused:
+        revalidate_rsm_geometry_source(receipt)
+    assert refused.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
