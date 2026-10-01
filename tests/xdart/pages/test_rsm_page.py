@@ -1758,6 +1758,29 @@ def test_the_background_is_released_by_clear_bg_by_its_result_admitted_again_and
     assert page._background.phase == "RELEASED" and page._background.keyed_source() is None
 
 
+def test_a_background_admitted_again_beside_another_result_leaves_that_result_drawn(qapp, monkeypatch):
+    """G8d's self-review: the background's result admitted again while another is shown (a stale run's output,
+    a late read: ``show=False``) releases the background, and the result shown is drawn again without it; the
+    view's release had cleared its panels, which stayed blank until the next draw."""
+    values = {"A": _grid_values(1.0), "A2": _grid_values(5.0), "B": _grid_values(3.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.background.click()
+        page._add_result("/tmp/b_rsm.nexus", "B")
+        assert page.view.keyed_projection.background_set
+        page._add_result("/tmp/a_rsm.nexus", "A2", show=False)
+        assert page._background.phase == "RELEASED"
+        drawn = page.view.keyed_projection
+        assert drawn is not None and not drawn.background_set and page.view.background.text() == "Set BG"
+        own = _panels_at(values["B"], page.shown[1].state.axis_indices)
+        for got, panel in zip(_drawn_arrays(page.view), own, strict=True):
+            np.testing.assert_array_equal(got, panel.image if hasattr(panel, "image") else panel.intensity)
+    finally:
+        _close(page, qapp)
+
+
 def test_a_queued_preview_counts_the_dark_and_flat_warnings_as_the_single_one_does(qapp, tmp_path, monkeypatch):
     """G8c's residual: a queued Preview's status counts the dark and flat checks' warnings, each distinct one
     once, as the single Preview's does (each RSM of the queue shares the page's flat)."""

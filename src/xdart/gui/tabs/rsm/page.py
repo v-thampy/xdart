@@ -1826,8 +1826,9 @@ class RSMPage(QtWidgets.QWidget):
         (the one asked to be shown stays: a late read kept beside it does not push it out)."""
         if show:
             self._requested = path
-        if self._background_path() == path:  # the background's result admitted again: let it go (Stitch's
-            self._release_background()       # 30f74f29: its identity is the data it was set from)
+        released = self._background_path() == path
+        if released:  # the background's result admitted again: let it go (Stitch's 30f74f29: its identity is
+            self._release_background()  # the data it was set from)
         self._results[path] = payload
         self._viewers.pop(path, None)  # a result admitted again (Replace, a read back) is drawn from itself
         self._results.move_to_end(path)
@@ -1843,6 +1844,8 @@ class RSMPage(QtWidgets.QWidget):
         self._publish_results()
         if show:
             self._show(path, payload)
+        elif released:  # the view let go of its panels with the background: the result shown, drawn again
+            self._redraw()
 
     def _result_selected(self, path):
         self._requested = path
