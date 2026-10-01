@@ -222,10 +222,12 @@ def test_stop_cancels_a_run(qapp, tmp_path, monkeypatch):
         _close(page, qapp)
 
 
-def test_open_reads_saved_results_off_the_gui_thread_and_keeps_the_newest_two(qapp, tmp_path, monkeypatch):
+def test_open_reads_saved_results_off_the_gui_thread_and_keeps_the_newest_five(qapp, tmp_path, monkeypatch):
     """Open… reads a record on the shared single-worker owner and paints its six. The Results list shows a
-    kept result at once and reads an older one again: two are kept (32 MB each at Full 200³, probe 1)."""
-    shown = {name: _values(offset=float(index)) for index, name in enumerate(("one", "two", "three"))}
+    kept result at once and reads an older one again: five are kept (the maintainer, 2026-10-01: "about 4-5
+    for quick access"; 32 MB each at Full 200³, probe 3)."""
+    names = ("one", "two", "three", "four", "five", "six")
+    shown = {name: _values(offset=float(index)) for index, name in enumerate(names)}
     monkeypatch.setattr(page_module, "make_rsm_viewer_values", shown.__getitem__)
     reads = []
 
@@ -238,13 +240,12 @@ def test_open_reads_saved_results_off_the_gui_thread_and_keeps_the_newest_two(qa
             assert page.reopen(str(tmp_path / f"{name}_rsm.nexus"))
             _wait(page, qapp, lambda: not page.active())
             assert page.view.shown[0] is shown[name]
-        assert [page.results.item(row).text() for row in range(3)] == [f"{name}_rsm.nexus" for name in shown]
+        assert [page.results.item(row).text() for row in range(6)] == [f"{name}_rsm.nexus" for name in shown]
         page.results.setCurrentRow(1)  # kept: shown at once
-        assert page.view.shown[0] is shown["two"] and len(reads) == 3
+        assert page.view.shown[0] is shown["two"] and len(reads) == 6
         page.results.setCurrentRow(0)  # the oldest: read again
         _wait(page, qapp, lambda: not page.active())
-        assert page.view.shown[0] is shown["one"] and reads == [
-            "one_rsm.nexus", "two_rsm.nexus", "three_rsm.nexus", "one_rsm.nexus"]
+        assert page.view.shown[0] is shown["one"] and reads == [f"{name}_rsm.nexus" for name in (*names, "one")]
     finally:
         _close(page, qapp)
 

@@ -65,9 +65,11 @@ _RSM_MODES = ("RSM",)
 #: The operation's stages in words (its progress counts frames plus the masks and four steps).
 _STAGE_TEXT = {"revalidate": "Checking the inputs", "static-mask": "Masking hot pixels", "science": "Gridding",
                "projection": "Projecting", "publish": "Saving", "reload": "Checking the saved result"}
-#: Results kept in memory at once (float32: 32 MB each at Full 200³, and the shown one's viewer copy as
-#: much again; probe 1); another is read again from its file, off the GUI thread, when it is shown.
-_RESIDENT_RESULTS = 2
+#: Results kept in memory at once (the maintainer, 2026-10-01: "I'm happy keeping even more, about 4-5 for
+#: quick access"): float32, 32 MB each at Full 200³ and 160 MB for five; the shown one's viewer values share
+#: its buffer, and its six products are 0.5 MB (probe 3). Another is read again from its file, off the GUI
+#: thread, when it is shown.
+_RESIDENT_RESULTS = 5
 #: The page's fields: (card, key, label, default, choices, browse).
 _FIELDS = (
     (SectionId.PROJECT, "project_root", "Folder", "", (), True),

@@ -282,6 +282,53 @@ def test_builtin_rsm_selection_mounts_the_native_page_from_every_mode_box(
     finally:
         window.close()
         window.deleteLater()
+
+
+#: Int's own modes: its run bar's mode list less Stitch's and RSM's.
+_INT_MODES = ("Int 1D", "Int 2D", "Int 1D (XYE)", "1D Viewer", "2D Viewer")
+
+
+def test_rsm_is_reachable_from_every_mode_and_reaches_each_one(qapp, isolated_settings):
+    """AUD-9 stage 2 (the maintainer, 2026-10-01: RSM "should be reachable from any of the other modes"). The
+    one mode list is on Int's, Stitch's and RSM's run bars: choosing RSM opens the RSM page from Int in each
+    of its modes and from Stitch in each of its, and choosing any other mode on the RSM page opens that
+    mode's page in it."""
+    from xdart.gui.pages.values import ActionCompleted
+
+    window = _mounted_host(None)
+    try:
+        integration = window.page_handle.widget
+        combo = integration._shell.run_controls.modeCombo
+        for mode in _INT_MODES:
+            combo.setCurrentText(mode)
+            qapp.processEvents()
+            assert integration._intents.snapshot().thaw().processing_mode == mode
+            combo.setCurrentText("RSM")
+            qapp.processEvents()
+            assert window.selected_page_key == RSM_PAGE.key, mode
+            assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
+        for mode in ("Stitch 1D", "Stitch 2D"):
+            assert window.select_page(STITCH_PAGE.key) == ActionCompleted(str(STITCH_PAGE.key))
+            stitch = window.page_handle.widget
+            assert stitch.select_mode(mode) and stitch.run_bar.modeCombo.currentText() == mode
+            stitch.run_bar.modeCombo.setCurrentText("RSM")
+            qapp.processEvents()
+            assert window.selected_page_key == RSM_PAGE.key, mode
+        rsm = window.page_handle.widget
+        for mode in (*_INT_MODES, "Stitch 1D", "Stitch 2D"):
+            assert window.open_tool(RSM_TOOL_KEY) == ActionCompleted("rsm")
+            rsm.run_bar.modeCombo.setCurrentText(mode)
+            qapp.processEvents()
+            page = window.page_handle.widget
+            if mode.startswith("Stitch"):
+                assert (window.selected_page_key, page._mode) == (STITCH_PAGE.key, mode)
+            else:
+                assert (window.selected_page_key, page._intents.snapshot().thaw().processing_mode) == (
+                    SCATTERING_WORKSPACE_PAGE.key, mode)
+            assert rsm.run_bar.modeCombo.currentText() == "RSM"
+    finally:
+        window.close()
+        window.deleteLater()
         qapp.processEvents()
 
 
