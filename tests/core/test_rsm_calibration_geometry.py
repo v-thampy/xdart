@@ -571,3 +571,60 @@ def test_a_record_changed_after_preview_is_refused_at_the_run(tmp_path):
     with pytest.raises(RSMGeometryAssetRefused) as refused:
         revalidate_rsm_geometry_source(receipt)
     assert refused.value.code == "RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH"
+
+
+@pytest.mark.slow
+def test_scan_43_indexes_nearer_integer_under_standard_psic_than_under_the_17_2_reversals(rsm_r2_project):
+    """Decision 2's physical check, through the product's own path (the maintainer, 2026-10-01: "I think our diff
+    motor directions are off from the Psic standard and that is problematic ..."). It takes the STO substrate
+    (113) that SPEC centred on the detector in scan 43 (frame 22, pixel (95, 244)), with the UB each model
+    recomputes from scan 43's own reflections (1 1 4) and (-1 0 4):
+    - psic's standard directions put it 0.049 from (1 1 3), where SPEC's own #Q puts it;
+    - the 17-2 record's reversals of mu and chi put it 0.17 off. Its nu reversal cannot matter: nu is 0 throughout
+      the scan and both reflections. No combination of reversals did better than the standard
+      (probes/s3c_sense_search.py);
+    - the remaining 0.049 is not a direction error. The two orientation reflections are themselves 0.060 r.l.u.
+      apart under the cubic lattice, and the pdi's del offset (PD_DELTA -0.834) makes it worse
+      (probes/s3c_offset_scan.py).
+    A finding, not a verdict: a corrected record, or corrected orientation reflections, should move these
+    numbers, and this row then shows it."""
+    from dataclasses import replace
+
+    from silx.io.specfile import SpecFile
+
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2, rsm_preflight_summary_lines
+
+    locator = _canonical_partner(rsm_r2_project)
+    pyfai = rsm_r2_project / locator
+    provenance = pyfai.with_suffix(".xu.json.provenance.json")
+    form = replace(_form(rsm_r2_project, (43,), 40), geometry_asset=rsm_calibration_geometry_input(locator))
+    scan = SpecFile(str(rsm_r2_project / "STO_align"))["43.1"]
+    fixed = dict(zip(("del", "eta", "chi", "phi", "nu", "mu"),
+                     (float(value) for value in scan.scan_header_dict["P0"].split()[:6])))
+    eta = float(np.asarray(scan.data_column_by_name("eta"), dtype=float)[22])
+    angles = [np.array([value]) for value in (fixed["mu"], eta, fixed["chi"], fixed["phi"], fixed["nu"],
+                                              fixed["del"])]
+    off = {}
+    try:
+        for name, reversals in (("standard", ()), ("17-2", ("mu", "chi"))):
+            if reversals:
+                _with_record(pyfai, reversals)
+            prepared = prepare_rsm_tool_v2(form)
+            member = prepared.request.preflight.members[0]
+            mapper = rsm_effective_pixel_q_map(prepared.request.preflight.effective_geometry)
+            h, k, l = mapper.pixel_q(angles, member.energy_eV, UB=np.asarray(member.ub))
+            at = np.array([h[0, 95, 244], k[0, 95, 244], l[0, 95, 244]])
+            off[name] = float(np.linalg.norm(at - (1.0, 1.0, 3.0)))
+            lines = rsm_preflight_summary_lines(prepared.summary)
+            if reversals:
+                assert "Circle directions: the calibration's instrument record: psic, reversed mu, chi" in lines
+                assert any(line.startswith("  UB: recomputed from (1 1 4) and (-1 0 4) in the instrument's "
+                                           "directions; #G3 differs by") and line.endswith("there: chi, mu")
+                           for line in lines)
+            else:
+                assert any(line.startswith("  UB: #G3; recomputed") for line in lines)
+    finally:
+        provenance.unlink(missing_ok=True)
+    print("scan 43 (113) |off|", off)
+    assert off["standard"] <= 0.06 and off["17-2"] >= 0.10, off

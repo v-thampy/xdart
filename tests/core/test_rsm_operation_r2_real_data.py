@@ -273,3 +273,25 @@ def test_rsm_v2_matches_independent_authenticated_oracle(
     finally:
         if output.exists():
             output.unlink()
+
+
+@pytest.mark.slow
+def test_the_default_on_scan_43_reference(rsm_r2_project):
+    """Decision 5's corrections (solid angle on, polarization 0.99: the form's default) on scan 43 at 40³, pinned
+    under the canonical asset's psic standard directions: on scan 43 they index the substrate (113) nearest
+    (0.049 from (1 1 3), against 0.171 under the 17-2 record's reversals of mu and chi;
+    test_rsm_calibration_geometry's physical row). The all-off reference (8a88826f…) is kept beside it."""
+    from dataclasses import replace
+
+    default = RSMToolFormV2.__dataclass_fields__["corrections"].default
+    assert default == RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+    form = replace(_form(rsm_r2_project, (43,), 40), corrections=default,
+                   output_path=rsm_r2_project / "rsm-r2-43-40-default-on.nexus")
+    try:
+        result = run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED
+        assert int(np.isfinite(result.payload.intensity).sum()) == 5531
+        assert result.payload.result_fingerprint == (
+            "5d72bcaaeb3e923a32037a7117271b866c4f93635c93aeee2071b2b6791b46cc")
+    finally:
+        Path(form.output_path).unlink(missing_ok=True)
