@@ -871,3 +871,73 @@ def test_a_series_capsule_rebinds_by_stat_byte_for_byte_and_resolves_again_on_an
     (tmp_path / "bg_4.tif").write_bytes(b"source-new")  # a member added
     assert module._rebind_series_frame_background(capsule, plan, fact(10, 6.0)) is None
     assert resolve_frame_background(plan, fact(11, 6.0)).disposition != "RESOLVED"  # bg_4 has no decoder value
+
+
+def _monitor_sidecar(path: Path, monitor: float) -> None:
+    path.write_text(f"# Counters\nmonitor = {monitor}\n# Motors\ndel = 0.0\n"
+                    "User: review, time: Mon Jan 15 10:30:00 2024  # Temp\n")
+
+
+def test_a_series_whose_metadata_is_reached_through_a_link_keeps_no_capsule(tmp_path: Path) -> None:
+    """Codex BG-SERIES F1, its reproduction with the real TIFF and metadata readers: a member's sidecar is a
+    symbolic link. The receipt names the resolved file only, so a link retargeted to another valid sidecar
+    left every recorded state unchanged and the rebind reused a background 3.5 times too large. No capsule is
+    kept for such a Series (each frame resolves in full, as before BG-SERIES-REREAD); without the link one is."""
+    import tifffile
+    from xrd_tools.reduction import background as module
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"bg_{index}.tif"
+        tifffile.imwrite(path, np.arange(15, dtype=np.float32).reshape(3, 5) + 2 * index + 1)
+        _monitor_sidecar(path.with_suffix(".txt"), (2, 5, 11)[index])
+        paths.append(path)
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(paths[0]), normalization_key="monitor",
+                               metadata_format="txt")
+    target = _fact(tmp_path / "target_0.tif", shape=(3, 5), metadata=(("monitor", ("number", (3.0).hex())),))
+    with module.series_capsule_requested({}) as held:
+        assert resolve_frame_background(plan, target).disposition == "RESOLVED"
+    assert "series" in held  # the control: plain sidecars keep a capsule
+    old_meta, new_meta = tmp_path / "old_monitor.txt", tmp_path / "new_monitor.txt"
+    _monitor_sidecar(old_meta, 5)
+    _monitor_sidecar(new_meta, 50)
+    alias = paths[1].with_suffix(".txt")
+    alias.unlink()
+    alias.symlink_to(old_meta)
+    with module.series_capsule_requested({}) as held:
+        initial = resolve_frame_background(plan, target)
+    assert initial.disposition == "RESOLVED" and initial.background[0, 0] == 1.5  # mean 3 × 3 / 6
+    assert "series" not in held
+    alias.unlink()
+    alias.symlink_to(new_meta)
+    retargeted = resolve_frame_background(plan, target)
+    assert retargeted.background[0, 0] == pytest.approx(3 * 3 / 21, abs=0)  # monitors 2, 50, 11
+    assert retargeted.fingerprint != initial.fingerprint
+
+
+def test_a_series_with_an_edf_whose_pixels_live_in_another_file_keeps_no_capsule(tmp_path: Path) -> None:
+    """Codex BG-SERIES F2, its reproduction with the real EDF reader: fabio reads an EDF's pixels from the
+    file its header names in ``EDF_BinaryFileName``, which no stat of the EDF proves, so rewriting only that
+    file left the rebind on the old pixels. No capsule is kept for such a member; an EDF holding its own
+    pixels keeps one."""
+    import fabio
+    from xrd_tools.reduction import background as module
+    shape = (3, 4)
+    own = tmp_path / "own_1.edf"
+    fabio.edfimage.EdfImage(data=np.full(shape, 5, dtype="<u2")).write(str(own))
+    fact = _fact(tmp_path / "target_1.tif", shape=shape)
+    with module.series_capsule_requested({}) as held:
+        assert resolve_frame_background(FrameBackgroundPlan(mode="Series Average", locator=str(own)),
+                                        fact).disposition == "RESOLVED"
+    assert "series" in held  # the control
+    member, payload = tmp_path / "bg_1.edf", tmp_path / "pixels.bin"
+    payload.write_bytes(np.full(shape, 3, dtype="<u2").tobytes())
+    fabio.edfimage.EdfImage(data=np.zeros(shape, dtype="<u2"), header={
+        "EDF_BinaryFileName": payload.name, "EDF_BinaryFileSize": "24", "EDF_BinaryFilePosition": "0",
+    }).write(str(member))
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(member))
+    with module.series_capsule_requested({}) as held:
+        initial = resolve_frame_background(plan, fact)
+    np.testing.assert_array_equal(initial.background, np.full(shape, 3.0))
+    assert "series" not in held
+    payload.write_bytes(np.full(shape, 9, dtype="<u2").tobytes())
+    np.testing.assert_array_equal(resolve_frame_background(plan, fact).background, np.full(shape, 9.0))

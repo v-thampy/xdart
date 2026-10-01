@@ -398,7 +398,9 @@ class _PreparedSeriesFrameBackground:
     denominator, and the state of every member and metadata file read. A later frame rebinds it after a stat
     proof (the member set listed again, each file's ``_source_state`` unchanged) instead of reading, decoding
     and hashing every member again; its own normalization scales the mean as the full resolution does
-    (``_series_result``), and the same normalization as the last frame's reuses that result."""
+    (``_series_result``), and the same normalization as the last frame's reuses that result. None is kept
+    where a stat cannot prove an input: a metadata file reached through a link, or an EDF whose pixels live
+    in another file (Codex BG-SERIES F1, F2)."""
 
     plan: FrameBackgroundPlan
     frame_shape: tuple[int, int]
@@ -587,13 +589,32 @@ def _frame(value: tuple[object, ...], *, persisted=False) -> tuple[int, str, str
     if len(_json(value)) > _MAX_FRAME_FACT or len(_json(metadata)) > 12_288:
         raise ValueError("frame_fact exceeds its bounded encoding")
     return label, locator, selector, index, shape, metadata
-def _metadata(path: Path, plan: FrameBackgroundPlan, keys: tuple[str, ...], cancelled):
+def _edf_holds_its_pixels(path: Path) -> bool:
+    """Whether a one-frame EDF stores its own pixels. Fabio reads them from another file when the header
+    names ``EDF_BinaryFileName``, and no stat of the EDF proves that file (Codex BG-SERIES F2). Header only
+    (about 0.3 ms); a multi-frame or unreadable header counts as not proven."""
+    import fabio
+    try:
+        with fabio.openheader(str(path)) as image:
+            return int(image.nframes) == 1 and "EDF_BinaryFileName" not in image.header
+    except Exception:
+        return False
+
+
+def _metadata(path: Path, plan: FrameBackgroundPlan, keys: tuple[str, ...], cancelled, *,
+              aliased: list | None = None):
+    """``aliased`` (a Series capsule's request) records whether the metadata file was reached through a
+    symbolic link: the receipt names the resolved file only, so a link retargeted later is invisible to a
+    stat of it (Codex BG-SERIES F1)."""
     keys = tuple(sorted(set(keys)))
     if not keys: return (), None
     if _cancelled(cancelled): raise InterruptedError
     discovery = read_image_metadata_observed(path, meta_format=plan.metadata_format); _poll(cancelled)
     if discovery.source_path is None: raise ValueError("required Background metadata is absent")
-    source = Path(discovery.source_path).resolve(strict=True); del discovery
+    source = Path(discovery.source_path).resolve(strict=True)
+    if aliased is not None:
+        aliased.append(Path(os.path.abspath(discovery.source_path)) != source)
+    del discovery
     if len(str(source).encode()) > 4096: raise ValueError("Background metadata path exceeds cap")
     before = _digest(source, cancelled)
     if _cancelled(cancelled): raise InterruptedError
@@ -990,6 +1011,10 @@ def resolve_frame_background(
             manifest = hashlib.sha256(b"XDART-FRAME-BG-SERIES-MANIFEST-V1\0")
             receipt_bytes = 0; norm_sum = 0.0; itemsize = None
             states = {}  # every file read and its state: a later frame's stat proof (BG-SERIES-REREAD)
+            # a capsule only when those states prove every input (Codex BG-SERIES F1, F2): no metadata file
+            # reached through a link, no EDF whose pixels live in another file; else each frame resolves in full
+            requested = _SERIES_CAPSULE.get()
+            aliased = None if requested is None else []
             for ordinal, member in enumerate(members):
                 if _cancelled(cancelled): raise InterruptedError
                 member = member.resolve(strict=True)
@@ -998,7 +1023,10 @@ def resolve_frame_background(
                 if itemsize not in {None, observed_itemsize}: raise ValueError("Background Series native itemsize differs")
                 itemsize = observed_itemsize
                 metadata, metadata_source = _metadata(member, plan,
-                    tuple(key for key in (plan.normalization_key,) if key), cancelled)
+                    tuple(key for key in (plan.normalization_key,) if key), cancelled, aliased=aliased)
+                if aliased is not None and (any(aliased) or (
+                        member.suffix.casefold() == ".edf" and not _edf_holds_its_pixels(member))):
+                    aliased = requested = None
                 states[source["locator"]] = tuple(source["state"])
                 if metadata_source is not None:
                     states[metadata_source["locator"]] = tuple(metadata_source["state"])
@@ -1016,7 +1044,6 @@ def resolve_frame_background(
             most = int(counts.max())
             uniform = most and np.count_nonzero(counts == most) == np.count_nonzero(covered)
             del covered
-            requested = _SERIES_CAPSULE.get()
             # uneven counts: without a capsule this resolution's own, used once (no copy); a capsule keeps a
             # read-only uint16 copy (at most _MAX_MEMBERS a pixel)
             uneven = None if uniform else counts if requested is None else counts.astype(np.uint16)
