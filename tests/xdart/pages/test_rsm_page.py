@@ -22,16 +22,105 @@ from xdart.gui.tabs.rsm.display import rsm_keyed_projection
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.controls_inventory import THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN
 from xdart.gui.tools import rsm_owner
-from xdart.gui.tools.rsm_tool import RSMToolDialog
 from xrd_tools.analysis.module_transaction import ModuleDisposition, ModuleTerminalResult
 from xrd_tools.analysis.rsm_operation import RSMOperationExecutionV2, RSMOperationResultV2
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from tests.core.test_rsm_calibration_geometry import _canonical_partner
 from tests.core.test_rsm_operation_r2_real_data import _SCIENCE, rsm_r2_project  # noqa: F401
-from tests.xdart.tools.test_rsm_tool_dialog import (  # noqa: F401
-    _Owner, _Status, _q_values, _values, qapp,
-)
+from xdart.gui.pages.operation_owner import OperationIdentity, OperationTerminalStatus
+from xdart.gui.pages.values import CloseReceipt
+from xdart.gui.tools.rsm_owner import RSMOwnerAction, RSMOwnerOutcome, RSMOwnerOutcomeKind, RSMOwnerUpdate
+from xdart.gui.tools.rsm_values import RSMScanMemberForm, RSMToolFormV2, rsm_tool_preset
+from xrd_tools.analysis.rsm_geometry_asset import CANONICAL_RSM_GEOMETRY_LOCATOR, rsm_geometry_asset_input
+from xrd_tools.analysis.rsm_operation import RSMNormalizationPolicy
+from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
+from xrd_tools.session.rsm_viewer_model import make_rsm_viewer_values
+
+
+# The doubles and synthetic values below were the classic RSM dialog's test helpers; they moved here when the
+# dialog was retired (AUD-9 stage 2b G10).
+@pytest.fixture(scope="module")
+def qapp():
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+class _Status:
+    def __init__(self):
+        self.messages = []
+
+    def show(self, text, timeout_ms=0):
+        self.messages.append((str(text), int(timeout_ms)))
+
+
+class _Owner:
+    def __init__(self):
+        self.busy = False
+        self.form = None
+        self.prepared = None
+        self.finalization = rsm_owner.RSMOwnerFinalization.NONE
+        self.closed = 0
+
+    def set_form(self, form):
+        self.form = form
+        return False
+
+    def begin_preflight(self):
+        return None
+
+    def begin_run(self):
+        return None
+
+    def begin_retry_cleanup(self):
+        return None
+
+    def begin_retry_verification(self):
+        return None
+
+    def cancel(self):
+        return False
+
+    def poll(self):
+        return None
+
+    def close(self):
+        self.closed += 1
+        return CloseReceipt(PageCleanup.CLEAN)
+
+
+def _frame_values(names, units, shape=(5, 7, 9), *, offset=0.0):
+    axes = tuple((name, np.linspace(offset + index, offset + index + 1.0, size))
+                 for index, (name, size) in enumerate(zip(names, shape, strict=True)))
+    intensity = np.arange(np.prod(shape), dtype=np.float64).reshape(shape) + offset
+    projection = project_analysis_artifact_result(
+        kind=AnalysisArtifactKind.RSM, axes=axes, axis_units=tuple(zip(names, units, strict=True)),
+        intensity=intensity, sigma=None, coverage=None, normalization=None)
+    return make_rsm_viewer_values(projection)
+
+
+def _values(shape=(5, 7, 9), *, offset=0.0):
+    return _frame_values(("h", "k", "l"), (None, None, None), shape, offset=offset)
+
+
+def _q_values(shape=(5, 7, 9), *, offset=0.0):
+    frame = RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    return _frame_values(frame.axis_names, frame.axis_units, shape, offset=offset)
+
+
+def _scan43_dialog_form(root, output, *, frame=RSMCoordinateFrame.HKL, bins=None, normalization=None):
+    """The scan-43 RSM v2 form the classic RSM dialog built (retired in G10), composed as it composed it from
+    the shared preset: the Project as typed, the member's paths under it, the preset's conditioning, chunk and
+    memory, CREATE_NEW and the canonical geometry asset; its grid choice (``bins``) and normalization choice."""
+    preset = rsm_tool_preset()
+    member = RSMScanMemberForm(root / preset.spec_relative_path, preset.scan,
+                               root / preset.image_directory_relative_path, preset.image_stem,
+                               preset.frame_selector, preset.detector_shape, preset.raw_dtype,
+                               preset.raw_header_skip, preset.motor_selectors)
+    return RSMToolFormV2(
+        str(root), rsm_geometry_asset_input(CANONICAL_RSM_GEOMETRY_LOCATOR), (member,), preset.conditioning,
+        preset.normalization if normalization is None else normalization,
+        preset.quick_bins if bins is None else bins, preset.chunk_size, preset.max_frame_bytes,
+        preset.max_chunk_bytes, output, AnalysisArtifactOverwrite.CREATE_NEW, coordinate_frame=frame)
 
 
 
@@ -77,14 +166,14 @@ def _wait(page, qapp, done, seconds=20.0):
     raise AssertionError(page.run_bar.readinessLabel.full_text())
 
 
-def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
-    """The page and the RSM dialog it replaces make the same exact RSM v2 form from the same inputs (its
-    fingerprint names every member, selector, grid, frame and the output), for HKL and for Cartesian Q; the
-    page's replaces its own result (stage 2), the dialog's creates a new one, the page's geometry is its
-    Calibration row's where the dialog installs the canonical asset (stage 2b C7b), and the page's Max chunk
-    MiB is Auto where the dialog's is the preset's 256 (stage 2b S3a). The page's threshold is Int's (Auto by
-    default, as Stitch's), its "High → NaN" retired into Int's Manual High (G8b): the dialog's form takes the
-    same in ``_as_page``."""
+def test_the_page_builds_the_retired_dialogs_exact_scan43_form(qapp, tmp_path):
+    """The page makes the exact RSM v2 form the classic RSM dialog made from the same inputs (its fingerprint
+    names every member, selector, grid, frame and the output), for HKL and for Cartesian Q. The dialog is retired
+    (G10); ``_scan43_dialog_form`` composes its form from the shared preset as it did, which G10 proved equal to
+    the dialog's own before deleting it. The page's differences are deliberate: it replaces its own result
+    (stage 2), its geometry is its Calibration row's (stage 2b C7b), its Max chunk MiB is Auto (S3a), and its
+    threshold is Int's (Auto by default), the dialog's "High → NaN" retired into Int's Manual High (G8b), which
+    ``_as_page`` applies."""
     from dataclasses import replace as replaced
     from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 
@@ -92,7 +181,6 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
         return replaced(form, conditioning=replaced(form.conditioning, high_threshold=None),
                         corrections=replaced(form.corrections, threshold=StitchConditioning("auto")), **fields)
     page = _page(qapp, owner=_Owner())
-    dialog = RSMToolDialog(empty_host_services(_Status()), owner=_Owner())
     try:
         output = tmp_path / "rsm.nexus"
         _sto_align(tmp_path)  # the preset's scan on disk: the page finds its member through Stitch's Source
@@ -104,26 +192,19 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
                            ("frame_last", "60")):
             page.set_field(key, value)
         page.resolve_source()
-        dialog.project_edit.setText(str(tmp_path))
-        dialog._apply_scan43_preset()
-        dialog.output_edit.setText(str(output))
         geometry = page.build_form().geometry_asset
         assert page.build_form().fingerprint == _as_page(
-            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry,
-            max_chunk_bytes=None).fingerprint
+            _scan43_dialog_form(tmp_path, output), overwrite=AnalysisArtifactOverwrite.REPLACE,
+            geometry_asset=geometry, max_chunk_bytes=None).fingerprint
         page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
         page.set_field("grid", "Full 200×200×200")
         page.set_field("normalization", "None")
-        dialog.coordinate_frame_combo.setCurrentIndex(
-            dialog.coordinate_frame_combo.findData(RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU))
-        dialog.grid_combo.setCurrentIndex(1)
-        dialog.normalization_combo.setCurrentIndex(1)
         assert page.build_form().fingerprint == _as_page(
-            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry,
-            max_chunk_bytes=None).fingerprint
+            _scan43_dialog_form(tmp_path, output, frame=RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+                                bins=rsm_tool_preset().full_bins, normalization=RSMNormalizationPolicy.identity()),
+            overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry, max_chunk_bytes=None).fingerprint
     finally:
         _close(page, qapp)
-        dialog.shutdown()
 
 
 def _spec_scan(number, mu):
@@ -2026,3 +2107,59 @@ def test_custom_slice_in_q_coordinates_takes_qx_qy_qz_vectors(qapp, monkeypatch)
     finally:
         _close(page, qapp)
 
+
+@pytest.mark.parametrize("message", (
+    "analysis artifact published; verification remains pending",
+    "analysis artifact document close remains pending",
+))
+def test_a_pending_finalization_notice_keeps_the_actual_publication_state(qapp, message):
+    """A saving left pending names what actually happened (the owner's finalization message, published or not)
+    and offers Retry without regridding. Moved from the classic RSM dialog's row when it was retired (G10)."""
+    status = _Status()
+    page = RSMPage(empty_host_services(status), owner=_Owner())
+    try:
+        page._accept(RSMOwnerUpdate(
+            OperationIdentity(1, object()), RSMOwnerAction.RUN, terminal_status=OperationTerminalStatus.RETURNED,
+            outcome=RSMOwnerOutcome(RSMOwnerOutcomeKind.CLEANUP_PENDING, finalization_message=message)))
+        shown = page.run_bar.readinessLabel.full_text()
+        assert message in shown and "Retry" in shown
+        assert any(message in text for text, _timeout in status.messages)
+    finally:
+        _close(page, qapp)
+
+
+def test_an_edit_after_preview_drops_the_prepared_form(qapp, tmp_path):
+    """The classic RSM dialog bound Run to the exact form its Preview prepared (moved, G10). On the page any edit
+    drops that prepared form's fingerprint, so a Run previews the edited inputs again instead of running the
+    stale Preview (``_begin_action`` reuses a Preview only for the same fingerprint); a refresh with no edit
+    keeps it."""
+    page = _page(qapp, owner=_Owner())
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        form = page.build_form()
+        page._prepared_fingerprint = form.fingerprint
+        page._sync_actions()
+        assert page._prepared_fingerprint == form.fingerprint
+        page.set_field("grid", "Full 200×200×200")
+        assert page._prepared_fingerprint is None
+        assert page.build_form().fingerprint != form.fingerprint
+    finally:
+        _close(page, qapp)
+
+
+def test_a_presentation_failure_in_poll_is_contained_with_its_stable_code(qapp, monkeypatch):
+    """A failure while the page presents an owner update is caught in ``_poll``: the page names it with its
+    stable code and the error, and its timer stops once the owner is idle. Moved from the classic RSM dialog's
+    row when it was retired (G10)."""
+    page = _page(qapp, owner=_Owner())
+    monkeypatch.setattr(page._owner, "poll", lambda: object())
+    monkeypatch.setattr(page, "_accept", lambda _update: (_ for _ in ()).throw(RuntimeError("paint fault")))
+    try:
+        page._timer.start()
+        page._poll()
+        shown = page.run_bar.readinessLabel.full_text()
+        assert "RSM_VIEW_PRESENTATION_FAILED" in shown and "paint fault" in shown
+        assert not page._timer.isActive()
+    finally:
+        _close(page, qapp)
