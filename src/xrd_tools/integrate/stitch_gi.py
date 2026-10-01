@@ -7,10 +7,11 @@ its own coordinate's range and keeps the pixels whose other coordinate lies in t
 Qip + Qoop gives exactly the two single-cut results.
 
 Both backends take the sample surface normal n̂ from psic's four sample circles, per frame: eta from
-the incidence motor (or a Manual angle), chi from the tilt motor (or a Manual χ; 90° is level at
-17-2's chi-90 mounting), mu and phi from the Geometry's motors (maintainer, 2026-09-29: "pyfai
-should get the tilt from the data as well just like the incidence angle"). With q the lab-frame
-scattering vector:
+the incidence motor (or a Manual angle), chi from the tilt motor, mu and phi from the Geometry's
+motors (maintainer, 2026-09-29: "pyfai should get the tilt from the data as well just like the
+incidence angle"). A Manual tilt is Int's "Tilt angle", pyFAI's tilt with 0 level, on every frame
+(maintainer, 2026-09-30, option (b)): the frame's incidence comes from its circles with the sample
+level, and n̂ then tilts by the angle. With q the lab-frame scattering vector:
 
 - q_oop = q·n̂;
 - q_ip = |q − (q·n̂) n̂|, signed along the pyFAI sample orientation's horizontal axis projected into
@@ -97,8 +98,8 @@ class StitchGI:
     binned over its own coordinate's range (None: the data's span) and keeps the pixels whose other
     coordinate lies in the other range (None: all). The sample normal comes from psic's circles per
     frame: eta is ``incidence_motor``'s value or ``incident_angle_deg`` (Manual), chi is
-    ``tilt_motor``'s value or ``tilt_chi_deg`` (Manual, 90° by default: level at a chi-90 mounting),
-    and mu and phi are ``sample_motors``' (None reads zero). ``sample_orientation`` is pyFAI's (1–8):
+    ``tilt_motor``'s value, and mu and phi are ``sample_motors``' (None reads zero). A Manual tilt,
+    ``tilt_angle_deg``, is Int's "Tilt angle" (pyFAI's tilt; 0, level, by default) on every frame. ``sample_orientation`` is pyFAI's (1–8):
     the frame pyFAI's incidence and tilt are taken in, and the q_ip sign of both backends.
     ``motor_zeros`` are the Diffractometer panel's motor-zero readings of the motors read here:
     a circle's angle is its motor's reading minus its zero (a Manual angle is already one).
@@ -110,7 +111,7 @@ class StitchGI:
     incidence_motor: str | None = None
     incident_angle_deg: float | None = None
     tilt_motor: str | None = None
-    tilt_chi_deg: float | None = None
+    tilt_angle_deg: float | None = None
     sample_orientation: int = 4
     sample_motors: tuple[tuple[str, str | None], ...] = tuple((role, None) for role in GI_SAMPLE_ROLES)
     ip_range: tuple[float, float] | None = None
@@ -125,10 +126,10 @@ class StitchGI:
             raise ValueError(f"GI cuts must be one or both of {GI_CUTS}")
         object.__setattr__(self, "cuts", tuple(cut for cut in GI_CUTS if cut in cuts))
         for motor, value, name in ((self.incidence_motor, "incident_angle_deg", "incidence"),
-                                   (self.tilt_motor, "tilt_chi_deg", "tilt")):
+                                   (self.tilt_motor, "tilt_angle_deg", "tilt")):
             manual = getattr(self, value)
             if motor is None and manual is None and name == "tilt":
-                object.__setattr__(self, value, manual := 90.0)  # level at a chi-90 mounting
+                object.__setattr__(self, value, manual := 0.0)  # level
             if (manual is not None) == (motor is not None):
                 raise ValueError(f"GI needs exactly one of a {name} motor or a Manual {name} angle")
             if manual is not None:
@@ -175,14 +176,14 @@ class StitchGI:
     def identity(self) -> tuple[object, ...]:
         """Canonical value for a plan fingerprint."""
         return ("stitch-gi-v3", self.cuts, self.incidence_motor, self.incident_angle_deg, self.tilt_motor,
-                self.tilt_chi_deg, self.sample_orientation, self.sample_motors, self.ip_range, self.oop_range) + (
+                self.tilt_angle_deg, self.sample_orientation, self.sample_motors, self.ip_range, self.oop_range) + (
             (("motor-zeros", self.motor_zeros),) if self.motor_zeros else ()) + (
             (("reversed-motors", self.reversed_motors),) if self.reversed_motors else ())
 
     def to_provenance(self) -> dict[str, object]:
         return {"cuts": list(self.cuts), "units": {cut: GI_UNITS[cut] for cut in self.cuts},
                 "incidence_motor": self.incidence_motor, "incident_angle_deg": self.incident_angle_deg,
-                "tilt_motor": self.tilt_motor, "tilt_chi_deg": self.tilt_chi_deg,
+                "tilt_motor": self.tilt_motor, "tilt_angle_deg": self.tilt_angle_deg,
                 "sample_orientation": self.sample_orientation,
                 "sample_motors": {role: motor for role, motor in self.sample_motors},
                 "ip_range": None if self.ip_range is None else list(self.ip_range),
@@ -192,19 +193,30 @@ class StitchGI:
                 **({"reversed_motors": list(self.reversed_motors)} if self.reversed_motors else {})}
 
     def circles(self, metadata) -> tuple[float, float, float, float]:
-        """This frame's psic sample circles (mu, eta, chi, phi) in degrees."""
+        """This frame's psic sample circles (mu, eta, chi, phi) in degrees; with a Manual tilt chi is the
+        level one for the sample orientation (90° for 3 and 4), which :meth:`normal` then tilts."""
         motors, zeros = dict(self.sample_motors), dict(self.motor_zeros)
         values = tuple(
             manual if motor is None and manual is not None else 0.0 if motor is None
             # physical angle = reading - zero, negated for a circle turning about psic's reversed axis
             else (-1.0 if motor in self.reversed_motors else 1.0) * (float(metadata[motor]) - zeros.get(motor, 0.0))
             for motor, manual in ((motors["mu"], None), (self.incidence_motor, self.incident_angle_deg),
-                                  (self.tilt_motor, self.tilt_chi_deg), (motors["phi"], None)))
+                                  (self.tilt_motor, _level_chi(self.sample_orientation)), (motors["phi"], None)))
         return tuple(_finite(value, "sample angle") for value in values)
 
     def normal(self, metadata) -> np.ndarray:
-        """This frame's sample surface normal in the lab."""
-        return psic_normal(*self.circles(metadata))
+        """This frame's sample surface normal in the lab: its circles', or with a Manual tilt the normal
+        at the circles' incidence whose pyFAI tilt is the angle given (as Int's "Tilt angle")."""
+        normal = psic_normal(*self.circles(metadata))
+        if self.tilt_motor is not None:
+            return normal
+        incidence, _level = self.pyfai_angles(normal)
+        vertical, horizontal = (np.asarray(axis, dtype=np.float64)
+                                for axis in _ORIENTATION_AXES[self.sample_orientation])
+        alpha, tilt = math.radians(incidence), math.radians(self.tilt_angle_deg)
+        # pyFAI's fiber normal for (α, t): (−sin α cos t, −sin t, cos α cos t) in (beam, horizontal, vertical)
+        return (-math.sin(alpha) * math.cos(tilt) * _BEAM - math.sin(tilt) * horizontal
+                + math.cos(alpha) * math.cos(tilt) * vertical)
 
     def pyfai_angles(self, normal) -> tuple[float, float]:
         """pyFAI's (incident angle, tilt) in degrees giving ``normal`` in this sample orientation."""
@@ -228,6 +240,21 @@ class StitchGI:
         return axis / length
 
 
+def _level_chi(sample_orientation: int) -> float:
+    """The chi that makes a sample level in a pyFAI sample orientation (eta, mu, phi zero): its surface
+    normal along the orientation's vertical axis (90° for orientations 3 and 4, a chi-90 mounting)."""
+    vertical = _ORIENTATION_AXES[sample_orientation][0]
+    return math.degrees(math.atan2(vertical[0], vertical[2]))
+
+
+def tilt_angle_from_chi(chi_deg: float, sample_orientation: int) -> float:
+    """The Manual tilt angle (pyFAI's) of an older Manual χ: the tilt that χ gave with eta, mu and phi at
+    zero (orientation 4: χ − 90, orientation 3: 90 − χ); 0 where that χ was no level-ish mounting."""
+    horizontal = np.asarray(_ORIENTATION_AXES[sample_orientation][1], dtype=np.float64)
+    tilt = math.degrees(-math.asin(max(-1.0, min(1.0, float(psic_normal(0.0, 0.0, float(chi_deg), 0.0) @ horizontal)))))
+    return tilt if abs(tilt) < _MAX_ORIENTATION_ANGLE else 0.0
+
+
 def gi_coordinates(qx: np.ndarray, qy: np.ndarray, qz: np.ndarray, normal, axis) -> tuple[np.ndarray, np.ndarray]:
     """(q_ip, q_oop) of lab-frame q components for the unit surface normal ``normal`` and the in-plane
     sign axis ``axis`` (``StitchGI.in_plane_axis``): q_oop = q·n̂; q_ip the in-plane magnitude, signed
@@ -241,4 +268,5 @@ def gi_coordinates(qx: np.ndarray, qy: np.ndarray, qz: np.ndarray, normal, axis)
     return q_ip, q_oop
 
 
-__all__ = ["GI_CUTS", "GI_SAMPLE_ROLES", "GI_UNITS", "StitchGI", "gi_coordinates", "psic_normal"]
+__all__ = ["GI_CUTS", "GI_SAMPLE_ROLES", "GI_UNITS", "StitchGI", "gi_coordinates", "psic_normal",
+           "tilt_angle_from_chi"]

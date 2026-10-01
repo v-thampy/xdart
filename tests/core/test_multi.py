@@ -906,7 +906,7 @@ def test_codex_f1_a_pixel_below_the_other_window_counts_in_neither_gi_cut():
     from xrd_tools.integrate.stitch_gi import StitchGI
     q_ip, q_oop = _window_probe_coordinates((.37, 1.8))
     assert -.4 < q_ip[28, 0] < .4 and q_oop[28, 0] < -.4
-    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_chi_deg=88.2, ip_range=(-.4, .4),
+    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_angle_deg=1.8, ip_range=(-.4, .4),
                   oop_range=(-.4, .4))
     mask = np.ones((29, 43), dtype=np.int8)
     mask[28, 0] = 0
@@ -934,7 +934,7 @@ def test_a_gi_pixel_counts_in_both_cuts_only_inside_the_closed_window(coordinate
         value = coordinates[coordinate]
         hair = abs(value) * 1e-9 * (1 if outside else -1)
         ranges[coordinate] = (value + hair, value + .3) if side == "low" else (value - .3, value - hair)
-        gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_chi_deg=88.2, ip_range=ranges["q_ip"],
+        gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_angle_deg=1.8, ip_range=ranges["q_ip"],
                       oop_range=ranges["q_oop"])
         counted = 0. if outside else 1.
         sums = _window_sums(gi, ranges, mask)
@@ -959,7 +959,7 @@ def test_the_gi_window_holds_for_auto_and_explicit_ranges_under_every_correction
     mask = np.zeros(shape, dtype=np.int8)
     mask[1::4, 2::7] = 1
     angles = (.37, 1.8)
-    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_chi_deg=88.2, **ranges)
+    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_angle_deg=1.8, **ranges)
     bins = _gi_bins(lambda: iter((_window_probe_integrator(),)), (angles,), gi)
     inside = mask == 0
     for values, window in zip(_window_probe_coordinates(angles), (gi.ip_range, gi.oop_range)):
@@ -997,7 +997,7 @@ def test_the_gi_window_keeps_the_detectors_own_mask():
     q_ip, q_oop = _window_probe_coordinates((.37, 1.8))
     window = (q_ip >= .2) & (q_ip <= .45) & (q_oop >= -.35) & (q_oop <= -.2)
     assert (window & (detector_mask == 1)).any()
-    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_chi_deg=88.2, ip_range=(.2, .45),
+    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_angle_deg=1.8, ip_range=(.2, .45),
                   oop_range=(-.35, -.2))
     sums = _window_sums(gi, {"q_ip": (.2, .45), "q_oop": (-.35, -.2)}, None,
                         integrator=_window_probe_integrator(detector_mask))

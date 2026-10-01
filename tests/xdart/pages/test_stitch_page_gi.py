@@ -145,12 +145,12 @@ def test_a_manual_angle_axis_and_ranges_reach_the_form_and_round_trip(qapp, tmp_
         page.set_field("gi_ip_auto", False)
         page.set_field("gi_ip_min", -1.)
         page.set_field("gi_ip_max", 1.5)
-        tilt, chi = page._tilt_rows  # Advanced: a Manual tilt takes one χ for every frame
+        tilt, chi = page._tilt_rows  # Advanced: a Manual tilt takes Int's one tilt angle for every frame
         _choose(qapp, tilt, "Manual")
         assert not chi.isHidden()
-        chi.editor.setText("89.5")
+        chi.editor.setText("-0.5")
         chi.editor.editingFinished.emit()
-        expected = StitchGI(cuts, incident_angle_deg=.3, tilt_chi_deg=89.5, sample_motors=_SAMPLE, ip_range=(-1., 1.5))
+        expected = StitchGI(cuts, incident_angle_deg=.3, tilt_angle_deg=-.5, sample_motors=_SAMPLE, ip_range=(-1., 1.5))
         assert page.build_form().gi == expected
         (tmp_path / "other").mkdir()
         other = StitchPage(empty_host_services(_Status()))
@@ -159,7 +159,11 @@ def test_a_manual_angle_axis_and_ranges_reach_the_form_and_round_trip(qapp, tmp_
         assert other.build_form().gi == expected
         other.load_form(page.build_form())  # a prepared form restores it too
         assert other.build_form().gi == expected and _row(other, GI_THETA).editor.text() == "0.3"
-        assert other._value("unit") == axis and other._tilt_rows[1].editor.text() == "89.5"
+        assert other._value("unit") == axis and other._tilt_rows[1].editor.text() == "-0.5"
+        older = page_settings(page)  # settings saved before: a Manual χ of 89.5 at orientation 4
+        older["gi"] = {**{k: v for k, v in older["gi"].items() if k != "tilt_angle"}, "tilt_chi": "89.5"}
+        apply_page_settings(other, older)
+        assert other._gi["tilt_angle"] == "-0.5"  # the same surface as Int's tilt angle
     finally:
         _close(page, qapp)
         if other is not None:

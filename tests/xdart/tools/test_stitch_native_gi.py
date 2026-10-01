@@ -24,12 +24,32 @@ def _gi_form(tmp_path, backend, gi):
     return replace(form, gi=gi)
 
 
+def test_a_manual_tilt_is_ints_tilt_angle_in_every_orientation():
+    """GI tilt, option (b) (maintainer, 2026-09-30: "okay with (b)"): the tilt motor stays; Manual takes Int's
+    "Tilt angle", pyFAI's tilt with 0 level, whatever the frame's incidence and the sample orientation."""
+    import numpy as np
+    from xrd_tools.integrate.stitch_gi import tilt_angle_from_chi
+    for orientation in (1, 2, 3, 4):  # a Manual χ of 90 was refused in 1 and 2 (their level χ is -90)
+        for angle in (0., 1.8, -2.5):
+            gi = StitchGI(("q_ip",), incident_angle_deg=.37, tilt_angle_deg=angle, sample_orientation=orientation)
+            incidence, tilt = gi.pyfai_angles(gi.normal({}))
+            assert abs(incidence) == pytest.approx(.37, abs=1e-9) and tilt == pytest.approx(angle, abs=1e-9)
+    mu = StitchGI(("q_ip",), incident_angle_deg=.37, tilt_angle_deg=1.8, sample_motors=(("mu", "mu"), ("phi", None)))
+    assert mu.pyfai_angles(mu.normal({"mu": .5}))[1] == pytest.approx(1.8, abs=1e-9)  # mu off zero: still the angle
+    # an older Manual χ is the same surface as its tilt angle, at any incidence (mu zero)
+    for orientation, chi, angle in ((4, 88.2, -1.8), (3, 88.2, 1.8), (4, 90., 0.)):
+        assert tilt_angle_from_chi(chi, orientation) == pytest.approx(angle, abs=1e-12)
+        read = StitchGI(("q_ip",), incident_angle_deg=.37, tilt_motor="chi", sample_orientation=orientation)
+        manual = StitchGI(("q_ip",), incident_angle_deg=.37, tilt_angle_deg=angle, sample_orientation=orientation)
+        np.testing.assert_allclose(manual.normal({}), read.normal({"chi": chi}), rtol=0, atol=1e-12)
+
+
 def test_the_gi_value_takes_one_incidence_and_one_tilt_and_names_the_motors_it_reads():
     motor = StitchGI(("q_ip",), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE, oop_range=(0., .5))
     assert GI_UNITS == {"q_ip": "qip_A^-1", "q_oop": "qoop_A^-1"}
     assert motor.metadata_names() == ("eta", "chi", "mu", "phi")  # both backends: every circle
     manual = StitchGI(("q_ip",), incident_angle_deg=.2)
-    assert manual.metadata_names() == () and manual.tilt_chi_deg == 90.  # Manual: level at a chi-90 mounting
+    assert manual.metadata_names() == () and manual.tilt_angle_deg == 0.  # Manual: Int's tilt angle, level
     assert motor.circles({"eta": .3, "chi": 88., "mu": .5, "phi": -1.7}) == (.5, .3, 88., -1.7)
     assert manual.circles({}) == (0., .2, 90., 0.)
     # pyFAI's incidence and tilt come from the circles' surface normal: chi 90 is no tilt
@@ -40,7 +60,7 @@ def test_the_gi_value_takes_one_incidence_and_one_tilt_and_names_the_motors_it_r
     assert both.cuts == ("q_ip", "q_oop")  # one order
     assert (both.bins("q_ip"), both.window("q_ip"), both.bins("q_oop"), both.window("q_oop")) == (
         (-1., 1.), (0., .5), (0., .5), (-1., 1.))
-    for bad, message in ((dict(cuts=("q_ip",), incident_angle_deg=.2, tilt_motor="chi", tilt_chi_deg=90.), "exactly one"),
+    for bad, message in ((dict(cuts=("q_ip",), incident_angle_deg=.2, tilt_motor="chi", tilt_angle_deg=0.), "exactly one"),
                          (dict(cuts=("q_total",), incident_angle_deg=.2), "cuts"),
                          (dict(cuts=(), incident_angle_deg=.2), "cuts"),
                          (dict(cuts=("q_ip", "q_ip"), incident_angle_deg=.2), "cuts"),

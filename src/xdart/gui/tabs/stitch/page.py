@@ -719,7 +719,7 @@ class StitchPage(QtWidgets.QWidget):
         # Grazing incidence as Int sets it, in the Experiment section (maintainer, 2026-09-29):
         # Int's own rows, rebuilt from this page's values (_render_gi).
         # tilt_motor None: the default (chi, gonchi, else Manual) once the scan's motors are known
-        self._gi = dict(enabled=False, motor=None, angle="0.1", orientation="4", tilt_motor=None, tilt_chi="90")
+        self._gi = dict(enabled=False, motor=None, angle="0.1", orientation="4", tilt_motor=None, tilt_angle="0")
         self._gi_catalog = None
         self._gi_host = QtWidgets.QWidget()
         QtWidgets.QVBoxLayout(self._gi_host).setContentsMargins(0, 0, 0, 0)
@@ -873,17 +873,18 @@ class StitchPage(QtWidgets.QWidget):
             "On rotation axis drops a stacked-arm calibration's fitted sample offset, "
             "for a sample aligned onto the axis (for example after GI alignment).")
         # Grazing incidence's tilt, read per frame like the incidence (maintainer, 2026-09-29): the
-        # motor is psic's chi circle; Manual takes one χ for every frame. Rendered from self._gi.
+        # motor is psic's chi circle; Manual takes Int's one tilt angle for every frame (2026-09-30,
+        # option (b): "okay with (b)"). Rendered from self._gi.
         self._tilt_rows = (
             FormRow(label="GI tilt motor", path=("Stitch", "gi_tilt_motor"), value="Manual", kind="combo",
                     choices=("Manual",)),
-            FormRow(label="GI tilt χ (°)", path=("Stitch", "gi_tilt_chi"), value="90", kind="line"))
+            FormRow(label="GI tilt angle (°)", path=("Stitch", "gi_tilt_angle"), value="0", kind="line"))
         self._tilt_rows[0].setToolTip(
             "Grazing incidence: the motor giving each frame's chi circle (psic's χ; 90° is level at a "
             "chi-90 mounting). With the incidence, mu and phi it sets the sample surface for both "
-            "backends. Default: chi, then gonchi, else Manual.")
-        self._tilt_rows[1].setToolTip("Manual tilt motor: psic's χ for every frame (90° is level at a "
-                                      "chi-90 mounting).")
+            "backends. Default: chi, then gonchi, else Manual (one tilt angle, as Int's).")
+        self._tilt_rows[1].setToolTip("Manual tilt: Int's Tilt angle, pyFAI's tilt of the sample (0 is level), for "
+                                      "every frame; the incidence still comes from the circles.")
         for row in self._tilt_rows:
             row.valueChanged.connect(self._tilt_edited)
             row.draftChanged.connect(self._edited)
@@ -1030,12 +1031,12 @@ class StitchPage(QtWidgets.QWidget):
         motor, chi = self._tilt_rows
         motor.apply_field(ControlFormField(SectionId.PROCESSING, "GI tilt motor", motor._path, tilt,
                                            ControlFieldKind.COMBO, tuple(dict.fromkeys(choices))))
-        chi.apply_field(ControlFormField(SectionId.PROCESSING, "GI tilt χ (°)", chi._path, self._gi["tilt_chi"],
-                                         ControlFieldKind.LINE))
+        chi.apply_field(ControlFormField(SectionId.PROCESSING, "GI tilt angle (°)", chi._path,
+                                         self._gi["tilt_angle"], ControlFieldKind.LINE))
         chi.setVisible(tilt == "Manual")
 
     def _tilt_edited(self, path, value):
-        key = {"gi_tilt_motor": "tilt_motor", "gi_tilt_chi": "tilt_chi"}[path[-1]]
+        key = {"gi_tilt_motor": "tilt_motor", "gi_tilt_angle": "tilt_angle"}[path[-1]]
         if self._gi[key] == str(value):
             return
         self._gi[key] = str(value)
@@ -1098,7 +1099,7 @@ class StitchPage(QtWidgets.QWidget):
             GI_CUTS, incidence_motor=None if motor == "Manual" else motor,
             incident_angle_deg=float(self._gi["angle"]) if motor == "Manual" else None,
             tilt_motor=None if tilt == "Manual" else tilt,
-            tilt_chi_deg=float(self._gi["tilt_chi"]) if tilt == "Manual" else None,
+            tilt_angle_deg=float(self._gi["tilt_angle"]) if tilt == "Manual" else None,
             sample_orientation=int(self._gi["orientation"]), sample_motors=sample_motors,
             ip_range=ip, oop_range=oop, motor_zeros=zeros, reversed_motors=flipped)
 
@@ -1112,8 +1113,8 @@ class StitchPage(QtWidgets.QWidget):
                             orientation=str(gi.sample_orientation))
             if gi.incident_angle_deg is not None:
                 self._gi["angle"] = f"{gi.incident_angle_deg:g}"
-            if gi.tilt_chi_deg is not None:
-                self._gi["tilt_chi"] = f"{gi.tilt_chi_deg:g}"
+            if gi.tilt_angle_deg is not None:
+                self._gi["tilt_angle"] = f"{gi.tilt_angle_deg:g}"
             self._render_gi()  # Grazing's axis choices, before choosing one
             self.set_field("unit", self._gi_axis)  # the one it opens on: the Grazing axis last chosen
             for prefix, bounds in (("gi_ip", gi.ip_range), ("gi_oop", gi.oop_range)):

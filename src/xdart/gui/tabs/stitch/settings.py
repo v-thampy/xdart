@@ -121,6 +121,12 @@ def apply_page_settings(page, document: Any) -> None:
     gi = document.get("gi", {})
     page._gi.update({key: bool(value) if key == "enabled" else None if value is None else str(value)
                      for key, value in gi.items() if key in page._gi})
+    if "tilt_chi" in gi and "tilt_angle" not in gi:  # older settings: a Manual χ, now Int's tilt angle
+        from xrd_tools.integrate.stitch_gi import tilt_angle_from_chi
+        try:
+            page._gi["tilt_angle"] = f"{tilt_angle_from_chi(float(gi['tilt_chi']), int(page._gi['orientation'])):g}"
+        except (TypeError, ValueError, KeyError):
+            pass  # an unreadable one: level
     # the mapping follows the restored geometry, and readiness rechecks the calibration's arm
     page._instrument_changed()
     # As after load_form: the XU asset owns some fields, now that its paths are back.
