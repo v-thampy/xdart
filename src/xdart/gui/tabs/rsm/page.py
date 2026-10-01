@@ -1677,7 +1677,10 @@ class RSMPage(QtWidgets.QWidget):
             if self._run_requested:
                 self._start_run(current)
             else:
-                self._status(f"Preview ready · {summary.total_selected_frames} frames", ready=True)
+                warned = len(summary.detector_image_warnings)
+                self._status(f"Preview ready · {summary.total_selected_frames} frames" + (
+                    f" · {warned} {'warning' if warned == 1 else 'warnings'} (Preview lists them)" if warned else ""),
+                    ready=True)
                 self.preview_dialog.show()
             return
         self._run_requested = False

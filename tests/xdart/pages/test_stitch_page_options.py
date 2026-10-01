@@ -136,6 +136,28 @@ def test_preview_warns_when_the_flat_median_is_far_from_one(tmp_path):
         assert any(item.startswith("Flat field median 1000") for item in warnings) is warned
 
 
+def test_preview_lists_the_shared_dark_and_flat_checks_warnings_once(tmp_path):
+    """G8c: the Preview's dark and flat warnings are the shared check's (``check_detector_image``, as Int's and
+    RSM's): the flat's median far from 1 and the masked share of a dark or flat, each once over every output;
+    Stitch's own median rule is gone, so nothing is said twice."""
+    form = _native_form(tmp_path, "multigeometry", scans="1,2")
+    rows, cols = form.detector_shape
+    flat, dark = np.full((rows, cols), 1000.), np.zeros((rows, cols))
+    flat[: rows // 2] = 0  # dead: masked by the flat's cutoff
+    dark[: rows // 2] = np.nan  # not finite
+    np.save(tmp_path / "flat.npy", flat)
+    np.save(tmp_path / "dark.npy", dark)
+    prepared = prepare_stitch_tool(replace(form, flat_path=str(tmp_path / "flat.npy"),
+                                           dark_path=str(tmp_path / "dark.npy")))
+    assert len(prepared.requests) == 2
+    masked = 100 * (rows // 2) / rows
+    assert tuple(item for item in prepared.warnings if "independent Euler" not in item) == (
+        f"The dark masks {masked:.1f} % of the detector's usable pixels (not finite)",
+        "Flat field median 1000 is far from 1, so intensities scale by its inverse",
+        f"The flat field masks {masked:.1f} % of the detector's usable pixels (dead or below 10 % of its median)",
+    )
+
+
 def test_the_angle_mapping_follows_the_geometry_not_the_files_position_names(qapp, tmp_path):
     import json
     from xrd_tools.session.instrument import InstrumentGeometry

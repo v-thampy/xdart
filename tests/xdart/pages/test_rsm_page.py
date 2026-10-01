@@ -1450,6 +1450,30 @@ def test_advanced_corrections_reach_the_runs_frame_corrections(qapp, tmp_path):
         page.close_page()
 
 
+def test_preview_lists_the_shared_dark_and_flat_checks_warnings(qapp, tmp_path, monkeypatch):
+    """G8c: RSM's Preview lists the dark and flat checks' warnings as Stitch's does (the shared check, its
+    ``detector_image_warnings``), and its status counts them."""
+    _commit_instead_of_gridding(monkeypatch, _values())
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        flat = np.full((195, 487), 1000.)  # the members' detector
+        flat[:97] = 0  # dead: masked by the flat's cutoff
+        np.save(tmp_path / "flat.npy", flat)
+        page.set_field("flat_path", "flat.npy")
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in label.full_text())
+        assert label.full_text().endswith(" frames · 2 warnings (Preview lists them)")
+        assert page.preview_text.toPlainText().startswith(
+            "Warnings\nFlat field median 1000 is far from 1, so intensities scale by its inverse\n"
+            f"The flat field masks {100 * 97 / 195:.1f} % of the detector's usable pixels (dead or below 10 % of its "
+            "median)\n\nProject: ")
+    finally:
+        _close(page, qapp)
+
+
 _NO_UB = "This source records no UB matrix. Enter one, or take it from a SPEC scan, or choose Q coordinates."
 
 

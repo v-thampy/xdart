@@ -310,11 +310,11 @@ def prepare_native_stitch_tool(form, project):
         warning = _affine_geometry_warning(request)
         if warning is not None:
             warnings.append(warning)
-        flat = getattr(request.plan, "_flat_receipt", None)
-        if (flat is not None and flat.flat_median is not None and not .5 <= flat.flat_median <= 2
-                and not any(item.startswith("Flat field median") for item in warnings)):
-            warnings.append(f"Flat field median {flat.flat_median:.4g} is far from 1: pyFAI divides by "
-                            "the flat as given, so intensities scale by its inverse")
+        from xrd_tools.analysis.stitch_native import detector_image_warnings
+        # the shared dark and flat check's (detector-aware), as RSM's Preview lists them: each once
+        warnings.extend(item for item in detector_image_warnings(
+            getattr(request.plan, "_dark_receipt", None), getattr(request.plan, "_flat_receipt", None))
+            if item not in warnings)
     unchanged = tuple(index for index, request in enumerate(requests) if stitch_output_current(request))
     return StitchToolPreflight(form, requests[0], None, _PREFLIGHT_FACTORY,
                                requests=tuple(requests), skipped=resolution.skipped,

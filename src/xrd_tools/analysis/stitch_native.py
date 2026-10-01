@@ -194,6 +194,19 @@ def capture_detector_image(path, role, max_bytes, min_fraction=DEFAULT_MIN_FLAT_
     return receipt, pixels
 
 
+def detector_image_warnings(*receipts):
+    """The dark and flat checks' warnings (``check_detector_image``: a flat's median far from 1, many masked pixels,
+    counted without the calibrated detector's own mask) of these receipts, each once and as Int shows them: what
+    Stitch's and RSM's Previews list for their dark and flat (G8c)."""
+    shown = []
+    for receipt in receipts:
+        for item in (() if receipt is None else receipt.warnings):
+            line = item[:1].upper() + item[1:]
+            if line not in shown:
+                shown.append(line)
+    return tuple(shown)
+
+
 def calibration_detector_mask(value):
     """An xrayutilities calibration's detector mask (module gaps) in the calibration's own turned frame, as Stitch's
     XU backend rebuilds it: pyFAI's detector from the partner's factory name and config, its count and digest

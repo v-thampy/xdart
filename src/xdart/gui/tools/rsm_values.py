@@ -34,6 +34,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     lower_rsm_effective_geometry,
     rsm_calibration_solid_angle_source,
 )
+from xrd_tools.analysis.stitch_native import detector_image_warnings
 from xrd_tools.analysis.rsm_operation import (
     RSMDetectorGeometry,
     RSMFrameCorrections,
@@ -1646,6 +1647,9 @@ class RSMToolPreflightSummaryV2:
     solid_angle: str | None = None
     detector_mask: tuple[int, int] | None = None
     ub_given: str | None = None
+    #: Display only (G8c): the dark and flat checks' warnings, as Stitch's Preview lists them
+    #: (``detector_image_warnings``)
+    detector_image_warnings: tuple[str, ...] = ()
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -2116,6 +2120,8 @@ def prepare_rsm_tool_v2(
         ub_given=None if given is None else (
             "typed, in SPEC's #G3 convention" if given.spec_receipt is None
             else f"scan {given.spec_receipt[4]} of {given.spec_receipt[0]} (its #G3)") + f": {_ub_text(given.matrix)}",
+        detector_image_warnings=(() if request.plan.corrections is None else detector_image_warnings(
+            request.plan.corrections.dark_receipt, request.plan.corrections.flat_receipt)),
         _claim=_PREFLIGHT_V2_FACTORY,
     )
     return RSMToolPreflightV2(
@@ -2177,6 +2183,7 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
         )
     )
     lines = [
+        *(() if not summary.detector_image_warnings else ("Warnings", *summary.detector_image_warnings, "")),
         f"Project: {summary.project_root}",
         f"Output: {summary.output_relative_path}",
         f"Coordinate frame: {frame.display_name}",
