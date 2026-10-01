@@ -25,6 +25,7 @@ import logging
 import math
 from pathlib import Path
 import re
+import threading
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -160,9 +161,39 @@ def _resolve_rsm_groups(arguments, cancel, _progress):
     from xdart.gui.tools.rsm_values import rsm_member_groups
     if cancel.is_set():
         return None
-    selection, options = arguments
+    selection, options, queue = arguments
     groups, skipped = rsm_member_groups(selection, **options)
-    return groups, skipped, _source_ubs(groups)
+    return groups, skipped, _source_ubs(groups), _queue_refusals(queue, groups, cancel)
+
+
+def queue_output_slots(project, folder, groups):
+    """Each queued RSM's (family, output) in the Save Path's folder (``<folder>/<family>_rsm.nexus``, the
+    family's stable slot): what ``build_forms`` writes to, and what a queued Run checks before its first RSM is
+    gridded (G11). One helper for both, so the outputs checked are the outputs written."""
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    slots = []
+    for members in groups:
+        family = suggested_family(project, members)
+        slots.append((family, resolve_finite_output_target(folder, family, operation_token="rsm")))
+    return tuple(slots)
+
+
+def _queue_refusals(queue, groups, cancel):
+    """Every queued RSM's output checked as its Replace checks it, from the header only
+    (``analysis_output_refusal``), off the GUI thread: {output: refusal, or None when it can be written}. The
+    maintainer, 2026-10-01, on queued runs: "Yes for your recommendation" (check every output before the first
+    RSM is gridded, as Stitch does). Several RSMs only (one RSM's own preflight checks its output); empty while
+    the Save Path is not usable (``build_forms`` refuses it then)."""
+    if queue is None or len(groups) < 2:
+        return {}
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, analysis_output_refusal
+    project, folder = queue
+    checked = {}
+    for _family, output in queue_output_slots(project, folder, groups):
+        if cancel.is_set():
+            return {}
+        checked[str(output)] = analysis_output_refusal(output, AnalysisArtifactKind.RSM)
+    return checked
 
 
 def _source_ubs(groups):
@@ -897,22 +928,31 @@ class RSMPage(QtWidgets.QWidget):
             detector_shape=(int(self._value("adv_rows")), int(self._value("adv_columns"))),
             raw_dtype=str(self._value("adv_dtype")), raw_header_skip=int(self._value("adv_header")),
             motor_selectors=parse_rsm_angle_mapping(self._value("adv_angle_mapping")))
-        return selection, options
+        return selection, options, self._queue_target(root)
+
+    def _queue_target(self, project):
+        """(Project, the Save Path's folder): where several RSMs' outputs go, for their check while the scans are
+        found (``_queue_refusals``, G11); None while the Save Path is blank (``build_forms`` refuses it)."""
+        try:
+            return project, self._inside(project, str(self._value("output_path")).strip(), "output path").parent
+        except (TypeError, ValueError, OSError):
+            return None
 
     def resolve_source(self):
         """The Source's member groups found now, on the calling thread (scripts and rows; Preview and Run find
         them on the shared single worker first): (groups, skipped). ``build_form`` reads them."""
         from xdart.gui.tools.rsm_values import rsm_member_groups
         key = self._group_key()
-        selection, options = self._resolution_request()
+        selection, options, queue = self._resolution_request()
         groups, skipped = rsm_member_groups(selection, **options)
-        self._found(key, groups, skipped, _source_ubs(groups))
+        self._found(key, groups, skipped, _source_ubs(groups), _queue_refusals(queue, groups, threading.Event()))
         return groups, skipped
 
-    def _found(self, key, groups, skipped, ubs=()):
+    def _found(self, key, groups, skipped, ubs=(), checked=None):
         """Member groups found for ``key``: kept for ``build_form`` with the one RSM's members' own UBs (the
-        Source header's warning), and the suggested output follows them."""
-        self._groups = (key, tuple(groups), tuple(skipped), tuple(ubs))
+        Source header's warning) and, for several RSMs, each output's check (``_queue_refusals``); the suggested
+        output follows them."""
+        self._groups = (key, tuple(groups), tuple(skipped), tuple(ubs), dict(checked or {}))
         if self._apply_suggestion():
             self._edited()
         else:  # the found members' UBs: the Source header (no new form: a prepared Preview stays current)
@@ -926,7 +966,7 @@ class RSMPage(QtWidgets.QWidget):
         found = self._groups
         if found is None or found[0] != self._group_key():
             raise ValueError("the Source's scans are not found yet (Preview finds them)")
-        _key, groups, skipped, _ubs = found
+        _key, groups, skipped, _ubs, _checked = found
         if not groups:
             reason = ""
             if skipped:  # the first skip's file, scan and why (Stitch's skips)
@@ -1054,16 +1094,14 @@ class RSMPage(QtWidgets.QWidget):
         owner, a form at a time, as Stitch queues its outputs. One RSM is ``build_form``'s form. Several each
         take their own family's stable slot in the Save Path's folder (``<folder>/<family>_rsm.nexus``), so each
         records its family and has its own Append check; two RSMs naming one slot are refused (ValueError)."""
-        from xrd_tools.io.output_path import resolve_finite_output_target
         project = self._form_project()
         groups = self._groups_members()
         if len(groups) == 1:
             return (self.build_form(),)
         folder = self._inside(project, str(self._value("output_path")).strip(), "output path").parent
         forms, slots = [], {}
-        for index, members in enumerate(groups, 1):
-            family = suggested_family(project, members)
-            output = resolve_finite_output_target(folder, family, operation_token="rsm")
+        for index, (members, (family, output)) in enumerate(
+                zip(groups, queue_output_slots(project, folder, groups), strict=True), 1):
             if output in slots:
                 raise ValueError(f"RSMs {slots[output]} and {index} would both write {output.name}: "
                                  "combine their scans in brackets, or select them separately")
@@ -1505,18 +1543,19 @@ class RSMPage(QtWidgets.QWidget):
         elif terminal.status is OperationTerminalStatus.FAILED:
             self._notice(f"Source refused: {terminal.failure_message or terminal.failure_type}")
         elif terminal.status is OperationTerminalStatus.RETURNED and terminal.payload is not None:
-            groups, skipped, ubs = terminal.payload
+            groups, skipped, ubs, checked = terminal.payload
             if key != self._group_key():
                 self._notice("The scans were found, but the Source changed: Preview again")
                 return
-            self._found(key, groups, skipped, ubs)
+            self._found(key, groups, skipped, ubs, checked)
             self._continue(action)
         else:
             self._notice("RSM stopped")
 
     def _continue(self, action):
         """Preview, or Run, on the member groups just found; an HKL map of a source with no UB waits for one.
-        Several RSMs are queued (``build_forms``): each is prepared, and on Run gridded, before the next."""
+        Several RSMs are queued (``build_forms``): each is prepared, and on Run gridded, before the next; a
+        Run first checks every output (``_queue_outputs_writable``)."""
         if self._ub_wanted():
             self._notice(_NO_UB)
             return
@@ -1526,6 +1565,8 @@ class RSMPage(QtWidgets.QWidget):
             self._notice(f"Invalid RSM request: {error}")
             return
         if len(forms) > 1:
+            if action == "run" and not self._queue_outputs_writable(forms):
+                return
             self._jobs, self._job_action, self._job_total = list(forms), action, len(forms)
             self._job_lines, self._job_skipped, self._job_warnings = [], 0, {}
             self._next_job()
@@ -1535,6 +1576,25 @@ class RSMPage(QtWidgets.QWidget):
             self._start_run(form)
         else:
             self._begin_preflight(run=action == "run", form=form)
+
+    def _queue_outputs_writable(self, forms):
+        """True when every queued RSM's output was checked, with the scans just found, and can be written: a
+        queued Run checks them all before its first RSM is gridded, as Stitch checks its outputs (G11), so it
+        never stops halfway with some RSMs saved. Each RSM's own preflight still checks its output just before
+        its gridding, for a file that appears meanwhile."""
+        checked = self._groups[4] if self._groups is not None else {}
+        for position, form in enumerate(forms, 1):
+            if form.overwrite is not AnalysisArtifactOverwrite.REPLACE:
+                continue
+            output = str(Path(form.output_path))
+            if output not in checked:  # the Save Path changed while the scans were found
+                self._notice("The output changed while the scans were found: Run again")
+                return False
+            if checked[output] is not None:
+                self._notice(f"Run refused (RSM {position} of {len(forms)}): OUTPUT_NOT_PREVIOUS_ANALYSIS: "
+                             f"{checked[output]} · nothing was gridded")
+                return False
+        return True
 
     def _next_job(self):
         """The queue's next RSM: prepared (Preview), or prepared and gridded (Run); at the end, Preview shows

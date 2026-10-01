@@ -4,6 +4,7 @@ Controls panel, run bar and scientific panes, over the one RSM v2 owner."""
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1311,6 +1312,97 @@ def test_two_queued_rsms_naming_one_slot_are_refused(qapp, tmp_path, monkeypatch
         monkeypatch.setattr(page_module, "suggested_family", lambda _project, _members: "same")
         with pytest.raises(ValueError, match="RSMs 1 and 2 would both write same_rsm.nexus"):
             page.build_forms()
+    finally:
+        _close(page, qapp)
+
+
+# AUD-9 stage 2b G11: a queued Run checks every output before its first RSM is gridded
+
+
+def test_a_queued_run_refuses_a_foreign_file_at_any_output_before_gridding_the_first(qapp, tmp_path, monkeypatch):
+    """The maintainer, 2026-10-01, on queued runs: "Yes for your recommendation": every queued output is checked
+    (from its header, while the scans are found, off the GUI thread) before the first RSM is gridded, as Stitch
+    checks its outputs. A foreign file at RSM 2's output refuses the whole Run, named, with nothing gridded or
+    saved and the file untouched; before, RSM 1 was gridded and saved, then RSM 2 refused."""
+    grids = _counting_grids(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        second = Path(page.build_forms()[1].output_path)
+        second.parent.mkdir(parents=True, exist_ok=True)
+        second.write_bytes(b"an operator's own file")
+        page.begin_run()
+        _wait(page, qapp, lambda: not page.active() and "refused" in label.full_text())
+        assert label.full_text().startswith("Run refused (RSM 2 of 2): OUTPUT_NOT_PREVIOUS_ANALYSIS: ")
+        assert f"{second.name} is not an RSM result that Replace can overwrite (" in label.full_text()
+        assert label.full_text().endswith(" · nothing was gridded")
+        assert grids == [] and page.results.count() == 0 and page._jobs == []
+        assert second.read_bytes() == b"an operator's own file"
+    finally:
+        _close(page, qapp)
+
+
+def test_a_file_appearing_at_a_queued_output_after_the_check_is_refused_at_its_turn(qapp, tmp_path, monkeypatch):
+    """The early check does not replace the one just before each RSM's gridding: a file that appears at RSM 2's
+    output while RSM 1 is gridded is still refused by RSM 2's own preflight, and left untouched; RSM 1 is saved."""
+    _commit_instead_of_gridding(monkeypatch, _values())
+    committed, grids, planted = RSMOperationExecutionV2.run, [], []
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        first, second = (Path(form.output_path) for form in page.build_forms())
+
+        def gridding(self, **kwargs):
+            grids.append(Path(self.request.module.output.target).name)
+            if not planted:  # RSM 1 is being gridded: the file appears at RSM 2's output
+                second.parent.mkdir(parents=True, exist_ok=True)
+                second.write_bytes(b"an operator's own file")
+                planted.append(second)
+            return committed(self, **kwargs)
+        monkeypatch.setattr(RSMOperationExecutionV2, "run", gridding)
+        page.begin_run()
+        _wait(page, qapp, lambda: not page.active() and "refused" in label.full_text())
+        assert label.full_text().startswith("Preview refused (RSM 2 of 2): ")
+        assert f"{second.name} is not an RSM result" in label.full_text()
+        assert grids == [first.name] and page.results.count() == 1
+        assert second.read_bytes() == b"an operator's own file"
+    finally:
+        _close(page, qapp)
+
+
+def test_a_save_path_changed_while_the_scans_were_found_asks_for_another_run(qapp, tmp_path, monkeypatch):
+    """The outputs checked are the outputs written (``queue_output_slots`` serves both). When the Save Path moves
+    while the scans are being found, the outputs checked were the old folder's: the queued Run grids nothing and
+    asks for another Run, which checks and grids the new folder's."""
+    from xdart.gui.tools import rsm_values
+    grids = _counting_grids(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        found, release = rsm_values.rsm_member_groups, threading.Event()
+
+        def held(*args, **kwargs):  # the scans are being found while the Save Path moves
+            release.wait(10)
+            return found(*args, **kwargs)
+        monkeypatch.setattr(rsm_values, "rsm_member_groups", held)
+        page.begin_run()
+        elsewhere = tmp_path / "elsewhere"
+        page.set_field("output_path", str(elsewhere / "named.nexus"))
+        release.set()
+        _wait(page, qapp, lambda: not page.active() and "Run again" in label.full_text())
+        assert label.full_text() == "The output changed while the scans were found: Run again"
+        assert grids == [] and page.results.count() == 0
+        names = [Path(form.output_path) for form in page.build_forms()]
+        assert [path.parent for path in names] == [elsewhere, elsewhere]
+        page.begin_run()
+        _wait(page, qapp, lambda: "Saved 2 of 2 RSMs" in label.full_text())
+        assert grids == [path.name for path in names]
     finally:
         _close(page, qapp)
 
