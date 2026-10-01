@@ -441,8 +441,8 @@ def test_a_failed_paint_keeps_the_six_shown(qapp, monkeypatch):
 @pytest.mark.parametrize(("make", "names"), (
     (_values, ("H", "K", "L")), (_q_values, ("Qx (Å⁻¹)", "Qy (Å⁻¹)", "Qz (Å⁻¹)"))), ids=("hkl", "q"))
 def test_each_pane_carries_the_frames_own_axis_labels(qapp, make, names):
-    """Each axis is labelled as its frame and the RSM dialog label it (a Cartesian Q axis as Qx, Qy or Qz
-    in Å⁻¹, not as Int's 1-D "Q"), and each slice title names the index it is taken at."""
+    """Each axis is labelled as its frame names it, as the classic RSM dialog did (a Cartesian Q axis as Qx,
+    Qy or Qz in Å⁻¹, not as Int's 1-D "Q"), and each slice title names the index it is taken at."""
     from xrd_tools.session.rsm_viewer_model import RSMViewerModel
     view = ScientificView()
     try:
@@ -639,7 +639,7 @@ def test_a_pending_verification_keeps_a_clickable_retry(qapp, tmp_path, monkeypa
 @pytest.mark.parametrize("frame", tuple(RSMCoordinateFrame), ids=lambda frame: frame.value)
 def test_each_slice_pixel_sits_at_its_bin_centre(qapp, frame):
     """F3: the shared pane spans an image over its axes' first and last values, so the slices give it their
-    bins' outer edges (the dialog's half-bin bounds, now one headless helper): each pixel centre is its bin
+    bins' outer edges (the classic dialog's half-bin bounds, now one headless helper): each pixel centre is its bin
     centre, as the projections plot them. Codex's example: H 10..30, K 100..106."""
     from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
     from xrd_tools.session.rsm_viewer_model import RSMViewerModel, make_rsm_viewer_values

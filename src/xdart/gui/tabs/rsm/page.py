@@ -134,7 +134,7 @@ _NORMALIZATION_MODES = {normalization.NONE: RSMNormalizationMode.IDENTITY,
 #: text; ``rsm_values`` stays the authority that refuses it (Codex's stage-1 review F1). The frame range is
 #: Stitch's one range for every member, in Advanced (design §2).
 _INTEGER_FIELDS = {"frame_first": (0, None, False), "frame_last": (0, None, True), "frame_step": (1, None, False),
-                   # Advanced (the dialog's spin boxes' ranges, as rows)
+                   # Advanced (the classic RSM dialog's spin-box ranges, as rows)
                    "adv_rows": (2, 1_000_000, False), "adv_columns": (2, 1_000_000, False),
                    "adv_header": (0, 1 << 30, False),
                    "adv_foil_occurrence": (0, 1024, False), "adv_exposure_occurrence": (0, 1024, False),
