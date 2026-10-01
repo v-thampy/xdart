@@ -317,6 +317,10 @@ class _KeyedImagePanel:
         self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis, color_map=color_map,
                          log_scale=log_scale)
         self.pane.plot.setTitle(panel.title)
+        for widget in (self.previous, self.selector, self.next):  # a plane with no index to step has none
+            widget.setVisible(panel.navigation)
+        if not panel.navigation:
+            return
         blocker = QtCore.QSignalBlocker(self.selector)
         if panel.index_captions != self._captions:
             self.selector.clear()
@@ -3035,6 +3039,7 @@ class ScientificView(QtWidgets.QFrame):
             widgets.container.deleteLater()
         self._keyed_panels, self._keyed_layout = {}, ()
         grid = self._keyed_area.layout()
+        width = max(len(row) for row in layout)
         for row_index, row in enumerate(layout):
             for column, key in enumerate(row):
                 if key.role is PanelRole.SLICE_2D:
@@ -3043,7 +3048,8 @@ class ScientificView(QtWidgets.QFrame):
                     widgets = _KeyedTracePanel(key)
                 else:
                     raise ValueError(f"a keyed layout draws SLICE_2D and PROJ_1D panels, not {key.role.value}")
-                grid.addWidget(widgets.container, row_index, column)
+                # a row of one panel spans the widest row (Custom Slice's plane over its two projections)
+                grid.addWidget(widgets.container, row_index, column, 1, width if len(row) == 1 else 1)
                 self._keyed_panels[key] = widgets
         self._keyed_layout = layout
 

@@ -153,3 +153,35 @@ def test_the_colour_map_and_log_controls_are_built_once_for_every_intensity_view
     finally:
         view.deleteLater()
         qapp.processEvents()
+
+
+def test_a_plane_with_no_index_to_step_spans_its_row_and_draws_no_navigation(qapp):
+    """Custom Slice's layout (AUD-9 stage 2b G9): one plane, ``navigation=False`` (no index to step along a
+    normal), alone in its row so it spans the widest row, over its two projections. The RSM 2×3 is unchanged:
+    every panel of a row of several takes one column."""
+    plane, along_t, along_s = (PanelKey(PanelRole.SLICE_2D, "custom"), PanelKey(PanelRole.PROJ_1D, "t"),
+                               PanelKey(PanelRole.PROJ_1D, "s"))
+    x, y = np.array([1.0, 2.0, 3.0]), np.array([10.0, 20.0])
+    image = KeyedImageProjection(plane, "HH-L plane", np.arange(6.0).reshape(2, 3), AxisProjection(x, "HH", ""),
+                                 AxisProjection(y, "L", ""), 0, (), navigation=False)
+    traces = tuple(KeyedTraceProjection(key, key.instance, AxisProjection(axis, key.instance, ""),
+                                        np.ones(axis.size), "Mean I") for key, axis in ((along_t, x), (along_s, y)))
+    state = KeyedPanelsProjection(((plane,), (along_t, along_s)), (image, *traces))
+    with pytest.raises(TypeError):  # a plane without navigation names no captions
+        KeyedImageProjection(plane, "", np.zeros((2, 3)), AxisProjection(x, "HH", ""), AxisProjection(y, "L", ""),
+                             0, ("0",), navigation=False)
+    view = ScientificView()
+    try:
+        view.reconcile_keyed(state)
+        grid = view._keyed_area.layout()
+        panel = view.keyed_panel(plane)
+        assert grid.getItemPosition(grid.indexOf(panel.container)) == (0, 0, 1, 2)
+        assert all(widget.isHidden() for widget in (panel.previous, panel.selector, panel.next))
+        np.testing.assert_array_equal(panel.pane.canvas.raw_image, np.arange(6.0).reshape(2, 3).T)
+        view.reconcile_keyed(_state())  # the 2×3-style layout: each panel one column, navigation drawn
+        grid = view._keyed_area.layout()
+        assert grid.getItemPosition(grid.indexOf(view.keyed_panel(_HK).container)) == (0, 0, 1, 1)
+        assert not view.keyed_panel(_HK).selector.isHidden()
+    finally:
+        view.deleteLater()
+        qapp.processEvents()

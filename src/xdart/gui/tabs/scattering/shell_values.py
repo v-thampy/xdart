@@ -342,6 +342,9 @@ class KeyedImageProjection:
     y_axis: AxisProjection
     index: int
     index_captions: tuple[str, ...]
+    #: False for a plane with no index to step (Custom Slice): no navigation is drawn, ``index`` is 0 and
+    #: ``index_captions`` is empty
+    navigation: bool = True
 
     def __post_init__(self) -> None:
         if type(self.key) is not PanelKey or self.key.role is not PanelRole.SLICE_2D:
@@ -349,7 +352,12 @@ class KeyedImageProjection:
         if (type(self.image) is not np.ndarray or self.image.ndim != 2
                 or self.image.shape != (self.y_axis.values.size, self.x_axis.values.size)):
             raise TypeError("a keyed image is (y, x) on its two axes")
-        if (type(self.index_captions) is not tuple or not self.index_captions
+        if type(self.navigation) is not bool:
+            raise TypeError("a keyed image's navigation is a bool")
+        if not self.navigation:
+            if self.index != 0 or self.index_captions != ():
+                raise TypeError("a keyed image without navigation has index 0 and no captions")
+        elif (type(self.index_captions) is not tuple or not self.index_captions
                 or any(type(caption) is not str for caption in self.index_captions)
                 or type(self.index) is not int or not 0 <= self.index < len(self.index_captions)):
             raise TypeError("a keyed image's index is one of its captions")
