@@ -2688,12 +2688,21 @@ class RSMOperationPlanV2:
     corrections: object = None
     #: A UB given at Preview (``RSMBoundUB``), replacing every member's source UB; None: the sources' own.
     ub_override: object = None
+    #: The calibrated detector's own mask (module gaps) in the raw frame, read-only (``rsm_calibration_detector_mask``),
+    #: masked in every frame whatever the corrections (S3c unit 4b); None: the canonical asset, or no gaps. Not
+    #: identity: the geometry receipt carries its digest.
+    detector_mask: object = None
 
     def __post_init__(self, _claim: object) -> None:
+        header = getattr(self.effective_geometry, "detector_header", None)
         if (
             _claim is not _RSM_V2_FACTORY
             or (self.corrections is not None and type(self.corrections) is not RSMBoundCorrections)
             or (self.ub_override is not None and type(self.ub_override) is not RSMBoundUB)
+            or (self.detector_mask is not None and (
+                type(self.detector_mask) is not np.ndarray or self.detector_mask.dtype != np.dtype(bool)
+                or self.detector_mask.flags.writeable or header is None
+                or self.detector_mask.shape != (int(header.Nch1), int(header.Nch2))))
             or type(self.effective_geometry) is not RSMEffectiveGeometry
             or type(self.ordered_geometry_bindings) is not tuple
             or not 1 <= len(self.ordered_geometry_bindings) <= 16
@@ -2816,6 +2825,7 @@ def _make_rsm_operation_plan_v2(
     max_chunk_bytes: int,
     corrections: RSMBoundCorrections | None = None,
     ub_override: RSMBoundUB | None = None,
+    detector_mask: np.ndarray | None = None,
 ) -> RSMOperationPlanV2:
     canonical = (
         "rsm-operation-plan-v2",
@@ -2855,6 +2865,7 @@ def _make_rsm_operation_plan_v2(
         _RSM_V2_FACTORY,
         corrections,
         ub_override,
+        detector_mask,
     )
 
 
@@ -3637,13 +3648,15 @@ def _rsm_v2_correction_charge(value, dark: bool, flat: bool, detector_shape, cro
 
 
 def rsm_v2_chunk_bytes(detector_shape, cropped_shape, frame_count: int, *, static_hot: bool,
-                       corrections=None, dark: bool = False, flat: bool = False) -> int:
+                       corrections=None, dark: bool = False, flat: bool = False, detector_mask: bool = False) -> int:
     """The bytes a run charges one chunk of ``frame_count`` frames of one member against Max chunk MiB, in
     shapes and flags (AUD-9 stage 2b S3a): the larger of the science pass (decoded and conditioned frames, q,
     the feed and the per-frame corrections) and, with all-frame hot masking, the mask pass. The memory plan
-    (``_require_rsm_v2_memory_plan``) and the Preview's Auto cap both charge through it."""
+    (``_require_rsm_v2_memory_plan``) and the Preview's Auto cap both charge through it. ``detector_mask``: the
+    plan holds the calibrated detector's own mask (one bool a detector pixel) through both passes (S3c)."""
     full = math.prod(detector_shape)
     cropped = math.prod(cropped_shape)
+    held = full * np.dtype(bool).itemsize if detector_mask else 0
     pixels = frame_count * full
     raw_bytes = pixels * np.dtype(np.float64).itemsize
     float_bytes = pixels * np.dtype(np.float64).itemsize
@@ -3651,7 +3664,7 @@ def rsm_v2_chunk_bytes(detector_shape, cropped_shape, frame_count: int, *, stati
         raw_bytes=raw_bytes,
         float_bytes=float_bytes,
         pixel_count=pixels,
-        mask_state_bytes=cropped * np.dtype(bool).itemsize if static_hot else 0,
+        mask_state_bytes=(cropped * np.dtype(bool).itemsize if static_hot else 0) + held,
         science=True,
     ) + (0 if corrections is None
          else _rsm_v2_correction_charge(corrections, dark, flat, detector_shape, cropped_shape, frame_count))
@@ -3660,7 +3673,7 @@ def rsm_v2_chunk_bytes(detector_shape, cropped_shape, frame_count: int, *, stati
     mask_state_bytes = max(
         full * (np.dtype(np.float64).itemsize + 3 * np.dtype(bool).itemsize),
         full * np.dtype(bool).itemsize + cropped * np.dtype(bool).itemsize,
-    )
+    ) + held
     return max(science, _rsm_v2_chunk_owned_bytes(
         raw_bytes=raw_bytes,
         float_bytes=float_bytes,
@@ -3687,17 +3700,19 @@ _RSM_AUTO_CHUNK_FLOOR_BYTES = 256 * 1024 * 1024
 
 
 def rsm_v2_auto_chunking(detector_shape, cropped_shape, chunk_size: int, *, static_hot: bool,
-                         corrections=None) -> tuple[int, int]:
+                         corrections=None, detector_mask: bool = False) -> tuple[int, int]:
     """Auto Max chunk MiB (AUD-9 stage 2b S3a): the preset's 256 MiB, or one frame's charge rounded up to the
     next MiB when that is larger, so a default run never refuses for memory on a large detector (an Eiger 4M's
     plain frame alone charges 282.3 MiB); and the chunk holds as many frames as that cap fits, at most
     ``chunk_size`` and at least one. ``corrections``: the form's ``RSMFrameCorrections`` (its dark and flat
-    charged when their paths are set). Returns (chunk_size, max_chunk_bytes)."""
+    charged when their paths are set); ``detector_mask``: the calibration's detector has its own mask, which the plan
+    holds. Returns (chunk_size, max_chunk_bytes)."""
     flags = {
         "static_hot": static_hot,
         "corrections": corrections,
         "dark": corrections is not None and corrections.dark_path is not None,
         "flat": corrections is not None and corrections.flat_path is not None,
+        "detector_mask": detector_mask,
     }
     mib = 1024 * 1024
     one = rsm_v2_chunk_bytes(detector_shape, cropped_shape, 1, **flags)
@@ -4081,10 +4096,12 @@ def _make_rsm_v2_chunk_lease(
         science=True,
         mask_state_bytes=(
             0 if cropped_static_mask is None else cropped_static_mask.nbytes
-        ),
+        ) + (0 if plan.detector_mask is None else plan.detector_mask.nbytes),
         cancel_token=cancel_token,
     )
     conditioned = condition_rsm_images(raw, plan.conditioning)
+    if plan.detector_mask is not None:  # the calibrated detector's own gaps, whatever the corrections (S3c)
+        np.copyto(conditioned, np.nan, where=plan.detector_mask)
     if cropped_static_mask is not None:
         roi = plan.effective_geometry.roi
         if (
@@ -4152,7 +4169,7 @@ def _derive_rsm_v2_static_mask(
         ),
         full_pixels * np.dtype(bool).itemsize
         + cropped_pixels * np.dtype(bool).itemsize,
-    )
+    ) + (0 if plan.detector_mask is None else plan.detector_mask.nbytes)
     contributions = member.contributions
     for start in range(0, len(contributions), plan.chunk_size):
         if cancel_token is not None and cancel_token.is_set():
@@ -4259,6 +4276,7 @@ def _require_rsm_v2_memory_plan(request: RSMOperationRequestV2) -> None:
             corrections=None if bound is None else bound.corrections,
             dark=bound is not None and bound.dark_receipt is not None,
             flat=bound is not None and bound.flat_receipt is not None,
+            detector_mask=plan.detector_mask is not None,
         )
         if required > plan.max_chunk_bytes:
             mib = 1024 * 1024
@@ -4269,7 +4287,8 @@ def _require_rsm_v2_memory_plan(request: RSMOperationRequestV2) -> None:
                 "Chunk, or leave Max chunk MiB on Auto",
             )
         peak_chunk_bytes = max(peak_chunk_bytes, required)
-    transient_bytes = fixed_grid_bytes + _rsm_v2_correction_state_bytes(plan, request.preflight.members)
+    transient_bytes = (fixed_grid_bytes + _rsm_v2_correction_state_bytes(plan, request.preflight.members)
+                       + (0 if plan.detector_mask is None else plan.detector_mask.nbytes))
     resident_bytes = max(
         fixed_grid_bytes + peak_chunk_bytes,
         finalization_bytes,
@@ -4540,12 +4559,16 @@ def prepare_rsm_operation_v2(
     charged = None if corrections is None or corrections == RSMFrameCorrections() else corrections
     with xu_runtime_session() as runtime_session:
         effective = lower_rsm_effective_geometry(geometry_asset_receipt)
+        # the calibrated detector's own mask (module gaps), built once (S3c unit 4b): every frame's mask whatever
+        # the corrections, the dark and flat checks' exclusion, and memory the plan holds and charges
+        detector_mask = rsm_calibration_detector_mask(geometry_asset_receipt)
         if max_chunk_bytes is None:  # Auto: sized from the detector before any member is charged (S3a)
             header = effective.detector_header
             cropped = header if effective.roi is None else header.with_roi(effective.roi)
             chunk_size, max_chunk_bytes = rsm_v2_auto_chunking(
                 (int(header.Nch1), int(header.Nch2)), (int(cropped.Nch1), int(cropped.Nch2)), chunk_size,
-                static_hot=conditioning.static_hot_threshold is not None, corrections=charged)
+                static_hot=conditioning.static_hot_threshold is not None, corrections=charged,
+                detector_mask=detector_mask is not None)
             if max_chunk_bytes > _MAX_CHUNK_BYTES:
                 raise RSMOperationRefused(
                     "Q_MEMORY_LIMIT_EXCEEDED",
@@ -4558,7 +4581,8 @@ def prepare_rsm_operation_v2(
                 (int(header.Nch1), int(header.Nch2)), (int(cropped.Nch1), int(cropped.Nch2)), 1,
                 static_hot=conditioning.static_hot_threshold is not None, corrections=charged,
                 dark=charged is not None and charged.dark_path is not None,
-                flat=charged is not None and charged.flat_path is not None)
+                flat=charged is not None and charged.flat_path is not None,
+                detector_mask=detector_mask is not None)
             if one > max_chunk_bytes:
                 mib = 1024 * 1024
                 raise RSMOperationRefused(
@@ -4670,12 +4694,9 @@ def prepare_rsm_operation_v2(
             max_chunk_bytes=max_chunk_bytes,
             corrections=_bind_rsm_corrections(
                 corrections, member_tuple, max_frame_bytes,
-                detector=_rsm_calibration_detector(geometry_asset_receipt),
-                # built only for a dark or flat to check
-                detector_mask=(rsm_calibration_detector_mask(geometry_asset_receipt)
-                               if getattr(corrections, "dark_path", None) or getattr(corrections, "flat_path", None)
-                               else None)),
+                detector=_rsm_calibration_detector(geometry_asset_receipt), detector_mask=detector_mask),
             ub_override=bound_ub,
+            detector_mask=detector_mask,
         )
         preflight = _make_rsm_group_preflight_v2(
             project_root=root,

@@ -702,3 +702,74 @@ def test_scan_43_indexes_nearer_integer_under_standard_psic_than_under_the_17_2_
         provenance.unlink(missing_ok=True)
     print("scan 43 (113) |off|", off)
     assert off["standard"] <= 0.06 and off["17-2"] >= 0.10, off
+
+
+# S3c unit 4b/4c: the calibrated detector's own mask (module gaps) is every frame's, whatever the corrections, beside
+# the Mask File; the plan holds it, so every charge of a chunk counts it (Preview's Auto cap, the user's cap, the
+# run's memory plan and each pass's load check).
+def test_the_detector_mask_is_charged_in_every_pass_and_in_auto():
+    from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, rsm_v2_auto_chunking, rsm_v2_chunk_bytes
+
+    for shape in ((195, 487), (2167, 2070)):
+        for static_hot in (False, True):
+            for corrections in (None, RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)):
+                plain = rsm_v2_chunk_bytes(shape, shape, 3, static_hot=static_hot, corrections=corrections)
+                held = rsm_v2_chunk_bytes(shape, shape, 3, static_hot=static_hot, corrections=corrections,
+                                          detector_mask=True)
+                assert held - plain == shape[0] * shape[1]  # one bool a pixel, in whichever pass is larger
+    big, mib = (2167, 2070), 1024 * 1024  # an Eiger 4M: one frame's charge sets Auto's cap
+    one = rsm_v2_chunk_bytes(big, big, 1, static_hot=False, detector_mask=True)
+    assert rsm_v2_auto_chunking(big, big, 4, static_hot=False, detector_mask=True) == (1, -(-one // mib) * mib)
+    assert rsm_v2_auto_chunking(big, big, 4, static_hot=False)[1] < -(-one // mib) * mib
+
+
+@pytest.mark.slow
+def test_the_calibrations_detector_mask_masks_every_frame_beside_the_mask_file(rsm_r2_project, tmp_path,
+                                                                                monkeypatch):
+    """Row B's calibration, its detector given a 12-row gap: gaps with a Mask File grid exactly as the Mask File
+    of their union alone; with every correction off the gaps still mask (row B's unmasked reference moves); and
+    each charge of a chunk counts the mask (Auto's cap and a typed cap, then the run's memory plan)."""
+    from dataclasses import replace
+
+    from xrd_tools.analysis import rsm_operation
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
+    from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from tests.core.test_rsm_operation_r2_real_data import _SCIENCE
+
+    gaps = np.zeros((195, 487), dtype=bool)
+    gaps[60:72] = True
+    gaps.setflags(write=False)
+    file_mask = np.zeros((195, 487), dtype=bool)
+    file_mask[:, 200:230] = True
+    np.save(tmp_path / "file.npy", file_mask)
+    np.save(tmp_path / "union.npy", gaps | file_mask)
+    flags, charge = [], rsm_operation.rsm_v2_chunk_bytes
+
+    def counted(*args, **kwargs):
+        flags.append(kwargs.get("detector_mask", False))
+        return charge(*args, **kwargs)
+
+    monkeypatch.setattr(rsm_operation, "rsm_v2_chunk_bytes", counted)
+    base = replace(_form(rsm_r2_project, (43,), 40),
+                   geometry_asset=rsm_calibration_geometry_input(_canonical_partner(rsm_r2_project)))
+
+    def run(name, corrections, mask, max_chunk_bytes=None):
+        monkeypatch.setattr(rsm_operation, "rsm_calibration_detector_mask", lambda receipt: mask)
+        form = replace(base, corrections=corrections, max_chunk_bytes=max_chunk_bytes,
+                       output_path=rsm_r2_project / f"rsm-s3c-{name}.nexus")
+        flags.clear()
+        request = prepare_rsm_tool_v2(form).request
+        assert request.plan.detector_mask is mask
+        try:
+            result = run_rsm_operation_v2(request)
+        finally:
+            Path(form.output_path).unlink(missing_ok=True)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED
+        assert flags and all(flag is (mask is not None) for flag in flags)
+        return result.payload.result_fingerprint
+
+    with_file = run("gaps-file", RSMFrameCorrections(mask_path=str(tmp_path / "file.npy")), gaps)
+    assert with_file == run("union", RSMFrameCorrections(mask_path=str(tmp_path / "union.npy")), None)
+    assert run("gaps", RSMFrameCorrections(), gaps, 256 * 1024 * 1024) != _SCIENCE[((43,), 40)]["result"]
