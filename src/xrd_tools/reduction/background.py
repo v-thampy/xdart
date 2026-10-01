@@ -1015,10 +1015,14 @@ def resolve_frame_background(
             # uniform: every covered pixel's count is the largest (AUD-7: no compacted copy)
             most = int(counts.max())
             uniform = most and np.count_nonzero(counts == most) == np.count_nonzero(covered)
+            del covered
             requested = _SERIES_CAPSULE.get()
+            # uneven counts: without a capsule this resolution's own, used once (no copy); a capsule keeps a
+            # read-only uint16 copy (at most _MAX_MEMBERS a pixel)
+            uneven = None if uniform else counts if requested is None else counts.astype(np.uint16)
             series = _PreparedSeriesFrameBackground(
                 plan, shape, tuple(str(member) for member in members), tuple(states.items()), sums,
-                None if uniform else counts.astype(np.uint16), most, norm_sum / len(members),
+                uneven, most, norm_sum / len(members),
                 (len(members), receipt_bytes, manifest.hexdigest()), str(Path(plan.locator or "").resolve()), [])
             if requested is None:  # no capsule kept: the mean is scaled in place, as before
                 return _series_result(series, frame_fact, target_norm, cancelled, in_place=True)
