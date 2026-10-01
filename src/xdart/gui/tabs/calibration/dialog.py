@@ -583,7 +583,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         return form.labelForField(row)
 
     def _auto_placeholders(self, prefix=''):
-        """The automatic image folder and stem for a blank field, as the Stitch page shows them."""
+        """The automatic image folder and stem for a blank field, as the page shows them."""
         spec = self._text(prefix + 'source')
         path = Path(spec) if spec else None
         first = re.match(r'\s*(\d+)', self._text(prefix + 'scan'))
@@ -1293,13 +1293,13 @@ class CalibrationDialog(QtWidgets.QDialog):
          'Without a Distance range, the distance is fitted within this percentage of where it starts.'),
     )
 
-    #: Choices saved with the Stitch settings. The calibrant-scan and same-detector
+    #: Choices saved with the page's settings (Stitch's, RSM's). The calibrant-scan and same-detector
     #: confirmations are per use and never saved.
     _SAVED_CHOICES = ('source_kind', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
                       'motion', 'rough_mode')
 
     def settings(self):
-        """This dialog's inputs as plain values, for the saved Stitch settings."""
+        """This dialog's inputs as plain values, for the page's saved settings."""
         choices = {name: {'data': _plain_choice(getattr(self, name).currentData()),
                           'text': getattr(self, name).currentText()}
                    for name in self._SAVED_CHOICES}
@@ -1313,7 +1313,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         }
 
     def set_instrument(self, geometry: InstrumentGeometry):
-        """The diffractometer and motor names (the page's, shared by Stitch)."""
+        """The diffractometer and motor names (the page's own)."""
         self.geometry_editor.set_value(geometry)
 
     def apply_settings(self, values):
