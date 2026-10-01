@@ -350,6 +350,51 @@ def test_invalid_frame_text_stays_as_typed_and_is_refused(qapp, tmp_path, key):
         _close(page, qapp)
 
 
+def test_the_advanced_settings_are_ints_advanced_dialog_of_shared_rows(qapp, tmp_path):
+    """Codex's reuse audits (2026-10-01): RSM's Advanced was its own dialog of raw spin boxes, a combo and line
+    edits. It is Int's AdvancedDialog of shared rows: the selected member's raw decoder and psic motor columns,
+    the column occurrences, and the chunk and memory. A refused whole number is named by readiness and refused
+    by the form, so the member's earlier number never runs unseen (Codex F1); a valid one reaches the member and
+    the form; each member shows its own."""
+    from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+    from xdart.gui.widgets.controls_panel import FormRow, SubsectionCard
+    page = _page(qapp)
+    try:
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
+        cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
+        assert set(cards) == {"Raw decoder (selected member)", "psic motor columns (selected member)",
+                              "Motor column occurrences (selected member)", "Normalization column occurrences",
+                              "Chunk and memory"}
+        page.set_field("adv_foil_occurrence", "-1")  # a normalization occurrence is Processing's
+        assert "Advanced Foil column occurrence" in page._headers["processing"].detail
+        page.set_field("adv_foil_occurrence", "0")
+        assert all(type(page._rows[key]) is FormRow and cards["Raw decoder (selected member)"].isAncestorOf(
+            page._rows[key]) for key in ("adv_rows", "adv_columns", "adv_dtype", "adv_header"))
+        assert page._readiness[1], page._readiness
+        page.set_field("adv_rows", "abc")
+        assert page._value("adv_rows") == "abc" and not page._readiness[1]
+        assert "Advanced Rows ('abc' is not a whole number)" in page._readiness[0]
+        assert not page.run_bar.startButton.isEnabled()
+        with pytest.raises(ValueError, match=r"Advanced: Rows \('abc' is not a whole number\)"):
+            page.build_form()
+        page.set_field("adv_rows", str(page._members[0].detector_rows))
+        page.set_field("adv_chunk", "0")  # below the row's minimum, in Processing
+        assert "Advanced Frames per chunk" in page._readiness[0]
+        page.set_field("adv_chunk", "4")
+        page.set_field("adv_header", "16")
+        assert page._readiness[1], page._readiness
+        form = page.build_form()
+        assert form.chunk_size == 4 and form.members[0].raw_header_skip == 16
+        second = page._members[1].raw_header_skip
+        page._load_member(1)  # each member shows its own decoder
+        assert page._value("adv_header") == str(second)
+        page._load_member(0)
+        assert page._value("adv_header") == "16"
+    finally:
+        _close(page, qapp)
+
+
 def test_a_zero_frame_step_is_refused_without_a_table_exception(qapp, tmp_path):
     """F1: Step 0 divided in the member table's frame count before anything refused it."""
     page = _page(qapp)

@@ -28,6 +28,7 @@ from xdart.gui.pages.values import (
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
 from xdart.gui.tabs.rsm.result_view import RSMResultView
+from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.controls_readiness import SectionHeaderProjection
 from xdart.gui.tabs.scattering.shell_widgets import apply_section_header
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
@@ -98,9 +99,22 @@ _FIELDS = (
 )
 #: The member's whole-number rows (FormRow kind "int"): (minimum, maximum, blank allowed). The row outlines a
 #: refused text; ``rsm_values`` stays the authority that refuses it (Codex's stage-1 review F1).
-_INTEGER_FIELDS = {"member_first": (0, None, False), "member_last": (0, None, True), "member_step": (1, None, False)}
+_INTEGER_FIELDS = {"member_first": (0, None, False), "member_last": (0, None, True), "member_step": (1, None, False),
+                   # Advanced (the dialog's spin boxes' ranges, as rows)
+                   "adv_rows": (2, 1_000_000, False), "adv_columns": (2, 1_000_000, False),
+                   "adv_header": (0, 1 << 30, False),
+                   **{f"adv_occurrence_{role}": (0, 1024, False) for role in _PSIC_ROLES},
+                   "adv_foil_occurrence": (0, 1024, False), "adv_exposure_occurrence": (0, 1024, False),
+                   "adv_chunk": (1, 1024, False), "adv_max_frame_mib": (1, 4096, False),
+                   "adv_max_chunk_mib": (1, 4096, False)}
 _MEMBER_KEYS = ("member_spec", "member_scan", "member_images", "member_stem", "member_first", "member_last",
                 "member_step")
+#: The Advanced rows that are the selected member's (its raw decoder and psic motor columns), stored into its
+#: draft on each commit as the member rows are.
+_MEMBER_ADVANCED_KEYS = ("adv_rows", "adv_columns", "adv_dtype", "adv_header",
+                         *(f"adv_motor_{role}" for role in _PSIC_ROLES),
+                         *(f"adv_occurrence_{role}" for role in _PSIC_ROLES))
+_RAW_DTYPES = ("int32", "uint16", "float32", "float64")
 
 
 def _read_rsm_record(path, cancel, _progress):
@@ -337,65 +351,51 @@ class RSMPage(QtWidgets.QWidget):
         return panel
 
     def _build_advanced(self):
-        """The rarely changed member and memory settings, in Int's Advanced dialog place."""
-        self.advanced = QtWidgets.QDialog(self)
-        self.advanced.setWindowTitle("Advanced — RSM")
-        form = QtWidgets.QFormLayout(self.advanced)
-        self.detector_rows, self.detector_columns = QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
-        for spin in (self.detector_rows, self.detector_columns):
-            spin.setRange(2, 1_000_000)
-        self.raw_dtype = QtWidgets.QComboBox()
-        self.raw_dtype.addItems(("int32", "uint16", "float32", "float64"))
-        self.raw_header = QtWidgets.QSpinBox()
-        self.raw_header.setRange(0, 1 << 30)
-        decoder = QtWidgets.QHBoxLayout()
-        for text, widget in (("rows", self.detector_rows), ("columns", self.detector_columns),
-                             ("dtype", self.raw_dtype), ("header bytes", self.raw_header)):
-            decoder.addWidget(QtWidgets.QLabel(text))
-            decoder.addWidget(widget)
-        form.addRow("Raw decoder (selected member)", decoder)
-        self.motor_edits = {}
-        motors = QtWidgets.QGridLayout()
-        for column, role in enumerate(_PSIC_ROLES):
-            name, occurrence = QtWidgets.QLineEdit(), QtWidgets.QSpinBox()
-            occurrence.setRange(0, 1024)
-            motors.addWidget(QtWidgets.QLabel(role), 0, column)
-            motors.addWidget(name, 1, column)
-            motors.addWidget(occurrence, 2, column)
-            self.motor_edits[role] = (name, occurrence)
-        form.addRow("psic motor columns (name, occurrence)", motors)
-        self.foil_occurrence, self.exposure_occurrence = QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
-        for spin in (self.foil_occurrence, self.exposure_occurrence):
-            spin.setRange(0, 1024)
-        occurrences = QtWidgets.QHBoxLayout()
-        for text, widget in (("foil", self.foil_occurrence), ("exposure", self.exposure_occurrence)):
-            occurrences.addWidget(QtWidgets.QLabel(text))
-            occurrences.addWidget(widget)
-        form.addRow("Normalization column occurrences", occurrences)
+        """The rarely changed member and memory settings: Int's Advanced dialog, its groups the page's shared
+        rows (Codex's reuse audits, 2026-10-01: this was a dialog of raw spin boxes, a combo and line edits)."""
         preset = rsm_tool_preset()
-        self.chunk_size = QtWidgets.QSpinBox()
-        self.chunk_size.setRange(1, 1024)
-        self.chunk_size.setValue(preset.chunk_size)
-        self.max_frame_mib, self.max_chunk_mib = QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
-        for spin, value in ((self.max_frame_mib, preset.max_frame_bytes), (self.max_chunk_mib, preset.max_chunk_bytes)):
-            spin.setRange(1, 4096)
-            spin.setValue(value // _MIB)
-        memory = QtWidgets.QHBoxLayout()
-        for text, widget in (("chunk", self.chunk_size), ("max frame MiB", self.max_frame_mib),
-                             ("max chunk MiB", self.max_chunk_mib)):
-            memory.addWidget(QtWidgets.QLabel(text))
-            memory.addWidget(widget)
-        form.addRow("Chunk / memory", memory)
-        close = QtWidgets.QPushButton("Close")
-        close.clicked.connect(self.advanced.close)
-        form.addRow(close)
-        for widget in (self.detector_rows, self.detector_columns, self.raw_header, self.foil_occurrence,
-                       self.exposure_occurrence, self.chunk_size, self.max_frame_mib, self.max_chunk_mib):
-            widget.valueChanged.connect(self._advanced_edited)
-        self.raw_dtype.currentIndexChanged.connect(self._advanced_edited)
-        for name, occurrence in self.motor_edits.values():
-            name.editingFinished.connect(self._advanced_edited)
-            occurrence.valueChanged.connect(self._advanced_edited)
+        self.advanced = AdvancedDialog(self, title="Advanced — RSM", object_name="rsmAdvancedDialog")
+        groups = (
+            ("Raw decoder (selected member)", SectionId.SOURCE, (
+                ("adv_rows", "Rows", str(preset.detector_shape[0]), ()),
+                ("adv_columns", "Columns", str(preset.detector_shape[1]), ()),
+                ("adv_dtype", "Data type", preset.raw_dtype, _RAW_DTYPES),
+                ("adv_header", "Header bytes", str(preset.raw_header_skip), ()))),
+            ("psic motor columns (selected member)", SectionId.SOURCE, tuple(
+                (f"adv_motor_{role}", f"{role} column", "", ()) for role in _PSIC_ROLES)),
+            ("Motor column occurrences (selected member)", SectionId.SOURCE, tuple(
+                (f"adv_occurrence_{role}", f"{role} occurrence", "0", ()) for role in _PSIC_ROLES)),
+            ("Normalization column occurrences", SectionId.PROCESSING, (
+                ("adv_foil_occurrence", "Foil column occurrence", "0", ()),
+                ("adv_exposure_occurrence", "Exposure column occurrence", "0", ()))),
+            ("Chunk and memory", SectionId.PROCESSING, (
+                ("adv_chunk", "Frames per chunk", str(preset.chunk_size), ()),
+                ("adv_max_frame_mib", "Max frame MiB", str(preset.max_frame_bytes // _MIB), ()),
+                ("adv_max_chunk_mib", "Max chunk MiB", str(preset.max_chunk_bytes // _MIB), ()))),
+        )
+        for title, section, rows in groups:
+            self.advanced.add_group(title, tuple(self._row(section, key, label, value, choices, False)
+                                                 for key, label, value, choices in rows))
+        self._tip("adv_header", "Bytes before the pixels in each raw image file.")
+        for role in _PSIC_ROLES:
+            self._tip(f"adv_occurrence_{role}", "Which of the SPEC columns with this name (0 is the first), "
+                                                "when the scan repeats a column name.")
+
+    def _tip(self, key, text):
+        self._rows[key].setToolTip(text)
+
+    def _whole(self, key, fallback):
+        """An Advanced whole-number row's value; ``fallback`` (the draft's) while its text is refused, which
+        readiness names and ``build_form`` refuses, so the older value is never run (Codex's F1)."""
+        return int(str(self._value(key)).strip()) if not self._rows[key].refusal() else fallback
+
+    def _advanced_refusal(self, section=None):
+        """The first refused Advanced whole-number row, as readiness and ``build_form`` name it ("" if none)."""
+        for key in _INTEGER_FIELDS:
+            if (key.startswith("adv_") and (section is None or self._fields[key].section is section)
+                    and self._rows[key].refusal()):
+                return f"{self._fields[key].label} ({self._rows[key].refusal()})"
+        return ""
 
     # ── values ──
     def _value(self, key):
@@ -409,16 +409,10 @@ class RSMPage(QtWidgets.QWidget):
     def _committed(self, key):
         """A committed edit: the selected member's rows go into its draft; the output follows the members
         until a name is chosen."""
-        if key in _MEMBER_KEYS:
+        if key in _MEMBER_KEYS or key in _MEMBER_ADVANCED_KEYS:
             self._store_member()
         if key == "output_path":
             self._output_suggested = not str(self._value("output_path")).strip()
-        self._edited()
-
-    def _advanced_edited(self, *_args):
-        if getattr(self, "_loading", False):
-            return
-        self._store_member()
         self._edited()
 
     def _store_member(self):
@@ -433,11 +427,13 @@ class RSMPage(QtWidgets.QWidget):
         draft.frame_start = str(self._value("member_first")).strip()
         draft.frame_stop = str(self._value("member_last")).strip()
         draft.frame_step = str(self._value("member_step")).strip()
-        draft.detector_rows, draft.detector_columns = self.detector_rows.value(), self.detector_columns.value()
-        draft.raw_dtype = self.raw_dtype.currentText()
-        draft.raw_header_skip = self.raw_header.value()
-        draft.selector_names = tuple(self.motor_edits[role][0].text().strip() for role in _PSIC_ROLES)
-        draft.selector_occurrences = tuple(self.motor_edits[role][1].value() for role in _PSIC_ROLES)
+        draft.detector_rows = self._whole("adv_rows", draft.detector_rows)
+        draft.detector_columns = self._whole("adv_columns", draft.detector_columns)
+        draft.raw_dtype = str(self._value("adv_dtype"))
+        draft.raw_header_skip = self._whole("adv_header", draft.raw_header_skip)
+        draft.selector_names = tuple(str(self._value(f"adv_motor_{role}")).strip() for role in _PSIC_ROLES)
+        draft.selector_occurrences = tuple(self._whole(f"adv_occurrence_{role}", occurrence) for role, occurrence
+                                           in zip(_PSIC_ROLES, draft.selector_occurrences, strict=True))
         self._refresh_members()
 
     def _load_member(self, index):
@@ -454,14 +450,14 @@ class RSMPage(QtWidgets.QWidget):
                                ("member_step", draft.frame_step)):
                 self._fields[key] = replace(self._fields[key], value=str(value))
                 self._rows[key].apply_field(self._fields[key])
-            self.detector_rows.setValue(draft.detector_rows)
-            self.detector_columns.setValue(draft.detector_columns)
-            self.raw_dtype.setCurrentText(draft.raw_dtype)
-            self.raw_header.setValue(draft.raw_header_skip)
+            values = {"adv_rows": draft.detector_rows, "adv_columns": draft.detector_columns,
+                      "adv_dtype": draft.raw_dtype, "adv_header": draft.raw_header_skip}
             for role, name, occurrence in zip(_PSIC_ROLES, draft.selector_names, draft.selector_occurrences,
                                               strict=True):
-                self.motor_edits[role][0].setText(name)
-                self.motor_edits[role][1].setValue(occurrence)
+                values[f"adv_motor_{role}"], values[f"adv_occurrence_{role}"] = name, occurrence
+            for key, value in values.items():
+                self._fields[key] = replace(self._fields[key], value=str(value))
+                self._rows[key].apply_field(self._fields[key])
         finally:
             self._loading = False
         self._refresh_members()
@@ -518,6 +514,9 @@ class RSMPage(QtWidgets.QWidget):
     def build_form(self):
         """The exact RSM v2 form of the page's inputs (the dialog's form for the same inputs)."""
         self._store_member()
+        refused = self._advanced_refusal()
+        if refused:
+            raise ValueError(f"Advanced: {refused}")
         project_text = str(self._value("project_root")).strip()
         if not project_text:
             raise ValueError("Project root is required")
@@ -536,8 +535,10 @@ class RSMPage(QtWidgets.QWidget):
             normalization = RSMNormalizationPolicy.identity()
         else:
             normalization = RSMNormalizationPolicy(
-                mode, MetadataColumnSelector(str(self._value("foil")).strip(), self.foil_occurrence.value()),
-                MetadataColumnSelector(str(self._value("exposure")).strip(), self.exposure_occurrence.value()),
+                mode, MetadataColumnSelector(str(self._value("foil")).strip(),
+                                             int(self._value("adv_foil_occurrence"))),
+                MetadataColumnSelector(str(self._value("exposure")).strip(),
+                                       int(self._value("adv_exposure_occurrence"))),
                 tuple(float(part) for part in str(self._value("absorption")).replace(";", ",").split(",")
                       if part.strip()))
 
@@ -551,8 +552,8 @@ class RSMPage(QtWidgets.QWidget):
         return RSMToolFormV2(
             project_text, rsm_geometry_asset_input(str(self._value("geometry_asset")).strip()), tuple(members),
             RSMImageConditioning(float(self._value("offset")), optional("high_threshold"), optional("static_hot")),
-            normalization, tuple(_GRIDS[self._value("grid")]), self.chunk_size.value(),
-            self.max_frame_mib.value() * _MIB, self.max_chunk_mib.value() * _MIB, output,
+            normalization, tuple(_GRIDS[self._value("grid")]), int(self._value("adv_chunk")),
+            int(self._value("adv_max_frame_mib")) * _MIB, int(self._value("adv_max_chunk_mib")) * _MIB, output,
             AnalysisArtifactOverwrite.REPLACE,  # Append is the page's skip, as Stitch's (_start_run)
             coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family)
 
@@ -608,6 +609,10 @@ class RSMPage(QtWidgets.QWidget):
             output = str(self._value("output_path")).strip()
             if not output.endswith(".nexus"):
                 need("project", "an Output ending in .nexus")
+        for key, section in (("source", SectionId.SOURCE), ("processing", SectionId.PROCESSING)):
+            refused = self._advanced_refusal(section)
+            if refused:
+                need(key, f"Advanced {refused}")
         members = len(self._members)
         grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
         ready_detail = {"project": "Project folder and Output are ready.",
