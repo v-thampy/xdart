@@ -199,6 +199,8 @@ def prepare_native_stitch_tool(form, project):
                   native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
                   frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=gi,
                   azimuth_range_1d=form.chi_range_1d)
+    if form.foil_normalization is not None:  # the plan's default (None) otherwise: its identity unchanged
+        common.update(foil_normalization=form.foil_normalization)
     if form.mode == "2d":  # the map on its own axis as Int 2D's, and I(q) beside it on the 1-D one
         common.update(mode="2d", npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
                       azimuth_range=form.chi_range, map_unit=form.map_unit,
@@ -250,6 +252,9 @@ def prepare_native_stitch_tool(form, project):
                 selected = form.frame_selector.select(table.labels)
                 selectors = tuple(MetadataColumnSelector(str(name)) for name in motors)
                 selectors += () if form.monitor_selector is None else (form.monitor_selector,)
+                foil = form.foil_normalization  # the columns a foil choice reads
+                selectors += () if foil is None else tuple(
+                    selector for selector in (foil.foil_selector, foil.exposure_selector) if selector is not None)
                 names = tuple(column.name for column in table.columns)
                 if names.count(energy_name) > 1:
                     raise StitchToolPreflightRefused("AMBIGUOUS_METADATA_SELECTOR", "Energy must be unique")

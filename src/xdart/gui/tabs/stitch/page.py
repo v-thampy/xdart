@@ -32,6 +32,7 @@ from xdart.gui.tools.stitch_owner import (
     StitchOwnerAction, StitchOwnerFinalization, StitchOwnerOutcomeKind,
     StitchToolOwner,
 )
+from xdart.gui.tools import normalization_values as normalization
 from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm
 from xdart.gui.widgets.controls_panel import (
     PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
@@ -43,7 +44,7 @@ from xdart.gui.tabs.scattering.shell_widgets import foldable
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.stitch_native import native_ceilings
-from xrd_tools.analysis.stitch_operation import StitchGeometryKind
+from xrd_tools.analysis.stitch_operation import StitchFoilNormalization, StitchGeometryKind
 from xrd_tools.core.geometry import ImageOrientation
 from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
@@ -115,7 +116,12 @@ _PROCESSING = (
     ("Conditioning", "threshold_enabled", THRESHOLD_ENABLED, True),
     ("Conditioning", "threshold_min", THRESHOLD_MIN, 0.0),
     ("Conditioning", "threshold", THRESHOLD_MAX, None),
+    # one Normalization group, RSM's too (``normalization_values``; decision 4's four choices)
+    ("Conditioning", "normalization", ("Stitch", "normalization"), normalization.NONE),
     ("Conditioning", "monitor", ("Stitch", "monitor"), "None"),
+    ("Conditioning", "foil_column", ("Stitch", "foil_column"), normalization.DEFAULT_FOIL_COLUMN),
+    ("Conditioning", "exposure_column", ("Stitch", "exposure_column"), normalization.DEFAULT_EXPOSURE_COLUMN),
+    ("Conditioning", "foil_lengths", ("Stitch", "foil_lengths"), normalization.DEFAULT_FOIL_LENGTHS),
 )
 #: A GI range's label: (the rows' label, what it bins and windows).
 _GI_RANGES = {"gi_ip": ("Qip (Å⁻¹)", "Bins I(Qip) (Auto: the data's span) and is I(Qoop)'s window (Auto: every "
@@ -812,8 +818,10 @@ class StitchPage(QtWidgets.QWidget):
         self._axis_q = self._map_q = True  # each radial range's unit: Q (every axis but 2θ, 2θ-χ)
         self._gi_axis = "Q"  # the Grazing axis last chosen: the one a loaded GI form opens on
         for _group, key, path, value in _PROCESSING:
-            self._fields[key] = self._new_field(SectionId.PROCESSING, key, key, value, path=path,
-                                                choices=("None",) if key == "monitor" else ())
+            self._fields[key] = self._new_field(
+                SectionId.PROCESSING, key, key, value, path=path,
+                choices=(normalization.NORMALIZATION_CHOICES if key == "normalization"
+                         else ("None",) if key in ("monitor", "foil_column", "exposure_column") else ()))
             if path[-1].endswith(("_auto", "_low", "_high")) or path[0] == "Mask":
                 self._range_keys.add(key)
         fields = self._processing_fields()
@@ -857,7 +865,10 @@ class StitchPage(QtWidgets.QWidget):
         self.chi_range_1d.setToolTip("I(q)'s χ window, as Int 1D's (Auto: every χ), in pyFAI's χ, which "
                                      "xrayutilities shares pixel for pixel. Grazing's cuts keep their Qip and "
                                      "Qoop windows; a Stitch 2D's map its own χ range.")
-        self._align_to_ranges(self._rows["monitor"])
+        for key in normalization.NORMALIZATION_KEYS:
+            self._align_to_ranges(self._rows[key])
+            self._tip(key, normalization.TIPS[key])
+        self._rows["normalization"].valueChanged.connect(self._normalization_edited)
         for key in ("unit", "map_axis"):
             self._rows[key].valueChanged.connect(self._processing_axis_changed)
         self._render_gi()
@@ -995,12 +1006,29 @@ class StitchPage(QtWidgets.QWidget):
         keep = str(keep or "").strip() or "None"
         return choices if keep in choices else (*choices, keep)
 
+    def _scan_columns(self):
+        """The first selected SPEC scan's counters, for the foil and exposure columns (all of them)."""
+        first = self._first_spec_scan()
+        return tuple((None if first is None else _spec_counter_names(first[0], _file_states(first[0]),
+                                                                      first[1])) or ())
+
     def _refresh_monitor_choices(self):
-        """On a committed source or scan edit (Codex audit G-F2): the new scan's counters."""
-        field = replace(self._fields["monitor"], value=self._value("monitor"),
-                        choices=self._monitor_choices(self._value("monitor")))
-        self._fields["monitor"] = field
-        self._rows["monitor"].apply_field(field)
+        """On a committed source or scan edit (Codex audit G-F2): the new scan's counters, for the whole
+        Normalization group (the monitor, foil and exposure columns, and what the choice greys)."""
+        fields = self._processing_fields()
+        for key in normalization.NORMALIZATION_KEYS:
+            self._fields[key] = fields[key]
+            self._rows[key].apply_field(fields[key])
+
+    def _normalization_selection(self):
+        """The Normalization group's selection (``normalization_values``); ValueError names what it needs."""
+        value = self._value
+        return normalization.normalization_selection(value("normalization"), value("monitor"), value("foil_column"),
+                                                     value("exposure_column"), value("foil_lengths"))
+
+    def _normalization_edited(self, *_args):
+        """A new choice greys the rows it does not read (their values are kept)."""
+        self._refresh_monitor_choices()
 
     def _gi_sample_motors(self):
         """The Geometry's other sample circles (mu, phi) by its motor names: both backends read them
@@ -1183,13 +1211,15 @@ class StitchPage(QtWidgets.QWidget):
         projected = {field.path: field for field in project_control_fields(values, {
             INT_1D_AXIS: tuple(_GI_AXES) if grazing else _STANDARD_AXES,
             INT_2D_AXIS: _GI_MAP_AXES if grazing else _STANDARD_MAP_AXES})}
-        fields = {}
+        fields = normalization.normalization_fields(  # the Normalization group, shared with RSM
+            {**self._fields, "monitor": replace(self._fields["monitor"],
+                                               choices=self._monitor_choices(current("monitor")))},
+            {key: current(key) for key in normalization.NORMALIZATION_KEYS}, self._scan_columns())
         for _group, key, path, _value in _PROCESSING:
             if path in projected:
                 fields[key] = projected[path]
-            elif key == "monitor":
-                fields[key] = replace(self._fields[key], label="Monitor", value=current(key),
-                                      choices=self._monitor_choices(current(key)))
+            elif key in fields:
+                continue
             else:  # a GI range's bound or Auto, with Int's range rule
                 prefix, part = key.rsplit("_", 1)
                 label, auto = _GI_RANGES[prefix][0], bool(self._fields[f"{prefix}_auto"].value)
@@ -1348,11 +1378,22 @@ class StitchPage(QtWidgets.QWidget):
         field = replace(self._fields[key], value=value)
         if key == "camera":
             field = _camera_field(field, value)
+        switch = None
         if key == "monitor":  # "" in older settings: none; any other name stays a choice
             value = str(value or "").strip() or "None"
             field = replace(field, value=value, choices=self._monitor_choices(value))
+            # older settings and forms knew only the Monitor row: a monitor named under None is the Monitor
+            # choice, and none under Monitor is None (Settings apply Normalization after, so it wins)
+            choice = self._value("normalization")
+            switch = (normalization.MONITOR if value != "None" and choice == normalization.NONE
+                      else normalization.NONE if value == "None" and choice == normalization.MONITOR else None)
         self._fields[key] = field
         self._rows[key].apply_field(field)
+        if switch is not None:
+            self.set_field("normalization", switch)
+            return
+        if key in normalization.NORMALIZATION_KEYS:
+            self._refresh_monitor_choices()  # the rows the choice reads, the others greyed
         self._edited()
         if key == "backend":
             self._backend_changed()
@@ -1569,6 +1610,11 @@ class StitchPage(QtWidgets.QWidget):
                 ("npt_1d", "npt_rad_2d", "npt_azim_2d") if map_mode else ("npt_1d",)))
         except ValueError:
             processing_ready = False
+        try:
+            self._normalization_selection()
+            normalization_need = ""
+        except ValueError as error:  # what the Normalization choice still reads
+            normalization_need, processing_ready = str(error), False
         self.controls.processing_card.set_status_text(
             f"{self._mode.lower()} · " + ("xrayutilities" if xu else "multigeometry"))
         # What each input still needs, in a few words, as Int's "Needs …" (maintainer, 2026-09-30:
@@ -1588,7 +1634,7 @@ class StitchPage(QtWidgets.QWidget):
         elif refused:  # an Advanced whole number (its row outlines it and says why)
             needs["source"] = refused
         if not processing_ready:
-            needs["processing"] = "Pts above 0"
+            needs["processing"] = normalization_need or "Pts above 0"
         checks = ((self.controls.project_card, "project"), (self.controls.experiment_card, "experiment"),
                   (self.controls.source_card, "source"), (self.controls.processing_card, "processing"))
         for card, key in checks:
@@ -1880,8 +1926,11 @@ class StitchPage(QtWidgets.QWidget):
         kind = (StitchGeometryKind.PYFAI_GONIOMETER_JSON if value("geometry_kind") == "Goniometer JSON"
                 else StitchGeometryKind.PONI)
         orientation = camera_orientation(value("camera"))  # the detector camera's turn and mirror
-        monitor = str(value("monitor")).strip()
-        monitor = "" if monitor == "None" else monitor
+        chosen = self._normalization_selection()  # decision 4's choice (ValueError: readiness names it)
+        monitor = chosen.monitor or ""
+        foil_normalization = None if chosen.foil is None else StitchFoilNormalization(
+            MetadataColumnSelector(chosen.foil), chosen.lengths,
+            None if chosen.exposure is None else MetadataColumnSelector(chosen.exposure))
         directory = value("source_kind") == "Directory"
         selection = StitchSourceSelection(value("source_kind"), self._source_paths,
             scans=str(value("scan")), stitch_all=value("scan_mode") == "Stitch All",
@@ -1949,6 +1998,7 @@ class StitchPage(QtWidgets.QWidget):
             q_range=None if value("radial_auto") else (float(value("q_min")), float(value("q_max"))), npt_1d=int(value("npt_1d")),
             chi_range_1d=None if value("chi1d_auto") else (float(value("chi1d_min")), float(value("chi1d_max"))),
             output_path=output, monitor_selector=MetadataColumnSelector(monitor) if monitor else None,
+            foil_normalization=foil_normalization,
             backend="xu_hist" if value("backend") == "xrayutilities histogram" else "multigeometry",
             max_frame_bytes=int(value("max_frame_mib")) * 1024 * 1024,
             gi=self._gi_value(),
@@ -1999,6 +2049,15 @@ class StitchPage(QtWidgets.QWidget):
                 fields.update(chi_min=chi[0], chi_max=chi[1])
             if radial is not None:
                 fields.update(map_min=radial[0], map_max=radial[1])
+        foil = form.foil_normalization  # decision 4's choice, as the form holds it
+        fields.update(monitor="None" if form.monitor_selector is None else form.monitor_selector.name)
+        if foil is not None:
+            fields.update(foil_column=foil.foil_selector.name,
+                          exposure_column="None" if foil.exposure_selector is None else foil.exposure_selector.name,
+                          foil_lengths=", ".join(f"{length:g}" for length in foil.absorption_lengths))
+        fields.update(normalization=normalization.choice_from(
+            fields["monitor"], fields.get("foil_column") if foil is not None else None,
+            fields.get("exposure_column") if foil is not None else None))
         self.select_mode("Stitch 2D" if form.mode == "2d" else "Stitch 1D")
         for key, value in fields.items():
             self.set_field(key, value)

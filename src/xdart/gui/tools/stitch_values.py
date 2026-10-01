@@ -34,6 +34,7 @@ from xrd_tools.analysis.scan_operations import (
 from xrd_tools.analysis.stitch_operation import (
     SAMPLE_POSITIONS,
     STITCH_ERROR_MODELS,
+    StitchFoilNormalization,
     StitchGeometryInput,
     StitchGeometryKind,
     StitchOperationPlan,
@@ -288,6 +289,10 @@ class StitchToolForm:
     #: I(q)'s χ window (°), as Int 1D's azimuthal range (native; a Stitch 2D's I(q) beside the map too);
     #: None (Auto): every χ. ``chi_range`` is the map's.
     chi_range_1d: tuple[float, float] | None = None
+    #: Decision 4's foil choices (native): Foil transmission × exposure (no monitor) or Monitor × foil
+    #: transmission (the monitor before the foils). None: the monitor alone, or none, with the identity a
+    #: form without the foil choices had.
+    foil_normalization: StitchFoilNormalization | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -397,6 +402,15 @@ class StitchToolForm:
             if not native:
                 raise ValueError("I(q)'s χ range goes with a native Stitch: choose its sources on the Stitch page")
             object.__setattr__(self, "chi_range_1d", _ordered_range(self.chi_range_1d, "χ range"))
+        foil = self.foil_normalization
+        if foil is not None:
+            if type(foil) is not StitchFoilNormalization:
+                raise TypeError("the foil choice must be an exact StitchFoilNormalization")
+            if not native:
+                raise ValueError("the foil choices go with a native Stitch: choose its sources on the Stitch page")
+            if (foil.exposure_selector is None) is (self.monitor_selector is None):
+                raise ValueError("Foil transmission × exposure takes no monitor; Monitor × foil transmission takes "
+                                 "the monitor before the foils and no exposure")
         if type(self.npt_1d) is not int or not 1 <= self.npt_1d <= 1_000_000:
             raise ValueError("1-D bin count must be a bounded positive integer")
         if self.monitor_selector is not None and type(
@@ -541,6 +555,12 @@ class StitchToolForm:
             canonical = (canonical, ("image-flip", True))
         if self.chi_range_1d is not None:  # a χ-windowed I(q)'s; every χ keeps the identity it had
             canonical = (canonical, ("i-q-chi-window", self.chi_range_1d))
+        if foil is not None:  # a foil choice's; None and the monitor alone keep the identity they had
+            canonical = (canonical, ("beam-normalization-v1", foil.mode(),
+                                     (foil.foil_selector.name, foil.foil_selector.occurrence),
+                                     None if foil.exposure_selector is None
+                                     else (foil.exposure_selector.name, foil.exposure_selector.occurrence),
+                                     foil.absorption_lengths))
         object.__setattr__(
             self,
             "fingerprint",

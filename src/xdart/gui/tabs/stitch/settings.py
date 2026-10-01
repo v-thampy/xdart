@@ -90,8 +90,10 @@ def apply_page_settings(page, document: Any) -> None:
                            if type(paths) is list}
     page.set_sources(page._paths_by_kind.get(page._value("source_kind"), ()))
     for key, value in fields.items():
-        if key not in _FIRST and key not in _THRESHOLD:
+        if key not in _FIRST and key not in _THRESHOLD and key != "normalization":
             page.set_field(key, value)
+    if "normalization" in fields:  # last: the saved choice wins over a monitor's implied one
+        page.set_field("normalization", fields["normalization"])
     saved = document.get("fields", {})
     if "camera" not in saved and str(saved.get("image_rotation", "")).strip() in ("0", "90", "180", "270"):
         from xrd_tools.core.geometry import ImageOrientation  # older settings: the rotation's unmirrored camera

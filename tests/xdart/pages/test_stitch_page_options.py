@@ -964,3 +964,96 @@ def test_an_older_stitch_file_says_to_stitch_it_again(qapp, tmp_path):
         assert "stitch it again" in page.run_bar.readinessLabel.full_text()
     finally:
         _close(page, qapp)
+
+
+def _with_foil_columns(form):
+    """The native form's SPEC with a monitor before the foils (I0), the foil codes and the counting time."""
+    spec = Path(form.spec_path)
+    out, row = [], 0
+    for line in spec.read_text().splitlines():
+        if line.startswith("#L "):
+            out.append(line + "  I0  foil status  Seconds")
+            row = 0
+        elif line and (line[0].isdigit() or line[0] == "-"):
+            out.append(f"{line} {1000.0 + row} {1100.0 if row % 2 else 0.0} {1.0 + row}")
+            row += 1
+        elif line.startswith("#N "):
+            out.append(f"#N {int(line.split()[1]) + 3}")
+        else:
+            out.append(line)
+    spec.write_text("\n".join(out) + "\n")
+    return form
+
+
+def test_the_normalization_group_takes_each_choice_to_the_plan(qapp, tmp_path):
+    """Decision 4's four choices on Stitch's page, through the one Normalization group (``normalization_values``,
+    RSM's too): each reaches the form and the prepared plan, with its columns bound; the rows a choice does not
+    read are greyed with their values kept, and Processing's readiness names what a choice still needs."""
+    from xdart.gui.tools.stitch_values import prepare_stitch_tool
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_with_foil_columns(_native_form(tmp_path, "multigeometry", scans="1")))
+        assert page._value("normalization") == "None" and page.build_form().foil_normalization is None
+        assert page._fields["foil_column"].choices == ("None", "I0", "foil status", "Seconds")  # the scan's counters
+        assert not page._rows["monitor"].editor.isEnabled() and not page._rows["foil_lengths"].editor.isEnabled()
+        expected = {
+            "Monitor": ("I0", None),
+            "Foil transmission × exposure": (None, ("foil status", "Seconds")),
+            "Monitor × foil transmission": ("I0", ("foil status", None)),
+        }
+        for choice, (monitor, foil) in expected.items():
+            page.set_field("normalization", choice)
+            page.set_field("monitor", "I0")
+            page.set_field("foil_column", "foil status")
+            page.set_field("exposure_column", "Seconds")
+            assert page._value("normalization") == choice  # naming a monitor under a foil choice keeps it
+            form = page.build_form()
+            assert (form.monitor_selector.name if form.monitor_selector else None) == monitor
+            got = form.foil_normalization
+            assert (None if got is None else (got.foil_selector.name, got.exposure_selector.name
+                                              if got.exposure_selector else None)) == foil
+            if got is not None:
+                assert got.absorption_lengths == (1.06, 3.04, 4.65, 9.5)
+            plan = prepare_stitch_tool(form).request.plan
+            assert plan.foil_normalization == got and plan.monitor_selector == form.monitor_selector
+        page.set_field("foil_column", "None")
+        assert page.run_bar.readinessLabel.full_text() == "Needs a foil column"
+        page.set_field("foil_column", "foil status")
+        page.set_field("foil_lengths", "1, 2")
+        assert page.run_bar.readinessLabel.full_text() == (
+            "Needs Foil absorption: four numbers are needed, first foil first")
+    finally:
+        _close(page, qapp)
+
+
+def test_saved_normalization_restores_and_older_settings_take_their_monitor(qapp, tmp_path):
+    """The group's choice and columns travel with Stitch's settings; the saved choice wins over the monitor it
+    keeps (a None with a monitor still named stays None), and older settings, which knew only the Monitor row,
+    open on the Monitor choice."""
+    from xdart.gui.tabs.stitch.settings import apply_page_settings, page_settings
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    other = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_with_foil_columns(_native_form(tmp_path, "multigeometry", scans="1")))
+        page.set_field("normalization", "Foil transmission × exposure")
+        page.set_field("foil_lengths", "1.06, 3.04, 4.64, 13.22")
+        document = page_settings(page)
+        apply_page_settings(other, document)
+        assert other._value("normalization") == "Foil transmission × exposure"
+        assert other.build_form().foil_normalization.absorption_lengths == (1.06, 3.04, 4.64, 13.22)
+        page.set_field("normalization", "Monitor")
+        page.set_field("monitor", "I0")
+        page.set_field("normalization", "None")
+        apply_page_settings(other, page_settings(page))
+        assert other._value("normalization") == "None" and other._value("monitor") == "I0"
+        assert other.build_form().monitor_selector is None
+        older = page_settings(page)
+        del older["fields"]["normalization"]
+        older["fields"]["monitor"] = "I0"
+        apply_page_settings(other, older)
+        assert other._value("normalization") == "Monitor" and other.build_form().monitor_selector.name == "I0"
+    finally:
+        _close(page, qapp)
+        _close(other, qapp)
