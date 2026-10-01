@@ -31,6 +31,7 @@ from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
+from xdart.gui.tabs.scattering.controls_inventory import MASK_FILE, PONI_FILE
 from xdart.gui.tabs.scattering.controls_readiness import SectionHeaderProjection
 from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
 from xdart.gui.tabs.scattering.shell_widgets import apply_section_header
@@ -44,12 +45,9 @@ from xdart.gui.tools.rsm_values import (
 from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
-from xrd_tools.analysis.rsm_geometry_asset import (
-    CANONICAL_RSM_GEOMETRY_LOCATOR, RSMGeometryAssetRefused, install_canonical_rsm_geometry_asset,
-    rsm_geometry_asset_input,
-)
+from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
 from xrd_tools.analysis.rsm_operation import (
-    RSMImageConditioning, RSMNormalizationMode, RSMNormalizationPolicy, RSMOperationResultV2,
+    RSMFrameCorrections, RSMImageConditioning, RSMNormalizationMode, RSMNormalizationPolicy, RSMOperationResultV2,
 )
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
@@ -86,8 +84,7 @@ _RESIDENT_RESULTS = 5
 #: The page's fields: (card, key, label, default, choices, browse).
 _FIELDS = (
     (SectionId.PROJECT, "project_root", "Folder", "", (), True),
-    (SectionId.PROJECT, "output_path", "Output", "", (), True),
-    (SectionId.EXPERIMENT, "geometry_asset", "Geometry", CANONICAL_RSM_GEOMETRY_LOCATOR, (), True),
+    (SectionId.PROJECT, "output_path", "Save Path", "", (), True),
     (SectionId.EXPERIMENT, "coordinates", "Coordinates", RSMCoordinateFrame.HKL.display_name, tuple(_FRAMES),
      False),
     (SectionId.SOURCE, "member_spec", "SPEC", "", (), True),
@@ -197,7 +194,14 @@ class RSMPage(QtWidgets.QWidget):
         self._color_map = "Default"  # Int's top bar: viridis
         self._log_scale = False
         self._closing = False
+        # the shared calibration and mask windows (tabs/calibration), opened with RSM's context
+        self._authoring_dialogs = []
+        self._calibration_dialog = None
+        self._calibration_project = None
         self._build_ui()
+        self._authoring_timer = QtCore.QTimer(self)
+        self._authoring_timer.setInterval(50)
+        self._authoring_timer.timeout.connect(self._sync_actions)
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._poll)
@@ -267,40 +271,41 @@ class RSMPage(QtWidgets.QWidget):
             if self.run_bar.write_mode() == "Append" else
             "Replace: grid again; the output is replaced once its new result is written")
 
-    def _row(self, section, key, label, value, choices, browse):
-        kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.INT if key in _INTEGER_FIELDS
-                else ControlFieldKind.LINE)
-        path = ("Project", "project_folder") if key == "project_root" else ("RSM", key)
+    @staticmethod
+    def _new_field(section, key, label, value, choices=(), browse=False, path=None):
+        """One of the page's fields; ``path`` Int's for a row Int's composer lays out."""
+        kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.BOOL if isinstance(value, bool)
+                else ControlFieldKind.INT if key in _INTEGER_FIELDS else ControlFieldKind.LINE)
+        if path is None:
+            path = ("Project", "project_folder") if key == "project_root" else ("RSM", key)
         minimum, maximum, allow_blank = _INTEGER_FIELDS.get(key, (None, None, False))
-        field = ControlFormField(section, label, path, value, kind, tuple(choices), browse,
-                                 minimum=minimum, maximum=maximum, allow_blank=allow_blank)
-        row = FormRow(label=label, path=path, value=value, kind=field.kind.value, choices=choices, browse=browse,
-                      minimum=minimum, maximum=maximum, allow_blank=allow_blank)
+        return ControlFormField(section, label, path, value, kind, tuple(choices), browse,
+                                minimum=minimum, maximum=maximum, allow_blank=allow_blank)
+
+    def _bind(self, key, field, row):
+        """A row the page reads and edits by ``key``, built here or by Int's composer."""
         row.editor.setProperty("rsmField", key)
         row.valueChanged.connect(lambda _path, _value, name=key: self._committed(name))
         row.browseRequested.connect(lambda _path, name=key: self._browse(name))
         self._fields[key], self._rows[key] = field, row
         return row
 
+    def _row(self, section, key, label, value, choices, browse):
+        field = self._new_field(section, key, label, value, choices, browse)
+        return self._bind(key, field, FormRow(
+            label=label, path=field.path, value=value, kind=field.kind.value, choices=choices, browse=browse,
+            minimum=field.minimum, maximum=field.maximum, allow_blank=field.allow_blank))
+
     def _build_controls(self):
         cards = {SectionId.PROJECT: self.controls.project_card, SectionId.EXPERIMENT: self.controls.experiment_card,
                  SectionId.SOURCE: self.controls.source_card, SectionId.PROCESSING: self.controls.processing_card}
         for section, key, label, value, choices, browse in _FIELDS:
+            if key == "coordinates":  # Stitch's Experiment rows first (the maintainer: its control panel)
+                self._build_experiment()
             row = self._row(section, key, label, value, choices, browse)
             if key == "member_spec":  # the ordered members above the selected one's rows
                 cards[section].add_row(self._member_panel())
             cards[section].add_row(row)
-            if key == "geometry_asset":
-                install = QtWidgets.QPushButton("Install canonical")
-                install.setObjectName("rsmPageInstallCanonical")
-                install.setToolTip("Write the canonical psic geometry asset into the Project")
-                install.clicked.connect(self._install_geometry)
-                self.install_button = install
-                cards[section].add_row(install)
-        self.identity = QtWidgets.QLabel("Asset identity not yet authenticated")
-        self.identity.setObjectName("rsmPageGeometryIdentity")
-        self.identity.setWordWrap(True)
-        self.controls.experiment_card.add_row(self.identity)
         buttons = self.controls.render_actions(self.controls.processing_card, tuple(
             ControlActionSpec(action, label, SectionId.PROCESSING) for action, label in (
                 (ControlAction.PREVIEW, "Preview"), (ControlAction.RETRY, "Retry"),
@@ -318,6 +323,37 @@ class RSMPage(QtWidgets.QWidget):
         self.preview_text.setReadOnly(True)
         preview_layout.addWidget(self.preview_text)
         self.preview_dialog.resize(760, 560)
+
+    def _build_experiment(self):
+        """Stitch's Experiment rows, from Int's composer (no Grazing: the maintainer): Calibrate · Make Mask on
+        top, the Detector subsection (the Calibration and the Mask File), then the calibration's refinement. RSM
+        calibrates its own data in the shared calibration window (the maintainer, 2026-10-01: "the idea is to
+        reuse what was developed for stitch, not use the calibration that was done in stitch"), and its geometry
+        is the Calibration row's (AUD-9 stage 2b C7b)."""
+        experiment = self.controls.experiment_card
+        detector = {"geometry_path": self._new_field(SectionId.EXPERIMENT, "geometry_path", "Calibration", "",
+                                                     browse=True, path=PONI_FILE),
+                    "mask_path": self._new_field(SectionId.EXPERIMENT, "mask_path", "Mask File", "", browse=True,
+                                                 path=MASK_FILE)}
+        built = self.controls.render_experiment_rows(experiment, tuple(detector.values()), (
+            ControlActionSpec(ControlAction.CALIBRATE, "Calibrate", SectionId.EXPERIMENT),
+            ControlActionSpec(ControlAction.MAKE_MASK, "Make Mask", SectionId.EXPERIMENT)))
+        for key, field in detector.items():
+            self._bind(key, field, built[field.path])
+        self.calibrate_button, self.mask_button = built[ControlAction.CALIBRATE], built[ControlAction.MAKE_MASK]
+        self.calibrate_button.setToolTip("Calibrate the detector from a calibrant or direct-beam scan in the "
+                                         "shared calibration window; its saved file becomes the Calibration.")
+        self.mask_button.setToolTip("Draw a detector mask on one of the scan's frames.")
+        self._tip("geometry_path", "The calibration window's pyFAI file (its xrayutilities partner, "
+                                   "<name>.xu.json, is saved beside it): the distance, beam pixel, pixel size "
+                                   "and camera. Inside the Project.")
+        self._tip("mask_path", "A detector mask, applied to every frame with the detector's own.")
+        refinement = self._row(SectionId.EXPERIMENT, "refinement", "Use the calibration's refinement", True,
+                               (), False)
+        refinement.setToolTip("When the calibration carries a refined fit: its del/nu zero offsets, detector "
+                              "mount tilts and energy offset (each scan keeps its own recorded energy plus the "
+                              "offset). Never the calibrant's sample offset.")
+        experiment.add_row(refinement)
 
     def _member_panel(self):
         panel = QtWidgets.QWidget()
@@ -509,8 +545,29 @@ class RSMPage(QtWidgets.QWidget):
         path = Path(spelling).expanduser()
         return path if path.is_absolute() else project / path
 
+    def _calibration_locator(self, root):
+        """The Calibration row's file, Project relative, as RSM's calibration input takes it; ValueError
+        naming what is wrong."""
+        text = str(self._value("geometry_path")).strip()
+        if not text:
+            raise ValueError("a Calibration (Calibrate, or choose its file)")
+        path = Path(text).expanduser()
+        try:
+            locator = (path.as_posix() if not path.is_absolute()
+                       else path.resolve().relative_to(Path(root).expanduser().resolve()).as_posix())
+            rsm_calibration_geometry_input(locator)  # its exact Project-relative spelling (no ".."), no reads
+        except (TypeError, ValueError, OSError):
+            raise ValueError("a Calibration inside the Project") from None
+        return locator
+
+    def _mask_path(self, root):
+        """The Mask File as the run reads it (None when blank)."""
+        text = str(self._value("mask_path")).strip()
+        return None if not text else str(self._inside(root, text, "Mask File"))
+
     def build_form(self):
-        """The exact RSM v2 form of the page's inputs (the dialog's form for the same inputs)."""
+        """The exact RSM v2 form of the page's inputs: the dialog's form for the same inputs, with the
+        Calibration row's geometry (AUD-9 stage 2b C7b) and the Mask File (C4)."""
         self._store_member()
         refused = self._advanced_refusal()
         if refused:
@@ -547,13 +604,18 @@ class RSMPage(QtWidgets.QWidget):
         # the suggested output is its family's stable slot, and the result records that family
         family = (suggested_family(project, self._members)
                   if str(output) == suggested_output(project, self._members) else None)
+        geometry = rsm_calibration_geometry_input(self._calibration_locator(project),
+                                                  refinement=bool(self._value("refinement")))
+        # decision 5's defaults (solid angle, polarization 0.99) with the Mask File
+        corrections = RSMFrameCorrections(mask_path=self._mask_path(project), solid_angle=True,
+                                          polarization_factor=0.99)
         return RSMToolFormV2(
-            project_text, rsm_geometry_asset_input(str(self._value("geometry_asset")).strip()), tuple(members),
+            project_text, geometry, tuple(members),
             RSMImageConditioning(float(self._value("offset")), optional("high_threshold"), optional("static_hot")),
             normalization, tuple(_GRIDS[self._value("grid")]), int(self._value("adv_chunk")),
             int(self._value("adv_max_frame_mib")) * _MIB, int(self._value("adv_max_chunk_mib")) * _MIB, output,
             AnalysisArtifactOverwrite.REPLACE,  # Append is the page's skip, as Stitch's (_start_run)
-            coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family)
+            coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family, corrections=corrections)
 
     # ── readiness ──
     def _edited(self, *_args):
@@ -567,6 +629,12 @@ class RSMPage(QtWidgets.QWidget):
                 self._fields["output_path"] = replace(self._fields["output_path"], value=suggestion)
                 self._rows["output_path"].apply_field(self._fields["output_path"])
         self.controls.apply_card_visibility(project)
+        named = bool(str(self._value("geometry_path")).strip())
+        refinement = self._fields["refinement"]
+        if refinement.enabled != named:
+            self._fields["refinement"] = replace(refinement, enabled=named,
+                                                 reason="" if named else "Choose a Calibration first")
+            self._rows["refinement"].apply_field(self._fields["refinement"])
         self._readiness = self._readiness_now()
         self._show_readiness()
         self._sync_actions()
@@ -588,9 +656,16 @@ class RSMPage(QtWidgets.QWidget):
         elif not root.is_dir():
             need("project", f"an existing Project folder ({root.name} not found)")
         else:
-            geometry = str(self._value("geometry_asset")).strip()
-            if not geometry or not self._inside(root, geometry, "geometry").is_file():
-                need("experiment", "the geometry asset (Install canonical)")
+            try:
+                locator = self._calibration_locator(root)
+            except ValueError as error:
+                need("experiment", str(error))
+            else:
+                if not (root / locator).is_file():
+                    need("experiment", f"the Calibration ({Path(locator).name} not found)")
+            mask = str(self._value("mask_path")).strip()
+            if mask and not self._inside(root, mask, "Mask File").is_file():
+                need("experiment", f"the Mask File ({Path(mask).name} not found)")
             for number, draft in enumerate(self._members, 1):
                 spec = self._inside(root, draft.spec_path, "SPEC") if draft.spec_path else None
                 images = self._inside(root, draft.image_dir, "images") if draft.image_dir else None
@@ -614,7 +689,7 @@ class RSMPage(QtWidgets.QWidget):
         members = len(self._members)
         grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
         ready_detail = {"project": "Project folder and Output are ready.",
-                        "experiment": "The geometry asset is installed.",
+                        "experiment": "The Calibration (and any Mask File) is ready.",
                         "source": "Every member's SPEC file, images and frames are ready.",
                         "processing": "The grid and normalization are set."}
         texts = {"project": "", "experiment": str(self._value("coordinates")),
@@ -650,8 +725,16 @@ class RSMPage(QtWidgets.QWidget):
         busy = bool(self._owner.busy)
         final = self._owner.finalization
         reading = self._reading is not None
-        idle = not busy and not reading and final is RSMOwnerFinalization.NONE and not self._closing
+        authoring = self._authoring_active()
+        idle = (not busy and not reading and not authoring and final is RSMOwnerFinalization.NONE
+                and not self._closing)
         self.controls.set_editors_enabled(idle)  # the action row stays usable: Retry (Codex F2)
+        self.calibrate_button.setEnabled(idle)
+        self.mask_button.setEnabled(idle)
+        for dialog in self._authoring_dialogs:
+            dialog.setEnabled(not busy and not self._closing and (not authoring or dialog.active()))
+        if not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs):
+            self._authoring_timer.stop()
         self.run_bar.set_mode_row_enabled(idle)
         self.member_table.setEnabled(idle)
         self.advanced.setEnabled(idle)
@@ -667,8 +750,90 @@ class RSMPage(QtWidgets.QWidget):
 
     # ── the owner ──
     def _control_action(self, action):
-        {ControlAction.PREVIEW: self.begin_preview, ControlAction.RETRY: self.retry,
+        {ControlAction.CALIBRATE: self._calibrate, ControlAction.MAKE_MASK: self._make_mask,
+         ControlAction.PREVIEW: self.begin_preview, ControlAction.RETRY: self.retry,
          ControlAction.ADVANCED_PROCESSING: self.advanced.show}.get(action, lambda: None)()
+
+    # ── the shared calibration and mask windows ──
+    def _authoring_active(self):
+        return any(dialog.active() for dialog in self._authoring_dialogs)
+
+    def _source_spec_for_tools(self):
+        """The selected member's scan, for the calibration and mask windows (None without one)."""
+        from xrd_tools.core.scan import SourceKind, SourceSpec
+        project = str(self._value("project_root")).strip()
+        if not project or not 0 <= self._selected < len(self._members):
+            return None
+        draft = self._members[self._selected]
+        if not draft.spec_path or not draft.image_dir:
+            return None
+        root = Path(project).expanduser()
+        return SourceSpec(str(self._inside(root, draft.spec_path, "SPEC path")), SourceKind.SPEC, options={
+            "scan": draft.scan, "image_dir": str(self._inside(root, draft.image_dir, "image directory")),
+            "image_stem": draft.image_stem or None,
+            "read_image_kwargs": dict(detector_shape=(draft.detector_rows, draft.detector_columns),
+                                      raw_dtype=draft.raw_dtype, raw_header_skip=draft.raw_header_skip)})
+
+    def _calibrate(self):
+        """Calibrate: the shared calibration window with RSM's context ("Save geometry and use in RSM"), so RSM
+        calibrates its own data; its saved file becomes the Calibration row's."""
+        from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
+        if self._owner.busy or self._closing or self._authoring_active():
+            return
+        try:
+            project = str(self._value("project_root")).strip()
+            if not project:
+                raise ValueError("Choose a Project folder first")
+            if self._calibration_dialog is not None and self._calibration_project != project:
+                self._calibration_dialog.hide()
+                self._calibration_dialog = None
+            fresh = self._calibration_dialog is None
+            if fresh:
+                self._calibration_dialog = CalibrationDialog(CalibrationContext("RSM", project), parent=self)
+                self._calibration_project = project
+                self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
+                self._authoring_dialogs.append(self._calibration_dialog)
+            source = self._source_spec_for_tools() if fresh else None
+            if source is not None:  # RSM reads raw images: no turn or mirror of its own
+                self._calibration_dialog.set_source_context(source, image_rotation=0, image_flip=False)
+            self._calibration_dialog.show()
+            self._calibration_dialog.raise_()
+            self._authoring_timer.start()
+        except (TypeError, ValueError, OSError) as error:
+            self._notice(str(error))
+
+    def _adopt_calibration(self, path, _backend=None):
+        """A calibration the window saved: the Calibration row takes it (and its mask, the detector's)."""
+        if self._closing or self._calibration_project != str(self._value("project_root")).strip():
+            self._notice(f"Calibration saved: {path} · Project changed; select the calibration to use it")
+            return
+        self.set_field("geometry_path", str(path))
+        dialog = self._calibration_dialog
+        if dialog is not None and dialog.saved_mask:
+            self.set_field("mask_path", dialog.saved_mask)
+
+    def _make_mask(self):
+        """Make Mask: the shared mask window on the selected member's scan; its saved mask fills Mask File."""
+        from xdart.gui.tabs.calibration.mask import MaskDialog
+        if self._owner.busy or self._closing or self._authoring_active():
+            return
+        try:
+            draft = self._members[self._selected]
+            dialog = MaskDialog(str(self._value("project_root")), source=self._source_spec_for_tools(), rotation=0,
+                                reader_options=dict(detector_shape=(draft.detector_rows, draft.detector_columns),
+                                                    raw_dtype=draft.raw_dtype,
+                                                    raw_header_skip=draft.raw_header_skip, rotation=0),
+                                parent=self)
+            self._authoring_dialogs.append(dialog)
+            revision = self._form_revision
+            dialog.maskSaved.connect(lambda path: self.set_field("mask_path", str(path))
+                                     if revision == self._form_revision and not self._closing
+                                     else self._notice(f"Mask saved: {path} · Inputs changed; select the mask "
+                                                       "to use it"))
+            dialog.show()
+            self._authoring_timer.start()
+        except (TypeError, ValueError, OSError) as error:
+            self._notice(str(error))
 
     def _current_form(self):
         try:
@@ -800,9 +965,7 @@ class RSMPage(QtWidgets.QWidget):
             if preflight.output_current:  # as Stitch's Preview says it
                 lines.append(f"Output {Path(preflight.form.output_path).name}: already gridded with these "
                              "settings (Append skips it)")
-            self.preview_text.setPlainText("\n".join(lines))
-            self.identity.setText(f"raw {summary.geometry_asset_raw_sha256[:12]} · semantic "
-                                  f"{summary.geometry_asset_semantic_fingerprint[:12]}")
+            self.preview_text.setPlainText("\n".join(lines))  # it names the geometry and its energies
             if self._run_requested:
                 self._start_run(current)
             else:
@@ -1019,6 +1182,10 @@ class RSMPage(QtWidgets.QWidget):
             picks = dialogs.browse(self, "Choose folder", folder=True, **common)
         elif key == "member_spec":
             picks = dialogs.browse_spec(self, "Choose SPEC file", **common)
+        elif key in {"geometry_path", "mask_path"}:  # Int's file types for the same inputs
+            title, file_filter = (("Choose calibration", dialogs.CALIBRATION_FILTER) if key == "geometry_path"
+                                  else ("Choose detector mask", dialogs.MASK_FILTER))
+            picks = dialogs.browse(self, title, file_filter=file_filter, **common)
         elif key == "output_path":  # the shared save: the last folder, the current output's name
             picks = dialogs.browse(self, "Choose RSM output", save=True, file_filter="NeXus result (*.nexus)",
                                    default_name=Path(common["current"]).name if common["current"] else "",
@@ -1027,20 +1194,6 @@ class RSMPage(QtWidgets.QWidget):
             picks = dialogs.browse(self, "Choose " + self._fields[key].label, **common)
         if picks:
             self.set_field(key, picks[0])
-
-    def _install_geometry(self):
-        project = str(self._value("project_root")).strip()
-        if not project:
-            self._notice("Install canonical needs a Project folder")
-            return
-        try:
-            receipt = install_canonical_rsm_geometry_asset(project_root=project)
-        except RSMGeometryAssetRefused as error:
-            self._notice(f"{error.code}: {error}")
-            return
-        self.set_field("geometry_asset", receipt.request.locator)
-        self.identity.setText(f"raw {receipt.raw_sha256[:12]} · semantic {receipt.semantic_fingerprint[:12]}")
-        self._notice(f"Canonical RSM geometry ready: {receipt.lexical_relative_path}", ready=True)
 
     # ── modes and the host ──
     def _mode_chosen(self, mode):
@@ -1057,7 +1210,7 @@ class RSMPage(QtWidgets.QWidget):
 
     def active(self):
         return bool(self._owner.busy or self._reading is not None
-                    or self._owner.finalization is not RSMOwnerFinalization.NONE)
+                    or self._owner.finalization is not RSMOwnerFinalization.NONE or self._authoring_active())
 
     def mount_points(self):
         return AppMenuHosts(self.browser.menus["Config"], self.browser.menus["Help"],
@@ -1076,7 +1229,9 @@ class RSMPage(QtWidgets.QWidget):
         """Close the owner and the reader; PENDING while either still has a worker."""
         self._closing = True
         self._timer.stop()
-        receipts = (self._owner.close(), self._reader.close())
+        self._authoring_timer.stop()
+        receipts = (self._owner.close(), self._reader.close(),
+                    *(dialog.shutdown() for dialog in self._authoring_dialogs))
         pending = [receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN]
         if pending:
             self._closing = False

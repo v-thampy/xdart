@@ -24,10 +24,10 @@ from xdart.gui.tools import rsm_owner
 from xdart.gui.tools.rsm_tool import RSMToolDialog
 from xdart.gui.tools.rsm_values import RSMMemberDraft
 from xrd_tools.analysis.module_transaction import ModuleDisposition, ModuleTerminalResult
-from xrd_tools.analysis.rsm_geometry_asset import install_canonical_rsm_geometry_asset
 from xrd_tools.analysis.rsm_operation import RSMOperationExecutionV2, RSMOperationResultV2
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+from tests.core.test_rsm_calibration_geometry import _canonical_partner
 from tests.core.test_rsm_operation_r2_real_data import _SCIENCE, rsm_r2_project  # noqa: F401
 from tests.xdart.tools.test_rsm_tool_dialog import (  # noqa: F401
     _Owner, _Status, _q_values, _values, _write_member, qapp,
@@ -80,19 +80,22 @@ def _wait(page, qapp, done, seconds=20.0):
 def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
     """The page and the RSM dialog it replaces make the same exact RSM v2 form from the same inputs (its
     fingerprint names every member, selector, grid, frame and the output), for HKL and for Cartesian Q; the
-    page's replaces its own result (stage 2), the dialog's creates a new one."""
+    page's replaces its own result (stage 2), the dialog's creates a new one, and the page's geometry is its
+    Calibration row's where the dialog installs the canonical asset (stage 2b C7b)."""
     from dataclasses import replace as replaced
     page = _page(qapp, owner=_Owner())
     dialog = RSMToolDialog(empty_host_services(_Status()), owner=_Owner())
     try:
         output = tmp_path / "rsm.nexus"
         page.set_field("project_root", str(tmp_path))
+        page.set_field("geometry_path", _canonical_partner(tmp_path))
         page.set_field("output_path", str(output))
         dialog.project_edit.setText(str(tmp_path))
         dialog._apply_scan43_preset()
         dialog.output_edit.setText(str(output))
+        geometry = page.build_form().geometry_asset
         assert page.build_form().fingerprint == replaced(
-            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE).fingerprint
+            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry).fingerprint
         page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
         page.set_field("grid", "Full 200×200×200")
         page.set_field("normalization", "Identity")
@@ -101,15 +104,16 @@ def test_the_page_builds_the_dialogs_exact_form(qapp, tmp_path):
         dialog.grid_combo.setCurrentIndex(1)
         dialog.normalization_combo.setCurrentIndex(1)
         assert page.build_form().fingerprint == replaced(
-            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE).fingerprint
+            dialog._build_form(), overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry).fingerprint
     finally:
         _close(page, qapp)
         dialog.shutdown()
 
 
 def _synthetic_members(root):
-    """Two ordered synthetic SPEC members on disk (the RSM dialog tests' fixture) and the canonical asset."""
-    install_canonical_rsm_geometry_asset(project_root=root)
+    """Two ordered synthetic SPEC members on disk (the RSM dialog tests' fixture) and a calibration encoding the
+    canonical geometry (row B's, AUD-9 stage 2b C7b: the page's geometry is its Calibration row's)."""
+    _canonical_partner(root)
     drafts = []
     for ordinal in range(2):
         form = _write_member(root, ordinal)
@@ -123,6 +127,7 @@ def _synthetic_members(root):
 
 def _with_members(page, root, drafts):
     page.set_field("project_root", str(root))
+    page.set_field("geometry_path", "calibration/rsm_canonical.json")
     page._members = drafts
     page._load_member(0)
     page.set_field("normalization", "Identity")
@@ -329,9 +334,10 @@ def test_each_pane_carries_the_frames_own_axis_labels(qapp, make, names):
 
 @pytest.mark.slow
 def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, rsm_r2_project):  # noqa: F811
-    """Real data: STO scan 43 at 40³ run from the page (its preset member, the canonical asset, the
-    suggested output) commits the same result as the headless run of the page's own form, paints it, and
-    Open… reads the same result back from the file.
+    """Real data: STO scan 43 at 40³ run from the page (its preset member, a calibration encoding the canonical
+    geometry on its Calibration row (row B's, bit for bit the canonical asset's), the suggested output) commits
+    the same result as the headless run of the page's own form, paints it, and Open… reads the same result back
+    from the file.
 
     The page's form carries decision 5's defaults (solid angle and polarization on), so its result is not the
     independent oracle's pinned one (test_rsm_operation_r2_real_data, every correction off): with them off, the
@@ -342,6 +348,7 @@ def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, 
     page = _page(qapp)
     try:
         page.set_field("project_root", str(rsm_r2_project))
+        page.set_field("geometry_path", _canonical_partner(rsm_r2_project))
         assert page._readiness[1], page._readiness
         form = page.build_form()
         assert form.corrections == RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
@@ -832,5 +839,91 @@ def test_the_3d_viewer_and_custom_slice_buttons_reach_the_page(qapp, monkeypatch
         page.view.page_tool("custom").click()
         assert pressed == ["3d", "custom"]
         assert page.view.slice.isHidden() and page.view.pin.isHidden()
+    finally:
+        _close(page, qapp)
+
+
+# AUD-9 stage 2b G8a: the RSM controls become Stitch's sections (the maintainer, 2026-10-01: "the control panel can
+# be almost identical to the stitch control panel for the project, experiment (except the standard/grazing which
+# are not required), and source. Only the processing panel would be different")
+
+
+def test_the_experiment_section_is_stitchs_calibration_and_mask_rows(qapp, tmp_path):
+    """Experiment is Stitch's, from Int's composer: Calibrate · Make Mask, the Detector subsection's Calibration and
+    Mask File ("Mask File and Make Mask ... they should. And masks should be applied when specified"), and the
+    calibration's refinement, greyed until a Calibration is named. The canonical asset's Install button and
+    identity leave the page; the form's geometry is the Calibration row's (its refinement the toggle's), and the
+    Mask File reaches the run's corrections."""
+    from xdart.gui.widgets.controls_panel import SubsectionCard
+    from xrd_tools.analysis.rsm_geometry_asset import RSMCalibrationGeometryInput
+    page = _page(qapp)
+    try:
+        assert not hasattr(page, "install_button") and not hasattr(page, "identity")
+        card = page.controls.experiment_card
+        assert card.isAncestorOf(page.calibrate_button) and card.isAncestorOf(page.mask_button)
+        detector = next(sub for sub in card.findChildren(SubsectionCard)
+                        if sub.isAncestorOf(page._rows["geometry_path"]))
+        assert detector.isAncestorOf(page._rows["mask_path"])
+        assert not page._fields["refinement"].enabled  # greyed until a Calibration is named
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        assert page._fields["refinement"].enabled and page._readiness[1], page._readiness
+        form = page.build_form()
+        assert type(form.geometry_asset) is RSMCalibrationGeometryInput
+        assert form.geometry_asset.locator == "calibration/rsm_canonical.json" and form.geometry_asset.refinement
+        assert form.corrections.mask_path is None
+        page.set_field("refinement", False)
+        assert not page.build_form().geometry_asset.refinement
+        assert page.build_form().fingerprint != form.fingerprint
+        mask = tmp_path / "mask.npy"
+        np.save(mask, np.zeros((195, 487), dtype=bool))
+        page.set_field("mask_path", str(mask))
+        assert page.build_form().corrections.mask_path == str(mask)
+        page.set_field("geometry_path", "")
+        assert not page._readiness[1] and "a Calibration (Calibrate, or choose its file)" in page._readiness[0]
+        assert "Calibration" in page._headers["experiment"].detail
+        page.set_field("geometry_path", str(tmp_path.parent / "elsewhere.json"))
+        assert "a Calibration inside the Project" in page._readiness[0]
+    finally:
+        _close(page, qapp)
+
+
+def test_calibrate_and_make_mask_open_the_shared_windows_with_rsms_context(qapp, tmp_path):
+    """Calibrate opens the shared calibration window (tabs/calibration) with RSM's context, so RSM calibrates its
+    own data ("reuse what was developed for stitch, not use the calibration that was done in stitch"): its title
+    and save button name RSM, and its saved calibration (and the detector mask saved with it) fill the
+    Calibration and the Mask File. Make Mask opens the shared mask window, whose saved mask fills the Mask File."""
+    from xdart.gui.tabs.calibration.mask import MaskDialog
+    from xrd_tools.session.readiness import ControlAction
+    page = _page(qapp)
+    try:
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        page._control_action(ControlAction.CALIBRATE)
+        dialog = page._calibration_dialog
+        assert dialog is not None and dialog.windowTitle() == "RSM calibration"
+        assert dialog.save_button.text() == "Save geometry and use in RSM"
+        dialog.saved_mask = str(tmp_path / "cal_mask.npy")
+        dialog.calibrationSaved.emit(str(tmp_path / "calibration" / "new.json"), "multigeometry")
+        assert page._value("geometry_path") == str(tmp_path / "calibration" / "new.json")
+        assert page._value("mask_path") == str(tmp_path / "cal_mask.npy")
+        dialog.hide()
+        page._control_action(ControlAction.MAKE_MASK)
+        mask_dialog = page._authoring_dialogs[-1]
+        assert type(mask_dialog) is MaskDialog
+        mask_dialog.maskSaved.emit(str(tmp_path / "drawn.npy"))
+        assert page._value("mask_path") == str(tmp_path / "drawn.npy")
+        mask_dialog.hide()
+    finally:
+        _close(page, qapp)
+
+
+def test_a_calibration_outside_the_project_is_named_before_any_preview(qapp, tmp_path):
+    """A relative Calibration that climbs out of the Project is refused by readiness, as an absolute one outside
+    it is, rather than by the form at Preview."""
+    page = _page(qapp)
+    try:
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        page.set_field("geometry_path", "../calibration/rsm_canonical.json")
+        assert not page._readiness[1] and "a Calibration inside the Project" in page._readiness[0]
+        assert page._rows["refinement"].editor.isEnabled()  # a Calibration is named: the toggle stays usable
     finally:
         _close(page, qapp)
