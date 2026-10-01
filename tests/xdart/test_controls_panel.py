@@ -1242,3 +1242,37 @@ def test_set_editors_enabled_locks_every_row_but_the_action_rows(qapp):
     assert all(row.isEnabled() for row in rows.values()) and loose.isEnabled()
     assert buttons[ControlAction.RETRY].isEnabled() and not buttons[ControlAction.PREVIEW].isEnabled()
     panel.deleteLater()
+
+
+def test_an_integer_row_keeps_refused_text_marks_it_and_names_why(qapp):
+    """The whole-number kind (Codex's RSM stage-1 review F1, on the shared row): text that is no whole number
+    within the field's bounds stays as typed (a refused value never leaves an older one in force), the row is
+    outlined (the theme's ``invalid`` property) and its tooltip says why, and ``refusal()`` gives a page's
+    readiness the same rule (``integer_field_refusal``). The value emitted is the typed text, as a line's."""
+    from xrd_tools.session.readiness import integer_field_refusal
+    assert integer_field_refusal("3", minimum=1) == ""
+    assert integer_field_refusal("0", minimum=1) == "must be at least 1"
+    assert integer_field_refusal("9", maximum=8) == "must be at most 8"
+    assert integer_field_refusal("1.5") == "'1.5' is not a whole number"
+    assert integer_field_refusal(" ", allow_blank=True) == "" and integer_field_refusal("") == "a whole number is needed"
+    row = FormRow(label="Frame step", path=("Stitch", "frame_step"), value="1", kind="int", minimum=1)
+    emitted = []
+    row.valueChanged.connect(lambda path, value: emitted.append(value))
+    try:
+        assert row.refusal() == "" and not row.editor.property("invalid")
+        row.editor.setText("0")
+        row.editor.editingFinished.emit()
+        assert emitted == ["0"] and row.editor.text() == "0"  # kept and emitted as typed
+        assert row.refusal() == "must be at least 1" and row.editor.property("invalid") is True
+        assert row.toolTip() == "Frame step: must be at least 1" == row.editor.toolTip()
+        field = ControlFormField(SectionId.SOURCE, "Frame step", ("Stitch", "frame_step"), "0",
+                                 ControlFieldKind.INT, minimum=0)
+        assert row.apply_field(field) and row.refusal() == "" and not row.editor.property("invalid")
+        assert row.toolTip() != "Frame step: must be at least 1"
+        assert not FormRow(label="Last", path=("Stitch", "frame_stop"), value="", kind="int", minimum=0,
+                           allow_blank=True).refusal()
+        line = FormRow(label="Name", path=("Stitch", "name"), value="x", kind="line")
+        assert line.refusal() == ""  # every other kind refuses nothing here
+        line.deleteLater()
+    finally:
+        row.deleteLater()

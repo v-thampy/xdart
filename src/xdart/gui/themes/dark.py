@@ -1007,6 +1007,11 @@ QComboBox#controlsComboBox:disabled {
     background-color: $panel;
     color: $text_muted;
 }
+/* An integer row's refused text (FormRow kind "int"): kept as typed, outlined, and its tooltip
+   says why; unscoped so a page's Advanced rows outside the panel show it too. */
+QLineEdit#controlsLineEdit[invalid="true"] {
+    border: 1px solid $stop_text;
+}
 QToolButton#controlsBrowseButton,
 QToolButton#controlsMoreButton {
     background-color: #4d6fbd;

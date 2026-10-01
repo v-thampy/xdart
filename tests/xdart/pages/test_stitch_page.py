@@ -1141,3 +1141,27 @@ def test_a_pending_result_keeps_its_retry_clickable(qapp, monkeypatch):
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()
+
+
+def test_a_refused_advanced_whole_number_holds_run_and_says_why(qapp, tmp_path):
+    """The shared whole-number row on Stitch's Advanced integers: a refused text (a Frame step of 0, a
+    fractional First frame) is kept as typed and Source's readiness names it, so Run waits; before, Run was
+    ready and the run failed on the text. A blank Last frame is all frames."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        assert page.run_bar.readinessLabel.full_text().startswith("Ready")
+        page.set_field("frame_step", "0")
+        assert page.run_bar.readinessLabel.full_text() == "Needs Frame step: must be at least 1"
+        assert not page.run_bar.startButton.isEnabled() and page._rows["frame_step"].editor.text() == "0"
+        page.set_field("frame_step", "2")
+        page.set_field("frame_start", "1.5")
+        assert page.run_bar.readinessLabel.full_text() == "Needs First frame: '1.5' is not a whole number"
+        page.set_field("frame_start", "0")
+        page.set_field("frame_stop", "")
+        assert page.run_bar.readinessLabel.full_text().startswith("Ready")
+    finally:
+        page.shutdown()
+        page.deleteLater()
+        qapp.processEvents()

@@ -19,6 +19,7 @@ from xrd_tools.session.readiness import (
     ControlsProjection,
     ProcessingPage,
     SectionId,
+    integer_field_refusal,
 )
 
 
@@ -614,6 +615,9 @@ class FormRow(QtWidgets.QWidget):
         browse: bool = False,
         enabled: bool = True,
         reason: str = "",
+        minimum: int | None = None,
+        maximum: int | None = None,
+        allow_blank: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -621,6 +625,9 @@ class FormRow(QtWidgets.QWidget):
         self._path = tuple(path)
         self._kind = kind
         self._enabled = bool(enabled)
+        #: "int" rows: the bounds their text is checked against (``integer_field_refusal``)
+        self._bounds = (minimum, maximum, bool(allow_blank))
+        self._reason = reason
         self._file_name_only = (
             kind == "line"
             and browse
@@ -689,6 +696,8 @@ class FormRow(QtWidgets.QWidget):
             # revisioned at action time so it survives a rebuild and wins by
             # revision (§12.4); it commits (and applies) on editingFinished.
             editor.textEdited.connect(self._draft_edited)
+            if kind == "int":  # the typed text is kept and shown refused, never reverted
+                editor.textChanged.connect(lambda _text: self._show_validity())
             lay.addWidget(editor, 1)
 
         self.editor = editor
@@ -713,10 +722,36 @@ class FormRow(QtWidgets.QWidget):
         )
         for widget in (self, self.editor, self.label):
             widget.setToolTip(tip)
+        if kind == "int":
+            self._show_validity()
 
     @property
     def path(self) -> tuple[str, ...]:
         return self._path
+
+    def refusal(self) -> str:
+        """Why an ``int`` row's text is no whole number within its bounds ("" when it is, and for
+        every other kind): the rule a page's readiness names (``integer_field_refusal``)."""
+        if self._kind != "int":
+            return ""
+        minimum, maximum, allow_blank = self._bounds
+        return integer_field_refusal(self.editor.text(), minimum=minimum, maximum=maximum,
+                                     allow_blank=allow_blank)
+
+    def _show_validity(self) -> None:
+        """An ``int`` row marks refused text (the theme's ``invalid`` property) and says why in its
+        tooltip; the text itself stays as typed."""
+        refusal = self.refusal()
+        if bool(self.editor.property("invalid")) != bool(refusal):
+            self.editor.setProperty("invalid", bool(refusal))
+            style = self.editor.style()
+            style.unpolish(self.editor)
+            style.polish(self.editor)
+        tip = (f"{self.label.text()}: {refusal}" if refusal
+               else _field_tooltip(self._path, self._reason))
+        for widget in (self, self.editor, self.label):
+            if widget.toolTip() != tip:
+                widget.setToolTip(tip)
 
     def add_trailing_widget(self, widget: QtWidgets.QWidget) -> None:
         """Append a widget to the right of the row (after the editor).  Used to
@@ -798,6 +833,10 @@ class FormRow(QtWidgets.QWidget):
         for widget in (self, self.editor, self.label):
             if widget is not None and widget.toolTip() != tip:
                 widget.setToolTip(tip)
+        self._reason = field.reason
+        if self._kind == "int":
+            self._bounds = (field.minimum, field.maximum, bool(field.allow_blank))
+            self._show_validity()
         return True
 
     def _line_display_value(self, value) -> str:
@@ -2343,6 +2382,9 @@ class ControlsPanel(QtWidgets.QWidget):
             browse=field.browse,
             enabled=field.enabled,
             reason=field.reason,
+            minimum=field.minimum,
+            maximum=field.maximum,
+            allow_blank=field.allow_blank,
         )
         row.valueChanged.connect(self.fieldValueChanged)
         row.draftChanged.connect(self.fieldDraftChanged)

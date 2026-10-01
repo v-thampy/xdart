@@ -579,6 +579,31 @@ class ControlFieldKind(str, Enum):
     LINE = "line"
     BOOL = "bool"
     COMBO = "combo"
+    #: A whole number typed into a line: the text is kept as typed and refused, never reverted, when it is
+    #: no whole number within the field's bounds (:func:`integer_field_refusal`).
+    INT = "int"
+
+
+def integer_field_refusal(text, *, minimum: int | None = None, maximum: int | None = None,
+                          allow_blank: bool = False) -> str:
+    """Why ``text`` is not a whole number within the bounds, in a few words ("" when it is one).
+
+    The one rule an integer field's row shows and a page's readiness names. It never replaces the
+    typed value (Codex's RSM stage-1 review F1: a refused value must not leave an older one in force).
+    ``allow_blank``: an empty field is valid (the field's automatic value, as a blank Last frame).
+    """
+    value = "" if text is None else str(text).strip()
+    if not value:
+        return "" if allow_blank else "a whole number is needed"
+    try:
+        number = int(value)
+    except ValueError:
+        return f"{value!r} is not a whole number"
+    if minimum is not None and number < minimum:
+        return f"must be at least {minimum}"
+    if maximum is not None and number > maximum:
+        return f"must be at most {maximum}"
+    return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,6 +627,11 @@ class ControlFormField:
     #: The grey hint an empty range bound shows (None leaves the renderer's own), e.g. the
     #: automatic threshold ceiling, which is never the field's value (decision 39).
     placeholder: str | None = None
+    #: INT fields only: the bounds, and whether a blank (automatic) value is valid
+    #: (:func:`integer_field_refusal`).
+    minimum: int | None = None
+    maximum: int | None = None
+    allow_blank: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -243,6 +243,16 @@ def _spec_motor_names(path, _state, scan):
 #: Monitor lists every counter a scan records but what is clearly no monitor (maintainer, 2026-09-30:
 #: "all the metadata columns that could be beam monitors of any kind listed (i0, i1, mon, monitor, bs,
 #: beamstop, pd, photod, etc). if in doubt, list it"): the likely monitors first, in the file's order.
+#: The whole-number rows (FormRow kind "int"): (minimum, maximum, blank allowed), as the form and plan bound them
+#: (a refused text is kept as typed and named by Source's readiness, never reverted).
+_INTEGER_FIELDS = {
+    "detector_rows": (1, None, False), "detector_cols": (1, None, False),
+    "raw_header_skip": (0, 1 << 30, False),
+    "frame_start": (0, None, False), "frame_stop": (0, None, True), "frame_step": (1, None, False),
+    "max_frame_mib": (1, 4096, False),
+}
+
+
 def monitor_choices(counters):
     """"None" (no monitor), then the scan's counters as beam-monitor choices: likely monitors first, the
     time stamp and H, K, L left out (``core.metadata.monitor_candidates``, which Int's Norm channel takes)."""
@@ -673,7 +683,8 @@ class StitchPage(QtWidgets.QWidget):
     def _field(self, card, section, key, label, value="", *, choices=(), browse=False):
         field = self._new_field(section, key, label, value, choices=choices, browse=browse)
         row = FormRow(label=label, path=field.path, value=value, kind=field.kind.value,
-                      choices=choices, browse=browse)
+                      choices=choices, browse=browse, minimum=field.minimum, maximum=field.maximum,
+                      allow_blank=field.allow_blank)
         if card is not None:
             card.add_row(row)
         return self._bind(key, field, row)
@@ -682,10 +693,12 @@ class StitchPage(QtWidgets.QWidget):
     def _new_field(section, key, label, value="", *, choices=(), browse=False, path=None):
         """One of this page's fields; ``path`` Int's for a row Int's composer lays out."""
         kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.BOOL if isinstance(value, bool)
-                else ControlFieldKind.LINE)
+                else ControlFieldKind.INT if key in _INTEGER_FIELDS else ControlFieldKind.LINE)
         if path is None:
             path = ("Project", "project_folder") if key == "project_root" else ("Stitch", key)
-        return ControlFormField(section, label, path, value, kind, tuple(choices), browse)
+        minimum, maximum, allow_blank = _INTEGER_FIELDS.get(key, (None, None, False))
+        return ControlFormField(section, label, path, value, kind, tuple(choices), browse,
+                                minimum=minimum, maximum=maximum, allow_blank=allow_blank)
 
     def _bind(self, key, field, row):
         """A row this page reads and edits by ``key``, built here or by Int's composer."""
@@ -1546,6 +1559,8 @@ class StitchPage(QtWidgets.QWidget):
         else:
             text = f"{len(sources)} {'NeXus file' if kind == 'NeXus' else f'{kind} source'}{'s' * (len(sources) != 1)}"
         source_ready = present and groups != 0
+        refused = next((f"{self._fields[key].label}: {self._rows[key].refusal()}" for key in _INTEGER_FIELDS
+                        if key in self._rows and self._rows[key].refusal()), "")
         self.controls.source_card.set_status_text(text if sources else "")
         self.controls.source_card.status.setToolTip(self._frames_tooltip() if sources else "")
         map_mode = self._mode == "Stitch 2D"
@@ -1570,6 +1585,8 @@ class StitchPage(QtWidgets.QWidget):
             needs["source"] = ({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "a source folder"}
                                .get(kind, "a source") if not sources else f"{gone[0]} (not found)" if gone
                                else "a scan selection such as 1,2,[3-5]")
+        elif refused:  # an Advanced whole number (its row outlines it and says why)
+            needs["source"] = refused
         if not processing_ready:
             needs["processing"] = "Pts above 0"
         checks = ((self.controls.project_card, "project"), (self.controls.experiment_card, "experiment"),

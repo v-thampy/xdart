@@ -94,6 +94,9 @@ _FIELDS = (
     (SectionId.PROCESSING, "high_threshold", "High → NaN", "20000000000", (), False),
     (SectionId.PROCESSING, "static_hot", "All-frame hot", "100", (), False),
 )
+#: The member's whole-number rows (FormRow kind "int"): (minimum, maximum, blank allowed). The row outlines a
+#: refused text; ``rsm_values`` stays the authority that refuses it (Codex's stage-1 review F1).
+_INTEGER_FIELDS = {"member_first": (0, None, False), "member_last": (0, None, True), "member_step": (1, None, False)}
 _MEMBER_KEYS = ("member_spec", "member_scan", "member_images", "member_stem", "member_first", "member_last",
                 "member_step")
 
@@ -251,10 +254,14 @@ class RSMPage(QtWidgets.QWidget):
             "Replace: grid again; the output is replaced once its new result is written")
 
     def _row(self, section, key, label, value, choices, browse):
-        kind = ControlFieldKind.COMBO if choices else ControlFieldKind.LINE
+        kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.INT if key in _INTEGER_FIELDS
+                else ControlFieldKind.LINE)
         path = ("Project", "project_folder") if key == "project_root" else ("RSM", key)
-        field = ControlFormField(section, label, path, value, kind, tuple(choices), browse)
-        row = FormRow(label=label, path=path, value=value, kind=field.kind.value, choices=choices, browse=browse)
+        minimum, maximum, allow_blank = _INTEGER_FIELDS.get(key, (None, None, False))
+        field = ControlFormField(section, label, path, value, kind, tuple(choices), browse,
+                                 minimum=minimum, maximum=maximum, allow_blank=allow_blank)
+        row = FormRow(label=label, path=path, value=value, kind=field.kind.value, choices=choices, browse=browse,
+                      minimum=minimum, maximum=maximum, allow_blank=allow_blank)
         row.editor.setProperty("rsmField", key)
         row.valueChanged.connect(lambda _path, _value, name=key: self._committed(name))
         row.browseRequested.connect(lambda _path, name=key: self._browse(name))
