@@ -898,7 +898,7 @@ def test_the_stitch_display_is_ints_scientific_view(qapp):
         assert choices == ["Q", "2theta"] and not view.plot_axis.isHidden()
         assert view.title.text() == "Current"
         with pytest.raises(ValueError, match="unknown scientific-view tools"):
-            view.set_hidden_tools("slice")
+            view.set_hidden_tools("plot_axis")  # not a tool a host leaves out ("slice" is, since G7: RSM's)
         # every plot mode Int has, Waterfall's options too (maintainer, 2026-09-30: Average/Sum/Waterfall)
         modes = lambda combo: [combo.itemText(row) for row in range(combo.count())]  # noqa: E731
         assert modes(view.plot_mode) == ["Single", "Overlay", "Average", "Sum", "Waterfall"]

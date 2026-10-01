@@ -801,3 +801,20 @@ def test_ints_colour_map_and_log_redraw_the_six(qapp, monkeypatch):
         assert _slices(page.view)[0]._render_contract[6:8] == ("magma", True)
     finally:
         _close(page, qapp)
+
+
+def test_the_3d_viewer_and_custom_slice_buttons_reach_the_page(qapp, monkeypatch):
+    """The maintainer's two extra tools, "as extra tools that pop up separate windows to keep the scientific
+    view clean for now": two buttons in Int's top bar whose presses reach the page (their windows come with
+    G9). RSM has no χ (c/w) cut, so that tool is left out."""
+    page = _page(qapp, owner=_Owner())
+    pressed = []
+    monkeypatch.setattr(page, "_page_tool", pressed.append)
+    try:
+        assert [page.view.page_tool(name).text() for name in ("3d", "custom")] == ["3D Viewer", "Custom Slice"]
+        page.view.page_tool("3d").click()
+        page.view.page_tool("custom").click()
+        assert pressed == ["3d", "custom"]
+        assert page.view.slice.isHidden() and page.view.pin.isHidden()
+    finally:
+        _close(page, qapp)

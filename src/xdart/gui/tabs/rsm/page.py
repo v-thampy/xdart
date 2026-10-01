@@ -218,7 +218,12 @@ class RSMPage(QtWidgets.QWidget):
         # Int's top bar (colour map, Log); the tools RSM has no operation for are left out
         self.view = ScientificView()
         self.view.setObjectName("rsmPageView")
-        self.view.set_hidden_tools("norm", "background", "raw", "raw_pane")
+        self.view.set_hidden_tools("norm", "background", "raw", "raw_pane", "slice")
+        # the maintainer's two extra tools, "as extra tools that pop up separate windows to keep the scientific
+        # view clean for now"; their windows come with G9
+        self.view.set_page_tools(
+            ("3d", "3D Viewer", "The whole RSM volume in 3-D, in its own window"),
+            ("custom", "Custom Slice", "A slice along any two directions (for example HH and L), in its own window"))
         self.view.commandRequested.connect(self._view_command)
         self.splitter.addWidget(self.view)
 
@@ -982,6 +987,12 @@ class RSMPage(QtWidgets.QWidget):
             self._redraw()
         elif kind is ShellCommandKind.SET_PANEL_INDEX:
             self._step_slice(command.path[0] if command.path else "", command.value)
+        elif kind is ShellCommandKind.PAGE_TOOL:
+            self._page_tool(str(command.value))
+
+    def _page_tool(self, name):
+        """The 3D Viewer and Custom Slice buttons: their windows come with stage 2b's G9."""
+        _LOG.info("RSM page tool %r pressed; its window is not built yet (stage 2b G9)", name)
 
     def _step_slice(self, instance, index):
         shown = self._viewers.get(self._shown_path) if self._shown_path else None

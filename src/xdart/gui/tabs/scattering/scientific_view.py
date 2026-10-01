@@ -742,6 +742,8 @@ class ScientificView(QtWidgets.QFrame):
         row.addWidget(self.norm)
         row.addWidget(self.background)
         row.addWidget(self.raw_popup_button)
+        self._top_bar_row = row
+        self._page_tool_buttons: dict[str, QtWidgets.QPushButton] = {}
         row.addWidget(self.title, 1)
         row.addWidget(self.color_map)
         row.addWidget(self.log_scale)
@@ -3076,9 +3078,35 @@ class ScientificView(QtWidgets.QFrame):
     def _emit_panel_index(self, key: PanelKey, index: int) -> None:
         self.commandRequested.emit(ShellCommand(ShellCommandKind.SET_PANEL_INDEX, int(index), (key.instance,)))
 
-    #: Top-bar tools a host page may leave out, by name.
+    def set_page_tools(self, *tools: tuple[str, str, str]) -> None:
+        """A host page's own tools, as (name, label, tooltip): buttons in the top bar where Int's Raw pop-up
+        button sits, each emitting ``PAGE_TOOL`` with its name (RSM's "3D Viewer" and "Custom Slice", whose
+        windows the page opens). Calling it again replaces them."""
+        if any(type(tool) is not tuple or len(tool) != 3 or any(type(part) is not str or not part
+                                                                for part in tool) for tool in tools):
+            raise TypeError("a page tool is (name, label, tooltip), all non-empty text")
+        if len({tool[0] for tool in tools}) != len(tools):
+            raise ValueError("page tools are named uniquely")
+        for button in self._page_tool_buttons.values():
+            self._top_bar_row.removeWidget(button)
+            button.deleteLater()
+        self._page_tool_buttons = {}
+        at = self._top_bar_row.indexOf(self.raw_popup_button) + 1
+        for offset, (name, label, tooltip) in enumerate(tools):
+            button = QtWidgets.QPushButton(label)
+            button.setObjectName(f"e7PageTool_{name}")
+            button.setToolTip(tooltip)
+            button.clicked.connect(lambda _checked=False, name=name: self._emit(ShellCommandKind.PAGE_TOOL, name))
+            self._top_bar_row.insertWidget(at + offset, button)
+            self._page_tool_buttons[name] = button
+
+    def page_tool(self, name: str) -> QtWidgets.QPushButton:
+        """A host page's tool button, by name."""
+        return self._page_tool_buttons[name]
+
+    #: Top-bar tools a host page may leave out, by name (some name several widgets).
     _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button",
-                   "raw_pane": "raw"}
+                   "raw_pane": "raw", "slice": ("slice", "slice_center", "slice_width", "pin")}
     _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
 
     def set_plot_modes(self, *names: str) -> None:
@@ -3097,8 +3125,9 @@ class ScientificView(QtWidgets.QFrame):
 
     def set_hidden_tools(self, *names: str) -> None:
         """Leave out top-bar tools the host page has no operation for (Stitch: no
-        normalization channel, 1-D Background or raw popup), and the raw detector pane
-        ('raw_pane': Stitch's map has no one detector image; Int 2D's layout keeps its cake).
+        normalization channel, 1-D Background or raw popup), the raw detector pane
+        ('raw_pane': Stitch's map has no one detector image; Int 2D's layout keeps its cake),
+        and the χ (c/w) slice with its Pin ('slice': RSM's keyed layout has no cake to cut).
         Int shows them all."""
         unknown = set(names) - set(self._HOST_TOOLS)
         if unknown:
@@ -3108,7 +3137,9 @@ class ScientificView(QtWidgets.QFrame):
 
     def _apply_hidden_tools(self) -> None:
         for name in self._hidden_tools:
-            getattr(self, self._HOST_TOOLS[name]).setVisible(False)
+            widgets = self._HOST_TOOLS[name]
+            for widget in (widgets if type(widgets) is tuple else (widgets,)):
+                getattr(self, widget).setVisible(False)
 
     def _apply_processing_layout(self, mode: str) -> None:
         self._apply_mode_layout(mode)

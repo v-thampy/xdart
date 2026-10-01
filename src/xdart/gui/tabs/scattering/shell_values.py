@@ -80,6 +80,8 @@ class ShellCommandKind(str, Enum):
     #: a keyed layout's image panel stepped to another index along its normal (an RSM slice): its value the
     #: index, its path the panel's instance (``PanelKey.instance``)
     SET_PANEL_INDEX = "set_panel_index"
+    #: a host page's own tool button pressed (``ScientificView.set_page_tools``): its value the tool's name
+    PAGE_TOOL = "page_tool"
 
 
 class FrameSelectionIntent(str, Enum):

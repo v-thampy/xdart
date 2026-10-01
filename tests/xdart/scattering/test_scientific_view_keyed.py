@@ -108,3 +108,30 @@ def test_a_keyed_draw_is_all_or_nothing_and_refuses_roles_it_cannot_draw(qapp, m
     finally:
         view.deleteLater()
         qapp.processEvents()
+
+
+def test_a_host_pages_tools_sit_in_the_top_bar_and_the_slice_tool_can_be_left_out(qapp):
+    """``set_page_tools`` puts a host page's own buttons where Int's Raw pop-up button sits, each emitting
+    PAGE_TOOL with its name; ``set_hidden_tools("slice")`` leaves out the χ (c/w) slice and its Pin, also
+    through Int's own mode layouts."""
+    view = ScientificView()
+    commands = []
+    view.commandRequested.connect(commands.append)
+    try:
+        view.set_page_tools(("3d", "3D Viewer", "tip"), ("custom", "Custom Slice", "tip"))
+        row = view._top_bar_row
+        assert [row.indexOf(view.page_tool(name)) for name in ("3d", "custom")] == [
+            row.indexOf(view.raw_popup_button) + 1, row.indexOf(view.raw_popup_button) + 2]
+        view.page_tool("custom").click()
+        assert [(command.kind, command.value) for command in commands] == [(ShellCommandKind.PAGE_TOOL, "custom")]
+        view.set_page_tools(("3d", "3D Viewer", "tip"))  # replaced
+        with pytest.raises(KeyError):
+            view.page_tool("custom")
+        with pytest.raises(TypeError):
+            view.set_page_tools(("3d", "", "tip"))
+        view.set_hidden_tools("slice")
+        view._apply_processing_layout("Int 2D")
+        assert all(widget.isHidden() for widget in (view.slice, view.slice_center, view.slice_width, view.pin))
+    finally:
+        view.deleteLater()
+        qapp.processEvents()
