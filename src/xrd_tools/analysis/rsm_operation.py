@@ -128,7 +128,6 @@ _RSM_V2_HOLDS = (
     "volume-rendering-isosurfaces-vtk-ui-and-gpu-opencl",
     "non-psic-custom-fourc-two-circle-and-sixc-geometry-assets",
     "non-identity-raw-image-orientation",
-    "authored-arbitrary-detector-masks-and-mask-editing-ui",
     "nexus-tiled-and-processed-scan-members",
     "heterogeneous-detector-geometry-or-roi",
     "windows-smb-unc-linux-and-intel-macos-validation",
@@ -320,6 +319,84 @@ class RSMNormalizationPolicy:
             _selector_value(self.exposure_selector),
             self.absorption_lengths,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RSMFrameCorrections:
+    """The per-frame corrections RSM shares with Stitch (design §4; the maintainer, 2026-10-01: "masks should
+    be applied when specified. Other processing options like thresholding, monitor etc should also apply";
+    decision 5: solid angle and polarization on by default, which the form sets).
+
+    ``mask_path``: a Mask File (with the detector's own mask). ``threshold``: Int's threshold policy on the
+    native values. ``dark_path`` and ``flat_path`` (with ``flat_min_fraction``): admitted by Int's owners.
+    ``solid_angle`` and ``polarization_factor``: the normalization weight, as pyFAI's. Every field at its
+    default is no correction, and a plan without corrections keeps the identity it had."""
+
+    mask_path: str | None = None
+    threshold: object = None
+    dark_path: str | None = None
+    flat_path: str | None = None
+    flat_min_fraction: float = 0.1
+    solid_angle: bool = False
+    polarization_factor: float | None = None
+
+    def __post_init__(self) -> None:
+        from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+        for name in ("mask_path", "dark_path", "flat_path"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not str or not value):
+                raise TypeError(f"RSM {name} must be a non-empty path string")
+        if self.threshold is not None and type(self.threshold) is not StitchConditioning:
+            raise TypeError("RSM threshold must be Int's exact StitchConditioning")
+        if type(self.solid_angle) is not bool:
+            raise TypeError("RSM solid angle must be an exact bool")
+        fraction = _finite_float(self.flat_min_fraction, "RSM flat cutoff")
+        if not 0 <= fraction < 1:
+            raise ValueError("RSM flat cutoff must be a fraction of the flat's median")
+        object.__setattr__(self, "flat_min_fraction", fraction)
+        if self.polarization_factor is not None:
+            factor = _finite_float(self.polarization_factor, "RSM polarization factor")
+            if not -1 <= factor <= 1:
+                raise ValueError("RSM polarization factor must lie in [-1, 1]")
+            object.__setattr__(self, "polarization_factor", factor)
+
+
+@dataclass(frozen=True, slots=True)
+class RSMBoundCorrections:
+    """``RSMFrameCorrections`` bound at Preview: the mask, dark and flat receipts (Stitch's own captures)."""
+
+    corrections: RSMFrameCorrections
+    mask_receipt: object
+    dark_receipt: object
+    flat_receipt: object
+
+    def identity(self) -> tuple[object, ...]:
+        value = self.corrections
+        return ("frame-corrections-v1",
+                None if self.mask_receipt is None else (self.mask_receipt.sha256, self.mask_receipt.shape),
+                None if value.threshold is None else (value.threshold.mode, value.threshold.threshold_min,
+                                                      value.threshold.threshold_max),
+                None if self.dark_receipt is None else self.dark_receipt.fingerprint,
+                None if self.flat_receipt is None else (self.flat_receipt.fingerprint, value.flat_min_fraction),
+                value.solid_angle, value.polarization_factor)
+
+    def to_provenance(self) -> dict[str, object]:
+        value = self.corrections
+        return {
+            "mask": None if self.mask_receipt is None else {
+                "name": Path(self.mask_receipt.lexical_path).name, "sha256": self.mask_receipt.sha256,
+                "shape": list(self.mask_receipt.shape)},
+            "threshold": None if value.threshold is None else {
+                "mode": value.threshold.mode, "threshold_min": value.threshold.threshold_min,
+                "threshold_max": value.threshold.threshold_max},
+            "dark": None if self.dark_receipt is None else {
+                "name": Path(self.dark_receipt.lexical_path).name, "fingerprint": self.dark_receipt.fingerprint},
+            "flat": None if self.flat_receipt is None else {
+                "name": Path(self.flat_receipt.lexical_path).name, "fingerprint": self.flat_receipt.fingerprint,
+                "min_fraction": value.flat_min_fraction},
+            "solid_angle": value.solid_angle,
+            "polarization_factor": value.polarization_factor,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -2317,10 +2394,13 @@ class RSMOperationPlanV2:
     max_chunk_bytes: int
     fingerprint: str
     _claim: InitVar[object] = None
+    #: The per-frame corrections bound at Preview (``RSMBoundCorrections``); None: none, as before.
+    corrections: object = None
 
     def __post_init__(self, _claim: object) -> None:
         if (
             _claim is not _RSM_V2_FACTORY
+            or (self.corrections is not None and type(self.corrections) is not RSMBoundCorrections)
             or type(self.effective_geometry) is not RSMEffectiveGeometry
             or type(self.ordered_geometry_bindings) is not tuple
             or not 1 <= len(self.ordered_geometry_bindings) <= 16
@@ -2395,7 +2475,7 @@ class RSMOperationPlanV2:
             "bounded-chunk-working-set-v1",
             None,
             None,
-        )
+        ) + (() if self.corrections is None else (self.corrections.identity(),))
 
     def to_provenance(self) -> dict[str, object]:
         return {
@@ -2413,6 +2493,8 @@ class RSMOperationPlanV2:
             "working_set_policy": "bounded-chunk-working-set-v1",
             "gi_q_correction": None,
             "gi_intensity_correction": None,
+            # the per-frame corrections, only when the plan has them
+            **({} if self.corrections is None else {"frame_corrections": self.corrections.to_provenance()}),
             "fingerprint": self.fingerprint,
         }
 
@@ -2436,6 +2518,7 @@ def _make_rsm_operation_plan_v2(
     chunk_size: int,
     max_frame_bytes: int,
     max_chunk_bytes: int,
+    corrections: RSMBoundCorrections | None = None,
 ) -> RSMOperationPlanV2:
     canonical = (
         "rsm-operation-plan-v2",
@@ -2458,7 +2541,7 @@ def _make_rsm_operation_plan_v2(
         "bounded-chunk-working-set-v1",
         None,
         None,
-    )
+    ) + (() if corrections is None else (corrections.identity(),))
     fingerprint = module_plan_fingerprint(ModuleKind.RSM, canonical)
     return RSMOperationPlanV2(
         effective_geometry,
@@ -2472,6 +2555,7 @@ def _make_rsm_operation_plan_v2(
         max_chunk_bytes,
         fingerprint,
         _RSM_V2_FACTORY,
+        corrections,
     )
 
 
@@ -3299,6 +3383,158 @@ def _rsm_v2_contribution_angles(
     return tuple(values)
 
 
+def _bind_rsm_corrections(corrections, members, max_frame_bytes):
+    """Bind a plan's corrections at Preview: Stitch's mask capture and Int-admitted dark and flat
+    (``capture_detector_image``), each the members' full detector shape. None: None."""
+    if type(corrections) not in {RSMFrameCorrections, type(None)}:
+        raise TypeError("RSM corrections must be exact RSMFrameCorrections")
+    if corrections is None or corrections == RSMFrameCorrections():  # every field at its default: none
+        return None
+    from xrd_tools.analysis.stitch_native import capture_detector_image, capture_mask
+    shapes = {tuple(member.detector_shape) for member in members}
+    if len(shapes) != 1:
+        raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", "the members' detectors differ")
+    shape, = shapes
+    mask = dark = flat = None
+    try:
+        if corrections.mask_path is not None:
+            mask = capture_mask(corrections.mask_path)
+            if tuple(mask.shape) != shape:
+                raise RSMOperationRefused("RSM_MASK_INVALID", f"the mask is {mask.shape}, the detector {shape}")
+    except ValueError as error:
+        if type(error) is RSMOperationRefused:
+            raise
+        raise RSMOperationRefused("RSM_MASK_INVALID", str(error)) from None
+    for role in ("dark", "flat"):
+        path = getattr(corrections, f"{role}_path")
+        if path is None:
+            continue
+        try:
+            receipt, pixels = capture_detector_image(path, role, max_frame_bytes, corrections.flat_min_fraction)
+        except ValueError as error:
+            raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", str(error)) from None
+        if tuple(pixels.shape) != shape:
+            raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID",
+                                      f"the {role} is {pixels.shape}, the detector {shape}")
+        if role == "dark":
+            dark = receipt
+        else:
+            flat = receipt
+    return RSMBoundCorrections(corrections, mask, dark, flat)
+
+
+@dataclass(frozen=True, slots=True)
+class _RSMCorrectionState:
+    """A run's corrections, decoded once: the static invalid pixels (Mask File, unusable dark or flat
+    pixels), the neutral-filled dark and flat, the solid angle, the polarization axes."""
+
+    bound: RSMBoundCorrections
+    invalid: np.ndarray | None
+    dark: np.ndarray | None
+    flat: np.ndarray | None
+    solid: np.ndarray | None
+    axes: tuple | None
+
+
+def _rsm_correction_state(plan, header, diffractometer) -> _RSMCorrectionState | None:
+    """Decode a plan's corrections for its run (each image verified against its Preview receipt)."""
+    bound = plan.corrections
+    if bound is None:
+        return None
+    from xrd_tools.analysis.stitch_native import capture_detector_image, revalidate_mask
+    from xrd_tools.corrections.frame_preparation import (
+        correction_image, flat_detector_solid_angle, polarization_axes,
+    )
+    shape = (int(header.Nch1), int(header.Nch2))
+    invalid = None
+    if bound.mask_receipt is not None:
+        revalidate_mask(bound.mask_receipt)
+        invalid = np.frombuffer(bound.mask_receipt.pixels, dtype=bool).reshape(shape).copy()
+    images = {}
+    for role in ("dark", "flat"):
+        receipt = getattr(bound, f"{role}_receipt")
+        if receipt is None:
+            images[role] = None
+            continue
+        current, pixels = capture_detector_image(receipt.lexical_path, role, plan.max_frame_bytes,
+                                                 bound.corrections.flat_min_fraction)
+        if current != receipt:
+            raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", f"the {role} no longer matches Preview")
+        values, unusable = correction_image(pixels, role, min_fraction=bound.corrections.flat_min_fraction)
+        images[role] = values
+        if unusable is not None:
+            invalid = unusable if invalid is None else np.logical_or(invalid, unusable)
+    solid = None
+    if bound.corrections.solid_angle:
+        solid = flat_detector_solid_angle(shape, distance=float(header.distance),
+                                          cch=(float(header.cch1), float(header.cch2)),
+                                          pixel_size=(float(header.pwidth1), float(header.pwidth2)))
+    axes = None
+    if bound.corrections.polarization_factor is not None:
+        # the outer detector circle (nu) is the vertical; the Diffractometer's or a legacy config's stack
+        circles = getattr(diffractometer, "detector_circles", None) or diffractometer.detector_rot
+        axes = polarization_axes(diffractometer.r_i, circles[0])
+    return _RSMCorrectionState(bound, invalid, images["dark"], images["flat"], solid, axes)
+
+
+def _rsm_chunk_weights(state, mapper, session, angles, energy, roi):
+    """One chunk's normalization weights (solid angle × polarization × flat), cropped to the ROI: one detector
+    array for a chunk at one detector pose, one per frame otherwise; None: no weight (1, as before)."""
+    from xrd_tools.corrections.frame_preparation import frame_weights, polarization_weight
+    if state is None or (state.solid is None and state.axes is None and state.flat is None):
+        return None
+    r0, r1, c0, c1 = roi if roi is not None else (0, int(mapper.header.Nch1), 0, int(mapper.header.Nch2))
+    shape = (r1 - r0, c1 - c0)
+    base = np.ones(shape) if state.solid is None else state.solid[r0:r1, c0:c1]
+    flat = None if state.flat is None else state.flat[r0:r1, c0:c1]
+    nu, delta = (np.asarray(angles[index], dtype=np.float64) for index in (4, 5))
+    poses = sorted({(float(a), float(b)) for a, b in zip(nu, delta)})
+    weights_by_pose = {}
+    for pose in poses:
+        polarization = None
+        if state.axes is not None:
+            # the detector pose alone, in the lab frame (the sample circles at zero, an identity UB): the
+            # elastic scattered direction of each pixel
+            lab = tuple(np.zeros(1) for _ in range(4)) + (np.array([pose[0]]), np.array([pose[1]]))
+            qx, qy, qz = mapper.pixel_q(lab, float(energy), UB=np.eye(3), roi=roi, runtime_session=session)
+            xu_module, _numpy = session.active_modules()
+            polarization = polarization_weight(
+                np.asarray(qx)[0], np.asarray(qy)[0], np.asarray(qz)[0],
+                factor=state.bound.corrections.polarization_factor,
+                wavelength_A=float(xu_module.en2lam(float(energy))), beam=state.axes[0], vertical=state.axes[1])
+        weights_by_pose[pose] = frame_weights(base, polarization=polarization, flat=flat)
+    if len(poses) == 1:
+        weights = np.ascontiguousarray(weights_by_pose[poses[0]], dtype=np.float64)
+    else:
+        weights = np.ascontiguousarray(np.stack([weights_by_pose[(float(a), float(b))]
+                                                 for a, b in zip(nu, delta)]), dtype=np.float64)
+    if weights is base or weights.base is not None or weights is state.solid:
+        weights = np.array(weights, copy=True)
+    weights.setflags(write=False)
+    return weights
+
+
+def _apply_rsm_frame_corrections(raw, conditioned, state, divisors):
+    """A chunk's per-frame corrections, in place on its conditioned float64 frames: Int's threshold on the
+    native values, the static invalid pixels, then the dark and the frame's divisor (the shared
+    ``prepare_frame_signal``, Stitch's)."""
+    from xrd_tools.corrections.frame_preparation import FramePreparationRefused, prepare_frame_signal
+    from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+    threshold = state.bound.corrections.threshold
+    for index in range(conditioned.shape[0]):
+        frame = conditioned[index]
+        if threshold is not None:
+            frame[np.isnan(condition_stitch_frame(raw[index], threshold))] = np.nan
+        if state.invalid is not None:
+            frame[state.invalid] = np.nan
+        try:
+            prepare_frame_signal(frame, dark=state.dark, divisor=float(divisors[index]))
+        except FramePreparationRefused:
+            raise RSMOperationRefused("NORMALIZATION_RESULT_INVALID") from None
+    if np.any(np.isinf(conditioned)):
+        raise RSMOperationRefused("NORMALIZATION_RESULT_INVALID")
+
+
 def _make_rsm_v2_chunk_lease(
     source: object,
     member: RSMPreflightMemberV2,
@@ -3307,6 +3543,7 @@ def _make_rsm_v2_chunk_lease(
     *,
     cropped_static_mask: np.ndarray | None,
     cancel_token: threading.Event | None,
+    corrections: _RSMCorrectionState | None = None,
 ) -> RSMGridChunkLease:
     """Build one non-generator chunk whose image roots are owned by its lease."""
 
@@ -3344,8 +3581,11 @@ def _make_rsm_v2_chunk_lease(
         [item.normalization_divisor for item in contributions],
         dtype=np.float64,
     )
-    with np.errstate(over="ignore", invalid="ignore"):
-        conditioned /= divisors[:, None, None]
+    if corrections is not None:  # the shared per-frame corrections (AUD-9 stage 2b)
+        _apply_rsm_frame_corrections(raw, conditioned, corrections, divisors)
+    else:
+        with np.errstate(over="ignore", invalid="ignore"):
+            conditioned /= divisors[:, None, None]
     divisors = None
     if np.any(np.isinf(conditioned)):
         raise RSMOperationRefused("NORMALIZATION_RESULT_INVALID")
@@ -3699,8 +3939,10 @@ def prepare_rsm_operation_v2(
     project_root: str | Path,
     coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
     cancel_token: threading.Event | None = None,
+    corrections: RSMFrameCorrections | None = None,
 ) -> RSMOperationRequestV2:
-    """Build one ordered, image-free RSM v2 Preview transaction."""
+    """Build one ordered, image-free RSM v2 Preview transaction. ``corrections`` (``RSMFrameCorrections``)
+    binds the Mask File, dark and flat here, as Stitch's Preview does."""
 
     if (
         type(source_group) is not ModuleSourceGroupReceipt
@@ -3876,6 +4118,7 @@ def prepare_rsm_operation_v2(
             chunk_size=chunk_size,
             max_frame_bytes=max_frame_bytes,
             max_chunk_bytes=max_chunk_bytes,
+            corrections=_bind_rsm_corrections(corrections, member_tuple, max_frame_bytes),
         )
         preflight = _make_rsm_group_preflight_v2(
             project_root=root,
@@ -5509,6 +5752,11 @@ class RSMOperationExecutionV2:
                     coordinate_frame=self.request.plan.coordinate_frame,
                 )
                 gridder.set_bounds(*self.request.plan.common_grid.bounds)
+                correction_state = _rsm_correction_state(
+                    self.request.plan,
+                    self.request.plan.effective_geometry.detector_header,
+                    self.request.plan.effective_geometry.diffractometer_projection,
+                )
                 for source_receipt, member in zip(
                     self.request.module.source.members,
                     self.request.preflight.members,
@@ -5564,6 +5812,11 @@ class RSMOperationExecutionV2:
                                 contributions,
                                 cropped_static_mask=cropped_mask,
                                 cancel_token=cancel_token,
+                                **({} if correction_state is None else {"corrections": correction_state}),
+                            )
+                            weights = _rsm_chunk_weights(
+                                correction_state, mapper, session, angles, member.energy_eV,
+                                self.request.plan.effective_geometry.roi,
                             )
                             release = gridder.add_leased(
                                 lease,
@@ -5574,8 +5827,9 @@ class RSMOperationExecutionV2:
                                     dtype=np.float64,
                                 ),
                                 roi=self.request.plan.effective_geometry.roi,
-                                weight=1.0,
+                                weight=1.0 if weights is None else weights,
                             )
+                            weights = None
                             release_facts = _rsm_grid_chunk_release_facts(
                                 release,
                                 expected_frame_count=len(contributions),
@@ -5852,9 +6106,11 @@ def rsm_output_current(request: RSMOperationRequestV2) -> bool:
 
 
 __all__ = [
+    "RSMBoundCorrections",
     "RSMCommonGrid",
     "RSMContribution",
     "RSMDetectorGeometry",
+    "RSMFrameCorrections",
     "RSMImageConditioning",
     "RSMManifestFile",
     "RSMNormalizationMode",

@@ -32,6 +32,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
 )
 from xrd_tools.analysis.rsm_operation import (
     RSMDetectorGeometry,
+    RSMFrameCorrections,
     RSMImageConditioning,
     RSMNormalizationMode,
     RSMNormalizationPolicy,
@@ -397,6 +398,8 @@ class RSMToolFormV2:
     #: The family of the stable slot ``<family>_rsm.nexus`` that ``output_path`` is, when it is one the
     #: page suggested; persisted with the result as native Stitch persists its own (AUD-9 stage 2).
     output_family: str | None = None
+    #: The per-frame corrections RSM shares with Stitch (``RSMFrameCorrections``; AUD-9 stage 2b); None: none.
+    corrections: RSMFrameCorrections | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -433,6 +436,7 @@ class RSMToolFormV2:
             or not 1 <= self.max_chunk_bytes <= _MAX_FRAME_OR_CHUNK_BYTES
             or type(self.overwrite) is not AnalysisArtifactOverwrite
             or type(self.coordinate_frame) is not RSMCoordinateFrame
+            or (self.corrections is not None and type(self.corrections) is not RSMFrameCorrections)
         ):
             raise TypeError("RSM v2 tool form is invalid")
         normalization_keys = {
@@ -471,7 +475,8 @@ class RSMToolFormV2:
             self.coordinate_frame.axis_names,
             self.coordinate_frame.axis_units,
             self.coordinate_frame.matrix_policy,
-        ) + (() if self.output_family is None else (self.output_family,))
+        ) + (() if self.output_family is None else (self.output_family,)) + (
+            () if self.corrections is None else (("frame-corrections", repr(self.corrections)),))
         object.__setattr__(
             self,
             "fingerprint",
@@ -1695,6 +1700,7 @@ def prepare_rsm_tool_v2(
             project_root=project,
             coordinate_frame=form.coordinate_frame,
             cancel_token=cancel_token,
+            **({} if form.corrections is None else {"corrections": form.corrections}),
         )
     except (
         RSMOperationRefused,

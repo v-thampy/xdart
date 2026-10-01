@@ -915,13 +915,15 @@ class StreamingGridder:
             elif (
                 type(weight) is not np.ndarray
                 or weight.dtype.kind not in "biuf"
-                or weight.shape != expected_shape[1:]
+                # one detector array for every frame, or one per frame (a weight that varies with the
+                # detector's pose: the polarization; AUD-9 stage 2b)
+                or weight.shape not in {expected_shape[1:], expected_shape}
                 or not weight.flags.c_contiguous
                 or weight.flags.writeable
             ):
                 raise TypeError(
                     "RSM leased weight must be a positive scalar or borrowed "
-                    "read-only detector array"
+                    "read-only detector or per-frame array"
                 )
 
         raw = conditioned = conditioned_view = None

@@ -140,11 +140,35 @@ def polarization_weight(qx, qy, qz, *, factor: float, wavelength_A: float, beam,
     return side
 
 
+
+def flat_detector_solid_angle(shape, *, distance: float, cch, pixel_size) -> np.ndarray:
+    """Each pixel's solid angle relative to the direct-beam pixel's, for an untilted flat detector seen from a
+    sample on the rotation axis (RSM: no sample offset, a rigid arm, so one array serves every frame): pyFAI's
+    own (``CorrectionStack().normalization``, as Stitch's xrayutilities path takes it), with xrayutilities'
+    header as a PONI at the direct-beam pixel's centre, ``poni = (cch + 0.5) × pixel``. ``distance`` and
+    ``pixel_size`` in one unit. A tilted detector (the calibration's mount, C7) needs the tilts here too."""
+    from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    from xrd_tools.corrections.stack import CorrectionStack
+    from xrd_tools.integrate.pyfai_numexpr import PYFAI_NUMEXPR_LOCK
+    shape = tuple(int(value) for value in shape)
+    unit = 1e-3  # pyFAI's metres from millimetres; the ratio is unit-free
+    pixel1, pixel2 = (float(value) * unit for value in pixel_size)
+    detector = Detector(pixel1=pixel1, pixel2=pixel2, max_shape=shape)
+    integrator = AzimuthalIntegrator(dist=float(distance) * unit, poni1=(float(cch[0]) + 0.5) * pixel1,
+                                     poni2=(float(cch[1]) + 0.5) * pixel2, detector=detector)
+    with PYFAI_NUMEXPR_LOCK:
+        values = np.ascontiguousarray(CorrectionStack().normalization(integrator, shape), dtype=np.float64)
+    if values.shape != shape or not np.isfinite(values).all() or np.any(values <= 0):
+        raise FramePreparationRefused("SOLID_ANGLE_INVALID", "the detector's solid angle is not finite and positive")
+    return values
+
 __all__ = [
     "AXES",
     "FramePreparationRefused",
     "correction_image",
     "frame_valid",
+    "flat_detector_solid_angle",
     "frame_weights",
     "polarization_axes",
     "polarization_weight",
