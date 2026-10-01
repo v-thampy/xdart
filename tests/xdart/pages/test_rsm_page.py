@@ -608,3 +608,27 @@ def test_a_refused_or_stopped_replace_keeps_the_prior_result_shown(qapp, tmp_pat
         assert page.view.shown is prior and page.results.count() == 1
     finally:
         _close(page, qapp)
+
+
+def test_each_section_header_shows_its_readiness_as_ints_do(qapp, tmp_path):
+    """Codex's reuse audit (REUSE.md): the page did not drive its sections' readiness headers. Each card now
+    takes Int's ``SectionHeaderProjection`` through Int's ``apply_section_header``: its status, its ✓ when the
+    section is ready, and what it still needs as the tip."""
+    page = _page(qapp)
+    try:
+        cards = {"project": page.controls.project_card, "source": page.controls.source_card,
+                 "experiment": page.controls.experiment_card, "processing": page.controls.processing_card}
+        page.set_field("project_root", "")
+        assert not cards["project"].valid_marker.isVisibleTo(page)
+        assert cards["project"].valid_marker.toolTip() == "Needs a Project folder"
+        _with_members(page, tmp_path, _synthetic_members(tmp_path))
+        assert page.run_bar.readinessLabel.full_text().startswith("Ready · RSM · 2 members")
+        assert all(card.valid_marker.isVisibleTo(page) for card in cards.values())
+        assert cards["source"].status.text() == "2 members" and cards["processing"].status.text().startswith("grid ")
+        page._members[1].spec_path = "missing.spec"
+        page._edited()
+        assert not cards["source"].valid_marker.isVisibleTo(page)
+        assert cards["source"].valid_marker.toolTip() == "Needs member 2's SPEC file"
+        assert cards["project"].valid_marker.isVisibleTo(page) and cards["experiment"].valid_marker.isVisibleTo(page)
+    finally:
+        _close(page, qapp)

@@ -28,6 +28,8 @@ from xdart.gui.pages.values import (
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
 from xdart.gui.tabs.rsm.result_view import RSMResultView
+from xdart.gui.tabs.scattering.controls_readiness import SectionHeaderProjection
+from xdart.gui.tabs.scattering.shell_widgets import apply_section_header
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xdart.gui.tools.rsm_owner import (
     RSMOwnerAction, RSMOwnerFinalization, RSMOwnerOutcomeKind, RSMOwnerUpdate, RSMToolOwner,
@@ -572,43 +574,64 @@ class RSMPage(QtWidgets.QWidget):
 
     def _readiness_now(self):
         """("Needs …", False) or ("Ready · RSM · …", True), from committed values; the disk is asked only
-        whether the named files and folders exist."""
-        needs = []
+        whether the named files and folders exist. Each section's header (Int's ``SectionHeaderProjection``:
+        its status, its ✓ when ready, what it still needs as the tip) is left in ``self._headers``."""
+        needs = []  # in the readiness line's order
+        sections = {key: [] for key in ("project", "experiment", "source", "processing")}
+
+        def need(section, text):
+            needs.append(text)
+            sections[section].append(text)
         project = str(self._value("project_root")).strip()
+        root = Path(project).expanduser() if project else None
         if not project:
-            return "Needs a Project folder", False
-        root = Path(project).expanduser()
-        if not root.is_dir():
-            return f"Needs an existing Project folder ({root.name} not found)", False
-        geometry = str(self._value("geometry_asset")).strip()
-        if not geometry or not self._inside(root, geometry, "geometry").is_file():
-            needs.append("the geometry asset (Install canonical)")
-        for number, draft in enumerate(self._members, 1):
-            spec = self._inside(root, draft.spec_path, "SPEC") if draft.spec_path else None
-            images = self._inside(root, draft.image_dir, "images") if draft.image_dir else None
-            if spec is None or not spec.is_file():
-                needs.append(f"member {number}'s SPEC file")
-            elif images is None or not images.is_dir():
-                needs.append(f"member {number}'s image folder")
-            elif not draft.scan or not draft.image_stem:
-                needs.append(f"member {number}'s scan and image stem")
-            try:
-                draft.frame_selector()
-            except ValueError as error:
-                needs.append(f"member {number}'s frames ({error})")
-        output = str(self._value("output_path")).strip()
-        if not output.endswith(".nexus"):
-            needs.append("an Output ending in .nexus")
+            need("project", "a Project folder")
+        elif not root.is_dir():
+            need("project", f"an existing Project folder ({root.name} not found)")
+        else:
+            geometry = str(self._value("geometry_asset")).strip()
+            if not geometry or not self._inside(root, geometry, "geometry").is_file():
+                need("experiment", "the geometry asset (Install canonical)")
+            for number, draft in enumerate(self._members, 1):
+                spec = self._inside(root, draft.spec_path, "SPEC") if draft.spec_path else None
+                images = self._inside(root, draft.image_dir, "images") if draft.image_dir else None
+                if spec is None or not spec.is_file():
+                    need("source", f"member {number}'s SPEC file")
+                elif images is None or not images.is_dir():
+                    need("source", f"member {number}'s image folder")
+                elif not draft.scan or not draft.image_stem:
+                    need("source", f"member {number}'s scan and image stem")
+                try:
+                    draft.frame_selector()
+                except ValueError as error:
+                    need("source", f"member {number}'s frames ({error})")
+            output = str(self._value("output_path")).strip()
+            if not output.endswith(".nexus"):
+                need("project", "an Output ending in .nexus")
+        members = len(self._members)
+        grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
+        ready_detail = {"project": "Project folder and Output are ready.",
+                        "experiment": "The geometry asset is installed.",
+                        "source": "Every member's SPEC file, images and frames are ready.",
+                        "processing": "The grid and normalization are set."}
+        texts = {"project": "", "experiment": str(self._value("coordinates")),
+                 "source": f"{members} member{'s' * (members != 1)}", "processing": f"grid {grid}"}
+        self._headers = {key: SectionHeaderProjection(
+            texts[key], not sections[key],
+            ready_detail[key] if not sections[key] else "Needs " + ", ".join(sections[key]))
+            for key in sections}
         if needs:
             return "Needs " + ", ".join(needs), False
-        grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
-        members = len(self._members)
         return (f"Ready · RSM · {members} member{'s' * (members != 1)} · {self._value('coordinates')} · "
                 f"grid {grid}"), True
 
     def _show_readiness(self):
         text, ready = self._readiness
         self.run_bar.set_readiness_summary(text, ready=ready)
+        cards = {"project": self.controls.project_card, "experiment": self.controls.experiment_card,
+                 "source": self.controls.source_card, "processing": self.controls.processing_card}
+        for key, header in getattr(self, "_headers", {}).items():  # Int's header adapter
+            apply_section_header(cards[key], header)
 
     def _status(self, text, *, ready=True):
         self.run_bar.set_readiness_summary(str(text), ready=ready)
