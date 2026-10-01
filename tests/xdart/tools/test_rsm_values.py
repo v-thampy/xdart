@@ -270,3 +270,28 @@ def test_form_rejects_extension_and_unsafe_decoder(rsm_tool_form):
         replace(rsm_tool_form, spec_path=rsm_tool_form.spec_path + ".spec")
     with pytest.raises(ValueError, match="scalar real numeric"):
         replace(rsm_tool_form, raw_dtype="complex64")
+
+
+def test_a_members_own_ub_and_a_typed_ub_are_read_as_the_run_reads_them(tmp_path):
+    """G8b: ``rsm_member_source_ub`` reads a SPEC member's #G3 (None when the scan has no #G3 line; () when the
+    line does not parse, which counts as recorded and is the run's to refuse), and ``parse_rsm_ub_rows`` reads a
+    typed UB as nine numbers, naming a row that is not three numbers or a matrix an HKL map cannot invert."""
+    from dataclasses import replace
+    from tests.core.test_rsm_operation_r2 import _write_member
+    from xdart.gui.tools.rsm_values import parse_rsm_ub_rows, rsm_member_source_ub
+    member = _write_member(tmp_path, 0, ub=(2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0))
+    assert rsm_member_source_ub(member) == (2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0)
+    spec = Path(member.spec_path)
+    text = spec.read_text(encoding="utf-8")
+    spec.write_text(text.replace("#G3 2.0 0.0 0.0 0.0 2.0 0.0 0.0 0.0 2.0\n", ""), encoding="utf-8")
+    assert rsm_member_source_ub(member) is None
+    spec.write_text(text.replace("#G3 2.0 0.0", "#G3 two 0.0"), encoding="utf-8")
+    assert rsm_member_source_ub(member) == ()
+    with pytest.raises(KeyError):  # a scan the file does not hold is not "no UB"
+        rsm_member_source_ub(replace(member, scan="7.1"))
+    assert parse_rsm_ub_rows(("1, 0, 0", "0 1 0", " 0  0 1 ")) == (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    for rows, reason in ((("1 0 0", "0 1", "0 0 1"), "row 2 needs three numbers"),
+                         (("1 0 0", "0 1 0", "0 0 nan"), "row 3 needs three numbers"),
+                         (("1 0 0", "2 0 0", "0 0 1"), "the matrix is singular")):
+        with pytest.raises(ValueError, match=reason):
+            parse_rsm_ub_rows(rows)

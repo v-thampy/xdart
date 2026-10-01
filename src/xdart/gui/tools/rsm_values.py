@@ -396,6 +396,55 @@ def rsm_member_groups(
     return tuple(groups), tuple(skipped)
 
 
+def rsm_member_source_ub(member) -> tuple[float, ...] | None:
+    """A member's own UB as its source records it, nine numbers row by row in SPEC's ``#G3`` convention (the
+    readers the run takes: a SPEC scan's ``#G3`` line through ``get_UB``, a raw NeXus entry's ``sample/ub_matrix``
+    or ``orientation_matrix`` through ``read_nexus``), or None when it records none: an HKL map of it needs a UB
+    given (``RSMToolFormV2.ub``) or Q coordinates (the maintainer, 2026-10-01: "For files with no ub matrix, a
+    warning with a chance to enter the ub matrix manually or through a spec file can be offered"). For the page's
+    warning and the Preview only; the run reads its own. ``()``: a ``#G3`` line that does not parse, which counts
+    as recorded (the run refuses it with its own reason in HKL, and Q never reads it)."""
+    if type(member) is RSMNexusMemberForm:
+        from xrd_tools.io.nexus import read_nexus
+        ub = read_nexus(Path(member.nexus_path), entry=member.entry).ub_matrix
+        return None if ub is None else tuple(float(value) for value in np.asarray(ub, dtype=float).ravel())
+    if type(member) is not RSMScanMemberForm:
+        raise TypeError("an RSM member is an exact SPEC scan or raw NeXus member form")
+    from xrd_tools.io.spec import get_UB
+    try:
+        ub = get_UB(str(member.spec_path), member.scan)
+    except KeyError as error:
+        if error.args and error.args[0] == "G3":
+            return None
+        raise
+    except ValueError:  # a #G3 that does not parse: recorded (the run names it)
+        return ()
+    return tuple(float(value) for value in np.asarray(ub, dtype=float).ravel())
+
+
+def parse_rsm_ub_rows(rows) -> tuple[float, ...]:
+    """A UB typed as three rows of three numbers (commas or spaces), in SPEC's ``#G3`` convention (row by row, in
+    Å⁻¹ with 2π included, as SPEC writes the line), as ``RSMUBOverride``'s nine. ValueError names a refused row, or
+    a matrix an HKL map cannot use (``rsm_coordinate_matrix``: finite and nonsingular, the run's own rule)."""
+    from xrd_tools.rsm.coordinate_frame import rsm_coordinate_matrix
+    values = []
+    for number, text in enumerate(rows, 1):
+        try:
+            row = [float(part) for part in str(text or "").replace(",", " ").split()]
+        except ValueError:
+            row = []
+        if len(row) != 3 or not all(math.isfinite(value) for value in row):
+            raise ValueError(f"row {number} needs three numbers")
+        values.extend(row)
+    if len(values) != 9:
+        raise ValueError("three rows of three numbers are needed")
+    try:
+        rsm_coordinate_matrix(RSMCoordinateFrame.HKL, np.asarray(values, dtype=np.float64).reshape(3, 3))
+    except ValueError:
+        raise ValueError("the matrix is singular (an HKL map needs an invertible one)") from None
+    return tuple(values)
+
+
 @dataclass(frozen=True, slots=True)
 class RSMScanMemberForm:
     """One visible ordered SPEC member for an RSM v2 group."""
@@ -2199,9 +2248,11 @@ __all__ = [
     "RSMToolPreflightSummaryV2",
     "RSMToolPreflightV2",
     "RSMToolPresetValues",
+    "parse_rsm_ub_rows",
     "prepare_rsm_tool",
     "prepare_rsm_tool_v2",
     "rsm_member_groups",
+    "rsm_member_source_ub",
     "rsm_preflight_summary_lines",
     "rsm_tool_preset",
 ]

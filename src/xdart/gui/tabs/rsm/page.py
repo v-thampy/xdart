@@ -50,7 +50,7 @@ from xdart.gui.tools.rsm_owner import (
     RSMOwnerAction, RSMOwnerFinalization, RSMOwnerOutcomeKind, RSMOwnerUpdate, RSMToolOwner,
 )
 from xdart.gui.tools.rsm_values import (
-    RSMToolFormV2, format_rsm_angle_mapping, parse_rsm_angle_mapping, rsm_frame_selector,
+    RSMToolFormV2, format_rsm_angle_mapping, parse_rsm_angle_mapping, parse_rsm_ub_rows, rsm_frame_selector,
     rsm_preflight_summary_lines, rsm_tool_preset,
 )
 from xdart.gui.tools import normalization_values as normalization
@@ -60,6 +60,7 @@ from xrd_tools.analysis.module_transaction import MetadataColumnSelector, Module
 from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
 from xrd_tools.analysis.rsm_operation import (
     RSMFrameCorrections, RSMImageConditioning, RSMNormalizationMode, RSMNormalizationPolicy, RSMOperationResultV2,
+    RSMUBOverride,
 )
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
@@ -136,6 +137,13 @@ _SOURCE_KINDS = ("Spec", "NeXus", "Directory")
 #: One RSM per run for now (Stitch queues one output per group; the RSM page does not yet).
 _ONE_GROUP = "one RSM per run for now: brackets combine scans into one RSM, as [42-44]"
 _RAW_DTYPES = ("int32", "uint16", "float32", "float64")
+#: The UB matrix group's choices (the maintainer, 2026-10-01: "For files with no ub matrix, a warning with a chance
+#: to enter the ub matrix manually or through a spec file can be offered"): the source's own, nine typed numbers,
+#: or a SPEC scan's ``#G3``; ``RSMToolFormV2.ub``, for an HKL map only.
+_UB_SOURCE, _UB_TYPED, _UB_SPEC = "The source's", "Typed", "A SPEC scan's"
+_UB_KEYS = ("ub_from", "ub_row1", "ub_row2", "ub_row3", "ub_spec_path", "ub_scan")
+#: The Source header's warning for an HKL map of a source with no UB (the brief's words; design "A source with no UB").
+_NO_UB = "This source records no UB matrix. Enter one, or take it from a SPEC scan, or choose Q coordinates."
 
 
 def _resolve_rsm_groups(arguments, cancel, _progress):
@@ -145,7 +153,24 @@ def _resolve_rsm_groups(arguments, cancel, _progress):
     if cancel.is_set():
         return None
     selection, options = arguments
-    return rsm_member_groups(selection, **options)
+    groups, skipped = rsm_member_groups(selection, **options)
+    return groups, skipped, _source_ubs(groups)
+
+
+def _source_ubs(groups):
+    """The one RSM's members' own UBs (``rsm_member_source_ub``: None where a member records none), for the
+    Source header's warning and Run's wait; () unless the source is one RSM (the page grids one per run). A
+    member whose UB cannot be read counts as recording one: Preview names what is wrong."""
+    from xdart.gui.tools.rsm_values import rsm_member_source_ub
+    if len(groups) != 1:
+        return ()
+
+    def own(member):
+        try:
+            return rsm_member_source_ub(member)
+        except (OSError, KeyError, ValueError):
+            return ()
+    return tuple(own(member) for member in groups[0])
 
 
 def _read_rsm_record(path, cancel, _progress):
@@ -347,6 +372,7 @@ class RSMPage(QtWidgets.QWidget):
         for section, key, label, value, choices, browse in _FIELDS:
             cards[section].add_row(self._row(section, key, label, value, choices, browse))
         self._build_conditioning()
+        self._render_ub()  # the Coordinates row is built: what the UB rows read
         buttons = self.controls.render_actions(self.controls.processing_card, tuple(
             ControlActionSpec(action, label, SectionId.PROCESSING) for action, label in (
                 (ControlAction.PREVIEW, "Preview"), (ControlAction.RETRY, "Retry"),
@@ -597,6 +623,74 @@ class RSMPage(QtWidgets.QWidget):
         self._tip("scan", "Scan numbers, as Stitch's Selection: brackets combine scans into one RSM ([42-44] "
                           "is one RSM of three scans); 42,43 would be two RSMs, and the page grids one RSM per "
                           "run for now.")
+        self._build_ub()
+
+    def _build_ub(self):
+        """The UB matrix group of shared rows (design: "A source with no UB"): the source's own UB by default,
+        or one given for an HKL map (``RSMToolFormV2.ub``), typed as three rows of three numbers in SPEC's
+        ``#G3`` convention or taken from a SPEC scan's ``#G3``. Folded until it is needed or opened to override."""
+        self.ub_card = SubsectionCard("UB matrix", accent="source")
+        self.controls.source_card.add_row(self.ub_card)
+        for key, label, value, choices, browse in (
+                ("ub_from", "UB", _UB_SOURCE, (_UB_SOURCE, _UB_TYPED, _UB_SPEC), False),
+                ("ub_row1", "Row 1", "", (), False), ("ub_row2", "Row 2", "", (), False),
+                ("ub_row3", "Row 3", "", (), False),
+                ("ub_spec_path", "SPEC file", "", (), True), ("ub_scan", "Scan", "", (), False)):
+            self.ub_card.add_row(self._row(SectionId.SOURCE, key, label, value, choices, browse))
+        self.ub_card.set_collapsed(True)
+        self._tip("ub_from", "The UB an HKL map uses: the source's own (a SPEC scan's #G3, a NeXus entry's "
+                             "ub_matrix), nine typed numbers, or another SPEC scan's #G3. Q coordinates use none.")
+        for number in (1, 2, 3):
+            self._tip(f"ub_row{number}", f"The UB's row {number}: three numbers, in SPEC's #G3 convention (row by "
+                                         "row, in Å⁻¹ with 2π included, as SPEC writes the #G3 line).")
+        self._tip("ub_spec_path", "The SPEC file whose scan's #G3 is the UB (a relative one is the Project's).")
+        self._tip("ub_scan", "That SPEC file's scan (43 is 43.1).")
+
+    def _render_ub(self):
+        """The UB rows a choice reads, the others greyed (their values kept); all greyed in Q, which uses none.
+        The group's status names the UB in use."""
+        hkl = self._value("coordinates") == RSMCoordinateFrame.HKL.display_name
+        choice = self._value("ub_from")
+        reads = {"ub_from": True, **{key: choice == _UB_TYPED for key in ("ub_row1", "ub_row2", "ub_row3")},
+                 "ub_spec_path": choice == _UB_SPEC, "ub_scan": choice == _UB_SPEC}
+        for key in _UB_KEYS:
+            used = hkl and reads[key]
+            field = replace(self._fields[key], value=self._value(key), enabled=used, reason="" if used else (
+                "Q coordinates use no UB" if not hkl else f"{self._fields[key].label} is not read by {choice}"))
+            self._fields[key] = field
+            self._rows[key].apply_field(field)
+        status = "none in Q" if not hkl else {_UB_SOURCE: "the source's", _UB_TYPED: "typed",
+                                              _UB_SPEC: "a SPEC scan's"}[choice]
+        self.ub_card.status.setText(status)
+        self.ub_card.status.setVisible(True)
+
+    def _ub_override(self, root):
+        """The UB given for an HKL map (``RSMUBOverride``), None for the source's own or in Q. ValueError names a
+        refused row."""
+        if self._value("coordinates") != RSMCoordinateFrame.HKL.display_name:
+            return None
+        choice = self._value("ub_from")
+        if choice == _UB_TYPED:
+            return RSMUBOverride(matrix=parse_rsm_ub_rows(self._value(key) for key in ("ub_row1", "ub_row2",
+                                                                                           "ub_row3")))
+        if choice == _UB_SPEC:
+            scan = str(self._value("ub_scan")).strip()
+            if not scan:
+                raise ValueError("the UB's scan is required")
+            return RSMUBOverride(spec_path=str(self._inside(root, self._value("ub_spec_path"), "the UB's SPEC file")),
+                                 scan=scan)
+        return None
+
+    def _ub_wanted(self):
+        """True when an HKL map takes the source's own UB and a found member records none: the Source header's
+        warning, and Preview and Run wait for a UB (or Q)."""
+        if (self._value("coordinates") != RSMCoordinateFrame.HKL.display_name
+                or self._value("ub_from") != _UB_SOURCE):
+            return False
+        found = self._groups
+        if found is None or found[0] != self._group_key():
+            return False
+        return any(ub is None for ub in found[3])
 
     def _build_advanced(self):
         """The rarely changed settings: Int's Advanced dialog, its groups the page's shared rows (Codex's reuse
@@ -690,6 +784,8 @@ class RSMPage(QtWidgets.QWidget):
             self._output_suggested = not str(self._value("output_path")).strip()
         if key in {"project_root", "spec_path", "scan_mode", "scan", "normalization"} and "normalization" in self._rows:
             self._refresh_normalization()  # a kind's own files come through set_sources
+        if key in {"coordinates", "ub_from"}:
+            self._render_ub()
         self._edited()
 
     # ── the Source (Stitch's rows and owner) ──
@@ -784,14 +880,18 @@ class RSMPage(QtWidgets.QWidget):
         key = self._group_key()
         selection, options = self._resolution_request()
         groups, skipped = rsm_member_groups(selection, **options)
-        self._found(key, groups, skipped)
+        self._found(key, groups, skipped, _source_ubs(groups))
         return groups, skipped
 
-    def _found(self, key, groups, skipped):
-        """Member groups found for ``key``: kept for ``build_form``, and the suggested output follows them."""
-        self._groups = (key, tuple(groups), tuple(skipped))
+    def _found(self, key, groups, skipped, ubs=()):
+        """Member groups found for ``key``: kept for ``build_form`` with the one RSM's members' own UBs (the
+        Source header's warning), and the suggested output follows them."""
+        self._groups = (key, tuple(groups), tuple(skipped), tuple(ubs))
         if self._apply_suggestion():
             self._edited()
+        else:  # the found members' UBs: the Source header (no new form: a prepared Preview stays current)
+            self._readiness = self._readiness_now()
+            self._show_readiness()
 
     def _group_members(self):
         """The one RSM's ordered members, from the groups found for the Source as it stands (ValueError
@@ -800,7 +900,7 @@ class RSMPage(QtWidgets.QWidget):
         found = self._groups
         if found is None or found[0] != self._group_key():
             raise ValueError("the Source's scans are not found yet (Preview finds them)")
-        _key, groups, skipped = found
+        _key, groups, skipped, _ubs = found
         if not groups:
             reason = ""
             if skipped:  # the first skip's file, scan and why (Stitch's skips)
@@ -934,6 +1034,10 @@ class RSMPage(QtWidgets.QWidget):
             corrections = self._corrections(project)  # the Mask File, Int's threshold, Advanced's corrections
         except ValueError as error:
             raise ValueError(f"Advanced: {error}") from None
+        try:
+            ub = self._ub_override(project)  # a UB given for an HKL map; None in Q (the form takes none there)
+        except ValueError as error:
+            raise ValueError(f"UB matrix: {error}") from None
         return RSMToolFormV2(
             project_text, geometry, members,
             # "High → NaN" is Int's threshold's Manual High now (design §2)
@@ -941,7 +1045,8 @@ class RSMPage(QtWidgets.QWidget):
             policy, tuple(_GRIDS[self._value("grid")]), int(self._value("adv_chunk")),
             int(self._value("adv_max_frame_mib")) * _MIB, self._max_chunk_bytes(), output,
             AnalysisArtifactOverwrite.REPLACE,  # Append is the page's skip, as Stitch's (_start_run)
-            coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family, corrections=corrections)
+            coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family, corrections=corrections,
+            ub=ub)
 
     # ── readiness ──
     def _edited(self, *_args):
@@ -994,6 +1099,16 @@ class RSMPage(QtWidgets.QWidget):
             output = str(self._value("output_path")).strip()
             if not output.endswith(".nexus"):
                 need("project", "an Output ending in .nexus")
+            try:  # a UB given for an HKL map: its rows, or its SPEC file and scan
+                given = self._ub_override(root)
+            except ValueError as error:
+                need("source", f"UB matrix: {error}")
+            else:
+                if given is not None and given.spec_path is not None and not Path(given.spec_path).is_file():
+                    need("source", f"the UB's SPEC file ({Path(given.spec_path).name} not found)")
+        warned = self._ub_wanted()
+        if warned:  # an HKL map of a found source with no UB: Run waits (design "A source with no UB")
+            needs.append("a UB matrix")
         for key, section in (("source", SectionId.SOURCE), ("processing", SectionId.PROCESSING)):
             refused = self._advanced_refusal(section)
             if refused:
@@ -1024,9 +1139,13 @@ class RSMPage(QtWidgets.QWidget):
         texts = {"project": "", "experiment": Path(calibration).name if calibration else "",
                  "source": self._source_text(),
                  "processing": f"{self._value('coordinates')} · grid {grid}"}
+        details = {key: ready_detail[key] if not sections[key] else "Needs " + ", ".join(sections[key])
+                   for key in sections}
+        if warned:  # the Source header warns in the brief's words, whatever else it needs
+            details["source"] = _NO_UB if not sections["source"] else f"{_NO_UB} {details['source']}"
+            texts["source"] = " · ".join(part for part in (texts["source"], "⚠ no UB matrix") if part)
         self._headers = {key: SectionHeaderProjection(
-            texts[key], not sections[key],
-            ready_detail[key] if not sections[key] else "Needs " + ", ".join(sections[key]))
+            texts[key], not sections[key] and not (warned and key == "source"), details[key])
             for key in sections}
         if needs:
             return "Needs " + ", ".join(needs), False
@@ -1119,6 +1238,8 @@ class RSMPage(QtWidgets.QWidget):
                  "source": self.controls.source_card, "processing": self.controls.processing_card}
         for key, header in getattr(self, "_headers", {}).items():  # Int's header adapter
             apply_section_header(cards[key], header)
+        if self._ub_wanted():  # the UB rows show when one is needed
+            self.ub_card.set_collapsed(False)
 
     def _status(self, text, *, ready=True):
         self.run_bar.set_readiness_summary(str(text), ready=ready)
@@ -1324,17 +1445,20 @@ class RSMPage(QtWidgets.QWidget):
         elif terminal.status is OperationTerminalStatus.FAILED:
             self._notice(f"Source refused: {terminal.failure_message or terminal.failure_type}")
         elif terminal.status is OperationTerminalStatus.RETURNED and terminal.payload is not None:
-            groups, skipped = terminal.payload
+            groups, skipped, ubs = terminal.payload
             if key != self._group_key():
                 self._notice("The scans were found, but the Source changed: Preview again")
                 return
-            self._found(key, groups, skipped)
+            self._found(key, groups, skipped, ubs)
             self._continue(action)
         else:
             self._notice("RSM stopped")
 
     def _continue(self, action):
-        """Preview, or Run, on the member groups just found."""
+        """Preview, or Run, on the member groups just found; an HKL map of a source with no UB waits for one."""
+        if self._ub_wanted():
+            self._notice(_NO_UB)
+            return
         form = self._current_form()
         if form is None:
             return
@@ -1683,6 +1807,8 @@ class RSMPage(QtWidgets.QWidget):
             title, file_filter = (("Choose calibration", dialogs.CALIBRATION_FILTER) if key == "geometry_path"
                                   else ("Choose detector mask", dialogs.MASK_FILTER))
             picks = dialogs.browse(self, title, file_filter=file_filter, **common)
+        elif key == "ub_spec_path":  # the shared SPEC pick (it refuses a file that is not one)
+            picks = dialogs.browse_spec(self, "Choose the UB's SPEC file", **common)
         elif key in {"dark_path", "flat_path"}:  # Int's file types for the correction images
             picks = dialogs.browse(self, {"dark_path": "Choose dark", "flat_path": "Choose flat field"}[key],
                                    file_filter=dialogs.CORRECTION_FILTER, **common)

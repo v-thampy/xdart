@@ -1298,3 +1298,85 @@ def test_advanced_corrections_reach_the_runs_frame_corrections(qapp, tmp_path):
         assert "the Dark (missing.npy not found)" in page._headers["processing"].detail
     finally:
         page.close_page()
+
+
+_NO_UB = "This source records no UB matrix. Enter one, or take it from a SPEC scan, or choose Q coordinates."
+
+
+def test_a_ub_less_nexus_member_is_warned_and_waits_in_hkl_and_is_ready_in_q(qapp, tmp_path):
+    """G8b (the maintainer, 2026-10-01: "For files with no ub matrix, a warning with a chance to enter the ub matrix
+    manually or through a spec file can be offered"): once the Source is found, an HKL map of a NeXus member that
+    records no UB is warned in the Source header, the UB rows show, and Preview and Run wait; Q coordinates need
+    none and are ready; a typed UB is then the form's."""
+    from tests.core.test_rsm_nexus_members import _write_rsm_nexus
+    from xrd_tools.analysis.rsm_operation import RSMUBOverride
+    page = _page(qapp)
+    try:
+        _canonical_partner(tmp_path)
+        nexus = _write_rsm_nexus(tmp_path / "member_noub.nxs", ub=False)
+        page.set_field("project_root", str(tmp_path))
+        page.set_field("geometry_path", "calibration/rsm_canonical.json")
+        page.set_field("source_kind", "NeXus")
+        page.set_sources([str(nexus)])
+        page.set_field("normalization", "None")
+        assert page._readiness[1] and page.ub_card._collapsed  # not known until the Source is found
+        page.begin_preview()  # finds the member, then waits for a UB: nothing is prepared
+        _wait(page, qapp, lambda: not page.active())
+        assert page.run_bar.readinessLabel.full_text() == _NO_UB and page._owner.prepared is None
+        header = page._headers["source"]
+        assert header.detail == _NO_UB and not header.ready and "⚠ no UB matrix" in header.text
+        assert not page._readiness[1] and "a UB matrix" in page._readiness[0]
+        assert not page.ub_card._collapsed  # the UB rows show
+        page.begin_run()  # Run waits too
+        assert not page.active() and page._owner.prepared is None
+        page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
+        assert page._readiness[1] and page._headers["source"].ready and _NO_UB not in page._headers["source"].detail
+        assert page.build_form().ub is None
+        page.set_field("coordinates", RSMCoordinateFrame.HKL.display_name)
+        assert not page._readiness[1]
+        page.set_field("ub_from", "Typed")
+        for number, row in enumerate(("1 0 0", "0 1 0", "0 0 1"), 1):
+            page.set_field(f"ub_row{number}", row)
+        assert page._readiness[1], page._readiness
+        assert page.build_form().ub == RSMUBOverride(matrix=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    finally:
+        _close(page, qapp)
+
+
+def test_a_typed_or_spec_scan_ub_reaches_the_form_and_a_refused_one_is_named(qapp, tmp_path):
+    """G8b: a source with a UB keeps it (the form's ``ub`` None); the UB matrix group can override it, typed as three
+    rows of three numbers in SPEC's #G3 convention or taken from a SPEC scan's #G3 (a relative file is the Project's),
+    for an HKL map only. A row that is not three numbers, a singular matrix or a SPEC file not there is named in
+    the Source header."""
+    from xrd_tools.analysis.rsm_operation import RSMUBOverride
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        assert page._readiness[1] and page.build_form().ub is None  # the source's own (#G3)
+        assert _NO_UB not in page._headers["source"].detail
+        assert not page._rows["ub_row1"].editor.isEnabled()  # rows the choice does not read are greyed
+        page.set_field("ub_from", "Typed")
+        for number, row in enumerate(("2, 0, 0", "0 2 0", "0 0 2"), 1):
+            page.set_field(f"ub_row{number}", row)
+        assert page._readiness[1], page._readiness
+        assert page.build_form().ub == RSMUBOverride(matrix=(2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0))
+        page.set_field("ub_row2", "4 0 0")
+        assert "UB matrix: the matrix is singular" in page._headers["source"].detail and not page._readiness[1]
+        with pytest.raises(ValueError, match="UB matrix: the matrix is singular"):
+            page.build_form()
+        page.set_field("ub_row2", "0 2")
+        assert "UB matrix: row 2 needs three numbers" in page._headers["source"].detail
+        page.set_field("ub_from", "A SPEC scan's")
+        page.set_field("ub_spec_path", "source/RSM_synth")
+        page.set_field("ub_scan", "2")
+        assert page._readiness[1], page._readiness
+        assert page.build_form().ub == RSMUBOverride(spec_path=str(tmp_path / "source" / "RSM_synth"), scan="2")
+        page.set_field("ub_spec_path", "source/absent")
+        assert "the UB's SPEC file (absent not found)" in page._headers["source"].detail
+        page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)  # HKL only
+        assert page.build_form().ub is None and page._readiness[1]
+        assert not page._rows["ub_spec_path"].editor.isEnabled()
+        assert page._fields["ub_spec_path"].reason == "Q coordinates use no UB"
+    finally:
+        _close(page, qapp)
