@@ -27,6 +27,8 @@ from xdart.gui.gui_utils import RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.widgets.intensity_controls import IntensityControls
 from xrd_tools.session.display_logic import (
+    PanelKey,
+    PanelRole,
     canonical_axis_key,
     resample_image_axis_to_uniform,
     waterfall_display_rows,
@@ -66,6 +68,8 @@ from .shell_values import (
     BrowseTraceSnapshot,
     FrameNavigationProjection,
     FrameSelectionIntent,
+    KeyedImageProjection,
+    KeyedPanelsProjection,
     ScientificPlotOptions,
     ScientificProjection,
     ShellCommand,
@@ -267,6 +271,98 @@ def _pixmap_pixel_count(pixmap) -> int:
     return pixmap.width() * pixmap.height()
 
 
+class _KeyedImagePanel:
+    """A keyed layout's image panel: Int's image pane, titled, over the frame navigation's own widgets, which
+    step its slice along its normal (``SET_PANEL_INDEX``)."""
+
+    def __init__(self, view: "ScientificView", key: PanelKey) -> None:
+        self.key = key
+        self.container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(self.container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.pane = ScientificImagePane(lock_aspect=False)
+        self.pane.setObjectName(f"e7KeyedImage_{key.instance}")
+        layout.addWidget(self.pane, 1)
+        navigation = QtWidgets.QHBoxLayout()
+        navigation.setContentsMargins(0, 0, 0, 0)
+        self.previous = QtWidgets.QToolButton()
+        self.previous.setObjectName("e4FrameNavigationButton")
+        self.previous.setText("<")
+        self.selector = CompactFrameSelector()
+        self.selector.setObjectName("e3FrameSelector")
+        self.next = QtWidgets.QToolButton()
+        self.next.setObjectName("e4FrameNavigationButton")
+        self.next.setText(">")
+        navigation.addStretch(1)
+        for widget in (self.previous, self.selector, self.next):
+            navigation.addWidget(widget)
+        navigation.addStretch(1)
+        layout.addLayout(navigation)
+        self._captions: tuple[str, ...] = ()
+        self.selector.currentIndexChanged.connect(
+            lambda index: index >= 0 and view._emit_panel_index(key, index))
+        self.previous.clicked.connect(lambda: self.step(-1))
+        self.next.clicked.connect(lambda: self.step(1))
+        self.clear()
+
+    def step(self, offset: int) -> None:
+        index = self.selector.currentIndex() + offset
+        if 0 <= index < self.selector.count():
+            self.selector.setCurrentIndex(index)
+
+    def draw(self, panel: KeyedImageProjection, color_map: str, log_scale: bool) -> None:
+        self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis, color_map=color_map,
+                         log_scale=log_scale)
+        self.pane.plot.setTitle(panel.title)
+        blocker = QtCore.QSignalBlocker(self.selector)
+        if panel.index_captions != self._captions:
+            self.selector.clear()
+            for caption in panel.index_captions:
+                QtWidgets.QComboBox.addItem(self.selector, caption)
+            self._captions = panel.index_captions
+        self.selector.setCurrentIndex(panel.index)
+        del blocker
+        self.selector.setEnabled(True)
+        self.previous.setEnabled(panel.index > 0)
+        self.next.setEnabled(panel.index < len(panel.index_captions) - 1)
+
+    def clear(self) -> None:
+        self.pane.clear_image_buffers()
+        self.pane.plot.setTitle("")
+        blocker = QtCore.QSignalBlocker(self.selector)
+        self.selector.clear()
+        del blocker
+        self._captions = ()
+        for widget in (self.previous, self.selector, self.next):
+            widget.setEnabled(False)
+
+
+class _KeyedTracePanel:
+    """A keyed layout's 1-D panel: a plot styled as Int's 1-D plot (box zoom, the seaborn style, the cursor
+    readout), one curve."""
+
+    def __init__(self, key: PanelKey) -> None:
+        self.key = key
+        self.container = self.plot = pg.PlotWidget(viewBox=RectViewBox())
+        self.plot.setObjectName(f"e7KeyedPlot_{key.instance}")
+        apply_seaborn_plot_style(self.plot.getPlotItem(), grid=True)
+        self.readout = PlotCursorReadout(self.plot)
+        self.curve = self.plot.plot(connect="finite")
+
+    def draw(self, panel, color) -> None:
+        self.curve.setData(np.asarray(panel.axis.values, dtype=float), np.asarray(panel.intensity, dtype=float))
+        self.curve.setPen(pg.mkPen(color=color, width=1.4, style=QtCore.Qt.PenStyle.SolidLine))
+        self.plot.setTitle(panel.title)
+        label, unit = _axis_presentation(panel.axis.label, panel.axis.unit)
+        self.plot.setLabel("bottom", label, units=unit or None)
+        self.plot.setLabel("left", panel.y_label)
+
+    def clear(self) -> None:
+        self.curve.setData([], [])
+        self.plot.setTitle("")
+
+
 class ScientificView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
     #: The plot-options dialog was accepted. Emitted after the view has read its own options
@@ -281,6 +377,13 @@ class ScientificView(QtWidgets.QFrame):
         self.setObjectName("e3ScientificView")
         self.setMinimumWidth(300)
         self._hidden_tools: frozenset[str] = frozenset()
+        # the keyed layout (``reconcile_keyed``): built on its first draw, so Int's and Stitch's views never
+        # allocate it
+        self._keyed_area: QtWidgets.QWidget | None = None
+        self._keyed_layout: tuple[tuple[PanelKey, ...], ...] = ()
+        self._keyed_panels: dict[PanelKey, _KeyedImagePanel | _KeyedTracePanel] = {}
+        self._keyed_shown: KeyedPanelsProjection | None = None
+        self._keyed_hidden: tuple[QtWidgets.QWidget, ...] = ()
         self._heavy_available: frozenset[DisplayFrameKey] = frozenset()
         self._frame_keys: tuple[DisplayFrameKey, ...] = ()
         self._current_key: DisplayFrameKey | None = None
@@ -413,6 +516,7 @@ class ScientificView(QtWidgets.QFrame):
         self.vertical_splitter.setStretchFactor(1, 1)
         self.vertical_splitter.setSizes([500, 500])
         layout.addWidget(self.vertical_splitter, 1)
+        self._main_layout = layout
 
         self.footer = QtWidgets.QHBoxLayout()
         self.viewer_intensity = IntensityControls(self)
@@ -2856,6 +2960,122 @@ class ScientificView(QtWidgets.QFrame):
             self._reflow_follows = 0
             self._align_curve_under_cake()
 
+    # -- the keyed layout: display_logic's repeated PanelKey roles (the H11/WS-X2 seam) -----------------------
+    def reconcile_keyed(self, state: KeyedPanelsProjection) -> None:
+        """Draw a keyed layout: ``state.layout``'s rows of ``PanelKey``s, a SLICE_2D key on Int's image pane
+        over the frame navigation's own widgets (stepping its slice along its normal: ``SET_PANEL_INDEX``),
+        a PROJ_1D key on a 1-D plot styled as Int's. The top bar's colour map, Log and Set BG drive every
+        panel; Int's own layout is hidden while it is shown, and ``_apply_mode_layout`` brings it back for
+        Int's modes. All or nothing: on a failure the prior panels are drawn again (or cleared) and the
+        error raised."""
+        if type(state) is not KeyedPanelsProjection:
+            raise TypeError("a keyed layout is drawn from a KeyedPanelsProjection")
+        prior = self._keyed_shown
+        try:
+            self._paint_keyed(state)
+        except BaseException:
+            try:
+                if prior is None:
+                    self.clear_keyed()
+                else:
+                    self._paint_keyed(prior)
+            except BaseException:  # the primary failure is the one reported
+                pass
+            raise
+        self._keyed_shown = state
+
+    @property
+    def keyed_projection(self) -> KeyedPanelsProjection | None:
+        """The keyed layout drawn now, or None."""
+        return self._keyed_shown
+
+    def keyed_panel(self, key: PanelKey):
+        """A keyed panel's widgets (an image panel's ``pane``, ``previous``, ``selector`` and ``next``; a 1-D
+        panel's ``plot`` and ``curve``), for its host's checks."""
+        return self._keyed_panels[key]
+
+    def clear_keyed(self, detail: str = "") -> None:
+        """Empty every keyed panel, keeping the layout."""
+        for widgets in self._keyed_panels.values():
+            widgets.clear()
+        if self._layout_mode == "keyed":
+            self.title.setText("")
+            self.status.setText(str(detail))
+        self._keyed_shown = None
+
+    def _paint_keyed(self, state: KeyedPanelsProjection) -> None:
+        self._enter_keyed_layout()
+        if state.layout != self._keyed_layout:
+            self._build_keyed(state.layout)
+        color = trace_colors(state.color_map, 1)[0]
+        for panel in state.panels:
+            widgets = self._keyed_panels[panel.key]
+            if type(panel) is KeyedImageProjection:
+                widgets.draw(panel, state.color_map, state.log_scale)
+            else:
+                widgets.draw(panel, color)
+        blockers = [QtCore.QSignalBlocker(widget) for widget in (self.color_map, self.log_scale)]
+        set_combo_value(self.color_map, state.color_map, fallback="Default")
+        self.log_scale.setChecked(state.log_scale)
+        del blockers
+        self.background.setEnabled(state.background_enabled)
+        self.background.setText(("Clear" if state.background_set else "Set") + " BG")
+        self.title.setText(state.title)
+        self.status.setText(state.status)
+
+    def _build_keyed(self, layout: tuple[tuple[PanelKey, ...], ...]) -> None:
+        for widgets in self._keyed_panels.values():
+            widgets.container.setParent(None)
+            widgets.container.deleteLater()
+        self._keyed_panels, self._keyed_layout = {}, ()
+        grid = self._keyed_area.layout()
+        for row_index, row in enumerate(layout):
+            for column, key in enumerate(row):
+                if key.role is PanelRole.SLICE_2D:
+                    widgets = _KeyedImagePanel(self, key)
+                elif key.role is PanelRole.PROJ_1D:
+                    widgets = _KeyedTracePanel(key)
+                else:
+                    raise ValueError(f"a keyed layout draws SLICE_2D and PROJ_1D panels, not {key.role.value}")
+                grid.addWidget(widgets.container, row_index, column)
+                self._keyed_panels[key] = widgets
+        self._keyed_layout = layout
+
+    def _enter_keyed_layout(self) -> None:
+        if self._layout_mode == "keyed":
+            return
+        if self._keyed_area is None:
+            self._keyed_area = QtWidgets.QWidget(self)
+            self._keyed_area.setObjectName("e7KeyedPanels")
+            grid = QtWidgets.QGridLayout(self._keyed_area)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setSpacing(4)
+            self._main_layout.insertWidget(self._main_layout.indexOf(self.vertical_splitter) + 1,
+                                           self._keyed_area, 1)
+        self.drop_viewer_loading_snapshot()
+        self._set_share_link(False)
+        if self.raw_popup_dialog is not None and not self._raw_popup_host:
+            self.raw_popup_dialog.close()
+        hidden = tuple(widget for widget in (
+            self.vertical_splitter, self.viewer_intensity_row, self.previous_frame, self.frame_selector,
+            self.next_frame, self.progress, self.raw_popup_button,
+        ) if not widget.isHidden())
+        for widget in hidden:
+            widget.setVisible(False)
+        self._keyed_hidden = hidden
+        self._keyed_area.setVisible(True)
+        self._layout_mode = self._processing_mode = "keyed"
+
+    def _leave_keyed_layout(self) -> None:
+        if self._keyed_area is not None:
+            self._keyed_area.setVisible(False)
+        for widget in self._keyed_hidden:
+            widget.setVisible(True)
+        self._keyed_hidden = ()
+
+    def _emit_panel_index(self, key: PanelKey, index: int) -> None:
+        self.commandRequested.emit(ShellCommand(ShellCommandKind.SET_PANEL_INDEX, int(index), (key.instance,)))
+
     #: Top-bar tools a host page may leave out, by name.
     _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button",
                    "raw_pane": "raw"}
@@ -2895,6 +3115,8 @@ class ScientificView(QtWidgets.QFrame):
         self._apply_hidden_tools()
 
     def _apply_mode_layout(self, mode: str) -> None:
+        if self._layout_mode == "keyed":
+            self._leave_keyed_layout()
         normalized = str(mode or "")
         if (
             self._viewer_loading_mode is not None

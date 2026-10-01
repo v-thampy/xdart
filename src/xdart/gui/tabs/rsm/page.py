@@ -27,9 +27,10 @@ from xdart.gui.pages.values import (
     ActionAccepted, ActionCompleted, ActionRefused, CloseReceipt, PageCleanup,
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
-from xdart.gui.tabs.rsm.result_view import RSMResultView
+from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
+from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.controls_readiness import SectionHeaderProjection
 from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
 from xdart.gui.tabs.scattering.shell_widgets import apply_section_header
@@ -188,7 +189,13 @@ class RSMPage(QtWidgets.QWidget):
         self._results = OrderedDict()  # path → payload, the most recent last
         self._listed = []  # the Results list's paths, in the order they were first listed
         self._requested = None  # the result last asked to be shown: a late read shows only it (Codex F4)
-        self._model = None
+        # each resident result's viewer values and model, built once (Codex's reuse audit rec. 3): showing it
+        # again recomputes nothing; dropped with its payload when it leaves the five resident
+        self._viewers = {}  # path → (payload, values, model)
+        self._shown_path = None
+        self._shown = None  # (values, snapshot) drawn now
+        self._color_map = "Default"  # Int's top bar: viridis
+        self._log_scale = False
         self._closing = False
         self._build_ui()
         self._timer = QtCore.QTimer(self)
@@ -207,8 +214,12 @@ class RSMPage(QtWidgets.QWidget):
         self.browser.commandRequested.connect(self._browser_command)
         self.splitter.addWidget(self.browser)
 
-        self.view = RSMResultView()
-        self.view.indicesChanged.connect(self._indices_changed)
+        # Int's scientific view, its keyed 2×3 layout (hard rule 14): the slices and mean projections under
+        # Int's top bar (colour map, Log); the tools RSM has no operation for are left out
+        self.view = ScientificView()
+        self.view.setObjectName("rsmPageView")
+        self.view.set_hidden_tools("norm", "background", "raw", "raw_pane")
+        self.view.commandRequested.connect(self._view_command)
         self.splitter.addWidget(self.view)
 
         right = QtWidgets.QWidget()
@@ -899,18 +910,20 @@ class RSMPage(QtWidgets.QWidget):
         if show:
             self._requested = path
         self._results[path] = payload
+        self._viewers.pop(path, None)  # a result admitted again (Replace, a read back) is drawn from itself
         self._results.move_to_end(path)
         resident = [key for key, value in self._results.items() if value is not None]
         excess = len(resident) - _RESIDENT_RESULTS
         for key in resident:
             if excess > 0 and key != self._requested:
                 self._results[key] = None
+                self._viewers.pop(key, None)
                 excess -= 1
         if path not in self._listed:
             self._listed.append(path)
         self._publish_results()
         if show:
-            self._show(payload)
+            self._show(path, payload)
 
     def _result_selected(self, path):
         self._requested = path
@@ -920,33 +933,72 @@ class RSMPage(QtWidgets.QWidget):
                 self.reopen(path)
             return
         try:
-            self._show(payload)
+            self._show(path, payload)
         except Exception as error:  # the prior six stay
             _LOG.exception("RSM result presentation failed")
             self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")
 
-    def _show(self, payload):
-        values = make_rsm_viewer_values(payload)
-        model = RSMViewerModel()
-        snapshot = model.snapshot(values)
-        self.view.show_snapshot(values, snapshot)
-        self._model = model
+    @property
+    def shown(self):
+        """The result drawn now: (its viewer values, the viewer-model snapshot drawn), or None."""
+        return self._shown
 
-    def _indices_changed(self, h_index, k_index, l_index):
-        shown = self.view.shown
-        if shown is None or self._model is None:
+    def _viewer(self, path, payload):
+        """The result's viewer values and model, built once while it stays resident."""
+        viewer = self._viewers.get(path)
+        if viewer is None or viewer[0] is not payload:  # a new result under the same path is built again
+            values = make_rsm_viewer_values(payload)
+            model = RSMViewerModel()
+            model.snapshot(values)
+            viewer = self._viewers[path] = (payload, values, model)
+        return viewer
+
+    def _show(self, path, payload):
+        _payload, values, model = self._viewer(path, payload)
+        self._draw(values, model.current_snapshot, path)
+        self._shown_path = path
+
+    def _draw(self, values, snapshot, path=None):
+        path = self._shown_path if path is None else path
+        self.view.reconcile_keyed(rsm_keyed_projection(
+            values, snapshot, color_map=self._color_map, log_scale=self._log_scale,
+            title=Path(path).name if path else ""))
+        self._shown = (values, snapshot)
+
+    def _redraw(self):
+        shown = self.shown
+        if shown is not None:
+            self._draw(*shown)
+
+    def _view_command(self, command):
+        """Int's view's commands for the RSM drawn: its colour map and Log (as Int's top bar sets them), and a
+        slice stepped along its normal."""
+        kind = command.kind
+        if kind is ShellCommandKind.SET_COLOR_MAP:
+            self._color_map = str(command.value)
+            self._redraw()
+        elif kind is ShellCommandKind.SET_LOG_SCALE:
+            self._log_scale = bool(command.value)
+            self._redraw()
+        elif kind is ShellCommandKind.SET_PANEL_INDEX:
+            self._step_slice(command.path[0] if command.path else "", command.value)
+
+    def _step_slice(self, instance, index):
+        shown = self._viewers.get(self._shown_path) if self._shown_path else None
+        if shown is None or type(index) is not int:
             return
-        values, prior = shown
+        _payload, values, model = shown
+        normal = rsm_slice_normals(values).get(instance)
+        if normal is None:
+            return
+        indices = list(model.current_snapshot.state.axis_indices)
+        indices[normal] = index
         try:
-            self.view.show_snapshot(values, self._model.snapshot(h_index=h_index, k_index=k_index,
-                                                                 l_index=l_index))
-        except Exception as error:
+            self._draw(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
+                                              l_index=indices[2]))
+        except Exception as error:  # the view keeps the six it drew
             _LOG.exception("RSM slice presentation failed")
             self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")
-            try:  # the index boxes back to the six shown
-                self.view.show_snapshot(values, prior)
-            except Exception:
-                _LOG.exception("RSM slice repaint failed")
 
     # ── paths ──
     def _browse(self, key):
@@ -1018,7 +1070,9 @@ class RSMPage(QtWidgets.QWidget):
         if pending:
             self._closing = False
             return pending[0]
-        self.view.clear()
+        self.view.clear_keyed("No RSM result shown")
+        self._viewers.clear()
+        self._shown_path = self._shown = None
         return CloseReceipt(PageCleanup.CLEAN)
 
 

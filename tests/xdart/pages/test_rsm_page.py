@@ -18,7 +18,8 @@ from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.rsm import page as page_module
 from xdart.gui.tabs.rsm.page import RSMPage, suggested_output
-from xdart.gui.tabs.rsm.result_view import RSMResultView
+from xdart.gui.tabs.rsm.display import rsm_keyed_projection
+from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tools import rsm_owner
 from xdart.gui.tools.rsm_tool import RSMToolDialog
 from xdart.gui.tools.rsm_values import RSMMemberDraft
@@ -32,6 +33,28 @@ from tests.xdart.tools.test_rsm_tool_dialog import (  # noqa: F401
     _Owner, _Status, _q_values, _values, _write_member, qapp,
 )
 
+
+
+def _keys(view):
+    return [key for row in view.keyed_projection.layout for key in row]
+
+
+def _slices(view):
+    """The three slices' panes on Int's view, in the layout's order."""
+    return [view.keyed_panel(key).pane for key in _keys(view)[:3]]
+
+
+def _curves(view):
+    return [view.keyed_panel(key).curve for key in _keys(view)[3:]]
+
+
+def _plots(view):
+    return [view.keyed_panel(key).plot for key in _keys(view)[3:]]
+
+
+def _selectors(view):
+    """Each slice's index selector: the HK slice's steps L, the HL slice's K, the KL slice's H."""
+    return [view.keyed_panel(key).selector for key in _keys(view)[:3]]
 
 def _page(qapp, **owners):
     return RSMPage(empty_host_services(_Status()), **owners)
@@ -145,19 +168,19 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
         shown = page.preview_text.toPlainText()
         assert "Ordered members: 2 · total frames 4" in shown and "Member 2:" in shown
         page.begin_run()
-        _wait(page, qapp, lambda: page.view.shown is not None)
-        snapshot = page.view.shown[1]
-        for pane, product in zip(page.view.slices, snapshot.products[:3], strict=True):
+        _wait(page, qapp, lambda: page.shown is not None)
+        snapshot = page.shown[1]
+        for pane, product in zip(_slices(page.view), snapshot.products[:3], strict=True):
             np.testing.assert_array_equal(pane.canvas.raw_image, np.asarray(product.values).T)
-        for curve, product in zip(page.view.curves, snapshot.products[3:], strict=True):
+        for curve, product in zip(_curves(page.view), snapshot.products[3:], strict=True):
             x, y = curve.getData()
             np.testing.assert_array_equal(x, product.x_axis)
             np.testing.assert_array_equal(y, product.values)
-        assert [control.value() for control in page.view.index_controls] == [2, 3, 4]
-        page.view.index_controls[0].setValue(0)  # H: the KL slice moves to the new index
-        moved = page.view.shown[1]
+        assert [selector.currentIndex() for selector in _selectors(page.view)] == [4, 3, 2]  # L, K, H
+        _selectors(page.view)[2].setCurrentIndex(0)  # the KL slice's H index: it moves to H 0
+        moved = page.shown[1]
         assert (moved.state.h_index, moved.state.k_index, moved.state.l_index) == (0, 3, 4)
-        np.testing.assert_array_equal(page.view.slices[2].canvas.raw_image, np.asarray(moved.products[2].values).T)
+        np.testing.assert_array_equal(_slices(page.view)[2].canvas.raw_image, np.asarray(moved.products[2].values).T)
         assert page.results.count() == 1 and page.results.item(0).text() == output.name
         assert page.run_bar.readinessLabel.full_text() == f"Saved {output.name}"
         output.parent.mkdir()
@@ -186,7 +209,7 @@ def test_typing_in_a_field_then_run_runs_the_typed_inputs(qapp, tmp_path, monkey
         QTest.keyClicks(editor, str(tmp_path / "typed.nexus"))  # typed, not committed: no Return or Tab
         assert editor.hasFocus()
         page.run_bar.startButton.click()  # a click that leaves the focus in the field
-        _wait(page, qapp, lambda: page.view.shown is not None)
+        _wait(page, qapp, lambda: page.shown is not None)
         assert page.results.item(0).text() == "typed.nexus"
     finally:
         _close(page, qapp)
@@ -217,7 +240,7 @@ def test_stop_cancels_a_run(qapp, tmp_path, monkeypatch):
         page.stop()
         _wait(page, qapp, lambda: not page.active())
         assert page.run_bar.readinessLabel.full_text() == "RSM stopped"
-        assert page.view.shown is None and page.results.count() == 0 and page._readiness[1]
+        assert page.shown is None and page.results.count() == 0 and page._readiness[1]
     finally:
         _close(page, qapp)
 
@@ -239,13 +262,13 @@ def test_open_reads_saved_results_off_the_gui_thread_and_keeps_the_newest_five(q
         for name in shown:
             assert page.reopen(str(tmp_path / f"{name}_rsm.nexus"))
             _wait(page, qapp, lambda: not page.active())
-            assert page.view.shown[0] is shown[name]
+            assert page.shown[0] is shown[name]
         assert [page.results.item(row).text() for row in range(6)] == [f"{name}_rsm.nexus" for name in shown]
         page.results.setCurrentRow(1)  # kept: shown at once
-        assert page.view.shown[0] is shown["two"] and len(reads) == 6
+        assert page.shown[0] is shown["two"] and len(reads) == 6
         page.results.setCurrentRow(0)  # the oldest: read again
         _wait(page, qapp, lambda: not page.active())
-        assert page.view.shown[0] is shown["one"] and reads == [f"{name}_rsm.nexus" for name in (*names, "one")]
+        assert page.shown[0] is shown["one"] and reads == [f"{name}_rsm.nexus" for name in (*names, "one")]
     finally:
         _close(page, qapp)
 
@@ -257,23 +280,23 @@ def test_a_failed_paint_keeps_the_six_shown(qapp, monkeypatch):
     try:
         values = _values()
         model = RSMViewerModel()
-        page.view.show_snapshot(values, model.snapshot(values))
-        prior = page.view.shown
-        before = [np.array(pane.canvas.raw_image) for pane in page.view.slices]
+        page.view.reconcile_keyed(rsm_keyed_projection(values, model.snapshot(values)))
+        prior = page.view.keyed_projection
+        before = [np.array(pane.canvas.raw_image) for pane in _slices(page.view)]
         calls = []
-        original = page.view.slices[1].render
+        original = _slices(page.view)[1].render
 
         def failing(*args, **kwargs):
             calls.append(True)
             if len(calls) == 1:
                 raise RuntimeError("pane failed")
             return original(*args, **kwargs)
-        monkeypatch.setattr(page.view.slices[1], "render", failing)
+        monkeypatch.setattr(_slices(page.view)[1], "render", failing)
         other = _values(offset=5.0)
         with pytest.raises(RuntimeError, match="pane failed"):
-            page.view.show_snapshot(other, RSMViewerModel().snapshot(other))
-        assert page.view.shown is prior
-        for pane, image in zip(page.view.slices, before, strict=True):
+            page.view.reconcile_keyed(rsm_keyed_projection(other, RSMViewerModel().snapshot(other)))
+        assert page.view.keyed_projection is prior
+        for pane, image in zip(_slices(page.view), before, strict=True):
             np.testing.assert_array_equal(pane.canvas.raw_image, image)
     finally:
         _close(page, qapp)
@@ -285,18 +308,20 @@ def test_each_pane_carries_the_frames_own_axis_labels(qapp, make, names):
     """Each axis is labelled as its frame and the RSM dialog label it (a Cartesian Q axis as Qx, Qy or Qz
     in Å⁻¹, not as Int's 1-D "Q"), and each slice title names the index it is taken at."""
     from xrd_tools.session.rsm_viewer_model import RSMViewerModel
-    view = RSMResultView()
+    view = ScientificView()
     try:
         values = make()
-        view.show_snapshot(values, RSMViewerModel().snapshot(values))
+        view.reconcile_keyed(rsm_keyed_projection(values, RSMViewerModel().snapshot(values)))
         first, second, third = names
         assert [(pane.plot.getAxis("bottom").labelText, pane.plot.getAxis("left").labelText)
-                for pane in view.slices] == [(first, second), (first, third), (second, third)]
-        assert [plot.getAxis("bottom").labelText for plot in view.projections] == list(names)
-        assert {pane.plot.getAxis(side).labelUnits for pane in view.slices for side in ("bottom", "left")} | {
-            plot.getAxis("bottom").labelUnits for plot in view.projections} == {""}
+                for pane in _slices(view)] == [(first, second), (first, third), (second, third)]
+        assert [plot.getAxis("bottom").labelText for plot in _plots(view)] == list(names)
+        assert {pane.plot.getAxis(side).labelUnits for pane in _slices(view) for side in ("bottom", "left")} | {
+            plot.getAxis("bottom").labelUnits for plot in _plots(view)} == {""}
         symbols = values.coordinate_frame.axis_symbols
-        assert view.slices[0].plot.titleLabel.text == f"{symbols[0]}{symbols[1]} slice · {symbols[2]} index 4"
+        normal = float(np.asarray(values.axes[2][1])[4])
+        assert _slices(view)[0].plot.titleLabel.text == (
+            f"{symbols[0]}{symbols[1]} slice · {symbols[2]} = {normal:.6g} (index 4)")
     finally:
         view.deleteLater()
         qapp.processEvents()
@@ -318,13 +343,13 @@ def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, 
         assert page.run_bar.readinessLabel.full_text() == f"Saved {Path(output).name}"
         committed = page._results[output]
         assert committed.result_fingerprint == expected
-        assert page.view.shown[0].result_fingerprint == expected
+        assert page.shown[0].result_fingerprint == expected
         assert page.reopen(output)
         _wait(page, qapp, lambda: not page.active())
         reopened = page._results[output]
         assert reopened is not committed and reopened.result_fingerprint == expected
-        assert page.view.shown[0].result_fingerprint == expected
-        np.testing.assert_array_equal(page.view.shown[0].intensity, committed.intensity)
+        assert page.shown[0].result_fingerprint == expected
+        np.testing.assert_array_equal(page.shown[0].intensity, committed.intensity)
     finally:
         _close(page, qapp)
 
@@ -442,7 +467,7 @@ def test_a_pending_verification_keeps_a_clickable_retry(qapp, tmp_path, monkeypa
         qapp.processEvents()
         assert page._owner.busy, "the Retry click did not start the retained verification"
         _wait(page, qapp, lambda: not page.active())
-        assert page.view.shown is not None and len(reads) == 2
+        assert page.shown is not None and len(reads) == 2
     finally:
         monkeypatch.setattr(operation, "read_analysis_artifact", real_read)
         _wait(page, qapp, lambda: page.close_page().status is PageCleanup.CLEAN)
@@ -463,18 +488,18 @@ def test_each_slice_pixel_sits_at_its_bin_centre(qapp, frame):
         axis_units=tuple(zip(frame.axis_names, frame.axis_units, strict=True)),
         intensity=np.arange(60, dtype=np.float64).reshape(3, 4, 5) + 1, sigma=None, coverage=None,
         normalization=None))
-    view = RSMResultView()
+    view = ScientificView()
     try:
         snapshot = RSMViewerModel().snapshot(values, h_index=1, k_index=2, l_index=3)
-        view.show_snapshot(values, snapshot)
-        for pane, product in zip(view.slices, snapshot.products[:3], strict=True):
+        view.reconcile_keyed(rsm_keyed_projection(values, snapshot))
+        for pane, product in zip(_slices(view), snapshot.products[:3], strict=True):
             x, y = np.asarray(product.x_axis), np.asarray(product.y_axis_or_none)
             first = pane.image.mapToParent(QtCore.QPointF(.5, .5))
             last = pane.image.mapToParent(QtCore.QPointF(x.size - .5, y.size - .5))
             assert (first.x(), first.y(), last.x(), last.y()) == pytest.approx(
                 (x[0], y[0], x[-1], y[-1]), abs=1e-9)
-        first = view.slices[0].image.mapToParent(QtCore.QPointF(.5, .5))
-        last = view.slices[0].image.mapToParent(QtCore.QPointF(2.5, 3.5))
+        first = _slices(view)[0].image.mapToParent(QtCore.QPointF(.5, .5))
+        last = _slices(view)[0].image.mapToParent(QtCore.QPointF(2.5, 3.5))
         assert (first.x(), first.y(), last.x(), last.y()) == pytest.approx((10, 100, 30, 106), abs=1e-9)
     finally:
         view.deleteLater()
@@ -561,11 +586,11 @@ def test_a_late_read_does_not_override_the_newer_selection(qapp, tmp_path):
         page.results.setCurrentRow(0)
         assert started.wait(3)
         page.results.setCurrentRow(1)
-        shown = page.view.shown
+        shown = page.shown
         assert page.results.currentItem().data(role) == paths[1]
         released.set()
         _wait(page, qapp, lambda: not page.active())
-        assert page.results.currentItem().data(role) == paths[1] and page.view.shown is shown
+        assert page.results.currentItem().data(role) == paths[1] and page.shown is shown
         assert page._results[paths[0]] is not None  # kept for its next selection
     finally:
         released.set()
@@ -660,15 +685,15 @@ def test_a_replace_repaints_the_new_result_under_the_same_name(qapp, tmp_path, m
         _with_members(page, tmp_path, _synthetic_members(tmp_path))
         page.run_bar.writeModeButton.click()  # Replace
         page.begin_run()
-        _wait(page, qapp, lambda: page.view.shown is not None)
-        assert page.view.shown[0] is first
+        _wait(page, qapp, lambda: page.shown is not None)
+        assert page.shown[0] is first
         assert Path(page._value("output_path")).is_file()
         monkeypatch.setattr(page_module, "make_rsm_viewer_values", {"payload": second}.__getitem__)
         page.begin_run()
-        _wait(page, qapp, lambda: page.view.shown[0] is second and not page.active())
+        _wait(page, qapp, lambda: page.shown[0] is second and not page.active())
         assert page.results.count() == 1
-        np.testing.assert_array_equal(page.view.slices[0].canvas.raw_image,
-                                      np.asarray(page.view.shown[1].products[0].values).T)
+        np.testing.assert_array_equal(_slices(page.view)[0].canvas.raw_image,
+                                      np.asarray(page.shown[1].products[0].values).T)
     finally:
         _close(page, qapp)
 
@@ -684,20 +709,20 @@ def test_a_refused_or_stopped_replace_keeps_the_prior_result_shown(qapp, tmp_pat
         _with_members(page, tmp_path, _synthetic_members(tmp_path))
         page.run_bar.writeModeButton.click()  # Replace
         page.begin_run()
-        _wait(page, qapp, lambda: page.view.shown is not None and not page.active())
-        prior = page.view.shown
+        _wait(page, qapp, lambda: page.shown is not None and not page.active())
+        prior = page.shown
         assert Path(page._value("output_path")).is_file()
         _terminal_instead_of_gridding(monkeypatch, ModuleDisposition.REFUSED, "OUTPUT_NOT_PREVIOUS_ANALYSIS")
         page.begin_run()
         _wait(page, qapp, lambda: "refused" in label.full_text() and not page.active())
         assert label.full_text() == "RSM refused: OUTPUT_NOT_PREVIOUS_ANALYSIS"
-        assert page.view.shown is prior and page.results.count() == 1
+        assert page.shown is prior and page.results.count() == 1
         _terminal_instead_of_gridding(monkeypatch, ModuleDisposition.CANCELLED, "CANCELLED", until_stopped=True)
         page.begin_run()
         _wait(page, qapp, lambda: page._owner.busy and page.run_bar.stopButton.isEnabled())
         page.stop()
         _wait(page, qapp, lambda: "stopped" in label.full_text() and not page.active())
-        assert page.view.shown is prior and page.results.count() == 1
+        assert page.shown is prior and page.results.count() == 1
     finally:
         _close(page, qapp)
 
@@ -722,5 +747,57 @@ def test_each_section_header_shows_its_readiness_as_ints_do(qapp, tmp_path):
         assert not cards["source"].valid_marker.isVisibleTo(page)
         assert cards["source"].valid_marker.toolTip() == "Needs member 2's SPEC file"
         assert cards["project"].valid_marker.isVisibleTo(page) and cards["experiment"].valid_marker.isVisibleTo(page)
+    finally:
+        _close(page, qapp)
+
+
+def test_a_resident_result_shown_again_recomputes_nothing_and_an_evicted_ones_viewer_goes(
+        qapp, tmp_path, monkeypatch):
+    """Codex's reuse audit rec. 3: each resident result keeps its viewer values and model, built once, so
+    showing it again builds and slices nothing; its viewer leaves with its payload when it drops out of the
+    five resident (no volume kept per evicted result)."""
+    from xrd_tools.session import rsm_viewer_model
+    names = ("one", "two", "three", "four", "five", "six")
+    values = {name: _values(offset=float(index)) for index, name in enumerate(names)}
+    built, sliced = [], []
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values",
+                        lambda payload: built.append(payload) or values[payload])
+    original = rsm_viewer_model.RSMViewerModel.snapshot
+
+    def counting(self, *args, **kwargs):
+        sliced.append(kwargs)
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(rsm_viewer_model.RSMViewerModel, "snapshot", counting)
+
+    def read(path, _cancel, _progress):
+        return Path(path).name.split("_")[0]
+    page = _page(qapp, owner=_Owner(), reader=SingleWorkerOwner(read))
+    try:
+        for name in names:
+            assert page.reopen(str(tmp_path / f"{name}_rsm.nexus"))
+            _wait(page, qapp, lambda: not page.active())
+        assert built == list(names) and len(sliced) == 6
+        built.clear(), sliced.clear()
+        for row in (1, 2, 1):  # "two", "three", "two": resident
+            page.results.setCurrentRow(row)
+        assert built == [] and sliced == [] and page.shown[0] is values["two"]
+        assert set(page._viewers) == {str(tmp_path / f"{name}_rsm.nexus") for name in names[1:]}
+    finally:
+        _close(page, qapp)
+
+
+def test_ints_colour_map_and_log_redraw_the_six(qapp, monkeypatch):
+    """Int's top bar drives the RSM's six (the maintainer: "Color map should be viridis by default. The other
+    color maps should also be available like in Int"): "Default" is viridis, the others Int's list."""
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", {"payload": _values()}.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/x_rsm.nexus", "payload")
+        assert page.view.keyed_projection.color_map == "Default" and not page.view.keyed_projection.log_scale
+        page.view.color_map.setCurrentText("magma")
+        page.view.log_scale.click()
+        drawn = page.view.keyed_projection
+        assert (drawn.color_map, drawn.log_scale) == ("magma", True)
+        assert _slices(page.view)[0]._render_contract[6:8] == ("magma", True)
     finally:
         _close(page, qapp)

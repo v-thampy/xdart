@@ -12,6 +12,7 @@ from typing import Mapping
 
 import numpy as np
 
+from xrd_tools.session.display_logic import PanelKey, PanelRole
 from xrd_tools.session.readiness import ControlsProjection
 
 from .browser_catalog import BrowserCatalogEntry, natural_name_key
@@ -76,6 +77,9 @@ class ShellCommandKind(str, Enum):
     SELECT_RESULTS = "select_results"
     SELECT_RESULT_FRAME = "select_result_frame"
     SHOW_RAW_IMAGE = "show_raw_image"
+    #: a keyed layout's image panel stepped to another index along its normal (an RSM slice): its value the
+    #: index, its path the panel's instance (``PanelKey.instance``)
+    SET_PANEL_INDEX = "set_panel_index"
 
 
 class FrameSelectionIntent(str, Enum):
@@ -321,6 +325,76 @@ class AxisProjection:
                     or any(type(value) is not float or not math.isfinite(value) for value in self.edges)
                     or not self.edges[0] < self.edges[1]):
                 raise TypeError("axis edges must be two finite increasing floats")
+
+
+@dataclass(frozen=True, slots=True)
+class KeyedImageProjection:
+    """One image panel of a keyed layout (``display_logic``'s repeated ``PanelKey`` roles, the H11/WS-X2
+    seam): an RSM slice. ``image`` is (y, x), as Int's cake; ``index`` of ``index_count`` is where the slice is
+    taken along its plane's normal, each index captioned by ``index_captions``."""
+
+    key: PanelKey
+    title: str
+    image: np.ndarray
+    x_axis: AxisProjection
+    y_axis: AxisProjection
+    index: int
+    index_captions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.key) is not PanelKey or self.key.role is not PanelRole.SLICE_2D:
+            raise TypeError("a keyed image panel is a SLICE_2D PanelKey")
+        if (type(self.image) is not np.ndarray or self.image.ndim != 2
+                or self.image.shape != (self.y_axis.values.size, self.x_axis.values.size)):
+            raise TypeError("a keyed image is (y, x) on its two axes")
+        if (type(self.index_captions) is not tuple or not self.index_captions
+                or any(type(caption) is not str for caption in self.index_captions)
+                or type(self.index) is not int or not 0 <= self.index < len(self.index_captions)):
+            raise TypeError("a keyed image's index is one of its captions")
+
+
+@dataclass(frozen=True, slots=True)
+class KeyedTraceProjection:
+    """One 1-D panel of a keyed layout: an RSM mean projection along ``axis``."""
+
+    key: PanelKey
+    title: str
+    axis: AxisProjection
+    intensity: np.ndarray
+    y_label: str
+
+    def __post_init__(self) -> None:
+        if type(self.key) is not PanelKey or self.key.role is not PanelRole.PROJ_1D:
+            raise TypeError("a keyed trace panel is a PROJ_1D PanelKey")
+        if type(self.intensity) is not np.ndarray or self.intensity.shape != self.axis.values.shape:
+            raise TypeError("a keyed trace's intensity follows its axis")
+
+
+@dataclass(frozen=True, slots=True)
+class KeyedPanelsProjection:
+    """A keyed layout for ``ScientificView.reconcile_keyed``: rows of ``PanelKey``s (``DisplayState.layout``),
+    each drawn from its one panel, under the view's own top bar (colour map, Log, Set BG)."""
+
+    layout: tuple[tuple[PanelKey, ...], ...]
+    panels: tuple[KeyedImageProjection | KeyedTraceProjection, ...]
+    title: str = ""
+    status: str = ""
+    color_map: str = "Default"
+    log_scale: bool = False
+    background_enabled: bool = False
+    background_set: bool = False
+
+    def __post_init__(self) -> None:
+        keys = [key for row in self.layout for key in row]
+        if (type(self.layout) is not tuple or not keys
+                or any(type(row) is not tuple for row in self.layout)
+                or len(set(keys)) != len(keys)
+                or sorted(map(repr, keys)) != sorted(repr(panel.key) for panel in self.panels)
+                or len(self.panels) != len(keys)):
+            raise TypeError("a keyed layout draws each of its keys from exactly one panel")
+
+    def panel(self, key: PanelKey) -> KeyedImageProjection | KeyedTraceProjection:
+        return next(panel for panel in self.panels if panel.key == key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,6 +817,9 @@ __all__ = [
     "FrameSelectionIntent",
     "FrameNavigationProjection",
     "HeavyProjection",
+    "KeyedImageProjection",
+    "KeyedPanelsProjection",
+    "KeyedTraceProjection",
     "ProgressProjection",
     "PinnedTraceProjection",
     "RunStripProjection",
