@@ -348,6 +348,20 @@ class ImageOrientation:
             out = out[..., :, ::-1]
         return np.ascontiguousarray(out)
 
+    def unapply(self, image: "np.ndarray") -> np.ndarray:
+        """:meth:`apply`'s inverse: an array in the calibrated orientation back to the raw detector's (a
+        calibrated detector's own mask or solid angle into the frames' raw frame), one contiguous copy."""
+        out = np.asarray(image)
+        if self.flip_horizontal:
+            out = out[..., :, ::-1]
+        if self.flip_vertical:
+            out = out[..., ::-1, :]
+        if self.rotation:
+            out = np.rot90(out, k=-(self.rotation // 90), axes=(-2, -1))
+        if self.transpose:
+            out = np.swapaxes(out, -1, -2)
+        return np.ascontiguousarray(out)
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

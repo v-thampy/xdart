@@ -57,6 +57,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     revalidate_rsm_geometry_asset,
     revalidate_rsm_geometry_source,
     rsm_calibration_detector_mask,
+    rsm_calibration_solid_angle,
     rsm_effective_pixel_q_map,
 )
 
@@ -3710,6 +3711,8 @@ def rsm_v2_auto_chunking(detector_shape, cropped_shape, chunk_size: int, *, stat
 #: pyFAI's solid angle, computed once a run before the chunks (``_rsm_correction_state``) and not banded,
 #: since banding would change its weights: its traced peak, output included, measured 2026-10-01
 #: (``logs/s3a-solid-angle-transient.log``): 48.1 B/px at Pilatus 100K, 48.0 B/px at 2167 x 2070. Charged at 49.
+#: A refined version-3 calibration's (``rsm_calibration_solid_angle``, Stitch's arm then the inverse turn) peaks
+#: the same: 48.0 B/px at 195 x 1475, turned and not (``logs/s3c-solid-angle-transient.log``).
 _RSM_SOLID_ANGLE_TRANSIENT_BYTES_PER_PIXEL = 49
 
 
@@ -3910,8 +3913,10 @@ class _RSMCorrectionState:
     axes: tuple | None
 
 
-def _rsm_correction_state(plan, header, diffractometer) -> _RSMCorrectionState | None:
-    """Decode a plan's corrections for its run (each image verified against its Preview receipt)."""
+def _rsm_correction_state(plan, header, diffractometer, asset=None) -> _RSMCorrectionState | None:
+    """Decode a plan's corrections for its run (each image verified against its Preview receipt). The solid
+    angle: a refined version-3 calibration's (``asset``; its mount, as Stitch's arm), else the untilted formula
+    about the beam pixel."""
     bound = plan.corrections
     if bound is None:
         return None
@@ -3941,9 +3946,17 @@ def _rsm_correction_state(plan, header, diffractometer) -> _RSMCorrectionState |
             invalid = unusable if invalid is None else np.logical_or(invalid, unusable)
     solid = None
     if bound.corrections.solid_angle:
-        solid = flat_detector_solid_angle(shape, distance=float(header.distance),
-                                          cch=(float(header.cch1), float(header.cch2)),
-                                          pixel_size=(float(header.pwidth1), float(header.pwidth2)))
+        try:
+            solid = rsm_calibration_solid_angle(asset)
+        except RSMGeometryAssetRefused as error:
+            raise RSMOperationRefused(error.code, str(error)) from None
+        if solid is None:
+            solid = flat_detector_solid_angle(shape, distance=float(header.distance),
+                                              cch=(float(header.cch1), float(header.cch2)),
+                                              pixel_size=(float(header.pwidth1), float(header.pwidth2)))
+        elif tuple(solid.shape) != shape:
+            raise RSMOperationRefused("RSM_CALIBRATION_UNSUPPORTED",
+                                      f"the calibration's solid angle is {solid.shape}, the detector {shape}")
     axes = None
     if bound.corrections.polarization_factor is not None:
         # the outer detector circle (nu) is the vertical; the Diffractometer's or a legacy config's stack
@@ -6305,6 +6318,7 @@ class RSMOperationExecutionV2:
                     self.request.plan,
                     self.request.plan.effective_geometry.detector_header,
                     self.request.plan.effective_geometry.diffractometer_projection,
+                    self.request.preflight.geometry_asset_receipt,
                 )
                 for source_receipt, member in zip(
                     self.request.module.source.members,

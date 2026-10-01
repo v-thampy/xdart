@@ -337,6 +337,80 @@ def test_the_polarization_weight_uses_the_energy_q_is_mapped_with(tmp_path, v3_a
     assert np.array_equal(refined, explicit)
 
 
+@pytest.mark.parametrize("quarter", [0, 1, 2, 3])
+@pytest.mark.parametrize("flip", [False, True])
+def test_the_solid_angle_follows_the_calibrations_mount_as_stitchs_arm(tmp_path, v3_asset, quarter, flip):
+    """S3b's leftover (S3c unit 4a): with the refinement, a version-3 calibration's solid-angle weight is Stitch's
+    own (``_extended_solid_angle``), the calibrant's sample offset at zero as RSM's q takes it, in the raw frame.
+    pyFAI's relative solid angle is (dist / r)³ about its PONI, the perpendicular foot from the sample; the tilted
+    mount moves that foot off xrayutilities' beam pixel, about which the untilted formula is centred (2 % apart on
+    this fixture: logs/s3c-solid-angle-arm.log). Without the sample offset the weight is the same at every pose,
+    so the run computes it once."""
+    from types import SimpleNamespace
+
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_solid_angle
+    from xrd_tools.analysis.rsm_operation import RSMBoundCorrections, RSMFrameCorrections, _rsm_correction_state
+    from xrd_tools.corrections.frame_preparation import flat_detector_solid_angle
+    from xrd_tools.integrate.xu_stitch import _extended_solid_angle
+
+    pyfai, value = _v3_partner(tmp_path, v3_asset, quarter, flip)
+    receipt = capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path)
+    effective = lower_rsm_effective_geometry(receipt)
+    header = effective.detector_header
+    plan = SimpleNamespace(corrections=RSMBoundCorrections(RSMFrameCorrections(solid_angle=True), None, None, None))
+    state = _rsm_correction_state(plan, header, effective.diffractometer_projection, receipt)
+    assert np.array_equal(state.solid, rsm_calibration_solid_angle(receipt)) and not state.solid.flags.writeable
+    turned = ImageOrientation(rotation=90 * quarter, flip_horizontal=flip).apply(state.solid)
+    stitch = _extended_solid_angle(value["corrections"], tuple(value["detector"]["shape"]), sample_offset=False)
+    for del_, nu in ANGLES:
+        assert np.array_equal(turned, stitch(nu, del_))  # Stitch's weight, bit for bit, the same at every pose
+    with_offset = _extended_solid_angle(value["corrections"], tuple(value["detector"]["shape"]))
+    assert not np.array_equal(with_offset(*ANGLES[1][::-1]), turned)  # Stitch's own run takes the offset
+    untilted = flat_detector_solid_angle((int(header.Nch1), int(header.Nch2)), distance=float(header.distance),
+                                         cch=(float(header.cch1), float(header.cch2)),
+                                         pixel_size=(float(header.pwidth1), float(header.pwidth2)))
+    assert float(np.max(np.abs(state.solid / untilted - 1))) > 1e-2
+    # the untilted formula stays for the refinement off, a version-2 partner and the canonical asset
+    off = capture_rsm_calibration_geometry(pyfai.name, project_root=tmp_path, refinement=False)
+    v2 = capture_rsm_calibration_geometry(_write_partner(tmp_path, rotation=0, cch=(4., 6.)).name,
+                                          project_root=tmp_path)
+    assert all(rsm_calibration_solid_angle(item) is None for item in (off, v2, None))
+    off_state = _rsm_correction_state(plan, lower_rsm_effective_geometry(off).detector_header,
+                                      effective.diffractometer_projection, off)
+    assert np.array_equal(off_state.solid, untilted)
+
+
+@pytest.mark.slow
+def test_the_run_hands_its_calibration_to_the_solid_angle(rsm_r2_project, monkeypatch):
+    """The run's correction state takes the plan's own calibration (row B's version-2 partner: no arm, so the
+    untilted formula, and the run commits)."""
+    from dataclasses import replace
+
+    from xrd_tools.analysis import rsm_operation
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
+    from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+
+    seen, real = [], rsm_operation.rsm_calibration_solid_angle
+
+    def spy(receipt):
+        seen.append(type(receipt).__name__)
+        return real(receipt)
+
+    monkeypatch.setattr(rsm_operation, "rsm_calibration_solid_angle", spy)
+    form = replace(_form(rsm_r2_project, (43,), 40),
+                   geometry_asset=rsm_calibration_geometry_input(_canonical_partner(rsm_r2_project)),
+                   corrections=RSMFrameCorrections(solid_angle=True),
+                   output_path=rsm_r2_project / "rsm-s3c-solid-angle.nexus")
+    try:
+        result = run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
+    finally:
+        Path(form.output_path).unlink(missing_ok=True)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert seen == ["RSMCalibrationGeometryReceipt"]
+
+
 # Unit 3: an Auto threshold's ceiling from the calibrated detector (decision 39, as Stitch passes it). RSM decodes
 # every frame to float64, so the data type's rule had nothing to find there (C4's disclosure): Auto left out only
 # negatives and the UINT32 dummy.

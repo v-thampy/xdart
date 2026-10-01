@@ -1370,7 +1370,6 @@ def rsm_calibration_detector_mask(receipt) -> np.ndarray | None:
     import numpy as np
     from pyFAI.detectors import detector_factory
 
-    from xrd_tools.core.geometry.diffractometer import ImageOrientation
     from xrd_tools.integrate.xu_stitch import _sha256_array
 
     value = receipt.calibration.projection.value
@@ -1389,13 +1388,44 @@ def rsm_calibration_detector_mask(receipt) -> np.ndarray | None:
         _refuse("RSM_CALIBRATION_UNSUPPORTED", "the calibration's detector mask differs from its record")
     if not turned.any():
         return None
-    orientation = ImageOrientation(rotation=90 * int(acquisition["image_rotation_quarter_turns"]),
-                                   flip_horizontal=bool(acquisition.get("image_flip", False)))
-    raw_shape = shape[::-1] if orientation.swaps_axes else shape
-    index = np.asarray(orientation.apply(np.arange(turned.size).reshape(raw_shape)))  # each turned pixel's raw
-    raw = np.zeros(turned.size, dtype=bool)
-    raw[index.ravel()] = turned.ravel()
-    raw = raw.reshape(raw_shape)
+    raw = _partner_orientation(acquisition).unapply(turned)
+    raw.setflags(write=False)
+    return raw
+
+
+def _partner_orientation(acquisition):
+    """The turn from the raw frame to the partner's (``image_rotation_quarter_turns``, ``image_flip``)."""
+    from xrd_tools.core.geometry.diffractometer import ImageOrientation
+
+    return ImageOrientation(rotation=90 * int(acquisition["image_rotation_quarter_turns"]),
+                            flip_horizontal=bool(acquisition.get("image_flip", False)))
+
+
+def rsm_calibration_solid_angle(receipt) -> np.ndarray | None:
+    """The solid-angle weight of a refined version-3 calibration, in the raw frame RSM reads, read-only: Stitch's
+    own per-frame weight from the attested pyFAI arm (``_extended_solid_angle``), with the calibrant's sample
+    offset at zero as RSM's q takes it, so it is the same at every pose and computed once; then the inverse turn.
+
+    The mount enters through the arm's PONI and distance: pyFAI's relative solid angle is (dist / r)³ about the
+    PONI, the perpendicular foot from the sample, and a tilted mount moves that foot off xrayutilities' beam pixel,
+    about which the untilted formula is centred (the arm's tilt and roll themselves leave the weight unchanged;
+    measured, ``logs/s3c-solid-angle-arm.log``). None (the untilted formula applies): the canonical asset, the
+    refinement off, or a version-2 partner, which records no arm."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt or not receipt.refinement:
+        return None
+    from xrd_tools.analysis.xu_stitch_calibration import EXTENDED_SOLID_ANGLE_POLICY
+    from xrd_tools.integrate.xu_stitch import XuStitchScienceRefused, _extended_solid_angle, _thaw
+
+    value = receipt.calibration.projection.value
+    corrections = _thaw(value["corrections"])
+    if corrections.get("solid_angle_policy") != EXTENDED_SOLID_ANGLE_POLICY:
+        return None
+    shape = tuple(int(item) for item in value["detector"]["shape"])
+    try:
+        turned = _extended_solid_angle(corrections, shape, sample_offset=False)(0.0, 0.0)
+    except XuStitchScienceRefused as error:
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", f"the calibration's solid angle: {error}")
+    raw = _partner_orientation(value["acquisition"]).unapply(turned)
     raw.setflags(write=False)
     return raw
 
