@@ -63,6 +63,7 @@ from xdart.gui.tabs.scattering.controls_inventory import (
     THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN,
 )
 from xrd_tools.session.threshold_editing import (
+    auto_ceiling_hint,
     ThresholdEditRefusal, ThresholdState, threshold_transition,
 )
 
@@ -1185,14 +1186,7 @@ class StitchPage(QtWidgets.QWidget):
         """The automatic ceiling (decision 39) as the Max box's grey hint, never its value: the one
         value every scan shares, else "per scan". The transitions' default maximum is the largest
         value it keeps; typing any number makes the threshold manual."""
-        values = {ceiling[0] for ceiling in ceilings if ceiling is not None}
-        if len(ceilings) and None not in ceilings and len(values) == 1:
-            value = values.pop()
-            source = ("saturation" if any(ceiling[1] == "saturation" for ceiling in ceilings)
-                      else "data type maximum")
-            self._auto_threshold_max, hint = float(value - 1), f"Auto · {value} ({source})"
-        else:
-            self._auto_threshold_max, hint = None, "Auto · per scan" if values else "Auto"
+        self._auto_threshold_max, hint = auto_ceiling_hint(ceilings)
         self._fields["threshold"] = replace(self._fields["threshold"], placeholder=hint)
         self._render_ranges()
 

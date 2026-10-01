@@ -17,6 +17,21 @@ class ThresholdEditRefusal:
     reason: str
 
 
+def auto_ceiling_hint(ceilings):
+    """Threshold Auto's ceiling (decision 39) as the High box's grey hint, never its value, with the transitions'
+    default maximum (the largest value it keeps): the one value every member shares, ``(value - 1, "Auto · value
+    (source)")``; else ``(None, "Auto · per scan")`` when members differ or one is unknown, and ``(None, "Auto")``
+    when none is known. ``ceilings``: each member's ``(value, "saturation" | "data type")``, or None (Stitch's and
+    RSM's Threshold rows, G8c)."""
+    values = {ceiling[0] for ceiling in ceilings if ceiling is not None}
+    if len(ceilings) and None not in ceilings and len(values) == 1:
+        value = values.pop()
+        source = ("saturation" if any(ceiling[1] == "saturation" for ceiling in ceilings)
+                  else "data type maximum")
+        return float(value - 1), f"Auto · {value} ({source})"
+    return None, "Auto · per scan" if values else "Auto"
+
+
 def threshold_transition(
     state: ThresholdState, field: str, value: object, default_max: float | None,
 ) -> ThresholdState | ThresholdEditRefusal | None:

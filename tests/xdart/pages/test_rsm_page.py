@@ -1474,6 +1474,33 @@ def test_preview_lists_the_shared_dark_and_flat_checks_warnings(qapp, tmp_path, 
         _close(page, qapp)
 
 
+def test_preview_shows_stitchs_auto_ceiling_hint_on_the_threshold_row(qapp, tmp_path, monkeypatch):
+    """G8c (G8b choice): once a Preview resolved each member's automatic ceiling (decision 39's calibrated-detector
+    counter limit, on the worker), the Threshold's High box shows Stitch's hint (the shared ``auto_ceiling_hint``),
+    never its value, and the transitions start a typed High from it; a new selection returns to the default."""
+    from PySide6 import QtWidgets
+    from xrd_tools.analysis import rsm_operation
+    monkeypatch.setattr(rsm_operation, "_rsm_member_saturation",
+                        lambda threshold, members, detector: (65535,) * len(members))
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        page._threshold_edited(THRESHOLD_ENABLED, True)
+
+        def hints():
+            return {edit.placeholderText() for edit in page.threshold_range.findChildren(QtWidgets.QLineEdit)}
+        assert "Auto · the detector's saturation" in hints()
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in label.full_text())
+        assert "Auto · 65535 (saturation)" in hints() and page._auto_threshold_max == 65534.0
+        page.set_sources(page._source_paths)
+        assert "Auto · the detector's saturation" in hints() and page._auto_threshold_max is None
+    finally:
+        _close(page, qapp)
+
+
 _NO_UB = "This source records no UB matrix. Enter one, or take it from a SPEC scan, or choose Q coordinates."
 
 

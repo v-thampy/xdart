@@ -68,7 +68,11 @@ from xrd_tools.session.readiness import (
     ControlAction, ControlActionSpec, ControlFieldKind, ControlFormField, SectionId,
 )
 from xrd_tools.session.rsm_viewer_model import RSMViewerModel, make_rsm_viewer_values
-from xrd_tools.session.threshold_editing import ThresholdEditRefusal, ThresholdState, threshold_transition
+from xrd_tools.session.threshold_editing import (
+    ThresholdEditRefusal, ThresholdState, auto_ceiling_hint, threshold_transition,
+)
+
+_AUTO_HINT = "Auto · the detector's saturation"  # before a Preview resolves each member's ceiling
 
 _LOG = logging.getLogger(__name__)
 _MIB = 1024 * 1024
@@ -437,7 +441,7 @@ class RSMPage(QtWidgets.QWidget):
         fields["threshold_min"] = replace(fields["threshold_min"],
                                           value=0.0 if state.threshold_min is None else state.threshold_min)
         fields["threshold"] = replace(
-            fields["threshold"], placeholder="Auto · the detector's saturation",
+            fields["threshold"], placeholder=getattr(self, "_auto_hint", _AUTO_HINT),
             value=(state.threshold_max if state.threshold_max is not None or state.apply_threshold else None))
         values = {key: (self._value(key) if key in self._rows else self._fields[key].value)
                   for key in normalization.NORMALIZATION_KEYS}
@@ -449,6 +453,14 @@ class RSMPage(QtWidgets.QWidget):
         fields.update(normalization.normalization_fields(base, values, columns))
         return fields
 
+    def _show_auto_ceiling(self, ceilings):
+        """Stitch's Auto hint (``auto_ceiling_hint``) on the Threshold's High box once a Preview resolved each
+        member's ceiling (decision 39's calibrated-detector counter limit, on the worker: no file read here), and
+        the transitions' default maximum; the default words before one, or for a new selection."""
+        self._auto_threshold_max, hint = auto_ceiling_hint(ceilings)
+        self._auto_hint = hint if ceilings else _AUTO_HINT
+        self._render_threshold()
+
     def _render_threshold(self):
         """The Threshold row from Int's transitions' state (Int's same-schema update)."""
         self.threshold_range.apply_fields({field.path: field for field in self._conditioning_fields().values()})
@@ -459,7 +471,7 @@ class RSMPage(QtWidgets.QWidget):
         field = {THRESHOLD_MIN: "min", THRESHOLD_MAX: "max", THRESHOLD_ENABLED: "enabled"}.get(tuple(path))
         if field is None:
             return
-        result = threshold_transition(self._threshold_state, field, value, None)
+        result = threshold_transition(self._threshold_state, field, value, getattr(self, "_auto_threshold_max", None))
         if isinstance(result, ThresholdEditRefusal):
             self._render_threshold()
             self._status(result.reason, ready=False)
@@ -797,6 +809,7 @@ class RSMPage(QtWidgets.QWidget):
     def set_sources(self, paths):
         """The SPEC or NeXus files, or the folder (Directory), as Stitch's ``set_sources``: one is shown, more
         as "N files selected"."""
+        self._show_auto_ceiling(())  # a new selection: its ceilings are Preview's to resolve
         self._adopt_sources(paths)
         count = len(self._source_paths)
         self._source_shown = ("" if not count else self._source_paths[0] if count == 1
@@ -1660,6 +1673,10 @@ class RSMPage(QtWidgets.QWidget):
                 return
             self._prepared_fingerprint = preflight.form.fingerprint
             summary = preflight.summary
+            bound = preflight.request.plan.corrections
+            saturation = None if bound is None else bound.saturation
+            self._show_auto_ceiling(() if saturation is None else tuple(
+                None if value is None else (value, "saturation") for value in saturation))
             lines = rsm_preflight_summary_lines(summary)
             if preflight.output_current:  # as Stitch's Preview says it
                 lines.append(f"Output {Path(preflight.form.output_path).name}: already gridded with these "
