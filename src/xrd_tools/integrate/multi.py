@@ -26,6 +26,7 @@ from xrd_tools.core.containers import (
     IntegrationResult2D,
 )
 from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
+from xrd_tools.corrections.frame_preparation import correction_image
 from xrd_tools.integrate import pyfai_numexpr
 from xrd_tools.integrate.frame_workers import parallel_frames
 from xrd_tools.integrate.detector_mask import mask_with_detector
@@ -84,29 +85,6 @@ def _normalization_factors(
             f"(monitor must be > 0): {values[values <= 0].tolist()}"
         )
     return values
-
-
-def _detector_correction(value: np.ndarray | None, name: str, fill: float,
-                         min_fraction: float = DEFAULT_MIN_FLAT_FRACTION):
-    """Split a dark or flat image into finite values and the pixels it invalidates.
-
-    A non-finite dark pixel, or a flat pixel that ``prepare_flatfield`` finds
-    unusable (non-finite, not positive, or below ``min_fraction`` of the median),
-    cannot be corrected: it joins the frame mask and carries a neutral value.
-    """
-    if value is None:
-        return None, None
-    array = np.asarray(value, dtype=float)
-    if array.ndim != 2:
-        raise ValueError(f"Stitch {name} must be a 2-D detector image")
-    if name == "flat":
-        from xrd_tools.corrections.detector import prepare_flatfield  # noqa: PLC0415
-        invalid = ~np.isfinite(prepare_flatfield(array, min_fraction))
-    else:
-        invalid = ~np.isfinite(array)
-    if not invalid.any():
-        return array, None
-    return np.where(invalid, fill, array), invalid
 
 
 def _scout_extents(integrator, radial_unit, radial: bool, azimuth: bool):
@@ -276,8 +254,9 @@ def _streaming_multigeometry(
     # normalization, like solid angle. Its Poisson model treats the dark as
     # noiseless (variance max(1, raw)); a measured dark carries its own counting
     # noise, so with a dark the variance max(1, raw) + dark is passed explicitly.
-    dark, dark_invalid = _detector_correction(dark, "dark", 0.0)
-    flat, flat_invalid = _detector_correction(flat, "flat", 1.0, flat_min_fraction)
+    # admitted by Int's owners (corrections.frame_preparation, shared with the xrayutilities path and RSM)
+    dark, dark_invalid = correction_image(dark, "dark")
+    flat, flat_invalid = correction_image(flat, "flat", min_fraction=flat_min_fraction)
     invalid = (dark_invalid if flat_invalid is None else flat_invalid if dark_invalid is None
                else dark_invalid | flat_invalid)
     fixed_radial, fixed_azimuth = _resolve_streaming_ranges(
