@@ -92,7 +92,7 @@ from xrd_tools.io.analysis_artifact import (
 )
 from xrd_tools.io.nexus import write_rsm
 from xrd_tools.io.stat_identity import identity_ctime_ns
-from xrd_tools.io.spec import get_energy, get_energy_and_UB
+from xrd_tools.io.spec import get_UB, get_energy, get_energy_and_UB
 from xrd_tools.rsm.gridding import (
     RSMGridChunkLease,
     RSMGridChunkReleaseError,
@@ -397,6 +397,121 @@ class RSMBoundCorrections:
             "solid_angle": value.solid_angle,
             "polarization_factor": value.polarization_factor,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class RSMUBOverride:
+    """A UB matrix for an RSM in HKL, replacing the source's (the maintainer, 2026-10-01: "For files with no ub
+    matrix, a warning with a chance to enter the ub matrix manually or through a spec file can be offered").
+
+    Exactly one of ``matrix``, nine numbers row by row in SPEC's ``#G3`` convention (as SPEC writes the line), or
+    ``spec_path`` with ``scan``, that SPEC scan's own ``#G3``. The numbers are checked when bound
+    (``RSM_UB_INVALID``)."""
+
+    matrix: tuple[float, ...] | None = None
+    spec_path: str | None = None
+    scan: str | None = None
+
+    def __post_init__(self) -> None:
+        manual = self.matrix is not None
+        if manual == (self.spec_path is not None or self.scan is not None):
+            raise TypeError("an RSM UB is nine numbers or a SPEC file and scan, not both")
+        if manual:
+            if type(self.matrix) is not tuple or len(self.matrix) != 9 or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float)) for value in self.matrix):
+                raise TypeError("an RSM UB matrix is nine numbers, row by row")
+            object.__setattr__(self, "matrix", tuple(float(value) for value in self.matrix))
+        elif (type(self.spec_path) is not str or not self.spec_path or type(self.scan) is not str
+              or not self.scan.strip()):
+            raise TypeError("an RSM UB from SPEC needs a SPEC file and a scan")
+
+
+@dataclass(frozen=True, slots=True)
+class RSMBoundUB:
+    """``RSMUBOverride`` bound at Preview: the nine numbers used, and for a SPEC source its file's revision."""
+
+    override: RSMUBOverride
+    matrix: tuple[float, ...]
+    #: (name, resolved path, SHA-256, stat state, scan key) of the SPEC file; None for a typed matrix
+    spec_receipt: tuple | None
+
+    def array(self) -> np.ndarray:
+        return np.asarray(self.matrix, dtype=np.float64).reshape(3, 3)
+
+    def identity(self) -> tuple[object, ...]:
+        return ("ub-override-v1", self.matrix,
+                None if self.spec_receipt is None else (self.spec_receipt[4], self.spec_receipt[2]))
+
+    def to_provenance(self) -> dict[str, object]:
+        if self.spec_receipt is None:
+            return {"kind": "manual", "matrix": list(self.matrix)}
+        return {"kind": "spec", "name": self.spec_receipt[0], "scan": self.spec_receipt[4],
+                "sha256": self.spec_receipt[2], "matrix": list(self.matrix)}
+
+
+def _rsm_spec_scan_key(scan: str) -> str:
+    """A SPEC scan as silx keys it: ``43`` is its first occurrence, ``43.1``; ``43.2`` as given."""
+    value = scan.strip()
+    return f"{value}.1" if value.isdigit() else value
+
+
+def _rsm_ub_file_state(path: Path) -> tuple[int, ...]:
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _bind_rsm_ub(override, coordinate_frame) -> RSMBoundUB | None:
+    """Bind a UB override at Preview: typed numbers as given, or a SPEC scan's ``#G3`` with its file's revision.
+    Only an HKL map uses a UB (``RSM_UB_OVERRIDE_UNUSED`` in Q); a non-finite or singular matrix is
+    ``RSM_UB_INVALID``, a SPEC scan without a ``#G3`` line ``RSM_UB_MISSING``."""
+    if override is None:
+        return None
+    if type(override) is not RSMUBOverride:
+        raise TypeError("RSM UB override must be exact RSMUBOverride")
+    if coordinate_frame is not RSMCoordinateFrame.HKL:
+        raise RSMOperationRefused("RSM_UB_OVERRIDE_UNUSED", "a UB applies to an HKL map; Q coordinates use none")
+    receipt = None
+    if override.matrix is not None:
+        values = override.matrix
+    else:
+        scan = _rsm_spec_scan_key(override.scan)
+        try:
+            resolved = Path(override.spec_path).expanduser().resolve(strict=True)
+            before = _rsm_ub_file_state(resolved)
+            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            ub = get_UB(str(resolved), scan)
+            if _rsm_ub_file_state(resolved) != before:
+                raise RSMOperationRefused("RSM_UB_INVALID", "the UB's SPEC file changed while read")
+        except KeyError as error:
+            if error.args and error.args[0] == "G3":
+                raise RSMOperationRefused("RSM_UB_MISSING",
+                                          f"SPEC scan {scan} records no UB matrix (#G3)") from error
+            raise RSMOperationRefused("RSM_UB_INVALID", f"that SPEC file has no scan {scan}") from error
+        except (OSError, ValueError, TypeError) as error:
+            if isinstance(error, RSMOperationRefused):
+                raise
+            raise RSMOperationRefused("RSM_UB_INVALID", f"the UB's SPEC scan is unreadable: {error}") from error
+        values = tuple(float(value) for value in np.asarray(ub, dtype=np.float64).ravel())
+        receipt = (resolved.name, str(resolved), digest, before, scan)
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (9,) or not np.all(np.isfinite(array)):
+        raise RSMOperationRefused("RSM_UB_INVALID", "a UB matrix is nine finite numbers")
+    _rsm_coordinate_matrix(RSMCoordinateFrame.HKL, array.reshape(3, 3), invalid_ub_code="RSM_UB_INVALID")
+    return RSMBoundUB(override, tuple(float(value) for value in array), receipt)
+
+
+def _revalidate_rsm_ub(bound) -> None:
+    """At the run: a SPEC file the UB came from is unchanged since Preview."""
+    if bound is None or bound.spec_receipt is None:
+        return
+    path = Path(bound.spec_receipt[1])
+    try:
+        unchanged = (_rsm_ub_file_state(path) == bound.spec_receipt[3]
+                     and hashlib.sha256(path.read_bytes()).hexdigest() == bound.spec_receipt[2])
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        raise RSMOperationRefused("SOURCE_IDENTITY_MISMATCH", "the UB's SPEC file changed since Preview")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1459,6 +1574,7 @@ def _capture_preflight_facts(
     allow_single_static_hot: bool = False,
     cancel_token: threading.Event | None = None,
     coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
+    ub_override: RSMBoundUB | None = None,
 ) -> _RSMCapturedMemberFacts:
     if type(coordinate_frame) is not RSMCoordinateFrame:
         raise TypeError("RSM coordinate frame must be exact")
@@ -1592,7 +1708,14 @@ def _capture_preflight_facts(
             cancel_token=cancel_token,
         ) as opened:
             try:
-                if coordinate_frame is RSMCoordinateFrame.HKL:
+                if coordinate_frame is RSMCoordinateFrame.HKL and ub_override is not None:
+                    # a UB given at Preview replaces the source's (AUD-9 stage 2b C5); the energy is the source's
+                    energy = get_energy(
+                        analysis.resolved_root,
+                        analysis.resolved_scan,
+                    )
+                    ub_value = ub_override.array()
+                elif coordinate_frame is RSMCoordinateFrame.HKL:
                     energy, ub_value = get_energy_and_UB(
                         analysis.resolved_root,
                         analysis.resolved_scan,
@@ -1605,17 +1728,19 @@ def _capture_preflight_facts(
                     ub_value = None
             except KeyError as error:
                 if normalize_source_fact_errors:
-                    code = (
-                        invalid_ub_code
-                        if (
-                            coordinate_frame is RSMCoordinateFrame.HKL
-                            and error.args
-                            and error.args[0] == "G3"
-                        )
-                        else invalid_energy_code
+                    missing_ub = (
+                        coordinate_frame is RSMCoordinateFrame.HKL
+                        and error.args
+                        and error.args[0] == "G3"
                     )
+                    if missing_ub:  # no #G3 line: give a UB, or map in Q (AUD-9 stage 2b C5)
+                        raise RSMOperationRefused(
+                            "RSM_UB_MISSING",
+                            "this source records no UB matrix (#G3); enter one, take it from a SPEC "
+                            "scan, or choose Q coordinates",
+                        ) from error
                     raise RSMOperationRefused(
-                        code or "RSM_MEMBER_ENERGY_INVALID"
+                        invalid_energy_code or "RSM_MEMBER_ENERGY_INVALID"
                     ) from error
                 raise
             except ValueError as error:
@@ -2396,11 +2521,14 @@ class RSMOperationPlanV2:
     _claim: InitVar[object] = None
     #: The per-frame corrections bound at Preview (``RSMBoundCorrections``); None: none, as before.
     corrections: object = None
+    #: A UB given at Preview (``RSMBoundUB``), replacing every member's source UB; None: the sources' own.
+    ub_override: object = None
 
     def __post_init__(self, _claim: object) -> None:
         if (
             _claim is not _RSM_V2_FACTORY
             or (self.corrections is not None and type(self.corrections) is not RSMBoundCorrections)
+            or (self.ub_override is not None and type(self.ub_override) is not RSMBoundUB)
             or type(self.effective_geometry) is not RSMEffectiveGeometry
             or type(self.ordered_geometry_bindings) is not tuple
             or not 1 <= len(self.ordered_geometry_bindings) <= 16
@@ -2475,7 +2603,8 @@ class RSMOperationPlanV2:
             "bounded-chunk-working-set-v1",
             None,
             None,
-        ) + (() if self.corrections is None else (self.corrections.identity(),))
+        ) + (() if self.corrections is None else (self.corrections.identity(),)) + (
+            () if self.ub_override is None else (self.ub_override.identity(),))
 
     def to_provenance(self) -> dict[str, object]:
         return {
@@ -2495,6 +2624,8 @@ class RSMOperationPlanV2:
             "gi_intensity_correction": None,
             # the per-frame corrections, only when the plan has them
             **({} if self.corrections is None else {"frame_corrections": self.corrections.to_provenance()}),
+            # where the UB came from, only when given at Preview (the sources' own otherwise)
+            **({} if self.ub_override is None else {"ub_source": self.ub_override.to_provenance()}),
             "fingerprint": self.fingerprint,
         }
 
@@ -2519,6 +2650,7 @@ def _make_rsm_operation_plan_v2(
     max_frame_bytes: int,
     max_chunk_bytes: int,
     corrections: RSMBoundCorrections | None = None,
+    ub_override: RSMBoundUB | None = None,
 ) -> RSMOperationPlanV2:
     canonical = (
         "rsm-operation-plan-v2",
@@ -2541,7 +2673,8 @@ def _make_rsm_operation_plan_v2(
         "bounded-chunk-working-set-v1",
         None,
         None,
-    ) + (() if corrections is None else (corrections.identity(),))
+    ) + (() if corrections is None else (corrections.identity(),)) + (
+        () if ub_override is None else (ub_override.identity(),))
     fingerprint = module_plan_fingerprint(ModuleKind.RSM, canonical)
     return RSMOperationPlanV2(
         effective_geometry,
@@ -2556,6 +2689,7 @@ def _make_rsm_operation_plan_v2(
         fingerprint,
         _RSM_V2_FACTORY,
         corrections,
+        ub_override,
     )
 
 
@@ -4006,9 +4140,11 @@ def prepare_rsm_operation_v2(
     coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
     cancel_token: threading.Event | None = None,
     corrections: RSMFrameCorrections | None = None,
+    ub_override: RSMUBOverride | None = None,
 ) -> RSMOperationRequestV2:
     """Build one ordered, image-free RSM v2 Preview transaction. ``corrections`` (``RSMFrameCorrections``)
-    binds the Mask File, dark and flat here, as Stitch's Preview does."""
+    binds the Mask File, dark and flat here, as Stitch's Preview does. ``ub_override`` (``RSMUBOverride``, HKL
+    only) replaces every member's source UB, typed or from a named SPEC scan."""
 
     if (
         type(source_group) is not ModuleSourceGroupReceipt
@@ -4080,6 +4216,7 @@ def prepare_rsm_operation_v2(
     output = _bind_project_output(output, root)
     # Preview creates no folder: the run makes it (_create_rsm_v2_output_folder)
     output_authority = _capture_output_authority(output, root, allow_absent_parent=True)
+    bound_ub = _bind_rsm_ub(ub_override, coordinate_frame)  # after the cheap checks: it reads a file
 
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 
@@ -4141,6 +4278,7 @@ def prepare_rsm_operation_v2(
                 allow_single_static_hot=True,
                 cancel_token=cancel_token,
                 coordinate_frame=coordinate_frame,
+                ub_override=bound_ub,
             )
             try:
                 read_options = json.loads(facts.source_options_json)[
@@ -4185,6 +4323,7 @@ def prepare_rsm_operation_v2(
             max_frame_bytes=max_frame_bytes,
             max_chunk_bytes=max_chunk_bytes,
             corrections=_bind_rsm_corrections(corrections, member_tuple, max_frame_bytes),
+            ub_override=bound_ub,
         )
         preflight = _make_rsm_group_preflight_v2(
             project_root=root,
@@ -5411,6 +5550,7 @@ def _revalidate_rsm_v2_authorities(
     cancel_token: threading.Event | None,
 ) -> None:
     _revalidate_rsm_v2_geometry(request)
+    _revalidate_rsm_ub(request.plan.ub_override)  # a UB taken from a SPEC file: that file unchanged
     for source, member in zip(
         request.module.source.members,
         request.preflight.members,

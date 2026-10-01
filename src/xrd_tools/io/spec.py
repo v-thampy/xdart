@@ -173,6 +173,14 @@ def get_energy_and_UB(spec_file: Path | str, scan_num: str) -> tuple[float, np.n
     return energy, UB
 
 
+def get_UB(spec_file: Path | str, scan_num: str) -> np.ndarray:
+    """Return a scan's ``#G3`` UB matrix (3 x 3) without requiring an energy motor. A scan with no ``#G3``
+    line raises ``KeyError("G3")``; a scan the file does not hold raises silx's own ``KeyError``."""
+
+    header_dict = _get_spec_scan(spec_file, scan_num).scan_header_dict
+    return np.array(header_dict["G3"].split(), dtype=float).reshape(3, 3)
+
+
 def get_energy(spec_file: Path | str, scan_num: str) -> float:
     """Return scan energy without requiring or parsing a ``#G3`` UB header."""
 

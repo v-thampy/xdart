@@ -33,6 +33,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
 from xrd_tools.analysis.rsm_operation import (
     RSMDetectorGeometry,
     RSMFrameCorrections,
+    RSMUBOverride,
     RSMImageConditioning,
     RSMNormalizationMode,
     RSMNormalizationPolicy,
@@ -402,6 +403,10 @@ class RSMToolFormV2:
     #: Decision 5 (maintainer, 2026-10-01, "turn on by default"): the solid angle and polarization, at
     #: Stitch's 0.99.
     corrections: RSMFrameCorrections | None = RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+    #: A UB given for an HKL map (``RSMUBOverride``: typed, or a SPEC scan's), replacing the sources' own; it
+    #: applies to HKL only, so a Q form neither passes nor fingerprints it (AUD-9 stage 2b C5). None: the
+    #: sources' own UB.
+    ub: RSMUBOverride | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -439,6 +444,7 @@ class RSMToolFormV2:
             or type(self.overwrite) is not AnalysisArtifactOverwrite
             or type(self.coordinate_frame) is not RSMCoordinateFrame
             or (self.corrections is not None and type(self.corrections) is not RSMFrameCorrections)
+            or (self.ub is not None and type(self.ub) is not RSMUBOverride)
         ):
             raise TypeError("RSM v2 tool form is invalid")
         normalization_keys = {
@@ -478,7 +484,9 @@ class RSMToolFormV2:
             self.coordinate_frame.axis_units,
             self.coordinate_frame.matrix_policy,
         ) + (() if self.output_family is None else (self.output_family,)) + (
-            () if self.corrections is None else (("frame-corrections", repr(self.corrections)),))
+            () if self.corrections is None else (("frame-corrections", repr(self.corrections)),)) + (
+            () if self.ub is None or self.coordinate_frame is not RSMCoordinateFrame.HKL
+            else (("ub-override", repr(self.ub)),))
         object.__setattr__(
             self,
             "fingerprint",
@@ -1703,6 +1711,8 @@ def prepare_rsm_tool_v2(
             coordinate_frame=form.coordinate_frame,
             cancel_token=cancel_token,
             **({} if form.corrections is None else {"corrections": form.corrections}),
+            **({} if form.ub is None or form.coordinate_frame is not RSMCoordinateFrame.HKL
+               else {"ub_override": form.ub}),
         )
     except (
         RSMOperationRefused,
