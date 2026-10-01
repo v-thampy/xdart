@@ -590,6 +590,72 @@ def rsm_tool_preset(
     )
 
 
+@dataclass(slots=True)
+class RSMMemberDraft:
+    """One ordered RSM member as an editor holds it (text and numbers, not yet a validated
+    ``RSMScanMemberForm``): the RSM dialog's and the RSM page's member draft."""
+
+    spec_path: str
+    scan: str
+    image_dir: str
+    image_stem: str
+    frame_start: int
+    frame_stop: str
+    frame_step: int
+    detector_rows: int
+    detector_columns: int
+    raw_dtype: str
+    raw_header_skip: int
+    selector_names: tuple[str, ...]
+    selector_occurrences: tuple[int, ...]
+
+    @classmethod
+    def from_scan43(cls):
+        preset = rsm_tool_preset()
+        selectors = tuple(selector for _role, selector in preset.motor_selectors)
+        return cls(
+            preset.spec_relative_path,
+            preset.scan,
+            preset.image_directory_relative_path,
+            preset.image_stem,
+            preset.frame_selector.start_label,
+            str(preset.frame_selector.stop_label),
+            preset.frame_selector.step,
+            preset.detector_shape[0],
+            preset.detector_shape[1],
+            preset.raw_dtype,
+            preset.raw_header_skip,
+            tuple(selector.name for selector in selectors),
+            tuple(selector.occurrence for selector in selectors),
+        )
+
+    def clone(self):
+        return RSMMemberDraft(
+            self.spec_path,
+            self.scan,
+            self.image_dir,
+            self.image_stem,
+            self.frame_start,
+            self.frame_stop,
+            self.frame_step,
+            self.detector_rows,
+            self.detector_columns,
+            self.raw_dtype,
+            self.raw_header_skip,
+            tuple(self.selector_names),
+            tuple(self.selector_occurrences),
+        )
+
+    def selected_count_text(self) -> str:
+        try:
+            stop = int(self.frame_stop)
+        except ValueError:
+            return "open"
+        if stop < self.frame_start:
+            return "invalid"
+        return str((stop - self.frame_start) // self.frame_step + 1)
+
+
 @dataclass(frozen=True, slots=True)
 class RSMPreflightMember:
     label: int
@@ -1687,8 +1753,122 @@ def prepare_rsm_tool_v2(
     return RSMToolPreflightV2(form, request, summary, _PREFLIGHT_V2_FACTORY)
 
 
+def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]:
+    """An RSM v2 Preview as text, one line a fact: the ordered members, every exact identity and each
+    member's raw dependencies (the RSM dialog's and the RSM page's Preview)."""
+    if type(summary) is not RSMToolPreflightSummaryV2:
+        raise TypeError("RSM v2 presenter requires exact summary")
+    frame = summary.coordinate_frame
+    axis_symbols = frame.axis_symbols
+    if frame is RSMCoordinateFrame.HKL:
+        source_ub_authority = (
+            "Source UB authority: authenticated source UB drives H/K/L "
+            "conversion"
+        )
+    else:
+        source_ub_authority = (
+            "Source UB authority: source UB is unused and non-driving; "
+            "explicit identity drives Cartesian Q"
+        )
+    union = ", ".join(
+        f"{name} {low:.10g}..{high:.10g}"
+        for name, (low, high) in zip(
+            axis_symbols,
+            summary.union_q_bounds,
+            strict=True,
+        )
+    )
+    lines = [
+        f"Project: {summary.project_root}",
+        f"Output: {summary.output_relative_path}",
+        f"Coordinate frame: {frame.display_name}",
+        "Stored axes: "
+        + ", ".join(
+            label if unit is None else f"{label} [{unit}]"
+            for label, unit in zip(
+                frame.axis_symbols,
+                frame.axis_units,
+                strict=True,
+            )
+        ),
+        f"xrayutilities matrix policy: {frame.matrix_policy}",
+        source_ub_authority,
+        (
+            f"Ordered members: {len(summary.members)} · total frames "
+            f"{summary.total_selected_frames}"
+        ),
+        f"Asset raw: {summary.geometry_asset_raw_sha256}",
+        f"Asset semantic: {summary.geometry_asset_semantic_fingerprint}",
+        f"Asset receipt: {summary.geometry_asset_receipt_fingerprint}",
+        f"Effective geometry: {summary.effective_geometry_fingerprint}",
+        f"Common grid: {summary.common_grid_fingerprint}",
+        (
+            "Union q bounds: "
+            if frame is RSMCoordinateFrame.HKL
+            else "Union coordinate bounds: "
+        )
+        + union,
+        f"Grid bins: {summary.bins} · detector {summary.detector_shape}",
+        (
+            f"Normalization: {summary.normalization_mode.value} · divisor "
+            f"{summary.normalization_divisor_range[0]:.12g}.."
+            f"{summary.normalization_divisor_range[1]:.12g}"
+        ),
+        f"Mask intent: {summary.mask_intent}",
+        f"Group source: {summary.group_source_fingerprint}",
+        f"Group preflight: {summary.group_preflight_fingerprint}",
+        f"Plan: {summary.plan_fingerprint}",
+        f"Request: {summary.request_fingerprint}",
+        f"Output identity: {summary.output_fingerprint}",
+        "Holds: " + ", ".join(summary.holds),
+        "",
+    ]
+    for member in summary.members:
+        coordinate_matrix = "; ".join(
+            " ".join(f"{value:.10g}" for value in row) for row in member.ub
+        )
+        bounds = ", ".join(
+            f"{name} {low:.10g}..{high:.10g}"
+            for name, (low, high) in zip(
+                axis_symbols,
+                member.q_bounds,
+                strict=True,
+            )
+        )
+        lines.extend(
+            (
+                (
+                    f"Member {member.ordinal + 1}: "
+                    f"{member.source_relative_path} · scan "
+                    f"{member.source_scan} · "
+                    f"{member.selected_frame_count} frames"
+                ),
+                f"  labels: {member.selected_labels}",
+                f"  form: {member.member_form_fingerprint}",
+                f"  module source: {member.module_source_fingerprint}",
+                f"  source: {member.source_fingerprint}",
+                f"  table: {member.table_fingerprint}",
+                f"  member preflight: {member.member_preflight_fingerprint}",
+                f"  geometry binding: {member.geometry_binding_fingerprint}",
+                f"  energy: {member.energy_eV:.12g} eV",
+                f"  xrayutilities matrix: {coordinate_matrix}",
+                f"  coordinate bounds: {bounds}",
+                (
+                    "  divisor: "
+                    f"{member.normalization_divisor_range[0]:.12g}.."
+                    f"{member.normalization_divisor_range[1]:.12g}"
+                ),
+                f"  raw dependencies ({member.dependency_file_count}):",
+                *(f"    {path}" for path in member.dependency_files),
+                "",
+            )
+        )
+    return lines
+
+
 __all__ = [
     "RSMFrameSelector",
+    "RSMMemberDraft",
     "RSMPreflightMember",
     "RSMScanMemberForm",
     "RSMScanPreset",
@@ -1703,5 +1883,6 @@ __all__ = [
     "RSMToolPresetValues",
     "prepare_rsm_tool",
     "prepare_rsm_tool_v2",
+    "rsm_preflight_summary_lines",
     "rsm_tool_preset",
 ]
