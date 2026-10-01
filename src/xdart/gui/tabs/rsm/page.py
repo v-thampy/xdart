@@ -1,6 +1,6 @@
 """Native RSM workspace page (AUD-9, stage 1) over the RSM v2 owner.
 
-The maintainer, 2026-09-30: "Can you start aud 9 in a separate branch". The page is the RSM dialog's
+The maintainer, 2026-09-30: "Can you start aud 9 in a separate branch". The page is the classic RSM dialog's
 workflow in the main workspace, on the shared components as the Stitch page has them: Int's Controls panel
 and run bar, its section actions (Preview · Retry · Advanced), and its scientific panes for the six
 products. The RSM v2 owner (``tools.rsm_owner.RSMToolOwner.v2``) is the one operation owner: the page builds
@@ -15,7 +15,7 @@ the same settings over the same frames. Preview creates no folder: the run makes
 Stage 2b (design §2; the maintainer, 2026-10-01: "the control panel can be almost identical to the stitch control
 panel"): Experiment is Stitch's (Calibrate · Make Mask in the shared windows, Calibration, Mask File), and Source
 is Stitch's rows over Stitch's own source owner (``rsm_member_groups``), its scans found on the shared single
-worker before Preview and Run.
+worker before Preview and Run. The classic dialog was retired at the end of stage 2b (G10).
 """
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ _AUTO_HINT = "Auto · the detector's saturation"  # before a Preview resolves ea
 
 _LOG = logging.getLogger(__name__)
 _MIB = 1024 * 1024
-#: The grids the RSM dialog offers (the scan-43 preset's quick and full).
+#: The grids the scan-43 preset offers (quick and full), as the classic RSM dialog did.
 _GRIDS = {"Quick 40×40×40": (40, 40, 40), "Full 200×200×200": (200, 200, 200)}
 _FRAMES = {frame.display_name: frame for frame in RSMCoordinateFrame}
 #: The run bar's modes this page runs.
@@ -980,7 +980,7 @@ class RSMPage(QtWidgets.QWidget):
 
     @staticmethod
     def _inside(project, text, name):
-        """A path as the RSM dialog reads one: required; a relative one is inside the Project."""
+        """A path as the classic RSM dialog read one: required; a relative one is inside the Project."""
         spelling = str(text).strip()
         if not spelling:
             raise ValueError(f"{name} is required")

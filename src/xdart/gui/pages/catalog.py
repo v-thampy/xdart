@@ -68,8 +68,8 @@ STITCH_PAGE = PageDescriptor(
 )
 
 # The native RSM workspace (AUD-9) on the RSM tool's key: Int's and Stitch's mode boxes and the host's
-# open_tool("rsm") reach it unchanged. The RSM dialog stays in the tree, unregistered, until the page has
-# its workflows (it is then retired, as the Stitching dialog was).
+# open_tool("rsm") reach it unchanged. The classic RSM dialog was retired once the page had its workflows
+# (AUD-9 stage 2b G10), as the Stitching dialog was.
 RSM_PAGE = PageDescriptor(
     key=RSM_TOOL_KEY,
     label="RSM",

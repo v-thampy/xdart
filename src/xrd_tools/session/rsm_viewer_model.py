@@ -76,8 +76,7 @@ def rsm_viewer_layout(
 def rsm_axis_bounds(values: object) -> tuple[float, float]:
     """The outer edges of a slice axis's bins, from their centres: half a bin
     beyond the first and last centre, where an image of the slice begins and ends
-    so that each pixel sits at its bin's centre (the RSM dialog's and the RSM
-    page's slices)."""
+    so that each pixel sits at its bin's centre (the RSM page's slices)."""
 
     axis = np.asarray(values, dtype=np.float64)
     if (

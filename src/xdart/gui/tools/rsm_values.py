@@ -873,77 +873,6 @@ def parse_rsm_angle_mapping(text) -> tuple[tuple[str, MetadataColumnSelector], .
     return tuple((role, pairs[role]) for role in _PSIC_ROLES)
 
 
-@dataclass(slots=True)
-class RSMMemberDraft:
-    """One ordered RSM member as an editor holds it (text and numbers, not yet a validated
-    ``RSMScanMemberForm``): the RSM dialog's and the RSM page's member draft. The page's frame fields
-    hold the text as typed (the dialog's spin boxes, numbers): ``frame_selector`` reads and refuses it."""
-
-    spec_path: str
-    scan: str
-    image_dir: str
-    image_stem: str
-    frame_start: int | str
-    frame_stop: str
-    frame_step: int | str
-    detector_rows: int
-    detector_columns: int
-    raw_dtype: str
-    raw_header_skip: int
-    selector_names: tuple[str, ...]
-    selector_occurrences: tuple[int, ...]
-
-    @classmethod
-    def from_scan43(cls):
-        preset = rsm_tool_preset()
-        selectors = tuple(selector for _role, selector in preset.motor_selectors)
-        return cls(
-            preset.spec_relative_path,
-            preset.scan,
-            preset.image_directory_relative_path,
-            preset.image_stem,
-            preset.frame_selector.start_label,
-            str(preset.frame_selector.stop_label),
-            preset.frame_selector.step,
-            preset.detector_shape[0],
-            preset.detector_shape[1],
-            preset.raw_dtype,
-            preset.raw_header_skip,
-            tuple(selector.name for selector in selectors),
-            tuple(selector.occurrence for selector in selectors),
-        )
-
-    def clone(self):
-        return RSMMemberDraft(
-            self.spec_path,
-            self.scan,
-            self.image_dir,
-            self.image_stem,
-            self.frame_start,
-            self.frame_stop,
-            self.frame_step,
-            self.detector_rows,
-            self.detector_columns,
-            self.raw_dtype,
-            self.raw_header_skip,
-            tuple(self.selector_names),
-            tuple(self.selector_occurrences),
-        )
-
-    def frame_selector(self) -> RSMFrameSelector:
-        """The member's frame labels as typed (``rsm_frame_selector``)."""
-        return rsm_frame_selector(self.frame_start, self.frame_stop, self.frame_step)
-
-    def selected_count_text(self) -> str:
-        try:
-            selector = self.frame_selector()
-        except ValueError:
-            return "invalid"
-        if selector.stop_label is None:
-            return "open"
-        return str((selector.stop_label - selector.start_label) // selector.step + 1)
-
-
 @dataclass(frozen=True, slots=True)
 class RSMPreflightMember:
     label: int
@@ -2159,7 +2088,7 @@ def _source_ub_text(member) -> str:
 
 def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]:
     """An RSM v2 Preview as text, one line a fact: the ordered members, every exact identity and each
-    member's raw dependencies (the RSM dialog's and the RSM page's Preview)."""
+    member's raw dependencies (the RSM page's Preview)."""
     if type(summary) is not RSMToolPreflightSummaryV2:
         raise TypeError("RSM v2 presenter requires exact summary")
     frame = summary.coordinate_frame
@@ -2292,7 +2221,6 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
 __all__ = [
     "MAX_RSM_MEMBERS",
     "RSMFrameSelector",
-    "RSMMemberDraft",
     "RSMPreflightMember",
     "RSMScanMemberForm",
     "RSMScanPreset",

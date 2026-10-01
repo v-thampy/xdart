@@ -82,11 +82,6 @@ _DEBT: dict[str, dict[str, int]] = {
     "pages/scattering_workspace.py": {
         "QCheckBox": 1, "QLineEdit": 1, "QSpinBox": 1, "str:configMenuButton": 1, "str:helpMenuButton": 1,
     },
-    # The classic RSM dialog, retired with AUD-9's last stage.
-    "tools/rsm_tool.py": {
-        "ImageItem": 2, "PlotDataItem": 2, "PlotWidget": 1, "QComboBox": 4, "QFileDialog.getExistingDirectory": 1,
-        "QFileDialog.getOpenFileName": 1, "QFileDialog.getSaveFileName": 1, "QLineEdit": 11, "QSpinBox": 1,
-    },
 }
 
 

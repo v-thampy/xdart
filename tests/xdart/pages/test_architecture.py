@@ -38,7 +38,6 @@ for name in (
     'xdart.gui.tabs.scattering',
     'xdart.gui.tabs.scattering.page',
     'xdart.gui.tools.stitch_owner',
-    'xdart.gui.tools.rsm_tool',
     'xdart.gui.tools.rsm_owner',
     'xrd_tools.analysis.stitch_operation',
     'xrd_tools.analysis.rsm_operation',
