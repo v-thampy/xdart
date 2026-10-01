@@ -1407,6 +1407,34 @@ def test_a_save_path_changed_while_the_scans_were_found_asks_for_another_run(qap
         _close(page, qapp)
 
 
+def test_a_queued_preview_reads_no_output_header_ahead_of_its_rsms_preflights(qapp, tmp_path, monkeypatch):
+    """G11 self-review: only a queued Run checks its outputs while the scans are found. A Preview grids nothing,
+    and each RSM's own preflight checks its output, so the early check would read every header twice."""
+    from xrd_tools.io import analysis_artifact
+    _commit_instead_of_gridding(monkeypatch, _values())
+    early, check = [], analysis_artifact.analysis_output_refusal
+
+    def counted(target, kind):  # the early check's import (each preflight holds rsm_values' own)
+        early.append(Path(target).name)
+        return check(target, kind)
+    monkeypatch.setattr(analysis_artifact, "analysis_output_refusal", counted)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        names = [Path(form.output_path).name for form in page.build_forms()]
+        early.clear()  # resolve_source checks them (scripts and rows)
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready · 2 RSMs" in label.full_text())
+        assert early == []
+        page.begin_run()
+        _wait(page, qapp, lambda: "Saved 2 of 2 RSMs" in label.full_text())
+        assert early == names
+    finally:
+        _close(page, qapp)
+
+
 def _own_ubs(root, ubs):
     """The synthetic source's SPEC file again, each scan with its own #G3 (None: the scan records no UB)."""
     _spec_file(root / "source" / "RSM_synth", [

@@ -898,9 +898,11 @@ class RSMPage(QtWidgets.QWidget):
                     "frame_first", "frame_last", "frame_step", "adv_rows", "adv_columns", "adv_dtype",
                     "adv_header", "adv_angle_mapping")))
 
-    def _resolution_request(self):
-        """(Stitch's source selection, the members' options) for ``rsm_member_groups``: the Project's paths
-        absolute, one raw decoder, frame range and Angle mapping for every scan. ValueError names the row."""
+    def _resolution_request(self, *, outputs=True):
+        """(Stitch's source selection, the members' options, the outputs' place) for the resolver: the selection
+        and options for ``rsm_member_groups`` (the Project's paths absolute, one raw decoder, frame range and Angle
+        mapping for every scan) and, with ``outputs``, (Project, the Save Path's folder) for the queued outputs'
+        check (``_queue_refusals``; None skips it). ValueError names the row."""
         from xrd_tools.analysis.stitch_sources import StitchSourceSelection
         project = str(self._value("project_root")).strip()
         if not project:
@@ -928,7 +930,7 @@ class RSMPage(QtWidgets.QWidget):
             detector_shape=(int(self._value("adv_rows")), int(self._value("adv_columns"))),
             raw_dtype=str(self._value("adv_dtype")), raw_header_skip=int(self._value("adv_header")),
             motor_selectors=parse_rsm_angle_mapping(self._value("adv_angle_mapping")))
-        return selection, options, self._queue_target(root)
+        return selection, options, self._queue_target(root) if outputs else None
 
     def _queue_target(self, project):
         """(Project, the Save Path's folder): where several RSMs' outputs go, for their check while the scans are
@@ -1515,8 +1517,9 @@ class RSMPage(QtWidgets.QWidget):
         if self._owner.busy or self._resolving is not None:  # a running result keeps its form
             self._notice("RSM is busy · try again once it is done")
             return
-        try:
-            request = self._resolution_request()
+        try:  # a queued Run checks its outputs as the scans are found; a Preview grids nothing, and each RSM's
+            # own preflight checks its output (G11 self-review: no second header read per output)
+            request = self._resolution_request(outputs=action == "run")
         except (TypeError, ValueError) as error:
             self._notice(f"Invalid RSM request: {error}")
             return
