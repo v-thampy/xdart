@@ -1724,3 +1724,48 @@ def test_the_background_is_released_by_clear_bg_by_its_result_admitted_again_and
     finally:
         _close(page, qapp)
     assert page._background.phase == "RELEASED" and page._background.keyed_source() is None
+
+
+def test_a_queued_preview_counts_the_dark_and_flat_warnings_as_the_single_one_does(qapp, tmp_path, monkeypatch):
+    """G8c's residual: a queued Preview's status counts the dark and flat checks' warnings, each distinct one
+    once, as the single Preview's does (each RSM of the queue shares the page's flat)."""
+    _counting_grids(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        flat = np.full((195, 487), 1000.)
+        flat[:97] = 0
+        np.save(tmp_path / "flat.npy", flat)
+        page.set_field("flat_path", "flat.npy")
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready · 2 RSMs" in label.full_text())
+        assert label.full_text().endswith("Preview ready · 2 RSMs · 2 warnings (Preview lists them)")
+    finally:
+        _close(page, qapp)
+
+
+def test_another_calibration_returns_the_auto_hint_to_its_default(qapp, tmp_path, monkeypatch):
+    """G8c's residual: the Auto hint is the ceilings of the calibration a Preview resolved; another Calibration
+    row returns it to the default until the next Preview, as a new selection does."""
+    from PySide6 import QtWidgets
+    from xrd_tools.analysis import rsm_operation
+    monkeypatch.setattr(rsm_operation, "_rsm_member_saturation",
+                        lambda threshold, members, detector: (65535,) * len(members))
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        page._threshold_edited(THRESHOLD_ENABLED, True)
+
+        def hints():
+            return {edit.placeholderText() for edit in page.threshold_range.findChildren(QtWidgets.QLineEdit)}
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in label.full_text())
+        assert "Auto · 65535 (saturation)" in hints()
+        page.set_field("geometry_path", "calibration/another.json")
+        assert "Auto · the detector's saturation" in hints() and page._auto_threshold_max is None
+    finally:
+        _close(page, qapp)

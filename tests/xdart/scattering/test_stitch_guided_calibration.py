@@ -1006,3 +1006,22 @@ def test_each_page_opens_the_shared_calibration_window_with_its_own_context(tmp_
         for dialog in (stitch, rsm):
             dialog.close()
             dialog.deleteLater()
+
+
+def test_only_stitchs_window_says_pyfai_multigeometry_has_no_range_limit(tmp_path):
+    """G8c's residual: the del/nu range tips' closing sentence is about Stitch's Backend choice, so an RSM
+    window (which grids with the xrayutilities file alone) leaves it out."""
+    from pyqtgraph import QtWidgets
+
+    def range_tips(page):
+        dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
+        found = [dialog._fields[key].toolTip() or dialog._fields[key].parentWidget().toolTip()
+                 for key in ('del_domain', 'nu_domain')]
+        everything = [widget.toolTip() for widget in dialog.findChildren(QtWidgets.QWidget) if widget.toolTip()]
+        dialog.close()
+        return found, everything
+    stitch, _ = range_tips('Stitch')
+    assert all(tip.endswith('pyFAI MultiGeometry has no such limit.') for tip in stitch)
+    rsm, everything = range_tips('RSM')
+    assert all(tip.endswith("Blank: the calibrant scan's span.") for tip in rsm)
+    assert not [tip for tip in everything if 'MultiGeometry' in tip]

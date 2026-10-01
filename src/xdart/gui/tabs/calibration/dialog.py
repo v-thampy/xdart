@@ -351,6 +351,7 @@ _PAGE_USE = {
         "energy": " The saved calibration keeps the recorded energy, which Stitch checks the scans' energies against.",
         "energy_field": " (Stitch checks each scan's energy against it)",
         "range": ", and Stitch refuses frames outside what was checked",
+        "range_backend": " pyFAI MultiGeometry has no such limit.",
         "backend": ": the Backend under Processing chooses which of the two Stitch uses",
     },
     "RSM": {
@@ -843,8 +844,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         use = _PAGE_USE.get(self.context.page, {})
         range_tip = (f'The {{}} angles {self.context.page} may use this calibration\'s xrayutilities file for: it is '
                      'checked on every pixel over this range (with the calibrant frames and the scan\'s '
-                     f'frames){use.get("range", "")}. Blank: the calibrant scan\'s span. pyFAI MultiGeometry has no '
-                     'such limit.')
+                     f'frames){use.get("range", "")}. Blank: the calibrant scan\'s span.'
+                     f'{use.get("range_backend", "")}')  # Stitch's Backend choice; RSM grids with the one file
         self._edit(ranges, 'del_domain', 'del range for xrayutilities (min, max °)', '', tip=range_tip.format('del'))
         self._edit(ranges, 'nu_domain', 'nu range for xrayutilities (min, max °)', '', tip=range_tip.format('nu'))
         layout.addWidget(self._xu_ranges)

@@ -808,6 +808,8 @@ class RSMPage(QtWidgets.QWidget):
             self._source_changed(key)
         if key == "output_path":
             self._output_suggested = not str(self._value("output_path")).strip()
+        if key == "geometry_path":  # another calibration: its detector's ceilings are Preview's to resolve
+            self._show_auto_ceiling(())
         if key in {"project_root", "spec_path", "scan_mode", "scan", "normalization"} and "normalization" in self._rows:
             self._refresh_normalization()  # a kind's own files come through set_sources
         if key in {"coordinates", "ub_from"}:
@@ -1528,7 +1530,7 @@ class RSMPage(QtWidgets.QWidget):
             return
         if len(forms) > 1:
             self._jobs, self._job_action, self._job_total = list(forms), action, len(forms)
-            self._job_lines, self._job_skipped = [], 0
+            self._job_lines, self._job_skipped, self._job_warnings = [], 0, {}
             self._next_job()
             return
         form = forms[0]
@@ -1542,13 +1544,16 @@ class RSMPage(QtWidgets.QWidget):
         every RSM's lines."""
         if not self._jobs:
             done, total, skipped = self._job_form is not None, self._job_total, self._job_skipped
-            action, lines = self._job_action, self._job_lines
+            action, lines, warned = self._job_action, self._job_lines, len(self._job_warnings)
             self._clear_jobs()
             if not done:
                 return
             if action == "preview":
                 self.preview_text.setPlainText("\n".join([f"{total} RSMs", "", *lines, *self._skipped_lines()]))
-                self._status(f"Preview ready · {total} RSMs", ready=True)
+                # each distinct warning once, as the single Preview counts them (G8c's residual)
+                self._status(f"Preview ready · {total} RSMs" + (
+                    f" · {warned} {'warning' if warned == 1 else 'warnings'} (Preview lists them)" if warned else ""),
+                    ready=True)
                 self.preview_dialog.show()
             else:
                 gridded = total - skipped
@@ -1573,7 +1578,7 @@ class RSMPage(QtWidgets.QWidget):
 
     def _clear_jobs(self):
         self._jobs, self._job_action, self._job_form = [], None, None
-        self._job_total, self._job_lines, self._job_skipped = 0, [], 0
+        self._job_total, self._job_lines, self._job_skipped, self._job_warnings = 0, [], 0, {}
 
     def _begin_preflight(self, *, run, form=None):
         if self._owner.busy:  # a running result keeps its form
@@ -1691,6 +1696,7 @@ class RSMPage(QtWidgets.QWidget):
                 lines.append(f"Output {Path(preflight.form.output_path).name}: already gridded with these "
                              "settings (Append skips it)")
             if self._job_form is not None:  # a queue: this RSM's lines under its own heading
+                self._job_warnings.update(dict.fromkeys(summary.detector_image_warnings))
                 self._job_lines.extend([f"RSM {self._job_position()} · {Path(current.output_path).name}",
                                         *lines, ""])
                 if self._run_requested:
