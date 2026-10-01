@@ -66,6 +66,9 @@ class ShellCommandKind(str, Enum):
     RUN_ACTION = "run_action"
     STOP = "stop"
     SET_OUTPUT_POLICY = "set_output_policy"
+    #: a results-profile Data Browser (another page's results list): one result chosen, or Open… pressed
+    SELECT_RESULT = "select_result"
+    OPEN_RESULT = "open_result"
 
 
 class FrameSelectionIntent(str, Enum):

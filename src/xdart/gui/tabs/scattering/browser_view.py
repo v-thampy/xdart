@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
@@ -311,11 +312,58 @@ class _ElidedDirectoryLabel(QtWidgets.QLabel):
         self.setText(f"[{text}]")
 
 
+#: Int's Data Browser menus: (title, its actions); each button's object name is ``<title>MenuButton``.
+INT_BROWSER_MENUS = (
+    ("File", ("Open Folder", "New", "Save As", "Export")),
+    ("Config", ("Save", "Load", "Advanced", "Performance Diagnostics…")),
+    ("Help", ("Help", "Export Analyze Results Notebook")),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserProfile:
+    """What a page's Data Browser shows (AUD-9; the maintainer's reuse rule: another page mounts this view
+    instead of copying its menus, heading and lists). The default is Int's. A results profile (``results``)
+    lists a page's own results, filled through :meth:`BrowserView.reconcile_results`; choosing one emits
+    ``SELECT_RESULT`` and Open… emits ``OPEN_RESULT``."""
+
+    menus: tuple[tuple[str, tuple[str, ...]], ...] = INT_BROWSER_MENUS
+    #: Int's Config submenus (raw image resolution, heavy residency)
+    raw_resolution_menus: bool = True
+    list_caption: str = "Scans"
+    directory: bool = True
+    frames: bool = True
+    frames_caption: str = "Frames"
+    #: which actions show, of "Show All", "Metadata", "Auto Last" and "Open…"
+    actions: tuple[str, ...] = ("Show All", "Metadata", "Auto Last")
+    date_sort: bool = True
+    refresh: bool = True
+    results: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserResult:
+    """One entry of a results profile's list: its identity, the text shown and the tooltip."""
+
+    identifier: str
+    label: str
+    detail: str = ""
+
+
 class BrowserView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        profile: BrowserProfile | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.profile = BrowserProfile() if profile is None else profile
+        if type(self.profile) is not BrowserProfile:
+            raise TypeError("profile must be an exact BrowserProfile")
+        self._results: tuple[BrowserResult, ...] = ()
         self.setObjectName("e3BrowserView")
         self.setMinimumWidth(255)
         self._scans = ()
@@ -356,8 +404,10 @@ class BrowserView(QtWidgets.QFrame):
         scan_labels_layout = QtWidgets.QHBoxLayout(scan_labels)
         scan_labels_layout.setContentsMargins(0, 0, 0, 0)
         scan_labels_layout.setSpacing(4)
-        self.scans_label = QtWidgets.QLabel("Scans")
+        self.scans_label = QtWidgets.QLabel(self.profile.list_caption)
         self.directory_label = _ElidedDirectoryLabel()
+        if not self.profile.directory:
+            self.directory_label.hide()
         scan_labels_layout.addWidget(self.scans_label)
         scan_labels_layout.addWidget(self.directory_label, 1)
         self.scans = QtWidgets.QListWidget()
@@ -365,8 +415,9 @@ class BrowserView(QtWidgets.QFrame):
         self._artifact_navigation_filter = _ArtifactNavigationFilter(
             self.scans, self._activate_directory, self._visit_artifact,
         )
-        self.scans.installEventFilter(self._artifact_navigation_filter)
-        self.scans.viewport().installEventFilter(self._artifact_navigation_filter)
+        if not self.profile.results:  # a results list has no directories or artifacts to visit
+            self.scans.installEventFilter(self._artifact_navigation_filter)
+            self.scans.viewport().installEventFilter(self._artifact_navigation_filter)
         scan_pane_layout.addWidget(scan_labels)
         scan_pane_layout.addWidget(self.scans, 1)
 
@@ -374,7 +425,7 @@ class BrowserView(QtWidgets.QFrame):
         frame_pane_layout = QtWidgets.QVBoxLayout(frame_pane)
         frame_pane_layout.setContentsMargins(0, 0, 0, 0)
         self._frame_pane_layout = frame_pane_layout
-        self.frames_label = QtWidgets.QLabel("Frames")
+        self.frames_label = QtWidgets.QLabel(self.profile.frames_caption)
         self.frames = QtWidgets.QListView()
         self.frames.setUniformItemSizes(True)
         self.frames.setObjectName("e3BrowserFrameList")
@@ -406,6 +457,8 @@ class BrowserView(QtWidgets.QFrame):
 
         lists.addWidget(scan_pane)
         lists.addWidget(frame_pane)
+        if not self.profile.frames:
+            frame_pane.hide()
         lists.setStretchFactor(0, 3)
         lists.setStretchFactor(1, 1)
         layout.addWidget(lists, 1)
@@ -418,13 +471,29 @@ class BrowserView(QtWidgets.QFrame):
         for button in (self.show_all, self.metadata, self.auto_last):
             button.setObjectName("e3BrowserCompactButton")
         self.auto_last.setCheckable(True)
-        for button in (self.show_all, self.metadata, self.auto_last):
+        self._action_buttons = {"Show All": self.show_all, "Metadata": self.metadata,
+                                "Auto Last": self.auto_last}
+        for label, button in tuple(self._action_buttons.items()):
             actions.addWidget(button)
+            if label not in self.profile.actions:
+                button.hide()
+        self.open_result = None
+        if "Open…" in self.profile.actions:
+            self.open_result = QtWidgets.QPushButton("Open…")
+            self.open_result.setObjectName("e3BrowserCompactButton")
+            self._action_buttons["Open…"] = self.open_result
+            actions.addWidget(self.open_result)
+            self.open_result.clicked.connect(
+                lambda: self._emit(ShellCommandKind.OPEN_RESULT)
+            )
         layout.addLayout(actions)
 
-        self.scans.itemSelectionChanged.connect(self._scan_selected)
-        self.scans.itemClicked.connect(self._activate_directory)
-        self.scans.itemActivated.connect(self._activate_directory)
+        if self.profile.results:
+            self.scans.currentItemChanged.connect(self._result_selected)
+        else:
+            self.scans.itemSelectionChanged.connect(self._scan_selected)
+            self.scans.itemClicked.connect(self._activate_directory)
+            self.scans.itemActivated.connect(self._activate_directory)
         self.frames.selectionModel().selectionChanged.connect(
             self._frames_selected
         )
@@ -483,22 +552,10 @@ class BrowserView(QtWidgets.QFrame):
 
     def _make_menu_row(self) -> QtWidgets.QHBoxLayout:
         row = QtWidgets.QHBoxLayout()
-        for title, object_name, actions in (
-            (
-                "File",
-                "fileMenuButton",
-                ("Open Folder", "New", "Save As", "Export"),
-            ),
-            (
-                "Config",
-                "configMenuButton",
-                ("Save", "Load", "Advanced", "Performance Diagnostics…"),
-            ),
-            (
-                "Help", "helpMenuButton",
-                ("Help", "Export Analyze Results Notebook"),
-            ),
-        ):
+        #: each menu by its title: a page hands its Config and Help to the host (``AppMenuHosts``)
+        self.menus: dict[str, QtWidgets.QMenu] = {}
+        for title, actions in self.profile.menus:
+            object_name = f"{title.lower()}MenuButton"
             button = QtWidgets.QToolButton()
             button.setText(title)
             button.setObjectName(object_name)
@@ -513,7 +570,8 @@ class BrowserView(QtWidgets.QFrame):
                         ShellCommandKind.MENU, value
                     )
                 )
-            if title == "Config":
+            self.menus[title] = menu
+            if title == "Config" and self.profile.raw_resolution_menus:
                 self._detector_menu = QtWidgets.QMenu("Raw image resolution", menu)
                 menu.addMenu(self._detector_menu)
                 self._detector_group = QtGui.QActionGroup(self._detector_menu)
@@ -588,6 +646,10 @@ class BrowserView(QtWidgets.QFrame):
         row.addWidget(title, 1)
         row.addWidget(self.date_sort)
         row.addWidget(self.refresh)
+        if not self.profile.date_sort:
+            self.date_sort.hide()
+        if not self.profile.refresh:
+            self.refresh.hide()
         self.date_sort.toggled.connect(
             lambda checked: self._emit(
                 ShellCommandKind.SET_DATE_SORT, bool(checked)
@@ -597,6 +659,39 @@ class BrowserView(QtWidgets.QFrame):
             lambda: self._emit(ShellCommandKind.REFRESH_BROWSER)
         )
         return row
+
+    def reconcile_results(
+        self, entries: tuple[BrowserResult, ...], current: str | None,
+    ) -> None:
+        """A results profile's list: its entries in order, and the one current (None: none). The list is
+        rebuilt only when the entries change; neither a rebuild nor moving the current entry emits."""
+        if not self.profile.results:
+            raise RuntimeError("reconcile_results needs a results profile")
+        entries = tuple(entries)
+        if any(type(entry) is not BrowserResult for entry in entries):
+            raise TypeError("results must be exact BrowserResult entries")
+        blocker = QtCore.QSignalBlocker(self.scans)
+        if entries != self._results:
+            self.scans.clear()
+            for entry in entries:
+                item = QtWidgets.QListWidgetItem(entry.label)
+                item.setData(_USER_ROLE, entry.identifier)
+                item.setToolTip(entry.detail)
+                self.scans.addItem(item)
+            self._results = entries
+        target = next((self.scans.item(index) for index in range(self.scans.count())
+                       if self.scans.item(index).data(_USER_ROLE) == current), None)
+        if self.scans.currentItem() is not target:
+            self.scans.setCurrentItem(target)
+        del blocker
+
+    def _result_selected(self, current, _previous) -> None:
+        if current is not None:
+            self._emit(ShellCommandKind.SELECT_RESULT, current.data(_USER_ROLE))
+
+    def set_action_enabled(self, action: str, enabled: bool) -> None:
+        """Enable or disable one of the profile's actions ("Show All", "Metadata", "Auto Last", "Open…")."""
+        self._action_buttons[action].setEnabled(bool(enabled))
 
     def reconcile(
         self,
