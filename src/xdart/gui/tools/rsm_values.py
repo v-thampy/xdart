@@ -333,30 +333,33 @@ def rsm_member_groups(
     """Stitch's source selection, resolved by Stitch's own owner (``resolve_stitch_sources``: discovery, the
     Selection syntax, Directory mode and its skips), as RSM member groups: one RSM per group, each SPEC scan one
     member with the run's one frame range, raw decoder and angle mapping (design §2: ``[42-44]`` one RSM from
-    three scans, ``42,43`` two). Returns (groups, skipped). A NeXus member is refused
-    (``SOURCE_KIND_UNSUPPORTED``) until RSM reads NeXus sources (stage 2b C5c)."""
+    three scans, ``42,43`` two). Returns (groups, skipped). Until RSM reads NeXus sources (stage 2b C5c) a NeXus
+    selection is refused (``SOURCE_KIND_UNSUPPORTED``), and in Directory mode a folder's NeXus files are skipped
+    with that reason, so its SPEC scans still map."""
     from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
     if type(selection) is not StitchSourceSelection:
         raise TypeError("RSM members come from an exact Stitch source selection")
     read_image_kwargs = {"detector_shape": tuple(detector_shape), "raw_dtype": np.dtype(raw_dtype).str,
                          "raw_header_skip": int(raw_header_skip), "threshold": None, "rotation": 0}
     resolution = resolve_stitch_sources(selection, read_image_kwargs)
-    groups = []
+    groups, skipped = [], list(resolution.skipped)
     for group in resolution.groups:
         members = []
         for spec in group:
             if spec.kind is not SourceKind.SPEC:
-                raise RSMToolPreflightRefused(
-                    "SOURCE_KIND_UNSUPPORTED",
-                    f"{Path(spec.uri).name}: RSM reads SPEC scans here; NeXus sources come next (stage 2b C5c)",
-                )
+                reason = "RSM reads SPEC scans here; NeXus sources come next (stage 2b C5c)"
+                if selection.kind == "Directory":
+                    skipped.append((str(spec.uri), str(spec.entry or ""), reason))
+                    continue
+                raise RSMToolPreflightRefused("SOURCE_KIND_UNSUPPORTED", f"{Path(spec.uri).name}: {reason}")
             path, key = Path(spec.uri), spec.options["scan"]
             stem = spec.options.get("image_stem") or f"{path.stem}_scan{key.split('.')[0]}_"
             members.append(RSMScanMemberForm(path, key, spec.options["image_dir"], stem, frame_selector,
                                              tuple(detector_shape), raw_dtype, raw_header_skip,
                                              motor_selectors))
-        groups.append(tuple(members))
-    return tuple(groups), resolution.skipped
+        if members:
+            groups.append(tuple(members))
+    return tuple(groups), tuple(skipped)
 
 
 @dataclass(frozen=True, slots=True)

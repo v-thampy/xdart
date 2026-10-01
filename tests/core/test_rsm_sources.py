@@ -104,3 +104,23 @@ def test_a_nexus_member_waits_for_c5c():
     with pytest.raises(RSMToolPreflightRefused) as refused:
         _groups(StitchSourceSelection("NeXus", (str(masters[0]),)))
     assert refused.value.code == "SOURCE_KIND_UNSUPPORTED"
+
+
+def test_directory_mode_skips_a_folders_nexus_files_and_keeps_its_spec_scans(tmp_path, monkeypatch):
+    """Until C5c a NeXus member cannot map: an explicit NeXus selection is refused, but in Directory mode the
+    folder's NeXus files are skipped with that reason and its SPEC scans still map. Stitch's resolver is given
+    one NeXus group beside the SPEC ones (the mapping's branch; the resolver itself is Stitch's, tested there)."""
+    import xrd_tools.analysis.stitch_sources as stitch_sources
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    spec = _pair(tmp_path / "data")
+    real = stitch_sources.resolve_stitch_sources
+
+    def with_a_nexus_group(selection, read_image_kwargs):
+        resolved = real(selection, read_image_kwargs)
+        nexus = (SourceSpec(tmp_path / "data" / "burst_master.h5", SourceKind.EIGER_MASTER, entry="entry"),)
+        return replace(resolved, groups=resolved.groups + (nexus,), names=resolved.names + (("burst_master",),))
+    monkeypatch.setattr(stitch_sources, "resolve_stitch_sources", with_a_nexus_group)
+    groups, skipped = _groups(StitchSourceSelection("Directory", (str(spec.parent),)))
+    assert [[member.scan for member in group] for group in groups] == [["1.1"], ["2.1"]]
+    assert [(Path(path).name, entry) for path, entry, _reason in skipped] == [
+        ("RSM_pair", "3.1"), ("burst_master.h5", "entry")]
