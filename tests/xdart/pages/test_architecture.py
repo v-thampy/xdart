@@ -66,7 +66,7 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
         # stays subject to the same prohibition as every contract module, and
         # only the import census is narrowed (the token census below is
         # skipped for it — the adapter names its own page by design).
-        adapter_lazy = path.name in {"scattering_workspace.py", "stitch_workspace.py"}
+        adapter_lazy = path.name in {"scattering_workspace.py", "stitch_workspace.py", "rsm_workspace.py"}
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         type_checking_imports = {
             child
@@ -148,8 +148,8 @@ def test_catalog_is_the_only_builtin_registration_point():
     assert "LEGACY_STATIC_PAGE" not in catalog
     assert "STATIC_SCAN_PAGE_KEY" not in catalog
     assert "build_legacy_static" not in catalog
-    assert catalog.count("PageDescriptor(") == 2
-    assert catalog.count("ToolDescriptor(") == 1  # RSM; the old Stitch dialog was retired
+    assert catalog.count("PageDescriptor(") == 3  # Int, Stitch and RSM (AUD-9)
+    assert "ToolDescriptor" not in catalog  # the Stitch and RSM dialogs gave way to their pages
     assert "BUILTIN_PAGES" in catalog
     assert "BUILTIN_DESCRIPTORS" in catalog
     assert "BUILTIN_DESCRIPTORS" in main

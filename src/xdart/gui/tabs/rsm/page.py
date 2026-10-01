@@ -1,0 +1,983 @@
+"""Native RSM workspace page (AUD-9, stage 1) over the RSM v2 owner.
+
+The maintainer, 2026-09-30: "Can you start aud 9 in a separate branch". The page is the RSM dialog's
+workflow in the main workspace, on the shared components as the Stitch page has them: Int's Controls panel
+and run bar, its section actions (Preview · Retry · Advanced), and its scientific panes for the six
+products. The RSM v2 owner (``tools.rsm_owner.RSMToolOwner.v2``) is the one operation owner: the page builds
+its exact ``RSMToolFormV2`` and shows what the owner returns; it holds no operation state or science of
+its own. A saved result is reopened on the shared single-worker owner, off the GUI thread.
+
+Stage 1 keeps the operation's create-new output (a repeat names another file); the stable same-kind
+``_rsm.nexus`` replacement is stage 2.
+"""
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import replace
+import logging
+from pathlib import Path
+
+from pyqtgraph.Qt import QtCore, QtWidgets
+
+from xdart.gui.pages.handle import AppMenuHosts, PageHandle
+from xdart.gui.pages.operation_owner import OperationTerminalStatus, SingleWorkerOwner
+from xdart.gui.pages.values import (
+    ActionAccepted, ActionCompleted, ActionRefused, CloseReceipt, PageCleanup,
+    RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
+)
+from xdart.gui.tabs.rsm.result_view import RSMResultView
+from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
+from xdart.gui.tools.rsm_owner import (
+    RSMOwnerAction, RSMOwnerFinalization, RSMOwnerOutcomeKind, RSMOwnerUpdate, RSMToolOwner,
+)
+from xdart.gui.tools.rsm_values import (
+    RSMFrameSelector, RSMMemberDraft, RSMScanMemberForm, RSMToolFormV2, rsm_preflight_summary_lines,
+    rsm_tool_preset,
+)
+from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow
+from xdart.gui.widgets.run_controls import RunControlsBar
+from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
+from xrd_tools.analysis.rsm_geometry_asset import (
+    CANONICAL_RSM_GEOMETRY_LOCATOR, RSMGeometryAssetRefused, install_canonical_rsm_geometry_asset,
+    rsm_geometry_asset_input,
+)
+from xrd_tools.analysis.rsm_operation import (
+    RSMImageConditioning, RSMNormalizationMode, RSMNormalizationPolicy, RSMOperationResultV2,
+)
+from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+from xrd_tools.session.readiness import (
+    ControlAction, ControlActionSpec, ControlFieldKind, ControlFormField, SectionId,
+)
+from xrd_tools.session.rsm_viewer_model import RSMViewerModel, make_rsm_viewer_values
+
+_LOG = logging.getLogger(__name__)
+_PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
+_MIB = 1024 * 1024
+#: The grids the RSM dialog offers (the scan-43 preset's quick and full).
+_GRIDS = {"Quick 40×40×40": (40, 40, 40), "Full 200×200×200": (200, 200, 200)}
+_NORMALIZATIONS = {"Foil transmission / exposure": RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE,
+                   "Identity": RSMNormalizationMode.IDENTITY}
+_FRAMES = {frame.display_name: frame for frame in RSMCoordinateFrame}
+#: The run bar's modes this page runs.
+_RSM_MODES = ("RSM",)
+#: The operation's stages in words (its progress counts frames plus the masks and four steps).
+_STAGE_TEXT = {"revalidate": "Checking the inputs", "static-mask": "Masking hot pixels", "science": "Gridding",
+               "projection": "Projecting", "publish": "Saving", "reload": "Checking the saved result"}
+#: Results kept in memory at once (float32: 32 MB each at Full 200³, and the shown one's viewer copy as
+#: much again; probe 1); another is read again from its file, off the GUI thread, when it is shown.
+_RESIDENT_RESULTS = 2
+#: The page's fields: (card, key, label, default, choices, browse).
+_FIELDS = (
+    (SectionId.PROJECT, "project_root", "Folder", "", (), True),
+    (SectionId.PROJECT, "output_path", "Output", "", (), True),
+    (SectionId.EXPERIMENT, "geometry_asset", "Geometry", CANONICAL_RSM_GEOMETRY_LOCATOR, (), True),
+    (SectionId.EXPERIMENT, "coordinates", "Coordinates", RSMCoordinateFrame.HKL.display_name, tuple(_FRAMES),
+     False),
+    (SectionId.SOURCE, "member_spec", "SPEC", "", (), True),
+    (SectionId.SOURCE, "member_scan", "Scan", "", (), False),
+    (SectionId.SOURCE, "member_images", "Images", "", (), True),
+    (SectionId.SOURCE, "member_stem", "Image stem", "", (), False),
+    (SectionId.SOURCE, "member_first", "First frame", "0", (), False),
+    (SectionId.SOURCE, "member_last", "Last frame", "", (), False),
+    (SectionId.SOURCE, "member_step", "Frame step", "1", (), False),
+    (SectionId.PROCESSING, "grid", "Grid", "Quick 40×40×40", tuple(_GRIDS), False),
+    (SectionId.PROCESSING, "normalization", "Normalization", "Foil transmission / exposure",
+     tuple(_NORMALIZATIONS), False),
+    (SectionId.PROCESSING, "foil", "Foil column", "foil status", (), False),
+    (SectionId.PROCESSING, "exposure", "Exposure column", "Seconds", (), False),
+    (SectionId.PROCESSING, "absorption", "Foil absorption", "1.06, 3.04, 4.65, 9.5", (), False),
+    (SectionId.PROCESSING, "offset", "Offset", "1e-06", (), False),
+    (SectionId.PROCESSING, "high_threshold", "High → NaN", "20000000000", (), False),
+    (SectionId.PROCESSING, "static_hot", "All-frame hot", "100", (), False),
+)
+_MEMBER_KEYS = ("member_spec", "member_scan", "member_images", "member_stem", "member_first", "member_last",
+                "member_step")
+
+
+def _read_rsm_record(path, cancel, _progress):
+    """A saved RSM record, strictly admitted and detached (the shared reader's runner)."""
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+    if cancel.is_set():
+        return None
+    return read_analysis_artifact(Path(path), expected_kind=AnalysisArtifactKind.RSM)
+
+
+def _progress_text(stage, completed, total):
+    """A run's progress in words."""
+    if stage == "science" and total > 4:
+        return f"Gridding · {completed} of {total - 4}"
+    return f"{_STAGE_TEXT.get(stage, stage)}…"
+
+
+def suggested_output(project_root, members):
+    """The output a page suggests for its ordered members: ``<Project>/xdart_processed_data/<family>_rsm
+    .nexus``, the family as the slot policy derives it from the members (``rsm`` when it cannot)."""
+    from xrd_tools.io.output_path import automatic_artifact_family, is_artifact_family
+    root = Path(project_root)
+    try:
+        family = automatic_artifact_family(
+            tuple((root / member.spec_path, member.scan) for member in members), root)
+    except (ValueError, OSError):
+        family = ""
+    if not is_artifact_family(family):
+        family = "rsm"
+    return str(root / "xdart_processed_data" / f"{family}_rsm.nexus")
+
+
+class RSMPage(QtWidgets.QWidget):
+    """The native RSM workspace."""
+
+    toolRequested = QtCore.Signal(str)
+    #: (page key, processing mode): open that page in that mode
+    modeRequested = QtCore.Signal(str, str)
+
+    def __init__(self, services, parent=None, *, owner=None, reader=None):
+        super().__init__(parent)
+        self.setObjectName("rsmPage")
+        self._services = services
+        self._owner = RSMToolOwner.v2() if owner is None else owner
+        self._reader = SingleWorkerOwner(_read_rsm_record) if reader is None else reader
+        self._reading = None  # (identity, path) of the record being read
+        self._fields, self._rows = {}, {}
+        self._members = [RSMMemberDraft.from_scan43()]
+        self._selected = 0
+        self._readiness = ("", False)
+        self._output_suggested = True  # the output follows the members until the user names one
+        self._run_requested = False
+        self._form_revision = 0
+        self._active_revision = None
+        self._prepared_fingerprint = None
+        self._results = OrderedDict()  # path → payload, the most recent last
+        self._model = None
+        self._closing = False
+        self._build_ui()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._poll)
+        self._load_member(0)
+        self._edited()
+
+    # ── layout ──
+    def _build_ui(self):
+        outer = QtWidgets.QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        outer.addWidget(self.splitter)
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(5, 5, 5, 5)
+        menus = QtWidgets.QHBoxLayout()
+        for title, name in (("File", "fileMenuButton"), ("Config", "configMenuButton"),
+                            ("Help", "helpMenuButton")):
+            button = QtWidgets.QToolButton()
+            button.setObjectName(name)
+            button.setText(title)
+            button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+            menu = QtWidgets.QMenu(button)
+            button.setMenu(menu)
+            setattr(self, title.lower() + "_menu", menu)
+            menus.addWidget(button)
+        left_layout.addLayout(menus)
+        self.file_menu.addAction("Open result…", self.open_result)
+        self.file_menu.addAction("Integration workspace",
+                                 lambda: self.toolRequested.emit(str(SCATTERING_PAGE_KEY)))
+        heading = QtWidgets.QLabel("DATA BROWSER")
+        heading.setObjectName("browserHeading")
+        left_layout.addWidget(heading)
+        left_layout.addWidget(QtWidgets.QLabel("Results"))
+        self.results = QtWidgets.QListWidget()
+        self.results.setObjectName("rsmResults")
+        self.results.currentItemChanged.connect(self._result_selected)
+        left_layout.addWidget(self.results, 1)
+        self.open_button = QtWidgets.QPushButton("Open…")
+        self.open_button.clicked.connect(self.open_result)
+        left_layout.addWidget(self.open_button)
+        self.splitter.addWidget(left)
+
+        self.view = RSMResultView()
+        self.view.indicesChanged.connect(self._indices_changed)
+        self.splitter.addWidget(self.view)
+
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        self.controls = ControlsPanel(experiment_title="Configuration", show_section_numbers=False)  # Int's
+        self.controls.experiment_card.title.setText("EXPERIMENT")
+        self.controls.controlActionRequested.connect(self._control_action)
+        scroll = _HugWidthScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(self.controls)
+        right_layout.addWidget(scroll, 1)
+        self._build_controls()
+        self.run_bar = RunControlsBar()
+        from xdart.gui.tabs.scattering.run_mode_projection import (
+            RUN_MODE_CHOICES, UNOWNED_RUN_MODE_REASONS,
+        )
+        self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, live=False, batch=False, cores=False)
+        self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
+        self.run_bar.modeCombo.setCurrentText("RSM")
+        self.run_bar.modeChanged.connect(self._mode_chosen)
+        # Stage 1 writes a new file only (the operation refuses one that exists): the toggle says so
+        self.run_bar.writeModeButton.setEnabled(False)
+        self.run_bar.writeModeButton.setToolTip(
+            "RSM writes a new result: name another Output to repeat (replacing comes later)")
+        self.run_bar.actionClicked.connect(self.begin_run)
+        self.run_bar.stopClicked.connect(self.stop)
+        right_layout.addWidget(self.run_bar)
+        self.splitter.addWidget(right)
+        left.setMinimumWidth(255)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 3)
+        self.splitter.setStretchFactor(2, 1)
+        self.splitter.setSizes([289, 868, 323])  # Int's columns, so the pages switch in place
+
+    def _row(self, section, key, label, value, choices, browse):
+        kind = ControlFieldKind.COMBO if choices else ControlFieldKind.LINE
+        path = ("Project", "project_folder") if key == "project_root" else ("RSM", key)
+        field = ControlFormField(section, label, path, value, kind, tuple(choices), browse)
+        row = FormRow(label=label, path=path, value=value, kind=field.kind.value, choices=choices, browse=browse)
+        row.editor.setProperty("rsmField", key)
+        row.valueChanged.connect(lambda _path, _value, name=key: self._committed(name))
+        row.browseRequested.connect(lambda _path, name=key: self._browse(name))
+        self._fields[key], self._rows[key] = field, row
+        return row
+
+    def _build_controls(self):
+        cards = {SectionId.PROJECT: self.controls.project_card, SectionId.EXPERIMENT: self.controls.experiment_card,
+                 SectionId.SOURCE: self.controls.source_card, SectionId.PROCESSING: self.controls.processing_card}
+        for section, key, label, value, choices, browse in _FIELDS:
+            row = self._row(section, key, label, value, choices, browse)
+            if key == "member_spec":  # the ordered members above the selected one's rows
+                cards[section].add_row(self._member_panel())
+            cards[section].add_row(row)
+            if key == "geometry_asset":
+                install = QtWidgets.QPushButton("Install canonical")
+                install.setObjectName("rsmPageInstallCanonical")
+                install.setToolTip("Write the canonical psic geometry asset into the Project")
+                install.clicked.connect(self._install_geometry)
+                self.install_button = install
+                cards[section].add_row(install)
+        self.identity = QtWidgets.QLabel("Asset identity not yet authenticated")
+        self.identity.setObjectName("rsmPageGeometryIdentity")
+        self.identity.setWordWrap(True)
+        self.controls.experiment_card.add_row(self.identity)
+        buttons = self.controls.render_actions(self.controls.processing_card, tuple(
+            ControlActionSpec(action, label, SectionId.PROCESSING) for action, label in (
+                (ControlAction.PREVIEW, "Preview"), (ControlAction.RETRY, "Retry"),
+                (ControlAction.ADVANCED_PROCESSING, "Advanced"))), expand=True)
+        self.preview_button, self.retry_button, self.advanced_button = (
+            buttons[action] for action in (ControlAction.PREVIEW, ControlAction.RETRY,
+                                           ControlAction.ADVANCED_PROCESSING))
+        self.preview_button.setToolTip("Check the inputs and list every exact identity, without gridding.")
+        self.retry_button.setToolTip("Retry the last result's saving or its check.")
+        self._build_advanced()
+        self.preview_dialog = QtWidgets.QDialog(self)
+        self.preview_dialog.setWindowTitle("RSM preview")
+        preview_layout = QtWidgets.QVBoxLayout(self.preview_dialog)
+        self.preview_text = QtWidgets.QPlainTextEdit()
+        self.preview_text.setReadOnly(True)
+        preview_layout.addWidget(self.preview_text)
+        self.preview_dialog.resize(760, 560)
+
+    def _member_panel(self):
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.member_table = QtWidgets.QTableWidget(0, 5)
+        self.member_table.setObjectName("rsmPageMembers")
+        self.member_table.setHorizontalHeaderLabels(("#", "SPEC", "scan", "frames", "stem"))
+        self.member_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.member_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.member_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.member_table.verticalHeader().setVisible(False)
+        self.member_table.horizontalHeader().setStretchLastSection(True)
+        self.member_table.setMaximumHeight(130)
+        self.member_table.currentCellChanged.connect(lambda row, *_rest: self._load_member(row))
+        layout.addWidget(self.member_table)
+        buttons = QtWidgets.QHBoxLayout()
+        for name, text, slot in (("add", "Add", self._add_member), ("remove", "Remove", self._remove_member),
+                                 ("up", "Up", lambda: self._move_member(-1)),
+                                 ("down", "Down", lambda: self._move_member(1)),
+                                 ("preset", "Scan 43", self._apply_preset)):
+            button = QtWidgets.QPushButton(text)
+            button.setObjectName(f"rsmPageMember_{name}")
+            button.clicked.connect(slot)
+            setattr(self, f"member_{name}_button", button)
+            buttons.addWidget(button)
+        self.member_preset_button.setToolTip("Reset to the scan-43 STO preset (one member)")
+        layout.addLayout(buttons)
+        return panel
+
+    def _build_advanced(self):
+        """The rarely changed member and memory settings, in Int's Advanced dialog place."""
+        self.advanced = QtWidgets.QDialog(self)
+        self.advanced.setWindowTitle("Advanced — RSM")
+        form = QtWidgets.QFormLayout(self.advanced)
+        self.detector_rows, self.detector_columns = QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
+        for spin in (self.detector_rows, self.detector_columns):
+            spin.setRange(2, 1_000_000)
+        self.raw_dtype = QtWidgets.QComboBox()
+        self.raw_dtype.addItems(("int32", "uint16", "float32", "float64"))
+        self.raw_header = QtWidgets.QSpinBox()
+        self.raw_header.setRange(0, 1 << 30)
+        decoder = QtWidgets.QHBoxLayout()
+        for text, widget in (("rows", self.detector_rows), ("columns", self.detector_columns),
+                             ("dtype", self.raw_dtype), ("header bytes", self.raw_header)):
+            decoder.addWidget(QtWidgets.QLabel(text))
+            decoder.addWidget(widget)
+        form.addRow("Raw decoder (selected member)", decoder)
+        self.motor_edits = {}
+        motors = QtWidgets.QGridLayout()
+        for column, role in enumerate(_PSIC_ROLES):
+            name, occurrence = QtWidgets.QLineEdit(), QtWidgets.QSpinBox()
+            occurrence.setRange(0, 1024)
+            motors.addWidget(QtWidgets.QLabel(role), 0, column)
+            motors.addWidget(name, 1, column)
+            motors.addWidget(occurrence, 2, column)
+            self.motor_edits[role] = (name, occurrence)
+        form.addRow("psic motor columns (name, occurrence)", motors)
+        self.foil_occurrence, self.exposure_occurrence = QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
+        for spin in (self.foil_occurrence, self.exposure_occurrence):
+            spin.setRange(0, 1024)
+        occurrences = QtWidgets.QHBoxLayout()
+        for text, widget in (("foil", self.foil_occurrence), ("exposure", self.exposure_occurrence)):
+            occurrences.addWidget(QtWidgets.QLabel(text))
+            occurrences.addWidget(widget)
+        form.addRow("Normalization column occurrences", occurrences)
+        preset = rsm_tool_preset()
+        self.chunk_size = QtWidgets.QSpinBox()
+        self.chunk_size.setRange(1, 1024)
+        self.chunk_size.setValue(preset.chunk_size)
+        self.max_frame_mib, self.max_chunk_mib = QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
+        for spin, value in ((self.max_frame_mib, preset.max_frame_bytes), (self.max_chunk_mib, preset.max_chunk_bytes)):
+            spin.setRange(1, 4096)
+            spin.setValue(value // _MIB)
+        memory = QtWidgets.QHBoxLayout()
+        for text, widget in (("chunk", self.chunk_size), ("max frame MiB", self.max_frame_mib),
+                             ("max chunk MiB", self.max_chunk_mib)):
+            memory.addWidget(QtWidgets.QLabel(text))
+            memory.addWidget(widget)
+        form.addRow("Chunk / memory", memory)
+        close = QtWidgets.QPushButton("Close")
+        close.clicked.connect(self.advanced.close)
+        form.addRow(close)
+        for widget in (self.detector_rows, self.detector_columns, self.raw_header, self.foil_occurrence,
+                       self.exposure_occurrence, self.chunk_size, self.max_frame_mib, self.max_chunk_mib):
+            widget.valueChanged.connect(self._advanced_edited)
+        self.raw_dtype.currentIndexChanged.connect(self._advanced_edited)
+        for name, occurrence in self.motor_edits.values():
+            name.editingFinished.connect(self._advanced_edited)
+            occurrence.valueChanged.connect(self._advanced_edited)
+
+    # ── values ──
+    def _value(self, key):
+        return self._rows[key].current_value()
+
+    def set_field(self, key, value):
+        self._fields[key] = replace(self._fields[key], value=value)
+        self._rows[key].apply_field(self._fields[key])
+        self._committed(key)
+
+    def _committed(self, key):
+        """A committed edit: the selected member's rows go into its draft; the output follows the members
+        until a name is chosen."""
+        if key in _MEMBER_KEYS:
+            self._store_member()
+        if key == "output_path":
+            self._output_suggested = not str(self._value("output_path")).strip()
+        self._edited()
+
+    def _advanced_edited(self, *_args):
+        if getattr(self, "_loading", False):
+            return
+        self._store_member()
+        self._edited()
+
+    def _store_member(self):
+        if getattr(self, "_loading", False) or not 0 <= self._selected < len(self._members):
+            return
+        draft = self._members[self._selected]
+        draft.spec_path = str(self._value("member_spec")).strip()
+        draft.scan = str(self._value("member_scan")).strip()
+        draft.image_dir = str(self._value("member_images")).strip()
+        draft.image_stem = str(self._value("member_stem")).strip()
+        for attribute, key in (("frame_start", "member_first"), ("frame_step", "member_step")):
+            try:
+                setattr(draft, attribute, int(str(self._value(key)).strip()))
+            except ValueError:
+                pass  # readiness names it
+        draft.frame_stop = str(self._value("member_last")).strip()
+        draft.detector_rows, draft.detector_columns = self.detector_rows.value(), self.detector_columns.value()
+        draft.raw_dtype = self.raw_dtype.currentText()
+        draft.raw_header_skip = self.raw_header.value()
+        draft.selector_names = tuple(self.motor_edits[role][0].text().strip() for role in _PSIC_ROLES)
+        draft.selector_occurrences = tuple(self.motor_edits[role][1].value() for role in _PSIC_ROLES)
+        self._refresh_members()
+
+    def _load_member(self, index):
+        """Show member ``index`` in the selected-member rows and the Advanced decoder and motor columns."""
+        if not 0 <= index < len(self._members):
+            return
+        self._selected = index
+        draft = self._members[index]
+        self._loading = True
+        try:
+            for key, value in (("member_spec", draft.spec_path), ("member_scan", draft.scan),
+                               ("member_images", draft.image_dir), ("member_stem", draft.image_stem),
+                               ("member_first", draft.frame_start), ("member_last", draft.frame_stop),
+                               ("member_step", draft.frame_step)):
+                self._fields[key] = replace(self._fields[key], value=str(value))
+                self._rows[key].apply_field(self._fields[key])
+            self.detector_rows.setValue(draft.detector_rows)
+            self.detector_columns.setValue(draft.detector_columns)
+            self.raw_dtype.setCurrentText(draft.raw_dtype)
+            self.raw_header.setValue(draft.raw_header_skip)
+            for role, name, occurrence in zip(_PSIC_ROLES, draft.selector_names, draft.selector_occurrences,
+                                              strict=True):
+                self.motor_edits[role][0].setText(name)
+                self.motor_edits[role][1].setValue(occurrence)
+        finally:
+            self._loading = False
+        self._refresh_members()
+
+    def _refresh_members(self):
+        table = self.member_table
+        blocker = QtCore.QSignalBlocker(table)
+        table.setRowCount(len(self._members))
+        for row, draft in enumerate(self._members):
+            for column, text in enumerate((str(row + 1), draft.spec_path, draft.scan, draft.selected_count_text(),
+                                           draft.image_stem)):
+                table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
+        table.setCurrentCell(self._selected, 0)
+        del blocker
+        self.member_remove_button.setEnabled(len(self._members) > 1)
+        self.member_up_button.setEnabled(self._selected > 0)
+        self.member_down_button.setEnabled(self._selected < len(self._members) - 1)
+
+    def _add_member(self):
+        self._store_member()
+        self._members.append(self._members[self._selected].clone())
+        self._load_member(len(self._members) - 1)
+        self._edited()
+
+    def _remove_member(self):
+        if len(self._members) > 1:
+            del self._members[self._selected]
+            self._load_member(min(self._selected, len(self._members) - 1))
+            self._edited()
+
+    def _move_member(self, offset):
+        target = self._selected + offset
+        if 0 <= target < len(self._members):
+            self._store_member()
+            members = self._members
+            members[self._selected], members[target] = members[target], members[self._selected]
+            self._load_member(target)
+            self._edited()
+
+    def _apply_preset(self):
+        self._members = [RSMMemberDraft.from_scan43()]
+        self._load_member(0)
+        self._edited()
+
+    @staticmethod
+    def _inside(project, text, name):
+        """A path as the RSM dialog reads one: required; a relative one is inside the Project."""
+        spelling = str(text).strip()
+        if not spelling:
+            raise ValueError(f"{name} is required")
+        path = Path(spelling).expanduser()
+        return path if path.is_absolute() else project / path
+
+    def build_form(self):
+        """The exact RSM v2 form of the page's inputs (the dialog's form for the same inputs)."""
+        self._store_member()
+        project_text = str(self._value("project_root")).strip()
+        if not project_text:
+            raise ValueError("Project root is required")
+        project = Path(project_text).expanduser()
+        members = []
+        for draft in self._members:
+            stop = draft.frame_stop.strip()
+            members.append(RSMScanMemberForm(
+                self._inside(project, draft.spec_path, "SPEC path"), draft.scan,
+                self._inside(project, draft.image_dir, "image directory"), draft.image_stem,
+                RSMFrameSelector(draft.frame_start, None if not stop else int(stop), draft.frame_step),
+                (draft.detector_rows, draft.detector_columns), draft.raw_dtype, draft.raw_header_skip,
+                tuple((role, MetadataColumnSelector(name, occurrence)) for role, name, occurrence in zip(
+                    _PSIC_ROLES, draft.selector_names, draft.selector_occurrences, strict=True))))
+        mode = _NORMALIZATIONS[self._value("normalization")]
+        if mode is RSMNormalizationMode.IDENTITY:
+            normalization = RSMNormalizationPolicy.identity()
+        else:
+            normalization = RSMNormalizationPolicy(
+                mode, MetadataColumnSelector(str(self._value("foil")).strip(), self.foil_occurrence.value()),
+                MetadataColumnSelector(str(self._value("exposure")).strip(), self.exposure_occurrence.value()),
+                tuple(float(part) for part in str(self._value("absorption")).replace(";", ",").split(",")
+                      if part.strip()))
+
+        def optional(key):
+            text = str(self._value(key)).strip()
+            return None if not text else float(text)
+        return RSMToolFormV2(
+            project_text, rsm_geometry_asset_input(str(self._value("geometry_asset")).strip()), tuple(members),
+            RSMImageConditioning(float(self._value("offset")), optional("high_threshold"), optional("static_hot")),
+            normalization, tuple(_GRIDS[self._value("grid")]), self.chunk_size.value(),
+            self.max_frame_mib.value() * _MIB, self.max_chunk_mib.value() * _MIB,
+            self._inside(project, str(self._value("output_path")).strip(), "output path"),
+            AnalysisArtifactOverwrite.CREATE_NEW, coordinate_frame=_FRAMES[self._value("coordinates")])
+
+    # ── readiness ──
+    def _edited(self, *_args):
+        """Any edit: the output suggestion, the section gate and the readiness line (Int's)."""
+        self._form_revision += 1
+        self._prepared_fingerprint = None
+        project = str(self._value("project_root")).strip()
+        if self._output_suggested and project:
+            suggestion = suggested_output(project, self._members)
+            if suggestion != self._value("output_path"):
+                self._fields["output_path"] = replace(self._fields["output_path"], value=suggestion)
+                self._rows["output_path"].apply_field(self._fields["output_path"])
+        self.controls.apply_card_visibility(project)
+        self._readiness = self._readiness_now()
+        self._show_readiness()
+        self._sync_actions()
+
+    def _readiness_now(self):
+        """("Needs …", False) or ("Ready · RSM · …", True), from committed values; the disk is asked only
+        whether the named files and folders exist."""
+        needs = []
+        project = str(self._value("project_root")).strip()
+        if not project:
+            return "Needs a Project folder", False
+        root = Path(project).expanduser()
+        if not root.is_dir():
+            return f"Needs an existing Project folder ({root.name} not found)", False
+        geometry = str(self._value("geometry_asset")).strip()
+        if not geometry or not self._inside(root, geometry, "geometry").is_file():
+            needs.append("the geometry asset (Install canonical)")
+        for number, draft in enumerate(self._members, 1):
+            spec = self._inside(root, draft.spec_path, "SPEC") if draft.spec_path else None
+            images = self._inside(root, draft.image_dir, "images") if draft.image_dir else None
+            if spec is None or not spec.is_file():
+                needs.append(f"member {number}'s SPEC file")
+            elif images is None or not images.is_dir():
+                needs.append(f"member {number}'s image folder")
+            elif not draft.scan or not draft.image_stem:
+                needs.append(f"member {number}'s scan and image stem")
+        output = str(self._value("output_path")).strip()
+        if not output.endswith(".nexus"):
+            needs.append("an Output ending in .nexus")
+        elif self._inside(root, output, "output").exists():
+            return f"Output exists · choose another name ({Path(output).name})", False
+        if needs:
+            return "Needs " + ", ".join(needs), False
+        grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
+        members = len(self._members)
+        return (f"Ready · RSM · {members} member{'s' * (members != 1)} · {self._value('coordinates')} · "
+                f"grid {grid}"), True
+
+    def _show_readiness(self):
+        text, ready = self._readiness
+        self.run_bar.set_readiness_summary(text, ready=ready)
+
+    def _status(self, text, *, ready=True):
+        self.run_bar.set_readiness_summary(str(text), ready=ready)
+
+    def _notice(self, text, *, ready=False):
+        self._status(text, ready=ready)
+        try:
+            self._services.status.show(str(text), 8000)
+        except Exception:
+            _LOG.debug("RSM status presenter failed", exc_info=True)
+
+    def _sync_actions(self):
+        busy = bool(self._owner.busy)
+        final = self._owner.finalization
+        reading = self._reading is not None
+        idle = not busy and not reading and final is RSMOwnerFinalization.NONE and not self._closing
+        self.controls.setEnabled(idle)
+        self.run_bar.set_mode_row_enabled(idle)
+        self.member_table.setEnabled(idle)
+        self.advanced.setEnabled(idle)
+        self.open_button.setEnabled(not busy and not reading and not self._closing)
+        self.preview_button.setEnabled(idle)
+        self.retry_button.setEnabled(not busy and final is not RSMOwnerFinalization.NONE and not self._closing)
+        # Stitch's: "▶ Run" throughout (RSM has no pause), enabled while idle and ready
+        self.run_bar.startButton.setEnabled(idle and self._readiness[1])
+        identity = self._owner.current_identity if busy else None
+        self.run_bar.set_stop_enabled(identity is not None and identity.request.action in {
+            RSMOwnerAction.PREFLIGHT, RSMOwnerAction.RUN})  # what the owner cancels
+
+    # ── the owner ──
+    def _control_action(self, action):
+        {ControlAction.PREVIEW: self.begin_preview, ControlAction.RETRY: self.retry,
+         ControlAction.ADVANCED_PROCESSING: self.advanced.show}.get(action, lambda: None)()
+
+    def _current_form(self):
+        try:
+            return self.build_form()
+        except (TypeError, ValueError, OverflowError) as error:
+            self._notice(f"Invalid RSM request: {error}")
+            return None
+
+    def _commit_typing(self):
+        """Commit a field still being typed in before an action reads the inputs (Stitch's live lesson: a
+        click on Run leaves the focus in the field on macOS, and disabling the controls for the check then
+        committed it mid-check, which discarded the check as "the inputs changed")."""
+        focused = QtWidgets.QApplication.focusWidget()
+        if isinstance(focused, QtWidgets.QLineEdit) and (self.isAncestorOf(focused)
+                                                         or self.advanced.isAncestorOf(focused)):
+            focused.clearFocus()  # the row commits on the focus-out, as Return or Tab would
+
+    def begin_preview(self):
+        """Preview: check the inputs and list every exact identity, without gridding."""
+        self._commit_typing()
+        self._begin_preflight(run=False)
+
+    def begin_run(self):
+        """Run: Preview the inputs, then grid them (as Stitch's Run prepares first)."""
+        self._commit_typing()
+        if not self._readiness[1]:
+            self._notice(self._readiness[0])
+            return
+        form = self._current_form()
+        if form is None:
+            return
+        if self._prepared_fingerprint == form.fingerprint and self._owner.prepared is not None:
+            self._start_run(form)
+        else:
+            self._begin_preflight(run=True, form=form)
+
+    def _output_folder(self, form):
+        """The Output's folder, made inside the Project as Int's and Stitch's runs make theirs (the RSM
+        operation pins a folder that exists); one outside the Project the operation refuses itself."""
+        try:  # resolved, as the preflight reads them
+            folder = Path(form.output_path).resolve(strict=False).parent
+            inside = folder.is_relative_to(Path(form.project_root).resolve(strict=False))
+        except (OSError, RuntimeError):
+            return True
+        if folder.is_dir() or not inside:
+            return True
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self._notice(f"Could not make the Output folder {folder.name}: {error}")
+            return False
+        return True
+
+    def _begin_preflight(self, *, run, form=None):
+        if self._owner.busy:  # a running result keeps its form
+            self._notice("RSM is busy · try again once it is done")
+            return
+        form = self._current_form() if form is None else form
+        if form is None or not self._output_folder(form):
+            return
+        self._owner.set_form(form)
+        if self._owner.begin_preflight() is None:
+            self._notice("RSM is busy · try again once it is done")
+            return
+        self._run_requested = run
+        self._active_revision = self._form_revision
+        self._status("Checking the inputs…")
+        self._timer.start()
+        self._sync_actions()
+
+    def _start_run(self, form):
+        self._owner.set_form(form)
+        if self._owner.begin_run() is None:
+            self._prepared_fingerprint = None
+            self._notice("RSM could not start: Preview again")
+            return
+        self._run_requested = False
+        self._active_revision = self._form_revision
+        self._status("Gridding…")
+        self._timer.start()
+        self._sync_actions()
+
+    def stop(self):
+        if self._owner.cancel():
+            self._status("Stopping…")
+        return ActionAccepted("rsm-stop")
+
+    def retry(self):
+        final = self._owner.finalization
+        begin = (self._owner.begin_retry_cleanup if final is RSMOwnerFinalization.CLEANUP_PENDING
+                 else self._owner.begin_retry_verification)
+        if begin() is None:
+            self._notice("No RSM retry is available")
+            return
+        self._status("Retrying the result's saving…" if final is RSMOwnerFinalization.CLEANUP_PENDING
+                     else "Checking the saved result again…")
+        self._timer.start()
+        self._sync_actions()
+
+    def _poll(self):
+        try:
+            update = self._owner.poll()
+            if update is not None:
+                self._accept(update)
+            self._poll_reader()
+        except Exception as error:
+            _LOG.exception("RSM page update failed")
+            self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")
+        if not self._owner.busy and self._reading is None:
+            self._timer.stop()
+        self._sync_actions()
+
+    def _accept(self, update):
+        if type(update) is not RSMOwnerUpdate:
+            raise TypeError("the RSM page requires an exact owner update")
+        if update.progress is not None:
+            progress = update.progress
+            self._status(_progress_text(progress.stage, progress.completed, progress.total))
+            return
+        if update.terminal_status is OperationTerminalStatus.FAILED:
+            self._notice(f"RSM {update.action.value} failed: {update.failure_message or update.failure_type}")
+            return
+        if update.terminal_status is OperationTerminalStatus.CANCELLED:
+            self._notice("RSM stopped")
+            return
+        outcome = update.outcome
+        if outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_READY:
+            preflight = outcome.preflight
+            current = self._current_form()
+            if update.stale or self._active_revision != self._form_revision or current is None \
+                    or not preflight.is_current(current):
+                self._run_requested = False
+                self._notice("Preview completed, but the inputs changed: Preview again")
+                return
+            self._prepared_fingerprint = preflight.form.fingerprint
+            summary = preflight.summary
+            self.preview_text.setPlainText("\n".join(rsm_preflight_summary_lines(summary)))
+            self.identity.setText(f"raw {summary.geometry_asset_raw_sha256[:12]} · semantic "
+                                  f"{summary.geometry_asset_semantic_fingerprint[:12]}")
+            if self._run_requested:
+                self._start_run(current)
+            else:
+                self._status(f"Preview ready · {summary.total_selected_frames} frames", ready=True)
+                self.preview_dialog.show()
+            return
+        self._run_requested = False
+        if outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_REFUSED:
+            self._notice(f"Preview refused: {outcome.refusal_message or outcome.refusal_code}")
+            return
+        if outcome.kind is RSMOwnerOutcomeKind.CLEANUP_PENDING:
+            self._notice((outcome.finalization_message or "Saving needs a retry") + " · Retry (no regridding)")
+            return
+        if outcome.kind is RSMOwnerOutcomeKind.VERIFICATION_PENDING:
+            self._notice("Saved; its check needs a retry · Retry")
+            return
+        result = outcome.result
+        if outcome.kind is not RSMOwnerOutcomeKind.RESULT or result is None:
+            raise RuntimeError("RSM owner returned an invalid outcome")
+        terminal = result.terminal
+        if terminal.disposition is ModuleDisposition.COMMITTED:
+            if type(result) is not RSMOperationResultV2 or result.payload is None:
+                raise ValueError("the RSM page shows only a strict committed payload")
+            target = str(result.request.module.output.target)
+            current = not update.stale and self._active_revision == self._form_revision
+            self._add_result(target, result.payload, show=current)
+            self._edited()  # the output now exists: Run waits for another name
+            if current:
+                self._status(f"Saved {Path(target).name}", ready=True)
+            else:
+                self._notice(f"Saved {Path(target).name}, but the inputs changed: listed, not shown")
+            return
+        detail = f" · {terminal.diagnostic}" if terminal.diagnostic else ""
+        if terminal.disposition is ModuleDisposition.CANCELLED:
+            self._notice("RSM stopped" + detail)
+        else:
+            self._notice(f"RSM {terminal.disposition.value}: {terminal.code}{detail}")
+
+    # ── results ──
+    def open_result(self):
+        from xdart.gui.widgets import file_dialogs as dialogs
+        picks = dialogs.browse(self, "Open RSM result", file_filter=dialogs.NEXUS_FILTER,
+                               current=str(self._value("output_path") or ""),
+                               fallback=str(self._value("project_root") or ""))
+        if picks:
+            self.reopen(picks[0])
+
+    def reopen(self, path):
+        """Read a saved RSM record on the shared single-worker reader, then show it."""
+        identity = self._reader.begin(str(path))
+        if identity is None:
+            self._notice("A result is still being read")
+            return False
+        self._reading = (identity, str(path))
+        self._status(f"Reading {Path(path).name}…")
+        self._timer.start()
+        self._sync_actions()
+        return True
+
+    def _poll_reader(self):
+        if self._reading is None:
+            return
+        identity, path = self._reading
+        update = self._reader.poll(identity)
+        if update is None or update.terminal is None:
+            return
+        self._reading = None
+        terminal = update.terminal
+        if terminal.status is OperationTerminalStatus.RETURNED and terminal.payload is not None:
+            self._add_result(path, terminal.payload)
+            self._status(f"Opened {Path(path).name}", ready=True)
+        elif terminal.status is OperationTerminalStatus.FAILED:
+            self._notice(f"Could not open {Path(path).name}: {terminal.failure_message or terminal.failure_type}")
+
+    def _add_result(self, path, payload, *, show=True):
+        """List a result and keep its payload; the oldest beyond the newest few are read again when shown."""
+        self._results[path] = payload
+        self._results.move_to_end(path)
+        resident = [key for key, value in self._results.items() if value is not None]
+        for key in resident[:-_RESIDENT_RESULTS]:
+            self._results[key] = None
+        for row in range(self.results.count()):
+            if self.results.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == path:
+                item = self.results.item(row)
+                break
+        else:
+            item = QtWidgets.QListWidgetItem(Path(path).name)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            self.results.addItem(item)
+        if show:
+            blocker = QtCore.QSignalBlocker(self.results)
+            self.results.setCurrentItem(item)
+            del blocker
+            self._show(payload)
+
+    def _result_selected(self, current, _previous):
+        if current is None:
+            return
+        path = current.data(QtCore.Qt.ItemDataRole.UserRole)
+        payload = self._results.get(path)
+        if payload is None:
+            self.reopen(path)
+            return
+        try:
+            self._show(payload)
+        except Exception as error:  # the prior six stay
+            _LOG.exception("RSM result presentation failed")
+            self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")
+
+    def _show(self, payload):
+        values = make_rsm_viewer_values(payload)
+        model = RSMViewerModel()
+        snapshot = model.snapshot(values)
+        self.view.show_snapshot(values, snapshot)
+        self._model = model
+
+    def _indices_changed(self, h_index, k_index, l_index):
+        shown = self.view.shown
+        if shown is None or self._model is None:
+            return
+        values, prior = shown
+        try:
+            self.view.show_snapshot(values, self._model.snapshot(h_index=h_index, k_index=k_index,
+                                                                 l_index=l_index))
+        except Exception as error:
+            _LOG.exception("RSM slice presentation failed")
+            self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")
+            try:  # the index boxes back to the six shown
+                self.view.show_snapshot(values, prior)
+            except Exception:
+                _LOG.exception("RSM slice repaint failed")
+
+    # ── paths ──
+    def _browse(self, key):
+        from xdart.gui.widgets import file_dialogs as dialogs
+        common = dict(current=str(self._value(key) or ""), fallback=str(self._value("project_root") or ""))
+        if key in {"project_root", "member_images"}:
+            picks = dialogs.browse(self, "Choose folder", folder=True, **common)
+        elif key == "member_spec":
+            picks = dialogs.browse_spec(self, "Choose SPEC file", **common)
+        elif key == "output_path":
+            chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Choose RSM output", common["current"] or common["fallback"], "NeXus result (*.nexus)")
+            picks = [chosen] if chosen else []
+        else:
+            picks = dialogs.browse(self, "Choose " + self._fields[key].label, **common)
+        if picks:
+            self.set_field(key, picks[0])
+
+    def _install_geometry(self):
+        project = str(self._value("project_root")).strip()
+        if not project:
+            self._notice("Install canonical needs a Project folder")
+            return
+        try:
+            receipt = install_canonical_rsm_geometry_asset(project_root=project)
+        except RSMGeometryAssetRefused as error:
+            self._notice(f"{error.code}: {error}")
+            return
+        self.set_field("geometry_asset", receipt.request.locator)
+        self.identity.setText(f"raw {receipt.raw_sha256[:12]} · semantic {receipt.semantic_fingerprint[:12]}")
+        self._notice(f"Canonical RSM geometry ready: {receipt.lexical_relative_path}", ready=True)
+
+    # ── modes and the host ──
+    def _mode_chosen(self, mode):
+        """RSM here; another mode leaves for its page (the host refuses while RSM runs)."""
+        blocker = QtCore.QSignalBlocker(self.run_bar.modeCombo)
+        self.run_bar.modeCombo.setCurrentText("RSM")
+        del blocker
+        if mode in _RSM_MODES:
+            return
+        if mode in {"Stitch 1D", "Stitch 2D"}:
+            self.modeRequested.emit(str(STITCH_TOOL_KEY), str(mode))
+        else:
+            self.modeRequested.emit(str(SCATTERING_PAGE_KEY), str(mode))
+
+    def active(self):
+        return bool(self._owner.busy or self._reading is not None
+                    or self._owner.finalization is not RSMOwnerFinalization.NONE)
+
+    def mount_points(self):
+        return AppMenuHosts(self.config_menu, self.help_menu, tool_requested=self.toolRequested,
+                            mode_requested=self.modeRequested)
+
+    def request(self):
+        self.open_result()
+        return ActionAccepted("open-rsm-result")
+
+    def run_pause(self):
+        self.begin_run()
+        return ActionAccepted("rsm-run")
+
+    def close_page(self):
+        """Close the owner and the reader; PENDING while either still has a worker."""
+        self._closing = True
+        self._timer.stop()
+        receipts = (self._owner.close(), self._reader.close())
+        pending = [receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN]
+        if pending:
+            self._closing = False
+            return pending[0]
+        self.view.clear()
+        return CloseReceipt(PageCleanup.CLEAN)
+
+
+class _RSMProcessingMode:
+    """Another page's request for RSM (Int's or Stitch's run bar)."""
+
+    def __init__(self, page):
+        self._page = page
+
+    def select(self, mode):
+        from xdart.gui.pages.values import MODE_REFUSED
+        if str(mode) in _RSM_MODES:
+            return ActionCompleted("processing-mode-RSM")
+        return ActionRefused(MODE_REFUSED)
+
+
+def build_rsm_page(services, parent):
+    page = RSMPage(services, parent)
+    return PageHandle(key=RSM_TOOL_KEY, widget=page, close=page.close_page, open_folder=page,
+                      run_control=page, activity=page, app_menus=page, processing_mode=_RSMProcessingMode(page))
+
+
+__all__ = ["RSMPage", "build_rsm_page", "suggested_output"]

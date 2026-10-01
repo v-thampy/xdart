@@ -24,7 +24,7 @@ from xdart.gui.pages.catalog import (
     BUILTIN_DESCRIPTORS,
     BUILTIN_PAGES,
     DEFAULT_PAGE_KEY,
-    RSM_TOOL,
+    RSM_PAGE,
     SCATTERING_WORKSPACE_PAGE,
     STITCH_PAGE,
 )
@@ -62,18 +62,20 @@ def test_catalog_registers_current_workspace_first_and_as_default():
     assert tuple(page.key for page in BUILTIN_PAGES) == (
         "scattering-workspace",
         "stitch",
+        "rsm",
     )
     assert DEFAULT_PAGE_KEY == "scattering-workspace"
     assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
-    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, RSM_TOOL)
+    assert BUILTIN_DESCRIPTORS == BUILTIN_PAGES
     assert STITCH_PAGE.key == STITCH_TOOL_KEY == "stitch"
-    assert RSM_TOOL.key == RSM_TOOL_KEY == "rsm"
-    assert (
-        RSM_TOOL.label,
-        RSM_TOOL.category,
-        RSM_TOOL.order,
-        RSM_TOOL.tool_kind,
-    ) == ("Reciprocal Space Map", "analysis", 110, "processing")
+    # the native RSM workspace (AUD-9) on the RSM tool's key
+    assert RSM_PAGE.key == RSM_TOOL_KEY == "rsm"
+    assert (RSM_PAGE.label, RSM_PAGE.category, RSM_PAGE.order, RSM_PAGE.lifecycle) == (
+        "RSM", "workspace", 200, PageLifecycle.RETAINED)
+    assert RSM_PAGE.capabilities == frozenset({
+        PageCapability.OPEN_FOLDER, PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY,
+        PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE,
+    })
 
 
 def test_scattering_descriptor_declares_the_frozen_adoption_ports():
@@ -102,7 +104,7 @@ def test_default_selection_is_the_current_workspace():
     assert registry.select(
         STITCH_TOOL_KEY, DEFAULT_PAGE_KEY) is STITCH_PAGE
     assert registry.select(
-        RSM_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
+        RSM_TOOL_KEY, DEFAULT_PAGE_KEY) is RSM_PAGE
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +179,7 @@ def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
         assert window._page_handles[STITCH_PAGE.key] is handle
         assert handle.widget._value("scan") == "14"
         assert STITCH_TOOL_KEY not in window._tool_handles
-        assert RSM_TOOL.key not in window._tool_handles
+        assert RSM_TOOL_KEY not in window._tool_handles
     finally:
         window.close()
         window.deleteLater()
@@ -239,37 +241,44 @@ def test_stitch_selection_obeys_active_integration_page_fence(
         qapp.processEvents()
 
 
-def test_builtin_rsm_action_constructs_one_idle_tool_only_when_opened(
+def test_builtin_rsm_selection_mounts_the_native_page_from_every_mode_box(
         qapp, isolated_settings):
+    """AUD-9: RSM is a native workspace page on the RSM key. Int's mode box navigates to it (as it does to
+    Stitch), Int's Run on an RSM intent and the host's open_tool("rsm") select it, and its own mode box goes
+    back to Int's or Stitch's page in the mode chosen; no RSM dialog is built."""
     from xdart.gui.pages.values import ActionCompleted
 
     window = _mounted_host(None)
     try:
-        page_widget = window.main_widget
-        selected_page_key = window.selected_page_key
-        assert RSM_TOOL.key not in window._tool_handles
         assert window.ui.menuAnalysis is None
         page = window.page_handle.widget
-        page._shell.run_controls.modeCombo.setCurrentText("RSM")
-        assert page._shell.run_controls.startButton.isEnabled()
-        page._shell.run_controls.startButton.click()
+        combo = page._shell.run_controls.modeCombo
+        prior_intent = page._intents.snapshot()
+        combo.setCurrentText("RSM")
         qapp.processEvents()
-        handle = window._tool_handles[RSM_TOOL.key]
-        dialog = handle.widget
-        assert handle.key == RSM_TOOL_KEY
-        assert dialog.objectName() == "rsmToolDialog"
-        assert dialog.isWindow()
-        assert dialog.parent() is window
+        assert window.selected_page_key == RSM_PAGE.key
+        handle = window._page_handles[RSM_PAGE.key]
+        rsm = handle.widget
+        assert rsm.objectName() == "rsmPage" and not rsm.isWindow()
+        assert window.centralWidget().currentWidget() is rsm
         assert handle.activity.active() is False
-        dialog.close()
+        assert page._intents.snapshot() == prior_intent  # the integration intent is kept for the return
+        assert window._tool_handles == {}
+        for mode, key in (("Int 2D", SCATTERING_WORKSPACE_PAGE.key), ("Stitch 2D", STITCH_PAGE.key)):
+            rsm.run_bar.modeCombo.setCurrentText(mode)
+            qapp.processEvents()
+            assert window.selected_page_key == key, mode
+            assert rsm.run_bar.modeCombo.currentText() == "RSM"  # the RSM page's own box is unchanged
+            assert window.open_tool(RSM_TOOL_KEY) == ActionCompleted("rsm")
+            assert window.page_handle is handle
+        assert window.select_page(STITCH_PAGE.key) == ActionCompleted(str(STITCH_PAGE.key))
+        window.page_handle.widget.run_bar.modeCombo.setCurrentText("RSM")  # Stitch's mode box
         qapp.processEvents()
-        assert not dialog.isVisible()
-        assert window.open_tool(RSM_TOOL.key) == ActionCompleted("rsm")
-        assert window._tool_handles[RSM_TOOL.key] is handle
-        assert window._tool_handles[RSM_TOOL.key].widget is dialog
-        assert window.main_widget is page_widget
-        assert window.selected_page_key == selected_page_key
-        assert STITCH_TOOL_KEY not in window._tool_handles
+        assert window.page_handle is handle
+        assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
+        page.toolRequested.emit("rsm")  # Int's Run on an RSM intent (an older session's)
+        qapp.processEvents()
+        assert window.page_handle is handle and window._tool_handles == {}
     finally:
         window.close()
         window.deleteLater()
