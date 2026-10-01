@@ -109,6 +109,41 @@ def _detector_correction(value: np.ndarray | None, name: str, fill: float,
     return np.where(invalid, fill, array), invalid
 
 
+def _scout_extents(integrator, radial_unit, radial: bool, azimuth: bool):
+    """One frame's (radial (min, max), χ (min, max)) for MultiGeometry's range guesses, each None when not
+    asked: what ``array_from_unit`` gives (pyFAI's ``center_array`` formula), its pixel positions (pyFAI's
+    Cython) computed once for both and outside the numexpr lock, only the unit formulas under it. A geometry
+    with a parallax correction, whose positions evaluate numexpr, or a fiber unit takes pyFAI's own call
+    under the lock."""
+    from pyFAI import units
+
+    try:
+        # MultiGeometry defaults to chi_disc=180 and mutates every member
+        # before integrating.  Scout in that same convention; otherwise a
+        # caller-supplied AI using chiDiscAtZero can produce a 0..360 range
+        # which is then paired with -180..180 integration values, dropping
+        # half the detector.
+        integrator.setChiDiscAtPi()
+        positions = None
+        if getattr(integrator, "_parallax", True) is None and not isinstance(radial_unit, units.UnitFiber):
+            positions = integrator.position_array(corners=False)
+
+        def extent(unit):
+            if positions is None:
+                values = integrator.array_from_unit(unit=unit)
+            else:  # center_array's own formula (scale=True) on those positions
+                values = unit.equation(positions[..., 2], positions[..., 1], positions[..., 0],
+                                       integrator.wavelength) * unit.scale
+            values = np.asarray(values, dtype=float)
+            return float(values.min()), float(values.max())
+
+        with pyfai_numexpr.PYFAI_NUMEXPR_LOCK:  # the unit formulas are numexpr's
+            return (extent(radial_unit) if radial else None,
+                    extent(units.CHI_DEG) if azimuth else None)
+    finally:
+        integrator.reset(collect_garbage=False)
+
+
 def _resolve_streaming_ranges(
     integrator_factory: Callable[[], Iterator[AzimuthalIntegrator]],
     image_count: int,
@@ -116,8 +151,10 @@ def _resolve_streaming_ranges(
     unit: str,
     radial_range: tuple[float, float] | None,
     azimuth_range: tuple[float, float] | None,
+    workers: int = 1,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Match MultiGeometry's global range guesses with O(one-AI) residency."""
+    """Match MultiGeometry's global range guesses with O(one-AI) residency (one a worker: ``workers``
+    frames scouted at once, ``_scout_extents``; their extents merge in frame order)."""
 
     if radial_range is not None and azimuth_range is not None:
         return radial_range, azimuth_range
@@ -128,36 +165,39 @@ def _resolve_streaming_ranges(
     radial_max = -math.inf
     azimuth_min = math.inf
     azimuth_max = -math.inf
-    observed = 0
-    for integrator in integrator_factory():
-        observed += 1
+    integrators = iter(integrator_factory())
+
+    def read(index):
         try:
-            # MultiGeometry defaults to chi_disc=180 and mutates every member
-            # before integrating.  Scout in that same convention; otherwise a
-            # caller-supplied AI using chiDiscAtZero can produce a 0..360 range
-            # which is then paired with -180..180 integration values, dropping
-            # half the detector.
-            integrator.setChiDiscAtPi()
-            with pyfai_numexpr.PYFAI_NUMEXPR_LOCK:  # the centre arrays are numexpr formulas
-                if radial_range is None:
-                    values = np.asarray(
-                        integrator.array_from_unit(unit=radial_unit), dtype=float
-                    )
-                    radial_min = min(radial_min, float(values.min()))
-                    radial_max = max(radial_max, float(values.max()))
-                if azimuth_range is None:
-                    values = np.asarray(
-                        integrator.array_from_unit(unit=units.CHI_DEG), dtype=float
-                    )
-                    azimuth_min = min(azimuth_min, float(values.min()))
-                    azimuth_max = max(azimuth_max, float(values.max()))
-        finally:
-            integrator.reset(collect_garbage=False)
-    if observed != image_count:
-        raise ValueError(
-            f"streaming Stitch received {observed} integrators; "
-            f"expected {image_count}"
-        )
+            return (next(integrators),)
+        except StopIteration as error:
+            raise ValueError(
+                f"streaming Stitch received {index} integrators; "
+                f"expected {image_count}"
+            ) from error
+
+    def scout(_index, integrator):
+        return _scout_extents(integrator, radial_unit, radial_range is None, azimuth_range is None)
+
+    def merge(extents):
+        nonlocal radial_min, radial_max, azimuth_min, azimuth_max
+        radial, azimuth = extents
+        if radial is not None:
+            radial_min, radial_max = min(radial_min, radial[0]), max(radial_max, radial[1])
+        if azimuth is not None:
+            azimuth_min, azimuth_max = min(azimuth_min, azimuth[0]), max(azimuth_max, azimuth[1])
+
+    if workers == 1:
+        for index in range(image_count):
+            merge(scout(index, *read(index)))
+    else:
+        parallel_frames(image_count, read, scout, merge, workers)
+    try:
+        next(integrators)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("streaming Stitch received more integrators than declared")
     resolved_radial = (
         radial_range if radial_range is not None else (radial_min, radial_max)
     )
@@ -246,6 +286,7 @@ def _streaming_multigeometry(
         unit=unit,
         radial_range=radial_range,
         azimuth_range=azimuth_range,
+        workers=workers,
     )
     if gi is not None and (gi_angles is None or len(gi_angles) != image_count
                            or (mode == "2d" and (profile_npt is None or gi_map_npt is None))):
@@ -270,7 +311,7 @@ def _streaming_multigeometry(
         if profile_radial is None or profile_azimuth is None:
             profile_radial, profile_azimuth = _resolve_streaming_ranges(
                 integrator_factory, image_count, unit=profile_unit, radial_range=profile_radial,
-                azimuth_range=profile_azimuth)
+                azimuth_range=profile_azimuth, workers=workers)
     gi_bins = {} if gi is None else _gi_bins(integrator_factory, gi_angles, gi)
     gi_totals = None
 

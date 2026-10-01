@@ -5,6 +5,7 @@ bit for bit; pyFAI's numexpr work holds the one process-wide lock Int's workers 
 serializes its calls); a failure or a stopped read ends the run as one worker's would, leaving no thread."""
 import dataclasses
 import inspect
+import math
 import threading
 
 import numexpr
@@ -97,6 +98,50 @@ def test_any_worker_count_merges_the_same_sums_bit_for_bit(config):
     if config == "1d-screen":
         assert _stitch(config, 4)[1] == [False] * 4 + [True] + [False] * 5  # the dropped frame, left out
 
+
+
+@pytest.mark.parametrize("unit", ("q_A^-1", "2th_deg"))
+def test_the_range_scouting_finds_array_from_units_extents_on_any_worker_count(unit):
+    """PERF-STITCH-3's scouting pass: each frame's pixel positions once, outside the lock (pyFAI's Cython),
+    only the unit formulas under it, ``workers`` frames at once; the extents are pyFAI's ``array_from_unit``'s,
+    bit for bit. (The census below checks every numexpr call holds the lock.)"""
+    from pyFAI import units
+    expected = [math.inf, -math.inf, math.inf, -math.inf]
+    for integrator in _factory():
+        integrator.setChiDiscAtPi()
+        for offset, scouted in ((0, units.to_unit(unit)), (2, units.CHI_DEG)):
+            values = np.asarray(integrator.array_from_unit(unit=scouted), dtype=float)
+            expected[offset] = min(expected[offset], float(values.min()))
+            expected[offset + 1] = max(expected[offset + 1], float(values.max()))
+    for workers in (1, 4):
+        radial, azimuth = multi._resolve_streaming_ranges(_factory, len(ARM), unit=unit, radial_range=None,
+                                                          azimuth_range=None, workers=workers)
+        assert (*radial, *azimuth) == tuple(expected), workers
+
+
+def test_a_parallax_geometry_scouts_through_pyfais_own_call():
+    """Positions with a parallax correction evaluate numexpr: such a geometry keeps pyFAI's own call, under
+    the lock, never the positions outside it."""
+    from pyFAI import units
+    calls = []
+
+    class Parallax:
+        _parallax, wavelength = object(), 1e-10
+
+        def setChiDiscAtPi(self):
+            calls.append("disc")
+
+        def reset(self, collect_garbage):
+            calls.append("reset")
+
+        def position_array(self, *args, **kwargs):
+            raise AssertionError("positions outside the lock")
+
+        def array_from_unit(self, unit):
+            calls.append(unit.name)
+            return np.arange(4.)
+    assert multi._scout_extents(Parallax(), units.to_unit("q_A^-1"), True, True) == ((0., 3.), (0., 3.))
+    assert calls == ["disc", "q_A^-1", "chi_deg", "reset"]
 
 class _OwnedLock:
     """The shared lock, knowing which thread holds it."""
