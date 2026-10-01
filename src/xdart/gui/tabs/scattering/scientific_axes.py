@@ -15,7 +15,7 @@ from xrd_tools.core import (
     axis_from_unit,
     convert_radial_axis,
 )
-from xrd_tools.core.metadata import resolve_monitor_norm
+from xrd_tools.core.metadata import monitor_candidates, resolve_monitor_norm
 from xrd_tools.io import is_readable_output_path
 from xrd_tools.session.display_logic import (
     canonical_axis_key,
@@ -725,7 +725,9 @@ def resolve_norm_presentation(
     normalization cannot disagree.  :func:`trace_normalization_scope` derives
     the narrower trace-cache regime from that result.  Exact type and revision
     are validated here; choices carry only complete channels outside the
-    reserved sentinel; the effective channel is empty unless the one accepted
+    reserved sentinel, likely beam monitors first and the time stamp and H, K,
+    L left out unless saved (Stitch's Monitor ordering: ``monitor_candidates``;
+    maintainer 2026-09-30); the effective channel is empty unless the one accepted
     aggregate covers EVERY selected frame and the saved selection
     case-insensitively names a complete, non-reserved channel.
     """
@@ -737,11 +739,14 @@ def resolve_norm_presentation(
         return None, 0, "", ("Norm Channel",)
     choices = (
         "Norm Channel",
-        *(
-            key
-            for key in accepted.channels
-            if key.lower() != _RESERVED_NORM_SENTINEL
-            and not channel_is_partial(accepted, key)
+        *monitor_candidates(
+            (
+                key
+                for key in accepted.channels
+                if key.lower() != _RESERVED_NORM_SENTINEL
+                and not channel_is_partial(accepted, key)
+            ),
+            keep=(saved_channel.lower(),) if type(saved_channel) is str else (),
         ),
     )
     effective = ""

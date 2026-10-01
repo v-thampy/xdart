@@ -238,16 +238,11 @@ def _spec_motor_names(path, _state, scan):
 #: Monitor lists every counter a scan records but what is clearly no monitor (maintainer, 2026-09-30:
 #: "all the metadata columns that could be beam monitors of any kind listed (i0, i1, mon, monitor, bs,
 #: beamstop, pd, photod, etc). if in doubt, list it"): the likely monitors first, in the file's order.
-_LIKELY_MONITOR = re.compile(r"^(i\d|io$|ic\d*$|ion|mon|bs|beam.?stop|pd|photo|diode|flux|norm)", re.IGNORECASE)
-_NOT_MONITORS = frozenset({"epoch", "h", "k", "l"})
-
-
 def monitor_choices(counters):
-    """"None" (no monitor), then ``counters`` without the clearly-not-monitors, likely monitors first."""
-    kept = list(dict.fromkeys(  # a file may name a column twice
-        name for name in counters if name.strip() and name.strip().lower() not in _NOT_MONITORS))
-    likely = [name for name in kept if _LIKELY_MONITOR.match(name.strip())]
-    return ("None", *likely, *(name for name in kept if name not in likely))
+    """"None" (no monitor), then the scan's counters as beam-monitor choices: likely monitors first, the
+    time stamp and H, K, L left out (``core.metadata.monitor_candidates``, which Int's Norm channel takes)."""
+    from xrd_tools.core.metadata import monitor_candidates
+    return ("None", *monitor_candidates(name for name in counters if name.strip()))
 
 
 #: The detector camera's eight values, "rows, columns" (xrayutilities' detectorDir1, detectorDir2), Stitch's

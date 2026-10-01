@@ -115,3 +115,14 @@ def test_metadata_resolvers_import_without_gui_or_heavy_reader_stack() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_monitor_candidates_list_likely_monitors_first_and_drop_the_never_monitors():
+    """Stitch's Monitor and Int's Norm channel (maintainer, 2026-09-30): \"if in doubt, list it. if it
+    clearly not a monitor ... it can be dropped\"; a choice already made is kept."""
+    from xrd_tools.core.metadata import monitor_candidates
+    names = ("Two Theta", "H", "K", "L", "Epoch", "Seconds", "Seconds", "mon", "det", "I0", "pd1",
+             "bstop", "Beamstop", "ic1", "temp")
+    assert monitor_candidates(names) == ("mon", "I0", "pd1", "bstop", "Beamstop", "ic1", "Two Theta",
+                                         "Seconds", "det", "temp")
+    assert monitor_candidates(("epoch", "i1"), keep=("epoch",)) == ("i1", "epoch")
