@@ -15,6 +15,9 @@ to it, so a plane through voxel centres reproduces those voxels exactly, float32
 The slice is interpolated from the gridded volume, not re-gridded from the frames; ``CustomSlice.interpolated``
 says so, and the window shows ``CustomSlice.note``.
 
+An Auto range is the plane's own extent inside the volume's bin-centre box (a slab's, across its thickness), so
+any point on the plane cuts the same samples (Codex's combined stage-2b review F1).
+
 A Thickness above 0 averages a slab (the maintainer, 2026-10-01: "Do you want the Thickness option? Yes"): the
 planes parallel to the plane across ±thickness/2 along its unit normal n = u×v/|u×v|, in the volume's own
 coordinates (in HKL, r.l.u. taken as orthogonal axes: for a non-orthogonal lattice neither n nor the thickness is
@@ -28,6 +31,7 @@ the plane alone, by the same code as before the slab.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import itertools
 import math
 
 import numpy as np
@@ -44,6 +48,7 @@ _MIN_COVERAGE = 0.5
 _CHUNK_POINTS = 1 << 16
 _NOTE = "interpolated from the gridded volume (trilinear), not re-gridded from the frames"
 _SPACING_ROUNDING = 1e-9  # voxel spacings: a half-thickness a whole number of them, up to rounding, adds no planes
+_VERTEX_TOLERANCE = 1e-9  # of a face's scale: a vertex of the plane's cut this near outside another face is on it
 
 
 class CustomSliceRefused(ValueError):
@@ -147,8 +152,9 @@ def custom_slice(values, axes, origin=None, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0)
                  points=None, *, symbols=("H", "K", "L"), unit="r.l.u.", thickness=0.0) -> CustomSlice:
     """The plane ``origin + t·u + s·v`` of the volume (HH–L by default: u = (1, 1, 0), v = (0, 0, 1)).
 
-    ``origin`` defaults to the volume's centre; each range defaults to the volume's extent along its direction
-    from the origin; ``points`` (t, s) defaults to the volume's longest axis in each direction. ``thickness``
+    ``origin`` defaults to the volume's centre; each range defaults to the plane's extent inside the volume's
+    bin-centre box along its direction (for a ``thickness`` above 0, the slab's), the same cut through any point on
+    the plane; ``points`` (t, s) defaults to the volume's longest axis in each direction. ``thickness``
     above 0 averages the slab across ±thickness/2 along the plane's unit normal (the module's docstring). A zero
     or parallel direction, a plane that misses the volume, a bad range, more than ``MAX_SLICE_POINTS`` samples a
     plane, a negative or non-finite thickness or a slab of more than ``MAX_SLAB_SAMPLES`` are refused with a
@@ -160,8 +166,19 @@ def custom_slice(values, axes, origin=None, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0)
     low = np.array([centre[0] for centre in centres])
     high = np.array([centre[-1] for centre in centres])
     centre_point = _origin(volume_centre(centres) if origin is None else origin)
-    t_low, t_high = _span(first, centre_point, low, high) if u_range is None else _range(u_range)
-    s_low, s_high = _span(second, centre_point, low, high) if v_range is None else _range(v_range)
+    across = np.cross(first, second)
+    normal = across / np.linalg.norm(across)
+    extent = None  # the plane's (the slab's) extent in the box, found once for an Auto range
+    if u_range is None:
+        extent = _extent(centre_point, first, second, normal, width, low, high)
+        t_low, t_high = extent[0]
+    else:
+        t_low, t_high = _range(u_range)
+    if v_range is None:
+        extent = extent or _extent(centre_point, first, second, normal, width, low, high)
+        s_low, s_high = extent[1]
+    else:
+        s_low, s_high = _range(v_range)
     longest = max(volume.shape)
     count_t, count_s = (longest, longest) if points is None else (int(points[0]), int(points[1]))
     if count_t < 2 or count_s < 2:
@@ -169,8 +186,6 @@ def custom_slice(values, axes, origin=None, u=(1.0, 1.0, 0.0), v=(0.0, 0.0, 1.0)
     if count_t * count_s > MAX_SLICE_POINTS:
         raise CustomSliceRefused("CUSTOM_SLICE_TOO_LARGE",
                                  f"{count_t} × {count_s} samples is above Custom Slice's {MAX_SLICE_POINTS:,}")
-    across = np.cross(first, second)
-    normal = across / np.linalg.norm(across)
     planes = _slab_planes(centres, normal, width, count_t * count_s)
     t = np.linspace(t_low, t_high, count_t)
     s = np.linspace(s_low, s_high, count_s)
@@ -332,18 +347,82 @@ def _range(value) -> tuple[float, float]:
     return low, high
 
 
-def _span(direction: np.ndarray, origin: np.ndarray, low: np.ndarray, high: np.ndarray) -> tuple[float, float]:
-    """The coefficients along ``direction`` for which ``origin + c·direction`` stays inside the volume's box."""
-    lowest, highest = -np.inf, np.inf
+def _extent(origin, first, second, normal, width, low, high) -> tuple[tuple[float, float], tuple[float, float]]:
+    """The Auto ranges: the least and greatest t and s of the points ``origin + t·u + s·v`` (for a ``width``
+    above 0, ``+ w·normal`` with |w| ≤ width/2: the slab) inside the box ``low``…``high``, the bin centres'
+    extent; refused when there is none. That is the plane's (the slab's) cut through the box, the same cut
+    through any point on the plane (Codex's combined stage-2b review F1: the lines through the point, which the
+    ranges were before, can miss the box where the plane crosses it).
+
+    The extremes are at vertices, where the plane meets two of the box's faces (the slab, three of the box's and
+    its own two faces): each is solved and kept when inside the other faces. An axis only one direction moves
+    bounds that direction alone, ``(face − origin) / direction``, as the line through the point did, and no
+    vertex passes that bound; so where each axis moves with one direction at most (H–K, HH–L) the ranges are the
+    line's, to the last bit."""
+    columns = (first, second, normal) if width else (first, second)
+    rows = []  # per moved axis (and the slab): its coefficients, its two faces less the origin, its scale
+    bounds = [[-math.inf, math.inf], [-math.inf, math.inf]]  # what an axis moved by t (by s) alone allows
     for k in range(3):
-        if direction[k] != 0.0:
-            ends = sorted(((low[k] - origin[k]) / direction[k], (high[k] - origin[k]) / direction[k]))
-            lowest, highest = max(lowest, ends[0]), min(highest, ends[1])
-        elif not low[k] <= origin[k] <= high[k]:
-            lowest, highest = 1.0, 0.0  # the line runs outside the box on this axis
-    if not highest > lowest:
-        raise CustomSliceRefused("CUSTOM_SLICE_OUTSIDE", "the plane does not cross the volume")
-    return float(lowest), float(highest)
+        coefficients = tuple(float(column[k]) for column in columns)
+        moved = [index for index, value in enumerate(coefficients) if value != 0.0]
+        if not moved:  # an axis the plane does not move: the point must be inside the box on it
+            if not low[k] <= origin[k] <= high[k]:
+                raise CustomSliceRefused("CUSTOM_SLICE_OUTSIDE", "the plane does not cross the volume")
+            continue
+        faces = (low[k] - origin[k], high[k] - origin[k])
+        rows.append((coefficients, faces, abs(low[k]) + abs(high[k]) + abs(origin[k])))
+        if len(moved) == 1 and moved[0] < 2:
+            index = moved[0]
+            ends = sorted((faces[0] / coefficients[index], faces[1] / coefficients[index]))
+            bounds[index] = [max(bounds[index][0], ends[0]), min(bounds[index][1], ends[1])]
+    if width:
+        rows.append(((0.0, 0.0, 1.0), (-width / 2.0, width / 2.0), width))
+    found = [[math.inf, -math.inf], [math.inf, -math.inf]]
+    for chosen in itertools.combinations(range(len(rows)), len(columns)):
+        for sides in itertools.product((0, 1), repeat=len(columns)):
+            vertex = _solve([rows[r][0] for r in chosen], [rows[r][1][side] for r, side in zip(chosen, sides)])
+            if vertex is None or not all(_inside_faces(*rows[r], vertex) for r in range(len(rows))
+                                         if r not in chosen):
+                continue
+            for index in (0, 1):
+                found[index] = [min(found[index][0], vertex[index]), max(found[index][1], vertex[index])]
+    extent = []
+    for (lowest, highest), (floor, ceiling) in zip(found, bounds):
+        lowest, highest = max(lowest, floor), min(highest, ceiling)
+        if not highest > lowest:
+            raise CustomSliceRefused("CUSTOM_SLICE_OUTSIDE", "the plane does not cross the volume")
+        extent.append((float(lowest), float(highest)))
+    return extent[0], extent[1]
+
+
+def _solve(rows, values) -> list[float] | None:
+    """``rows · x = values`` for two or three unknowns, by Gaussian elimination with partial pivoting in floats;
+    None when singular or not finite. A row that moves one unknown leaves the others' rows as they are, so where
+    every row does (an axis-aligned vertex) each unknown is its face's one division, as ``_extent``'s bounds are."""
+    size = len(values)
+    matrix = [[float(item) for item in row] + [float(value)] for row, value in zip(rows, values)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(matrix[row][column]))
+        if matrix[pivot][column] == 0.0:
+            return None
+        matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
+        for row in range(column + 1, size):
+            factor = matrix[row][column] / matrix[column][column]
+            if factor != 0.0:
+                matrix[row] = [item - factor * lead for item, lead in zip(matrix[row], matrix[column])]
+    solution = [0.0] * size
+    for row in reversed(range(size)):
+        known = sum(matrix[row][j] * solution[j] for j in range(row + 1, size))
+        solution[row] = (matrix[row][size] - known) / matrix[row][row]
+    return solution if all(math.isfinite(item) for item in solution) else None
+
+
+def _inside_faces(coefficients, faces, scale, vertex) -> bool:
+    """Whether a vertex is between one axis's (or the slab's) two faces, up to ``_VERTEX_TOLERANCE`` of its
+    scale: solving rounds, and a plane through a box corner meets three faces there."""
+    value = sum(coefficient * item for coefficient, item in zip(coefficients, vertex))
+    slack = _VERTEX_TOLERANCE * (scale + abs(value))
+    return faces[0] - slack <= value <= faces[1] + slack
 
 
 def _finite_mean(values: np.ndarray, *, axis: int) -> np.ndarray:

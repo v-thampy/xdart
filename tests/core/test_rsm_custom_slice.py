@@ -330,6 +330,182 @@ def test_a_negative_non_finite_or_too_thick_thickness_is_refused() -> None:
     assert MAX_SLAB_SAMPLES == 16_000_000
 
 
+# Codex's combined stage-2b review (2026-10-01) F1: the Auto ranges came from the two LINES through the point,
+# origin + t·u and origin + s·v, so a Through whose lines miss the box refused a plane that crosses it. They are
+# the plane's (the slab's) own extent inside the box now, the same for every Through on the plane.
+
+
+def test_auto_hk_plane_is_independent_of_through_point_within_the_same_plane():
+    """Codex's reproduction (its test_custom_slice_origin.py), adopted as is."""
+    h = k = np.linspace(0.8, 1.2, 5)
+    l = np.linspace(2.8, 3.2, 5)
+    axes = (h, k, l)
+    values = (h[:, None, None] + 2 * k[None, :, None] + 3 * l[None, None, :]).astype(np.float32)
+    first, second = (1, 0, 0), (0, 1, 0)
+    centered = custom_slice(values, axes, origin=(1, 1, 3), u=first, v=second, points=(5, 5))
+    # Both equations describe L = 3, which intersects every H/K bin in this volume.
+    # The GUI accepts a Through point and defaults its Along ranges to Auto.
+    from_origin = custom_slice(values, axes, origin=(0, 0, 3), u=first, v=second, points=(5, 5))
+    np.testing.assert_array_equal(from_origin.values, centered.values)
+
+
+def _dyadic_volume():
+    """Axes in steps of 1/4 and a volume that is no linear function (a shifted range shows), with empty voxels:
+    every Auto bound, offset and sample coordinate below is exact, so a plane cut through any point on it is the
+    same samples bit for bit."""
+    axes = (np.linspace(0.0, 2.0, 9), np.linspace(0.0, 2.0, 9), np.linspace(1.0, 3.0, 9))
+    volume = np.random.default_rng(3).normal(size=(9, 9, 9))
+    volume[2, 3, 4] = volume[6, 6, 1] = np.nan
+    return volume, axes
+
+
+def _same_cut(first, second):
+    """The same plane, cut through two of its points: the t and s offsets differ by the points' own offset along
+    the directions, and the values and projections are the same bytes."""
+    assert first.values.shape == second.values.shape
+    for name in ("values", "projection_t", "projection_s"):
+        assert getattr(first, name).tobytes() == getattr(second, name).tobytes(), name
+    assert np.isfinite(first.values).any()
+
+
+def test_a_plane_through_any_of_its_points_is_the_same_cut() -> None:
+    """Through moved within the plane changes no sample: H–K, HH–L (u = (1, 1, 0), v = (0, 0, 1)) and a coupled,
+    non-orthogonal basis (u = (1, 1, 0), v = (0, 1, 1): K moves with both). Each moved point's line along one
+    direction misses the box (refused before), or (the coupled basis) crosses it on a shorter span than the plane
+    (a different, narrower cut before)."""
+    volume, axes = _dyadic_volume()
+    centre = np.array([1.0, 1.0, 2.0])
+    for u, v, moves, points in (
+            ((1, 0, 0), (0, 1, 0), ((-1.0, 2.0), (-3.0, -0.5)), ((0.0, 3.0, 2.0), (-2.0, 0.5, 2.0))),
+            ((1, 1, 0), (0, 0, 1), ((-1.0, 2.0), (2.0, -2.0)), ((0.0, 0.0, 4.0), (3.0, 3.0, 0.0))),
+            ((1, 1, 0), (0, 1, 1), ((0.0, 2.0), (-0.5, 0.5)), ((1.0, 3.0, 4.0), (0.5, 1.0, 2.5)))):
+        reference = custom_slice(volume, axes, origin=centre, u=u, v=v, points=(9, 9))
+        for (a, b), point in zip(moves, points, strict=True):
+            assert tuple(centre + a * np.array(u) + b * np.array(v)) == point  # a point of the same plane
+            cut = custom_slice(volume, axes, origin=point, u=u, v=v, points=(9, 9))
+            _same_cut(cut, reference)
+            np.testing.assert_array_equal(cut.t, reference.t - a)
+            np.testing.assert_array_equal(cut.s, reference.s - b)
+
+
+def test_a_slab_through_any_point_of_its_middle_plane_is_the_same_cut() -> None:
+    """With a thickness, the slab's planes are the same through any point of the middle plane: H–K (normal L,
+    every offset exact) bit for bit; HH–L (normal [1 −1 0]/√2, offsets not exact) to rounding."""
+    volume, axes = _dyadic_volume()
+    reference = custom_slice(volume, axes, origin=(1.0, 1.0, 2.0), u=(1, 0, 0), v=(0, 1, 0), points=(9, 9),
+                             thickness=0.5)
+    assert reference.planes == 3
+    _same_cut(custom_slice(volume, axes, origin=(0.0, 3.0, 2.0), u=(1, 0, 0), v=(0, 1, 0), points=(9, 9),
+                           thickness=0.5), reference)
+    reference = custom_slice(volume, axes, origin=(1.0, 1.0, 2.0), points=(9, 9), thickness=0.5)  # HH–L
+    moved = custom_slice(volume, axes, origin=(0.0, 0.0, 4.0), points=(9, 9), thickness=0.5)
+    assert moved.planes == reference.planes == 3
+    np.testing.assert_array_equal(moved.t, reference.t + 1.0)
+    np.testing.assert_array_equal(moved.s, reference.s - 2.0)
+    for name in ("values", "projection_t", "projection_s"):
+        np.testing.assert_allclose(getattr(moved, name), getattr(reference, name), rtol=1e-6, atol=1e-6,
+                                   equal_nan=True, err_msg=name)
+
+
+def _line_span(direction, origin, axes):
+    """The range Auto gave before F1 (G9–G13): where the line origin + c·direction stays inside the box. The
+    reference for the planes on which it is the plane's own extent."""
+    centres = tuple(np.asarray(axis, dtype=np.float64) for axis in axes)
+    low, high = np.array([centre[0] for centre in centres]), np.array([centre[-1] for centre in centres])
+    direction, origin = np.asarray(direction, dtype=np.float64), np.asarray(origin, dtype=np.float64)
+    lowest, highest = -np.inf, np.inf
+    for k in range(3):
+        if direction[k] != 0.0:
+            ends = sorted(((low[k] - origin[k]) / direction[k], (high[k] - origin[k]) / direction[k]))
+            lowest, highest = max(lowest, ends[0]), min(highest, ends[1])
+        else:
+            assert low[k] <= origin[k] <= high[k]
+    assert highest > lowest
+    return float(lowest), float(highest)
+
+
+def test_where_the_lines_crossed_on_a_separable_basis_auto_is_the_old_range_bit_for_bit() -> None:
+    """Thickness 0, on a basis that moves each axis with one direction at most (H–K, H–L, K–L, HH–L, H and K
+    against L, (1, 0, 0) against (0, 1, 1), non-unit and negative directions), through points whose two lines
+    cross the box: the plane's extent is the lines' own, so Auto is the old range to the last bit (float32 axes
+    too), and so is the cut. The default HH–L slab through the centre keeps the old range too, its edge columns
+    drawn."""
+    axes = _axes()
+    volume = _linear(axes)
+    volume[3:6, 2:4, 5:7] = np.nan
+    axes32 = tuple(axis.astype(np.float32) for axis in axes)
+    inside = (0.1, 0.9, 2.2)
+    for case_axes, u, v, origin, points in (
+            (axes, (1, 1, 0), (0, 0, 1), None, None),  # the window's default
+            (axes32, (1, 1, 0), (0, 0, 1), None, None),
+            (axes, (1, 0, 0), (0, 1, 0), inside, (11, 9)),
+            (axes, (1, 0, 0), (0, 0, 1), inside, (11, 13)),
+            (axes, (0, 1, 0), (0, 0, 1), inside, (9, 13)),
+            (axes, (1, 1, 0), (0, 0, 1), inside, (15, 13)),
+            (axes, (1, 0, 0), (0, 1, 1), inside, (17, 9)),
+            (axes32, (1, 0, 0), (0, 1, 1), inside, (17, 9)),
+            (axes, (2, 0, 0), (0, 0, 3), (0.3, 1.1, 1.7), (12, 10)),
+            (axes, (1, -1, 0), (0, 0, 1), (0.25, 1.3, 2.0), (12, 10)),
+            (axes, (0, 0, 1), (1, 0, 0), None, None)):
+        point = volume_centre(case_axes) if origin is None else origin
+        auto = custom_slice(volume, case_axes, origin, u, v, points=points)
+        old = custom_slice(volume, case_axes, origin, u, v, _line_span(u, point, case_axes),
+                           _line_span(v, point, case_axes), points)
+        for name in ("t", "s", "values", "projection_t", "projection_s"):
+            assert getattr(auto, name).tobytes() == getattr(old, name).tobytes(), (u, v, origin, name)
+    slab = custom_slice(volume, axes, thickness=0.8)
+    assert (slab.t[0], slab.t[-1], slab.s[0], slab.s[-1]) == (-1.0, 1.0, -1.0, 1.0)  # the old range
+    assert np.isfinite(slab.values[[0, -1], :]).all() and np.isfinite(slab.values[:, [0, -1]]).all()
+
+
+def test_a_slab_whose_middle_plane_misses_the_box_but_crosses_it_is_cut() -> None:
+    """The planes averaged decide: a slab around L = 3.2 (the box ends at 3) whose lower planes cross the box is
+    cut over the box's H and K, each value the finite mean of its planes inside it; refused before (the middle
+    plane's lines miss)."""
+    axes = _axes()
+    volume = _linear(axes)
+    slab = custom_slice(volume, axes, origin=(0.0, 1.0, 3.2), u=(1, 0, 0), v=(0, 1, 0), points=(11, 9),
+                        thickness=1.0)
+    assert (slab.t[0], slab.t[-1], slab.s[0], slab.s[-1]) == (-1.0, 1.0, -1.0, 1.0)  # H −1…1 and K 0…2
+    stack = _stack(volume, axes, slab)
+    finite = np.isfinite(stack)
+    assert finite.any(axis=-1).all() and not finite.all()  # every value from the planes inside, some outside
+    expected = np.where(finite, stack, 0.0).sum(axis=-1) / finite.sum(axis=-1)
+    np.testing.assert_allclose(slab.values, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_a_plane_or_slab_that_misses_the_box_is_still_refused() -> None:
+    """Off the box altogether, Auto still refuses CUSTOM_SLICE_OUTSIDE: an H–K plane above it, HH–L planes
+    beside it (H − K = 20), a coupled plane past its corner, and a slab too thin to reach it."""
+    axes = _axes()  # H −1…1, K 0…2, L 1…3
+    volume = _linear(axes)
+    for kwargs in (dict(origin=(0.0, 1.0, 100.0), u=(1, 0, 0), v=(0, 1, 0)),
+                   dict(origin=(10.0, -10.0, 2.0)),
+                   dict(origin=(10.0, -10.0, 2.0), thickness=1.0),
+                   dict(origin=(5.0, 2.0, 3.0), u=(1, 1, 0), v=(0, 1, 1)),
+                   dict(origin=(0.0, 1.0, 3.6), u=(1, 0, 0), v=(0, 1, 0), thickness=1.0)):
+        with pytest.raises(CustomSliceRefused) as refused:
+            custom_slice(volume, axes, **kwargs)
+        assert refused.value.code == "CUSTOM_SLICE_OUTSIDE", kwargs
+        assert str(refused.value) == "the plane does not cross the volume", kwargs
+
+
+def test_typed_ranges_are_cut_as_typed() -> None:
+    """A range typed (not Auto) is the cut's own, sample for sample, whatever the plane's extent; one typed and
+    one Auto keeps the typed one."""
+    axes = _axes()
+    volume = _linear(axes)
+    volume[3:6, 2:4, 5:7] = np.nan
+    origin, u, v = np.array([0.1, 0.9, 2.2]), np.array([1.0, 1.0, 0.0]), np.array([0.0, 1.0, 1.0])
+    cut = custom_slice(volume, axes, origin, u, v, (-0.7, 0.4), (-1.5, 0.3), (12, 10))
+    t, s = np.linspace(-0.7, 0.4, 12), np.linspace(-1.5, 0.3, 10)
+    expected = sample_volume(volume, axes, origin + t[:, None, None] * u + s[None, :, None] * v).astype(np.float32)
+    assert cut.t.tobytes() == t.tobytes() and cut.s.tobytes() == s.tobytes()
+    assert cut.values.tobytes() == expected.tobytes()
+    mixed = custom_slice(volume, axes, origin, u, v, (-0.7, 0.4), None, (12, 10))
+    assert mixed.t.tobytes() == t.tobytes()
+
+
 def test_importing_custom_slice_loads_no_qt_plotting_or_scipy() -> None:
     root = Path(__file__).resolve().parents[2]
     script = textwrap.dedent(
