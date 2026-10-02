@@ -1191,6 +1191,51 @@ def test_calibrate_and_make_mask_open_the_shared_windows_with_rsms_context(qapp,
         _close(page, qapp)
 
 
+def test_rsms_calibration_window_starts_on_rsms_detector_and_camera_unless_saved(qapp, tmp_path):
+    """Item 10 (the maintainer: "is this the camera orientation that works for the test data? If yes, then start
+    with this orientation"): with no saved window settings RSM's calibration window starts on the canonical
+    geometry's detector, the Pilatus 100K (195 × 487 at 0.172 mm), and its camera z−, x− (row C reproduces scan
+    43's reference with them), its hint in the turned frame; the page's source still seeds the window but no
+    longer turns its camera back. Saved window settings win, their detector and camera too."""
+    import json
+    from pyFAI.detectors import detector_factory
+    from xrd_tools.analysis.rsm_geometry_asset import canonical_rsm_geometry_resource_bytes
+    from xrd_tools.core.geometry.camera import DetectorCamera
+    from xrd_tools.session.readiness import ControlAction
+    canonical = json.loads(canonical_rsm_geometry_resource_bytes())
+    header, model = canonical["detector"]["header"], detector_factory("Pilatus100k")
+    assert tuple(model.shape) == (header["Nch1"], header["Nch2"])
+    assert (model.pixel1 * 1e3, model.pixel2 * 1e3) == pytest.approx((header["pwidth1"], header["pwidth2"]),
+                                                                     rel=1e-12, abs=0)
+    page, restored = _page(qapp), _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        for each in (page, restored):
+            _with_source(each, tmp_path)
+        page._control_action(ControlAction.CALIBRATE)
+        dialog = page._calibration_dialog
+        assert dialog._text("source") == str(tmp_path / "source" / "RSM_synth")
+        assert (dialog._text("beam_detector"), tuple(dialog.camera.value().to_xu())) == (
+            "Pilatus100k", tuple(canonical["diffractometer"]["camera"]))
+        assert dialog._text("shape") == "195, 487"
+        assert dialog._image_size.text() == ("195 × 487 px (x × y) in the window (the stored image is 487 × 195, "
+                                             "turned 270°): x 0–194, y 0–486 · camera rows z-, columns x-")
+        dialog._set_field_text("beam_detector", "Pilatus300kw")
+        dialog.camera.set_value(DetectorCamera("x-", "z-"))  # a mirror, the saved window's own
+        saved = page.settings()
+        saved["calibration"]["fields"]["source"] = ""  # saved without a source: the page's source seeds it again
+        dialog.hide()
+        restored.apply_settings(saved)
+        restored._control_action(ControlAction.CALIBRATE)
+        again = restored._calibration_dialog
+        assert (again._text("beam_detector"), again.camera.value()) == ("Pilatus300kw", DetectorCamera("x-", "z-"))
+        assert again._text("source") == str(tmp_path / "source" / "RSM_synth")
+        again.hide()
+    finally:
+        for each in (page, restored):
+            _close(each, qapp)
+
+
 def test_a_calibration_outside_the_project_is_named_before_any_preview(qapp, tmp_path):
     """A relative Calibration that climbs out of the Project is refused by readiness, as an absolute one outside
     it is, rather than by the form at Preview."""

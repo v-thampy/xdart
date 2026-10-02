@@ -9,6 +9,7 @@ import logging
 import math
 from pathlib import Path
 import re
+from typing import TYPE_CHECKING
 import uuid
 
 import numpy as np
@@ -31,6 +32,9 @@ from xrd_tools.integrate.stitch_calibration import (
 from .fit_windows import (
     PARAMETER_LABELS, RECORD_LABELS, CalibrationFitWindow, DirectBeamFitWindow, calibration_fit_text, direct_beam_fit_text,
 )
+
+if TYPE_CHECKING:
+    from xrd_tools.core.geometry.camera import DetectorCamera
 
 _LOG = logging.getLogger(__name__)
 
@@ -374,10 +378,24 @@ class CalibrationContext:
     """The page a calibration window serves: its name, in the window's title and buttons ("Save geometry and
     use in RSM"), and its Project, where the window keeps its sessions and saves. Each page opens its own
     window with its own context, from its own Project and source (``set_source_context``), and adopts only
-    its own window's saves. The page, not the window, keeps the window's settings."""
+    its own window's saves. The page, not the window, keeps the window's settings.
+
+    ``detector`` (a pyFAI detector name) and ``camera`` (a ``DetectorCamera``) are the page's own detector the
+    window starts on, before any saved settings are applied (they win); None: the window's defaults, the
+    Pilatus 300K-W in Stitch's frame (AUD-9 stage 2b item 10: RSM starts on its Pilatus 100K, camera z−, x−)."""
 
     page: str
     project_root: str | Path
+    detector: str | None = None
+    camera: DetectorCamera | None = None
+
+    def __post_init__(self):
+        if self.detector is not None and (type(self.detector) is not str or not self.detector.strip()):
+            raise TypeError("a calibration window's starting detector is a pyFAI detector name")
+        if self.camera is not None:
+            from xrd_tools.core.geometry.camera import DetectorCamera
+            if type(self.camera) is not DetectorCamera:
+                raise TypeError("a calibration window's starting camera is a DetectorCamera")
 
 
 class CalibrationDialog(QtWidgets.QDialog):
@@ -388,7 +406,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     ``set_source_context(SourceSpec, image_rotation=0, del_motor='del',
     nu_motor='nu', geometry_path=None)`` seeds the source controls (and the
     automatic refinement's seed geometry) without selecting frames or changing
-    previously completed rows. Call ``show/raise_/activateWindow``.
+    previously completed rows; ``image_rotation=None`` keeps the window's camera
+    (a page with no turn of its own). Call ``show/raise_/activateWindow``.
     """
     calibrationSaved = QtCore.Signal(str, str)
     #: The diffractometer or a circle's motor changed (the page keeps the same geometry).
@@ -481,6 +500,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._poll)
+        # the page's own detector and camera, when it names them (item 10); saved settings applied after win
+        if context.detector is not None:
+            self._set_field_text('beam_detector', context.detector)
+        if context.camera is not None:
+            self.camera.set_value(context.camera)
 
     def _form(self, title, key):
         widget = QtWidgets.QWidget()
@@ -1286,6 +1310,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         for key, value in [('shape', ', '.join(map(str, reader.get('detector_shape', (195, 1475))))),
                            ('dtype', reader.get('raw_dtype', 'int32')), ('header', reader.get('raw_header_skip', 0))]:
             self._fields[key].setText(str(value))
+        if image_rotation is None:  # the page turns no images of its own: the window's camera stays (item 10)
+            return
         from xrd_tools.core.geometry import ImageOrientation
         from xrd_tools.core.geometry.camera import stitch_camera
         self.camera.set_value(stitch_camera(ImageOrientation(rotation=image_rotation, flip_horizontal=image_flip)))

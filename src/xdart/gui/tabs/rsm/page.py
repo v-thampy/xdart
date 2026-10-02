@@ -109,6 +109,12 @@ _STAGE_TEXT = {"revalidate": "Checking the inputs", "static-mask": "Masking hot 
 #: its buffer, and its six products are 0.5 MB (probe 3). Another is read again from its file, off the GUI
 #: thread, when it is shown.
 _RESIDENT_RESULTS = 5
+#: The detector and camera RSM's calibration window starts on when the page has no saved window settings
+#: (AUD-9 stage 2b item 10; the maintainer: "is this the camera orientation that works for the test data? If yes,
+#: then start with this orientation"): the canonical geometry's (ssrl17_2_psic_pilatus300k_sto_v1: 195 × 487 at
+#: 0.172 mm, the Pilatus 100K, camera z−, x−), with which row C reproduces scan 43's reference.
+_CALIBRATION_DETECTOR = "Pilatus100k"
+_CALIBRATION_CAMERA = ("z-", "x-")
 #: The page's fields: (card, key, label, default, choices, browse).
 _FIELDS = (
     (SectionId.PROJECT, "project_root", "Folder", "", (), True),
@@ -1495,7 +1501,10 @@ class RSMPage(QtWidgets.QWidget):
                 self._release_calibration_dialog()
             unconfigured = False
             if self._calibration_dialog is None:
-                self._calibration_dialog = CalibrationDialog(CalibrationContext("RSM", project), parent=self)
+                from xrd_tools.core.geometry.camera import DetectorCamera
+                context = CalibrationContext("RSM", project, detector=_CALIBRATION_DETECTOR,
+                                             camera=DetectorCamera(*_CALIBRATION_CAMERA))
+                self._calibration_dialog = CalibrationDialog(context, parent=self)
                 saved = self._calibration_settings or {}
                 if saved:
                     self._calibration_dialog.apply_settings(saved)
@@ -1504,8 +1513,8 @@ class RSMPage(QtWidgets.QWidget):
                 self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
                 self._authoring_dialogs.append(self._calibration_dialog)
             source = self._source_spec_for_tools() if unconfigured else None
-            if source is not None:  # RSM reads raw images: no turn or mirror of its own
-                self._calibration_dialog.set_source_context(source, image_rotation=0, image_flip=False)
+            if source is not None:  # RSM turns no images of its own: the window's camera stays (item 10)
+                self._calibration_dialog.set_source_context(source, image_rotation=None)
             self._calibration_dialog.show()
             self._calibration_dialog.raise_()
             self._authoring_timer.start()

@@ -269,3 +269,16 @@ def test_pyfai_calib2_is_given_the_turned_model_s_gaps_and_never_a_bare_generic_
     frame = type("Frame", (), {"energy_eV": 12000.0})()
     assert "-D" not in _pyfai_arguments(frame, {"calibrant": "LaB6", "detector": "Detector"})
     assert _pyfai_arguments(frame, {"calibrant": "LaB6", "detector": "Pilatus100k"})[-2:] == ("-D", "Pilatus100k")
+
+
+def test_stitchs_calibration_window_keeps_its_own_starting_detector_and_camera(qapp, tmp_path):
+    """Item 10 changes RSM's start only: Stitch's page names no starting detector or camera, so its window starts
+    as it always did, on the Pilatus 300K-W in Stitch's frame (camera x−, z+), RAW 195 × 1475."""
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        assert (dialog._text("beam_detector"), tuple(dialog.camera.value().to_xu()), dialog._text("shape")) == (
+            "Pilatus300kw", ("x-", "z+"), "195, 1475")
+        assert dialog._image_size.text() == "1475 × 195 px (x × y): x 0–1474, y 0–194 · camera rows x-, columns z+"
+    finally:
+        dialog.close()
+        page.shutdown()
