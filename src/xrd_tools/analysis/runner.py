@@ -456,3 +456,105 @@ def _phase_overlay(x: np.ndarray, y: np.ndarray, entry: "dict[str, Any]") -> Ove
         except Exception:
             pass
     return Overlay(x=x, traces=traces, markers=[])
+
+
+# --------------------------------------------------------------------------
+# The displayed-fit operations as analyzers (FIT-TOOLS-2026-10, Codex's design
+# review F3): the accepted single-input policy of Int's Peak Fit and Phase Fit
+# (``display_fit_operations``: its selection policy, limits and refusals),
+# adapted to this interface so a host's Batch (``run_batch``) fits each input
+# with it. The analyzers above keep their own callers unchanged.
+# --------------------------------------------------------------------------
+
+
+def _displayed_input(inp: Any):
+    """An input's label, trace and snapshot (None): a ``FitInputSnapshot`` (its key is the trace's receipt) or an
+    :class:`AnalysisInput` (a notebook's pattern, its label its identity)."""
+    from pathlib import Path
+
+    from xrd_tools.analysis.display_fit_operations import DisplayedTraceInput, DisplayedTraceReceipt
+    from xrd_tools.analysis.fit_snapshot import FitInputSnapshot
+    if isinstance(inp, FitInputSnapshot):
+        return inp.key.result_identity, inp.trace_input(), inp
+    label = str(inp.label)
+    receipt = DisplayedTraceReceipt("analysis-input-v1", 0, "", None, Path(label), label)
+    trace = DisplayedTraceInput(np.asarray(inp.x, dtype=float), np.asarray(inp.y, dtype=float), label,
+                                str(inp.x_unit or ""), label, 0, receipt)
+    return label, trace, None
+
+
+def _displayed_outcome(label: str, plan: Any, result: Any, params: "dict[str, float]") -> AnalysisOutcome:
+    """A displayed fit's terminal as an outcome: a refusal is not ok, its code and reasons its message; a completed
+    fit's overlay is its fit, background and residual on the x they were fitted on, and its markers."""
+    from xrd_tools.analysis.display_fit_operations import displayed_fit_axis
+    from xrd_tools.analysis.scan_operations import AnalysisDisposition
+    if result.disposition is not AnalysisDisposition.COMPLETED:
+        return AnalysisOutcome(label, False, result=result, message="; ".join((result.code, *result.diagnostics)))
+    overlay = Overlay(np.array(displayed_fit_axis(plan), copy=True),
+                      {"fit": result.fit, "background": result.background, "residual": result.residual},
+                      [float(value) for value in result.marker_positions])
+    return AnalysisOutcome(label, bool(result.fit_success), params, overlay, result, result.message)
+
+
+@dataclass
+class DisplayedPeakFitAnalyzer:
+    """``run_displayed_peak_fit`` as a frame-unit analyzer: each input (a ``FitInputSnapshot`` or an
+    :class:`AnalysisInput`) fitted with ``settings``, ``DisplayedPeakFitPlan``'s fields but its trace. Its params are
+    each peak's ``center_i``, ``center_err_i`` (only when the fit estimated it: an unknown error is no zero),
+    ``fwhm_i`` and ``amplitude_i``, the trend's families; its result the ``DisplayedPeakFitResult``.
+    ``cancel_token`` cancels a fit between its steps; an lmfit solve under way is drained, not interrupted."""
+
+    settings: "dict[str, Any]" = field(default_factory=dict)
+    cancel_token: Any = None
+    kind: str = "peak_fit"
+    unit: str = "frame"
+
+    def analyze(self, inp: Any) -> AnalysisOutcome:
+        from xrd_tools.analysis.display_fit_operations import DisplayedPeakFitPlan, run_displayed_peak_fit
+        label, trace, _snapshot = _displayed_input(inp)
+        plan = DisplayedPeakFitPlan(trace, **dict(self.settings))
+        result = run_displayed_peak_fit(plan, cancel_token=self.cancel_token)
+        values = dict(zip(result.parameter_names, result.parameter_values))
+        errors = dict(zip(result.parameter_names, result.parameter_stderr))
+        params: "dict[str, float]" = {}
+        for index in range(0 if result.marker_positions is None else int(result.marker_positions.size)):
+            prefix = f"p{index}_"
+            if f"{prefix}center" in values:
+                params[f"center_{index}"] = float(values[f"{prefix}center"])
+            if errors.get(f"{prefix}center") is not None:
+                params[f"center_err_{index}"] = float(errors[f"{prefix}center"])
+            for family in ("fwhm", "amplitude"):
+                if f"{prefix}{family}" in values:
+                    params[f"{family}_{index}"] = float(values[f"{prefix}{family}"])
+        return _displayed_outcome(label, plan, result, params)
+
+    def analyze_scan(self, inputs: Sequence[AnalysisInput]) -> AnalysisOutcome:
+        raise NotImplementedError("DisplayedPeakFitAnalyzer is frame-unit; the runner calls analyze() per input.")
+
+
+@dataclass
+class DisplayedPhaseFitAnalyzer:
+    """``run_displayed_phase_fit`` as a frame-unit analyzer, with ``settings`` (``DisplayedPhaseFitPlan``'s fields but
+    its trace and wavelength). A snapshot is fitted at its own recorded wavelength (None is refused by name, never
+    replaced by a default); an :class:`AnalysisInput` at ``wavelength_angstrom``, the caller's. Its params are each
+    phase's ``frac_<phase>`` and ``<phase>_<a|b|c|alpha|beta|gamma>``."""
+
+    settings: "dict[str, Any]" = field(default_factory=dict)
+    wavelength_angstrom: "float | None" = None
+    cancel_token: Any = None
+    kind: str = "phase_fit"
+    unit: str = "frame"
+
+    def analyze(self, inp: Any) -> AnalysisOutcome:
+        from xrd_tools.analysis.display_fit_operations import DisplayedPhaseFitPlan, run_displayed_phase_fit
+        label, trace, snapshot = _displayed_input(inp)
+        wavelength = self.wavelength_angstrom if snapshot is None else snapshot.wavelength_angstrom
+        plan = DisplayedPhaseFitPlan(trace, wavelength_angstrom=wavelength, **dict(self.settings))
+        result = run_displayed_phase_fit(plan, cancel_token=self.cancel_token)
+        params = {f"frac_{name}": float(value) for name, value in result.phase_fractions}
+        for name, cell in result.lattice_parameters:
+            params.update((f"{name}_{key}", float(value)) for key, value in cell)
+        return _displayed_outcome(label, plan, result, params)
+
+    def analyze_scan(self, inputs: Sequence[AnalysisInput]) -> AnalysisOutcome:
+        raise NotImplementedError("DisplayedPhaseFitAnalyzer is frame-unit; the runner calls analyze() per input.")

@@ -27,7 +27,7 @@ from xrd_tools.analysis.scan_operations import (
 __all__ = [
     "DisplayedTraceReceipt", "DisplayedTraceInput", "DisplayedPeakFitPlan", "DisplayedPeakFitResult",
     "CifAssetReceipt", "DisplayedPhaseFitPlan", "DisplayedPhaseFitResult",
-    "run_displayed_peak_fit", "run_displayed_phase_fit",
+    "run_displayed_peak_fit", "run_displayed_phase_fit", "displayed_fit_axis",
 ]
 _MAX_TRACE_POINTS = 1_000_000
 _MAX_TRACE_BYTES, _MAX_FIT_BYTES = 16 * 1024 * 1024, 64 * 1024 * 1024
@@ -284,6 +284,17 @@ def _auto_peak_policy(x: np.ndarray, y: np.ndarray) -> tuple[float, ...]:
         key=lambda item: float(item[1]), reverse=True,
     )[:12]
     return tuple(sorted(float(x[index]) for index, _ in ranked))
+def _fitted_mask(trace: DisplayedTraceInput, bounds: tuple[float, float]) -> np.ndarray:
+    return ((trace.axis >= bounds[0]) & (trace.axis <= bounds[1])
+            & np.isfinite(trace.axis) & np.isfinite(trace.intensity))
+def displayed_fit_axis(plan: DisplayedPeakFitPlan | DisplayedPhaseFitPlan) -> np.ndarray:
+    """The axis values a completed displayed fit's arrays (fit, background, residual, components) are on: the
+    trace's finite samples, within a peak fit's bounds (its whole finite extent when it has none)."""
+    trace = plan.trace
+    finite = trace.axis[np.isfinite(trace.axis)]
+    extent = (float(np.min(finite)), float(np.max(finite))) if finite.size else (0.0, 0.0)
+    bounds = getattr(plan, "fit_bounds", None) or extent
+    return trace.axis[_fitted_mask(trace, bounds)]
 def _validate_peak(plan: DisplayedPeakFitPlan) -> tuple[np.ndarray, np.ndarray, tuple[float, ...] | None, int]:
     if not isinstance(plan, DisplayedPeakFitPlan):
         raise _Refusal("INVALID_PEAK_PLAN", "plan has the wrong type")
@@ -322,7 +333,7 @@ def _validate_peak(plan: DisplayedPeakFitPlan) -> tuple[np.ndarray, np.ndarray, 
         raise _Refusal("INVALID_PEAK_PLAN", "invalid fraction")
     if plan.max_nfev is not None and (type(plan.max_nfev) is not int or not 1 <= plan.max_nfev <= 100_000):
         raise _Refusal("INVALID_PEAK_PLAN", "invalid max_nfev")
-    mask = (plan.trace.axis >= bounds[0]) & (plan.trace.axis <= bounds[1]) & np.isfinite(plan.trace.axis) & np.isfinite(plan.trace.intensity)
+    mask = _fitted_mask(plan.trace, bounds)
     x, y = plan.trace.axis[mask], plan.trace.intensity[mask]
     positions = tuple(sorted(float(v) for v in plan.manual_centers)) or None
     count = len(positions) if positions else plan.n_peaks
