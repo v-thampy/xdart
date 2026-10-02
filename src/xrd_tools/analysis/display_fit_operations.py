@@ -473,7 +473,7 @@ def run_displayed_peak_fit(
         selected = [np.asarray(value, dtype=float) for key, value in components.items() if "background" in str(key).lower() or str(key).lower().startswith("bg")]
         background = _result_array(sum(selected, np.zeros(x.size)), x.size)
         size = _result_add(size, background)
-        residual = _result_array(fit_result.residual, x.size)
+        residual = _result_array(y - fit if plan.use_uncertainties else fit_result.residual, x.size)
         size = _result_add(size, residual)
         markers = _owned(np.asarray(payload.peak_centers, dtype=float))
         if markers.ndim != 1 or markers.size > 12 or not np.isfinite(markers).all():

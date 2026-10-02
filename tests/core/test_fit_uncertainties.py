@@ -34,6 +34,7 @@ def test_owned_sigma_is_optional_and_only_weighting_changes_the_default_fit():
                                     fit_kwargs={'weights': 1 / s.sigma}), s.axes[0].values, s.values).payload
     assert weighted.ok and weighted.result.parameter_values == tuple(float(v.value) for v in direct.params.values())
     assert weighted.result.parameter_values != default.result.parameter_values
+    np.testing.assert_array_equal(weighted.result.residual, s.values - weighted.result.fit)
     inp = AnalysisInput('scan', s.axes[0].values, s.values, s.sigma, x_unit='A^-1')
     assert DisplayedPeakFitAnalyzer({**settings, 'use_uncertainties': True}).analyze(inp).result.parameter_values == weighted.result.parameter_values
 
