@@ -557,6 +557,17 @@ def capture_stitch_geometry(request: StitchGeometryInput) -> StitchGeometryRecei
         )
     if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
         record = _json_mapping(raw)
+        turned = record.get(TURNED_DETECTOR_KEY)  # admitted by _json_mapping as exactly the model turned
+        if turned is not None and (turned["image_rotation"], turned["image_flip"]) != (
+                request.image_rotation, request.image_flip):
+            # another camera's turn gives the same turned shape: the model's gaps would land where they are not
+            raise StitchOperationRefused(
+                "GEOMETRY_CAMERA_MISMATCH",
+                f"the calibration's detector was turned for another camera (turned {turned['image_rotation']}°"
+                f"{' and mirrored' if turned['image_flip'] else ''}) than this one's (turned "
+                f"{request.image_rotation}°{' and mirrored' if request.image_flip else ''}): calibrate with this "
+                "camera, or set the camera the calibration was made with",
+            )
         declared_positions = _json_position_names(record)
         bound_positions = tuple(name for name, _source in request.source_motors)
         if set(bound_positions) != set(declared_positions):

@@ -410,3 +410,24 @@ def test_the_automatic_refinement_from_a_quarter_turned_seed_carries_the_turned_
     record = fit.asset["calibration"]
     assert (record["detector"], record["detector_config"], record[TURNED_DETECTOR_KEY]) == ("Detector", config, turned)
     assert fit.rms_q < .005, fit.rms_q
+
+
+def test_stitch_refuses_a_quarter_turned_calibration_under_another_camera(tmp_path):
+    """The record's turn is its camera's: a Stitch form whose camera turns the other way, or mirrors, gives the same
+    turned shape, so pyFAI's shape check passes and the model's gaps would be masked where they are not. Its capture
+    (which every Preview and run makes again) is refused by name; the record's own camera is admitted."""
+    from xrd_tools.analysis.stitch_operation import (
+        StitchGeometryInput, StitchGeometryKind, StitchOperationRefused, capture_stitch_geometry,
+    )
+    path = tmp_path / "rough.json"
+    path.write_text(json.dumps(_rough("Pilatus300k", ImageOrientation(rotation=270))), encoding="utf-8")
+
+    def capture(rotation, flip=False):
+        return capture_stitch_geometry(StitchGeometryInput(
+            path, StitchGeometryKind.PYFAI_GONIOMETER_JSON, source_motors=tuple(sorted(_MOTORS.items())),
+            image_rotation=rotation, image_flip=flip))
+    for rotation, flip in ((90, False), (270, True), (90, True), (0, False), (180, True)):
+        with pytest.raises(StitchOperationRefused, match="turned for another camera") as refused:
+            capture(rotation, flip)
+        assert refused.value.code == "GEOMETRY_CAMERA_MISMATCH"
+    assert capture(270).request.image_rotation == 270
