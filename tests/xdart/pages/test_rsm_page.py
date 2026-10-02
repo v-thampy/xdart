@@ -515,6 +515,99 @@ def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, 
         _close(page, qapp)
 
 
+@pytest.mark.slow
+def test_scan43_from_a_rough_calibration_authored_in_the_window_runs_and_reopens(  # noqa: F811
+        qapp, rsm_r2_project, monkeypatch):
+    """Row C (AUD-9 stage 2b item 9): a rough (2 · Rough geometry) calibration of STO scan 43 authored in the shared
+    calibration window opened from the page, for RSM's Pilatus 100K (camera z−, x−: stored 195 × 487, turned 270°
+    in the window): row B's distance and beam pixel typed, saved and adopted on the Calibration row. Preview names
+    it a direct-beam calibration (item 7); the page grids scan 43 at 40³, commits and reopens it.
+
+    Tolerance: a rough geometry is the distance and beam pixel with the rotations held, which here are row B's
+    canonical geometry (its offsets and tilts are zero), so the result must be row B's: the grid axes and the
+    finite voxels identical (within rtol 1e-8, the transfer gate of the window's partner, 1e-8 Å⁻¹), with every
+    correction off the reference fingerprint pinned for row B exactly, and with the page's corrections (solid
+    angle, polarization 0.99) the intensities within rtol 1e-6 of row B's (the partner's polarization gate; the
+    solid angle and polarization come from the partner's own arm, 1.0e-7 at most on 3 of 5531 voxels when
+    measured). Its grid spans the (1 1 3) neighbourhood scan 43 was taken around."""
+    import json
+    from dataclasses import replace
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
+    from xrd_tools.core.geometry.camera import DetectorCamera
+    from xrd_tools.integrate.stitch_calibration import xu_partner_path
+    project = Path(rsm_r2_project)
+    canonical = _canonical_partner(project)  # row B's calibration, the reference
+    target = (project / "calibration" / "rowc_rough.json").resolve()
+    page = _page(qapp)
+    try:
+        page.set_field("project_root", str(project))
+        page.set_sources(["STO_align"])
+        page.set_field("scan", "43")
+        page.set_field("image_dir", "images")
+        page._calibrate()
+        dialog = page._calibration_dialog
+        dialog.camera.set_value(DetectorCamera("z-", "x-"))
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData("manual"))
+        for key, value in (("beam_detector", "Pilatus100k"), ("rough_distance", "1014.7173"),
+                           ("beam_pixel", "97, 243"),  # row B's (row 97, column 243) stored, turned: column, row
+                           ("rough_wavelength", "0.953724089788569"),  # 13 000.007 eV, row B's energy
+                           ("del_domain", "-50, 50"), ("nu_domain", "-35, 35")):
+            dialog._set_field_text(key, value)
+        hint = dialog._image_size.text()  # said last: the window's frame (item 8)
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                            staticmethod(lambda *args, **kwargs: (str(target), "")))
+        dialog.save_rough_button.click()
+        deadline = time.monotonic() + 120
+        while (dialog.active() or page._value("geometry_path") != str(target)) and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        assert page._value("geometry_path") == str(target), dialog.status.text()
+        dialog.close()
+        rough = json.loads(xu_partner_path(target).read_text(encoding="utf-8"))["detector"]
+        reference = json.loads((project / canonical).with_name("rsm_canonical.xu.json").read_text())["detector"]
+        assert (rough["detector_factory_name"], rough["shape"]) == ("Pilatus100k", reference["shape"])
+        assert (rough["cch1_px"], rough["cch2_px"]) == pytest.approx((reference["cch1_px"], reference["cch2_px"]),
+                                                                     abs=1e-9)
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text(), seconds=120)
+        assert ("  calibration: direct-beam (rough): the distance and beam pixel, rotations held; not ring-fitted"
+                in page.preview_text.toPlainText().splitlines())
+        page.begin_run()
+        _wait(page, qapp, lambda: not page.active(), seconds=600)
+        output = page._value("output_path")
+        assert page.run_bar.readinessLabel.full_text() == f"Saved {Path(output).name}"
+        committed = page._results[output]
+        assert page.reopen(output)
+        _wait(page, qapp, lambda: not page.active())
+        reopened = page._results[output]
+        assert reopened is not committed and reopened.result_fingerprint == committed.result_fingerprint
+        np.testing.assert_array_equal(page.shown[0].intensity, committed.intensity)
+        # row B's, headless from the page's own form: every correction off (its pinned reference), then the page's
+        rough_form = page.build_form()
+        headless = project / "rowc-headless.nexus"
+        off = run_rsm_operation_v2(prepare_rsm_tool_v2(replace(
+            rough_form, output_path=headless, output_family=None, corrections=RSMFrameCorrections())).request)
+        assert off.payload.result_fingerprint == _SCIENCE[((43,), 40)]["result"]
+        page.set_field("geometry_path", canonical)
+        page.resolve_source()
+        row_b = run_rsm_operation_v2(prepare_rsm_tool_v2(replace(
+            page.build_form(), output_path=headless.with_name("rowc-row-b.nexus"), output_family=None)).request).payload
+    finally:
+        _close(page, qapp)
+    finite = np.isfinite(committed.intensity)
+    assert int(finite.sum()) == int(np.isfinite(row_b.intensity).sum()) == _SCIENCE[((43,), 40)]["finite"]
+    np.testing.assert_array_equal(finite, np.isfinite(row_b.intensity))
+    for (name, values), (reference_name, reference_values) in zip(committed.axes, row_b.axes, strict=True):
+        assert name == reference_name
+        np.testing.assert_allclose(values, reference_values, rtol=1e-8, atol=0)
+    np.testing.assert_allclose(committed.intensity[finite], row_b.intensity[finite], rtol=1e-6, atol=0)
+    spans = {name: (float(values[0]), float(values[-1])) for name, values in committed.axes}
+    assert spans["h"][0] <= 1 <= spans["h"][1] and spans["k"][0] <= 1 <= spans["k"][1]
+    assert spans["l"][0] <= 3 <= spans["l"][1]
+    assert hint.startswith("195 × 487 px (x × y) in the window (the stored image is 487 × 195, turned 270°)")
+
+
 # Codex's stage-1 review (2026-10-01, REWORK), its reproductions adapted
 
 
