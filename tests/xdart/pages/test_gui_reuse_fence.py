@@ -66,17 +66,6 @@ _STRINGS: dict[str, str] = dict.fromkeys(
 )
 
 _DEBT: dict[str, dict[str, int]] = {
-    "analysis/param_trend.py": {
-        "PlotWidget": 1, "QCheckBox": 1, "QComboBox": 2, "QFileDialog.getSaveFileName": 1,
-    },
-    "analysis/peak_fit_dialog.py": {
-        "LinearRegionItem": 1, "PlotWidget": 2, "QCheckBox": 2, "QComboBox": 2, "QLineEdit": 4, "QSpinBox": 2,
-        "QTableWidget": 1,
-    },
-    "analysis/phase_fit_dialog.py": {
-        "QComboBox": 3, "QFileDialog.getOpenFileName": 1, "QFileDialog.getOpenFileNames": 1,
-        "QLineEdit": 2, "QListWidget": 1, "QSpinBox": 1, "QTableWidget": 1,
-    },
     "analysis/roi_select_dialog.py": {
         "ColorBarItem": 1, "ImageItem": 1, "PlotWidget": 1, "QCheckBox": 2, "QComboBox": 2, "QLineEdit": 1,
         "QListWidget": 1, "RectROI": 1, "getFromMatplotlib": 1,

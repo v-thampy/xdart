@@ -4,11 +4,13 @@
     line so the fit reads on top of the points.
 (2) BACKGROUND (and any non-total-fit component) = DASHED, line width +30%.
 (3) the TOTAL fit stays SOLID.
-Drives the real PeakFitDialog._draw_outcome; captures each plot() call's style.
+Drives the real PeakFitDialog._draw_outcome and reads each drawn item's style. FIT-TOOLS-2026-10: the dialog draws
+on the shared FitView, whose series roles carry these looks; the rows read the real plot's items (the fake host
+these rows once bound ``_draw_outcome`` to is gone with the dialog's own plots).
 """
 
 import os
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,25 +24,8 @@ from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
 
 
 def _draw():
-    calls: list = []
-
-    class _Plot:
-        def clear(self):
-            pass
-
-        def addItem(self, *_):
-            pass
-
-        def setLabel(self, *_a, **_k):
-            pass
-
-        def plot(self, *a, **k):
-            calls.append(k)
-            return SimpleNamespace()
-
-        def addLine(self, *_a, **_k):
-            pass
-
+    from pyqtgraph.Qt import QtWidgets
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     x = np.linspace(0.0, 5.0, 20)
     overlay = SimpleNamespace(
         x=x, traces={"fit": np.ones_like(x), "background": np.zeros_like(x),
@@ -51,17 +36,13 @@ def _draw():
     outcome = SimpleNamespace(
         overlay=overlay, result=SimpleNamespace(payload=payload),
         label="current", params={})
-
-    host = SimpleNamespace(
-        plot=_Plot(), resid_plot=_Plot(), region=object(),
-        _x=x, _y=np.ones_like(x), _x_label="q",
-        _clear_fit=lambda: None,
-        table=SimpleNamespace(setRowCount=lambda *_: None,
-                              setItem=lambda *_: None),
-        status=SimpleNamespace(setText=lambda *_: None))
-    host._draw_outcome = MethodType(PeakFitDialog._draw_outcome, host)
-    host._draw_outcome(outcome)
-    return {k.get("name"): k for k in calls if k.get("name")}
+    dialog = PeakFitDialog(analysis_context=None)
+    try:
+        dialog.set_live_pattern(x, np.ones_like(x), "q")
+        dialog._draw_outcome(outcome)
+        return {item.name(): item.opts for item in dialog.plot.listDataItems() if item.name()}
+    finally:
+        dialog.close()
 
 
 def test_data_is_markers_only():

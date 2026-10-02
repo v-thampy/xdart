@@ -241,25 +241,6 @@ def analysis_result_matches(payload: object, facts: object) -> bool:
         DisplayedPhaseFitResult if kind == "phase" else None)
     return bool(expected is not None and type(payload) is expected
                 and (payload.trace_fingerprint, payload.trace_receipt) == echo)
-def fit_result_series(x, result, components=()):
-    """``fit_view.fit_result_series`` (the fit display's owner makes a displayed result's series)."""
-    from xdart.gui.tabs.scattering.fit_view import fit_result_series as series
-    return series(x, result, components)
-def render_fit_projection(plot, residual_plot, x, result, components=()):
-    """Draw ``fit_result_series`` on a dialog's own two plots, through the fit display's own primitives
-    (the peak-fit dialog's path until it mounts ``FitView``, as the phase-fit dialog does)."""
-    from xdart.gui.tabs.scattering.fit_view import draw_marker, draw_series, draw_zero_line
-    upper, markers, lower = fit_result_series(x, result, components)
-    for series in upper: draw_series(plot, series)
-    for position in markers: draw_marker(plot, position)
-    residual_plot.clear(); draw_zero_line(residual_plot)
-    for series in lower: draw_series(residual_plot, series)
-def render_table_rows(table, headers, rows):
-    table.setColumnCount(len(headers)); table.setHorizontalHeaderLabels(headers)
-    table.setRowCount(len(rows))
-    for row, values in enumerate(rows):
-        for column, value in enumerate(values):
-            table.setItem(row, column, QtWidgets.QTableWidgetItem(str(value)))
 @dataclass(frozen=True, slots=True)
 class MetadataSource:
     """One source of a result's metadata table, for ``MetadataResultDialog.adopt_sources`` (a grouped

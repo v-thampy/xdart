@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """Self-contained Phase Fitting popup (Direction-A Tools).
 
-Structure-informed multi-phase fitting of the active 1-D pattern: load one or
-more CIFs, set the fit options (profile / background / lattice tolerance /
-texture — the notebook 03/04 knobs), and fit.  Drives the headless
-``xrd_tools.analysis.runner.PhaseFitAnalyzer`` through the SAME contract the
-Peak Fitter uses, so Batch reuses the shared worker + the vs-frame trend (phase
-fractions / lattice vs frame).
+Structure-informed multi-phase fitting of the active 1-D pattern: load one or more CIFs, set the fit options (profile /
+background / lattice tolerance / texture — the notebook 03/04 knobs), and fit. Without Int's page it drives the
+headless ``xrd_tools.analysis.runner.PhaseFitAnalyzer`` through the same contract the Peak Fitter uses, so Batch
+reuses the shared worker and the parameter trend (phase fractions / lattice vs frame).
 
-Needs the ``xrd-tools[fitting]`` extra: ``lmfit`` (the fit) AND ``pymatgen``
-(CIF parsing).  Both are imported lazily so xdart still launches without them —
-the dialog shows a friendly install hint instead.
+It builds no display or editor widget of its own (hard rule 14; FIT-TOOLS-2026-10 phase 0): its phases are the shared
+Data Browser's keyed list (``keyed_list_profile``), reconciled after each Add or Remove; its options the shared
+Controls rows in a ``SectionCard``; its rarely changed values the shared ``AdvancedDialog``; its plots ``FitView``,
+its trend ``TrendView``, its table ``ResultsTable``; Browse the shared ``file_dialogs``.
+
+Needs the ``xrd-tools[fitting]`` extra: ``lmfit`` (the fit) AND ``pymatgen`` (CIF parsing). Both are imported lazily
+so xdart still launches without them — the dialog shows a friendly install hint instead.
 """
 
 import logging
@@ -21,11 +23,20 @@ from dataclasses import replace
 import numpy as np
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView
-
-from .param_trend import ParamTrendMixin
+from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
+from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView, fit_result_series
+from xdart.gui.tabs.scattering.results_table import (
+    PHASE_OUTCOME_HEADERS, ResultsTable, phase_outcome_rows, phase_result_rows,
+)
+from xdart.gui.tabs.scattering.trend_view import TrendView
+from xdart.gui.widgets.controls_panel import FormRow, SectionCard
+from xdart.gui.widgets.file_dialogs import browse
 
 logger = logging.getLogger(__name__)
+
+#: A phase's crystal structure.
+CIF_FILTER = "CIF files (*.cif);;All files (*)"
 
 # (display label, PhaseFitter phase_profile)
 _PROFILES = [
@@ -48,7 +59,16 @@ _TEXTURES = [
 ]
 
 
-class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
+def _path(name):
+    return ("phase_fit", name)
+
+
+def _combo(label, name, choices):
+    labels = [text for text, _ in choices]
+    return FormRow(label=label, path=_path(name), value=labels[0], kind="combo", choices=labels)
+
+
+class PhaseFitDialog(QtWidgets.QDialog):
     """Phase-fit the active 1-D pattern against CIF-defined phases.
 
     Parameters
@@ -72,13 +92,13 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self._x = None
         self._y = None
         self._x_label = "q"
-        #: list of (path, PhaseModel) added from CIFs.
+        #: the phases added from CIFs: (path, PhaseModel), or (path, name) when Int's page fits them
         self._phases = []
-        self._param_accumulator = {}
-        self._param_family_keys = ()
+        #: what the phases' list shows for each (its row's text and tooltip: a fit's CIF receipt once fitted)
+        self._phase_entries = []
         self.setObjectName("phaseFitDialog")
         self.setWindowTitle("Phase Fitting")
-        self.resize(600, 860)
+        self.resize(600, 900)
         self._build_ui()
         if self._vnext:
             self.texture_combo.setCurrentIndex(0); self.texture_combo.setEnabled(False)
@@ -92,86 +112,45 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
 
-        # Phases: a list of CIFs + Add / Remove.
-        phases_row = QtWidgets.QHBoxLayout()
-        phases_row.setSpacing(7)
-        phases_row.addWidget(QtWidgets.QLabel("Phases"))
-        self.cif_list = QtWidgets.QListWidget()
-        self.cif_list.setObjectName("phaseCifList")
-        self.cif_list.setMaximumHeight(86)
+        # Phases: the CIFs, on the shared browser's keyed list, with Add and Remove.
+        phases = SectionCard("Phases", collapsible=False)
+        self.cif_browser = BrowserView(self, profile=keyed_list_profile("CIF files"))
+        self.cif_browser.setObjectName("phaseCifBrowser")
+        self.cif_browser.setMinimumWidth(0)
+        self.cif_browser.setMaximumHeight(150)
+        self.cif_list = self.cif_browser.scans
         self.cif_list.setToolTip("CIF files defining the phases to fit")
-        phases_row.addWidget(self.cif_list, 1)
-        btn_col = QtWidgets.QVBoxLayout()
-        btn_col.setSpacing(4)
+        buttons = QtWidgets.QHBoxLayout()
         self.add_cif_btn = QtWidgets.QPushButton("Add CIF…")
         self.add_cif_btn.setToolTip("Browse for a CIF and add it as a phase (+)")
         self.remove_cif_btn = QtWidgets.QPushButton("Remove")
         self.remove_cif_btn.setToolTip("Remove the selected phase")
-        btn_col.addWidget(self.add_cif_btn)
-        btn_col.addWidget(self.remove_cif_btn)
-        btn_col.addStretch(1)
-        phases_row.addLayout(btn_col)
-        lay.addLayout(phases_row)
+        buttons.addWidget(self.add_cif_btn)
+        buttons.addWidget(self.remove_cif_btn)
+        buttons.addStretch(1)
+        phases.add_row(self.cif_browser)
+        row = QtWidgets.QWidget()
+        row.setLayout(buttons)
+        phases.add_row(row)
+        lay.addWidget(phases)
 
-        # Options (the notebook knobs).
-        opts = QtWidgets.QHBoxLayout()
-        opts.setSpacing(7)
-        self.profile_combo = QtWidgets.QComboBox()
-        for label, _ in _PROFILES:
-            self.profile_combo.addItem(label)
-        self.bkg_combo = QtWidgets.QComboBox()
-        for label, _ in _BACKGROUNDS:
-            self.bkg_combo.addItem(label)
-        self.texture_combo = QtWidgets.QComboBox()
-        for label, _ in _TEXTURES:
-            self.texture_combo.addItem(label)
-        self.lattice_pct = QtWidgets.QLineEdit("5")
+        # Options (the notebook knobs), on the shared rows.
+        options = SectionCard("Phase fit", collapsible=False)
+        self.profile_row = _combo("Profile", "profile", _PROFILES)
+        self.bkg_row = _combo("Background", "background", _BACKGROUNDS)
+        self.texture_row = _combo("Texture", "texture", _TEXTURES)
+        self.lattice_row = FormRow(label="Lattice ±%", path=_path("lattice_pct"), value="5")
+        self.profile_combo, self.bkg_combo = self.profile_row.editor, self.bkg_row.editor
+        self.texture_combo, self.lattice_pct = self.texture_row.editor, self.lattice_row.editor
         self.lattice_pct.setValidator(QtGui.QDoubleValidator(self))
-        self.lattice_pct.setMaximumWidth(54)
         self.lattice_pct.setToolTip("Lattice tolerance ±% (a/b/c float within this band)")
-        opts.addWidget(QtWidgets.QLabel("Profile"))
-        opts.addWidget(self.profile_combo)
-        opts.addWidget(QtWidgets.QLabel("Background"))
-        opts.addWidget(self.bkg_combo)
-        opts.addWidget(QtWidgets.QLabel("Texture"))
-        opts.addWidget(self.texture_combo)
-        opts.addWidget(QtWidgets.QLabel("Lattice ±%"))
-        opts.addWidget(self.lattice_pct)
-        opts.addStretch(1)
-        lay.addLayout(opts)
-
-        # Advanced (collapsible): min intensity + solver iterations.
-        self.advanced_btn = QtWidgets.QPushButton("Advanced ▾")
-        self.advanced_btn.setCheckable(True)
-        adv_row = QtWidgets.QHBoxLayout()
-        adv_row.addWidget(self.advanced_btn)
-        adv_row.addStretch(1)
-        lay.addLayout(adv_row)
-        self.advanced_box = QtWidgets.QWidget()
-        self.advanced_box.setVisible(False)
-        adv = QtWidgets.QHBoxLayout(self.advanced_box)
-        adv.setContentsMargins(2, 2, 2, 2)
-        self.min_intensity = QtWidgets.QLineEdit("5")
-        self.min_intensity.setValidator(QtGui.QDoubleValidator(self))
-        self.min_intensity.setMaximumWidth(60)
-        self.min_intensity.setToolTip(
-            "Drop template peaks below this % of a phase's max intensity")
-        self.max_nfev = QtWidgets.QSpinBox()
-        self.max_nfev.setRange(0, 1000000)
-        self.max_nfev.setSingleStep(500)
-        self.max_nfev.setSpecialValueText("auto")
-        self.max_nfev.setMaximumWidth(110)
-        self.max_nfev.setToolTip("Max solver iterations (max_nfev); 0 = default")
-        adv.addWidget(QtWidgets.QLabel("Min peak intensity %"))
-        adv.addWidget(self.min_intensity)
-        adv.addWidget(QtWidgets.QLabel("Max iterations"))
-        adv.addWidget(self.max_nfev)
-        adv.addStretch(1)
-        lay.addWidget(self.advanced_box)
+        for item in (self.profile_row, self.bkg_row, self.texture_row, self.lattice_row):
+            options.add_row(item)
+        lay.addWidget(options)
 
         # Run controls.
         run_row = QtWidgets.QHBoxLayout()
-        run_row.addStretch(1)
+        self.advanced_btn = QtWidgets.QPushButton("Advanced…")
         self.refresh_btn = QtWidgets.QPushButton("Reload")
         self.refresh_btn.setToolTip("Re-grab the currently selected frame's pattern")
         self.fit_btn = QtWidgets.QPushButton("Fit")
@@ -179,10 +158,14 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.batch_btn = QtWidgets.QPushButton("Batch")
         self.batch_btn.setToolTip(
             "Phase-fit every frame, then plot fractions / lattice vs frame.")
+        run_row.addWidget(self.advanced_btn)
+        run_row.addStretch(1)
         run_row.addWidget(self.refresh_btn)
         run_row.addWidget(self.fit_btn)
         run_row.addWidget(self.batch_btn)
         lay.addLayout(run_row)
+
+        self._build_advanced()
 
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("peakFitStatus")
@@ -197,38 +180,55 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.fit_view.reconcile(FitProjection(lower=FitPanel(zero_line=True)))
         lay.addWidget(self.fit_view, 4)
 
-        # Row 3: parameters (fractions / lattice) vs frame (shared trend).
-        self._build_param_trend_row(lay)
+        # Parameters (fractions / lattice) vs frame, on the shared trend.
+        self.trend = TrendView(self, name="phaseFitTrend")
+        self.trend.messageChanged.connect(self.status.setText)
+        lay.addWidget(self.trend, 2)
 
-        # Results table: phase / fraction / a / b / c.
-        self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Phase", "Fraction", "a", "b", "c"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QtWidgets.QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setMaximumHeight(120)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        # Results table: phase / fraction / a / b / c, on the shared table.
+        self.table = ResultsTable(PHASE_OUTCOME_HEADERS, self, name="phaseFitTable", max_height=120)
         lay.addWidget(self.table)
 
         self.add_cif_btn.clicked.connect(self._add_cif)
         self.remove_cif_btn.clicked.connect(self._remove_cif)
         self.refresh_btn.clicked.connect(self.refresh_pattern)
         self.fit_btn.clicked.connect(self._do_fit)
-        self.advanced_btn.toggled.connect(self._on_advanced_toggled)
-        self._connect_param_trend()
+        self.advanced_btn.clicked.connect(self._show_advanced)
 
-    def _on_advanced_toggled(self, on):
-        self.advanced_box.setVisible(on)
-        self.advanced_btn.setText("Advanced ▴" if on else "Advanced ▾")
+    def _build_advanced(self):
+        """Min intensity and solver iterations, on the shared Advanced dialog's rows."""
+        self.advanced = AdvancedDialog(self, title="Advanced — Phase Fitting", object_name="phaseFitAdvancedDialog")
+        minimum = FormRow(label="Min peak intensity %", path=_path("min_intensity"), value="5")
+        self._maxfev_row = FormRow(label="Max iterations", path=_path("max_nfev"), value="", kind="int", minimum=0,
+                                   maximum=1_000_000, allow_blank=True)
+        self.advanced.add_group("Phases", (minimum, self._maxfev_row))
+        self.min_intensity, self.max_nfev = minimum.editor, self._maxfev_row.editor
+        self.min_intensity.setValidator(QtGui.QDoubleValidator(self))
+        self.min_intensity.setToolTip("Drop template peaks below this % of a phase's max intensity")
+        self.max_nfev.setPlaceholderText("auto")
+        self.max_nfev.setToolTip("Max solver iterations (max_nfev); blank or 0 = default")
+
+    def _show_advanced(self):
+        self.advanced.show(); self.advanced.raise_(); self.advanced.activateWindow()
+
+    def _refusal(self):
+        """Max iterations' text refused, named as the row names it ("" when none)."""
+        refusal = self._maxfev_row.refusal()
+        return f"{self._maxfev_row.label.text()}: {refusal}" if refusal else ""
 
     # ---- phases (CIF) ---------------------------------------------------
+    def _sync_phase_list(self):
+        """The phases' list shows the phases, in order; the one chosen stays chosen."""
+        self.cif_browser.reconcile_results(tuple(self._phase_entries), self.cif_browser.current_result())
+
     def _add_cif(self):
         if self._vnext:
             if len(self._phases) >= 8:
                 self.status.setText("PHASE_COUNT_LIMIT_EXCEEDED"); return
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Choose CIF", "", "CIF files (*.cif);;All files (*)")
-            if not path:
+            picks = browse(self, "Choose CIF", file_filter=CIF_FILTER)
+            if not picks:
                 return
+            path = picks[0]
             if any(path == existing for existing, _name in self._phases):
                 self.status.setText("Duplicate CIF path ignored."); return
             base = os.path.splitext(os.path.basename(path))[0] or "phase"
@@ -239,7 +239,9 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
                 name = f"{base}_{suffix}"; suffix += 1
             if len(name.encode("utf-8")) > 256:
                 self.status.setText("PHASE_NAME_LIMIT_EXCEEDED"); return
-            self._phases.append((path, name)); self.cif_list.addItem(name)
+            self._phases.append((path, name))
+            self._phase_entries.append(BrowserResult(str(len(self._phase_entries)), name))
+            self._renumber_entries()
             return
         try:
             from xrd_tools.analysis.phase import PhaseModel  # noqa: F401
@@ -250,12 +252,7 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
                 "`pip install \"xrd-tools[fitting]\"`, then reopen.")
             return
         from xrd_tools.analysis.phase import PhaseModel
-        from xdart.utils.browse import browse_start_dir, remember_browse_path
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Add CIF phase(s)", browse_start_dir(),
-            "CIF files (*.cif);;All files (*)")
-        if paths:
-            remember_browse_path(paths[0])
+        paths = browse(self, "Add CIF phase(s)", many=True, file_filter=CIF_FILTER)
         for path in paths:
             try:
                 phase = PhaseModel.from_cif(path)
@@ -264,20 +261,25 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
                 self.status.setText(f"Could not load {os.path.basename(path)}: {exc}")
                 continue
             self._phases.append((path, phase))
-            item = QtWidgets.QListWidgetItem(f"{phase.name}  ({os.path.basename(path)})")
-            item.setToolTip(path)
-            self.cif_list.addItem(item)
+            self._phase_entries.append(BrowserResult("", f"{phase.name}  ({os.path.basename(path)})", path))
+        self._renumber_entries()
         if self._phases:
             self.status.setText(
                 f"{len(self._phases)} phase(s) loaded. Set options and click Fit.")
 
+    def _renumber_entries(self):
+        """Each row keyed by its place (two phases may come from one file), then the list reconciled."""
+        self._phase_entries = [replace(entry, identifier=str(index))
+                               for index, entry in enumerate(self._phase_entries)]
+        self._sync_phase_list()
+
     def _remove_cif(self):
-        row = self.cif_list.currentRow()
-        if row < 0:
+        row = self.cif_browser.current_result_row()
+        if not 0 <= row < len(self._phases):
             return
-        self.cif_list.takeItem(row)
-        if 0 <= row < len(self._phases):
-            self._phases.pop(row)
+        self._phases.pop(row)
+        self._phase_entries.pop(row)
+        self._renumber_entries()
 
     # ---- data + fit -----------------------------------------------------
     def keyPressEvent(self, event):
@@ -321,6 +323,7 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
         self._x_label = x_label or "q"
+        self.trend.set_value_unit(self._x_label)
         self.fit_view.reconcile(replace(self.fit_view.projection, upper=self._pattern_panel()))
 
     def _pattern_panel(self, *series, markers=()):
@@ -331,7 +334,7 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
 
     def _clear_fit(self):
         self.fit_view.reconcile(replace(self.fit_view.projection, lower=FitPanel(zero_line=True)))
-        self.table.setRowCount(0)
+        self.table.clear_rows()
 
     def build_fit_request(self):
         """Build ``(AnalysisInput, PhaseFitAnalyzer)`` from the pattern + CIFs +
@@ -341,6 +344,10 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             return None
         if not self._phases:
             self.status.setText("Add at least one CIF phase to fit.")
+            return None
+        refusal = self._refusal()
+        if refusal:
+            self.status.setText(refusal)
             return None
         try:
             from xrd_tools.analysis.fitting import fit_peaks  # noqa: F401  lmfit probe
@@ -376,7 +383,7 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             init_kw["prefit_background"] = background
         fit_kw = {"phase_profile": profile, "lattice_pct": lattice_pct,
                   "texture": texture}
-        if self.max_nfev.value() > 0:
+        if self.max_nfev.value():
             fit_kw["max_nfev"] = int(self.max_nfev.value())
 
         phases = [pm for _, pm in self._phases]
@@ -392,6 +399,7 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         except ValueError: lattice = 0.05
         try: minimum = float(self.min_intensity.text())
         except ValueError: minimum = 5.0
+        nfev = self.max_nfev.value()
         return {
             "cif_paths": tuple(path for path, _name in self._phases),
             "phase_names": tuple(name for _path, name in self._phases),
@@ -399,11 +407,14 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             "prefit_background": _BACKGROUNDS[self.bkg_combo.currentIndex()][1],
             "phase_profile": _PROFILES[self.profile_combo.currentIndex()][1],
             "lattice_pct": lattice, "min_intensity": minimum,
-            "max_nfev": (int(self.max_nfev.value())
-                          if self.max_nfev.value() > 0 else None),
+            "max_nfev": int(nfev) if nfev else None,
         }
 
     def _do_fit(self):
+        refusal = self._refusal()
+        if refusal:
+            self.status.setText(refusal)
+            return
         if self._vnext:
             self._vnext_submit("fit", self.vnext_fit_values())
             return
@@ -431,30 +442,20 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
 
     def set_vnext_result(self, result):
         fit_x = self._x[np.isfinite(self._x) & np.isfinite(self._y)]
-        from xdart.gui.tabs.scattering.analysis_mount import (
-            fit_result_series, render_table_rows)
         upper, markers, lower = fit_result_series(fit_x, result,
             tuple((receipt.phase_name, values) for receipt, values in zip(
                 result.cif_receipts, result.phase_components, strict=True)))
         self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper, markers=markers),
                                               FitPanel(lower, zero_line=True)))
         for index, receipt in enumerate(result.cif_receipts):
-            item = self.cif_list.item(index)
-            if item is not None:
-                item.setText(receipt.phase_name)
-                item.setToolTip("\n".join(map(str, (receipt.lexical_path,
-                    receipt.resolved_path, receipt.byte_count, receipt.sha256,
-                    receipt.expected_sha256, receipt.pre_state,
-                    receipt.post_state, receipt.receipt_fingerprint))))
-        lattice = dict(result.lattice_parameters)
-        rows = [(name, value, ", ".join(f"{key}={number}"
-                 for key, number in lattice.get(name, ())), "phase", "")
-                for name, value in result.phase_fractions]
-        rows += [(name, value, "", "parameter", error) for name, value, error
-                 in zip(result.parameter_names, result.parameter_values,
-                        result.parameter_stderr, strict=True)]
-        render_table_rows(self.table,
-            ["Name", "Value", "Lattice", "Kind", "StdErr"], rows)
+            if index < len(self._phase_entries):  # the row shows the CIF the fit read: its receipt
+                self._phase_entries[index] = replace(
+                    self._phase_entries[index], label=receipt.phase_name, detail="\n".join(map(str, (
+                        receipt.lexical_path, receipt.resolved_path, receipt.byte_count, receipt.sha256,
+                        receipt.expected_sha256, receipt.pre_state, receipt.post_state,
+                        receipt.receipt_fingerprint))))
+        self._sync_phase_list()
+        self.table.show_rows(*phase_result_rows(result))
         detail = "; ".join(result.diagnostics)
         self.status.setText((result.message or result.code) +
             (f"; wavelength={result.wavelength_angstrom}" if result.wavelength_angstrom else "") +
@@ -476,8 +477,6 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.fit_view.reconcile(FitProjection(
             self._pattern_panel(*fit),
             FitPanel(residual, y_label="resid" if residual else "", zero_line=True)))
-        self.table.setRowCount(0)
-
         self._fill_phase_table(outcome)
 
         # Feed the vs-frame trend for live / batch (label = frame index).
@@ -496,19 +495,7 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
                 entry = store[0]
         except Exception:
             entry = None
-        fracs = (entry or {}).get("phase_fractions", {}) or {}
-        lattice = (entry or {}).get("lattice_params", {}) or {}
-        names = list(fracs) or [name for name, _ in
-                                ((p.name, p) for _, p in self._phases)]
-        self.table.setRowCount(len(names))
-        for r, name in enumerate(names):
-            lat = lattice.get(name, {})
-            vals = [name, f"{fracs.get(name, float('nan')):.3f}"]
-            for key in ("a", "b", "c"):
-                v = lat.get(key)
-                vals.append(f"{v:.4f}" if v is not None else "—")
-            for col, v in enumerate(vals):
-                self.table.setItem(r, col, QtWidgets.QTableWidgetItem(v))
+        self.table.show_rows(*phase_outcome_rows(entry, [getattr(phase, "name", phase) for _, phase in self._phases]))
         ok = bool(entry.get("success", False)) if entry else False
         rchi = entry.get("redchi") if entry else None
         msg = "Phase fit converged." if ok else "Phase fit did NOT converge (best effort)."
@@ -528,3 +515,12 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
 
     def set_batch_progress(self, done, total):
         self.status.setText(f"Phase-fitting… {done}/{total}")
+
+    # ---- the parameter trend ---------------------------------------------
+    def reset_param_trend(self):
+        """A fresh vs-frame trend (Reload, a new batch run)."""
+        self.trend.clear()
+
+    def _accumulate_frame_params(self, frame_idx, params):
+        """One frame's parameters on the trend (a re-fit of the frame replaces its row)."""
+        self.trend.set_row(str(int(frame_idx)), int(frame_idx), params)
