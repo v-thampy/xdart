@@ -23,6 +23,7 @@ from xrd_tools.analysis.scan_operations import (
     _canonical_frame_charge,
     _digest,
     _owned,
+    _owned_missing,
 )
 __all__ = [
     "DisplayedTraceReceipt", "DisplayedTraceInput", "DisplayedPeakFitPlan", "DisplayedPeakFitResult",
@@ -61,6 +62,8 @@ def _frozen_array(value: Any) -> np.ndarray:
     result = _owned(value)
     if result.ndim != 1 or result.dtype.kind not in "biuf":
         raise ValueError("displayed traces require a numeric rank-1 array")
+    if not np.isfinite(result).all():
+        result = _owned_missing(np.where(np.isfinite(result), result, np.nan))
     return result
 @dataclass(frozen=True, slots=True)
 class DisplayedTraceReceipt:
@@ -86,6 +89,7 @@ class DisplayedTraceInput:
     receipt: DisplayedTraceReceipt
     trace_fingerprint: str = ""
     storage_bytes: int = 0
+    sigma: np.ndarray | None = None
     def __post_init__(self) -> None:
         if not isinstance(self.receipt, DisplayedTraceReceipt) or any(type(value) is not str for value in (self.label, self.axis_unit, self.title)) or type(self.epoch) is not int:
             raise TypeError("invalid displayed trace identity")
@@ -96,11 +100,17 @@ class DisplayedTraceInput:
             axis, intensity, self.label,
             self.axis_unit, self.title, self.epoch, _receipt_value(self.receipt),
         )
-        fingerprint = _digest(identity)
+        if self.sigma is not None:
+            sigma = _frozen_array(self.sigma)
+            if sigma.shape != intensity.shape:
+                raise ValueError("displayed sigma and intensity must have equal shape")
+            object.__setattr__(self, "sigma", sigma)
+            identity += ("sigma", sigma)
+        fingerprint = _digest(identity, allow_missing=True)
         object.__setattr__(self, "axis", axis)
         object.__setattr__(self, "intensity", intensity)
         object.__setattr__(self, "trace_fingerprint", fingerprint)
-        object.__setattr__(self, "storage_bytes", _canonical_charge((identity, fingerprint)))
+        object.__setattr__(self, "storage_bytes", _canonical_charge((identity, fingerprint), allow_missing=True))
 @dataclass(frozen=True, slots=True)
 class DisplayedPeakFitPlan:
     trace: DisplayedTraceInput
@@ -117,6 +127,7 @@ class DisplayedPeakFitPlan:
     center_bounds_delta: float | None = None
     fraction_init: float = 0.5
     max_nfev: int | None = None
+    use_uncertainties: bool = False
     def __post_init__(self) -> None:
         object.__setattr__(self, "manual_centers", _tuple_once(self.manual_centers))
         for name in ("fit_bounds", "sigma_bounds", "amplitude_bounds"):
@@ -173,6 +184,7 @@ class DisplayedPhaseFitPlan:
     lattice_pct: float = 0.05
     min_intensity: float = 0.0
     max_nfev: int | None = None
+    use_uncertainties: bool = False
     def __post_init__(self) -> None:
         object.__setattr__(self, "cif_paths", tuple(Path(p) for p in _tuple_once(self.cif_paths)))
         object.__setattr__(self, "expected_hashes", _tuple_once(self.expected_hashes))
@@ -228,13 +240,27 @@ def _fit_trace(trace: DisplayedTraceInput) -> None:
     if trace.storage_bytes > _MAX_TRACE_BYTES:
         raise _Refusal("TRACE_BYTE_LIMIT_EXCEEDED", "trace byte limit exceeded")
 def _fit_plan_value(plan: DisplayedPeakFitPlan) -> tuple[Any, ...]:
-    return (
+    value = (
         plan.trace.trace_fingerprint, plan.fit_bounds, plan.selection_mode,
         plan.manual_centers, plan.n_peaks, plan.model, plan.background,
         plan.sigma_init, plan.sigma_bounds, plan.amplitude_init,
         plan.amplitude_bounds, plan.center_bounds_delta, plan.fraction_init,
         plan.max_nfev,
     )
+    return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
+
+def _fit_sigma(plan, mask: np.ndarray) -> np.ndarray | None:
+    """Use measured uncertainties only when explicitly requested, on admitted fit samples."""
+    if type(plan.use_uncertainties) is not bool:
+        raise _Refusal("INVALID_FIT_UNCERTAINTIES", "use_uncertainties must be a bool")
+    if not plan.use_uncertainties:
+        return None
+    if plan.trace.sigma is None:
+        raise _Refusal("FIT_UNCERTAINTIES_REQUIRED", "this input has no measured uncertainties")
+    sigma = plan.trace.sigma[mask]
+    if not np.all(np.isfinite(sigma) & (sigma > 0)):
+        raise _Refusal("INVALID_FIT_UNCERTAINTIES", "fitted uncertainties must be finite and positive")
+    return sigma
 def _terminal(result_type, disposition, plan: Any, code: str, message: str):
     trace = getattr(plan, "trace", None)
     keywords = {}
@@ -334,6 +360,7 @@ def _validate_peak(plan: DisplayedPeakFitPlan) -> tuple[np.ndarray, np.ndarray, 
     if plan.max_nfev is not None and (type(plan.max_nfev) is not int or not 1 <= plan.max_nfev <= 100_000):
         raise _Refusal("INVALID_PEAK_PLAN", "invalid max_nfev")
     mask = _fitted_mask(plan.trace, bounds)
+    _fit_sigma(plan, mask)
     x, y = plan.trace.axis[mask], plan.trace.intensity[mask]
     positions = tuple(sorted(float(v) for v in plan.manual_centers)) or None
     count = len(positions) if positions else plan.n_peaks
@@ -410,6 +437,12 @@ def run_displayed_peak_fit(
             PeakFitPlan, runner = _load_peak_backend()
         except ImportError:
             return _peak_refusal(plan, "PEAK_FIT_DEPENDENCY_UNAVAILABLE", "Peak fitting dependency unavailable")
+        fit_kwargs = {} if plan.max_nfev is None else {"max_nfev": plan.max_nfev}
+        finite_axis = plan.trace.axis[np.isfinite(plan.trace.axis)]
+        sigma = _fit_sigma(plan, _fitted_mask(plan.trace, plan.fit_bounds or
+                           (float(np.min(finite_axis)), float(np.max(finite_axis)))))
+        if sigma is not None:
+            fit_kwargs["weights"] = 1.0 / sigma
         backend_plan = PeakFitPlan(
             positions=positions, n_peaks=count, model=plan.model,
             background=plan.background, sigma_init=plan.sigma_init,
@@ -417,7 +450,7 @@ def run_displayed_peak_fit(
             amplitude_bounds=plan.amplitude_bounds,
             center_bounds_delta=plan.center_bounds_delta,
             fraction_init=plan.fraction_init,
-            fit_kwargs={} if plan.max_nfev is None else {"max_nfev": plan.max_nfev},
+            fit_kwargs=fit_kwargs,
         )
         try:
             payload = runner(backend_plan, x, y).payload
@@ -467,12 +500,13 @@ def run_displayed_peak_fit(
 def _phase_plan_value(
     plan: DisplayedPhaseFitPlan, wavelength_angstrom: float,
 ) -> tuple[Any, ...]:
-    return (
+    value = (
         plan.trace.trace_fingerprint, plan.cif_paths, plan.expected_hashes,
         plan.phase_names, wavelength_angstrom,
         plan.prefit_background, plan.phase_profile,
         plan.lattice_pct, plan.min_intensity, plan.max_nfev,
     )
+    return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
 def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
     if not isinstance(plan, DisplayedPhaseFitPlan):
         raise _Refusal("INVALID_PHASE_PLAN", "plan has the wrong type")
@@ -493,6 +527,7 @@ def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
     if plan.max_nfev is not None and (type(plan.max_nfev) is not int or not 1 <= plan.max_nfev <= 100_000):
         raise _Refusal("INVALID_PHASE_PLAN", "invalid max_nfev")
     finite = np.isfinite(plan.trace.axis) & np.isfinite(plan.trace.intensity)
+    _fit_sigma(plan, finite)
     if np.count_nonzero(finite) < 10:
         raise _Refusal("INSUFFICIENT_FIT_POINTS", "phase fit needs ten finite points")
     return float(plan.wavelength_angstrom)
@@ -581,7 +616,9 @@ def run_displayed_phase_fit(
         profile_extra = 1 if plan.phase_profile in {"pseudovoigt", "voigt"} else 0
         if 1 + len(phases) * (8 + 3 + profile_extra + 2) > _MAX_FIT_PARAMETERS:
             raise _Refusal("FIT_PARAMETER_LIMIT_EXCEEDED", "predicted fit parameter limit exceeded")
-        fitter = PhaseFitter(x, y, prefit_background=plan.prefit_background)
+        sigma = _fit_sigma(plan, finite)
+        fitter = PhaseFitter(x, y, prefit_background=plan.prefit_background) if sigma is None else PhaseFitter(
+            x, y, sigma, prefit_background=plan.prefit_background)
         for phase in phases:
             fitter.add_phase(phase, q_range=q_range, min_intensity=plan.min_intensity)
         params = fitter.build_parameters(

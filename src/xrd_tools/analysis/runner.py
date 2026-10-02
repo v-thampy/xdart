@@ -530,7 +530,7 @@ def _displayed_input(inp: Any):
     label = str(inp.label)
     receipt = DisplayedTraceReceipt("analysis-input-v1", 0, "", None, Path(label), label)
     trace = DisplayedTraceInput(np.asarray(inp.x, dtype=float), np.asarray(inp.y, dtype=float), label,
-                                str(inp.x_unit or ""), label, 0, receipt)
+                                str(inp.x_unit or ""), label, 0, receipt, sigma=inp.sigma)
     return label, trace, None
 
 

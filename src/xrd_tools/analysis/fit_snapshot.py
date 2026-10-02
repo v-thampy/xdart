@@ -93,6 +93,7 @@ class FitInputSnapshot:
     values: np.ndarray
     mask: np.ndarray | None = None
     wavelength_angstrom: float | None = None
+    sigma: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if type(self.key) is not FitInputKey:
@@ -104,6 +105,12 @@ class FitInputSnapshot:
             raise ValueError("a fit input's values have one dimension per axis, each its axis's length")
         values.flags.writeable = False
         object.__setattr__(self, "values", values)
+        if self.sigma is not None:
+            sigma = np.array(self.sigma, dtype=float, copy=True, order="C")
+            if sigma.shape != values.shape:
+                raise ValueError("a fit input's sigma has its values' shape")
+            sigma.flags.writeable = False
+            object.__setattr__(self, "sigma", sigma)
         if self.mask is not None:
             mask = np.array(self.mask, copy=True, order="C")
             if mask.dtype != bool or mask.shape != values.shape:
@@ -137,7 +144,7 @@ class FitInputSnapshot:
         receipt = DisplayedTraceReceipt(_SCHEMA, key.generation, key.fingerprint, key.result_identity,
                                         Path(key.path), ";".join(f"{name}={value!r}" for name, value in key.selection))
         return DisplayedTraceInput(axis.values, self.fitted_values(), axis.name, axis.unit, key.result_identity, 0,
-                                   receipt)
+                                   receipt, sigma=self.sigma)
 
 
 __all__ = ["BACKGROUND_POLICIES", "FitAxis", "FitInputKey", "FitInputSnapshot"]
