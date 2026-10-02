@@ -533,6 +533,7 @@ class StitchPage(QtWidgets.QWidget):
         # Frames, and Open… · Metadata · Raw image. Stitch publishes its results and frames to it and acts on
         # its commands, as the lists' own signals did.
         from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserView
+        from xdart.gui.tabs.scattering.tools_view import BrowserToolsColumn, ToolsView
         self.browser = BrowserView(profile=BrowserProfile(
             menus=(("File", ("Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
             raw_resolution_menus=False, list_caption="Results", directory=False, frames=True,
@@ -541,7 +542,14 @@ class StitchPage(QtWidgets.QWidget):
         ))
         self.browser.commandRequested.connect(self._browser_command)
         self._listed = []  # the results listed, in the order they came
-        self.splitter.addWidget(self.browser)
+        self.tools = ToolsView(page_tools=(
+            ("peak_fit", "∧ Peak Fitting", "Fit the current linear trace. Batch fits selected results, or all "
+             "listed results when none are selected. Overlay selects displayed slices for a slice batch."),
+            ("phase_fit", "≈ Phase Fitting", "Fit radial Intensity in Q or 2θ with its recorded wavelength. "
+             "Batch fits selected results, or all listed results when none are selected."),
+        ), external_viewers=False)
+        self.tools.commandRequested.connect(self._view_command)
+        self.splitter.addWidget(BrowserToolsColumn(self.browser, self.tools))
 
         # Int's scientific display, fed Stitch results: one pane for both pages, not a copy.
         from xdart.gui.tabs.scattering.scientific_view import ScientificView
@@ -552,17 +560,10 @@ class StitchPage(QtWidgets.QWidget):
         # (maintainer, 2026-09-30: Average/Sum/Waterfall "this should be straighforward"), and Int's display
         # background, Set BG ("would the plot only -set as background like in Int work here easily?": yes).
         self.scientific.set_hidden_tools("norm", "raw", "raw_pane")
-        self.scientific.set_page_tools(
-            ("peak_fit", "Peak Fit", "Fit the current linear trace. Batch fits selected results, or all listed "
-             "results when none are selected. Overlay selects displayed slices for a slice batch."),
-            ("phase_fit", "Phase Fit", "Fit radial Intensity in Q or 2θ with its recorded wavelength. Batch "
-             "fits selected results, or all listed results when none are selected."),
-            ("export-run", "Export Run replay…", "Export current processing inputs; the notebook's Run writes "
-             "to a fresh output folder inside DATA_ROOT."),
-        )
         from xdart.gui.analysis.workflow_export import WorkflowExportActions
         self._workflow_export = WorkflowExportActions(self, capture=self._capture_run_workflow,
             source_root=lambda: str(self._value("project_root")), status=self._status)
+        self._workflow_export.mount_help_menu(self.browser.menus["Help"])
         from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
         self._background = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_context = None  # what the background was set on (_background_scope)
@@ -2846,7 +2847,7 @@ class StitchPage(QtWidgets.QWidget):
 
     def _sync_fit_tools(self):
         for kind in ("peak", "phase"):
-            button = self.scientific.page_tool(f"{kind}_fit")
+            button = self.tools.page_tool(f"{kind}_fit")
             reason = self._fit_reason(kind)
             button.setEnabled(not reason and not self._authoring_active())
             if reason:

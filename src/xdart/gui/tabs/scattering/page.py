@@ -749,7 +749,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         from xdart.gui.analysis.workflow_export import WorkflowExportActions
         self._workflow_export_actions = WorkflowExportActions(self, capture=self._capture_workflow_recipe,
             source_root=lambda: self._intents.snapshot().thaw().project_root, status=self._notice)
-        self._shell.scientific.set_page_tools(("export-run", "Export Run notebook…", "Export current Int Run settings for Jupyter or marimo"))
+        self._workflow_export_actions.mount_help_menu(self._shell.browser.menus["Help"])
         self._source_status = SourceStatusView(self._shell.controls)
         self._shell.controls.set_source_widget(
             self._source_status,

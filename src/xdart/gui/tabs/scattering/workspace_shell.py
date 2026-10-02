@@ -22,7 +22,7 @@ from .shell_values import (
     ShellPhase,
     ShellProjection,
 )
-from .tools_view import ToolsView
+from .tools_view import BrowserToolsColumn, ToolsView
 
 
 class _HugWidthScrollArea(QtWidgets.QScrollArea):
@@ -98,17 +98,9 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         self._connect_controls()
 
     def _make_left_column(self) -> QtWidgets.QFrame:
-        column = QtWidgets.QFrame()
-        column.setObjectName("e3BrowserColumn")
-        column.setMinimumWidth(255)
-        layout = QtWidgets.QVBoxLayout(column)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
         self.browser = BrowserView()
         self.tools = ToolsView()
-        layout.addWidget(self.browser, 1)
-        layout.addWidget(self.tools, 0)
-        return column
+        return BrowserToolsColumn(self.browser, self.tools)
 
     def _make_right_column(self) -> QtWidgets.QFrame:
         column = QtWidgets.QFrame()

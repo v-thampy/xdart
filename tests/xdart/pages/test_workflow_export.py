@@ -2,7 +2,7 @@
 import json
 
 
-def test_int_page_exports_current_intent_without_run_or_generation_change(tmp_path):
+def test_int_page_exports_current_intent_without_run_or_generation_change(tmp_path, monkeypatch):
     from pyqtgraph.Qt import QtWidgets
     from xrd_tools.session.intent_store import RunIntentStore
     from xrd_tools.session.run_configuration import RunIntent
@@ -18,12 +18,18 @@ def test_int_page_exports_current_intent_without_run_or_generation_change(tmp_pa
     before = store.snapshot()
     try:
         assert isinstance(page._workflow_export_actions, WorkflowExportActions)
-        assert page._shell.scientific.page_tool("export-run").text()
+        menu = page._shell.browser.menus["Help"]
+        labels = [action.text() for action in menu.actions()]
+        assert "Export Analyze Results Notebook" in labels
+        action = next(action for action in menu.actions() if action.text() == "Export Run notebook…")
+        assert page._shell.scientific.findChild(QtWidgets.QPushButton, "e7PageTool_export-run") is None
         expected = json.loads(dump_run_intent_profile(before.thaw()))
         captured = page._capture_workflow_recipe()
         assert captured.mode == "int" and captured.configuration == expected
         path = tmp_path / "replay.ipynb"
-        page._workflow_export_actions.export_to(path)
+        from xdart.gui.widgets import file_dialogs
+        monkeypatch.setattr(file_dialogs, "browse", lambda *args, **kwargs: (str(path),))
+        action.trigger()
         assert path.is_file() and "RUN_PROCESSING = False" in path.read_text()
         assert not (tmp_path / "replay_outputs").exists()
         after = store.snapshot()

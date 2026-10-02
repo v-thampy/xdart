@@ -48,7 +48,7 @@ def test_linear_current_background_and_real_shared_dialogs(qapp, tmp_path):
     path, payload = _published(form)
     page = StitchPage(empty_host_services(_Status()))
     try:
-        assert not page.scientific.page_tool("peak_fit").isEnabled()
+        assert not page.tools.page_tool("peak_fit").isEnabled()
         page.open_result(path)
         _wait(page, qapp)
         original = page._fit_current("peak").load()
@@ -58,12 +58,12 @@ def test_linear_current_background_and_real_shared_dialogs(qapp, tmp_path):
         _command(page, ShellCommandKind.SET_LOG_SCALE, True)
         assert page._fit_scope() == scope
         np.testing.assert_array_equal(page._fit_current("peak").load().values, original.values)
-        page.scientific.page_tool("peak_fit").click()
+        page.tools.page_tool("peak_fit").click()
         peak = page._fit_hosts["peak"]
         assert type(peak.dialog) is PeakFitDialog
         _finish(peak, qapp)
         np.testing.assert_array_equal(peak.dialog._y, payload.intensity)
-        page.scientific.page_tool("phase_fit").click()
+        page.tools.page_tool("phase_fit").click()
         phase = page._fit_hosts["phase"]
         assert type(phase.dialog) is PhaseFitDialog
         _finish(phase, qapp)
@@ -91,7 +91,7 @@ def test_linear_current_background_and_real_shared_dialogs(qapp, tmp_path):
         page._diagnostic = "Coverage"
         page._draw()
         for kind in ("peak", "phase"):
-            assert not page.scientific.page_tool(f"{kind}_fit").isEnabled()
+            assert not page.tools.page_tool(f"{kind}_fit").isEnabled()
             with pytest.raises(ValueError, match="FIT_INTENSITY_REQUIRED"):
                 page._fit_current(kind)
     finally:
@@ -129,7 +129,7 @@ def test_slice_and_matching_pin_are_the_actual_radial_trace(qapp, tmp_path):
         _command(page, ShellCommandKind.SET_PLOT_AXIS, "chi")
         _command(page, ShellCommandKind.SET_SLICE_CENTER, float(radial[len(radial) // 2]))
         _command(page, ShellCommandKind.SET_SLICE_WIDTH, float(abs(radial[-1] - radial[0]) / 4))
-        assert not page.scientific.page_tool("phase_fit").isEnabled()
+        assert not page.tools.page_tool("phase_fit").isEnabled()
         with pytest.raises(ValueError, match="PHASE_RADIAL_INTENSITY_REQUIRED"):
             page._fit_current("phase")
         np.testing.assert_array_equal(page._fit_current("peak").load().values,
@@ -170,7 +170,7 @@ def test_gi_native_cut_is_peak_only(qapp, tmp_path):
         assert current.axes[0].name == "Q" and dict(current.key.selection)["meaning"] == "radial"
         assert dict(current.key.selection)["requested_coordinate"] == "q_ip"
         np.testing.assert_array_equal(current.values, radial.profile.intensity)
-        assert page.scientific.page_tool("phase_fit").isEnabled()
+        assert page.tools.page_tool("phase_fit").isEnabled()
     finally:
         _dispose(page, qapp)
 

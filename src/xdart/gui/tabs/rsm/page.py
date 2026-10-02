@@ -397,7 +397,14 @@ class RSMPage(QtWidgets.QWidget):
         outer.addWidget(self.splitter)
         self.browser = BrowserView(profile=_BROWSER)  # Int's Data Browser (hard rule 14)
         self.browser.commandRequested.connect(self._browser_command)
-        self.splitter.addWidget(self.browser)
+        from xdart.gui.tabs.scattering.tools_view import BrowserToolsColumn, ToolsView
+        self.tools = ToolsView(page_tools=(
+            ("lineout", "Lineout / Peak Fit", "Fit a native-axis lineout, or compare fits across results"),
+            ("fit2d", "2-D Peak Fit", "Fit one native plane with a rectangular region"),
+            ("fit3d", "3-D Peak Fit", "Fit a native volume box jointly in three dimensions"),
+        ), external_viewers=False)
+        self.tools.commandRequested.connect(self._view_command)
+        self.splitter.addWidget(BrowserToolsColumn(self.browser, self.tools))
 
         # Int's scientific view, its keyed 2×3 layout (hard rule 14): the slices and mean projections under
         # Int's top bar (colour map, Log); the tools RSM has no operation for are left out
@@ -408,15 +415,11 @@ class RSMPage(QtWidgets.QWidget):
         # view clean for now"; their windows come with G9
         self.view.set_page_tools(
             ("3d", "3D Viewer", "The whole RSM volume in 3-D, in its own window"),
-            ("custom", "Custom Slice", "A slice along any two directions (for example HH and L), in its own window"),
-            ("lineout", "Lineout / Peak Fit", "Fit a native-axis lineout, or compare fits across results"),
-            ("fit2d", "2-D Peak Fit", "Fit one native plane with a rectangular region"),
-            ("fit3d", "3-D Peak Fit", "Fit a native volume box jointly in three dimensions"),
-            ("export-run", "Export Run replay…", "Export current processing inputs; the notebook's Run writes "
-             "to a fresh output folder inside DATA_ROOT."))
+            ("custom", "Custom Slice", "A slice along any two directions (for example HH and L), in its own window"))
         from xdart.gui.analysis.workflow_export import WorkflowExportActions
         self._workflow_export = WorkflowExportActions(self, capture=self._capture_run_workflow,
             source_root=lambda: str(self._value("project_root")), status=self._status)
+        self._workflow_export.mount_help_menu(self.browser.menus["Help"])
         self.view.commandRequested.connect(self._view_command)
         self.splitter.addWidget(self.view)
 

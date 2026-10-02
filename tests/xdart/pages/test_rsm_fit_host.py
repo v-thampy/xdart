@@ -41,7 +41,7 @@ def test_page_mounts_native_lineout_plane_and_volume_fits(qapp, tmp_path):
         page._rows['project_root'].editor.setText(str(tmp_path))
         page._add_result(path, admitted)
         for name in ('lineout', 'fit2d', 'fit3d'):
-            page.view.page_tool(name).click()
+            page.tools.page_tool(name).click()
             settle(page, qapp)
             window = page._tool_windows[name]
             assert window.current().reference.path == path
@@ -78,7 +78,7 @@ def test_lineout_batch_is_lazy_project_scoped_and_keeps_scalar_rows(qapp, tmp_pa
         first, second = payload(tmp_path/'one'), payload(tmp_path/'two')
         page._add_result(first.inspection.path, first, show=False)
         page._add_result(second.inspection.path, second)
-        page.view.page_tool('lineout').click()
+        page.tools.page_tool('lineout').click()
         settle(page, qapp)
         window = page._tool_windows['lineout']
         # No selection: Batch uses all listed results, including one that is no longer resident.

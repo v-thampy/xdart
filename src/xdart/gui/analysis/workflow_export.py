@@ -12,6 +12,14 @@ class WorkflowExportActions(QtCore.QObject):
         super().__init__(parent)
         self.capture, self.source_root, self.status = capture, source_root, status
 
+    def mount_help_menu(self, menu):
+        """Mount the same Run export action beside a page's existing Help actions."""
+        action = menu.addAction("Export Run notebook…")
+        action.setToolTip("Export current processing inputs for Jupyter or marimo; Run writes "
+                          "to a fresh output folder inside DATA_ROOT.")
+        action.triggered.connect(lambda _checked=False: self.choose())
+        return action
+
     def export_to(self, path):
         from xrd_tools.notebooks.workflow_render import render_workflow_notebook
         path = Path(path)
