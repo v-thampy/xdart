@@ -192,7 +192,10 @@ def read_rsm_metadata(
     inspection = payload.inspection
     if _stat_revision(os.stat(inspection.path)) != inspection.storage_revision:
         raise ValueError("Saved result changed; reopen it before reading metadata")
-    members = json.loads(payload.provenance_json).get("members") or ()
+    members = json.loads(payload.provenance_json).get("members")
+    if not members:  # an older RSM schema records no member manifest
+        return (StitchMetadataTable("Source", (), (), MetadataTableResult(
+            AnalysisDisposition.REFUSED, "Experimental metadata is unavailable for this older result")),)
     results: list[StitchMetadataTable] = []
     total_bytes = 0
     for member in members:

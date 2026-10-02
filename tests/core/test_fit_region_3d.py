@@ -277,6 +277,23 @@ def vars_of(outcome):
     return [getattr(outcome, name) for name in outcome.__slots__]
 
 
+def test_weighted_fit_uses_the_joint_finite_positive_sigma_mask():
+    _grid, truth = _row1_truth()
+    axes = tuple(RegionAxis(name, values) for name, values in zip("hkl", (H1, K1, L1)))
+    seeds = (PeakSeed("peak", (1.0, 0.0, 3.0)),)
+    plain = fit_3d_region(truth, axes, seeds=seeds)
+    sigma = np.full(truth.shape, 2.0)
+    sigma[:, :, :3] = 0.0           # unusable: excluded from the fit
+    sigma[0, 0, 5] = np.nan         # unusable: excluded from the fit
+    weighted = fit_3d_region(truth, axes, seeds=seeds, sigma=sigma)
+    assert weighted.diagnostics.weighted and not plain.diagnostics.weighted
+    np.testing.assert_array_equal(weighted.valid, np.isfinite(sigma) & (sigma > 0))
+    # noiseless data: a constant weight leaves the solution where the unweighted fit puts it
+    np.testing.assert_allclose(weighted.components[0].covariance, plain.components[0].covariance, rtol=1e-6)
+    np.testing.assert_allclose([e.value for e in weighted.components[0].center],
+                               [e.value for e in plain.components[0].center], rtol=1e-9)
+
+
 def test_cancellation_user_mask_and_flat_units():
     _grid, truth = _row1_truth()
     volume = _volume((H1, K1, L1), truth)

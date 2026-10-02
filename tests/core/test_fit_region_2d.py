@@ -124,6 +124,21 @@ def test_data_xy_order_against_displayed_yx():
     np.testing.assert_allclose(shown.residual, truth.T - shown.model, rtol=0, atol=1e-12)
 
 
+def test_the_2d_analyzer_wraps_the_same_fit():
+    from xrd_tools.analysis.fitting.region_analyzers import REGION_2D_KEY, Region2DFitAnalyzer, Region2DInput
+    from xrd_tools.analysis.runner import AnalysisInput
+
+    truth = PLANE + sum(_gaussian(*peak) for peak in PEAKS.values())
+    region = Region2DInput(truth, RegionAxis("qx", X), RegionAxis("qz", Y))
+    inp = AnalysisInput("slice-3", np.empty(0), np.empty(0), metadata={REGION_2D_KEY: region})
+    analyzed = Region2DFitAnalyzer(seeds=SEEDS).analyze(inp)
+    assert analyzed.ok and analyzed.overlay is None
+    assert analyzed.params == fit_2d_region(truth, region.x, region.y, seeds=SEEDS).flat_params()
+    assert {"left.angle_deg", "right.fwhm_major", "bg.slope_qz"} <= set(analyzed.params)
+    weighted = Region2DFitAnalyzer(seeds=SEEDS, use_uncertainties=True).analyze(inp)
+    assert not weighted.ok and "WEIGHTS_UNUSABLE" in weighted.message
+
+
 def test_empty_and_insufficient_regions_are_refused_by_name():
     with pytest.raises(RegionFitRefused) as empty:
         fit_2d_region(np.full((41, 33), np.nan), X, Y)

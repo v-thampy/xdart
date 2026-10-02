@@ -139,7 +139,9 @@ class PhysicalComponent:
     center_q: tuple[Estimate, ...]
     covariance_q: np.ndarray
     principal_fwhm: tuple[Estimate, ...]  # descending
-    principal_directions: tuple[np.ndarray | None, ...]  # unit vectors in Q; None when unidentifiable
+    #: unit vectors in Q, in principal_fwhm's order, signed so their largest component is positive (the sign
+    #: of an axis is arbitrary); None when the direction is unidentifiable (a near-equal principal width)
+    principal_directions: tuple[np.ndarray | None, ...]
     identifiable: tuple[bool, ...]
     integral: Estimate  # intensity x Angstrom^-3
 
@@ -246,6 +248,8 @@ def _profile_integral(kind: str, ndim: int, eta) -> float:
     """``integral of g(|z|^2) d^n z`` (so a component integrates to ``A sqrt(det Sigma)`` times this)."""
     if kind == "gaussian":
         return (2.0 * math.pi) ** (ndim / 2.0)
+    if ndim != 2:
+        raise ValueError(f"the {kind} profile is defined for 2-D regions only")
     if kind == "lorentzian2":
         return math.pi
     return (1.0 - eta) * math.pi / LN2 + eta * math.pi / _KAPPA
