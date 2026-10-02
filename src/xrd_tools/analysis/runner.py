@@ -102,7 +102,7 @@ class Analyzer(Protocol):
 # --------------------------------------------------------------------------
 
 
-def run_batch(analyzer, inputs, on_progress=None, should_cancel=None, on_frame=None):
+def run_batch(analyzer, inputs, on_progress=None, should_cancel=None, on_frame=None, *, compact=False):
     """Apply ``analyzer`` across a sequence of :class:`AnalysisInput`.
 
     Branches ONCE on ``analyzer.unit`` (the single analysis-specific decision):
@@ -118,7 +118,20 @@ def run_batch(analyzer, inputs, on_progress=None, should_cancel=None, on_frame=N
     ``on_frame(outcome)`` streams each outcome as it is computed (so a live
     vs-frame plot can grow during the run).  ``should_cancel()`` is polled
     before each frame (frame-unit only); if it returns true the loop stops and
-    the outcomes gathered so far are returned."""
+    the outcomes gathered so far are returned.
+
+    ``compact=True`` (FIT-TOOLS-2026-10, Codex's design review F5) is for many or
+    heavy inputs, frame-unit analyzers only. ``inputs`` is then a sized
+    collection of descriptors, each an input or a zero-argument callable that
+    loads one (a result read, a cut extracted), loaded only when its turn comes,
+    so one input is in memory at a time. ``should_cancel`` is polled before
+    each load: a cancel stops before the next load and between fits (a fit
+    under way is drained, not interrupted). ``on_frame`` sees each outcome
+    whole (the host draws the one it shows); every outcome but the last keeps
+    only its label, status, params and message, so what the batch retains does
+    not grow with the number of inputs: one heavy outcome, the last."""
+    if compact:
+        return _run_compact(analyzer, inputs, on_progress, should_cancel, on_frame)
     inputs = list(inputs)
     total = len(inputs)
     if getattr(analyzer, "unit", "frame") == "scan":
@@ -145,6 +158,44 @@ def run_batch(analyzer, inputs, on_progress=None, should_cancel=None, on_frame=N
         if on_progress is not None:
             on_progress(i + 1, total)
     return outcomes
+
+
+def _run_compact(analyzer, descriptors, on_progress, should_cancel, on_frame):
+    """``run_batch(compact=True)``: load, fit, keep a row, let go (the docstring above)."""
+    if getattr(analyzer, "unit", "frame") != "frame":
+        raise ValueError("a compact batch runs frame-unit analyzers")
+    total = len(descriptors)
+    outcomes: "list[AnalysisOutcome]" = []
+    for index, descriptor in enumerate(descriptors):
+        if should_cancel is not None and should_cancel():
+            break
+        inp = None
+        try:
+            inp = descriptor() if callable(descriptor) else descriptor
+            out = analyzer.analyze(inp)
+        except Exception as exc:  # noqa: BLE001 — one bad input (or load) can't abort the batch
+            out = AnalysisOutcome(label=_input_label(inp, descriptor, index), ok=False, message=str(exc))
+        del inp  # the input goes before the next one is loaded
+        if outcomes:  # the one before keeps only its row
+            last = outcomes[-1]
+            outcomes[-1] = AnalysisOutcome(last.label, last.ok, last.params, message=last.message)
+        outcomes.append(out)
+        if on_frame is not None:
+            on_frame(out)
+        del out
+        if on_progress is not None:
+            on_progress(index + 1, total)
+    return outcomes
+
+
+def _input_label(inp: Any, descriptor: Any, index: int) -> str:
+    """The label of an input that failed: its own, its snapshot key's identity, else its place."""
+    for candidate in (inp, descriptor):
+        key = getattr(candidate, "key", None)
+        label = getattr(key, "result_identity", None) or getattr(candidate, "label", None)
+        if isinstance(label, str):
+            return label
+    return str(index)
 
 
 def batch_params_table(outcomes):
