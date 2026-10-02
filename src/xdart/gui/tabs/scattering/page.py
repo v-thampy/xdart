@@ -746,6 +746,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self._shell = ScatteringWorkspaceShell(self)
         layout.addWidget(self._shell)
+        from xdart.gui.analysis.workflow_export import WorkflowExportActions
+        self._workflow_export_actions = WorkflowExportActions(self, capture=self._capture_workflow_recipe,
+            source_root=lambda: self._intents.snapshot().thaw().project_root, status=self._notice)
+        self._shell.scientific.set_page_tools(("export-run", "Export Run notebook…", "Export current Int Run settings for Jupyter or marimo"))
         self._source_status = SourceStatusView(self._shell.controls)
         self._shell.controls.set_source_widget(
             self._source_status,
@@ -3161,6 +3165,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if kind is ShellCommandKind.RUN_ACTION:
             self._run_action()
             return
+        if kind is ShellCommandKind.PAGE_TOOL and command.value == "export-run":
+            self._workflow_export_actions.choose()
+            return
         if kind is ShellCommandKind.STOP:
             average = self._workspace_operations.average_identity
             if average is not None and self._workspace_operations.current_identity is average:
@@ -3638,6 +3645,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return "", (), "Select ready XYE result files or one stable processed NeXus file."
             selected_paths.append(path)
         return "xye", tuple(selected_paths), ""
+
+    def _capture_workflow_recipe(self):
+        """Capture the committed intent through its public profile codec without allocating a run generation."""
+        import json
+        from xrd_tools.notebooks.workflow import WorkflowRecipe
+        if not self._profile_action_permitted():
+            raise ValueError("WORKFLOW_IDLE_REQUIRED: wait for the current operation to finish")
+        if not self._commit_focused_control_edit_for_run():
+            raise ValueError("WORKFLOW_SETTINGS_REQUIRED: finish the current control edit")
+        return WorkflowRecipe("int", json.loads(dump_run_intent_profile(self._intents.snapshot().thaw())))
 
     def _export_results_notebook(self) -> None:
         kind, paths, reason = self._selected_results_notebook_sources()

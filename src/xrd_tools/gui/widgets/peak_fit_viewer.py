@@ -35,12 +35,12 @@ class PatternSelector:
 
 class FitRangeControls:
     """Scientific fit bounds separate from typed presentation limits and Reset."""
-    def __init__(self, extent, *, fit_bounds=None, label="native axis", on_display=None):
+    def __init__(self, extent, *, fit_bounds=None, label="native axis", on_display=None, fit_enabled=True):
         import ipywidgets as widgets
         lo, hi = map(float, extent)
         self.fit_bounds = widgets.FloatRangeSlider(value=fit_bounds or (lo, hi), min=lo, max=hi,
                                                    step=(hi-lo)/500, continuous_update=False,
-                                                   description=f"Fit {label}")
+                                                   description=f"Fit {label}") if fit_enabled else None
         self.display_min = widgets.FloatText(value=lo, description="Display min")
         self.display_max = widgets.FloatText(value=hi, description="Display max")
         self.reset = widgets.Button(description="Reset view")
@@ -48,7 +48,8 @@ class FitRangeControls:
         self.display_min.observe(self._changed, names="value")
         self.display_max.observe(self._changed, names="value")
         self.reset.on_click(self._reset)
-        self.widget = widgets.VBox([self.fit_bounds, widgets.HBox([self.display_min, self.display_max, self.reset])])
+        display = widgets.HBox([self.display_min, self.display_max, self.reset])
+        self.widget = widgets.VBox(([self.fit_bounds] if fit_enabled else []) + [display])
 
     def _changed(self, change):
         if self._callback is not None and self.display_min.value < self.display_max.value:
