@@ -281,8 +281,8 @@ def test_a_document_saved_without_a_calibration_window_closes_the_one_opened_sin
     """Codex's combined stage-2b review F3 (its same-page reproduction; pre-existing in Stitch): a document saved
     before Calibrate was opened holds ``calibration: null``. Loaded after the window was opened and edited (RMS
     .02) and hidden, it restores that: the next document has no calibration window, and Calibrate opens a new
-    window on the defaults. The window is let go as a Project change lets it go (hidden; the page still shuts it
-    down). A document without the section keeps the window and its edits, as before."""
+    window on the defaults. The window is let go as a Project change lets it go: an idle one is shut down at once and leaves the
+    page's windows, so repeated loads do not pile up hidden windows. A document without the section keeps the window and its edits, as before."""
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.set_field("project_root", str(tmp_path))
@@ -296,7 +296,8 @@ def test_a_document_saved_without_a_calibration_window_closes_the_one_opened_sin
         assert default_rms != ".02" and page.settings()["calibration"]["fields"]["rms"] == ".02"
         page.apply_settings(original)
         assert page.settings()["calibration"] is None and page.settings() == original
-        assert page._calibration_dialog is None and not dialog.isVisible() and dialog in page._authoring_dialogs
+        assert page._calibration_dialog is None and not dialog.isVisible()
+        assert dialog not in page._authoring_dialogs  # idle: shut down and let go at once, its memory with it
         page._calibrate()
         again = page._calibration_dialog
         assert again is not dialog and again._text("rms") == default_rms

@@ -1514,10 +1514,17 @@ class RSMPage(QtWidgets.QWidget):
 
     def _release_calibration_dialog(self):
         """Let the retained calibration window go (a Project change, or a settings document with no window): it is
-        hidden and no longer the page's, and ``close_page`` still shuts it down with the other authoring windows."""
-        if self._calibration_dialog is not None:
-            self._calibration_dialog.hide()
+        hidden and no longer the page's. An idle window is shut down at once (its session recorded, as at close) and
+        leaves the authoring windows, its memory with it, so repeated loads or Project changes do not pile up hidden
+        windows; one still working stays among them, and ``close_page`` shuts it down with the others."""
+        dialog = self._calibration_dialog
+        if dialog is None:
+            return
+        dialog.hide()
         self._calibration_dialog = None
+        if not dialog.active() and dialog.shutdown().status is PageCleanup.CLEAN:
+            self._authoring_dialogs.remove(dialog)
+            dialog.deleteLater()
 
     def _adopt_calibration(self, path, _backend=None):
         """A calibration the window saved: the Calibration row takes it (and its mask, the detector's)."""
