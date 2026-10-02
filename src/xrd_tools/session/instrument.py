@@ -12,8 +12,19 @@ with the other detector circle held at zero. (For RSM, the sample side of the
 horizontal mapping is not validated yet.)
 
 A circle may turn the other way from psic's standard (``reversed_circles``): its axis is psic's
-reversed, as 17-2's mu, chi and nu are until November 2026. Stitch's detector arm and its
-xrayutilities file take the detector circles' senses, its grazing incidence the sample's.
+reversed. Stitch's detector arm and its xrayutilities file take the detector circles' senses, its
+grazing incidence the sample's.
+
+Reversing mu, chi and nu together (the circles that turn about x and y) makes the instrument psic's
+mirror image, left to right through the vertical plane that holds the beam (``is_mirror``); eta, phi
+and del turn about z, which that mirror leaves alone. 17-2 is such a mirror, with phi reversed as well
+for now (the maintainer, 2026-10-01: "at chi=0, phi and eta move in opposite directions, at chi = 180,
+they both move in the same direction. that is right now"; "i will be switching the phi rotation sense
+when we start extperiments again", after which 17-2 is the pure mirror). A mirror image puts every
+reflection where psic predicts it and only flips the handedness of the indices, so SPEC's own psic
+model, its orientation reflections' labels and its UB are the mirror image's. RSM therefore maps SPEC
+data through the mirror (``mirror_residual`` is what remains reversed there); Stitch's arm, whose
+powder rings a mirror cannot change, takes the record as it is.
 
 ``halpha`` is a motor name (for the incidence circle, ``eta`` or ``th``), not a geometry.
 xdart's ``sixc`` is an alias of psic; SPEC's own sixc is a different geometry and has no
@@ -52,9 +63,20 @@ LAB_FRAME = 'x up, y along the beam, z = x × y (left, looking downstream)'
 PSIC_AXES = {'mu': 'x+', 'eta': 'z-', 'chi': 'y+', 'phi': 'z-', 'nu': 'x+', 'del': 'z-'}
 
 
+#: The psic circles that turn about x or y: reversing all three is psic's left-right mirror image
+#: (z → −z), which turns every rotation about x or y the other way and leaves those about z.
+MIRROR_CIRCLES = ('mu', 'chi', 'nu')
+
+
 def signed_axis(axis, sense) -> str:
     """``axis`` ('x+', 'z-', ...) as is for ``sense`` 1, reversed for −1."""
     return axis if sense > 0 else axis[0] + ('-' if axis[1] == '+' else '+')
+
+
+def mirrored_axis(axis) -> str:
+    """A rotation axis ('x+', 'z-', ...) seen in psic's left-right mirror (z → −z): a turn about x or y
+    reverses, a turn about z does not."""
+    return signed_axis(axis, -1) if axis[0] in 'xy' else axis
 
 
 #: Other names beamlines give a circle's motor (matched whole, ignoring case).
@@ -95,7 +117,8 @@ class InstrumentGeometry:
     zeros: tuple[tuple[str, float], ...] = ()
     #: the circles that turn opposite to psic's standard sense, about the reversed axis
     #: (maintainer, 2026-09-30: 17-2's "[x-, z-, y-, z-], [x-, z-]" against the standard
-    #: "[x+, z-, y+, z-], [x+, z-]"; "let's just stick with swapping the signs for now").
+    #: "[x+, z-, y+, z-], [x+, z-]"; "let's just stick with swapping the signs for now"; 2026-10-01:
+    #: phi too, "so i think it should be phi=z+ in what we have", until the restart).
     reversed_circles: tuple[str, ...] = ()
 
     def __post_init__(self):
@@ -138,6 +161,18 @@ class InstrumentGeometry:
     def sense(self, circle) -> int:
         """1 when the circle turns as psic's circle it plays (``PSIC_AXES``), −1 when reversed."""
         return -1 if circle in self.reversed_circles else 1
+
+    def is_mirror(self) -> bool:
+        """True for a psic whose mu, chi and nu all turn the other way: psic's left-right mirror image
+        (``MIRROR_CIRCLES``), as 17-2 is. SPEC's psic model and its labels are then the mirror's."""
+        return self.geometry == 'psic' and set(MIRROR_CIRCLES) <= set(self.reversed_circles)
+
+    def mirror_residual(self) -> tuple[str, ...]:
+        """The circles still reversed in psic's mirror image (none for a pure mirror; 17-2's phi for now),
+        in circle order; the reversed circles themselves when the record is not a mirror."""
+        if not self.is_mirror():
+            return self.reversed_circles
+        return tuple(circle for circle in self.reversed_circles if circle not in MIRROR_CIRCLES)
 
     def arm_senses(self) -> dict[str, int]:
         """The senses of Stitch's detector arm by the psic circle each plays ('del', 'nu'), as
@@ -281,5 +316,5 @@ class InstrumentGeometry:
                    keep.reversed_circles if same else ())
 
 
-__all__ = ['GEOMETRIES', 'GEOMETRY_LABELS', 'INCIDENCE_CIRCLE', 'InstrumentGeometry', 'PLANES',
-           'PLANE_LABELS', 'calibration_arm', 'signed_axis']
+__all__ = ['GEOMETRIES', 'GEOMETRY_LABELS', 'INCIDENCE_CIRCLE', 'InstrumentGeometry', 'MIRROR_CIRCLES', 'PLANES',
+           'PLANE_LABELS', 'calibration_arm', 'mirrored_axis', 'signed_axis']

@@ -653,20 +653,19 @@ def test_a_record_changed_after_preview_is_refused_at_the_run(tmp_path):
 
 
 @pytest.mark.slow
-def test_scan_43_indexes_nearer_integer_under_standard_psic_than_under_the_17_2_reversals(rsm_r2_project):
-    """Decision 2's physical check, through the product's own path (the maintainer, 2026-10-01: "I think our diff
-    motor directions are off from the Psic standard and that is problematic ..."). It takes the STO substrate
-    (113) that SPEC centred on the detector in scan 43 (frame 22, pixel (95, 244)), with the UB each model
-    recomputes from scan 43's own reflections (1 1 4) and (-1 0 4):
+def test_scan_43_under_a_partial_reversal_of_mu_and_chi_misindexes_specs_labels(rsm_r2_project):
+    """A record reversing mu and chi but not nu is not a mirror (a version-2 partner's arm is fitted in psic's
+    standard detector directions), so RSM maps it as recorded, recomputing the UB from scan 43's reflections
+    (1 1 4) and (-1 0 4) as SPEC labelled them. Through the product's path, at the STO substrate's (113) that SPEC
+    centred on the detector (frame 22, pixel (95, 244)):
     - psic's standard directions put it 0.049 from (1 1 3), where SPEC's own #Q puts it;
-    - the 17-2 record's reversals of mu and chi put it 0.17 off. Its nu reversal cannot matter: nu is 0 throughout
-      the scan and both reflections. No combination of reversals did better than the standard
-      (probes/s3c_sense_search.py);
-    - the remaining 0.049 is not a direction error. The two orientation reflections are themselves 0.060 r.l.u.
-      apart under the cubic lattice, and the pdi's del offset (PD_DELTA -0.834) makes it worse
-      (probes/s3c_offset_scan.py).
-    A finding, not a verdict: a corrected record, or corrected orientation reflections, should move these
-    numbers, and this row then shows it."""
+    - the partial record puts it 0.17 off: SPEC's labels were assigned in its own psic model, whose handedness this
+      model does not share (nu is 0 throughout, so only mu and chi enter).
+    This is about SPEC's labels under a partial reversal, not evidence about 17-2's motors (this row's first
+    reading, 2026-10-01, was retracted the same day). 17-2's whole record reverses nu too: psic's mirror image,
+    which no set of reflection angles can tell from psic, and which RSM maps through the mirror
+    (test_scan_43_with_17_2s_whole_record_maps_through_the_mirror_as_spec_does). The remaining 0.049 is the
+    orientation reflections' own disagreement: or1 sits about 0.9° off or0 and the (113) under every direction set."""
     from dataclasses import replace
 
     from silx.io.specfile import SpecFile
@@ -707,6 +706,160 @@ def test_scan_43_indexes_nearer_integer_under_standard_psic_than_under_the_17_2_
         provenance.unlink(missing_ok=True)
     print("scan 43 (113) |off|", off)
     assert off["standard"] <= 0.06 and off["17-2"] >= 0.10, off
+
+
+def _mirror_partner(project: Path, asset, reversed_circles) -> str:
+    """Row B's canonical geometry (scan 43) as 17-2 describes it, psic's mirror image: nu turns the other way (a
+    version-3 file; a version-2 file's arm is fitted in psic's standard detector directions), the raw camera's
+    left-right axis is flipped (rows z+, columns x-, for row B's z-, x-), and the record reverses mu, chi and nu,
+    with any other circle in ``reversed_circles``. Seen in the mirror it is row B's file exactly."""
+    import math
+
+    from pyFAI.detectors import Detector
+
+    from xrd_tools.analysis.xu_stitch_calibration import extended_surface_calibration
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    raw_shape, raw_cch = (195, 487), (97.0, 243.0)
+    orientation = stitch_orientation(DetectorCamera("z+", "x-"))
+    turned = (raw_shape[1], raw_shape[0]) if orientation.swaps_axes else raw_shape
+    origin = np.array(_raw_frame_pixel(orientation, raw_shape, (0.0, 0.0)))
+    matrix = np.column_stack([np.array(_raw_frame_pixel(orientation, raw_shape, point)) - origin
+                              for point in ((1.0, 0.0), (0.0, 1.0))])
+    turned_cch = np.linalg.solve(matrix, np.array(raw_cch) - origin)
+    assert _raw_frame_pixel(orientation, raw_shape, tuple(turned_cch)) == raw_cch
+    with xu_runtime_session() as session:
+        wavelength = float(session.xu.en2lam(13_000.007))
+    domain = {"del": [-50., 50.], "nu": [-35., 35.]}
+    validation = asset["validation"]
+    # the solid-angle arm (off in these forms) as this file's own: nu's scale reversed with the detector axes
+    arm = json.loads(json.dumps(asset["corrections"]["solid_angle_arm"]))
+    arm.update(detector="Detector", nu_scale=-math.pi / 180, del_scale=math.pi / 180, beam_rotation=0.0,
+               wavelength_m=energy_eV_to_wavelength_m(13_000.007), source_motors={"del_angle": "del", "nu_angle": "nu"})
+    value = extended_surface_calibration(
+        detector=Detector(pixel1=172e-6, pixel2=172e-6, max_shape=turned),
+        xu_parameters={"cch1_px": float(turned_cch[0]), "cch2_px": float(turned_cch[1]), "distance_m": 1.0147173,
+                       "del_offset_deg": 0.0, "nu_offset_deg": 0.0, "detrot_deg": 0.0, "tilt_deg": 0.0,
+                       "tiltazimuth_deg": 0.0, "sampledis_mm": [0.0, 0.0, 0.0]},
+        arm=arm, energy_eV=13_000.007, xu_wavelength_A=wavelength,
+        source_motors={"del": "del", "nu": "nu"}, rotation=orientation.rotation, control_domain=domain,
+        domain=domain, fit_frames=validation["transfer_frame_count"],
+        validation_frames=validation["validation_frame_count"],
+        validation_pixels=validation["validation_pixel_count"], max_dq=validation["transfer_max_abs_dq_A^-1"],
+        detector_axes=("x-", "z-"), flip=orientation.flip_horizontal)
+    folder = project / "calibration"
+    folder.mkdir(exist_ok=True)
+    name = "rsm_17_2_" + "_".join(reversed_circles)
+    (folder / f"{name}.xu.json").write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+    (folder / f"{name}.json").write_text("{}")
+    _with_record(folder / f"{name}.json", reversed_circles)
+    return f"calibration/{name}.json"
+
+
+def test_17_2s_whole_record_is_a_mirror_the_map_goes_through(tmp_path, v3_asset):
+    """Lowering: the whole 17-2 record (mu, chi and nu reversed) sets the mirror, names it in Preview's circle
+    directions with what stays reversed there, and enters the fingerprint (so an output a mirror-less map made from
+    the same files is not current); the polarization weights stay the physical lab frame's, bit for bit."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from xrd_tools.analysis.rsm_operation import _rsm_chunk_weights
+    from xrd_tools.corrections.frame_preparation import polarization_axes
+    lowered = {}
+    for circles, residual in ((("mu", "chi", "nu"), "psic's standard"),
+                              (("mu", "chi", "phi", "nu"), "psic with phi reversed")):
+        locator = _mirror_partner(tmp_path, v3_asset, circles)
+        effective = lower_rsm_effective_geometry(capture_rsm_calibration_geometry(locator, project_root=tmp_path))
+        lowered[circles] = locator, effective
+        assert effective.mirror
+        assert effective.circle_directions == (
+            "the calibration's instrument record: psic, reversed " + ", ".join(circles)
+            + "; mapped through the mirror into SPEC's handedness: " + residual)
+        mapper = rsm_effective_pixel_q_map(effective)
+        assert mapper.mirror and effective.diffractometer_projection.detector_circles == ("x-", "z-")
+        diffractometer = effective.diffractometer_projection
+        state = SimpleNamespace(
+            bound=SimpleNamespace(corrections=SimpleNamespace(polarization_factor=0.99)), solid=None, flat=None,
+            axes=polarization_axes(diffractometer.r_i, diffractometer.detector_circles[0]))
+        angles = [np.zeros(2)] * 4 + [np.array([7.0, -12.0]), np.array([21.0, 33.0])]
+        with xu_runtime_session() as session:
+            through = _rsm_chunk_weights(state, mapper, session, angles, 13_000.007, (0, -1, 0, -1))
+            physical = _rsm_chunk_weights(state, replace(mapper, mirror=False), session, angles, 13_000.007,
+                                          (0, -1, 0, -1))
+        assert np.array_equal(through, physical)
+    locator, mirrored = lowered[("mu", "chi", "nu")]
+    (tmp_path / locator).with_suffix(".xu.json.provenance.json").unlink()  # no record: the partner's own directions
+    plain = lower_rsm_effective_geometry(capture_rsm_calibration_geometry(locator, project_root=tmp_path))
+    assert not plain.mirror and plain.fingerprint != mirrored.fingerprint
+    assert plain.diffractometer_projection.sample_circles == ("x+", "z-", "y+", "z-")
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("circles", [("mu", "chi", "nu"), ("mu", "chi", "phi", "nu")],
+                         ids=["pure-mirror", "phi-reversed-too"])
+def test_scan_43_with_17_2s_whole_record_maps_through_the_mirror_as_spec_does(rsm_r2_project, v3_asset, circles):
+    """The fix (approved 2026-10-01): with 17-2's whole record, RSM maps scan 43 through the mirror. SPEC's #G3 is
+    kept (its reflections give it there to the header's rounding), the (113) lands where psic's standard model
+    puts it (0.049 from (1 1 3), where SPEC's #Q puts it, against 0.171 for the partial record mapped as
+    recorded), and the run's grid and intensities are row B's, the canonical reference's. With phi reversed too
+    (17-2 now) nothing moves: phi is 0 throughout scan 43."""
+    from dataclasses import replace
+
+    from silx.io.specfile import SpecFile
+
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
+    from xrd_tools.analysis.rsm_operation import run_rsm_operation_v2
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2, rsm_preflight_summary_lines
+
+    canonical_form = _form(rsm_r2_project, (43,), 40)
+    mirror_form = replace(canonical_form,
+                          geometry_asset=rsm_calibration_geometry_input(
+                              _mirror_partner(rsm_r2_project, v3_asset, circles)),
+                          output_path=rsm_r2_project / f"rsm-17-2-{len(circles)}.nexus")
+    scan = SpecFile(str(rsm_r2_project / "STO_align"))["43.1"]
+    fixed = dict(zip(("del", "eta", "chi", "phi", "nu", "mu"),
+                     (float(value) for value in scan.scan_header_dict["P0"].split()[:6])))
+    eta = float(np.asarray(scan.data_column_by_name("eta"), dtype=float)[22])
+    angles = [np.array([value]) for value in (fixed["mu"], eta, fixed["chi"], fixed["phi"], fixed["nu"],
+                                              fixed["del"])]
+    peaks, payloads, ubs, lines = [], [], [], []
+    try:
+        for form in (canonical_form, mirror_form):
+            prepared = prepare_rsm_tool_v2(form)
+            member = prepared.request.preflight.members[0]
+            mapper = rsm_effective_pixel_q_map(prepared.request.preflight.effective_geometry)
+            h, k, l = mapper.pixel_q(angles, member.energy_eV, UB=np.asarray(member.ub))
+            peaks.append(np.array([h[0, 95, 244], k[0, 95, 244], l[0, 95, 244]]))
+            ubs.append(member.ub)
+            lines = rsm_preflight_summary_lines(prepared.summary)
+            result = run_rsm_operation_v2(prepared.request)
+            assert result.terminal.disposition is ModuleDisposition.COMMITTED
+            payloads.append(result.payload)
+    finally:
+        for form in (canonical_form, mirror_form):
+            if Path(form.output_path).exists():
+                Path(form.output_path).unlink()
+    off = float(np.linalg.norm(peaks[1] - (1.0, 1.0, 3.0)))
+    print("scan 43 (113) through the mirror", peaks[1], "|off|", off, "max |d| vs canonical",
+          float(np.max(np.abs(peaks[1] - peaks[0]))))
+    np.testing.assert_allclose(peaks[1], peaks[0], rtol=0, atol=1e-12)
+    assert abs(off - 0.04917069605879838) < 1e-9
+    assert ubs[1] == ubs[0]  # SPEC's #G3, its own bytes
+    residual = "psic's standard" if "phi" not in circles else "psic with phi reversed"
+    assert (f"Circle directions: the calibration's instrument record: psic, reversed {', '.join(circles)}; "
+            f"mapped through the mirror into SPEC's handedness: {residual}") in lines
+    assert any(line.startswith("  UB: #G3; recomputed from (1 1 4) and (-1 0 4) in the instrument's directions "
+                               "through the mirror it agrees to") for line in lines)
+    canonical, mirrored = payloads
+    assert canonical.result_fingerprint == "8a88826f85eda95bf9fb4eb9cd043b7b822e0827e4ec3d285203f9256f43b324"
+    finite = np.isfinite(canonical.intensity), np.isfinite(mirrored.intensity)
+    assert int(finite[0].sum()) == int(finite[1].sum()) == 5531 and np.array_equal(finite[0], finite[1])
+    for (_name, axis), (_other, other) in zip(canonical.axes, mirrored.axes, strict=True):
+        np.testing.assert_allclose(other, axis, rtol=1e-12, atol=0)
+    differ = finite[0] & ~np.isclose(canonical.intensity, mirrored.intensity, rtol=1e-12, atol=0)
+    print("through the mirror: voxels differing", int(differ.sum()), "fingerprint", mirrored.result_fingerprint)
+    assert int(differ.sum()) == 0
+    assert mirrored.result_fingerprint == canonical.result_fingerprint  # measured: bit for bit
 
 
 # S3c unit 4b/4c: the calibrated detector's own mask (module gaps) is every frame's, whatever the corrections, beside

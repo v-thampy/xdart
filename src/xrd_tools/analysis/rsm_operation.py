@@ -1625,11 +1625,16 @@ _STANDARD_PSIC_AXES = ("x+", "z-", "y+", "z-", "x+", "z-")  # mu, eta, chi, phi,
 
 
 def _rsm_reversed_circles(mapper: PixelQMap) -> tuple[str, ...]:
-    """The psic circles a map turns other than psic's standard way (by role)."""
+    """The psic circles a map turns other than psic's standard way (by role). A mirror's map
+    (``PixelQMap.mirror``) is read through the mirror, where it maps: the circles still reversed there (17-2's
+    phi, for now)."""
     from xrd_tools.rsm.orientation import ROLE_ORDER
+    from xrd_tools.session.instrument import mirrored_axis
     axes = tuple(mapper.diff_config.sample_circles) + tuple(mapper.diff_config.detector_circles)
     if len(axes) != len(_STANDARD_PSIC_AXES):
         return ()
+    if mapper.mirror:
+        axes = tuple(mirrored_axis(axis) for axis in axes)
     return tuple(role for role, axis, plain in zip(ROLE_ORDER, axes, _STANDARD_PSIC_AXES) if axis != plain)
 
 
@@ -1643,7 +1648,11 @@ def _rsm_orientation_ub(analysis, g3, mapper: PixelQMap, runtime_session) -> tup
     its rounding, or they cannot be trusted in another: psic's standard model then keeps ``#G3`` (with a warning),
     any other refuses. And a recompute within the rounding of ``#G3`` is ``#G3`` itself, so its bytes and every
     identity are unchanged. A model other than psic's standard needs the reflections
-    (``RSM_ORIENTATION_REFLECTIONS_MISSING``)."""
+    (``RSM_ORIENTATION_REFLECTIONS_MISSING``).
+
+    A mirror's map (``PixelQMap.mirror``, 17-2) recomputes through the mirror: SPEC's labels are its psic model's,
+    which is the mirror image's, so a pure mirror's recompute is ``#G3`` and only what stays reversed there (17-2's
+    phi, for now) can move it. The standard self-check is always made without the mirror."""
     from dataclasses import replace
 
     from xrd_tools.rsm.orientation import ROLE_ORDER, ROUNDING, relative_difference, spec_orientation
@@ -1666,7 +1675,8 @@ def _rsm_orientation_ub(analysis, g3, mapper: PixelQMap, runtime_session) -> tup
         )
     named = " and ".join(
         "(" + " ".join(f"{value:g}" for value in item.hkl) + ")" for item in orientation.reflections)
-    standard = mapper if plain else replace(
+    model = "the instrument's directions" + (" through the mirror" if mapper.mirror else "")
+    standard = mapper if plain and not mapper.mirror else replace(
         mapper,
         diff_config=replace(
             mapper.diff_config,
@@ -1674,6 +1684,7 @@ def _rsm_orientation_ub(analysis, g3, mapper: PixelQMap, runtime_session) -> tup
             detector_circles=_STANDARD_PSIC_AXES[4:],
         ),
         angle_offsets=(),
+        mirror=False,
     )
     self_check = relative_difference(standard.orientation_ub(orientation, runtime_session=runtime_session), g3)
     if self_check > ROUNDING:
@@ -1685,16 +1696,16 @@ def _rsm_orientation_ub(analysis, g3, mapper: PixelQMap, runtime_session) -> tup
             f"this scan's reflections {named} do not reproduce its own #G3 in psic's standard directions "
             f"({self_check:.3g}, relative), so its UB cannot be recomputed in the instrument's; give a UB",
         )
-    if plain:
+    if plain and not mapper.mirror:
         return g3, f"#G3; recomputed from {named} in the instrument's directions it agrees to {self_check:.2g}"
     recomputed = mapper.orientation_ub(orientation, runtime_session=runtime_session)
     difference = relative_difference(recomputed, g3)
     if difference <= ROUNDING:
-        return g3, f"#G3; recomputed from {named} in the instrument's directions it agrees to {difference:.2g}"
+        return g3, f"#G3; recomputed from {named} in {model} it agrees to {difference:.2g}"
     moved = sorted({role for role in reversed_roles for item in orientation.reflections
                     if abs(math.remainder(item.angles[ROLE_ORDER.index(role)], 180.0)) > 1e-6})
     note = "" if not moved else "; reversed circles away from 0° or 180° there: " + ", ".join(moved)
-    return recomputed, (f"recomputed from {named} in the instrument's directions; #G3 differs by "
+    return recomputed, (f"recomputed from {named} in {model}; #G3 differs by "
                         f"{difference:.3g} (relative){note}")
 
 
@@ -3146,6 +3157,8 @@ def _effective_geometry_provenance(
                 "energy_offset_eV": effective.energy_offset_eV,
                 "calibration_energy_eV": effective.calibration_energy_eV,
             },
+            # the record is psic's mirror image: the sample frame's q is mirrored (z → −z) into SPEC's handedness
+            **({"mirror": True} if effective.mirror else {}),
         }),
         "fingerprint": effective.fingerprint,
     }
@@ -4033,6 +4046,11 @@ def _rsm_chunk_weights(state, mapper, session, angles, energy, roi):
     xu_module, _numpy = session.active_modules()
     # the energy q is mapped with: a refined calibration's offset included (C7b), so the scatter is elastic
     wavelength = float(xu_module.en2lam(float(mapper.mapped_energy(energy))))
+    if mapper.mirror:
+        from dataclasses import replace
+        lab_mapper = replace(mapper, mirror=False)
+    else:
+        lab_mapper = mapper
     factor = state.bound.corrections.polarization_factor
     band = _rsm_weight_band_rows(shape[1])
     first = {}
@@ -4044,12 +4062,13 @@ def _rsm_chunk_weights(state, mapper, session, angles, energy, roi):
             continue
         first[pose] = index
         # the detector pose alone, in the lab frame (the sample circles at zero, an identity UB): the elastic
-        # scattered direction of each pixel
+        # scattered direction of each pixel, as the circles turn (a mirror's map unmirrored: the beam's
+        # polarization is physical, and a left-right mirror leaves its weight unchanged anyway)
         lab = tuple(np.zeros(1) for _ in range(4)) + (np.array([pose[0]]), np.array([pose[1]]))
         for start in range(0, shape[0], band):
             stop = min(start + band, shape[0])
-            qx, qy, qz = mapper.pixel_q(lab, float(energy), UB=np.eye(3), roi=roi, runtime_session=session,
-                                        rows=(start, stop))
+            qx, qy, qz = lab_mapper.pixel_q(lab, float(energy), UB=np.eye(3), roi=roi, runtime_session=session,
+                                            rows=(start, stop))
             polarization = polarization_weight(
                 np.asarray(qx)[0], np.asarray(qy)[0], np.asarray(qz)[0], factor=factor,
                 wavelength_A=wavelength, beam=state.axes[0], vertical=state.axes[1])
@@ -4431,7 +4450,7 @@ def _resolve_exact_rsm_q_bounds_active(
         try:
             q_values = hxrd.Ang2Q.area(
                 *(item[start:stop] for item in values),
-                UB=matrix,
+                UB=mapper.frame_ub(matrix),  # a mirror's map: through the mirror, as pixel_q
                 **mapper.diff_config.ang2q_kwargs,
             )
             expected = (stop - start, header.Nch1, header.Nch2)

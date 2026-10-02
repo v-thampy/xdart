@@ -223,6 +223,12 @@ class DetectorHeader:
 # PixelQMap
 # ---------------------------------------------------------------------------
 
+#: psic's left-right mirror (z → −z in its lab frame, x up and y along the beam), applied to a mirrored
+#: instrument's sample-frame Q (``PixelQMap.mirror``).
+MIRROR = np.diag((1.0, 1.0, -1.0))
+MIRROR.setflags(write=False)
+
+
 @dataclass(frozen=True, slots=True)
 class PixelQMap:
     """Map per-frame angle arrays to per-pixel ``(qx, qy, qz)`` arrays.
@@ -251,6 +257,15 @@ class PixelQMap:
     angle_offsets: tuple[float, ...] = ()
     #: Added to the energy a caller passes (a refined calibration's energy offset, eV).
     energy_offset_eV: float = 0.0
+    #: The instrument is psic's left-right mirror image (``InstrumentGeometry.is_mirror``, 17-2): the sample
+    #: frame's Q is mirrored (z → −z, ``MIRROR``) into SPEC's handedness, where its psic model, orientation
+    #: reflections and UB live; the pixels are computed with the circles as they turn. Only RSM's lowering sets it.
+    mirror: bool = False
+
+    def frame_ub(self, UB: np.ndarray) -> np.ndarray:
+        """The matrix xrayutilities applies (it returns ``inv(UB) @ Q``): ``UB`` itself, or ``MIRROR @ UB`` for a
+        mirror, so its H, K, L (or, with the identity, its Q) are SPEC's handedness'."""
+        return UB if not self.mirror else MIRROR @ UB
 
     def init_area_extra(self) -> dict[str, float]:
         """``init_area``'s mount keywords: none for an unmounted detector, so its call is unchanged."""
@@ -277,7 +292,8 @@ class PixelQMap:
         circle directions; the calibration's zero offsets subtracted from the reflections' angles as from every
         frame's), by Busing and Levy (``xrd_tools.rsm.orientation``; AUD-9 stage 2b decision 2). The energy offset
         and the mount do not enter: U uses only the reflections' directions, and a reflection is centred on the
-        beam pixel."""
+        beam pixel. A mirror's reflections are mirrored too (``frame_ub``), as its pixels are, so SPEC's labels
+        keep their handedness."""
         from xrd_tools.core.geometry.xu_runtime import (
             XuRuntimeSession,
             require_active_xu_runtime_session,
@@ -295,8 +311,8 @@ class PixelQMap:
                 values = (angles if not any(offsets)
                           else tuple(angle - offset for angle, offset in zip(angles, offsets, strict=True)))
                 require_active_xu_runtime_session(active_session)
-                return np.asarray(hxrd.Ang2Q.point(*values, UB=np.identity(3), wl=float(wavelength)),
-                                  dtype=np.float64)
+                return np.asarray(hxrd.Ang2Q.point(*values, UB=self.frame_ub(np.identity(3)),
+                                                   wl=float(wavelength)), dtype=np.float64)
 
             return busing_levy_ub(point, orientation)
 
@@ -420,7 +436,7 @@ class PixelQMap:
                 raise ValueError("pixel_q UB must be one finite 3x3 matrix")
             qx, qy, qz = hxrd.Ang2Q.area(
                 *self.area_angles(angles),
-                UB=matrix,
+                UB=self.frame_ub(matrix),
                 **area_kwargs,
             )
             require_active_xu_runtime_session(active_session)
@@ -456,5 +472,6 @@ class PixelQMap:
 
 __all__ = [
     "DetectorHeader",
+    "MIRROR",
     "PixelQMap",
 ]

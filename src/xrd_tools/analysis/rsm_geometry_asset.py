@@ -863,6 +863,9 @@ class RSMEffectiveGeometry:
     #: Where the circle directions came from, for Preview (decision 2); the directions themselves are in the
     #: diffractometer and the fingerprint.
     circle_directions: str | None = None
+    #: The instrument record is psic's mirror image (``InstrumentGeometry.is_mirror``): RSM maps through the mirror
+    #: into SPEC's handedness (``PixelQMap.mirror``). In the fingerprint only when set.
+    mirror: bool = False
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
@@ -871,6 +874,8 @@ class RSMEffectiveGeometry:
             or type(self.asset_receipt_fingerprint) is not str
             or len(self.asset_receipt_fingerprint) != 64
             or self.source not in {"asset", "calibration"}
+            or type(self.mirror) is not bool
+            or (self.mirror and self.source != "calibration")
             or (self.source == "asset"
                 and self.asset_semantic_fingerprint != _RESOURCE_SEMANTIC_FINGERPRINT)
             or type(self.asset_semantic_fingerprint) is not str
@@ -1161,6 +1166,7 @@ def rsm_effective_pixel_q_map(effective_geometry: RSMEffectiveGeometry):
         area_mount=effective_geometry.area_mount,
         angle_offsets=effective_geometry.angle_offsets,
         energy_offset_eV=effective_geometry.energy_offset_eV,
+        mirror=effective_geometry.mirror,
     )
 
 
@@ -1503,6 +1509,7 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
     # sample and detector circles alike; the partner's detector circles must already be the record's (its fit was
     # made in them). Without a record, psic's standard directions, as the partner carries them.
     directions = "psic's standard (the calibration records no instrument)"
+    mirror = False
     if receipt.instrument_record is not None:
         from xrd_tools.session.instrument import InstrumentGeometry
 
@@ -1521,6 +1528,16 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
         directions = ("the calibration's instrument record: psic, "
                       + ("every circle as psic's standard" if not reversed_roles
                          else "reversed " + ", ".join(reversed_roles)))
+        # A record reversing mu, chi and nu is psic's mirror image (17-2): SPEC's psic model, its orientation
+        # reflections' labels and its UB are that image's, so RSM maps through the mirror into SPEC's handedness
+        # (the maintainer approved 2026-10-01), with whatever else the record reverses (17-2's phi, for now).
+        mirror = record.is_mirror()
+        if mirror:
+            residual = [role for role in _PSIC_ROLES if role in record.mirror_residual()]
+            directions += ("; mapped through the mirror into SPEC's handedness: psic's standard"
+                           if not residual else
+                           "; mapped through the mirror into SPEC's handedness: psic with "
+                           + ", ".join(residual) + " reversed")
     for name in ("qconv_kwargs", "hxrd_kwargs", "ang2q_kwargs"):
         object.__setattr__(
             diffractometer, name, MappingProxyType(dict(getattr(diffractometer, name))),
@@ -1561,7 +1578,7 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
         ),
         roi,
         xu_runtime_requirements_projection(requirements),
-    )
+    ) + ((("mirror", True),) if mirror else ())  # every other geometry keeps its identity
     fingerprint = analysis_canonical_fingerprint(
         "rsm-effective-geometry-calibration-v1", identity
     )
@@ -1581,6 +1598,7 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
         refinement=receipt.refinement,
         calibration_energy_eV=calibration_energy,
         circle_directions=directions,
+        mirror=mirror,
         _claim=_EFFECTIVE_FACTORY,
     )
 

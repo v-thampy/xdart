@@ -142,3 +142,24 @@ def test_each_circle_turns_about_psics_axis_for_the_circle_it_plays():
     assert InstrumentGeometry('fourc', plane='horizontal').circle_axes() == (
         ('th', 'x+'), ('chi', 'y+'), ('phi', 'z-'), ('tth', 'x+'))
     assert InstrumentGeometry('twoc', plane='horizontal').circle_axes() == (('th', 'x+'), ('tth', 'x+'))
+
+
+def test_reversing_mu_chi_and_nu_is_psics_mirror_image():
+    """17-2's record (the maintainer, 2026-09-30) reverses mu, chi and nu, the circles that turn about x and y: psic's
+    left-right mirror image. For now phi is reversed too (2026-10-01), which the mirror does not undo."""
+    from xrd_tools.session.instrument import MIRROR_CIRCLES, mirrored_axis
+    assert MIRROR_CIRCLES == ('mu', 'chi', 'nu')
+    assert [mirrored_axis(axis) for axis in ('x+', 'x-', 'y+', 'y-', 'z+', 'z-')] == [
+        'x-', 'x+', 'y-', 'y+', 'z+', 'z-']
+    pure = InstrumentGeometry('psic', reversed_circles=('mu', 'chi', 'nu'))
+    assert pure.is_mirror() and pure.mirror_residual() == ()
+    now = InstrumentGeometry('psic', reversed_circles=('phi', 'nu', 'mu', 'chi'))
+    assert now.reversed_circles == ('mu', 'chi', 'phi', 'nu') and now.is_mirror()
+    assert now.mirror_residual() == ('phi',)
+    # the mirror read through the record's own axes: every circle but the residual turns as psic's
+    assert {circle: mirrored_axis(axis) for circle, axis in now.circle_axes()} == {
+        'mu': 'x+', 'eta': 'z-', 'chi': 'y+', 'phi': 'z+', 'nu': 'x+', 'del': 'z-'}
+    partial = InstrumentGeometry('psic', reversed_circles=('mu', 'chi'))
+    assert not partial.is_mirror() and partial.mirror_residual() == ('mu', 'chi')
+    assert not InstrumentGeometry('psic').is_mirror() and InstrumentGeometry('psic').mirror_residual() == ()
+    assert not InstrumentGeometry('fourc', plane='horizontal', reversed_circles=('th', 'chi', 'tth')).is_mirror()
