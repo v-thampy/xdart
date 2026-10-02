@@ -340,6 +340,39 @@ def test_calibrate_opens_on_the_saved_window_settings_and_keeps_its_own_calibrat
             _close(each, qapp)
 
 
+def test_a_document_saved_without_a_calibration_window_closes_the_one_opened_since(qapp, tmp_path):
+    """Codex's combined stage-2b review F3 (its same-page reproduction): a document saved before Calibrate was
+    opened holds ``calibration: null``. Loaded after the window was opened and edited (RMS .02) and hidden, it
+    restores that: the next document has no calibration window, and Calibrate opens a new window on the
+    defaults. The window is let go as a Project change lets it go (hidden; the page still shuts it down). A
+    document without the section keeps the window and its edits (RSM's omission rule)."""
+    page = _page(qapp, owner=_Owner())
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        original = page.settings()
+        assert original["calibration"] is None
+        page._calibrate()
+        dialog = page._calibration_dialog
+        default_rms = dialog._text("rms")
+        dialog._set_field_text("rms", ".02")
+        dialog.hide()
+        assert default_rms != ".02" and page.settings()["calibration"]["fields"]["rms"] == ".02"
+        page.apply_settings(original)
+        assert page.settings()["calibration"] is None and page.settings() == original
+        assert page._calibration_dialog is None and not dialog.isVisible() and dialog in page._authoring_dialogs
+        page._calibrate()
+        again = page._calibration_dialog
+        assert again is not dialog and again._text("rms") == default_rms
+        again._set_field_text("rms", ".02")
+        again.hide()
+        partial = {key: value for key, value in original.items() if key != "calibration"}
+        page.apply_settings(partial)  # no calibration section: the window stays, edits and all
+        assert page._calibration_dialog is again and page.settings()["calibration"]["fields"]["rms"] == ".02"
+    finally:
+        _close(page, qapp)
+
+
 def test_the_scan43_settings_file_makes_the_retired_presets_form_on_any_project(qapp, tmp_path, session):
     """Design §2 item 5: the "Scan 43" preset button went with the classic dialog (G10), and its inputs ship as a
     settings file (``fixtures/rsm_scan43_settings.json``, made by the page). It names no Project, calibration

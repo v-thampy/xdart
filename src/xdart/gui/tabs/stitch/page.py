@@ -2443,8 +2443,7 @@ class StitchPage(QtWidgets.QWidget):
                 raise ValueError("Choose a Project folder first")
             if self._calibration_dialog is not None and self._calibration_project != project:
                 self._calibration_settings = self._calibration_dialog.settings()
-                self._calibration_dialog.hide()
-                self._calibration_dialog = None
+                self._release_calibration_dialog()
             # The processing scan only fills a new dialog with no calibration source: the
             # calibrant scan is usually another scan, and saved or edited inputs are kept.
             unconfigured = False
@@ -2473,6 +2472,13 @@ class StitchPage(QtWidgets.QWidget):
             self._authoring_timer.start()
         except (TypeError, ValueError, OSError) as error:
             self._status(str(error), ready=False)
+
+    def _release_calibration_dialog(self):
+        """Let the retained calibration window go (a Project change, or a settings document with no window): it is
+        hidden and no longer the page's, and ``shutdown`` still shuts it down with the other authoring windows."""
+        if self._calibration_dialog is not None:
+            self._calibration_dialog.hide()
+        self._calibration_dialog = None
 
     def _adopt_calibration(self, path, backend):
         if self._closing or self._calibration_project != str(self._value("project_root")):
@@ -3009,8 +3015,13 @@ class StitchPage(QtWidgets.QWidget):
         return dialog.settings() if dialog is not None else self._calibration_settings
 
     def _set_calibration_settings(self, values):
+        """A document's calibration window: its settings, applied to the window when it exists; None (a document
+        saved with no window, ``calibration: null``) lets a retained window go, so the next Calibrate opens a new
+        one on the defaults (Codex's combined stage-2b review F3). A load waits while the window works."""
         self._calibration_settings = values if isinstance(values, dict) else None
-        if self._calibration_dialog is not None and self._calibration_settings:
+        if values is None:
+            self._release_calibration_dialog()
+        elif self._calibration_dialog is not None and self._calibration_settings:
             self._calibration_dialog.apply_settings(self._calibration_settings)
 
     def _choose_settings_path(self, action, start):
