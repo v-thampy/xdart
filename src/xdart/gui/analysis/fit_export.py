@@ -23,7 +23,7 @@ def plain_settings(values):
 
 
 def write_fit_notebook(path, snapshot, tool, settings, *, batch=(), batch_inputs=(),
-                       data_root=None, reciprocal_transform=None, reference=None):
+                       data_root=None, reciprocal_transform=None, reference=None, trend_column=""):
     """Write the detached current request, including lossless derived values, before a fit is needed."""
     from xrd_tools.notebooks import FitNotebookRecipe, capture_snapshot, render_notebook
     path = Path(path)
@@ -50,6 +50,7 @@ def write_fit_notebook(path, snapshot, tool, settings, *, batch=(), batch_inputs
     recipe = FitNotebookRecipe(tool=tool, input=reference if captured is None else captured.reference,
                                settings=settings, batch=tuple(references),
                                title=snapshot.key.result_identity, reciprocal_transform=transform,
+                               trend_column=trend_column,
                                orthonormal=all(a.unit in {'A^-1', 'Å⁻¹', 'q_A^-1'} for a in snapshot.axes))
     document = render_notebook(recipe, format=format, bundle_root=str(path.parent),
                                data_root=None if data_root is None else str(data_root))

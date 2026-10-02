@@ -1,5 +1,6 @@
 """Shared host: real fit worker, before-fit export and held Int capabilities."""
 from dataclasses import replace
+import json
 import time
 import numpy as np
 from pyqtgraph.Qt import QtWidgets
@@ -32,9 +33,19 @@ def test_before_fit_export_and_single_batch_use_same_real_owner(tmp_path):
     drain(app, host)
     assert host.dialog.batch_btn.isEnabled() and not host.dialog.live_check.isEnabled()
     # Current settings exported even before any fit has succeeded.
+    host.column_row.editor.setCurrentText('del')
     host.export_to(tmp_path / 'fit.ipynb')
     assert (tmp_path / 'fit.ipynb').is_file()
     assert len(tuple(tmp_path.glob('fit.batch-*.input.npz'))) == 3
+    # Both direct and GUI worker exports preserve the selected experimental trend column.
+    host._export(tmp_path / 'worker.ipynb')
+    drain(app, host)
+    for name in ('fit.ipynb', 'worker.ipynb'):
+        config = next(cell['source'] for cell in json.loads((tmp_path / name).read_text())['cells']
+                      if cell['cell_type'] == 'code' and 'recipe = recipe_from_json' in cell['source'])
+        namespace = {}
+        exec(config, namespace)
+        assert namespace['recipe'].trend_column == 'del'
     host.dialog.fit_btn.click()
     drain(app, host)
     assert host.outcomes, host.dialog.status.text()

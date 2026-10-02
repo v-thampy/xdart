@@ -60,7 +60,7 @@ def _job(request, cancel, progress):
                     yield (item.reference if isinstance(item, FitTarget) and item.reference is not None
                            else _snapshot(item, request.settings))
             return write_fit_notebook(request.destination, snapshot, request.kind, settings,
-                                      batch_inputs=batch_inputs(), data_root=request.data_root,
+                                      batch_inputs=batch_inputs(), data_root=request.data_root, trend_column=request.column,
                                       reference=getattr(request.inputs[0], 'reference', None))
         return snapshot
     analyzer_type = DisplayedPeakFitAnalyzer if request.kind == 'peak' else DisplayedPhaseFitAnalyzer
@@ -247,7 +247,7 @@ class SnapshotFitHost(QtCore.QObject):
                  else _snapshot(item, frozen) for item in inputs)
         current = self.current()
         return write_fit_notebook(path, _snapshot(current, frozen), self.kind, settings,
-                                  batch_inputs=batch,
+                                  batch_inputs=batch, trend_column=self.trend_column,
                                   data_root=self.source_root() if callable(self.source_root) else self.source_root,
                                   reference=getattr(current, 'reference', None))
 

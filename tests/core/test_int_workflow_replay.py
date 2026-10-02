@@ -22,9 +22,16 @@ def _fixture(root):
     poni.write_text('poni_version: 2\nDetector: Pilatus100k\nDetector_config: {}\nDistance: 0.1234\nPoni1: 0.01\nPoni2: 0.03\nRot1: 0\nRot2: 0\nRot3: 0\nWavelength: 1e-10\n')
     source = root / 'raw.h5'
     with h5py.File(source, 'w') as handle:
+        handle.attrs['creator'] = 'NXWriter'
         detector = handle.create_group('entry/instrument/detector')
-        detector.create_dataset('data', data=np.full((2, 195, 487), 100, np.uint16))
-        handle.create_dataset('entry/measurement/I0', data=[2., 4.])
+        images = detector.create_dataset('data', data=np.full((2, 195, 487), 100, np.uint16))
+        images.attrs['signal_type'] = 'detector'
+        data = handle.create_group('entry/data')
+        data.attrs['NX_class'] = 'NXdata'
+        data.attrs['signal'] = 'image'
+        data['image'] = images
+        data.create_dataset('i0', data=[2., 4.])
+        handle.create_dataset('entry/end_time', data=np.bytes_('2026-10-02T00:00:00'))
     return RunIntent(source_spec=SourceSpec(source, SourceKind.NEXUS_STACK),
         project_root=str(root), poni_file=str(poni), save_path=str(root / 'old'),
         max_cores=2, processing_mode='Int 2D',
@@ -41,6 +48,8 @@ def test_int_replay_uses_the_same_admitted_assets_and_native_reducer(tmp_path, m
     from xrd_tools.sources import open_source
     intent = _fixture(tmp_path / 'project')
     intent.processing_mode = mode
+    intent.bai_1d_args['monitor'] = 'I0'
+    intent.bai_2d_args['monitor'] = 'I0'
     shape = (195, 487)
     for name, array in (('dark', np.full(shape, 3.1)), ('flat', np.full(shape, 2.3)),
                         ('mask', np.zeros(shape, bool))):
