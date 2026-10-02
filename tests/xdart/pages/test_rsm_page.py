@@ -2215,24 +2215,28 @@ def test_the_3d_viewer_opens_on_the_result_shown_follows_it_and_closes_with_the_
         assert "3d" not in page._tool_windows
         page._add_result("/tmp/a_rsm.nexus", "A")
         page.view.page_tool("3d").click()
+        _settled(page._tool_windows["3d"])
         window = page._tool_windows["3d"]
         assert window.isVisible() and not window.isModal()
         assert window.windowTitle() == "RSM 3D Viewer — a_rsm.nexus"
         assert np.shares_memory(window.view.projection.values, values["A"].intensity)
         assert window.view.projection.labels == tuple(values["A"].coordinate_frame.axis_labels)
         page._add_result("/tmp/b_rsm.nexus", "B")  # the window follows the result shown
+        _settled(window)
         assert window.windowTitle() == "RSM 3D Viewer — b_rsm.nexus"
         assert np.shares_memory(window.view.projection.values, values["B"].intensity)
         page.view.page_tool("3d").click()  # a later press raises the same window
+        _settled(page._tool_windows["3d"])
         assert page._tool_windows["3d"] is window
         window.hideEvent(_Minimised())  # minimised, not closed: the window keeps its volume
         assert np.shares_memory(window.view.projection.values, values["B"].intensity)
         window.close()  # closed by the user: its volume and RGBA go until it is shown again
         assert window.view.projection is None and window.view.rgba is None
         page.view.page_tool("3d").click()
+        _settled(page._tool_windows["3d"])
         assert np.shares_memory(window.view.projection.values, values["B"].intensity)
     finally:
-        _close(page, qapp)
+        _close_settled(page, qapp)
     assert window.view.projection is None and window.view.rgba is None and not page._tool_windows
 
 
@@ -2241,6 +2245,33 @@ def _type(editor, text):
     editor.setText(text)
     editor.setModified(True)
     editor.editingFinished.emit()
+
+
+def _settled(window, seconds=20.0):
+    """A tool window once what it was asked for is done (item 6: each computes on its own worker): its last plane
+    or draw drawn or dropped as the event loop delivers it, and its worker idle."""
+    from xdart.gui.tabs.rsm.tool_windows import RSMVolumeWindow
+    worker = window.view if isinstance(window, RSMVolumeWindow) else window
+    deadline = time.monotonic() + seconds
+    while (worker.computing or worker._running is not None) and time.monotonic() < deadline:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(0.002)
+    assert not worker.computing and worker._running is None
+    return window
+
+
+def _typed(window, editor, text):
+    """``_type`` into one of a tool window's rows, then the window once its plane is drawn or refused."""
+    _type(editor, text)
+    _settled(window)
+
+
+def _close_settled(page, qapp):
+    """``_close`` once the page's tool windows have no plane or draw still computing (item 6: one computing makes
+    the page's close PENDING until it returns; ``test_closing_the_page_while_a_tool_computes_is_pending...``)."""
+    for window in page._tool_windows.values():
+        _settled(window)
+    _close(page, qapp)
 
 
 def test_custom_slice_opens_on_hh_l_through_the_centre_follows_the_result_and_closes_with_the_page(
@@ -2258,6 +2289,7 @@ def test_custom_slice_opens_on_hh_l_through_the_centre_follows_the_result_and_cl
         assert "custom" not in page._tool_windows
         page._add_result("/tmp/a_rsm.nexus", "A")
         page.view.page_tool("custom").click()
+        _settled(page._tool_windows["custom"])
         window = page._tool_windows["custom"]
         assert window.isVisible() and not window.isModal()
         assert window.windowTitle() == "RSM Custom Slice — a_rsm.nexus"
@@ -2289,20 +2321,23 @@ def test_custom_slice_opens_on_hh_l_through_the_centre_follows_the_result_and_cl
         window.view.log_scale.click()  # Int's Log (and colour map) draw the plane again
         assert window.view.keyed_projection.log_scale
         page._add_result("/tmp/b_rsm.nexus", "B")  # the window follows the result shown
+        _settled(window)
         assert window.windowTitle() == "RSM Custom Slice — b_rsm.nexus"
         np.testing.assert_array_equal(window.view.keyed_projection.panels[0].image,
                                       custom_slice(values["B"].intensity, axes).values.T)
         assert window.view.keyed_projection.log_scale
         page.view.page_tool("custom").click()  # a later press raises the same window
+        _settled(page._tool_windows["custom"])
         assert page._tool_windows["custom"] is window
         window.hideEvent(_Minimised())  # minimised, not closed: the window keeps its plane
         assert window._values is values["B"] and window.custom is not None
         window.close()  # closed by the user: the volume and the plane go until it is shown again
         assert window._values is None and window.custom is None and window.view.keyed_projection is None
         page.view.page_tool("custom").click()
+        _settled(page._tool_windows["custom"])
         assert window._values is values["B"] and window.custom is not None
     finally:
-        _close(page, qapp)
+        _close_settled(page, qapp)
     assert window._values is None and window.custom is None and not page._tool_windows
 
 
@@ -2316,9 +2351,10 @@ def test_an_axis_aligned_custom_slice_is_the_main_views_hk_slice(qapp, monkeypat
     try:
         page._add_result("/tmp/a_rsm.nexus", "A")
         page.view.page_tool("custom").click()
+        _settled(page._tool_windows["custom"])
         window = page._tool_windows["custom"]
         for name, text in (("first", "1 0 0"), ("second", "0 1 0"), ("first_points", "5"), ("second_points", "7")):
-            _type(window.rows[name].editor, text)
+            _typed(window, window.rows[name].editor, text)
         plane = window.view.keyed_projection.panels[0]
         hk = next(panel for panel in _panels_at(values["A"], (0, 0, 4)) if panel.key == RSM_HK)
         assert plane.image.shape == hk.image.shape == (7, 5)
@@ -2328,13 +2364,13 @@ def test_an_axis_aligned_custom_slice_is_the_main_views_hk_slice(qapp, monkeypat
         np.testing.assert_array_equal(plane.image, hk.image)
         assert (plane.x_axis.label, plane.y_axis.label) == ("H (r.l.u.)", "K (r.l.u.)")
         low, high = window.rows["first_range"].findChildren(QtWidgets.QLineEdit)
-        _type(low, "0.25")
-        _type(high, "0.75")  # a range is H itself, not an offset from the point
+        _typed(window, low, "0.25")
+        _typed(window, high, "0.75")  # a range is H itself, not an offset from the point
         ranged = window.view.keyed_projection.panels[0]
         np.testing.assert_allclose(ranged.x_axis.values, np.linspace(0.25, 0.75, 5), rtol=0, atol=1e-12)
         np.testing.assert_array_equal(ranged.image[:, ::2], hk.image[:, 1:4])  # H 0.25, 0.5, 0.75: voxels 1–3
     finally:
-        _close(page, qapp)
+        _close_settled(page, qapp)
 
 
 def test_each_plane_custom_slice_refuses_is_named_in_its_card(qapp, monkeypatch):
@@ -2346,6 +2382,7 @@ def test_each_plane_custom_slice_refuses_is_named_in_its_card(qapp, monkeypatch)
     try:
         page._add_result("/tmp/a_rsm.nexus", "A")
         page.view.page_tool("custom").click()
+        _settled(page._tool_windows["custom"])
         window = page._tool_windows["custom"]
         low, high = window.rows["first_range"].findChildren(QtWidgets.QLineEdit)
         cases = (
@@ -2356,18 +2393,18 @@ def test_each_plane_custom_slice_refuses_is_named_in_its_card(qapp, monkeypatch)
             (low, "50", "", "Along 1 needs both bounds, or neither (Auto)"),
         )
         for editor, refused, readable, reason in cases:
-            _type(editor, refused)
+            _typed(window, editor, refused)
             assert reason in window.card.status.text() and not window.card.status.isHidden(), reason
             assert window.card.valid_marker.isHidden() and window.custom is None
             assert window.view.keyed_projection is None and reason in window.view.status.text()
-            _type(editor, readable)
+            _typed(window, editor, readable)
             assert window.custom is not None and window.card.status.isHidden(), reason
-        _type(low, "50")
-        _type(high, "60")  # HH from 50 to 60: the plane holds no data
+        _typed(window, low, "50")
+        _typed(window, high, "60")  # HH from 50 to 60: the plane holds no data
         assert "the plane does not cross the volume's data" in window.card.status.text()
         assert window.custom is None and window.view.keyed_projection is None
     finally:
-        _close(page, qapp)
+        _close_settled(page, qapp)
 
 
 def test_custom_slice_in_q_coordinates_takes_qx_qy_qz_vectors(qapp, monkeypatch):
@@ -2388,6 +2425,7 @@ def test_custom_slice_in_q_coordinates_takes_qx_qy_qz_vectors(qapp, monkeypatch)
     try:
         page._add_result("/tmp/q_rsm.nexus", "Q")
         page.view.page_tool("custom").click()
+        _settled(page._tool_windows["custom"])
         window = page._tool_windows["custom"]
         assert [window.rows[name].label.text() for name in ("first", "second", "through")] == [
             "Direction 1 (Qx Qy Qz)", "Direction 2 (Qx Qy Qz)", "Through (Qx Qy Qz)"]
@@ -2397,7 +2435,7 @@ def test_custom_slice_in_q_coordinates_takes_qx_qy_qz_vectors(qapp, monkeypatch)
                                 symbols=("Qx", "Qy", "Qz"), unit="Å⁻¹")
         np.testing.assert_array_equal(plane.image, expected.values.T)
     finally:
-        _close(page, qapp)
+        _close_settled(page, qapp)
 
 
 _HKL_CAVEAT = (" In HKL the normal and the thickness are r.l.u. ones, H, K and L taken as orthonormal: for a "
@@ -2417,6 +2455,7 @@ def test_custom_slice_thickness_averages_a_slab_and_the_note_names_it(qapp, monk
     try:
         page._add_result("/tmp/a_rsm.nexus", "A")
         page.view.page_tool("custom").click()
+        _settled(page._tool_windows["custom"])
         window = page._tool_windows["custom"]
         row = window.rows["thickness"]
         assert type(row) is FormRow and row.current_value() == "0"
@@ -2425,7 +2464,7 @@ def test_custom_slice_thickness_averages_a_slab_and_the_note_names_it(qapp, monk
         assert plane.thickness == 0.0 and "averaged" not in window.note.text() and "In HKL" not in window.note.text()
         axes = tuple(axis for _name, axis in values["A"].axes)
         expected = custom_slice(values["A"].intensity, axes, thickness=0.5)
-        _type(row.editor, "0.5")
+        _typed(window, row.editor, "0.5")
         slab, drawn = window.custom, window.view.keyed_projection
         assert (slab.thickness, slab.planes) == (0.5, expected.planes) and expected.planes > 3
         np.testing.assert_array_equal(drawn.panels[0].image, expected.values.T)
@@ -2436,11 +2475,11 @@ def test_custom_slice_thickness_averages_a_slab_and_the_note_names_it(qapp, monk
                                       "along [1 −1 0]." + _HKL_CAVEAT)
         assert window.card.status.isHidden() and not window.card.valid_marker.isHidden()
         for no_thickness in ("0", ""):
-            _type(row.editor, no_thickness)
+            _typed(window, row.editor, no_thickness)
             assert window.custom.thickness == 0.0 and window.note.text() == f"The plane is {plane.note}."
             np.testing.assert_array_equal(window.view.keyed_projection.panels[0].image, plane.values.T)
     finally:
-        _close(page, qapp)
+        _close_settled(page, qapp)
     names = ("qx", "qy", "qz")
     from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
     from xrd_tools.session.rsm_viewer_model import make_rsm_viewer_values
@@ -2454,13 +2493,14 @@ def test_custom_slice_thickness_averages_a_slab_and_the_note_names_it(qapp, monk
     try:
         page._add_result("/tmp/q_rsm.nexus", "Q")
         page.view.page_tool("custom").click()
+        _settled(page._tool_windows["custom"])
         window = page._tool_windows["custom"]
         assert window.rows["thickness"].label.text() == "Thickness (Å⁻¹)"
-        _type(window.rows["thickness"].editor, "0.5")
+        _typed(window, window.rows["thickness"].editor, "0.5")
         assert window.custom.planes > 3 and window.note.text().endswith(" along [1 −1 0].")
         assert "In HKL" not in window.note.text()
     finally:
-        _close(page, qapp)
+        _close_settled(page, qapp)
 
 
 def test_a_custom_slice_thickness_that_is_no_number_0_or_more_is_named_in_its_card(qapp, monkeypatch):
@@ -2472,19 +2512,139 @@ def test_a_custom_slice_thickness_that_is_no_number_0_or_more_is_named_in_its_ca
     try:
         page._add_result("/tmp/a_rsm.nexus", "A")
         page.view.page_tool("custom").click()
+        _settled(page._tool_windows["custom"])
         window = page._tool_windows["custom"]
         editor = window.rows["thickness"].editor
         reason = "Thickness (r.l.u.): a number, 0 or more"
         for refused in ("-0.1", "thick", "nan", "inf", "-inf"):
-            _type(editor, refused)
+            _typed(window, editor, refused)
             assert window.card.status.text() == reason and not window.card.status.isHidden(), refused
             assert window.card.valid_marker.isHidden() and window.custom is None and window.note.text() == ""
             assert window.view.keyed_projection is None and reason in window.view.status.text()
             assert editor.text() == refused
-            _type(editor, "0.2")
+            _typed(window, editor, "0.2")
             assert window.custom is not None and window.custom.thickness == 0.2 and window.card.status.isHidden()
     finally:
-        _close(page, qapp)
+        _close_settled(page, qapp)
+
+
+# AUD-9 stage 2b item 6 (the maintainer: "yes go ahead with both"): Custom Slice cuts on its window's worker, the
+# latest plane wins; the page's close waits for it
+
+
+def _held_cuts(monkeypatch):
+    """Custom Slice's real cut, each result held before it returns until ``release`` is set (the gate of
+    test_volume_view); the first plane is let through."""
+    from tests.xdart.scattering.test_volume_view import _Held
+    from xdart.gui.tabs.rsm import tool_windows
+    held = _Held(tool_windows._cut_plane)
+    monkeypatch.setattr(tool_windows, "_cut_plane", held)
+    held.release.set()
+    return held
+
+
+def _hold(held):
+    held.release.clear()
+    held.computed.clear()
+
+
+def test_only_the_latest_plane_is_drawn_and_a_stale_one_is_let_go(qapp, monkeypatch):
+    """While a plane is cut the window keeps the plane drawn and says it computes; a plane finished after a later
+    one was asked for is dropped and let go; the plane drawn is the latest, custom_slice's to the byte."""
+    import gc
+    from xrd_tools.rsm.custom_slice import custom_slice
+    values = {"A": _grid_values(1.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    held = _held_cuts(monkeypatch)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("custom").click()
+        window = _settled(page._tool_windows["custom"])
+        first, drawn = window.custom, window.view.keyed_projection
+        _hold(held)
+        _type(window.rows["first_points"].editor, "5")  # plane B, held on the worker once cut
+        assert held.computed.wait(20)
+        assert window.computing and window.custom is first and window.view.keyed_projection is drawn
+        assert window.card.status.text() == "Computing the plane…" and not window.card.valid_marker.isHidden()
+        _type(window.rows["second_points"].editor, "6")  # plane C, asked for while B is on the worker
+        assert window._running[1].points == (5, 9) and window._wanted.points == (5, 6)
+        held.release.set()
+        _settled(window)
+        expected = custom_slice(values["A"].intensity, tuple(axis for _name, axis in values["A"].axes),
+                                points=(5, 6))
+        assert window.custom.values.tobytes() == expected.values.tobytes()
+        np.testing.assert_array_equal(window.view.keyed_projection.panels[0].image, expected.values.T)
+        assert window.card.status.isHidden() and len(held.results) == 3
+        gc.collect()
+        assert held.results[1]() is None  # B's plane, dropped
+    finally:
+        held.release.set()
+        _close_settled(page, qapp)
+
+
+def test_closing_custom_slice_while_it_cuts_drops_the_plane_and_lets_it_go(qapp, monkeypatch):
+    """Closed (not minimised) while a plane is cut: nothing is drawn when it returns and it is let go; shown again,
+    the window cuts what its rows say."""
+    import gc
+    values = {"A": _grid_values(1.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    held = _held_cuts(monkeypatch)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("custom").click()
+        window = _settled(page._tool_windows["custom"])
+        _hold(held)
+        _type(window.rows["first_points"].editor, "5")
+        assert held.computed.wait(20)
+        window.close()
+        assert window.custom is None and not window.computing and window.view.keyed_projection is None
+        held.release.set()
+        _settled(window)
+        assert window.custom is None and window._values is None and window.view.keyed_projection is None
+        gc.collect()
+        assert held.results[1]() is None
+        page.view.page_tool("custom").click()
+        _settled(window)
+        assert window.custom.values.shape == (5, 9)
+    finally:
+        held.release.set()
+        _close_settled(page, qapp)
+
+
+def test_closing_the_page_while_a_tool_computes_is_pending_until_it_returns(qapp, monkeypatch):
+    """The page's close goes through the tool windows' workers as through its own owners: PENDING while a plane
+    is cut (the host asks again), CLEAN once it returned, the plane never drawn and let go."""
+    import gc
+    values = {"A": _grid_values(1.0)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    held = _held_cuts(monkeypatch)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.page_tool("custom").click()
+        window = _settled(page._tool_windows["custom"])
+        first = window.custom
+        _hold(held)
+        _type(window.rows["first_points"].editor, "5")
+        assert held.computed.wait(20)
+        assert page.close_page().status is PageCleanup.PENDING
+        assert window.custom is first
+        held.release.set()
+        deadline = time.monotonic() + 20
+        receipt = page.close_page()
+        while receipt.status is PageCleanup.PENDING and time.monotonic() < deadline:
+            time.sleep(0.01)
+            receipt = page.close_page()
+        assert receipt.status is PageCleanup.CLEAN and not page._tool_windows
+        assert window.custom is None and window._running is None
+        gc.collect()
+        assert held.results[1]() is None
+    finally:
+        held.release.set()
+        page.deleteLater()
+        qapp.processEvents()
 
 
 @pytest.mark.parametrize("message", (

@@ -6,12 +6,21 @@ tools that pop up separate windows to keep the scientific view clean for now". E
 only mounts shared components (hard rule 14): the 3D Viewer the shared ``VolumeView``; Custom Slice Int's
 ``ScientificView`` (its keyed layout: the plane over its two projections) beside a ``SectionCard`` of Int's rows. The
 page opens them from its view's page tools and keeps them on the result it shows.
+
+Both compute off the GUI thread (item 6; the maintainer: "yes go ahead with both"), each on its own
+``SingleWorkerOwner`` (the pages' worker owner): the latest request wins, and ``shutdown`` closes the worker with the
+page's other owners.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
+import logging
 
 import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from xdart.gui.pages.operation_owner import OperationCancelled, OperationTerminalStatus, SingleWorkerOwner
+from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import (
     AxisProjection, KeyedImageProjection, KeyedPanelsProjection, KeyedTraceProjection, ShellCommandKind,
@@ -23,6 +32,8 @@ from xrd_tools.rsm.custom_slice import CustomSliceRefused, custom_slice, plane_o
 from xrd_tools.session.display_logic import PanelKey, PanelRole
 from xrd_tools.session.readiness import integer_field_refusal
 from xrd_tools.session.rsm_viewer_model import rsm_axis_bounds
+
+_LOG = logging.getLogger(__name__)
 
 
 class RSMVolumeWindow(QtWidgets.QDialog):
@@ -46,14 +57,65 @@ class RSMVolumeWindow(QtWidgets.QDialog):
         self.view.reconcile(VolumeProjection(values.intensity, axes, tuple(values.coordinate_frame.axis_labels),
                                              name))
 
+    @property
+    def computing(self) -> bool:
+        """Whether a draw asked for is still being computed (``VolumeView.computing``)."""
+        return self.view.computing
+
     def release(self) -> None:
         self.view.release()
         self.setWindowTitle("RSM 3D Viewer")
+
+    def shutdown(self):
+        """The view's worker closed with the page (``VolumeView.shutdown``)."""
+        return self.view.shutdown()
 
     def hideEvent(self, event) -> None:
         if not event.spontaneous():  # closed (not minimised): the volume and its RGBA go until it is shown again
             self.release()
         super().hideEvent(event)
+
+
+@dataclass(frozen=True, eq=False)
+class _CutRequest:
+    """One plane asked for: the result's viewer values (their volume shared, not copied) and every input
+    ``custom_slice`` takes, with the plane's offsets for its axes."""
+
+    values: object
+    axes: tuple
+    through: tuple
+    first: tuple
+    second: tuple
+    ranges: tuple
+    points: tuple
+    symbols: tuple
+    unit: str
+    thickness: float
+    offsets: tuple
+
+    def matches(self, other) -> bool:
+        """The same plane of the same volume."""
+        return other is not None and other.values is self.values and self._inputs() == other._inputs()
+
+    def _inputs(self):
+        return (self.through, self.first, self.second, self.ranges, self.points, self.symbols, self.unit,
+                self.thickness)
+
+
+def _cut_plane(request: _CutRequest, cancel, _progress):
+    """A plane on the window's worker: ``custom_slice``'s result, or its refusal as a value (shown as the window
+    shows a refusal). Dropped before and after the cut when a later request supersedes it."""
+    if cancel.is_set():
+        raise OperationCancelled()
+    try:
+        cut = custom_slice(request.values.intensity, request.axes, request.through, request.first, request.second,
+                           request.ranges[0], request.ranges[1], request.points, symbols=request.symbols,
+                           unit=request.unit, thickness=request.thickness)
+    except CustomSliceRefused as refused:
+        return refused
+    if cancel.is_set():
+        raise OperationCancelled()
+    return cut
 
 
 _PLANE = PanelKey(PanelRole.SLICE_2D, "custom")
@@ -93,7 +155,11 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
 
     Thickness (the maintainer, 2026-10-01: "Do you want the Thickness option? Yes"), 0 by default, averages the
     slab across ±Thickness/2 along the plane's normal (``custom_slice``'s ``thickness``); the note names its
-    planes, and in HKL that the normal and the thickness are r.l.u. ones (H, K and L taken as orthonormal)."""
+    planes, and in HKL that the normal and the thickness are r.l.u. ones (H, K and L taken as orthonormal).
+
+    The cut runs on the window's worker (item 6): the rows are read here, where a typed refusal is named at once;
+    the latest plane asked for wins, one is computed at a time, and while it is the card says so over the plane
+    shown. A plane still computing when the window closes is dropped when it returns."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -154,12 +220,24 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
         self._offsets = (0.0, 0.0)
         self._name = ""
         self._color_map, self._log_scale, self._share_axis = "Default", False, False
+        # the planes: the one drawn, the one asked for last (None once drawn) and the one on the worker,
+        # (identity, request)
+        self._drawn_request = self._wanted = self._running = None
+        self._worker = SingleWorkerOwner(lambda request, cancel, progress: _cut_plane(request, cancel, progress))
+        self._poll_timer = QtCore.QTimer(self)
+        self._poll_timer.setInterval(50)
+        self._poll_timer.timeout.connect(self._poll)
         self.resize(1100, 720)
 
     @property
     def custom(self):
         """The plane drawn now (``custom_slice``'s result, its ``t`` and ``s`` offsets from the point), or None."""
         return self._slice
+
+    @property
+    def computing(self) -> bool:
+        """Whether a plane asked for is still being computed (the plane shown is the one before it)."""
+        return self._wanted is not None
 
     def show_result(self, name: str, values) -> None:
         """Cut the plane from ``values`` (the page's shown result; its volume is shared, not copied)."""
@@ -182,6 +260,8 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
         self.recompute()
 
     def recompute(self) -> None:
+        """Ask for the plane the rows say (read here: a typed refusal is named at once); the cut runs on the
+        window's worker and is drawn when it returns, if it is still the plane asked for."""
         values = self._values
         if values is None:
             return
@@ -195,17 +275,79 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
             offsets = plane_offsets(through, first, second)
             ranges = [self._range(name, offset) for name, offset in zip(("first", "second"), offsets, strict=True)]
             points = tuple(self._points(name, max(values.intensity.shape)) for name in ("first", "second"))
-            cut = custom_slice(values.intensity, axes, through, first, second, ranges[0], ranges[1], points,
-                               symbols=frame.axis_symbols, unit=_unit(frame), thickness=self._thickness())
-            projection = self._projection(cut, offsets)
+            request = _CutRequest(values, axes, tuple(through), tuple(first), tuple(second), tuple(ranges), points,
+                                  tuple(frame.axis_symbols), _unit(frame), self._thickness(), offsets)
         except CustomSliceRefused as refused:
-            self._slice = None
-            self.card.set_status_text(str(refused))
-            self.card.set_valid_marker(False)
-            self.note.setText("")
-            self.view.clear_keyed(str(refused))
+            self._ask(None)
+            self._refuse(refused)
             return
-        self._slice, self._offsets = cut, offsets
+        if request.matches(self._drawn_request) and self._slice is not None:
+            self._ask(None)  # the plane drawn is this one: one still computing is dropped
+            return
+        self._ask(request)
+
+    def _ask(self, request) -> None:
+        """The latest plane wins: ``request`` (None: none) is the one asked for; a different plane on the worker
+        is cancelled, and dropped when it returns."""
+        self._wanted = request
+        if self._running is not None and not (request is not None and request.matches(self._running[1])):
+            self._worker.cancel(self._running[0])
+        if request is None:
+            if self.card.status.text() == _COMPUTING:
+                self.card.set_status_text("")
+            return
+        self.card.set_status_text(_COMPUTING)  # over the plane shown, which stays until the new one is drawn
+        self._start()
+
+    def _start(self) -> None:
+        if self._running is not None or self._wanted is None:
+            return
+        request = self._wanted
+        identity = self._worker.begin(request)
+        if identity is None:  # the worker is closed (the page closing): nothing more is cut
+            return
+        self._running = (identity, request)
+        self._poll_timer.start()
+
+    def _poll(self) -> None:
+        """A plane returned: drawn if it is still the one asked for, else dropped; then the latest asked for."""
+        if self._running is None:
+            self._poll_timer.stop()
+            return
+        identity, request = self._running
+        update = self._worker.poll(identity)
+        if update is None or update.terminal is None:
+            return
+        self._running = None
+        terminal = update.terminal
+        if (terminal.status is not OperationTerminalStatus.CANCELLED and self._wanted is not None
+                and request.matches(self._wanted)):  # a cancelled plane asked for again is cut again
+            self._wanted = None
+            if terminal.status is OperationTerminalStatus.RETURNED:
+                self._draw(request, terminal.payload)
+            else:
+                _LOG.warning("Custom Slice failed: %s: %s", terminal.failure_type, terminal.failure_message)
+                self._refuse(CustomSliceRefused(
+                    "CUSTOM_SLICE_FAILED", f"the plane could not be cut ({terminal.failure_type}: "
+                                           f"{terminal.failure_message})"))
+        del update, terminal  # a dropped plane's buffers go with it
+        if self._wanted is not None:
+            self._start()
+        elif self._running is None:
+            self._poll_timer.stop()
+
+    def _draw(self, request, cut) -> None:
+        """Draw a plane the worker cut (or name its refusal, as before the worker)."""
+        if isinstance(cut, CustomSliceRefused):
+            self._refuse(cut)
+            return
+        try:
+            projection = self._projection(cut, request.offsets)
+        except CustomSliceRefused as refused:
+            self._refuse(refused)
+            return
+        frame = request.values.coordinate_frame
+        self._slice, self._offsets, self._drawn_request = cut, request.offsets, request
         self.card.set_status_text("")
         self.card.set_valid_marker(True, "The plane is drawn")
         self.note.setText(f"The plane is {cut.note}." + (
@@ -213,6 +355,14 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
             "non-orthogonal lattice they are not the reciprocal-space normal and distance."
             if cut.thickness and frame is RSMCoordinateFrame.HKL else ""))
         self.view.reconcile_keyed(projection)
+
+    def _refuse(self, refused) -> None:
+        """A plane refused: the card's readiness and the view say why, and nothing is drawn."""
+        self._slice = self._drawn_request = None
+        self.card.set_status_text(str(refused))
+        self.card.set_valid_marker(False)
+        self.note.setText("")
+        self.view.clear_keyed(str(refused))
 
     def _range(self, name: str, offset: float):
         """A direction's typed range, as offsets from the point (``custom_slice``'s ``t``); None: Auto."""
@@ -282,17 +432,31 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
             self.view.reconcile_keyed(self._projection(self._slice, self._offsets))
 
     def release(self) -> None:
-        """Let go of the volume and the plane (the window closing); the rows keep what was typed."""
-        self._values = self._slice = None
+        """Let go of the volume and the plane (the window closing); the rows keep what was typed. A plane still
+        computing is dropped, and its buffers freed, when it returns."""
+        self._ask(None)
+        self._values = self._slice = self._drawn_request = None
         self.view.clear_keyed("")
         self.card.set_status_text("")
         self.note.setText("")
         self.setWindowTitle("RSM Custom Slice")
+
+    def shutdown(self):
+        """Close the window's worker with the page, as the page's owners close: CLEAN, or PENDING while a plane
+        is still cut (the page asks again); nothing is cut after it."""
+        self._wanted = None
+        receipt = self._worker.close()
+        self._poll_timer.stop()  # a closing worker reports nothing more; the page's next close retires it
+        if receipt.status is PageCleanup.CLEAN:
+            self._running = None
+        return receipt
 
     def hideEvent(self, event) -> None:
         if not event.spontaneous():  # closed (not minimised): the volume goes until it is shown again
             self.release()
         super().hideEvent(event)
 
+
+_COMPUTING = "Computing the plane…"
 
 __all__ = ["RSMCustomSliceWindow", "RSMVolumeWindow"]

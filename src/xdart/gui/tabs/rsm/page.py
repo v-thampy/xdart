@@ -345,7 +345,9 @@ class RSMPage(QtWidgets.QWidget):
         self._viewers = {}  # path → (payload, values, model)
         #: the page tools' windows ("3d": the 3D Viewer; "custom": Custom Slice), built on their first press; they
         #: follow the result shown. While open, each holds the shown volume (shared, not copied); the 3D Viewer adds
-        #: its RGBA (32 MB at Full 200³), Custom Slice its plane (float32, at most 2000 × 2000: 16 MB).
+        #: its RGBA (32 MB at Full 200³) and the index and opacity it was coloured from (16 MB), Custom Slice its
+        #: plane (float32, at most 2000 × 2000: 16 MB). Each computes on its own worker (item 6), keeping the image
+        #: shown until the new one arrives (one more RGBA or plane meanwhile), and closes with the page.
         self._tool_windows = {}
         self._shown_path = None
         self._shown = None  # (values, snapshot) drawn now
@@ -2271,12 +2273,14 @@ class RSMPage(QtWidgets.QWidget):
         return ActionAccepted("rsm-run")
 
     def close_page(self):
-        """Close the owner and the reader; PENDING while either still has a worker."""
+        """Close the owner, the reader, the finder, the authoring windows and the tool windows' workers; PENDING
+        while any still has a worker."""
         self._closing = True
         self._timer.stop()
         self._authoring_timer.stop()
         receipts = (self._owner.close(), self._reader.close(), self._resolver.close(),
-                    *(dialog.shutdown() for dialog in self._authoring_dialogs))
+                    *(dialog.shutdown() for dialog in self._authoring_dialogs),
+                    *(window.shutdown() for window in self._tool_windows.values()))
         pending = [receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN]
         if pending:
             self._closing = False
