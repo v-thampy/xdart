@@ -122,6 +122,13 @@ class FitInputSnapshot:
                                        or wavelength <= 0):
             raise ValueError("a fit input's wavelength is a finite positive number of angstrom, or None")
 
+    @property
+    def storage_bytes(self) -> int:
+        """Owned numeric storage, for bounded fit and export residency."""
+        return sum(value.nbytes for value in
+                   (self.values, self.mask, self.sigma, *(axis.values for axis in self.axes))
+                   if value is not None)
+
     def is_current(self, key: FitInputKey) -> bool:
         """Whether this input is still the host's current one (its ``key`` is ``key``)."""
         return self.key == key

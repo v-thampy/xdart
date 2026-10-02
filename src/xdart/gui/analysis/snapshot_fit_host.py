@@ -36,6 +36,7 @@ class _Request:
     inputs: tuple
     column: str = ''
     destination: Path | None = None
+    data_root: object = None
 
 
 def _snapshot(target, settings):
@@ -52,9 +53,14 @@ def _job(request, cancel, progress):
         if cancel.is_set():
             return None
         if request.action == 'export':
-            refs = tuple(item.reference for item in request.inputs[1:]
-                         if isinstance(item, FitTarget) and item.reference is not None)
-            return write_fit_notebook(request.destination, snapshot, request.kind, settings, batch=refs)
+            def batch_inputs():
+                for item in request.inputs[1:]:
+                    if cancel.is_set():
+                        raise ValueError('CANCELLED: notebook export cancelled')
+                    yield (item.reference if isinstance(item, FitTarget) and item.reference is not None
+                           else _snapshot(item, request.settings))
+            return write_fit_notebook(request.destination, snapshot, request.kind, settings,
+                                      batch_inputs=batch_inputs(), data_root=request.data_root)
         return snapshot
     analyzer_type = DisplayedPeakFitAnalyzer if request.kind == 'peak' else DisplayedPhaseFitAnalyzer
     analyzer = analyzer_type(settings=settings, cancel_token=cancel)
@@ -96,6 +102,7 @@ class SnapshotFitHost(QtCore.QObject):
         self.dialog.trend.save.clicked.disconnect()
         self.dialog.trend.save.clicked.connect(self._choose_csv)
         self.dialog.export_actions.export = self._export
+        self.dialog.export_actions.source_root = source_root
         self.dialog._export_snapshot_provider = self.current
         self.column_row = FormRow(label='Trend column', path=('fit', 'trend_column'), value='Result order',
                                    kind='combo', choices=('Result order',))
@@ -129,7 +136,8 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.set_batch_running(True)
         elif action == 'reload':
             self.dialog.fit_btn.setEnabled(False)
-        self.owner.ask(_Request(action, self.kind, self.scope(), settings, tuple(inputs), self.trend_column, destination))
+        self.owner.ask(_Request(action, self.kind, self.scope(), settings, tuple(inputs),
+                                self.trend_column, destination, self.source_root))
 
     def reload(self):
         try:
@@ -231,7 +239,12 @@ class SnapshotFitHost(QtCore.QObject):
     def export_to(self, path):
         """Direct publication interface, also used by scripts/tests; GUI uses the worker path."""
         settings = self.dialog.vnext_fit_values()
-        return write_fit_notebook(path, _snapshot(self.current(), plain_settings(settings)), self.kind, settings)
+        frozen = plain_settings(settings)
+        inputs = () if self.batch is None else tuple(self.batch())
+        batch = (item.reference if isinstance(item, FitTarget) and item.reference is not None
+                 else _snapshot(item, frozen) for item in inputs)
+        return write_fit_notebook(path, _snapshot(self.current(), frozen), self.kind, settings,
+                                  batch_inputs=batch, data_root=self.source_root)
 
     def export_csv(self, path):
         from xrd_tools.analysis.fit_table import outcomes_table, table_csv

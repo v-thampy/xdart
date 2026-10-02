@@ -34,6 +34,7 @@ def test_before_fit_export_and_single_batch_use_same_real_owner(tmp_path):
     # Current settings exported even before any fit has succeeded.
     host.export_to(tmp_path / 'fit.ipynb')
     assert (tmp_path / 'fit.ipynb').is_file()
+    assert len(tuple(tmp_path.glob('fit.batch-*.input.npz'))) == 3
     host.dialog.fit_btn.click()
     drain(app, host)
     assert host.outcomes, host.dialog.status.text()

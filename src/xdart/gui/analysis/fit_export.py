@@ -22,7 +22,8 @@ def plain_settings(values):
     return tuple(sorted((str(name), plain(value)) for name, value in values.items()))
 
 
-def write_fit_notebook(path, snapshot, tool, settings, *, batch=(), reciprocal_transform=None):
+def write_fit_notebook(path, snapshot, tool, settings, *, batch=(), batch_inputs=(),
+                       data_root=None, reciprocal_transform=None, reference=None):
     """Write the detached current request, including lossless derived values, before a fit is needed."""
     from xrd_tools.notebooks import FitNotebookRecipe, capture_snapshot, render_notebook
     path = Path(path)
@@ -33,16 +34,30 @@ def write_fit_notebook(path, snapshot, tool, settings, *, batch=(), reciprocal_t
     transform = None if reciprocal_transform is None else tuple(tuple(float(v) for v in row)
                                                                for row in reciprocal_transform)
     snapshot = replace(snapshot, key=replace(snapshot.key, settings=plain_settings(settings)))
-    captured = capture_snapshot(snapshot, path.stem + '.input.npz')
-    recipe = FitNotebookRecipe(tool=tool, input=captured.reference, settings=settings, batch=tuple(batch),
+    captured = None if reference is not None else capture_snapshot(snapshot, path.stem + '.input.npz')
+    captures, references = ([] if captured is None else [captured]), list(batch)
+    charged = snapshot.storage_bytes
+    for item in batch_inputs:
+        if isinstance(item, FitInputSnapshot):
+            charged += item.storage_bytes
+            if charged > 32 << 20:
+                raise ValueError('INPUT_LIMIT: captured batch exceeds 32 MiB; export a smaller selection')
+            part = capture_snapshot(item, f'{path.stem}.batch-{len(references) + 1}.input.npz')
+            captures.append(part)
+            references.append(part.reference)
+        else:
+            references.append(item)
+    recipe = FitNotebookRecipe(tool=tool, input=reference if captured is None else captured.reference,
+                               settings=settings, batch=tuple(references),
                                title=snapshot.key.result_identity, reciprocal_transform=transform,
                                orthonormal=all(a.unit in {'A^-1', 'Å⁻¹', 'q_A^-1'} for a in snapshot.axes))
-    document = render_notebook(recipe, format=format, bundle_root=str(path.parent))
+    document = render_notebook(recipe, format=format, bundle_root=str(path.parent),
+                               data_root=None if data_root is None else str(data_root))
     # Both files are prepared before publishing either; scientific NeXus is never modified.
     prepared = []
     try:
-        for destination, content in ((path.parent / captured.reference.path, captured.content),
-                                     (path, document.encode('utf-8'))):
+        parts = [(path.parent / item.reference.path, item.content) for item in captures]
+        for destination, content in (*parts, (path, document.encode('utf-8'))):
             with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.' + destination.name, delete=False) as handle:
                 temporary = Path(handle.name)
                 prepared.append((temporary, destination))
@@ -63,6 +78,7 @@ class FitExportActions(QtCore.QObject):
         super().__init__(parent)
         self.tool, self.snapshot, self.settings = tool, snapshot, settings
         self.export = export
+        self.source_root = None
         row = QtWidgets.QHBoxLayout()
         self.buttons = {}
         for format, label in (('jupyter', 'Export Jupyter…'), ('marimo', 'Export marimo…')):
@@ -79,8 +95,12 @@ class FitExportActions(QtCore.QObject):
             if snapshot is None:
                 raise ValueError('FIT_INPUT_REQUIRED: load a scientific input first')
             path = getattr(getattr(snapshot, 'key', None), 'path', '')
+            reference = getattr(snapshot, 'reference', None)
+            if not path and reference is not None:
+                path = reference.original_path or reference.path
             picks = file_dialogs.browse(self.parent(), 'Export fitting workflow', save=True, current=path,
-                default_name='fit' + extension, file_filter=f'Notebook (*{extension})')
+                fallback=str(self.source_root or ''), default_name='fit' + extension,
+                file_filter=f'Notebook (*{extension})')
             if not picks:
                 return
             destination = Path(picks[0]).with_suffix(extension)
