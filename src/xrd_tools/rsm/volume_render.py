@@ -17,7 +17,9 @@ shared GUI component; this module is its headless half (hard invariant 7: no Qt,
   level.
 
 Memory: the RGBA volume (4 B/voxel) and, on Log, one float32 transformed copy are the only volume-sized
-allocations; the rest is done in slabs along the first axis.
+allocations; the rest is done in slabs along the first axis. The 3D Viewer colours through ``volume_index`` (each
+voxel's colour-table row and opacity, two uint8 volumes, 2 B/voxel) and ``colour_volume`` (a table applied), the
+same bytes, so a colour map change only applies another table to the index it keeps.
 """
 from __future__ import annotations
 
@@ -109,32 +111,81 @@ def volume_rgba(values: np.ndarray, colormap: str = "Default", log: bool = False
     Colour is the colour map at the voxel's place between ``levels`` (clipped); opacity is zero for non-finite
     voxels and at or below ``floor``, then rises linearly to opaque at the upper level. ``levels`` and ``floor``
     are in the displayed space (post-Log when ``log``); by default ``levels`` are Int's percentiles and
-    ``floor`` the lower level."""
+    ``floor`` the lower level. The same bytes as ``colour_volume(color_table(colormap), *volume_index(...))``,
+    made a slab at a time without the two index volumes."""
     source = np.asarray(values)
     check_render_size(source.shape, max_voxels)
     table = color_table(colormap)
     shown = log_transform(source) if log else source
-    low, high = volume_levels(shown, log=log) if levels is None else (float(levels[0]), float(levels[1]))
+    low, high, cutoff = _checked_levels(volume_levels(shown, log=log) if levels is None else levels, floor)
+    out = np.zeros(source.shape + (4,), dtype=np.uint8)
+    for start, stop in _slabs(source.shape):
+        index, alpha = _index_slab(shown[start:stop], low, high, cutoff)
+        out[start:stop, ..., :3] = table[index, :3]
+        out[start:stop, ..., 3] = alpha
+    return out
+
+
+def volume_index(shown: np.ndarray, levels: tuple[float, float],
+                 floor: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Each voxel of ``shown`` (already in the displayed space: post-Log when Log is on) as the 3D Viewer colours
+    it: its colour-table row, 0–255 (its place between ``levels``, clipped, as ``volume_rgba`` places it), and its
+    opacity, 0–255 (zero where empty and at or below ``floor``, the lower level by default; then rising to opaque
+    at the upper level). Two uint8 volumes, made a slab at a time. ``colour_volume`` applies a colour table to
+    them, so a colour map change applies another table to the same index; with ``color_table(colormap)`` the
+    result is ``volume_rgba``'s bytes. Levels or a floor that are not finite, or levels not low below high, are
+    refused as ``volume_rgba`` refuses them."""
+    source = np.asarray(shown)
+    low, high, cutoff = _checked_levels(levels, floor)
+    index = np.empty(source.shape, dtype=np.uint8)
+    alpha = np.empty(source.shape, dtype=np.uint8)
+    for start, stop in _slabs(source.shape):
+        index[start:stop], alpha[start:stop] = _index_slab(source[start:stop], low, high, cutoff)
+    return index, alpha
+
+
+def colour_volume(table: np.ndarray, index: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """The RGBA uint8 volume of ``volume_index``'s two volumes under a colour table (``color_table``): each
+    voxel's row of the table, then its opacity. A slab at a time, so the only volume-sized array is the RGBA."""
+    out = np.empty(index.shape + (4,), dtype=np.uint8)
+    for start, stop in _slabs(index.shape):
+        out[start:stop, ..., :3] = table[index[start:stop], :3]
+        out[start:stop, ..., 3] = alpha[start:stop]
+    return out
+
+
+def _checked_levels(levels, floor) -> tuple[float, float, float]:
+    """(low, high, the opacity floor), refused unless finite with low below high."""
+    low, high = float(levels[0]), float(levels[1])
     if not (np.isfinite(low) and np.isfinite(high) and high > low):
         raise VolumeRenderRefused("VOLUME_LEVELS_INVALID", "the levels need two finite values, low below high")
     cutoff = low if floor is None else float(floor)
     if not np.isfinite(cutoff):
         raise VolumeRenderRefused("VOLUME_LEVELS_INVALID", "the opacity floor must be finite")
-    out = np.zeros(source.shape + (4,), dtype=np.uint8)
-    plane = max(1, int(np.prod(source.shape[1:], dtype=np.int64)))
+    return low, high, cutoff
+
+
+def _slabs(shape):
+    """(start, stop) along the first axis, about ``_SLAB_VOXELS`` voxels each."""
+    plane = max(1, int(np.prod(shape[1:], dtype=np.int64)))
     step = max(1, _SLAB_VOXELS // plane)
-    for start in range(0, source.shape[0], step):
-        slab = np.asarray(shown[start:start + step], dtype=np.float64)
-        finite = np.isfinite(slab)
-        place = np.clip((np.where(finite, slab, low) - low) / (high - low), 0.0, 1.0)
-        out[start:start + step, ..., :3] = table[np.rint(place * 255.0).astype(np.intp), :3]
-        if high > cutoff:
-            ramp = np.clip((np.where(finite, slab, cutoff) - cutoff) / (high - cutoff), 0.0, 1.0)
-        else:
-            ramp = np.ones(slab.shape)
-        visible = finite & (slab > cutoff)
-        out[start:start + step, ..., 3] = np.where(visible, np.rint(ramp * 255.0), 0).astype(np.uint8)
-    return out
+    for start in range(0, shape[0], step):
+        yield start, min(start + step, shape[0])
+
+
+def _index_slab(values, low: float, high: float, cutoff: float) -> tuple[np.ndarray, np.ndarray]:
+    """One slab's colour-table rows and opacities (uint8): the one formula of ``volume_rgba`` and
+    ``volume_index``."""
+    slab = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(slab)
+    place = np.clip((np.where(finite, slab, low) - low) / (high - low), 0.0, 1.0)
+    index = np.rint(place * 255.0).astype(np.uint8)  # 0 to 255 exactly: the table's rows
+    if high > cutoff:
+        ramp = np.clip((np.where(finite, slab, cutoff) - cutoff) / (high - cutoff), 0.0, 1.0)
+    else:
+        ramp = np.ones(slab.shape)
+    visible = finite & (slab > cutoff)
+    return index, np.where(visible, np.rint(ramp * 255.0), 0).astype(np.uint8)
 
 
 @dataclass(frozen=True)

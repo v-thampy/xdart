@@ -111,6 +111,78 @@ def test_a_volume_above_the_limit_is_refused_naming_its_size_and_the_2x_view() -
     assert refused.value.code == "VOLUME_TOO_LARGE"
 
 
+# AUD-9 stage 2b item 6 (the maintainer: "yes go ahead with both"): the 3D Viewer colours off the GUI thread through
+# an 8-bit index volume and a 256-entry table, which must be volume_rgba's bytes exactly.
+
+
+def _reference_rgba(values, colormap="Default", log=False, levels=None, floor=None):
+    """``volume_rgba`` as it stood at 2a9dfe76, its slab loop verbatim: the bytes every route must reproduce."""
+    source = np.asarray(values)
+    table = color_table(colormap)
+    shown = log_transform(source) if log else source
+    low, high = volume_levels(shown, log=log) if levels is None else (float(levels[0]), float(levels[1]))
+    cutoff = low if floor is None else float(floor)
+    out = np.zeros(source.shape + (4,), dtype=np.uint8)
+    plane = max(1, int(np.prod(source.shape[1:], dtype=np.int64)))
+    step = max(1, (1 << 18) // plane)
+    for start in range(0, source.shape[0], step):
+        slab = np.asarray(shown[start:start + step], dtype=np.float64)
+        finite = np.isfinite(slab)
+        place = np.clip((np.where(finite, slab, low) - low) / (high - low), 0.0, 1.0)
+        out[start:start + step, ..., :3] = table[np.rint(place * 255.0).astype(np.intp), :3]
+        if high > cutoff:
+            ramp = np.clip((np.where(finite, slab, cutoff) - cutoff) / (high - cutoff), 0.0, 1.0)
+        else:
+            ramp = np.ones(slab.shape)
+        visible = finite & (slab > cutoff)
+        out[start:start + step, ..., 3] = np.where(visible, np.rint(ramp * 255.0), 0).astype(np.uint8)
+    return out
+
+
+def _colouring_cases():
+    """Volumes over several slabs, with empty voxels and values below 1 and 0; Log off and on; automatic and
+    typed levels; a floor inside and one above the upper level; two colour maps."""
+    rng = np.random.default_rng(6)
+    volume = (rng.gamma(0.7, 40.0, size=(300, 40, 30)) - 3.0).astype(np.float32)
+    volume[rng.random(volume.shape) < 0.04] = np.nan
+    for log in (False, True):
+        shown = log_transform(volume) if log else volume
+        auto = volume_levels(shown, log=log)
+        middle = (auto[0] + auto[1]) / 2.0
+        for levels, floor in ((None, None), ((auto[0], middle), None), (auto, middle), (auto, auto[1] + 1.0)):
+            for colormap in ("Default", "magma"):
+                yield volume, colormap, log, levels, floor
+
+
+def test_volume_rgba_is_its_own_slab_loop_byte_for_byte() -> None:
+    """A preservation row: whatever route volume_rgba takes, its bytes are the reference loop's."""
+    for volume, colormap, log, levels, floor in _colouring_cases():
+        expected = _reference_rgba(volume, colormap, log, levels, floor)
+        assert volume_rgba(volume, colormap, log, levels, floor).tobytes() == expected.tobytes(), (
+            colormap, log, levels, floor)
+
+
+def test_an_index_volume_and_a_colour_table_give_volume_rgbas_bytes() -> None:
+    """The index route: ``volume_index`` (each voxel's colour-table row and opacity, from the levels and the
+    floor, in the displayed space) and ``colour_volume`` (the table applied) give volume_rgba's bytes, so a colour
+    map change only applies another table to the same index."""
+    from xrd_tools.rsm.volume_render import colour_volume, volume_index
+    for volume, colormap, log, levels, floor in _colouring_cases():
+        shown = log_transform(volume) if log else volume
+        chosen = volume_levels(shown, log=log) if levels is None else levels
+        index, alpha = volume_index(shown, chosen, floor)
+        assert index.dtype == alpha.dtype == np.uint8 and index.shape == alpha.shape == volume.shape
+        rgba = colour_volume(color_table(colormap), index, alpha)
+        assert rgba.tobytes() == _reference_rgba(volume, colormap, log, levels, floor).tobytes(), (
+            colormap, log, levels, floor)
+    with pytest.raises(VolumeRenderRefused) as refused:
+        volume_index(np.zeros((2, 2, 2)), (1.0, 1.0))
+    assert refused.value.code == "VOLUME_LEVELS_INVALID"
+    with pytest.raises(VolumeRenderRefused) as refused:
+        volume_index(np.zeros((2, 2, 2)), (0.0, 1.0), np.nan)
+    assert str(refused.value) == "the opacity floor must be finite"
+
+
 def test_importing_the_transfer_function_loads_no_qt_or_plotting_library() -> None:
     root = Path(__file__).resolve().parents[2]
     script = textwrap.dedent(
