@@ -39,24 +39,14 @@ logger = logging.getLogger(__name__)
 _SESSION_PROFILE_KEY = "scattering_run_profile"
 
 
-def _tool_button_menu(widget, object_name: str):
-    """The page-owned QMenu behind one named toolbutton, fail-loud."""
-    from pyqtgraph.Qt import QtWidgets
-
-    button = widget.findChild(QtWidgets.QToolButton, object_name)
-    if button is None or button.menu() is None:
-        raise RuntimeError(f"vNext menu host {object_name!r} is missing")
-    return button.menu()
-
-
 @dataclass(frozen=True, slots=True)
 class _WorkspaceMenus:
     widget: "ScatteringWorkspace"
 
     def mount_points(self) -> AppMenuHosts:
         return AppMenuHosts(
-            _tool_button_menu(self.widget, "configMenuButton"),
-            _tool_button_menu(self.widget, "helpMenuButton"),
+            self.widget._shell.browser.menus["Config"],
+            self.widget._shell.browser.menus["Help"],
             tool_requested=self.widget.toolRequested,
             mode_requested=self.widget.modeRequested,
         )
@@ -275,6 +265,7 @@ def _qualify_mask_hdf_dialog_selection(
 def _mask_hdf_dialog_type():
     """Build the xdart-owned, metadata-only HDF frame selector type."""
     from pyqtgraph.Qt import QtCore, QtWidgets
+    from xdart.gui.widgets.controls_panel import FormRow
 
     class _MaskHdfFrameDialog(QtWidgets.QDialog):
         def __init__(self, parent, source: str):
@@ -293,22 +284,22 @@ def _mask_hdf_dialog_type():
             source_label.setWordWrap(True)
             layout.addWidget(source_label)
 
-            form = QtWidgets.QFormLayout()
-            self.dataset_path = QtWidgets.QLineEdit(
-                "/entry/data/data_000001", self)
+            self.dataset_row = FormRow(label="Dataset path", path=("mask", "dataset"),
+                                       value="/entry/data/data_000001", parent=self)
+            self.dataset_path = self.dataset_row.editor
             self.dataset_path.setObjectName("maskHdfDatasetPath")
             self.dataset_path.setMaxLength(4096)
-            form.addRow("Dataset path", self.dataset_path)
-            self.no_frame = QtWidgets.QCheckBox(
-                "Dataset is one 2-D image (no frame index)", self)
+            layout.addWidget(self.dataset_row)
+            self.no_frame_row = FormRow(label="Dataset is one 2-D image (no frame index)",
+                                        path=("mask", "no_frame"), value=False, kind="bool", parent=self)
+            self.no_frame = self.no_frame_row.editor
             self.no_frame.setObjectName("maskHdfNoFrame")
-            form.addRow("", self.no_frame)
-            self.frame_index = QtWidgets.QSpinBox(self)
+            layout.addWidget(self.no_frame_row)
+            self.frame_row = FormRow(label="Frame index", path=("mask", "frame"), value=0, kind="int",
+                                     minimum=0, maximum=2_147_483_647, parent=self)
+            self.frame_index = self.frame_row.editor
             self.frame_index.setObjectName("maskHdfFrameIndex")
-            self.frame_index.setRange(0, 2_147_483_647)
-            self.frame_index.setValue(0)
-            form.addRow("Frame index", self.frame_index)
-            layout.addLayout(form)
+            layout.addWidget(self.frame_row)
             self.no_frame.toggled.connect(
                 lambda checked: self.frame_index.setEnabled(not checked))
 
@@ -331,9 +322,10 @@ def _mask_hdf_dialog_type():
 
         def accept(self):
             data_path = self.dataset_path.text().strip()
-            frame = None if self.no_frame.isChecked() \
-                else int(self.frame_index.value())
             try:
+                if not self.no_frame.isChecked() and self.frame_row.refusal():
+                    raise ValueError(self.frame_row.refusal())
+                frame = None if self.no_frame.isChecked() else int(self.frame_index.value())
                 selected = _qualify_mask_hdf_dialog_selection(
                     self._source, data_path, frame)
             except Exception as exc:

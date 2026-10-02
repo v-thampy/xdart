@@ -28,6 +28,8 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.sources.probe import probe_first_frame, raw_is_reachable  # noqa: F401
+from xdart.gui.widgets.controls_panel import FormRow
+from xdart.gui.widgets.file_dialogs import browse
 
 logger = logging.getLogger(__name__)
 
@@ -172,24 +174,28 @@ class ScanSourceWidget(QtWidgets.QWidget):
         # Row 1: entry mode + path + (kind label | scan-kind combo) + Choose.
         row1 = QtWidgets.QHBoxLayout()
         row1.setSpacing(6)
-        self.dir_check = QtWidgets.QCheckBox("Folder")
+        self.dir_row = FormRow(label="Folder", path=("source", "directory"), value=False, kind="bool")
+        self.dir_check = self.dir_row.editor
         # Reserve room for the full label (it was clipping to "Folde" on macOS).
         self.dir_check.setMinimumWidth(
             self.dir_check.fontMetrics().horizontalAdvance("Folder") + 30)
         self.dir_check.setToolTip(
             "Directory mode: pick a folder + a scan kind; the folder is walked "
             "for matching scans")
-        row1.addWidget(self.dir_check)
-        self.path_edit = QtWidgets.QLineEdit()
+        row1.addWidget(self.dir_row)
+        self.path_row = FormRow(label="", path=("source", "path"), value="")
+        self.path_row.label.hide()
+        self.path_edit = self.path_row.editor
         self.path_edit.setReadOnly(True)
         self.path_edit.setPlaceholderText("(no scan chosen)")
-        row1.addWidget(self.path_edit, 1)
-        self.dir_kind_combo = QtWidgets.QComboBox()
-        for label, _ in _DIR_KINDS:
-            self.dir_kind_combo.addItem(label)
-        self.dir_kind_combo.setVisible(False)
+        row1.addWidget(self.path_row, 1)
+        self.dir_kind_row = FormRow(label="", path=("source", "kind"), value=_DIR_KINDS[0][0], kind="combo",
+                                    choices=[label for label, _ in _DIR_KINDS])
+        self.dir_kind_row.label.hide()
+        self.dir_kind_combo = self.dir_kind_row.editor
+        self.dir_kind_row.setVisible(False)
         self.dir_kind_combo.setToolTip("Scan kind to look for in the folder")
-        row1.addWidget(self.dir_kind_combo)
+        row1.addWidget(self.dir_kind_row)
         self.kind_label = QtWidgets.QLabel("")
         self.kind_label.setMinimumWidth(56)
         row1.addWidget(self.kind_label)
@@ -200,15 +206,13 @@ class ScanSourceWidget(QtWidgets.QWidget):
         # Row 2: scan/entry selector (shown when >1 candidate).
         row2 = QtWidgets.QHBoxLayout()
         row2.setSpacing(6)
-        self.scan_label = QtWidgets.QLabel("Scan")
-        self.scan_combo = QtWidgets.QComboBox()
+        self.scan_row = FormRow(label="Scan", path=("source", "scan"), value="", kind="combo")
+        self.scan_label, self.scan_combo = self.scan_row.label, self.scan_row.editor
         self.scan_combo.setMinimumWidth(90)
         self.scan_combo.setToolTip("Which scan / entry to use")
-        row2.addWidget(self.scan_label)
-        row2.addWidget(self.scan_combo)
+        row2.addWidget(self.scan_row)
         row2.addStretch(1)
-        self.scan_label.setVisible(False)
-        self.scan_combo.setVisible(False)
+        self.scan_row.setVisible(False)
         lay.addLayout(row2)
 
         # Row 3: images folder + filename root + raw-reachable dot.
@@ -216,22 +220,20 @@ class ScanSourceWidget(QtWidgets.QWidget):
         row3 = QtWidgets.QHBoxLayout(self.images_row)
         row3.setContentsMargins(0, 0, 0, 0)
         row3.setSpacing(6)
-        self.images_label = QtWidgets.QLabel("Images")
-        row3.addWidget(self.images_label)
-        self.image_dir_edit = QtWidgets.QLineEdit()
+        self.image_dir_row = FormRow(label="Images", path=("source", "images"), value="")
+        self.images_label, self.image_dir_edit = self.image_dir_row.label, self.image_dir_row.editor
         self.image_dir_edit.setPlaceholderText("(image folder — blank = metadata only)")
-        row3.addWidget(self.image_dir_edit, 1)
+        row3.addWidget(self.image_dir_row, 1)
         self.image_dir_btn = QtWidgets.QPushButton("Folder…")
         row3.addWidget(self.image_dir_btn)
-        self.image_stem_label = QtWidgets.QLabel("Filename contains")
-        row3.addWidget(self.image_stem_label)
-        self.image_stem_edit = QtWidgets.QLineEdit()
+        self.image_stem_row = FormRow(label="Filename contains", path=("source", "stem"), value="")
+        self.image_stem_label, self.image_stem_edit = self.image_stem_row.label, self.image_stem_row.editor
         self.image_stem_edit.setMaximumWidth(140)
         self.image_stem_edit.setPlaceholderText("auto")
         self.image_stem_edit.setToolTip(
             "Optional filename substring. Leave blank for automatic matching "
             "from the SPEC file name and scan number.")
-        row3.addWidget(self.image_stem_edit)
+        row3.addWidget(self.image_stem_row)
         self.raw_dot = QtWidgets.QLabel("○ raw unavailable")
         self._raw_status_tooltip = (
             "Whether the selected scan's first detector frame can be read. "
@@ -250,24 +252,22 @@ class ScanSourceWidget(QtWidgets.QWidget):
         adv = QtWidgets.QHBoxLayout(self.adv_box)
         adv.setContentsMargins(2, 0, 2, 0)
         adv.setSpacing(5)
-        self.det_rows = QtWidgets.QLineEdit()
-        self.det_cols = QtWidgets.QLineEdit()
+        self.det_rows_row = FormRow(label="shape", path=("source", "rows"), value="")
+        self.det_cols_row = FormRow(label="×", path=("source", "columns"), value="")
+        self.det_rows, self.det_cols = self.det_rows_row.editor, self.det_cols_row.editor
         for e in (self.det_rows, self.det_cols):
             e.setMaximumWidth(60)
             e.setPlaceholderText("auto")
-        self.dtype_combo = QtWidgets.QComboBox()
-        self.dtype_combo.addItems(_RAW_DTYPES)
-        self.header_skip = QtWidgets.QLineEdit()
+        self.dtype_row = FormRow(label="dtype", path=("source", "dtype"), value=_RAW_DTYPES[0], kind="combo",
+                                 choices=_RAW_DTYPES)
+        self.dtype_combo = self.dtype_row.editor
+        self.header_row = FormRow(label="header", path=("source", "header"), value="")
+        self.header_skip = self.header_row.editor
         self.header_skip.setMaximumWidth(60)
         self.header_skip.setPlaceholderText("0")
-        adv.addWidget(QtWidgets.QLabel("shape"))
-        adv.addWidget(self.det_rows)
-        adv.addWidget(QtWidgets.QLabel("×"))
-        adv.addWidget(self.det_cols)
-        adv.addWidget(QtWidgets.QLabel("dtype"))
-        adv.addWidget(self.dtype_combo)
-        adv.addWidget(QtWidgets.QLabel("header"))
-        adv.addWidget(self.header_skip)
+        for row in (self.det_rows_row, self.det_cols_row, self.dtype_row, self.header_row):
+            row.label.setMinimumWidth(0)
+            adv.addWidget(row)
         adv.addStretch(1)
         lay.addWidget(self.adv_box)
 
@@ -276,10 +276,10 @@ class ScanSourceWidget(QtWidgets.QWidget):
         grp = QtWidgets.QHBoxLayout(self.group_row)
         grp.setContentsMargins(0, 0, 0, 0)
         grp.setSpacing(6)
-        grp.addWidget(QtWidgets.QLabel("Group"))
-        self.group_edit = QtWidgets.QLineEdit()
+        self.group_field_row = FormRow(label="Group", path=("source", "group"), value="")
+        self.group_edit = self.group_field_row.editor
         self.group_edit.setPlaceholderText("e.g. 1-3, 5, 7-9  (combine into one output)")
-        grp.addWidget(self.group_edit, 1)
+        grp.addWidget(self.group_field_row, 1)
         lay.addWidget(self.group_row)
         self.group_row.setVisible(self._allow_grouping)
 
@@ -300,7 +300,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self.adv_btn.setText("Raw params ▴" if on else "Raw params ▾")
 
     def _on_mode_toggled(self, _on):
-        self.dir_kind_combo.setVisible(self.dir_check.isChecked())
+        self.dir_kind_row.setVisible(self.dir_check.isChecked())
         self.kind_label.setVisible(not self.dir_check.isChecked())
         self.kind_label.setText("")            # stale until a file is chosen
         self.path_edit.clear()
@@ -309,28 +309,20 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
     # ---- picking --------------------------------------------------------
     def _choose(self):
-        from xdart.utils.browse import browse_start_dir, remember_browse_path
-        start = browse_start_dir(self.path_edit.text())
-        if self.dir_check.isChecked():
-            path = QtWidgets.QFileDialog.getExistingDirectory(
-                self, "Choose a folder", start)
-        else:
-            # All files first/default — SPEC scan files are extensionless.
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Choose a scan", start,
-                "All files (*);;Scans (*.nexus *.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff *.raw)")
-        if path:
-            remember_browse_path(path)
+        folder = self.dir_check.isChecked()
+        # All files first/default — SPEC scan files are extensionless.
+        picks = browse(self, "Choose a folder" if folder else "Choose a scan", folder=folder,
+                       current=self.path_edit.text(),
+                       file_filter="All files (*);;Scans (*.nexus *.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff *.raw)")
+        if picks:
+            path = picks[0]
             self.path_edit.setText(path)
             self._refresh_candidates()
 
     def _choose_image_dir(self):
-        from xdart.utils.browse import browse_start_dir, remember_browse_path
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Choose image folder",
-            browse_start_dir(self.image_dir_edit.text()))
-        if path:
-            remember_browse_path(path)
+        picks = browse(self, "Choose image folder", folder=True, current=self.image_dir_edit.text())
+        if picks:
+            path = picks[0]
             self.image_dir_edit.setText(path)
             self._emit_selection()
 
@@ -343,7 +335,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             self._external_candidates = ()
             self.scan_combo.blockSignals(True); self.scan_combo.clear()
             self.scan_combo.blockSignals(False)
-            self.scan_label.setVisible(False); self.scan_combo.setVisible(False)
+            self.scan_row.setVisible(False); self.scan_combo.setVisible(False)
             self.sigExternalSyntaxChanged.emit(self.external_source_syntax())
             return
         if not path:
@@ -408,7 +400,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             self.scan_combo.addItem(self._candidate_label(spec))
         self.scan_combo.blockSignals(False)
         multi = len(self._candidates) > 1
-        self.scan_label.setVisible(multi)
+        self.scan_row.setVisible(multi)
         self.scan_combo.setVisible(multi)
         # SPEC pairs external images; other kinds carry images inline → hide the
         # images folder field (the dot still reflects reachability).
@@ -438,8 +430,9 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self.image_dir_edit.setPlaceholderText(
             "(raw tree root, if the data moved)" if is_proc
             else "(blank = automatic matching next to the SPEC file)")
-        for widget in (self.images_label, self.image_dir_edit, self.image_dir_btn):
+        for widget in (self.image_dir_row, self.images_label, self.image_dir_edit, self.image_dir_btn):
             widget.setVisible(show_pairing)
+        self.image_stem_row.setVisible(is_spec)
         self.image_stem_label.setVisible(is_spec)
         self.image_stem_edit.setVisible(is_spec)
         self.image_dir_edit.setEnabled(show_pairing)
@@ -899,7 +892,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             self.scan_combo.addItem(self._candidate_label(spec), spec)
         self.scan_combo.setCurrentIndex(0)
         self.scan_combo.blockSignals(False)
-        self.scan_label.setVisible(True); self.scan_combo.setVisible(True)
+        self.scan_row.setVisible(True); self.scan_combo.setVisible(True)
         self._set_dot(False, text="headless")
         self.sigExternalSyntaxChanged.emit(self.external_source_syntax())
 

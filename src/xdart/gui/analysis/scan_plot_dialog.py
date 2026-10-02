@@ -17,15 +17,14 @@ from contextlib import contextmanager
 from dataclasses import replace
 
 import numpy as np
-import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.sources.probe import probe_first_frame, raw_is_reachable  # noqa: F401
 
-from xdart.gui.themes import plot_font
-
-from .peak_fit_util import CURVE_PENS
-from .plot_axes import add_right_series, attach_right_axis
+from xdart.gui.widgets.controls_panel import FormRow
+from xdart.gui.widgets.file_dialogs import browse
+from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
+from xdart.gui.tabs.scattering.trend_view import PlotSeries, SeriesProjection, TrendView
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +66,6 @@ def _table_from_source(src):
                 pass
         out[k] = col
     return out
-
-
-def _checkable_item(text):
-    """An unchecked, user-checkable ``QListWidgetItem`` for a column selector."""
-    item = QtWidgets.QListWidgetItem(text)
-    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-    item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-    return item
 
 
 def _numeric_columns(table):
@@ -147,15 +138,17 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # Axes row: X / Normalize combos (Y is the multi-select below).
         axes_row = QtWidgets.QHBoxLayout()
         axes_row.setSpacing(7)
-        axes_row.addWidget(QtWidgets.QLabel("X"))
-        self.x_combo = QtWidgets.QComboBox()
+        self.x_row = FormRow(label="X", path=("scan_plot", "x"), value="", kind="combo")
+        self.x_combo = self.x_row.editor
         self.x_combo.setMinimumWidth(120)
-        axes_row.addWidget(self.x_combo)
-        axes_row.addWidget(QtWidgets.QLabel("Normalize"))
-        self.norm_combo = QtWidgets.QComboBox()
+        self.x_row.label.setMinimumWidth(0)
+        axes_row.addWidget(self.x_row)
+        self.norm_row = FormRow(label="Normalize", path=("scan_plot", "normalization"), value="", kind="combo")
+        self.norm_combo = self.norm_row.editor
         self.norm_combo.setMinimumWidth(110)
         self.norm_combo.setToolTip("Divide Y by this column (None = off)")
-        axes_row.addWidget(self.norm_combo)
+        self.norm_row.label.setMinimumWidth(0)
+        axes_row.addWidget(self.norm_row)
         axes_row.addStretch(1)
         self.roi_btn = QtWidgets.QPushButton("Plot ROI…")
         self.roi_btn.setObjectName("scanPlotRoiBtn")
@@ -167,10 +160,10 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.save_btn = QtWidgets.QPushButton("Save CSV…")
         self.save_btn.setEnabled(False)
         axes_row.addWidget(self.save_btn)
-        self.log_btn = QtWidgets.QPushButton("Log")
-        self.log_btn.setCheckable(True)
+        self.log_row = FormRow(label="Log", path=("scan_plot", "log_left"), value=False, kind="bool")
+        self.log_btn = self.log_row.editor
         self.log_btn.setToolTip("Log scale on the (left) Y axis")
-        axes_row.addWidget(self.log_btn)
+        axes_row.addWidget(self.log_row)
         lay.addLayout(axes_row)
 
         # Y multi-select (check several to overlay) + the plot, side by side.
@@ -178,33 +171,28 @@ class ScanPlotDialog(QtWidgets.QDialog):
         body.setSpacing(7)
         y_col = QtWidgets.QVBoxLayout()
         y_col.setSpacing(2)
-        y_col.addWidget(QtWidgets.QLabel("Y (overlay)"))
-        self.y_list = QtWidgets.QListWidget()
+        self.y_browser = BrowserView(self, profile=keyed_list_profile("Y (overlay)", checkable=True))
+        self.y_list = self.y_browser.scans
         self.y_list.setObjectName("scanPlotYList")
         self.y_list.setMaximumWidth(160)
         self.y_list.setToolTip("Check one or more columns to plot vs X")
-        y_col.addWidget(self.y_list, 1)
-        y_col.addWidget(QtWidgets.QLabel("Right axis"))
-        self.r_list = QtWidgets.QListWidget()
+        self.y_browser.setMaximumWidth(160)
+        y_col.addWidget(self.y_browser, 1)
+        self.r_browser = BrowserView(self, profile=keyed_list_profile("Right axis", checkable=True))
+        self.r_list = self.r_browser.scans
         self.r_list.setObjectName("scanPlotRList")
         self.r_list.setMaximumWidth(160)
         self.r_list.setMaximumHeight(110)
         self.r_list.setToolTip(
             "Check a (plotted) column here to draw it against a second Y axis on "
             "the right — for columns of very different magnitude")
-        y_col.addWidget(self.r_list)
+        self.r_browser.setMaximumWidth(160)
+        y_col.addWidget(self.r_browser)
         body.addLayout(y_col)
-        self.plot = pg.PlotWidget()
-        self.legend = self.plot.addLegend(offset=(-10, 10))
-        # ~50% larger than pyqtgraph's ~9pt legend default (readability).  Two
-        # points above the application plot tier reproduces the 13pt this had
-        # at the Default tier and keeps the emphasis at every other one; a
-        # literal here would have frozen this one legend while the rest of the
-        # application scaled.
-        self.legend.setLabelTextSize(
-            f"{plot_font().pointSize() + 2}pt")
-        self.right_vb, self.right_axis = attach_right_axis(self.plot)
-        body.addWidget(self.plot, 1)
+        self.trend = TrendView(self, name="scanPlotSeries", series_only=True)
+        self.plot, self.legend = self.trend.plot, self.trend.legend
+        self.right_vb, self.right_axis = self.trend.right_view_box, self.trend.right_axis
+        body.addWidget(self.trend, 1)
         lay.addLayout(body, 1)
 
         self.status = QtWidgets.QLabel("")
@@ -214,8 +202,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
 
         self.x_combo.currentIndexChanged.connect(self._redraw)
         self.norm_combo.currentIndexChanged.connect(self._redraw)
-        self.y_list.itemChanged.connect(self._redraw)
-        self.r_list.itemChanged.connect(self._redraw)
+        self.y_browser.checksChanged.connect(lambda _checked: self._redraw())
+        self.r_browser.checksChanged.connect(lambda _checked: self._redraw())
         if self._vnext:
             self.source_widget.sigExternalSyntaxChanged.connect(
                 lambda value: self._vnext_submit("metadata", value))
@@ -391,24 +379,21 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.r_list.blockSignals(True)
         self.x_combo.clear()
         self.norm_combo.clear()
-        self.y_list.clear()
-        self.r_list.clear()
         self.x_combo.addItems(cols)
         self.norm_combo.addItem("None", None)
         for c in cols:
             self.norm_combo.addItem(c, c)
-        for c in cols:
-            self.y_list.addItem(_checkable_item(c))
-            self.r_list.addItem(_checkable_item(c))
         # Defaults: X = the scanned positioner, Y = an intensity-like column.
         if cols:
             x_default, y_default = self._guess_axes(cols)
             if x_default:
                 self.x_combo.setCurrentText(x_default)
             if y_default is not None:
-                items = self.y_list.findItems(y_default, QtCore.Qt.MatchFlag.MatchExactly)
-                if items:
-                    items[0].setCheckState(QtCore.Qt.CheckState.Checked)
+                self._sync_column_lists(cols, (y_default,))
+            else:
+                self._sync_column_lists(cols)
+        if not cols:
+            self._sync_column_lists(())
         self.x_combo.blockSignals(False)
         self.norm_combo.blockSignals(False)
         self.y_list.blockSignals(False)
@@ -474,27 +459,22 @@ class ScanPlotDialog(QtWidgets.QDialog):
             return "frame_index"
         return None
 
-    @staticmethod
-    def _checked_in(list_widget):
-        out = []
-        for i in range(list_widget.count()):
-            item = list_widget.item(i)
-            if item.checkState() == QtCore.Qt.CheckState.Checked:
-                out.append(item.text())
-        return out
+    def _sync_column_lists(self, names, checked_y=(), checked_right=()):
+        self._selector_columns = list(names)
+        entries = tuple(BrowserResult(name, name) for name in self._selector_columns)
+        self.y_browser.reconcile_checked_results(entries, checked_y)
+        self.r_browser.reconcile_checked_results(entries, checked_right)
 
     def _checked_y(self):
-        return self._checked_in(self.y_list)
+        return list(self.y_browser.checked_results())
 
     def _right_cols(self):
-        """Columns assigned to the right-hand axis.  Checking a column here
-        plots it on the right axis even if it isn't checked in Y, so the
-        right-axis toggle is never a silent no-op."""
-        return set(self._checked_in(self.r_list))
+        """A right check plots independently of the left-axis check."""
+        return set(self.r_browser.checked_results())
 
     def vnext_plot_values(self):
         """Capture controls only; table/normalization science stays headless."""
-        right = tuple(self._checked_in(self.r_list))
+        right = self.r_browser.checked_results()
         accepted = () if self._vnext_scan_request is None else self._vnext_scan_request[3]
         requested = tuple(dict.fromkeys((*self._checked_y(), *right)))
         if len(requested) == len(accepted) and set(requested) == set(accepted): requested = accepted
@@ -511,62 +491,29 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 self.set_vnext_scan_result(self._vnext_scan_result); return
             if values[5] is not None: self._vnext_submit("scan_plot", values)
             return
-        self.plot.clear()
-        self.right_vb.clear()
-        if self.legend is not None:
-            self.legend.clear()
-        if not self._columns:
-            self.right_axis.setVisible(False)
-            return
         xcol = self.x_combo.currentText()
-        if xcol not in self._table:
-            self.right_axis.setVisible(False)
+        if not self._columns or xcol not in self._table:
+            self.trend.reconcile_series(SeriesProjection())
             return
         x = np.asarray(self._table[xcol], dtype=float)
         norm_col = self.norm_combo.currentData()
         norm = None
         if norm_col and norm_col in self._table:
             norm = np.asarray(self._table[norm_col], dtype=float)
-            norm = np.where(norm == 0, np.nan, norm)   # avoid /0
-        normalized = norm is not None
+            norm = np.where(norm == 0, np.nan, norm)
         right_cols = self._right_cols()
-        # A column plots if it's checked in Y OR assigned to the right axis;
-        # draw in the stable column order for deterministic colours/legend.
         y_cols = set(self._checked_y())
-        draw_cols = [c for c in self._columns if c in y_cols or c in right_cols]
-        any_left = any_right = False
-        for n, ycol in enumerate(draw_cols):
-            y = np.asarray(self._table[ycol], dtype=float)
-            if normalized:
-                y = y / norm
-            if not (np.isfinite(x).any() and np.isfinite(y).any()):
+        series = []
+        for name in self._columns:
+            if name not in y_cols and name not in right_cols:
                 continue
-            color = CURVE_PENS[n % len(CURVE_PENS)]
-            pen = pg.mkPen(color, width=3)
-            if ycol in right_cols:
-                add_right_series(self.right_vb, self.legend, x, y, pen=pen,
-                                 name=ycol, symbol="o", symbol_size=7,
-                                 symbol_brush=color)
-                any_right = True
-            else:
-                self.plot.plot(x, y, pen=pen, name=ycol, symbol="o",
-                               symbolSize=7, symbolBrush=color)
-                any_left = True
-        self.plot.setLabel("bottom", xcol)
-        value_label = ("value / " + norm_col) if normalized else "value"
-        self.plot.setLabel("left", value_label if any_left else "")
-        self.right_axis.setVisible(any_right)
-        self.right_vb.setVisible(any_right)
-        if any_right:
-            self.right_axis.setLabel(f"{value_label} (right)")
-        # Re-apply the Y-log toggle: plot.clear() at the top of every _redraw
-        # resets per-axis log mode, so the state lives on the button.  Log the
-        # LEFT axis only, then force the right axis back to linear: its curves
-        # live in a separate ViewBox that PlotItem.setLogMode does NOT transform,
-        # so without this the right ticks would go log while the data stayed
-        # linear (mislabelled).  Right axis = linear ticks + linear data.
-        self.plot.setLogMode(False, self.log_btn.isChecked())
-        self.right_axis.setLogMode(False)
+            y = np.asarray(self._table[name], dtype=float)
+            if norm is not None:
+                y = y / norm
+            series.append(PlotSeries(name, x, y, name in right_cols))
+        label = f"value / {norm_col}" if norm is not None else "value"
+        self.trend.reconcile_series(SeriesProjection(tuple(series), xcol, label, f"{label} (right)",
+                                                    self.log_btn.isChecked()))
 
     def _schedule_redraw(self):
         if self._closing:
@@ -629,11 +576,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         try:
             self.x_combo.addItem(name)
             self.norm_combo.addItem(name, name)
-            item = _checkable_item(name)
-            if check:
-                item.setCheckState(QtCore.Qt.CheckState.Checked)
-            self.y_list.addItem(item)
-            self.r_list.addItem(_checkable_item(name))
+            checked = (*self._checked_y(), name) if check else self._checked_y()
+            self._sync_column_lists(self._columns, checked, self.r_browser.checked_results())
         finally:
             self.x_combo.blockSignals(False)
             self.norm_combo.blockSignals(False)
@@ -656,10 +600,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             j = self.norm_combo.findText(name)
             if j >= 0:
                 self.norm_combo.removeItem(j)
-            for lst in (self.y_list, self.r_list):
-                for k in range(lst.count() - 1, -1, -1):
-                    if lst.item(k).text() == name:
-                        lst.takeItem(k)
+            self._sync_column_lists(self._columns, self._checked_y(), self.r_browser.checked_results())
         finally:
             self.x_combo.blockSignals(False)
             self.norm_combo.blockSignals(False)
@@ -837,9 +778,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
         self._vnext_rendering = True
         try:
-            self.plot.clear(); self.right_vb.clear()
-            if self.legend is not None: self.legend.clear()
-            self.right_axis.setVisible(False); self.right_vb.setVisible(False)
+            self.trend.reconcile_series(SeriesProjection())
             self.status.setText("")
         finally:
             self._vnext_rendering = False
@@ -854,14 +793,14 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 if column.numeric is not None:
                     table[column.name] = column.numeric
             self._table = table; self._columns = list(table)
-            for widget in (self.x_combo, self.norm_combo, self.y_list, self.r_list):
+            for widget in (self.x_combo, self.norm_combo):
                 widget.blockSignals(True); widget.clear()
             self.x_combo.addItems(self._columns)
             self.norm_combo.addItem("None", None)
             for name in self._columns:
                 self.norm_combo.addItem(name, name)
-                self.y_list.addItem(_checkable_item(name))
-                self.r_list.addItem(_checkable_item(name))
+
+            self._sync_column_lists(self._columns)
             selected = result.selected_scanned_positioner or (
                 "frame_index" if "frame_index" in table else None)
             if selected is not None: self.x_combo.setCurrentText(selected)
@@ -875,9 +814,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
     def clear_vnext_metadata(self):
         self._retire_vnext_result(); self._vnext_table_result = None
         self._table = {}; self._columns = []; self._vnext_rendering = True
-        for widget in (self.x_combo, self.norm_combo, self.y_list, self.r_list):
+        for widget in (self.x_combo, self.norm_combo):
             widget.clear()
-        self.plot.clear(); self.right_vb.clear(); self.roi_btn.setEnabled(False)
+        self._sync_column_lists(())
+        self.trend.reconcile_series(SeriesProjection())
+        self.roi_btn.setEnabled(False)
         self._vnext_rendering = False
 
     def set_vnext_scan_result(self, result, request=None):
@@ -885,40 +826,22 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if request is not None: self._vnext_scan_request = request
         self._vnext_rendering = True
         try:
-            self.plot.clear(); self.right_vb.clear()
-            if self.legend is not None: self.legend.clear()
-            right = set(self.vnext_plot_values()[3]); any_right = False
-            if result.x is not None:
-                for index, (name, identity, values) in enumerate(zip(
-                        result.trace_names, result.original_identities,
-                        result.traces, strict=True)):
-                    color = CURVE_PENS[index % len(CURVE_PENS)]
-                    pen = pg.mkPen(color, width=3)
-                    if identity in right:
-                        add_right_series(self.right_vb, self.legend, result.x,
-                            values, pen=pen, name=name, symbol="o",
-                            symbol_size=7, symbol_brush=color); any_right = True
-                    else:
-                        self.plot.plot(result.x, values, pen=pen, symbol="o",
-                            symbolSize=7, symbolBrush=color, name=name)
-                self.plot.setLabel("bottom", result.x_name)
-            self.plot.setLogMode(x=False, y=self.log_btn.isChecked())
-            self.right_axis.setVisible(any_right); self.right_vb.setVisible(any_right)
-            label = (f"value / {result.normalization}"
-                     if result.normalization else "value")
-            self.plot.setLabel("left", label)
-            if any_right: self.right_axis.setLabel(f"{label} (right)")
+            right = set(self.r_browser.checked_results())
+            series = () if result.x is None else tuple(
+                PlotSeries(name, result.x, values, identity in right)
+                for name, identity, values in zip(result.trace_names, result.original_identities,
+                                                 result.traces, strict=True))
+            label = f"value / {result.normalization}" if result.normalization else "value"
+            self.trend.reconcile_series(SeriesProjection(series, result.x_name or "", label, f"{label} (right)",
+                                                        self.log_btn.isChecked()))
             self.status.setText(result.code)
         finally:
             self._vnext_rendering = False
 
     def set_vnext_roi_result(self, result):
         self._vnext_roi_result = result
-        existing = {self.y_list.item(i).text() for i in range(self.y_list.count())}
-        for name in result.signal_names:
-            if name not in existing:
-                self.y_list.addItem(_checkable_item(name))
-                self.r_list.addItem(_checkable_item(name)); existing.add(name)
+        names = tuple(dict.fromkeys((*getattr(self, "_selector_columns", ()), *result.signal_names)))
+        self._sync_column_lists(names, self._checked_y(), self.r_browser.checked_results())
         self.status.setText(result.code)
 
     def _csv_columns(self):
@@ -949,13 +872,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
     def _save_csv(self):
         if not self._table:
             return
-        from xdart.utils.browse import remember_browse_path, suggest_save_path
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save scan table", suggest_save_path("scan_table.csv"),
-            "CSV files (*.csv)")
-        if not path:
+        picks = browse(self, "Save scan table", save=True, file_filter="CSV files (*.csv)",
+                       default_name="scan_table.csv")
+        if not picks:
             return
-        remember_browse_path(path)
+        path = picks[0]
         try:
             self._write_csv(path)
             self.status.setText(f"Saved {path}")

@@ -66,20 +66,6 @@ _STRINGS: dict[str, str] = dict.fromkeys(
 )
 
 _DEBT: dict[str, dict[str, int]] = {
-    "analysis/roi_select_dialog.py": {
-        "ColorBarItem": 1, "ImageItem": 1, "PlotWidget": 1, "QCheckBox": 2, "QComboBox": 2, "QLineEdit": 1,
-        "QListWidget": 1, "RectROI": 1, "getFromMatplotlib": 1,
-    },
-    "analysis/scan_plot_dialog.py": {
-        "PlotWidget": 1, "QComboBox": 2, "QFileDialog.getSaveFileName": 1, "QListWidget": 2,
-    },
-    "analysis/scan_source_widget.py": {
-        "QCheckBox": 1, "QComboBox": 3, "QFileDialog.getExistingDirectory": 2, "QFileDialog.getOpenFileName": 1,
-        "QLineEdit": 7,
-    },
-    "pages/scattering_workspace.py": {
-        "QCheckBox": 1, "QLineEdit": 1, "QSpinBox": 1, "str:configMenuButton": 1, "str:helpMenuButton": 1,
-    },
     #: the calibration window's frame selection and frame tables, which predate the table fence (FIT-TOOLS-2026-10)
     "tabs/calibration/dialog.py": {"QTableWidget": 2},
 }

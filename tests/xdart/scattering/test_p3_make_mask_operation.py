@@ -281,6 +281,31 @@ def test_hdf_selector_explicit_2d_control_omits_frame_slice(
         qapp.processEvents()
 
 
+def test_hdf_selector_uses_shared_integer_refusal_before_qualifying_a_frame(monkeypatch, qapp) -> None:
+    from xdart.gui.pages import scattering_workspace as workspace
+    from xdart.gui.widgets.controls_panel import FormRow
+
+    calls = []
+    monkeypatch.setattr(workspace, "_qualify_mask_hdf_dialog_selection",
+                        lambda source, dataset, frame: calls.append((dataset, frame)) or source)
+    parent = QtWidgets.QWidget()
+    dialog = workspace._mask_hdf_dialog_type()(parent, "chosen.nxs")
+    try:
+        assert isinstance(dialog.dataset_row, FormRow) and isinstance(dialog.frame_row, FormRow)
+        for text in ("-1", "2147483648", "1.5", ""):
+            dialog.frame_index.setText(text)
+            dialog.accept()
+            assert dialog.selected_source is None and dialog.error_label.text() and not calls
+        dialog.frame_index.setValue(2)
+        dialog.accept()
+        assert calls == [("/entry/data/data_000001", 2)]
+        assert dialog.result() == QtWidgets.QDialog.DialogCode.Accepted
+    finally:
+        dialog.deleteLater()
+        parent.deleteLater()
+        qapp.processEvents()
+
+
 def test_live_mask_chooser_returns_tiff_after_one_file_dialog(
     tmp_path, monkeypatch, qapp,
 ) -> None:

@@ -236,6 +236,38 @@ def test_roi_select_reducer_and_background(qapp):
         dlg.close()
 
 
+def test_roi_picker_mounts_shared_owners_and_preserves_all_signal_and_background_marks(qapp):
+    from xdart.gui.analysis.roi_select_dialog import RoiSelectDialog
+    from xdart.gui.tabs.scattering.browser_view import BrowserView
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
+    from xdart.gui.widgets.controls_panel import FormRow
+
+    dlg = RoiSelectDialog(np.zeros((50, 70)))
+    try:
+        assert isinstance(dlg.scientific, ScientificView) and isinstance(dlg.roi_browser, BrowserView)
+        assert isinstance(dlg.reducer_row, FormRow)
+        dlg.bg_check.setChecked(True)
+        first = dlg._rois[0]
+        dlg._add_roi()
+        second = dlg._rois[1]
+        assert all(item.isVisible() for item in (first.rect, first.bg_rect, second.rect))
+        assert len(dlg.scientific.keyed_panel(dlg._image_key).regions) == 3
+        # A non-current rectangle moves too, without overwriting the current ROI's fields.
+        selected = dlg.f_ccol.text()
+        first.rect.setPos((2, 3), finish=False)
+        assert dlg.f_ccol.text() == selected
+        assert dlg.roi_signals()[0].roi.center_x == pytest.approx(37)
+        dlg.roi_list.setCurrentRow(0)
+        assert float(dlg.f_ccol.text()) == pytest.approx(37)
+        dlg.bg_check.setChecked(False)
+        assert not first.bg_rect.isVisible() and second.rect.isVisible()
+        dlg._remove_roi()
+        assert len(dlg.scientific.keyed_panel(dlg._image_key).regions) == 1
+        assert dlg.roi_signals()[0].name == second.name
+    finally:
+        dlg.close()
+
+
 # ── end-to-end: compute fills table columns == direct run_roi_signals ─────
 
 

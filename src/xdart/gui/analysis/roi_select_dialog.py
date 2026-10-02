@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """ROI selection popup for the Scan Plot tool.
 
-Pops the scan's first raw frame with one or more draggable ``pg.RectROI``
-rectangles, each two-way synced to numeric ``center_row / center_col /
+Mounts ScientificView's detector picker with independently keyed signal and
+background rectangles, each two-way synced to numeric ``center_row / center_col /
 width_row / width_col`` fields — the 2-D generalization of the Peak Fitter's
 fit-range ``LinearRegionItem`` ↔ fields sync.  Each signal ROI carries its own
 reducer (sum/mean/max/min/std) and an optional paired *background* ROI combined
@@ -11,18 +11,20 @@ by subtract or divide.  ``Compute`` emits the assembled
 headless (``run_roi_signals``) — this dialog is the thin picker.
 
 The image is drawn row-major (array axis 0 = rows = the y axis, axis 1 = cols =
-the x axis), so a ``RectROI`` at item ``(x, y)`` maps directly to a
+the x axis), so a region at ``(x, y)`` maps directly to a
 ``RoiSpec(center_x=col, center_y=row, …)``.
 """
 
 import logging
 
 import numpy as np
-import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from .peak_fit_util import CURVE_PENS
-from xdart.gui.widgets.image_widget import _ceiling_safe_levels
+from xdart.gui.widgets.controls_panel import FormRow
+from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
+from xdart.gui.tabs.scattering.scientific_view import ScientificView
+from xdart.gui.tabs.scattering.shell_values import RectRegion
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ def _rect_center_size(rect):
 
 
 class _RoiEntry:
-    """One signal ROI: its rectangle + reducer + optional background."""
+    """One signal ROI's choices and borrowed interaction handles; ScientificView owns the marks."""
 
     __slots__ = ("name", "rect", "reducer", "bg_enabled", "bg_op", "bg_rect")
 
@@ -81,49 +83,25 @@ class RoiSelectDialog(QtWidgets.QDialog):
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
 
-        # Image with a fixed aspect ratio, row-major so (x, y) == (col, row).
-        self.image_plot = pg.PlotWidget()
-        self.image_plot.setMinimumHeight(300)
-        self.image_plot.setAspectLocked(True)
-        self.image_plot.invertY(True)               # row 0 at the top
-        self.image_item = pg.ImageItem(axisOrder="row-major")
-        self.image_plot.addItem(self.image_item)
-        # Intensity bar + colormap matching the main Image Viewer mode: a
-        # ColorBarItem linked to the frame (the same widget pgImageWidget uses).
-        self._cmap = pg.colormap.getFromMatplotlib("viridis")
-        self.colorbar = pg.ColorBarItem(width=15)
-        self.colorbar.setImageItem(self.image_item,
-                                   insert_in=self.image_plot.getPlotItem())
-        self.colorbar.setColorMap(self._cmap)
-        lay.addWidget(self.image_plot, 3)
-
-        # Default / Log intensity scale, mirroring the Image Viewer's buttons.
-        scale_row = QtWidgets.QHBoxLayout()
-        scale_row.setSpacing(6)
-        scale_row.addWidget(QtWidgets.QLabel("Intensity"))
-        self.scale_default_btn = QtWidgets.QPushButton("Default")
-        self.scale_log_btn = QtWidgets.QPushButton("Log")
-        self._scale_group = QtWidgets.QButtonGroup(self)
-        self._scale_group.setExclusive(True)
-        for b in (self.scale_default_btn, self.scale_log_btn):
-            b.setCheckable(True)
-            self._scale_group.addButton(b)
-        self.scale_default_btn.setChecked(True)
-        scale_row.addWidget(self.scale_default_btn)
-        scale_row.addWidget(self.scale_log_btn)
-        scale_row.addStretch(1)
-        lay.addLayout(scale_row)
-        self.scale_log_btn.toggled.connect(self._apply_scale)
-        self._apply_scale()                         # initial linear render
+        self.scientific = ScientificView(self, detector_picker=True)
+        self.scientific.setMinimumHeight(300)
+        self._image_key = self.scientific.reconcile_detector_image(self._image)
+        self.scientific.keyedNamedRegionChanged.connect(self._on_mark_changed)
+        pane = self.scientific.keyed_panel(self._image_key).pane
+        # Borrowed compatibility handles; the shared owner constructs and retains every display widget.
+        self.image_plot, self.image_item, self.colorbar = pane.plot, pane.image, pane.color_scale
+        self.scale_default_btn, self.scale_log_btn = self.scientific.default_scale, self.scientific.detector_log
+        lay.addWidget(self.scientific, 3)
 
         # ROI list + Add / Remove.
         roi_row = QtWidgets.QHBoxLayout()
         roi_row.setSpacing(7)
-        self.roi_list = QtWidgets.QListWidget()
+        self.roi_browser = BrowserView(self, profile=keyed_list_profile("Signal ROIs"))
+        self.roi_list = self.roi_browser.scans
         self.roi_list.setObjectName("roiList")
         self.roi_list.setMaximumHeight(90)
         self.roi_list.setToolTip("Signal ROIs — each becomes a plotted column")
-        roi_row.addWidget(self.roi_list, 1)
+        roi_row.addWidget(self.roi_browser, 1)
         btn_col = QtWidgets.QVBoxLayout()
         btn_col.setSpacing(4)
         self.add_btn = QtWidgets.QPushButton("Add ROI")
@@ -141,46 +119,53 @@ class RoiSelectDialog(QtWidgets.QDialog):
         ed.setHorizontalSpacing(7)
         ed.setVerticalSpacing(5)
 
-        def _num():
-            e = QtWidgets.QLineEdit()
-            e.setValidator(QtGui.QDoubleValidator(self))
-            e.setMaximumWidth(80)
-            return e
+        self._numeric_rows = {}
 
-        self.f_crow, self.f_ccol = _num(), _num()
-        self.f_wrow, self.f_wcol = _num(), _num()
+        def _num(name):
+            row = FormRow(label="", path=("roi", name), value="")
+            row.label.hide()
+            row.editor.setValidator(QtGui.QDoubleValidator(self))
+            row.editor.setMaximumWidth(80)
+            self._numeric_rows[row.editor] = row
+            return row.editor
+
+        self.f_crow, self.f_ccol = _num("center_row"), _num("center_column")
+        self.f_wrow, self.f_wcol = _num("width_row"), _num("width_column")
         ed.addWidget(QtWidgets.QLabel("Center (row, col)"), 0, 0)
-        ed.addWidget(self.f_crow, 0, 1)
-        ed.addWidget(self.f_ccol, 0, 2)
+        ed.addWidget(self._numeric_rows[self.f_crow], 0, 1)
+        ed.addWidget(self._numeric_rows[self.f_ccol], 0, 2)
         ed.addWidget(QtWidgets.QLabel("Size (row, col)"), 1, 0)
-        ed.addWidget(self.f_wrow, 1, 1)
-        ed.addWidget(self.f_wcol, 1, 2)
+        ed.addWidget(self._numeric_rows[self.f_wrow], 1, 1)
+        ed.addWidget(self._numeric_rows[self.f_wcol], 1, 2)
 
         ed.addWidget(QtWidgets.QLabel("Reducer"), 2, 0)
-        self.reducer_combo = QtWidgets.QComboBox()
-        for r in _REDUCERS:
-            self.reducer_combo.addItem(r)
-        ed.addWidget(self.reducer_combo, 2, 1, 1, 2)
+        self.reducer_row = FormRow(label="", path=("roi", "reducer"), value="mean", kind="combo",
+                                   choices=_REDUCERS)
+        self.reducer_row.label.hide()
+        self.reducer_combo = self.reducer_row.editor
+        ed.addWidget(self.reducer_row, 2, 1, 1, 2)
 
-        self.bg_check = QtWidgets.QCheckBox("Background ROI")
+        self.bg_row = FormRow(label="Background ROI", path=("roi", "background"), value=False, kind="bool")
+        self.bg_check = self.bg_row.editor
         self.bg_check.setToolTip(
             "Pair this signal ROI with a background ROI, combined per the "
             "operation below")
-        ed.addWidget(self.bg_check, 3, 0)
-        self.bg_op_combo = QtWidgets.QComboBox()
-        for label, _op in _BG_OPS:
-            self.bg_op_combo.addItem(label)
+        ed.addWidget(self.bg_row, 3, 0)
+        self.bg_op_row = FormRow(label="", path=("roi", "background_op"), value="Subtract", kind="combo",
+                                 choices=[label for label, _op in _BG_OPS])
+        self.bg_op_row.label.hide()
+        self.bg_op_combo = self.bg_op_row.editor
         self.bg_op_combo.setEnabled(False)
-        ed.addWidget(self.bg_op_combo, 3, 1, 1, 2)
+        ed.addWidget(self.bg_op_row, 3, 1, 1, 2)
 
         self.bg_label = QtWidgets.QLabel("Bkg center / size")
-        self.f_bg_crow, self.f_bg_ccol = _num(), _num()
-        self.f_bg_wrow, self.f_bg_wcol = _num(), _num()
+        self.f_bg_crow, self.f_bg_ccol = _num("background_center_row"), _num("background_center_column")
+        self.f_bg_wrow, self.f_bg_wcol = _num("background_width_row"), _num("background_width_column")
         ed.addWidget(self.bg_label, 4, 0)
         bg_box = QtWidgets.QHBoxLayout()
         bg_box.setSpacing(4)
         for w in (self.f_bg_crow, self.f_bg_ccol, self.f_bg_wrow, self.f_bg_wcol):
-            bg_box.addWidget(w)
+            bg_box.addWidget(self._numeric_rows[w])
         ed.addLayout(bg_box, 4, 1, 1, 2)
         ed.setColumnStretch(2, 1)
         lay.addWidget(self.editor)
@@ -192,12 +177,13 @@ class RoiSelectDialog(QtWidgets.QDialog):
 
         # Compute / Close.
         action_row = QtWidgets.QHBoxLayout()
-        self.mask_sat_check = QtWidgets.QCheckBox("Mask saturated")
+        self.mask_sat_row = FormRow(label="Mask saturated", path=("roi", "mask_saturated"), value=False, kind="bool")
+        self.mask_sat_check = self.mask_sat_row.editor
         self.mask_sat_check.setToolTip(
             "Exclude dead/saturated pixels (the dtype-ceiling module mask) from "
             "the ROI stats — matches the integrator's saturated-pixel masking. "
             "The uint32 dummy + non-finite pixels are always excluded.")
-        action_row.addWidget(self.mask_sat_check)
+        action_row.addWidget(self.mask_sat_row)
         action_row.addStretch(1)
         self.compute_btn = QtWidgets.QPushButton("Compute")
         self.compute_btn.setObjectName("roiCompute")
@@ -232,33 +218,7 @@ class RoiSelectDialog(QtWidgets.QDialog):
         super().keyPressEvent(event)
 
     def _apply_scale(self, *_args):
-        """Render the frame at the chosen intensity scale (Default = linear,
-        Log), reusing the main Image Viewer's ceiling-safe autoscale + colorbar
-        so ROI picking sees the same levels the viewer does.  The RectROI
-        overlay lives on the plot (not the image item), so re-rendering here
-        never disturbs the picked boxes."""
-        disp = np.asarray(np.copy(self._image), dtype=float)
-        if disp.size == 0 or not np.isfinite(disp).any():
-            self.image_item.setImage(disp)
-            return
-        if self.scale_log_btn.isChecked():
-            min_val = float(np.nanmin(disp))
-            if min_val < 1:
-                disp -= (min_val - 1)
-            disp = np.log10(disp)
-            levels = _ceiling_safe_levels(disp, self._image, (0.1, 99.9))
-            self.image_item.setImage(disp, levels=levels)
-            self.colorbar.axis.setLogMode(True)
-        else:
-            levels = _ceiling_safe_levels(disp, self._image, (2, 98))
-            self.image_item.setImage(disp, levels=levels)
-            self.colorbar.axis.setLogMode(False)
-        if np.isfinite(disp).any():
-            low, high = float(np.nanmin(disp)), float(np.nanmax(disp))
-        else:
-            low, high = 0.0, 1.0
-        self.colorbar.lo_lim, self.colorbar.hi_lim = low, high
-        self.colorbar.setLevels(values=levels)
+        self.scientific.reconcile_detector_image(self._image)
 
     # ---- ROI lifecycle --------------------------------------------------
     def _default_box(self):
@@ -281,26 +241,32 @@ class RoiSelectDialog(QtWidgets.QDialog):
             i += 1
         return f"roi{i}"
 
-    def _make_rect(self, pos, size, color, dashed=False):
-        style = QtCore.Qt.PenStyle.DashLine if dashed else QtCore.Qt.PenStyle.SolidLine
-        pen = pg.mkPen(color, width=2, style=style)
-        rect = pg.RectROI(pos, size, pen=pen, movable=True, resizable=True)
-        rect.addScaleHandle([0, 0], [1, 1])         # a second corner handle
-        rect.setZValue(10)
-        self.image_plot.addItem(rect)
-        return rect
+    def _make_mark(self, name, pos, size, color, dashed=False):
+        region = RectRegion((float(pos[0]), float(pos[0] + size[0])),
+                            (float(pos[1]), float(pos[1] + size[1])), ("column", "px"), ("row", "px"))
+        self.scientific.set_keyed_named_region(self._image_key, name, region, color=color, dashed=dashed)
+        return self.scientific.keyed_region_item(self._image_key, name)
+
+    def _sync_roi_list(self, row):
+        current = self._rois[row].name if 0 <= row < len(self._rois) else None
+        self.roi_browser.reconcile_results(tuple(BrowserResult(entry.name, entry.name) for entry in self._rois), current)
+        self._on_select(row)
+
+    def _on_mark_changed(self, _key, name, _region):
+        for entry in self._rois:
+            if name in (entry.name, f"{entry.name}_bg"):
+                self._on_rect_changed(entry, bg=name.endswith("_bg"))
+                break
 
     def _add_roi(self):
         # The first ROI defaults to the whole frame; later ones to a ¼ box.
         pos, size = self._full_frame_box() if not self._rois else self._default_box()
         color = CURVE_PENS[len(self._rois) % len(CURVE_PENS)]
-        rect = self._make_rect(pos, size, color)
-        entry = _RoiEntry(self._new_name(), rect)
-        rect.sigRegionChanged.connect(
-            lambda *_a, e=entry: self._on_rect_changed(e, bg=False))
+        name = self._new_name()
+        rect = self._make_mark(name, pos, size, color)
+        entry = _RoiEntry(name, rect)
         self._rois.append(entry)
-        self.roi_list.addItem(entry.name)
-        self.roi_list.setCurrentRow(len(self._rois) - 1)
+        self._sync_roi_list(len(self._rois) - 1)
         self._update_status()
 
     def _remove_roi(self):
@@ -308,10 +274,9 @@ class RoiSelectDialog(QtWidgets.QDialog):
         if not (0 <= row < len(self._rois)):
             return
         entry = self._rois.pop(row)
-        self.image_plot.removeItem(entry.rect)
-        if entry.bg_rect is not None:
-            self.image_plot.removeItem(entry.bg_rect)
-        self.roi_list.takeItem(row)
+        self.scientific.set_keyed_named_region(self._image_key, entry.name, None)
+        self.scientific.set_keyed_named_region(self._image_key, f"{entry.name}_bg", None)
+        self._sync_roi_list(min(row, len(self._rois) - 1))
         self._update_status()
 
     def _current_entry(self):
@@ -407,8 +372,9 @@ class RoiSelectDialog(QtWidgets.QDialog):
         pos, size = box
         self._guard = True
         try:
-            rect.setSize(size, update=False)
-            rect.setPos(pos)
+            entry = next(e for e in self._rois if rect is e.rect or rect is e.bg_rect)
+            bg = rect is entry.bg_rect
+            self._make_mark(f"{entry.name}_bg" if bg else entry.name, pos, size, rect.pen.color(), dashed=bg)
         finally:
             self._guard = False
 
@@ -446,9 +412,7 @@ class RoiSelectDialog(QtWidgets.QDialog):
             pos, size = self._default_box()
             pos = [pos[0] + size[0] * 0.6, pos[1] + size[1] * 0.6]
             color = CURVE_PENS[(self._rois.index(entry) + 3) % len(CURVE_PENS)]
-            entry.bg_rect = self._make_rect(pos, size, color, dashed=True)
-            entry.bg_rect.sigRegionChanged.connect(
-                lambda *_a, e=entry: self._on_rect_changed(e, bg=True))
+            entry.bg_rect = self._make_mark(f"{entry.name}_bg", pos, size, color, dashed=True)
             self._guard = True
             try:
                 self._rect_to_fields(entry.bg_rect, self.f_bg_crow, self.f_bg_ccol,
@@ -456,12 +420,14 @@ class RoiSelectDialog(QtWidgets.QDialog):
             finally:
                 self._guard = False
         if entry.bg_rect is not None:
-            entry.bg_rect.setVisible(bool(on))
+            region = self.scientific.keyed_named_region(self._image_key, f"{entry.name}_bg")
+            self.scientific.set_keyed_named_region(self._image_key, f"{entry.name}_bg", region,
+                color=entry.bg_rect.pen.color(), dashed=True, visible=bool(on))
 
     def _set_bg_fields_visible(self, on):
         for w in (self.bg_label, self.f_bg_crow, self.f_bg_ccol,
                   self.f_bg_wrow, self.f_bg_wcol):
-            w.setVisible(bool(on))
+            self._numeric_rows.get(w, w).setVisible(bool(on))
 
     def _update_status(self):
         self.status.setText(
