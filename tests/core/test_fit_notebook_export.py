@@ -92,6 +92,80 @@ def test_documents_literal_and_ordinary_fit_executes_without_ui(tmp_path, format
     assert "50.0," not in document  # numerical arrays live only in the sidecar
 
 
+def test_marimo_comparison_inputs_use_native_controls_and_semantic_coordinates(tmp_path):
+    import importlib.util
+    from dataclasses import replace
+    import marimo as mo
+    from xrd_tools.core.containers import convert_radial_axis
+    from xrd_tools.notebooks import capture_snapshot, render_notebook
+    recipe, _ = recipe_bundle(tmp_path)
+    q = np.linspace(1.2, 4.2, 91)
+    patterns = (
+        FitInputSnapshot(FitInputKey("batch q pattern", "derived", "receipt q", 0),
+                         (FitAxis("q", "A^-1", q),), 4. + np.exp(-((q-2.7)/.2)**2),
+                         wavelength_angstrom=1.54),
+        FitInputSnapshot(FitInputKey("batch angle pattern", "derived", "receipt angle", 0),
+                         (FitAxis("2θ", "2th_deg", convert_radial_axis(q, "q_A^-1", "2th_deg", 1.54)),),
+                         7. + 3.*np.exp(-((q-3.)/.3)**2), wavelength_angstrom=1.54),
+    )
+    references = []
+    for i, pattern in enumerate(patterns):
+        captured = capture_snapshot(pattern, f"batch-{i}.npz")
+        (tmp_path / captured.reference.path).write_bytes(captured.content)
+        references.append(captured.reference)
+    recipe = replace(recipe, batch=tuple(references))
+    path = tmp_path / "comparison.py"
+    path.write_text(render_notebook(recipe, format="marimo", bundle_root=str(tmp_path)))
+    spec = importlib.util.spec_from_file_location("native_comparison_inputs", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _, definitions = module.app.run()
+    assert "comparison_selector" in definitions
+    selector = definitions["comparison_selector"]
+    assert isinstance(selector, mo.ui.multiselect)
+    chosen = [name for name, index in selector.options.items() if index in (1, 2)]
+    # Native controls with selected initial values drive the generated production cells. This is App.run
+    # execution evidence, not browser DOM/event evidence.
+    controls = ("input_selector", "overlay_selector", "log_display", "fit_range", "region_ranges",
+                "phase_selector", "settings_editor", "axis_unit_selector", "display_min", "display_max",
+                "slice_axis", "slice_coordinate", "fit_apply", "fit_batch")
+    overrides = {name: definitions[name] for name in controls}
+    overrides.update({name: definitions[name] for name in ("get_committed", "set_committed", "get_batch", "set_batch")})
+    overrides["comparison_selector"] = mo.ui.multiselect(options=selector.options, value=chosen, max_selections=4)
+    axis = definitions["axis_unit_selector"]
+    overrides["axis_unit_selector"] = mo.ui.dropdown(options=axis.options, value="2theta (deg)")
+    _, selected = module.app.run(defs=overrides)
+    assert selected["get_committed"]()[1] is definitions["outcome"]
+    figure = selected["fit_figure"]
+    expected_x = convert_radial_axis(q, "q_A^-1", "2th_deg", 1.54)
+    for pattern in patterns:
+        trace = next(trace for trace in figure.data if trace.name == pattern.key.result_identity)
+        np.testing.assert_allclose(trace.x, expected_x)
+        np.testing.assert_array_equal(trace.y, pattern.values)
+    assert figure.layout.xaxis2.title.text == "2θ (2th_deg)"
+
+
+def test_trend_column_is_metadata_and_old_recipes_remain_readable(tmp_path):
+    from dataclasses import replace
+    from xrd_tools.notebooks import recipe_to_json, recipe_from_json, render_notebook
+    from xrd_tools.notebooks.recipe import recipe_analyzer
+    recipe, _ = recipe_bundle(tmp_path)
+    selected = replace(recipe, trend_column="elapsed seconds")
+    restored = recipe_from_json(recipe_to_json(selected))
+    assert restored.trend_column == "elapsed seconds" and restored.settings == recipe.settings
+    assert recipe_analyzer(restored, data_root=tmp_path).settings == dict(recipe.settings)
+    old_json = json.loads(recipe_to_json(selected))
+    old_json.pop("trend_column")
+    assert recipe_from_json(json.dumps(old_json)).trend_column == ""
+    jupyter = json.loads(render_notebook(selected, format="jupyter", bundle_root=str(tmp_path)))
+    assert "elapsed seconds" in jupyter["cells"][0]["source"]
+    namespace = {}
+    exec(jupyter["cells"][1]["source"], namespace)
+    assert namespace["TREND_COLUMN"] == "elapsed seconds"
+    marimo = render_notebook(selected, format="marimo", bundle_root=str(tmp_path))
+    assert "TREND_COLUMN = recipe.trend_column" in marimo and "elapsed seconds" in marimo
+
+
 def test_safe_recipe_literals_settings_and_region_extension(tmp_path):
     from xrd_tools.notebooks import FitNotebookRecipe, recipe_from_json, recipe_to_json, render_notebook
     recipe, _ = recipe_bundle(tmp_path)
@@ -198,7 +272,7 @@ def test_real_phase_request_native_two_theta_and_compact_batch(tmp_path, format)
         # Public programmatic cell overrides exercise the production Apply/state cells. This is a native
         # marimo DAG check, not browser-event evidence (the root owner covers the actual frontend).
         from types import SimpleNamespace
-        control_names = ("input_selector", "overlay_selector", "log_display", "fit_range", "region_ranges",
+        control_names = ("input_selector", "overlay_selector", "comparison_selector", "log_display", "fit_range", "region_ranges",
                          "phase_selector", "settings_editor", "axis_unit_selector", "display_min", "display_max",
                          "slice_axis", "fit_apply", "fit_batch")
         overrides = {name: definitions[name] for name in control_names}

@@ -26,6 +26,7 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
         BUNDLE_ROOT = Path({bundle_root!r}).expanduser()
         DATA_ROOT = Path({(bundle_root if data_root is None else data_root)!r}).expanduser()
         recipe = recipe_from_json({recipe_to_json(recipe)!r})
+        TREND_COLUMN = recipe.trend_column
     """)
     scientific = _code("""
         # Ordinary scientific execution: this runs in scripts/headless kernels without any button click.
@@ -49,6 +50,9 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
               "Marimo 0.25: `marimo edit <export>.py`. Plotly is the interactive default. Fit/Apply commits "
               "scientific settings; pan, zoom and Log change presentation. Optional batch fitting is an explicit "
               "call to run_recipe_batch(recipe, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT).\n")
+    if recipe.trend_column:
+        header += (f"\nSelected trend column: {recipe.trend_column}. TREND_COLUMN preserves this choice for advanced "
+                   "callers of the existing read_trend_values API with DATA_ROOT; no trend is loaded automatically.\n")
     if format == "jupyter":
         viewer = _code("""
             # Re-executing this cell disposes the previous controls and callbacks.
@@ -85,7 +89,7 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
         ("Path, recipe_from_json", f"BUNDLE_ROOT = Path({bundle_root!r}).expanduser()\n"
          f"DATA_ROOT = Path({(bundle_root if data_root is None else data_root)!r}).expanduser()\n"
          f"recipe = recipe_from_json({recipe_to_json(recipe)!r})\nnotebook_description = {header!r}\n"
-         "return BUNDLE_ROOT, DATA_ROOT, recipe, notebook_description"),
+         "TREND_COLUMN = recipe.trend_column\nreturn BUNDLE_ROOT, DATA_ROOT, recipe, notebook_description, TREND_COLUMN"),
         ("mo, notebook_description", "mo.md(notebook_description)\nreturn"),
         ("recipe, BUNDLE_ROOT, DATA_ROOT, run_recipe, outcomes_table, table_csv, load_snapshot",
          "outcome = run_recipe(recipe, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)\n"
@@ -96,8 +100,9 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
         ("mo, recipe",
          "input_selector = mo.ui.dropdown(options={r.label + ' [' + str(i) + ']': i for i, r in enumerate((recipe.input, *recipe.batch))}, value=recipe.input.label + ' [0]', label='Input')\n"
          "overlay_selector = mo.ui.multiselect(options=['fit', 'background', 'residual', 'components'], value=['fit', 'background', 'residual'], label='Overlays')\n"
+         "comparison_selector = mo.ui.multiselect(options={r.label + ' [' + str(i) + ']': i for i, r in enumerate((recipe.input, *recipe.batch))}, value=[], max_selections=4, label='Comparison inputs') if recipe.tool in ('peak', 'phase') else None\n"
          "log_display = mo.ui.switch(value=False, label='Log intensity')\n"
-         "mo.hstack([input_selector, overlay_selector, log_display])\nreturn input_selector, overlay_selector, log_display"),
+         "mo.hstack([w for w in [input_selector, overlay_selector, comparison_selector, log_display] if w is not None])\nreturn input_selector, overlay_selector, comparison_selector, log_display"),
         ("mo, recipe, BUNDLE_ROOT, DATA_ROOT, load_snapshot, json, input_selector",
          "_reference = (recipe.input, *recipe.batch)[input_selector.value]\n"
          "_snapshot = load_snapshot(_reference, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)\n"
@@ -144,18 +149,20 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
          "if fit_batch.value:\n"
          "    _applied, _fit = get_committed()\n"
          "    set_batch(run_recipe_batch(_applied, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT))\nreturn"),
-        ("mo, get_committed, get_batch, BUNDLE_ROOT, DATA_ROOT, load_snapshot, plot_analysis_outcome, overlay_selector, log_display, axis_unit_selector, display_min, display_max, slice_axis, slice_coordinate, outcomes_table, table_csv",
+        ("mo, recipe, get_committed, get_batch, BUNDLE_ROOT, DATA_ROOT, load_snapshot, plot_analysis_outcome, overlay_selector, comparison_selector, log_display, axis_unit_selector, display_min, display_max, slice_axis, slice_coordinate, outcomes_table, table_csv",
          "_applied, _fit = get_committed()\n"
          "_snapshot = load_snapshot(_applied.input, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)\n"
          "_held = next(a for a in _snapshot.axes if a.name == slice_axis.value)\n"
          "_index = int(abs(_held.values - slice_coordinate.value).argmin())\n"
-         "fit_plot = mo.ui.plotly(plot_analysis_outcome(_snapshot, _fit, overlays=overlay_selector.value, log_y=log_display.value, axis_unit=axis_unit_selector.value, x_range=(display_min.value, display_max.value), peak_model=dict(_applied.settings).get('model', 'pseudovoigt'), plane_axis=slice_axis.value, plane_coordinate=slice_coordinate.value))\n"
+         "_comparisons = (load_snapshot((recipe.input, *recipe.batch)[i], bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT) for i in (comparison_selector.value[:4] if comparison_selector is not None else ()))\n"
+         "fit_figure = plot_analysis_outcome(_snapshot, _fit, overlays=overlay_selector.value, log_y=log_display.value, axis_unit=axis_unit_selector.value, x_range=(display_min.value, display_max.value), peak_model=dict(_applied.settings).get('model', 'pseudovoigt'), plane_axis=slice_axis.value, plane_coordinate=slice_coordinate.value, comparisons=_comparisons)\n"
+         "fit_plot = mo.ui.plotly(fit_figure)\n"
          "_batch = get_batch()\n"
          "_contexts = {ref.label: ref for ref in _applied.batch}\n"
          "_contexts[_snapshot.key.result_identity] = _snapshot\n"
          "_table = outcomes_table(_batch or [_fit], contexts=_contexts, model=dict(_applied.settings).get('model', dict(_applied.settings).get('phase_profile', dict(_applied.settings).get('profile', 'pseudovoigt' if _applied.tool in ('peak', 'phase') else 'gaussian'))), settings=_applied.settings)\n"
          "fit_csv = table_csv(_table)\n"
-         "mo.vstack([fit_plot, mo.md(_fit.message or ('Fit complete' if _fit.ok else 'Fit failed')), mo.ui.table([{'input': r.input, 'component': r.component, 'parameter': r.parameter, 'value': r.value, 'stderr': r.stderr, 'unit': r.unit, 'status': r.status, 'message': r.message} for r in _table.rows]), mo.download(fit_csv.encode('utf-8'), filename='fit-results.csv', label='Download CSV')])\nreturn fit_plot, fit_csv"),
+         "mo.vstack([fit_plot, mo.md(_fit.message or ('Fit complete' if _fit.ok else 'Fit failed')), mo.ui.table([{'input': r.input, 'component': r.component, 'parameter': r.parameter, 'value': r.value, 'stderr': r.stderr, 'unit': r.unit, 'status': r.status, 'message': r.message} for r in _table.rows]), mo.download(fit_csv.encode('utf-8'), filename='fit-results.csv', label='Download CSV')])\nreturn fit_figure, fit_plot, fit_csv"),
     ]
     document = "import marimo\n\n__generated_with = '0.25.0'\napp = marimo.App(width='full')\n"
     for parameters, body in cells:

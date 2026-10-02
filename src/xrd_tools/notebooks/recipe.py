@@ -29,12 +29,15 @@ class FitNotebookRecipe:
     # Native->Cartesian transform for HKL region fits, explicit primitive rows; no inferred lattice metric.
     reciprocal_transform: tuple[tuple[float, ...], ...] | None = None
     orthonormal: bool = False
+    trend_column: str = ""
 
     def __post_init__(self):
         if self.tool not in {"peak", "phase", "region2d", "region3d"}:
             raise ValueError("notebook tool is peak, phase, region2d or region3d")
         if type(self.input) not in {SnapshotReference, SourceReference} or type(self.title) is not str:
             raise TypeError("notebook input is a snapshot/source reference and title is text")
+        if type(self.trend_column) is not str:
+            raise TypeError("a notebook trend column is text")
         pairs = self.settings.items() if type(self.settings) is dict else self.settings
         settings = tuple((name, _plain(value)) for name, value in pairs)
         if any(type(name) is not str for name, _ in settings) or len(dict(settings)) != len(settings):
@@ -54,7 +57,8 @@ def recipe_to_json(recipe: FitNotebookRecipe) -> str:
     return json.dumps({"schema": "fit-notebook-recipe-v1", "tool": recipe.tool, "input": reference(recipe.input),
                        "settings": dict(recipe.settings), "batch": [reference(item) for item in recipe.batch],
                        "title": recipe.title, "reciprocal_transform": recipe.reciprocal_transform,
-                       "orthonormal": recipe.orthonormal}, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+                       "orthonormal": recipe.orthonormal, "trend_column": recipe.trend_column},
+                      ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
 def recipe_from_json(text: str) -> FitNotebookRecipe:

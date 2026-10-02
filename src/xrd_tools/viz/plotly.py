@@ -593,12 +593,13 @@ def convert_analysis_axis(snapshot, values, axis_unit=None):
 
 def plot_analysis_outcome(snapshot, outcome=None, *, overlays=("fit", "background", "residual"),
                           log_y=False, x_range=None, height=550, axis_unit=None, peak_model="pseudovoigt",
-                          plane_axis=None, plane_index=None, plane_coordinate=None):
+                          plane_axis=None, plane_index=None, plane_coordinate=None, comparisons=()):
     """A public analyzer outcome on its admitted native axis; signed residuals stay linear.
 
     The shared notebook hosts call this model (Jupyter wraps it in FigureWidget, marimo in mo.ui.plotly).
     Region inputs use the solver's bounded central projection instead of sending a whole volume to a browser.
     Presentation bounds and log intensity never modify the input or scientific fit bounds.
+    Hosts may lazily supply bounded one-dimensional comparisons; each uses its own admitted coordinate receipt.
     """
     go = _import_go()
     from plotly.subplots import make_subplots
@@ -680,6 +681,9 @@ def plot_analysis_outcome(snapshot, outcome=None, *, overlays=("fit", "backgroun
                 fig.add_trace(go.Scattergl(x=convert(overlay.x), y=component, name=prefix.rstrip("_"), mode="lines"), row=1, col=1)
         for center in convert(overlay.markers):
             fig.add_vline(x=center, line_dash="dot", line_width=1, row=1, col=1)
+    for other in comparisons:
+        fig.add_trace(go.Scattergl(x=convert_analysis_axis(other, other.axes[0].values, target_unit),
+                                   y=other.fitted_values(), mode="lines", name=other.key.result_identity), row=1, col=1)
     fig.update_yaxes(title_text="Intensity", type="log" if log_y else "linear", row=1, col=1)
     if show_residual:
         fig.update_yaxes(title_text="data − model", type="linear", row=2, col=1)
