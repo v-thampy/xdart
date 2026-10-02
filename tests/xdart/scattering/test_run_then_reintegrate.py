@@ -35,6 +35,33 @@ from tests.xdart.scattering.test_p1b_output_graph import (
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardEventKind
 
 
+@pytest.mark.parametrize('unit', ['q_A^-1', '2th_deg'])
+def test_real_run_uses_metadata_energy_with_effective_persisted_calibration(tmp_path, unit):
+    from xrd_tools.sources import image_series_spec
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.io import open_scan
+    from xrd_tools.core.provenance import read_provenance
+    raw = tmp_path / 'energy_0001.tif'
+    _write_tiff(raw, 1)
+    raw.with_suffix('.txt').write_text('# Counters\nI0 = 1\n# Motors\nenergy = 16000\n'
+        'User: energy, time: Mon Jan 15 10:30:00 2024  # Temp\n')
+    poni = tmp_path / 'cal.poni'
+    write_poni(poni)
+    intent = _intent(raw, tmp_path / 'energy.nexus', poni)
+    intent.source_spec = image_series_spec(raw, metadata_format='txt')
+    intent.bai_1d_args['unit'] = unit
+    executor, identity, events = _run_to_terminal(intent, request_value=9102)
+    terminal = next(event for event in events if event.kind in _TERMINAL)
+    assert terminal.kind is StandardEventKind.FINISHED, terminal.primary
+    executor.close(identity)
+    artifact = written(tmp_path / 'energy.nexus', 'Int 1D')
+    assert open_scan(artifact).metadata['wavelength_A'] == pytest.approx(
+        energy_eV_to_wavelength_m(16000.) * 1e10)
+    selection = read_provenance(artifact)['config']['energy_selection']
+    assert selection['source'] == 'metadata'
+    assert selection['energy_eV'] == pytest.approx(16000.)
+
+
 def test_a_real_run_output_carries_what_reintegrate_requires(tmp_path: Path) -> None:
     from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR
     from xrd_tools.reduction import ReintegrateSuccessorPlan

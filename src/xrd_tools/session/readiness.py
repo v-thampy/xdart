@@ -1065,8 +1065,45 @@ def execution_plan_values(
     }
 
 
+def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=None,
+                                  metadata_energy_eV=()):
+    """Bind already-read source metadata to a new Int scan, without loading pixels.
+
+    Explicitly called by new Run/replay only; persisted and Reintegrate scans retain
+    their existing interpretation. The returned calibration is an effective copy.
+    """
+    from dataclasses import replace
+    from xrd_tools.core.energy import resolve_acquisition_energy, wavelength_m_to_energy_eV
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    energies = list(metadata_energy_eV)
+    for frame in scan.frames:
+        row = {str(key).casefold(): value for key, value in frame.metadata.items()}
+        if 'energy' in row:
+            energies.append(row['energy'])  # SPEC and metadata-provider motor energy: eV
+        else:
+            for name, factor in (('wavelength_m', 1.), ('wavelength_a', 1e-10)):
+                if name in row:
+                    energies.append(wavelength_m_to_energy_eV(float(row[name]) * factor))
+    if metadata_wavelength_A is not None:
+        energies.append(wavelength_m_to_energy_eV(float(metadata_wavelength_A) * 1e-10))
+    selection = resolve_acquisition_energy(calibration.poni.wavelength, energies)
+    if selection['disagreement']:
+        logger.warning('X-ray energy mismatch: metadata=%.1f eV, PONI=%.1f eV; using metadata',
+                       selection['source_energy_eV'], selection['calibration_energy_eV'])
+    wavelength = selection['wavelength_m']
+    if wavelength is not None:
+        calibration = replace(calibration, poni=replace(calibration.poni, wavelength=wavelength))
+    scan.poni = calibration.poni
+    scan.integrator = detector_calibration_to_integrator(calibration)
+    scan.wavelength = None if wavelength is None else wavelength * 1e10
+    scan.energy = None if selection['energy_eV'] is None else selection['energy_eV'] / 1000
+    scan.extra = {**scan.extra, 'energy_selection': selection}
+    return calibration
+
+
 def native_int_reduction_plan(
     configuration: FrozenRunConfiguration, *, companion_modes_2d: bool = False,
+    energy_selection: Mapping[str, Any] | None = None,
 ):
     """Translate one frozen Controls configuration into its mask-free plan.
 
@@ -1085,6 +1122,10 @@ def native_int_reduction_plan(
     )
 
     one, two, values = execution_plan_values(configuration)
-    return build_native_int_reduction_plan_from_args(
+    plan = build_native_int_reduction_plan_from_args(
         one, two, declare_companion_modes_2d=companion_modes_2d, **values,
     )
+    if energy_selection is not None:
+        from dataclasses import replace
+        plan = replace(plan, extra={**plan.extra, 'energy_selection': dict(energy_selection)})
+    return plan

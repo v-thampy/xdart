@@ -1,6 +1,10 @@
 """X-ray energy ↔ wavelength conversion — one canonical place.
 
-**The canonical energy source for an experiment is the calibration wavelength**
+New acquisition plans select valid scan metadata before the calibration wavelength.
+Persisted results keep their recorded wavelength. Existing fitted-energy offsets
+are separate from the acquisition energy.
+
+**Legacy calibration consumers use the calibration wavelength**
 (it persists under ``/entry/diffractometer`` and feeds the pyFAI integrators).
 ``RSMPlan.energy`` and ``GICorrectionStack.energy_eV`` are conveniences that must
 be **consistent** with it — :func:`check_energy_consistency` warns on divergence
@@ -27,6 +31,7 @@ __all__ = [
     "wavelength_m_to_energy_eV",
     "calibration_recorded_energy_eV",
     "check_energy_consistency",
+    "resolve_acquisition_energy",
     # X1 Slice 3a0 (R3-P1): the one headless wavelength vocabulary.
     "WavelengthUnit",
     "canonical_wavelength_m",
@@ -141,6 +146,52 @@ def energy_eV_to_wavelength_m(energy_eV: float) -> float:
 def wavelength_m_to_energy_eV(wavelength_m: float) -> float:
     """X-ray wavelength (m) → energy (eV)."""
     return _HC_EV_M / float(wavelength_m)
+
+
+def resolve_acquisition_energy(calibration_wavelength_m, metadata_energy_eV=(), *,
+                               fitted_source_energy_eV=None) -> dict:
+    """Freeze one acquisition energy and its explicit fitted correction, without I/O.
+
+    Metadata values must be positive, finite and common within the existing 0.1 %
+    source-energy tolerance. An empty sequence selects the calibration fallback.
+    The calibration itself remains immutable.
+    """
+    values = []
+    for value in metadata_energy_eV:
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError("metadata energy must be finite and positive")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("metadata energy must be finite and positive") from error
+        if not np.isfinite(number) or number <= 0:
+            raise ValueError("metadata energy must be finite and positive")
+        values.append(number)
+    if values and any(abs(value - values[0]) > .001 * values[0] for value in values):
+        raise ValueError("metadata energy must be common across selected frames")
+    wavelength = canonical_wavelength_m(calibration_wavelength_m, WavelengthUnit.METRE)
+    calibration = None if wavelength is None else wavelength_m_to_energy_eV(wavelength)
+    if fitted_source_energy_eV is not None and calibration is None:
+        raise ValueError('a fitted energy offset requires a positive calibration wavelength')
+    offset = 0. if fitted_source_energy_eV is None else calibration - float(fitted_source_energy_eV)
+    base = values[0] if values else (calibration if fitted_source_energy_eV is None
+                                   else float(fitted_source_energy_eV))
+    effective = None if base is None else base + offset
+    if effective is not None and (not np.isfinite(effective) or effective <= 0):
+        raise ValueError("effective acquisition energy must be finite and positive")
+    reference = calibration if fitted_source_energy_eV is None else float(fitted_source_energy_eV)
+    disagreement = bool(values and reference is not None and abs(base - reference) > .001 * reference)
+    # Retain the exact accepted wavelength for the fallback and unchanged energy.
+    # A hc/(hc/wavelength) round trip can otherwise move it by one ulp.
+    if not values or effective == calibration:
+        effective, selected_wavelength = calibration, wavelength
+    else:
+        selected_wavelength = None if effective is None else energy_eV_to_wavelength_m(effective)
+    return {"source": "metadata" if values else "calibration", "source_energy_eV": base,
+            "calibration_energy_eV": calibration, "fitted_energy_offset_eV": offset,
+            "energy_eV": effective,
+            "wavelength_m": selected_wavelength,
+            "disagreement": disagreement}
 
 
 def calibration_recorded_energy_eV(record) -> float | None:
