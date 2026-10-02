@@ -70,7 +70,6 @@ _DEBT: dict[str, dict[str, int]] = {
         "QComboBox": 3, "QFileDialog.getOpenFileName": 1, "QFileDialog.getOpenFileNames": 1,
         "QLineEdit": 2, "QListWidget": 1, "QSpinBox": 1,
     },
-    "analysis/plot_axes.py": {"PlotDataItem": 1},
     "analysis/roi_select_dialog.py": {
         "ColorBarItem": 1, "ImageItem": 1, "PlotWidget": 1, "QCheckBox": 2, "QComboBox": 2, "QLineEdit": 1,
         "QListWidget": 1, "getFromMatplotlib": 1,
