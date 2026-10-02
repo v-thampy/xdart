@@ -637,18 +637,19 @@ def test_p3_1a_no_calibration_mask_crosses_legacy_floor_without_promotion(
     assert len(accepted.mask_bytes) == np.prod(shape)
     assert accepted.mask_bytes[0] == 1
 
+    from xrd_tools.session import scientific_assets as asset_module
     tiny = tmp_path / "declared-too-large.edf"
     tiny.write_bytes(b"header")
     intent.mask_file = str(tiny)
     monkeypatch.setattr(
-        preflight_module,
+        asset_module,
         "read_detector_image_layout",
         lambda _path: DetectorImageLayout(
             (16385, 16385), np.dtype(np.uint8).str, 1,
         ),
     )
     monkeypatch.setattr(
-        preflight_module,
+        asset_module,
         "load_mask",
         lambda *_args, **_kwargs: pytest.fail(
             "oversize declared layout reached pixel decode"

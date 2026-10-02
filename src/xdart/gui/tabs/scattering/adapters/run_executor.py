@@ -99,59 +99,12 @@ _LIVE_DIRECTORY_POLL_S = 0.1
 _SOURCE_SUBMISSION_END = object()
 
 
-def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
-                                      *, cancelled, retryable=False,
-                                      frame_fact=None, capsule_owner=None) -> bool:
-    """The sole immediate-pre-submit Background array insertion seam."""
-    if type(plan) is not FrameBackgroundPlan: raise TypeError("Background plan must be exact")
-    frame.background = None; frame.background_dependency_bytes = None
-    frame.background_dependency_fingerprint = None
-    if plan.mode == "None": return True
-    fact = binding[1] if binding is not None else frame_fact
-    if fact is None: raise RuntimeError("Background resolution lost its frame fact")
-    prepared = (
-        None
-        if capsule_owner is None
-        else getattr(capsule_owner, "background_capsule", None)
-    )
-    result = (
-        _rebind_single_frame_background(
-            prepared, plan, fact, cancelled=cancelled,
-        )
-        if type(prepared) is _PreparedSingleFrameBackground
-        else _rebind_series_frame_background(
-            prepared, plan, fact, cancelled=cancelled,
-        )
-        if type(prepared) is _PreparedSeriesFrameBackground
-        else None
-    )
-    candidate = None
-    if result is None:
-        if capsule_owner is not None:
-            capsule_owner.background_capsule = None
-        if capsule_owner is not None and plan.mode == "Series Average":
-            # resolved once a run: later frames rebind it after a stat proof (BG-SERIES-REREAD)
-            with series_capsule_requested({}) as requested:
-                result = resolve_frame_background(plan, fact, cancelled=cancelled)
-            candidate = requested.get("series")
-        else:
-            result = resolve_frame_background(plan, fact, cancelled=cancelled)
-            candidate = _prepare_single_frame_background(plan, fact, result)
-    if result.disposition == "RETRYABLE" and retryable: return False
-    if result.disposition == "CANCELLED": raise RuntimeError("admission cancelled")
-    if result.disposition != "RESOLVED" or result.background is None:
-        raise SourceRevisionChanged("Background dependency is not presently resolvable")
-    pair = result.descriptor_bytes, result.fingerprint
-    if binding is not None:
-        if pair != binding[2:]: raise SourceRevisionChanged("Background dependency changed after qualification")
-        pair = binding[2], binding[3]
-    if candidate is not None and capsule_owner is not None:
-        capsule_owner.background_capsule = candidate
-    frame.background = result.background
-    frame.background_variance_factor = result.variance_factor
-    frame.background_scale = result.scale
-    frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
-    return True
+def _resolve_background_before_submit(frame, plan, binding, *, cancelled,
+                                      retryable=False, frame_fact=None, capsule_owner=None):
+    from xrd_tools.reduction.background import resolve_background_before_submit
+    return resolve_background_before_submit(frame, plan, binding, cancelled=cancelled,
+        retryable=retryable, frame_fact=frame_fact, capsule_owner=capsule_owner,
+        resolver=resolve_frame_background)
 
 
 def _qualify_background_bindings(configuration, scan, item, decision, policy,

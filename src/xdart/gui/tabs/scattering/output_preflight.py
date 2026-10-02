@@ -656,28 +656,7 @@ def inspect_output(
     )
 
 
-def _background_frame_fact(frame, plan, shape, selector=None) -> tuple[object, ...]:
-    """Freeze one bounded, array-free target fact for Background qualification."""
-    path = str(Path(frame.source_path).resolve(strict=False))
-    keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
-    items = []
-    for key in keys:
-        matches = (value for name, value in frame.metadata.items() if type(name) is str and name.casefold() == key.casefold())
-        value = next(matches, items)
-        if value is items or next(matches, items) is not items: raise ValueError("target Background metadata is absent or ambiguous")
-        value = value.item() if isinstance(value, np.generic) else value
-        if type(value) is bool: tagged = ("bool", value)
-        elif isinstance(value, (int, float)) and not isinstance(value, bool) and (not isinstance(value, int) or abs(value) <= float.fromhex("0x1.fffffffffffffp+1023")) and np.isfinite(numeric := float(value)):
-            tagged = ("number", numeric.hex())
-        elif type(value) is str and len(value) <= 4085 and len(value.encode("utf-8")) <= 4085: tagged = ("text", value)
-        elif type(value) is bytes and len(value) <= 2042: tagged = ("bytes", value.hex())
-        else: raise ValueError("target Background metadata scalar is unsupported")
-        if len(json.dumps(tagged, separators=(",", ":")).encode()) > 4096: raise ValueError("target Background scalar exceeds cap")
-        items.append((key, tagged))
-    fact = (int(frame.index), path, selector, int(frame.source_frame_index or 0), tuple(shape), tuple(items))
-    if len(json.dumps(fact, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) > 24_576:
-        raise ValueError("target Background frame fact exceeds cap")
-    return fact
+from xrd_tools.reduction.background import background_frame_fact as _background_frame_fact
 
 
 def _merge_background_binding(bindings, binding, *, limit: int):
@@ -697,44 +676,10 @@ def _merge_background_binding(bindings, binding, *, limit: int):
     return tuple(sorted((*bindings, binding), key=lambda value: value[0]))
 
 
-def _background_resource_terms(plan, pixels: int) -> tuple[int, int, int, int]:
-    from xrd_tools.reduction import FrameBackgroundPlan
-    if type(plan) is not FrameBackgroundPlan or type(pixels) is not int or pixels <= 0:
-        raise TypeError("Background resource inputs are not exact")
-    if plan.mode == "None": return 0, 0, 0, 0
-    return 8 * pixels, (25 if plan.mode == "Series Average" else 8) * pixels, \
-        8 * pixels, 64 * 1024 ** 2
+from xrd_tools.reduction.background import background_resource_terms as _background_resource_terms
 
 
-def _directory_candidate_groups(
-    plan: RunCandidatePlan,
-) -> tuple[tuple[Candidate, ...], ...]:
-    groups: list[tuple[Candidate, ...]] = []
-    consumed: set[Path] = set()
-    for candidate in plan.candidates:
-        if candidate.path in consumed:
-            continue
-        adapter = get_adapter(candidate.adapter_id)
-        if adapter is None:
-            raise ValueError(
-                f"directory candidate lost adapter {candidate.adapter_id!r}"
-            )
-        if SourceKind.IMAGE_FILE in adapter.kinds:
-            name = adapter.scan_name(candidate.path)
-            members = tuple(
-                value
-                for value in plan.candidates
-                if (
-                    value.adapter_id == candidate.adapter_id
-                    and value.path.parent == candidate.path.parent
-                    and adapter.scan_name(value.path) == name
-                )
-            )
-        else:
-            members = (candidate,)
-        consumed.update(value.path for value in members)
-        groups.append(members)
-    return tuple(groups)
+from xrd_tools.sources.run_plan import directory_candidate_groups as _directory_candidate_groups
 
 
 def _save_path_is_directory(path: Path) -> bool:
@@ -1973,60 +1918,10 @@ def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
     return source_snapshots_projection(
         item.graph, writer=False
     )
-def execution_plan_values(
-    configuration: FrozenRunConfiguration,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    threshold, gi = configuration.threshold, configuration.gi
-    one, two = configuration.bai_1d_args, configuration.bai_2d_args
-    if gi.enabled:
-        one["gi_mode_1d"], two["gi_mode_2d"] = gi.mode_1d, gi.mode_2d
-    manual = gi.enabled and gi.effective_motor == "Manual"
-    return one, two, {
-        "gi_enabled": gi.enabled,
-        "gi_incident_angle": gi.th_val if manual else None,
-        "incidence_motor": gi.effective_motor if gi.enabled and not manual else None,
-        "tilt_angle": gi.tilt_angle, "sample_orientation": gi.sample_orientation,
-        "integrate_1d": True,
-        "integrate_2d": not (
-            "Viewer" not in configuration.processing_mode
-            and "1D" in configuration.processing_mode
-            and "2D" not in configuration.processing_mode
-        ),
-        "threshold_min": (
-            threshold.threshold_min if threshold.apply_threshold else None
-        ),
-        "threshold_max": (
-            threshold.threshold_max if threshold.apply_threshold else None
-        ),
-        "mask_saturation": threshold.mask_saturation,
-        # the source's resolved ceiling (decision 39); absent: the data type's rule
-        "saturation": threshold.saturation,
-    }
+from xrd_tools.session.readiness import execution_plan_values
 
 
-def native_int_reduction_plan(
-    configuration: FrozenRunConfiguration, *, companion_modes_2d: bool = False,
-):
-    """Translate one frozen Controls configuration into its mask-free plan.
-
-    *companion_modes_2d* is set only by an ordinary Run: it alone integrates the
-    GI companion map the "Q-χ + Qip-Qoop" choice selects.  Average and the XYE
-    naming lookup stay single-mode.
-
-    Scientific assets are admitted independently of control intent. The
-    ordinary run path attaches its already-authenticated detector mask after
-    this pure translation; Average keeps the mask in its calibration state so
-    it can apply the accepted static mask while accumulating detector pixels.
-    """
-
-    from xrd_tools.session.readiness import (
-        build_native_int_reduction_plan_from_args,
-    )
-
-    one, two, values = execution_plan_values(configuration)
-    return build_native_int_reduction_plan_from_args(
-        one, two, declare_companion_modes_2d=companion_modes_2d, **values,
-    )
+from xrd_tools.session.readiness import native_int_reduction_plan
 def _validate_targets(
     configuration: FrozenRunConfiguration | OutputCandidate,
     source: SourceSpec | DirectorySourceSpec,
@@ -2073,421 +1968,29 @@ def _validate_targets(
             recursive=bool(getattr(source, "recursive", False)),
             container_directory_mode=type(source) is DirectorySourceSpec,
         )
-def _load_scientific_assets(
-    intent: RunIntent,
-    *,
-    cancelled: Callable[[], bool] = _not_cancelled,
-) -> AcceptedScientificAssets:
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    calibration, poni_digest = _load_stable_asset(
-        intent.poni_file,
-        lambda path, data: load_poni(path, data=data)
-        if load_poni is load_detector_calibration else load_poni(path),
-        max_bytes=1 << 20,
-    )
-    # The optional v3 override is absent from legacy intent projections and
-    # helper-owned, RunIntent-compatible views.
-    override = getattr(intent, "poni_v3_override", None)
-    if override is not None:
-        if calibration is None:
-            raise ValueError(
-                "an enabled PONI v3 override requires a selected PONI"
-            )
-        calibration = apply_sensor_parallax(
-            calibration,
-            material=override.material,
-            thickness_m=override.thickness_m,
-            parallax=override.parallax,
-        )
-    mask, mask_digest = _load_stable_mask_asset(
-        intent.mask_file, calibration, cancelled=cancelled,
-    )
-    detector = (
-        _detector_facts(calibration)
-        if getattr(intent, "flat_file", "") or getattr(intent, "dark_file", "") else None
-    )
-    flat, flat_digest, flat_warnings = _load_stable_correction_asset(
-        getattr(intent, "flat_file", ""), "flat", cancelled=cancelled, detector=detector,
-        min_fraction=getattr(intent, "flat_min_fraction", DEFAULT_MIN_FLAT_FRACTION),
-    )
-    dark, dark_digest, dark_warnings = _load_stable_correction_asset(
-        getattr(intent, "dark_file", ""), "dark", cancelled=cancelled, detector=detector,
-    )
-    poni = None if calibration is None else calibration.poni
-    poni_values = None if poni is None else (
-        float(poni.dist), float(poni.poni1), float(poni.poni2), float(poni.rot1),
-        float(poni.rot2), float(poni.rot3), float(poni.wavelength),
-        str(poni.detector),
-    )
-    accepted = (
-        None if mask is None
-        else np.ascontiguousarray(mask, dtype=bool)
-    )
-    config_json = None if calibration is None else json.dumps(
-        dict(calibration.detector_config), sort_keys=True, separators=(",", ":"),
-        allow_nan=False,
-    )
-    return AcceptedScientificAssets(
-        poni_values, None if accepted is None else accepted.dtype.str,
-        None if accepted is None else tuple(accepted.shape),
-        None if accepted is None else accepted.tobytes(),
-        poni_digest, mask_digest, config_json,
-        None if calibration is None else calibration.parallax,
-        flat_shape=None if flat is None else tuple(int(v) for v in flat.shape),
-        flat_bytes=None if flat is None else flat.tobytes(),
-        flat_sha256=flat_digest,
-        dark_shape=None if dark is None else tuple(int(v) for v in dark.shape),
-        dark_bytes=None if dark is None else dark.tobytes(),
-        dark_sha256=dark_digest,
-        correction_warnings=flat_warnings + dark_warnings,
-    )
-def _scientific_mask_layout(path: Path) -> tuple[tuple[int, int], np.dtype]:
-    if path.suffix.casefold() == ".npy":
-        value = np.load(path, allow_pickle=False, mmap_mode="r")
-        try:
-            shape = tuple(value.shape)
-            dtype = np.dtype(value.dtype)
-        finally:
-            mapping = getattr(value, "_mmap", None)
-            if mapping is not None:
-                mapping.close()
-        frame_count = 1
-    else:
-        layout = read_detector_image_layout(path)
-        shape, dtype, frame_count = (
-            tuple(layout.shape), np.dtype(layout.dtype), layout.frame_count,
-        )
-    if (
-        len(shape) != 2 or any(type(value) is not int or value <= 0 for value in shape)
-        or frame_count != 1 or dtype.kind not in "biuf" or dtype.itemsize > 8
-        or int(shape[0]) * int(shape[1]) * dtype.itemsize
-        > _SCIENTIFIC_MASK_MAX_DECODED_BYTES
-    ):
-        raise ValueError(f"scientific mask schema is unsupported: {path}")
-    return (int(shape[0]), int(shape[1])), dtype
-def _scientific_mask_file_limit(
-    calibration: object | None,
-) -> int:
-    shape = None
-    config = getattr(calibration, "detector_config", None)
-    if isinstance(config, dict) or hasattr(config, "get"):
-        shape = config.get("max_shape")
-        if shape is None:
-            shape = config.get("shape")
-    valid = (
-        type(shape) in {tuple, list}
-        and len(shape) == 2
-        and all(type(value) is int and value > 0 for value in shape)
-    )
-    if valid:
-        pixels = int(shape[0]) * int(shape[1])
-        itemsize = 8
-        if pixels * itemsize > _SCIENTIFIC_MASK_MAX_DECODED_BYTES:
-            raise ValueError("calibration mask shape exceeds the decoded limit")
-    else:
-        pixels = _SCIENTIFIC_MASK_MAX_DECODED_BYTES
-        itemsize = 1
-    return max(
-        _SCIENTIFIC_MASK_COMPATIBILITY_FLOOR_BYTES,
-        itemsize * pixels + _SCIENTIFIC_MASK_HEADER_ALLOWANCE_BYTES,
-    )
-def _asset_state(path: Path) -> tuple[int, ...]:
-    state = path.stat()
-    return (
-        state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
-        state.st_dev, state.st_ino,
-    )
-def _asset_descriptor_state(stream: object) -> tuple[int, ...]:
-    # Compared against the pathname view above: ctime on the win32 seam.
-    state = os.fstat(stream.fileno())
-    return (
-        state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
-        state.st_dev, state.st_ino,
-    )
-def _stream_asset(
-    path: Path, *, target: Path | None = None, max_bytes: int,
-    cancelled: Callable[[], bool] = _not_cancelled,
-) -> tuple[tuple[int, ...], str]:
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    digest = hashlib.sha256()
-    total = 0
-    output = None if target is None else target.open("xb")
-    try:
-        try:
-            stream = path.open("rb")
-        except FileNotFoundError:
-            raise
-        with stream:
-            opened = _asset_descriptor_state(stream)
-            try:
-                before = _asset_state(path)
-            except FileNotFoundError as exc:
-                raise ValueError(
-                    f"scientific asset changed while admitted: {path}"
-                ) from exc
-            if before != opened:
-                raise ValueError(
-                    f"scientific asset changed while admitted: {path}"
-                )
-            while True:
-                if cancelled():
-                    raise RuntimeError("admission cancelled")
-                payload = stream.read(_SCIENTIFIC_ASSET_STREAM_CHUNK_BYTES)
-                if not payload:
-                    break
-                total += len(payload)
-                if total > max_bytes:
-                    raise ValueError(
-                        f"scientific asset exceeds {max_bytes} bytes: {path}"
-                    )
-                digest.update(payload)
-                if output is not None:
-                    output.write(payload)
-            finished = _asset_descriptor_state(stream)
-    finally:
-        if output is not None:
-            output.close()
-    try:
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        after = _asset_state(path)
-    except FileNotFoundError as exc:
-        raise ValueError(
-            f"scientific asset changed while admitted: {path}"
-        ) from exc
-    if after != before or finished != opened:
-        raise ValueError(f"scientific asset changed while admitted: {path}")
-    return before, digest.hexdigest()
-def _load_stable_mask_asset(
-    path_text: object, calibration: object | None,
-    *,
-    cancelled: Callable[[], bool] = _not_cancelled,
-) -> tuple[object | None, str | None]:
-    if type(path_text) is not str or not path_text:
-        return None, None
-    path = Path(path_text)
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    try:
-        limit = _scientific_mask_file_limit(calibration)
-    except FileNotFoundError:
-        return None, None
-    with tempfile.TemporaryDirectory(prefix="xdart-mask-preflight-") as root:
-        snapshot = Path(root) / ("mask" + path.suffix)
-        try:
-            before_state, before_digest = _stream_asset(
-                path, target=snapshot, max_bytes=limit,
-                cancelled=cancelled,
-            )
-        except FileNotFoundError:
-            return None, None
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        shape, dtype = _scientific_mask_layout(snapshot)
-        snapshot_limit = max(
-            _SCIENTIFIC_MASK_COMPATIBILITY_FLOOR_BYTES,
-            int(shape[0]) * int(shape[1]) * int(dtype.itemsize)
-            + _SCIENTIFIC_MASK_HEADER_ALLOWANCE_BYTES,
-        )
-        if snapshot.stat().st_size > snapshot_limit:
-            raise ValueError(f"scientific mask schema is unsupported: {path}")
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        value = load_mask(snapshot)
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        try:
-            after_state, after_digest = _stream_asset(
-                path, max_bytes=limit, cancelled=cancelled,
-            )
-        except FileNotFoundError as exc:
-            raise ValueError(
-                f"scientific asset changed while admitted: {path}"
-            ) from exc
-    if after_state != before_state or after_digest != before_digest:
-        raise ValueError(f"scientific asset changed while admitted: {path}")
-    if value.dtype != np.dtype(bool) or tuple(value.shape) != shape:
-        raise ValueError(f"scientific mask schema is unsupported: {path}")
-    return value, before_digest
-def _detector_facts(calibration: object | None) -> tuple[tuple[int, int] | None, np.ndarray | None] | None:
-    """The calibrated detector's shape and own mask (gaps), or None when unknown."""
-    if calibration is None:
-        return None
-    try:
-        from xrd_tools.integrate.calibration import detector_calibration_to_integrator
-        detector = detector_calibration_to_integrator(calibration).detector
-        shape = None if detector.shape is None else tuple(int(v) for v in detector.shape)
-        mask = detector.mask
-    except Exception:  # noqa: BLE001 - an unknown detector only skips the checks
-        _LOG.debug("detector facts unavailable for the correction checks", exc_info=True)
-        return None
-    return shape, (None if mask is None else np.asarray(mask, dtype=bool))
+def _load_scientific_assets(intent, *, cancelled=_not_cancelled):
+    # Preserve this public preflight seam, including traced calibration loaders.
+    from xrd_tools.session.scientific_assets import load_scientific_assets
+    return load_scientific_assets(intent, cancelled=cancelled, calibration_loader=load_poni)
+from xrd_tools.session.scientific_assets import _scientific_mask_layout
+from xrd_tools.session.scientific_assets import _scientific_mask_file_limit
+from xrd_tools.session.scientific_assets import _asset_state
+from xrd_tools.session.scientific_assets import _asset_descriptor_state
+from xrd_tools.session.scientific_assets import _stream_asset
+from xrd_tools.session.scientific_assets import _load_stable_mask_asset
+from xrd_tools.session.scientific_assets import _detector_facts
 
 
-def _read_correction_image(path: Path, name: str) -> np.ndarray:
-    """Decode one dark or flat-field image, refusing anything but one 2-D image."""
-    try:
-        _scientific_mask_layout(path)
-    except ValueError as exc:
-        raise ValueError(f"the {name} must be one 2-D image: {path}") from exc
-    return (np.load(path, allow_pickle=False) if path.suffix.casefold() == ".npy"
-            else read_image(path))
+from xrd_tools.session.scientific_assets import _read_correction_image
 
 
-def inspect_detector_correction(
-    poni_file: str, path_text: str, role: str,
-    min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
-    cache: dict | None = None,
-) -> DetectorImageCheck:
-    """Check a dark or flat-field file before a run: for the Advanced dialog.
-
-    Uses the selected PONI's detector for the shape and gap checks when one is set.
-    ``cache`` (owned by the caller, e.g. for one dialog session) keeps the last
-    decoded image per role, so a cutoff change does not re-read the file.
-    """
-    name = "flat field" if role == "flat" else "dark"
-    path = Path(path_text)
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return DetectorImageCheck(role, (), errors=(f"the {name} file does not exist",))
-    except OSError as exc:
-        return DetectorImageCheck(role, (), errors=(str(exc),))
-    key = (str(path), stat.st_mtime_ns, stat.st_size, str(poni_file))
-    loaded = None if cache is None else cache.get(role)
-    if loaded is None or loaded[0] != key:
-        try:
-            raw = _read_correction_image(path, name)
-        except FileNotFoundError:
-            return DetectorImageCheck(role, (), errors=(f"the {name} file does not exist",))
-        except (OSError, ValueError) as exc:
-            return DetectorImageCheck(role, (), errors=(str(exc),))
-        detector = None
-        if poni_file:
-            try:
-                detector = _detector_facts(load_poni(Path(poni_file)))
-            except Exception:  # noqa: BLE001 - an unreadable PONI only skips the checks
-                detector = None
-        loaded = (key, raw, detector)
-        if cache is not None:
-            cache[role] = loaded
-    _key, raw, detector = loaded
-    shape, mask = (None, None) if detector is None else detector
-    return check_detector_image(raw, role, detector_shape=shape, detector_mask=mask,
-                                min_fraction=min_fraction)
+from xrd_tools.session.scientific_assets import inspect_detector_correction
 
 
-def _load_stable_correction_asset(
-    path_text: object,
-    role: str,
-    *,
-    cancelled: Callable[[], bool] = _not_cancelled,
-    min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
-    detector: tuple[tuple[int, int] | None, np.ndarray | None] | None = None,
-) -> tuple[np.ndarray | None, str | None, tuple[str, ...]]:
-    """Admit a flat field or dark: one bounded 2-D image, prepared, stable while read.
-
-    A missing file is refused, not skipped: dropping a requested correction
-    would change the science silently. So is an image that does not match the
-    calibrated detector; warnings (see ``check_detector_image``) are returned.
-    """
-    if type(path_text) is not str or not path_text:
-        return None, None, ()
-    from xrd_tools.corrections import prepare_dark, prepare_flatfield
-    name = "flat field" if role == "flat" else "dark"
-    path = Path(path_text)
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    with tempfile.TemporaryDirectory(prefix=f"xdart-{role}-preflight-") as root:
-        snapshot = Path(root) / (role + path.suffix)
-        try:
-            before_state, before_digest = _stream_asset(
-                path, target=snapshot, max_bytes=_SCIENTIFIC_MASK_MAX_DECODED_BYTES,
-                cancelled=cancelled,
-            )
-        except FileNotFoundError as exc:
-            raise ValueError(f"{name} file is unavailable: {path}") from exc
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        try:
-            raw = _read_correction_image(snapshot, name)
-        except ValueError as exc:
-            raise ValueError(f"the {name} must be one 2-D image: {path}") from exc
-        try:
-            prepared = (prepare_flatfield(raw, min_fraction) if role == "flat"
-                        else prepare_dark(raw))
-        except ValueError as exc:
-            raise ValueError(f"the {name} is unusable: {exc}: {path}") from exc
-        shape, mask = (None, None) if detector is None else detector
-        # One prepared copy serves the check and the admitted value.
-        check = check_detector_image(raw, role, detector_shape=shape, detector_mask=mask,
-                                     min_fraction=min_fraction, prepared=prepared)
-        if check.errors:
-            raise ValueError(f"{check.errors[0]}: {path}")
-        value = prepared.astype(np.float32)
-        del prepared, raw
-        try:
-            after_state, after_digest = _stream_asset(
-                path, max_bytes=_SCIENTIFIC_MASK_MAX_DECODED_BYTES, cancelled=cancelled,
-            )
-        except FileNotFoundError as exc:
-            raise ValueError(f"scientific asset changed while admitted: {path}") from exc
-    if after_state != before_state or after_digest != before_digest:
-        raise ValueError(f"scientific asset changed while admitted: {path}")
-    return np.ascontiguousarray(value), before_digest, check.warnings
+from xrd_tools.session.scientific_assets import _load_stable_correction_asset
 
 
-def _load_stable_asset(
-    path_text: object, loader: Callable[[Path, bytes], object],
-    *, max_bytes: int | None = None,
-) -> tuple[object | None, str | None]:
-    if type(path_text) is not str or not path_text:
-        return None, None
-    path = Path(path_text)
-    def observation() -> tuple[tuple[int, ...], bytes]:
-        try:
-            stream = path.open("rb")
-        except FileNotFoundError:
-            raise
-        with stream:
-            opened = _asset_descriptor_state(stream)
-            try:
-                state = _asset_state(path)
-            except FileNotFoundError as exc:
-                raise ValueError(
-                    f"scientific asset changed while admitted: {path}"
-                ) from exc
-            if state != opened:
-                raise ValueError(
-                    f"scientific asset changed while admitted: {path}"
-                )
-            payload = stream.read() if max_bytes is None else stream.read(max_bytes + 1)
-            finished = _asset_descriptor_state(stream)
-        if max_bytes is not None and len(payload) > max_bytes:
-            raise ValueError(f"scientific asset exceeds {max_bytes} bytes: {path}")
-        try:
-            after = _asset_state(path)
-        except FileNotFoundError as exc:
-            raise ValueError(
-                f"scientific asset changed while admitted: {path}"
-            ) from exc
-        if after != state or finished != opened:
-            raise ValueError(f"scientific asset changed while admitted: {path}")
-        return state, payload
-    try:
-        before_state, before = observation()
-    except FileNotFoundError:
-        return None, None
-    value = loader(path, before)
-    try:
-        after_state, after = observation()
-    except FileNotFoundError as exc:
-        raise ValueError(f"scientific asset changed while admitted: {path}") from exc
-    if after_state != before_state or after != before:
-        raise ValueError(f"scientific asset changed while admitted: {path}")
-    return value, hashlib.sha256(before).hexdigest()
+from xrd_tools.session.scientific_assets import _load_stable_asset
 def _lexical_key(path: Path | str) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
 

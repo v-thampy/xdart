@@ -9,7 +9,10 @@ from enum import Enum
 import logging
 import math
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from xrd_tools.session.run_configuration import FrozenRunConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -1028,4 +1031,61 @@ def build_native_int_reduction_plan_from_scan(
         mask_saturation=mask_saturation,
         detector_mask=getattr(scan, "global_mask", None),
         detector_shape=detector_shape,
+    )
+
+
+def execution_plan_values(
+    configuration: FrozenRunConfiguration,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    threshold, gi = configuration.threshold, configuration.gi
+    one, two = configuration.bai_1d_args, configuration.bai_2d_args
+    if gi.enabled:
+        one["gi_mode_1d"], two["gi_mode_2d"] = gi.mode_1d, gi.mode_2d
+    manual = gi.enabled and gi.effective_motor == "Manual"
+    return one, two, {
+        "gi_enabled": gi.enabled,
+        "gi_incident_angle": gi.th_val if manual else None,
+        "incidence_motor": gi.effective_motor if gi.enabled and not manual else None,
+        "tilt_angle": gi.tilt_angle, "sample_orientation": gi.sample_orientation,
+        "gi_exit_angle_convention": gi.gi_exit_angle_convention,
+        "integrate_1d": True,
+        "integrate_2d": not (
+            "Viewer" not in configuration.processing_mode
+            and "1D" in configuration.processing_mode
+            and "2D" not in configuration.processing_mode
+        ),
+        "threshold_min": (
+            threshold.threshold_min if threshold.apply_threshold else None
+        ),
+        "threshold_max": (
+            threshold.threshold_max if threshold.apply_threshold else None
+        ),
+        "mask_saturation": threshold.mask_saturation,
+        # the source's resolved ceiling (decision 39); absent: the data type's rule
+        "saturation": threshold.saturation,
+    }
+
+
+def native_int_reduction_plan(
+    configuration: FrozenRunConfiguration, *, companion_modes_2d: bool = False,
+):
+    """Translate one frozen Controls configuration into its mask-free plan.
+
+    *companion_modes_2d* is set only by an ordinary Run: it alone integrates the
+    GI companion map the "Q-χ + Qip-Qoop" choice selects.  Average and the XYE
+    naming lookup stay single-mode.
+
+    Scientific assets are admitted independently of control intent. The
+    ordinary run path attaches its already-authenticated detector mask after
+    this pure translation; Average keeps the mask in its calibration state so
+    it can apply the accepted static mask while accumulating detector pixels.
+    """
+
+    from xrd_tools.session.readiness import (
+        build_native_int_reduction_plan_from_args,
+    )
+
+    one, two, values = execution_plan_values(configuration)
+    return build_native_int_reduction_plan_from_args(
+        one, two, declare_companion_modes_2d=companion_modes_2d, **values,
     )
