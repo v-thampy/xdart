@@ -123,6 +123,7 @@ def _spec_column(path: Path, scan: int, column: str) -> list[float]:
     return [float(row[names.index(column)]) for row in rows]
 
 
+@pytest.mark.slow  # copies scans 42 and 43's raw frames (about 85 MB), as the sibling real-data RSM rows do
 def test_grouped_spec_rsm_result_scan_42_and_43_through_its_saved_contributors(tmp_path):
     root = _data_root()
     from xdart.gui.tools.rsm_values import (
