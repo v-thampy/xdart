@@ -70,7 +70,7 @@ def render_workflow_notebook(recipe, *, format, data_root=".", name="workflow"):
          "mo.hstack([w for w in [result_selector, comparison_selector, log_display] if w is not None])\nreturn references, result_selector, comparison_selector, log_display"),
         ("mo, references, result_selector, read_workflow_result",
          "_snapshot = read_workflow_result(references[result_selector.value]) if result_selector is not None else None\n"
-         "display_bounds = mo.ui.range_slider(start=float(_snapshot.axes[0].values.min()), stop=float(_snapshot.axes[0].values.max()), value=(float(_snapshot.axes[0].values.min()), float(_snapshot.axes[0].values.max())), label='Display range (native coordinate)') if _snapshot is not None else None\n"
+         "display_bounds = mo.ui.range_slider(start=float(_snapshot.axes[0].values.min()), stop=float(_snapshot.axes[0].values.max()), step=max(float(_snapshot.axes[0].values.max()-_snapshot.axes[0].values.min())/500, 1e-12), value=(float(_snapshot.axes[0].values.min()), float(_snapshot.axes[0].values.max())), label='Display range (native coordinate)') if _snapshot is not None else None\n"
          "mo.vstack([display_bounds]) if display_bounds is not None else None\nreturn display_bounds"),
         ("mo, references, result_selector, comparison_selector, display_bounds, log_display, read_workflow_result, plot_analysis_outcome, get_outputs",
          "if result_selector is not None:\n"
