@@ -22,7 +22,9 @@ a finished request is handed to ``done`` only if it is still the one asked for a
 one asked for again is computed again); any other is dropped. ``forget()``: what the tool shows is no longer a
 request's (a refusal, a cleared view). ``release()`` (the tool closing): forget, and drop whatever is computing when
 it returns. ``shutdown()``: the owner's close, as the page's owners close: CLEAN, or PENDING while a job runs (the
-host asks again); nothing is computed or handed over after it.
+host asks again); nothing is computed or handed over after it. Each of the three, called while ``done`` draws a
+result (the window closing as it draws), wins over the "shown" that ``done`` then returns: nothing is shown, so the
+same request asked for again is computed again (FIT-TOOLS D1a).
 
 It lives here, with the shared GUI building blocks, because ``pages/operation_owner.py`` is standard-library only
 by contract (``test_owner_is_stdlib_only_and_page_architecture_safe``) and this needs a Qt timer; it composes that
@@ -46,6 +48,8 @@ class LatestRequestOwner(QtCore.QObject):
         self._done, self._same = done, same
         self._unchanged = same if unchanged is None else unchanged
         self._wanted = self._running = self._shown = None
+        #: counts forget, release and shutdown: one inside ``done`` voids the "shown" that ``done`` returns
+        self._epoch = 0
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(int(interval_ms))
         self._timer.timeout.connect(self._poll)
@@ -85,15 +89,17 @@ class LatestRequestOwner(QtCore.QObject):
     def forget(self) -> None:
         """What the tool shows is no longer a request's result."""
         self._shown = None
+        self._epoch += 1
 
     def release(self) -> None:
         """The tool closing: nothing is shown, and a computation still running is dropped (its buffers let go)
         when it returns."""
-        self._shown = None
+        self.forget()
         self.ask(None)
 
     def shutdown(self):
         """Close the owner with the tool's host: CLEAN, or PENDING while a job still runs (the host asks again)."""
+        self._epoch += 1
         self._wanted = None
         receipt = self._owner.close()
         self._timer.stop()  # a closing owner reports nothing more; the host's next close retires it
@@ -126,7 +132,9 @@ class LatestRequestOwner(QtCore.QObject):
         if (terminal.status is not OperationTerminalStatus.CANCELLED and self._wanted is not None
                 and self._same(request, self._wanted)):  # a cancelled request asked for again is computed again
             self._wanted = None
-            self._shown = request if self._done(request, terminal) else None
+            epoch = self._epoch
+            shown = self._done(request, terminal)
+            self._shown = request if shown and epoch == self._epoch else None  # forgotten inside done: not shown
         del update, terminal  # a dropped computation's buffers go with it
         if self._wanted is not None:
             self._start()

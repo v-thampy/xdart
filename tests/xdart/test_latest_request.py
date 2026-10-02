@@ -34,12 +34,14 @@ class _Tool:
     """A tool as VolumeView and Custom Slice mount the owner: its job (held before it returns until ``release`` is
     set; it can honour its cancel event, or fail) and ``done``, recording what it is handed."""
 
-    def __init__(self, *, fail=False, honours_cancel=False):
+    def __init__(self, *, fail=False, honours_cancel=False, inside_done=None):
         from xdart.gui.widgets.latest_request import LatestRequestOwner
         self.calls, self.results, self.handed = [], [], []
         self.computed, self.release = threading.Event(), threading.Event()
         self.release.set()
         self.fail, self.honours_cancel = fail, honours_cancel
+        #: what the tool does on the owner while it draws a result (FIT-TOOLS D1a: a window closing as it draws)
+        self.inside_done = inside_done
         self.owner = LatestRequestOwner(self.job, self.done, same=lambda a, b: a == b)
 
     def job(self, request, cancel, _progress):
@@ -57,6 +59,8 @@ class _Tool:
     def done(self, request, terminal):
         payload = None if terminal.payload is None else terminal.payload.request
         self.handed.append((request, terminal.status, payload, terminal.failure_type))
+        if self.inside_done is not None:
+            self.inside_done(self.owner)
         return terminal.status is OperationTerminalStatus.RETURNED
 
     def hold(self):
@@ -155,4 +159,52 @@ def test_a_cancelled_request_asked_for_again_is_computed_again(qapp):
     _settled(tool.owner)
     assert tool.calls == ["A", "A"]
     assert tool.handed == [("A", OperationTerminalStatus.RETURNED, "A", "")]
+    tool.owner.shutdown()
+
+
+# FIT-TOOLS-2026-10 D1a (Codex's design review F8): what the tool does to the owner while ``done`` draws a result
+# wins over the "shown" that ``done`` returns.
+
+
+@pytest.mark.parametrize("inside", ("release", "forget"))
+def test_a_done_that_releases_or_forgets_does_not_suppress_the_next_identical_ask(qapp, inside):
+    """The window closes (``release``) or clears what it shows (``forget``) while it draws a result and still returns
+    "shown": nothing is shown, so asking for the same request again computes it and hands it over again."""
+    tool = _Tool(inside_done=lambda owner: getattr(owner, inside)())
+    assert tool.owner.ask("A")
+    _settled(tool.owner)
+    assert tool.owner.shown is None
+    tool.inside_done = None
+    assert tool.owner.ask("A")
+    _settled(tool.owner)
+    assert tool.calls == ["A", "A"] and [request for request, *_rest in tool.handed] == ["A", "A"]
+    assert tool.owner.shown == "A"
+    tool.owner.shutdown()
+
+
+def test_a_done_that_shuts_the_owner_down_leaves_nothing_shown_and_nothing_more_computed(qapp):
+    """The host closes the owner while a result is drawn: its "shown" is void and nothing is computed after it."""
+    receipts = []
+    tool = _Tool(inside_done=lambda owner: receipts.append(owner.shutdown()))
+    assert tool.owner.ask("A")
+    _settled(tool.owner)
+    assert tool.owner.shown is None and receipts[0].status is PageCleanup.CLEAN
+    tool.owner.ask("B")
+    QtWidgets.QApplication.processEvents()
+    assert tool.calls == ["A"] and len(tool.handed) == 1
+
+
+@pytest.mark.parametrize("honours_cancel", (False, True))
+def test_release_then_an_immediate_identical_ask_computes_it_and_shows_it_once(qapp, honours_cancel):
+    """The window closes while A computes and is reopened on A at once, before A returns: A is shown, handed over
+    once (computed again when its run honoured the release's cancel)."""
+    tool = _Tool(honours_cancel=honours_cancel)
+    tool.hold()
+    assert tool.owner.ask("A") and tool.computed.wait(20)
+    tool.owner.release()
+    assert tool.owner.ask("A") and tool.owner.computing
+    tool.release.set()
+    _settled(tool.owner)
+    assert tool.calls == (["A", "A"] if honours_cancel else ["A"])
+    assert tool.handed == [("A", OperationTerminalStatus.RETURNED, "A", "")] and tool.owner.shown == "A"
     tool.owner.shutdown()
