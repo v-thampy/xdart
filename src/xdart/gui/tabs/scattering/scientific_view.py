@@ -73,6 +73,7 @@ from .shell_values import (
     FrameSelectionIntent,
     KeyedImageProjection,
     KeyedPanelsProjection,
+    RectRegion,
     ScientificPlotOptions,
     ScientificProjection,
     ShellCommand,
@@ -274,9 +275,14 @@ def _pixmap_pixel_count(pixmap) -> int:
     return pixmap.width() * pixmap.height()
 
 
+#: A signed panel's map (a fit's residual: ``KeyedImageProjection.presentation``): diverging about zero.
+SIGNED_COLOR_MAP = "RdBu_r"
+_REGION_PEN = (240, 200, 90)
+
+
 class _KeyedImagePanel:
     """A keyed layout's image panel: Int's image pane, titled, over the frame navigation's own widgets, which
-    step its slice along its normal (``SET_PANEL_INDEX``)."""
+    step its slice along its normal (``SET_PANEL_INDEX``); a rectangle region on it (``set_region``)."""
 
     def __init__(self, view: "ScientificView", key: PanelKey) -> None:
         self.key = key
@@ -303,6 +309,10 @@ class _KeyedImagePanel:
         navigation.addStretch(1)
         layout.addLayout(navigation)
         self._captions: tuple[str, ...] = ()
+        #: the panel's presentation and the (label, unit) of its two axes, as last drawn; its rectangle, or None
+        self.presentation = "shared"
+        self.axes: tuple[tuple[str, str], tuple[str, str]] | None = None
+        self.region: pg.RectROI | None = None
         self.selector.currentIndexChanged.connect(
             lambda index: index >= 0 and view._emit_panel_index(key, index))
         self.previous.clicked.connect(lambda: self.step(-1))
@@ -315,13 +325,26 @@ class _KeyedImagePanel:
             self.selector.setCurrentIndex(index)
 
     def draw(self, panel: KeyedImageProjection, color_map: str, log_scale: bool) -> None:
-        if self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis, color_map=color_map,
-                            log_scale=log_scale):  # drawn again (not kept): its own levels and range, for the view's
-            # intensity controls (``_refresh_keyed_intensity``); none for a slice with no finite value, whose colour
-            # bar the pane leaves as it was
+        signed = panel.presentation == "signed"
+        if self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis,
+                            color_map=SIGNED_COLOR_MAP if signed else color_map,
+                            log_scale=False if signed else log_scale):  # drawn again (not kept): its own levels and
+            # range, for the view's intensity controls (``_refresh_keyed_intensity``); none for a slice with no finite
+            # value, whose colour bar the pane leaves as it was
             histogram = self.pane.canvas.histogram
+            finite = np.isfinite(panel.image)
+            if signed:  # its own limits, symmetric about zero, so a sign is never lost to the levels
+                bound = float(np.max(np.abs(panel.image), where=finite, initial=0.0))
+                bound = bound if bound > 0.0 else 1.0
+                histogram.lo_lim, histogram.hi_lim = -bound, bound
+                histogram.setLevels((-bound, bound))
             self.levels = (((histogram.lo_lim, histogram.hi_lim), tuple(histogram.levels()))
-                           if np.isfinite(panel.image).any() else None)
+                           if finite.any() else None)
+        self.presentation = panel.presentation
+        axes = ((panel.x_axis.label, panel.x_axis.unit), (panel.y_axis.label, panel.y_axis.unit))
+        if self.region is not None and axes != self.axes:  # its rectangle was in other coordinates: it goes
+            self.set_region(None, None)
+        self.axes = axes
         self.pane.plot.setTitle(panel.title)
         for widget in (self.previous, self.selector, self.next):  # a plane with no index to step has none
             widget.setVisible(panel.navigation)
@@ -338,6 +361,36 @@ class _KeyedImagePanel:
         self.selector.setEnabled(True)
         self.previous.setEnabled(panel.index > 0)
         self.next.setEnabled(panel.index < len(panel.index_captions) - 1)
+
+    def set_region(self, region: RectRegion | None, moved) -> None:
+        """Show ``region`` as a rectangle the user can move and resize (None: none), ``moved()`` called when they
+        have; it must be in the coordinates the panel draws."""
+        box = self.pane.canvas.imageViewBox
+        if region is None:
+            if self.region is not None:
+                box.removeItem(self.region)
+                self.region = None
+            return
+        if self.axes is None or (region.x_axis, region.y_axis) != self.axes:
+            raise TypeError(f"a region on {(region.x_axis, region.y_axis)} cannot be drawn on a panel of "
+                            f"{self.axes}")
+        (x0, x1), (y0, y1) = region.x, region.y
+        if self.region is None:
+            self.region = pg.RectROI((x0, y0), (x1 - x0, y1 - y0), pen=pg.mkPen(_REGION_PEN, width=1.5))
+            self.region.sigRegionChangeFinished.connect(lambda _roi: moved())
+            box.addItem(self.region)
+        else:  # as code moves it: no "moved"
+            self.region.setPos((x0, y0), update=False, finish=False)
+            self.region.setSize((x1 - x0, y1 - y0), finish=False)
+
+    def region_shown(self) -> RectRegion | None:
+        """The rectangle where it is now (moved or not), typed by the panel's axes."""
+        if self.region is None:
+            return None
+        position, size = self.region.pos(), self.region.size()
+        x = tuple(sorted((float(position.x()), float(position.x() + size.x()))))
+        y = tuple(sorted((float(position.y()), float(position.y() + size.y()))))
+        return RectRegion(x, y, *self.axes)
 
     def clear(self) -> None:
         self.pane.clear_image_buffers()
@@ -379,6 +432,9 @@ class _KeyedTracePanel:
 
 class ScientificView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
+    #: The user moved or resized a keyed image panel's rectangle (``set_keyed_region``): its ``PanelKey`` and the
+    #: ``RectRegion`` it now covers.
+    keyedRegionChanged = QtCore.Signal(object, object)
     #: The plot-options dialog was accepted. Emitted after the view has read its own options
     #: and before it emits their commands, so a host reads the choices it added
     #: (``plot_options_dialog.add_choice``) before any of its own redraws resets them.
@@ -3017,6 +3073,21 @@ class ScientificView(QtWidgets.QFrame):
         panel's ``plot`` and ``curve``), for its host's checks."""
         return self._keyed_panels[key]
 
+    def set_keyed_region(self, key: PanelKey, region: RectRegion | None) -> None:
+        """Show ``region`` as a rectangle the user can move and resize on the keyed image panel ``key`` (None: no
+        rectangle there), drawn in the panel's coordinates: a region in other coordinates than the panel draws is
+        refused (``TypeError``). It stays over the panel's redraws in the same coordinates; a redraw in other ones
+        or a new layout drops it. Setting it emits nothing; the user's moves emit ``keyedRegionChanged``."""
+        widgets = self._keyed_panels.get(key)
+        if type(widgets) is not _KeyedImagePanel:
+            raise KeyError(f"no keyed image panel {key!r}")
+        widgets.set_region(region, lambda: self.keyedRegionChanged.emit(key, widgets.region_shown()))
+
+    def keyed_region(self, key: PanelKey) -> RectRegion | None:
+        """The keyed image panel's rectangle where it is now, or None."""
+        widgets = self._keyed_panels.get(key)
+        return widgets.region_shown() if type(widgets) is _KeyedImagePanel else None
+
     def clear_keyed(self, detail: str = "") -> None:
         """Empty every keyed panel, keeping the layout."""
         for widgets in self._keyed_panels.values():
@@ -3122,10 +3193,12 @@ class ScientificView(QtWidgets.QFrame):
         """Int's intensity controls over a keyed layout's slices: one set of levels for them all, in what each
         pane draws (log10 with Log, as Int's viewer's). Autoscale spans the slices' own automatic levels (each
         Int's rule over its finite values), and the controls' range their values; typed or dragged levels are
-        kept across draws. A slice's own colour bar stays, for a look at it alone until the next draw."""
+        kept across draws. A slice's own colour bar stays, for a look at it alone until the next draw. A panel
+        presented on its own ("own", "signed": ``KeyedImageProjection.presentation``) keeps its own levels."""
         controls = self.viewer_intensity
         drawn = [widgets.levels for widgets in self._keyed_panels.values()
-                 if type(widgets) is _KeyedImagePanel and widgets.levels is not None]
+                 if type(widgets) is _KeyedImagePanel and widgets.levels is not None
+                 and widgets.presentation == "shared"]
         if not drawn:
             self._viewer_intensity_domain = self._viewer_auto_levels = None
             controls.sync(None, None)
@@ -3143,7 +3216,8 @@ class ScientificView(QtWidgets.QFrame):
             return
         low, high = levels
         for widgets in self._keyed_panels.values():
-            if type(widgets) is _KeyedImagePanel and widgets.levels is not None:
+            if (type(widgets) is _KeyedImagePanel and widgets.levels is not None
+                    and widgets.presentation == "shared"):
                 histogram = widgets.pane.canvas.histogram
                 (own_low, own_high), _automatic = widgets.levels
                 histogram.lo_lim, histogram.hi_lim = min(own_low, low), max(own_high, high)

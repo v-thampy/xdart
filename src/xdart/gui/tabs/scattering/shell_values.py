@@ -329,6 +329,51 @@ class AxisProjection:
                 raise TypeError("axis edges must be two finite increasing floats")
 
 
+#: A keyed image panel's presentations (``KeyedImageProjection.presentation``).
+KEYED_IMAGE_PRESENTATIONS = ("shared", "own", "signed")
+
+
+@dataclass(frozen=True, slots=True)
+class RectRegion:
+    """A rectangle on a keyed image panel (``ScientificView.set_keyed_region``), typed by the coordinates it is in.
+
+    ``x`` and ``y`` are its (low, high) along the panel's x axis (the image's columns) and y axis (its rows), in the
+    panel's own coordinates; ``x_axis`` and ``y_axis`` are those axes' (label, unit), which say what the numbers
+    are: a detector's pixels (an ROI picked on a detector image) or a slice's coordinates (H and K, Qx and Qz: a
+    region to fit). The view refuses a region whose axes are not the ones its panel draws. One type for both:
+    ``index_bounds`` gives the rows and columns whose bins lie inside, on either (FIT-TOOLS-2026-10, Codex's design
+    review F7: "Track D's detector ROI and F's slice ROI should use that same typed region API")."""
+
+    x: tuple[float, float]
+    y: tuple[float, float]
+    x_axis: tuple[str, str]
+    y_axis: tuple[str, str]
+
+    def __post_init__(self) -> None:
+        for bounds in (self.x, self.y):
+            if (type(bounds) is not tuple or len(bounds) != 2
+                    or any(type(value) not in {int, float} or not math.isfinite(value) for value in bounds)
+                    or not bounds[0] < bounds[1]):
+                raise TypeError("a region's x and y are (low, high): two finite increasing numbers")
+        for axis in (self.x_axis, self.y_axis):
+            if type(axis) is not tuple or len(axis) != 2 or any(type(part) is not str for part in axis):
+                raise TypeError("a region's axes are (label, unit) text")
+        object.__setattr__(self, "x", (float(self.x[0]), float(self.x[1])))
+        object.__setattr__(self, "y", (float(self.y[0]), float(self.y[1])))
+
+    def index_bounds(self, x_values: np.ndarray, y_values: np.ndarray) -> tuple[slice, slice]:
+        """The rows and columns, as ``(rows, columns)`` slices of a (y, x) image, whose bin centres (the panel's axis
+        values, increasing or decreasing) lie inside the rectangle, edges included: views of the image, no copies.
+        An empty slice where none does."""
+        return tuple(_inside(np.asarray(values, dtype=float), bounds)
+                     for values, bounds in ((y_values, self.y), (x_values, self.x)))
+
+
+def _inside(values: np.ndarray, bounds: tuple[float, float]) -> slice:
+    found = np.flatnonzero((values >= bounds[0]) & (values <= bounds[1]))
+    return slice(0, 0) if found.size == 0 else slice(int(found[0]), int(found[-1]) + 1)
+
+
 @dataclass(frozen=True, slots=True)
 class KeyedImageProjection:
     """One image panel of a keyed layout (``display_logic``'s repeated ``PanelKey`` roles, the H11/WS-X2
@@ -345,10 +390,18 @@ class KeyedImageProjection:
     #: False for a plane with no index to step (Custom Slice): no navigation is drawn, ``index`` is 0 and
     #: ``index_captions`` is empty
     navigation: bool = True
+    #: How the panel is presented (FIT-TOOLS-2026-10, Codex's design review F7): "shared", the view's colour map and
+    #: Log and the levels every shared slice takes from the intensity controls (RSM's slices; a fit's data and
+    #: model); "own", the view's colour map and Log with the panel's own automatic levels; "signed", a signed
+    #: difference (a fit's residual): linear whatever Log says, a diverging map and its own symmetric limits, so its
+    #: sign and zero always show
+    presentation: str = "shared"
 
     def __post_init__(self) -> None:
         if type(self.key) is not PanelKey or self.key.role is not PanelRole.SLICE_2D:
             raise TypeError("a keyed image panel is a SLICE_2D PanelKey")
+        if self.presentation not in KEYED_IMAGE_PRESENTATIONS:
+            raise TypeError(f"a keyed image's presentation is one of {KEYED_IMAGE_PRESENTATIONS}")
         if (type(self.image) is not np.ndarray or self.image.ndim != 2
                 or self.image.shape != (self.y_axis.values.size, self.x_axis.values.size)):
             raise TypeError("a keyed image is (y, x) on its two axes")
@@ -833,11 +886,13 @@ __all__ = [
     "FrameSelectionIntent",
     "FrameNavigationProjection",
     "HeavyProjection",
+    "KEYED_IMAGE_PRESENTATIONS",
     "KeyedImageProjection",
     "KeyedPanelsProjection",
     "KeyedTraceProjection",
     "ProgressProjection",
     "PinnedTraceProjection",
+    "RectRegion",
     "RunStripProjection",
     "ScientificPlotOptions",
     "ScientificProjection",
