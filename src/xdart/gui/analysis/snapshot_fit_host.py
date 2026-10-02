@@ -217,8 +217,7 @@ class SnapshotFitHost(QtCore.QObject):
         self.owner.release()
         self.snapshot = None
         self.outcomes, self._keys = (), {}
-        self.dialog._export_trace = None
-        self.dialog._clear_fit()
+        self.dialog.clear_input()
         self.dialog.trend.clear()
 
     def _export(self, path):

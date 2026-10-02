@@ -585,6 +585,15 @@ class PeakFitDialog(QtWidgets.QDialog):
         self._show_pattern(trace.axis, trace.intensity, trace.axis_unit or trace.label, clear_fit=True)
         self.status.setText("Displayed trace captured. Click Fit.")
 
+    def clear_input(self):
+        """Release a detached displayed input when its host changes scope or closes."""
+        self._x = self._y = self._export_trace = None
+        self.fit_view.reconcile(FitProjection(FitPanel(), FitPanel(zero_line=True)))
+        self.table.clear_rows()
+        self.fit_btn.setEnabled(False)
+        self.use_uncertainties.setChecked(False)
+        self.use_uncertainties.setEnabled(False)
+
     def export_snapshot(self):
         if self._export_snapshot_provider is not None:
             return self._export_snapshot_provider()

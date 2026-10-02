@@ -45,6 +45,8 @@ def test_before_fit_export_and_single_batch_use_same_real_owner(tmp_path):
     host.export_csv(tmp_path / 'fit.csv')
     assert 'result' in (tmp_path / 'fit.csv').read_text()
     host.dialog.close()
+    assert host.snapshot is None and host.dialog._x is None and host.dialog._y is None
+    assert not host.dialog.fit_view.projection.upper.series
     while host.shutdown().status.value == 'pending':
         app.processEvents()
 
