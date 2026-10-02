@@ -43,9 +43,10 @@ def test_the_peak_fit_mounts_the_shared_owners_and_its_advanced_values_are_the_a
         assert isinstance(dialog.npeaks_spin, IntegerLineEdit) and dialog.model_combo.objectName() == "controlsComboBox"
         assert (dialog.range_lo, dialog.range_hi) == dialog.range_row.editors
         advanced = {dialog.adv_centers, dialog.adv_sigma_init, dialog.adv_sigma_min, dialog.adv_sigma_max,
-                    dialog.adv_center_delta, dialog.adv_fraction, dialog.adv_maxfev}
+                    dialog.adv_center_delta, dialog.adv_fraction, dialog.adv_maxfev, dialog.use_uncertainties}
         assert all(dialog.advanced.isAncestorOf(editor) for editor in advanced)
-        assert len(_rows(dialog.advanced)) == 6
+        assert len(_rows(dialog.advanced)) == 7
+        assert not dialog.use_uncertainties.isChecked()  # the original unweighted default is held
         dialog.show()
         dialog.advanced_btn.click()
         assert dialog.advanced.isVisible()

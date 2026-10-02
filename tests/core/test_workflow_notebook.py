@@ -61,6 +61,7 @@ def test_workflow_notebook_open_and_run_all_never_process_without_activation(tmp
         assert definitions["run_processing"].value is False
         assert definitions["get_outputs"]() == ()
         assert definitions["recipe"].configuration == recipe.configuration
+        assert 'Processing has not produced' in definitions['workflow_display']._repr_html_()
     assert not (data_root / (path.stem + "_outputs")).exists()
     assert list(data_root.iterdir()) == []
 

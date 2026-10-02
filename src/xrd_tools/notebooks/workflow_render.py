@@ -78,8 +78,9 @@ def render_workflow_notebook(recipe, *, format, data_root=".", name="workflow"):
          "    _comparisons = (read_workflow_result(references[i]) for i in (comparison_selector.value[:4] if comparison_selector is not None else ()))\n"
          "    _figure = plot_analysis_outcome(_snapshot, log_y=log_display.value, x_range=display_bounds.value, comparisons=_comparisons)\n"
          "    if len(_snapshot.axes) > 1:\n        _figure.update_xaxes(range=list(display_bounds.value))\n"
-         "    mo.ui.plotly(_figure)\n"
-         "else:\n    mo.md('Processing has not produced a committed result. Enable Run explicitly; terminal values remain in get_outputs().')\nreturn"),
+         "    workflow_display = mo.ui.plotly(_figure)\n"
+         "else:\n    workflow_display = mo.md('Processing has not produced a committed result. Enable Run explicitly; terminal values remain in get_outputs().')\n"
+         "workflow_display\nreturn workflow_display"),
     ]
     document = "import marimo\n\n__generated_with = '0.25.0'\napp = marimo.App(width='full')\n"
     for parameters, body in cells:
