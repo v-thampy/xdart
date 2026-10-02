@@ -4,9 +4,10 @@ Int's fit dialogs feed it (``test_fit_tools_preservation.py``); the Scan Plot dr
 from __future__ import annotations
 
 import pytest
+import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xdart.gui.tabs.scattering.trend_view import TrendView
+from xdart.gui.tabs.scattering.trend_view import PlotSeries, SeriesProjection, TrendView
 
 
 @pytest.fixture
@@ -128,3 +129,36 @@ def test_the_scan_plot_draws_its_right_axis_through_the_trends_helpers():
     from xdart.gui.tabs.scattering import trend_view
     assert (plot_axes.attach_right_axis, plot_axes.add_right_series, plot_axes.set_right_axis_visible) == (
         trend_view.attach_right_axis, trend_view.add_right_series, trend_view.set_right_axis_visible)
+
+
+def test_generic_prepared_series_share_the_trend_owner_and_keep_the_right_axis_linear(qapp):
+    view = TrendView(series_only=True)
+    try:
+        view.reconcile_series(SeriesProjection((PlotSeries("signal", [0, 1], [2, 4]),
+            PlotSeries("monitor", [0, 1], [200, 400], right=True)), "motor", "value / i0", "monitor", True))
+        assert [name for name, *_xy in _curves(view)] == ["signal"]
+        assert [item.name() for item in view.right_view_box.addedItems] == ["monitor"]
+        assert view.plot.getAxis("left").logMode and not view.right_axis.logMode
+        assert view.right_axis.labelText == "monitor"
+        assert [label.text for _sample, label in view.legend.items] == ["signal", "monitor (R)"]
+        with pytest.raises(ValueError, match="equal-length"):
+            view.reconcile_series(SeriesProjection((PlotSeries("invalid", [0, 1], [2]),)))
+        assert [name for name, *_xy in _curves(view)] == ["signal"]  # refused before touching the prior display
+        view.reconcile_series(SeriesProjection((PlotSeries("missing", [0, 1], [np.nan, np.nan]),)))
+        assert not _curves(view) and not view.right_view_box.addedItems and not view.right_axis.isVisible()
+        assert not view.legend.items
+    finally:
+        view.deleteLater()
+
+
+def test_csv_exports_the_actual_numeric_x_or_blank_and_explicit_result_identity(qapp, monkeypatch, tmp_path):
+    target = tmp_path / "generic-trend.csv"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", lambda *args: (str(target), "CSV"))
+    view = TrendView(x_name="motor", identity_column="result")
+    try:
+        view.set_row("scan9", 12.5, {"center_0": 2.0})
+        view.set_row("unavailable", None, {"center_0": 3.0})
+        view.save.click()
+        assert target.read_bytes() == b"result,motor,center_0\r\nscan9,12.5,2.0\r\nunavailable,,3.0\r\n"
+    finally:
+        view.deleteLater()

@@ -5,7 +5,7 @@ browsers keep their own profiles (``test_browser_results_profile.py``, ``test_st
 ``test_rsm_page.py``)."""
 from __future__ import annotations
 
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
 from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
@@ -56,6 +56,26 @@ def test_ints_browser_keeps_its_heading() -> None:
         view.show()
         assert view.heading.text() == "DATA BROWSER" and view.heading.isVisible()
         assert view.profile.heading
+    finally:
+        view.close()
+        view.deleteLater()
+
+
+def test_independent_column_checks_reconcile_silently_and_emit_identities_in_list_order() -> None:
+    _app()
+    view = BrowserView(profile=keyed_list_profile("Columns", checkable=True))
+    changed = []
+    view.checksChanged.connect(changed.append)
+    try:
+        a, b, c = (BrowserResult(name, name.upper()) for name in ("a", "b", "c"))
+        view.reconcile_checked_results((a, b), ("b",))
+        assert view.checked_results() == ("b",) and not changed
+        view.scans.item(0).setCheckState(QtCore.Qt.CheckState.Checked)
+        assert changed == [("a", "b")] and view.current_result() is None
+        view.reconcile_checked_results((c, a, b), view.checked_results())
+        assert view.checked_results() == ("a", "b") and len(changed) == 1
+        view.reconcile_checked_results((c, b), ("a", "b"))
+        assert view.checked_results() == ("b",) and len(changed) == 1
     finally:
         view.close()
         view.deleteLater()

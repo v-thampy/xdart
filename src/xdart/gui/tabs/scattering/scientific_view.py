@@ -286,6 +286,8 @@ class _KeyedImagePanel:
 
     def __init__(self, view: "ScientificView", key: PanelKey) -> None:
         self.key = key
+        self.detector_picker = view._detector_picker
+        self._detector_shape = None
         self.container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(self.container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -313,6 +315,7 @@ class _KeyedImagePanel:
         self.presentation = "shared"
         self.axes: tuple[tuple[str, str], tuple[str, str]] | None = None
         self.region: pg.RectROI | None = None
+        self.regions: dict[str, pg.RectROI] = {}
         self.selector.currentIndexChanged.connect(
             lambda index: index >= 0 and view._emit_panel_index(key, index))
         self.previous.clicked.connect(lambda: self.step(-1))
@@ -326,9 +329,24 @@ class _KeyedImagePanel:
 
     def draw(self, panel: KeyedImageProjection, color_map: str, log_scale: bool) -> None:
         signed = panel.presentation == "signed"
-        if self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis,
+        if self.detector_picker:
+            # Detector selection uses pixel edges 0..N and row zero at the top, without the raw viewer's mirror.
+            rows, columns = panel.image.shape
+            rect = QtCore.QRectF(0, 0, columns, rows)
+            self.pane.canvas.setImage(panel.image.T, rect=rect, scale="Log" if log_scale else "Linear",
+                                      cmap=color_map, linear_percentiles=(2, 98), expand_degenerate_levels=False)
+            box = self.pane.canvas.imageViewBox
+            box.setAspectLocked(True)
+            box.invertY(True)
+            if self._detector_shape != panel.image.shape:
+                box.setRange(rect, padding=0)
+                self._detector_shape = panel.image.shape
+            rendered = True
+        else:
+            rendered = self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis,
                             color_map=SIGNED_COLOR_MAP if signed else color_map,
-                            log_scale=False if signed else log_scale):  # drawn again (not kept): its own levels and
+                            log_scale=False if signed else log_scale)
+        if rendered:  # drawn again (not kept): its own levels and
             # range, for the view's intensity controls (``_refresh_keyed_intensity``); none for a slice with no finite
             # value, whose colour bar the pane leaves as it was
             histogram = self.pane.canvas.histogram
@@ -344,6 +362,9 @@ class _KeyedImagePanel:
         axes = ((panel.x_axis.label, panel.x_axis.unit), (panel.y_axis.label, panel.y_axis.unit))
         if self.region is not None and axes != self.axes:  # its rectangle was in other coordinates: it goes
             self.set_region(None, None)
+        if axes != self.axes:
+            for name in tuple(self.regions):
+                self.set_named_region(name, None, None)
         self.axes = axes
         self.pane.plot.setTitle(panel.title)
         for widget in (self.previous, self.selector, self.next):  # a plane with no index to step has none
@@ -365,23 +386,7 @@ class _KeyedImagePanel:
     def set_region(self, region: RectRegion | None, moved) -> None:
         """Show ``region`` as a rectangle the user can move and resize (None: none), ``moved()`` called when they
         have; it must be in the coordinates the panel draws."""
-        box = self.pane.canvas.imageViewBox
-        if region is None:
-            if self.region is not None:
-                box.removeItem(self.region)
-                self.region = None
-            return
-        if self.axes is None or (region.x_axis, region.y_axis) != self.axes:
-            raise TypeError(f"a region on {(region.x_axis, region.y_axis)} cannot be drawn on a panel of "
-                            f"{self.axes}")
-        (x0, x1), (y0, y1) = region.x, region.y
-        if self.region is None:
-            self.region = pg.RectROI((x0, y0), (x1 - x0, y1 - y0), pen=pg.mkPen(_REGION_PEN, width=1.5))
-            self.region.sigRegionChangeFinished.connect(lambda _roi: moved())
-            box.addItem(self.region)
-        else:  # as code moves it: no "moved"
-            self.region.setPos((x0, y0), update=False, finish=False)
-            self.region.setSize((x1 - x0, y1 - y0), finish=False)
+        self.set_named_region("", region, moved, width=1.5, live=False, corner_handle=False)
 
     def region_shown(self) -> RectRegion | None:
         """The rectangle where it is now (moved or not), typed by the panel's axes."""
@@ -391,6 +396,50 @@ class _KeyedImagePanel:
         x = tuple(sorted((float(position.x()), float(position.x() + size.x()))))
         y = tuple(sorted((float(position.y()), float(position.y() + size.y()))))
         return RectRegion(x, y, *self.axes)
+
+    def set_named_region(self, name, region, moved, *, color=_REGION_PEN, dashed=False, visible=True,
+                         width=2, live=True, corner_handle=True):
+        """Independent signal/background marks, all owned here; programmatic reconciliation is silent."""
+        box = self.pane.canvas.imageViewBox
+        item = self.regions.get(name)
+        if region is None:
+            if item is not None:
+                box.removeItem(item)
+                del self.regions[name]
+            if not name:
+                self.region = None
+            return
+        if self.axes is None or (region.x_axis, region.y_axis) != self.axes:
+            raise TypeError(f"a region on {(region.x_axis, region.y_axis)} cannot be drawn on a panel of {self.axes}")
+        (x0, x1), (y0, y1) = region.x, region.y
+        pen = pg.mkPen(color, width=width, style=(QtCore.Qt.PenStyle.DashLine if dashed
+                                             else QtCore.Qt.PenStyle.SolidLine))
+        if item is None:
+            item = pg.RectROI((x0, y0), (x1 - x0, y1 - y0), pen=pen, movable=True, resizable=True)
+            if corner_handle:
+                item.addScaleHandle([0, 0], [1, 1])
+            item.setZValue(10)
+            self.regions[name] = item
+            signal = item.sigRegionChanged if live else item.sigRegionChangeFinished
+            signal.connect(lambda _roi: moved())
+            box.addItem(item)
+        else:
+            blocker = QtCore.QSignalBlocker(item)
+            item.setPos((x0, y0), update=False, finish=False)
+            item.setSize((x1 - x0, y1 - y0), finish=False)
+            item.setPen(pen)
+            del blocker
+        item.setVisible(bool(visible))
+        if not name:
+            self.region = item
+
+    def named_region_shown(self, name):
+        item = self.regions.get(name)
+        if item is None:
+            return None
+        position, size = item.pos(), item.size()
+        return RectRegion(tuple(sorted((float(position.x()), float(position.x() + size.x())))),
+                          tuple(sorted((float(position.y()), float(position.y() + size.y())))), *self.axes)
 
     def clear(self) -> None:
         self.pane.clear_image_buffers()
@@ -435,6 +484,8 @@ class ScientificView(QtWidgets.QFrame):
     #: The user moved or resized a keyed image panel's rectangle (``set_keyed_region``): its ``PanelKey`` and the
     #: ``RectRegion`` it now covers.
     keyedRegionChanged = QtCore.Signal(object, object)
+    #: A named region's live move: panel key, region identity, and typed geometry.
+    keyedNamedRegionChanged = QtCore.Signal(object, str, object)
     #: The plot-options dialog was accepted. Emitted after the view has read its own options
     #: and before it emits their commands, so a host reads the choices it added
     #: (``plot_options_dialog.add_choice``) before any of its own redraws resets them.
@@ -442,8 +493,9 @@ class ScientificView(QtWidgets.QFrame):
     #: A host page's raw pop-up (``show_raw_popup``) was closed; its image is already cleared.
     rawPopupClosed = QtCore.Signal()
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(self, parent: QtWidgets.QWidget | None = None, *, detector_picker: bool = False) -> None:
         super().__init__(parent)
+        self._detector_picker = bool(detector_picker)
         self.setObjectName("e3ScientificView")
         self.setMinimumWidth(300)
         self._hidden_tools: frozenset[str] = frozenset()
@@ -648,6 +700,42 @@ class ScientificView(QtWidgets.QFrame):
             widget.installEventFilter(self)
         self._viewer_loading_overlay.hide()
         self._install_share_geometry_hooks()
+        if self._detector_picker:
+            self._detector_picker_image = None
+            self._main_layout.itemAt(0).widget().hide()
+            scale = QtWidgets.QHBoxLayout()
+            scale.addWidget(QtWidgets.QLabel("Intensity"))
+            self.default_scale = QtWidgets.QPushButton("Default")
+            self.detector_log = QtWidgets.QPushButton("Log")
+            group = self._detector_scale_group = QtWidgets.QButtonGroup(self)
+            group.setExclusive(True)
+            for button in (self.default_scale, self.detector_log):
+                button.setCheckable(True)
+                group.addButton(button)
+                scale.addWidget(button)
+            self.default_scale.setChecked(True)
+            scale.addStretch(1)
+            self._main_layout.addLayout(scale)
+            self.detector_log.toggled.connect(lambda _on: self.reconcile_detector_image(self._detector_picker_image))
+
+    def reconcile_detector_image(self, image) -> PanelKey:
+        """Detector-picker profile: Int's image/scale owners, row-major pixel coordinates, independent ROI marks."""
+        if not self._detector_picker:
+            raise RuntimeError("reconcile_detector_image needs the detector_picker profile")
+        self._detector_picker_image = image
+        key = PanelKey(PanelRole.SLICE_2D, "detector")
+        if image is None:
+            return key
+        rows, columns = np.asarray(image).shape
+        panel = KeyedImageProjection(key, "", np.asarray(image),
+            AxisProjection(np.arange(columns, dtype=float) + 0.5, "column", "px"),
+            AxisProjection(np.arange(rows, dtype=float) + 0.5, "row", "px"), 0, (), navigation=False,
+            presentation="own")
+        self.reconcile_keyed(KeyedPanelsProjection(((key,),), (panel,), color_map="viridis",
+                                                  log_scale=self.detector_log.isChecked()))
+        self.viewer_intensity_row.hide()
+        self.status.hide()
+        return key
 
     def reconcile_operation_status(self, status: object) -> bool:
         """Replace only the scalar scientific-footer status text."""
@@ -3087,6 +3175,26 @@ class ScientificView(QtWidgets.QFrame):
         """The keyed image panel's rectangle where it is now, or None."""
         widgets = self._keyed_panels.get(key)
         return widgets.region_shown() if type(widgets) is _KeyedImagePanel else None
+
+    def set_keyed_named_region(self, key: PanelKey, name: str, region: RectRegion | None, *,
+                               color=_REGION_PEN, dashed: bool = False, visible: bool = True) -> None:
+        """Reconcile one independent mark by identity. Other marks stay; live gestures emit typed geometry.
+        None removes it; hidden backgrounds keep their geometry. Axes changes drop every mark."""
+        widgets = self._keyed_panels.get(key)
+        if type(widgets) is not _KeyedImagePanel:
+            raise KeyError(f"no keyed image panel {key!r}")
+        widgets.set_named_region(str(name), region,
+            lambda: self.keyedNamedRegionChanged.emit(key, str(name), widgets.named_region_shown(str(name))),
+            color=color, dashed=dashed, visible=visible)
+
+    def keyed_named_region(self, key: PanelKey, name: str) -> RectRegion | None:
+        widgets = self._keyed_panels.get(key)
+        return widgets.named_region_shown(str(name)) if type(widgets) is _KeyedImagePanel else None
+
+    def keyed_region_item(self, key: PanelKey, name: str = ""):
+        """Borrowed interaction handle for compatibility and gesture checks; lifetime stays with the view."""
+        widgets = self._keyed_panels[key]
+        return widgets.regions.get(str(name)) if name else widgets.region
 
     def clear_keyed(self, detail: str = "") -> None:
         """Empty every keyed panel, keeping the layout."""

@@ -348,15 +348,18 @@ class BrowserProfile:
     result_frames: bool = False
     #: the "DATA BROWSER" heading row (a keyed list inside a tool window has none: ``keyed_list_profile``)
     heading: bool = True
+    #: A keyed tool list's independent checks (metadata columns), reconciled through reconcile_checked_results.
+    result_checks: bool = False
 
 
-def keyed_list_profile(caption: str) -> BrowserProfile:
+def keyed_list_profile(caption: str, *, checkable: bool = False) -> BrowserProfile:
     """A plain keyed list (FIT-TOOLS-2026-10, Codex's design review F7: the Phase Fit's CIF rows): a window's own
     entries under ``caption``, each keyed by its identity (``BrowserResult``), with no menus, heading, frames or
     actions and none of a scan's or a frame's meaning. The window keeps its collection and reconciles the list from
     it after each Add or Remove (``reconcile_results``); ``current_result`` is the entry chosen."""
     return BrowserProfile(menus=(), raw_resolution_menus=False, list_caption=caption, directory=False, frames=False,
-                          actions=(), date_sort=False, refresh=False, results=True, heading=False)
+                          actions=(), date_sort=False, refresh=False, results=True, heading=False,
+                          result_checks=bool(checkable))
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +375,8 @@ class BrowserResult:
 
 class BrowserView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
+    #: A user changed independent checks: the checked identities in list order; reconciliation emits nothing.
+    checksChanged = QtCore.Signal(object)
 
     def __init__(
         self,
@@ -387,9 +392,11 @@ class BrowserView(QtWidgets.QFrame):
             raise ValueError("result_selection must be 'single' or 'extended'")
         if self.profile.result_frames and not self.profile.results:
             raise ValueError("result_frames needs a results profile")
+        if self.profile.result_checks and not self.profile.results:
+            raise ValueError("result_checks needs a results profile")
         self._results: tuple[BrowserResult, ...] = ()
         self.setObjectName("e3BrowserView")
-        self.setMinimumWidth(255)
+        self.setMinimumWidth(255 if self.profile.heading else 0)
         self._scans = ()
         self._current_artifact = ""
         self._artifact_selection_contract = None
@@ -549,6 +556,8 @@ class BrowserView(QtWidgets.QFrame):
             self.scans.itemSelectionChanged.connect(self._scan_selected)
             self.scans.itemClicked.connect(self._activate_directory)
             self.scans.itemActivated.connect(self._activate_directory)
+        if self.profile.result_checks:
+            self.scans.itemChanged.connect(lambda _item: self.checksChanged.emit(self.checked_results()))
         self.frames.selectionModel().selectionChanged.connect(
             self._frames_selected
         )
@@ -749,6 +758,25 @@ class BrowserView(QtWidgets.QFrame):
     def _result_selected(self, current, _previous) -> None:
         if current is not None:
             self._emit(ShellCommandKind.SELECT_RESULT, current.data(_USER_ROLE))
+
+    def reconcile_checked_results(self, entries: tuple[BrowserResult, ...], checked=()) -> None:
+        """A keyed checkable list's passive projection. Checks are independent of the current row."""
+        if not self.profile.result_checks:
+            raise RuntimeError("reconcile_checked_results needs a checkable results profile")
+        blocker = QtCore.QSignalBlocker(self.scans)
+        self.reconcile_results(entries, self.current_result())
+        checked = set(checked)
+        for index in range(self.scans.count()):
+            item = self.scans.item(index)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Checked if item.data(_USER_ROLE) in checked
+                               else QtCore.Qt.CheckState.Unchecked)
+        del blocker
+
+    def checked_results(self) -> tuple[str, ...]:
+        """The independently checked entries, in stable list order."""
+        return tuple(item.data(_USER_ROLE) for item in (self.scans.item(index) for index in range(self.scans.count()))
+                     if item.checkState() == QtCore.Qt.CheckState.Checked)
 
     def current_result(self) -> str | None:
         """A results list's current entry's identity (None: none)."""

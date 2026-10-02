@@ -13,6 +13,7 @@ pytest.importorskip("pyqtgraph")
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore
 
 from xdart.gui.tabs.scattering.scientific_view import SIGNED_COLOR_MAP, ScientificView
 from xdart.gui.tabs.scattering.shell_values import (
@@ -136,3 +137,56 @@ def test_one_region_type_gives_a_detectors_pixels_or_a_slices_bins_as_index_rang
     with pytest.raises(TypeError):
         KeyedImageProjection(_DATA, "d", np.zeros((1, 1)), AxisProjection(np.zeros(1), "H"),
                              AxisProjection(np.zeros(1), "K"), 0, (), navigation=False, presentation="log")
+
+
+def test_named_signal_and_background_marks_coexist_move_live_and_reconcile_silently(qapp):
+    view = ScientificView()
+    moved = []
+    view.keyedNamedRegionChanged.connect(lambda key, name, region: moved.append((key, name, region)))
+    try:
+        view.reconcile_keyed(_fit()[0])
+        region = RectRegion((0.95, 1.05), (1.95, 2.05), _H, _K)
+        view.set_keyed_named_region(_DATA, "signal", region, color="red")
+        view.set_keyed_named_region(_DATA, "background", region, color="blue", dashed=True, visible=False)
+        signal = view.keyed_region_item(_DATA, "signal")
+        background = view.keyed_region_item(_DATA, "background")
+        assert signal is not background and len(view.keyed_panel(_DATA).regions) == 2
+        assert background.pen.style() == QtCore.Qt.PenStyle.DashLine and not background.isVisible()
+        assert not moved
+        signal.setPos((0.92, 1.90), finish=False)  # live drag, before the gesture has finished
+        assert moved[-1][:2] == (_DATA, "signal")
+        assert moved[-1][2].x == pytest.approx((0.92, 1.02))
+        count = len(moved)
+        view.set_keyed_named_region(_DATA, "signal", region, color="red")
+        view.set_keyed_named_region(_DATA, "background", region, dashed=True, visible=True)
+        assert len(moved) == count and background.isVisible()
+        view.reconcile_keyed(_fit(log_scale=True)[0])
+        assert view.keyed_region_item(_DATA, "signal") is signal
+        view.reconcile_keyed(_fit(x_label="L")[0])
+        assert view.keyed_named_region(_DATA, "signal") is None
+        assert not view.keyed_panel(_DATA).regions
+    finally:
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_detector_picker_reuses_image_and_scale_with_pixel_edges_and_row_zero_at_top(qapp):
+    view = ScientificView(detector_picker=True)
+    image = np.arange(12.0).reshape(3, 4)
+    try:
+        key = view.reconcile_detector_image(image)
+        pane = view.keyed_panel(key).pane
+        np.testing.assert_array_equal(pane.canvas.displayed_image, image.T)
+        assert pane.image.boundingRect() == QtCore.QRectF(0, 0, 4, 3)
+        assert pane.canvas.imageViewBox.state["yInverted"]
+        assert pane.canvas.imageViewBox.state["aspectLocked"]
+        region = RectRegion((0, 4), (0, 3), ("column", "px"), ("row", "px"))
+        view.set_keyed_named_region(key, "full", region)
+        view.detector_log.setChecked(True)
+        np.testing.assert_allclose(pane.canvas.displayed_image, np.log10(image.T + 1))
+        assert view.keyed_named_region(key, "full") == region
+        view.default_scale.setChecked(True)
+        np.testing.assert_array_equal(pane.canvas.displayed_image, image.T)
+    finally:
+        view.deleteLater()
+        qapp.processEvents()

@@ -2,8 +2,8 @@
 
 FIT-TOOLS-2026-10 (Codex's design review F4, F7): Int's Peak Fit and Phase Fit built this row themselves
 (``ParamTrendMixin``: their own plot, combos, check box and CSV dialog); it is now this one owner, which every fit
-window mounts, and the right-hand axis the Scan Plot shares lives here once (``attach_right_axis``,
-``add_right_series``; ``analysis/plot_axes.py`` re-exports them for the Scan Plot until it mounts the owners).
+window mounts. The Scan Plot mounts its passive generic-series profile (``SeriesProjection``); its right-hand
+axis uses the same ``attach_right_axis`` and ``add_right_series`` owners.
 
 A row is one result's flat parameters (``center_0``, ``fwhm_1``, ``frac_TiN`` …), keyed by its identity, so a
 re-fit updates its row and two results at the same x stay two rows. Its x is the host's: a frame index (Int), a
@@ -27,7 +27,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.analysis.peak_fit_util import CURVE_PENS, FAMILY_LABELS, X_UNIT_FAMILIES, group_families
 from xdart.gui.gui_utils import RectViewBox
-from xdart.gui.themes import apply_seaborn_plot_style
+from xdart.gui.themes import apply_seaborn_plot_style, plot_font
 from xdart.gui.widgets.controls_panel import FormRow
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,27 @@ class TrendRow:
     params: Mapping[str, float]
 
 
+@dataclass(frozen=True, slots=True)
+class PlotSeries:
+    """An already prepared 1-D series, independently assigned to the left or right axis."""
+
+    name: str
+    x: object
+    y: object
+    right: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesProjection:
+    """A passive generic-series view: science and column choices belong to its host."""
+
+    series: tuple[PlotSeries, ...] = ()
+    x_label: str = ""
+    left_label: str = "value"
+    right_label: str = "value (right)"
+    log_left: bool = False
+
+
 class TrendView(QtWidgets.QWidget):
     """Fitted parameters across results (the module docstring): the Track/Overlay/Right rows and Save CSV… over a
     plot styled as Int's 1-D plot, with a right-hand axis."""
@@ -101,11 +122,14 @@ class TrendView(QtWidgets.QWidget):
 
     def __init__(self, parent=None, *, name: str = "trendView", x_label: str = "Frame", x_name: str = "frame",
                  order: bool = False, save_title: str = "Save parameters vs frame",
-                 save_name: str = "fit_params_vs_frame.csv", min_height: int = 150) -> None:
+                 save_name: str = "fit_params_vs_frame.csv", min_height: int = 150,
+                 series_only: bool = False, identity_column: str | None = None) -> None:
         super().__init__(parent)
         self.setObjectName(name)
         self._x_name, self._order = x_name, bool(order)
         self._save_title, self._save_name = save_title, save_name
+        self._series_only = bool(series_only)
+        self._identity_column = identity_column
         self._rows: dict[str, TrendRow] = {}
         self._families: tuple[str, ...] = ()
         self._value_unit = ""
@@ -148,6 +172,47 @@ class TrendView(QtWidgets.QWidget):
         self.overlay.toggled.connect(self.redraw)
         self.save.clicked.connect(self._save_csv)
         self._set_enabled(False)
+        if self._series_only:
+            for widget in (self.family_row, self.overlay_row, self.right_row, self.save, self.note):
+                widget.hide()
+            self.legend.setLabelTextSize(f"{plot_font().pointSize() + 2}pt")
+
+    def reconcile_series(self, projection: SeriesProjection) -> None:
+        """Draw prepared arbitrary series through the same plot/right-axis owner as fitted trends.
+        The right axis stays linear when the left is logarithmic. Empty and all-nonfinite series are omitted."""
+        if not self._series_only:
+            raise RuntimeError("reconcile_series needs the series_only profile")
+        if type(projection) is not SeriesProjection:
+            raise TypeError("series must be a SeriesProjection")
+        prepared = []
+        for series in projection.series:
+            if type(series) is not PlotSeries:
+                raise TypeError("series must contain PlotSeries values")
+            x, y = np.asarray(series.x, dtype=float), np.asarray(series.y, dtype=float)
+            if x.ndim != 1 or y.ndim != 1 or x.shape != y.shape:
+                raise ValueError("series axes must be equal-length 1-D arrays")
+            prepared.append((series, x, y))
+        self.plot.clear()
+        self.right_view_box.clear()
+        self.legend.clear()
+        any_left = any_right = False
+        for index, (series, x, y) in enumerate(prepared):
+            if not (np.isfinite(x).any() and np.isfinite(y).any()):
+                continue
+            color = CURVE_PENS[index % len(CURVE_PENS)]
+            pen = pg.mkPen(color, width=3)
+            if series.right:
+                add_right_series(self.right_view_box, self.legend, x, y, pen=pen, name=series.name,
+                                 symbol="o", symbol_size=7, symbol_brush=color)
+                any_right = True
+            else:
+                self.plot.plot(x, y, pen=pen, name=series.name, symbol="o", symbolSize=7, symbolBrush=color)
+                any_left = True
+        self.plot.setLabel("bottom", projection.x_label)
+        self.plot.setLabel("left", projection.left_label if any_left else "")
+        set_right_axis_visible(self.right_view_box, self.right_axis, any_right, projection.right_label)
+        self.plot.setLogMode(x=False, y=projection.log_left)
+        self.right_axis.setLogMode(False)
 
     @property
     def rows(self) -> tuple[TrendRow, ...]:
@@ -282,14 +347,19 @@ class TrendView(QtWidgets.QWidget):
         if not picks:
             return
         path = picks[0]
-        identities, _xs, columns = self.table()
+        identities, xs, columns = self.table()
         keys = list(columns)
         try:
             with open(path, "w", newline="") as handle:
                 writer = csv.writer(handle)
-                writer.writerow([self._x_name] + keys)
+                prefix = [self._identity_column] if self._identity_column is not None else []
+                writer.writerow(prefix + [self._x_name] + keys)
                 for index, identity in enumerate(identities):
-                    writer.writerow([identity] + [columns[key][index] for key in keys])
+                    x = xs[index]
+                    # Keep Int's integral frame CSV spelling while exporting the actual numeric x.
+                    value = "" if x is None else int(x) if float(x).is_integer() else x
+                    prefix = [identity] if self._identity_column is not None else []
+                    writer.writerow(prefix + [value] + [columns[key][index] for key in keys])
         except OSError:
             logger.exception("trend CSV save failed")
             self.messageChanged.emit("Could not save CSV (see log).")
@@ -297,4 +367,5 @@ class TrendView(QtWidgets.QWidget):
         self.messageChanged.emit(f"Saved {path}")
 
 
-__all__ = ["CSV_FILTER", "TrendRow", "TrendView", "add_right_series", "attach_right_axis", "set_right_axis_visible"]
+__all__ = ["CSV_FILTER", "PlotSeries", "SeriesProjection", "TrendRow", "TrendView", "add_right_series",
+           "attach_right_axis", "set_right_axis_visible"]
