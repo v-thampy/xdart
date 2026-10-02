@@ -32,6 +32,8 @@ _EDITOR_OWNER = (
 )
 _BROWSER_OWNER = "BrowserView (tabs/scattering/browser_view.py)"
 _BROWSE_OWNER = "file_dialogs (widgets/file_dialogs.py)"
+#: Codex's combined stage-2b review F2: a Preview, a provenance record or a fit's summary is read-only text
+_TEXT_OWNER = "ReadOnlyTextPane or ReadOnlyTextWindow (widgets/read_only_text.py)"
 
 #: The constructs a page must not build, with the owner that provides them.
 _CALLS: dict[str, str] = {
@@ -49,6 +51,7 @@ _CALLS: dict[str, str] = {
         ("QSpinBox", "QDoubleSpinBox", "QLineEdit", "QComboBox", "QSlider", "QCheckBox"), _EDITOR_OWNER,
     ),
     "QListWidget": _BROWSER_OWNER,
+    **dict.fromkeys(("QPlainTextEdit", "QTextEdit", "QTextBrowser"), _TEXT_OWNER),
 }
 _NAMES: dict[str, str] = {"matplotlib_colormaps": _DISPLAY_OWNER}
 #: Literal markers of a copied Data Browser header and menus.

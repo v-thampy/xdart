@@ -38,6 +38,7 @@ from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm
 from xdart.gui.widgets.controls_panel import (
     PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
 )
+from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
@@ -910,13 +911,9 @@ class StitchPage(QtWidgets.QWidget):
         self.preview_button.setToolTip("Check the inputs and list what a Run stitches, without stitching.")
         self.retry_button.setToolTip("Retry the last result's saving or cleanup.")
         self.advanced_button.setToolTip("The source, geometry, frame and correction settings.")
-        self.preview_dialog = QtWidgets.QDialog(self)
-        self.preview_dialog.setWindowTitle("Stitch preview")
-        preview_layout = QtWidgets.QVBoxLayout(self.preview_dialog)
-        self.preview_text = QtWidgets.QPlainTextEdit()
-        self.preview_text.setReadOnly(True)
-        preview_layout.addWidget(self.preview_text)
-        self.preview_dialog.resize(680, 480)
+        # Preview's lines: the shared read-only text window (Codex's combined stage-2b review F2)
+        self.preview_dialog = ReadOnlyTextWindow("Stitch preview", (680, 480), self)
+        self.preview_text = self.preview_dialog.pane
 
     _GI_KEYS = {GI_ENABLED: "enabled", GI_MOTOR: "motor", GI_THETA: "angle", GI_ORIENTATION: "orientation"}
 

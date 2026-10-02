@@ -67,6 +67,7 @@ from xdart.gui.tools import normalization_values as normalization
 from xdart.gui.tools.correction_values import correction_rows
 from xdart.gui.tools.page_settings import PageSettings
 from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, SubsectionCard
+from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
@@ -487,13 +488,9 @@ class RSMPage(QtWidgets.QWidget):
         self.preview_button.setToolTip("Check the inputs and list every exact identity, without gridding.")
         self.retry_button.setToolTip("Retry the last result's saving or its check.")
         self._build_advanced()
-        self.preview_dialog = QtWidgets.QDialog(self)
-        self.preview_dialog.setWindowTitle("RSM preview")
-        preview_layout = QtWidgets.QVBoxLayout(self.preview_dialog)
-        self.preview_text = QtWidgets.QPlainTextEdit()
-        self.preview_text.setReadOnly(True)
-        preview_layout.addWidget(self.preview_text)
-        self.preview_dialog.resize(760, 560)
+        # Preview's lines: the shared read-only text window (Codex's combined stage-2b review F2)
+        self.preview_dialog = ReadOnlyTextWindow("RSM preview", (760, 560), self)
+        self.preview_text = self.preview_dialog.pane
 
     def _build_conditioning(self):
         """Int's Conditioning rows, laid out by Int's processing composer: the Threshold (Int's RangeRow, driven by

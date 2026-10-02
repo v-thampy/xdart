@@ -5,6 +5,7 @@ import json
 from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog, MetadataSource
+from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 
 
 class StitchMetadataDialog(MetadataResultDialog):
@@ -12,14 +13,10 @@ class StitchMetadataDialog(MetadataResultDialog):
         super().__init__(parent)
         self.provenance_button = QtWidgets.QPushButton("Provenance…", self)
         self.layout().addWidget(self.provenance_button)
-        self.provenance_dialog = QtWidgets.QDialog(self)
-        self.provenance_dialog.setWindowTitle("Saved Stitch provenance")
-        layout = QtWidgets.QVBoxLayout(self.provenance_dialog)
-        self.provenance_text = QtWidgets.QPlainTextEdit(self.provenance_dialog)
-        self.provenance_text.setReadOnly(True)
-        self.provenance_text.setPlainText(json.dumps(json.loads(provenance_json), indent=2))
-        layout.addWidget(self.provenance_text)
-        self.provenance_dialog.resize(720, 520)
+        # the saved provenance: the shared read-only text window (Codex's combined stage-2b review F2)
+        self.provenance_dialog = ReadOnlyTextWindow("Saved Stitch provenance", (720, 520), self)
+        self.provenance_text = self.provenance_dialog.pane
+        self.provenance_dialog.set_text(json.dumps(json.loads(provenance_json), indent=2))
         self.provenance_button.clicked.connect(self.provenance_dialog.show)
         self.resize(760, 450)
 

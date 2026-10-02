@@ -17,6 +17,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
 from xdart.gui.widgets.controls_panel import FormRow
 from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
+from xdart.gui.widgets.read_only_text import ReadOnlyTextPane
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration_seed import (
     DETECTOR_ORIENTATIONS, detector_choices, detector_shape, ring_summary, rough_arm_record,
@@ -824,8 +825,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                                       'only when they predict held-out nu rows better.')
         self.refine_button.clicked.connect(self._refine)
         auto.addRow(self.refine_button)
-        self.fit_summary = QtWidgets.QPlainTextEdit()
-        self.fit_summary.setReadOnly(True)
+        self.fit_summary = ReadOnlyTextPane()  # the shared read-only text (Codex's stage-2b review F2)
         self.fit_summary.setMinimumHeight(self.fit_summary.fontMetrics().lineSpacing() * 8)
         layout.addWidget(self.fit_summary, 1)
         self.show_calibration_fit_button = QtWidgets.QPushButton('Show the fit…')
@@ -980,8 +980,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                                     'it moves per degree.')
         self.beam_button.clicked.connect(self._distance)
         layout.addWidget(self.beam_button)
-        self.beam_summary = QtWidgets.QPlainTextEdit()
-        self.beam_summary.setReadOnly(True)
+        self.beam_summary = ReadOnlyTextPane()
         self.beam_summary.setMaximumHeight(self.beam_summary.fontMetrics().lineSpacing() * 9)
         layout.addWidget(self.beam_summary)
         self.show_fit_button = QtWidgets.QPushButton('Show the fit…')
