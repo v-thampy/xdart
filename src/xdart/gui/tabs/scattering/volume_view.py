@@ -11,12 +11,13 @@ the headless ``xrd_tools.rsm.volume_render`` (colour from the map between the le
 floor and where empty), ``volume_rgba``'s bytes, through an 8-bit index volume and a 256-entry colour table.
 
 Off the GUI thread (AUD-9 stage 2b item 6; the maintainer: "yes go ahead with both"): each draw is computed on the
-view's own ``SingleWorkerOwner`` (the pages' worker owner) and only the GL upload stays on the GUI thread. The
-latest draw asked for wins: a draw is painted only if it is still the one asked for, a superseded one is cancelled
-and its result dropped, and at most one is computed at a time. While one is computed the view keeps the image it
-shows and says so. A Log or levels change makes a new index; a colour-map change applies the new table to the
-index kept with the image. ``release`` (the window closed) drops a draw still computing when it returns, and
-``shutdown`` closes the worker as the page's other owners close (PENDING while a draw runs).
+shared ``LatestRequestOwner`` (``widgets/latest_request.py``: a ``SingleWorkerOwner`` and its poll timer, which
+Custom Slice mounts too), and only the GL upload stays on the GUI thread. The latest draw asked for wins: a draw is
+painted only if it is still the one asked for, a superseded one is cancelled and its result dropped, at most one is
+computed at a time, and a draw that would show the image shown computes nothing. While one is computed the view
+keeps the image it shows and says so. A Log or levels change makes a new index; a colour-map change applies the new
+table to the index kept with the image. ``release`` (the window closed) drops a draw still computing when it
+returns, and ``shutdown`` closes the worker as the page's other owners close (PENDING while a draw runs).
 
 Contract, unlike ``ScientificView``'s: the host gives the data (``reconcile(VolumeProjection)``); the colour map,
 Log and levels are this view's own state, since a 3D Viewer's presentation is nothing a page persists, so the view
@@ -31,9 +32,9 @@ from dataclasses import dataclass
 import numpy as np
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from xdart.gui.pages.operation_owner import OperationCancelled, OperationTerminalStatus, SingleWorkerOwner
-from xdart.gui.pages.values import PageCleanup
+from xdart.gui.pages.operation_owner import OperationCancelled, OperationTerminalStatus
 from xdart.gui.widgets.intensity_controls import IntensityControls
+from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xrd_tools.rsm.volume_render import (
     MAX_RENDER_VOXELS, VolumeRenderRefused, check_render_size, color_table, colour_volume, downsample_volume_2x,
     log_transform, volume_index, volume_levels,
@@ -193,13 +194,14 @@ class VolumeView(QtWidgets.QFrame):
         # colour-map change applies another table to them
         self._index = self._alpha = self._index_values = self._index_log = None
         self._index_levels = self._index_auto = self._drawn_map = None
-        # the draws: the one asked for last (None once drawn), and the one on the worker, (identity, request)
-        self._wanted: _DrawRequest | None = None
-        self._running = None
-        self._worker = SingleWorkerOwner(lambda request, cancel, progress: _draw_volume(request, cancel, progress))
-        self._poll_timer = QtCore.QTimer(self)
-        self._poll_timer.setInterval(50)
-        self._poll_timer.timeout.connect(self._poll)
+        # the draws, on the shared latest-request owner (the job bound late, so a test can hold its result); a draw
+        # that would show the image shown is one whose index is the kept one, under the drawn colour map
+        self._requests = LatestRequestOwner(
+            lambda request, cancel, progress: _draw_volume(request, cancel, progress), self._done,
+            same=lambda request, other: request.matches(other),
+            unchanged=lambda request, _shown: (request.index is not None and request.index is self._index
+                                               and request.color_map == self._drawn_map),
+            parent=self)
         self.color_map.currentTextChanged.connect(lambda _name: self._draw())
         self.log_scale.toggled.connect(lambda _checked: self._draw(reset_levels=True))
         self.intensity.rangeChanged.connect(lambda _low, _high: self._draw())
@@ -217,7 +219,17 @@ class VolumeView(QtWidgets.QFrame):
     @property
     def computing(self) -> bool:
         """Whether a draw asked for is still being computed (the image shown is the one before it)."""
-        return self._wanted is not None
+        return self._requests.computing
+
+    @property
+    def _wanted(self) -> _DrawRequest | None:
+        """The draw asked for and not yet drawn (the shared owner's), or None."""
+        return self._requests.wanted
+
+    @property
+    def _running(self):
+        """``(identity, request)`` of the draw on the worker (the shared owner's), or None."""
+        return self._requests.running
 
     def reconcile(self, projection: VolumeProjection) -> None:
         """Show ``projection``'s volume at full resolution (a 2× view asked for an earlier volume is dropped)."""
@@ -240,7 +252,7 @@ class VolumeView(QtWidgets.QFrame):
     def release(self) -> None:
         """Let go of the volume, its RGBA and its index (the window closing); a draw still computing is dropped,
         and its buffers freed, when it returns."""
-        self._ask(None)
+        self._requests.release()
         self._projection = self._half = self.rgba = None
         self._forget_index()
         self.title.setText("")
@@ -251,12 +263,7 @@ class VolumeView(QtWidgets.QFrame):
     def shutdown(self):
         """Close the view's worker (its host closing), as the page's owners close: CLEAN, or PENDING while a draw
         still runs (the host asks again); nothing is drawn after it."""
-        self._wanted = None
-        receipt = self._worker.close()
-        self._poll_timer.stop()  # a closing worker reports nothing more; the host's next close retires it
-        if receipt.status is PageCleanup.CLEAN:
-            self._running = None
-        return receipt
+        return self._requests.shutdown()
 
     def _drawn(self):
         if self._half is not None:
@@ -279,7 +286,8 @@ class VolumeView(QtWidgets.QFrame):
             self._clear_items()
             self._show_notice(str(refused), offer_half=self._half is None)
             return
-        if self._wanted is not None and self._wanted.reset:
+        wanted = self._requests.wanted
+        if wanted is not None and wanted.reset:
             reset_levels = True  # a reset not yet drawn (Log's) holds for the draw that supersedes it
         log = self.log_scale.isChecked()
         automatic = reset_levels or self.intensity.autoscale.isChecked()
@@ -287,9 +295,6 @@ class VolumeView(QtWidgets.QFrame):
         kept = (self._index is not None and self._index_values is values and self._index_log == log
                 and self._index_levels == (self._index_auto if automatic else levels))
         name = self.color_map.currentText()
-        if kept and name == self._drawn_map:
-            self._ask(None)  # the image shown is this draw: one still computing is dropped
-            return
         try:
             table = color_table(name)
         except VolumeRenderRefused as refused:  # a colour map matplotlib lacks: refused as volume_rgba refused it
@@ -301,62 +306,31 @@ class VolumeView(QtWidgets.QFrame):
                                self._index_levels if kept else levels, name, table, *index))
 
     def _ask(self, request: _DrawRequest | None) -> None:
-        """The latest draw wins: ``request`` (None: none) is the one asked for; a different draw on the worker is
-        cancelled, and dropped when it returns."""
-        self._wanted = request
-        if self._running is not None and not (request is not None and request.matches(self._running[1])):
-            self._worker.cancel(self._running[0])
-        if request is None:
-            if self.notice.text() == _DRAWING:
-                self._show_notice("", offer_half=False)
-            return
-        self._show_notice(_DRAWING, offer_half=False)  # the image shown stays until the new one is drawn
-        self._start()
+        """Ask the shared owner for ``request`` (None: none; the latest wins), the notice saying a draw is on its
+        way while the image shown stays."""
+        if self._requests.ask(request):
+            self._show_notice(_DRAWING, offer_half=False)
+        elif self.notice.text() == _DRAWING:
+            self._show_notice("", offer_half=False)
 
-    def _start(self) -> None:
-        if self._running is not None or self._wanted is None:
-            return
-        request = self._wanted
-        identity = self._worker.begin(request)
-        if identity is None:  # the worker is closed (the page closing): nothing more is drawn
-            return
-        self._running = (identity, request)
-        self._poll_timer.start()
+    def _done(self, request: _DrawRequest, terminal) -> bool:
+        """The draw asked for returned (the shared owner's ``done``): drawn, or its refusal or failure named;
+        whether it is drawn."""
+        if terminal.status is OperationTerminalStatus.RETURNED:
+            return self._apply(request, terminal.payload)
+        return self._apply(request, VolumeRenderRefused(
+            "VOLUME_DRAW_FAILED", f"the 3D view could not be drawn ({terminal.failure_type}: "
+                                  f"{terminal.failure_message})"))
 
-    def _poll(self) -> None:
-        """A draw returned: shown if it is still the one asked for, else dropped; then the latest asked for."""
-        if self._running is None:
-            self._poll_timer.stop()
-            return
-        identity, request = self._running
-        update = self._worker.poll(identity)
-        if update is None or update.terminal is None:
-            return
-        self._running = None
-        terminal = update.terminal
-        if (terminal.status is not OperationTerminalStatus.CANCELLED and self._wanted is not None
-                and request.matches(self._wanted)):  # a cancelled draw asked for again is computed again
-            self._wanted = None
-            if terminal.status is OperationTerminalStatus.RETURNED:
-                self._apply(request, terminal.payload)
-            elif terminal.status is OperationTerminalStatus.FAILED:
-                self._apply(request, VolumeRenderRefused(
-                    "VOLUME_DRAW_FAILED", f"the 3D view could not be drawn ({terminal.failure_type}: "
-                                          f"{terminal.failure_message})"))
-        del update, terminal  # a dropped draw's buffers go with it
-        if self._wanted is not None:
-            self._start()
-        elif self._running is None:
-            self._poll_timer.stop()
-
-    def _apply(self, request: _DrawRequest, drawn) -> None:
-        """Show a draw (the GUI thread's part: the intensity controls, then the GL upload) or its refusal."""
+    def _apply(self, request: _DrawRequest, drawn) -> bool:
+        """Show a draw (the GUI thread's part: the intensity controls, then the GL upload) or its refusal; whether
+        it is drawn."""
         if isinstance(drawn, VolumeRenderRefused):
             self.rgba = None
             self._forget_index()
             self._clear_items()
             self._show_notice(str(drawn), offer_half=False)
-            return
+            return False
         if drawn.domain is not None:  # a full draw: the controls take its domain and automatic levels
             domain = drawn.domain
             blocker = QtCore.QSignalBlocker(self.intensity)
@@ -369,8 +343,10 @@ class VolumeView(QtWidgets.QFrame):
         self._index_values, self._index_log, self._drawn_map = request.values, request.log, request.color_map
         self._show_notice("", offer_half=False)
         self._draw_items(request.axes)
+        return True
 
     def _forget_index(self) -> None:
+        self._requests.forget()  # no image shown: no draw is the image shown
         self._index = self._alpha = self._index_values = self._index_log = None
         self._index_levels = self._index_auto = self._drawn_map = None
 
