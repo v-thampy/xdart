@@ -359,8 +359,9 @@ def test_real_browse_load_is_off_thread_exact_and_independently_owned(
     assert len(context.publication_store) == 0
     assert len(context.record_store) == 0
     assert context.calibration_identity
-    assert context.mask_identity == "True"
-    assert context.result_identity == str(path)
+    assert context.requested_path == str(path)
+    assert not hasattr(context, "mask_identity")
+    assert not hasattr(context, "result_identity")
     assert calls == [
         ("open_scan", "scattering-browse"),
         ("read_scalar_catalog", "scattering-browse"),

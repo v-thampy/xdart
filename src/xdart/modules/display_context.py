@@ -1335,8 +1335,6 @@ class BrowseContext(_WriteOnceIdentity):
     #: The owned payload has been dropped as well (replacement, run end).
     released: bool = False
     calibration_identity: str = ""
-    mask_identity: str = ""
-    result_identity: str = ""
     target_entry: str = ""
     loaded_labels: tuple[int, ...] = ()
     target_snapshot: object = None
@@ -1451,11 +1449,9 @@ class BrowseContext(_WriteOnceIdentity):
                 and context_token == self.context_token
                 and load_generation == self.load_generation)
 
-    def stamp_provenance(self, *, calibration="", mask="", result="") -> None:
-        """Record the loaded scan's detached provenance (admission owner)."""
+    def stamp_provenance(self, *, calibration="") -> None:
+        """Record detached calibration presentation for GI and wavelength views."""
         self.calibration_identity = str(calibration or "")
-        self.mask_identity = str(mask or "")
-        self.result_identity = str(result or "")
 
     def _validate_scalar_catalog(self) -> None:
         catalog = self.scalar_catalog

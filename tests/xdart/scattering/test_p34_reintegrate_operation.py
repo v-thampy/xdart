@@ -2473,7 +2473,9 @@ def test_terminal_browse_uses_one_targeted_presentation_read(
     assert calls == [(str(target), "scattering-browse")]
     assert json.loads(context.calibration_identity) == expected_presentation
     assert expected_mask is None
-    assert context.mask_identity == "False"
+    assert context.requested_path == str(target)
+    assert not hasattr(context, "mask_identity")
+    assert not hasattr(context, "result_identity")
     assert context.loaded_labels == seeded.labels
     assert loader.release_context(context).cleanup_status.value == "cleaned"
 

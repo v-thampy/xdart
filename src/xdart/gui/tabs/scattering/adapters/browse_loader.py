@@ -1048,7 +1048,7 @@ class BrowseLoader:
         if not labels:
             raise ValueError("processed browse artifact has no frames")
         started = stage_start()
-        presentation, persisted_mask = read_browse_presentation(
+        presentation, _ = read_browse_presentation(
             canonical_path,
         )
         stage_finish("presentation_read_s", started)
@@ -1134,11 +1134,6 @@ class BrowseLoader:
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
-                mask=str(
-                    persisted_mask
-                    or catalog.rows[0].mask_baked
-                ),
-                result=request.source_path,
             )
             context.mark_loaded()
             if cancelled.is_set():

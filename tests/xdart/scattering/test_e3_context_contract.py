@@ -623,21 +623,13 @@ def test_case_03_browse_renders_raw_cake_1d_title_and_provenance():
     controller, _, _, loader, _ = _running_controller()
     controller.pause()
     _, browse = _select_browse(controller, loader)
-    browse.stamp_provenance(
-        calibration="poni-b",
-        mask="mask-b",
-        result="result-b",
-    )
+    browse.stamp_provenance(calibration="poni-b")
     payload = controller.project(_current_key(controller))
     assert payload.view.raw is not None
     assert payload.view.intensity_2d is not None
     assert payload.view.intensity_1d is not None
     assert "browse.b" in payload.title
-    assert (
-        browse.calibration_identity,
-        browse.mask_identity,
-        browse.result_identity,
-    ) == ("poni-b", "mask-b", "result-b")
+    assert browse.calibration_identity == "poni-b"
 
 
 def test_case_04_browse_never_mutates_acquisition_owners():
