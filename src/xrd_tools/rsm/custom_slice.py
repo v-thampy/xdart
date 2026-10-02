@@ -357,8 +357,10 @@ def _extent(origin, first, second, normal, width, low, high) -> tuple[tuple[floa
     The extremes are at vertices, where the plane meets two of the box's faces (the slab, three of the box's and
     its own two faces): each is solved and kept when inside the other faces. An axis only one direction moves
     bounds that direction alone, ``(face − origin) / direction``, as the line through the point did, and no
-    vertex passes that bound; so where each axis moves with one direction at most (H–K, HH–L) the ranges are the
-    line's, to the last bit."""
+    vertex passes that bound; so where each axis moves with one direction at most (H–K, HH–L) and the point's
+    lines cross the box, the ranges are those lines' (before F1), to the last bit. Where an axis moves with both
+    directions, the plane's extent can be wider than the lines' through the point, and is the same through any
+    point on the plane."""
     columns = (first, second, normal) if width else (first, second)
     rows = []  # per moved axis (and the slab): its coefficients, its two faces less the origin, its scale
     bounds = [[-math.inf, math.inf], [-math.inf, math.inf]]  # what an axis moved by t (by s) alone allows
