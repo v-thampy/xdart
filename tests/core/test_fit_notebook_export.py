@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import ast
 import sys
 
 import numpy as np
@@ -28,6 +29,42 @@ def recipe_bundle(tmp_path, **settings):
                                settings={"selection_mode": "count", "n_peaks": 1,
                                          "model": "gaussian", "background": "constant", **settings})
     return recipe, captured
+
+
+@pytest.mark.parametrize("owner", ["fit", "run"])
+@pytest.mark.parametrize("format", ["jupyter", "marimo"])
+def test_export_headers_use_installed_launchers(tmp_path, owner, format):
+    from xrd_tools import __version__
+    from xrd_tools.notebooks import render_notebook
+    from xrd_tools.notebooks.workflow import WorkflowRecipe
+    from xrd_tools.notebooks.workflow_render import render_workflow_notebook
+    if owner == "fit":
+        recipe, _ = recipe_bundle(tmp_path)
+        document = render_notebook(recipe, format=format)
+        description_name = "notebook_description"
+    else:
+        document = render_workflow_notebook(WorkflowRecipe("int", {}), format=format)
+        description_name = "description"
+    if format == "jupyter":
+        notebook = json.loads(document)
+        header = notebook["cells"][0]["source"]
+        assert notebook["cells"][0]["cell_type"] == "markdown"
+        if owner == "run":
+            assert "RUN_PROCESSING = False" in notebook["cells"][1]["source"]
+    else:
+        tree = ast.parse(document)
+        assignment = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == description_name
+                                  for target in node.targets))
+        header = ast.literal_eval(assignment.value)
+        assert f"mo.md({description_name})" in document
+        if owner == "run":
+            assert "if run_processing.value:" in document
+            assert "mo.ui.run_button(label='Run processing')" in document
+    assert "`xdart-notebook exported.ipynb`" in header
+    assert "`xdart-notebook --marimo exported.py`" in header
+    assert f"xdart/xrd_tools {__version__}" in header
+    assert "marimo>=0.25,<0.26" in header
 
 
 def test_lossless_selected_input_transport_and_named_failure(tmp_path, monkeypatch):

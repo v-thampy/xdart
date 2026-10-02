@@ -6,6 +6,7 @@ from .workflow import workflow_to_json
 
 
 def render_workflow_notebook(recipe, *, format, data_root=".", name="workflow"):
+    from xrd_tools import __version__
     configuration = textwrap.dedent(f"""
         from pathlib import Path
         from xrd_tools.notebooks.workflow import WorkflowRecipe, workflow_from_json, run_workflow, workflow_result_references, read_workflow_result
@@ -20,7 +21,10 @@ def render_workflow_notebook(recipe, *, format, data_root=".", name="workflow"):
                    "marimo: press Run processing. OUTPUT_ROOT must be a fresh folder below DATA_ROOT, the source Project; "
                    "existing targets are refused. Export/opening creates no output folder. Live replay is refused by the "
                    "finite processing owner. Original source admission, correction, cancellation and publication rules apply. "
-                   "After Run, select a published result/frame and compare native patterns using the shared Plotly owners.\n")
+                   "After Run, select a published result/frame and compare native patterns using the shared Plotly owners.\n\n"
+                   f"Created with xdart/xrd_tools {__version__}. Open with the installed xdart environment: "
+                   "Jupyter: `xdart-notebook exported.ipynb`; marimo: `xdart-notebook --marimo exported.py` "
+                   "(supported marimo>=0.25,<0.26).\n")
     if format == "jupyter":
         sources = [description, configuration,
                    "# Read/edit CONFIGURATION and the two roots before enabling this processing call.\n"

@@ -46,8 +46,9 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
               "Edit BUNDLE_ROOT if your kernel "
               "starts in another directory; edit DATA_ROOT for external CIF assets. Changed captured input is "
               "reported as INPUT_CHANGED, not replayed silently.\n\n"
-              f"Created with xrd-tools {__version__}. Use the same xrd-tools environment as xdart. Jupyter: open this file with JupyterLab. "
-              "Marimo 0.25: `marimo edit <export>.py`. Plotly is the interactive default. Fit/Apply commits "
+              f"Created with xdart/xrd_tools {__version__}. Open with the installed xdart environment: "
+              "Jupyter: `xdart-notebook exported.ipynb`; marimo: `xdart-notebook --marimo exported.py` "
+              "(supported marimo>=0.25,<0.26). Plotly is the interactive default. Fit/Apply commits "
               "scientific settings; pan, zoom and Log change presentation. Optional batch fitting is an explicit "
               "call to run_recipe_batch(recipe, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT).\n")
     if recipe.trend_column:
