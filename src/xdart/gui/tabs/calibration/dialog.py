@@ -134,6 +134,19 @@ def _frame_energy_known(frame, seed):
 
 def _dispatch_job(request, cancelled, publish):
     kind, arguments = request
+    if kind == 'source_details':
+        from xrd_tools.integrate.stitch_calibration import calibration_source_energy_eV
+        from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
+        prefix, spec, folder, stem = arguments
+        energy = calibration_source_energy_eV(spec) if not prefix else None
+        automatic = None
+        if spec.kind is SourceKind.SPEC and not stem:
+            files = find_spec_image_files(folder, Path(spec.uri).stem, spec.options['scan'])
+            if files:
+                automatic = spec_image_stem(files[0], Path(spec.uri).stem, spec.options['scan'])
+        if cancelled.is_set():
+            raise OperationCancelled('source metadata cancelled')
+        return prefix, energy, automatic
     if kind == 'refine':
         from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
         spec, seed, options = arguments
@@ -443,6 +456,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._calibration_fit_window = None
         self._fit_kind = 'fit'  # the job the current fit came from: 'fit' or 'refine'
         self._distance_key = self._distance_pending_key = None  # what the result was fitted from
+        self._source_energy_text = None
+        self._restoring_fields = False
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
         self._frame_motors = ('del', 'nu')
         #: The instrument the current fit recorded; any other value leaves it unsaveable.
@@ -505,6 +520,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._set_field_text('beam_detector', context.detector)
         if context.camera is not None:
             self.camera.set_value(context.camera)
+        self._pixel_detector = self._text('beam_detector')
+        self._pixel_orientation = self._orientation()
 
     def _form(self, title, key):
         widget = QtWidgets.QWidget()
@@ -633,6 +650,30 @@ class CalibrationDialog(QtWidgets.QDialog):
                            fallback=str(self.project_root))
         if picks and picks[0]:
             self._set_field_text(key, picks[0])
+            if key in ('beam_source', 'beam_images', 'source', 'images'):
+                if key == 'beam_source':
+                    self._set_field_text('beam_image_file', '')
+                self._source_details('beam_' if key.startswith('beam_') else '')
+
+    def _source_details(self, prefix=''):
+        """Committed source fields only: reuse the worker for pixel-free metadata and naming."""
+        if self._owner.busy or self._restoring_fields:
+            return
+        if not prefix:
+            if self._source_energy_text == self._text('rough_energy'):
+                self._set_field_text('rough_energy', '')
+            self._source_energy_text = None
+        path = self._text(prefix + 'source')
+        if not path:
+            return
+        kind = (SourceKind.NEXUS_STACK if self.beam_source_kind.currentData() == 'nexus'
+                else SourceKind.SPEC) if prefix else SourceKind(self.source_kind.currentData())
+        spec = SourceSpec(Path(path).expanduser().absolute(), kind,
+                          entry=self._text(prefix + 'entry') or 'entry',
+                          options={'scan': self._text(prefix + 'scan')} if kind is SourceKind.SPEC else {})
+        folder = self._text(prefix + 'images') or str(Path(path).expanduser().absolute().parent)
+        self._auto_placeholders(prefix)
+        self._start('source_details', (prefix, spec, folder, self._text(prefix + 'stem')))
 
     def _set_field_text(self, key, value):
         field, value = self._fields[key], str(value)
@@ -671,9 +712,21 @@ class CalibrationDialog(QtWidgets.QDialog):
                 'rings, and the refinement fits them. Another pyFAI calibrant name may be typed.')
         self.refine_calibrant.setEditable(True)
         self.refine_calibrant.currentTextChanged.connect(self._render_frames)
+        self._formrows['calibrant'] = self._row_of[self.refine_calibrant]
+        self._rows['calibrant'] = (form, self._row_of[self.refine_calibrant])
+        self._attach('rough_energy', 'calibrant', 'Energy (keV)', '', width=150,
+                     placeholder='auto from scan',
+                     tip='The calibrant scan\'s X-ray energy, in keV, populated from its recorded energy or '
+                         'wavelength when the source is committed. Type it when metadata is absent. '
+                         'Wavelength is computed from this value; the direct-beam distance fit needs no energy. '
+                         'Saving a rough calibration needs this or the direct-beam scan\'s recorded energy'
+                         + _PAGE_USE.get(self.context.page, {}).get('energy_field', '') + '.')
+        self._fields['rough_energy'].editingFinished.connect(self._render_frames)
         self.source_kind.currentIndexChanged.connect(self._sync_source_rows)
         for key in ('source', 'scan'):
             self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders())
+        for key in ('source', 'scan', 'entry', 'images', 'stem'):
+            self._fields[key].editingFinished.connect(lambda: self._source_details())
         self._sync_source_rows()
         self._auto_placeholders()
         self.list_button = QtWidgets.QPushButton('Read metadata and suggest 5 frames')
@@ -973,6 +1026,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         for key in ('beam_source', 'beam_scan'):
             self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders('beam_'))
         self._auto_placeholders('beam_')
+        for key in ('beam_source', 'beam_scan', 'beam_entry', 'beam_images', 'beam_stem'):
+            self._fields[key].editingFinished.connect(lambda: self._source_details('beam_'))
         self._edit(form, 'beam_motor', 'Two-theta motor (degrees)', 'del',
                    tip='The motor that swings the detector in the direct-beam scan (del for psic\'s vertical arm).')
         self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '',
@@ -983,17 +1038,14 @@ class CalibrationDialog(QtWidgets.QDialog):
                        'brightest spot, a lone hot pixel ignored). Typed: along the beam\'s motion it can be '
                        'rough; across it (the row for horizontal motion, the column for vertical) it must be '
                        'within the strip half width, because the spot is searched only in that strip.')
-        self.motion = self._combo(form, 'Beam motion', [('horizontal', None), ('vertical', None)],
-                                  tip='The direction the beam spot moves across the image as the motor turns.')
+        self.motion = self._combo(form, 'Beam motion', [('Auto (motor)', 'auto'),
+                                                       ('horizontal', None), ('vertical', None)],
+                                  tip='The beam spot\'s direction in the oriented image. Auto uses the configured '
+                                      'circle: del (vertical) or nu (horizontal), including a single 2θ arm. '
+                                      'Choose an explicit direction to override it.')
         self._edit(form, 'rough_mount', 'Detector mount tilt, roll (°)', '0, 0',
                    tip='The detector mount\'s tilt and roll, held fixed (the arm\'s mount extension; a '
                        'single 2θ arm has none). 0, 0: the detector faces the beam squarely at every angle.')
-        self._edit(form, 'rough_wavelength', 'Wavelength (Å)', '',
-                   placeholder="blank: the calibrant scan's energy, else the direct-beam scan's",
-                   tip='The X-ray wavelength of this geometry. Blank: the calibrant scan\'s recorded energy (3 · '
-                       'Calibrant scan), else the direct-beam scan\'s once it is fitted, when they record one. '
-                       'Save as calibration and a refinement started from this geometry need it'
-                       + _PAGE_USE.get(self.context.page, {}).get('energy_field', '') + '.')
         self._fit_options, options = self._card(layout, 'Fit options')
         self._edit(options, 'beam_strip', 'Strip half width (pixels)', '2',
                    tip='The beam spot is searched in a strip this many pixels either side of its path.')
@@ -1035,7 +1087,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.save_rough_button)
         layout.addStretch(1)
         self.rough_mode.currentIndexChanged.connect(self._sync_rough_rows)
-        for key in ('rough_distance', 'beam_pixel', 'beam_motor', 'rough_mount', 'rough_wavelength'):
+        for key in ('rough_distance', 'beam_pixel', 'beam_motor', 'rough_mount'):
             self._fields[key].editingFinished.connect(self._render_frames)
         self._fields['rough_mount'].textChanged.connect(self._invalidate_fit)  # the fits' mount estimate
         self._fields['rough_mount'].textChanged.connect(self._bounds_edited)
@@ -1044,6 +1096,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._fields['beam_detector'].currentIndexChanged.connect(self._detector_chosen)
         self._fields['beam_detector'].currentIndexChanged.connect(self._update_image_size)
         self.camera.changed.connect(self._update_image_size)  # the beam pixel's image turns
+        self.camera.changed.connect(self._beam_camera_changed)
         self.camera.changed.connect(self._camera_edited)
         self._update_image_size()
 
@@ -1124,7 +1177,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         'skip': 'No rough geometry: each frame\'s rings are predicted from a geometry file (4 · Calibrate and fit '
                 '▸ Refine from the whole scan), or from the first frame you calibrate.',
     }
-    #: Hidden by Skip. The wavelength stays: a frame whose scan records no energy is calibrated at it.
+    #: Hidden by Skip. Calibrant scan owns the energy field for frames without recorded energy.
     _GEOMETRY_ROWS = ('beam_motor', 'beam_pixel', 'rough_mount')
 
     _CAMERA_TIP = ('The lab directions the stored image\'s rows (top to bottom) and columns (left to right) run '
@@ -1186,7 +1239,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         """A direct-beam scan finds the beam pixel when it is blank; a typed distance needs it."""
         if not hasattr(self, 'rough_mode'):  # still being built
             return
-        found = getattr(self._distance_result, 'beam_pixel', None)
+        found = getattr(self._distance_result, 'beam_pixel', None) if self._distance_fresh() else None
         self._fields['beam_pixel'].setPlaceholderText(
             'column, row where the direct beam hits at the zero' if self.rough_mode.currentData() != 'scan'
             else f'auto · the direct beam found at {found[0]:.1f}, {found[1]:.1f}' if found is not None
@@ -1194,17 +1247,33 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _detector_chosen(self, *_args):
         """The chosen detector's shape becomes the RAW reader's rows and columns."""
+        model = self._text('beam_detector')
+        if not self._restoring_fields and model != getattr(self, '_pixel_detector', model):
+            self._set_field_text('beam_pixel', '')  # a pixel belongs to one detector, not another model
+        self._pixel_detector = model
         shape = detector_shape(self._text('beam_detector'))
         if shape is not None and 'shape' in self._fields:
             self._fields['shape'].setText(f'{shape[0]}, {shape[1]}')
+
+    def _beam_camera_changed(self):
+        orientation, old = self._orientation(), getattr(self, '_pixel_orientation', self._orientation())
+        shape = detector_shape(self._text('beam_detector'))
+        if not self._restoring_fields and shape and self._text('beam_pixel'):
+            try:
+                pixel = tuple(map(float, self._text('beam_pixel').split(',')))
+                pixel = orientation.apply_pixel(old.unapply_pixel(pixel, shape), shape)
+                self._set_field_text('beam_pixel', ', '.join(f'{value:.12g}' for value in pixel))
+            except ValueError:
+                self._set_field_text('beam_pixel', '')
+        self._pixel_orientation = orientation
 
     def _sync_rough_rows(self, *_args):
         """Every Rough geometry row's visibility, from the rough mode and the direct-beam source together."""
         mode, kind = self.rough_mode.currentData(), self.beam_source_kind.currentData()
         scan = mode == 'scan'
         visible = {'rough_distance': mode == 'manual', 'beam_source': scan,
-                   'beam_scan': scan and kind != 'nexus', 'beam_image_file': scan and kind == 'spec_container',
-                   'beam_images': scan and kind == 'spec_series', 'beam_stem': scan and kind == 'spec_series',
+                   'beam_scan': scan and kind != 'nexus', 'beam_image_file': False,
+                   'beam_images': scan and kind != 'nexus', 'beam_stem': scan and kind != 'nexus',
                    'beam_entry': scan and kind != 'spec_series',
                    **dict.fromkeys(self._GEOMETRY_ROWS, mode != 'skip')}
         form = self._beam_form
@@ -1268,12 +1337,15 @@ class CalibrationDialog(QtWidgets.QDialog):
             camera=self._orientation())  # a quarter turn: the detector turned with the images (item 8)
 
     def _rough_wavelength_A(self):
-        """The typed wavelength (Å), else the calibrant scan's when every frame read records the same
+        """Wavelength from the Energy field, else the calibrant scan's when every frame records the same
         energy, else the direct-beam scan's (maintainer, 2026-09-29: "why doesn't it get it from the
         spec file?") while its fit is current, else None."""
-        if self._text('rough_wavelength'):
-            return float(self._text('rough_wavelength'))
         from xrd_tools.core.energy import energy_eV_to_wavelength_m
+        if self._text('rough_energy'):
+            energy = float(self._text('rough_energy')) * 1000
+            if not math.isfinite(energy) or energy <= 0:
+                raise ValueError('Energy must be finite and positive, in keV')
+            return float(energy_eV_to_wavelength_m(energy)) * 1e10
         energies = {energy for _index, _values, energy in self._choices if energy is not None}
         if len(energies) == 1:
             return float(energy_eV_to_wavelength_m(energies.pop())) * 1e10
@@ -1370,6 +1442,16 @@ class CalibrationDialog(QtWidgets.QDialog):
         except (ValueError, TypeError):
             pass  # an older settings file: the del/nu fields below still name the arm
         fields = dict(values.get('fields') or {})
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        if fields.get('rough_wavelength') and not fields.get('rough_energy'):
+            try:
+                fields['rough_energy'] = f"{float(wavelength_m_to_energy_eV(float(fields['rough_wavelength']) * 1e-10)) / 1000:.15g}"
+            except (TypeError, ValueError):
+                pass
+        if fields.get('beam_image_file') and not fields.get('beam_images') and not fields.get('beam_stem'):
+            old = Path(fields['beam_image_file'])
+            fields.update(beam_images=str(old.parent), beam_stem=old.stem, beam_image_file='')
+        self._restoring_fields = True
         for old, new in (('beam_mask', 'mask'), ('beam_saturation', 'saturation'), ('refine_max_counts', 'saturation')):
             if fields.get(old) and not fields.get(new):  # an older window's field, now the Detector panel's
                 fields[new] = fields[old]
@@ -1395,6 +1477,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if isinstance(values.get('refine_energy'), bool):
             self.refine_energy.setChecked(values['refine_energy'])
         self._apply_camera(values)
+        self._restoring_fields = False
         # after the del/nu fields an older file names its arm with: its normal-incidence zero
         self.geometry_editor.set_value(migrated_instrument(self.geometry_editor.value(), values))
         self._sync_arm_model()
@@ -1567,9 +1650,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             kind = SourceKind(self.source_kind.currentData())
         options = {}
         if kind is SourceKind.SPEC:
-            if beam and self.beam_source_kind.currentData() == 'spec_container':
-                if not self._text('beam_image_file'):
-                    raise ValueError('select the Eiger or NeXus image container for this SPEC scan')
+            if (beam and self.beam_source_kind.currentData() == 'spec_container'
+                    and self._text('beam_image_file') and not self._text('beam_images') and not self._text('beam_stem')):
                 return SourceSpec(Path(path).resolve(), kind, entry=self._text('beam_entry') or 'entry',
                     options={'scan': self._text('beam_scan'), 'image_file': self._text('beam_image_file')})
             # a blank folder is the SPEC file's, as in Stitch; a blank stem is the source's default
@@ -1629,8 +1711,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                 raise ValueError(self._staged_camera_message())  # (Codex round-2 review F3; the Fit's refusal)
             frame, seed = self._selected_frame(), {**self._seed_options(), 'mask': self._pyfai_mask()}
             if not _frame_energy_known(frame, seed):
-                raise ValueError(f'frame {frame.identity}: its scan records no energy; type the wavelength '
-                                 '(2 · Rough geometry) so pyFAI calibrates it at the right one')
+                raise ValueError(f'frame {frame.identity}: its scan records no energy; type Energy (keV) '
+                                 '(3 · Calibrant scan) so pyFAI calibrates it at the right one')
             self._start('calibrate', (frame, seed))
         self._guard(start)
 
@@ -1824,7 +1906,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                 if seed is None:
                     raise ValueError('measure or type the distance and the beam pixel first (2 · Rough geometry)')
                 if self._rough_wavelength_A() is None:
-                    raise ValueError('type the wavelength in 2 · Rough geometry: the rings are predicted with it')
+                    raise ValueError('type Energy (keV) in 3 · Calibrant scan: the rings are predicted with it')
             else:
                 if not self._text('refine_seed_path'):
                     raise ValueError('choose the geometry file to start from')
@@ -1920,7 +2002,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if record is None:
             raise ValueError('measure or type the distance and the beam pixel first (2 · Rough geometry)')
         if self._rough_wavelength_A() is None:
-            raise ValueError('type the wavelength to save this geometry as a calibration')
+            raise ValueError('type Energy (keV) to save this geometry as a calibration')
         delta, nu = self.geometry_editor.value().stitch_arm()  # as _rough_arm
         direct = ({**self._distance_record(self._distance_result),
                    'held_motor_readings': dict(self._distance_held)}  # the pose the beam was seen at
@@ -2018,11 +2100,16 @@ class CalibrationDialog(QtWidgets.QDialog):
         """The direct-beam fit's (source, motor, options) from the window as it is now; without the
         mask's pixels its state stands in (for the result's identity)."""
         orientation = int(self._text('beam_orientation'))
+        motion = self.motion.currentText()
+        if self.motion.currentData() == 'auto':
+            motion = {'del': 'vertical', 'nu': 'horizontal'}.get(self._beam_role())
+            if motion is None:
+                raise ValueError('Choose Horizontal or Vertical for a motor not mapped to the detector arm')
         options = dict(detector=self._text('beam_detector'),
             detector_config={'orientation': orientation} if orientation != 3 else None,
             beam_pixel=(tuple(float(v) for v in self._text('beam_pixel').split(','))
                         if self._text('beam_pixel') else None),  # blank: found at the zero
-            motion=self.motion.currentText(), strip_half_width=int(self._text('beam_strip')),
+            motion=motion, strip_half_width=int(self._text('beam_strip')),
             model='tangent', angle_zero_deg=self._zeros().get(self._beam_role(), 0.),
             rotation=self._orientation().rotation, flip=self._orientation().flip_horizontal)
         if self._text('beam_roi'):
@@ -2091,8 +2178,9 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def keyPressEvent(self, event):
         """Return or Enter commits the box being typed in and presses no button: with many boxes and
-        buttons, the dialog's default button (Fit direct-beam distance) would start a job."""
-        if event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+        buttons, the dialog's default button (Fit direct-beam distance) would start a job.
+        Escape returning from a file chooser must not reject this retained window."""
+        if event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter, QtCore.Qt.Key.Key_Escape):
             event.accept()
             return
         super().keyPressEvent(event)
@@ -2225,7 +2313,15 @@ class CalibrationDialog(QtWidgets.QDialog):
         if terminal.status is OperationTerminalStatus.RETURNED:
             result = terminal.payload
             try:
-                if kind == 'enumerate':
+                if kind == 'source_details':
+                    prefix, energy, automatic = result
+                    if energy is not None:
+                        self._source_energy_text = f'{energy / 1000:.15g}'
+                        self._set_field_text('rough_energy', self._source_energy_text)
+                    if automatic is not None:
+                        self._fields[prefix + 'stem'].setPlaceholderText(f'auto · {automatic}')
+                    self._render_frames()
+                elif kind == 'enumerate':
                     result, names, record = result
                     self.geometry_editor.set_available_motors(names)
                     self.geometry_editor.set_value(InstrumentGeometry.from_record(record))
@@ -2234,6 +2330,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.selection.setColumnCount(2 + len(read))
                     self.selection.setHorizontalHeaderLabels(['Use', 'Frame', *(f'{motor} (°)' for motor in read)])
                     self._choices = result
+                    energies = {energy for _index, _values, energy in result if energy is not None}
+                    if len(energies) == 1:
+                        self._source_energy_text = f'{energies.pop() / 1000:.15g}'
+                        self._set_field_text('rough_energy', self._source_energy_text)
                     suggested = suggested_frame_indices(result)
                     self.selection.setRowCount(len(result))
                     for row, (index, motors, _) in enumerate(result):

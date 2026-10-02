@@ -350,6 +350,38 @@ class ImageOrientation:
             out = out[..., :, ::-1]
         return np.ascontiguousarray(out)
 
+    def apply_pixel(self, pixel, shape) -> tuple[float, float]:
+        """Map a zero-based (column, row) coordinate as :meth:`apply` maps an array.
+
+        ``shape`` is the stored image's (rows, columns); no detector array is allocated.
+        Fractional beam coordinates keep their precision.
+        """
+        x, y = map(float, pixel)
+        rows, columns = shape
+        if self.transpose:
+            x, y, rows, columns = y, x, columns, rows
+        for _ in range(self.rotation // 90):
+            x, y, rows, columns = y, columns - 1 - x, columns, rows
+        if self.flip_vertical:
+            y = rows - 1 - y
+        if self.flip_horizontal:
+            x = columns - 1 - x
+        return x, y
+
+    def unapply_pixel(self, pixel, shape) -> tuple[float, float]:
+        """Inverse of :meth:`apply_pixel`, with the same stored-image ``shape``."""
+        x, y = map(float, pixel)
+        rows, columns = shape[::-1] if self.swaps_axes else shape
+        if self.flip_horizontal:
+            x = columns - 1 - x
+        if self.flip_vertical:
+            y = rows - 1 - y
+        for _ in range(self.rotation // 90):
+            x, y, rows, columns = rows - 1 - y, x, columns, rows
+        if self.transpose:
+            x, y = y, x
+        return x, y
+
     def unapply(self, image: "np.ndarray") -> np.ndarray:
         """:meth:`apply`'s inverse: an array in the calibrated orientation back to the raw detector's (a
         calibrated detector's own mask or solid angle into the frames' raw frame), one contiguous copy."""

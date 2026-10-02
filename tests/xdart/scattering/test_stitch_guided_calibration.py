@@ -343,7 +343,7 @@ def test_the_tabs_hold_the_instrument_then_advanced_above_the_fits_and_the_range
         assert not dialog._advanced_card.isAncestorOf(dialog._fields[key])
     # Skip keeps the wavelength: a frame whose scan records no energy is calibrated at it
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
-    assert dialog._row_visible('rough_wavelength') and not dialog._row_visible('beam_pixel')
+    assert dialog._row_visible('rough_energy') and not dialog._row_visible('beam_pixel')
     from xdart.gui.pages.values import PageCleanup
     assert dialog.shutdown().status is PageCleanup.CLEAN
     dialog.close()
@@ -564,7 +564,8 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
         dialog._set_field_text(key, value)
     assert dialog._fields['beam_pixel'].placeholderText().startswith('auto · where the direct beam hits')
     assert dialog._fields['beam_scan'].isHidden() == (source_kind == 'nexus')
-    assert dialog._fields['beam_images'].parentWidget().isHidden()
+    assert dialog._row_visible('beam_images') == (source_kind == 'spec_container')
+    dialog.motion.setCurrentText('horizontal')  # synthetic spot direction
     dialog.beam_button.click()
     for _ in range(100):
         QtWidgets.QApplication.processEvents()
@@ -595,6 +596,7 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
 
 def _fit_direct_beam(dialog):
     from pyqtgraph.Qt import QtWidgets, QtTest
+    dialog.motion.setCurrentText('horizontal')  # synthetic spot direction
     dialog.beam_button.click()
     for _ in range(1500):
         QtWidgets.QApplication.processEvents()
@@ -874,8 +876,9 @@ def test_the_rough_geometry_puts_the_beam_where_the_fit_says_it_is_at_the_zero(t
     try:
         dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
         for key, value in dict(beam_source=nexus, beam_entry='measurement', beam_detector='Pilatus100k',
-                               beam_pixel='', rough_wavelength='1').items():
+                               beam_pixel='', rough_energy='12.39841984').items():
             dialog._set_field_text(key, value)
+        dialog.motion.setCurrentText('horizontal')  # synthetic spot direction
         dialog.beam_button.click()
         for _ in range(1500):
             QtWidgets.QApplication.processEvents()

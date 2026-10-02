@@ -6,6 +6,8 @@ import time
 
 import numpy as np
 import pytest
+
+from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.pages.operation_owner import OperationCancelled
@@ -604,8 +606,8 @@ def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit
         _save_to(monkeypatch, target)
         dialog.save_rough_button.click()  # Stitch checks each scan's energy against the wavelength
         _wait(dialog)
-        assert 'wavelength' in dialog.status.text() and not target.exists()
-        dialog._fields['rough_wavelength'].setText('0.7293')
+        assert 'Energy (keV)' in dialog.status.text() and not target.exists()
+        dialog._fields['rough_energy'].setText(str(wavelength_m_to_energy_eV(.7293e-10) / 1000))
         dialog._fields['del_domain'].setText('0, 40')  # nu stays at 0: only del's range is typed
         adopted = []
         dialog.calibrationSaved.connect(lambda path, backend: adopted.append((path, backend)))
@@ -652,8 +654,8 @@ def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_
         _truth_bounds(dialog)
         dialog.refine_button.click()  # no wavelength typed and the scan records no energy: said at once
         _wait(dialog)
-        assert 'wavelength' in dialog.status.text() and dialog.fit is None
-        dialog._fields['rough_wavelength'].setText('0.7293')
+        assert 'Energy (keV)' in dialog.status.text() and dialog.fit is None
+        dialog._fields['rough_energy'].setText(str(wavelength_m_to_energy_eV(.7293e-10) / 1000))
         dialog.refine_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
@@ -684,7 +686,7 @@ def test_the_quick_save_builds_the_arm_the_geometry_shows(qapp, tmp_path, plane,
         geometry = InstrumentGeometry('twoc', (('tth', 'two_theta'),), plane)
         dialog.set_instrument(geometry)
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
-        for key, value in (('rough_distance', '150'), ('beam_pixel', '700, 100'), ('rough_wavelength', '0.7293')):
+        for key, value in (('rough_distance', '150'), ('beam_pixel', '700, 100'), ('rough_energy', str(wavelength_m_to_energy_eV(.7293e-10) / 1000))):
             dialog._fields[key].setText(value)
         fit = dialog._rough_fit()
         assert fit.asset['provenance']['source_motors'] == {position: 'two_theta'}

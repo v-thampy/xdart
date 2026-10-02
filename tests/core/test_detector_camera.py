@@ -13,6 +13,21 @@ CAMERAS = [DetectorCamera(rows, columns) for rows in CAMERA_AXES for columns in 
            if rows[0] != columns[0]]
 
 
+@pytest.mark.parametrize('rotation', [0, 90, 180, 270])
+@pytest.mark.parametrize('transpose,vertical,horizontal', [
+    (t, v, h) for t in (False, True) for v in (False, True) for h in (False, True)])
+def test_fractional_pixels_and_inverse_follow_the_actual_array(rotation, transpose, vertical, horizontal):
+    orientation = ImageOrientation(rotation, vertical, horizontal, transpose)
+    image = np.arange(7 * 11).reshape(7, 11)
+    transformed = orientation.apply(image)
+    # The midpoint of four neighbours maps to their midpoint under every camera.
+    xy = [np.argwhere(transformed == image[y, x])[0][::-1] for y in (2, 3) for x in (4, 5)]
+    expected = np.mean(xy, axis=0)
+    actual = orientation.apply_pixel((4.5, 2.5), image.shape)
+    assert actual == tuple(expected)
+    assert orientation.unapply_pixel(actual, image.shape) == (4.5, 2.5)
+
+
 def _xu_maps(camera):
     """2θ and pyFAI's χ per raw pixel, from psic's lists with every circle at zero (x up, y beam)."""
     qconv = xu.QConversion(['x+', 'z-', 'y+', 'z-'], ['x+', 'z-'], [0, 1, 0])

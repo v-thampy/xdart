@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from xrd_tools.core.energy import wavelength_m_to_energy_eV
+
 from xrd_tools.core.geometry import Diffractometer
 from tests.core.test_stacked_arm_extension import TRUTH
 from tests.xdart.scattering.test_stitch_calibration_fit_dialog import (  # noqa: F401  (qapp)
@@ -32,7 +34,7 @@ def test_the_direct_beam_and_the_rough_arm_read_the_panels_zeros(qapp, tmp_path)
         assert 'beam_zero' not in dialog._fields
         _type_zeros(dialog, {'del': 2.3, 'nu': -.8})
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
-        for key, value in (('rough_distance', '390'), ('beam_pixel', '700, 95'), ('rough_wavelength', '0.7293')):
+        for key, value in (('rough_distance', '390'), ('beam_pixel', '700, 95'), ('rough_energy', str(wavelength_m_to_energy_eV(.7293e-10) / 1000))):
             dialog._fields[key].setText(value)
         record = dialog._rough_arm()
         assert Diffractometer.from_pyfai_goniometer(record, source_motors=SOURCES).stacked_arm.motor_zeros() \
@@ -192,7 +194,7 @@ def test_the_first_opening_keeps_an_older_windows_normal_incidence_zero(qapp, tm
     try:
         assert dialog.geometry_editor.value().arm_zeros() == zeros
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
-        for key, value in (('rough_distance', '390'), ('beam_pixel', '240, 97'), ('rough_wavelength', '0.7293')):
+        for key, value in (('rough_distance', '390'), ('beam_pixel', '240, 97'), ('rough_energy', str(wavelength_m_to_energy_eV(.7293e-10) / 1000))):
             dialog._fields[key].setText(value)
         bound = ({'del_angle': 'del', 'nu_angle': 'nu'} if record['geometry'] == 'psic'
                  else {'nu_angle' if 'nu' in zeros else 'del_angle': 'tth'})  # a single arm: its one circle
@@ -214,7 +216,7 @@ def test_a_malformed_zero_is_refused_by_every_operation_and_a_typed_zero_is_supp
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
-        for key, value in (('rough_distance', '390'), ('beam_pixel', '240, 97'), ('rough_wavelength', '0.7293')):
+        for key, value in (('rough_distance', '390'), ('beam_pixel', '240, 97'), ('rough_energy', str(wavelength_m_to_energy_eV(.7293e-10) / 1000))):
             dialog._fields[key].setText(value)
         dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData('rough'))
         dialog._fields['source'].setText(str(tmp_path / 'calibrant'))
@@ -260,8 +262,9 @@ def test_a_direct_beam_result_is_used_only_with_the_inputs_it_was_fitted_from(qa
         dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec_container'))
         for key, value in dict(beam_source=spec, beam_image_file=master, beam_scan='8.1', beam_entry='measurement',
                                beam_detector='Pilatus100k', beam_pixel=', '.join(map(str, beam)),
-                               rough_wavelength='0.7293').items():
+                               rough_energy=str(wavelength_m_to_energy_eV(.7293e-10) / 1000)).items():
             dialog._set_field_text(key, str(value))
+        dialog.motion.setCurrentText('horizontal')  # synthetic spot direction
         dialog.beam_button.click()
         _wait(dialog)
         assert dialog._distance_result is not None and dialog._distance_fresh(), dialog.status.text()

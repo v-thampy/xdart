@@ -70,7 +70,7 @@ def _save_rough(dialog, monkeypatch, tmp_path, model, orientation):
     dialog.camera.set_value(stitch_camera(orientation))
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData("manual"))
     for key, value in (("beam_detector", model), ("rough_distance", "1014.7173"),
-                       ("beam_pixel", f"{BEAM[0]}, {BEAM[1]}"), ("rough_wavelength", "0.953724089788569"),
+                       ("beam_pixel", f"{BEAM[0]}, {BEAM[1]}"), ("rough_energy", "13.000007"),
                        ("del_domain", "-10, 30"), ("nu_domain", "-5, 5")):
         dialog._set_field_text(key, value)
     target = (tmp_path / "calibration" / "rough.json").resolve()

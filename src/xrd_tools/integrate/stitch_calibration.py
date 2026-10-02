@@ -114,6 +114,49 @@ def _exact_source(spec):
     return spec
 
 
+def calibration_source_energy_eV(spec: SourceSpec) -> float | None:
+    """A scan's common recorded energy, without reading detector pixels.
+
+    SPEC energy columns/positioners are eV; its explicit wavelength_m/wavelength_A keys declare
+    their units. NeXus uses the existing metadata reader's keV/angstrom projection. A missing,
+    invalid or varying energy is not a default energy, and an absent SPEC selector never falls back.
+    """
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    if spec.kind is SourceKind.SPEC:
+        from xrd_tools.io.spec import list_spec_scans, read_spec_scan_columns
+        key = str(spec.options.get('scan', ''))
+        keys = list_spec_scans(spec.uri)
+        if key not in keys:
+            key += '.1'
+        if key not in keys:
+            raise ValueError('select an existing SPEC scan explicitly')
+        columns, fixed, _ = read_spec_scan_columns(spec.uri, key)
+        metadata = {name.casefold(): np.asarray(value, dtype=float) for name, value in (*fixed, *columns)}
+        values = metadata.get('energy')
+        if values is None:
+            for name, factor in (('wavelength_m', 1.), ('wavelength_a', 1e-10)):
+                if name in metadata:
+                    values = wavelength_m_to_energy_eV(metadata[name] * factor)
+                    break
+        if values is None:
+            return None
+        values = np.asarray(values, dtype=float).reshape(-1)
+        if not len(values) or not np.all(np.isfinite(values) & (values > 0)):
+            return None
+        return float(values[0]) if np.all(values == values[0]) else None
+    from xrd_tools.io.nexus import read_nexus
+    metadata = read_nexus(spec.uri, spec.entry or 'entry', motor_names=['energy'], counter_names=[])
+    values = np.asarray(metadata.angles.get('energy', ()), dtype=float)
+    if values.size:
+        return (float(values.flat[0]) if np.all(np.isfinite(values) & (values > 0))
+                and np.all(values == values.flat[0]) else None)
+    if math.isfinite(metadata.energy) and metadata.energy > 0:
+        return float(metadata.energy) * 1000
+    if math.isfinite(metadata.wavelength) and metadata.wavelength > 0:
+        return float(wavelength_m_to_energy_eV(metadata.wavelength * 1e-10))
+    return None
+
+
 def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
     """Metadata-only enumeration; requested SPEC selectors never fall back."""
     from xrd_tools.sources import open_source
