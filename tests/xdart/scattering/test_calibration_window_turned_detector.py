@@ -199,3 +199,70 @@ def test_a_rough_calibration_saved_for_a_camera_keeping_the_axes_names_the_model
     assert (partner["detector"]["detector_factory_name"], partner["detector"]["shape"]) == (model, list(native.shape))
     assert (provenance["image_rotation"], provenance.get("image_flip", False)) == (
         orientation.rotation, orientation.flip_horizontal)
+
+
+# --- item 8b: the guided fit's and pyFAI-calib2's records under a quarter turn
+
+@pytest.mark.parametrize("page_name", ["RSM", "Stitch"])
+def test_the_guided_fit_saved_for_a_quarter_turned_camera_carries_the_turned_model(
+        qapp, tmp_path, monkeypatch, page_name):
+    """Frames pyFAI-calib2 calibrated with the window's turned detector: Fit takes the Detector panel's model turned
+    (a model they were not calibrated with is refused by name), and Save writes the record and partner with it."""
+    from xrd_tools.integrate.stitch_calibration import xu_partner_path
+    from tests.core.test_turned_detector import _TURNED, _turned_guided
+    model, config, turned, shape, _controls, frames = _turned_guided(tmp_path)
+    dialog, close = _window(page_name, tmp_path)
+    try:
+        dialog.camera.set_value(stitch_camera(_TURNED))
+        dialog._set_field_text("beam_detector", "Pilatus100k")  # not the frames' detector
+        dialog.frames, dialog._frame_motors = frames, ("del", "nu")
+        dialog._choices = [(index, dict(frame.motors), None) for index, frame in enumerate(frames)]
+        dialog._render_frames()
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is None and "is not the Pilatus100k turned" in dialog.status.text(), dialog.status.text()
+        dialog._set_field_text("beam_detector", model)
+        dialog.fit_button.click()
+        _wait(dialog)
+        assert dialog.fit is not None, dialog.status.text()
+        target = (tmp_path / "calibration" / "guided.json").resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_button.click()
+        _wait(dialog, timeout=120)
+        assert xu_partner_path(target).is_file(), dialog.status.text()
+    finally:
+        dialog.close()
+        close()
+    record = json.loads(target.read_text(encoding="utf-8"))
+    assert (record["detector"], record["detector_config"], record[TURNED_KEY]) == ("Detector", config, turned)
+    partner = json.loads(xu_partner_path(target).read_text(encoding="utf-8"))["detector"]
+    gaps = _TURNED.apply(_gaps(model))
+    assert (partner["detector_factory_name"], partner["shape"], partner["mask_count"]) == (
+        model, list(shape), int(gaps.sum()))
+
+
+def test_pyfai_calib2_is_given_the_turned_model_s_gaps_and_never_a_bare_generic_detector(qapp, tmp_path):
+    """Under a quarter turn pyFAI-calib2 sees the generic turned detector, which holds no mask: the window's mask
+    file for it carries the model's gaps turned (with the Detector panel's mask); a camera keeping the axes adds
+    nothing, as before. A saved frame naming the generic detector is never passed on as a bare name."""
+    import fabio
+    from xdart.gui.tabs.calibration.dialog import _pyfai_arguments
+    from tests.core.test_turned_detector import _TURNED
+    dialog = CalibrationDialog(CalibrationContext("RSM", tmp_path))
+    try:
+        dialog._set_field_text("beam_detector", "Pilatus300k")
+        assert dialog._pyfai_mask() is None  # the default camera keeps the axes, no mask drawn: none
+        dialog.camera.set_value(stitch_camera(_TURNED))
+        gaps = _TURNED.apply(_gaps("Pilatus300k"))
+        np.testing.assert_array_equal(fabio.open(dialog._pyfai_mask()).data.astype(bool), gaps)
+        drawn = np.zeros(_native("Pilatus300k").shape, dtype=np.uint8)  # on the stored image
+        drawn[:7, :40] = 1
+        np.save(tmp_path / "drawn.npy", drawn)
+        dialog._set_field_text("mask", str(tmp_path / "drawn.npy"))
+        np.testing.assert_array_equal(fabio.open(dialog._pyfai_mask()).data.astype(bool),
+                                      gaps | _TURNED.apply(drawn.astype(bool)))
+    finally:
+        dialog.close()
+    frame = type("Frame", (), {"energy_eV": 12000.0})()
+    assert "-D" not in _pyfai_arguments(frame, {"calibrant": "LaB6", "detector": "Detector"})
+    assert _pyfai_arguments(frame, {"calibrant": "LaB6", "detector": "Pilatus100k"})[-2:] == ("-D", "Pilatus100k")

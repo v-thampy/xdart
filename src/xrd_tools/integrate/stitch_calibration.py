@@ -531,14 +531,26 @@ def fit_point_residuals(result, controls, indices) -> dict:
                             for index, control in zip(indices, controls))}
 
 
-def _mg_detector_config(calibration):
+def _mg_detector_config(calibration, turned_from=None):
     """Use the existing Stitch JSON config without dropping detector geometry.
 
     pyFAI saves fixed detector pitches redundantly in PONI files. They can be
     omitted from a goniometer record only when the registered detector with
     the admitted orientation/binning reproduces the exact full configuration.
-    Generic/custom pitches, shapes and sensor configurations stay unsupported.
+    Generic/custom pitches, shapes and sensor configurations stay unsupported,
+    but for a registered model turned by a quarter with the images (``turned_from``,
+    else the calibration's own; AUD-9 stage 2b item 8): its generic detector of the
+    turned shape is kept exactly as the calibration window writes it.
     """
+    turned = turned_from if turned_from is not None else getattr(calibration, 'turned_from', None)
+    if turned is not None:
+        from xrd_tools.core.geometry.stacked_arm import checked_turned_detector
+        from xrd_tools.integrate.turned_detector import is_turned_window_record
+        turned = checked_turned_detector(turned)
+        if not is_turned_window_record(calibration.poni.detector, calibration.detector_config, turned):
+            raise ValueError(f"the frames' detector is not the {turned['detector']} turned with the images "
+                             f"(turned {turned['image_rotation']}°)")
+        return dict(calibration.detector_config)
     config = dict(calibration.detector_config)
     admitted = {key: value for key, value in config.items() if key in {'orientation', 'binning'}}
     extra = config.keys() - admitted.keys()
@@ -559,7 +571,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                     fit_scales=False, distance_seed_m=None, distance_bounds_m=None,
                     max_rms_q=0.03, domain=None, distance_provenance=None, cancelled=None,
                     arm_model='stacked', validation_angles=None, progress=None,
-                    instrument_geometry=None, min_frames=3, energy_bound_eV=None, bounds=None):
+                    instrument_geometry=None, min_frames=3, energy_bound_eV=None, bounds=None,
+                    turned_from=None):
     """Fit the matched rows and refuse unconverged, degenerate or poor fits.
 
     ``bounds`` (:class:`~xrd_tools.integrate.refine.ArmFitBounds`; None: its defaults) gives the
@@ -590,6 +603,10 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     extension is refused; the message and provenance say which, and why.
     ``instrument_geometry`` (an ``InstrumentGeometry`` record) also gives the circles' senses:
     a detector circle turning opposite to psic's fits with its motor scale reversed.
+    ``turned_from`` (AUD-9 stage 2b item 8): the model the frames' camera turns by a quarter into their frame
+    (``TURNED_DETECTOR_KEY``'s value): their PONIs name it turned (pyFAI's generic detector of the turned shape,
+    as the window seeds pyFAI with it), and the saved record carries it, so its gaps are rebuilt. Quarter-turned
+    frames that pyFAI calibrated with the model as it stores its images are refused by name.
     """
     from xrd_tools.integrate.refine import ArmFitBounds
     from xrd_tools.session.instrument import InstrumentGeometry
@@ -603,7 +620,7 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                        domain=domain, distance_provenance=distance_provenance, cancelled=cancelled,
                        validation_angles=validation_angles, progress=progress,
                        instrument_geometry=instrument_geometry, min_frames=min_frames,
-                       energy_bound_eV=energy_bound_eV, bounds=bounds)
+                       energy_bound_eV=energy_bound_eV, bounds=bounds, turned_from=turned_from)
         reason = automatic_arm_reason(frames, del_motor=del_motor, nu_motor=nu_motor, fit_scales=fit_scales)
         if not reason:
             try:
@@ -657,7 +674,8 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
         raise InterruptedError('calibration fit cancelled')
     energy = {}
     if backend == 'multigeometry':
-        exported_config = _mg_detector_config(base)
+        turned = _turned_frames_detector(frames, base, turned_from)
+        exported_config = _mg_detector_config(base, turned_from=turned)
         result = refine_goniometer(frames[0].poni_path, controls, rot1_motor=nu_motor,
                                   rot2_motor=del_motor, calibrant=calibrants[0],
                                   fit_scales=fit_scales, distance_seed_m=distance_seed_m,
@@ -668,8 +686,11 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
                                   energy_bound_eV=energy_bound_eV, bounds=bounds, senses=senses)
         if not result.success or result.rms_q > max_rms_q:
             raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
+        calibration = result.diffractometer.calibration
+        if turned is not None:  # the model and its turn travel with the record (AUD-9 item 8)
+            calibration = replace(calibration, turned_from=turned)
         asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(
-            result.diffractometer.calibration)
+            calibration)
         asset['detector_config'] = exported_config
         energy = dict(result.energy_refinement)
         if energy:  # the refined wavelength; the recorded energy the scans are checked against
@@ -725,6 +746,33 @@ def fit_calibration(frames, *, backend='multigeometry', del_motor='del', nu_moto
     # Provenance is a separate adjacent document for standard pyFAI files.
     return CalibrationFit(backend, {'calibration': asset, 'provenance': provenance}, rms, condition, count, message,
                           point_residuals=residuals)
+
+
+def _turned_frames_detector(frames, base, turned_from):
+    """The turned-detector record a fit of ``frames`` carries: ``turned_from`` when their camera turns them by a
+    quarter (checked against their turn; their PONIs' detector is checked by ``_mg_detector_config``), else None.
+    Quarter-turned frames that pyFAI calibrated with a model as it stores its images (its shape the frames'
+    transposed: pyFAI-calib2 given the model, not the window's seed) are refused by name (AUD-9 item 8)."""
+    from xrd_tools.core.geometry.stacked_arm import checked_turned_detector
+    turned_from = checked_turned_detector(turned_from)
+    orientation = ImageOrientation(rotation=frames[0].rotation, flip_horizontal=frames[0].flip)
+    if not orientation.swaps_axes:
+        return None
+    if base.poni.detector != 'Detector':
+        from pyFAI.detectors import detector_factory
+        config = dict(base.detector_config)
+        rows, columns = (int(value) for value in (detector_factory(base.poni.detector, config=config) if config
+                                                  else detector_factory(base.poni.detector)).shape)
+        if (rows, columns) != tuple(frames[0].shape) and (columns, rows) == tuple(frames[0].shape):
+            raise ValueError(
+                f'pyFAI calibrated these frames with the {base.poni.detector} as it stores its images '
+                f'({columns} × {rows} px), not turned with them as the window shows them ({rows} × {columns} px): '
+                'calibrate them from 2 · Rough geometry or a calibration file, which give pyFAI the turned detector')
+        return None
+    if turned_from is not None and (turned_from['image_rotation'], turned_from['image_flip']) != (
+            orientation.rotation, orientation.flip_horizontal):
+        raise ValueError("the turned detector's turn is not the frames' camera's")
+    return turned_from
 
 
 def bound_contact_note(table) -> str:

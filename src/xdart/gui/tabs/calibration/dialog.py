@@ -69,7 +69,8 @@ def _seed_record(seed, cancelled):
         from xrd_tools.integrate.calibration_seed import session_prediction
         record = session_prediction(seed['frames'], del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
                                     cancelled=cancelled, bounds=seed.get('bounds'),
-                                    instrument_geometry=seed.get('instrument'), **seed.get('distance', {}))
+                                    instrument_geometry=seed.get('instrument'), turned_from=seed.get('turned'),
+                                    **seed.get('distance', {}))
         if record is not None:
             return record  # else the saved frames do not fit yet: the rough geometry or the file
     return seed.get('rough') if seed.get('rough') is not None else seed.get('file')
@@ -83,7 +84,8 @@ def _prediction_after(seed, adopted, cancelled):
     try:
         return session_prediction((*frames, adopted), del_motor=seed['del_motor'], nu_motor=seed['nu_motor'],
                                   cancelled=cancelled, bounds=seed.get('bounds'),
-                                  instrument_geometry=seed.get('instrument'), **seed.get('distance', {}))
+                                  instrument_geometry=seed.get('instrument'), turned_from=seed.get('turned'),
+                                  **seed.get('distance', {}))
     except InterruptedError:
         return None
 
@@ -114,7 +116,7 @@ def _pyfai_arguments(frame, seed, cancelled=None):
             pass  # an unusable calibration only loses the head start
     if frame.energy_eV:
         arguments += ['-e', f'{frame.energy_eV / 1000:.9g}']
-    if seed.get('detector'):
+    if seed.get('detector') and seed['detector'] != 'Detector':  # a generic one needs its pitches (item 8)
         arguments += ['-D', seed['detector']]
     return tuple(arguments)
 
@@ -179,7 +181,8 @@ def _dispatch_job(request, cancelled, publish):
         from xrd_tools.integrate.calibration_seed import session_prediction
         return key, session_prediction(seed['frames'], del_motor=seed['del_motor'],
                                        nu_motor=seed['nu_motor'], cancelled=cancelled, bounds=seed.get('bounds'),
-                                       instrument_geometry=seed.get('instrument'), **seed.get('distance', {}))
+                                       instrument_geometry=seed.get('instrument'), turned_from=seed.get('turned'),
+                                       **seed.get('distance', {}))
     if kind == 'fit':
         frames, options = arguments
         return fit_calibration(frames, cancelled=cancelled,
@@ -1111,6 +1114,16 @@ class CalibrationDialog(QtWidgets.QDialog):
         from xrd_tools.core.geometry.camera import stitch_orientation
         return stitch_orientation(self.camera.value())
 
+    def _turned_detector(self):
+        """The Detector panel's model as the camera turns it by a quarter into the window's frame
+        (``TURNED_DETECTOR_KEY``'s value), or None: a camera keeping the axes, or a detector pyFAI does not
+        list (AUD-9 stage 2b item 8)."""
+        from xrd_tools.integrate.turned_detector import turned_detector_record
+        orientation, model = self._orientation(), self._text('beam_detector')
+        if not orientation.swaps_axes or detector_shape(model) is None:
+            return None
+        return turned_detector_record(model, orientation)
+
     def _apply_camera(self, values):
         """The saved camera, else an older window's image rotation (its unmirrored camera)."""
         from xrd_tools.core.geometry import ImageOrientation
@@ -1618,16 +1631,19 @@ class CalibrationDialog(QtWidgets.QDialog):
                     distance=self._distance_or_none(),
                     file=str(Path(path).resolve()) if path and Path(path).is_file() else None,
                     detector=detector, wavelength_A=wavelength,
-                    instrument=self.geometry_editor.value().to_record())  # its circles' senses
+                    instrument=self.geometry_editor.value().to_record(),  # its circles' senses
+                    turned=self._turned_detector())  # a quarter turn's model (item 8)
 
     def _calibrated_key(self):
         """The calibrated frames and the bounds and senses the prediction was fitted with: editing a
         zero, a bound or a circle's sense leaves a prediction stale."""
         bounds = self._bounds_or_none()
-        return (tuple((frame.identity, frame.poni_sha256) for frame in self.frames if frame.complete),
-                json.dumps([None if bounds is None else bounds.to_record(),
-                            self._text('distance_seed'), self._text('distance_bounds'),
-                            self.geometry_editor.value().arm_senses()], sort_keys=True))
+        key = (tuple((frame.identity, frame.poni_sha256) for frame in self.frames if frame.complete),
+               json.dumps([None if bounds is None else bounds.to_record(),
+                           self._text('distance_seed'), self._text('distance_bounds'),
+                           self.geometry_editor.value().arm_senses()], sort_keys=True))
+        turned = self._turned_detector()  # a quarter turn: and the model it was fitted turned (item 8)
+        return key if turned is None else (*key, json.dumps(turned, sort_keys=True))
 
     def _expected_rings(self, frame):
         """The calibrant rings predicted on this frame (None without a calibration)."""
@@ -1749,7 +1765,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                                      is not None and self._distance_provenance_key == self._direct_beam_key()
                                      else None),  # a direct-beam record only while its inputs hold
                 # the solver refines the energy only with fixed scales: fitted ones hold it (arm note)
-                energy_bound_eV=None if self.scales.isChecked() else self._energy_bound(), bounds=self._bounds())
+                energy_bound_eV=None if self.scales.isChecked() else self._energy_bound(), bounds=self._bounds(),
+                turned_from=self._turned_detector())  # a quarter turn's model: the record carries it (item 8)
             self._invalidate_fit()
             self._job_policy = self._fit_policy()
             self._start('fit', (frames, options))
@@ -1946,11 +1963,21 @@ class CalibrationDialog(QtWidgets.QDialog):
         return self._mask_cache[1]
 
     def _pyfai_mask(self):
-        """The turned mask as a file pyFAI-calib2 reads (non-zero: masked), in the session folder."""
+        """The turned mask as a file pyFAI-calib2 reads (non-zero: masked), in the session folder; under a quarter
+        turn with the model's own gaps turned too, which pyFAI's generic detector there does not hold (item 8)."""
         mask = self._loaded_mask()
+        if mask is None and self._text('mask'):
+            raise ValueError(f"the Detector panel's mask cannot be read: {self._text('mask')}")
+        turned = self._turned_detector()
+        if turned is not None:
+            from xrd_tools.integrate.turned_detector import turned_model_mask
+            gaps = turned_model_mask(turned['detector'], self._orientation())
+            if gaps is not None and mask is not None and mask.shape != gaps.shape:
+                raise ValueError(f"the Detector panel's mask is {mask.shape[1]} × {mask.shape[0]} px turned, the "
+                                 f"{turned['detector']}'s image {gaps.shape[1]} × {gaps.shape[0]}")
+            if gaps is not None:
+                mask = gaps if mask is None else mask | gaps
         if mask is None:
-            if self._text('mask'):
-                raise ValueError(f"the Detector panel's mask cannot be read: {self._text('mask')}")
             return None
         import hashlib
         import fabio

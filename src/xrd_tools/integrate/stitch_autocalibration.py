@@ -231,6 +231,11 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     row_of = _row_of(arm.nu_motor, arm.del_motor)
     by_index = {row[0]: row for row in rows}
     orientation = ImageOrientation(rotation=image_rotation, flip_horizontal=bool(image_flip))
+    turned = diff.calibration.turned_from  # a model turned by a quarter, its gaps by this turn (AUD-9 item 8)
+    if turned is not None and (turned['image_rotation'], turned['image_flip']) != (orientation.rotation,
+                                                                                  orientation.flip_horizontal):
+        raise ValueError("the starting geometry's detector was turned for another camera than the Detector "
+                         "panel's: start from a geometry made with this camera")
     exact = _exact_source(spec)
     # Screen every frame of the scan (cheap totals) before choosing, so each frame
     # is compared with all of its nu-row neighbours, not with a sparse selection.
@@ -443,7 +448,10 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     validation.update({'chosen': chosen, 'reason': reason})
     if not result.success or result.rms_q > max_rms_q:
         raise ValueError(result.message or f'fit RMS {result.rms_q:.5g} exceeds {max_rms_q:g} Å⁻¹')
-    asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(result.diffractometer.calibration)
+    calibration = result.diffractometer.calibration
+    if diff.calibration.turned_from is not None:  # the seed's quarter-turned model travels on (AUD-9 item 8)
+        calibration = replace(calibration, turned_from=diff.calibration.turned_from)
+    asset = result.diffractometer.stacked_arm.to_pyfai_goniometer(calibration)
     asset['detector_config'] = _mg_detector_config(diff.calibration)
     energy = dict(result.energy_refinement)
     if energy or recorded is not None:  # the energy the scans recorded stays with the calibration

@@ -242,3 +242,167 @@ def test_stitch_runs_a_quarter_turned_window_calibration_with_the_model_s_gaps(t
                                     AnalysisArtifactOverwrite.CREATE_NEW), plan, project_root=tmp_path)
     result = run_stitch_operation(request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+
+
+# --- the guided ring fit and the automatic refinement (item 8b): the record each writes carries the turned model
+
+_TRUTH5 = {"nu_offset": .02, "del_offset": -.03}  # within the fit's default ±2° of each zero
+_ROWS = [(d, n) for n in (-10., -3., 4., 11.) for d in (6., 20., 34.)]
+_TURNED = ImageOrientation(rotation=270)
+
+
+def _turned_poni():
+    from xrd_tools.core.containers import PONI
+    from tests.core.test_stacked_arm_extension import WAVELENGTH
+    return PONI(dist=.39, poni1=.045, poni2=.035, wavelength=WAVELENGTH, detector="Detector")
+
+
+def _turned_controls(shape, angles):
+    """Ring points in the window's (turned) frame of a Pilatus 300K-W, from the independent ray of the stacked arm
+    (``_ray``: its pixels 172 µm square, as the turned detector's are)."""
+    from pyFAI.calibrant import get_calibrant
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.integrate.refine import ControlFrame
+    from tests.core.test_stacked_arm_extension import WAVELENGTH, _ray
+    calibrant = get_calibrant("LaB6")
+    calibrant.wavelength = WAVELENGTH
+    q_ring = 2 * np.pi / np.asarray(calibrant.dspacing)
+    calibration = DetectorCalibration(_turned_poni())
+    grid, columns = np.arange(0., shape[0] - .25, .25), np.arange(3.3, shape[1], 17.7)
+    controls = []
+    for delta, nu in angles:
+        rows_g, cols_g = np.meshgrid(grid, columns, indexing="ij")
+        q, _ = _ray(_TRUTH5, calibration, delta, nu, rows_g, cols_g)
+        points = []
+        for ring, target in enumerate(q_ring[:30]):
+            s = q - target
+            i, j = np.nonzero(s[:-1] * s[1:] < 0)
+            r, c = grid[i] + .25 * s[i, j] / (s[i, j] - s[i + 1, j]), columns[j]
+            for _ in range(3):  # Newton along the rows, as ``_ring_controls`` places its points
+                f0 = _ray(_TRUTH5, calibration, delta, nu, r, c)[0] - target
+                slope = (_ray(_TRUTH5, calibration, delta, nu, r + 1e-3, c)[0]
+                         - _ray(_TRUTH5, calibration, delta, nu, r - 1e-3, c)[0]) / 2e-3
+                r = r - f0 / slope
+            points += [(a, b, ring) for a, b in zip(r, c)]
+        rows, cols, rings = np.asarray(points).T
+        controls.append(ControlFrame(rows, cols, rings, {"del": delta, "nu": nu}))
+    return controls
+
+
+def _turned_frames(root, controls, shape, detector, orientation=_TURNED):
+    """The calibrated frames the window stages for a quarter-turned camera: images in its (turned) frame, each
+    PONI written by pyFAI (as pyFAI-calib2 saves it) for ``detector``, the detector pyFAI-calib2 was given."""
+    import tifffile
+    from pyFAI.calibrant import get_calibrant
+    from pyFAI.control_points import ControlPoints
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+    from xrd_tools.integrate.stitch_calibration import CalibrationFrame, adopt_calibration_pair
+    from tests.core.test_stitch_guided_calibration import _digest
+    poni, frames = _turned_poni(), []
+    for index, control in enumerate(controls):
+        directory = root / str(index)
+        directory.mkdir(parents=True)
+        image = directory / "frame.tif"
+        tifffile.imwrite(image, np.zeros(shape, dtype=np.float32))
+        points = ControlPoints(calibrant=get_calibrant("LaB6"), wavelength=poni.wavelength)
+        for ring in np.unique(control.rings):
+            selected = control.rings == ring
+            points.append(points=np.column_stack([control.rows[selected], control.cols[selected]]).tolist(),
+                          ring=int(ring))
+        npt, seed = directory / "frame.npt", directory / "frame.poni"
+        points.save(str(npt))
+        AzimuthalIntegrator(dist=poni.dist, poni1=poni.poni1, poni2=poni.poni2, wavelength=poni.wavelength,
+                            detector=detector).save(str(seed))
+        frame = CalibrationFrame(str(index), str(image), "image_file", {}, index, str(image), 0, str(image),
+                                 _digest(image), tuple(shape), orientation.rotation, dict(control.motors), None,
+                                 flip=orientation.flip_horizontal)
+        frames.append(adopt_calibration_pair(frame, seed, npt))
+    return tuple(frames)
+
+
+def _turned_guided(tmp_path):
+    model = "Pilatus300kw"
+    detector, _name, config, turned = window_detector(model, _TURNED)
+    shape = tuple(int(value) for value in detector.shape)
+    controls = _turned_controls(shape, _ROWS)
+    return model, config, turned, shape, controls, _turned_frames(tmp_path / "frames", controls, shape, detector)
+
+
+def test_a_guided_fit_of_quarter_turned_frames_saves_the_turned_model(tmp_path):
+    """pyFAI-calib2, seeded by the window, calibrates each frame with the generic turned detector (its PONI as pyFAI
+    writes it, read strictly); the fit given the window's turned model admits exactly that detector and its record,
+    the prediction's and the saved partner carry the model, its gaps turned."""
+    from xrd_tools.integrate.calibration_seed import session_prediction
+    from xrd_tools.integrate.stitch_calibration import fit_calibration, pair_validation_angles, save_calibration_pair
+    model, config, turned, shape, _controls, frames = _turned_guided(tmp_path)
+    assert shape == (1475, 195)
+    with pytest.raises(ValueError, match="registered detector pitch and shape"):
+        fit_calibration(frames, arm_model="stacked")  # without the window's model: a generic detector, as before
+    with pytest.raises(ValueError, match="is not the Pilatus300k turned"):
+        fit_calibration(frames, arm_model="stacked", turned_from=dict(turned, detector="Pilatus300k"))
+    fit = fit_calibration(frames, arm_model="stacked", turned_from=turned)
+    record = fit.asset["calibration"]
+    assert (record["detector"], record["detector_config"], record[TURNED_DETECTOR_KEY]) == ("Detector", config, turned)
+    # these synthetic rings fit the five-parameter arm to ~1e-3 Å⁻¹ in the stored frame with the model too (9.8e-4,
+    # the same generator on a 195 × 1475 frame): the turned frame fits as well
+    assert fit.rms_q < 2e-3, fit.rms_q
+    assert session_prediction(frames, turned_from=turned)[TURNED_DETECTOR_KEY] == turned
+    saved = save_calibration_pair(fit, tmp_path / "calibration" / "guided.json",
+                                  validation_angles=pair_validation_angles(fit))
+    assert saved.xu_path is not None, saved.xu_refusal
+    partner = json.loads(Path(saved.xu_path).read_text(encoding="utf-8"))["detector"]
+    gaps = _TURNED.apply(_native_gaps(model))
+    assert (partner["detector_factory_name"], partner["shape"], partner["mask_count"]) == (
+        model, list(shape), int(gaps.sum()))
+    assert int(gaps.sum()) > 0
+
+
+def test_quarter_turned_frames_calibrated_with_the_model_as_stored_are_refused_by_name(tmp_path):
+    from xrd_tools.integrate.stitch_calibration import fit_calibration
+    model, _config, turned, shape, controls, _frames = _turned_guided(tmp_path)
+    native = _turned_frames(tmp_path / "native", controls, shape, _native(model))
+    with pytest.raises(ValueError, match=r"as it stores its images \(1475 × 195 px\), not turned with them as the "
+                                         r"window shows them \(195 × 1475 px\)"):
+        fit_calibration(native, arm_model="stacked", turned_from=turned)
+
+
+def _turned_ring_scan(root, orientation=_TURNED, angles=_ROWS):
+    """A SPEC scan of LaB6 ring images a quarter-turned Pilatus 300K-W stores (195 × 1475), whose rings are the
+    stacked arm's in the window's (turned) frame."""
+    from pyFAI.calibrant import get_calibrant
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from tests.core.test_stacked_arm_extension import WAVELENGTH, _ray
+    calibrant = get_calibrant("LaB6")
+    calibrant.wavelength = WAVELENGTH
+    q_rings = 2 * np.pi / np.asarray(calibrant.dspacing)[:25]
+    rows, cols = np.indices((1475, 195), dtype=float)
+    images = root / "images"
+    images.mkdir(parents=True)
+    for index, (delta, nu) in enumerate(angles):
+        q, _ = _ray(_TRUTH5, DetectorCalibration(_turned_poni()), delta, nu, rows, cols)
+        turned = 10 + 5000 * np.exp(-((q[..., None] - q_rings) ** 2) / (2 * .008 ** 2)).sum(-1)
+        orientation.unapply(turned).astype("<i4").tofile(images / f"ring_scan1_{index:04d}.raw")
+    lines = "\n".join(f"{d} {n}" for d, n in angles)
+    (root / "ring").write_text("#F ring\n#E 1\n#D today\n#O0 del nu\n#S 1 ascan del 6 34 11 1\n"
+                               f"#D today\n#P0 0 0\n#N 2\n#L del  nu\n{lines}\n")
+    return SourceSpec(root / "ring", SourceKind.SPEC, options={
+        "scan": "1", "image_dir": str(images), "image_stem": "ring_scan1_",
+        "read_image_kwargs": {"detector_shape": (195, 1475), "raw_dtype": "int32"}})
+
+
+def test_the_automatic_refinement_from_a_quarter_turned_seed_carries_the_turned_model(tmp_path):
+    """The window's refinement starts from a turned record (here the guided fit's): its images turned as the camera
+    says match the generic turned detector, its gaps masked, and the refined record carries the model; a seed turned
+    for another camera is refused."""
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    from xrd_tools.integrate.stitch_calibration import fit_calibration
+    _model, config, turned, _shape, _controls, frames = _turned_guided(tmp_path)
+    seed = fit_calibration(frames, arm_model="stacked", turned_from=turned).asset["calibration"]
+    spec = _turned_ring_scan(tmp_path / "scan")
+    with pytest.raises(ValueError, match="turned for another camera"):
+        refine_arm_from_scan(spec, seed, image_rotation=90, max_frames=12)
+    fit = refine_arm_from_scan(spec, seed, image_rotation=270, max_frames=12)
+    record = fit.asset["calibration"]
+    assert (record["detector"], record["detector_config"], record[TURNED_DETECTOR_KEY]) == ("Detector", config, turned)
+    assert fit.rms_q < .005, fit.rms_q

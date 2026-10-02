@@ -837,7 +837,12 @@ def test_the_detector_mask_reaches_pyfai_turned_as_the_frames_are(tmp_path):
         from xrd_tools.core.geometry.camera import DetectorCamera
         dialog.camera.set_value(DetectorCamera('z+', 'x+'))  # turned 90° counterclockwise into Stitch's frame
         path = dialog._pyfai_mask()
-        np.testing.assert_array_equal(fabio.open(path).data.astype(bool), np.rot90(mask))  # 90° counterclockwise
+        # 90° counterclockwise; with the Pilatus 300K-W's own gaps turned too, since pyFAI is given the detector
+        # turned with the images, which holds none (AUD-9 stage 2b item 8)
+        from pyFAI.detectors import detector_factory
+        gaps = np.rot90(np.asarray(detector_factory('Pilatus300kw').calc_mask(), dtype=bool))
+        assert (gaps & ~np.rot90(mask)).any()  # the gaps add pixels the drawn mask leaves
+        np.testing.assert_array_equal(fabio.open(path).data.astype(bool), np.rot90(mask) | gaps)
         np.testing.assert_array_equal(dialog._loaded_mask(), np.rot90(mask))  # the expected rings' mask too
         seed = {**dialog._seed_options(), 'mask': path}
         arguments = _pyfai_arguments(_frame({'del': 20., 'nu': 0.}, shape=(1475, 195)), seed)
