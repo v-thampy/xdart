@@ -32,6 +32,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     capture_rsm_calibration_geometry,
     capture_rsm_geometry_asset,
     lower_rsm_effective_geometry,
+    rsm_calibration_kind,
     rsm_calibration_solid_angle_source,
 )
 from xrd_tools.analysis.stitch_native import detector_image_warnings
@@ -1579,6 +1580,9 @@ class RSMToolPreflightSummaryV2:
     #: Display only (G8c): the dark and flat checks' warnings, as Stitch's Preview lists them
     #: (``detector_image_warnings``)
     detector_image_warnings: tuple[str, ...] = ()
+    #: Display only (item 7): what kind of calibration the Calibration row's pair is, in words, from its provenance
+    #: (``rsm_calibration_kind``); None for the canonical asset
+    calibration_kind: str | None = None
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
 
@@ -2051,6 +2055,7 @@ def prepare_rsm_tool_v2(
             else f"scan {given.spec_receipt[4]} of {given.spec_receipt[0]} (its #G3)") + f": {_ub_text(given.matrix)}",
         detector_image_warnings=(() if request.plan.corrections is None else detector_image_warnings(
             request.plan.corrections.dark_receipt, request.plan.corrections.flat_receipt)),
+        calibration_kind=rsm_calibration_kind(request.preflight.geometry_asset_receipt),
         _claim=_PREFLIGHT_V2_FACTORY,
     )
     return RSMToolPreflightV2(
@@ -2133,7 +2138,8 @@ def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]
         ),
         *(() if summary.calibration is None else (
             "Geometry: the calibration on the Calibration row, refinement "
-            + ("on (its del/nu offsets, mount and energy offset)" if summary.calibration[0] else "off"),)),
+            + ("on (its del/nu offsets, mount and energy offset)" if summary.calibration[0] else "off"),
+            *(() if summary.calibration_kind is None else (f"  calibration: {summary.calibration_kind}",)))),
         *(() if summary.circle_directions is None else (f"Circle directions: {summary.circle_directions}",)),
         f"Asset raw: {summary.geometry_asset_raw_sha256}",
         f"Asset semantic: {summary.geometry_asset_semantic_fingerprint}",

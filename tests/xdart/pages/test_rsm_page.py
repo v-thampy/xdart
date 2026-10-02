@@ -2012,6 +2012,41 @@ def test_the_preview_names_the_solid_angle_the_detector_mask_and_a_given_ub_besi
         _close(page, qapp)
 
 
+def test_the_preview_names_the_calibrations_kind_from_its_provenance_outside_every_identity(qapp, tmp_path):
+    """Item 7 (row C's finding 2): under "Geometry: the calibration on the Calibration row" the Preview says what
+    kind of calibration the pair is, from its provenance in plain words: the calibration window's
+    ``calibration_kind`` for a rough (direct-beam) pair, the calibrant frames of a ring fit, or that none is
+    recorded. Display only: the three give the same summary, request, plan and output identities."""
+    import json
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2, rsm_preflight_summary_lines
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        provenance = tmp_path / "calibration" / "rsm_canonical.xu.json.provenance.json"
+        seen = {}
+        for name, record in (("none", None),
+                             ("rough", {"calibration_kind": "direct_beam_not_ring_fitted", "frames": []}),
+                             ("ring", {"frames": [{"index": 0}, {"index": 3}, {"index": 7}], "rms_q_A^-1": 0.0021})):
+            if record is not None:
+                provenance.write_text(json.dumps(record))
+            summary = prepare_rsm_tool_v2(page.build_form()).summary
+            lines = rsm_preflight_summary_lines(summary)
+            geometry = next(index for index, line in enumerate(lines) if line.startswith("Geometry: the calibration"))
+            seen[name] = (lines[geometry + 1], (summary.fingerprint, summary.request_fingerprint,
+                                                summary.plan_fingerprint, summary.output_fingerprint))
+        assert seen["none"][0] == "  calibration: its kind is not recorded (no provenance beside the pair)"
+        assert seen["rough"][0] == ("  calibration: direct-beam (rough): the distance and beam pixel, rotations "
+                                    "held; not ring-fitted")
+        assert seen["ring"][0] == "  calibration: ring-fitted on 3 calibrant frames (RMS |q| 0.0021 Å⁻¹)"
+        assert seen["none"][1] == seen["rough"][1] == seen["ring"][1]
+        page.begin_preview()  # the page's own Preview shows it
+        _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
+        assert seen["ring"][0] in page.preview_text.toPlainText().splitlines()
+    finally:
+        _close(page, qapp)
+
+
 # AUD-9 stage 2b G8d: Set BG on the keyed 2×3 layout (the maintainer: "Other quick toggles like switching to log
 # scale set bg, etc should also be there")
 

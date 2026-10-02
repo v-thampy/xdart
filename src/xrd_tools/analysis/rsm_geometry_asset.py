@@ -1415,6 +1415,35 @@ def rsm_calibration_solid_angle_source(receipt) -> str:
     return "the untilted formula about the beam pixel"
 
 
+def rsm_calibration_kind(receipt) -> str | None:
+    """What kind of calibration the Calibration row's pair is, in words, for the Preview only (item 7; it enters
+    no identity): from the pair's provenance (``<name>.xu.json.provenance.json``), the calibration window's
+    ``calibration_kind`` (``direct_beam_not_ring_fitted``: 2 · Rough geometry's distance and beam pixel), else the
+    calibrant frames a ring fit used. None for the canonical asset; a pair without a readable provenance says so."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt:
+        return None
+    partner = Path(receipt.project_root) / receipt.resolved_relative_path
+    provenance = partner.with_suffix(partner.suffix + ".provenance.json")
+    try:
+        value = json.loads(provenance.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "its kind is not recorded (no provenance beside the pair)"
+    except (OSError, ValueError):
+        return "its kind is not recorded (its provenance cannot be read)"
+    kind = value.get("calibration_kind") if isinstance(value, dict) else None
+    if kind == "direct_beam_not_ring_fitted":
+        return "direct-beam (rough): the distance and beam pixel, rotations held; not ring-fitted"
+    if isinstance(kind, str) and kind:
+        return "recorded as " + kind.replace("_", " ")
+    frames = value.get("frames") if isinstance(value, dict) else None
+    if isinstance(frames, list) and frames:
+        rms = value.get("rms_q_A^-1")
+        return (f"ring-fitted on {len(frames)} calibrant frame{'s' if len(frames) != 1 else ''}"
+                + (f" (RMS |q| {rms:.3g} Å⁻¹)" if isinstance(rms, (int, float)) and not isinstance(rms, bool)
+                   else ""))
+    return "its kind is not recorded"
+
+
 def rsm_calibration_solid_angle(receipt) -> np.ndarray | None:
     """The solid-angle weight of a refined version-3 calibration, in the raw frame RSM reads, read-only: Stitch's
     own per-frame weight from the attested pyFAI arm (``_extended_solid_angle``), with the calibrant's sample
