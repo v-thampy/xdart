@@ -35,6 +35,7 @@ __all__ = [
     "plot_peak_fit_frame",
     "plot_thermal_history",
     "plot_analysis_outcome",
+    "convert_analysis_axis",
 ]
 
 
@@ -578,6 +579,18 @@ def plot_peak_fit(
     return fig
 
 
+def convert_analysis_axis(snapshot, values, axis_unit=None):
+    """Present one admitted trace's coordinates through the public radial conversion owner."""
+    axis = snapshot.axes[0]
+    target_unit = axis.unit if axis_unit is None else axis_unit
+    if target_unit == axis.unit:
+        return values
+    from xrd_tools.core.containers import convert_radial_axis
+    from xrd_tools.analysis.axis_units import canonical_q_unit
+    source_unit = "q_A^-1" if canonical_q_unit(axis.unit) == "q_A^-1" else axis.unit
+    return convert_radial_axis(np.asarray(values), source_unit, target_unit, snapshot.wavelength_angstrom)
+
+
 def plot_analysis_outcome(snapshot, outcome=None, *, overlays=("fit", "background", "residual"),
                           log_y=False, x_range=None, height=550, axis_unit=None, peak_model="pseudovoigt",
                           plane_axis=None, plane_index=None, plane_coordinate=None):
@@ -638,12 +651,7 @@ def plot_analysis_outcome(snapshot, outcome=None, *, overlays=("fit", "backgroun
     axis = snapshot.axes[0]
     target_unit = axis.unit if axis_unit is None else axis_unit
     def convert(values):
-        if target_unit == axis.unit:
-            return values
-        from xrd_tools.core.containers import convert_radial_axis
-        from xrd_tools.analysis.axis_units import canonical_q_unit
-        source_unit = "q_A^-1" if canonical_q_unit(axis.unit) == "q_A^-1" else axis.unit
-        return convert_radial_axis(np.asarray(values), source_unit, target_unit, snapshot.wavelength_angstrom)
+        return convert_analysis_axis(snapshot, values, target_unit)
     show_residual = outcome is not None and outcome.overlay is not None and "residual" in overlays
     fig = make_subplots(rows=2 if show_residual else 1, cols=1, shared_xaxes=True,
                         row_heights=[.76, .24] if show_residual else [1.], vertical_spacing=.04)

@@ -83,6 +83,7 @@ class PeakFitViewer:
         self.tool, self._disposed = tool, False
         self.snapshot, self.outcome = load_input(0), outcome
         self._settings = dict(settings or {})
+        self._committed_model = self._settings.get("model", "pseudovoigt")
         self._context_refs = dict(contexts or {})
         self.selector = PatternSelector(labels, on_select=self.select)
         self.pattern_viewer = PatternViewer()  # the shared owner, extended with an analyzer outcome model
@@ -171,7 +172,9 @@ class PeakFitViewer:
     def fit(self):
         if self._disposed:
             return None
-        self.outcome = self._fit(self.snapshot, self.current_settings())
+        settings = self.current_settings()
+        self.outcome = self._fit(self.snapshot, settings)
+        self._committed_model = settings.get("model", "pseudovoigt")
         self.render()
         self.set_table([self.outcome])
         return self.outcome
@@ -187,20 +190,21 @@ class PeakFitViewer:
     def render(self):
         if self._disposed:
             return
-        from xrd_tools.viz.plotly import plot_analysis_outcome
+        from xrd_tools.viz.plotly import plot_analysis_outcome, convert_analysis_axis
         import plotly.graph_objects as go
         fig = plot_analysis_outcome(self.snapshot, self.outcome, overlays=self._overlays.value,
                                     log_y=self._log.value,
                                     x_range=(self.ranges.display_min.value, self.ranges.display_max.value),
                                     axis_unit=self._axis_unit.value,
-                                    peak_model=self.current_settings().get("model", "pseudovoigt"),
+                                    peak_model=self._committed_model,
                                     plane_axis=self.region_ranges.plane[0] if self.region_ranges is not None else None,
                                     plane_coordinate=self.region_ranges.slice_coordinate.value if self.region_ranges is not None else None)
         # Bound comparison overlays to four; they are loaded only for this render and released immediately.
         if len(self.snapshot.axes) == 1:
             for index in self.selector.overlays.value[:4]:
                 other = self._load(index)
-                fig.add_trace(go.Scattergl(x=other.axes[0].values, y=other.fitted_values(), mode="lines",
+                fig.add_trace(go.Scattergl(x=convert_analysis_axis(other, other.axes[0].values, self._axis_unit.value),
+                                           y=other.fitted_values(), mode="lines",
                                            name=other.key.result_identity), row=1, col=1)
         with self.figure_widget.batch_update():
             self.figure_widget.data = ()
