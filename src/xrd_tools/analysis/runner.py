@@ -78,6 +78,10 @@ class AnalysisOutcome:
     #: the raw :class:`AnalysisResult` for callers that need full detail.
     result: "AnalysisResult | None" = None
     message: str = ""
+    #: Compact scientific table rows survive releasing the numerical result.
+    parameter_values: "dict[str, float]" = field(default_factory=dict)
+    parameter_errors: "dict[str, float | None]" = field(default_factory=dict)
+    parameter_units: "dict[str, str]" = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -178,7 +182,9 @@ def _run_compact(analyzer, descriptors, on_progress, should_cancel, on_frame):
         del inp  # the input goes before the next one is loaded
         if outcomes:  # the one before keeps only its row
             last = outcomes[-1]
-            outcomes[-1] = AnalysisOutcome(last.label, last.ok, last.params, message=last.message)
+            outcomes[-1] = AnalysisOutcome(last.label, last.ok, last.params, message=last.message,
+                parameter_values=last.parameter_values, parameter_errors=last.parameter_errors,
+                parameter_units=last.parameter_units)
         outcomes.append(out)
         if on_frame is not None:
             on_frame(out)
@@ -544,7 +550,19 @@ def _displayed_outcome(label: str, plan: Any, result: Any, params: "dict[str, fl
     overlay = Overlay(np.array(displayed_fit_axis(plan), copy=True),
                       {"fit": result.fit, "background": result.background, "residual": result.residual},
                       [float(value) for value in result.marker_positions])
-    return AnalysisOutcome(label, bool(result.fit_success), params, overlay, result, result.message)
+    values = dict(zip(result.parameter_names, result.parameter_values))
+    errors = dict(zip(result.parameter_names, result.parameter_stderr))
+    units = {}
+    for name in values:
+        parameter = name.split("_", 1)[-1]
+        if parameter in {"center", "sigma", "fwhm"}:
+            units[name] = result.axis_unit
+        elif name.endswith(("_a", "_b", "_c")):
+            units[name] = "Å"
+        elif name.endswith(("_alpha", "_beta", "_gamma")):
+            units[name] = "deg"
+    return AnalysisOutcome(label, bool(result.fit_success), params, overlay, result, result.message,
+                           values, errors, units)
 
 
 @dataclass
