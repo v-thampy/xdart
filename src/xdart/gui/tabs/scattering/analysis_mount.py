@@ -242,19 +242,9 @@ def analysis_result_matches(payload: object, facts: object) -> bool:
     return bool(expected is not None and type(payload) is expected
                 and (payload.trace_fingerprint, payload.trace_receipt) == echo)
 def fit_result_series(x, result, components=()):
-    """A displayed fit result as the shared fit display's series (``tabs/scattering/fit_view``): its fit,
-    background and named ``components`` above, the peak markers, and its residual below."""
-    from xdart.gui.tabs.scattering.fit_view import FitSeries
-    upper = []
-    if result.fit is not None:
-        upper.append(FitSeries(x, result.fit, "fit", "fit"))
-    if result.background is not None:
-        upper.append(FitSeries(x, result.background, "background", "background"))
-    upper += [FitSeries(x, values, "component", name) for name, values in components]
-    markers = (() if result.marker_positions is None
-               else tuple(float(position) for position in result.marker_positions))
-    lower = () if result.residual is None else (FitSeries(x, result.residual, "residual"),)
-    return tuple(upper), markers, lower
+    """``fit_view.fit_result_series`` (the fit display's owner makes a displayed result's series)."""
+    from xdart.gui.tabs.scattering.fit_view import fit_result_series as series
+    return series(x, result, components)
 def render_fit_projection(plot, residual_plot, x, result, components=()):
     """Draw ``fit_result_series`` on a dialog's own two plots, through the fit display's own primitives
     (the peak-fit dialog's path until it mounts ``FitView``, as the phase-fit dialog does)."""

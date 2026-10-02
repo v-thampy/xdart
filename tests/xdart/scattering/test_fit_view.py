@@ -110,3 +110,50 @@ def test_the_phase_fit_dialog_shows_its_pattern_fit_and_residual_through_the_sha
         assert not dialog.resid_plot.listDataItems() and dialog.fit_view.projection.upper == shown.upper
     finally:
         dialog.close()
+
+
+def test_the_fit_range_is_the_views_kept_over_every_redraw_and_a_drag_says_where_it_went() -> None:
+    """FIT-TOOLS-2026-10 (Codex's design review F7): the fit range is a FitView capability, not a page's plot. Shown
+    within the data's extent and clamped to it, kept over each redraw, hidden with None; setting it is silent, a drag
+    of one edge emits the range, sorted."""
+    _app()
+    view = FitView()
+    moved = []
+    view.rangeChanged.connect(lambda low, high: moved.append((low, high)))
+    try:
+        region = view._region
+        assert view.fit_range is None and not region.isVisible()
+        view.set_fit_range((3.0, 1.5), limits=(1.0, 4.0))
+        assert view.fit_range == (1.5, 3.0) and region.isVisible() and region in view.plot.getPlotItem().items
+        view.set_fit_range((0.0, 9.0), limits=(1.0, 4.0))
+        assert view.fit_range == (1.0, 4.0) and not moved
+        x = np.linspace(1.0, 4.0, 7)
+        view.reconcile(FitProjection(FitPanel((FitSeries(x, x, "data", "data"),), markers=(2.0,))))
+        assert view.fit_range == (1.0, 4.0) and region in view.plot.getPlotItem().items and region.isVisible()
+        assert [item.name() for item in view.plot.listDataItems()] == ["data"]
+        markers = [item for item in view.plot.getPlotItem().items if isinstance(item, pg.InfiniteLine)]
+        assert [line.value() for line in markers] == [2.0]
+        region.lines[1].setValue(2.5)  # the user drags the upper edge
+        assert view.fit_range == (1.0, 2.5) and moved[-1] == (1.0, 2.5)
+        region.lines[0].setValue(3.0)  # past the other edge: still low, high
+        assert moved[-1] == (2.5, 3.0)
+        view.set_fit_range(None)
+        assert view.fit_range is None and not region.isVisible()
+        count = len(moved)
+        region.lines[0].setValue(1.2)  # a hidden range is no fit range
+        assert len(moved) == count
+    finally:
+        view.close()
+        view.deleteLater()
+
+
+def test_a_displayed_fit_result_is_the_views_series_fit_background_components_markers_and_residual() -> None:
+    from xdart.gui.tabs.scattering.fit_view import fit_result_series
+    x = np.arange(3.0)
+    result = SimpleNamespace(fit=x + 1, background=x * 0, residual=x - 1, marker_positions=np.array([1.0, 2.0]))
+    upper, markers, lower = fit_result_series(x, result, (("alpha", x * 2),))
+    assert [(series.role, series.name) for series in upper] == [
+        ("fit", "fit"), ("background", "background"), ("component", "alpha")]
+    assert markers == (1.0, 2.0) and [series.role for series in lower] == ["residual"]
+    empty = SimpleNamespace(fit=None, background=None, residual=None, marker_positions=None)
+    assert fit_result_series(x, empty) == ((), (), ())

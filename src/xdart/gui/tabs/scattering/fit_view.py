@@ -7,7 +7,12 @@ own conventions (``RectViewBox`` box zoom, middle-click to show all and pyqtgrap
 right button; the seaborn style; the cursor readout on the upper panel). Each series names its role, and
 the role decides the look, here and nowhere else: data points, a data line, the fit, the background, a
 component, groups of points coloured as the 1-D plot colours its traces (``trace_colors``), rejected
-points, residuals. The view has no commands of its own yet; zoom, export and the readout are pyqtgraph's.
+points, residuals. Zoom, export and the readout are pyqtgraph's.
+
+A fit window's fit range is the view's too (FIT-TOOLS-2026-10, Codex's design review F7: "a fit-range region is a
+``FitView`` extension, not a page's plot"): ``set_fit_range`` shows a range over the upper panel, kept over every
+redraw, and ``rangeChanged`` says where the user dragged it. ``fit_result_series`` is a displayed fit result
+(``DisplayedPeakFitResult``, ``DisplayedPhaseFitResult``) as the view's series, for every host's fit window.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ _RESIDUAL = (230, 133, 151)
 _REJECTED = (230, 110, 110)
 _ZERO = (130, 130, 140)
 _MARKER = (240, 200, 90)
+_RANGE = (189, 147, 249, 30)
 
 #: Each role's look: points ("o" filled, "x" crosses) or a line, its colour (None: the theme's
 #: foreground; "group": the 1-D plot's trace colour for the series' group) and size or width.
@@ -113,6 +119,21 @@ def draw_zero_line(plot):
     return plot.addLine(y=0, pen=pg.mkPen(_ZERO, width=1))
 
 
+def fit_result_series(x, result, components=()):
+    """A displayed fit result as the view's series: its fit, background and named ``components`` (name, values)
+    above, the peak markers, and its residual below; every array on the fitted ``x``."""
+    upper = []
+    if result.fit is not None:
+        upper.append(FitSeries(x, result.fit, "fit", "fit"))
+    if result.background is not None:
+        upper.append(FitSeries(x, result.background, "background", "background"))
+    upper += [FitSeries(x, values, "component", name) for name, values in components]
+    markers = (() if result.marker_positions is None
+               else tuple(float(position) for position in result.marker_positions))
+    lower = () if result.residual is None else (FitSeries(x, result.residual, "residual"),)
+    return tuple(upper), markers, lower
+
+
 def _draw_panel(plot: pg.PlotWidget, panel: FitPanel) -> None:
     plot.clear()
     if panel.zero_line:
@@ -132,7 +153,10 @@ def _draw_panel(plot: pg.PlotWidget, panel: FitPanel) -> None:
 class FitView(QtWidgets.QWidget):
     """A fit's summary, an upper panel (data and model) and a lower one (residuals), from a
     ``FitProjection``. ``plot`` and ``residuals`` are the panels' plot widgets, read by their consumers'
-    tests; only ``reconcile`` draws on them."""
+    tests; only ``reconcile`` draws on them, and the fit range (``set_fit_range``) stays over its redraws."""
+
+    #: The user moved the fit range on the upper panel: its (low, high), sorted. ``set_fit_range`` does not emit it.
+    rangeChanged = QtCore.Signal(float, float)
 
     def __init__(self, parent=None, *, name: str = "fitView", summary: bool = True,
                  stretch: tuple[int, int] = (1, 1), upper_min_height: int | None = None,
@@ -164,6 +188,14 @@ class FitView(QtWidgets.QWidget):
         layout.addWidget(self.plot, stretch[0])
         layout.addWidget(self.residuals, stretch[1])
         self._projection = FitProjection()
+        # the fit range: one region, behind the series, re-added after each redraw clears the upper panel
+        self._range: tuple[float, float] | None = None
+        self._setting_range = False
+        self._region = pg.LinearRegionItem(brush=_RANGE)
+        self._region.setZValue(-10)
+        self._region.hide()
+        self._region.sigRegionChanged.connect(self._region_moved)
+        self.plot.addItem(self._region)
 
     @property
     def projection(self) -> FitProjection:
@@ -177,5 +209,35 @@ class FitView(QtWidgets.QWidget):
         if self.summary is not None:
             self.summary.setText(projection.summary)
         _draw_panel(self.plot, projection.upper)
+        self.plot.addItem(self._region)  # the fit range, shown or not, outlives the redraw
         _draw_panel(self.residuals, projection.lower)
         self._projection = projection
+
+    @property
+    def fit_range(self) -> tuple[float, float] | None:
+        """The fit range shown (low, high), or None."""
+        return self._range
+
+    def set_fit_range(self, bounds: tuple[float, float] | None, *,
+                      limits: tuple[float, float] | None = None) -> None:
+        """Show the fit range ``bounds`` (low, high) over the upper panel, draggable within ``limits`` (the data's
+        extent; None: anywhere), the range clamped to them; None hides it. It stays over every redraw until it is
+        set again, and setting it does not emit ``rangeChanged``."""
+        self._setting_range = True
+        try:
+            if bounds is None:
+                self._range = None
+                self._region.hide()
+                return
+            self._region.setBounds([None, None] if limits is None else sorted(float(value) for value in limits))
+            self._region.setRegion(tuple(sorted(float(value) for value in bounds)))
+            self._range = tuple(sorted(float(value) for value in self._region.getRegion()))
+            self._region.show()
+        finally:
+            self._setting_range = False
+
+    def _region_moved(self) -> None:
+        if self._setting_range or self._range is None:
+            return
+        self._range = tuple(sorted(float(value) for value in self._region.getRegion()))
+        self.rangeChanged.emit(*self._range)
