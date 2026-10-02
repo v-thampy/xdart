@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+import threading
 
 import numpy as np
 
@@ -60,10 +61,16 @@ def _run(label: str, region, expected: type, key: str, fit) -> AnalysisOutcome:
         outcome = fit(region)
     except (RegionFitRefused, RegionFitCancelled, ValueError) as error:
         return AnalysisOutcome(label, ok=False, message=str(error))
-    return AnalysisOutcome(
+    result = AnalysisOutcome(
         label=label, ok=outcome.diagnostics.success, params=outcome.flat_params(), overlay=None,
         result=AnalysisResult(kind=key, payload=outcome), message=outcome.diagnostics.message,
+        parameter_values={name: estimate.value if estimate is not None else None
+                          for name, estimate, _unit in outcome._flat_items()},
+        parameter_errors={name: estimate.stderr if estimate is not None else None
+                          for name, estimate, _unit in outcome._flat_items()},
+        parameter_units={name: unit for name, _estimate, unit in outcome._flat_items()},
     )
+    return result
 
 
 @dataclass
@@ -76,6 +83,7 @@ class Region2DFitAnalyzer:
     use_uncertainties: bool = False
     kind: str = "peak_fit_2d"
     unit: str = "frame"
+    cancel_token: threading.Event | None = None
 
     def analyze(self, inp: AnalysisInput) -> AnalysisOutcome:
         region = (inp.metadata or {}).get(REGION_2D_KEY)
@@ -85,7 +93,7 @@ class Region2DFitAnalyzer:
                 raise RegionFitRefused("WEIGHTS_UNUSABLE", "the input carries no admitted uncertainties")
             return fit_2d_region(item.data, item.x, item.y, seeds=tuple(self.seeds), profile=self.profile,
                                  background=self.background, mask=item.mask,
-                                 sigma=item.sigma if self.use_uncertainties else None)
+                                 sigma=item.sigma if self.use_uncertainties else None, cancel_token=self.cancel_token)
 
         return _run(inp.label, region, Region2DInput, REGION_2D_KEY, fit)
 
@@ -102,6 +110,7 @@ class Region3DFitAnalyzer:
     use_uncertainties: bool = False
     kind: str = "peak_fit_3d"
     unit: str = "frame"
+    cancel_token: threading.Event | None = None
 
     def analyze(self, inp: AnalysisInput) -> AnalysisOutcome:
         region = (inp.metadata or {}).get(REGION_3D_KEY)
@@ -111,7 +120,8 @@ class Region3DFitAnalyzer:
                 raise RegionFitRefused("WEIGHTS_UNUSABLE", "the input carries no admitted uncertainties")
             return fit_3d_region(item.data, item.axes, seeds=tuple(self.seeds), background=self.background,
                                  mask=item.mask, sigma=item.sigma if self.use_uncertainties else None,
-                                 reciprocal_transform=item.reciprocal_transform, orthonormal=item.orthonormal)
+                                 reciprocal_transform=item.reciprocal_transform, orthonormal=item.orthonormal,
+                                 cancel_token=self.cancel_token)
 
         return _run(inp.label, region, Region3DInput, REGION_3D_KEY, fit)
 
