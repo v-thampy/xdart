@@ -77,6 +77,8 @@ def test_a_refused_peak_count_is_named_and_nothing_is_asked(qapp):
     asked = []
     dialog = PeakFitDialog(vnext_submit=lambda *args: asked.append(args))
     try:
+        x = np.linspace(1.0, 4.0, 301)
+        dialog.set_vnext_trace(_trace(x, np.ones_like(x)))
         dialog.auto_check.setChecked(False)
         dialog.npeaks_spin.setValue(13)
         dialog.fit_btn.click()
@@ -129,3 +131,36 @@ def test_the_phase_fit_mounts_the_shared_owners_and_its_phases_are_a_keyed_list(
         assert dialog.vnext_fit_values()["cif_paths"] == ("/tmp/beta.cif",)
     finally:
         dialog.close()
+
+
+@pytest.mark.parametrize("kind", ("peak", "phase"))
+def test_fit_pressed_before_any_trace_was_shown_takes_the_displayed_trace_first(qapp, monkeypatch, kind):
+    """Pre-existing (d352977f): a fit window opened before a 1-D trace was displayed, then Fit pressed once one is,
+    fitted the page's trace and raised drawing the result on the window's empty pattern. Fit now takes the displayed
+    trace first, as Reload does, and the result is drawn on it."""
+    import xdart.gui.tabs.scattering.analysis_mount as mount
+    from tests.xdart.scattering.test_fit_tools_preservation import _close_page, _page, _peaks, _settle, _trace
+    trace, anchor = _trace(*_peaks())
+    captured = {"trace": (None, None)}
+    monkeypatch.setattr(mount, "display_anchor_matches", lambda *args: True)
+    monkeypatch.setattr(mount, "phase_wavelength_angstrom", lambda controller, frame: 1.0)
+    page = _page()
+    try:
+        monkeypatch.setattr(page, "_capture_analysis_trace", lambda _kind: captured["trace"])
+        page._open_analysis_mount(kind)  # nothing displayed yet
+        dialog = getattr(page, f"_{kind}_dialog")
+        assert dialog._x is None
+        captured["trace"] = (trace, anchor)  # the user displays a frame, then presses Fit
+        if kind == "phase":
+            monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
+                                lambda *args, **kwargs: ("/nonexistent/alpha.cif", "CIF"))
+            dialog._add_cif()
+        dialog.fit_btn.click()
+        assert dialog._x is not None and page._analysis_identity is not None
+        assert page._consume_analysis_update(_settle(page))
+        if kind == "peak":
+            assert page._peak_result is not None and dialog.table.rowCount() == len(page._peak_result.parameter_names)
+        else:  # the CIF is missing: refused by name, nothing raised
+            assert page._phase_result is None and page._notice_text == "CIF_UNAVAILABLE"
+    finally:
+        _close_page(page, qapp)

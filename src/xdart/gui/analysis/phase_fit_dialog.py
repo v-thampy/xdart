@@ -316,15 +316,18 @@ class PhaseFitDialog(QtWidgets.QDialog):
             f"{n_phases} phase(s). " + ("Click Fit." if n_phases else "Add a CIF."))
 
     def set_live_pattern(self, x, y, x_label):
-        self._clear_fit()
-        self._show_pattern(x, y, x_label)
+        self._show_pattern(x, y, x_label, clear_fit=True)
 
-    def _show_pattern(self, x, y, x_label):
+    def _show_pattern(self, x, y, x_label, *, clear_fit=False):
+        """Draw the pattern; ``clear_fit``: the last fit goes too (its residual and rows), in the same redraw."""
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
         self._x_label = x_label or "q"
         self.trend.set_value_unit(self._x_label)
-        self.fit_view.reconcile(replace(self.fit_view.projection, upper=self._pattern_panel()))
+        lower = FitPanel(zero_line=True) if clear_fit else self.fit_view.projection.lower
+        self.fit_view.reconcile(FitProjection(self._pattern_panel(), lower))
+        if clear_fit:
+            self.table.clear_rows()
 
     def _pattern_panel(self, *series, markers=()):
         """The upper panel: the pattern as a line ("data"), then ``series`` (fit, background,
@@ -416,6 +419,10 @@ class PhaseFitDialog(QtWidgets.QDialog):
             self.status.setText(refusal)
             return
         if self._vnext:
+            if self._x is None:  # nothing shown yet: the displayed trace first, as Reload, so its fit can be drawn
+                self._vnext_submit("reload", None)
+                if self._x is None:
+                    return
             self._vnext_submit("fit", self.vnext_fit_values())
             return
         if self._x is None or self._y is None:
@@ -436,8 +443,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._draw_outcome(outcome)
 
     def set_vnext_trace(self, trace):
-        self._clear_fit(); self._show_pattern(
-            trace.axis, trace.intensity, trace.axis_unit or trace.label)
+        self._show_pattern(trace.axis, trace.intensity, trace.axis_unit or trace.label, clear_fit=True)
         self.status.setText("Displayed trace captured. Add CIFs and click Fit.")
 
     def set_vnext_result(self, result):
