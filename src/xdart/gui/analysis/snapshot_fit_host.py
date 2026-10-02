@@ -60,7 +60,8 @@ def _job(request, cancel, progress):
                     yield (item.reference if isinstance(item, FitTarget) and item.reference is not None
                            else _snapshot(item, request.settings))
             return write_fit_notebook(request.destination, snapshot, request.kind, settings,
-                                      batch_inputs=batch_inputs(), data_root=request.data_root)
+                                      batch_inputs=batch_inputs(), data_root=request.data_root,
+                                      reference=getattr(request.inputs[0], 'reference', None))
         return snapshot
     analyzer_type = DisplayedPeakFitAnalyzer if request.kind == 'peak' else DisplayedPhaseFitAnalyzer
     analyzer = analyzer_type(settings=settings, cancel_token=cancel)
@@ -243,8 +244,10 @@ class SnapshotFitHost(QtCore.QObject):
         inputs = () if self.batch is None else tuple(self.batch())
         batch = (item.reference if isinstance(item, FitTarget) and item.reference is not None
                  else _snapshot(item, frozen) for item in inputs)
-        return write_fit_notebook(path, _snapshot(self.current(), frozen), self.kind, settings,
-                                  batch_inputs=batch, data_root=self.source_root)
+        current = self.current()
+        return write_fit_notebook(path, _snapshot(current, frozen), self.kind, settings,
+                                  batch_inputs=batch, data_root=self.source_root,
+                                  reference=getattr(current, 'reference', None))
 
     def export_csv(self, path):
         from xrd_tools.analysis.fit_table import outcomes_table, table_csv
