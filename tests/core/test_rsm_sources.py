@@ -130,3 +130,12 @@ def test_directory_mode_maps_a_folders_nexus_files_beside_its_spec_scans(tmp_pat
     assert type(nexus) is RSMNexusMemberForm and (Path(nexus.nexus_path).name, nexus.entry) == (
         "burst_master.h5", "entry")
     assert [(Path(path).name, entry) for path, entry, _reason in skipped] == [("RSM_pair", "3.1")]
+
+
+def test_rsm_automatic_stem_retains_discovered_scan_padding(tmp_path):
+    spec = _pair(tmp_path / "padded", with_images=(1,), scans=(1,))
+    for path in spec.parent.glob("*_scan1_*.tif"):
+        path.rename(path.with_name(path.name.replace("_scan1_", "_scan001_")))
+    (group,), skipped = _groups(StitchSourceSelection("Spec", (str(spec),), "1"))
+    assert skipped == ()
+    assert group[0].image_stem == "RSM_pair_scan001_"

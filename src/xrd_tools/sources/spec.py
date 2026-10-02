@@ -32,6 +32,43 @@ from xrd_tools.core.scan import (
 from xrd_tools.sources.base import BaseFrameSource
 
 
+def find_spec_image_files(directory: str | Path, spec_stem: str, scan: Any,
+                          image_stem: str | None = None) -> list[Path]:
+    """Discover SPEC detector inputs, allowing zero-padded automatic scan tokens.
+
+    Explicit stems retain ``find_image_files`` substring/glob semantics. Eiger
+    data shards are omitted when their same-prefix master is in the directory.
+    Discovery uses filenames only; the existing image reader owns content.
+    """
+    import re
+    from xrd_tools.io.image import find_image_files
+
+    files = find_image_files(directory, stem=image_stem or None)
+    if not image_stem:
+        files = [path for path in files if _spec_scan_match(path, spec_stem, scan) is not None]
+    files = [path for path in files if path.is_file()]
+    return [path for path in files if not (
+        (match := re.fullmatch(r"(.+)_data_\d+", path.stem))
+        and path.suffix.lower() == ".h5"
+        and path.with_name(match[1] + "_master.h5").is_file())]
+
+
+def _spec_scan_match(path: str | Path, spec_stem: str, scan: Any):
+    import re
+    pattern = re.compile(re.escape(spec_stem) + r"_scan(\d+)_")
+    scan_number = int(str(scan).split(".")[0])
+    return next((match for match in pattern.finditer(Path(path).name)
+                 if int(match[1]) == scan_number), None)
+
+
+def spec_image_stem(path: str | Path, spec_stem: str, scan: Any) -> str:
+    """Return a discovered input's automatic SPEC prefix, including its padding."""
+    match = _spec_scan_match(path, spec_stem, scan)
+    if match is None:
+        raise ValueError("input filename does not match the SPEC scan")
+    return match[0]
+
+
 class SpecSource(BaseFrameSource):
     """FrameSource over ONE scan of a SPEC file (metadata; raw images optional).
 
@@ -102,9 +139,8 @@ class SpecSource(BaseFrameSource):
         self._read_image_kwargs = dict(read_image_kwargs or {})
         self._frame_map: list[tuple[Path, int]] = []
         if self.image_dir is not None and self.scan_key is not None:
-            from xrd_tools.io.image import find_image_files
             stem = image_stem or self._default_image_stem(self.scan_key)
-            files = list(find_image_files(self.image_dir, stem=stem))
+            files = find_spec_image_files(self.image_dir, self.path.stem, self.scan_key, image_stem)
             if require_complete_images and files:
                 from xrd_tools.io.image import read_detector_image_layout
                 layouts = [read_detector_image_layout(path, **{
@@ -286,4 +322,4 @@ class SpecSource(BaseFrameSource):
         )
 
 
-__all__ = ["SpecSource"]
+__all__ = ["SpecSource", "find_spec_image_files", "spec_image_stem"]

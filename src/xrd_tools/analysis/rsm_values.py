@@ -394,6 +394,11 @@ def rsm_member_groups(
                 raise RSMToolPreflightRefused("SOURCE_KIND_UNSUPPORTED", f"{Path(spec.uri).name}: {reason}")
             path, key = Path(spec.uri), spec.options["scan"]
             stem = spec.options.get("image_stem") or f"{path.stem}_scan{key.split('.')[0]}_"
+            if not spec.options.get("image_stem"):
+                from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
+                files = find_spec_image_files(spec.options["image_dir"], path.stem, key)
+                if files:
+                    stem = spec_image_stem(files[0], path.stem, key)
             members.append(RSMScanMemberForm(path, key, spec.options["image_dir"], stem, frame_selector,
                                              tuple(detector_shape), raw_dtype, raw_header_skip,
                                              motor_selectors))

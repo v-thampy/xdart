@@ -339,3 +339,44 @@ def test_motor_names_read_the_scan_header_alone(tmp_path, monkeypatch):
     monkeypatch.setattr(specfile.Scan, "data", property(lambda self: pytest.fail("the data table was read")))
     assert read_spec_scan_motor_names(path) == ("th", "chi", "phi")
     assert scans and all(scan._data is None for scan in scans)
+
+
+@pytest.mark.parametrize("scan,expected", [(1, ["myscan_scan1_2.raw", "myscan_scan001_10.raw"]),
+                                         (10, ["myscan_scan010_0.raw"]),
+                                         (101, ["myscan_scan101_0.raw"])])
+def test_spec_numeric_scan_discovery(tmp_path, scan, expected):
+    from xrd_tools.sources.spec import find_spec_image_files
+    for name in ["myscan_scan1_2.raw", "myscan_scan001_10.raw", "myscan_scan010_0.raw",
+                 "myscan_scan101_0.raw", "myscan_scan1x_0.raw", "other_scan1_0.raw"]:
+        (tmp_path / name).touch()
+    (tmp_path / "myscan_scan1_0.raw").mkdir()
+    assert [p.name for p in find_spec_image_files(tmp_path, "myscan", scan)] == expected
+
+
+def test_spec_explicit_stem_keeps_glob_semantics(tmp_path):
+    from xrd_tools.sources.spec import find_spec_image_files
+    for name in ["other_2.raw", "other_10.raw", "myscan_scan001_0.raw"]:
+        (tmp_path / name).touch()
+    assert [p.name for p in find_spec_image_files(tmp_path, "myscan", 1, "other_*")] == [
+        "other_2.raw", "other_10.raw"]
+
+
+def test_spec_padded_eiger_master_owns_external_frames_and_stitch_name(tmp_path):
+    import h5py
+    from xrd_tools.analysis.stitch_sources import int_scan_name, spec_scan_name
+    from xrd_tools.sources.spec import find_spec_image_files
+    path = _spec(tmp_path)
+    data = tmp_path / "myscan_scan005_data_000001.h5"
+    master = tmp_path / "myscan_scan005_master.h5"
+    images = np.arange(3 * 6 * 6, dtype="uint32").reshape(3, 6, 6)
+    with h5py.File(data, "w") as handle:
+        handle.create_dataset("/entry/data/data", data=images)
+    with h5py.File(master, "w") as handle:
+        handle["/entry/data/data_000001"] = h5py.ExternalLink(data.name, "/entry/data/data")
+    assert find_spec_image_files(tmp_path, "myscan", "5.1") == [master]
+    source = SpecSource(path, scan=5, image_dir=tmp_path, require_complete_images=True)
+    assert source.frame_indices == [0, 1, 2]
+    for index in range(3):
+        assert source.raw_locator_for(index) == (master, index)
+        np.testing.assert_array_equal(source.load_frame(index), images[index])
+    assert spec_scan_name(path, "5.1", tmp_path, "") == int_scan_name(master)

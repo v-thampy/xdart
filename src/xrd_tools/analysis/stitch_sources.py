@@ -93,9 +93,8 @@ def int_scan_name(path) -> str:
 def spec_scan_name(path, key, image_dir, image_stem) -> str | None:
     """Int's scan name for one SPEC scan's images (its first image's), or None when none match: the
     automatic result name before Preview, from the files the source would read."""
-    from xrd_tools.io.image import find_image_files
-    stem = image_stem or f"{Path(path).stem}_scan{str(key).split('.')[0]}_"
-    files = list(find_image_files(Path(image_dir or Path(path).parent), stem=stem))
+    from xrd_tools.sources.spec import find_spec_image_files
+    files = find_spec_image_files(Path(image_dir or Path(path).parent), Path(path).stem, key, image_stem)
     return int_scan_name(files[0]) if files else None
 
 
