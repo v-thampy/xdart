@@ -25,7 +25,9 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
 import numpy as np
 
 from xrd_tools.core.containers import PONI
-from xrd_tools.core.geometry.stacked_arm import ARM_EXTENSION_FIELDS, StackedDetectorArm
+from xrd_tools.core.geometry.stacked_arm import (
+    ARM_EXTENSION_FIELDS, TURNED_DETECTOR_KEY, StackedDetectorArm, checked_turned_detector,
+)
 
 if TYPE_CHECKING:  # Only needed for type checkers; avoided at runtime.
     import xrayutilities as xu
@@ -398,6 +400,9 @@ class DetectorCalibration:
     detector_config: Mapping[str, Any] = field(default_factory=dict)
     image_orientation: ImageOrientation = field(default_factory=ImageOrientation)
     parallax: bool | None = None
+    #: A detector turned by a quarter into the calibration's frame (AUD-9 stage 2b item 8): the model and the turn
+    #: (``TURNED_DETECTOR_KEY``'s value), from which its module gaps are rebuilt; None for every other detector.
+    turned_from: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         # store detector_config JSON-canonical so to_json never crashes on a
@@ -406,6 +411,7 @@ class DetectorCalibration:
                            _json_canonical(dict(self.detector_config)))
         if self.parallax is not None and type(self.parallax) is not bool:
             raise TypeError("parallax must be bool or None")
+        object.__setattr__(self, "turned_from", checked_turned_detector(self.turned_from))
 
     def to_json(self) -> str:
         return json.dumps(self._as_jsonable(), separators=(",", ":"),
@@ -419,6 +425,8 @@ class DetectorCalibration:
         }
         if self.parallax is not None:
             values["parallax"] = self.parallax
+        if self.turned_from is not None:
+            values["turned_from"] = dict(self.turned_from)
         return values
 
     @classmethod
@@ -429,6 +437,7 @@ class DetectorCalibration:
             image_orientation=ImageOrientation.from_dict(
                 d.get("image_orientation", {})),
             parallax=d.get("parallax"),
+            turned_from=d.get("turned_from"),
         )
 
     @classmethod
@@ -890,6 +899,7 @@ class Diffractometer:
             detector_config=dict(data.get("detector_config", {})),
             image_orientation=image_orientation or ImageOrientation(),
             parallax=data.get("parallax"),
+            turned_from=data.get(TURNED_DETECTOR_KEY),
         )
 
         # The xu half is not in the pyFAI JSON — donate it from ``base``.

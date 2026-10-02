@@ -211,16 +211,12 @@ def calibration_detector_mask(value):
     """An xrayutilities calibration's detector mask (module gaps) in the calibration's own turned frame, as Stitch's
     XU backend rebuilds it: pyFAI's detector from the partner's factory name and config, its count and digest
     checked against the record. None: a detector without one. ValueError: not rebuildable, or not the record's."""
-    from pyFAI.detectors import detector_factory
-
+    from xrd_tools.integrate.turned_detector import partner_detector
     from xrd_tools.integrate.xu_stitch import _sha256_array
 
     detector = value["detector"]
-    config = dict(detector["detector_config"])
-    if "max_shape" in config:
-        config["max_shape"] = tuple(config["max_shape"])
-    try:
-        mask = detector_factory(detector["detector_factory_name"], config).calc_mask()
+    try:  # the named model, or a quarter-turned partner's model turned by its own turn (AUD-9 item 8)
+        _rebuilt, mask = partner_detector(detector, value["acquisition"])
     except Exception as error:  # noqa: BLE001 - pyFAI's own failure, by name
         raise ValueError(f"the calibration's detector cannot be rebuilt: {error}") from None
     shape = tuple(int(item) for item in detector["shape"])

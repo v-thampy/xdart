@@ -33,6 +33,11 @@ STACKED_ARM_MARKER = 'xdart_stacked_arm_v1'
 EXTENDED_ARM_MARKER = 'xdart_stacked_arm_v2'
 SINGLE_ARM_MARKER = 'xdart_single_arm_v1'
 STACKED_ARM_MARKERS = (STACKED_ARM_MARKER, EXTENDED_ARM_MARKER, SINGLE_ARM_MARKER)
+#: A goniometer record's key for a detector turned by a quarter into the calibration's frame (AUD-9 stage 2b
+#: item 8): the pyFAI detector the record names is then the generic one of the turned shape, and this names the
+#: model and the turn its images take, so its module gaps can be rebuilt (``xrd_tools.integrate.turned_detector``).
+#: Absent for every other detector.
+TURNED_DETECTOR_KEY = 'xdart_turned_detector'
 _PARAM_NAMES = ('dist', 'poni1', 'poni2', 'nu_offset', 'nu_scale',
                 'del_offset', 'del_scale', 'beam_rotation')
 _SINGLE_NAMES = ('dist', 'poni1', 'poni2', 'nu_offset', 'del_offset', 'del_scale', 'beam_rotation')
@@ -142,6 +147,20 @@ def is_arm_record(record) -> bool:
     trans = record.get('trans_function') if isinstance(record, dict) else None
     constants = trans.get('constants') if isinstance(trans, dict) else None
     return isinstance(constants, dict) and any(marker in constants for marker in STACKED_ARM_MARKERS)
+
+
+def checked_turned_detector(value):
+    """A ``TURNED_DETECTOR_KEY`` value as a plain dict: the model (its pyFAI name) and the quarter turn (90 or 270)
+    and mirror its images take into the calibration's frame; None for None; ValueError for anything else."""
+    if value is None:
+        return None
+    if (not hasattr(value, 'keys') or set(value) != {'detector', 'image_rotation', 'image_flip'}
+            or type(value['detector']) is not str or not value['detector']
+            or type(value['image_rotation']) is not int or value['image_rotation'] not in (90, 270)
+            or type(value['image_flip']) is not bool):
+        raise ValueError('the turned detector record is malformed')
+    return {'detector': value['detector'], 'image_rotation': value['image_rotation'],
+            'image_flip': value['image_flip']}
 
 
 @dataclass(frozen=True)
@@ -291,6 +310,9 @@ class StackedDetectorArm:
             trans_function=stacked_arm_transformation(self.extended, held=held))
         if calibration.parallax is not None:
             record['parallax'] = calibration.parallax
+        turned = getattr(calibration, 'turned_from', None)
+        if turned is not None:  # a quarter-turned detector: its model and turn travel with the record
+            record[TURNED_DETECTOR_KEY] = dict(turned)
         return record
 
     @classmethod

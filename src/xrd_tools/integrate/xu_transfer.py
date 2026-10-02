@@ -125,6 +125,11 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     arm, calibration = diff.stacked_arm, diff.calibration
     if arm is None or calibration is None:
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', 'the transfer needs a stacked (del-on-nu) detector arm')
+    turned = calibration.turned_from  # a model turned by a quarter into the frames' frame (AUD-9 item 8)
+    if turned is not None and (turned['image_rotation'] != int(image_rotation)
+                               or turned['image_flip'] != bool(image_flip)):
+        raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', "the calibration's detector was turned for another "
+                                'camera than the one it is saved with')
     if (arm.del_motor is None) != (del_motor is None) or (arm.nu_motor is None) != (nu_motor is None):
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', 'the arm and the source motors hold different circles')
     if int(dict(calibration.detector_config).get('orientation', 3)) != 3:  # as the XU fit refuses it
@@ -268,7 +273,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
             arm=compact, energy_eV=energy, xu_wavelength_A=xu_wavelength, detector_axes=detector_axes,
             source_energy_eV=calibration_recorded_energy_eV(record),
             source_motors={'del': del_motor, 'nu': nu_motor}, rotation=int(image_rotation), flip=bool(image_flip),
-            control_domain=domain(fit if fitted else validation), domain=domain(validation),
+            turned_from=turned, control_domain=domain(fit if fitted else validation), domain=domain(validation),
             fit_frames=len(fit) if fitted else 0, validation_frames=len(validation),
             validation_pixels=len(validation) * shape[0] * shape[1], max_dq=worst_dq)
         stitch_dq, polarization = _stitch_path_gate(asset, validation, integrators(validation), shape,

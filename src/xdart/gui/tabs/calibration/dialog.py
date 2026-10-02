@@ -1126,16 +1126,22 @@ class CalibrationDialog(QtWidgets.QDialog):
             pass  # an unknown camera: the default stays
 
     def _update_image_size(self, *_args):
-        """The detector image's x × y size, as the beam pixel is read (turned by the Detector panel's camera)."""
+        """The detector image's x × y size, as the beam pixel is read (turned by the Detector panel's camera); a
+        quarter turn also says the stored image's size and the turn."""
         shape = detector_shape(self._text('beam_detector'))
         if shape is None:
             self._image_size.setText('unknown detector')
             self._fields['beam_pixel'].setPlaceholderText('column, row')
             return
         rows, columns = shape
-        width, height = (rows, columns) if self._orientation().swaps_axes else (columns, rows)
+        orientation = self._orientation()
+        width, height = (rows, columns) if orientation.swaps_axes else (columns, rows)
         camera = self.camera.value()
-        self._image_size.setText(f'{width} × {height} px (x × y): x 0–{width - 1}, y 0–{height - 1} · '
+        # a quarter turn: the window's image is the stored one turned, and so is its detector (item 8)
+        stored = (f' in the window (the stored image is {columns} × {rows}, turned {orientation.rotation}°'
+                  f'{" and mirrored left-right" if orientation.flip_horizontal else ""})'
+                  if orientation.swaps_axes else '')
+        self._image_size.setText(f'{width} × {height} px (x × y){stored}: x 0–{width - 1}, y 0–{height - 1} · '
                                  f'camera rows {camera.rows}, columns {camera.columns}')
         self._beam_pixel_hint()
 
@@ -1221,7 +1227,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             del_motor=delta, nu_motor=nu,
             orientation=int(self._text('beam_orientation')), mount_deg=mount,
             wavelength_m=wavelength * 1e-10 if wavelength is not None else 1e-10,
-            beam_readings=readings or None, senses=geometry.arm_senses())
+            beam_readings=readings or None, senses=geometry.arm_senses(),
+            camera=self._orientation())  # a quarter turn: the detector turned with the images (item 8)
 
     def _rough_wavelength_A(self):
         """The typed wavelength (Å), else the calibrant scan's when every frame read records the same

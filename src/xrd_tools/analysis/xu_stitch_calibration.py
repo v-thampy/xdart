@@ -510,13 +510,18 @@ def _validate_extended_surface(value):
 def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_wavelength_A,
                                  source_motors, rotation, control_domain, domain, fit_frames,
                                  validation_frames, validation_pixels, max_dq, source_energy_eV=None,
-                                 detector_axes=None, flip=False):
+                                 detector_axes=None, flip=False, turned_from=None):
     """Build and strictly admit a transferred SURFACE v3 asset (imports are lazy).
 
     ``xu_parameters`` holds cch1/cch2 (px), distance_m, del/nu offsets (deg),
     detrot/tilt/tiltazimuth (deg) and sampledis_mm; ``arm`` is the compact pyFAI arm.
     ``detector_axes`` (nu's, del's; None: psic's x+, z-) reverses a circle that turns the other way.
     ``flip``: the frames are also mirrored left-right after the rotation (a mirrored camera).
+    ``turned_from`` (AUD-9 stage 2b item 8): ``detector`` is a model turned by a quarter into the frames' frame
+    (pyFAI's generic detector there; the model and turn, ``TURNED_DETECTOR_KEY``'s value): the asset then names the
+    model as its detector, with the turned frame's shape and pitches and the model's own mask turned as the
+    images are, and so does its solid-angle arm; its readers rebuild it by the asset's own turn
+    (``turned_detector.partner_detector``).
     """
     import numpy as np
     from xrd_tools.core.energy import energy_eV_to_wavelength_m
@@ -530,10 +535,26 @@ def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_
     config = json.loads(json.dumps(config))
     mask = detector.calc_mask()
     mask = np.zeros(shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    name = detector.__class__.__name__
+    if turned_from is not None:  # a quarter-turned model: named, in the turned frame, with its own gaps turned
+        from pyFAI.detectors import detector_factory
+        from xrd_tools.core.geometry.diffractometer import ImageOrientation
+        from xrd_tools.integrate.turned_detector import turned_model_mask
+        orientation = ImageOrientation(rotation=int(turned_from['image_rotation']),
+                                       flip_horizontal=bool(turned_from['image_flip']))
+        if (not orientation.swaps_axes or orientation.rotation != int(rotation)
+                or orientation.flip_horizontal != bool(flip)
+                or tuple(int(v) for v in detector_factory(turned_from['detector']).shape)[::-1] != shape):
+            raise ValueError("the turned detector's model and turn do not fit its frame")
+        name = str(turned_from['detector'])
+        config = {'orientation': config['orientation'], 'pixel1': float(detector.pixel1),
+                  'pixel2': float(detector.pixel2)}
+        gaps = turned_model_mask(name, orientation)
+        mask = np.zeros(shape, dtype=bool) if gaps is None else np.asarray(gaps, dtype=bool)
     p = xu_parameters
     value['detector'].update(cch1_px=p['cch1_px'], cch2_px=p['cch2_px'], distance_m=p['distance_m'],
         detrot_deg=p['detrot_deg'], tilt_deg=p['tilt_deg'], tiltazimuth_deg=p['tiltazimuth_deg'],
-        detector_factory_name=detector.__class__.__name__, detector_config=config,
+        detector_factory_name=name, detector_config=config,
         shape=list(shape), pixel1_m=float(detector.pixel1), pixel2_m=float(detector.pixel2),
         mask_count=int(mask.sum()),
         mask_sha256=hashlib.sha256(np.ascontiguousarray(mask, dtype='|u1').tobytes()).hexdigest())
@@ -549,6 +570,8 @@ def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_
         value['acquisition']['image_flip'] = True
     arm = json.loads(json.dumps(arm))
     arm['detector_config'] = config
+    if turned_from is not None:  # the arm names the asset's detector, as its admission requires
+        arm['detector'] = name
     value['corrections'].update(solid_angle_policy=EXTENDED_SOLID_ANGLE_POLICY,
                                 solid_angle_sha256=extended_arm_digest(arm), solid_angle_arm=arm)
     value['validation'] = {

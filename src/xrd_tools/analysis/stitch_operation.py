@@ -64,6 +64,7 @@ from xrd_tools.analysis.xu_stitch_calibration import (
 )
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.geometry import AngleMapping, Diffractometer, ImageOrientation
+from xrd_tools.core.geometry.stacked_arm import TURNED_DETECTOR_KEY
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.core.staging import reduction_worker_cap
 from xrd_tools.sources.composite import CompositeFrameSource
@@ -288,6 +289,13 @@ def _json_position_names(value: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(raw_positions)
 
 
+def _turned_window_record(detector: str, config: dict, turned: object) -> bool:
+    """A quarter-turned model's record names exactly that model turned (``is_turned_window_record``)."""
+    from xrd_tools.integrate.turned_detector import is_turned_window_record
+
+    return is_turned_window_record(detector, config, turned)
+
+
 def _json_mapping(raw: bytes) -> dict[str, object]:
     def no_duplicates(pairs):
         result = dict(pairs)
@@ -347,13 +355,16 @@ def _json_mapping(raw: bytes) -> dict[str, object]:
             )
     detector = value.get("detector")
     config = value.get("detector_config")
+    turned = value.get(TURNED_DETECTOR_KEY)
     if (
         type(detector) is not str
         or not detector
         or len(detector) > 128
         or any(mark in detector for mark in ("\0", "/", "\\", "://"))
         or type(config) is not dict
-        or not set(config) <= {"orientation", "binning"}
+        # a registered model; or, for a quarter-turned one, exactly that model turned (AUD-9 stage 2b item 8)
+        or not (set(config) <= {"orientation", "binning"} if turned is None
+                else _turned_window_record(detector, config, turned))
     ):
         raise StitchOperationRefused(
             "GEOMETRY_PARSE_FAILED", "goniometer detector configuration is unsafe"
@@ -2701,6 +2712,8 @@ def _detector_mask(diffractometer) -> np.ndarray | None:
     if detector is None or not hasattr(detector, "calc_mask"):
         return None
     value = detector.calc_mask()
+    if value is None and getattr(diffractometer.calibration, "turned_from", None) is not None:
+        value = detector.mask  # a quarter-turned model's gaps, which its generic detector holds (AUD-9 item 8)
     if value is None:
         return None
     mask = np.ascontiguousarray(np.asarray(value, dtype=bool))

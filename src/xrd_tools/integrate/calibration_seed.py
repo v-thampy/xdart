@@ -164,7 +164,7 @@ def detector_shape(detector) -> tuple[int, int] | None:
 
 def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor='del', nu_motor='nu',
                      wavelength_m=1e-10, orientation=3, mount_deg=(0., 0.), beam_readings=None,
-                     senses=None) -> dict:
+                     senses=None, camera=None) -> dict:
     """A nominal stacked (del-on-nu) arm from a rough distance, for a new setup.
 
     ``zeros_deg`` gives each moving circle's motor-zero reading ('del', 'nu'; physical angle =
@@ -188,15 +188,19 @@ def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor
     not the zero pose: a direct-beam scan turns one circle and holds the other where it read (17-2's
     scan 3 holds del at 0, its zero 2.3°), so the PONI moves to put the beam on ``beam_px`` there
     (maintainer, 2026-09-29: a refinement started from that geometry "looks totally off").
+    ``camera`` is the turn and mirror the window's images take (``ImageOrientation``; None: none): for a quarter
+    turn the detector is the model turned with them (``turned_detector.window_detector``: pyFAI's generic detector of
+    the transposed shape, the model and turn recorded beside it), so ``beam_px`` and the record are in that frame.
     """
-    from pyFAI.detectors import detector_factory
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.core.geometry.diffractometer import ImageOrientation
     from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm, arm_signs
+    from xrd_tools.integrate.turned_detector import window_detector
     if not math.isfinite(float(distance_m)) or float(distance_m) <= 0:
         raise ValueError('the rough distance must be a positive number')
-    config = {} if int(orientation) == 3 else {'orientation': int(orientation)}
-    pixels = detector_factory(detector, config=config or None)
+    pixels, name, config, turned = window_detector(detector, camera or ImageOrientation(),
+                                                   pyfai_orientation=int(orientation))
     x, y = (float(value) for value in beam_px)
     moving = {circle: motor for circle, motor in (('del', del_motor), ('nu', nu_motor)) if motor is not None}
     held = set(zeros_deg or {}) - set(moving)
@@ -211,22 +215,22 @@ def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor
     # the configured detector's own conversion; for orientation 3 it is (y + .5, x + .5) pitches exactly
     poni1, poni2, _ = pixels.calc_cartesian_positions(d1=np.array([y]), d2=np.array([x]))
     poni = PONI(dist=float(distance_m), poni1=float(poni1[0]), poni2=float(poni2[0]),
-                wavelength=float(wavelength_m), detector=str(detector))
+                wavelength=float(wavelength_m), detector=name)
     tilt, roll = (math.radians(float(value)) for value in mount_deg)
     arm = StackedDetectorArm(nu_motor=nu_motor, del_motor=del_motor, **scales, **offset,
                              mount_tilt=tilt, mount_roll=roll)
-    record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+    record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config, turned_from=turned))
     if tilt or roll:  # the tilted plane moves the beam off its pixel (Codex review F2): put it back
         pose = dict(del_motor=del_motor, nu_motor=nu_motor,
                     readings={moving[circle]: zero for circle, zero in zeros.items()})
         along = _direct_beam_hit(record, **pose)[1]
         poni.dist *= float(distance_m) / along  # the plane's distance scales the one along the beam
-        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config, turned_from=turned))
         (hit1, hit2), _ = _direct_beam_hit(record, **pose)
         at1, at2, _ = pixels.calc_cartesian_positions(d1=np.array([hit1]), d2=np.array([hit2]))
         poni.poni1 += float(poni1[0] - at1[0])  # moving the PONI translates the pattern in the plane
         poni.poni2 += float(poni2[0] - at2[0])
-        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config, turned_from=turned))
     if beam_readings:  # the beam was seen off the zero pose: put it on its pixel there
         pose = dict(del_motor=del_motor, nu_motor=nu_motor,
                     readings={**{moving[circle]: zero for circle, zero in zeros.items()},
@@ -235,7 +239,7 @@ def rough_arm_record(*, distance_m, detector, beam_px, zeros_deg=None, del_motor
         at1, at2, _ = pixels.calc_cartesian_positions(d1=np.array([hit1]), d2=np.array([hit2]))
         poni.poni1 += float(poni1[0] - at1[0])
         poni.poni2 += float(poni2[0] - at2[0])
-        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config))
+        record = arm.to_pyfai_goniometer(DetectorCalibration(poni=poni, detector_config=config, turned_from=turned))
     return record
 
 

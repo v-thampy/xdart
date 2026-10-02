@@ -359,10 +359,14 @@ def _extended_solid_angle(corrections, shape, *, sample_offset=True):
         raise XuStitchScienceRefused("XU_SOLID_ANGLE_MISMATCH", "the extended solid-angle arm is not attested")
     if not sample_offset:
         arm = {**arm, "sample_offset1": 0.0, "sample_offset2": 0.0, "sample_offset3": 0.0}
+    from xrd_tools.integrate.turned_detector import frame_detector_record
+    # the arm's model in the partner's frame: itself, or (a quarter-turned partner, AUD-9 item 8) pyFAI's generic
+    # detector of the partner's shape and the arm's pitches
+    name, config = frame_detector_record(arm["detector"], arm["detector_config"], shape)
     calibration = DetectorCalibration(
         PONI(dist=arm["dist_m"], poni1=arm["poni1_m"], poni2=arm["poni2_m"],
-             wavelength=arm["wavelength_m"], detector=arm["detector"]),
-        detector_config=dict(arm["detector_config"]))
+             wavelength=arm["wavelength_m"], detector=name),
+        detector_config=dict(config))
     stacked = StackedDetectorArm(
         nu_motor="nu", del_motor="del", nu_offset=arm["nu_offset"], nu_scale=arm["nu_scale"],
         del_offset=arm["del_offset"], del_scale=arm["del_scale"], beam_rotation=arm["beam_rotation"],
@@ -404,7 +408,8 @@ def resolve_xu_stitch_effective_geometry(
     corrections = asset["corrections"]
     try:
         import pyFAI
-        from pyFAI.detectors import detector_factory
+
+        from xrd_tools.integrate.turned_detector import partner_detector
 
         if (
             importlib.metadata.version("pyFAI") != "2026.5.0"
@@ -413,10 +418,9 @@ def resolve_xu_stitch_effective_geometry(
             raise XuStitchScienceRefused(
                 "XU_RUNTIME_UNSUPPORTED", "pyFAI 2026.5.0 is required"
             )
-        detector = detector_factory(
-            detector_asset["detector_factory_name"],
-            dict(detector_asset["detector_config"]),
-        )
+        # the named model, or (a quarter-turned partner, AUD-9 item 8) pyFAI's generic detector of the partner's
+        # shape with the model's own mask turned as the images are
+        detector, detector_mask = partner_detector(detector_asset, acquisition)
     except XuStitchScienceRefused:
         raise
     except BaseException as error:
@@ -462,7 +466,6 @@ def resolve_xu_stitch_effective_geometry(
             "XU_SENSOR_PARALLAX_UNSUPPORTED",
             "detector or sensor reconstruction differs from calibration",
         )
-    detector_mask = detector.calc_mask()
     mask = np.zeros(shape, dtype=bool) if detector_mask is None else np.ascontiguousarray(detector_mask, dtype=bool)
     if (
         mask.shape != shape

@@ -668,6 +668,17 @@ def detector_calibration_to_integrator(
         )
     else:
         det = None
+    turned = getattr(cal, "turned_from", None)
+    if turned is not None and det is not None:  # a quarter-turned model: its own gaps, turned (AUD-9 item 8)
+        from xrd_tools.core.geometry.diffractometer import ImageOrientation  # noqa: PLC0415
+        from xrd_tools.integrate.turned_detector import turned_frame_shape, turned_model_mask  # noqa: PLC0415
+
+        if tuple(det.shape) != turned_frame_shape(turned["detector"]):
+            raise ValueError("the turned detector's model does not fit the calibration's detector")
+        gaps = turned_model_mask(turned["detector"], ImageOrientation(
+            rotation=turned["image_rotation"], flip_horizontal=turned["image_flip"]))
+        if gaps is not None:
+            det.mask = np.array(gaps, dtype=np.int8)
     integrator = AzimuthalIntegrator(
         dist=float(p.dist if dist is None else dist),
         poni1=float(p.poni1 if poni1 is None else poni1),
