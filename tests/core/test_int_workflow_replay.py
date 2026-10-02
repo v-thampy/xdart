@@ -10,7 +10,6 @@ import pytest
 
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io import open_scan
-from xrd_tools.notebooks.int_replay import run_int_replay
 from xrd_tools.session.run_configuration import RunIntent, ThresholdIntent
 from xrd_tools.session.run_intent_profile import dump_run_intent_profile
 from xrd_tools.sources.selection import DirectorySourceSpec
@@ -41,6 +40,7 @@ def _fixture(root):
 
 @pytest.mark.parametrize('mode', ['Int 1D', 'Int 2D'])
 def test_int_replay_uses_the_same_admitted_assets_and_native_reducer(tmp_path, mode):
+    from xrd_tools.notebooks.int_replay import run_int_replay
     from dataclasses import replace
     from xdart.gui.tabs.scattering.output_preflight import _load_scientific_assets, native_int_reduction_plan
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
@@ -91,6 +91,7 @@ def test_int_replay_uses_the_same_admitted_assets_and_native_reducer(tmp_path, m
 
 
 def test_int_replay_live_refusal_and_relocated_project(tmp_path):
+    from xrd_tools.notebooks.int_replay import run_int_replay
     import shutil
     intent = _fixture(tmp_path / 'original')
     encoded = json.loads(dump_run_intent_profile(intent))
@@ -107,6 +108,7 @@ def test_int_replay_live_refusal_and_relocated_project(tmp_path):
 
 
 def test_int_replay_directory_uses_native_scan_grouping(tmp_path):
+    from xrd_tools.notebooks.int_replay import run_int_replay
     intent = _fixture(tmp_path / 'project')
     raw = tmp_path / 'project' / 'inputs'
     raw.mkdir()
@@ -122,17 +124,50 @@ def test_int_replay_directory_uses_native_scan_grouping(tmp_path):
     assert all(len(open_scan(path).frame_indices) == 2 for path in outputs)
 
 
-def test_shared_plan_honors_the_recorded_gi_exit_convention():
-    from xrd_tools.session.readiness import native_int_reduction_plan
+def test_legacy_gi_profile_new_run_integrates_current_exit_angle_axes():
+    from xdart.gui.tabs.scattering.output_preflight import native_int_reduction_plan
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.corrections.grazing import (
+        GI_EXIT_ANGLE_CONVENTION, LEGACY_GI_EXIT_ANGLE_CONVENTION,
+    )
+    from xrd_tools.integrate.gid import create_fiber_integrator
+    from xrd_tools.reduction import core
     from xrd_tools.session.run_configuration import GIIntent
-    from xrd_tools.corrections.grazing import LEGACY_GI_EXIT_ANGLE_CONVENTION
-    intent = RunIntent(gi=GIIntent(enabled=True, incidence_motor='Manual',
-                     gi_exit_angle_convention=LEGACY_GI_EXIT_ANGLE_CONVENTION))
-    assert native_int_reduction_plan(intent.freeze()).gi.gi_exit_angle_convention == LEGACY_GI_EXIT_ANGLE_CONVENTION
+    from xrd_tools.session.run_intent_profile import load_run_intent_profile
+
+    intent = RunIntent(
+        source_spec=SourceSpec(Path('/data/frame.tif'), SourceKind.IMAGE_FILE),
+        gi=GIIntent(enabled=True, incidence_motor='Manual', th_val=0.2,
+                    mode_1d='exit_angle', mode_2d='exit_angles'),
+    )
+    profile = json.loads(dump_run_intent_profile(intent))
+    profile['intent']['gi'].pop('gi_exit_angle_convention')
+    restored = load_run_intent_profile(json.dumps(profile))
+    assert restored.gi.gi_exit_angle_convention == LEGACY_GI_EXIT_ANGLE_CONVENTION
+    plan = native_int_reduction_plan(restored.freeze())
+    assert plan.gi.gi_exit_angle_convention == GI_EXIT_ANGLE_CONVENTION
+
+    poni = PONI(dist=0.2, poni1=0.02, poni2=0.02,
+                wavelength=1e-10, detector='Pilatus100k')
+    integrator = create_fiber_integrator(poni, incident_angle=0.2)
+    image = np.ones((195, 487), dtype=np.float32)
+    result_1d = core._run_gi_1d(
+        image, integrator, plan.integration_1d, plan.gi, mask=None,
+        incident_angle=0.2, normalization_factor=None,
+    )
+    result_2d = core._run_gi_2d(
+        image, integrator, plan.integration_2d, plan.gi, mask=None,
+        incident_angle=0.2, normalization_factor=None,
+    )
+    assert result_1d.intensity.shape == (1000,)
+    assert result_2d.intensity.shape == (1000, 360)
+    assert np.isfinite(result_1d.intensity).any()
+    assert np.isfinite(result_2d.intensity).any()
 
 
 @pytest.mark.parametrize('mode', ['Int 1D', 'Int 1D (XYE)'])
 def test_int_replay_background_uses_the_shared_submission_owner(tmp_path, mode):
+    from xrd_tools.notebooks.int_replay import run_int_replay
     from xrd_tools.reduction import FrameBackgroundPlan
     from fabio.tifimage import TifImage
     intent = _fixture(tmp_path / 'project')

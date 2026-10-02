@@ -1047,7 +1047,6 @@ def execution_plan_values(
         "gi_incident_angle": gi.th_val if manual else None,
         "incidence_motor": gi.effective_motor if gi.enabled and not manual else None,
         "tilt_angle": gi.tilt_angle, "sample_orientation": gi.sample_orientation,
-        "gi_exit_angle_convention": gi.gi_exit_angle_convention,
         "integrate_1d": True,
         "integrate_2d": not (
             "Viewer" not in configuration.processing_mode
