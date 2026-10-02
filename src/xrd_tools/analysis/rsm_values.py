@@ -1,0 +1,2249 @@
+"""Immutable, Qt-free operator values for the standalone RSM tool.
+
+The editable form carries one already-typed :class:`RSMOperationPlan`.
+Preflight binds it to an exact SPEC scan and returns the request that Run must
+consume unchanged; the GUI never reconstructs scientific authority at dispatch.
+"""
+
+from __future__ import annotations
+
+from dataclasses import InitVar, dataclass, field
+from enum import Enum
+import json
+import math
+import os
+from pathlib import Path
+import re
+import threading
+
+import numpy as np
+
+from xrd_tools.analysis.module_transaction import (
+    MetadataColumnSelector,
+    ModuleKind,
+    ModuleOutputRequest,
+    ModuleSourceGroupReceipt,
+    ModuleSourceReceipt,
+)
+from xrd_tools.analysis.rsm_geometry_asset import (
+    RSMCalibrationGeometryInput,
+    RSMGeometryAssetInput,
+    RSMGeometryAssetRefused,
+    capture_rsm_calibration_geometry,
+    capture_rsm_geometry_asset,
+    lower_rsm_effective_geometry,
+    rsm_calibration_kind,
+    rsm_calibration_solid_angle_source,
+)
+from xrd_tools.analysis.stitch_native import detector_image_warnings
+from xrd_tools.analysis.rsm_operation import (
+    RSMDetectorGeometry,
+    RSMFrameCorrections,
+    RSMUBOverride,
+    RSMImageConditioning,
+    RSMNormalizationMode,
+    RSMNormalizationPolicy,
+    RSMOperationPlan,
+    RSMOperationRefused,
+    RSMOperationRequest,
+    RSMOperationRequestV2,
+    prepare_rsm_operation,
+    prepare_rsm_operation_v2,
+    required_rsm_selectors,
+    required_rsm_selectors_v2,
+    rsm_output_current,
+)
+from xrd_tools.analysis.scan_operations import (
+    AnalysisDisposition,
+    MetadataTablePlan,
+    analysis_canonical_fingerprint,
+    run_metadata_table,
+)
+from xrd_tools.core.geometry import DetectorHeader, ImageOrientation
+from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
+from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.io.analysis_artifact import (
+    AnalysisArtifactKind,
+    AnalysisArtifactOverwrite,
+    analysis_output_refusal,
+)
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_SCAN = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+_PREFLIGHT_FACTORY = object()
+_PREFLIGHT_V2_FACTORY = object()
+_MAX_SELECTED_FRAMES = 4096
+#: The most scans one RSM grids (a page refuses more, naming this bound).
+MAX_RSM_MEMBERS = 16
+_MAX_RSM_MEMBERS = MAX_RSM_MEMBERS
+_MAX_RSM_AXIS_POINTS = 1_000_000
+_MAX_RSM_VOXELS = 8_000_000
+_MAX_CHUNK_SIZE = 1024
+_MAX_FRAME_OR_CHUNK_BYTES = 4 * 1024 * 1024 * 1024
+_PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
+
+
+class RSMToolPreflightRefused(ValueError):
+    """One RSM form could not be admitted as an exact runnable request."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str | None = None,
+        *,
+        diagnostics: tuple[str, ...] = (),
+    ) -> None:
+        if type(code) is not str or not code:
+            raise TypeError("preflight refusal code must be a nonempty string")
+        if type(diagnostics) is not tuple or any(
+            type(item) is not str for item in diagnostics
+        ):
+            raise TypeError("preflight diagnostics must be an exact string tuple")
+        self.code = code
+        self.diagnostics = diagnostics
+        super().__init__(code if message is None else f"{code}: {message}")
+
+
+def _absolute_path(value: object, name: str) -> str:
+    try:
+        spelling = os.fspath(value)
+    except TypeError as error:
+        raise TypeError(f"{name} must be path-like") from error
+    if type(spelling) is not str or not spelling.strip() or "\0" in spelling:
+        raise ValueError(f"{name} is required")
+    return os.path.normcase(os.path.abspath(os.path.expanduser(spelling)))
+
+
+def _inside_project(path: str | Path, root: Path, name: str) -> str:
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise RSMToolPreflightRefused(
+            f"{name.upper()}_OUTSIDE_PROJECT",
+            f"{name.replace('_', ' ')} must resolve inside the selected Project",
+        ) from error
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise RSMToolPreflightRefused(
+            f"{name.upper()}_INVALID",
+            f"{name.replace('_', ' ')} is invalid",
+        )
+    return relative.as_posix()
+
+
+def _relative_path(value: object, name: str) -> str:
+    if type(value) is not str or not value:
+        raise TypeError(f"{name} must be a nonempty string")
+    path = Path(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"{name} must be one safe relative path")
+    return path.as_posix()
+
+
+@dataclass(frozen=True, slots=True)
+class RSMFrameSelector:
+    """Inclusive numeric frame-label range, never an ordinal table slice."""
+
+    start_label: int = 0
+    stop_label: int | None = None
+    step: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.start_label) is not int
+            or self.start_label < 0
+            or (
+                self.stop_label is not None
+                and (
+                    type(self.stop_label) is not int
+                    or self.stop_label < self.start_label
+                )
+            )
+            or type(self.step) is not int
+            or self.step < 1
+        ):
+            raise ValueError("RSM frame-label selector is invalid")
+
+    def select(self, labels: tuple[int, ...]) -> tuple[int, ...]:
+        if type(labels) is not tuple or not labels or any(
+            type(label) is not int or label < 0 for label in labels
+        ):
+            raise RSMToolPreflightRefused(
+                "SOURCE_LABELS_INVALID", "source frame labels are invalid"
+            )
+        stop = max(labels) if self.stop_label is None else self.stop_label
+        count = (stop - self.start_label) // self.step + 1
+        if count > _MAX_SELECTED_FRAMES:
+            raise RSMToolPreflightRefused(
+                "FRAME_SELECTION_LIMIT_EXCEEDED",
+                "RSM selection exceeds 4096 frames",
+            )
+        expected = tuple(range(self.start_label, stop + 1, self.step))
+        expected_set = set(expected)
+        selected = tuple(label for label in labels if label in expected_set)
+        if not expected or selected != expected:
+            raise RSMToolPreflightRefused(
+                "FRAME_SELECTION_OUTSIDE_SOURCE",
+                "requested frame labels are not one exact ordered source subset",
+            )
+        return selected
+
+    @property
+    def fingerprint_value(self) -> tuple[object, ...]:
+        return self.start_label, self.stop_label, self.step
+
+
+@dataclass(frozen=True, slots=True)
+class RSMToolForm:
+    """All operator-editable source/output intent plus one typed science plan."""
+
+    project_root: str | Path
+    spec_path: str | Path
+    scan: str
+    image_dir: str | Path
+    image_stem: str
+    frame_selector: RSMFrameSelector
+    detector_shape: tuple[int, int]
+    raw_dtype: str
+    plan: RSMOperationPlan
+    output_path: str | Path
+    raw_header_skip: int = 0
+    overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        project = _absolute_path(self.project_root, "Project root")
+        spec = _absolute_path(self.spec_path, "SPEC path")
+        image_dir = _absolute_path(self.image_dir, "image directory")
+        output = _absolute_path(self.output_path, "output path")
+        if Path(spec).suffix:
+            raise ValueError("RSM SPEC path must be extensionless")
+        if Path(output).suffix.casefold() != ".nexus":
+            raise ValueError("RSM output path must end in .nexus")
+        if type(self.scan) is not str or _SCAN.fullmatch(self.scan) is None:
+            raise ValueError("SPEC scan must be an exact N or N.M selector")
+        if (
+            type(self.image_stem) is not str
+            or not self.image_stem
+            or self.image_stem.strip() != self.image_stem
+            or len(self.image_stem.encode("utf-8")) > 4096
+            or any(mark in self.image_stem for mark in ("\0", "/", "\\"))
+        ):
+            raise ValueError("image stem must be one bounded filename substring")
+        if type(self.frame_selector) is not RSMFrameSelector:
+            raise TypeError("frame selector must be exact RSMFrameSelector")
+        if (
+            type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(item) is not int or item < 2 for item in self.detector_shape)
+        ):
+            raise ValueError("detector shape must contain two exact integers >= 2")
+        if type(self.raw_dtype) is not str or not self.raw_dtype:
+            raise TypeError("raw dtype must be a nonempty string")
+        try:
+            dtype = np.dtype(self.raw_dtype)
+        except TypeError as error:
+            raise ValueError("raw dtype is not a NumPy dtype") from error
+        if dtype.fields is not None or dtype.subdtype is not None or dtype.kind not in "biuf":
+            raise ValueError("raw dtype must be one scalar real numeric dtype")
+        if (
+            type(self.raw_header_skip) is not int
+            or not 0 <= self.raw_header_skip <= (1 << 30)
+        ):
+            raise ValueError("raw header skip must be an integer from 0 through 1 GiB")
+        if type(self.plan) is not RSMOperationPlan:
+            raise TypeError("RSM form plan must be exact RSMOperationPlan")
+        plan_shape = (
+            self.plan.geometry.header.Nch1,
+            self.plan.geometry.header.Nch2,
+        )
+        if self.detector_shape != plan_shape:
+            raise ValueError("raw detector shape must match the RSM detector header")
+        if type(self.overwrite) is not AnalysisArtifactOverwrite:
+            raise TypeError("overwrite policy must be exact AnalysisArtifactOverwrite")
+        object.__setattr__(self, "project_root", project)
+        object.__setattr__(self, "spec_path", spec)
+        object.__setattr__(self, "image_dir", image_dir)
+        object.__setattr__(self, "output_path", output)
+        object.__setattr__(self, "detector_shape", tuple(self.detector_shape))
+        object.__setattr__(self, "raw_dtype", dtype.str)
+        canonical = (
+            "rsm-tool-form-v1",
+            project,
+            spec,
+            self.scan,
+            image_dir,
+            self.image_stem,
+            self.frame_selector.fingerprint_value,
+            self.detector_shape,
+            dtype.str,
+            self.raw_header_skip,
+            self.plan.fingerprint,
+            output,
+            self.overwrite,
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint("rsm-tool-form-v1", canonical),
+        )
+
+
+def _rsm_member_motor_selectors(
+    value: object,
+) -> tuple[tuple[str, MetadataColumnSelector], ...]:
+    if type(value) is not tuple or len(value) != len(_PSIC_ROLES):
+        raise TypeError("RSM member motor selectors must be one exact six-tuple")
+    admitted: list[tuple[str, MetadataColumnSelector]] = []
+    for expected, item in zip(_PSIC_ROLES, value, strict=True):
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or item[0] != expected
+            or type(item[1]) is not MetadataColumnSelector
+        ):
+            raise TypeError("RSM member motor selector binding is invalid")
+        admitted.append((expected, item[1]))
+    if len({(item.name, item.occurrence) for _role, item in admitted}) != 6:
+        raise ValueError("RSM member motor selector occurrences must be unique")
+    return tuple(admitted)
+
+
+def _missing_motor_role(source_spec, motor_selectors, cancel_token):
+    """The first psic role whose column the scan does not record, from its whole metadata table (read only on
+    a refused projection): (role, selector), or None when every role's column is there."""
+    options = {key: value for key, value in source_spec.options.items() if key != "metadata_column_projection"}
+    full = run_metadata_table(
+        MetadataTablePlan(SourceSpec(source_spec.uri, source_spec.kind, options=options)),
+        cancel_token=cancel_token,
+    )
+    if full.disposition is not AnalysisDisposition.COMPLETED:
+        return None
+    return _missing_role_in_table(full, motor_selectors)
+
+
+def _missing_role_in_table(table, motor_selectors):
+    """The first psic role whose column a whole metadata table lacks: (role, selector), or None."""
+    counts: dict[str, int] = {}
+    for column in table.columns:
+        counts[column.name] = counts.get(column.name, 0) + 1
+    for role, selector in motor_selectors:
+        if counts.get(selector.name, 0) <= selector.occurrence:
+            return role, selector
+    return None
+
+
+def _append_rsm_member_source(sources, table, member, selectors) -> None:
+    """One admitted member's module source: its frames by the member's selector, its selectors bound."""
+    selected = member.frame_selector.select(table.labels)
+    try:
+        sources.append(
+            ModuleSourceReceipt.from_metadata_table(
+                table,
+                kind=ModuleKind.RSM,
+                selected_labels=selected,
+                resolved_selectors=selectors,
+            )
+        )
+    except ValueError as error:
+        if str(error) != "metadata table is no longer an exact source fact":
+            raise
+        raise RSMToolPreflightRefused(
+            "SOURCE_REVISION_CHANGED",
+            "the source changed while binding the RSM v2 Preview",
+            diagnostics=(str(error),),
+        ) from error
+
+
+def rsm_member_groups(
+    selection,
+    *,
+    frame_selector,
+    detector_shape: tuple[int, int],
+    raw_dtype: str,
+    raw_header_skip: int,
+    motor_selectors,
+):
+    """Stitch's source selection, resolved by Stitch's own owner (``resolve_stitch_sources``: discovery, the
+    Selection syntax, Directory mode and its skips), as RSM member groups: one RSM per group, each SPEC scan one
+    member with the run's one frame range, raw decoder and angle mapping (design §2: ``[42-44]`` one RSM from
+    three scans, ``42,43`` two). Returns (groups, skipped). A raw NeXus stack is a member too (stage 2b C5c:
+    ``RSMNexusMemberForm``, its path, kind and entry), in an explicit selection and in Directory mode; any other
+    kind is refused, or skipped in Directory mode."""
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
+    if type(selection) is not StitchSourceSelection:
+        raise TypeError("RSM members come from an exact Stitch source selection")
+    read_image_kwargs = {"detector_shape": tuple(detector_shape), "raw_dtype": np.dtype(raw_dtype).str,
+                         "raw_header_skip": int(raw_header_skip), "threshold": None, "rotation": 0}
+    resolution = resolve_stitch_sources(selection, read_image_kwargs)
+    groups, skipped = [], list(resolution.skipped)
+    for group in resolution.groups:
+        members = []
+        for spec in group:
+            if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:  # a raw NeXus stack (C5c)
+                members.append(RSMNexusMemberForm(Path(spec.uri), spec.kind, spec.entry or "entry",
+                                                  frame_selector, tuple(detector_shape), motor_selectors))
+                continue
+            if spec.kind is not SourceKind.SPEC:
+                reason = "RSM reads SPEC scans and raw NeXus stacks"
+                if selection.kind == "Directory":
+                    skipped.append((str(spec.uri), str(spec.entry or ""), reason))
+                    continue
+                raise RSMToolPreflightRefused("SOURCE_KIND_UNSUPPORTED", f"{Path(spec.uri).name}: {reason}")
+            path, key = Path(spec.uri), spec.options["scan"]
+            stem = spec.options.get("image_stem") or f"{path.stem}_scan{key.split('.')[0]}_"
+            members.append(RSMScanMemberForm(path, key, spec.options["image_dir"], stem, frame_selector,
+                                             tuple(detector_shape), raw_dtype, raw_header_skip,
+                                             motor_selectors))
+        if members:
+            groups.append(tuple(members))
+    return tuple(groups), tuple(skipped)
+
+
+def rsm_member_source_ub(member) -> tuple[float, ...] | None:
+    """A member's own UB as its source records it, nine numbers row by row in SPEC's ``#G3`` convention (the
+    readers the run takes: a SPEC scan's ``#G3`` line through ``get_UB``, a raw NeXus entry's ``sample/ub_matrix``
+    or ``orientation_matrix`` through ``read_nexus``), or None when it records none: an HKL map of it needs a UB
+    given (``RSMToolFormV2.ub``) or Q coordinates (the maintainer, 2026-10-01: "For files with no ub matrix, a
+    warning with a chance to enter the ub matrix manually or through a spec file can be offered"). For the page's
+    warning and the Preview only; the run reads its own. ``()``: a ``#G3`` line that does not parse, which counts
+    as recorded (the run refuses it with its own reason in HKL, and Q never reads it)."""
+    if type(member) is RSMNexusMemberForm:
+        from xrd_tools.io.nexus import read_nexus
+        ub = read_nexus(Path(member.nexus_path), entry=member.entry).ub_matrix
+        return None if ub is None else tuple(float(value) for value in np.asarray(ub, dtype=float).ravel())
+    if type(member) is not RSMScanMemberForm:
+        raise TypeError("an RSM member is an exact SPEC scan or raw NeXus member form")
+    from xrd_tools.io.spec import get_UB
+    try:
+        ub = get_UB(str(member.spec_path), member.scan)
+    except KeyError as error:
+        if error.args and error.args[0] == "G3":
+            return None
+        raise
+    except ValueError:  # a #G3 that does not parse: recorded (the run names it)
+        return ()
+    return tuple(float(value) for value in np.asarray(ub, dtype=float).ravel())
+
+
+def parse_rsm_ub_rows(rows) -> tuple[float, ...]:
+    """A UB typed as three rows of three numbers (commas or spaces), in SPEC's ``#G3`` convention (row by row, in
+    Å⁻¹ with 2π included, as SPEC writes the line), as ``RSMUBOverride``'s nine. ValueError names a refused row, or
+    a matrix an HKL map cannot use (``rsm_coordinate_matrix``: finite and nonsingular, the run's own rule)."""
+    from xrd_tools.rsm.coordinate_frame import rsm_coordinate_matrix
+    values = []
+    for number, text in enumerate(rows, 1):
+        try:
+            row = [float(part) for part in str(text or "").replace(",", " ").split()]
+        except ValueError:
+            row = []
+        if len(row) != 3 or not all(math.isfinite(value) for value in row):
+            raise ValueError(f"row {number} needs three numbers")
+        values.extend(row)
+    if len(values) != 9:
+        raise ValueError("three rows of three numbers are needed")
+    try:
+        rsm_coordinate_matrix(RSMCoordinateFrame.HKL, np.asarray(values, dtype=np.float64).reshape(3, 3))
+    except ValueError:
+        raise ValueError("the matrix is singular (an HKL map needs an invertible one)") from None
+    return tuple(values)
+
+
+@dataclass(frozen=True, slots=True)
+class RSMScanMemberForm:
+    """One visible ordered SPEC member for an RSM v2 group."""
+
+    spec_path: str | Path
+    scan: str
+    image_dir: str | Path
+    image_stem: str
+    frame_selector: RSMFrameSelector
+    detector_shape: tuple[int, int]
+    raw_dtype: str
+    raw_header_skip: int
+    motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        spec = _absolute_path(self.spec_path, "RSM member SPEC path")
+        image_dir = _absolute_path(self.image_dir, "RSM member image directory")
+        if Path(spec).suffix:
+            raise ValueError("RSM member SPEC path must be extensionless")
+        if type(self.scan) is not str or _SCAN.fullmatch(self.scan) is None:
+            raise ValueError("RSM member scan must be an exact N or N.M selector")
+        if (
+            type(self.image_stem) is not str
+            or not self.image_stem
+            or self.image_stem.strip() != self.image_stem
+            or len(self.image_stem.encode("utf-8")) > 4096
+            or any(mark in self.image_stem for mark in ("\0", "/", "\\"))
+        ):
+            raise ValueError("RSM member image stem is invalid")
+        if type(self.frame_selector) is not RSMFrameSelector:
+            raise TypeError("RSM member frame selector must be exact")
+        if (
+            type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(item) is not int or item < 2 for item in self.detector_shape)
+        ):
+            raise ValueError("RSM member detector shape is invalid")
+        if type(self.raw_dtype) is not str or not self.raw_dtype:
+            raise TypeError("RSM member raw dtype must be a nonempty string")
+        try:
+            dtype = np.dtype(self.raw_dtype)
+        except TypeError as error:
+            raise ValueError("RSM member raw dtype is invalid") from error
+        if dtype.fields is not None or dtype.subdtype is not None or dtype.kind not in "biuf":
+            raise ValueError("RSM member raw dtype must be scalar real numeric")
+        if (
+            type(self.raw_header_skip) is not int
+            or not 0 <= self.raw_header_skip <= (1 << 30)
+        ):
+            raise ValueError("RSM member raw header skip is outside the bound")
+        motors = _rsm_member_motor_selectors(self.motor_selectors)
+        object.__setattr__(self, "spec_path", spec)
+        object.__setattr__(self, "image_dir", image_dir)
+        object.__setattr__(self, "detector_shape", tuple(self.detector_shape))
+        object.__setattr__(self, "raw_dtype", dtype.str)
+        object.__setattr__(self, "motor_selectors", motors)
+        canonical = (
+            spec,
+            self.scan,
+            image_dir,
+            self.image_stem,
+            self.frame_selector.fingerprint_value,
+            self.detector_shape,
+            dtype.str,
+            self.raw_header_skip,
+            tuple(
+                (role, selector.name, selector.occurrence)
+                for role, selector in motors
+            ),
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint("rsm-scan-member-form-v1", canonical),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RSMNexusMemberForm:
+    """One visible ordered raw NeXus member for an RSM v2 group (AUD-9 stage 2b C5c): the stack's path, its kind
+    (``NEXUS_STACK`` or ``EIGER_MASTER``) and entry, the frame range and the six-role angle mapping, whose
+    columns are the entry's positioners (a Dectris goniometer's ``omega``/``kappa``/``phi``/``chi`` are named
+    as any column). No raw decoder: the stack carries its own dtype, decoded to float64."""
+
+    nexus_path: str | Path
+    kind: SourceKind
+    entry: str
+    frame_selector: RSMFrameSelector
+    detector_shape: tuple[int, int]
+    motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        path = _absolute_path(self.nexus_path, "RSM member NeXus path")
+        if self.kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+            raise ValueError("RSM NeXus member kind must be a raw NeXus stack or Eiger master")
+        if (
+            type(self.entry) is not str
+            or not self.entry
+            or self.entry.strip() != self.entry
+            or any(mark in self.entry for mark in ("\0", "\\"))
+        ):
+            raise ValueError("RSM NeXus member entry is invalid")
+        if type(self.frame_selector) is not RSMFrameSelector:
+            raise TypeError("RSM member frame selector must be exact")
+        if (
+            type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(item) is not int or item < 2 for item in self.detector_shape)
+        ):
+            raise ValueError("RSM member detector shape is invalid")
+        motors = _rsm_member_motor_selectors(self.motor_selectors)
+        object.__setattr__(self, "nexus_path", path)
+        object.__setattr__(self, "motor_selectors", motors)
+        canonical = (
+            path,
+            self.kind.value,
+            self.entry,
+            self.frame_selector.fingerprint_value,
+            tuple(self.detector_shape),
+            tuple((role, selector.name, selector.occurrence) for role, selector in motors),
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint("rsm-nexus-member-form-v1", canonical),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RSMToolFormV2:
+    """Complete ordered RSM v2 Preview intent; R1 form stays unchanged."""
+
+    project_root: str | Path
+    geometry_asset: RSMGeometryAssetInput | RSMCalibrationGeometryInput
+    members: tuple[RSMScanMemberForm | RSMNexusMemberForm, ...]
+    conditioning: RSMImageConditioning
+    normalization: RSMNormalizationPolicy
+    bins: tuple[int, int, int]
+    chunk_size: int
+    max_frame_bytes: int
+    #: None is Auto (AUD-9 stage 2b S3a, ``rsm_v2_auto_chunking``): the preset's 256 MiB, or one frame's charge
+    #: when larger, the chunk then holding as many frames as fit (at most ``chunk_size``). A number is the
+    #: user's cap, refused at Preview when a chunk cannot fit it, with what it needs.
+    max_chunk_bytes: int | None
+    output_path: str | Path
+    overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW
+    coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL
+    #: The family of the stable slot ``<family>_rsm.nexus`` that ``output_path`` is, when it is one the
+    #: page suggested; persisted with the result as native Stitch persists its own (AUD-9 stage 2).
+    output_family: str | None = None
+    #: The per-frame corrections RSM shares with Stitch (``RSMFrameCorrections``; AUD-9 stage 2b); None: none.
+    #: Decision 5 (maintainer, 2026-10-01, "turn on by default"): the solid angle and polarization, at
+    #: Stitch's 0.99.
+    corrections: RSMFrameCorrections | None = RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+    #: A UB given for an HKL map (``RSMUBOverride``: typed, or a SPEC scan's), replacing the sources' own; it
+    #: applies to HKL only, so a Q form neither passes nor fingerprints it (AUD-9 stage 2b C5). None: the
+    #: sources' own UB.
+    ub: RSMUBOverride | None = None
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        project = _absolute_path(self.project_root, "Project root")
+        output = _absolute_path(self.output_path, "RSM v2 output path")
+        if Path(output).suffix.casefold() != ".nexus":
+            raise ValueError("RSM v2 output path must end in .nexus")
+        if self.output_family is not None:
+            from xrd_tools.io.output_path import resolve_finite_output_target
+            if type(self.output_family) is not str or os.path.normcase(str(resolve_finite_output_target(
+                    Path(output).parent, self.output_family, operation_token="rsm"))) != output:
+                raise ValueError("RSM v2 output family does not name its output's stable slot")
+        if (
+            type(self.geometry_asset) not in {RSMGeometryAssetInput, RSMCalibrationGeometryInput}
+            or type(self.members) is not tuple
+            or not 1 <= len(self.members) <= _MAX_RSM_MEMBERS
+            or any(type(item) not in {RSMScanMemberForm, RSMNexusMemberForm} for item in self.members)
+            or len({item.fingerprint for item in self.members}) != len(self.members)
+            or type(self.conditioning) is not RSMImageConditioning
+            or type(self.normalization) is not RSMNormalizationPolicy
+            or type(self.bins) is not tuple
+            or len(self.bins) != 3
+            or any(
+                type(item) is not int
+                or not 2 <= item <= _MAX_RSM_AXIS_POINTS
+                for item in self.bins
+            )
+            or math.prod(self.bins) > _MAX_RSM_VOXELS
+            or type(self.chunk_size) is not int
+            or not 1 <= self.chunk_size <= _MAX_CHUNK_SIZE
+            or type(self.max_frame_bytes) is not int
+            or not 1 <= self.max_frame_bytes <= _MAX_FRAME_OR_CHUNK_BYTES
+            or (self.max_chunk_bytes is not None and (
+                type(self.max_chunk_bytes) is not int
+                or not 1 <= self.max_chunk_bytes <= _MAX_FRAME_OR_CHUNK_BYTES))
+            or type(self.overwrite) is not AnalysisArtifactOverwrite
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
+            or (self.corrections is not None and type(self.corrections) is not RSMFrameCorrections)
+            or (self.ub is not None and type(self.ub) is not RSMUBOverride)
+        ):
+            raise TypeError("RSM v2 tool form is invalid")
+        normalization_keys = {
+            (selector.name, selector.occurrence) for selector in self.normalization.selectors
+        }
+        for member in self.members:
+            motor_keys = {
+                (selector.name, selector.occurrence)
+                for _role, selector in member.motor_selectors
+            }
+            if motor_keys & normalization_keys:
+                raise ValueError(
+                    "RSM normalization selectors must be disjoint from motor selectors"
+                )
+        object.__setattr__(self, "project_root", project)
+        object.__setattr__(self, "output_path", output)
+        canonical = (
+            "rsm-tool-form-v2",
+            project,
+            # a calibration (AUD-9 stage 2b C7b) is tagged; the asset's locator stays as it was
+            (self.geometry_asset.locator if type(self.geometry_asset) is RSMGeometryAssetInput
+             else ("calibration", self.geometry_asset.locator, self.geometry_asset.refinement)),
+            tuple(item.fingerprint for item in self.members),
+            self.conditioning._canonical_value(),
+            self.normalization._canonical_value(),
+            self.bins,
+            self.chunk_size,
+            self.max_frame_bytes,
+            self.max_chunk_bytes,
+            output,
+            self.overwrite,
+            self.coordinate_frame,
+            self.coordinate_frame.axis_names,
+            self.coordinate_frame.axis_units,
+            self.coordinate_frame.matrix_policy,
+        ) + (() if self.output_family is None else (self.output_family,)) + (
+            () if self.corrections is None else (("frame-corrections", repr(self.corrections)),)) + (
+            () if self.ub is None or self.coordinate_frame is not RSMCoordinateFrame.HKL
+            else (("ub-override", repr(self.ub)),))
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint("rsm-tool-form-v2", canonical),
+        )
+
+
+class RSMScanPreset(str, Enum):
+    STO_ALIGN_SCAN43 = "sto-align-scan43"
+
+
+@dataclass(frozen=True, slots=True)
+class RSMToolPresetValues:
+    """Filesystem-free defaults for one documented operator/science preset."""
+
+    preset: RSMScanPreset
+    spec_relative_path: str
+    scan: str
+    image_directory_relative_path: str
+    image_stem: str
+    frame_selector: RSMFrameSelector
+    detector_shape: tuple[int, int]
+    raw_dtype: str
+    raw_header_skip: int
+    header: DetectorHeader
+    roi: tuple[int, int, int, int]
+    motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
+    conditioning: RSMImageConditioning
+    normalization: RSMNormalizationPolicy
+    quick_bins: tuple[int, int, int]
+    full_bins: tuple[int, int, int]
+    chunk_size: int
+    max_frame_bytes: int
+    max_chunk_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.preset) is not RSMScanPreset:
+            raise TypeError("RSM preset kind must be exact")
+        _relative_path(self.spec_relative_path, "preset SPEC path")
+        _relative_path(
+            self.image_directory_relative_path,
+            "preset image directory",
+        )
+
+    def plan(self, bins: tuple[int, int, int] | None = None) -> RSMOperationPlan:
+        selected_bins = self.quick_bins if bins is None else bins
+        if selected_bins not in {self.quick_bins, self.full_bins}:
+            raise ValueError("preset grid must be the quick or full exact choice")
+        return RSMOperationPlan(
+            RSMDetectorGeometry(
+                self.header,
+                self.motor_selectors,
+                ImageOrientation(),
+                self.roi,
+            ),
+            self.conditioning,
+            self.normalization,
+            bins=selected_bins,
+            chunk_size=self.chunk_size,
+            max_frame_bytes=self.max_frame_bytes,
+            max_chunk_bytes=self.max_chunk_bytes,
+        )
+
+    def form(
+        self,
+        project_root: str | Path,
+        output_path: str | Path,
+        *,
+        bins: tuple[int, int, int] | None = None,
+        overwrite: AnalysisArtifactOverwrite = AnalysisArtifactOverwrite.CREATE_NEW,
+    ) -> RSMToolForm:
+        root = Path(project_root)
+        return RSMToolForm(
+            root,
+            root / self.spec_relative_path,
+            self.scan,
+            root / self.image_directory_relative_path,
+            self.image_stem,
+            self.frame_selector,
+            self.detector_shape,
+            self.raw_dtype,
+            self.plan(bins),
+            output_path,
+            self.raw_header_skip,
+            overwrite,
+        )
+
+
+def rsm_tool_preset(
+    preset: RSMScanPreset = RSMScanPreset.STO_ALIGN_SCAN43,
+) -> RSMToolPresetValues:
+    """Return immutable scan-43 defaults without probing the filesystem."""
+
+    if preset is not RSMScanPreset.STO_ALIGN_SCAN43:
+        raise ValueError("unknown RSM preset")
+    return RSMToolPresetValues(
+        preset,
+        "STO_align",
+        "43.1",
+        "images",
+        "b_thampy_STO_align_scan43_",
+        RSMFrameSelector(0, 60, 1),
+        (195, 487),
+        "int32",
+        0,
+        DetectorHeader(97.0, 243.0, 0.172, 0.172, 1014.7173, 195, 487),
+        (0, -1, 0, -1),
+        tuple(
+            (role, MetadataColumnSelector(role, 0)) for role in _PSIC_ROLES
+        ),
+        RSMImageConditioning(1.0e-6, 2.0e10, 100.0),
+        RSMNormalizationPolicy(
+            RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE,
+            MetadataColumnSelector("foil status", 0),
+            MetadataColumnSelector("Seconds", 0),
+            (1.06, 3.04, 4.65, 9.5),
+        ),
+        (40, 40, 40),
+        (200, 200, 200),
+        8,
+        64 * 1024 * 1024,
+        256 * 1024 * 1024,
+    )
+
+
+def rsm_frame_selector(first, last, step) -> RSMFrameSelector:
+    """The frame labels as typed (the RSM page's one range for every member, as Stitch's): First a whole number
+    from 0, Step one from 1 and Last blank (to the source's end) or a whole number from First. A ValueError
+    names the first field that is not."""
+    numbers = []
+    for name, value in (("First frame", first), ("Frame step", step)):
+        try:
+            numbers.append(value if type(value) is int else int(str(value).strip()))
+        except ValueError:
+            raise ValueError(f"{name} must be a whole number, not {str(value).strip()!r}") from None
+    start, step = numbers
+    text = str(last if last is not None else "").strip()
+    try:
+        stop = None if not text else int(text)
+    except ValueError:
+        raise ValueError(f"Last frame must be blank or a whole number, not {text!r}") from None
+    if start < 0:
+        raise ValueError("First frame must be 0 or more")
+    if step < 1:
+        raise ValueError("Frame step must be 1 or more")
+    if stop is not None and stop < start:
+        raise ValueError("Last frame must not come before First frame")
+    return RSMFrameSelector(start, stop, step)
+
+
+def format_rsm_angle_mapping(motor_selectors) -> str:
+    """The six psic roles' columns as the Angle mapping row shows them: ``mu=Mu, eta=Theta, ...``, a repeated
+    SPEC column's occurrence as ``#n`` (``nu=Nu#1``)."""
+    return ", ".join(f"{role}={selector.name}" + (f"#{selector.occurrence}" if selector.occurrence else "")
+                     for role, selector in motor_selectors)
+
+
+def parse_rsm_angle_mapping(text) -> tuple[tuple[str, MetadataColumnSelector], ...]:
+    """The Angle mapping row's ``role=column[#n]`` pairs (commas, semicolons or lines), every psic role exactly
+    once, in psic's order. A ValueError names what is wrong."""
+    pairs = {}
+    for part in re.split(r"[,;\n]+", str(text or "")):
+        if not part.strip():
+            continue
+        role, sep, column = (item.strip() for item in part.partition("="))
+        if not sep or not role or not column:
+            raise ValueError(f"Angle mapping: {part.strip()!r} is not role=column")
+        if role not in _PSIC_ROLES:
+            raise ValueError(f"Angle mapping: {role!r} is not a psic circle ({', '.join(_PSIC_ROLES)})")
+        if role in pairs:
+            raise ValueError(f"Angle mapping: {role} is given twice")
+        name, hash_mark, occurrence = column.partition("#")
+        try:
+            index = int(occurrence) if hash_mark else 0
+        except ValueError:
+            raise ValueError(f"Angle mapping: {column!r} has no whole-number occurrence after #") from None
+        if not name.strip() or index < 0:
+            raise ValueError(f"Angle mapping: {column!r} is not a column")
+        pairs[role] = MetadataColumnSelector(name.strip(), index)
+    missing = [role for role in _PSIC_ROLES if role not in pairs]
+    if missing:
+        raise ValueError(f"Angle mapping: {', '.join(missing)} not given")
+    return tuple((role, pairs[role]) for role in _PSIC_ROLES)
+
+
+@dataclass(frozen=True, slots=True)
+class RSMPreflightMember:
+    label: int
+    relative_path: str
+    source_frame_index: int
+    values: tuple[tuple[str, int, float], ...]
+    normalization_divisor: float
+
+    def __post_init__(self) -> None:
+        path = Path(self.relative_path)
+        if (
+            type(self.label) is not int
+            or self.label < 0
+            or type(self.relative_path) is not str
+            or not self.relative_path
+            or len(self.relative_path.encode("utf-8")) > 4096
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or type(self.source_frame_index) is not int
+            or self.source_frame_index < 0
+            or type(self.values) is not tuple
+            or not self.values
+            or any(
+                type(item) is not tuple
+                or len(item) != 3
+                or type(item[0]) is not str
+                or not item[0]
+                or item[0].strip() != item[0]
+                or type(item[1]) is not int
+                or item[1] < 0
+                or type(item[2]) is not float
+                or not math.isfinite(item[2])
+                for item in self.values
+            )
+            or tuple(self.values)
+            != tuple(sorted(self.values, key=lambda item: (item[0], item[1])))
+            or len({(item[0], item[1]) for item in self.values})
+            != len(self.values)
+            or type(self.normalization_divisor) is not float
+            or not math.isfinite(self.normalization_divisor)
+            or self.normalization_divisor <= 0
+        ):
+            raise TypeError("RSM preflight member is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class RSMToolPreflightSummary:
+    form_fingerprint: str
+    request_fingerprint: str
+    source_fingerprint: str
+    module_source_fingerprint: str
+    table_fingerprint: str
+    preflight_fingerprint: str
+    plan_fingerprint: str
+    project_root: str
+    source_relative_path: str
+    source_scan: str
+    image_directory_relative_path: str
+    image_stem: str
+    output_relative_path: str
+    selected_labels: tuple[int, ...]
+    members: tuple[RSMPreflightMember, ...]
+    dependency_files: tuple[str, ...]
+    required_selectors: tuple[MetadataColumnSelector, ...]
+    detector_shape: tuple[int, int]
+    cropped_shape: tuple[int, int]
+    raw_dtype: str
+    raw_header_skip: int
+    energy_eV: float
+    ub: tuple[tuple[float, float, float], ...]
+    q_bounds: tuple[tuple[float, float], ...]
+    bins: tuple[int, int, int]
+    chunk_size: int
+    max_frame_bytes: int
+    max_chunk_bytes: int
+    conditioning: tuple[float, float | None, float | None]
+    normalization_mode: RSMNormalizationMode
+    absorption_lengths: tuple[float, float, float, float]
+    overwrite: AnalysisArtifactOverwrite
+    holds: tuple[str, ...]
+    fingerprint: str = field(init=False)
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        hashes = (
+            self.form_fingerprint,
+            self.request_fingerprint,
+            self.source_fingerprint,
+            self.module_source_fingerprint,
+            self.table_fingerprint,
+            self.preflight_fingerprint,
+            self.plan_fingerprint,
+        )
+        try:
+            source_relative = _relative_path(
+                self.source_relative_path, "RSM summary source path"
+            )
+            image_relative = _relative_path(
+                self.image_directory_relative_path,
+                "RSM summary image directory",
+            )
+            output_relative = _relative_path(
+                self.output_relative_path, "RSM summary output path"
+            )
+            dependencies = tuple(
+                _relative_path(item, "RSM summary dependency")
+                for item in self.dependency_files
+            )
+            dtype = np.dtype(self.raw_dtype)
+        except (TypeError, ValueError) as error:
+            raise TypeError("RSM preflight summary is invalid") from error
+        shapes = (self.detector_shape, self.cropped_shape)
+        if (
+            _claim is not _PREFLIGHT_FACTORY
+            or any(type(item) is not str or _SHA256.fullmatch(item) is None for item in hashes)
+            or type(self.project_root) is not str
+            or not Path(self.project_root).is_absolute()
+            or source_relative != self.source_relative_path
+            or type(self.source_scan) is not str
+            or _SCAN.fullmatch(self.source_scan) is None
+            or image_relative != self.image_directory_relative_path
+            or type(self.image_stem) is not str
+            or not self.image_stem
+            or self.image_stem.strip() != self.image_stem
+            or len(self.image_stem.encode("utf-8")) > 4096
+            or any(mark in self.image_stem for mark in ("\0", "/", "\\"))
+            or output_relative != self.output_relative_path
+            or type(self.selected_labels) is not tuple
+            or not self.selected_labels
+            or any(type(item) is not int or item < 0 for item in self.selected_labels)
+            or len(set(self.selected_labels)) != len(self.selected_labels)
+            or type(self.members) is not tuple
+            or any(type(item) is not RSMPreflightMember for item in self.members)
+            or tuple(item.label for item in self.members) != self.selected_labels
+            or type(self.dependency_files) is not tuple
+            or not self.dependency_files
+            or dependencies != self.dependency_files
+            or len(set(self.dependency_files)) != len(self.dependency_files)
+            or type(self.required_selectors) is not tuple
+            or not self.required_selectors
+            or any(type(item) is not MetadataColumnSelector for item in self.required_selectors)
+            or len(
+                {(item.name, item.occurrence) for item in self.required_selectors}
+            )
+            != len(self.required_selectors)
+            or any(
+                type(shape) is not tuple
+                or len(shape) != 2
+                or any(type(value) is not int or value < 2 for value in shape)
+                for shape in shapes
+            )
+            or any(
+                cropped > detector
+                for cropped, detector in zip(
+                    self.cropped_shape, self.detector_shape
+                )
+            )
+            or type(self.raw_dtype) is not str
+            or dtype.str != self.raw_dtype
+            or dtype.fields is not None
+            or dtype.subdtype is not None
+            or dtype.kind not in "biuf"
+            or type(self.raw_header_skip) is not int
+            or not 0 <= self.raw_header_skip <= (1 << 30)
+            or type(self.energy_eV) is not float
+            or not math.isfinite(self.energy_eV)
+            or self.energy_eV <= 0
+            or type(self.ub) is not tuple
+            or len(self.ub) != 3
+            or any(type(row) is not tuple or len(row) != 3 for row in self.ub)
+            or any(
+                type(value) is not float or not math.isfinite(value)
+                for row in self.ub
+                for value in row
+            )
+            or type(self.q_bounds) is not tuple
+            or len(self.q_bounds) != 3
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or any(type(value) is not float for value in item)
+                or not all(math.isfinite(value) for value in item)
+                or item[1] <= item[0]
+                for item in self.q_bounds
+            )
+            or type(self.bins) is not tuple
+            or len(self.bins) != 3
+            or any(type(item) is not int or item < 2 for item in self.bins)
+            or math.prod(self.bins) > 8_000_000
+            or type(self.chunk_size) is not int
+            or self.chunk_size < 1
+            or type(self.max_frame_bytes) is not int
+            or self.max_frame_bytes < 1
+            or type(self.max_chunk_bytes) is not int
+            or self.max_chunk_bytes < 1
+            or type(self.conditioning) is not tuple
+            or len(self.conditioning) != 3
+            or type(self.conditioning[0]) is not float
+            or not math.isfinite(self.conditioning[0])
+            or any(
+                item is not None
+                and (type(item) is not float or not math.isfinite(item))
+                for item in self.conditioning[1:]
+            )
+            or type(self.normalization_mode) is not RSMNormalizationMode
+            or type(self.absorption_lengths) is not tuple
+            or len(self.absorption_lengths) != 4
+            or any(
+                type(item) is not float or not math.isfinite(item) or item < 0
+                for item in self.absorption_lengths
+            )
+            or (
+                self.normalization_mode in {RSMNormalizationMode.IDENTITY, RSMNormalizationMode.MONITOR}
+                and self.absorption_lengths != (0.0, 0.0, 0.0, 0.0)
+            )
+            or (
+                self.normalization_mode in {RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE,
+                                            RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION}
+                and not any(item > 0 for item in self.absorption_lengths)
+            )
+            or type(self.overwrite) is not AnalysisArtifactOverwrite
+            or type(self.holds) is not tuple
+            or any(type(item) is not str or not item for item in self.holds)
+            or len(set(self.holds)) != len(self.holds)
+        ):
+            raise TypeError("RSM preflight summary is invalid")
+        canonical = (
+            "rsm-tool-preflight-summary-v1",
+            hashes,
+            self.project_root,
+            self.source_relative_path,
+            self.source_scan,
+            self.image_directory_relative_path,
+            self.image_stem,
+            self.output_relative_path,
+            self.selected_labels,
+            tuple(
+                (
+                    item.label,
+                    item.relative_path,
+                    item.source_frame_index,
+                    item.values,
+                    item.normalization_divisor,
+                )
+                for item in self.members
+            ),
+            self.dependency_files,
+            tuple((item.name, item.occurrence) for item in self.required_selectors),
+            self.detector_shape,
+            self.cropped_shape,
+            self.raw_dtype,
+            self.raw_header_skip,
+            self.energy_eV,
+            self.ub,
+            self.q_bounds,
+            self.bins,
+            self.chunk_size,
+            self.max_frame_bytes,
+            self.max_chunk_bytes,
+            self.conditioning,
+            self.normalization_mode,
+            self.absorption_lengths,
+            self.overwrite,
+            self.holds,
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint(
+                "rsm-tool-preflight-summary-v1", canonical
+            ),
+        )
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMToolPreflight:
+    form: RSMToolForm
+    request: RSMOperationRequest
+    summary: RSMToolPreflightSummary
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _PREFLIGHT_FACTORY
+            or type(self.form) is not RSMToolForm
+            or type(self.request) is not RSMOperationRequest
+            or type(self.summary) is not RSMToolPreflightSummary
+        ):
+            raise TypeError("RSM tool preflight is invalid")
+        receipt = self.request.preflight
+        source = self.request.module.source
+        plan = self.request.plan
+        try:
+            options = json.loads(receipt.source_options_json)
+            read_options = options["read_image_kwargs"]
+            project = Path(self.form.project_root).resolve(strict=True)
+            form_spec = Path(self.form.spec_path).resolve(strict=True)
+            form_image = Path(self.form.image_dir).resolve(strict=True)
+            form_output = Path(self.form.output_path).resolve(strict=False)
+            output_relative = Path(
+                self.request.module.output.target
+            ).relative_to(Path(receipt.project_root)).as_posix()
+            expected_spec = Path(receipt.project_root) / receipt.source_relative_path
+            expected_image = Path(receipt.project_root) / options["image_dir"]
+            selected_from_form = self.form.frame_selector.select(
+                source.analysis.labels
+            )
+            holds_value = self.request.provenance["holds"]
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise TypeError("RSM tool preflight is invalid") from error
+        expected_members = tuple(
+            RSMPreflightMember(
+                contribution.label,
+                receipt.files[contribution.file_ordinal].relative_path,
+                contribution.source_frame_index,
+                contribution.values,
+                contribution.normalization_divisor,
+            )
+            for contribution in receipt.contributions
+        )
+        expected_holds = (
+            tuple(holds_value)
+            if type(holds_value) is list
+            and all(type(item) is str for item in holds_value)
+            else ()
+        )
+        expected_conditioning = (
+            plan.conditioning.additive_offset,
+            plan.conditioning.high_threshold,
+            plan.conditioning.static_hot_threshold,
+        )
+        if (
+            type(read_options) is not dict
+            or project != Path(receipt.project_root)
+            or form_spec != expected_spec
+            or self.form.scan != receipt.source_scan
+            or form_image != expected_image
+            or self.form.image_stem != options.get("image_stem")
+            or selected_from_form != source.selected_labels
+            or self.form.detector_shape != receipt.detector_shape
+            or read_options.get("detector_shape") != list(self.form.detector_shape)
+            or read_options.get("raw_dtype") != self.form.raw_dtype
+            or read_options.get("raw_header_skip") != self.form.raw_header_skip
+            or read_options.get("threshold") is not None
+            or read_options.get("rotation") != 0
+            or self.form.plan.fingerprint != plan.fingerprint
+            or form_output != Path(self.request.module.output.target)
+            or self.form.overwrite != self.request.module.output.overwrite
+            or self.summary.form_fingerprint != self.form.fingerprint
+            or self.summary.request_fingerprint
+            != self.request.module.fingerprint
+            or self.summary.source_fingerprint
+            != source.analysis.source_fingerprint
+            or self.summary.module_source_fingerprint != source.fingerprint
+            or self.summary.table_fingerprint != source.table_fingerprint
+            or self.summary.preflight_fingerprint != receipt.fingerprint
+            or self.summary.plan_fingerprint != plan.fingerprint
+            or self.summary.project_root != receipt.project_root
+            or self.summary.source_relative_path != receipt.source_relative_path
+            or self.summary.source_scan != receipt.source_scan
+            or self.summary.image_directory_relative_path
+            != options.get("image_dir")
+            or self.summary.image_stem != options.get("image_stem")
+            or self.summary.output_relative_path != output_relative
+            or self.summary.selected_labels != source.selected_labels
+            or self.summary.members != expected_members
+            or self.summary.dependency_files
+            != tuple(item.relative_path for item in receipt.files)
+            or self.summary.required_selectors != required_rsm_selectors(plan)
+            or self.summary.detector_shape != receipt.detector_shape
+            or self.summary.cropped_shape != receipt.cropped_shape
+            or self.summary.raw_dtype != self.form.raw_dtype
+            or self.summary.raw_header_skip != self.form.raw_header_skip
+            or self.summary.energy_eV != receipt.energy_eV
+            or self.summary.ub != receipt.ub
+            or self.summary.q_bounds != receipt.q_bounds
+            or self.summary.bins != plan.bins
+            or self.summary.chunk_size != plan.chunk_size
+            or self.summary.max_frame_bytes != plan.max_frame_bytes
+            or self.summary.max_chunk_bytes != plan.max_chunk_bytes
+            or self.summary.conditioning != expected_conditioning
+            or self.summary.normalization_mode != plan.normalization.mode
+            or self.summary.absorption_lengths
+            != plan.normalization.absorption_lengths
+            or self.summary.overwrite != self.request.module.output.overwrite
+            or self.summary.holds != expected_holds
+        ):
+            raise TypeError("RSM tool preflight facts disagree with its request")
+
+    def is_current(self, form: RSMToolForm | None) -> bool:
+        return type(form) is RSMToolForm and form.fingerprint == self.form.fingerprint
+
+
+def prepare_rsm_tool(
+    form: RSMToolForm,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> RSMToolPreflight:
+    """Perform blocking, image-free preflight for one exact operator form."""
+
+    if type(form) is not RSMToolForm:
+        raise TypeError("RSM preflight requires exact RSMToolForm")
+    if cancel_token is not None and type(cancel_token) is not threading.Event:
+        raise TypeError("RSM preflight cancellation must be threading.Event")
+    try:
+        project = Path(form.project_root).resolve(strict=True)
+    except OSError as error:
+        raise RSMToolPreflightRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is unavailable"
+        ) from error
+    if not project.is_dir():
+        raise RSMToolPreflightRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is not a directory"
+        )
+    spec_relative = _inside_project(form.spec_path, project, "spec")
+    output_relative = _inside_project(form.output_path, project, "output")
+    if Path(form.output_path).is_symlink():
+        raise RSMToolPreflightRefused(
+            "OUTPUT_SYMLINK_UNSUPPORTED",
+            "RSM output target must not be a symbolic link",
+        )
+    if not (project / output_relative).parent.is_dir():
+        raise RSMToolPreflightRefused(
+            "OUTPUT_PARENT_UNAVAILABLE",
+            "RSM output parent directory must already exist",
+        )
+    image_relative = _inside_project(form.image_dir, project, "image_directory")
+    spec_path = project / spec_relative
+    image_path = project / image_relative
+    output_path = project / output_relative
+    selectors = required_rsm_selectors(form.plan)
+    source_spec = SourceSpec(
+        spec_path,
+        SourceKind.SPEC,
+        options={
+            "scan": form.scan,
+            "image_dir": image_path,
+            "image_stem": form.image_stem,
+            "read_image_kwargs": {
+                "detector_shape": form.detector_shape,
+                "raw_dtype": form.raw_dtype,
+                "raw_header_skip": form.raw_header_skip,
+                "threshold": None,
+                "rotation": 0,
+            },
+            "metadata_column_projection": tuple(
+                (selector.name, selector.occurrence) for selector in selectors
+            ),
+        },
+    )
+    table = run_metadata_table(
+        MetadataTablePlan(source_spec),
+        cancel_token=cancel_token,
+    )
+    if table.disposition is not AnalysisDisposition.COMPLETED:
+        raise RSMToolPreflightRefused(
+            table.code or "SOURCE_PREFLIGHT_REFUSED",
+            "SPEC source could not be admitted for RSM",
+            diagnostics=table.diagnostics,
+        )
+    selected = form.frame_selector.select(table.labels)
+    try:
+        source = ModuleSourceReceipt.from_metadata_table(
+            table,
+            kind=ModuleKind.RSM,
+            selected_labels=selected,
+            resolved_selectors=selectors,
+        )
+        output = ModuleOutputRequest(
+            output_path,
+            AnalysisArtifactKind.RSM,
+            form.overwrite,
+        )
+        request = prepare_rsm_operation(
+            source,
+            output,
+            form.plan,
+            project_root=project,
+            cancel_token=cancel_token,
+        )
+    except RSMOperationRefused as error:
+        raise RSMToolPreflightRefused(error.code, str(error)) from error
+    except ValueError as error:
+        if str(error) != "metadata table is no longer an exact source fact":
+            raise
+        raise RSMToolPreflightRefused(
+            "SOURCE_REVISION_CHANGED",
+            "SPEC source changed while binding the RSM Preview",
+            diagnostics=(str(error),),
+        ) from error
+    receipt = request.preflight
+    if (
+        receipt.source_relative_path != spec_relative
+        or request.module.output.target != str(output_path)
+    ):
+        raise RSMToolPreflightRefused(
+            "PROJECT_BINDING_MISMATCH",
+            "RSM source or output no longer matches its Project binding",
+        )
+    members = tuple(
+        RSMPreflightMember(
+            contribution.label,
+            receipt.files[contribution.file_ordinal].relative_path,
+            contribution.source_frame_index,
+            contribution.values,
+            contribution.normalization_divisor,
+        )
+        for contribution in receipt.contributions
+    )
+    provenance = request.provenance
+    holds_value = provenance.get("holds", ())
+    holds = tuple(holds_value) if type(holds_value) is list else ()
+    conditioning = request.plan.conditioning
+    summary = RSMToolPreflightSummary(
+        form.fingerprint,
+        request.module.fingerprint,
+        request.module.source.analysis.source_fingerprint,
+        request.module.source.fingerprint,
+        request.module.source.table_fingerprint,
+        receipt.fingerprint,
+        request.plan.fingerprint,
+        str(project),
+        receipt.source_relative_path,
+        receipt.source_scan,
+        image_relative,
+        form.image_stem,
+        output_relative,
+        request.module.source.selected_labels,
+        members,
+        tuple(item.relative_path for item in receipt.files),
+        selectors,
+        receipt.detector_shape,
+        receipt.cropped_shape,
+        form.raw_dtype,
+        form.raw_header_skip,
+        receipt.energy_eV,
+        receipt.ub,
+        receipt.q_bounds,
+        request.plan.bins,
+        request.plan.chunk_size,
+        request.plan.max_frame_bytes,
+        request.plan.max_chunk_bytes,
+        (
+            conditioning.additive_offset,
+            conditioning.high_threshold,
+            conditioning.static_hot_threshold,
+        ),
+        request.plan.normalization.mode,
+        request.plan.normalization.absorption_lengths,
+        form.overwrite,
+        holds,
+        _claim=_PREFLIGHT_FACTORY,
+    )
+    return RSMToolPreflight(form, request, summary, _PREFLIGHT_FACTORY)
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMToolPreflightMemberSummaryV2:
+    ordinal: int
+    member_form_fingerprint: str
+    module_source_fingerprint: str
+    source_fingerprint: str
+    table_fingerprint: str
+    member_preflight_fingerprint: str
+    geometry_binding_fingerprint: str
+    source_relative_path: str
+    source_scan: str
+    selected_labels: tuple[int, ...]
+    selected_frame_count: int
+    dependency_files: tuple[str, ...]
+    dependency_file_count: int
+    coordinate_frame: RSMCoordinateFrame
+    energy_eV: float
+    ub: tuple[tuple[float, float, float], ...]
+    q_bounds: tuple[tuple[float, float], ...]
+    normalization_divisor_range: tuple[float, float]
+    _claim: InitVar[object] = None
+    #: a NeXus member's entry, where a SPEC member has its scan (AUD-9 stage 2b C5c); None for SPEC
+    source_entry: str | None = None
+    #: where the UB came from (decision 2: #G3, or recomputed in the instrument's directions); None in Q
+    ub_origin: str | None = None
+    #: beside a UB given for an HKL map, the member's own as its source records it (the Preview shows both): its
+    #: nine numbers, or what it lacks; None when no UB is given. Display only, outside the summary's identity.
+    source_ub: str | None = None
+
+    def __post_init__(self, _claim: object) -> None:
+        hashes = (
+            self.member_form_fingerprint,
+            self.module_source_fingerprint,
+            self.source_fingerprint,
+            self.table_fingerprint,
+            self.member_preflight_fingerprint,
+            self.geometry_binding_fingerprint,
+        )
+        if (
+            _claim is not _PREFLIGHT_V2_FACTORY
+            or type(self.ordinal) is not int
+            or not 0 <= self.ordinal < _MAX_RSM_MEMBERS
+            or any(type(item) is not str or _SHA256.fullmatch(item) is None for item in hashes)
+            or type(self.source_relative_path) is not str
+            or not self.source_relative_path
+            or type(self.source_scan) is not str
+            or (_SCAN.fullmatch(self.source_scan) is None if self.source_entry is None
+                else self.source_scan != "" or type(self.source_entry) is not str or not self.source_entry)
+            or type(self.selected_labels) is not tuple
+            or not self.selected_labels
+            or any(type(item) is not int or item < 0 for item in self.selected_labels)
+            or len(set(self.selected_labels)) != len(self.selected_labels)
+            or type(self.selected_frame_count) is not int
+            or self.selected_frame_count != len(self.selected_labels)
+            or type(self.dependency_files) is not tuple
+            or not self.dependency_files
+            or any(type(item) is not str or not item for item in self.dependency_files)
+            or type(self.dependency_file_count) is not int
+            or self.dependency_file_count != len(self.dependency_files)
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
+            or type(self.energy_eV) is not float
+            or not math.isfinite(self.energy_eV)
+            or self.energy_eV <= 0.0
+            or type(self.ub) is not tuple
+            or len(self.ub) != 3
+            or any(type(row) is not tuple or len(row) != 3 for row in self.ub)
+            or any(
+                type(value) is not float or not math.isfinite(value)
+                for row in self.ub
+                for value in row
+            )
+            or type(self.q_bounds) is not tuple
+            or len(self.q_bounds) != 3
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or any(type(value) is not float for value in item)
+                or not all(math.isfinite(value) for value in item)
+                or item[1] <= item[0]
+                for item in self.q_bounds
+            )
+            or type(self.normalization_divisor_range) is not tuple
+            or len(self.normalization_divisor_range) != 2
+            or any(
+                type(value) is not float
+                or not math.isfinite(value)
+                or value <= 0.0
+                for value in self.normalization_divisor_range
+            )
+            or self.normalization_divisor_range[1]
+            < self.normalization_divisor_range[0]
+        ):
+            raise TypeError("RSM v2 member summary is invalid")
+        _relative_path(self.source_relative_path, "RSM v2 summary source")
+
+    def __copy__(self):
+        raise TypeError("RSM v2 member summary is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM v2 member summary is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM v2 member summary is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM v2 member summary is not serializable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("RSM v2 member summary is not replaceable")
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMToolPreflightSummaryV2:
+    form_fingerprint: str
+    request_fingerprint: str
+    group_source_fingerprint: str
+    group_preflight_fingerprint: str
+    plan_fingerprint: str
+    output_fingerprint: str
+    geometry_asset_raw_sha256: str
+    geometry_asset_semantic_fingerprint: str
+    geometry_asset_receipt_fingerprint: str
+    effective_geometry_fingerprint: str
+    common_grid_fingerprint: str
+    coordinate_frame: RSMCoordinateFrame
+    project_root: str
+    output_relative_path: str
+    members: tuple[RSMToolPreflightMemberSummaryV2, ...]
+    union_q_bounds: tuple[tuple[float, float], ...]
+    bins: tuple[int, int, int]
+    detector_shape: tuple[int, int]
+    total_selected_frames: int
+    normalization_mode: RSMNormalizationMode
+    normalization_divisor_range: tuple[float, float]
+    mask_intent: str
+    holds: tuple[str, ...]
+    #: A calibration-sourced geometry (AUD-9 stage 2b C7b): (refinement applied, the energy offset in eV, the
+    #: calibration's recorded energy in eV). None for the canonical asset.
+    calibration: tuple[bool, float, float] | None = None
+    #: where the circle directions came from (decision 2): a calibration's instrument record, or psic's standard
+    circle_directions: str | None = None
+    #: Display only, outside the summary's identity (G8b): where the solid angle comes from
+    #: (``rsm_calibration_solid_angle_source``; None when it is off), the calibrated detector's own mask as
+    #: (masked pixels, detector pixels) (None when it has none), and a UB given for an HKL map, in words.
+    solid_angle: str | None = None
+    detector_mask: tuple[int, int] | None = None
+    ub_given: str | None = None
+    #: Display only (G8c): the dark and flat checks' warnings, as Stitch's Preview lists them
+    #: (``detector_image_warnings``)
+    detector_image_warnings: tuple[str, ...] = ()
+    #: Display only (item 7): what kind of calibration the Calibration row's pair is, in words, from its provenance
+    #: (``rsm_calibration_kind``); None for the canonical asset
+    calibration_kind: str | None = None
+    fingerprint: str = field(init=False)
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        hashes = (
+            self.form_fingerprint,
+            self.request_fingerprint,
+            self.group_source_fingerprint,
+            self.group_preflight_fingerprint,
+            self.plan_fingerprint,
+            self.output_fingerprint,
+            self.geometry_asset_raw_sha256,
+            self.geometry_asset_semantic_fingerprint,
+            self.geometry_asset_receipt_fingerprint,
+            self.effective_geometry_fingerprint,
+            self.common_grid_fingerprint,
+        )
+        if (
+            _claim is not _PREFLIGHT_V2_FACTORY
+            or any(type(item) is not str or _SHA256.fullmatch(item) is None for item in hashes)
+            or type(self.coordinate_frame) is not RSMCoordinateFrame
+            or type(self.project_root) is not str
+            or not Path(self.project_root).is_absolute()
+            or _relative_path(self.output_relative_path, "RSM v2 output path")
+            != self.output_relative_path
+            or type(self.members) is not tuple
+            or not 1 <= len(self.members) <= _MAX_RSM_MEMBERS
+            or any(type(item) is not RSMToolPreflightMemberSummaryV2 for item in self.members)
+            or tuple(item.ordinal for item in self.members)
+            != tuple(range(len(self.members)))
+            or any(
+                item.coordinate_frame is not self.coordinate_frame
+                for item in self.members
+            )
+            or type(self.union_q_bounds) is not tuple
+            or len(self.union_q_bounds) != 3
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or any(type(value) is not float for value in item)
+                or not all(math.isfinite(value) for value in item)
+                or item[1] <= item[0]
+                for item in self.union_q_bounds
+            )
+            or type(self.bins) is not tuple
+            or len(self.bins) != 3
+            or any(type(item) is not int or item < 2 for item in self.bins)
+            or type(self.detector_shape) is not tuple
+            or len(self.detector_shape) != 2
+            or any(type(item) is not int or item < 2 for item in self.detector_shape)
+            or type(self.total_selected_frames) is not int
+            or self.total_selected_frames
+            != sum(len(item.selected_labels) for item in self.members)
+            or not 1 <= self.total_selected_frames <= _MAX_SELECTED_FRAMES
+            or type(self.normalization_mode) is not RSMNormalizationMode
+            or type(self.normalization_divisor_range) is not tuple
+            or len(self.normalization_divisor_range) != 2
+            or any(
+                type(value) is not float
+                or not math.isfinite(value)
+                or value <= 0.0
+                for value in self.normalization_divisor_range
+            )
+            or self.normalization_divisor_range[1]
+            < self.normalization_divisor_range[0]
+            or self.mask_intent not in {"derived during Run", "none"}
+            or type(self.holds) is not tuple
+            or any(type(item) is not str or not item for item in self.holds)
+        ):
+            raise TypeError("RSM v2 preflight summary is invalid")
+        canonical = (
+            "rsm-tool-preflight-summary-v2",
+            hashes,
+            self.coordinate_frame,
+            self.coordinate_frame.axis_names,
+            self.coordinate_frame.axis_units,
+            self.coordinate_frame.matrix_policy,
+            self.project_root,
+            self.output_relative_path,
+            tuple(
+                (
+                    item.ordinal,
+                    item.member_form_fingerprint,
+                    item.module_source_fingerprint,
+                    item.source_fingerprint,
+                    item.table_fingerprint,
+                    item.member_preflight_fingerprint,
+                    item.geometry_binding_fingerprint,
+                    item.source_relative_path,
+                    item.source_scan,
+                    item.selected_labels,
+                    item.selected_frame_count,
+                    item.dependency_files,
+                    item.dependency_file_count,
+                    item.coordinate_frame,
+                    item.energy_eV,
+                    item.ub,
+                    item.q_bounds,
+                    item.normalization_divisor_range,
+                )
+                for item in self.members
+            ),
+            self.union_q_bounds,
+            self.bins,
+            self.detector_shape,
+            self.total_selected_frames,
+            self.normalization_mode,
+            self.normalization_divisor_range,
+            self.mask_intent,
+            self.holds,
+            *(() if self.calibration is None else (("calibration", self.calibration),)),
+        )
+        object.__setattr__(
+            self,
+            "fingerprint",
+            analysis_canonical_fingerprint(
+                "rsm-tool-preflight-summary-v2",
+                canonical,
+            ),
+        )
+
+    def __copy__(self):
+        raise TypeError("RSM v2 preflight summary is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM v2 preflight summary is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM v2 preflight summary is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM v2 preflight summary is not serializable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("RSM v2 preflight summary is not replaceable")
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMToolPreflightV2:
+    form: RSMToolFormV2
+    request: RSMOperationRequestV2
+    summary: RSMToolPreflightSummaryV2
+    #: The output already holds this request's RSM (``rsm_output_current``): a Run in Append skips it.
+    output_current: bool = False
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if (
+            _claim is not _PREFLIGHT_V2_FACTORY
+            or type(self.output_current) is not bool
+            or type(self.form) is not RSMToolFormV2
+            or type(self.request) is not RSMOperationRequestV2
+            or type(self.summary) is not RSMToolPreflightSummaryV2
+            or self.summary.form_fingerprint != self.form.fingerprint
+            or self.summary.request_fingerprint != self.request.module.fingerprint
+            or self.summary.group_source_fingerprint
+            != self.request.module.source.fingerprint
+            or self.summary.group_preflight_fingerprint
+            != self.request.preflight.fingerprint
+            or self.summary.plan_fingerprint != self.request.plan.fingerprint
+            or self.summary.output_fingerprint
+            != self.request.module.output.fingerprint
+            or self.summary.geometry_asset_raw_sha256
+            != self.request.preflight.geometry_asset_receipt.raw_sha256
+            or self.summary.geometry_asset_semantic_fingerprint
+            != self.request.preflight.geometry_asset_receipt.semantic_fingerprint
+            or self.summary.geometry_asset_receipt_fingerprint
+            != self.request.preflight.geometry_asset_receipt.receipt_fingerprint
+            or self.summary.effective_geometry_fingerprint
+            != self.request.preflight.effective_geometry.fingerprint
+            or self.summary.common_grid_fingerprint
+            != self.request.preflight.common_grid.fingerprint
+            or self.summary.coordinate_frame is not self.form.coordinate_frame
+            or self.summary.coordinate_frame is not self.request.plan.coordinate_frame
+        ):
+            raise TypeError("RSM v2 tool preflight is invalid")
+
+    def is_current(self, form: RSMToolFormV2 | None) -> bool:
+        return type(form) is RSMToolFormV2 and form.fingerprint == self.form.fingerprint
+
+    def __copy__(self):
+        raise TypeError("RSM v2 tool preflight is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM v2 tool preflight is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM v2 tool preflight is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM v2 tool preflight is not serializable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("RSM v2 tool preflight is not replaceable")
+
+
+def prepare_rsm_tool_v2(
+    form: RSMToolFormV2,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> RSMToolPreflightV2:
+    """Perform one ordered, detector-image-free RSM v2 Preview."""
+
+    if type(form) is not RSMToolFormV2:
+        raise TypeError("RSM v2 preflight requires exact RSMToolFormV2")
+    if cancel_token is not None and type(cancel_token) is not threading.Event:
+        raise TypeError("RSM v2 preflight cancellation must be threading.Event")
+    try:
+        project = Path(form.project_root).resolve(strict=True)
+    except OSError as error:
+        raise RSMToolPreflightRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is unavailable"
+        ) from error
+    if not project.is_dir():
+        raise RSMToolPreflightRefused(
+            "PROJECT_UNAVAILABLE", "selected Project root is not a directory"
+        )
+    output_relative = _inside_project(form.output_path, project, "output")
+    if Path(form.output_path).is_symlink():
+        raise RSMToolPreflightRefused(
+            "OUTPUT_SYMLINK_UNSUPPORTED",
+            "RSM output target must not be a symbolic link",
+        )
+    refusal = (analysis_output_refusal(form.output_path, AnalysisArtifactKind.RSM)
+               if form.overwrite is AnalysisArtifactOverwrite.REPLACE else None)
+    if refusal is not None:  # what the run's Replace would refuse, before any gridding
+        raise RSMToolPreflightRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS", refusal)
+    # The output's folder need not exist: the operation qualifies its existing ancestry and its run
+    # makes the folder, as Stitch's does (AUD-9 stage 2); Preview creates nothing.
+    try:
+        if type(form.geometry_asset) is RSMCalibrationGeometryInput:
+            asset = capture_rsm_calibration_geometry(form.geometry_asset.locator, project_root=project,
+                                                     refinement=form.geometry_asset.refinement)
+            header = lower_rsm_effective_geometry(asset).detector_header  # the raw frame's shape
+            expected_shape = (header.Nch1, header.Nch2)
+        else:
+            asset = capture_rsm_geometry_asset(
+                form.geometry_asset,
+                project_root=project,
+            )
+            detector = asset.projection.value["detector"]["header"]
+            expected_shape = (detector["Nch1"], detector["Nch2"])
+    except RSMGeometryAssetRefused as error:
+        raise RSMToolPreflightRefused(error.code, str(error)) from error
+    if any(member.detector_shape != expected_shape for member in form.members):
+        raise RSMToolPreflightRefused(
+            "RSM_MEMBER_IDENTITY_MISMATCH",
+            "every member detector shape must match the geometry asset",
+        )
+
+    sources: list[ModuleSourceReceipt] = []
+    for member in form.members:
+        if cancel_token is not None and cancel_token.is_set():
+            raise RSMToolPreflightRefused("CANCELLED")
+        selectors = required_rsm_selectors_v2(
+            member.motor_selectors,
+            form.normalization,
+        )
+        if type(member) is RSMNexusMemberForm:  # a raw NeXus stack (AUD-9 stage 2b C5c)
+            nexus_relative = _inside_project(member.nexus_path, project, "nexus")
+            source_spec = SourceSpec(project / nexus_relative, member.kind, entry=member.entry)
+            table = run_metadata_table(MetadataTablePlan(source_spec), cancel_token=cancel_token)
+            if table.disposition is AnalysisDisposition.COMPLETED:
+                missing = _missing_role_in_table(table, member.motor_selectors)
+                if missing is not None:
+                    role, selector = missing
+                    raise RSMToolPreflightRefused(
+                        "RSM_MOTOR_MISSING",
+                        f"entry {member.entry} of {Path(member.nexus_path).name}: the psic role {role} maps to "
+                        f"column {selector.name!r} (occurrence {selector.occurrence}), which the entry does not "
+                        "record; map it in Angle mapping",
+                    )
+                # the normalization's columns too (a whole table, not a SPEC projection that refuses them)
+                for name, selector in (("foil", form.normalization.foil_selector),
+                                       ("exposure", form.normalization.exposure_selector),
+                                       ("monitor", form.normalization.monitor_selector)):
+                    if selector is not None and _missing_role_in_table(table, ((name, selector),)) is not None:
+                        raise RSMToolPreflightRefused(
+                            "RSM_NORMALIZATION_COLUMN_MISSING",
+                            f"entry {member.entry} of {Path(member.nexus_path).name}: the normalization's {name} "
+                            f"column {selector.name!r} (occurrence {selector.occurrence}) is not recorded; "
+                            "choose its column or another normalization",
+                        )
+            if table.disposition is not AnalysisDisposition.COMPLETED:
+                raise RSMToolPreflightRefused(
+                    table.code or "SOURCE_PREFLIGHT_REFUSED",
+                    "NeXus source could not be admitted for RSM v2",
+                    diagnostics=table.diagnostics,
+                )
+            _append_rsm_member_source(sources, table, member, selectors)
+            continue
+        spec_relative = _inside_project(member.spec_path, project, "spec")
+        image_relative = _inside_project(
+            member.image_dir,
+            project,
+            "image_directory",
+        )
+        source_spec = SourceSpec(
+            project / spec_relative,
+            SourceKind.SPEC,
+            options={
+                "scan": member.scan,
+                "image_dir": project / image_relative,
+                "image_stem": member.image_stem,
+                "read_image_kwargs": {
+                    "detector_shape": member.detector_shape,
+                    "raw_dtype": member.raw_dtype,
+                    "raw_header_skip": member.raw_header_skip,
+                    "threshold": None,
+                    "rotation": 0,
+                },
+                "metadata_column_projection": tuple(
+                    (selector.name, selector.occurrence) for selector in selectors
+                ),
+            },
+        )
+        table = run_metadata_table(
+            MetadataTablePlan(source_spec),
+            cancel_token=cancel_token,
+        )
+        if (
+            table.disposition is not AnalysisDisposition.COMPLETED
+            and table.code == "METADATA_COLUMN_PROJECTION_INVALID"
+        ):
+            missing = _missing_motor_role(source_spec, member.motor_selectors, cancel_token)
+            if missing is not None:  # name the psic role the scan lacks (AUD-9 stage 2b C5)
+                role, selector = missing
+                raise RSMToolPreflightRefused(
+                    "RSM_MOTOR_MISSING",
+                    f"scan {member.scan}: the psic role {role} maps to column {selector.name!r} "
+                    f"(occurrence {selector.occurrence}), which the scan does not record; map it in "
+                    "Angle mapping",
+                )
+        if table.disposition is not AnalysisDisposition.COMPLETED:
+            raise RSMToolPreflightRefused(
+                table.code or "SOURCE_PREFLIGHT_REFUSED",
+                "SPEC source could not be admitted for RSM v2",
+                diagnostics=table.diagnostics,
+            )
+        _append_rsm_member_source(sources, table, member, selectors)
+    try:
+        group = ModuleSourceGroupReceipt.from_members(tuple(sources))
+        output = ModuleOutputRequest(
+            project / output_relative,
+            AnalysisArtifactKind.RSM,
+            form.overwrite,
+            form.output_family,
+        )
+        request = prepare_rsm_operation_v2(
+            group,
+            output,
+            asset,
+            tuple(member.fingerprint for member in form.members),
+            tuple(member.motor_selectors for member in form.members),
+            form.conditioning,
+            form.normalization,
+            form.bins,
+            chunk_size=form.chunk_size,
+            max_frame_bytes=form.max_frame_bytes,
+            max_chunk_bytes=form.max_chunk_bytes,
+            project_root=project,
+            coordinate_frame=form.coordinate_frame,
+            cancel_token=cancel_token,
+            **({} if form.corrections is None else {"corrections": form.corrections}),
+            **({} if form.ub is None or form.coordinate_frame is not RSMCoordinateFrame.HKL
+               else {"ub_override": form.ub}),
+        )
+    except (
+        RSMOperationRefused,
+        RSMGeometryAssetRefused,
+        XuRuntimeUnsupported,
+    ) as error:
+        raise RSMToolPreflightRefused(error.code, str(error)) from error
+    except ValueError as error:
+        if "4096 selected frames" not in str(error):
+            raise
+        raise RSMToolPreflightRefused(
+            "RSM_SOURCE_GROUP_LIMIT_EXCEEDED",
+            str(error),
+        ) from error
+
+    given = request.plan.ub_override  # a UB given for an HKL map (RSMBoundUB), None for the sources' own
+    member_summaries = tuple(
+        RSMToolPreflightMemberSummaryV2(
+            item.ordinal,
+            item.member_form_fingerprint,
+            item.module_source_fingerprint,
+            item.source_fingerprint,
+            item.table_fingerprint,
+            item.fingerprint,
+            item.geometry_binding.fingerprint,
+            item.source_relative_path,
+            item.source_scan,
+            source.selected_labels,
+            len(source.selected_labels),
+            tuple(file.relative_path for file in item.dependency_files),
+            len(item.dependency_files),
+            item.coordinate_frame,
+            item.energy_eV,
+            item.ub,
+            item.member_q_bounds,
+            (
+                min(
+                    contribution.normalization_divisor
+                    for contribution in item.contributions
+                ),
+                max(
+                    contribution.normalization_divisor
+                    for contribution in item.contributions
+                ),
+            ),
+            _PREFLIGHT_V2_FACTORY,
+            json.loads(item.source_options_json).get("entry"),
+            item.ub_origin,
+            source_ub=None if given is None else _source_ub_text(member),
+        )
+        for item, source, member in zip(
+            request.preflight.members,
+            request.module.source.members,
+            form.members,
+            strict=True,
+        )
+    )
+    holds_value = request.provenance["holds"]
+    all_divisors = tuple(
+        contribution.normalization_divisor
+        for item in request.preflight.members
+        for contribution in item.contributions
+    )
+    summary = RSMToolPreflightSummaryV2(
+        form.fingerprint,
+        request.module.fingerprint,
+        request.module.source.fingerprint,
+        request.preflight.fingerprint,
+        request.plan.fingerprint,
+        request.module.output.fingerprint,
+        request.preflight.geometry_asset_receipt.raw_sha256,
+        request.preflight.geometry_asset_receipt.semantic_fingerprint,
+        request.preflight.geometry_asset_receipt.receipt_fingerprint,
+        request.preflight.effective_geometry.fingerprint,
+        request.preflight.common_grid.fingerprint,
+        request.plan.coordinate_frame,
+        str(project),
+        output_relative,
+        member_summaries,
+        request.preflight.common_grid.bounds,
+        request.preflight.common_grid.bins,
+        expected_shape,
+        request.module.source.selected_frame_count,
+        request.plan.normalization.mode,
+        (min(all_divisors), max(all_divisors)),
+        (
+            "none"
+            if request.plan.conditioning.static_hot_threshold is None
+            else "derived during Run"
+        ),
+        tuple(holds_value),
+        calibration=(
+            None if request.preflight.effective_geometry.source != "calibration"
+            else (request.preflight.effective_geometry.refinement,
+                  request.preflight.effective_geometry.energy_offset_eV,
+                  request.preflight.effective_geometry.calibration_energy_eV)),
+        circle_directions=request.preflight.effective_geometry.circle_directions,
+        solid_angle=(None if form.corrections is None or not form.corrections.solid_angle
+                     else rsm_calibration_solid_angle_source(request.preflight.geometry_asset_receipt)),
+        detector_mask=(None if request.plan.detector_mask is None
+                       else (int(np.count_nonzero(request.plan.detector_mask)), int(request.plan.detector_mask.size))),
+        ub_given=None if given is None else (
+            "typed, in SPEC's #G3 convention" if given.spec_receipt is None
+            else f"scan {given.spec_receipt[4]} of {given.spec_receipt[0]} (its #G3)") + f": {_ub_text(given.matrix)}",
+        detector_image_warnings=(() if request.plan.corrections is None else detector_image_warnings(
+            request.plan.corrections.dark_receipt, request.plan.corrections.flat_receipt)),
+        calibration_kind=rsm_calibration_kind(request.preflight.geometry_asset_receipt),
+        _claim=_PREFLIGHT_V2_FACTORY,
+    )
+    return RSMToolPreflightV2(
+        form, request, summary, rsm_output_current(request), _PREFLIGHT_V2_FACTORY
+    )
+
+
+def _rsm_member_energy_lines(recorded: float, calibration) -> tuple[str, ...]:
+    """A member's energy: with a calibration's refinement, the recorded energy, the offset and the energy used,
+    and a warning when the scan was recorded more than 2 % from the calibration's energy: a constant offset is
+    exact at the calibration's energy, and a monochromator angle error grows roughly as E² away from it."""
+    if calibration is None or not calibration[0]:
+        return (f"  energy: {recorded:.12g} eV",)
+    _refined, offset, calibration_energy = calibration
+    lines = [f"  energy: recorded {recorded:.12g} eV, offset {offset:+.6g} eV, used {recorded + offset:.12g} eV"]
+    if calibration_energy and abs(recorded - calibration_energy) > 0.02 * calibration_energy:
+        lines.append(f"  ⚠ recorded {100 * abs(recorded - calibration_energy) / calibration_energy:.1f} % from the "
+                     f"calibration's {calibration_energy:.12g} eV: the energy offset is exact only near it")
+    return tuple(lines)
+
+
+def _ub_text(values) -> str:
+    """Nine numbers row by row, as the Preview writes a matrix ("a b c; d e f; g h i")."""
+    return "; ".join(" ".join(f"{float(value):.10g}" for value in values[row:row + 3]) for row in (0, 3, 6))
+
+
+def _source_ub_text(member) -> str:
+    """A member's own UB beside a given one, in the Preview's words (``rsm_member_source_ub``)."""
+    try:
+        own = rsm_member_source_ub(member)
+    except (OSError, KeyError, ValueError) as error:
+        return f"unreadable ({error})"
+    return "none recorded" if own is None else "a #G3 that does not parse" if not own else _ub_text(own)
+
+
+def rsm_preflight_summary_lines(summary: RSMToolPreflightSummaryV2) -> list[str]:
+    """An RSM v2 Preview as text, one line a fact: the ordered members, every exact identity and each
+    member's raw dependencies (the RSM page's Preview)."""
+    if type(summary) is not RSMToolPreflightSummaryV2:
+        raise TypeError("RSM v2 presenter requires exact summary")
+    frame = summary.coordinate_frame
+    axis_symbols = frame.axis_symbols
+    if frame is RSMCoordinateFrame.HKL:
+        source_ub_authority = (
+            "Source UB authority: authenticated source UB drives H/K/L "
+            "conversion"
+        )
+    else:
+        source_ub_authority = (
+            "Source UB authority: source UB is unused and non-driving; "
+            "explicit identity drives Cartesian Q"
+        )
+    union = ", ".join(
+        f"{name} {low:.10g}..{high:.10g}"
+        for name, (low, high) in zip(
+            axis_symbols,
+            summary.union_q_bounds,
+            strict=True,
+        )
+    )
+    lines = [
+        *(() if not summary.detector_image_warnings else ("Warnings", *summary.detector_image_warnings, "")),
+        f"Project: {summary.project_root}",
+        f"Output: {summary.output_relative_path}",
+        f"Coordinate frame: {frame.display_name}",
+        "Stored axes: "
+        + ", ".join(
+            label if unit is None else f"{label} [{unit}]"
+            for label, unit in zip(
+                frame.axis_symbols,
+                frame.axis_units,
+                strict=True,
+            )
+        ),
+        f"xrayutilities matrix policy: {frame.matrix_policy}",
+        source_ub_authority,
+        (
+            f"Ordered members: {len(summary.members)} · total frames "
+            f"{summary.total_selected_frames}"
+        ),
+        *(() if summary.calibration is None else (
+            "Geometry: the calibration on the Calibration row, refinement "
+            + ("on (its del/nu offsets, mount and energy offset)" if summary.calibration[0] else "off"),
+            *(() if summary.calibration_kind is None else (f"  calibration: {summary.calibration_kind}",)))),
+        *(() if summary.circle_directions is None else (f"Circle directions: {summary.circle_directions}",)),
+        f"Asset raw: {summary.geometry_asset_raw_sha256}",
+        f"Asset semantic: {summary.geometry_asset_semantic_fingerprint}",
+        f"Asset receipt: {summary.geometry_asset_receipt_fingerprint}",
+        f"Effective geometry: {summary.effective_geometry_fingerprint}",
+        f"Common grid: {summary.common_grid_fingerprint}",
+        (
+            "Union q bounds: "
+            if frame is RSMCoordinateFrame.HKL
+            else "Union coordinate bounds: "
+        )
+        + union,
+        f"Grid bins: {summary.bins} · detector {summary.detector_shape}",
+        (
+            f"Normalization: {summary.normalization_mode.value} · divisor "
+            f"{summary.normalization_divisor_range[0]:.12g}.."
+            f"{summary.normalization_divisor_range[1]:.12g}"
+        ),
+        f"Mask intent: {summary.mask_intent}",
+        f"Solid angle: {summary.solid_angle or 'off'}",
+        ("Detector mask: none" if summary.detector_mask is None else
+         f"Detector mask: the calibrated detector's own, {summary.detector_mask[0]} of {summary.detector_mask[1]} "
+         "pixels (its gaps), on every frame"),
+        *(() if summary.ub_given is None or frame is not RSMCoordinateFrame.HKL else (
+            f"UB given: {summary.ub_given}, in place of the sources' own (each member's below)",)),
+        f"Group source: {summary.group_source_fingerprint}",
+        f"Group preflight: {summary.group_preflight_fingerprint}",
+        f"Plan: {summary.plan_fingerprint}",
+        f"Request: {summary.request_fingerprint}",
+        f"Output identity: {summary.output_fingerprint}",
+        "Holds: " + ", ".join(summary.holds),
+        "",
+    ]
+    for member in summary.members:
+        coordinate_matrix = "; ".join(
+            " ".join(f"{value:.10g}" for value in row) for row in member.ub
+        )
+        bounds = ", ".join(
+            f"{name} {low:.10g}..{high:.10g}"
+            for name, (low, high) in zip(
+                axis_symbols,
+                member.q_bounds,
+                strict=True,
+            )
+        )
+        lines.extend(
+            (
+                (
+                    f"Member {member.ordinal + 1}: "
+                    f"{member.source_relative_path} · "
+                    + (f"scan {member.source_scan}" if member.source_entry is None
+                       else f"NeXus entry {member.source_entry}")
+                    + f" · {member.selected_frame_count} frames"
+                ),
+                *(() if member.source_entry is None or frame is not RSMCoordinateFrame.HKL else (
+                    "  UB: the NeXus entry's own, read in SPEC's #G3 convention (2π included, as xdart writes "
+                    "it), unless one is given",)),
+                *(() if member.ub_origin is None or frame is not RSMCoordinateFrame.HKL else (
+                    f"  UB: {member.ub_origin}",)),  # #G3, and its cross-check (decision 2)
+                *(() if member.source_ub is None or frame is not RSMCoordinateFrame.HKL else (
+                    f"  UB the source records: {member.source_ub}",)),
+                f"  labels: {member.selected_labels}",
+                f"  form: {member.member_form_fingerprint}",
+                f"  module source: {member.module_source_fingerprint}",
+                f"  source: {member.source_fingerprint}",
+                f"  table: {member.table_fingerprint}",
+                f"  member preflight: {member.member_preflight_fingerprint}",
+                f"  geometry binding: {member.geometry_binding_fingerprint}",
+                *_rsm_member_energy_lines(member.energy_eV, summary.calibration),
+                f"  xrayutilities matrix: {coordinate_matrix}",
+                f"  coordinate bounds: {bounds}",
+                (
+                    "  divisor: "
+                    f"{member.normalization_divisor_range[0]:.12g}.."
+                    f"{member.normalization_divisor_range[1]:.12g}"
+                ),
+                f"  raw dependencies ({member.dependency_file_count}):",
+                *(f"    {path}" for path in member.dependency_files),
+                "",
+            )
+        )
+    return lines
+
+
+__all__ = [
+    "MAX_RSM_MEMBERS",
+    "RSMFrameSelector",
+    "RSMPreflightMember",
+    "RSMScanMemberForm",
+    "RSMScanPreset",
+    "RSMToolForm",
+    "RSMToolFormV2",
+    "RSMToolPreflight",
+    "RSMToolPreflightMemberSummaryV2",
+    "RSMToolPreflightRefused",
+    "RSMToolPreflightSummary",
+    "RSMToolPreflightSummaryV2",
+    "RSMToolPreflightV2",
+    "RSMToolPresetValues",
+    "parse_rsm_ub_rows",
+    "prepare_rsm_tool",
+    "prepare_rsm_tool_v2",
+    "rsm_member_groups",
+    "rsm_member_source_ub",
+    "rsm_preflight_summary_lines",
+    "rsm_tool_preset",
+]

@@ -1,0 +1,322 @@
+"""Native Stitch selections projected onto existing finite operation owners."""
+import json
+from dataclasses import replace
+from pathlib import Path
+
+from xrd_tools.analysis.module_transaction import (
+    MetadataColumnSelector, ModuleKind, ModuleOutputRequest, ModuleSourceReceipt,
+    ModuleSourceGroupReceipt,
+)
+from xrd_tools.analysis.scan_operations import (
+    AnalysisDisposition, MetadataTablePlan,
+    run_metadata_table,
+)
+from xrd_tools.analysis.stitch_operation import (
+    StitchGeometryInput, StitchGeometryKind, StitchOperationPlan, XuStitchOperationPlan,
+    capture_stitch_geometry, prepare_stitch_operation, stitch_output_current,
+)
+from xrd_tools.analysis.stitch_sources import resolve_stitch_sources
+from xrd_tools.analysis.xu_stitch_calibration import (
+    XuStitchCalibrationInput, capture_xu_stitch_calibration,
+)
+from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+from xrd_tools.integrate.frame_screen import FrameScreenPolicy
+from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry
+from xrd_tools.io.analysis_artifact import (
+    AnalysisArtifactKind, AnalysisArtifactOverwrite, analysis_output_refusal,
+)
+from xrd_tools.io.output_path import (
+    generated_artifact_family, is_artifact_family, resolve_finite_output_target, scan_family,
+)
+
+
+def _combined(group):
+    # Multiple entries of one NeXus file remain one source/file output.
+    return len({(str(Path(spec.uri).resolve()), spec.options.get("scan"))
+                for spec in group}) > 1
+
+
+def _families(form, resolution, project):
+    """Readable slots are independent of frame subsets and processing settings."""
+    from .stitch_values import StitchToolPreflightRefused
+    groups = resolution.groups
+
+    def refused(code, message):
+        if resolution.skipped:
+            skipped = "; ".join(f"{Path(path).relative_to(project)} · scan {scan}: {reason}"
+                                for path, scan, reason in resolution.skipped)
+            message += f". Skipped scans: {skipped}"
+        return StitchToolPreflightRefused(code, message)
+
+    explicit = list(form.output_families or ("",) * len(groups))
+    if len(explicit) != len(groups):
+        raise refused("OUTPUT_FAMILY_COUNT_MISMATCH",
+            "Enter one result name per output, separated by ; (blank names are automatic)")
+    if form.output_family:
+        combined = [i for i, group in enumerate(groups) if _combined(group)]
+        if len(groups) == 1:
+            explicit[0] = form.output_family
+        elif len(combined) == 1:
+            explicit[combined[0]] = form.output_family
+        else:
+            raise refused("OUTPUT_FAMILY_COUNT_MISMATCH",
+                "For multiple outputs, enter result names in output order separated by ;")
+    families, seen = [], set()
+    for index, (group, name, members) in enumerate(zip(groups, explicit, resolution.names), 1):
+        if not name:  # as Int names a result: the scan's name, _gi for grazing incidence
+            name = generated_artifact_family(scan_family(members), grazing_incidence=form.gi is not None)
+            if _combined(group) and not is_artifact_family(name):
+                raise refused("OUTPUT_FAMILY_REQUIRED",
+                    f"Output {index} combines sources and its automatic name {name!r} is not a "
+                    "result name of at most 80 characters; enter one under Advanced · Result names")
+        if not is_artifact_family(name):
+            raise refused("OUTPUT_FAMILY_INVALID",
+                f"Output {index} name {name!r} is invalid; choose a readable name of at most 80 characters")
+        if name.casefold() in seen:
+            raise refused("OUTPUT_FAMILY_COLLISION",
+                f"Multiple outputs use {name!r}; choose distinct result names")
+        seen.add(name.casefold())
+        families.append(name)
+    return tuple(families)
+
+
+def _recorded_gi(gi, tables):
+    """The form's grazing incidence as the selected scans record it: a sample circle (mu, phi) no
+    selected scan records reads 0 (bound to None, and returned so Preview says so); one only some
+    scans record is refused, naming a scan without it (Codex review F3: every scan decides)."""
+    from .stitch_values import StitchToolPreflightRefused
+    if gi is None:
+        return None, ()
+    names = [(spec, {column.name for column in table.columns}) for spec, table in tables]
+    pairs, unrecorded = [], []
+    for role, motor in gi.sample_motors:
+        lacking = [spec for spec, recorded in names if motor is not None and motor not in recorded]
+        if motor is not None and len(lacking) == len(names):
+            motor = None
+            unrecorded.append(role)
+        elif lacking:
+            spec = lacking[0]
+            raise StitchToolPreflightRefused("GI_SAMPLE_CIRCLE_MIXED",
+                f"{role} ({motor}) is recorded by some selected scans and not others, not by {spec.uri} "
+                f"(scan {spec.options.get('scan', '-')}): select scans that record the same sample circles")
+        pairs.append((role, motor))
+    return replace(gi, sample_motors=tuple(pairs)), tuple(unrecorded)
+
+
+def _check_output_directory(target, project):
+    """Qualify existing ancestry without creating directories during Preview."""
+    from .stitch_values import StitchToolPreflightRefused, _inside_project
+    _inside_project(target, project, "output")
+    ancestor = Path(target).parent
+    while not ancestor.exists() and not ancestor.is_symlink():
+        ancestor = ancestor.parent
+    if not ancestor.is_dir():
+        raise StitchToolPreflightRefused("OUTPUT_PARENT_UNAVAILABLE",
+            f"Output ancestor is not a directory: {ancestor}")
+
+
+def create_native_output_directory(request):
+    """Run-only setup; the existing publisher still owns target admission."""
+    target = Path(request.module.output.target)
+    project = Path(request.manifest.project_root)
+    _check_output_directory(target, project)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _check_output_directory(target, project)
+
+
+def _affine_geometry_warning(request):
+    """Display-only caution from captured geometry and selected motor facts."""
+    if type(request.plan) is not StitchOperationPlan:
+        return None
+    geometry = request.plan.geometry
+    if geometry.request.kind is not StitchGeometryKind.PYFAI_GONIOMETER_JSON:
+        return None
+    asset = json.loads(geometry.content)
+    constants = asset["trans_function"].get("constants", {})
+    from xrd_tools.core.geometry.stacked_arm import STACKED_ARM_MARKERS
+    markers = [constants.get(name) for name in STACKED_ARM_MARKERS] if type(constants) is dict else []
+    if any(type(marker) in (int, float) and marker == 1 for marker in markers):
+        return None
+    bindings = dict(geometry.request.source_motors)
+    nu = bindings.get("nu_angle", bindings.get("nu"))
+    delta = bindings.get("del_angle", bindings.get("del"))
+    if not nu or not delta:
+        return None
+    from xrd_tools.core.geometry import Diffractometer
+    try:
+        instrument = Diffractometer.from_pyfai_goniometer(asset, source_motors=bindings)
+    except (KeyError, ValueError, TypeError, NotImplementedError, SyntaxError):
+        # Preview's warning does not change existing model admission semantics.
+        return None
+    if (getattr(instrument, "stacked_arm", None) is not None
+        or not instrument.rot1.is_active or instrument.rot1.source_motor != nu
+        or not instrument.rot2.is_active or instrument.rot2.source_motor != delta
+        or instrument.rot3.is_active):
+        return None
+    for contribution in request.manifest.contributions:
+        values = {(name, occurrence): value for name, occurrence, value in contribution.values}
+        if values[(nu, 0)] != 0 and values[(delta, 0)] != 0:
+            return (
+                f"{Path(request.module.output.target).name}: this calibration uses independent Euler "
+                "mappings, and selected frames have both del and nu nonzero. If del is mounted on nu, "
+                "these mappings do not describe that rotation order; create a stacked calibration "
+                "before using these results."
+            )
+    return None
+
+
+def prepare_native_stitch_tool(form, project):
+    from .stitch_values import (
+        StitchToolPreflight, StitchToolPreflightRefused, _PREFLIGHT_FACTORY,
+        _inside_project,
+    )
+    output_dir = Path(form.output_path).parent
+    _check_output_directory(form.output_path, project)
+    for path in form.source_selection.paths:
+        # The Project root itself is a valid directory input.
+        if Path(path).resolve() != project:
+            _inside_project(path, project, "source")
+    read_options = dict(detector_shape=form.detector_shape, raw_dtype=form.raw_dtype,
+                        raw_header_skip=form.raw_header_skip, rotation=0)
+    resolution = resolve_stitch_sources(form.source_selection, read_options)
+    if not resolution.groups:
+        return StitchToolPreflight(form, None, None, _PREFLIGHT_FACTORY,
+                                   requests=(), skipped=resolution.skipped)
+    families = _families(form, resolution, project)
+    # Metadata is loaded once per exact source. The table is reused without
+    # changing membership when a scan appears in more than one output group.
+    tables = {}
+    for spec in (spec for group in resolution.groups for spec in group):
+        cache_key = (str(spec.uri), spec.entry, str(spec.options))
+        if cache_key not in tables:
+            table = run_metadata_table(MetadataTablePlan(spec))
+            if table.disposition is not AnalysisDisposition.COMPLETED:
+                raise StitchToolPreflightRefused(table.code or "SOURCE_PREFLIGHT_REFUSED",
+                    f"Source metadata could not be admitted: {spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')})",
+                    diagnostics=table.diagnostics)
+            tables[cache_key] = (spec, table)
+    gi, unrecorded = _recorded_gi(form.gi, tables.values())
+    common = dict(npt_1d=form.npt_1d, unit=form.unit, radial_range=form.q_range,
+                  monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
+                  native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
+                  frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=gi,
+                  azimuth_range_1d=form.chi_range_1d)
+    if form.foil_normalization is not None:  # the plan's default (None) otherwise: its identity unchanged
+        common.update(foil_normalization=form.foil_normalization)
+    if form.mode == "2d":  # the map on its own axis as Int 2D's, and I(q) beside it on the 1-D one
+        common.update(mode="2d", npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
+                      azimuth_range=form.chi_range, map_unit=form.map_unit,
+                      map_radial_range=form.map_radial_range)
+    kind = AnalysisArtifactKind.STITCH_2D if form.mode == "2d" else AnalysisArtifactKind.STITCH_1D
+    if form.backend == "multigeometry":
+        geometry = capture_stitch_geometry(StitchGeometryInput(
+            form.geometry_path, form.geometry_kind,
+            expected_sha256=form.expected_geometry_sha256, source_motors=form.source_motors,
+            reference_motor_positions=form.poni_references, image_rotation=form.image_rotation,
+            image_flip=form.image_flip,
+        ))
+        plan = StitchOperationPlan(
+            geometry, use_detector_mask=form.use_detector_mask,
+            sample_position=form.sample_position, correct_solid_angle=form.correct_solid_angle,
+            polarization_factor=form.polarization_factor, error_model=form.error_model,
+            dark_path=form.dark_path, flat_path=form.flat_path,
+            flat_min_fraction=form.flat_min_fraction, **common)
+        motors = tuple(source for _name, source in form.source_motors)
+        energy_name = "energy"
+    else:
+        from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+        calibration = capture_xu_stitch_calibration(  # a pyFAI file's partner, saved beside it
+            XuStitchCalibrationInput(xu_calibration_path(form.geometry_path, project)), project_root=project)
+        runtime_owner = xu_runtime_session()
+        with runtime_owner as session:
+            effective = resolve_xu_stitch_effective_geometry(calibration, session).projection
+        if runtime_owner.execution_record is None:
+            raise StitchToolPreflightRefused("XU_RUNTIME_CONFIG_RESTORE_FAILED")
+        plan = XuStitchOperationPlan(calibration, effective, polarization_factor=form.polarization_factor,
+                                     dark_path=form.dark_path, flat_path=form.flat_path,
+                                     flat_min_fraction=form.flat_min_fraction, **common)
+        acquisition = calibration.projection.value["acquisition"]
+        motors = tuple(name for name in acquisition["source_motors"].values()
+                       if name is not None)  # a single 2θ arm reads no nu
+        energy_name = acquisition["source_energy_selector"]
+    if gi is not None:  # every frame's sample circles: the incidence, the tilt, mu and phi
+        motors += gi.metadata_names()
+    requests, preview_members, warnings = [], [], []
+    if unrecorded:
+        warnings.append(f"Grazing: no selected scan records {', '.join(unrecorded)}; read as 0")
+    cached = {}
+    for group, family in zip(resolution.groups, families):
+        receipts = []
+        for spec in group:
+            cache_key = (str(spec.uri), spec.entry, str(spec.options))
+            if cache_key not in cached:
+                table = tables[cache_key][1]
+                selected = form.frame_selector.select(table.labels)
+                selectors = tuple(MetadataColumnSelector(str(name)) for name in motors)
+                selectors += () if form.monitor_selector is None else (form.monitor_selector,)
+                foil = form.foil_normalization  # the columns a foil choice reads
+                selectors += () if foil is None else tuple(
+                    selector for selector in (foil.foil_selector, foil.exposure_selector) if selector is not None)
+                names = tuple(column.name for column in table.columns)
+                if names.count(energy_name) > 1:
+                    raise StitchToolPreflightRefused("AMBIGUOUS_METADATA_SELECTOR", "Energy must be unique")
+                if energy_name in names:
+                    selectors += (MetadataColumnSelector(energy_name),)
+                selectors = tuple(sorted({(s.name, s.occurrence): s for s in selectors}.values(),
+                                         key=lambda s: (s.name, s.occurrence)))
+                missing = tuple(s.name for s in selectors if names.count(s.name) <= s.occurrence)
+                if missing:
+                    raise StitchToolPreflightRefused("MISSING_REQUIRED_METADATA",
+                        f"{spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')}): "
+                        f"missing required column(s): {', '.join(missing)}")
+                cached[cache_key] = ModuleSourceReceipt.from_metadata_table(table,
+                    kind=ModuleKind.STITCH, selected_labels=selected, resolved_selectors=selectors,
+                    fresh=True)  # read just above, in this check
+            receipt = cached[cache_key]
+            receipts.append(receipt)
+        target = resolve_finite_output_target(output_dir, family, operation_token=f"stitch-{form.mode}")
+        refusal = (analysis_output_refusal(target, kind)
+                   if form.overwrite is AnalysisArtifactOverwrite.REPLACE else None)
+        if refusal is not None:  # what the run's Replace would refuse, before any integration
+            raise StitchToolPreflightRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS",
+                                             f"Output {len(requests) + 1} ({family}): {refusal}")
+        output = ModuleOutputRequest(target, kind, form.overwrite, artifact_family=family)
+        try:
+            source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(
+                tuple(receipts), kind=ModuleKind.STITCH)
+            # the tables this check admitted, reused rather than read again (PERF-STITCH-1)
+            admitted = tuple(tables[(str(spec.uri), spec.entry, str(spec.options))][1] for spec in group)
+            request = prepare_stitch_operation(source, output, plan, project_root=project,
+                                               tables=admitted if len(admitted) > 1 else admitted[0])
+            from xrd_tools.analysis.stitch_native import native_frame_members
+            members = tuple(native_frame_members(request))
+            if gi is not None:  # every frame's sample normal suits the pyFAI sample orientation
+                for item in request.manifest.contributions:
+                    gi.pyfai_angles(gi.normal({name: value for name, _occurrence, value in item.values}))
+        except (ValueError, TypeError) as error:
+            count = sum(len(receipt.selected_labels) for receipt in receipts)
+            code = getattr(error, "code", "STITCH_PREFLIGHT_REFUSED")
+            reason = str(error)
+            if code == "MANIFEST_BYTE_LIMIT_EXCEEDED":
+                reason = "source manifest exceeds 512 KiB; reduce scans or frames in this output"
+            elif "analysis provenance exceeds the bounded input size" in reason:
+                reason = "provenance exceeds 1 MiB; reduce scans or frames in this output"
+            elif len(receipts) > 256:
+                reason = "a grouped result supports at most 256 source entries"
+            raise StitchToolPreflightRefused(code,
+                f"Output {len(requests) + 1} ({family}), {len(receipts)} sources, {count} frames: {reason}") from error
+        requests.append(request)
+        preview_members.append(members)
+        warning = _affine_geometry_warning(request)
+        if warning is not None:
+            warnings.append(warning)
+        from xrd_tools.analysis.stitch_native import detector_image_warnings
+        # the shared dark and flat check's (detector-aware), as RSM's Preview lists them: each once
+        warnings.extend(item for item in detector_image_warnings(
+            getattr(request.plan, "_dark_receipt", None), getattr(request.plan, "_flat_receipt", None))
+            if item not in warnings)
+    unchanged = tuple(index for index, request in enumerate(requests) if stitch_output_current(request))
+    return StitchToolPreflight(form, requests[0], None, _PREFLIGHT_FACTORY,
+                               requests=tuple(requests), skipped=resolution.skipped,
+                               preview_members=tuple(preview_members), warnings=tuple(warnings),
+                               unchanged=unchanged)
