@@ -594,6 +594,24 @@ def browse_button(label: str) -> QtWidgets.QToolButton:
     return button
 
 
+class IntegerLineEdit(QtWidgets.QLineEdit):
+    """A whole-number row's editor (``FormRow`` with ``kind="int"``): a line edit whose text is kept as typed and
+    shown refused, never reverted, with a spin box's ``value``/``setValue`` for a window that drives the row itself
+    (FIT-TOOLS-2026-10: Int's Peak Fit sets its peak count to the peaks it found)."""
+
+    def value(self) -> int | None:
+        """The text as a whole number (``integer_field_refusal``'s reading), None when it is blank or none (the row
+        says why: ``FormRow.refusal``)."""
+        try:
+            return int(self.text().strip())
+        except ValueError:
+            return None
+
+    def setValue(self, value: int | None) -> None:  # noqa: N802 (a spin box's name, which its callers use)
+        """Show ``value`` (None: blank), as code sets text: no draft and no commit."""
+        self.setText("" if value is None else str(int(value)))
+
+
 class FormRow(QtWidgets.QWidget):
     """One editable row in the Controls form."""
 
@@ -689,7 +707,7 @@ class FormRow(QtWidgets.QWidget):
             lay.addWidget(editor, 1)
         else:
             lay.addWidget(self.label)
-            editor = QtWidgets.QLineEdit(self._line_display_value(value))
+            editor = (IntegerLineEdit if kind == "int" else QtWidgets.QLineEdit)(self._line_display_value(value))
             editor.setObjectName("controlsLineEdit")
             editor.editingFinished.connect(self._emit_editor_edit)
             # A focused draft (user typing, NOT programmatic setText) is
@@ -1024,6 +1042,15 @@ class RangeRow(QtWidgets.QWidget):
         )
         lay.addWidget(edit, 1)
         return edit, path
+
+    @property
+    def editors(self) -> tuple[QtWidgets.QLineEdit, QtWidgets.QLineEdit]:
+        """The low and high editors, for a window that drives the row itself (a fit range dragged on its plot)."""
+        return self._low, self._high
+
+    def add_trailing_widget(self, widget: QtWidgets.QWidget, stretch: int = 0) -> None:
+        """Append a widget to the right of the row (a fit range's Full button), as ``FormRow`` does."""
+        self.layout().addWidget(widget, stretch)
 
     @staticmethod
     def _model_text(value) -> str:

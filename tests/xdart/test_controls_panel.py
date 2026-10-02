@@ -1308,3 +1308,45 @@ def test_a_file_row_set_by_code_while_unfocused_takes_the_value_without_a_draft_
         row.close()
         row.deleteLater()
 
+
+
+def test_an_integer_row_is_driven_as_a_spin_box_by_a_window_that_sets_it(qapp):
+    """FIT-TOOLS-2026-10: a window driving its whole-number row (Int's Peak Fit setting its peak count to the peaks it
+    found) uses the editor's ``setValue``/``value``: it is still the themed line edit, the value set as code sets
+    text (no draft, no commit) and still checked against the row's bounds."""
+    from xdart.gui.widgets.controls_panel import IntegerLineEdit
+    row = FormRow(label="Peaks", path=("peak_fit", "n_peaks"), value="1", kind="int", minimum=1, maximum=12)
+    edits = []
+    row.valueChanged.connect(lambda path, value: edits.append(value))
+    row.draftChanged.connect(lambda path, value: edits.append(value))
+    try:
+        editor = row.editor
+        assert isinstance(editor, IntegerLineEdit) and isinstance(editor, QtWidgets.QLineEdit)
+        assert editor.objectName() == "controlsLineEdit" and editor.value() == 1
+        editor.setValue(2)
+        assert editor.text() == "2" and editor.value() == 2 and row.current_value() == "2" and not edits
+        editor.setValue(13)
+        assert row.refusal() == "must be at most 12" and editor.property("invalid") is True
+        editor.setValue(None)
+        assert editor.text() == "" and editor.value() is None and row.refusal() == "a whole number is needed"
+        editor.setText("2.5")
+        assert editor.value() is None
+        line = FormRow(label="Name", path=("x", "name"), value="a", kind="line")
+        assert type(line.editor) is QtWidgets.QLineEdit  # only the whole-number kind
+        line.deleteLater()
+    finally:
+        row.deleteLater()
+
+
+def test_a_range_rows_editors_and_trailing_widget(qapp):
+    from xdart.gui.widgets.controls_panel import RangeRow
+    row = RangeRow(label="Range", low={"path": ("fit", "low"), "value": ""}, high={"path": ("fit", "high"), "value": ""})
+    try:
+        low, high = row.editors
+        assert (low.objectName(), high.objectName()) == ("controlsLineEdit", "controlsLineEdit")
+        assert row.layout().indexOf(low) < row.layout().indexOf(high)
+        button = QtWidgets.QPushButton("Full")
+        row.add_trailing_widget(button)
+        assert row.layout().indexOf(button) == row.layout().count() - 1
+    finally:
+        row.deleteLater()
