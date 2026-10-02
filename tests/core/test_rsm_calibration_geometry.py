@@ -931,3 +931,45 @@ def test_the_calibrations_detector_mask_masks_every_frame_beside_the_mask_file(r
     with_file = run("gaps-file", RSMFrameCorrections(mask_path=str(tmp_path / "file.npy")), gaps)
     assert with_file == run("union", RSMFrameCorrections(mask_path=str(tmp_path / "union.npy")), None)
     assert run("gaps", RSMFrameCorrections(), gaps, 256 * 1024 * 1024) != _SCIENCE[((43,), 40)]["result"]
+
+
+@pytest.mark.slow
+def test_scan_43_in_q_with_17_2s_whole_record_is_q_in_specs_handedness(rsm_r2_project, v3_asset):
+    """Q coordinates take the same mirror (the maintainer accepted it with the fix: a scan's Q and HKL maps stay
+    in one handedness, SPEC's): through the mirror, scan 43's Q grid and intensities are the canonical Q map's,
+    including the exact q-bounds pass, which hands xrayutilities the mirror for its identity matrix."""
+    from dataclasses import replace
+
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
+    from xrd_tools.analysis.rsm_operation import run_rsm_operation_v2
+    from xrd_tools.rsm import RSMCoordinateFrame
+    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+
+    canonical_form = replace(_form(rsm_r2_project, (43,), 40),
+                             coordinate_frame=RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
+                             output_path=rsm_r2_project / "rsm-q-canonical.nexus")
+    mirror_form = replace(canonical_form,
+                          geometry_asset=rsm_calibration_geometry_input(
+                              _mirror_partner(rsm_r2_project, v3_asset, ("mu", "chi", "nu"))),
+                          output_path=rsm_r2_project / "rsm-q-17-2.nexus")
+    payloads = []
+    try:
+        for form in (canonical_form, mirror_form):
+            result = run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
+            assert result.terminal.disposition is ModuleDisposition.COMMITTED
+            payloads.append(result.payload)
+    finally:
+        for form in (canonical_form, mirror_form):
+            if Path(form.output_path).exists():
+                Path(form.output_path).unlink()
+    canonical, mirrored = payloads
+    finite = np.isfinite(canonical.intensity), np.isfinite(mirrored.intensity)
+    assert int(finite[0].sum()) > 0 and np.array_equal(finite[0], finite[1])
+    for (_name, axis), (_other, other) in zip(canonical.axes, mirrored.axes, strict=True):
+        np.testing.assert_allclose(other, axis, rtol=1e-12, atol=0)
+    differ = finite[0] & ~np.isclose(canonical.intensity, mirrored.intensity, rtol=1e-12, atol=0)
+    print("Q through the mirror: finite", int(finite[0].sum()), "voxels differing", int(differ.sum()),
+          "fingerprints", canonical.result_fingerprint, mirrored.result_fingerprint)
+    assert int(differ.sum()) == 0
+    assert mirrored.result_fingerprint == canonical.result_fingerprint  # measured: bit for bit
