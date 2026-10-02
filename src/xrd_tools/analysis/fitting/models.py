@@ -72,12 +72,30 @@ def guess_from_peak(model, y, x, negative, ampscale=1.0, sigscale=1.0, amp_area=
     return pars
 
 
+def _finite_2d_samples(data, x, y):
+    """Flatten ``data``/``x``/``y`` and keep the samples where all three are finite."""
+    data = np.asarray(data, dtype=float).ravel()
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    if not data.shape == x.shape == y.shape:
+        raise ValueError("2D guess needs data, x and y of one size")
+    finite = np.isfinite(data) & np.isfinite(x) & np.isfinite(y)
+    if not finite.any():
+        raise ValueError("2D guess needs at least one finite sample")
+    return data[finite], x[finite], y[finite]
+
+
 def _guess_2d_params(model, data, x, y, **kwargs):
-    """Delegate 2D parameter guessing to lmfit.models.Gaussian2dModel."""
+    """Starting centres and widths from lmfit's Gaussian2dModel guess on the finite samples.
+
+    The custom 2D models take ``amplitude`` as the peak HEIGHT, so the height guess is the finite data range
+    (lmfit's own ``amplitude`` guess is a volume-like ``height*sigmax*sigmay``, not a height).
+    """
     from lmfit.models import Gaussian2dModel
+    data, x, y = _finite_2d_samples(data, x, y)
     g_pars = Gaussian2dModel().guess(data, x, y)
     pars = model.make_params(
-        amplitude=g_pars["amplitude"].value,
+        amplitude=float(data.max() - data.min()),
         centerx=g_pars["centerx"].value,
         centery=g_pars["centery"].value,
         sigmax=g_pars["sigmax"].value,
@@ -177,24 +195,36 @@ def lor2_2D(x, y, amplitude=1.0, centerx=0.0, centery=0.0, sigmax=1.0, sigmay=1.
 
 
 def gauss_2D(x, y, amplitude=1.0, centerx=0.0, centery=0.0, sigmax=1.0, sigmay=1.0):
-    """2D Gaussian by amplitude."""
+    """2D Gaussian by amplitude (= peak height). FWHM = 2*sqrt(2*ln2)*sigma = 2.354820*sigma."""
     return amplitude * np.exp(
         -1.0 * (x - centerx) ** 2 / (2 * sigmax**2)
         - 1.0 * (y - centery) ** 2 / (2 * sigmay**2)
     )
 
 
+#: Gaussian sigma per half width at half maximum: exp(-h**2/(2 s**2)) = 1/2 at s = h/sqrt(2 ln 2).
+_GAUSSIAN_SIGMA_PER_HWHM = 1.0 / np.sqrt(2.0 * np.log(2.0))
+#: Lorentzian-squared sigma per HWHM: (1 + (h/s)**2)**-2 = 1/2 at s = h/sqrt(sqrt(2) - 1).
+_LOR2_SIGMA_PER_HWHM = 1.0 / np.sqrt(np.sqrt(2.0) - 1.0)
+
+
 def pvoigt_2D(
     x, y, amplitude=1.0, centerx=0.0, centery=0.0, sigmax=1.0, sigmay=1.0, fraction=0.5
 ):
-    """2D pseudo-Voigt: (1-fraction)*Gaussian2D + fraction*LorentzianSquared2D, same FWHM."""
-    # Convert Lorentzian HWHM to Gaussian sigma for equal FWHM: sqrt(2*ln2) ≈ 1.17741
-    _FWHM_FACTOR = np.sqrt(2 * np.log(2))
-    sigmax_g = sigmax / _FWHM_FACTOR
-    sigmay_g = sigmay / _FWHM_FACTOR
+    """2D pseudo-Voigt as a common-HWHM mixture: (1-fraction)*Gaussian2D + fraction*LorentzianSquared2D.
+
+    ``sigmax``/``sigmay`` are the half widths at half maximum shared by BOTH components, so the mixture's FWHM is
+    ``2*sigma`` for every ``fraction``; ``amplitude`` is the peak height. Changed 2026-10 (FIT-TOOLS-2026-10, F1):
+    the Lorentzian-squared component is rescaled to that HWHM; it previously used ``sigma`` directly (its HWHM was
+    0.6436*sigma, a quarter height at the claimed half width), so older pseudo-Voigt fits change intentionally.
+    """
     return (1 - fraction) * gauss_2D(
-        x, y, amplitude, centerx, centery, sigmax_g, sigmay_g
-    ) + fraction * lor2_2D(x, y, amplitude, centerx, centery, sigmax, sigmay)
+        x, y, amplitude, centerx, centery,
+        sigmax * _GAUSSIAN_SIGMA_PER_HWHM, sigmay * _GAUSSIAN_SIGMA_PER_HWHM,
+    ) + fraction * lor2_2D(
+        x, y, amplitude, centerx, centery,
+        sigmax * _LOR2_SIGMA_PER_HWHM, sigmay * _LOR2_SIGMA_PER_HWHM,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -385,9 +415,10 @@ def make_chebyshev_model(
 # ---------------------------------------------------------------------------
 
 class Gaussian2DModel(Model):
-    """2D Gaussian (amplitude, centerx, centery, sigmax, sigmay)."""
+    """2D Gaussian (amplitude = height, centerx, centery, sigmax, sigmay)."""
     __doc__ = (gauss_2D.__doc__ or "") + COMMON_DOC
-    fwhm_factor = 2.0 * np.sqrt(np.log(2))
+    # FWHM = 2*sqrt(2*ln2)*sigma = 2.354820*sigma (was 2*sqrt(ln2) = 1.665109, a wrong width; F1)
+    fwhm_factor = 2.0 * np.sqrt(2.0 * np.log(2))
 
     def __init__(self, independent_vars=("x", "y"), prefix="", **kwargs):
         kwargs.update({"prefix": prefix, "independent_vars": list(independent_vars)})
@@ -419,9 +450,9 @@ class LorentzianSquared2DModel(Model):
 
 
 class PseudoVoigt2DModel(Model):
-    """2D pseudo-Voigt. Parameters: amplitude, centerx, centery, sigmax, sigmay, fraction."""
+    """2D pseudo-Voigt (common HWHM). Parameters: amplitude, centerx, centery, sigmax, sigmay, fraction."""
     __doc__ = (pvoigt_2D.__doc__ or "") + COMMON_DOC
-    fwhm_factor = 2.0
+    fwhm_factor = 2.0  # sigma is the common HWHM
 
     def __init__(self, independent_vars=("x", "y"), prefix="", **kwargs):
         kwargs.update({"prefix": prefix, "independent_vars": list(independent_vars)})
