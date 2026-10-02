@@ -70,11 +70,11 @@ gui = [
     "imageio",
     "packaging",         # Help → Check for Updates… version comparison (updater.py)
     # GUI analysis tools: Peak/Phase Fitting (lmfit, pymatgen) + the Grazing/GI/RSM
-    # workflow (xrayutilities, pyevtk).  The GUI surfaces these from the Tools menu
-    # and the Grazing corrections path, so a `[gui]` install ships them.
-    "xdart[fitting,rsm]",
+    # workflow (xrayutilities, pyevtk), plus both notebook export frontends.
+    # A `[gui]` install ships the complete desktop workflow.
+    "xdart[fitting,rsm,notebook]",
 ]
-notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab", "nbformat"]
+notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab", "nbformat", "marimo>=0.25,<0.26"]
 all = ["xdart[fitting,rsm,gui,notebook]"]
 dev = ["pytest", "pytest-timeout", "pytest-xdist>=3.8", "build", "twine", "tifffile", "imagecodecs"]  # tifffile: test fixtures write TIFFs; pytest-xdist: `pytest -n auto` parallel tests/core
 

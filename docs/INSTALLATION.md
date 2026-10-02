@@ -159,6 +159,21 @@ cd /shared/xrd-env && pixi run python -m ipykernel install --prefix /usr/local \
 Admins update the shared env with `pixi update` in that directory; the lockfile
 rebuilds it identically on a new machine (`pixi install`).
 
+## Marimo notebooks
+
+The GUI installation (conda or `pip install "xdart[gui]"`) includes both Jupyter
+and marimo. For a headless installation, add `pip install "xdart[notebook]"`.
+Open an exported marimo notebook with the explicit route:
+
+```bash
+xdart-notebook --marimo results.py
+```
+
+This edits an existing `.py` notebook in xdart's Python environment without
+creating a separate sandbox. Append marimo edit options as needed. Ordinary
+`xdart-notebook` arguments still open JupyterLab; a filename does not select
+the frontend automatically.
+
 ## Jupyter and VS Code kernel setup
 
 Use your [editable Pixi checkout](#editable-install-with-pixi-recommended) or a
@@ -256,15 +271,15 @@ modest for batch / pipeline / CI use:
 | Extra        | What it enables                                          | Packages                                                    |
 | ------------ | -------------------------------------------------------- | ----------------------------------------------------------- |
 | *(base)*     | `core`, `io`, `integrate`, `viz` — headless / batch      | numpy, scipy, pandas, xarray, h5py, hdf5plugin, nexusformat, fabio, silx, pyFAI, pyyaml, joblib, natsort, matplotlib, plotly |
-| `[gui]`      | the `xdart` desktop GUI **+ its analysis tools and external viewers** (bundles `[fitting]` + `[rsm]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk, nexpy (silx already in base) |
+| `[gui]`      | the `xdart` desktop GUI **+ its analysis tools, external viewers, and notebooks** (bundles `[fitting]` + `[rsm]` + `[notebook]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk, nexpy, notebook packages below (silx already in base) |
 | `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting     | lmfit, pymatgen                                             |
 | `[rsm]`      | `rsm.*` — reciprocal-space mapping, VTK export           | xrayutilities, pyevtk                                       |
-| `[notebook]` | self-contained Jupyter environment                       | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab, nbformat |
+| `[notebook]` | Jupyter and marimo environments                           | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab, nbformat, marimo |
 | `[all]`      | everything except dev                                    | `xdart[fitting,rsm,gui,notebook]`                       |
 | `[dev]`      | test / build / release tooling                           | pytest, pytest-timeout, pytest-xdist, build, twine, tifffile, imagecodecs |
 
-Extras compose. `[gui]` already bundles `[fitting]` + `[rsm]` — the GUI surfaces
-Peak/Phase Fitting and the Grazing/GI/RSM workflow — so `pip install "xdart[gui]"`
+Extras compose. `[gui]` already bundles `[fitting]` + `[rsm]` + `[notebook]` — the GUI surfaces
+Peak/Phase Fitting, the Grazing/GI/RSM workflow, and notebook export — so `pip install "xdart[gui]"`
 (and the conda package) give you the **complete** GUI with no missing-dependency prompts.
 
 > **Tip — use [`uv`](https://docs.astral.sh/uv/) if you have it.** It is a

@@ -53,10 +53,12 @@ To update later, close xdart and run `pixi global update xdart`.
 
 [Alternate installation methods and more details](docs/INSTALLATION.md)
 
-**Jupyter / VS Code (after installation):** the installation above includes
-JupyterLab and the notebook packages. Run
+**Notebooks (after installation):** the installation above includes
+JupyterLab, marimo, and the notebook widgets. Run
 `xdart-notebook` to start JupyterLab from it, or `xdart-notebook --register-kernel`
 once to offer it to VS Code as the kernel **Python (xdart)**.
+For an exported marimo notebook, run `xdart-notebook --marimo results.py`.
+Both frontends use the Python environment containing xdart.
 
 For an installed editable checkout or
 [notebook Pixi workspace](docs/INSTALLATION.md#headless--notebooks-with-pixi),

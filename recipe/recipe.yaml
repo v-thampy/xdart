@@ -115,6 +115,7 @@ requirements:
     - ipyfilechooser
     - jupyterlab
     - nbformat
+    - marimo >=0.25,<0.26
 
 tests:
   - python:
@@ -128,6 +129,7 @@ tests:
         - ipyfilechooser
         - jupyterlab
         - nbformat
+        - marimo
       pip_check: true             # every declared dep resolves in the solved env
   # NB: `xdart --help` is intentionally NOT tested — xdart_main launches the GUI
   # (no arg parsing), which would hang a headless build.  A real launch is the
