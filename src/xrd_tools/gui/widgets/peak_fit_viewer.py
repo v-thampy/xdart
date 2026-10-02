@@ -88,6 +88,14 @@ class PeakFitViewer:
         self.pattern_viewer = PatternViewer()  # the shared owner, extended with an analyzer outcome model
         self.figure_widget = self.pattern_viewer.figure_widget
         self._log = widgets.Checkbox(value=False, description="Log intensity")
+        from xrd_tools.analysis.axis_units import canonical_q_unit
+        unit = self.snapshot.axes[0].unit
+        unit_options = [("Native", unit)]
+        if len(self.snapshot.axes) == 1 and self.snapshot.wavelength_angstrom is not None and (
+                canonical_q_unit(unit) == "q_A^-1" or unit in {"2th_deg", "2th_rad"}):
+            unit_options += [("q (A^-1)", "q_A^-1"), ("2theta (deg)", "2th_deg")]
+        self._axis_unit = widgets.Dropdown(options=unit_options, value=unit, description="Axis")
+        self._axis_unit.observe(self._presentation_changed, names="value")
         self._overlays = widgets.SelectMultiple(options=["fit", "background", "residual", "components"],
                                                  value=("fit", "background", "residual"), description="Fit traces")
         self._log.observe(self._presentation_changed, names="value")
@@ -97,6 +105,11 @@ class PeakFitViewer:
         finite = axis.values[np.isfinite(axis.values)]
         self.ranges = FitRangeControls((finite.min(), finite.max()), fit_bounds=self._settings.get("fit_bounds"),
                                        label=f"{axis.name} ({axis.unit})", on_display=self.render)
+        self.region_ranges = None
+        if tool.startswith("region"):
+            from .region_controls import RegionRangeControls
+            self.region_ranges = RegionRangeControls(self.snapshot, bounds=self._settings.get("region_bounds"))
+            self.region_ranges.set_on_display(self.render)
         cls = PhaseFitControls if tool == "phase" else PeakFitControls
         self.controls = (cls(list(self._settings.get("phase_names", ())), on_fit=lambda _settings: self.fit())
                          if tool == "phase" else cls(on_fit=lambda _settings: self.fit()))
@@ -105,8 +118,9 @@ class PeakFitViewer:
         self._csv = widgets.Textarea(value="", description="CSV", layout=widgets.Layout(width="700px", height="100px"))
         self._fit_all = widgets.Button(description="Fit batch", disabled=batch_fit is None)
         self._fit_all.on_click(self._run_batch)
-        self.widget = widgets.VBox([self.selector.widget, widgets.HBox([self._log, self._overlays]),
-                                    self.ranges.widget, self.controls.widget, self._fit_all,
+        self.widget = widgets.VBox([self.selector.widget, widgets.HBox([self._log, self._axis_unit, self._overlays]),
+                                    self.region_ranges.widget if self.region_ranges is not None else self.ranges.widget,
+                                    self.controls.widget, self._fit_all,
                                     self.figure_widget, self._table, self._csv])
         self.render()
         self.set_table([outcome] if outcome is not None else [])
@@ -134,8 +148,13 @@ class PeakFitViewer:
         old = self.ranges
         self.ranges = FitRangeControls((float(np.nanmin(axis.values)), float(np.nanmax(axis.values))),
                                       label=f"{axis.name} ({axis.unit})", on_display=self.render)
+        if self.region_ranges is not None:
+            from .region_controls import RegionRangeControls
+            self.region_ranges.dispose()
+            self.region_ranges = RegionRangeControls(self.snapshot)
+            self.region_ranges.set_on_display(self.render)
         children = list(self.widget.children)
-        children[2] = self.ranges.widget
+        children[2] = self.region_ranges.widget if self.region_ranges is not None else self.ranges.widget
         self.widget.children = tuple(children)
         old.dispose()
         self.set_table([])
@@ -145,6 +164,8 @@ class PeakFitViewer:
         settings = self.controls.get_params()
         if self.tool in {"peak", "phase"}:
             settings["fit_bounds"] = tuple(self.ranges.fit_bounds.value)
+        elif self.region_ranges is not None:
+            settings["region_bounds"] = self.region_ranges.bounds
         return settings
 
     def fit(self):
@@ -170,7 +191,11 @@ class PeakFitViewer:
         import plotly.graph_objects as go
         fig = plot_analysis_outcome(self.snapshot, self.outcome, overlays=self._overlays.value,
                                     log_y=self._log.value,
-                                    x_range=(self.ranges.display_min.value, self.ranges.display_max.value))
+                                    x_range=(self.ranges.display_min.value, self.ranges.display_max.value),
+                                    axis_unit=self._axis_unit.value,
+                                    peak_model=self.current_settings().get("model", "pseudovoigt"),
+                                    plane_axis=self.region_ranges.plane[0] if self.region_ranges is not None else None,
+                                    plane_coordinate=self.region_ranges.slice_coordinate.value if self.region_ranges is not None else None)
         # Bound comparison overlays to four; they are loaded only for this render and released immediately.
         if len(self.snapshot.axes) == 1:
             for index in self.selector.overlays.value[:4]:
@@ -202,11 +227,14 @@ class PeakFitViewer:
             return
         self._disposed = True
         self._log.unobserve(self._presentation_changed, names="value")
+        self._axis_unit.unobserve(self._presentation_changed, names="value")
         self._overlays.unobserve(self._presentation_changed, names="value")
         self.selector.overlays.unobserve(self._presentation_changed, names="value")
         self._fit_all.on_click(self._run_batch, remove=True)
         self.selector.dispose()
         self.ranges.dispose()
+        if self.region_ranges is not None:
+            self.region_ranges.dispose()
         self.controls.dispose()
         self.pattern_viewer.dispose()
         from .fit_controls import _close_widgets

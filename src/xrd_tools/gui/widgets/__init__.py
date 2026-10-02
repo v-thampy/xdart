@@ -9,6 +9,7 @@ from xrd_tools.gui.widgets.fit_controls import PhaseFitControls, PeakFitControls
 from xrd_tools.gui.widgets.phase_fit_viewer import PhaseFitViewer
 from xrd_tools.gui.widgets.batch_phase_fit_viewer import BatchPhaseFitViewer
 from xrd_tools.gui.widgets.peak_fit_viewer import PeakFitViewer, PatternSelector, FitRangeControls
+from xrd_tools.gui.widgets.region_controls import RegionRangeControls
 
 __all__ = [
     "ImageViewer",
@@ -18,4 +19,5 @@ __all__ = [
     "PhaseFitViewer",
     "BatchPhaseFitViewer",
     "PeakFitViewer", "PatternSelector", "FitRangeControls",
+    "RegionRangeControls",
 ]

@@ -46,7 +46,8 @@ class SourceReference:
 
     ``path`` may be project-relative (resolved against DATA_ROOT) or an explicitly external absolute path.
     ``selection`` is the shared fit_sources owner's arguments, never an executable callback or array. Recorded
-    size/mtime are a cheap guard at the original path; relocation uses the existing scientific fingerprints.
+    size/mtime are a cheap guard at the original path. The public artifact reader retains its recorded-path
+    admission and can refuse a relocated container; the bounded captured NPZ transport is portable.
     """
     path: str
     reader: str
@@ -94,10 +95,11 @@ def capture_snapshot(snapshot: FitInputSnapshot, path: str) -> CapturedInput:
     if snapshot.values.ndim > 3 or snapshot.values.size > (100_000 if snapshot.values.ndim == 3 else 1_000_000):
         raise NotebookInputError("INPUT_LIMIT: export a bounded trace, slice or fitting box")
     key = snapshot.key
+    from xrd_tools import __version__
     metadata = {"schema": _SCHEMA, "key": {"result_identity": key.result_identity, "path": key.path,
                 "fingerprint": key.fingerprint, "selection": key.selection, "background": key.background,
                 "settings": key.settings}, "axes": [(axis.name, axis.unit) for axis in snapshot.axes],
-                "wavelength_angstrom": snapshot.wavelength_angstrom}
+                "wavelength_angstrom": snapshot.wavelength_angstrom, "xrd_tools_version": __version__}
     raw = json.dumps(metadata, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     arrays = {"values": snapshot.values, "metadata": np.frombuffer(raw, dtype=np.uint8)}
     arrays.update((f"axis_{i}", axis.values) for i, axis in enumerate(snapshot.axes))

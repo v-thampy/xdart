@@ -90,6 +90,7 @@ def recipe_analyzer(recipe: FitNotebookRecipe, *, data_root: str | Path):
     from xrd_tools.analysis.fitting.region_analyzers import Region2DFitAnalyzer, Region3DFitAnalyzer
     # Seed tuples: stable ID, centre, optional FWHMs, optional height, all native coordinates.
     seeds = tuple(PeakSeed(*seed) for seed in settings.pop("seeds", ()))
+    settings.pop("region_bounds", None)
     analyzer = Region2DFitAnalyzer if recipe.tool == "region2d" else Region3DFitAnalyzer
     return analyzer(seeds=seeds, **settings)
 
@@ -127,6 +128,25 @@ def _region_input(recipe, snapshot):
     from xrd_tools.analysis.fitting.region_analyzers import REGION_2D_KEY, REGION_3D_KEY, Region2DInput, Region3DInput
     from xrd_tools.analysis.runner import AnalysisInput
     import numpy as np
+    from dataclasses import replace
+    from xrd_tools.analysis.fit_snapshot import FitAxis
+    bounds = dict(recipe.settings).get("region_bounds")
+    if bounds is not None:
+        bounds = dict(bounds)
+        selectors, selected_axes = [], []
+        for axis in snapshot.axes:
+            lo, hi = bounds[axis.name]
+            if not lo < hi:
+                raise ValueError("FIT_REGION_EMPTY: native axis low must be less than high")
+            indices = np.flatnonzero((axis.values >= lo) & (axis.values <= hi))
+            if indices.size < 2:
+                raise ValueError(f"FIT_REGION_EMPTY: {axis.name} needs at least two native bins")
+            selectors.append(slice(int(indices[0]), int(indices[-1]) + 1))
+            selected_axes.append(FitAxis(axis.name, axis.unit, axis.values[selectors[-1]]))
+        selectors = tuple(selectors)
+        snapshot = replace(snapshot, axes=tuple(selected_axes), values=snapshot.values[selectors],
+                           mask=None if snapshot.mask is None else snapshot.mask[selectors],
+                           sigma=None if getattr(snapshot, "sigma", None) is None else snapshot.sigma[selectors])
     axes = tuple(RegionAxis(axis.name, axis.values, axis.unit) for axis in snapshot.axes)
     mask = None if snapshot.mask is None else ~snapshot.mask  # snapshot True includes; region True excludes
     sigma = getattr(snapshot, "sigma", None)

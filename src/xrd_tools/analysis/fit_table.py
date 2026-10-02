@@ -57,6 +57,7 @@ def outcomes_table(outcomes, *, axis_unit="", contexts=None, model="", settings=
         from xrd_tools.analysis.runner import AnalysisOutcome
         outcomes = [AnalysisOutcome(label, False, message="not fit") for label, _context in context_items]
     settings_pairs = tuple(settings.items()) if isinstance(settings, Mapping) else tuple(settings)
+    phase_names = tuple(dict(settings_pairs).get("phase_names", ()))
     rows = []
     for ordinal, outcome in enumerate(outcomes):
         context = (contexts.get(outcome.label) if is_mapping else
@@ -83,7 +84,12 @@ def outcomes_table(outcomes, *, axis_unit="", contexts=None, model="", settings=
             errors = outcome.parameter_errors
             parameter_units = outcome.parameter_units
             for name, value in scalar.items():
+                if name.startswith("frac_"):
+                    continue
                 component, parameter = _split_parameter(name)
+                if phase_names and component.startswith("p") and component[1:].isdigit():
+                    index = int(component[1:])
+                    component = phase_names[index] if index < len(phase_names) else component
                 rows.append(FitTableRow(outcome.label, component, parameter, _number(value),
                                         _number(errors.get(name)), parameter_units.get(name, ""),
                                         status, outcome.message, **metadata))
@@ -105,7 +111,7 @@ def outcomes_table(outcomes, *, axis_unit="", contexts=None, model="", settings=
                                         parameter_unit, status, outcome.message, **metadata))
         elif outcome.params:
             for name, value in outcome.params.items():
-                if name.startswith("center_err_") or name.endswith("_err"):
+                if name.startswith(("center_err_", "frac_")) or name.endswith("_err"):
                     continue
                 parameter, _, component = name.rpartition("_")
                 parameter = parameter or name
@@ -115,6 +121,13 @@ def outcomes_table(outcomes, *, axis_unit="", contexts=None, model="", settings=
                                         unit if parameter in {"center", "fwhm"} else "", status, outcome.message, **metadata))
         else:
             rows.append(FitTableRow(outcome.label, "", "", None, None, "", status, outcome.message, **metadata))
+        # Phase fractions are a named derived projection, not a raw lmfit parameter. The public analyzer's
+        # compact params retains it; its uncertainty is unavailable unless that owner explicitly supplies one.
+        for name, value in outcome.params.items():
+            if name.startswith("frac_"):
+                rows.append(FitTableRow(outcome.label, name[5:], "fraction", _number(value),
+                                        _number(getattr(outcome, "parameter_errors", {}).get(name)), "",
+                                        status, outcome.message, **metadata))
     return FitTable(tuple(rows))
 
 

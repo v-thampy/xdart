@@ -57,3 +57,43 @@ def test_phase_controls_use_actual_current_settings_and_explicit_phase_selection
     controls.dispose()
     controls._fit_button.click()
     assert len(calls) == 1
+
+
+def test_region_controls_use_each_native_axis_and_slice_coordinate():
+    from xrd_tools.gui.widgets import PeakFitViewer, RegionRangeControls
+    axes = (FitAxis("H", "r.l.u.", np.linspace(-1., 1., 11)),
+            FitAxis("K", "r.l.u.", np.linspace(-2., 2., 13)),
+            FitAxis("L", "r.l.u.", np.linspace(1., 3., 15)))
+    snapshot = FitInputSnapshot(FitInputKey("native box", "derived", "receipt", 1), axes,
+                                np.ones((11,13,15)))
+    fits = []
+    viewer = PeakFitViewer(["native box"], lambda index: snapshot,
+                           lambda inp, settings: fits.append(settings) or AnalysisOutcome("native box", False),
+                           tool="region3d", settings={"seeds": [["peak", [0., 0., 2.], None, None]]})
+    assert isinstance(viewer.region_ranges, RegionRangeControls)
+    viewer.region_ranges.ranges["K"].fit_bounds.value = (-1., 1.)
+    viewer.controls._fit_button.click()
+    assert len(fits) == 1
+    assert dict(fits[0]["region_bounds"])["K"] == (-1., 1.)
+    viewer.region_ranges.slice_axis.value = "H"
+    viewer.region_ranges.slice_coordinate.value = .2
+    assert viewer.region_ranges.plane == ("H", 6)
+    assert len(fits) == 1
+    viewer.dispose()
+
+
+def test_plotly_semantic_axis_conversion_and_peak_components():
+    from xrd_tools.viz.plotly import plot_analysis_outcome
+    from xrd_tools.core.containers import convert_radial_axis
+    from xrd_tools.analysis.runner import DisplayedPeakFitAnalyzer
+    x = np.linspace(1., 4., 151)
+    y = 3. + 10.*np.exp(-.5*((x-2.5)/.08)**2)
+    snapshot = FitInputSnapshot(FitInputKey("q input", "derived", "receipt", 1),
+                                (FitAxis("q", "A^-1", x),), y, wavelength_angstrom=1.)
+    outcome = DisplayedPeakFitAnalyzer({"model": "gaussian", "selection_mode": "count", "n_peaks": 1}).analyze(snapshot)
+    figure = plot_analysis_outcome(snapshot, outcome, axis_unit="2th_deg", peak_model="gaussian",
+                                   overlays=("fit", "residual", "components"), log_y=True)
+    np.testing.assert_allclose(figure.data[0].x, convert_radial_axis(x, "q_A^-1", "2th_deg", 1.))
+    assert figure.layout.xaxis2.title.text == "2θ (2th_deg)"
+    assert figure.layout.yaxis2.type == "linear"
+    assert any(trace.name == "p0" for trace in figure.data)

@@ -195,6 +195,27 @@ def test_real_phase_request_native_two_theta_and_compact_batch(tmp_path, format)
         spec.loader.exec_module(module)
         _, definitions = module.app.run()
         actual = definitions["outcome"]
+        # Public programmatic cell overrides exercise the production Apply/state cells. This is a native
+        # marimo DAG check, not browser-event evidence (the root owner covers the actual frontend).
+        from types import SimpleNamespace
+        control_names = ("input_selector", "overlay_selector", "log_display", "fit_range", "region_ranges",
+                         "phase_selector", "settings_editor", "axis_unit_selector", "display_min", "display_max",
+                         "slice_axis", "fit_apply", "fit_batch")
+        overrides = {name: definitions[name] for name in control_names}
+        bounds = (float(axis[30]), float(axis[-30]))
+        overrides["fit_range"] = SimpleNamespace(value=bounds)
+        overrides["fit_apply"] = SimpleNamespace(value=True)
+        _, applied_defs = module.app.run(defs=overrides)
+        applied_recipe, applied_fit = applied_defs["get_committed"]()
+        assert dict(applied_recipe.settings)["fit_bounds"] == bounds
+        assert applied_fit.ok, applied_fit.message
+        assert min(applied_fit.overlay.x) >= bounds[0] and max(applied_fit.overlay.x) <= bounds[1]
+        # A run button resets to False when another control changes. The committed fit stays in the same
+        # public state cell even though the Apply cell now does nothing.
+        overrides.update({name: applied_defs[name] for name in ("get_committed", "set_committed", "get_batch", "set_batch")})
+        overrides["fit_apply"] = SimpleNamespace(value=False)
+        _, reset_defs = module.app.run(defs=overrides)
+        assert reset_defs["get_committed"]()[0] == applied_recipe
     assert actual.ok, actual.message
     assert actual.params == pytest.approx(direct.params, rel=1e-9)
     np.testing.assert_allclose(actual.overlay.x, axis, rtol=1e-12, atol=1e-12)
@@ -202,6 +223,10 @@ def test_real_phase_request_native_two_theta_and_compact_batch(tmp_path, format)
     batch = run_recipe_batch(recipe, bundle_root=tmp_path)
     assert len(batch) == 1 and batch[0].ok
     assert batch[0].params == pytest.approx(actual.params, rel=1e-9)
+    from xrd_tools.analysis.fit_table import outcomes_table
+    rows = outcomes_table(batch, contexts=[native], model="gaussian", settings=recipe.settings).rows
+    assert any(row.component == "Cu" and row.parameter == "fraction" and row.value == 1. for row in rows)
+    assert any(row.component == "Cu" and row.parameter == "a" and row.unit == "Å" for row in rows)
 
 
 @pytest.mark.parametrize("ndim", [2, 3])
@@ -227,6 +252,22 @@ def test_region_recipe_uses_public_solver_native_axes_and_mask(tmp_path, ndim):
     fitted = outcome.result.payload
     assert fitted.components[0].id == "stable seed"
     np.testing.assert_allclose(fitted.model()[mask], truth[mask], rtol=1e-5, atol=1e-5)
+    from dataclasses import replace
+    cropped = replace(recipe, settings={**dict(recipe.settings),
+                                        "region_bounds": tuple((f"Q{i}", (float(c[1]), float(c[-2])))
+                                                               for i,c in enumerate(coordinates))})
+    narrowed = run_recipe(cropped, bundle_root=tmp_path)
+    assert narrowed.ok, narrowed.message
+    assert narrowed.result.payload.shape == tuple(len(c)-2 for c in coordinates)
+    from xrd_tools.viz.plotly import plot_analysis_outcome
+    figure = plot_analysis_outcome(native, narrowed, log_y=True,
+                                   plane_axis="Q0" if ndim == 3 else None, plane_index=2)
+    assert len(figure.data) == 3  # selected data/model and signed linear residual
+    residual = np.asarray(figure.data[-1].z)
+    assert np.nanmax(abs(residual)) < 1e-5
+    if ndim == 3:
+        plane = plot_analysis_outcome(native, narrowed, plane_axis="Q0", plane_coordinate=float(coordinates[0][2]))
+        assert f"Q0={coordinates[0][2]:.6g}" in plane.layout.title.text
 
 
 def test_source_reference_is_primitive_and_lazy(tmp_path):
