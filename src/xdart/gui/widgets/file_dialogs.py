@@ -73,17 +73,33 @@ def browse(parent, title: str, *, folder: bool = False, many: bool = False, save
 
 def browse_spec(parent, title: str, *, many: bool = False, current: str = "",
                 fallback: str = "") -> list[str]:
-    """Ask for SPEC files in the platform's own dialog, as :func:`browse` (maintainer, 2026-09-30:
-    "all others bring up the native mac os style dialog"). It lists every file, since a SPEC file has
-    no extension to filter on; a pick that is not a SPEC file (by its first line) is refused, saying
-    so, and the SPEC files among the picks are kept. [] when cancelled."""
+    """Show folders, extensionless files and case-insensitive .spec files; validate picked content.
+
+    SPEC alone uses Qt's widget dialog: native wildcard filters cannot express extensionless
+    files without also listing other extensions. The shared Browse start/pick rule still applies.
+    """
     from pathlib import Path
 
-    from pyqtgraph.Qt import QtWidgets
+    from pyqtgraph.Qt import QtCore, QtWidgets
 
     from xrd_tools.io.spec import is_spec_file
 
-    picks = browse(parent, title, many=many, current=current, fallback=fallback)
+    class SpecFiles(QtCore.QSortFilterProxyModel):
+        def filterAcceptsRow(self, row, parent):
+            model = self.sourceModel()
+            info = model.fileInfo(model.index(row, 0, parent))
+            return info.isDir() or Path(info.fileName()).suffix.lower() in ("", ".spec")
+
+    dialog = QtWidgets.QFileDialog(parent, title, browse_start_dir(current, fallback=fallback))
+    dialog.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, True)
+    dialog.setFileMode(QtWidgets.QFileDialog.ExistingFiles if many else QtWidgets.QFileDialog.ExistingFile)
+    dialog.setProxyModel(SpecFiles(dialog))
+    try:
+        picks = dialog.selectedFiles() if dialog.exec() == QtWidgets.QDialog.Accepted else []
+    finally:
+        dialog.deleteLater()
+    if picks:
+        remember_browse_path(picks[0])
     refused = [path for path in picks if not is_spec_file(path)]
     if refused:
         names = ", ".join(Path(path).name for path in refused[:5]) + (" …" if len(refused) > 5 else "")
