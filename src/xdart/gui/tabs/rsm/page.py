@@ -411,7 +411,12 @@ class RSMPage(QtWidgets.QWidget):
             ("custom", "Custom Slice", "A slice along any two directions (for example HH and L), in its own window"),
             ("lineout", "Lineout / Peak Fit", "Fit a native-axis lineout, or compare fits across results"),
             ("fit2d", "2-D Peak Fit", "Fit one native plane with a rectangular region"),
-            ("fit3d", "3-D Peak Fit", "Fit a native volume box jointly in three dimensions"))
+            ("fit3d", "3-D Peak Fit", "Fit a native volume box jointly in three dimensions"),
+            ("export-run", "Export Run replay…", "Export current processing inputs; the notebook's Run writes "
+             "to a fresh output folder inside DATA_ROOT."))
+        from xdart.gui.analysis.workflow_export import WorkflowExportActions
+        self._workflow_export = WorkflowExportActions(self, capture=self._capture_run_workflow,
+            source_root=lambda: str(self._value("project_root")), status=self._status)
         self.view.commandRequested.connect(self._view_command)
         self.splitter.addWidget(self.view)
 
@@ -2132,8 +2137,17 @@ class RSMPage(QtWidgets.QWidget):
         elif kind is ShellCommandKind.SET_BACKGROUND:
             self._toggle_background()
 
+    def _capture_run_workflow(self):
+        from xrd_tools.notebooks.workflow import WorkflowRecipe
+        from xrd_tools.notebooks.operation_replay import capture_rsm_forms
+        self._commit_typing()
+        return WorkflowRecipe("rsm", capture_rsm_forms(self.build_forms()))
+
     def _page_tool(self, name):
         """Mount a shared non-modal analysis window on the admitted result shown."""
+        if name == "export-run":
+            self._workflow_export.choose()
+            return
         from xdart.gui.tabs.rsm.fit_windows import RSMLineoutWindow
         from xdart.gui.analysis.region_fit_window import RegionFitWindow
         factory = {"3d": RSMVolumeWindow, "custom": RSMCustomSliceWindow,

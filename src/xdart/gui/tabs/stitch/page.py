@@ -557,7 +557,12 @@ class StitchPage(QtWidgets.QWidget):
              "results when none are selected. Overlay selects displayed slices for a slice batch."),
             ("phase_fit", "Phase Fit", "Fit radial Intensity in Q or 2θ with its recorded wavelength. Batch "
              "fits selected results, or all listed results when none are selected."),
+            ("export-run", "Export Run replay…", "Export current processing inputs; the notebook's Run writes "
+             "to a fresh output folder inside DATA_ROOT."),
         )
+        from xdart.gui.analysis.workflow_export import WorkflowExportActions
+        self._workflow_export = WorkflowExportActions(self, capture=self._capture_run_workflow,
+            source_root=lambda: str(self._value("project_root")), status=self._status)
         from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
         self._background = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_context = None  # what the background was set on (_background_scope)
@@ -3019,6 +3024,9 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.scientific_preferences import scientific_preference_updates
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         kind, view = command.kind, self._view
+        if kind is ShellCommandKind.PAGE_TOOL and command.value == "export-run":
+            self._workflow_export.choose()
+            return
         if kind is ShellCommandKind.PAGE_TOOL and command.value in {"peak_fit", "phase_fit"}:
             self._open_fit("peak" if command.value == "peak_fit" else "phase")
             return
@@ -3059,6 +3067,12 @@ class StitchPage(QtWidgets.QWidget):
         elif kind in {ShellCommandKind.SET_COLOR_MAP, ShellCommandKind.SET_LOG_SCALE}:
             self._render_raw()  # the raw popup's image too
         self._draw()
+
+    def _capture_run_workflow(self):
+        from xrd_tools.notebooks.workflow import WorkflowRecipe
+        from xrd_tools.notebooks.operation_replay import capture_stitch_form
+        self._commit_typing()
+        return WorkflowRecipe("stitch", capture_stitch_form(self.build_form()))
 
     def _install_diagnostic_option(self):
         """Stitch's Diagnostic (Intensity, Coverage or Normalization) as a row of the view's
