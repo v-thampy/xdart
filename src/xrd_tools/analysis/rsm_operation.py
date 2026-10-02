@@ -1619,6 +1619,9 @@ class _RSMCapturedMemberFacts:
     table_fingerprint: str
     #: where the UB came from, for Preview only (decision 2): never part of an identity
     ub_origin: str | None = None
+    #: Pixel-free NeXus facts used to bind Auto before conditioning changes the frame dtype.
+    detector_dtype: np.dtype | None = None
+    detector_saturation: int | None = None
 
 
 _STANDARD_PSIC_AXES = ("x+", "z-", "y+", "z-", "x+", "z-")  # mu, eta, chi, phi, nu, del
@@ -1862,6 +1865,7 @@ def _capture_preflight_facts(
         for _role, selector in motor_selectors
     )
     contributions: list[RSMContribution] = []
+    detector_dtype = detector_saturation = None
     try:
         with requalified_analysis_source(
             analysis,
@@ -1878,6 +1882,8 @@ def _capture_preflight_facts(
                         "RSM_MEMBER_IDENTITY_MISMATCH",
                         "member detector shape differs from effective geometry",
                     )
+                detector_dtype = descriptor.dtype
+                detector_saturation = descriptor.saturation
             ub_origin = None
             try:
                 if nexus:
@@ -2073,6 +2079,8 @@ def _capture_preflight_facts(
         source.fingerprint,
         source.table_fingerprint,
         ub_origin=ub_origin,
+        detector_dtype=detector_dtype,
+        detector_saturation=detector_saturation,
     )
 
 
@@ -3790,13 +3798,13 @@ def _load_rsm_v2_raw_chunk(
             ):
                 raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
             if nexus:
-                # a NeXus stack hands its dataset's native dtype, the same for every frame (C5c): decoded to
-                # float64 here, exactly for integers
+                # Keep native values until Int's threshold policy runs. Conditioning owns the float64
+                # copy; converting here first would lose native integer saturation sentinels.
                 if native_dtype is None:
                     native_dtype = observed.dtype
                 elif observed.dtype != native_dtype:
                     raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
-                owned = np.array(observed, dtype=expected_decoded_dtype, copy=True, order="C")
+                owned = np.array(observed, copy=True, order="C")
             else:
                 owned = np.array(observed, copy=True, order="C")
                 if owned.dtype != expected_decoded_dtype:  # SPEC's decoder contract: float64 every frame
@@ -3872,12 +3880,12 @@ def _rsm_calibration_detector(receipt) -> str | None:
 
 
 def _rsm_member_saturation(threshold, members, detector):
-    """Each member's automatic ceiling (decision 39), resolved as Stitch's ``_frame_facts`` does without a
-    recorded value: the calibrated detector's documented counter limit for integer data, else the data type's
-    rule (None; ``member_saturation``). A SPEC member's data type is its authenticated on-disk encoding; a
-    NeXus stack's is learned only at the run (its declared float64 is a byte charge), so it is unknown here
-    and the documented limit applies, as the resolver does for an unknown type."""
-    if threshold is None or threshold.mode != "auto" or detector is None:
+    """Each member's automatic ceiling (decision 39), through Stitch's shared resolver: a recorded value,
+    then the calibrated detector's documented counter limit, then the native dtype's ceiling (None in the
+    recorded plan; ``member_saturation``). NeXus members supply the descriptor's recorded saturation and
+    native dtype, captured in the existing pixel-free preflight open. The resolved cutoff belongs to the
+    bound corrections, hence the plan fingerprint and provenance. SPEC's decoded-frame contract is unchanged."""
+    if threshold is None or threshold.mode != "auto":
         return None
     from xrd_tools.analysis.stitch_native import member_saturation
     from xrd_tools.core.invalid import resolve_detector_saturation
@@ -3885,10 +3893,12 @@ def _rsm_member_saturation(threshold, members, detector):
     for member in members:
         try:
             options = json.loads(member.source_options_json)
-            dtype = None if "entry" in options else np.dtype(options["read_image_kwargs"]["raw_dtype"])
+            dtype = (getattr(member, "detector_dtype", None) if "entry" in options
+                     else None if detector is None else np.dtype(options["read_image_kwargs"]["raw_dtype"]))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             dtype = None
-        ceilings.append(resolve_detector_saturation(detector=detector, dtype=dtype))
+        ceilings.append(resolve_detector_saturation(recorded=getattr(member, "detector_saturation", None),
+                                                    detector=detector, dtype=dtype))
     return member_saturation(ceilings)
 
 
@@ -4628,6 +4638,7 @@ def prepare_rsm_operation_v2(
             for ordinal, motor_selectors in enumerate(member_motor_selectors)
         )
         members: list[RSMPreflightMemberV2] = []
+        captured: list[_RSMCapturedMemberFacts] = []
         for ordinal, (source, binding, form_fingerprint) in enumerate(
             zip(
                 source_group.members,
@@ -4703,6 +4714,7 @@ def prepare_rsm_operation_v2(
                     conditioning=conditioning,
                 )
             )
+            captured.append(facts)
         member_tuple = tuple(members)
         _require_unique_rsm_physical_contributions_v2(member_tuple)
         common_grid = make_rsm_common_grid(
@@ -4721,7 +4733,7 @@ def prepare_rsm_operation_v2(
             max_frame_bytes=max_frame_bytes,
             max_chunk_bytes=max_chunk_bytes,
             corrections=_bind_rsm_corrections(
-                corrections, member_tuple, max_frame_bytes,
+                corrections, captured, max_frame_bytes,
                 detector=_rsm_calibration_detector(geometry_asset_receipt), detector_mask=detector_mask),
             ub_override=bound_ub,
             detector_mask=detector_mask,

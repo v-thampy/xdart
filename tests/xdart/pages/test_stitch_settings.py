@@ -131,6 +131,24 @@ def test_calibration_dialog_settings_are_kept_but_not_its_confirmations(qapp, tm
         _close(restored, qapp)
 
 
+def test_omitted_calibration_keeps_restored_settings_before_the_window_is_opened(qapp):
+    """A partial settings load preserves calibration settings restored at startup, even before Calibrate
+    has created a window. An explicit null still clears them."""
+    page = StitchPage(empty_host_services(_Status()))
+    partial = {"kind": "xdart-stitch-settings", "version": 1, "fields": {}}
+    try:
+        page.apply_settings({**partial, "calibration": {"fields": {"rms": ".02"}, "choices": {}}})
+        saved = page.settings()["calibration"]
+        assert saved["fields"]["rms"] == ".02" and page._calibration_dialog is None
+        page.apply_settings(partial)
+        assert page.settings()["calibration"] == saved
+        assert page._calibration_dialog is None
+        page.apply_settings({**partial, "calibration": None})
+        assert page.settings()["calibration"] is None
+    finally:
+        _close(page, qapp)
+
+
 def test_a_load_waits_while_the_calibration_window_works(qapp, tmp_path):
     """G13 unit 3b (found in G12): a settings load waited for Stitch's own run only, so it could change the
     calibration window's inputs while a fit ran. It now waits for the window too, saying why, before any chooser;

@@ -69,6 +69,13 @@ def turned_frame_shape(model: str) -> tuple[int, int]:
     return columns, rows
 
 
+def _require_uniform_flat(detector, model):
+    """The generic quarter-turn record can retain only a uniform flat model's pixel geometry."""
+    if not detector.uniform_pixel or not detector.IS_FLAT:
+        raise ValueError(f"A quarter-turn camera cannot represent {model}'s nonuniform or curved pixels; "
+                         "choose a camera that keeps its axes.")
+
+
 def window_detector_record(model: str, orientation: ImageOrientation, *, pyfai_orientation: int = 3):
     """What a PONI or goniometer record writes for the window's detector: ``(name, config, turned)``, ``turned``
     being ``TURNED_DETECTOR_KEY``'s value (None when the model is not turned). A camera that keeps the image's axes:
@@ -80,6 +87,7 @@ def window_detector_record(model: str, orientation: ImageOrientation, *, pyfai_o
     if not orientation.swaps_axes:
         return str(model), config, None
     native = detector_factory(model, config=config) if config else detector_factory(model)
+    _require_uniform_flat(native, model)
     rows, columns = (int(value) for value in native.shape)
     turned_config = {"pixel1": float(native.pixel2), "pixel2": float(native.pixel1), "max_shape": [columns, rows],
                      "orientation": int(pyfai_orientation)}
@@ -129,6 +137,7 @@ def frame_detector_record(name: str, config, shape) -> tuple[str, dict]:
         return name, config
     model = detector_factory(name, config=config) if config else detector_factory(name)
     if tuple(int(value) for value in model.shape) != shape and tuple(int(value) for value in model.shape)[::-1] == shape:
+        _require_uniform_flat(model, name)
         return "Detector", {"pixel1": float(config.get("pixel1", model.pixel1)),
                             "pixel2": float(config.get("pixel2", model.pixel2)), "max_shape": list(shape),
                             "orientation": int(config.get("orientation", 3))}

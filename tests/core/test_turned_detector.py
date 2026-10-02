@@ -64,6 +64,37 @@ def test_a_camera_keeping_the_axes_keeps_the_model_itself(orientation):
         assert (type(detector).__name__, name, written, record) == ("Pilatus300k", "Pilatus300k", config, None)
 
 
+@pytest.mark.parametrize("model", ["ImXPadS140", "Aarhus"])
+def test_a_quarter_turn_refuses_models_a_uniform_flat_record_cannot_represent(model):
+    from xrd_tools.integrate.turned_detector import is_turned_window_record, window_detector_record
+    native = _native(model)
+    assert not native.uniform_pixel or not native.IS_FLAT
+    # The same model remains available with its own pixel geometry when no quarter conversion is needed.
+    assert window_detector_record(model, ImageOrientation())[0] == model
+    for orientation in QUARTER:
+        with pytest.raises(ValueError, match="nonuniform or curved"):
+            window_detector_record(model, orientation)
+        # A previously authored uniform approximation is not a valid turned record either.
+        value = {"detector": "Detector", "detector_config": {
+            "pixel1": native.pixel2, "pixel2": native.pixel1,
+            "max_shape": list(native.shape)[::-1], "orientation": 3},
+            TURNED_DETECTOR_KEY: {"detector": model, "image_rotation": orientation.rotation,
+                                 "image_flip": orientation.flip_horizontal}}
+        assert not is_turned_window_record(value["detector"], value["detector_config"], value[TURNED_DETECTOR_KEY])
+
+
+@pytest.mark.parametrize("model", ["ImXPadS140", "Aarhus"])
+def test_partner_readers_refuse_the_same_nonuniform_or_curved_quarter_conversion(model):
+    native = _native(model)
+    shape = tuple(native.shape)[::-1]
+    assert shape != tuple(native.shape)
+    with pytest.raises(ValueError, match="nonuniform or curved"):
+        frame_detector_record(model, {}, shape)
+    with pytest.raises(ValueError, match="nonuniform or curved"):
+        partner_detector({"detector_factory_name": model, "detector_config": {}, "shape": shape},
+                         {"image_rotation_quarter_turns": 1})
+
+
 def _rough(model, orientation=None, **extra):
     from xrd_tools.integrate.calibration_seed import rough_arm_record
     return rough_arm_record(distance_m=1.0147173, detector=model, beam_px=(97.0, 243.0),

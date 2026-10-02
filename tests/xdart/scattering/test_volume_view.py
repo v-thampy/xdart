@@ -373,3 +373,33 @@ def test_a_log_change_superseded_before_it_is_drawn_still_resets_the_levels(qapp
         _settled(view)
         view.deleteLater()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize("colormap", ["Default", "magma"])
+def test_a_log_round_trip_resets_controls_even_when_the_drawn_index_is_reused(qapp, colormap):
+    """Log on and off before delivery returns to the cached linear index. Its reset still applies,
+    whether the image is unchanged or that index is coloured under another map."""
+    view = VolumeView()
+    projection = _projection()
+    try:
+        view.reconcile(projection)
+        _settled(view)
+        levels = view.intensity.values()
+        index = view._index
+        view.intensity.autoscale.click()
+        _settled(view)
+        assert not view.intensity.autoscale.isChecked()
+        view.log_scale.click()
+        view.log_scale.click()
+        view.set_color_map(colormap)
+        _settled(view)
+        assert not view.log_scale.isChecked()
+        assert view.intensity.autoscale.isChecked()
+        assert view.intensity.values() == levels
+        assert view._index is index
+        assert view.rgba.tobytes() == volume_rgba(projection.values, colormap, levels=levels).tobytes()
+    finally:
+        _settled(view)
+        view.shutdown()
+        view.deleteLater()
+        qapp.processEvents()

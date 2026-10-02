@@ -83,8 +83,6 @@ def apply_page_settings(page, document: Any) -> None:
         page._render_ranges()
     if "calibration" in document:  # null: a document saved with no window lets a retained one go
         page._set_calibration_settings(document["calibration"])
-    else:  # a document without it: no saved window settings, and a retained window kept as it is
-        page._calibration_settings = None
     restore_write_mode(page, document)
     if document.get("mode") in ("Stitch 1D", "Stitch 2D"):
         page.select_mode(document["mode"])

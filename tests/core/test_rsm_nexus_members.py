@@ -7,6 +7,7 @@ file scan 43's own #G3 as ``sample/ub_matrix``. No real-file HKL claim: the 17-2
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -16,7 +17,8 @@ import pytest
 
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.rsm_operation import (
-    RSMCoordinateFrame, RSMNormalizationMode, RSMNormalizationPolicy, RSMUBOverride, run_rsm_operation_v2,
+    RSMCoordinateFrame, RSMFrameCorrections, RSMImageConditioning, RSMNormalizationMode,
+    RSMNormalizationPolicy, RSMUBOverride, rsm_output_current, run_rsm_operation_v2,
 )
 from xrd_tools.core.scan import SourceKind
 from xdart.gui.tools.rsm_values import (
@@ -24,6 +26,8 @@ from xdart.gui.tools.rsm_values import (
     rsm_tool_preset,
 )
 from xrd_tools.analysis.rsm_geometry_asset import CANONICAL_RSM_GEOMETRY_LOCATOR, rsm_geometry_asset_input
+from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
 from tests.core.test_rsm_operation_r2_real_data import rsm_r2_project  # noqa: F401 (the fixture)
 
@@ -146,3 +150,40 @@ def test_a_normalization_column_the_entry_lacks_is_refused_by_name(nexus_project
         prepare_rsm_tool_v2(form)
     assert refused.value.code == "RSM_NORMALIZATION_COLUMN_MISSING"
     assert "the normalization's foil column 'foil status'" in str(refused.value)
+
+
+@pytest.mark.parametrize(("dtype", "peak", "recorded"), [(np.uint16, 65535, None), (np.uint32, 100, 100)])
+def test_nexus_auto_excludes_native_and_recorded_saturation_through_the_operation(tmp_path, dtype, peak, recorded):
+    """The existing native Int/Stitch policy also applies to RSM NeXus frames before float conversion.
+    A recorded cutoff is bound in the plan and a changed cutoff invalidates Append."""
+    from xrd_tools.analysis.rsm_geometry_asset import install_canonical_rsm_geometry_asset
+
+    install_canonical_rsm_geometry_asset(project_root=tmp_path)
+    path = _write_rsm_nexus(tmp_path / "saturation.nxs", ub=True)
+    pixels = np.full((_FRAMES, 195, 487), 10, dtype=dtype)
+    pixels[:, 95, 244] = peak
+    with h5py.File(path, "r+") as stream:
+        del stream["entry/data/eiger_image"]
+        del stream["entry/instrument/detectors/eiger/data"]
+        image = stream["entry/data"].create_dataset("eiger_image", data=pixels)
+        image.attrs["signal_type"] = "detector"
+        stream["entry/instrument/detectors/eiger/data"] = image
+        if recorded is not None:
+            stream["entry/instrument"].require_group("detector").create_dataset("saturation_value", data=recorded)
+    form = replace(_form(tmp_path, path.name), conditioning=RSMImageConditioning(0, None, None),
+                   corrections=RSMFrameCorrections(threshold=StitchConditioning("auto")),
+                   overwrite=AnalysisArtifactOverwrite.REPLACE)
+    request = prepare_rsm_tool_v2(form).request
+    assert request.plan.corrections.saturation == (None if recorded is None else (recorded,))
+    result = run_rsm_operation_v2(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert np.nanmax(result.payload.intensity) == 10
+    if recorded is not None:
+        assert request.plan.corrections.to_provenance()["threshold"]["saturation"] == [recorded]
+        assert rsm_output_current(request)
+        with h5py.File(path, "r+") as stream:
+            stream["entry/instrument/detector/saturation_value"][()] = recorded + 1
+        changed = prepare_rsm_tool_v2(form).request
+        assert changed.plan.corrections.saturation == (recorded + 1,)
+        assert changed.plan.fingerprint != request.plan.fingerprint
+        assert not rsm_output_current(changed)

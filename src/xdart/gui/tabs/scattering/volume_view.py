@@ -193,7 +193,7 @@ class VolumeView(QtWidgets.QFrame):
         # the drawn image's index and opacity (2 B a voxel), what they were made from and at, and its colour map: a
         # colour-map change applies another table to them
         self._index = self._alpha = self._index_values = self._index_log = None
-        self._index_levels = self._index_auto = self._drawn_map = None
+        self._index_levels = self._index_auto = self._index_domain = self._drawn_map = None
         # the draws, on the shared latest-request owner (the job bound late, so a test can hold its result); a draw
         # that would show the image shown is one whose index is the kept one, under the drawn colour map
         self._requests = LatestRequestOwner(
@@ -294,6 +294,12 @@ class VolumeView(QtWidgets.QFrame):
         levels = None if automatic else tuple(float(v) for v in self.intensity.values())
         kept = (self._index is not None and self._index_values is values and self._index_log == log
                 and self._index_levels == (self._index_auto if automatic else levels))
+        if kept and reset_levels:
+            # Log on and off can return to the image already drawn. Reset the controls even if the
+            # latest-request owner skips that unchanged image or only recolours its cached index.
+            blocker = QtCore.QSignalBlocker(self.intensity)
+            self.intensity.sync(self._index_domain, self._index_auto, reset=True)
+            del blocker
         name = self.color_map.currentText()
         try:
             table = color_table(name)
@@ -334,8 +340,8 @@ class VolumeView(QtWidgets.QFrame):
         if drawn.domain is not None:  # a full draw: the controls take its domain and automatic levels
             domain = drawn.domain
             blocker = QtCore.QSignalBlocker(self.intensity)
-            self.intensity.sync(domain if domain[1] > domain[0] else (domain[0], domain[0] + 1.0), drawn.auto,
-                                reset=request.reset)
+            self._index_domain = domain if domain[1] > domain[0] else (domain[0], domain[0] + 1.0)
+            self.intensity.sync(self._index_domain, drawn.auto, reset=request.reset)
             del blocker
             self._index_auto = drawn.auto
         self.rgba = drawn.rgba
@@ -348,7 +354,7 @@ class VolumeView(QtWidgets.QFrame):
     def _forget_index(self) -> None:
         self._requests.forget()  # no image shown: no draw is the image shown
         self._index = self._alpha = self._index_values = self._index_log = None
-        self._index_levels = self._index_auto = self._drawn_map = None
+        self._index_levels = self._index_auto = self._index_domain = self._drawn_map = None
 
     def _show_notice(self, text: str, *, offer_half: bool) -> None:
         self.notice.setText(text)
