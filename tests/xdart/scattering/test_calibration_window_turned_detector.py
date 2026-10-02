@@ -162,7 +162,10 @@ def test_a_rough_calibration_saved_for_a_quarter_turned_camera_is_in_the_window_
     assert named["mask_count"] == (0 if turned_gaps is None else int(turned_gaps.sum()))
     assert (partner["acquisition"]["image_rotation_quarter_turns"], partner["acquisition"].get("image_flip", False)) \
         == (orientation.rotation // 90, orientation.flip_horizontal)
-    # Stitch's readers: the turned gaps; its XU capture admits the pair and resolves its geometry
+    # Stitch's readers: the turned gaps; its XU capture admits the pair and resolves its geometry; the page's
+    # Threshold Auto takes the model's documented counter limit (decision 39), as before
+    from xdart.gui.tabs.stitch.page import _calibration_detector
+    assert _calibration_detector(str(target)) == model
     stitch_mask = calibration_detector_mask(partner)
     receipt = capture_xu_stitch_calibration(XuStitchCalibrationInput(xu_partner_path(target)), project_root=tmp_path)
     with xu_runtime_session() as runtime:

@@ -348,6 +348,9 @@ def calibration_detector(plan):
     if type(plan) is XuStitchOperationPlan:
         return plan.calibration.projection.value["detector"].get("detector_factory_name")
     diff, _orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+    turned = getattr(diff.calibration, "turned_from", None)
+    if turned is not None:  # a quarter-turned model: pyFAI's generic detector names none (AUD-9 item 8)
+        return turned["detector"]
     return getattr(diff.calibration.poni, "detector", None)
 
 

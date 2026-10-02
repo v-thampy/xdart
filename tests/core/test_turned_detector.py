@@ -236,6 +236,10 @@ def test_stitch_runs_a_quarter_turned_window_calibration_with_the_model_s_gaps(t
     diffractometer, _orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
     np.testing.assert_array_equal(_detector_mask(diffractometer), orientation.apply(_native_gaps(model)))
     np.testing.assert_array_equal(native_detector_mask(plan), _native_gaps(model))  # the stored frame's
+    from xrd_tools.analysis.stitch_native import calibration_detector
+    from xrd_tools.core.invalid import PILATUS_COUNTER_LIMIT, documented_saturation
+    # decision 39's documented counter limit is the model's, not pyFAI's generic detector's (which has none)
+    assert calibration_detector(plan) == model and documented_saturation(model) == PILATUS_COUNTER_LIMIT
     (tmp_path / "output").mkdir()
     request = prepare_stitch_operation(
         source, ModuleOutputRequest(tmp_path / "output" / "stitched.nexus", AnalysisArtifactKind.STITCH_1D,

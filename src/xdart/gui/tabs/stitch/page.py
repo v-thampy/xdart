@@ -50,6 +50,7 @@ from xrd_tools.analysis.module_transaction import MetadataColumnSelector, Module
 from xrd_tools.analysis.stitch_native import native_ceilings
 from xrd_tools.analysis.stitch_operation import StitchFoilNormalization, StitchGeometryKind
 from xrd_tools.core.geometry import ImageOrientation
+from xrd_tools.core.geometry.stacked_arm import TURNED_DETECTOR_KEY
 from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
@@ -181,8 +182,9 @@ def _calibration_detector(path):
         record = _xu_calibration_record(path)
         detector = record.get("detector") if record is not None else None
         name = detector.get("detector_factory_name") if isinstance(detector, dict) else None
-    else:
-        name = record.get("detector")
+    else:  # a quarter-turned model is named beside pyFAI's generic detector (AUD-9 stage 2b item 8)
+        turned = record.get(TURNED_DETECTOR_KEY)
+        name = turned.get("detector") if isinstance(turned, dict) else record.get("detector")
     return name if isinstance(name, str) and name.strip() else None
 
 
