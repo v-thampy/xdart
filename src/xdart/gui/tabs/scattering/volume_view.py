@@ -166,7 +166,7 @@ class VolumeView(QtWidgets.QFrame):
             self._show_notice(str(refused), offer_half=self._half is None)
             return
         log = self.log_scale.isChecked()
-        shown = log_transform(values) if log else values
+        shown = log_transform(values) if log else values  # the displayed space, transformed once for this draw
         finite = np.isfinite(shown)
         if not finite.any():
             self.rgba = None
@@ -182,15 +182,19 @@ class VolumeView(QtWidgets.QFrame):
                             reset=reset_levels)
         del blocker
         levels = auto if self.intensity.autoscale.isChecked() else tuple(float(v) for v in self.intensity.values())
-        del shown
         try:
-            self.rgba = volume_rgba(values, self.color_map.currentText(), log, levels=levels,
+            # ``shown`` is already in the displayed space and the levels are in it, so volume_rgba draws it as it
+            # is (log=False) rather than taking Log of the same values again (Codex's combined stage-2b review,
+            # priority 5): the same bytes, as test_rsm_volume_render pins volume_rgba(v, log=True, levels) ==
+            # volume_rgba(log_transform(v), levels)
+            self.rgba = volume_rgba(shown, self.color_map.currentText(), False, levels=levels,
                                     max_voxels=self.max_voxels)
         except VolumeRenderRefused as refused:
             self.rgba = None
             self._clear_items()
             self._show_notice(str(refused), offer_half=False)
             return
+        del shown  # the Log copy goes before the GL items are built
         self._show_notice("", offer_half=False)
         self._draw_items(axes)
 

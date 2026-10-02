@@ -120,3 +120,41 @@ def test_the_gl_items_are_built_where_opengl_is_available(qapp, monkeypatch):
     finally:
         view.deleteLater()
         qapp.processEvents()
+
+
+def test_log_on_or_off_auto_or_manual_draws_the_bytes_and_levels_of_volume_rgbas_own_log(qapp):
+    """Codex's combined stage-2b review, priority 5: with Log on the view transforms the volume once, for its
+    domain and levels and for its colours alike, where volume_rgba transformed it a second time. The RGBA bytes,
+    the domain and the levels are those of volume_rgba transforming the volume itself (log=True) at the levels
+    taken in the transformed space: Log off and on, automatic and manual levels, empty voxels, and values below 1
+    (Log's shift)."""
+    shape = (6, 7, 8)
+    values = ((np.arange(np.prod(shape), dtype=np.float32).reshape(shape) - 40.0) / 3.0) ** 3 / 50.0
+    values[0, 0, 0] = values[3, 4, 5] = np.nan
+    values.setflags(write=False)
+    assert np.nanmin(values) < 0.0 < 1.0 < np.nanmax(values)
+    axes = tuple(np.linspace(index, index + 1.0, size) for index, size in enumerate(shape))
+    view = VolumeView()
+    try:
+        view.reconcile(VolumeProjection(values, axes, ("H", "K", "L"), "a_rsm.nexus"))
+        for log in (False, True):
+            if view.log_scale.isChecked() is not log:
+                view.log_scale.click()  # Log draws again at its automatic levels
+            shown = log_transform(values) if log else values
+            finite = shown[np.isfinite(shown)]
+            auto = volume_levels(shown, log=log)
+            assert view.intensity.autoscale.isChecked() and view.intensity.values() == auto, log
+            assert view.intensity.slider.domain() == (float(finite.min()), float(finite.max())), log
+            assert view.rgba.tobytes() == volume_rgba(values, "Default", log, levels=auto).tobytes(), log
+            assert view.rgba[0, 0, 0, 3] == view.rgba[3, 4, 5, 3] == 0  # empty voxels are transparent
+            manual = (auto[0] + 0.25 * (auto[1] - auto[0]), auto[1] - 0.125 * (auto[1] - auto[0]))
+            view.intensity.autoscale.setChecked(False)
+            view.intensity._set_window(manual)
+            view.intensity.rangeChanged.emit(*manual)
+            assert view.intensity.values() == manual, log
+            assert view.rgba.tobytes() == volume_rgba(values, "Default", log, levels=manual).tobytes(), log
+            view.intensity.autoscale.setChecked(True)
+            assert view.rgba.tobytes() == volume_rgba(values, "Default", log, levels=auto).tobytes(), log
+    finally:
+        view.deleteLater()
+        qapp.processEvents()
