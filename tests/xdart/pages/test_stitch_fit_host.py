@@ -70,6 +70,17 @@ def test_linear_current_background_and_real_shared_dialogs(qapp, tmp_path):
         radial = page._fit_current("phase").load()
         assert radial.axes[0].unit == "q_A^-1"
         assert radial.wavelength_angstrom == payload.wavelength_A
+        _command(page, ShellCommandKind.SET_PLOT_AXIS, "2theta")
+        phase.reload()
+        _finish(phase, qapp)
+        assert phase.snapshot.axes[0].unit == "2th_deg"
+        np.testing.assert_array_equal(phase.dialog._x, phase.snapshot.axes[0].values)
+        from xrd_tools.notebooks import load_snapshot
+        target = page._fit_current("phase")
+        replay = load_snapshot(target.reference, bundle_root=tmp_path)
+        assert replay.axes[0].unit == "2th_deg"
+        np.testing.assert_array_equal(replay.values, phase.snapshot.values)
+        _command(page, ShellCommandKind.SET_PLOT_AXIS, "Q")
         page.scientific.background.click()
         subtracted = page._fit_current("peak").load()
         assert subtracted.key.background == "presentation" and page._fit_scope() != scope

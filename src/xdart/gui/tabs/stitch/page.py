@@ -2884,8 +2884,10 @@ class StitchPage(QtWidgets.QWidget):
                     source_path = source_path.relative_to(project_root)
                 except ValueError:
                     pass  # an explicitly external result keeps its absolute path
+            reference_selection = tuple((name, False if name == "phase" else value)
+                                        for name, value in selection)
             reference = SourceReference(str(source_path), "stitch", str(path), payload.result_fingerprint,
-                                        payload.inspection.request_fingerprint, selection,
+                                        payload.inspection.request_fingerprint, reference_selection,
                                         original_path=str(path))
 
         def load():
@@ -2901,7 +2903,7 @@ class StitchPage(QtWidgets.QWidget):
                         or (coordinate in _CUT_AXES and coordinate not in dict(source.gi))):
                     raise ValueError("FIT_BATCH_SELECTION_UNAVAILABLE: select this result in Overlay to "
                                      "capture its displayed slice/background")
-                return stitch_fit_snapshot(source, admitted, coordinate=coordinate, phase=kind == "phase",
+                return stitch_fit_snapshot(source, admitted, coordinate=coordinate,
                                            diagnostic=dict(selection)["diagnostic"])
             if dict(selection)["diagnostic"] != "Intensity":
                 raise ValueError("FIT_INTENSITY_REQUIRED: coverage and normalization are diagnostics")
@@ -2913,7 +2915,7 @@ class StitchPage(QtWidgets.QWidget):
             snapshot = FitInputSnapshot(admitted, (FitAxis(coordinate, trace.axis_unit or "", trace.axis),),
                                         trace.intensity,
                                         wavelength_angstrom=source.wavelength_A, sigma=sigma)
-            return phase_fit_snapshot(snapshot) if kind == "phase" else snapshot
+            return snapshot  # the shared fit owner converts only for solving, retaining the native display axis
 
         def trend(column):
             from xrd_tools.io.analysis_artifact import read_analysis_artifact

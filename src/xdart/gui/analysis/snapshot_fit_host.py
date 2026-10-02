@@ -103,7 +103,7 @@ class SnapshotFitHost(QtCore.QObject):
         self.dialog.trend.save.clicked.disconnect()
         self.dialog.trend.save.clicked.connect(self._choose_csv)
         self.dialog.export_actions.export = self._export
-        self.dialog.export_actions.source_root = source_root
+        self.dialog.export_actions.source_root = source_root() if callable(source_root) else source_root
         self.dialog._export_snapshot_provider = self.current
         self.column_row = FormRow(label='Trend column', path=('fit', 'trend_column'), value='Result order',
                                    kind='combo', choices=('Result order',))
@@ -138,7 +138,8 @@ class SnapshotFitHost(QtCore.QObject):
         elif action == 'reload':
             self.dialog.fit_btn.setEnabled(False)
         self.owner.ask(_Request(action, self.kind, self.scope(), settings, tuple(inputs),
-                                self.trend_column, destination, self.source_root))
+                                self.trend_column, destination,
+                                self.source_root() if callable(self.source_root) else self.source_root))
 
     def reload(self):
         try:
@@ -246,7 +247,8 @@ class SnapshotFitHost(QtCore.QObject):
                  else _snapshot(item, frozen) for item in inputs)
         current = self.current()
         return write_fit_notebook(path, _snapshot(current, frozen), self.kind, settings,
-                                  batch_inputs=batch, data_root=self.source_root,
+                                  batch_inputs=batch,
+                                  data_root=self.source_root() if callable(self.source_root) else self.source_root,
                                   reference=getattr(current, 'reference', None))
 
     def export_csv(self, path):
