@@ -74,7 +74,7 @@ class PeakFitViewer:
     It never fits merely because presentation or input selection changes. ``from_recipe`` supplies the existing
     public recipe calls; old PatternViewer, PeakFitControls and PhaseFitControls callers keep their defaults.
     """
-    def __init__(self, labels, load_input, fit_input, *, settings=None, tool="peak", outcome=None, batch_fit=None):
+    def __init__(self, labels, load_input, fit_input, *, settings=None, tool="peak", outcome=None, batch_fit=None, contexts=None):
         import ipywidgets as widgets
         import plotly.graph_objects as go
         from .pattern_viewer import PatternViewer
@@ -83,6 +83,7 @@ class PeakFitViewer:
         self.tool, self._disposed = tool, False
         self.snapshot, self.outcome = load_input(0), outcome
         self._settings = dict(settings or {})
+        self._context_refs = dict(contexts or {})
         self.selector = PatternSelector(labels, on_select=self.select)
         self.pattern_viewer = PatternViewer()  # the shared owner, extended with an analyzer outcome model
         self.figure_widget = self.pattern_viewer.figure_widget
@@ -123,7 +124,7 @@ class PeakFitViewer:
         def batch(settings):
             return run_recipe_batch(replace(recipe, settings=settings), bundle_root=bundle_root, data_root=data_root)
         return cls([ref.label for ref in references], load, fit, settings=dict(recipe.settings), tool=recipe.tool,
-                   outcome=outcome, batch_fit=batch if recipe.batch else None)
+                   outcome=outcome, batch_fit=batch if recipe.batch else None, contexts={ref.label: ref for ref in references})
 
     def select(self, index):
         self.snapshot = self._load(index)
@@ -184,7 +185,11 @@ class PeakFitViewer:
 
     def set_table(self, outcomes):
         from xrd_tools.analysis.fit_table import outcomes_table, table_csv
-        table = outcomes_table(outcomes, axis_unit=self.snapshot.axes[0].unit)
+        contexts = {**self._context_refs, self.snapshot.key.result_identity: self.snapshot}
+        settings = self.current_settings()
+        model = settings.get("model", settings.get("phase_profile", settings.get("profile", "pseudovoigt" if self.tool in {"peak", "phase"} else "gaussian")))
+        table = outcomes_table(outcomes, axis_unit=self.snapshot.axes[0].unit, contexts=contexts,
+                               model=model, settings=settings)
         headings = ("Input", "Component", "Parameter", "Value", "Std err", "Unit", "Status", "Message")
         body = "".join("<tr>" + "".join(f"<td>{html.escape('' if v is None else str(v))}</td>" for v in
                                       (r.input, r.component, r.parameter, r.value, r.stderr, r.unit, r.status, r.message))

@@ -283,3 +283,28 @@ def test_source_reference_reuses_real_stitch_reader_and_named_receipts(tmp_path)
         load_snapshot(replace(reference, request_fingerprint="new request"), bundle_root=tmp_path)
     with pytest.raises(NotebookInputError, match="INPUT_MISSING"):
         load_snapshot(replace(reference, path="missing.nxs"), bundle_root=tmp_path)
+
+
+def test_f9_full_compact_metadata_and_uncertainties_are_identical(tmp_path):
+    from xrd_tools.notebooks import run_recipe
+    from xrd_tools.analysis.fit_table import outcomes_table, table_csv
+    from xrd_tools.analysis.runner import AnalysisOutcome
+    recipe, _ = recipe_bundle(tmp_path)
+    # The public owner estimates nonzero errors for a perturbed synthetic trace.
+    from dataclasses import replace
+    native = snapshot()
+    noisy = replace(native, values=native.values + .05*np.sin(np.arange(native.values.size)))
+    full = run_recipe(recipe, bundle_root=tmp_path, loader=lambda reference, **kwargs: noisy)
+    compact = AnalysisOutcome(full.label, full.ok, full.params, message=full.message,
+                              parameter_values=full.parameter_values, parameter_errors=full.parameter_errors,
+                              parameter_units=full.parameter_units)
+    kwargs = dict(contexts=[native], model="gaussian", settings=recipe.settings)
+    full_table = outcomes_table([full], **kwargs)
+    assert outcomes_table([compact], **kwargs) == full_table
+    assert any(row.stderr is not None and row.stderr > 0 for row in full_table.rows)
+    assert all(row.result_identity == native.key.result_identity and row.path == native.key.path
+               and row.selection == native.key.selection and row.model == "gaussian" for row in full_table.rows)
+    assert "original/result.h5" in table_csv(full_table)
+    before = outcomes_table([], **kwargs)
+    assert len(before.rows) == 1 and before.rows[0].status == "not fit"
+    assert before.rows[0].settings == recipe.settings and before.rows[0].selection == native.key.selection

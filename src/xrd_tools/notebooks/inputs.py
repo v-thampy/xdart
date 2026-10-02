@@ -154,7 +154,7 @@ def load_snapshot(reference: SnapshotReference | SourceReference, *, bundle_root
 
 
 def _load_source(reference: SourceReference, *, data_root):
-    from xrd_tools.io.analysis_artifact import read_analysis_artifact
+    from xrd_tools.io.analysis_artifact import read_analysis_artifact, AnalysisArtifactError
     from xrd_tools.analysis import fit_sources
     path = Path(reference.path)
     if not path.is_absolute():
@@ -169,7 +169,7 @@ def _load_source(reference: SourceReference, *, data_root):
             raise NotebookInputError(f"INPUT_CHANGED: {path}; source is a new admitted input")
     try:
         payload = read_analysis_artifact(path)
-    except (ValueError, OSError) as error:
+    except (AnalysisArtifactError, ValueError, OSError) as error:
         raise NotebookInputError(f"INPUT_SOURCE_INVALID: {path}: {error}") from error
     after = path.stat()
     if facts != (after.st_size, after.st_mtime_ns) or payload.result_fingerprint != reference.result_fingerprint:

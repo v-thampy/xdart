@@ -29,7 +29,8 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
     scientific = _code("""
         # Ordinary scientific execution: this runs in scripts/headless kernels without any button click.
         outcome = run_recipe(recipe, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)
-        results_table = outcomes_table([outcome])
+        results_table = outcomes_table([outcome], contexts=[load_snapshot(recipe.input, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)],
+                                      model=dict(recipe.settings).get('model', dict(recipe.settings).get('phase_profile', dict(recipe.settings).get('profile', 'pseudovoigt' if recipe.tool in ('peak', 'phase') else 'gaussian'))), settings=recipe.settings)
         csv_text = table_csv(results_table)
         print(outcome.label, outcome.ok, outcome.message)
     """)
@@ -79,9 +80,10 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
          f"recipe = recipe_from_json({recipe_to_json(recipe)!r})\nnotebook_description = {header!r}\n"
          "return BUNDLE_ROOT, DATA_ROOT, recipe, notebook_description"),
         ("mo, notebook_description", "mo.md(notebook_description)\nreturn"),
-        ("recipe, BUNDLE_ROOT, DATA_ROOT, run_recipe, outcomes_table, table_csv",
+        ("recipe, BUNDLE_ROOT, DATA_ROOT, run_recipe, outcomes_table, table_csv, load_snapshot",
          "outcome = run_recipe(recipe, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)\n"
-         "results_table = outcomes_table([outcome])\ncsv_text = table_csv(results_table)\nreturn outcome, results_table, csv_text"),
+         "results_table = outcomes_table([outcome], contexts=[load_snapshot(recipe.input, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)], model=dict(recipe.settings).get('model', dict(recipe.settings).get('phase_profile', dict(recipe.settings).get('profile', 'pseudovoigt' if recipe.tool in ('peak', 'phase') else 'gaussian'))), settings=recipe.settings)\n"
+         "csv_text = table_csv(results_table)\nreturn outcome, results_table, csv_text"),
         ("mo, recipe, outcome", "get_committed, set_committed = mo.state((recipe, outcome))\nreturn get_committed, set_committed"),
         ("mo, recipe, BUNDLE_ROOT, DATA_ROOT, load_snapshot, json",
          "_snapshot = load_snapshot(recipe.input, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)\n"
@@ -109,7 +111,7 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
          "_applied, _fit = get_committed()\n"
          "_snapshot = load_snapshot(_applied.input, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)\n"
          "fit_plot = mo.ui.plotly(plot_analysis_outcome(_snapshot, _fit, overlays=overlay_selector.value, log_y=log_display.value))\n"
-         "_table = outcomes_table([_fit])\n"
+         "_table = outcomes_table([_fit], contexts=[_snapshot], model=dict(_applied.settings).get('model', dict(_applied.settings).get('phase_profile', dict(_applied.settings).get('profile', 'pseudovoigt' if _applied.tool in ('peak', 'phase') else 'gaussian'))), settings=_applied.settings)\n"
          "fit_csv = table_csv(_table)\n"
          "mo.vstack([fit_plot, mo.md(_fit.message or ('Fit complete' if _fit.ok else 'Fit failed')), mo.ui.table([{'input': r.input, 'component': r.component, 'parameter': r.parameter, 'value': r.value, 'stderr': r.stderr, 'unit': r.unit, 'status': r.status, 'message': r.message} for r in _table.rows]), mo.download(fit_csv.encode('utf-8'), filename='fit-results.csv', label='Download CSV')])\nreturn fit_plot, fit_csv"),
     ]
