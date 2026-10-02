@@ -5,8 +5,9 @@ tightened 2026-10-01, after the native RSM page's first stage built its own resu
 Advanced dialog). A page mounts Int's owners and drives them with its own projections; where an owner falls
 short, the owner is extended, with tests for every consumer. A recorded reason does not license a copy.
 
-``_DEBT`` is the copies that existed when this fence landed (``stitch2d`` at ``3de62e92``). Each count is an
-upper bound for its file, to be lowered as the copy moves onto its owner and never raised. A new page has no
+``_DEBT`` is the copies that existed when this fence landed (``stitch2d`` at ``3de62e92``), and, for a construct
+fenced later, the copies that existed when it was fenced (FIT-TOOLS-2026-10 added tables and rectangles). Each count
+is an upper bound for its file, to be lowered as the copy moves onto its owner and never raised. A new page has no
 entry: its module builds none of these.
 """
 from __future__ import annotations
@@ -34,6 +35,9 @@ _BROWSER_OWNER = "BrowserView (tabs/scattering/browser_view.py)"
 _BROWSE_OWNER = "file_dialogs (widgets/file_dialogs.py)"
 #: Codex's combined stage-2b review F2: a Preview, a provenance record or a fit's summary is read-only text
 _TEXT_OWNER = "ReadOnlyTextPane or ReadOnlyTextWindow (widgets/read_only_text.py)"
+#: FIT-TOOLS-2026-10 (Codex's design review F8): a fit's result rows, and a rectangle on an image
+_TABLE_OWNER = "ResultsTable (tabs/scattering/results_table.py)"
+_REGION_OWNER = "ScientificView's typed rectangle (set_keyed_region, RectRegion: tabs/scattering/scientific_view.py)"
 
 #: The constructs a page must not build, with the owner that provides them.
 _CALLS: dict[str, str] = {
@@ -52,6 +56,8 @@ _CALLS: dict[str, str] = {
     ),
     "QListWidget": _BROWSER_OWNER,
     **dict.fromkeys(("QPlainTextEdit", "QTextEdit", "QTextBrowser"), _TEXT_OWNER),
+    **dict.fromkeys(("QTableWidget", "QTableView"), _TABLE_OWNER),
+    "RectROI": _REGION_OWNER,
 }
 _NAMES: dict[str, str] = {"matplotlib_colormaps": _DISPLAY_OWNER}
 #: Literal markers of a copied Data Browser header and menus.
@@ -65,14 +71,15 @@ _DEBT: dict[str, dict[str, int]] = {
     },
     "analysis/peak_fit_dialog.py": {
         "LinearRegionItem": 1, "PlotWidget": 2, "QCheckBox": 2, "QComboBox": 2, "QLineEdit": 4, "QSpinBox": 2,
+        "QTableWidget": 1,
     },
     "analysis/phase_fit_dialog.py": {
         "QComboBox": 3, "QFileDialog.getOpenFileName": 1, "QFileDialog.getOpenFileNames": 1,
-        "QLineEdit": 2, "QListWidget": 1, "QSpinBox": 1,
+        "QLineEdit": 2, "QListWidget": 1, "QSpinBox": 1, "QTableWidget": 1,
     },
     "analysis/roi_select_dialog.py": {
         "ColorBarItem": 1, "ImageItem": 1, "PlotWidget": 1, "QCheckBox": 2, "QComboBox": 2, "QLineEdit": 1,
-        "QListWidget": 1, "getFromMatplotlib": 1,
+        "QListWidget": 1, "RectROI": 1, "getFromMatplotlib": 1,
     },
     "analysis/scan_plot_dialog.py": {
         "PlotWidget": 1, "QComboBox": 2, "QFileDialog.getSaveFileName": 1, "QListWidget": 2,
@@ -84,6 +91,8 @@ _DEBT: dict[str, dict[str, int]] = {
     "pages/scattering_workspace.py": {
         "QCheckBox": 1, "QLineEdit": 1, "QSpinBox": 1, "str:configMenuButton": 1, "str:helpMenuButton": 1,
     },
+    #: the calibration window's frame selection and frame tables, which predate the table fence (FIT-TOOLS-2026-10)
+    "tabs/calibration/dialog.py": {"QTableWidget": 2},
 }
 
 
@@ -159,4 +168,16 @@ def test_fence_covers_every_page_package_and_no_new_page_has_debt():
     assert not any(path.startswith("tabs/scattering/") for path in fenced)
     pages = {path.name for path in (GUI / "tabs").iterdir()
              if path.is_dir() and path.name not in _OWNER_TABS and path.name != "__pycache__"}
-    assert {key.split("/")[1] for key in _DEBT if key.startswith("tabs/")} <= {"stitch"} <= pages
+    # stitch: the fence's first debt; calibration: its two tables, fenced later (FIT-TOOLS-2026-10)
+    assert {key.split("/")[1] for key in _DEBT if key.startswith("tabs/")} <= {"stitch", "calibration"} <= pages
+
+
+def test_a_copied_table_or_rectangle_is_refused_with_its_owner_named(tmp_path):
+    """FIT-TOOLS-2026-10 (Codex's design review F8): a page's own table or rectangle is caught, as its plots are."""
+    page = tmp_path / "page.py"
+    page.write_text("from pyqtgraph.Qt import QtWidgets\nimport pyqtgraph as pg\n"
+                    "table = QtWidgets.QTableWidget(0, 3)\nview = QtWidgets.QTableView()\n"
+                    "box = pg.RectROI((0, 0), (1, 1))\n", encoding="utf-8")
+    found = _constructs(page)
+    assert (found["QTableWidget"], found["QTableView"], found["RectROI"]) == (1, 1, 1)
+    assert _owner("QTableWidget") == _owner("QTableView") == _TABLE_OWNER and _owner("RectROI") == _REGION_OWNER
