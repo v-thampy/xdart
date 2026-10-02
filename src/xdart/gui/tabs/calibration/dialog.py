@@ -1130,7 +1130,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         # linked together ... x+, x-, z+, z-"): it turns and mirrors every image into Stitch's frame.
         from xdart.gui.widgets.camera_editor import CameraEditor
         self.camera = CameraEditor()
-        form.addRow('Camera', self.camera)
+        form.addRow('Camera (lab frame)', self.camera)
         self._tip(self._CAMERA_TIP, self.camera.rows, self.camera.columns, form.labelForField(self.camera))
         self._image_size = QtWidgets.QLabel()
         self._image_size.setWordWrap(True)
@@ -1156,7 +1156,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._edit(form, 'saturation', 'Saturation (counts)', '',
                    tip='Counts at or above this are saturated: a direct-beam frame with such a pixel in its '
                        'beam strip is left out, and the automatic refinement picks no ring points above it. '
-                       'Blank: the image type\'s maximum.')
+                       'Blank keeps Auto: the detector\'s documented counter limit when known, otherwise '
+                       'the image type\'s maximum. Eiger\'s physical cutoff depends on acquisition settings; '
+                       'type the file\'s cutoff to use it. A typed value stays when the detector changes.')
+        self._show_saturation_hint()
         self._edit(form, 'mask', 'Mask file', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
                    tip='Pixels to leave out everywhere in this calibration: the direct-beam fit, pyFAI-calib2 '
                        '(its mask), the automatic refinement\'s ring search and the expected rings. Drawn on '
@@ -1180,7 +1183,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     #: Hidden by Skip. Calibrant scan owns the energy field for frames without recorded energy.
     _GEOMETRY_ROWS = ('beam_motor', 'beam_pixel', 'rough_mount')
 
-    _CAMERA_TIP = ('The lab directions the stored image\'s rows (top to bottom) and columns (left to right) run '
+    _CAMERA_TIP = ('x± and z± refer to the same lab frame described in the Diffractometer section above. '
+                   'They are the directions the stored image\'s rows (top to bottom) and columns (left to right) run '
                    'along with every circle at zero, the detector facing the beam: x up, z to the left looking '
                    'downstream (xrayutilities\' detectorDir1, detectorDir2). Every image is turned and mirrored '
                    'into the calibration\'s frame, rows x−, columns z+, once before calibration; that is the default (an '
@@ -1254,6 +1258,23 @@ class CalibrationDialog(QtWidgets.QDialog):
         shape = detector_shape(self._text('beam_detector'))
         if shape is not None and 'shape' in self._fields:
             self._fields['shape'].setText(f'{shape[0]}, {shape[1]}')
+        self._show_saturation_hint()
+
+    def _show_saturation_hint(self):
+        """The shared documented limit without disk reads; the grey hint keeps Auto, like Int."""
+        from xrd_tools.core.invalid import resolve_detector_saturation
+        ceiling = resolve_detector_saturation(detector=self._text('beam_detector'))
+        self._fields['saturation'].setPlaceholderText(
+            f'Auto · {ceiling.value} (detector)' if ceiling is not None else
+            'Auto · image type maximum; acquisition cutoff varies')
+
+    def _saturation_value(self):
+        """An explicit cutoff, else the existing detector limit; unknown models keep dtype fallback."""
+        from xrd_tools.core.invalid import resolve_detector_saturation
+        if self._text('saturation'):
+            return float(self._text('saturation'))
+        ceiling = resolve_detector_saturation(detector=self._text('beam_detector'))
+        return None if ceiling is None else float(ceiling.value)
 
     def _beam_camera_changed(self):
         orientation, old = self._orientation(), getattr(self, '_pixel_orientation', self._orientation())
@@ -1918,13 +1939,16 @@ class CalibrationDialog(QtWidgets.QDialog):
             problem = geometry.arm_mismatch(*calibration_arm(record, source_motors))
             if problem:
                 raise ValueError(problem.replace('This calibration', 'The seed geometry', 1))
+            max_counts = self._saturation_value()
+            if max_counts is not None and not self._text('saturation'):
+                max_counts -= 1  # the ring finder keeps <= max_counts; Auto rejects the ceiling itself
             options = dict(source_motors=source_motors,
                            instrument_geometry=geometry.to_record(),
                            image_rotation=self._orientation().rotation,
                            image_flip=self._orientation().flip_horizontal,
                            calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
                            max_frames=int(self._text('refine_frames')),
-                           max_counts=float(self._text('saturation')) if self._text('saturation') else None,
+                           max_counts=max_counts,
                            mask=self._oriented_mask() if self._text('mask') else None,
                            max_rms_q=float(self._text('rms')), energy_bound_eV=self._energy_bound(),
                            bounds=self._bounds(), **self._distance_options())
@@ -2116,8 +2140,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             options['roi'] = tuple(int(v) for v in self._text('beam_roi').split(','))
         if self._text('mask'):
             options['mask'] = self._oriented_mask() if with_mask else self._mask_state()
-        if self._text('saturation'):
-            options['saturation'] = float(self._text('saturation'))
+        saturation = self._saturation_value()
+        if saturation is not None:
+            options['saturation'] = saturation
         arm = dict(zip(('del', 'nu'), self.geometry_editor.value().stitch_arm()))
         motor = arm.get(self._beam_role())
         held = tuple(name for circle, name in arm.items() if name and circle != self._beam_role())

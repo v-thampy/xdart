@@ -46,6 +46,44 @@ def test_detector_change_drops_the_previous_detectors_beam_pixel(qapp, tmp_path)
         dialog.close()
 
 
+def test_camera_names_the_diffractometers_lab_frame(qapp, tmp_path):
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        label = dialog.camera.parentWidget().layout().labelForField(dialog.camera)
+        assert 'lab frame' in label.text().lower()
+        assert 'Diffractometer' in dialog.camera.rows.toolTip()
+        assert 'x up' in dialog.camera.rows.toolTip()
+        assert 'z to the left' in dialog.camera.columns.toolTip()
+    finally:
+        dialog.close()
+
+
+def test_saturation_shows_the_documented_auto_value_and_keeps_manual_overrides(qapp, tmp_path):
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog._set_field_text('beam_source', tmp_path / 'beam')
+        field = dialog._fields['saturation']
+        assert dialog._text('saturation') == ''  # the hint is Auto, as in Int's threshold
+        assert '1048575' in field.placeholderText()
+        assert dialog._direct_beam_request()[2]['saturation'] == 1048575
+        dialog._set_field_text('saturation', '12345')
+        dialog._set_field_text('beam_detector', 'Eiger2_500k')
+        assert field.text() == '12345'
+        assert dialog._direct_beam_request()[2]['saturation'] == 12345
+        dialog._set_field_text('saturation', '')
+        assert 'acquisition' in field.placeholderText()
+        assert 'saturation' not in dialog._direct_beam_request()[2]
+        again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+        try:
+            again.apply_settings(dialog.settings())
+            assert again._text('saturation') == ''
+            assert again._fields['saturation'].placeholderText() == field.placeholderText()
+        finally:
+            again.close()
+    finally:
+        dialog.close()
+
+
 @pytest.mark.parametrize('rotation,flip', [(r, f) for r in (0, 90, 180, 270) for f in (False, True)])
 def test_typed_beam_pixel_follows_the_camera_but_not_pyfais_origin(qapp, tmp_path, rotation, flip):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
