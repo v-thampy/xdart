@@ -79,10 +79,14 @@ class PhaseFitDialog(QtWidgets.QDialog):
     """
 
     def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None,
-                 vnext_submit=None):
+                 vnext_submit=None, allow_batch=False):
         super().__init__(parent)
         self._vnext = callable(vnext_submit)
         self._vnext_submit = vnext_submit
+        self._allow_batch = bool(allow_batch)
+        self._export_trace = None
+        self._export_wavelength = None
+        self._export_snapshot_provider = None
         self._analysis_context = analysis_context
         self._provider = (
             analysis_context.current_pattern_tuple
@@ -103,8 +107,12 @@ class PhaseFitDialog(QtWidgets.QDialog):
         if self._vnext:
             self.texture_combo.setCurrentIndex(0); self.texture_combo.setEnabled(False)
             self.texture_combo.setToolTip("P3_7_PHASE_TEXTURE_UNAVAILABLE")
-            self.batch_btn.setEnabled(False)
-            self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+            self.batch_btn.setEnabled(bool(allow_batch))
+            if not allow_batch:
+                self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+        from .fit_export import FitExportActions
+        self.export_actions = FitExportActions(self, tool='phase', snapshot=self.export_snapshot,
+                                               settings=self.vnext_fit_values)
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
@@ -202,6 +210,11 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._maxfev_row = FormRow(label="Max iterations", path=_path("max_nfev"), value="", kind="int", minimum=0,
                                    maximum=1_000_000, allow_blank=True)
         self.advanced.add_group("Phases", (minimum, self._maxfev_row))
+        uncertainty = FormRow(label="Use uncertainties", path=_path("use_uncertainties"), value=False, kind="bool")
+        self.advanced.add_group("Weighting", (uncertainty,))
+        self.use_uncertainties = uncertainty.editor
+        self.use_uncertainties.setEnabled(False)
+        self.use_uncertainties.setToolTip("Use admitted measured sigma; no uncertainties are inferred")
         self.min_intensity, self.max_nfev = minimum.editor, self._maxfev_row.editor
         self.min_intensity.setValidator(QtGui.QDoubleValidator(self))
         self.min_intensity.setToolTip("Drop template peaks below this % of a phase's max intensity")
@@ -403,7 +416,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         try: minimum = float(self.min_intensity.text())
         except ValueError: minimum = 5.0
         nfev = self.max_nfev.value()
-        return {
+        values = {
             "cif_paths": tuple(path for path, _name in self._phases),
             "phase_names": tuple(name for _path, name in self._phases),
             "expected_hashes": (None,) * len(self._phases),
@@ -412,6 +425,9 @@ class PhaseFitDialog(QtWidgets.QDialog):
             "lattice_pct": lattice, "min_intensity": minimum,
             "max_nfev": int(nfev) if nfev else None,
         }
+        if self.use_uncertainties.isChecked():
+            values['use_uncertainties'] = True
+        return values
 
     def _do_fit(self):
         refusal = self._refusal()
@@ -443,8 +459,21 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._draw_outcome(outcome)
 
     def set_vnext_trace(self, trace):
+        self._export_trace = trace
+        self.use_uncertainties.setEnabled(trace.sigma is not None)
+        if trace.sigma is None:
+            self.use_uncertainties.setChecked(False)
         self._show_pattern(trace.axis, trace.intensity, trace.axis_unit or trace.label, clear_fit=True)
         self.status.setText("Displayed trace captured. Add CIFs and click Fit.")
+
+    def export_snapshot(self):
+        if self._export_snapshot_provider is not None:
+            return self._export_snapshot_provider()
+        if self._export_trace is None:
+            return None
+        from .fit_export import snapshot_from_trace, plain_settings
+        return snapshot_from_trace(self._export_trace, wavelength=self._export_wavelength,
+                                   settings=plain_settings(self.vnext_fit_values()))
 
     def set_vnext_result(self, result):
         fit_x = self._x[np.isfinite(self._x) & np.isfinite(self._y)]
@@ -518,6 +547,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
     def set_batch_running(self, running):
         self.batch_btn.setText("Cancel" if running else "Batch")
         self.fit_btn.setEnabled(not running)
+        self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
 
     def set_batch_progress(self, done, total):
         self.status.setText(f"Phase-fitting… {done}/{total}")

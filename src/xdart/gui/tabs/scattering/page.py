@@ -1249,6 +1249,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
             dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
             setattr(self, field, dialog)
+            if target in {"peak", "phase"}:
+                dialog._export_snapshot_provider = lambda t=target: self._fit_export_snapshot(t)
             if target in {"metadata", "scan_roi"}:
                 if self._metadata_operations.open_dialog(target) is None:
                     dialog.close()
@@ -1327,6 +1329,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if trace is None or dialog is None:
             self._notice("Select one displayed 1-D trace first."); return None
         dialog.set_vnext_trace(trace); return trace
+
+    def _fit_export_snapshot(self, kind):
+        """Detach the current displayed trace and controls, never an earlier fit's input."""
+        trace, anchor = self._capture_analysis_trace(kind)
+        dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
+        if trace is None or anchor is None or dialog is None:
+            return None
+        from .analysis_mount import phase_wavelength_angstrom
+        from xdart.gui.analysis.fit_export import snapshot_from_trace, plain_settings
+        return snapshot_from_trace(trace,
+            wavelength=phase_wavelength_angstrom(self._context_controller, anchor.frame),
+            settings=plain_settings(dialog.vnext_fit_values()))
 
     def _peak_analysis_action(self, action, values):
         if action == "close":

@@ -71,10 +71,13 @@ class PeakFitDialog(QtWidgets.QDialog):
     """
 
     def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None,
-                 vnext_submit=None):
+                 vnext_submit=None, allow_batch=False):
         super().__init__(parent)
         self._vnext = callable(vnext_submit)
         self._vnext_submit = vnext_submit
+        self._allow_batch = bool(allow_batch)
+        self._export_trace = None
+        self._export_snapshot_provider = None
         self._analysis_context = analysis_context
         self._provider = (
             analysis_context.current_pattern_tuple
@@ -95,8 +98,12 @@ class PeakFitDialog(QtWidgets.QDialog):
         if self._vnext:
             self.live_check.setChecked(False); self.live_check.setEnabled(False)
             self.live_check.setToolTip("P3_7_LIVE_FITTING_UNAVAILABLE")
-            self.batch_btn.setEnabled(False)
-            self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+            self.batch_btn.setEnabled(bool(allow_batch))
+            if not allow_batch:
+                self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+        from .fit_export import FitExportActions
+        self.export_actions = FitExportActions(self, tool='peak', snapshot=self.export_snapshot,
+                                               settings=self.vnext_fit_values)
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
@@ -201,6 +208,11 @@ class PeakFitDialog(QtWidgets.QDialog):
                                 maximum=1_000_000, allow_blank=True),
         }
         self.advanced.add_group("Peaks", tuple(rows.values()))
+        uncertainty = FormRow(label="Use uncertainties", path=_path("use_uncertainties"), value=False, kind="bool")
+        self.advanced.add_group("Weighting", (uncertainty,))
+        self.use_uncertainties = uncertainty.editor
+        self.use_uncertainties.setEnabled(False)
+        self.use_uncertainties.setToolTip("Use admitted measured sigma; no uncertainties are inferred")
         self._maxfev_row = rows["max_nfev"]
         self.adv_centers = rows["centers"].editor
         self.adv_sigma_init = rows["sigma_init"].editor
@@ -329,7 +341,8 @@ class PeakFitDialog(QtWidgets.QDialog):
         the single-frame controls are disabled (the workspace owns the run)."""
         self.batch_btn.setText("Cancel" if running else "Batch")
         self.fit_btn.setEnabled(not running)
-        self.live_check.setEnabled(not running)
+        self.live_check.setEnabled(not running and not self._vnext)
+        self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
 
     def set_batch_progress(self, done, total):
         self.status.setText(f"Batch fitting… {done}/{total}")
@@ -521,7 +534,7 @@ class PeakFitDialog(QtWidgets.QDialog):
         smin, smax = self._line_float(self.adv_sigma_min), self._line_float(self.adv_sigma_max)
         fraction = self._line_float(self.adv_fraction)
         nfev = self.adv_maxfev.value()
-        return {
+        values = {
             "selection_mode": "auto" if self.auto_check.isChecked() else "count",
             "n_peaks": len(centers) or int(self.npeaks_spin.value()),
             "model": _MODELS[self.model_combo.currentIndex()][1],
@@ -533,6 +546,9 @@ class PeakFitDialog(QtWidgets.QDialog):
             "fraction_init": 0.5 if fraction is None else fraction,
             "max_nfev": int(nfev) if nfev else None,
         }
+        if self.use_uncertainties.isChecked():
+            values['use_uncertainties'] = True
+        return values
 
     def _do_fit(self):
         refusal = self._refusal()
@@ -562,8 +578,20 @@ class PeakFitDialog(QtWidgets.QDialog):
         self._draw_outcome(outcome, auto=self.auto_check.isChecked())
 
     def set_vnext_trace(self, trace):
+        self._export_trace = trace
+        self.use_uncertainties.setEnabled(trace.sigma is not None)
+        if trace.sigma is None:
+            self.use_uncertainties.setChecked(False)
         self._show_pattern(trace.axis, trace.intensity, trace.axis_unit or trace.label, clear_fit=True)
         self.status.setText("Displayed trace captured. Click Fit.")
+
+    def export_snapshot(self):
+        if self._export_snapshot_provider is not None:
+            return self._export_snapshot_provider()
+        if self._export_trace is None:
+            return None
+        from .fit_export import snapshot_from_trace, plain_settings
+        return snapshot_from_trace(self._export_trace, settings=plain_settings(self.vnext_fit_values()))
 
     def set_vnext_result(self, result):
         lo, hi = self._fit_range()

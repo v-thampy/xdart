@@ -79,7 +79,7 @@ class AnalysisOutcome:
     result: "AnalysisResult | None" = None
     message: str = ""
     #: Compact scientific table rows survive releasing the numerical result.
-    parameter_values: "dict[str, float]" = field(default_factory=dict)
+    parameter_values: "dict[str, float | None]" = field(default_factory=dict)
     parameter_errors: "dict[str, float | None]" = field(default_factory=dict)
     parameter_units: "dict[str, str]" = field(default_factory=dict)
 
