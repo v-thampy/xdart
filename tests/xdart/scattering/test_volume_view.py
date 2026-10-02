@@ -342,3 +342,34 @@ def test_shutdown_while_a_draw_computes_is_pending_then_clean(qapp, monkeypatch)
         held.release.set()
         view.deleteLater()
         qapp.processEvents()
+
+
+def test_a_log_change_superseded_before_it_is_drawn_still_resets_the_levels(qapp, monkeypatch):
+    """Log resets the levels to their automatic ones; a colour-map change asked for before that draw arrives
+    keeps the reset (not the typed levels of the space Log left), as when each was drawn at once."""
+    held = _held(monkeypatch)
+    held.release.set()
+    view = VolumeView()
+    projection = _projection()
+    try:
+        view.reconcile(projection)
+        _settled(view)
+        view.intensity.autoscale.setChecked(False)
+        view.intensity._set_window((10.0, 200.0))  # typed levels, in the linear space
+        view.intensity.rangeChanged.emit(10.0, 200.0)
+        _settled(view)
+        held.release.clear()
+        held.computed.clear()
+        view.log_scale.click()  # Log: the levels reset, its draw held on the worker
+        assert held.computed.wait(20)
+        view.set_color_map("magma")  # asked for before the Log draw arrives
+        held.release.set()
+        _settled(view)
+        log_levels = volume_levels(log_transform(projection.values), log=True)
+        assert view.intensity.autoscale.isChecked() and view.intensity.values() == log_levels
+        assert view.rgba.tobytes() == volume_rgba(projection.values, "magma", True, levels=log_levels).tobytes()
+    finally:
+        held.release.set()
+        _settled(view)
+        view.deleteLater()
+        qapp.processEvents()

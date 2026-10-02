@@ -279,6 +279,8 @@ class VolumeView(QtWidgets.QFrame):
             self._clear_items()
             self._show_notice(str(refused), offer_half=self._half is None)
             return
+        if self._wanted is not None and self._wanted.reset:
+            reset_levels = True  # a reset not yet drawn (Log's) holds for the draw that supersedes it
         log = self.log_scale.isChecked()
         automatic = reset_levels or self.intensity.autoscale.isChecked()
         levels = None if automatic else tuple(float(v) for v in self.intensity.values())
