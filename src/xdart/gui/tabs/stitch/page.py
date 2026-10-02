@@ -505,6 +505,10 @@ class StitchPage(QtWidgets.QWidget):
         self._view = ScientificPreferences()
         #: The last map projection shown (a pin takes its slice); None while a pattern shows.
         self._last_map_state = None
+        # Only the shown linear traces, without a second hold on the map, for detached fit inputs.
+        self._fit_projection = None
+        self._fit_hosts = {}
+        self._fit_context = None
         #: What a Run stitches: 'Stitch 1D' or 'Stitch 2D' (the run bar's modes).
         self._mode = "Stitch 1D"
         self._build_ui()
@@ -548,6 +552,12 @@ class StitchPage(QtWidgets.QWidget):
         # (maintainer, 2026-09-30: Average/Sum/Waterfall "this should be straighforward"), and Int's display
         # background, Set BG ("would the plot only -set as background like in Int work here easily?": yes).
         self.scientific.set_hidden_tools("norm", "raw", "raw_pane")
+        self.scientific.set_page_tools(
+            ("peak_fit", "Peak Fit", "Fit the current linear trace. Batch fits selected results, or all listed "
+             "results when none are selected. Overlay selects displayed slices for a slice batch."),
+            ("phase_fit", "Phase Fit", "Fit radial Intensity in Q or 2θ with its recorded wavelength. Batch "
+             "fits selected results, or all listed results when none are selected."),
+        )
         from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
         self._background = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_context = None  # what the background was set on (_background_scope)
@@ -2767,9 +2777,179 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
         state = apply_presentation_background(state, self._background.projection())
         self._last_map_state = state if map_mode else None
+        fit_traces = state.traces
+        # Int removes an identical live slice from the overlay when it is already pinned. That pin is
+        # still the current displayed slice; a different pinned slice must never stand in for it.
+        from xdart.gui.tabs.scattering.scientific_axes import shown_slice_pin
+        pin = shown_slice_pin(state)
+        if pin is not None and not any(trace.frame is navigation.current for trace in fit_traces):
+            fit_traces += tuple(item.trace for item in state.pinned_traces
+                                if item.pin.projection_id == pin.projection_id)
+        self._fit_projection = replace(state, traces=fit_traces, heavy=None, pinned_traces=(),
+                                       browse_trace_snapshot=None)
+        context = self._fit_scope()
+        if context != self._fit_context:
+            self._fit_context = context
+            for host in self._fit_hosts.values():
+                host.invalidate()
         self.scientific.expect_display_background(self._background.active_key)
         self.scientific.reconcile(state, navigation, completed=self.browser.current_result_row() + 1,
                                   total=len(keys), detail="")
+        self._sync_fit_tools()
+
+    def _fit_selection(self):
+        state = self._fit_projection
+        coordinate = self._view.plot_axis if state is None else state.plot_axis
+        background_sources = (tuple((str(path), payload.result_fingerprint) for path, payload in self._selected())
+                              if self._background.phase == "ACTIVE" else ())
+        return tuple(sorted(dict(coordinate=coordinate, requested_coordinate=self._view.plot_axis,
+                                 diagnostic=self._diagnostic, mode=self._mode,
+                                 image_axis=self._view.image_axis, slice_enabled=self._view.slice_enabled,
+                                 slice_center=self._view.slice_center, slice_width=self._view.slice_width,
+                                 selected_results=tuple(map(str, self.browser.selected_results())),
+                                 background_sources=background_sources,
+                                 meaning="radial" if coordinate in {"Q", "2theta"} else coordinate).items()))
+
+    def _fit_scope(self):
+        """Already admitted facts only: no disk read, hashing or numerical copy on the GUI thread."""
+        path = self.browser.current_result()
+        payload = self._payloads.get(path)
+        return (path, None if payload is None else payload.result_fingerprint, self._view_revision,
+                tuple(self.browser.selected_results()), self._fit_selection(), self._background.active_key,
+                str(self._value("project_root")))
+
+    def _fit_reason(self, kind):
+        path = self.browser.current_result()
+        payload = self._payloads.get(path)
+        if self._closing or self._owner.busy:
+            return "Stitch is busy or closing"
+        if payload is None or self._fit_projection is None:
+            return "Open and select a processed Stitch result"
+        if self._diagnostic != "Intensity":
+            return "FIT_INTENSITY_REQUIRED: coverage and normalization are diagnostics"
+        current = self._result_keys.get(path)
+        traces = tuple(trace for trace in self._fit_projection.traces if trace.frame is current)
+        if kind == "phase":
+            from xdart.gui.tabs.scattering.scientific_axes import plot_axis_choice
+            if plot_axis_choice(traces, self._fit_projection.plot_axis) not in {"Q", "2theta"}:
+                return "PHASE_RADIAL_INTENSITY_REQUIRED: select Q or 2θ, not a GI cut or χ"
+            if payload.wavelength_A is None:
+                return "PHASE_WAVELENGTH_REQUIRED: the result has no recorded wavelength"
+        if len(traces) != 1:
+            return "FIT_CURRENT_SELECTION_UNAVAILABLE: an exact current displayed trace is required"
+        return ""
+
+    def _sync_fit_tools(self):
+        for kind in ("peak", "phase"):
+            button = self.scientific.page_tool(f"{kind}_fit")
+            reason = self._fit_reason(kind)
+            button.setEnabled(not reason and not self._authoring_active())
+            if reason:
+                button.setToolTip(reason)
+            else:
+                button.setToolTip("Fit the current linear trace. Batch fits selected results, or all listed "
+                                  "results when none are selected. Overlay selects displayed slices for a "
+                                  "slice batch; uncaptured slices or backgrounds fail explicitly.")
+
+    def _fit_target(self, path, kind, *, current=False):
+        """Capture immutable selectors/references now; copies, source reads and trend means run in the host."""
+        from xdart.gui.analysis.snapshot_fit_host import FitTarget
+        from xdart.gui.tabs.scattering.analysis_mount import displayed_trace_input
+        from xdart.gui.tabs.scattering.scientific_axes import plot_axis_choice
+        from xrd_tools.analysis.fit_snapshot import FitInputKey
+        payload = self._payloads.get(path)
+        selection = dict(self._fit_selection())
+        background = "presentation" if self._background.phase == "ACTIVE" else "none"
+        frame = self._result_keys.get(path)
+        projection = self._fit_projection
+        matches = () if projection is None else tuple(trace for trace in projection.traces if trace.frame is frame)
+        projection = (replace(projection, traces=matches) if len(matches) == 1 else None)
+        coordinate = plot_axis_choice(matches, selection["coordinate"])
+        selection.update(coordinate=coordinate, meaning="radial" if coordinate in {"Q", "2theta"} else coordinate,
+                         phase=kind == "phase")
+        selection = tuple(sorted(selection.items()))
+        key = FitInputKey(str(path), str(path), "" if payload is None else payload.result_fingerprint,
+                          self._view_revision, selection, background)
+        # A native GI cut is a native profile too. χ and any enabled map slice need the actual trace.
+        native = not self._view.slice_enabled and coordinate in {"Q", "2theta", *_CUT_AXES}
+        project_root = str(self._value("project_root")) or None
+        captured = payload if current else None
+        reference = None
+        if (payload is not None and native and background == "none"
+                and (coordinate not in _CUT_AXES or coordinate in dict(payload.gi))):
+            from xrd_tools.notebooks.inputs import SourceReference
+            source_path = Path(path)
+            if project_root is not None:
+                try:
+                    source_path = source_path.relative_to(project_root)
+                except ValueError:
+                    pass  # an explicitly external result keeps its absolute path
+            reference = SourceReference(str(source_path), "stitch", str(path), payload.result_fingerprint,
+                                        payload.inspection.request_fingerprint, selection,
+                                        original_path=str(path))
+
+        def load():
+            from xrd_tools.io.analysis_artifact import read_analysis_artifact
+            from xrd_tools.analysis.fit_snapshot import FitAxis, FitInputSnapshot
+            from xrd_tools.analysis.fit_sources import stitch_fit_snapshot, phase_fit_snapshot
+            source = captured if captured is not None else read_analysis_artifact(path)
+            if key.fingerprint and source.result_fingerprint != key.fingerprint:
+                raise ValueError("FIT_RESULT_CHANGED_REOPEN_REQUIRED: reopen the replaced result")
+            admitted = replace(key, fingerprint=source.result_fingerprint)
+            if projection is None:
+                if (background == "presentation" or not native
+                        or (coordinate in _CUT_AXES and coordinate not in dict(source.gi))):
+                    raise ValueError("FIT_BATCH_SELECTION_UNAVAILABLE: select this result in Overlay to "
+                                     "capture its displayed slice/background")
+                return stitch_fit_snapshot(source, admitted, coordinate=coordinate, phase=kind == "phase",
+                                           diagnostic=dict(selection)["diagnostic"])
+            if dict(selection)["diagnostic"] != "Intensity":
+                raise ValueError("FIT_INTENSITY_REQUIRED: coverage and normalization are diagnostics")
+            trace = displayed_trace_input(projection, frame)
+            # The scientific projection already owns the coordinate conversion and slice reduction.
+            # Its linear trace has no propagated uncertainty after a slice or presentation background.
+            sigma = (stitch_fit_snapshot(source, admitted, coordinate=coordinate).sigma
+                     if native and background == "none" else None)
+            snapshot = FitInputSnapshot(admitted, (FitAxis(coordinate, trace.axis_unit or "", trace.axis),),
+                                        trace.intensity,
+                                        wavelength_angstrom=source.wavelength_A, sigma=sigma)
+            return phase_fit_snapshot(snapshot) if kind == "phase" else snapshot
+
+        def trend(column):
+            from xrd_tools.io.analysis_artifact import read_analysis_artifact
+            from xrd_tools.analysis.trend_values import read_trend_values
+            source = read_analysis_artifact(path)
+            if key.fingerprint and source.result_fingerprint != key.fingerprint:
+                raise ValueError("FIT_RESULT_CHANGED_REOPEN_REQUIRED: reopen the replaced result")
+            return read_trend_values(((path, source),), column, source_root=project_root)[0][1]
+
+        return FitTarget(Path(path).name, load, trend=trend, reference=reference)
+
+    def _fit_current(self, kind):
+        reason = self._fit_reason(kind)
+        if reason:
+            raise ValueError(reason)
+        return self._fit_target(self.browser.current_result(), kind, current=True)
+
+    def _fit_batch(self, kind):
+        paths = tuple(self.browser.selected_results()) or tuple(self._listed)
+        return tuple(self._fit_target(path, kind) for path in paths)
+
+    def _open_fit(self, kind):
+        if self._fit_reason(kind) or self._authoring_active():
+            return
+        host = self._fit_hosts.get(kind)
+        if host is None:
+            from xdart.gui.analysis.snapshot_fit_host import SnapshotFitHost
+            host = SnapshotFitHost(kind=kind, parent=self, current=lambda: self._fit_current(kind),
+                                   scope=self._fit_scope, batch=lambda: self._fit_batch(kind),
+                                   source_root=lambda: str(self._value("project_root")) or None)
+            self._fit_hosts[kind] = host
+        host.reload()
+        host.dialog.show()
+        host.dialog.raise_()
+        self._authoring_timer.start()
+        self._sync_actions()
 
     def _background_scope(self, navigation):
         """What a display background belongs to: the layout, the selected and current results, the Diagnostic
@@ -2837,6 +3017,9 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.scientific_preferences import scientific_preference_updates
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         kind, view = command.kind, self._view
+        if kind is ShellCommandKind.PAGE_TOOL and command.value in {"peak_fit", "phase_fit"}:
+            self._open_fit("peak" if command.value == "peak_fit" else "phase")
+            return
         if kind in {ShellCommandKind.SELECT_FRAME, ShellCommandKind.HYDRATE_FRAME}:
             path = next((path for path, key in self._result_keys.items() if key is command.frame), None)
             if path in self._listed and path != self.browser.current_result():
@@ -2937,8 +3120,10 @@ class StitchPage(QtWidgets.QWidget):
             widget.setToolTip(_CORES_TIP)
         for dialog in self._authoring_dialogs:
             dialog.setEnabled(not busy and not self._closing and (not authoring or dialog.active()))
-        if not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs):
+        if (not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs)
+                and not any(host.dialog.isVisible() or host.computing for host in self._fit_hosts.values())):
             self._authoring_timer.stop()
+        self._sync_fit_tools()
         for row in self._rows.values():
             row.setEnabled(idle)
         if self._value("backend") == "xrayutilities histogram":
@@ -2967,13 +3152,16 @@ class StitchPage(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(0, self._request_reload)
 
     def _authoring_active(self):
-        return any(dialog.active() for dialog in self._authoring_dialogs)
+        return (any(dialog.active() for dialog in self._authoring_dialogs)
+                or any(host.computing for host in self._fit_hosts.values()))
 
     def _settings_busy(self):
         """Whether a settings load waits, and why (the shared owner's ``busy``): while a run works, and while the
         calibration or mask window works, whose inputs the load would change mid-job (G12's finding: a fit)."""
         if self._owner.busy:
             return True
+        if any(host.computing for host in self._fit_hosts.values()):
+            return "Stitch's fit window is working; load settings when it is done"
         for dialog in self._authoring_dialogs:
             if dialog.active():
                 what = "calibration" if dialog is self._calibration_dialog else "mask"
@@ -2993,9 +3181,10 @@ class StitchPage(QtWidgets.QWidget):
         self._authoring_timer.stop()
         receipt = self._owner.close()
         child_receipts = [dialog.shutdown() for dialog in self._authoring_dialogs]
+        child_receipts.extend(host.shutdown() for host in self._fit_hosts.values())
         if any(child.status is PageCleanup.PENDING for child in child_receipts):
             from xdart.gui.pages.values import CloseReceipt
-            return CloseReceipt(PageCleanup.PENDING, "Calibration or mask editor is closing")
+            return CloseReceipt(PageCleanup.PENDING, "Stitch analysis window is closing")
         if receipt.status is PageCleanup.CLEAN:
             self._release_background()  # its owner and the view's hold on it (Codex round-2 review F2)
             for dialog in self.findChildren(QtWidgets.QDialog):
@@ -3004,6 +3193,7 @@ class StitchPage(QtWidgets.QWidget):
             self._payloads.clear()
             self._payload_bytes.clear()
             self._recent.clear()
+            self._fit_projection = None
         return receipt
 
     # -- saved settings (File ▸ Save/Load Settings and the last session) -----------------
