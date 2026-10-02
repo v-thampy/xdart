@@ -575,3 +575,52 @@ def plot_peak_fit(
         margin=dict(l=60, r=20, t=50 if title else 30, b=50),
     )
     return fig
+
+
+def plot_analysis_outcome(snapshot, outcome=None, *, overlays=("fit", "background", "residual"),
+                          log_y=False, x_range=None, height=550):
+    """A public analyzer outcome on its admitted native axis; signed residuals stay linear.
+
+    The shared notebook hosts call this model (Jupyter wraps it in FigureWidget, marimo in mo.ui.plotly).
+    Region inputs use the solver's bounded central projection instead of sending a whole volume to a browser.
+    Presentation bounds and log intensity never modify the input or scientific fit bounds.
+    """
+    go = _import_go()
+    from plotly.subplots import make_subplots
+    if len(snapshot.axes) > 1:
+        data = snapshot.fitted_values()
+        if data.ndim == 3:
+            data = data[:, :, data.shape[2] // 2]
+        x, y = snapshot.axes[:2]
+        shown = np.where(data > 0, np.log10(np.maximum(data, np.finfo(float).tiny)), np.nan) if log_y else data
+        fig = go.Figure(go.Heatmap(x=x.values, y=y.values, z=shown.T, colorscale="Viridis"))
+        fig.update_layout(height=height, title=snapshot.key.result_identity,
+                          xaxis_title=f"{x.name} ({x.unit})", yaxis_title=f"{y.name} ({y.unit})")
+        return fig
+    axis = snapshot.axes[0]
+    show_residual = outcome is not None and outcome.overlay is not None and "residual" in overlays
+    fig = make_subplots(rows=2 if show_residual else 1, cols=1, shared_xaxes=True,
+                        row_heights=[.76, .24] if show_residual else [1.], vertical_spacing=.04)
+    fig.add_trace(go.Scattergl(x=axis.values, y=snapshot.fitted_values(), mode="lines", name="data"), row=1, col=1)
+    if outcome is not None and outcome.overlay is not None:
+        overlay = outcome.overlay
+        for name, values in overlay.traces.items():
+            if name not in overlays or values is None:
+                continue
+            fig.add_trace(go.Scattergl(x=overlay.x, y=values, mode="lines", name=name),
+                          row=2 if name == "residual" else 1, col=1)
+        result = outcome.result
+        for i, values in enumerate(getattr(result, "phase_components", ())):
+            if "components" in overlays:
+                fig.add_trace(go.Scattergl(x=overlay.x, y=values, mode="lines", name=f"phase {i}"), row=1, col=1)
+        for center in overlay.markers:
+            fig.add_vline(x=center, line_dash="dot", line_width=1, row=1, col=1)
+    fig.update_yaxes(title_text="Intensity", type="log" if log_y else "linear", row=1, col=1)
+    if show_residual:
+        fig.update_yaxes(title_text="data − model", type="linear", row=2, col=1)
+        fig.add_hline(y=0., line_width=.5, row=2, col=1)
+    fig.update_xaxes(title_text=f"{axis.name} ({axis.unit})", row=2 if show_residual else 1, col=1)
+    if x_range is not None:
+        fig.update_xaxes(range=list(x_range))
+    fig.update_layout(height=height, title=snapshot.key.result_identity, hovermode="x unified")
+    return fig

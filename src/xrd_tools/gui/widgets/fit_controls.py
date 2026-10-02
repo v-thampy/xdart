@@ -15,6 +15,8 @@ widget widths for a clean grid look.
 """
 from __future__ import annotations
 
+import json
+
 from typing import Any, Callable
 
 import ipywidgets as widgets
@@ -176,6 +178,14 @@ class PhaseFitControls:
         return [n for n, t in self._phase_toggles.items() if t.value]
 
     def get_params(self) -> dict[str, Any]:
+        if hasattr(self, "_displayed_editor"):
+            settings = json.loads(self._displayed_editor.value)
+            names = list(settings.get("phase_names", ()))
+            enabled = self.enabled_phases
+            indices = [i for i, name in enumerate(names) if name in enabled]
+            for field in ("phase_names", "cif_paths", "expected_hashes"):
+                settings[field] = tuple(settings[field][i] for i in indices)
+            return settings
         return dict(
             use_snip=self.use_snip.value,
             snip_width=self.snip_width.value,
@@ -189,6 +199,19 @@ class PhaseFitControls:
             mcmc_steps=self.mcmc_steps.value,
             enabled_phases=self.enabled_phases,
         )
+
+    def configure_displayed(self, settings: dict) -> None:
+        """Use the admitted public displayed-phase settings without replacing legacy notebook defaults."""
+        self._displayed_editor = widgets.Textarea(value=json.dumps(settings, indent=2),
+                                                  description="Settings", layout=widgets.Layout(width="700px", height="180px"))
+        self.widget.children = (widgets.HBox(list(self._phase_toggles.values())), self._displayed_editor,
+                                widgets.HBox([self._fit_button, self._status]))
+
+    def dispose(self) -> None:
+        """Disconnect and close a superseded notebook control panel."""
+        self._fit_button.on_click(self._do_fit, remove=True)
+        self._on_fit = None
+        _close_widgets(self.widget)
 
     def set_status(self, html: str, color: str = "black") -> None:
         self._status.value = f"<span style='color:{color}'>{html}</span>"
@@ -366,6 +389,8 @@ class PeakFitControls:
             return None
 
     def get_params(self) -> dict[str, Any]:
+        if hasattr(self, "_displayed_editor"):
+            return json.loads(self._displayed_editor.value)
         return dict(
             n_peaks=self.n_peaks.value,
             positions=self.positions_list,
@@ -381,6 +406,22 @@ class PeakFitControls:
             amorphous_sigma=self.amorphous_sigma.value,
             q_range=(self.q_min.value, self.q_max.value),
         )
+
+    def configure_displayed(self, settings: dict) -> None:
+        """Edit the exact admitted public plan, including optional guesses and bounds.
+
+        Legacy controls include scientific options the displayed owner deliberately does not support; this mode
+        mounts its existing Fit/status actions and a literal settings editor rather than translating those
+        defaults into a different fit. Missing guesses remain missing instead of becoming slider defaults.
+        """
+        self._displayed_editor = widgets.Textarea(value=json.dumps(settings, indent=2),
+                                                  description="Settings", layout=widgets.Layout(width="700px", height="180px"))
+        self.widget.children = (self._displayed_editor, widgets.HBox([self._fit_button, self._status]))
+
+    def dispose(self) -> None:
+        self._fit_button.on_click(self._do_fit, remove=True)
+        self._on_fit = None
+        _close_widgets(self.widget)
 
     def set_status(self, html: str, color: str = "black") -> None:
         self._status.value = f"<span style='color:{color}'>{html}</span>"
@@ -399,3 +440,10 @@ class PeakFitControls:
 
     def _ipython_display_(self) -> None:
         display(self.widget)
+
+
+def _close_widgets(widget) -> None:
+    """Close a composed widget tree once; notebook hosts dispose on cell rerun."""
+    for child in getattr(widget, "children", ()):
+        _close_widgets(child)
+    widget.close()
