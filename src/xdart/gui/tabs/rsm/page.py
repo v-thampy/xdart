@@ -408,7 +408,10 @@ class RSMPage(QtWidgets.QWidget):
         # view clean for now"; their windows come with G9
         self.view.set_page_tools(
             ("3d", "3D Viewer", "The whole RSM volume in 3-D, in its own window"),
-            ("custom", "Custom Slice", "A slice along any two directions (for example HH and L), in its own window"))
+            ("custom", "Custom Slice", "A slice along any two directions (for example HH and L), in its own window"),
+            ("lineout", "Lineout / Peak Fit", "Fit a native-axis lineout, or compare fits across results"),
+            ("fit2d", "2-D Peak Fit", "Fit one native plane with a rectangular region"),
+            ("fit3d", "3-D Peak Fit", "Fit a native volume box jointly in three dimensions"))
         self.view.commandRequested.connect(self._view_command)
         self.splitter.addWidget(self.view)
 
@@ -1229,6 +1232,11 @@ class RSMPage(QtWidgets.QWidget):
         self._readiness = self._readiness_now()
         self._show_readiness()
         self._sync_actions()
+        for name, window in self._tool_windows.items():
+            if name == "lineout":
+                window.configure_batch(self._fit_targets, source_root=project)
+            elif name in {"fit2d", "fit3d"}:
+                window.source_root = window.export_actions.source_root = project
 
     def _readiness_now(self):
         """("Needs …", False) or ("Ready · RSM · …", True), from committed values; the disk is asked only
@@ -2125,18 +2133,26 @@ class RSMPage(QtWidgets.QWidget):
             self._toggle_background()
 
     def _page_tool(self, name):
-        """The 3D Viewer and Custom Slice: non-modal windows built on their first press and raised on later
-        ones, kept on the result shown."""
-        factory = {"3d": RSMVolumeWindow, "custom": RSMCustomSliceWindow}.get(name)
+        """Mount a shared non-modal analysis window on the admitted result shown."""
+        from xdart.gui.tabs.rsm.fit_windows import RSMLineoutWindow
+        from xdart.gui.analysis.region_fit_window import RegionFitWindow
+        factory = {"3d": RSMVolumeWindow, "custom": RSMCustomSliceWindow,
+                   "lineout": RSMLineoutWindow,
+                   "fit2d": lambda parent: RegionFitWindow(parent, ndim=2),
+                   "fit3d": lambda parent: RegionFitWindow(parent, ndim=3)}.get(name)
         if factory is None:
             _LOG.info("RSM page tool %r pressed; its window is not built yet", name)
             return
         if self._shown_path is None or self._viewers.get(self._shown_path) is None:
-            self._notice("Show a result first: the 3D Viewer and Custom Slice draw the result shown")
+            self._notice("Show a result first: analysis uses the recorded result shown")
             return
         window = self._tool_windows.get(name)
         if window is None:
             window = self._tool_windows[name] = factory(self)
+        if name == "lineout":
+            window.configure_batch(self._fit_targets, source_root=self._value("project_root"))
+        elif name in {"fit2d", "fit3d"}:
+            window.source_root = window.export_actions.source_root = self._value("project_root")
         window.show()
         window.raise_()
         window.activateWindow()
@@ -2147,13 +2163,50 @@ class RSMPage(QtWidgets.QWidget):
         viewer = self._viewers.get(self._shown_path) if self._shown_path else None
         if viewer is None:
             return
-        for window in self._tool_windows.values():
+        for name, window in self._tool_windows.items():
             if window.isVisible():
                 try:
-                    window.show_result(Path(self._shown_path).name, viewer[1])
+                    if name == "lineout":
+                        window.configure_batch(self._fit_targets, source_root=self._value("project_root"))
+                    elif name in {"fit2d", "fit3d"}:
+                        window.source_root = window.export_actions.source_root = self._value("project_root")
+                    native = name in {"lineout", "fit2d", "fit3d"}
+                    window.show_result(self._shown_path if native else Path(self._shown_path).name,
+                                       viewer[0] if native else viewer[1])
                 except Exception as error:  # the page's own six stay drawn
                     _LOG.exception("RSM tool window presentation failed")
                     self._notice(f"RSM_TOOL_PRESENTATION_FAILED: {error}")
+
+    def _fit_targets(self, selection):
+        """Cheap native lineout descriptors; hydration and metadata reads stay on the fit worker."""
+        from xdart.gui.analysis.snapshot_fit_host import FitTarget
+        from xrd_tools.analysis.fit_snapshot import FitInputKey
+        from xrd_tools.analysis.fit_sources import rsm_lineout_snapshot
+        from xrd_tools.analysis.trend_values import read_trend_values
+        from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+        from xrd_tools.notebooks.inputs import SourceReference
+        paths = self.browser.selected_results() or tuple(self._listed)
+        root = self._value("project_root")
+        generation = self._form_revision
+        selected = dict(selection)
+        targets = []
+        for path in paths:
+            resident = self._results.get(path)
+            def admitted(path=path, resident=resident):
+                return resident if resident is not None else read_analysis_artifact(
+                    path, expected_kind=AnalysisArtifactKind.RSM)
+            def load(path=path, admitted=admitted):
+                payload = admitted()
+                key = FitInputKey(path, path, payload.result_fingerprint, generation, selection=selection)
+                return rsm_lineout_snapshot(payload, key, axis=selected["axis"],
+                                            centre=selected["centre"], width=selected["width"])
+            def trend(column, path=path, admitted=admitted):
+                return read_trend_values(((path, admitted()),), column, source_root=root)[0][1]
+            reference = None if resident is None else SourceReference(
+                path, "rsm_lineout", path, resident.result_fingerprint,
+                resident.inspection.request_fingerprint, selection=selection[:3], original_path=path)
+            targets.append(FitTarget(path, load, trend=trend, reference=reference))
+        return tuple(targets)
 
     def _step_slice(self, instance, index):
         shown = self._viewers.get(self._shown_path) if self._shown_path else None
@@ -2229,7 +2282,9 @@ class RSMPage(QtWidgets.QWidget):
     def active(self):
         return bool(self._owner.busy or self._reading is not None or self._resolving is not None
                     or self._job_form is not None  # a queue between its RSMs
-                    or self._owner.finalization is not RSMOwnerFinalization.NONE or self._authoring_active())
+                    or self._owner.finalization is not RSMOwnerFinalization.NONE or self._authoring_active()
+                    or any(window.active() if hasattr(window, "active") else window.computing
+                           for window in self._tool_windows.values()))
 
     # ── saved settings (File ▸ Save/Load Settings and the last session: the shared owner) ──
     def settings(self):

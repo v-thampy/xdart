@@ -117,7 +117,9 @@ class RSMLineoutWindow(QtWidgets.QDialog):
                          centre=values['centre'], width=values['width']), reference=reference)
 
     def scope(self):
-        return None if self._payload is None else (self._name, self._payload.result_fingerprint, self.selection(), self._generation)
+        return None if self._payload is None else (
+            self._name, self._payload.result_fingerprint, self.selection(), self._generation,
+            tuple(target.label for target in self.batch()))
 
     def batch(self):
         return () if self._batch_provider is None else tuple(self._batch_provider(self.selection()))
