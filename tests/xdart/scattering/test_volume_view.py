@@ -14,7 +14,7 @@ import pytest
 
 pytest.importorskip("pyqtgraph")
 
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.shell_widgets import color_map_choices
 from xdart.gui.tabs.scattering.volume_view import VolumeProjection, VolumeView, opengl_available
@@ -55,6 +55,13 @@ def test_the_volume_is_drawn_through_volume_rgba_under_ints_colour_map_and_log(q
         view.reconcile(projection)
         _settled(view)
         levels = volume_levels(projection.values)
+        assert view.intensity.slider.domain() == view.intensity.values() == levels
+        before = view.rgba
+        QtTest.QTest.mouseClick(view.intensity.label, QtCore.Qt.MouseButton.LeftButton)
+        qapp.processEvents()
+        assert view.intensity._entry_popup.isVisible()
+        assert view.rgba is before and view.intensity.values() == levels
+        view.intensity._entry_popup.close()
         np.testing.assert_array_equal(view.rgba, volume_rgba(projection.values, "Default", False, levels=levels))
         assert view.rgba[0, 0, 0, 3] == 0  # an empty voxel is transparent
         view.set_color_map("magma")
@@ -66,6 +73,7 @@ def test_the_volume_is_drawn_through_volume_rgba_under_ints_colour_map_and_log(q
         np.testing.assert_array_equal(view.rgba,
                                       volume_rgba(projection.values, "magma", True, levels=log_levels))
         assert view.intensity.autoscale.isChecked() and view.title.text() == "a_rsm.nexus"
+        assert view.intensity.slider.domain() == view.intensity.values() == log_levels
     finally:
         view.deleteLater()
         qapp.processEvents()
@@ -171,11 +179,12 @@ def test_log_on_or_off_auto_or_manual_draws_the_bytes_and_levels_of_volume_rgbas
             finite = shown[np.isfinite(shown)]
             auto = volume_levels(shown, log=log)
             assert view.intensity.autoscale.isChecked() and view.intensity.values() == auto, log
-            assert view.intensity.slider.domain() == (float(finite.min()), float(finite.max())), log
+            assert view.intensity.slider.domain() == auto, log
             assert view.rgba.tobytes() == volume_rgba(values, "Default", log, levels=auto).tobytes(), log
             assert view.rgba[0, 0, 0, 3] == view.rgba[3, 4, 5, 3] == 0  # empty voxels are transparent
             manual = (auto[0] + 0.25 * (auto[1] - auto[0]), auto[1] - 0.125 * (auto[1] - auto[0]))
             view.intensity.autoscale.setChecked(False)
+            assert view.intensity.slider.domain() == (float(finite.min()), float(finite.max())), log
             view.intensity._set_window(manual)
             view.intensity.rangeChanged.emit(*manual)
             _settled(view)

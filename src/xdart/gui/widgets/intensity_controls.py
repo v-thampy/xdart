@@ -19,10 +19,9 @@ def _interval(values):
 
 
 class IntensityRangeSlider(QtWidgets.QWidget):
-    """Canonical two-handle horizontal slider, with exact-entry activation."""
+    """Canonical two-handle horizontal slider."""
 
     sigRangeChanged = QtCore.Signal(float, float)
-    sigEditRequested = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -33,7 +32,7 @@ class IntensityRangeSlider(QtWidgets.QWidget):
         self.setMaximumHeight(28)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.setToolTip(
-            "Manual intensity range — drag the handles, or double-click "
+            "Manual intensity range — drag the handles, or click Intensity "
             "to type exact min/max values."
         )
 
@@ -72,7 +71,7 @@ class IntensityRangeSlider(QtWidgets.QWidget):
             self._lo, self._hi = lo, hi
         self.setToolTip(
             f"Intensity: {lo:.8g} to {hi:.8g}\n"
-            "Drag handles or double-click to enter exact minimum and maximum."
+            "Drag handles or click Intensity to enter exact minimum and maximum."
         )
         if changed:
             self.update()
@@ -127,11 +126,6 @@ class IntensityRangeSlider(QtWidgets.QWidget):
     def mouseReleaseEvent(self, event):
         self._drag = None
 
-    def mouseDoubleClickEvent(self, event):
-        if self.isEnabled():
-            self._drag = None
-            self.sigEditRequested.emit()
-
     def _move_handle(self, x):
         value = self._value_for_x(x)
         if self._drag == "lo":
@@ -159,7 +153,11 @@ class IntensityControls(QtWidgets.QFrame):
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(8)
-        layout.addWidget(QtWidgets.QLabel("Intensity", self))
+        self.label = QtWidgets.QLabel("Intensity", self)
+        self.label.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.label.setToolTip("Click to enter exact intensity minimum and maximum.")
+        self.label.installEventFilter(self)
+        layout.addWidget(self.label)
         self.slider = IntensityRangeSlider(self)
         self.slider.setEnabled(False)
         layout.addWidget(self.slider)
@@ -172,8 +170,16 @@ class IntensityControls(QtWidgets.QFrame):
         self._domain = self._current = None
         self._entry_popup = None
         self.slider.sigRangeChanged.connect(self._range_changed)
-        self.slider.sigEditRequested.connect(self._open_entry)
         self.autoscale.toggled.connect(self._auto_toggled)
+
+    def eventFilter(self, watched, event):
+        if (watched is self.label
+                and event.type() == QtCore.QEvent.Type.MouseButtonRelease
+                and event.button() == QtCore.Qt.MouseButton.LeftButton
+                and self.label.rect().contains(event.position().toPoint())):
+            self._open_entry()
+            return True
+        return super().eventFilter(watched, event)
 
     def values(self):
         return self.slider.values()
@@ -196,8 +202,12 @@ class IntensityControls(QtWidgets.QFrame):
             self.slider.setEnabled(False)
             return
         lo, hi = values
+        # Auto shows the active display interval, not the detector/data span.
+        # Manual editing keeps that span and can widen it for absolute limits.
+        domain = values if self.autoscale.isChecked() else (
+            min(self._domain[0], lo), max(self._domain[1], hi))
         self.slider.setDomain(
-            min(self._domain[0], lo), max(self._domain[1], hi),
+            *domain,
             lower=lo, upper=hi, emit=False,
         )
 

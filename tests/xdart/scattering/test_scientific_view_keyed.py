@@ -235,7 +235,7 @@ def _slice_levels(view):
 def test_the_intensity_controls_set_one_level_for_every_keyed_slice_and_autoscale_spans_them(qapp, log_scale):
     """G13 unit 1a (decision 1's toolbar, G7's choice 2 undone): Int's intensity controls, on the keyed layout's
     own row, drive the three slices together as one set of levels. Autoscale spans the slices' own automatic levels
-    (each Int's rule over its finite values) and the controls' range spans their values. Typed or dragged levels
+    (each Int's rule over its finite values) and the auto bar shows those active levels. Typed or dragged levels
     apply to every slice; Autoscale again brings the span back. With Log the levels are in what each pane draws,
     log10, as Int's viewer's are."""
     state = _rsm_state(log_scale=log_scale)
@@ -251,7 +251,7 @@ def test_the_intensity_controls_set_one_level_for_every_keyed_slice_and_autoscal
         assert not controls.isHidden() and controls.autoscale.isChecked() and controls.slider.isEnabled()
         np.testing.assert_allclose(_slice_levels(view), [span] * 3)
         np.testing.assert_allclose(controls.values(), span)
-        np.testing.assert_allclose(controls.slider.domain(), values)
+        np.testing.assert_allclose(controls.slider.domain(), span)
         typed = (0.8, 2.5) if log_scale else (30.0, 600.0)
         controls._open_entry()  # typed, as Int's viewer takes them
         low, high = controls._entry_editors()
@@ -259,6 +259,8 @@ def test_the_intensity_controls_set_one_level_for_every_keyed_slice_and_autoscal
         high.setText(f"{typed[1]:g}")
         controls._apply_entry()
         assert not controls.autoscale.isChecked()
+        np.testing.assert_allclose(controls.slider.domain(),
+                                   (min(values[0], typed[0]), max(values[1], typed[1])))
         np.testing.assert_allclose(_slice_levels(view), [typed] * 3)
         dragged = (1.2, 2.0) if log_scale else (50.0, 900.0)
         controls.slider.setValues(*dragged, emit=True)  # dragged

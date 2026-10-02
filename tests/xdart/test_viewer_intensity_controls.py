@@ -122,13 +122,13 @@ def test_empty_domain_retains_manual_limits_and_reset_is_silent(qapp):
     assert ranges == toggles == []
 
 
-def test_real_double_click_entry_applies_exact_displayed_limits(qapp):
+def test_real_label_click_entry_applies_exact_displayed_limits(qapp):
     control = _control(qapp)
     control.sync((-3, 3), (-1, 1))
     ranges, toggles = [], []
     control.rangeChanged.connect(lambda lo, hi: ranges.append((lo, hi)))
     control.autoToggled.connect(toggles.append)
-    QtTest.QTest.mouseDClick(control.slider, QtCore.Qt.MouseButton.LeftButton)
+    _click(control.findChild(QtWidgets.QLabel), qapp)
     qapp.processEvents()
     popup = control.findChild(QtWidgets.QFrame, "intensityEntryPopup")
     assert popup is not None and popup.isVisible()
@@ -151,7 +151,7 @@ def test_real_double_click_entry_applies_exact_displayed_limits(qapp):
 def test_invalid_numeric_entry_keeps_popup_and_previous_range(qapp, low, high):
     control = _control(qapp)
     control.sync((0, 1000), (100, 500))
-    QtTest.QTest.mouseDClick(control.slider, QtCore.Qt.MouseButton.LeftButton)
+    _click(control.findChild(QtWidgets.QLabel), qapp)
     qapp.processEvents()
     popup = control.findChild(QtWidgets.QFrame, "intensityEntryPopup")
     popup.findChild(QtWidgets.QLineEdit, "intensityMinimum").setText(low)
@@ -162,3 +162,36 @@ def test_invalid_numeric_entry_keeps_popup_and_previous_range(qapp, low, high):
     assert popup.isVisible()
     assert control.autoscale.isChecked()
     assert control.values() == (100, 500)
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_label_entry_opens_without_changing_active_range(qapp, manual):
+    control = _control(qapp)
+    control.sync((0, 4294967295), (100, 500))
+    if manual:
+        _click(control.autoscale, qapp)
+    before = control.values(), control.autoscale.isChecked()
+    ranges, toggles = [], []
+    control.rangeChanged.connect(lambda lo, hi: ranges.append((lo, hi)))
+    control.autoToggled.connect(toggles.append)
+    _click(control.findChild(QtWidgets.QLabel), qapp)
+    popup = control.findChild(QtWidgets.QFrame, "intensityEntryPopup")
+    assert popup is not None and popup.isVisible()
+    assert (control.values(), control.autoscale.isChecked()) == before
+    assert ranges == toggles == []
+    assert tuple(edit.text() for edit in control._entry_editors()) == ("100", "500")
+    popup.close()
+
+
+def test_autoscale_bar_and_tooltip_use_active_limits_not_detector_ceiling(qapp):
+    control = _control(qapp)
+    control.sync((0, 4294967295), (100, 500))
+    assert control.slider.domain() == control.values() == (100, 500)
+    assert "100 to 500" in control.slider.toolTip()
+    assert "4294967295" not in control.slider.toolTip()
+    _click(control.autoscale, qapp)
+    assert control.slider.domain() == (0, 4294967295)
+    control.sync((0, 4294967295), (200, 700))
+    assert control.values() == (100, 500)
+    _click(control.autoscale, qapp)
+    assert control.slider.domain() == control.values() == (200, 700)

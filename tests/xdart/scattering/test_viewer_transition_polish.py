@@ -337,3 +337,24 @@ def test_hdf_manual_color_range_survives_next_frame(viewer_2d):
     controls.autoscale.setChecked(True)
     app.processEvents()
     assert view.raw.image.levels[1] > 150
+
+
+@pytest.mark.parametrize("log_scale", [False, True])
+def test_hdf_auto_intensity_bar_matches_actual_display_levels(viewer_2d, log_scale):
+    page, app, _paths, _values = viewer_2d
+    view = page._shell.scientific
+    view.log_scale.setChecked(log_scale)
+    app.processEvents()
+    controls = view.viewer_intensity
+    active = tuple(view.raw.image.levels)
+    assert controls.autoscale.isChecked()
+    assert controls.values() == controls.slider.domain() == active
+    assert controls.slider.toolTip().startswith(
+        f"Intensity: {active[0]:.8g} to {active[1]:.8g}\n")
+    before = tuple(view.raw.image.levels)
+    QtTest.QTest.mouseClick(controls.label, QtCore.Qt.MouseButton.LeftButton)
+    app.processEvents()
+    assert controls._entry_popup.isVisible()
+    assert tuple(view.raw.image.levels) == before
+    assert controls.values() == active and controls.autoscale.isChecked()
+    controls._entry_popup.close()
