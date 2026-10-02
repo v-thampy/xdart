@@ -346,6 +346,17 @@ class BrowserProfile:
     #: a results list's second pane: the current result's own entries (Stitch's contributing frames), filled
     #: through :meth:`BrowserView.reconcile_result_frames`; choosing one emits ``SELECT_RESULT_FRAME``
     result_frames: bool = False
+    #: the "DATA BROWSER" heading row (a keyed list inside a tool window has none: ``keyed_list_profile``)
+    heading: bool = True
+
+
+def keyed_list_profile(caption: str) -> BrowserProfile:
+    """A plain keyed list (FIT-TOOLS-2026-10, Codex's design review F7: the Phase Fit's CIF rows): a window's own
+    entries under ``caption``, each keyed by its identity (``BrowserResult``), with no menus, heading, frames or
+    actions and none of a scan's or a frame's meaning. The window keeps its collection and reconciles the list from
+    it after each Add or Remove (``reconcile_results``); ``current_result`` is the entry chosen."""
+    return BrowserProfile(menus=(), raw_resolution_menus=False, list_caption=caption, directory=False, frames=False,
+                          actions=(), date_sort=False, refresh=False, results=True, heading=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,6 +690,9 @@ class BrowserView(QtWidgets.QFrame):
         row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("DATA BROWSER")
         title.setObjectName("dataBrowserHeader")
+        self.heading = title
+        if not self.profile.heading:
+            title.hide()
         self.date_sort = QtWidgets.QPushButton("Time")
         self.date_sort.setObjectName("e3BrowserCompactButton")
         self.date_sort.setCheckable(True)
@@ -1447,4 +1461,4 @@ def _command_belongs_to_catalog(
     )
 
 
-__all__ = ["BrowserView"]
+__all__ = ["BrowserProfile", "BrowserResult", "BrowserView", "keyed_list_profile"]
