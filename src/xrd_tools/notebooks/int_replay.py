@@ -87,14 +87,14 @@ def run_int_replay(configuration, *, data_root, output_root, on_progress=None, s
     One sustained source reader feeds the ordinary bounded streaming workers.
     """
     import numpy as np
-    from xrd_tools.integrate.calibration import detector_calibration_to_integrator, detector_calibration_record
+    from xrd_tools.integrate.calibration import detector_calibration_record
     from xrd_tools.io.output_path import generated_artifact_family, resolve_finite_output_target
     from xrd_tools.reduction import CancelToken, NexusSink, ReductionSession, XYESink
     from xrd_tools.reduction.background import background_frame_fact, resolve_background_before_submit, background_resource_terms
     from xrd_tools.session.policy import requirements_from, resolve_session_policy
     from xrd_tools.session.display_logic import xye_prefix_for_unit
     from types import SimpleNamespace
-    from xrd_tools.session.readiness import native_int_reduction_plan
+    from xrd_tools.session.readiness import native_int_reduction_plan, bind_native_int_source_energy
     from xrd_tools.session.scientific_assets import load_scientific_assets
     from xrd_tools.sources import open_source
     from xrd_tools.sources.execution_graph import (qualify_source_execution_graph, graph_saturation,
@@ -148,8 +148,11 @@ def run_int_replay(configuration, *, data_root, output_root, on_progress=None, s
         source = open_source(spec)
         try:
             calibration = assets.detector_calibration
-            integrator = detector_calibration_to_integrator(calibration)
-            scan = source.to_scan(poni=calibration.poni, integrator=integrator)
+            scan = source.to_scan()
+            calibration = bind_native_int_source_energy(scan, calibration,
+                metadata_wavelength_A=None if graph.descriptor is None else graph.descriptor.wavelength,
+                metadata_energy_eV=getattr(source, 'motors', {}).get('energy', ()))
+            integrator = scan.integrator
             scan.gi_config = frozen.gi.scan_config().copy()
             scan.extra = dict(scan.extra or {})
             if calibration.parallax is not None:
@@ -160,7 +163,8 @@ def run_int_replay(configuration, *, data_root, output_root, on_progress=None, s
                 scan.extra['flatfield'] = flat
             if dark is not None:
                 scan.extra['darkcurrent'] = dark
-            plan = replace(native_int_reduction_plan(frozen, companion_modes_2d=True), mask=mask, flat=flat, dark=dark)
+            plan = replace(native_int_reduction_plan(frozen, companion_modes_2d=True,
+                energy_selection=scan.extra['energy_selection']), mask=mask, flat=flat, dark=dark)
             family = generated_artifact_family(original_output.stem if original_output.suffix else scan.name,
                                                grazing_incidence=frozen.gi.enabled)
             directory = destination / relative

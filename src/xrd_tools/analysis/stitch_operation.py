@@ -1427,6 +1427,8 @@ class StitchOperationPlan:
     azimuth_range_1d: tuple[float, float] | None = None
     #: Decision 4's foil choices (``StitchFoilNormalization``); None: the monitor alone, or none.
     foil_normalization: StitchFoilNormalization | None = None
+    #: Frozen base acquisition energy from admitted metadata; the fitted offset stays separate.
+    metadata_energy_eV: float | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1437,6 +1439,12 @@ class StitchOperationPlan:
     def __post_init__(self) -> None:
         if type(self.geometry) is not StitchGeometryReceipt:
             raise TypeError("stitch plan requires an exact geometry receipt")
+        if self.metadata_energy_eV is not None and (
+            not self.native_records or isinstance(self.metadata_energy_eV, bool)
+            or not isinstance(self.metadata_energy_eV, (int, float))
+            or not math.isfinite(self.metadata_energy_eV) or self.metadata_energy_eV <= 0
+        ):
+            raise ValueError('native metadata energy must be finite and positive')
         if self.backend != "multigeometry":
             raise ValueError("S1 supports only the multigeometry backend")
         if self.mode not in {"1d", "2d"}:
@@ -2483,6 +2491,19 @@ def prepare_stitch_operation(
     table = _fresh_table(source) if tables is None else _admitted_tables(source, tables)
     # this preparation's admitted facts (its tables, then its frame facts), never kept past it
     preparation = {"tables": table if type(table) is tuple else (table,)}
+    if type(plan) is StitchOperationPlan and plan.native_records:
+        from xrd_tools.analysis.stitch_native import source_energy_checks, native_energy_selection
+        wavelength, _shape, _orientation = geometry_facts(replace(plan, metadata_energy_eV=None))
+        checks = source_energy_checks(source, wavelength, tables=preparation['tables'],
+                                      allow_calibration_override=True)
+        energies = [value for check in checks for value in (check['range_eV'] or ())]
+        try:
+            selection = native_energy_selection(replace(plan, metadata_energy_eV=None), energies)
+        except ValueError as error:
+            raise StitchOperationRefused('STITCH_SOURCE_ENERGY_CONFLICT', str(error)) from error
+        plan = replace(plan, metadata_energy_eV=(selection['source_energy_eV']
+                                               if selection['source'] == 'metadata' else None))
+        preparation['energy_checks'] = checks
     names = _table_names(table)
     required = _required_stitch_selectors(plan, names)
     tables = table if type(table) is tuple else (table,)
@@ -2686,7 +2707,7 @@ class _OrientedSource(BaseFrameSource):
         return self._source.frame_for(index)
 
 
-def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes):
+def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes, *, metadata_energy_eV=None):
     request = receipt.request
     orientation = ImageOrientation(rotation=request.image_rotation, flip_horizontal=request.image_flip)
     if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
@@ -2713,6 +2734,15 @@ def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes):
                   if "del" in motors else AngleMapping()),
         )
         diffractometer = replace(base, calibration=calibration)
+    if metadata_energy_eV is not None:
+        from xrd_tools.core.energy import resolve_acquisition_energy, calibration_recorded_energy_eV
+        recorded = (calibration_recorded_energy_eV(_json_mapping(raw))
+                    if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON else None)
+        calibration = diffractometer.calibration
+        energy = resolve_acquisition_energy(calibration.poni.wavelength, (metadata_energy_eV,),
+                                            fitted_source_energy_eV=recorded)
+        diffractometer = replace(diffractometer, calibration=replace(calibration,
+            poni=replace(calibration.poni, wavelength=energy['wavelength_m'])))
     return diffractometer, orientation
 
 
@@ -3352,7 +3382,7 @@ class StitchOperationExecution:
             raw = _revalidate_geometry(self.request.plan.geometry)
             records, frame_callback = capture_callback(self.request)
             diffractometer, orientation = _runtime_geometry(
-                self.request.plan.geometry, raw
+                self.request.plan.geometry, raw, metadata_energy_eV=self.request.plan.metadata_energy_eV
             )
             effective_calibration = None
             if (
