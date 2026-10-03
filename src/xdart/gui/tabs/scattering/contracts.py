@@ -16,6 +16,7 @@ from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.point_images import PointImageDetection
 
 from .events import (
     CleanupStatus,
@@ -258,10 +259,12 @@ class AdmissionFailure:
     token: AdmissionToken
     reason: str
     append_refused: bool = False
+    point_images: PointImageDetection | None = None
 
     def __post_init__(self) -> None:
         if (type(self.token) is not AdmissionToken or type(self.reason) is not str
-                or type(self.append_refused) is not bool):
+                or type(self.append_refused) is not bool
+                or (self.point_images is not None and type(self.point_images) is not PointImageDetection)):
             raise TypeError("admission failure values are invalid")
 
 @dataclass(frozen=True, slots=True)

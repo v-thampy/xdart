@@ -165,6 +165,8 @@ class RecordWrite:
     replace_existing: bool = False
     background_dependency_bytes: bytes | None = None
     background_dependency_fingerprint: str | None = None
+    source_constituents: tuple[Mapping[str, Any], ...] = ()
+    point_images: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -242,6 +244,22 @@ class RecordWrite:
                     > _MAX_REPLACEMENT_PATH_UTF8_BYTES):
             raise ValueError("source_path exceeds the persisted path byte ceiling")
         object.__setattr__(self, "source_snapshot", MappingProxyType(snapshot))
+        if self.source_constituents:
+            from xrd_tools.sources.point_images import PointImagePolicy
+            policy = PointImagePolicy.from_dict(self.point_images)
+            normalized = []
+            for member in self.source_constituents:
+                if set(member) != {"source_path", "source_frame_index", "source_snapshot"}:
+                    raise ValueError("point source constituent fields are malformed")
+                validated = RecordWrite(0, source_path=member["source_path"], source_frame_index=member["source_frame_index"], source_snapshot=member["source_snapshot"])
+                normalized.append(MappingProxyType({"source_path": str(validated.source_path), "source_frame_index": validated.source_frame_index, "source_snapshot": validated.source_snapshot}))
+            expected = 1 if policy.operation == "select" else policy.images_per_point
+            if len(normalized) != expected:
+                raise ValueError("point source constituents do not match the policy")
+            object.__setattr__(self, "source_constituents", tuple(normalized))
+            object.__setattr__(self, "point_images", MappingProxyType(policy.to_dict()))
+        elif self.point_images is not None:
+            raise ValueError("point image policy requires exact source constituents")
         if self.thumbnail_mask is not None:
             incoming_mask = np.asarray(self.thumbnail_mask)
             if incoming_mask.dtype != np.dtype(bool):
@@ -322,6 +340,8 @@ class _ExpectedFrameRow:
     source_snapshot: tuple[tuple[str, Any], ...]
     timestamp: str | None
     background_dependency: tuple[bytes, str] | None
+    source_constituents: tuple[Mapping[str, Any], ...] = ()
+    point_images: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +350,8 @@ class _PersistedSourceFact:
     path: str | None
     frame_index: int | None
     snapshot: tuple[tuple[str, Any | None], ...]
+    source_constituents: tuple[Mapping[str, Any], ...] = ()
+    point_images: Mapping[str, Any] | None = None
 
 
 _SOURCE_SNAPSHOT_ATTRIBUTES = (
@@ -365,7 +387,12 @@ def _replacement_json_node(parent, path, role, *, required=True):
     raw = _replacement_utf8_scalar(node, role); value = json.loads(raw)
     (None if raw == json.dumps(value, sort_keys=True, separators=(",", ":")) else (_ for _ in ()).throw(ValueError(f"{role} is noncanonical"))); return value
 def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "entry", rows: Mapping[str, Mapping[int, int]] | None = None, context: tuple[str, Mapping[str, Any] | None, Mapping[str, Any]] | None = None, metadata_keys: tuple[str, ...] = (), include_geometry: bool = False) -> Mapping[str, Any]:
-    label, group = int(label), _replacement_hard_group(handle, entry); frames = _replacement_hard_group(group, "frames"); frame_name = f"frame_{label:04d}"; frame = _replacement_hard_group(frames, frame_name); source = _replacement_hard_group(frame, "source"); path_node = _replacement_hard_group(source, "path", h5py.Dataset); index_node = _replacement_hard_group(source, "frame_index", h5py.Dataset)
+    label, group = int(label), _replacement_hard_group(handle, entry); frames = _replacement_hard_group(group, "frames"); frame_name = f"frame_{label:04d}"; frame = _replacement_hard_group(frames, frame_name); source = _replacement_hard_group(frame, "source")
+    from xrd_tools.io.nexus_record import read_point_source_ref
+    point = read_point_source_ref(source)
+    if point is not None:
+        source = _replacement_hard_group(source, "constituents/0000")
+    path_node = _replacement_hard_group(source, "path", h5py.Dataset); index_node = _replacement_hard_group(source, "frame_index", h5py.Dataset)
     try: source_class = _replacement_utf8_attribute(source, "NX_class", "replacement source class", max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES)
     except (AttributeError, TypeError, ValueError): source_class = None
     if not isinstance(source, h5py.Group) or set(source) != {"path", "frame_index"} or set(source.attrs) - {"NX_class", *(attr for _key, attr in _SOURCE_SNAPSHOT_ATTRIBUTES)} or source_class != "NXcollection" or type(source.get("path", getlink=True)) is not h5py.HardLink or type(source.get("frame_index", getlink=True)) is not h5py.HardLink or not isinstance(path_node, h5py.Dataset) or path_node.shape != () or path_node.maxshape != () or path_node.chunks is not None or path_node.compression is not None or len(path_node.attrs) != 0 or (encoding := h5py.check_string_dtype(path_node.dtype)) is None or encoding.encoding != "utf-8" or not isinstance(index_node, h5py.Dataset) or index_node.shape != () or index_node.maxshape != () or index_node.chunks is not None or index_node.compression is not None or len(index_node.attrs) != 0 or index_node.dtype.kind not in "iu": raise WriterStateError(f"replacement frame {label} has no exact source fact")
@@ -427,8 +454,9 @@ def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "ent
     return MappingProxyType({"label": label, "path": path, "frame_index": index,
         "snapshot": MappingProxyType(snapshot), "source_base": source_base,
         "source_execution": execution, "append_lineage": lineage,
-        "metadata": indexed("scan_data", metadata_keys), "geometry": indexed("per_frame_geometry", ("rot1", "rot2", "rot3", "incident_angle") if include_geometry else ()),
-        "background_dependency": background})
+        "metadata": MappingProxyType({**indexed("scan_data", metadata_keys), **({"point_images": {**point[0], "raw_locators": [{"path": member["source_path"], "frame": member["source_frame_index"]} for member in point[1]]}} if point is not None else {})}), "geometry": indexed("per_frame_geometry", ("rot1", "rot2", "rot3", "incident_angle") if include_geometry else ()),
+        "background_dependency": background,
+        **({"point_images": point[0], "source_constituents": tuple({**member, "source_snapshot": {key: member["source_snapshot"].get(key) for key, _attr in _SOURCE_SNAPSHOT_ATTRIBUTES}} for member in point[1])} if point is not None else {})})
 
 
 @dataclass(frozen=True, slots=True)
@@ -2787,6 +2815,8 @@ class NexusRecordWriter:
             timestamp,
             (None if record.background_dependency_bytes is None else
              (record.background_dependency_bytes, record.background_dependency_fingerprint)),
+            tuple({"source_path": member["source_path"] if self._replacement_configuration is not None else relative_source_path(member["source_path"], self.source_base), "source_frame_index": member["source_frame_index"], "source_snapshot": dict(member["source_snapshot"])} for member in record.source_constituents),
+            record.point_images,
         )
 
     def _remember_frame_row(
@@ -2813,6 +2843,8 @@ class NexusRecordWriter:
     def _source_fact_for_expected_frame(
         expected: _ExpectedFrameRow,
     ) -> _PersistedSourceFact:
+        if expected.source_constituents:
+            return _PersistedSourceFact(True, None, None, (), expected.source_constituents, expected.point_images)
         if expected.source_path is None:
             return _PersistedSourceFact(False, None, None, ())
         supplied = dict(expected.source_snapshot)
@@ -2885,6 +2917,10 @@ class NexusRecordWriter:
             return _PersistedSourceFact(False, None, None, ())
         if not isinstance(source, h5py.Group):
             raise WriterStateError(f"existing frame {label} source is not a group")
+        if "constituents" in source:
+            from xrd_tools.io.nexus_record import read_point_source_ref
+            policy, constituents = read_point_source_ref(source)
+            return _PersistedSourceFact(True, None, None, (), constituents, policy)
         try:
             path_node = (_replacement_hard_group(source, "path", h5py.Dataset) if self._replacement_configuration is not None else source["path"])
             index_node = (_replacement_hard_group(source, "frame_index", h5py.Dataset) if self._replacement_configuration is not None else source["frame_index"])
@@ -3110,7 +3146,7 @@ class NexusRecordWriter:
             digest=evidence.observed_hexdigest(),
         )
 
-    def _expected_frame_children(self, expected: _ExpectedFrameRow) -> set[str]: return {name for name, value in (("thumbnail", expected.thumbnail), ("thumbnail_mask", expected.thumbnail_mask), ("source", expected.source_path), ("timestamp", expected.timestamp), ("background_dependency", expected.background_dependency)) if value is not None}
+    def _expected_frame_children(self, expected: _ExpectedFrameRow) -> set[str]: return {name for name, value in (("thumbnail", expected.thumbnail), ("thumbnail_mask", expected.thumbnail_mask), ("source", expected.source_constituents if expected.source_constituents else expected.source_path), ("timestamp", expected.timestamp), ("background_dependency", expected.background_dependency)) if value is not None}
 
     def _verify_frame_row(self, evidence: _EvidenceBuilder, expected: _ExpectedFrameRow) -> None: self._verify_frame_row_with_children(evidence, expected, self._expected_frame_children(expected))
 
@@ -3183,7 +3219,11 @@ class NexusRecordWriter:
                 expected.thumbnail_mask,
                 np.asarray(mask[()]),
             )
-        if expected.source_path is None:
+        if expected.source_constituents:
+            if observed_source_fact != self._source_fact_for_expected_frame(expected):
+                raise WriterStateError(f"durability readback mismatch for {role}/source/constituents")
+            evidence.text(f"{role}/source/constituents", json.dumps({"point_images": dict(expected.point_images), "constituents": expected.source_constituents}, sort_keys=True), json.dumps({"point_images": dict(observed_source_fact.point_images), "constituents": observed_source_fact.source_constituents}, sort_keys=True))
+        elif expected.source_path is None:
             evidence.absent(f"{role}/source", "source" not in frame)
         else:
             source = frame.get("source")
@@ -5338,6 +5378,8 @@ class NexusRecordWriter:
                             timestamp=record.timestamp,
                             source_base=self.source_base,
                             source_snapshot=record.source_snapshot,
+                            source_constituents=record.source_constituents,
+                            point_images=record.point_images,
                             background_dependency_bytes=record.background_dependency_bytes,
                             background_dependency_fingerprint=record.background_dependency_fingerprint,
                             _prepared_thumbnail=prepared_thumbnails.get(

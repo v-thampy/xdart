@@ -790,7 +790,8 @@ class ScanSession:
         terms = ({name: getattr(descriptor, name) for name in names}
                  if all(background_declared) else {name: 0 for name in names})
         if any(type(value) is not int or value < 0 for value in terms.values()): raise ValueError("source Background resource declarations must be exact nonnegative integers")
-        requirements = requirements_from(descriptor, plan, **terms)
+        requirements = requirements_from(descriptor, plan, **terms,
+            source_auxiliary_bytes=getattr(descriptor, 'source_auxiliary_bytes', 0))
         prior = self._policy
         # A cadence-only SessionPolicy(allocation=None) is NOT explicit.
         explicit = None if prior is None else prior.allocation

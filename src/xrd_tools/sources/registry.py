@@ -196,7 +196,15 @@ def _nexus_open(spec: SourceSpec) -> FrameSource:
         return ProcessedNexusSource(
             spec.uri, entry=spec.entry or "entry",
             source_root=dict(spec.options).get("source_root"))
-    return NexusStackSource(spec.uri, entry=spec.entry or "entry")
+    source = NexusStackSource(spec.uri, entry=spec.entry or "entry")
+    if "point_images" in spec.options:
+        from xrd_tools.sources.point_images import PointImageSource
+        try:
+            return PointImageSource(source, spec)
+        except Exception:
+            source.close()
+            raise
+    return source
 
 
 def _nexus_metadata_provider(path: Path) -> Any:
@@ -567,11 +575,19 @@ def _spec_probe(path: Path) -> Any:
 
 def _spec_open(spec: SourceSpec) -> FrameSource:
     opts = dict(spec.options)
-    return SpecSource(
-        spec.uri, scan=opts.get("scan"), image_dir=opts.get("image_dir"),
-        image_stem=opts.get("image_stem"),
-        require_complete_images=opts.get("require_complete_images", False),
-        read_image_kwargs=opts.get("read_image_kwargs"))
+    from xrd_tools.sources.point_images import PointImagesRequired
+    try:
+        source = SpecSource(
+            spec.uri, scan=opts.get("scan"), image_dir=opts.get("image_dir"),
+            image_stem=opts.get("image_stem"),
+            require_complete_images=opts.get("require_complete_images", False),
+            read_image_kwargs=opts.get("read_image_kwargs"),
+            point_images=opts.get("point_images"))
+    except PointImagesRequired as error:
+        from dataclasses import replace
+        raise PointImagesRequired(replace(error.detection, source_spec=spec)) from error
+    source.spec = spec
+    return source
 
 
 def _live_is_candidate(_path: Path) -> bool:

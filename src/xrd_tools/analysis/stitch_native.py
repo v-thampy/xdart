@@ -405,28 +405,36 @@ def _frame_facts(source, manifest, plan):
         # Member ordinal prevents address collisions without discarding original scan identity.
         scan_label = f"{member_index + 1}-{original_scan}".replace("/", "_")
         for contribution in member.contributions:
-            file = member.files[contribution.file_ordinal]
-            path = Path(manifest.project_root) / file.relative_path
-            cache_key = (str(path), member.source_options_json, member.source_entry)
-            if cache_key not in cache:
-                cache[cache_key] = _snapshot(path, member, orientation.rotation, orientation.flip_horizontal)
-            snapshot, state, file_recorded = cache[cache_key]
-            recorded.add(file_recorded)
-            dtypes.add(snapshot["raw_dtype"])
-            shape = tuple(snapshot["raw_shape"])
-            if orientation.rotation in {90, 270}:
-                shape = shape[::-1]
-            if (state != file.revision or shape != expected_shape
-                    or contribution.source_frame_index >= snapshot["frame_count"]
-                    or math.prod(shape) * 8 > plan.max_frame_bytes):
-                _refuse("RAW_LAYOUT_MISMATCH", "selected raw frame differs from calibration or receipt")
-            records.append({"frame_index": contribution.label, "scan_label": scan_label,
-                "source_path": str(path), "source_frame_index": contribution.source_frame_index,
-                "source_snapshot": dict(snapshot), "identity": {
+            constituents = []
+            for ordinal, raw_index in contribution.constituents or ((contribution.file_ordinal, contribution.source_frame_index),):
+                file = member.files[ordinal]
+                path = Path(manifest.project_root) / file.relative_path
+                cache_key = (str(path), member.source_options_json, member.source_entry)
+                if cache_key not in cache:
+                    cache[cache_key] = _snapshot(path, member, orientation.rotation, orientation.flip_horizontal)
+                snapshot, state, file_recorded = cache[cache_key]
+                recorded.add(file_recorded)
+                dtypes.add(snapshot["raw_dtype"])
+                shape = tuple(snapshot["raw_shape"])
+                if orientation.rotation in {90, 270}:
+                    shape = shape[::-1]
+                if (state != file.revision or shape != expected_shape
+                        or raw_index >= snapshot["frame_count"]
+                        or math.prod(shape) * 8 > plan.max_frame_bytes):
+                    _refuse("RAW_LAYOUT_MISMATCH", "selected raw frame differs from calibration or receipt")
+                constituents.append({"source_path": str(path), "source_frame_index": raw_index,
+                                     "source_snapshot": dict(snapshot)})
+            record = {"frame_index": contribution.label, "scan_label": scan_label, "identity": {
                     "source_id": source_members[member_index].fingerprint,
                     "scan_id": str(original_scan), "frame_index": contribution.label,
                     "contribution_index": len(records),
-                }})
+                }}
+            if contribution.constituents:
+                record.update(source_constituents=constituents,
+                              point_images=json.loads(member.source_options_json)['point_images'])
+            else:
+                record.update(constituents[0])
+            records.append(record)
         if len(recorded) > 1:
             _refuse("STITCH_SATURATION_DIFFERS",
                     f"the files of scan {original_scan} record different detector saturations")
@@ -458,8 +466,9 @@ def native_ceilings(request, frames):
         if value is not None:
             ceilings.append((int(value), "saturation"))
         else:
-            native = {integer_saturation_ceiling(np.empty(0, np.dtype(frame["source_snapshot"]["raw_dtype"])))
-                      for frame in frames[start:start + count]}
+            native = {integer_saturation_ceiling(np.empty(0, np.dtype(raw["source_snapshot"]["raw_dtype"])))
+                      for frame in frames[start:start + count]
+                      for raw in frame.get("source_constituents", (frame,))}
             ceiling = native.pop() if len(native) == 1 else None
             ceilings.append(None if ceiling is None else (int(ceiling), "data type"))
         start += count
@@ -621,7 +630,8 @@ def capture_callback(request):
     records = []
     def capture(label, raw):
         seed = by_label[label]
-        if seed is not seeds[len(records)] or np.asarray(raw).dtype != np.dtype(seed["source_snapshot"]["raw_dtype"]):
+        dtype = np.dtype("float64") if "point_images" in seed else np.dtype(seed["source_snapshot"]["raw_dtype"])
+        if seed is not seeds[len(records)] or np.asarray(raw).dtype != dtype:
             _refuse("RAW_LAYOUT_MISMATCH", "science frame order or native dtype differs from Preview")
         records.append({**seed, "thumbnail": make_thumbnail_array(raw),
                         "mask_baked": False, "thumbnail_mask_baked": False})

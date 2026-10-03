@@ -12,6 +12,7 @@ from xrd_tools.sources.descriptor import describe_container
 from xrd_tools.sources.discover import discover_scans
 from xrd_tools.sources.grouping import parse_stitch_scan_groups
 from xrd_tools.sources.registry import open_source
+from xrd_tools.sources.point_images import PointImagePolicy, PointImagesRequired, inspect_point_images
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,7 @@ class StitchSourceSelection:
     #: ``-term`` = not; case-insensitive substrings of the name without its extension)
     recursive: bool = False
     name_filter: str = ""
+    point_image_choices: tuple[tuple[str, str, PointImagePolicy], ...] = ()
 
     def __post_init__(self):
         if self.kind not in {"Spec", "NeXus", "Directory"} or type(self.paths) is not tuple or not self.paths:
@@ -46,13 +48,21 @@ class StitchSourceSelection:
             compile_filter(self.name_filter)
         except ValueError as error:
             raise ValueError(f"Filter: {error}") from None
+        if (type(self.point_image_choices) is not tuple or any(
+                type(row) is not tuple or len(row) != 3 or type(row[0]) is not str
+                or type(row[1]) is not str or type(row[2]) is not PointImagePolicy
+                for row in self.point_image_choices)):
+            raise ValueError("Point image choices must be exact confirmed source policies")
 
     @property
     def fingerprint_value(self):
         value = (self.kind, self.paths, self.scans, self.stitch_all, self.image_dir, self.image_stem)
         # the Directory options only when set: a selection without them keeps its identity
         return value + (("recursive",) if self.recursive else ()) + (
-            ("filter", self.name_filter) if self.name_filter else ())
+            ("filter", self.name_filter) if self.name_filter else ()) + (
+            ("point_images", tuple((uri, scan, tuple(policy.to_dict().items()))
+                                  for uri, scan, policy in self.point_image_choices))
+            if self.point_image_choices else ())
 
 
 #: Files a Directory's SPEC search never opens: detector images, their notes, containers, results.
@@ -79,6 +89,7 @@ class StitchSourceResolution:
     skipped: tuple[tuple[str, str, str], ...]
     #: each group's members' scan names, as Int names them (``int_scan_name``)
     names: tuple[tuple[str, ...], ...] = ()
+    pending: tuple = ()
 
 
 @functools.lru_cache(maxsize=8)
@@ -159,7 +170,19 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
     """Freeze discovery and skips once at Preview; never rediscover during Run."""
     if type(selection) is not StitchSourceSelection:
         raise TypeError("exact Stitch source selection required")
-    groups, skipped, names = [], [], {}
+    groups, skipped, names, pending = [], [], {}, []
+    choices = {(uri, scan): policy for uri, scan, policy in selection.point_image_choices}
+
+    def confirmed(spec):
+        policy = choices.get((str(spec.uri), str(spec.options.get("scan") or spec.entry or "entry")))
+        detection = (inspect_point_images(spec) if policy is not None or spec.kind is not SourceKind.SPEC else None)
+        if detection is not None and (policy is None or policy.images_per_point != detection.images_per_point):
+            pending.append(detection)
+            return None
+        if policy is not None:
+            from dataclasses import replace
+            spec = replace(spec, options={**spec.options, "point_images": policy.to_dict()})
+        return spec
 
     def spec_member(path, key):
         stem = selection.image_stem.format(spec=path.stem, scan=key.split(".")[0], occurrence=key)
@@ -168,7 +191,14 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             "image_stem": stem or None, "read_image_kwargs": dict(read_image_kwargs),
             "require_complete_images": True,
         })
-        source = open_source(spec)
+        spec = confirmed(spec)
+        if spec is None:
+            return None
+        try:
+            source = open_source(spec)
+        except PointImagesRequired as error:
+            pending.append(error.detection)
+            return None
         try:
             if not source.capabilities.has_raw_references:
                 folder = selection.image_dir or str(path.parent)
@@ -205,7 +235,8 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
         if not entries:
             raise ValueError(f"{path.name} has no NeXus entries")
         # Each file remains one output/group; its exact entries contribute.
-        members = tuple(SourceSpec(path, kind, entry=entry) for entry in entries)
+        members = tuple(value for entry in entries
+                        if (value := confirmed(SourceSpec(path, kind, entry=entry))) is not None)
         names.update(dict.fromkeys(map(id, members), int_scan_name(path)))
         return members
 
@@ -233,5 +264,8 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                     groups.append(nexus_members(path))
     if len(groups) > 4096:
         raise ValueError("Selection exceeds 4096 result groups")
-    return StitchSourceResolution(tuple(groups), tuple(skipped),
-                                  tuple(tuple(names[id(spec)] for spec in group) for group in groups))
+    if pending:
+        # A grouped output never silently loses a member awaiting confirmation.
+        return StitchSourceResolution((), tuple(skipped), (), tuple(pending))
+    return StitchSourceResolution(tuple(group for group in groups if group), tuple(skipped),
+                                  tuple(tuple(names[id(spec)] for spec in group) for group in groups if group))

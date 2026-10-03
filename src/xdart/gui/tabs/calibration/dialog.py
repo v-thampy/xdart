@@ -21,6 +21,8 @@ from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
 from xdart.gui.widgets.read_only_text import ReadOnlyTextPane
 from xdart.gui.tabs.scattering.results_table import ResultsTable
 from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.sources.point_images import PointImagesRequired, PointImageDetection, inspect_point_images
+from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
 from xrd_tools.integrate.calibration_seed import (
     DETECTOR_ORIENTATIONS, detector_choices, detector_shape, ring_summary, rough_arm_record,
 )
@@ -62,7 +64,17 @@ def _staged_progress(publish, stages):
 
 def _run_job(request, cancelled, publish):
     try:
+        kind, arguments = request
+        for spec in arguments:
+            if type(spec) is SourceSpec and kind != 'fit':
+                detection = inspect_point_images(spec)
+                policy = spec.options.get('point_images')
+                if detection is not None and (policy is None or
+                        policy['images_per_point'] != detection.images_per_point):
+                    return detection
         return _dispatch_job(request, cancelled, publish)
+    except PointImagesRequired as error:
+        return error.detection
     except InterruptedError as error:  # the numerical owners' cancellation
         raise OperationCancelled(str(error)) from error
 
@@ -183,9 +195,10 @@ def _dispatch_job(request, cancelled, publish):
         motors = tuple(motor for motor in geometry.stitch_arm() if motor)  # a 2θ arm reads one
         return source_frame_choices(spec, motors), names, geometry.to_record()
     if kind == 'prepare':
-        spec, indices, directory, orientation, arm = arguments
+        spec, indices, directory, orientation, arm, conditioning, saturation = arguments
         return capture_calibration_frames(spec, indices, directory, rotation=orientation.rotation,
-                                           flip=orientation.flip_horizontal, arm=arm, cancelled=cancelled)
+                                           flip=orientation.flip_horizontal, arm=arm, cancelled=cancelled,
+                                           conditioning=conditioning, saturation=saturation)
     if kind == 'calibrate':
         from xdart.gui.tabs.scattering.experiment_authoring import prepare_calibration_request, run_calibration
         from xdart.gui.tabs.scattering.operation_values import OperationIdentity, OperationTerminalStatus as ChildStatus
@@ -998,6 +1011,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         # Above both buttons, as both fits take its options; collapsed (maintainer, 2026-09-30:
         # "Advanced should Move above 'Fit the Calibrated frames'", the energy option inside it).
         self._advanced_card, options = self._card(layout, 'Advanced')
+        self.point_images = PointImagesSettings()
+        options.addRow(self.point_images)
+        self.point_images.changed.connect(lambda: self._source_details())
         from xdart.gui.widgets.controls_panel import RangeRow
         self.threshold_range = RangeRow(label='Threshold',
             low={'path': ('Calibration', 'min'), 'value': 0},
@@ -1668,6 +1684,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             'instrument_geometry': self.geometry_editor.value().to_record(),
             'camera': list(self.camera.value().to_xu()),
             'calibration_threshold': asdict(self._threshold_state),
+            'point_images': self.point_images.document(),
         }
 
     def set_instrument(self, geometry: InstrumentGeometry):
@@ -1678,6 +1695,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         """Restore saved inputs; unknown entries are ignored."""
         if not isinstance(values, dict):
             return
+        if 'point_images' in values:
+            self.point_images.restore(values['point_images'])
         try:
             self.geometry_editor.set_value(InstrumentGeometry.from_record(values.get('instrument_geometry')))
         except (ValueError, TypeError):
@@ -1923,12 +1942,14 @@ class CalibrationDialog(QtWidgets.QDialog):
                        'read_image_kwargs': self._reader()}
             if self._text(prefix + 'stem'):
                 options['image_stem'] = self._text(prefix + 'stem')
-        return SourceSpec(Path(path).resolve(), kind, entry=self._text('beam_entry' if beam else 'entry') or 'entry', options=options)
+        return self.point_images.options(SourceSpec(Path(path).resolve(), kind,
+            entry=self._text('beam_entry' if beam else 'entry') or 'entry', options=options))
 
     def _start(self, kind, arguments):
         if self._owner.busy:
             return
         self._job = kind
+        self._point_request = (kind, arguments)
         if self._calibration_fit_window is not None:
             self._calibration_fit_window.preview_busy(True)
         self._identity = self._owner.begin((kind, arguments))
@@ -1960,8 +1981,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                             if self.selection.item(row, 0).checkState() == QtCore.Qt.CheckState.Checked)
             if self.frames:
                 raise ValueError('this session already has staged frames; open another calibration window for a new selection')
+            conditioning = self._conditioning()
             self._start('prepare', (self._enumerated_spec, indices, self.session_dir, self._orientation(),
-                                   self._enumerated_motors))
+                                   self._enumerated_motors, conditioning,
+                                   self._saturation_value() if conditioning.mode != 'off' else None))
         self._guard(go)
 
     def _selected_frame(self):
@@ -2693,6 +2716,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._guard(go)
 
     def _cancel(self):
+        self.point_images.finish_run()
         if self._identity is not None:
             self._owner.cancel(self._identity)
             self.status.setText('Cancelling; completed rows and saved files are retained.')
@@ -2713,6 +2737,23 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._calibration_fit_window.preview_busy(False)
         if terminal.status is OperationTerminalStatus.RETURNED:
             result = terminal.payload
+            if type(result) is PointImageDetection:
+                if self._close_pending:
+                    self.point_images.finish_run()
+                    self.close()
+                    return
+                if self.point_images.confirm((result,), self):
+                    _, arguments = self._point_request
+                    arguments = tuple(self.point_images.options(value) if type(value) is SourceSpec else value
+                                      for value in arguments)
+                    if kind == 'enumerate':
+                        self._enumerated_spec = arguments[0]
+                    self.point_images.finish_run()
+                    self._start(kind, arguments)
+                else:
+                    self.status.setText('Grouping not confirmed; scan unprocessed')
+                return
+            self.point_images.finish_run()
             try:
                 if kind == 'beam_detect':
                     if self._beam_probe_generation == self._beam_generation:

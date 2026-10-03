@@ -159,6 +159,8 @@ def _source_provenance(reader, frame):
     group = None if entry is None else entry.get(f"frames/frame_{frame:04d}/source")
     if group is None:
         return None, None, None, reader._source_base, None
+    if "constituents" in group:
+        group = group["constituents/0000"]
     locator = str(_decode(group["path"][()])) if "path" in group else None
     index, diagnostic = None, "raw frame identity unavailable"
     if "frame_index" in group:
@@ -220,6 +222,12 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
             if mode != mode_2d and extra.has_2d
         }
         provenance = _source_provenance(reader, frame)
+        from xrd_tools.io.nexus_record import read_point_source_ref
+        import json
+        source_group = None if reader._entry is None else reader._entry.get(f"frames/frame_{frame:04d}/source")
+        point = read_point_source_ref(source_group)
+        execution_node = None if reader._entry is None else reader._entry.get("reduction/config/source_execution")
+        execution = None if execution_node is None else json.loads(_decode(execution_node[()]))
         dataset = None if reader._entry is None else reader._entry.get("instrument/detector/detector_shape")
         try: shape_values = np.asarray(dataset[()]) if dataset is not None else np.asarray(())
         except Exception: shape_values = np.asarray(())
@@ -227,6 +235,9 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
     locator, source_index, dataset_path, source_base, source_error = provenance
     extra = {**view.extra, **({"detector_shape": detector_shape} if detector_shape is not None else {})}
     view = replace(view, source_frame_index=source_index, extra=extra)
+    if point is not None:
+        resolved = resolve_source_master(locator, scan_file=artifact, source_base=source_base, source_root=read_key.source_root)
+        view = replace(view, source_path=str(resolved) if resolved is not None else locator, extra={**extra, "point_images": point[0], "source_constituents": point[1]})
     raw = diagnostic = None
     if read_key.purpose is HydrationPurpose.PREVIEW and view.thumbnail is None:
         diagnostic = "stored thumbnail unavailable"
@@ -250,8 +261,13 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
                 diagnostic = "raw dataset identity unavailable"
             else:
                 try:
-                    source = read_image(resolved, frame=source_index, dataset_path=dataset_path, preserve_dtype=True, exact_frame=True)
-                    raw = _masked_detector(source, detector_projection)
+                    if point is not None:
+                        from xrd_tools.io.read import _point_raw_frame
+                        raw = _point_raw_frame(artifact, point, source_base=source_base, source_root=read_key.source_root, execution=execution, native_transform=lambda native: _masked_detector(native, detector_projection))
+                        raw.setflags(write=False)
+                    else:
+                        source = read_image(resolved, frame=source_index, dataset_path=dataset_path, preserve_dtype=True, exact_frame=True)
+                        raw = _masked_detector(source, detector_projection)
                 except Exception as error:
                     diagnostic = str(error) or type(error).__name__
     fallback = bool(raw is not None and read_key.purpose is HydrationPurpose.PREVIEW and view.thumbnail is None)

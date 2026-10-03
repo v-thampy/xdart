@@ -49,6 +49,7 @@ class ScanRingPoints:
     excluded: tuple[dict, ...]
     calibrant: object
     coverage: dict
+    screening_bypassed_labels: tuple[int, ...] = ()
 
 
 def _row_of(nu_motor, del_motor):
@@ -165,6 +166,27 @@ def _masked(valid, mask):
     return valid
 
 
+def _calibration_pixels(source, index, orientation, conditioning, max_counts):
+    """Value-mask original exposures before a confirmed point operation."""
+    from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+    grouped = getattr(source, 'point_image_policy', None) is not None
+    if grouped:
+        def condition(native):
+            image = condition_stitch_frame(native, conditioning,
+                None if max_counts is None else max_counts + 1)
+            if max_counts is not None:
+                image[np.asarray(native) > max_counts] = np.nan
+            return image
+        image = source.load_point_frame(index, native_transform=condition)
+    else:
+        loader = getattr(source, 'load_native_frame', source.load_frame)
+        image = loader(index)
+        if conditioning is not None and conditioning.mode != 'off':
+            image = condition_stitch_frame(image, conditioning,
+                None if max_counts is None else max_counts + 1)
+    return np.asarray(orientation.apply(image), dtype=np.float64), grouped
+
+
 def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen, cancelled, progress, mask=None,
                         conditioning=None):
     """Frames of the whole scan that the dropped-frame check excludes, before any selection."""
@@ -184,21 +206,18 @@ def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen
                      else np.asarray(integrator.detector.mask, dtype=bool))
     source = open_source(exact)
     try:
-        loader = getattr(source, 'load_native_frame', source.load_frame)
+        policy = getattr(source, 'point_image_policy', None)
+        if policy is not None and policy.operation == 'difference':
+            return []  # signed differences have no positive-count health statistic
         totals = []
         for index in labels:
             if cancelled is not None and cancelled.is_set():
                 raise InterruptedError('automatic refinement cancelled')
-            image = orientation.apply(loader(index))
-            if conditioning is not None and conditioning.mode != 'off':
-                from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
-                image = condition_stitch_frame(image, conditioning,
-                                               None if max_counts is None else max_counts + 1)
-            image = np.asarray(image, dtype=np.float64)
+            image, grouped = _calibration_pixels(source, index, orientation, conditioning, max_counts)
             valid = np.isfinite(image) & (image >= 0)
             if detector_mask is not None and detector_mask.shape == image.shape:
                 valid &= ~detector_mask
-            if max_counts is not None:
+            if max_counts is not None and not grouped:
                 valid &= image <= float(max_counts)
             valid = _masked(valid, mask)
             totals.append(float(image[valid].sum()))
@@ -274,21 +293,19 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     motors = {name: np.array([by_index[i][1][name] for i in selected]) for name in _arm_motors(arm)}
     source = open_source(exact)
     try:
-        loader = getattr(source, 'load_native_frame', source.load_frame)
-
+        policy = getattr(source, 'point_image_policy', None)
+        bypassed = (tuple(int(row[0]) for row in rows)
+                    if policy is not None and policy.operation == 'difference' else ())
         def pixels(index, integrator):
-            image = orientation.apply(loader(index))
-            if conditioning is not None and conditioning.mode != 'off':
-                from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
-                image = condition_stitch_frame(image, conditioning,
-                                               None if max_counts is None else max_counts + 1)
-            image = np.asarray(image, dtype=np.float64)
+            image, grouped = _calibration_pixels(source, index, orientation, conditioning, max_counts)
             if image.shape != tuple(integrator.detector.shape):
                 raise ValueError(f'frame {index}: image shape differs from the calibration detector')
-            valid = np.isfinite(image) & (image >= 0)
+            valid = np.isfinite(image)
+            if not grouped:
+                valid &= image >= 0
             if integrator.detector.mask is not None:
                 valid &= ~np.asarray(integrator.detector.mask, dtype=bool)
-            if max_counts is not None:
+            if max_counts is not None and not grouped:
                 valid &= image <= float(max_counts)
             return image, _masked(valid, mask)
 
@@ -325,7 +342,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
             close()
     if len(controls) < 3:
         raise ValueError('automatic refinement found ring points on fewer than three frames')
-    return ScanRingPoints(tuple(controls), tuple(frames), tuple(excluded), cal, coverage)
+    return ScanRingPoints(tuple(controls), tuple(frames), tuple(excluded), cal, coverage, bypassed)
 
 
 def _held_out(result, controls, calibrant, nu_motor, del_motor):
@@ -495,6 +512,10 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                       'frame_screen': frame_screen.to_provenance(), 'excluded_frames': list(points.excluded),
                       'outlier_threshold_sigma': reject_outliers, 'rejected_points': result.rejected_points,
                       'validation': validation}}
+    if points.screening_bypassed_labels:
+        provenance['automatic_refinement']['frame_screen'].update(
+            positive_total_screening=False,
+            positive_total_screening_bypassed_labels=list(points.screening_bypassed_labels))
     if conditioning is not None and conditioning.mode != 'off':
         provenance['automatic_refinement']['conditioning'] = conditioning.to_dict()
     if instrument_geometry is not None:  # which motor drives which circle, as the guided fit records it

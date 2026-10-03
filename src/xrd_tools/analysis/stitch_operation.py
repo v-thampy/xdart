@@ -726,6 +726,7 @@ class StitchContribution:
     file_ordinal: int
     source_frame_index: int
     values: tuple[tuple[str, int, float], ...]
+    constituents: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -755,6 +756,9 @@ class StitchContribution:
             raise ValueError("Stitch contribution metadata values must be sorted")
         if len({(name, occurrence) for name, occurrence, _value in parsed}) != len(parsed):
             raise ValueError("Stitch contribution metadata values must be unique")
+        if type(self.constituents) is not tuple or any(type(item) is not tuple or len(item) != 2
+            or any(type(value) is not int or value < 0 for value in item) for item in self.constituents):
+            raise TypeError("Stitch constituent locators are invalid")
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -799,6 +803,7 @@ class StitchInputManifestReceipt:
             or len(self.contributions) > _MAX_CONTRIBUTIONS
             or any(type(item) is not StitchContribution for item in self.contributions)
             or any(item.file_ordinal >= len(self.files) for item in self.contributions)
+            or any(ordinal >= len(self.files) for item in self.contributions for ordinal, _index in item.constituents)
             or len({item.label for item in self.contributions})
             != len(self.contributions)
         ):
@@ -853,6 +858,7 @@ class StitchInputManifestReceipt:
                     item.file_ordinal,
                     item.source_frame_index,
                     item.values,
+                    *((item.constituents,) if item.constituents else ()),
                 )
                 for item in self.contributions
             ),
@@ -892,6 +898,8 @@ class StitchInputManifestReceipt:
                         {"name": name, "occurrence": occurrence, "value": value}
                         for name, occurrence, value in item.values
                     ],
+                    **({"constituents": [{"file_ordinal": ordinal, "source_frame_index": index}
+                        for ordinal, index in item.constituents]} if item.constituents else {}),
                 }
                 for item in self.contributions
             ],
@@ -988,7 +996,7 @@ def _project_source_options(analysis, root: Path) -> str:
         )
     options = dict(analysis.source_spec.options)
     if analysis.resolved_kind is SourceKind.SPEC:
-        allowed = {"scan", "image_dir", "image_stem", "read_image_kwargs", "require_complete_images"}
+        allowed = {"scan", "image_dir", "image_stem", "read_image_kwargs", "require_complete_images", "point_images"}
         if (
             analysis.resolved_entry is not None
             or not analysis.resolved_scan
@@ -1136,9 +1144,9 @@ def _project_source_options(analysis, root: Path) -> str:
                 )
             projected["admitted_motor_values"] = tuple(projected_rows)
     elif analysis.resolved_kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
-        if options or not analysis.resolved_entry:
+        if set(options) - {"point_images", "scan_point_count", "scan_point_count_path"} or not analysis.resolved_entry:
             raise StitchOperationRefused("SOURCE_SPEC_UNSUPPORTED", "NeXus requires an exact entry and no reader overrides")
-        projected = {}
+        projected = options
     else:
         raise StitchOperationRefused("SOURCE_KIND_UNSUPPORTED")
 
@@ -1322,11 +1330,17 @@ def _capture_input_manifest(
                     values_list.append(
                         (selector.name, selector.occurrence, value)
                     )
+                constituents = ()
+                if frame.point_statistics_loader is not None:
+                    locators = opened.point_raw_locators(label)
+                    constituents = tuple((file_ordinals[Path(path).expanduser().resolve(strict=True)], index)
+                                         for path, index in locators)
                 contribution = StitchContribution(
                     label,
                     ordinal,
                     frame.source_frame_index,
                     tuple(sorted(values_list)),
+                    constituents,
                 )
                 charge_piece(
                     {
@@ -1334,6 +1348,7 @@ def _capture_input_manifest(
                         "file_ordinal": contribution.file_ordinal,
                         "source_frame_index": contribution.source_frame_index,
                         "values": contribution.values,
+                        **({"constituents": contribution.constituents} if contribution.constituents else {}),
                     }
                 )
                 contributions.append(contribution)
@@ -2652,13 +2667,17 @@ class _SelectedStitchSource(BaseFrameSource):
     def load_frame(self, index): return self._source.load_frame(index)
     def load_native_frame(self, index):
         return getattr(self._source, "load_native_frame", self._source.load_frame)(index)
+    def load_point_frame(self, index, conditioning=None, saturation=None):
+        from xrd_tools.integrate.stitch_conditioning import conditioned_stitch_frame
+        return conditioned_stitch_frame(self._source, index, conditioning, saturation)
     def metadata_for(self, index): return self._source.metadata_for(index)
     def frame_for(self, index): return self._source.frame_for(index)
     @property
     def motors(self):
         rows = [self.metadata_for(index) for index in self.frame_indices]
         keys = set.intersection(*(set(row) for row in rows)) if rows else set()
-        return {key: np.asarray([row[key] for row in rows]) for key in keys}
+        return {key: np.asarray([row[key] for row in rows]) for key in keys
+                if all(not isinstance(row[key], Mapping) for row in rows)}
 
 
 @contextmanager
@@ -2722,6 +2741,13 @@ class _OrientedSource(BaseFrameSource):
     def load_native_frame(self, index: int) -> np.ndarray:
         image = getattr(self._source, "load_native_frame", self._source.load_frame)(index)
         if image.size * 8 > self._max_frame_bytes:
+            raise MemoryError("oriented float64 frame exceeds max_frame_bytes")
+        return self._orientation.apply(image)
+
+    def load_point_frame(self, index, conditioning=None, saturation=None):
+        from xrd_tools.integrate.stitch_conditioning import conditioned_stitch_frame
+        image = conditioned_stitch_frame(self._source, index, conditioning, saturation)
+        if image.nbytes > self._max_frame_bytes:
             raise MemoryError("oriented float64 frame exceeds max_frame_bytes")
         return self._orientation.apply(image)
 
@@ -2833,7 +2859,7 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer, saturation=None) ->
     )
 
 
-def stitch_contributor_raw_preview(payload, raw, frame_index, *, scan=None):
+def stitch_contributor_raw_preview(payload, raw, frame_index, *, scan=None, source_root=None):
     """Apply the saved member's detector-value policy to display pixels only.
 
     Scientific readers retain native values. Thumbnails and legacy artifacts
@@ -2849,15 +2875,21 @@ def stitch_contributor_raw_preview(payload, raw, frame_index, *, scan=None):
     if not saved or saved["mode"] == "off":
         return raw
     policy = StitchConditioning(**saved)
+    row = next(item for item in payload.contributing_frames
+               if item["key"] == frame_record_key(scan, frame_index))
     saturation = None
     if policy.saturation is not None:
-        row = next(item for item in payload.contributing_frames
-                   if item["key"] == frame_record_key(scan, frame_index))
         manifest = provenance["source"]["input_manifest"]
         members = manifest.get("members", (manifest,))
         member_index = next(i for i, item in enumerate(members)
             if item["source"]["module_source_fingerprint"] == row["identity"]["source_id"])
         saturation = policy.saturation[member_index]
+    if 'point_images' in row:
+        from xrd_tools.io.read import _point_raw_frame
+        base = json.loads(payload.inspection.frame_manifest_json)['source_base']
+        return _point_raw_frame(payload.inspection.path, (row['point_images'], row['source_constituents']),
+            source_base=base, source_root=source_root,
+            native_transform=lambda native: condition_stitch_frame(native, policy, saturation))
     return condition_stitch_frame(raw, policy, saturation)
 
 
@@ -2986,9 +3018,26 @@ def read_stitch_contributor_view(payload, frame_index, *, scan=None, source_root
     _wavelength, _shape, orientation = geometry_facts(plan)
     # The shared raw reader applies its persisted rotation. Apply only the remaining camera mirror.
     raw = ImageOrientation(flip_horizontal=orientation.flip_horizontal).apply(view.raw)
-    source = MemoryFrameSource([ScanFrame(0, image=raw, metadata=metadata)])
     recorded = (saved["conditioning"].get("saturation") or [None] * len(members))[member_index]
     saturation = None if recorded is None else {0: recorded}
+    frame = ScanFrame(0, image=raw, metadata=metadata)
+    if 'point_images' in row:
+        from xrd_tools.io.read import _point_raw_frame
+        from xrd_tools.sources.point_images import PointImageResult
+        from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+        frame.metadata = {**metadata, 'point_images': row['point_images']}
+        mirror = ImageOrientation(flip_horizontal=orientation.flip_horizontal)
+        def statistics(index, conditioning=None, saturation=None, *, poisson=False):
+            cancelled()
+            result = _point_raw_frame(payload.inspection.path, (row['point_images'], row['source_constituents']),
+                source_base=base, source_root=source_root, poisson=poisson,
+                native_transform=lambda native: condition_stitch_frame(native, conditioning, saturation))
+            if not poisson:
+                result = PointImageResult(result, None, 0. if row['point_images']['operation'] == 'difference' else 1.)
+            return PointImageResult(mirror.apply(result.signal),
+                None if result.variance is None else mirror.apply(result.variance), result.exposure_multiplier)
+        frame.point_statistics_loader = statistics
+    source = MemoryFrameSource([frame])
     if backend == "multigeometry":
         diff, _orientation = _runtime_geometry(receipt, receipt.content)
         result = run_stitch(_runtime_plan(plan, diff, saturation), source, frame_indices=(0,),
@@ -3009,7 +3058,7 @@ def read_stitch_contributor_view(payload, frame_index, *, scan=None, source_root
     _revalidate_geometry(receipt) if backend == "multigeometry" else revalidate_xu_stitch_calibration(receipt)
     for role in ("mask", "dark", "flat"):
         revalidate_mask(getattr(plan, f"_{role}_receipt")) if role == "mask" else native_detector_image(plan, getattr(plan, f"_{role}_receipt"))
-    preview = stitch_contributor_raw_preview(payload, raw, frame_index, scan=scan)
+    preview = stitch_contributor_raw_preview(payload, raw, frame_index, scan=scan, source_root=source_root)
     return FrameView.from_results(label=frame_index, result_1d=one, result_2d=two, raw=preview,
         metadata_raw=metadata, source_path=view.source_path, source_frame_index=view.source_frame_index,
         extra={"wavelength_m": _wavelength * 1e-10, "saved_screen": row.get("screen"), "saved_excluded": row.get("excluded", False)})
@@ -3097,21 +3146,30 @@ def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...
     return tuple(dict.fromkeys(inputs))
 
 
-def _record_frame_screen(records, verdicts):
+def _record_frame_screen(records, verdicts, summary, source):
     """Stamp each captured frame record with its dropped-frame verdict.
 
     Verdicts join on stream position, which is the record's contribution index;
     grouped sources repeat frame labels across members.
     """
+    bypassed = [verdict.label for verdict in verdicts
+                if source.metadata_for(verdict.label).get("point_images", {}).get("operation") == "difference"]
+    if bypassed:
+        summary["positive_total_screening_bypassed_labels"] = bypassed
+        if len(bypassed) == len(verdicts):
+            summary["positive_total_screening"] = False
     if not records:
         return
     by_position = {verdict.position: verdict for verdict in verdicts}
     if sorted(by_position) != list(range(len(records))):
         raise StitchOperationRefused("FRAME_SCREEN_VERDICT_MISMATCH",
                                      "frame check verdicts differ from the captured frames")
+    bypassed = set(bypassed)
     for record in records:
         verdict = by_position[record["identity"]["contribution_index"]]
         record["screen"], record["excluded"] = verdict.status, verdict.excluded
+        if verdict.label in bypassed:
+            record["positive_total_screening"] = False
 
 
 def _native_artifact_args(request, records):
@@ -3385,7 +3443,7 @@ class StitchOperationExecution:
                     allow_extrapolation=plan.allow_extrapolation,
                 )
                 self._frame_screen = screen.summary()
-                _record_frame_screen(records, screen.verdicts)
+                _record_frame_screen(records, screen.verdicts, self._frame_screen, source)
             revalidate_xu_stitch_calibration(plan.calibration)
             revalidate_mask(plan._mask_receipt)
         except XuStitchCancelled:
@@ -3648,7 +3706,7 @@ class StitchOperationExecution:
                     workers=reduction_worker_cap(workers),
                 )
                 self._frame_screen = screen.summary()
-                _record_frame_screen(records, screen.verdicts)
+                _record_frame_screen(records, screen.verdicts, self._frame_screen, oriented)
             _revalidate_geometry(self.request.plan.geometry)
             revalidate_mask(self.request.plan._mask_receipt)
         except StitchCancelled:

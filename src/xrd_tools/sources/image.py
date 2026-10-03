@@ -119,6 +119,7 @@ class TiffSeriesSource(BaseFrameSource):
         raw_dtype: str = "int32",
         raw_header_skip: int = 0,
         admitted_motor_values: Sequence[tuple[str, str, float]] = (),
+        point_images=None,
     ) -> None:
         self.files = [Path(p) for p in files]
         self.metadata_format = metadata_format
@@ -176,9 +177,28 @@ class TiffSeriesSource(BaseFrameSource):
             int(index): path
             for index, path in zip(range(1, len(self.files) + 1), self.files)
         }
+        self.point_image_policy = None
+        self._point_source = None
+        if point_images is not None:
+            from xrd_tools.io.metadata import _extract_scan_info
+            from xrd_tools.sources.spec import SpecSource
+            from xrd_tools.sources.point_images import PointImagePolicy
+            if not self.files or self.metadata_format not in {"spec", "auto"}:
+                raise ValueError("TIFF point grouping requires recorded SPEC point metadata")
+            observed = read_image_metadata_observed(self.files[0], self.metadata_format, meta_dir=self.meta_dir)
+            _stem, scan_number, _image_number = _extract_scan_info(self.files[0])
+            if observed.source_path is None or scan_number is None:
+                raise ValueError("TIFF point grouping requires recorded SPEC point metadata")
+            self.point_image_policy = PointImagePolicy.from_dict(point_images)
+            self._point_source = SpecSource(observed.source_path, scan=scan_number,
+                image_dir=self.files[0].parent, require_complete_images=True, point_images=point_images,
+                read_image_kwargs={"detector_shape": detector_shape, "detector": detector,
+                    "raw_dtype": raw_dtype, "raw_header_skip": raw_header_skip})
+            if tuple(Path(path) for path, _frame in self._point_source._frame_map) != tuple(self.files):
+                raise ValueError("TIFF point grouping must cover the exact recorded scan image series")
         super().__init__(
             name=name or (self.files[0].stem if self.files else "tiff_series"),
-            frame_indices=range(1, len(self.files) + 1),
+            frame_indices=range(1, (len(self._point_source.frame_indices) if self._point_source is not None else len(self.files)) + 1),
             spec=SourceSpec(str(self.files[0]) if self.files else "", SourceKind.TIFF_SERIES),
             capabilities=SourceCapabilities(
                 supports_random_access=True,
@@ -227,7 +247,41 @@ class TiffSeriesSource(BaseFrameSource):
             raise IndexError(f"frame {index} is not in TIFF series {self.name!r}") from exc
 
     def load_frame(self, index: int) -> np.ndarray:
+        if self._point_source is not None:
+            return self._point_source.load_frame(int(index) - 1)
         return self._read_path(self._path_for(index))
+
+    def point_raw_locators(self, index):
+        if self._point_source is None:
+            return ((self._path_for(index), 0),)
+        return self._point_source.point_raw_locators(int(index) - 1)
+
+    def load_point_statistics(self, index, *args, **kwargs):
+        if self._point_source is None:
+            raise ValueError("TIFF source has no confirmed point grouping")
+        return self._point_source.load_point_statistics(int(index) - 1, *args, **kwargs)
+
+    def load_point_frame(self, index, *args, **kwargs):
+        return self.load_point_statistics(index, *args, **kwargs).signal
+
+    def iter_point_statistics(self, chunk_size, *, poisson=False, native_transform=None,
+                              conditioning=None, saturation=None, cancelled=None):
+        if self._point_source is None:
+            raise ValueError("TIFF source has no confirmed point grouping")
+        if type(chunk_size) is not int or chunk_size <= 0:
+            raise ValueError("point chunk size must be a positive whole count")
+        statistics, labels = [], []
+        for label in self.frame_indices:
+            if cancelled is not None and cancelled():
+                raise InterruptedError("point-image consumption cancelled")
+            statistics.append(self.load_point_statistics(label, conditioning, saturation,
+                poisson=poisson, native_transform=native_transform))
+            labels.append(label)
+            if len(labels) == chunk_size:
+                yield statistics, labels
+                statistics, labels = [], []
+        if labels:
+            yield statistics, labels
 
     def _read_path(self, path: str | Path) -> np.ndarray:
         return np.asarray(read_image(
@@ -242,6 +296,8 @@ class TiffSeriesSource(BaseFrameSource):
     def metadata_for(
         self, index: int, *, max_input_bytes: int | None = None,
     ) -> Mapping[str, Any]:
+        if self._point_source is not None:
+            return self._point_source.metadata_for(int(index) - 1)
         path = self._path_for(index)
         if self.metadata_format is None:
             metadata = {}
@@ -264,6 +320,12 @@ class TiffSeriesSource(BaseFrameSource):
         return metadata
 
     def frame_for(self, index: int) -> ScanFrame:
+        if self._point_source is not None:
+            frame = self._point_source.frame_for(int(index) - 1)
+            frame.index = int(index)
+            frame.loader = lambda current: self.load_frame(current.index)
+            frame.point_statistics_loader = self.load_point_statistics
+            return frame
         path = self._path_for(index)
         return ScanFrame(
             index=int(index),

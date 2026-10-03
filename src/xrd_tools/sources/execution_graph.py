@@ -609,7 +609,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                     if options.get("selection_mode") == "single_image"
                     else image_series_spec(selected, metadata_format=options.get("metadata_format")))
         qualified = dict(expanded.options)
-        for key in ("meta_dir", "detector", "detector_shape", "raw_dtype", "raw_header_skip"):
+        for key in ("meta_dir", "detector", "detector_shape", "raw_dtype", "raw_header_skip", "point_images"):
             if key in options: qualified[key] = options[key]
     else: qualified = options
     files = tuple(str(Path(value).expanduser()) for value in qualified.get("files", ()))
@@ -617,6 +617,19 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     if not files or compact and sum(Path(value) == selected for value in files) != 1:
         raise ValueError("TIFF source enumeration is empty or ambiguous")
     qualified.pop("admitted_motor_values", None)
+    if "point_images" not in qualified:
+        from xrd_tools.sources.point_images import inspect_point_images, PointImagesRequired
+        detection = inspect_point_images(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
+        if detection is not None:
+            raise PointImagesRequired(detection)
+    grouped_source = None
+    if "point_images" in qualified:
+        from xrd_tools.sources import open_source
+        if reader_binding:
+            from xrd_tools.io.metadata import read_image_metadata_observed
+            read_image_metadata_observed(files[0], qualified.get("metadata_format", "auto"),
+                meta_dir=qualified.get("meta_dir"), max_input_bytes=1 << 16)
+        grouped_source = open_source(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
     members: list[SourceFileState] = []; metadata_sources: list[AdmittedMetadataSource] = []
     motor_rows: list[AdmittedMotorValue] = []
     observed_motor_count = 0
@@ -627,7 +640,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     for index, value in enumerate(files):
         _cancelled(cancelled); path = Path(value); before = SourceFileState.capture(path)
         current = None
-        if compact:
+        if compact or grouped_source is not None:
             current = read_detector_image_layout(path,
                 detector_shape=qualified.get("detector_shape"), detector=qualified.get("detector"),
                 raw_dtype=str(qualified.get("raw_dtype", "int32")),
@@ -646,6 +659,10 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         second = (ImageMetadataRead({}, None) if metadata_format is None else
                   read_image_metadata_observed(path, metadata_format, meta_dir=qualified.get("meta_dir"),
                     max_input_bytes=(1 << 16) if reader_binding else None))
+        if grouped_source is not None:
+            point = index // grouped_source.point_image_policy.images_per_point + 1
+            first = ImageMetadataRead(dict(grouped_source.metadata_for(point)), first.source_path)
+            second = ImageMetadataRead(dict(grouped_source.metadata_for(point)), second.source_path)
         _cancelled(cancelled)
         second_state = None if second.source_path is None else SourceFileState.capture(second.source_path)
         _cancelled(cancelled)
@@ -862,6 +879,39 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
         if _drain_qualification(handle, slot):
             continue
         return complete()
+def _qualify_spec(source, *, selected_motor=None, cancelled=None):
+    from xrd_tools.sources import open_source
+    before = SourceFileState.capture(Path(source.uri))
+    opened = open_source(source)
+    files = tuple(path for path, _frame in opened._frame_map)
+    if not files:
+        raise ValueError("Int SPEC source requires recorded detector images")
+    members, rows, metadata, layout = [], [], [], None
+    policy = opened.point_image_policy
+    count = 1 if policy is None else policy.images_per_point
+    for ordinal, path in enumerate(files):
+        _cancelled(cancelled)
+        state = SourceFileState.capture(path)
+        current = read_detector_image_layout(path, **{key: value for key, value in dict(source.options.get("read_image_kwargs") or {}).items() if key in {"detector_shape", "detector", "raw_dtype", "raw_header_skip"}})
+        if current.frame_count != 1 or layout is not None and (current.shape, current.dtype) != (layout.shape, layout.dtype):
+            raise ValueError("Int SPEC native image layouts differ")
+        layout = current
+        members.append(state)
+        metadata.append(AdmittedMetadataSource(state.path, before))
+        if selected_motor is not None:
+            values = _finite_motors(dict(opened.metadata_for(ordinal // count)))
+            if selected_motor not in values:
+                raise ValueError("selected SPEC motor is absent")
+            rows.append(AdmittedMotorValue(state.path, selected_motor, values[selected_motor]))
+        _same(SourceFileState.capture(path), state, "SPEC detector image changed during admission")
+    _same(SourceFileState.capture(Path(source.uri)), before, "SPEC metadata changed during admission")
+    return freeze_source_execution_graph(source, source, source_path=files[0], group_key=opened.name,
+        file=members[0], adapter_id="tiff_series", frame_count=len(members), first_label=0,
+        detector_shape=tuple(layout.shape), native_dtype=layout.dtype,
+        members=tuple(members), admitted_motor_values=tuple(rows), metadata_sources=tuple(metadata),
+        motor_names=tuple(opened.motors), scanned_motor_names=None)
+
+
 def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | None = None,
         reader_binding: str | None = None,
         selected_container: SelectedContainerInput | None = None,
@@ -874,6 +924,10 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
         or source.kind not in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER)
     ):
         raise TypeError("selected container facts require ordinary container qualification")
+    if source.kind is SourceKind.SPEC:
+        if reader_binding is not None:
+            raise ValueError("SPEC source is unavailable to the bounded Average reader")
+        return _qualify_spec(source, selected_motor=selected_motor, cancelled=cancelled)
     if source.kind is SourceKind.TIFF_SERIES:
         return _qualify_tiff(source, selected_motor=selected_motor,
             reader_binding=reader_binding, cancelled=cancelled)
@@ -890,7 +944,10 @@ def requalify_source_execution_graph(source: SourceSpec, expected: PreparedSourc
     if reader_binding != expected.reader_binding or source.kind is not expected.execution_source.kind:
         raise SourceRevisionChanged("source reader binding or kind changed")
     validate_source_aliases(expected.stamp, cancelled=cancelled, check_candidate_owner=reader_binding is None)
-    if source.kind is SourceKind.TIFF_SERIES:
+    if source.kind is SourceKind.SPEC:
+        actual = _qualify_spec(source, selected_motor=selected_motor, cancelled=cancelled)
+        _same(actual, expected, "SPEC source graph changed")
+    elif source.kind is SourceKind.TIFF_SERIES:
         _qualify_tiff(source, selected_motor=selected_motor, reader_binding=reader_binding,
             cancelled=cancelled, expected=expected)
     elif source.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
@@ -904,7 +961,11 @@ def validate_source_execution_graph(value: PreparedSourceExecutionGraph, *,
         raise TypeError("source graph must be exact")
     validate_source_aliases(value.stamp, cancelled=cancelled, check_candidate_owner=value.reader_binding is None)
     source = value.execution_source
-    if source.kind is SourceKind.TIFF_SERIES:
+    if source.kind is SourceKind.SPEC:
+        rows = value.stamp.admitted_motor_values
+        actual = _qualify_spec(source, selected_motor=rows[0].motor if rows else None, cancelled=cancelled)
+        _same(actual, value, "SPEC source graph changed")
+    elif source.kind is SourceKind.TIFF_SERIES:
         rows = value.stamp.admitted_motor_values
         selected_motor = rows[0].motor if rows else None
         _qualify_tiff(source, selected_motor=selected_motor, reader_binding=value.reader_binding,
@@ -926,7 +987,7 @@ def source_snapshots_projection(value: PreparedSourceExecutionGraph, *, writer: 
         for metadata in stamp.metadata_sources:
             state = metadata.metadata_file
             if state is not None:
-                if state.path in snapshots and snapshots[state.path] != state.as_dict():
+                if state.path in snapshots and {key: snapshots[state.path].get(key) for key in state.as_dict()} != state.as_dict():
                     raise ValueError("conflicting source snapshot state")
                 snapshots[state.path] = {"adapter_id": "image_metadata", **state.as_dict(),
                     "frame_count": 0, "self_contained": True,
@@ -1988,10 +2049,10 @@ class _AverageSourceReadWindow:
     def __init__(self, value: PreparedSourceExecutionGraph, *, cancelled=None,
                  direct_chunk_policy=None, prevalidated=False):
         self._graph = value; self._cancelled = cancelled; self._cursor = None
-        self._tiff = None
+        self._tiff = None; self._point_tiff = None
         self._prevalidated = bool(prevalidated)
         self._direct_chunk_policy = direct_chunk_policy
-        self._direct_chunk_state = None; self._direct_iterator = None
+        self._direct_chunk_state = None; self._direct_iterator = None; self._direct_next = 0
         self._terminal_cleanup_error = None
         self._closed = False; self._entered = False
     @property
@@ -2042,23 +2103,29 @@ class _AverageSourceReadWindow:
                     for item in self._graph.stamp.admitted_motor_values
                 ),
             )
+            if "point_images" in options:
+                self._point_tiff = TiffSeriesSource(tuple(item.path for item in self._graph.stamp.members),
+                    metadata_format=options.get("metadata_format"), meta_dir=options.get("meta_dir"),
+                    detector_shape=options.get("detector_shape"), detector=options.get("detector"),
+                    raw_dtype=str(options.get("raw_dtype", "int32")), raw_header_skip=int(options.get("raw_header_skip", 0)),
+                    point_images=options["point_images"])
         self._entered = True
         return self
     def read_native(self, logical_index: int) -> np.ndarray:
         _cancelled(self._cancelled); index = int(logical_index)
         if not 0 <= index < self.extent: raise IndexError(index)
         if self._direct_iterator is not None:
-            try:
-                block = next(self._direct_iterator)
-            except StopIteration as error:
-                _cancelled(self._cancelled)
-                raise RuntimeError(
-                    "Average direct source ended before its admitted extent"
-                ) from error
-            if (block.start, block.stop) != (index, index + 1):
-                raise RuntimeError(
-                    "Average direct source violated exact frame order"
-                )
+            if index < self._direct_next:
+                raise RuntimeError("Average direct source violated exact frame order")
+            while self._direct_next <= index:
+                try:
+                    block = next(self._direct_iterator)
+                except StopIteration as error:
+                    _cancelled(self._cancelled)
+                    raise RuntimeError("Average direct source ended before its admitted extent") from error
+                if (block.start, block.stop) != (self._direct_next, self._direct_next + 1):
+                    raise RuntimeError("Average direct source violated exact frame order")
+                self._direct_next += 1
             array = np.asarray(block.array)
             if array.shape != (1, *self._graph.detector_shape):
                 raise RuntimeError(
@@ -2067,8 +2134,25 @@ class _AverageSourceReadWindow:
             return array[0]
         if self._cursor is not None: return self._cursor.read_frame(index)
         return np.asarray(self._tiff.load_frame(index + 1))
+    def finish_native_group(self, stop):
+        if self._direct_iterator is not None and self._direct_next < stop:
+            self.read_native(stop - 1)
     def complete_metadata_for(self, logical_index: int) -> dict[str, Any]:
         _cancelled(self._cancelled); index = int(logical_index)
+        policy = self._graph.execution_source.options.get("point_images")
+        if policy is not None:
+            k = policy["images_per_point"]
+            if self._point_tiff is not None:
+                return dict(self._point_tiff.metadata_for(index // k + 1))
+            provider = self._cursor.metadata_provider()
+            result = dict(provider.constants())
+            for name, values in provider.scan_table().items():
+                values = np.asarray(values)
+                position = index // k if len(values) == self.extent // k else index // k * k if len(values) == self.extent else None
+                if position is None:
+                    raise ValueError("NeXus counter metadata does not match image or point count")
+                result[name] = values[position].item()
+            return result
         if self._cursor is not None:
             return dict(self._cursor.metadata_provider().complete_metadata_for(index))
         return dict(getattr(self._tiff, "metadata_for")(
@@ -2110,6 +2194,7 @@ class _AverageSourceReadWindow:
                     self, "AVERAGE_SOURCE_CLEANUP_PENDING",
                 )
         self._closed = True
+        self._tiff = self._point_tiff = None
         if self._terminal_cleanup_error is not None:
             error, self._terminal_cleanup_error = (
                 self._terminal_cleanup_error, None,

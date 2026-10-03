@@ -337,10 +337,14 @@ def _light_policy_layout(
             frame.load_image()
         shape, native_dtype = frame.image.shape, frame.image.dtype
     pixels = int(np.prod(shape)); G, R, Bw, Bmap = _background_resource_terms(configuration.background, pixels)
+    if item.source_spec.options.get('point_images') is not None:
+        Bw += 16 * pixels  # logical float64 signal and native Poisson variance
+        native_dtype = np.dtype(np.float64)
     requirements = requirements_from(SimpleNamespace(
         frame_shape=tuple(shape), dtype=np.dtype(native_dtype)), plan,
         background_bytes=G, resolver_background_bytes=R,
-        worker_background_bytes=Bw, background_binding_bytes=Bmap)
+        worker_background_bytes=Bw, background_binding_bytes=Bmap,
+        source_auxiliary_bytes=(8 * pixels if item.source_spec.options.get('point_images') is not None else 0))
     requested = max(1, int(configuration.max_cores))
     requests = {}
     if _direct_eiger_candidate(item, range(item.source_stamp.frame_count)):
@@ -659,6 +663,8 @@ def _science_projection(
         # How a Background and a dark combine; unrecorded before 3b614512.
         **({"background_dark": values["background_dark"]}
            if "background_dark" in values else {}),
+        **({"point_images": values["point_images"]}
+           if "point_images" in values else {}),
     }
 
 
@@ -669,7 +675,7 @@ def _append_intent(
     generation: int,
     science_identity: str,
 ) -> AppendIntent:
-    frame_count = _supported_lineage_frame_count(item.source_stamp)
+    labels = _output_labels(item)
     return AppendIntent(
         entry=item.source_spec.entry or "entry",
         source_base=configuration.project_root or "",
@@ -679,11 +685,21 @@ def _append_intent(
         source=_append_source(
             item.source_stamp, item, generation=generation,
         ),
-        labels=tuple(range(
-            item.source_stamp.first_label,
-            item.source_stamp.first_label + frame_count,
-        )),
+        labels=labels,
     )
+
+
+def _output_labels(item):
+    """Logical point labels; Append's source lineage still covers every native image."""
+    frame_count = _supported_lineage_frame_count(item.source_stamp)
+    policy = item.source_spec.options.get("point_images")
+    if policy is not None:
+        from xrd_tools.sources.point_images import PointImagePolicy
+        size = PointImagePolicy.from_dict(policy).images_per_point
+        if frame_count % size:
+            raise ValueError("confirmed scan points do not divide the native source extent")
+        return tuple(range(item.source_stamp.first_label, item.source_stamp.first_label + frame_count // size))
+    return tuple(range(item.source_stamp.first_label, item.source_stamp.first_label + frame_count))
 
 
 def preview_append_decision(
@@ -1071,7 +1087,7 @@ class DynamicOutputAdapter:
             on_checkpoint_recoverable,
         )
         pipeline_coordinated = all(value is not None for value in mount_values)
-        frame_count = _supported_lineage_frame_count(item.source_stamp)
+        frame_count = len(_output_labels(item))
         science_identity = science_fingerprint(_science_projection(
             self.configuration,
             run_provenance.get("scientific_signature"),
@@ -1088,11 +1104,12 @@ class DynamicOutputAdapter:
         target = Path(item.group.target)
         key = _target_key(target)
         lineage = _stable_lineage(item)
-        labels = tuple(range(
-            item.source_stamp.first_label,
-            item.source_stamp.first_label + frame_count,
-        ))
+        labels = _output_labels(item)
         if tuple(int(frame.index) for frame in scan.frames) != labels:
+            if os.environ.get('XDART_DEBUG_POINT_IMAGES') == '1':
+                logger.error('point_output_admission kind=%s policy=%s native_count=%s expected=%s actual=%s',
+                    item.source_spec.kind.value, item.source_spec.options.get('point_images'),
+                    item.source_stamp.frame_count, labels, tuple(int(frame.index) for frame in scan.frames))
             raise ValueError("dynamic output requires the complete exact Scan")
         graph = self._graphs.get(key)
         if preparation.dormant_noop and graph is not None:

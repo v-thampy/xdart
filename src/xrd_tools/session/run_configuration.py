@@ -1175,6 +1175,10 @@ class FrozenRunConfiguration:
         }
         if self.background.mode != "None":
             values["background"] = self.background.to_mapping()
+        source = self.thaw_source_spec()
+        if type(source) is SourceSpec and "point_images" in source.options:
+            from xrd_tools.sources.point_images import PointImagePolicy
+            values["point_images"] = PointImagePolicy.from_dict(source.options["point_images"]).to_dict()
         if self.flat_file:
             values["flat_file"] = self.flat_file
             if self.flat_min_fraction != DEFAULT_MIN_FLAT_FRACTION:

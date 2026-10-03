@@ -7,6 +7,7 @@ consume unchanged; the GUI never reconstructs scientific authority at dispatch.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field
 from enum import Enum
 import json
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import threading
+from types import MappingProxyType
 
 import numpy as np
 
@@ -62,6 +64,7 @@ from xrd_tools.analysis.scan_operations import (
 from xrd_tools.core.geometry import DetectorHeader, ImageOrientation
 from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
 from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.sources.point_images import PointImagePolicy, PointImagesRequired
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
     AnalysisArtifactOverwrite,
@@ -378,13 +381,16 @@ def rsm_member_groups(
     read_image_kwargs = {"detector_shape": tuple(detector_shape), "raw_dtype": np.dtype(raw_dtype).str,
                          "raw_header_skip": int(raw_header_skip), "threshold": None, "rotation": 0}
     resolution = resolve_stitch_sources(selection, read_image_kwargs)
+    if resolution.pending:
+        raise PointImagesRequired(resolution.pending[0])
     groups, skipped = [], list(resolution.skipped)
     for group in resolution.groups:
         members = []
         for spec in group:
             if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:  # a raw NeXus stack (C5c)
                 members.append(RSMNexusMemberForm(Path(spec.uri), spec.kind, spec.entry or "entry",
-                                                  frame_selector, tuple(detector_shape), motor_selectors))
+                                                  frame_selector, tuple(detector_shape), motor_selectors,
+                                                  point_images=spec.options.get("point_images")))
                 continue
             if spec.kind is not SourceKind.SPEC:
                 reason = "RSM reads SPEC scans and raw NeXus stacks"
@@ -401,7 +407,7 @@ def rsm_member_groups(
                     stem = spec_image_stem(files[0], path.stem, key)
             members.append(RSMScanMemberForm(path, key, spec.options["image_dir"], stem, frame_selector,
                                              tuple(detector_shape), raw_dtype, raw_header_skip,
-                                             motor_selectors))
+                                             motor_selectors, point_images=spec.options.get("point_images")))
         if members:
             groups.append(tuple(members))
     return tuple(groups), tuple(skipped)
@@ -469,6 +475,7 @@ class RSMScanMemberForm:
     raw_dtype: str
     raw_header_skip: int
     motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
+    point_images: Mapping[str, object] | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -513,6 +520,8 @@ class RSMScanMemberForm:
         object.__setattr__(self, "detector_shape", tuple(self.detector_shape))
         object.__setattr__(self, "raw_dtype", dtype.str)
         object.__setattr__(self, "motor_selectors", motors)
+        policy = _rsm_point_image_mapping(self.point_images)
+        object.__setattr__(self, "point_images", policy)
         canonical = (
             spec,
             self.scan,
@@ -530,7 +539,8 @@ class RSMScanMemberForm:
         object.__setattr__(
             self,
             "fingerprint",
-            analysis_canonical_fingerprint("rsm-scan-member-form-v1", canonical),
+            analysis_canonical_fingerprint("rsm-scan-member-form-v1",
+                                           canonical if policy is None else canonical + (dict(policy),)),
         )
 
 
@@ -547,6 +557,7 @@ class RSMNexusMemberForm:
     frame_selector: RSMFrameSelector
     detector_shape: tuple[int, int]
     motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
+    point_images: Mapping[str, object] | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -571,6 +582,8 @@ class RSMNexusMemberForm:
         motors = _rsm_member_motor_selectors(self.motor_selectors)
         object.__setattr__(self, "nexus_path", path)
         object.__setattr__(self, "motor_selectors", motors)
+        policy = _rsm_point_image_mapping(self.point_images)
+        object.__setattr__(self, "point_images", policy)
         canonical = (
             path,
             self.kind.value,
@@ -582,8 +595,14 @@ class RSMNexusMemberForm:
         object.__setattr__(
             self,
             "fingerprint",
-            analysis_canonical_fingerprint("rsm-nexus-member-form-v1", canonical),
+            analysis_canonical_fingerprint("rsm-nexus-member-form-v1",
+                                           canonical if policy is None else canonical + (dict(policy),)),
         )
+
+
+def _rsm_point_image_mapping(value):
+    """A confirmed source policy; missing intent keeps the existing member identity."""
+    return None if value is None else MappingProxyType(PointImagePolicy.from_dict(value).to_dict())
 
 
 @dataclass(frozen=True, slots=True)
@@ -1795,6 +1814,15 @@ def prepare_rsm_tool_v2(
         raise TypeError("RSM v2 preflight requires exact RSMToolFormV2")
     if cancel_token is not None and type(cancel_token) is not threading.Event:
         raise TypeError("RSM v2 preflight cancellation must be threading.Event")
+
+    def member_table(source_spec):
+        try:
+            return run_metadata_table(MetadataTablePlan(source_spec), cancel_token=cancel_token)
+        except PointImagesRequired:
+            raise
+        except ValueError as error:
+            raise RSMToolPreflightRefused("SOURCE_PREFLIGHT_REFUSED", str(error)) from error
+
     try:
         project = Path(form.project_root).resolve(strict=True)
     except OSError as error:
@@ -1848,8 +1876,10 @@ def prepare_rsm_tool_v2(
         )
         if type(member) is RSMNexusMemberForm:  # a raw NeXus stack (AUD-9 stage 2b C5c)
             nexus_relative = _inside_project(member.nexus_path, project, "nexus")
-            source_spec = SourceSpec(project / nexus_relative, member.kind, entry=member.entry)
-            table = run_metadata_table(MetadataTablePlan(source_spec), cancel_token=cancel_token)
+            source_spec = SourceSpec(project / nexus_relative, member.kind, entry=member.entry,
+                                     options={} if member.point_images is None else
+                                     {"point_images": dict(member.point_images)})
+            table = member_table(source_spec)
             if table.disposition is AnalysisDisposition.COMPLETED:
                 missing = _missing_role_in_table(table, member.motor_selectors)
                 if missing is not None:
@@ -1890,6 +1920,7 @@ def prepare_rsm_tool_v2(
             SourceKind.SPEC,
             options={
                 "scan": member.scan,
+                "require_complete_images": True,
                 "image_dir": project / image_relative,
                 "image_stem": member.image_stem,
                 "read_image_kwargs": {
@@ -1902,12 +1933,10 @@ def prepare_rsm_tool_v2(
                 "metadata_column_projection": tuple(
                     (selector.name, selector.occurrence) for selector in selectors
                 ),
+                **({} if member.point_images is None else {"point_images": dict(member.point_images)}),
             },
         )
-        table = run_metadata_table(
-            MetadataTablePlan(source_spec),
-            cancel_token=cancel_token,
-        )
+        table = member_table(source_spec)
         if (
             table.disposition is not AnalysisDisposition.COMPLETED
             and table.code == "METADATA_COLUMN_PROJECTION_INVALID"

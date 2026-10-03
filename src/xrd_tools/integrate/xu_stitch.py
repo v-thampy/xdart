@@ -838,6 +838,7 @@ def _xu_frame_arrays(
     map_edges: tuple[np.ndarray, np.ndarray] | None = None,
     map_unit: str | None = None,
     chi_window: tuple[float, float] | None = None,
+    point_images: bool = False,
 ) -> tuple[dict, list]:
     """One frame's pixels and coordinates for its histograms (``_xu_frame_histograms``): every
     xrayutilities call of the frame, made on the thread its runtime session belongs to, whose lease is
@@ -858,14 +859,32 @@ def _xu_frame_arrays(
     pending: BaseException | None = None
     arrays = None
     try:
-        raw_image = load_stitch_frame(source, label, conditioning)
+        if point_images:
+            point_loader = getattr(source, "load_point_frame", None)
+            if callable(point_loader):
+                raw_image = np.asarray(point_loader(label, conditioning=conditioning, saturation=saturation))
+            else:
+                frame = source.frame_for(label)
+                statistics = frame.point_statistics_loader
+                if not callable(statistics):
+                    raise XuStitchScienceRefused(
+                        "POINT_IMAGE_LOADER_UNAVAILABLE", "grouped frame has no native point loader"
+                    )
+                raw_image = np.asarray(statistics(conditioning=conditioning, saturation=saturation).signal)
+                frame = statistics = None
+            point_loader = None
+        else:
+            raw_image = load_stitch_frame(source, label, conditioning)
         if raw_image.nbytes > max_frame_bytes:
             raise XuStitchScienceRefused(
                 "XU_FRAME_TOO_LARGE", "source frame exceeds max_frame_bytes"
             )
         if frame_record_callback is not None:
             frame_record_callback(label, raw_image)
-        image = condition_stitch_frame(raw_image, conditioning, saturation)
+        # A grouped loader already conditions each native operand. Applying the
+        # threshold to the result would discard legitimate signed differences.
+        image = (np.array(raw_image, dtype=np.float64, order="C", copy=True) if point_images else
+                 condition_stitch_frame(raw_image, conditioning, saturation))
         owned_refs.append(weakref.ref(image))
         raw_image = None
         if (
@@ -952,6 +971,7 @@ def _xu_frame_histograms(
     gi_cuts: tuple | None = None,
     map_edges: tuple[np.ndarray, np.ndarray] | None = None,
     chi_window: tuple[float, float] | None = None,
+    positive_total_screening: bool = True,
 ) -> tuple:
     """One frame's 1-D contributions from its ``_xu_frame_arrays`` (NumPy only: a frame worker's share
     with several workers), emptying ``arrays`` and proving the frame released before it returns.
@@ -1032,7 +1052,10 @@ def _xu_frame_histograms(
             inside = chi = radial = None
         # Whole-frame monitor-normalised total: the dropped-frame statistic. Not
         # the in-range histogram, which legitimately shrinks at the range edges.
-        d_total = float(image[valid].sum())
+        # Difference totals can be negative without a dropped exposure. NaN is
+        # FrameScreen's existing per-label unscreened statistic; other labels
+        # in a mixed source retain their positive-count screening.
+        d_total = float(image[valid].sum()) if positive_total_screening else float("nan")
     except BaseException as error:
         pending = error.with_traceback(None)
     finally:
@@ -1371,6 +1394,8 @@ def run_xu_hist_stitch_1d(
     acquisition = asset["acquisition"]
     validation = asset["validation"]
     frame_inputs: list[tuple[int, float, float, float]] = []
+    point_images: list[bool] = []
+    differences: list[bool] = []
     normals: list[np.ndarray] = []  # GI: each frame's sample normal, from psic's circles
     del_values: list[float] = []
     nu_values: list[float] = []
@@ -1387,6 +1412,10 @@ def run_xu_hist_stitch_1d(
             raise XuStitchScienceRefused(
                 "INVALID_METADATA_VALUE", "frame metadata is not a mapping"
             )
+        point_policy = metadata.get("point_images")
+        grouped = isinstance(point_policy, Mapping)
+        point_images.append(grouped)
+        differences.append(grouped and point_policy.get("operation") == "difference")
         try:
             # None: the circle a single 2θ arm holds at zero
             del_name, nu_name = (acquisition["source_motors"][circle] for circle in ("del", "nu"))
@@ -1546,11 +1575,14 @@ def run_xu_hist_stitch_1d(
         # admitted by Int's owners (corrections.frame_preparation, shared with the pyFAI path and RSM)
         dark, dark_invalid = correction_image(dark, "dark")
         flat, flat_invalid = correction_image(flat, "flat", min_fraction=flat_min_fraction)
-        for name, value, invalid in (("dark", dark, dark_invalid), ("flat", flat, flat_invalid)):
+        for name, value in (("dark", dark), ("flat", flat)):
             if value is not None and value.shape != geometry.projection.shape:
                 raise ValueError(f"Stitch {name} must have the calibrated detector shape")
-            if invalid is not None:
-                mask = invalid if mask is None else np.logical_or(mask, invalid)
+        if flat_invalid is not None:
+            mask = flat_invalid if mask is None else np.logical_or(mask, flat_invalid)
+        mask_without_dark = mask
+        if dark_invalid is not None:
+            mask = dark_invalid if mask is None else np.logical_or(mask, dark_invalid)
         polarization = None
         if polarization_factor is not None:
             polarization = (float(polarization_factor), geometry.projection.runtime_xu_wavelength_A,
@@ -1613,21 +1645,23 @@ def run_xu_hist_stitch_1d(
                 wavelength_A=wavelength_A,
                 conditioning=conditioning,
                 saturation=None if saturation is None else saturation.get(label),
-                mask=mask,
+                mask=mask_without_dark if differences[index] else mask,
                 frame_record_callback=frame_record_callback,
                 polarization=polarization,
-                dark=dark,
+                dark=None if differences[index] else dark,
                 flat=flat,
                 gi_cuts=gi_cuts[index],
                 map_edges=map_edges,
                 map_unit=map_unit,
                 chi_window=azimuth_range_1d,
+                point_images=point_images[index],
             )
 
         def compute(index, arrays, owned_refs):
             """The frame's histograms (NumPy only: a frame worker's share)."""
             return _xu_frame_histograms(arrays, owned_refs, q_edges=q_edges, gi_cuts=gi_cuts[index],
-                                        map_edges=map_edges, chi_window=azimuth_range_1d)
+                                        map_edges=map_edges, chi_window=azimuth_range_1d,
+                                        positive_total_screening=not differences[index])
 
         def merge(histograms):
             """Add one frame's histograms, in frame order (the screen holds a frame until its row

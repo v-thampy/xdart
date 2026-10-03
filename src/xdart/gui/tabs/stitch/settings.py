@@ -19,7 +19,7 @@ from xdart.gui.tools.page_settings import (
 )
 
 #: The document's kind and version, its key in the session file, and its own object section.
-STITCH_SETTINGS = SettingsKind("xdart-stitch-settings", 1, "stitch_settings", "Stitch", sections=("gi",))
+STITCH_SETTINGS = SettingsKind("xdart-stitch-settings", 1, "stitch_settings", "Stitch", sections=("gi", "point_images"))
 SETTINGS_KIND = STITCH_SETTINGS.kind
 SETTINGS_VERSION = STITCH_SETTINGS.version
 #: Where the last session's settings live in the session file.
@@ -38,6 +38,7 @@ def page_settings(page) -> dict[str, Any]:
         page, (key for key in page._fields if key not in _DERIVED),
         # grazing incidence as Int sets it (its axis and ranges are fields above)
         gi=dict(page._gi),
+        point_images=page.point_images.document(),
         # Append skips an output already stitched with these settings; "Overwrite" is Replace
         write_mode=page.run_bar.write_mode(),
         # Stitch 1D or Stitch 2D
@@ -56,6 +57,8 @@ load_settings = STITCH_SETTINGS.load
 def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
     document = validate_settings(document)
+    if "point_images" in document:
+        page.point_images.restore(document["point_images"])
     fields = saved_fields(page, document, _DERIVED)
     for key in _FIRST:
         if key in fields:

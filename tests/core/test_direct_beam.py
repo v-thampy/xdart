@@ -656,3 +656,124 @@ def test_the_zero_angle_beam_pixel_is_the_fits_intercept_not_the_strip_locator(m
     linear = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(shape, pitches),
                                    beam_pixel=None, angle_zero_deg=7., motion=motion, model='linear')
     assert linear.zero_beam_pixel == pytest.approx(origin, abs=.2)
+
+
+def _grouped_beam_source(tmp_path, operation, *, damage=None, image_index=2):
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.sources.point_images import PointImagePolicy
+    from xrd_tools.sources.registry import open_source
+
+    angles = np.array([8., 7.5, 7., 6.5, 6.])
+    images, centres, beam = beam_images(angles)
+    raw = []
+    for image in images:
+        first = image.astype(np.uint16)
+        second = (2 * image).astype(np.uint16)
+        if damage == 'signed':
+            first = np.full(image.shape, 1200, dtype=np.uint16)
+            second = (1200 + image - 50).astype(np.uint16)
+        raw.extend((first, second))
+    if damage in {'cutoff', 'dtype', 'unused'}:
+        raw[2][22, 20] = np.iinfo(np.uint16).max if damage == 'dtype' else 9000
+    path = tmp_path / 'beam'
+    path.write_text('#F beam\n#O0 del\n\n#S 1 ascan del 8 6 4 1\n#P0 7\n#N 1\n#L del\n'
+                    + '\n'.join(str(angle) for angle in angles) + '\n')
+    for index, image in enumerate(raw):
+        image.tofile(tmp_path / f'beam_scan1_{index:04}.raw')
+    policy = PointImagePolicy(2, operation, image_index=image_index)
+    source = open_source(SourceSpec(path, SourceKind.SPEC, options={
+        'scan': '1.1', 'image_dir': str(tmp_path), 'require_complete_images': True,
+        'point_images': policy.to_dict(),
+        'read_image_kwargs': {'detector_shape': (45, 161), 'raw_dtype': 'uint16'}}))
+    options = dict(detector='Detector', detector_config=config(), beam_pixel=beam, angle_zero_deg=7.)
+    return source, angles, centres, options
+
+
+@pytest.mark.parametrize('damage,saturation', [('cutoff', 9000), ('dtype', None)])
+def test_grouped_direct_beam_rejects_native_saturation_hidden_by_average(tmp_path, damage, saturation):
+    source, angles, centres, options = _grouped_beam_source(tmp_path, 'average', damage=damage)
+    try:
+        result = calibrate_direct_beam_scan(source, saturation=saturation, **options)
+        np.testing.assert_array_equal(result.used, [True, False, True, True, True])
+        assert 'saturated pixels in beam strip/ROI' in result.rejection_reasons[1]
+        assert result.distance_m == pytest.approx(.08, rel=2e-4)
+        np.testing.assert_array_equal(result.angles_deg, angles)
+        np.testing.assert_allclose(result.centres_px[result.used], centres[result.used], atol=.002)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+@pytest.mark.parametrize('operation', ['average', 'select', 'difference'])
+def test_grouped_direct_beam_clean_points_preserve_gaussian_fit(tmp_path, operation):
+    source, angles, centres, options = _grouped_beam_source(tmp_path, operation)
+    try:
+        result = calibrate_direct_beam_scan(source, **options)
+        assert result.used.all()
+        assert result.distance_m == pytest.approx(.08, rel=2e-4)
+        np.testing.assert_allclose(result.centres_px, centres, atol=.002)
+        np.testing.assert_array_equal(result.angles_deg, angles)
+        assert result.point_ids == tuple((source.path, label) for label in source.frame_indices)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+def test_grouped_direct_beam_select_ignores_unused_native_saturation(tmp_path):
+    source, _angles, centres, options = _grouped_beam_source(tmp_path, 'select', damage='unused')
+    try:
+        result = calibrate_direct_beam_scan(source, saturation=9000, **options)
+        assert result.used.all()
+        np.testing.assert_allclose(result.centres_px, centres, atol=.002)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+@pytest.mark.parametrize('exclusion', ['mask', 'roi', 'strip'])
+def test_grouped_direct_beam_native_saturation_respects_static_strip_and_roi(tmp_path, exclusion):
+    source, _angles, centres, options = _grouped_beam_source(tmp_path, 'average', damage='cutoff')
+    if exclusion == 'mask':
+        mask = np.zeros((45, 161), dtype=bool)
+        mask[22, 20] = True
+        options['mask'] = mask
+    elif exclusion == 'roi':
+        options['roi'] = (45, 19, 116, 26)
+    else:
+        # The same used native value, outside the fitted horizontal strip.
+        raw_path = tmp_path / 'beam_scan1_0002.raw'
+        image = np.fromfile(raw_path, dtype=np.uint16).reshape(45, 161)
+        image[22, 20], image[5, 20] = image[5, 20], image[22, 20]
+        image.tofile(raw_path)
+    try:
+        result = calibrate_direct_beam_scan(source, saturation=9000, **options)
+        assert result.used.all()
+        np.testing.assert_allclose(result.centres_px, centres, atol=.002)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+def test_grouped_direct_beam_difference_keeps_signed_background_and_positive_peak(tmp_path):
+    source, _angles, centres, options = _grouped_beam_source(tmp_path, 'difference', damage='signed')
+    try:
+        assert (source.load_frame(0) < 0).any()
+        result = calibrate_direct_beam_scan(source, **options)
+        assert result.used.all()
+        assert result.distance_m == pytest.approx(.08, rel=2e-4)
+        np.testing.assert_allclose(result.centres_px, centres, atol=.002)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+def test_grouped_direct_beam_motion_skips_native_saturated_endpoint(tmp_path):
+    from xrd_tools.integrate.direct_beam import infer_direct_beam_motion, open_direct_beam_scan
+
+    source, _angles, _centres, options = _grouped_beam_source(tmp_path, 'average', damage='cutoff')
+    try:
+        with open_direct_beam_scan(source, frame_indices=(1, 2, 3, 4)) as scan:
+            images = list(scan.images)
+            motion, displacement, endpoints = infer_direct_beam_motion(images,
+                detector=options['detector'], detector_config=options['detector_config'],
+                saturation=9000, return_details=True)
+        assert motion == 'horizontal'
+        assert displacement[0] > 0
+        assert endpoints == (1, 3)
+    finally:
+        getattr(source, 'close', lambda: None)()
