@@ -15,9 +15,12 @@ from xrd_tools.analysis.scan_operations import (
     run_metadata_table_requalification,
 )
 from xrd_tools.io.spec import (
+    get_angles,
+    get_from_spec_file,
     get_spec_scanned_axes,
     is_spec_file,
     read_spec_scan_columns,
+    read_spec_scan_table,
 )
 from xrd_tools.sources import (SourceKind, SpecSource, guess_source_kind,
                                open_source)
@@ -50,6 +53,74 @@ def _spec(tmp_path):
     p = tmp_path / "myscan"          # extensionless — the SSRL convention
     p.write_text(_SPEC)
     return p
+
+
+@pytest.mark.parametrize("token", ["np.float64(1.0)", "1.0junk", "1D0", "NaN"])
+def test_spec_refuses_complete_invalid_numeric_token_in_every_data_consumer(
+    tmp_path, token,
+):
+    path = tmp_path / "myscan"
+    text = _SPEC.replace("1 2 110 20", f"{token} 2 110 20")
+    path.write_text(text)
+    physical_row = text.splitlines().index(f"{token} 2 110 20") + 1
+    readers = (
+        lambda: read_spec_scan_columns(path, "5.1"),
+        lambda: read_spec_scan_table(path, "5.1"),
+        lambda: SpecSource(path, scan=5),
+        lambda: get_from_spec_file(path, "5.1", ["th", "chi"]),
+        lambda: get_angles(path, "5.1", ["th", "chi"]),
+    )
+    for read in readers:
+        with pytest.raises(ValueError) as error:
+            read()
+        message = str(error.value)
+        assert str(path) in message and "scan 5.1" in message
+        assert f"physical row {physical_row}" in message
+        assert "column 1 ('th')" in message and repr(token) in message
+
+
+@pytest.mark.parametrize("row", [
+    "1 2 110", "1 2 110 20 99", "1 2 110 20 #C note", "1 2 \\\n110 20",
+])
+def test_spec_refuses_incomplete_physical_data_rows(tmp_path, row):
+    path = tmp_path / "myscan"
+    path.write_text(_SPEC.replace("1 2 110 20", row))
+    with pytest.raises(ValueError, match=r"scan 5\.1.*physical row.*column"):
+        SpecSource(path, scan=5)
+
+
+def test_spec_numeric_values_comments_and_mca_continuations_reach_consumers(
+    tmp_path,
+):
+    path = tmp_path / "myscan"
+    path.write_text(_SPEC.replace(
+        "1 2 110 20",
+        "#C note\n+1.0e0 2E+0 1.10e2 +.2E2\n@A 1 2 \\\n3 4",
+    ))
+    columns, motors, npts = read_spec_scan_table(path, "5.1")
+    assert npts == 3 and motors == {"th": 0.0, "chi": 5.0, "phi": 10.0}
+    for name, expected in {"th": [0, 1, 2], "Epoch": [1, 2, 3],
+                           "i0": [100, 110, 120], "det": [10, 20, 30]}.items():
+        np.testing.assert_array_equal(columns[name], expected)
+    source = SpecSource(path, scan=5)
+    assert source.metadata_for(1)["th"] == 1.0
+    selected = get_from_spec_file(path, "5.1", ["th", "chi", "absent"])
+    assert set(selected) == {"th", "chi"}
+    np.testing.assert_array_equal(selected["th"], [0, 1, 2])
+    np.testing.assert_array_equal(selected["chi"], [5, 5, 5])
+    assert get_angles(path, "5.1", ["th", "chi"]) == [[0, 1, 2], [5, 5, 5]]
+
+
+def test_spec_numeric_validation_only_reads_selected_scan_occurrence(tmp_path):
+    path = tmp_path / "myscan"
+    first = _SPEC.split("#S 6", 1)[0]
+    path.write_text(first.replace("1 2 110 20", "np.float64(1.0) 2 110 20") + first)
+    source = SpecSource(path, scan="5.2")
+    assert source.scan_key == "5.2"
+    np.testing.assert_array_equal(source.motor_series("th"), [0, 1, 2])
+    assert get_angles(path, "5.2", ["th", "phi"]) == [[0, 1, 2], [10, 10, 10]]
+    with pytest.raises(ValueError, match=r"scan 5\.1"):
+        read_spec_scan_columns(path, "5.1")
 
 
 def test_spec_detected_by_content_not_extension(tmp_path):
@@ -202,6 +273,10 @@ def test_spec_occurrence_projection_preserves_duplicate_columns_and_fixed_motors
     np.testing.assert_allclose(physical[1][1], [1, 2])
     np.testing.assert_allclose(physical[2][1], [10, 20])
     assert fixed == (("eta", 0.0), ("chi", 5.0), ("mu", 6.0))
+    np.testing.assert_array_equal(
+        get_from_spec_file(path, "1.1", ["Seconds"])["Seconds"], [1, 2],
+    )
+    assert get_angles(path, "1.1", ["Seconds", "chi"]) == [[1, 2], [5, 5]]
 
     source = SpecSource(path, scan=1)
     occurrence_names = [
