@@ -165,6 +165,10 @@ class ScanFrame:
     #: The factor ``background`` was scaled by; with a dark, the reducer removes the
     #: background's own dark (scale · dark). None: the background carries no dark.
     background_scale: float | None = None
+    #: Grouped sources decode native operands under the consumer's value policy.
+    point_statistics_loader: Callable[..., Any] | None = None
+    point_variance: np.ndarray | None = None
+    point_exposure_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
         self.metadata = dict(self.metadata or {})
