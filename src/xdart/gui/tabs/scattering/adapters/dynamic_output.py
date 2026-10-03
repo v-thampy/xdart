@@ -1102,6 +1102,10 @@ class DynamicOutputAdapter:
         lineage = _stable_lineage(item)
         labels = _output_labels(item)
         if tuple(int(frame.index) for frame in scan.frames) != labels:
+            if os.environ.get('XDART_DEBUG_POINT_IMAGES') == '1':
+                logger.error('point_output_admission kind=%s policy=%s native_count=%s expected=%s actual=%s',
+                    item.source_spec.kind.value, item.source_spec.options.get('point_images'),
+                    item.source_stamp.frame_count, labels, tuple(int(frame.index) for frame in scan.frames))
             raise ValueError("dynamic output requires the complete exact Scan")
         graph = self._graphs.get(key)
         if preparation.dormant_noop and graph is not None:
