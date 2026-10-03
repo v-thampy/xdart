@@ -337,10 +337,14 @@ def _light_policy_layout(
             frame.load_image()
         shape, native_dtype = frame.image.shape, frame.image.dtype
     pixels = int(np.prod(shape)); G, R, Bw, Bmap = _background_resource_terms(configuration.background, pixels)
+    if item.source_spec.options.get('point_images') is not None:
+        Bw += 16 * pixels  # logical float64 signal and native Poisson variance
+        native_dtype = np.dtype(np.float64)
     requirements = requirements_from(SimpleNamespace(
         frame_shape=tuple(shape), dtype=np.dtype(native_dtype)), plan,
         background_bytes=G, resolver_background_bytes=R,
-        worker_background_bytes=Bw, background_binding_bytes=Bmap)
+        worker_background_bytes=Bw, background_binding_bytes=Bmap,
+        source_auxiliary_bytes=(8 * pixels if item.source_spec.options.get('point_images') is not None else 0))
     requested = max(1, int(configuration.max_cores))
     requests = {}
     if _direct_eiger_candidate(item, range(item.source_stamp.frame_count)):
@@ -694,7 +698,7 @@ def _output_labels(item):
         size = PointImagePolicy.from_dict(policy).images_per_point
         if frame_count % size:
             raise ValueError("confirmed scan points do not divide the native source extent")
-        return tuple(range(frame_count // size))
+        return tuple(range(item.source_stamp.first_label, item.source_stamp.first_label + frame_count // size))
     return tuple(range(item.source_stamp.first_label, item.source_stamp.first_label + frame_count))
 
 

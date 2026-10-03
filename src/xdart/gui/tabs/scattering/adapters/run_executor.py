@@ -40,6 +40,7 @@ from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources import open_source
 from xrd_tools.sources.cursor import open_container_cursor
 from xrd_tools.sources.nexus import NexusStackSource
+from xrd_tools.sources.point_images import PointImageSource
 from xrd_tools.sources.probe import ProbeState
 from ..contracts import (
     AdmittedOutput, AdmissionFailure, AdmissionReceipt, AdmissionReleased,
@@ -115,8 +116,7 @@ def _qualify_background_bindings(configuration, scan, item, decision, policy,
     shape = requirements.height, requirements.width
     selector = None if item.descriptor is None else item.descriptor.dataset_path
     if not prior and configuration.output_mode == "Append":
-        labels = tuple(range(item.source_stamp.first_label,
-            item.source_stamp.first_label + item.source_stamp.frame_count))
+        labels = tuple(int(frame.index) for frame in scan.frames)
         skipped = tuple(label for label in labels if label not in decision.labels)
         if skipped:
             from xrd_tools.io.record_writer import _read_persisted_background_bindings
@@ -410,6 +410,7 @@ class _StandardRun:
     capture: SourceCapture | None = None
     sink: Any | None = None
     output: DynamicOutputAdapter | None = None
+    point_plan: Any | None = None
     worker: Thread | None = None
     stop_requested: bool = False
     stop_signal: Event = field(default_factory=Event)
@@ -1389,6 +1390,8 @@ class StandardRunExecutor:
                 cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
                 try:
                     run.source = NexusStackSource(item.source_path, entry=item.source_spec.entry or 'entry', cursor=cursor)
+                    if source_spec.options.get('point_images') is not None:
+                        run.source = PointImageSource(run.source, source_spec)
                 except Exception:
                     cursor.close()
                     raise
@@ -1462,9 +1465,7 @@ class StandardRunExecutor:
             raise
         run.scan.gi_config = configuration.gi.scan_config().copy()
         run.current_total = (
-            item.source_stamp.frame_count
-            if item is not None
-            else len(run.scan.frames)
+            len(run.scan.frames)
         )
         for key, name in (("flat", "flat field"), ("dark", "dark")):
             if getattr(configuration, f"{key}_file", "") and (
@@ -1477,6 +1478,7 @@ class StandardRunExecutor:
             flat=None if assets is None else assets.flat,
             dark=None if assets is None else assets.dark,
         )
+        run.point_plan = plan if isinstance(run.source, PointImageSource) else None
         try:
             npt = int(configuration.bai_1d_args.get("npt", 0))
         except (TypeError, ValueError):
@@ -2242,7 +2244,7 @@ class StandardRunExecutor:
         }
         with _run_effect(run):
             session.start()
-        if isinstance(run.source, NexusStackSource) and write_labels:
+        if isinstance(run.source, (NexusStackSource, PointImageSource)) and write_labels:
             self._submit_container_source(run, output)
         else:
             for frame in scan.frames:
@@ -2381,7 +2383,7 @@ class StandardRunExecutor:
         queue; no h5py object crosses threads.
         """
         source = run.source
-        if not isinstance(source, NexusStackSource):
+        if not isinstance(source, (NexusStackSource, PointImageSource)):
             raise TypeError("container submission requires NexusStackSource")
 
         def publish_direct_fact() -> None:
@@ -2482,17 +2484,24 @@ class StandardRunExecutor:
                     continue
             return False
 
-        vnext_chunks = getattr(source, "_iter_vnext_chunks", None)
-        public_chunks = source.iter_chunks
-        canonical = getattr(type(source), "_canonical_iter_chunks", None)
         cancelled = lambda: (run.stop_requested or run.stop_signal.is_set()
                              or not accepting.is_set())
-        chunks = iter(
-            vnext_chunks(_CONTAINER_READ_CHUNK_FRAMES, cancelled)
-            if (callable(vnext_chunks)
-                and getattr(public_chunks, "__func__", None) is canonical)
-            else public_chunks(_CONTAINER_READ_CHUNK_FRAMES)
-        )
+        grouped = isinstance(source, PointImageSource)
+        if grouped:
+            from xrd_tools.reduction.core import _condition_point_operand, _wants_poisson
+            plan = run.point_plan
+            if plan is None:
+                raise RuntimeError('grouped container lost its frozen reduction plan')
+            chunks = iter(source.iter_point_statistics(1,
+                poisson=_wants_poisson(plan), native_transform=lambda native: _condition_point_operand(native, plan),
+                cancelled=cancelled))
+        else:
+            vnext_chunks = getattr(source, "_iter_vnext_chunks", None)
+            public_chunks = source.iter_chunks
+            canonical = getattr(type(source), "_canonical_iter_chunks", None)
+            chunks = iter(vnext_chunks(_CONTAINER_READ_CHUNK_FRAMES, cancelled)
+                if (callable(vnext_chunks) and getattr(public_chunks, "__func__", None) is canonical)
+                else public_chunks(_CONTAINER_READ_CHUNK_FRAMES))
         producer_error: BaseException | None = None
         try:
             while accepting.is_set() and not run.stop_requested:
@@ -2511,7 +2520,15 @@ class StandardRunExecutor:
                     frame = run.frames_by_label.get(int(label))
                     if frame is None:
                         continue
-                    if not enqueue((frame, np.asarray(block[offset]))):
+                    if grouped:
+                        statistics = block[offset]
+                        frame.point_statistics_loader = None
+                        frame.point_variance = statistics.variance
+                        frame.point_exposure_multiplier = statistics.exposure_multiplier
+                        image = statistics.signal
+                    else:
+                        image = np.asarray(block[offset])
+                    if not enqueue((frame, image)):
                         break
         except BaseException as error:
             producer_error = error
@@ -2837,6 +2854,7 @@ class StandardRunExecutor:
             if cleaned:
                 run.closed = True
                 run.configuration = None
+                run.point_plan = None
                 run.capture = None
                 run.scan = None
                 run.records = None

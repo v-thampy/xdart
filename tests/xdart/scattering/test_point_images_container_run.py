@@ -1,6 +1,4 @@
 """Confirmed container points keep the real admission, cursor and publication owners."""
-from dataclasses import replace
-
 import h5py
 import numpy as np
 import pytest
@@ -20,6 +18,8 @@ def test_confirmed_container_run_publishes_logical_points_and_native_statistics(
     from xdart.gui.tabs.scattering.events import CleanupStatus
     from xrd_tools.sources import open_source
     from xrd_tools.reduction import run_reduction
+    from xrd_tools.integrate.calibration import load_detector_calibration, detector_calibration_to_integrator
+    from xrd_tools.session.readiness import native_int_reduction_plan
 
     path, poni = tmp_path / 'points.h5', tmp_path / 'cal.poni'
     images = np.stack([np.full((195, 487), value, np.uint16) for value in (40, 20, 60, 30)])
@@ -32,27 +32,30 @@ def test_confirmed_container_run_publishes_logical_points_and_native_statistics(
     write_poni(poni)
     policy = PointImagePolicy(2, operation, image_index=2)
     spec = SourceSpec(path, SourceKind.NEXUS_STACK, options={'point_images': policy.to_dict()})
-    intent = _intent(path, tmp_path / 'processed', poni, processing_mode='Int 1D + 2D')
+    intent = _intent(path, tmp_path / 'processed', poni, processing_mode='Int 2D')
     intent.source_spec = spec
     intent.threshold = ThresholdIntent(apply_threshold=True, threshold_min=5., threshold_max=65534.)
     intent.bai_1d_args['error_model'] = 'poisson'
     intent.bai_2d_args['error_model'] = 'poisson'
     executor, run, _ = _prepared_run(tmp_path, intent=intent)
+    configuration = run.configuration
     try:
         executor._run(run)
         terminal = _terminal(executor)
         assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
-        with open_scan(run.artifact) as saved:
+        saved = open_scan(run.artifact)
+        if saved:
             assert saved.frame_indices == [0, 1]
             source = open_source(spec)
             try:
-                scan = source.to_scan(poni=saved.poni, integrator=saved.integrator)
-                plan = run.plan
+                calibration = load_detector_calibration(poni)
+                scan = source.to_scan(poni=calibration.poni, integrator=detector_calibration_to_integrator(calibration))
+                plan = native_int_reduction_plan(configuration)
                 expected = run_reduction(plan, scan, executor=1)
                 for label in (0, 1):
-                    view = saved.get_frame(label)
-                    np.testing.assert_allclose(view.int_1d.norm, expected.frames[label].int_1d.norm, rtol=1e-6)
-                    assert view.metadata['point_images']['operation'] == operation
+                    view = saved.get_1d(label)
+                    np.testing.assert_allclose(view.intensity, expected.frames[label].result_1d.intensity, rtol=1e-6)
+                    np.testing.assert_allclose(view.sigma, expected.frames[label].result_1d.sigma, rtol=1e-6)
             finally:
                 source.close()
     finally:

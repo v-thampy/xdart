@@ -73,13 +73,17 @@ def _validate_policy(
         dtype=getattr(image, "dtype", None),
     )
     supplied = policy.allocation.requirements
+    point = (scan.frames[0].metadata or {}).get('point_images')
+    point_bytes = 16 * int(np.prod(descriptor.frame_shape)) if point is not None else 0
+    if supplied.source_auxiliary_bytes != point_bytes // 2:
+        raise ValueError('explicit allocation has invalid point variance resource terms')
     terms = (
         supplied.background_bytes,
         supplied.resolver_background_bytes,
         supplied.worker_background_bytes,
         supplied.background_binding_bytes,
     )
-    if background_plan is None and terms != (0, 0, 0, 0):
+    if background_plan is None and terms != (0, 0, point_bytes, 0):
         raise ValueError("active allocation requires an exact Background plan")
     background = (
         FrameBackgroundPlan() if background_plan is None else background_plan
@@ -88,12 +92,12 @@ def _validate_policy(
         raise TypeError("Background plan must be exact")
     pixels = int(np.prod(descriptor.frame_shape))
     expected = (
-        (0, 0, 0, 0)
+        (0, 0, point_bytes, 0)
         if background.mode == "None"
         else (
             8 * pixels,
             25 * pixels if background.mode == "Series Average" else 8 * pixels,
-            8 * pixels,
+            8 * pixels + point_bytes,
             64 * 1024**2,
         )
     )
@@ -106,6 +110,7 @@ def _validate_policy(
         resolver_background_bytes=supplied.resolver_background_bytes,
         worker_background_bytes=supplied.worker_background_bytes,
         background_binding_bytes=supplied.background_binding_bytes,
+        source_auxiliary_bytes=supplied.source_auxiliary_bytes,
     )
     validated = resolve_session_policy(
         actual,

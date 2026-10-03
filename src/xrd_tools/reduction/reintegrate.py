@@ -2579,14 +2579,15 @@ def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, targ
     _reject(_gi_1d_freeze_key(frozen) is not None or _gi_2d_freeze_keys(frozen), "GI range freeze is incomplete"); args = (_integration_1d_args(frozen.integration_1d, frozen.gi) if selected["dimension"] == "1d" else _integration_2d_args(frozen.integration_2d, frozen.gi)); args.pop(f"gi_mode_{selected['dimension']}", None); return {**selected, "bai_args": args}, bootstrap
 def _requirements(shape, dtype, selected, shared):
     terms = _background_resource_terms(shared["background"]["mode"], shape)
-    descriptor = SimpleNamespace(frame_shape=shape, dtype=_native_dtype(dtype))
+    descriptor = SimpleNamespace(frame_shape=shape, dtype=_native_dtype('<f8' if 'point_images' in shared else dtype))
     return requirements_from(
         descriptor, _core_plan(selected, shared),
         background_bytes=terms[0], resolver_background_bytes=terms[1],
         worker_background_bytes=terms[2] + (16 * int(shape[0]) * int(shape[1]) if "point_images" in shared else 0),
         background_binding_bytes=terms[3],
+        source_auxiliary_bytes=(8 * int(shape[0]) * int(shape[1]) if 'point_images' in shared else 0),
     )
-def _allocation_recipe(allocation: SessionResourceAllocation) -> dict[str, Any]: return {"requirements": {f.name: getattr(allocation.requirements, f.name) for f in fields(SessionResourceRequirements)}, "envelope_bytes": allocation.envelope_bytes, "counts": dict(allocation.counts), "categories": dict(allocation.categories), "minimum_bytes": allocation.minimum_bytes, "floor_bytes": allocation.floor_bytes, "assigned_bytes": allocation.assigned_bytes, "origin": allocation.origin, "oversize_excess_bytes": allocation.oversize_excess_bytes}
+def _allocation_recipe(allocation: SessionResourceAllocation) -> dict[str, Any]: return {"requirements": {f.name: getattr(allocation.requirements, f.name) for f in fields(SessionResourceRequirements) if f.name != 'source_auxiliary_bytes' or allocation.requirements.source_auxiliary_bytes}, "envelope_bytes": allocation.envelope_bytes, "counts": dict(allocation.counts), "categories": dict(allocation.categories), "minimum_bytes": allocation.minimum_bytes, "floor_bytes": allocation.floor_bytes, "assigned_bytes": allocation.assigned_bytes, "origin": allocation.origin, "oversize_excess_bytes": allocation.oversize_excess_bytes}
 def _persisted_correction_bytes(shared, shape) -> int:
     """The retained bytes of the persisted float32 flat field and dark current."""
     assets = shared.get("accepted_scientific_assets") if isinstance(shared, Mapping) else None
@@ -2625,7 +2626,10 @@ def _policy(req, spec: Mapping[str, Any], mask_spec=None, correction_bytes=0) ->
         return policy
     _reject(spec["kind"] != "explicit", "resource policy kind")
     value = spec["allocation"]; _keys(value, {"requirements", "envelope_bytes", "counts", "categories", "minimum_bytes", "floor_bytes", "assigned_bytes", "origin", "oversize_excess_bytes"}, "allocation")
-    _keys(value["requirements"], {f.name for f in fields(SessionResourceRequirements)}, "requirements"); _keys(value["counts"], _REQUESTS, "counts"); _keys(value["categories"], {"source_native", "staging", "records", "publication", "worker"}, "categories")
+    requirement_names = {f.name for f in fields(SessionResourceRequirements)}
+    if 'source_auxiliary_bytes' not in value['requirements']:
+        requirement_names.remove('source_auxiliary_bytes')
+    _keys(value["requirements"], requirement_names, "requirements"); _keys(value["counts"], _REQUESTS, "counts"); _keys(value["categories"], {"source_native", "staging", "records", "publication", "worker"}, "categories")
     _reject(any(type(v) is not int or v < 0 for v in (*value["requirements"].values(), *value["counts"].values(), *value["categories"].values(), value["envelope_bytes"], value["minimum_bytes"], value["floor_bytes"], value["assigned_bytes"], value["oversize_excess_bytes"])) or value["origin"] not in {"automatic", "explicit"}, "allocation leaves are malformed"); req2 = SessionResourceRequirements(**value["requirements"]); _reject(req2.fingerprint != req.fingerprint, "RESOURCE_REQUIREMENTS_IDENTITY"); alloc = SessionResourceAllocation(requirements=req2, **{k: value[k] for k in value if k != "requirements"}); _reject(alloc.origin not in {"automatic", "explicit"}, "allocation origin"); policy = resolve_session_policy(req, allocation=alloc, flush=FlushPolicy()); _reject(owner is not None and policy.allocation.owner_block_bytes != owner, "REINTEGRATE_MASK_OWNER_BLOCK_GRANT_CHANGED"); return policy
 def _snapshot_mapping(value: TargetSnapshot) -> dict[str, Any]: return {f.name: getattr(value, f.name) for f in fields(TargetSnapshot)}
 def _validate_persisted_selected(selected, dimension):
@@ -2953,7 +2957,7 @@ class _ReintegrateFrameSource:
             owner.close(validate=validate)
             self._direct_hdf = None
     def container_descriptor(self):
-        import numpy as np; terms = _background_resource_terms(self.plan.requested_shared_science["background"]["mode"], self.plan.detector_shape); point_bytes = 16 * math.prod(self.plan.detector_shape) if "point_images" in self.plan.requested_shared_science else 0; return SimpleNamespace(frame_shape=self.plan.detector_shape, dtype=np.dtype(self.plan.native_dtype), background_bytes=terms[0], resolver_background_bytes=terms[1], worker_background_bytes=terms[2] + point_bytes, background_binding_bytes=terms[3])
+        import numpy as np; terms = _background_resource_terms(self.plan.requested_shared_science["background"]["mode"], self.plan.detector_shape); point_bytes = 16 * math.prod(self.plan.detector_shape) if "point_images" in self.plan.requested_shared_science else 0; return SimpleNamespace(frame_shape=self.plan.detector_shape, dtype=np.dtype('float64' if point_bytes else self.plan.native_dtype), background_bytes=terms[0], resolver_background_bytes=terms[1], worker_background_bytes=terms[2] + point_bytes, background_binding_bytes=terms[3], source_auxiliary_bytes=point_bytes // 2)
     def to_scan(self, **kwargs):
         from xrd_tools.reduction.core import Frame, Scan, _REINTEGRATE_SCAN_MARKER; calibration, integrator, fi = _calibration(self.plan.requested_shared_science, self.plan.gi_bootstrap_incidence); gi = self.plan.requested_shared_science["gi"]; frames = [Frame(label, metadata=({gi["resolved_motor"]: self.plan.gi_bootstrap_incidence} if label == self.plan.labels[0] and gi["enabled"] and gi["resolved_motor"] != "Manual" else {})) for label in self.plan.labels]; self._frames = {frame.index: frame for frame in frames}
         scan = Scan("reintegrate", frames, poni=None if calibration is None else calibration.poni, integrator=fi or integrator, **kwargs); scan.extra["_reintegrate_marker"] = _REINTEGRATE_SCAN_MARKER; return scan
