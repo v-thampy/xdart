@@ -96,12 +96,13 @@ class _DrawRequest:
     table: np.ndarray
     index: np.ndarray | None = None
     alpha: np.ndarray | None = None
+    percentiles: tuple[float, float] | None = None
 
     def matches(self, other) -> bool:
         """The same draw: the same volume, index and settings."""
         return (other is not None and other.values is self.values and other.index is self.index
-                and (other.log, other.automatic, other.reset, other.levels, other.color_map)
-                == (self.log, self.automatic, self.reset, self.levels, self.color_map))
+                and (other.log, other.automatic, other.reset, other.levels, other.color_map, other.percentiles)
+                == (self.log, self.automatic, self.reset, self.levels, self.color_map, self.percentiles))
 
 
 @dataclass(eq=False)
@@ -136,8 +137,8 @@ def _draw_volume(request: _DrawRequest, cancel, _progress):
               float(np.max(shown, where=finite, initial=-np.inf)))
     del finite
     check()
-    auto = volume_levels(shown, log=request.log)
-    levels = auto if request.automatic else request.levels
+    auto = volume_levels(shown, log=request.log, percentiles=request.percentiles)
+    levels = auto if request.automatic or request.percentiles is not None else request.levels
     try:
         index, alpha = volume_index(shown, levels)
     except VolumeRenderRefused as refused:
@@ -161,7 +162,7 @@ class VolumeView(QtWidgets.QFrame):
         self.title = QtWidgets.QLabel("")
         self.color_map = color_map_combo()
         self.log_scale = log_toggle()
-        self.intensity = IntensityControls(self)
+        self.intensity = IntensityControls(self, percentiles=(0.5, 99.5))
         bar.addWidget(self.title, 1)
         bar.addWidget(self.intensity)
         bar.addWidget(self.color_map)
@@ -220,6 +221,7 @@ class VolumeView(QtWidgets.QFrame):
         # colour-map change applies another table to them
         self._index = self._alpha = self._index_values = self._index_log = None
         self._index_levels = self._index_auto = self._index_domain = self._drawn_map = None
+        self._index_percentiles = None
         # the draws, on the shared latest-request owner (the job bound late, so a test can hold its result); a draw
         # that would show the image shown is one whose index is the kept one, under the drawn colour map
         self._requests = LatestRequestOwner(
@@ -274,7 +276,7 @@ class VolumeView(QtWidgets.QFrame):
                 editor.setText("")
                 editor.setPlaceholderText(f"Auto · {float(bound):.6g}")
         self.title.setText(projection.title)
-        self._apply_ranges()
+        self._apply_ranges(reset_levels=True)
 
     def _range_edited(self, path, value) -> None:
         text = str(value).strip()
@@ -283,7 +285,7 @@ class VolumeView(QtWidgets.QFrame):
         self._range_settings[tuple(path)] = text
         self._apply_ranges()
 
-    def _apply_ranges(self) -> None:
+    def _apply_ranges(self, *, reset_levels=False) -> None:
         """Select existing bin centres with array views; never read or regrid the source."""
         if self._projection is None:
             return
@@ -323,7 +325,7 @@ class VolumeView(QtWidgets.QFrame):
         self._display = (self._projection.values if full else self._projection.values[tuple(slices)],
                          tuple(axis[selection] for axis, selection in zip(self._projection.axes, slices, strict=True)))
         self._half = None
-        self._draw(reset_levels=True)
+        self._draw(reset_levels=reset_levels)
 
     def show_half_view(self) -> None:
         """Draw the 2× view (2×2×2 block means) of a volume above the 3D Viewer's limit."""
@@ -381,10 +383,15 @@ class VolumeView(QtWidgets.QFrame):
         if wanted is not None and wanted.reset:
             reset_levels = True  # a reset not yet drawn (Log's) holds for the draw that supersedes it
         log = self.log_scale.isChecked()
+        self.intensity.set_percentile_defaults((0.1, 99.9) if log else (0.5, 99.5))
         automatic = reset_levels or self.intensity.autoscale.isChecked()
-        levels = None if automatic else tuple(float(v) for v in self.intensity.values())
+        percentiles = self.intensity.percentile_values()
+        if percentiles is not None and reset_levels:
+            percentiles = (0.1, 99.9) if log else (0.5, 99.5)
+        levels = None if automatic or percentiles is not None else tuple(float(v) for v in self.intensity.values())
         kept = (self._index is not None and self._index_values is values and self._index_log == log
-                and self._index_levels == (self._index_auto if automatic else levels))
+                and self._index_percentiles == percentiles
+                and (percentiles is not None or self._index_levels == (self._index_auto if automatic else levels)))
         if kept and reset_levels:
             # Log on and off can return to the image already drawn. Reset the controls even if the
             # latest-request owner skips that unchanged image or only recolours its cached index.
@@ -400,7 +407,7 @@ class VolumeView(QtWidgets.QFrame):
             return
         index = (self._index, self._alpha) if kept else (None, None)
         self._ask(_DrawRequest(values, axes, log, automatic, reset_levels,
-                               self._index_levels if kept else levels, name, table, *index))
+                               self._index_levels if kept else levels, name, table, *index, percentiles))
 
     def _ask(self, request: _DrawRequest | None) -> None:
         """Ask the shared owner for ``request`` (None: none; the latest wins), the notice saying a draw is on its
@@ -432,12 +439,13 @@ class VolumeView(QtWidgets.QFrame):
             domain = drawn.domain
             blocker = QtCore.QSignalBlocker(self.intensity)
             self._index_domain = domain if domain[1] > domain[0] else (domain[0], domain[0] + 1.0)
-            self.intensity.sync(self._index_domain, drawn.auto, reset=request.reset)
+            self.intensity.sync(self._index_domain, drawn.levels, reset=request.reset)
             del blocker
             self._index_auto = drawn.auto
         self.rgba = drawn.rgba
         self._index, self._alpha, self._index_levels = drawn.index, drawn.alpha, drawn.levels
         self._index_values, self._index_log, self._drawn_map = request.values, request.log, request.color_map
+        self._index_percentiles = request.percentiles
         self._show_notice("", offer_half=False)
         self._draw_items(request.axes)
         return True
@@ -446,6 +454,7 @@ class VolumeView(QtWidgets.QFrame):
         self._requests.forget()  # no image shown: no draw is the image shown
         self._index = self._alpha = self._index_values = self._index_log = None
         self._index_levels = self._index_auto = self._index_domain = self._drawn_map = None
+        self._index_percentiles = None
 
     def _show_notice(self, text: str, *, offer_half: bool) -> None:
         self.notice.setText(text)

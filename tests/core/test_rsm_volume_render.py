@@ -76,6 +76,17 @@ def test_default_levels_are_ints_percentiles_in_the_displayed_space() -> None:
     assert refused.value.code == "VOLUME_EMPTY"
 
 
+def test_editable_percentiles_use_finite_values_and_keep_measured_zero_and_negative() -> None:
+    values = np.array([[[-20.0, 0.0, 10.0, 20.0, 100.0, np.nan, np.inf]]])
+    before = values.copy()
+    np.testing.assert_allclose(volume_levels(values, percentiles=(20, 80)), (-4.0, 36.0))
+    np.testing.assert_array_equal(values, before)
+    for pair in ((-1, 90), (20, 101), (50, 50), (90, 20), (np.nan, 90)):
+        with pytest.raises(VolumeRenderRefused) as refused:
+            volume_levels(values, percentiles=pair)
+        assert refused.value.code == "VOLUME_PERCENTILES_INVALID"
+
+
 def test_the_2x_view_is_a_nan_aware_block_mean_and_an_odd_axis_ends_in_a_half_block() -> None:
     even = np.arange(64, dtype=np.float64).reshape(4, 4, 4)
     axes = (np.arange(4.0), np.arange(4.0) * 2, np.arange(4.0) + 10)

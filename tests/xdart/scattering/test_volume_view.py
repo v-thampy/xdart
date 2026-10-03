@@ -45,6 +45,93 @@ def _projection(shape=(4, 5, 6)):
     return VolumeProjection(values, axes, ("H", "K", "L"), "a_rsm.nexus")
 
 
+def _absolute_mode(view, qapp):
+    QtTest.QTest.mouseDClick(view.intensity.label, QtCore.Qt.MouseButton.LeftButton)
+    qapp.processEvents()
+    popup = view.intensity._entry_popup
+    popup.findChild(QtWidgets.QComboBox, "intensityMode").setCurrentText("Absolute")
+    QtTest.QTest.mouseClick(popup.findChild(QtWidgets.QPushButton, "intensityApply"),
+                          QtCore.Qt.MouseButton.LeftButton)
+    _settled(view)
+    popup.close()
+    view.intensity.autoscale.setChecked(True)
+    _settled(view)
+
+
+def test_manual_percentiles_apply_repeatedly_then_follow_the_cropped_volume(qapp):
+    view = VolumeView()
+    projection = _projection()
+    before = projection.values.copy()
+    try:
+        view.show()
+        view.reconcile(projection)
+        _settled(view)
+        assert view.intensity.values() == (0.5, 99.5)
+        assert view.intensity.slider.domain() == (0.0, 100.0)
+        QtTest.QTest.mouseDClick(view.intensity.label, QtCore.Qt.MouseButton.LeftButton)
+        qapp.processEvents()
+        popup = view.intensity._entry_popup
+        assert popup is not None and popup.isVisible()
+        low = popup.findChild(QtWidgets.QLineEdit, "intensityMinimum")
+        high = popup.findChild(QtWidgets.QLineEdit, "intensityMaximum")
+        apply = popup.findChild(QtWidgets.QPushButton, "intensityApply")
+        for pair in ((10, 80), (20, 90)):
+            low.setText(str(pair[0]))
+            high.setText(str(pair[1]))
+            QtTest.QTest.mouseClick(apply, QtCore.Qt.MouseButton.LeftButton)
+            _settled(view)
+            assert popup.isVisible() and not view.intensity.autoscale.isChecked()
+            assert view.intensity.values() == pair
+            expected = np.percentile(projection.values[np.isfinite(projection.values)], pair)
+            np.testing.assert_array_equal(view.rgba, volume_rgba(projection.values, levels=expected))
+            assert all(f"{value:.8g}" in view.intensity.slider.toolTip() for value in expected)
+        QtTest.QTest.keyClick(high, QtCore.Qt.Key.Key_Escape)
+        qapp.processEvents()
+        assert not popup.isVisible()
+        view.axis_ranges[0]._low.setText(str(projection.axes[0][1]))
+        view.axis_ranges[0]._low.editingFinished.emit()
+        _settled(view)
+        cropped = projection.values[1:]
+        expected = np.percentile(cropped[np.isfinite(cropped)], (20, 90))
+        assert view.intensity.values() == (20, 90)
+        np.testing.assert_array_equal(view.rgba, volume_rgba(cropped, levels=expected))
+        np.testing.assert_array_equal(projection.values, before)
+    finally:
+        view.shutdown()
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_absolute_mode_keeps_exact_limits_when_the_volume_is_recoloured(qapp):
+    view = VolumeView()
+    projection = _projection()
+    try:
+        view.show()
+        view.reconcile(projection)
+        _settled(view)
+        QtTest.QTest.mouseDClick(view.intensity.label, QtCore.Qt.MouseButton.LeftButton)
+        qapp.processEvents()
+        popup = view.intensity._entry_popup
+        mode = popup.findChild(QtWidgets.QComboBox, "intensityMode")
+        mode.setCurrentText("Absolute")
+        popup.findChild(QtWidgets.QLineEdit, "intensityMinimum").setText("10")
+        popup.findChild(QtWidgets.QLineEdit, "intensityMaximum").setText("200")
+        QtTest.QTest.mouseClick(popup.findChild(QtWidgets.QPushButton, "intensityApply"),
+                              QtCore.Qt.MouseButton.LeftButton)
+        _settled(view)
+        assert view.intensity.percentile_values() is None
+        assert view.intensity.values() == (10, 200) and popup.isVisible()
+        np.testing.assert_array_equal(view.rgba, volume_rgba(projection.values, levels=(10, 200)))
+        view.set_color_map("magma")
+        _settled(view)
+        assert view.intensity.values() == (10, 200)
+        np.testing.assert_array_equal(view.rgba, volume_rgba(projection.values, "magma", levels=(10, 200)))
+    finally:
+        view.shutdown()
+        view.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize("descending", (False, True))
 def test_display_ranges_crop_three_axes_without_changing_the_result(qapp, descending):
     from xdart.gui.widgets.controls_panel import RangeRow
@@ -136,12 +223,13 @@ def test_the_volume_is_drawn_through_volume_rgba_under_ints_colour_map_and_log(q
         view.reconcile(projection)
         _settled(view)
         levels = volume_levels(projection.values)
-        assert view.intensity.slider.domain() == view.intensity.values() == levels
+        assert view.intensity.values() == (0.5, 99.5)
+        assert view.intensity.slider.domain() == (0.0, 100.0)
         before = view.rgba
         QtTest.QTest.mouseClick(view.intensity.label, QtCore.Qt.MouseButton.LeftButton)
         qapp.processEvents()
         assert view.intensity._entry_popup.isVisible()
-        assert view.rgba is before and view.intensity.values() == levels
+        assert view.rgba is before and view.intensity.values() == (0.5, 99.5)
         view.intensity._entry_popup.close()
         np.testing.assert_array_equal(view.rgba, volume_rgba(projection.values, "Default", False, levels=levels))
         assert view.rgba[0, 0, 0, 3] == 0  # an empty voxel is transparent
@@ -154,7 +242,8 @@ def test_the_volume_is_drawn_through_volume_rgba_under_ints_colour_map_and_log(q
         np.testing.assert_array_equal(view.rgba,
                                       volume_rgba(projection.values, "magma", True, levels=log_levels))
         assert view.intensity.autoscale.isChecked() and view.title.text() == "a_rsm.nexus"
-        assert view.intensity.slider.domain() == view.intensity.values() == log_levels
+        assert view.intensity.values() == (0.1, 99.9)
+        assert view.intensity.slider.domain() == (0.0, 100.0)
     finally:
         view.deleteLater()
         qapp.processEvents()
@@ -167,6 +256,7 @@ def test_manual_levels_draw_the_volume_between_them(qapp):
     try:
         view.reconcile(projection)
         _settled(view)
+        _absolute_mode(view, qapp)
         view.intensity.autoscale.setChecked(False)
         view.intensity._set_window((10.0, 200.0))
         view.intensity.rangeChanged.emit(10.0, 200.0)
@@ -252,6 +342,7 @@ def test_log_on_or_off_auto_or_manual_draws_the_bytes_and_levels_of_volume_rgbas
     try:
         view.reconcile(VolumeProjection(values, axes, ("H", "K", "L"), "a_rsm.nexus"))
         _settled(view)
+        _absolute_mode(view, qapp)
         for log in (False, True):
             if view.log_scale.isChecked() is not log:
                 view.log_scale.click()  # Log draws again at its automatic levels
@@ -444,6 +535,7 @@ def test_a_log_change_superseded_before_it_is_drawn_still_resets_the_levels(qapp
     try:
         view.reconcile(projection)
         _settled(view)
+        _absolute_mode(view, qapp)
         view.intensity.autoscale.setChecked(False)
         view.intensity._set_window((10.0, 200.0))  # typed levels, in the linear space
         view.intensity.rangeChanged.emit(10.0, 200.0)
@@ -487,7 +579,7 @@ def test_a_log_round_trip_resets_controls_even_when_the_drawn_index_is_reused(qa
         assert view.intensity.autoscale.isChecked()
         assert view.intensity.values() == levels
         assert view._index is index
-        assert view.rgba.tobytes() == volume_rgba(projection.values, colormap, levels=levels).tobytes()
+        assert view.rgba.tobytes() == volume_rgba(projection.values, colormap).tobytes()
     finally:
         _settled(view)
         view.shutdown()

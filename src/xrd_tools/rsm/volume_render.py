@@ -76,14 +76,24 @@ def log_transform(values: np.ndarray) -> np.ndarray:
     return out
 
 
-def volume_levels(values: np.ndarray, *, log: bool = False) -> tuple[float, float]:
+def volume_levels(values: np.ndarray, *, log: bool = False,
+                  percentiles: tuple[float, float] | None = None) -> tuple[float, float]:
     """The default display levels of ``values`` (already in the displayed space): Int's percentiles of the
     finite voxels, on a deterministic stride sample above ``_LEVEL_SAMPLE`` of them. Equal ends are spread by
-    ±0.5, as Int's non-detector pane expands degenerate levels."""
+    ±0.5, as Int's non-detector pane expands degenerate levels. Explicit percentiles are display-only,
+    between 0 and 100; measured zeros and negative values remain in the finite population."""
+    pair = (_LOG_PERCENTILES if log else _LINEAR_PERCENTILES) if percentiles is None else percentiles
+    try:
+        low_pct, high_pct = pair
+        valid = np.isfinite((low_pct, high_pct)).all() and 0 <= low_pct < high_pct <= 100
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise VolumeRenderRefused("VOLUME_PERCENTILES_INVALID", "percentiles must satisfy 0 ≤ min < max ≤ 100")
     sample = _finite_sample(np.asarray(values))
     if sample.size == 0:
         raise VolumeRenderRefused("VOLUME_EMPTY", "the volume has no finite voxel to show")
-    low, high = (float(item) for item in np.percentile(sample, _LOG_PERCENTILES if log else _LINEAR_PERCENTILES))
+    low, high = (float(item) for item in np.percentile(sample, (low_pct, high_pct)))
     if not high > low:
         low, high = low - 0.5, high + 0.5
     return low, high
