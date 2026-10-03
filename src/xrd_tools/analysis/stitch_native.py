@@ -277,10 +277,11 @@ def geometry_facts(plan):
         asset = plan.calibration.projection.value
         rotation = int(asset["acquisition"]["image_rotation_quarter_turns"]) * 90
         flip = asset["acquisition"].get("image_flip", False)  # a mirrored camera's (written only then)
-        return (float(asset["acquisition"]["xdart_wavelength_A"]),
+        return (plan.effective_geometry.runtime_xdart_wavelength_A,
                 tuple(asset["detector"]["shape"]), ImageOrientation(rotation=rotation, flip_horizontal=flip))
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
-    diff, orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+    diff, orientation = _runtime_geometry(plan.geometry, plan.geometry.content,
+                                          metadata_energy_eV=plan.metadata_energy_eV)
     ai = detector_calibration_to_integrator(diff.calibration)
     return float(ai.wavelength) * 1e10, tuple(ai.detector.shape), orientation
 
@@ -297,9 +298,26 @@ def native_mask(plan):
 
 
 def native_plan_identity(plan):
-    return ("native-stitch-controls-v1", plan.native_records,
+    value = ("native-stitch-controls-v1", plan.native_records,
             None if plan.conditioning is None else plan.conditioning.to_dict(),
             None if plan._mask_receipt is None else plan._mask_receipt.fingerprint)
+    energy = getattr(plan, 'metadata_energy_eV', None)
+    return value if energy is None else value + ('metadata-energy-eV', energy)
+
+
+def native_energy_selection(plan, metadata_energy_eV=None):
+    """Either backend's acquisition term and the calibration's separate fitted offset."""
+    from xrd_tools.analysis.stitch_operation import _runtime_geometry, XuStitchOperationPlan
+    from xrd_tools.core.energy import resolve_acquisition_energy
+    if type(plan) is XuStitchOperationPlan:
+        wavelength = float(plan.calibration.projection.value['acquisition']['xdart_wavelength_A']) * 1e-10
+    else:
+        base, _orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+        wavelength = base.calibration.poni.wavelength
+    if metadata_energy_eV is None:
+        metadata_energy_eV = () if plan.metadata_energy_eV is None else (plan.metadata_energy_eV,)
+    return resolve_acquisition_energy(wavelength, metadata_energy_eV,
+                                      fitted_source_energy_eV=recorded_energy_eV(plan))
 
 
 def _snapshot(path, manifest, rotation, flip=False):
@@ -489,8 +507,16 @@ def native_provenance(value, source, output, plan, manifest, *, preparation=None
     if plan.gi is not None:  # how the GI cuts were made, as the record's reader sees it
         value["plan"]["gi"] = plan.gi.to_provenance()
     value["wavelength_A"] = wavelength
-    value["source_energy_checks"] = source_energy_checks(
-        source, wavelength, recorded_energy_eV(plan),
+    from xrd_tools.analysis.stitch_operation import StitchOperationPlan
+    pyfai = type(plan) is StitchOperationPlan
+    if pyfai or plan.metadata_energy_eV is not None:
+        value['plan']['energy_selection'] = native_energy_selection(plan)
+        if pyfai and 'effective_calibration' in value['geometry']:
+            value['geometry']['effective_calibration']['wavelength'] = value['plan']['energy_selection']['wavelength_m']
+    cached = None if preparation is None else preparation.get('energy_checks')
+    value["source_energy_checks"] = cached if cached is not None else source_energy_checks(
+        source, wavelength, (plan.metadata_energy_eV if plan.metadata_energy_eV is not None
+                            else recorded_energy_eV(plan)),
         tables=None if preparation is None else preparation.get("tables"))
     seeds, ceilings = _frame_facts(source, manifest, plan)
     saturation = member_saturation(ceilings)
@@ -524,7 +550,8 @@ def recorded_energy_eV(plan):
     return None if value is None else float(value)
 
 
-def source_energy_checks(source, wavelength_A, recorded_eV=None, *, tables=None):
+def source_energy_checks(source, wavelength_A, recorded_eV=None, *, tables=None,
+                          allow_calibration_override=False):
     """``tables``: the members' metadata tables a preparation already admitted (in member order);
     absent, each is read."""
     from xrd_tools.analysis.module_transaction import MetadataColumnSelector
@@ -555,9 +582,11 @@ def source_energy_checks(source, wavelength_A, recorded_eV=None, *, tables=None)
                 energy_kev = _read_energy(handle[member.analysis.resolved_entry or "entry"])
                 if math.isfinite(energy_kev):
                     energies.append(energy_kev * 1000)
-        if any(not math.isfinite(energy) or energy <= 0 or abs(energy - expected) > 0.001 * expected
+        if any(not math.isfinite(energy) or energy <= 0 or
+               (not allow_calibration_override and abs(energy - expected) > 0.001 * expected)
                for energy in energies):
-            _refuse("STITCH_SOURCE_ENERGY_CONFLICT", "selected member energy differs from calibration")
+            _refuse("STITCH_SOURCE_ENERGY_CONFLICT", ("selected member metadata energy must be finite and positive"
+                if allow_calibration_override else "selected member energy differs from calibration"))
         checks.append({"source_id": member.fingerprint, "sample_count": len(energies),
                        "range_eV": [min(energies), max(energies)] if energies else None})
     return checks

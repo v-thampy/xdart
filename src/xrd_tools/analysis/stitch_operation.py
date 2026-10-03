@@ -1427,6 +1427,8 @@ class StitchOperationPlan:
     azimuth_range_1d: tuple[float, float] | None = None
     #: Decision 4's foil choices (``StitchFoilNormalization``); None: the monitor alone, or none.
     foil_normalization: StitchFoilNormalization | None = None
+    #: Frozen base acquisition energy from admitted metadata; the fitted offset stays separate.
+    metadata_energy_eV: float | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1437,6 +1439,12 @@ class StitchOperationPlan:
     def __post_init__(self) -> None:
         if type(self.geometry) is not StitchGeometryReceipt:
             raise TypeError("stitch plan requires an exact geometry receipt")
+        if self.metadata_energy_eV is not None and (
+            not self.native_records or isinstance(self.metadata_energy_eV, bool)
+            or not isinstance(self.metadata_energy_eV, (int, float))
+            or not math.isfinite(self.metadata_energy_eV) or self.metadata_energy_eV <= 0
+        ):
+            raise ValueError('native metadata energy must be finite and positive')
         if self.backend != "multigeometry":
             raise ValueError("S1 supports only the multigeometry backend")
         if self.mode not in {"1d", "2d"}:
@@ -1551,6 +1559,8 @@ class XuStitchOperationPlan:
     #: Decision 4's foil choices (``StitchFoilNormalization``); None: the monitor alone, or none.
     foil_normalization: StitchFoilNormalization | None = None
     allow_extrapolation: bool = False
+    #: Base acquisition energy, frozen from admitted metadata, before any fitted offset.
+    metadata_energy_eV: float | None = None
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1565,6 +1575,12 @@ class XuStitchOperationPlan:
         _native_plan_fields(self)
         if type(self.allow_extrapolation) is not bool:
             raise TypeError("allow_extrapolation must be an exact bool")
+        if self.metadata_energy_eV is not None and (
+            not self.native_records or isinstance(self.metadata_energy_eV, bool)
+            or not isinstance(self.metadata_energy_eV, (int, float))
+            or not math.isfinite(self.metadata_energy_eV) or self.metadata_energy_eV <= 0
+        ):
+            raise ValueError('native metadata energy must be finite and positive')
         if type(self.frame_screen) is not FrameScreenPolicy:
             raise TypeError("frame screen must be an exact FrameScreenPolicy")
         if not self.native_records and (self.dark_path is not None or self.flat_path is not None):
@@ -2488,6 +2504,24 @@ def prepare_stitch_operation(
     table = _fresh_table(source) if tables is None else _admitted_tables(source, tables)
     # this preparation's admitted facts (its tables, then its frame facts), never kept past it
     preparation = {"tables": table if type(table) is tuple else (table,)}
+    if plan.native_records:
+        from xrd_tools.analysis.stitch_native import source_energy_checks, native_energy_selection
+        base = replace(plan, metadata_energy_eV=None)
+        wavelength = native_energy_selection(base)['wavelength_m'] * 1e10
+        checks = source_energy_checks(source, wavelength, tables=preparation['tables'],
+                                      allow_calibration_override=True)
+        energies = [value for check in checks for value in (check['range_eV'] or ())]
+        try:
+            selection = native_energy_selection(base, energies)
+        except ValueError as error:
+            raise StitchOperationRefused('STITCH_SOURCE_ENERGY_CONFLICT', str(error)) from error
+        metadata_energy = selection['source_energy_eV'] if selection['source'] == 'metadata' else None
+        if type(plan) is XuStitchOperationPlan:
+            # Matching energy retains the exact historical XU record and identity.
+            if math.isclose(selection['wavelength_m'] * 1e10, wavelength, rel_tol=1e-14):
+                metadata_energy = None
+        plan = replace(plan, metadata_energy_eV=metadata_energy)
+        preparation['energy_checks'] = checks
     names = _table_names(table)
     required = _required_stitch_selectors(plan, names)
     tables = table if type(table) is tuple else (table,)
@@ -2557,6 +2591,7 @@ def prepare_stitch_operation(
                 effective = resolve_xu_stitch_effective_geometry(
                     plan.calibration,
                     session,
+                    metadata_energy_eV=plan.metadata_energy_eV,
                 ).projection
         except (
             XuRuntimeUnsupported,
@@ -2564,16 +2599,19 @@ def prepare_stitch_operation(
             XuStitchScienceRefused,
         ) as error:
             raise StitchOperationRefused(error.code) from error
+        expected_effective = (replace(plan.effective_geometry, runtime_energy=effective.runtime_energy)
+                              if plan.native_records else plan.effective_geometry)
         if (
             runtime_owner.execution_record is None
-            or effective.fingerprint != plan.effective_geometry.fingerprint
-            or effective.to_provenance()
-            != plan.effective_geometry.to_provenance()
+            or effective.fingerprint != expected_effective.fingerprint
+            or effective.to_provenance() != expected_effective.to_provenance()
         ):
             raise StitchOperationRefused(
                 "XU_EFFECTIVE_GEOMETRY_MISMATCH",
                 "effective XU geometry differs from the frozen operation plan",
             )
+        if plan.native_records:
+            plan = replace(plan, effective_geometry=effective)
         provenance = _xu_provenance(
             source,
             output,
@@ -2691,7 +2729,7 @@ class _OrientedSource(BaseFrameSource):
         return self._source.frame_for(index)
 
 
-def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes):
+def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes, *, metadata_energy_eV=None):
     request = receipt.request
     orientation = ImageOrientation(rotation=request.image_rotation, flip_horizontal=request.image_flip)
     if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON:
@@ -2718,6 +2756,15 @@ def _runtime_geometry(receipt: StitchGeometryReceipt, raw: bytes):
                   if "del" in motors else AngleMapping()),
         )
         diffractometer = replace(base, calibration=calibration)
+    if metadata_energy_eV is not None:
+        from xrd_tools.core.energy import resolve_acquisition_energy, calibration_recorded_energy_eV
+        recorded = (calibration_recorded_energy_eV(_json_mapping(raw))
+                    if request.kind is StitchGeometryKind.PYFAI_GONIOMETER_JSON else None)
+        calibration = diffractometer.calibration
+        energy = resolve_acquisition_energy(calibration.poni.wavelength, (metadata_energy_eV,),
+                                            fitted_source_energy_eV=recorded)
+        diffractometer = replace(diffractometer, calibration=replace(calibration,
+            poni=replace(calibration.poni, wavelength=energy['wavelength_m'])))
     return diffractometer, orientation
 
 
@@ -3296,6 +3343,7 @@ class StitchOperationExecution:
                     ),
                     **_foil_backend_kwargs(plan),
                     source_energy_key=energy_key,
+                    metadata_energy_eV=plan.metadata_energy_eV,
                     max_frame_bytes=plan.max_frame_bytes,
                     cancel_token=cancel_token,
                     progress_callback=science_progress,
@@ -3440,6 +3488,7 @@ class StitchOperationExecution:
                     current = resolve_xu_stitch_effective_geometry(
                         plan.calibration,
                         session,
+                        metadata_energy_eV=plan.metadata_energy_eV,
                     ).projection
                 if (
                     runtime_owner.execution_record is None
@@ -3511,7 +3560,7 @@ class StitchOperationExecution:
             raw = _revalidate_geometry(self.request.plan.geometry)
             records, frame_callback = capture_callback(self.request)
             diffractometer, orientation = _runtime_geometry(
-                self.request.plan.geometry, raw
+                self.request.plan.geometry, raw, metadata_energy_eV=self.request.plan.metadata_energy_eV
             )
             effective_calibration = None
             if (

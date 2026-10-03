@@ -141,9 +141,18 @@ class XuStitchEffectiveGeometryProjection:
     solid_angle_match: str
     solid_angle_max_rel_dev: float
     asset_version: int = 1
+    # Acquisition energy is separate from the immutable calibration attestation.
+    # None preserves the calibration's exact projection and historical fingerprint.
+    runtime_energy: tuple[float, float, float] | None = None
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if self.runtime_energy is not None and (
+            type(self.runtime_energy) is not tuple or len(self.runtime_energy) != 3
+            or any(type(v) is not float or not math.isfinite(v) or v <= 0
+                   for v in self.runtime_energy)
+        ):
+            raise TypeError("XU acquisition energy projection is invalid")
         if (
             type(self.asset_semantic_fingerprint) is not str
             or len(self.asset_semantic_fingerprint) != 64
@@ -216,7 +225,7 @@ class XuStitchEffectiveGeometryProjection:
                     self.sample_axes,
                     self.detector_axes,
                     self.camera,
-                ),
+                ) + (() if self.runtime_energy is None else ("acquisition-energy", self.runtime_energy)),
             ),
         )
 
@@ -241,7 +250,19 @@ class XuStitchEffectiveGeometryProjection:
         }
         if self.asset_version != 1:
             value["asset_version"] = self.asset_version
+        if self.runtime_energy is not None:
+            value["acquisition_energy"] = dict(zip(
+                ("energy_eV", "xdart_wavelength_A", "xu_mapping_wavelength_A"), self.runtime_energy,
+                strict=True))
         return value
+
+    @property
+    def runtime_xdart_wavelength_A(self) -> float:
+        return self.xdart_wavelength_A if self.runtime_energy is None else self.runtime_energy[1]
+
+    @property
+    def runtime_xu_wavelength_A(self) -> float:
+        return self.xu_mapping_wavelength_A if self.runtime_energy is None else self.runtime_energy[2]
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -392,6 +413,8 @@ def _extended_solid_angle(corrections, shape, *, sample_offset=True):
 def resolve_xu_stitch_effective_geometry(
     receipt: XuStitchCalibrationReceipt,
     session: XuRuntimeSession,
+    *,
+    metadata_energy_eV: float | None = None,
 ) -> XuStitchRuntimeGeometry:
     if (
         type(receipt) is not XuStitchCalibrationReceipt
@@ -500,6 +523,16 @@ def resolve_xu_stitch_effective_geometry(
             "XU_WAVELENGTH_MISMATCH", "xdart wavelength projection changed"
         )
     xu = session.xu
+    if float(xu.en2lam(energy)) != acquisition["xu_mapping_wavelength_A"]:
+        raise XuStitchScienceRefused("XU_WAVELENGTH_MISMATCH", "XU mapping wavelength projection changed")
+    runtime_energy = None
+    if metadata_energy_eV is not None:
+        from xrd_tools.core.energy import resolve_acquisition_energy
+        selected = resolve_acquisition_energy(float(acquisition["xdart_wavelength_A"]) * 1e-10,
+            (metadata_energy_eV,), fitted_source_energy_eV=acquisition.get("source_energy_eV"))
+        if not math.isclose(selected["energy_eV"], energy, rel_tol=1e-14):
+            runtime_energy = (float(selected["energy_eV"]), float(selected["wavelength_m"]) * 1e10,
+                              float(xu.en2lam(selected["energy_eV"])))
     qconversion = xu.QConversion(
         xu_asset["sample_axes"],
         xu_asset["detector_axes"],
@@ -509,12 +542,11 @@ def resolve_xu_stitch_effective_geometry(
         xu_asset["inplane_reference"],
         xu_asset["surface_normal_reference"],
         geometry=xu_asset["geometry"],
-        en=energy,
+        en=energy if runtime_energy is None else runtime_energy[0],
         qconv=qconversion,
     )
     if (
-        float(hxrd._wl) != acquisition["xu_mapping_wavelength_A"]
-        or float(xu.en2lam(energy)) != acquisition["xu_mapping_wavelength_A"]
+        float(hxrd._wl) != (acquisition["xu_mapping_wavelength_A"] if runtime_energy is None else runtime_energy[2])
     ):
         raise XuStitchScienceRefused(
             "XU_WAVELENGTH_MISMATCH", "XU mapping wavelength projection changed"
@@ -543,7 +575,7 @@ def resolve_xu_stitch_effective_geometry(
         str(corrections["solid_angle_sha256"]),
         energy,
         float(acquisition["xdart_wavelength_A"]),
-        float(hxrd._wl),
+        float(acquisition["xu_mapping_wavelength_A"]),
         tuple(xu_asset["sample_axes"]),
         tuple(xu_asset["detector_axes"]),
         tuple(xu_asset["camera"]),
@@ -551,6 +583,7 @@ def resolve_xu_stitch_effective_geometry(
         solid_match,
         solid_max_rel_dev,
         asset_version,
+        runtime_energy,
     )
     frozen_mask = np.frombuffer(mask.tobytes(order="C"), dtype=bool).reshape(shape)
     if asset_version == 3:
@@ -1207,6 +1240,7 @@ def run_xu_hist_stitch_1d(
     workers: int = 1,
     azimuth_range_1d: tuple[float, float] | None = None,
     allow_extrapolation: bool = False,
+    metadata_energy_eV: float | None = None,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
 
@@ -1430,7 +1464,8 @@ def run_xu_hist_stitch_1d(
                     "source energy is unavailable",
                 ) from error
             # a refined calibration's scans are checked against the energy they recorded
-            expected_energy = float(acquisition.get("source_energy_eV", acquisition["energy_eV"]))
+            expected_energy = (float(acquisition.get("source_energy_eV", acquisition["energy_eV"]))
+                               if metadata_energy_eV is None else metadata_energy_eV)
             if (
                 not math.isfinite(energy)
                 or energy <= 0
@@ -1502,9 +1537,9 @@ def run_xu_hist_stitch_1d(
             add(map_totals, *map_histograms)
     runtime_owner = xu_runtime_session()
     with runtime_owner as session:
-        geometry = resolve_xu_stitch_effective_geometry(receipt, session)
+        geometry = resolve_xu_stitch_effective_geometry(receipt, session, metadata_energy_eV=metadata_energy_eV)
         provider = XuPowderQProvider(geometry, acquisition)
-        wavelength_A = energy_eV_to_wavelength_m(geometry.projection.energy_eV) * 1e10
+        wavelength_A = geometry.projection.runtime_xdart_wavelength_A
         if mask is not None:
             if type(mask) is not np.ndarray or mask.dtype != np.dtype(bool) or mask.shape != geometry.projection.shape:
                 raise ValueError("external mask must be boolean with the calibrated detector shape")
@@ -1518,7 +1553,7 @@ def run_xu_hist_stitch_1d(
                 mask = invalid if mask is None else np.logical_or(mask, invalid)
         polarization = None
         if polarization_factor is not None:
-            polarization = (float(polarization_factor), geometry.projection.xu_mapping_wavelength_A,
+            polarization = (float(polarization_factor), geometry.projection.runtime_xu_wavelength_A,
                             *_polarization_axes(asset))
         bounds = radial_range if radial_range is not None else _scout_radial_range(
             provider, frame_inputs, unit, wavelength_A, cancel_token,

@@ -673,10 +673,10 @@ def test_xu_effective_geometry_drift_at_prepublish_refuses_commit(
     real_resolve = stitch_operation.resolve_xu_stitch_effective_geometry
     calls = []
 
-    def mutate_before_prepublish(receipt, session):
+    def mutate_before_prepublish(receipt, session, **kwargs):
         calls.append("resolve")
         asset.touch()
-        return real_resolve(receipt, session)
+        return real_resolve(receipt, session, **kwargs)
 
     monkeypatch.setattr(
         stitch_operation,
@@ -832,8 +832,8 @@ def test_poni_v3_stitch_persists_and_cross_checks_effective_calibration(
 
     runtime_geometry = stitch_operation._runtime_geometry
 
-    def lose_effective_parallax(receipt, raw):
-        diffractometer, orientation = runtime_geometry(receipt, raw)
+    def lose_effective_parallax(receipt, raw, **kwargs):
+        diffractometer, orientation = runtime_geometry(receipt, raw, **kwargs)
         calibration = replace(diffractometer.calibration, parallax=False)
         return replace(diffractometer, calibration=calibration), orientation
 

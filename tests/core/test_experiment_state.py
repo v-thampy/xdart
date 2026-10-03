@@ -13,11 +13,8 @@ import pytest
 from xrd_tools.core import energy as core_energy
 from xrd_tools.session.experiment_state import (
     CalibrationState,
-    CasStatus,
     EnergySource,
     EnergyState,
-    ExperimentEditor,
-    ExperimentEditorPort,
     ExperimentProvenance,
     ExperimentState,
     FactStatus,
@@ -350,115 +347,6 @@ def test_energy_conversion_delegates_to_existing_core_functions(monkeypatch) -> 
     assert energy.wavelength_m == pytest.approx(2.5e-10)
     assert energy.energy_eV == pytest.approx(43210.0)
     assert seen == [("to-wavelength", 9000.0), ("to-energy", 2.5e-10)]
-
-
-def test_editor_cas_is_identity_and_revision_qualified() -> None:
-    initial = _state(experiment_id="experiment-a", revision=3)
-    editor = ExperimentEditor(initial)
-    assert isinstance(editor, ExperimentEditorPort)
-
-    candidate = _calibration(wavelength_m=1.2e-10)
-    foreign = editor.propose_calibration(
-        candidate,
-        experiment_id="experiment-b",
-        expected_revision=3,
-    )
-    assert foreign.status is CasStatus.FOREIGN_IDENTITY
-    assert editor.current() is initial
-
-    stale = editor.propose_calibration(
-        candidate,
-        experiment_id="experiment-a",
-        expected_revision=2,
-    )
-    assert stale.status is CasStatus.STALE_REVISION
-    assert editor.current() is initial
-
-    accepted = editor.propose_calibration(
-        candidate,
-        experiment_id="experiment-a",
-        expected_revision=3,
-    )
-    assert accepted.status is CasStatus.ACCEPTED
-    assert accepted.state.revision == 4
-    assert editor.current() is accepted.state
-    assert accepted.state.energy.wavelength_m == initial.energy.wavelength_m
-    assert accepted.state.energy.evidence["calibration"] == pytest.approx(1.2e-10)
-
-    no_change = editor.propose_calibration(
-        candidate,
-        experiment_id="experiment-a",
-        expected_revision=4,
-    )
-    assert no_change.status is CasStatus.NO_CHANGE
-    assert no_change.state is accepted.state
-
-
-@pytest.mark.parametrize("revision_alias", [True, 1.0])
-def test_editor_refuses_non_integer_revision_aliases(revision_alias: object) -> None:
-    initial = _state(revision=1)
-    editor = ExperimentEditor(initial)
-
-    outcome = editor.propose_calibration(
-        _calibration(wavelength_m=1.2e-10),
-        experiment_id=initial.experiment_id,
-        expected_revision=revision_alias,  # type: ignore[arg-type]
-    )
-
-    assert outcome.status is CasStatus.STALE_REVISION
-    assert outcome.state is initial
-    assert editor.current() is initial
-
-
-def test_editor_refuses_non_string_identity_without_custom_equality() -> None:
-    class EqualityTrap:
-        def __eq__(self, other: object) -> bool:
-            raise AssertionError(f"custom equality invoked with {other!r}")
-
-    initial = _state(revision=1)
-    editor = ExperimentEditor(initial)
-    outcome = editor.propose_mask(
-        MaskState.absent(),
-        experiment_id=EqualityTrap(),  # type: ignore[arg-type]
-        expected_revision=1,
-    )
-
-    assert outcome.status is CasStatus.FOREIGN_IDENTITY
-    assert outcome.state is initial
-    assert editor.current() is initial
-
-
-def test_editor_mask_proposal_changes_only_mask_and_one_revision() -> None:
-    initial = _state()
-    editor = ExperimentEditor(initial)
-    mask = MaskState(
-        source_uri="mask.edf",
-        sha256="m" * 64,
-        dtype="bool",
-        shape=(2167, 2070),
-        status=FactStatus.PRESENT,
-    )
-    outcome = editor.propose_mask(
-        mask,
-        experiment_id=initial.experiment_id,
-        expected_revision=initial.revision,
-    )
-    assert outcome.status is CasStatus.ACCEPTED
-    assert outcome.state.revision == initial.revision + 1
-    assert outcome.state.calibration.mask is mask
-    assert outcome.state.energy is initial.energy
-    assert outcome.state.geometry is initial.geometry
-    assert outcome.state.sample is initial.sample
-
-    changed_bytes = dataclasses.replace(mask, sha256="n" * 64)
-    changed = editor.propose_mask(
-        changed_bytes,
-        experiment_id=initial.experiment_id,
-        expected_revision=outcome.state.revision,
-    )
-    assert changed.status is CasStatus.ACCEPTED
-    assert changed.state.calibration.mask.source_uri == mask.source_uri
-    assert changed.state.content_fingerprint != outcome.state.content_fingerprint
 
 
 def test_q3_modules_keep_the_frozen_import_and_owner_boundary() -> None:

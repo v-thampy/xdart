@@ -1117,7 +1117,9 @@ def _scan_calibration(recipe: AverageScanRecipe):
     from xrd_tools.core import PONI
     from xrd_tools.core.geometry import DetectorCalibration
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
-    poni = PONI(values.dist, values.poni1, values.poni2, values.rot1, values.rot2, values.rot3, values.wavelength_m, recipe.calibration.detector_id)
+    selection = _semantic_pairs(recipe.reduction_extra).get('energy_selection')
+    wavelength = values.wavelength_m if selection is None else selection['wavelength_m']
+    poni = PONI(values.dist, values.poni1, values.poni2, values.rot1, values.rot2, values.rot3, wavelength, recipe.calibration.detector_id)
     calibration = DetectorCalibration(poni, dict(recipe.calibration.detector_config), parallax=recipe.calibration.parallax)
     return (poni, detector_calibration_to_integrator(calibration), calibration)
 def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threading.Event | None, progress: Callable[[str, int, int], None]):
@@ -1138,6 +1140,11 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
     frame = ScanFrame(1, image=science['average'], metadata=dict(science['metadata']), source_path=None, source_frame_index=0, background=None, mask=science['zero'])
     provenance = {**_science_payload(plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys, plan.saturation), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
     scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.output_artifact, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})
+    selection = _semantic_pairs(plan.recipe.reduction_extra).get('energy_selection')
+    if selection is not None:
+        scan.wavelength = selection['wavelength_m'] * 1e10
+        scan.energy = selection['energy_eV'] / 1000
+        scan.extra = {**scan.extra, 'energy_selection': selection}
     progress('reduce', 0, 1)
     flat, dark = (_load_static_correction(plan.recipe, plan.detector_shape, token, role)
                   for role in ('flat', 'dark'))
@@ -1440,6 +1447,20 @@ class AverageScanRunner:
             self._preparation_window = window
             window.__enter__()
             self._preparation_first_row = window.complete_metadata_for(0)
+            if self.recipe.calibration.values is not None:
+                from xrd_tools.core.energy import metadata_energy_values, resolve_acquisition_energy
+                wavelength, unit = window.metadata_wavelength()
+                def energies():
+                    for index in range(window.extent):
+                        row = (self._preparation_first_row if index == 0
+                               else window.complete_metadata_for(index))
+                        yield from metadata_energy_values(row, wavelength=wavelength,
+                                                          wavelength_unit=unit)
+                selection = resolve_acquisition_energy(
+                    self.recipe.calibration.values.wavelength_m, energies())
+                extras = {**_semantic_pairs(self.recipe.reduction_extra),
+                          'energy_selection': selection}
+                self.recipe = replace(self.recipe, reduction_extra=_freeze_pairs(extras, [0]))
             if _direct_eiger_candidate(graph):
                 layout, _reason = window.eiger_direct_chunk_layout()
                 self._preparation_direct_eiger_eligible = layout is not None

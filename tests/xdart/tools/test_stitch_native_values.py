@@ -523,7 +523,7 @@ def test_a_single_arm_xu_calibration_reads_only_its_2theta_motor(tmp_path, held)
 def test_an_energy_refined_calibration_checks_the_scans_against_their_recorded_energy(tmp_path):
     """Maintainer, 2026-09-29: "add a refine energy toggle". A calibration refined to 17 100 eV keeps the
     17 000.018 eV the scans recorded (source_energy_eV, in the pyFAI file and its xrayutilities partner):
-    both backends check the scans against it, and Stitch runs; without it, the scans are refused."""
+    both backends retain its fitted offset. Without it, valid scan metadata supplies the energy."""
     import json
     from xrd_tools.analysis.stitch_operation import run_stitch_operation
     from xrd_tools.core.containers import PONI
@@ -554,12 +554,18 @@ def test_an_energy_refined_calibration_checks_the_scans_against_their_recorded_e
     for backend_form in (form, mg):
         prepared = prepare_stitch_tool(replace(backend_form, geometry_path=Path(refined.pyfai_path)))
         assert prepared.requests[0].provenance["source_energy_checks"]  # the scans' energies were checked
+        assert prepared.requests[0].provenance['wavelength_A'] == pytest.approx(
+            energy_eV_to_wavelength_m(17100.) * 1e10)
         result = run_stitch_operation(prepared.requests[0])
         assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
     unrecorded = pair("unrecorded")
     for backend_form in (form, mg):
-        with pytest.raises(StitchToolPreflightRefused, match="ENERGY"):
-            prepare_stitch_tool(replace(backend_form, geometry_path=Path(unrecorded.pyfai_path)))
+        prepared = prepare_stitch_tool(replace(backend_form, geometry_path=Path(unrecorded.pyfai_path)))
+        selection = prepared.requests[0].provenance['plan']['energy_selection']
+        assert selection['energy_eV'] == pytest.approx(17000.018)
+        assert selection['fitted_energy_offset_eV'] == 0.
+        result = run_stitch_operation(prepared.requests[0])
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
     # Codex re-review R2-F1: a recorded energy no comparison can fail (NaN, infinity, a string) or one
     # far from the calibration's own is refused at Preview, never taken as the reference
     for index, bad in enumerate(("nan", "inf", "17000", 16000.)):
