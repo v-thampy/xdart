@@ -1642,7 +1642,9 @@ def test_average_contributor_fields_are_exact_per_logical_frame_and_family(tmp_p
     assert tuple(item.name for item in fields(value)) == (
         "ordinal", "logical_index", "source_path", "source_frame_index",
         "dataset_path", "source_start", "source_stop", "size", "mtime_ns",
+        "source_constituents", "point_images",
     )
+    assert value.source_constituents == () and value.point_images is None
     with pytest.raises((TypeError, ValueError)):
         AverageContributor(1, 2, "/x", 0, None, 0, 1, 0, 0)
     with pytest.raises((TypeError, ValueError)):

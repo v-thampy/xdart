@@ -609,7 +609,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                     if options.get("selection_mode") == "single_image"
                     else image_series_spec(selected, metadata_format=options.get("metadata_format")))
         qualified = dict(expanded.options)
-        for key in ("meta_dir", "detector", "detector_shape", "raw_dtype", "raw_header_skip"):
+        for key in ("meta_dir", "detector", "detector_shape", "raw_dtype", "raw_header_skip", "point_images"):
             if key in options: qualified[key] = options[key]
     else: qualified = options
     files = tuple(str(Path(value).expanduser()) for value in qualified.get("files", ()))
@@ -625,6 +625,10 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     grouped_source = None
     if "point_images" in qualified:
         from xrd_tools.sources import open_source
+        if reader_binding:
+            from xrd_tools.io.metadata import read_image_metadata_observed
+            read_image_metadata_observed(files[0], qualified.get("metadata_format", "auto"),
+                meta_dir=qualified.get("meta_dir"), max_input_bytes=1 << 16)
         grouped_source = open_source(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
     members: list[SourceFileState] = []; metadata_sources: list[AdmittedMetadataSource] = []
     motor_rows: list[AdmittedMotorValue] = []
@@ -2045,10 +2049,10 @@ class _AverageSourceReadWindow:
     def __init__(self, value: PreparedSourceExecutionGraph, *, cancelled=None,
                  direct_chunk_policy=None, prevalidated=False):
         self._graph = value; self._cancelled = cancelled; self._cursor = None
-        self._tiff = None
+        self._tiff = None; self._point_tiff = None
         self._prevalidated = bool(prevalidated)
         self._direct_chunk_policy = direct_chunk_policy
-        self._direct_chunk_state = None; self._direct_iterator = None
+        self._direct_chunk_state = None; self._direct_iterator = None; self._direct_next = 0
         self._terminal_cleanup_error = None
         self._closed = False; self._entered = False
     @property
@@ -2099,23 +2103,29 @@ class _AverageSourceReadWindow:
                     for item in self._graph.stamp.admitted_motor_values
                 ),
             )
+            if "point_images" in options:
+                self._point_tiff = TiffSeriesSource(tuple(item.path for item in self._graph.stamp.members),
+                    metadata_format=options.get("metadata_format"), meta_dir=options.get("meta_dir"),
+                    detector_shape=options.get("detector_shape"), detector=options.get("detector"),
+                    raw_dtype=str(options.get("raw_dtype", "int32")), raw_header_skip=int(options.get("raw_header_skip", 0)),
+                    point_images=options["point_images"])
         self._entered = True
         return self
     def read_native(self, logical_index: int) -> np.ndarray:
         _cancelled(self._cancelled); index = int(logical_index)
         if not 0 <= index < self.extent: raise IndexError(index)
         if self._direct_iterator is not None:
-            try:
-                block = next(self._direct_iterator)
-            except StopIteration as error:
-                _cancelled(self._cancelled)
-                raise RuntimeError(
-                    "Average direct source ended before its admitted extent"
-                ) from error
-            if (block.start, block.stop) != (index, index + 1):
-                raise RuntimeError(
-                    "Average direct source violated exact frame order"
-                )
+            if index < self._direct_next:
+                raise RuntimeError("Average direct source violated exact frame order")
+            while self._direct_next <= index:
+                try:
+                    block = next(self._direct_iterator)
+                except StopIteration as error:
+                    _cancelled(self._cancelled)
+                    raise RuntimeError("Average direct source ended before its admitted extent") from error
+                if (block.start, block.stop) != (self._direct_next, self._direct_next + 1):
+                    raise RuntimeError("Average direct source violated exact frame order")
+                self._direct_next += 1
             array = np.asarray(block.array)
             if array.shape != (1, *self._graph.detector_shape):
                 raise RuntimeError(
@@ -2124,8 +2134,25 @@ class _AverageSourceReadWindow:
             return array[0]
         if self._cursor is not None: return self._cursor.read_frame(index)
         return np.asarray(self._tiff.load_frame(index + 1))
+    def finish_native_group(self, stop):
+        if self._direct_iterator is not None and self._direct_next < stop:
+            self.read_native(stop - 1)
     def complete_metadata_for(self, logical_index: int) -> dict[str, Any]:
         _cancelled(self._cancelled); index = int(logical_index)
+        policy = self._graph.execution_source.options.get("point_images")
+        if policy is not None:
+            k = policy["images_per_point"]
+            if self._point_tiff is not None:
+                return dict(self._point_tiff.metadata_for(index // k + 1))
+            provider = self._cursor.metadata_provider()
+            result = dict(provider.constants())
+            for name, values in provider.scan_table().items():
+                values = np.asarray(values)
+                position = index // k if len(values) == self.extent // k else index // k * k if len(values) == self.extent else None
+                if position is None:
+                    raise ValueError("NeXus counter metadata does not match image or point count")
+                result[name] = values[position].item()
+            return result
         if self._cursor is not None:
             return dict(self._cursor.metadata_provider().complete_metadata_for(index))
         return dict(getattr(self._tiff, "metadata_for")(
@@ -2167,6 +2194,7 @@ class _AverageSourceReadWindow:
                     self, "AVERAGE_SOURCE_CLEANUP_PENDING",
                 )
         self._closed = True
+        self._tiff = self._point_tiff = None
         if self._terminal_cleanup_error is not None:
             error, self._terminal_cleanup_error = (
                 self._terminal_cleanup_error, None,

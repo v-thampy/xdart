@@ -5061,7 +5061,7 @@ def _apply_gi_freeze_policy(
 
 
 def _signed_point_difference(metadata: Mapping[str, Any]) -> bool:
-    point = metadata.get("point_images")
+    point = metadata.get("point_images", metadata.get("average_point_images"))
     return isinstance(point, Mapping) and point.get("operation") == "difference"
 
 
@@ -5728,7 +5728,7 @@ def _reduce_frame(
     point_policy = (frame.metadata or {}).get("point_images")
     grouped = isinstance(point_policy, Mapping)
     signed_point = _signed_point_difference(frame.metadata)
-    if signed_point:
+    if signed_point and grouped:
         frame.metadata = {**frame.metadata, "point_images": {
             **point_policy, "positive_total_screening": False,
         }}
@@ -6046,6 +6046,11 @@ def _condition_point_operand(native, plan: ReductionPlan):
     invalid = detector_value_mask(None, native, enabled=bool(plan.mask_saturation), saturation=plan.saturation)
     if invalid is not None:
         image[invalid] = np.nan
+    if plan.flat is not None:
+        flat = np.asarray(plan.flat)
+        if flat.shape != native.shape:
+            raise ValueError("flat field shape must match each native detector operand")
+        image[~np.isfinite(flat) | (flat <= 0)] = np.nan
     return _apply_thresholds_owned(image, plan)
 
 
@@ -6723,7 +6728,7 @@ def _iter_reduction_chunks(
     frame_by_index = {int(frame.index): frame for frame in scan.frames}
     if not isinstance(source, Scan):
         statistics_iterator = getattr(source, "iter_point_statistics", None)
-        if callable(statistics_iterator) and plan is not None:
+        if callable(statistics_iterator) and getattr(source, "point_image_policy", None) is not None and plan is not None:
             for statistics, labels in statistics_iterator(chunk_size, poisson=_wants_poisson(plan), native_transform=lambda native: _condition_point_operand(native, plan)):
                 frames = [frame_by_index[int(label)] for label in labels]
                 for frame, result in zip(frames, statistics):

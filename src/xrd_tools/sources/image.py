@@ -264,6 +264,25 @@ class TiffSeriesSource(BaseFrameSource):
     def load_point_frame(self, index, *args, **kwargs):
         return self.load_point_statistics(index, *args, **kwargs).signal
 
+    def iter_point_statistics(self, chunk_size, *, poisson=False, native_transform=None,
+                              conditioning=None, saturation=None, cancelled=None):
+        if self._point_source is None:
+            raise ValueError("TIFF source has no confirmed point grouping")
+        if type(chunk_size) is not int or chunk_size <= 0:
+            raise ValueError("point chunk size must be a positive whole count")
+        statistics, labels = [], []
+        for label in self.frame_indices:
+            if cancelled is not None and cancelled():
+                raise InterruptedError("point-image consumption cancelled")
+            statistics.append(self.load_point_statistics(label, conditioning, saturation,
+                poisson=poisson, native_transform=native_transform))
+            labels.append(label)
+            if len(labels) == chunk_size:
+                yield statistics, labels
+                statistics, labels = [], []
+        if labels:
+            yield statistics, labels
+
     def _read_path(self, path: str | Path) -> np.ndarray:
         return np.asarray(read_image(
             path,

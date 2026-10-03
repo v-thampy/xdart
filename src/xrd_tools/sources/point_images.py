@@ -171,11 +171,14 @@ def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
         if observed.source_path is None or scan is None:
             return None
         metadata = SpecSource(observed.source_path, scan=scan)
+        detection = detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), len(files))
+        if detection is None:
+            return None
         recorded = tuple(find_spec_image_files(files[0].parent, Path(observed.source_path).stem,
                                               metadata.scan_key, stem))
         if tuple(Path(value) for value in recorded) != files:
             raise ValueError("TIFF point grouping must cover the exact recorded scan image series")
-        return detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), len(files))
+        return detection
     if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
         from xrd_tools.sources.descriptor import describe_container
 
