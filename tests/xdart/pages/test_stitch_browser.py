@@ -65,15 +65,15 @@ def test_stitch_frames_keep_identities_grouped_labels_and_excluded_marks_in_ints
         page.open_result(path)
         _wait(page, qapp)
         frames = page.browser.result_frames
-        assert [frames.item(i).text() for i in range(frames.count())] == ["2-0", "2-1", "3-0"]
-        identities = [tuple(json.loads(frames.item(i).data(_ROLE))) for i in range(frames.count())]
+        assert [frames.item(i).text() for i in range(frames.count())] == ["Full", "2-0", "2-1", "3-0"]
+        identities = [tuple(json.loads(frames.item(i).data(_ROLE))) for i in range(1, frames.count())]
         assert [frame for _scan, frame in identities] == [0, 1, 0]
         assert identities[0][0] == identities[1][0] != identities[2][0]  # two scans' own storage groups
-        assert page.raw_button.isEnabled() and page.browser.current_result_frame_label() == "2-0"
+        assert page.raw_button.isEnabled() and page.browser.current_result_frame_label() == "Full"
         page._show_raw()
         _wait(page, qapp)
-        page.frames.setCurrentRow(2)  # a user choosing a frame: the raw read follows it
-        assert page.browser.current_result_frame() == frames.item(2).data(_ROLE)
+        page.frames.setCurrentRow(3)  # a user choosing a frame: the raw read follows it
+        assert page.browser.current_result_frame() == frames.item(3).data(_ROLE)
         assert page.scientific.raw_popup_status.text() == "Loading selected frame…"
         _wait(page, qapp)
         assert "3-0" in page.scientific.raw_popup_status.text() and page.browser.current_result_frame_label() == "3-0"

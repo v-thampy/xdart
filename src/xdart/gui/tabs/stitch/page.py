@@ -515,6 +515,7 @@ class StitchPage(QtWidgets.QWidget):
         #: The view's settings as Int keeps them: plot mode and axis, plot options, color map and log
         #: scale, and for a map its image axis, slice and pins.
         self._view = ScientificPreferences()
+        self._member_preferences = self._member_frame_view = self._member_key = None
         #: The last map projection shown (a pin takes its slice); None while a pattern shows.
         self._last_map_state = None
         # Only the shown linear traces, without a second hold on the map, for detached fit inputs.
@@ -2256,6 +2257,9 @@ class StitchPage(QtWidgets.QWidget):
 
     def _poll(self):
         update = self._owner.poll()
+        if (update is not None and update.action is StitchOwnerAction.FRAME_READ
+                and self._raw_request_revision != self._raw_revision):
+            update = None  # cancelled/superseded frame work cannot repaint a newer frame or file
         if update is not None:
             if update.progress is not None:
                 p = update.progress
@@ -2271,6 +2275,8 @@ class StitchPage(QtWidgets.QWidget):
                     self._metadata_dialog.status.setText(update.failure_message or update.failure_type)
                 if update.action is StitchOwnerAction.FRAME_READ and self._raw_request_revision == self._raw_revision:
                     self.scientific.show_raw_status("Image unavailable · " + (update.failure_message or update.failure_type))
+                    if self._member_preferences is not None:
+                        self._draw()
             elif update.terminal_status is OperationTerminalStatus.CANCELLED:
                 self._queued_jobs.clear()
                 self._after_prepare = None
@@ -2336,11 +2342,15 @@ class StitchPage(QtWidgets.QWidget):
                          ready=bool(preflight.requests))
         elif outcome.kind is StitchOwnerOutcomeKind.FRAME_READ:
             if (self._raw_request_revision == self._raw_revision and not self._closing
-                    and self.scientific.raw_popup_shown()
+                    and (self.scientific.raw_popup_shown() or self._member_preferences is not None)
                     and self._current_payload() is not None
                     and outcome.artifact_path == self._current_payload().inspection.path):
-                self._raw_frame_view = outcome.frame_view
-                self._render_raw()
+                if self._member_preferences is not None:
+                    self._member_frame_view = outcome.frame_view
+                    self._draw()
+                else:
+                    self._raw_frame_view = outcome.frame_view
+                    self._render_raw()
                 self._status(f"Ready · saved {_kind_name(self._current_payload())} result")
         elif outcome.kind is StitchOwnerOutcomeKind.REOPENED and self._reloading is not None:
             path, self._reloading = self._reloading, None
@@ -2433,10 +2443,12 @@ class StitchPage(QtWidgets.QWidget):
         self._view_revision += 1
         self._raw_revision += 1
         self._raw_frame_view = None
+        self._member_preferences = self._member_frame_view = self._member_key = None
         from xdart.gui.tabs.scattering.browser_view import BrowserResult
         entries = []
         payload = self._current_payload()
         if payload is not None:
+            entries.append(BrowserResult("Full", "Full", "The stitched result and selected file comparison"))
             records = payload.contributing_frames
             manifest = json.loads(payload.provenance_json).get("source", {}).get("input_manifest", {})
             sources = {entry["source"]["module_source_fingerprint"]: entry["source"]["relative_path"]
@@ -2472,32 +2484,59 @@ class StitchPage(QtWidgets.QWidget):
             self._frame_changed()  # the first frame current, as the list's own signal did
         else:
             self.scientific.show_raw_status("", clear_image=True)
-        self._draw()
+            self._draw()
         if hasattr(self, "run_bar"):
             self._sync_actions()
 
     def _frame_changed(self, *_args):
         self._raw_revision += 1
         self._raw_frame_view = None
-        if self.scientific.raw_popup_shown():
+        self._member_frame_view = None
+        identity = self._owner.current_identity
+        if identity is not None and identity.request.action is StitchOwnerAction.FRAME_READ:
+            self._owner.cancel()
+        identifier = self.browser.current_result_frame()
+        payload = self._current_payload()
+        if identifier in {None, "Full"}:
+            self._member_preferences = self._member_key = None
+        elif payload is not None and payload.kind is AnalysisArtifactKind.STITCH_2D:
+            if self._member_preferences is None:
+                self._member_preferences = replace(self._view, plot_mode="Single", slice_enabled=False,
+                                                   slice_pins=(), detector_mode="full", plot_axis="Q")
+            scan, frame = json.loads(identifier)
+            self._member_key = replace(self._result_key(self.browser.current_result()),
+                source_scan=self.browser.current_result_frame_label(), artifact=payload.inspection.path,
+                local_frame_label=frame, work_ordinal=frame + 1)
+        if (identifier not in {None, "Full"}
+                and (self._member_preferences is not None or self.scientific.raw_popup_shown())):
             self.scientific.show_raw_status("Loading selected frame…", clear_image=True)
             self._raw_pending = True
             QtCore.QTimer.singleShot(0, self._request_raw)
+        else:
+            self._raw_pending = False
+        self._draw()
+        if identifier not in {None, "Full"} and payload is not None and payload.kind is AnalysisArtifactKind.STITCH_1D:
+            self._status("Contributor cake unavailable: no frozen 2D settings; Raw image reads the original contributor", ready=False)
 
     def _show_raw(self):
         """The current contributing frame in the view's own raw pop-up, in the mode it was last left in
         (Thumbnail at first)."""
+        if self.browser.current_result_frame() == "Full" and self.frames.count() > 1:
+            self.frames.setCurrentRow(1)
+        if self._member_preferences is not None:
+            self._frame_changed()
+            return  # this contributor's full scientific raw already has Int's main detector pane
         self.scientific.show_raw_popup("Stitch contributing frame", mode=self.scientific.raw_popup_mode())
         self._frame_changed()
 
     def _request_raw(self):
-        if self._closing or not self.scientific.raw_popup_shown():
+        if self._closing or (not self.scientific.raw_popup_shown() and self._member_preferences is None):
             self._raw_pending = False
             return
         if self._owner.busy or self._queued_jobs:
             return
         identifier, payload = self.browser.current_result_frame(), self._current_payload()
-        if identifier is None or payload is None:
+        if identifier in {None, "Full"} or payload is None:
             self._raw_pending = False
             return
         scan, frame = json.loads(identifier)
@@ -2505,7 +2544,7 @@ class StitchPage(QtWidgets.QWidget):
         self._raw_pending = False
         self._start("Loading contributing frame…", lambda: self._owner.begin_frame_read(
             payload, frame, scan=scan, source_root=str(self._value("project_root")) or None,
-            full_raw=self.scientific.raw_popup_mode() == "full"))
+            full_raw=self.scientific.raw_popup_mode() == "full", scientific=self._member_preferences is not None))
 
     def _render_raw(self):
         """The read frame in the raw pop-up: its full raw image when Full Raw is chosen and the original is
@@ -2654,8 +2693,11 @@ class StitchPage(QtWidgets.QWidget):
             self._status(str(error), ready=False)
 
     def _set_view(self, **changes):
-        self._view = replace(self._view, **changes)
-        self.browser.set_result_plot_mode(self._view.plot_mode)
+        if self._member_preferences is not None:
+            self._member_preferences = replace(self._member_preferences, **(changes | {"plot_mode": "Single", "slice_pins": ()}))
+        else:
+            self._view = replace(self._view, **changes)
+            self.browser.set_result_plot_mode(self._view.plot_mode)
 
     def _mount_payload(self, path, payload):
         if type(payload) is not AnalysisArtifactPayload or payload.inspection.kind not in {
@@ -2773,12 +2815,35 @@ class StitchPage(QtWidgets.QWidget):
         (a Stitch 2D result's I(q), as Int 1D shows a 2-D record's)."""
         if not hasattr(self, "scientific"):
             return
+        if self._member_preferences is not None:
+            self._draw_member()
+            return
+        self.scientific.set_hidden_tools("norm", "raw", "raw_pane")
+        self.scientific.set_plot_modes("Single", "Overlay", "Average", "Sum", "Waterfall")
         self._draw_projection("Int 2D" if self._mode == "Stitch 2D" else "Int 1D")
         self.curve.setLabel("left", scaled_intensity_label(self._diagnostic,
                                                            self._view.plot_options.intensity_scale))
         blocker = QtCore.QSignalBlocker(self._diagnostic_combo)
         self._diagnostic_combo.setCurrentText(self._diagnostic)
         del blocker
+
+    def _draw_member(self):
+        """Drive the whole Int scientific view with one contributor, independently of file comparisons."""
+        from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
+        from xdart.gui.tabs.scattering.shell_projection import build_scientific_projection
+        from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
+        key, view = self._member_key, self._member_frame_view
+        navigation = FrameNavigationProjection((key,), key, (key,))
+        payloads = () if view is None else (StandardDisplayPayload(0, key, key.source_scan, view,
+            status="complete", wavelength_m=view.extra["wavelength_m"]),)
+        state = build_scientific_projection(payloads, navigation, frozenset((key,)), self._member_preferences,
+                                            "", processing_mode="Int 2D")
+        state = replace(state, retain_display=False, replace_trace_history=True)
+        self._last_map_state = state
+        self.scientific.set_hidden_tools("norm", "raw")
+        self.scientific.set_plot_modes("Single")
+        self.scientific.reconcile(state, navigation, completed=1, total=1, detail="")
+        self._sync_fit_tools()
 
     def _navigation(self):
         """Every result's key, the current result's and the selected results' (the view's footer)."""
@@ -2921,6 +2986,8 @@ class StitchPage(QtWidgets.QWidget):
                 str(self._value("project_root")))
 
     def _fit_reason(self, kind):
+        if self._member_preferences is not None:
+            return "Return to Full to fit the saved stitched result"
         path = self.browser.current_result()
         payload = self._payloads.get(path)
         if self._closing or self._owner.busy:
@@ -3120,7 +3187,10 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.scientific_axes import shown_slice_pin
         from xdart.gui.tabs.scattering.scientific_preferences import scientific_preference_updates
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
-        kind, view = command.kind, self._view
+        kind, view = command.kind, self._member_preferences or self._view
+        if self._member_preferences is not None and kind in {
+                ShellCommandKind.PIN_SLICE, ShellCommandKind.SET_PLOT_MODE, ShellCommandKind.SET_BACKGROUND}:
+            return
         if kind is ShellCommandKind.PAGE_TOOL and command.value == "export-run":
             self._workflow_export.choose()
             return

@@ -2786,6 +2786,159 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer, saturation=None) ->
     )
 
 
+def read_stitch_contributor_view(payload, frame_index, *, scan=None, source_root=None, cancel_token=None):
+    """Reduce one saved contributor without publishing or consulting editable operator intent.
+
+    The existing raw/metadata readers bind originals to the artifact's receipts. Group screening is
+    retained as annotation; a one-frame inspection never reinterprets the group's admission verdict.
+    """
+    from xrd_tools.analysis.stitch_metadata import read_stitch_metadata
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.core.frame_view import FrameView
+    from xrd_tools.io.frame_view import read_contributing_frame_view
+    from xrd_tools.io.nexus_record import frame_record_key
+    from xrd_tools.io.read import resolve_source_master
+    from xrd_tools.sources.memory import MemoryFrameSource
+    from xrd_tools.analysis.xu_stitch_calibration import XuStitchCalibrationInput, capture_xu_stitch_calibration
+
+    def cancelled():
+        if cancel_token is not None and cancel_token.is_set():
+            raise StitchCancelled("contributor inspection cancelled")
+
+    cancelled()
+    row = next(item for item in payload.contributing_frames if item["key"] == frame_record_key(scan, frame_index))
+    provenance = json.loads(payload.provenance_json)
+    saved = provenance["plan"]
+    if saved["mode"] != "2d":
+        raise ValueError("Contributor cake unavailable: this Stitch1D result has no frozen 2D inspection settings")
+    if not saved.get("native_records"):
+        raise ValueError("Frozen contributor settings unavailable; stitch this result again")
+    manifest = provenance["source"]["input_manifest"]
+    members = manifest.get("members", (manifest,))
+    member_index = next(i for i, item in enumerate(members)
+        if item["source"]["module_source_fingerprint"] == row["identity"]["source_id"])
+    contribution = next(item for item in members[member_index]["contributions"] if item["label"] == frame_index)
+    tables = read_stitch_metadata(payload, source_root=source_root, cancel_token=cancel_token,
+                                 source_id=row["identity"]["source_id"])
+    cancelled()
+    if not tables or tables[0].table.disposition is not AnalysisDisposition.COMPLETED:
+        raise ValueError("Source metadata unavailable or changed: " + (tables[0].table.code if tables else "missing"))
+    metadata = {item["name"]: item["value"] for item in contribution["values"]}
+    base = json.loads(payload.inspection.frame_manifest_json)["source_base"]
+
+    def resolve(relative):
+        path = resolve_source_master(relative, scan_file=payload.inspection.path, source_base=base, source_root=source_root)
+        if path is None:
+            raise ValueError(f"Frozen input unavailable: {relative}")
+        return str(path)
+
+    def selector(value):
+        return None if value is None else MetadataColumnSelector(value["name"], value["occurrence"])
+
+    backend = saved["backend"]
+    corrections = saved.get("corrections", {})
+    common = {name: saved[name] for name in ("mode", "npt_1d", "unit", "max_frame_bytes")}
+    for name in ("radial_range", "azimuth_range_1d"):
+        common[name] = None if saved.get(name) is None else tuple(saved[name])
+    map_values = saved["map"] if backend == "xu_hist" else saved
+    if not {"npt_rad_2d", "npt_azim_2d", "azimuth_range",
+            "unit" if backend == "xu_hist" else "map_unit",
+            "radial_range" if backend == "xu_hist" else "map_radial_range"} <= map_values.keys():
+        raise ValueError("Frozen 2D contributor settings unavailable; stitch this result again")
+    common.update(npt_rad_2d=map_values["npt_rad_2d"], npt_azim_2d=map_values["npt_azim_2d"],
+                  azimuth_range=None if map_values["azimuth_range"] is None else tuple(map_values["azimuth_range"]),
+                  map_unit=map_values["unit" if backend == "xu_hist" else "map_unit"],
+                  map_radial_range=None if map_values["radial_range" if backend == "xu_hist" else "map_radial_range"] is None
+                  else tuple(map_values["radial_range" if backend == "xu_hist" else "map_radial_range"]),
+                  native_records=True, conditioning=StitchConditioning(**saved["conditioning"]),
+                  monitor_selector=selector(saved["monitor_selector"]), polarization_factor=corrections.get("polarization_factor"))
+    for role in ("mask", "dark", "flat"):
+        asset = saved.get("mask") if role == "mask" else corrections.get(role)
+        common[f"{role}_path"] = None if asset is None else resolve(asset["relative_path"])
+    flat = corrections.get("flat")
+    common["flat_min_fraction"] = DEFAULT_MIN_FLAT_FRACTION if flat is None else flat.get("min_fraction", DEFAULT_MIN_FLAT_FRACTION)
+    if saved.get("foil_normalization") is not None:
+        foil = saved["foil_normalization"]
+        common["foil_normalization"] = StitchFoilNormalization(selector(foil["foil_selector"]),
+            tuple(foil["absorption_lengths"]), selector(foil["exposure_selector"]))
+    if saved.get("gi") is not None:
+        gi = dict(saved["gi"])
+        gi.pop("units", None)
+        for name in ("cuts", "ip_range", "oop_range", "reversed_motors"):
+            if gi.get(name) is not None:
+                gi[name] = tuple(gi[name])
+        for name in ("sample_motors", "motor_zeros"):
+            if name in gi:
+                gi[name] = tuple(sorted(gi[name].items()))
+        common["gi"] = StitchGI(**gi)
+    if backend == "multigeometry":
+        geometry = provenance["geometry"]
+        orientation = geometry["image_orientation"]
+        receipt = capture_stitch_geometry(StitchGeometryInput(resolve(geometry["relative_path"]),
+            StitchGeometryKind(geometry["kind"]), geometry["sha256"],
+            tuple(tuple(item) for item in geometry["source_motors"]),
+            tuple(tuple(item) for item in geometry["reference_motor_positions"]), orientation["rotation"],
+            geometry["base_preset"], orientation.get("flip_horizontal", False)))
+        plan = StitchOperationPlan(receipt, **common, method=saved["method"], sample_position=saved["sample_position"],
+            use_detector_mask=saved["use_detector_mask"], correct_solid_angle=corrections["solid_angle"],
+            error_model=corrections["error_model"])
+        if _effective_poni_calibration(receipt, receipt.content) != geometry.get("effective_calibration"):
+            raise ValueError("Frozen effective calibration changed since stitching")
+    elif backend == "xu_hist":
+        asset = provenance["asset"]
+        receipt = capture_xu_stitch_calibration(XuStitchCalibrationInput(resolve(asset["lexical_relative_path"])),
+                                             project_root=source_root or base)
+        if receipt.raw_sha256 != asset["raw_sha256"]:
+            raise ValueError("Frozen calibration changed since stitching")
+        with xu_runtime_session() as session:
+            effective = resolve_xu_stitch_effective_geometry(receipt, session).projection
+        if effective.fingerprint != saved["effective_geometry_fingerprint"]:
+            raise ValueError("Frozen effective geometry changed since stitching")
+        plan = XuStitchOperationPlan(receipt, effective, **common, allow_extrapolation=saved.get("allow_extrapolation", False))
+    else:
+        raise ValueError("Frozen contributor backend unavailable")
+    for role in ("mask", "dark", "flat"):
+        original = saved.get("mask") if role == "mask" else corrections.get(role)
+        captured = getattr(plan, f"_{role}_receipt")
+        if original is not None and (captured.sha256 != original["sha256"]
+                or captured.revision[3:5] != tuple(original["revision"][3:5])):
+            raise ValueError(f"Frozen {role} changed since stitching")
+    cancelled()
+    view = read_contributing_frame_view(payload.inspection.path, frame_index, scan=scan, source_root=source_root,
+                                        full_raw=True, artifact_payload=payload)
+    if view.raw is None:
+        raise ValueError(view.extra.get("raw_unavailable_reason", "raw source unavailable"))
+    _wavelength, _shape, orientation = geometry_facts(plan)
+    # The shared raw reader applies its persisted rotation. Apply only the remaining camera mirror.
+    raw = ImageOrientation(flip_horizontal=orientation.flip_horizontal).apply(view.raw)
+    source = MemoryFrameSource([ScanFrame(0, image=raw, metadata=metadata)])
+    recorded = (saved["conditioning"].get("saturation") or [None] * len(members))[member_index]
+    saturation = None if recorded is None else {0: recorded}
+    if backend == "multigeometry":
+        diff, _orientation = _runtime_geometry(receipt, receipt.content)
+        result = run_stitch(_runtime_plan(plan, diff, saturation), source, frame_indices=(0,),
+                            cancel_token=cancel_token, collect_frame_records=False)
+        one, two = (result.payload, None) if plan.mode == "1d" else (result.profile[0], result.payload)
+    else:
+        result = run_xu_hist_stitch_1d(receipt, source, frame_indices=(0,), npt=plan.npt_1d,
+            monitor_key=None if plan.monitor_selector is None else plan.monitor_selector.name,
+            **_foil_backend_kwargs(plan), max_frame_bytes=plan.max_frame_bytes, unit=plan.unit,
+            radial_range=plan.radial_range, conditioning=plan.conditioning, saturation=saturation, mask=native_mask(plan),
+            polarization_factor=plan.polarization_factor, dark=native_detector_image(plan, plan._dark_receipt),
+            flat=native_detector_image(plan, plan._flat_receipt), flat_min_fraction=plan.flat_min_fraction,
+            cancel_token=cancel_token, gi=plan.gi, map_grid=None if plan.mode == "1d" else _xu_map_grid(plan),
+            map_unit=plan.map_unit, map_radial_range=plan.map_radial_range, azimuth_range_1d=plan.azimuth_range_1d,
+            allow_extrapolation=plan.allow_extrapolation)
+        one, two = result.payload, None if result.map is None else result.map[0]
+    cancelled()
+    _revalidate_geometry(receipt) if backend == "multigeometry" else revalidate_xu_stitch_calibration(receipt)
+    for role in ("mask", "dark", "flat"):
+        revalidate_mask(getattr(plan, f"_{role}_receipt")) if role == "mask" else native_detector_image(plan, getattr(plan, f"_{role}_receipt"))
+    return FrameView.from_results(label=frame_index, result_1d=one, result_2d=two, raw=raw,
+        metadata_raw=metadata, source_path=view.source_path, source_frame_index=view.source_frame_index,
+        extra={"wavelength_m": _wavelength * 1e-10, "saved_screen": row.get("screen"), "saved_excluded": row.get("excluded", False)})
+
+
 @dataclass(eq=False, frozen=True, slots=True)
 class StitchOperationResult:
     request: StitchOperationRequest
@@ -3647,6 +3800,7 @@ __all__ = [
     "XuStitchOperationPlan",
     "capture_stitch_geometry",
     "prepare_stitch_operation",
+    "read_stitch_contributor_view",
     "run_stitch_operation",
     "stitch_output_current",
 ]

@@ -101,6 +101,7 @@ def test_a_stitch_2d_shows_its_map_as_int_2d_without_the_raw_pane(qapp, tmp_path
         page.run_bar.modeCombo.setCurrentText("Stitch 2D")
         page.set_field("npt_rad_2d", "48")
         page.set_field("npt_azim_2d", "32")
+        _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
         target = page._owner.prepared.request.module.output.target
@@ -130,7 +131,7 @@ def test_a_stitch_2d_shows_its_map_as_int_2d_without_the_raw_pane(qapp, tmp_path
         (pinned,) = page._last_map_state.pinned_traces
         np.testing.assert_array_equal(pinned.trace.intensity, nanmean_slice(cake[window, :], 0))
         # the contributing frames, as a Stitch 1D's
-        assert page.frames.count() == 2
+        assert page.frames.count() == 3
         row = payload.contributing_frames[0]
         frame = read_contributing_frame_view(target, row["identity"]["frame_index"],
                                              scan=row["key"].split("/")[0][5:], artifact_payload=payload)
