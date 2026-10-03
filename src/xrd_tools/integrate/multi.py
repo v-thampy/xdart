@@ -310,7 +310,10 @@ def _streaming_multigeometry(
     def read(index):
         """The next frame and its integrator, read in frame order."""
         try:
-            image = np.asarray(next(image_iterator), dtype=float)
+            from xrd_tools.sources.point_images import PointImageResult
+            value = next(image_iterator)
+            statistics = value if isinstance(value, PointImageResult) else None
+            image = np.asarray(value.signal if statistics is not None else value, dtype=float)
         except StopIteration as error:
             raise ValueError(
                 f"streaming Stitch received {index} images; expected {image_count}"
@@ -322,9 +325,9 @@ def _streaming_multigeometry(
                 f"streaming Stitch received {index} integrators; "
                 f"expected {image_count}"
             ) from error
-        return image, integrator
+        return image, integrator, statistics
 
-    def frame_part(index, image, integrator):
+    def frame_part(index, image, integrator, statistics):
         """One frame's pyFAI sums, a frame worker's share: its integration result, I(q) beside a map,
         its GI sums and, screening, its total, with its radial and azimuthal axes. Its numexpr work (the
         polarization array, the GI sums) holds the pyFAI numexpr lock; the integrations run outside it."""
@@ -338,20 +341,25 @@ def _streaming_multigeometry(
                     raise ValueError(
                         f"Stitch {name} shape {value.shape} does not match the frame {image.shape}"
                     )
+            frame_dark = dark if statistics is None or statistics.exposure_multiplier else None
+            frame_invalid = invalid if frame_dark is not None else flat_invalid
+            if statistics is not None:
+                missing = ~np.isfinite(image)
+                frame_invalid = missing if frame_invalid is None else frame_invalid | missing
             frame_mask = (
                 None
-                if mask is None and invalid is None
+                if mask is None and frame_invalid is None
                 else np.asarray(mask_with_detector(
-                    integrator, invalid if mask is None else
-                    mask if invalid is None else np.logical_or(mask, invalid)), dtype=bool)
+                    integrator, frame_invalid if mask is None else
+                    mask if frame_invalid is None else np.logical_or(mask, frame_invalid)), dtype=bool)
             )
-            if dark is not None:
-                integrator.detector.darkcurrent = dark
+            if frame_dark is not None:
+                integrator.detector.darkcurrent = frame_dark
             monitor = 1.0 if factors is None else float(factors[index])
-            variance = None
-            if dark is not None and error_model == "poisson":
-                variance = np.maximum(image, 1.0)
-                variance += np.clip(dark, 0.0, None)
+            variance = None if statistics is None else statistics.variance
+            if error_model == "poisson" and frame_dark is not None:
+                variance = np.maximum(image, 1.0) if variance is None else variance.copy()
+                variance += np.clip(frame_dark, 0.0, None)
             if polarization_factor is not None:
                 # the integrations' one numexpr use: pyFAI keeps the array on the integrator, and both
                 # integrations below take this one
@@ -444,7 +452,7 @@ def _streaming_multigeometry(
                         integrator, image, gi_angles[index], gi, gi_bins,
                         npt_rad if mode == "1d" else profile_npt,
                         mask=frame_mask, correct_solid_angle=correct_solid_angle,
-                        polarization_factor=polarization_factor, dark=dark, flat=flat, monitor=monitor,
+                        polarization_factor=polarization_factor, dark=frame_dark, flat=flat, monitor=monitor,
                         map_npt=gi_map_npt)
             total = None
             if frame_screen is not None:
@@ -454,10 +462,11 @@ def _streaming_multigeometry(
                 if frame_mask is not None:
                     valid &= ~frame_mask
                 signal = float(image[valid].sum())
-                if dark is not None:
+                if frame_dark is not None:
                     # A dropped frame on a detector with a pedestal still holds the dark.
-                    signal -= float(dark[valid].sum())
-                total = signal / monitor
+                    signal -= float(frame_dark[valid].sum())
+                total = (float('nan') if statistics is not None and not statistics.exposure_multiplier
+                         else signal / monitor)
             return (result, profile, gi_part, total, np.asarray(result.radial, dtype=float),
                     np.asarray(result.azimuthal, dtype=float) if mode == "2d" else None)
         finally:
@@ -505,11 +514,11 @@ def _streaming_multigeometry(
 
     if workers == 1:
         for index in range(image_count):
-            image, integrator = read(index)
-            merge(frame_part(index, image, integrator))
+            image, integrator, statistics = read(index)
+            merge(frame_part(index, image, integrator, statistics))
             # Release the detector-sized frame before asking the source for its
             # successor.  The aggregate retains only pyFAI's O(nbin) result arrays.
-            del image, integrator
+            del image, integrator, statistics
     else:
         parallel_frames(image_count, read, frame_part, merge, workers)
     try:

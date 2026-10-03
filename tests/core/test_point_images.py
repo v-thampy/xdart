@@ -186,6 +186,28 @@ def test_eiger_detection_and_confirmed_wrapper_leave_base_source_unchanged(tmp_p
     original.close()
 
 
+@pytest.mark.parametrize('operation', ['average', 'difference', 'select'])
+def test_grouped_bluesky_counters_remain_point_rows(tmp_path, operation):
+    from tests.core.test_metadata_provider import _bluesky, NF, IMG
+    from xrd_tools.sources.point_images import PointImagePolicy
+    path, hy, monitor, epoch = _bluesky(tmp_path / 'points.nxs')
+    with h5py.File(path, 'r+') as stream:
+        del stream['entry/data/eiger_image']
+        signal = stream.create_dataset('entry/data/eiger_image',
+            data=np.full((NF * 2, *IMG), 10, np.uint32), chunks=(2, *IMG))
+        signal.attrs['signal_type'] = 'detector'
+    spec = SourceSpec(path, SourceKind.NEXUS_STACK, options={
+        'scan_point_count': NF, 'point_images': PointImagePolicy(2, operation, image_index=2).to_dict()})
+    source = open_source(spec)
+    try:
+        for index in range(NF):
+            row = source.metadata_for(index)
+            assert row['i0'] == monitor[index] and row['EPOCH'] == epoch[index]
+            assert row['hy'] == hy[index]
+    finally:
+        source.close()
+
+
 def test_nexus_without_explicit_point_count_does_not_infer_from_motor_positions(tmp_path):
     from xrd_tools.sources.point_images import inspect_point_images, PointImagePolicy
 

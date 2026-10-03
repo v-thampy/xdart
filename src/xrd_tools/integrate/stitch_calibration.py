@@ -84,6 +84,7 @@ class CalibrationFrame:
     #: the staged image is also mirrored left-right (after ``rotation``): the detector camera's
     #: transform into Stitch's frame (``camera.stitch_orientation``); saved only when True
     flip: bool = False
+    point_images: dict | None = None
 
     @property
     def complete(self) -> bool:
@@ -343,7 +344,8 @@ def suggested_frame_indices(rows, count=5):
 
 
 def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
-                               rotation=0, motor_names=('del', 'nu'), cancelled=None, arm=None, flip=False):
+                               rotation=0, motor_names=('del', 'nu'), cancelled=None, arm=None, flip=False,
+                               conditioning=None, saturation=None):
     """Persist the exact selected detector pixels and their source angles, turned by ``rotation`` and
     mirrored left-right by ``flip`` (the detector camera's transform into Stitch's frame).
 
@@ -357,7 +359,7 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
     from xrd_tools.io.image import read_image
     spec = _exact_source(spec)
     graph = None
-    if spec.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
+    if spec.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER) and 'point_images' not in spec.options:
         from xrd_tools.sources.execution_graph import (
             qualify_source_execution_graph, requalify_source_execution_graph,
         )
@@ -372,6 +374,14 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
     root = Path(directory).resolve()
     root.mkdir(parents=True, exist_ok=True)
     source = open_source(spec)
+    receipt = None
+    if 'point_images' in spec.options:
+        from xrd_tools.analysis.scan_operations import MetadataTablePlan, run_metadata_table, AnalysisDisposition
+        table = run_metadata_table(MetadataTablePlan(spec))
+        if table.disposition is not AnalysisDisposition.COMPLETED:
+            getattr(source, 'close', lambda: None)()
+            raise ValueError('grouped calibration source cannot be frozen: ' + table.code)
+        receipt = table.receipt
     frames = []
     source_options = {'entry': spec.entry, 'options': dict(spec.options)}
     descriptor = getattr(source, 'container_descriptor', None)
@@ -391,7 +401,13 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
             original = source.frame_for(index)
             before = Path(original.source_path or spec.uri).stat()
             loader = getattr(source, 'load_native_frame', source.load_frame)
-            pixels = ImageOrientation(rotation=rotation, flip_horizontal=bool(flip)).apply(loader(index))
+            grouped = 'point_images' in spec.options
+            raw_pixels = (source.load_point_frame(index, conditioning, saturation) if grouped else loader(index))
+            pixels = ImageOrientation(rotation=rotation, flip_horizontal=bool(flip)).apply(raw_pixels)
+            if receipt is not None:
+                from xrd_tools.analysis.scan_operations import requalified_analysis_source
+                with requalified_analysis_source(receipt):
+                    pass
             if graph is not None:
                 requalify_source_execution_graph(spec, graph,
                     cancelled=None if cancelled is None else cancelled.is_set)
@@ -419,7 +435,8 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
                 json.loads(json.dumps(source_options, default=str)), int(index),
                 str(Path(original.source_path or spec.uri).resolve()),
                 original.source_frame_index, str(image), _sha(image), tuple(pixels.shape),
-                int(rotation), dict(motors), energy, flip=bool(flip)))
+                int(rotation), dict(motors), energy, flip=bool(flip),
+                point_images=(dict(source.metadata_for(index)['point_images']) if grouped else None)))
             current = Path(spec.uri).stat()
             if (current.st_ino, current.st_size, current.st_mtime_ns) != (source_state.st_ino, source_state.st_size, source_state.st_mtime_ns):
                 raise ValueError('scan metadata changed during preparation')
@@ -449,6 +466,8 @@ def _session_row(frame):
     row = asdict(frame)
     if not row['flip']:
         del row['flip']
+    if row['point_images'] is None:
+        del row['point_images']
     return row
 
 
@@ -457,14 +476,15 @@ def calibration_frame_mask(frame, mask=None, *, conditioning=None, saturation=No
 
     The staged image stays unchanged. None/off preserves the existing static mask without reading pixels.
     """
-    if conditioning is None or conditioning.mode == 'off':
+    if frame.point_images is None and (conditioning is None or conditioning.mode == 'off'):
         return mask
     from xrd_tools.io.image import read_image
     from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
     image = read_image(frame.image_path)
     if tuple(image.shape) != tuple(frame.shape):
         raise ValueError('the staged calibration image changed shape')
-    bad = np.isnan(condition_stitch_frame(image, conditioning, saturation))
+    bad = (~np.isfinite(image) if frame.point_images is not None
+           else np.isnan(condition_stitch_frame(image, conditioning, saturation)))
     if mask is not None:
         if np.shape(mask) != bad.shape:
             raise ValueError('the calibration mask does not match the staged image')

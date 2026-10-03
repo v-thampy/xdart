@@ -22,6 +22,7 @@ from xrd_tools.integrate.stitch_conditioning import (
     StitchConditioning,
     condition_stitch_frame,
     load_stitch_frame,
+    conditioned_stitch_frame,
 )
 from xrd_tools.rsm.coordinate_frame import (
     RSMCoordinateFrame,
@@ -608,16 +609,26 @@ def run_stitch(
         nonlocal progress_done
         for label in labels:
             _stitch_cancelled(cancel_token)
-            raw = load_stitch_frame(src, label, plan.conditioning)
+            point_loader = getattr(src, 'load_point_frame', None)
+            frame = src.frame_for(label)
+            grouped_point = frame.point_statistics_loader is not None
+            saturation = None if plan.saturation is None else plan.saturation.get(label)
+            statistics = None
+            if plan.backend == 'multigeometry' and plan.streaming_multigeometry:
+                if frame.point_statistics_loader is not None:
+                    statistics = frame.point_statistics_loader(label, plan.conditioning, saturation,
+                        poisson=plan.error_model == 'poisson')
+            raw = (conditioned_stitch_frame(src, label, plan.conditioning, saturation)
+                   if grouped_point else load_stitch_frame(src, label, plan.conditioning)) if statistics is None else statistics.signal
             if frame_record_callback is not None and label not in recorded_labels:
                 frame_record_callback(label, raw)
                 recorded_labels.add(label)
-            image = (np.asarray(raw, dtype=float) if plan.conditioning is None
+            image = (np.asarray(raw, dtype=float) if plan.conditioning is None or grouped_point
                      else condition_stitch_frame(raw, plan.conditioning,
-                                                 None if plan.saturation is None else plan.saturation.get(label)))
+                                                 saturation))
             raw = None
             _stitch_cancelled(cancel_token)
-            yield image
+            yield image if statistics is None else statistics
             _stitch_cancelled(cancel_token)
             if report:  # the streaming MultiGeometry stitch counts merged frames instead (``merged``)
                 progress_done += 1

@@ -94,6 +94,14 @@ def load_stitch_frame(source, label, conditioning: StitchConditioning | None):
     return np.asarray(loader(label))
 
 
+def conditioned_stitch_frame(source, label, conditioning=None, saturation=None):
+    """Condition native contributors before a point operation; never threshold its signed result."""
+    point_loader = getattr(source, "load_point_frame", None)
+    if callable(point_loader):
+        return point_loader(label, conditioning=conditioning, saturation=saturation)
+    return condition_stitch_frame(load_stitch_frame(source, label, conditioning), conditioning, saturation)
+
+
 def prepare_stitch_mask(mask, image_orientation: ImageOrientation, expected_shape):
     """Coerce a raw mask and orient it once into the calibrated pixel frame.
 

@@ -366,6 +366,9 @@ class PointImageSource(BaseFrameSource):
     def take_direct_chunk_fact(self):
         return self.source.take_direct_chunk_fact()
 
+    def note_direct_chunk_bypass(self, reason):
+        return self.source.note_direct_chunk_bypass(reason)
+
     def load_frame(self, index):
         return self.load_point_frame(index)
 
@@ -373,8 +376,23 @@ class PointImageSource(BaseFrameSource):
         return self.load_point_frame(index)
 
     def metadata_for(self, index):
-        raw = next(iter(self._raw_indices(index)))
-        result = dict(self.source.metadata_for(raw))
+        self._raw_indices(index)  # bounds, independently of the chosen exposure
+        first = index * self.point_image_policy.images_per_point
+        provider_method = getattr(self.source, '_metadata_provider', None)
+        provider = provider_method() if callable(provider_method) else None
+        if provider is None:
+            result = dict(self.source.metadata_for(first))
+        else:
+            result = dict(provider.constants())
+            for name, values in provider.scan_table().items():
+                values = np.asarray(values)
+                if len(values) == len(self._frame_indices):
+                    position = index
+                elif len(values) == len(self.source.frame_indices):
+                    position = first
+                else:
+                    raise ValueError('NeXus counter metadata does not match image or point count')
+                result[name] = values[position].item()
         for name, values in self.motors.items():
             result[name] = np.asarray(values)[index].item()
         result["point_images"] = point_image_metadata(self.point_image_policy, self.point_raw_locators(index))
