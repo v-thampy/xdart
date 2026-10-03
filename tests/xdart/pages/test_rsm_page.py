@@ -1837,6 +1837,25 @@ def test_preview_and_run_find_the_scans_off_the_gui_thread(qapp, tmp_path, monke
         _close(page, qapp)
 
 
+def test_conditioning_editors_align_with_threshold(qapp, tmp_path):
+    page = _page(qapp)
+    try:
+        page.set_field("project_root", str(tmp_path))
+        page.resize(1400, 1000)
+        page.show()
+        for mode in ("Foil transmission × exposure", "Monitor × foil transmission"):
+            page.set_field("normalization", mode)
+            qapp.processEvents()
+            left = lambda editor: editor.mapTo(page.controls, QtCore.QPoint(0, 0)).x()
+            expected = left(page.threshold_range._low)
+            positions = {key: left(page._rows[key].editor) for key in (
+                "normalization", "monitor", "foil_column",
+                "exposure_column", "foil_lengths") if not page._rows[key].isHidden()}
+            assert set(positions.values()) == {expected}, (expected, positions)
+    finally:
+        _close(page, qapp)
+
+
 def test_processing_takes_ints_threshold_and_the_shared_normalization_group(qapp, tmp_path):
     """G8b (design §2; the maintainer, 2026-10-01: "Other processing options like thresholding, monitor etc should
     also apply"): the Conditioning rows are laid out by Int's processing composer. Int's Threshold is its RangeRow

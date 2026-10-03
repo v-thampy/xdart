@@ -90,6 +90,41 @@ def _drain_qt_events_after_test(qapp):
         qapp.processEvents()
 
 
+def test_grouped_counts_use_shared_integer_rows_and_axis_labels(qapp):
+    panel = ControlsPanel()
+    fields = tuple(ControlFormField(
+        SectionId.PROCESSING, axis, ("RSM", axis), "40", ControlFieldKind.INT,
+        minimum=1, maximum=1000) for axis in ("H", "K", "L"))
+    emitted = []
+    panel.fieldValueChanged.connect(lambda *args: emitted.append(args))
+    rows = panel.render_count_row(panel.processing_card, "Grid", fields)
+    try:
+        panel.resize(380, 900)
+        panel.processing_card.show()
+        panel.show()
+        qapp.processEvents()
+        editors = [rows[field.path].editor for field in fields]
+        assert all(editor.isVisible() for editor in editors)
+        assert [rows[field.path].label.text() for field in fields] == ["H", "K", "L"]
+        assert len({editor.mapTo(panel, QtCore.QPoint()).y() for editor in editors}) == 1
+        assert all(editors[index].mapTo(panel, QtCore.QPoint()).x() + editors[index].width()
+                   < editors[index + 1].mapTo(panel, QtCore.QPoint()).x() for index in (0, 1))
+        row = rows[fields[1].path]
+        _user_types(qapp, panel, row.editor, "64")
+        row.editor.editingFinished.emit()
+        assert emitted[-1] == (fields[1].path, "64")
+        _user_types(qapp, panel, row.editor, "0")
+        assert row.refusal()
+        updated = replace(fields[1], value="80")
+        row.editor.clearFocus()
+        qapp.processEvents()
+        row.apply_field(updated)
+        assert row.label.text() == "K" and row.current_value() == "80"
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def test_controls_panel_renders_bound_render_state_directly(qapp):
     state = ControlsProjection(
         processing_page=ProcessingPage.INT_2D,

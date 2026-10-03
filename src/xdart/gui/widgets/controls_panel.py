@@ -2200,6 +2200,44 @@ class ControlsPanel(QtWidgets.QWidget):
         its RangeRow). Edits emit ``fieldValueChanged`` with the fields' paths."""
         return self._render_processing_group_rows(sub, fields)
 
+    def render_count_row(
+        self,
+        section: SectionCard | SubsectionCard,
+        label: str,
+        fields: Sequence[ControlFormField],
+    ) -> dict[tuple[str, ...], FormRow]:
+        """Mount labeled numeric fields on one processing-aligned row.
+
+        Each field's label names its axis; the existing FormRow owns its
+        validation, drafts and committed edits.
+        """
+        container = QtWidgets.QWidget()
+        container.setToolTip("Number of points along each labeled axis.")
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(PROCESSING_ROW_GAP)
+        heading = QtWidgets.QLabel(label)
+        heading.setObjectName("controlsFieldLabel")
+        heading.setFixedWidth(PROCESSING_ROW_LABEL_WIDTH)
+        heading.setWordWrap(True)
+        heading.setToolTip(container.toolTip())
+        layout.addWidget(heading)
+        built = {}
+        for field in fields:
+            row = self._make_bound_row(field)
+            row.label.setMinimumWidth(0)
+            row.layout().setSpacing(PROCESSING_ROW_GAP)
+            layout.addWidget(row, 1)
+            built[field.path] = row
+        section.add_row(container)
+        return built
+
+    @staticmethod
+    def _align_processing_row(row: FormRow) -> None:
+        row.label.setFixedWidth(PROCESSING_ROW_LABEL_WIDTH)
+        row.label.setWordWrap(True)
+        row.layout().setSpacing(PROCESSING_ROW_GAP)
+
     def _render_processing_group_rows(
         self,
         sub: SubsectionCard,
@@ -2295,8 +2333,7 @@ class ControlsPanel(QtWidgets.QWidget):
                 # RangeRow is the alignment owner for the bounds directly
                 # below.  Match its label width and gap so the Axis combo and
                 # both range editors share one exact left edge.
-                row.label.setMinimumWidth(PROCESSING_ROW_LABEL_WIDTH)
-                row.layout().setSpacing(PROCESSING_ROW_GAP)
+                self._align_processing_row(row)
                 if point_fields:
                     built.update(self._attach_points_to_row(row, point_fields))
                     points_attached = True
@@ -2304,6 +2341,7 @@ class ControlsPanel(QtWidgets.QWidget):
                 built[path] = row
                 continue
             built[path] = row = self._make_bound_row(field)
+            self._align_processing_row(row)
             sub.add_row(row)
         flush_pills()
         # Safety net: never drop the point fields if a group has them but no
