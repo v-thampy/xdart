@@ -1,8 +1,6 @@
 """Shared fit-window export actions over the Qt-free notebook recipe owner."""
 from dataclasses import replace
 from pathlib import Path
-import os
-import tempfile
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 from xrd_tools.analysis.fit_snapshot import FitAxis, FitInputKey, FitInputSnapshot
@@ -34,7 +32,7 @@ def write_fit_notebook(path, snapshot, tool, settings, *, batch=(), batch_inputs
     transform = None if reciprocal_transform is None else tuple(tuple(float(v) for v in row)
                                                                for row in reciprocal_transform)
     snapshot = replace(snapshot, key=replace(snapshot.key, settings=plain_settings(settings)))
-    captured = None if reference is not None else capture_snapshot(snapshot, path.stem + '.input.npz')
+    captured = None if reference is not None else capture_snapshot(snapshot, path.name + '.input.npz')
     captures, references = ([] if captured is None else [captured]), list(batch)
     charged = snapshot.storage_bytes
     for item in batch_inputs:
@@ -42,7 +40,7 @@ def write_fit_notebook(path, snapshot, tool, settings, *, batch=(), batch_inputs
             charged += item.storage_bytes
             if charged > 32 << 20:
                 raise ValueError('INPUT_LIMIT: captured batch exceeds 32 MiB; export a smaller selection')
-            part = capture_snapshot(item, f'{path.stem}.batch-{len(references) + 1}.input.npz')
+            part = capture_snapshot(item, f'{path.name}.batch-{len(references) + 1}.input.npz')
             captures.append(part)
             references.append(part.reference)
         else:
@@ -54,22 +52,9 @@ def write_fit_notebook(path, snapshot, tool, settings, *, batch=(), batch_inputs
                                orthonormal=all(a.unit in {'A^-1', 'Å⁻¹', 'q_A^-1'} for a in snapshot.axes))
     document = render_notebook(recipe, format=format, bundle_root=str(path.parent),
                                data_root=None if data_root is None else str(data_root))
-    # Both files are prepared before publishing either; scientific NeXus is never modified.
-    prepared = []
-    try:
-        parts = [(path.parent / item.reference.path, item.content) for item in captures]
-        for destination, content in (*parts, (path, document.encode('utf-8'))):
-            with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.' + destination.name, delete=False) as handle:
-                temporary = Path(handle.name)
-                prepared.append((temporary, destination))
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-        for temporary, destination in prepared:
-            os.replace(temporary, destination)
-    finally:
-        for temporary, _destination in prepared:
-            temporary.unlink(missing_ok=True)
+    from xrd_tools.io.export import write_exports_atomically
+    parts = [(path.parent / item.reference.path, item.content) for item in captures]
+    write_exports_atomically((*parts, (path, document)))
     return path
 
 
@@ -100,7 +85,8 @@ class FitExportActions(QtCore.QObject):
             if not path and reference is not None:
                 path = reference.original_path or reference.path
             picks = file_dialogs.browse(self.parent(), 'Export fitting workflow', save=True, current=path,
-                fallback=str(self.source_root or ''), default_name='fit' + extension,
+                fallback=str(self.source_root or ''),
+                default_name=file_dialogs.export_name(snapshot.key.result_identity, self.tool, extension),
                 file_filter=f'Notebook (*{extension})')
             if not picks:
                 return

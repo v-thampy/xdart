@@ -9,6 +9,17 @@ import pytest
 from xrd_tools.io.export import read_xye, write_h5, write_xye
 
 
+def test_export_prepares_all_parts_before_replacing_any_destination(tmp_path):
+    from xrd_tools.io.export import write_exports_atomically
+    notebook = tmp_path / 'prior.ipynb'
+    notebook.write_bytes(b'prior notebook')
+    with pytest.raises(FileNotFoundError):
+        write_exports_atomically(((notebook, 'replacement'),
+                                  (tmp_path / 'missing-folder' / 'input.npz', b'input')))
+    assert notebook.read_bytes() == b'prior notebook'
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['prior.ipynb']
+
+
 # XYE is written at "%.9g" (io/export.py), so a round trip is lossy in the 9th
 # significant digit.  The tolerance below IS the accepted contract: values are
 # preserved to better than 5e-9 relative, far beyond any XRD measurement.  The

@@ -26,6 +26,14 @@ SETTINGS_FILTER = "Settings (*.json);;All files (*)"
 ANY_FILTER = "All files (*)"
 
 
+def export_name(result: str, tool: str, extension: str) -> str:
+    """A portable result/tool name for the shared export save dialogs."""
+    import re
+    from pathlib import Path
+    stem = re.sub(r'[^\w.-]+', '_', Path(result).stem).strip('._') or 'result'
+    return f'{stem}_{tool}{extension}'
+
+
 def ask(parent, title: str, *, start: str = "", folder: bool = False, many: bool = False,
         save: bool = False, file_filter: str = ANY_FILTER) -> list[str]:
     """The one place a file dialog opens (Codex's Stitch/Int reuse audit R5): ask for a folder, a file or

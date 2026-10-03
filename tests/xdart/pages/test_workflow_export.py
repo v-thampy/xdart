@@ -28,9 +28,14 @@ def test_int_page_exports_current_intent_without_run_or_generation_change(tmp_pa
         assert captured.mode == "int" and captured.configuration == expected
         path = tmp_path / "replay.ipynb"
         from xdart.gui.widgets import file_dialogs
-        monkeypatch.setattr(file_dialogs, "browse", lambda *args, **kwargs: (str(path),))
+        offered = []
+        def choose(*args, **kwargs):
+            offered.append(kwargs['default_name'])
+            return (str(path),)
+        monkeypatch.setattr(file_dialogs, "browse", choose)
         action.trigger()
         assert path.is_file() and "RUN_PROCESSING = False" in path.read_text()
+        assert offered == [tmp_path.name + '_run.ipynb']
         assert not (tmp_path / "replay_outputs").exists()
         after = store.snapshot()
         assert after.revision == before.revision

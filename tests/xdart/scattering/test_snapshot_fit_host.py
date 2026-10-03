@@ -23,7 +23,7 @@ def drain(app, host):
     assert not host.computing
 
 
-def test_before_fit_export_and_single_batch_use_same_real_owner(tmp_path):
+def test_before_fit_export_and_single_batch_use_same_real_owner(tmp_path, monkeypatch):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     state = [sample()]
     host = SnapshotFitHost('peak', current=lambda: state[0], scope=lambda: state[0].key,
@@ -32,11 +32,20 @@ def test_before_fit_export_and_single_batch_use_same_real_owner(tmp_path):
     host.reload()
     drain(app, host)
     assert host.dialog.batch_btn.isEnabled() and not host.dialog.live_check.isEnabled()
+    from xdart.gui.widgets import file_dialogs
+    offered = []
+    def cancel(*args, **kwargs):
+        offered.append(kwargs['default_name'])
+        return ()
+    monkeypatch.setattr(file_dialogs, 'browse', cancel)
+    for format in ('jupyter', 'marimo'):
+        host.dialog.export_actions.choose(format)
+    assert offered == ['scan_peak.ipynb', 'scan_peak.py']
     # Current settings exported even before any fit has succeeded.
     host.column_row.editor.setCurrentText('del')
     host.export_to(tmp_path / 'fit.ipynb')
     assert (tmp_path / 'fit.ipynb').is_file()
-    assert len(tuple(tmp_path.glob('fit.batch-*.input.npz'))) == 3
+    assert len(tuple(tmp_path.glob('fit.ipynb.batch-*.input.npz'))) == 3
     # Both direct and GUI worker exports preserve the selected experimental trend column.
     host._export(tmp_path / 'worker.ipynb')
     drain(app, host)

@@ -37,9 +37,16 @@ def test_page_exports_current_run_recipe_without_processing(qapp, tmp_path, mode
         before = {str(path.relative_to(tmp_path)): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
         notebook = tmp_path / "replay.ipynb"
         from xdart.gui.widgets import file_dialogs
-        monkeypatch.setattr(file_dialogs, "browse", lambda *args, **kwargs: (str(notebook),))
+        offered = []
+        def choose(*args, **kwargs):
+            offered.append(kwargs['default_name'])
+            return (str(notebook),)
+        monkeypatch.setattr(file_dialogs, "browse", choose)
         action.trigger()
         assert notebook.is_file()
+        expected_output = recipe.configuration['forms'][0]['fields']['output_path']['$path']
+        from pathlib import Path
+        assert offered == [Path(expected_output).stem + '_run.ipynb']
         document = json.loads(notebook.read_text())
         assert "run_workflow" in "".join("".join(cell.get("source", ())) for cell in document["cells"])
         assert not page._owner.busy

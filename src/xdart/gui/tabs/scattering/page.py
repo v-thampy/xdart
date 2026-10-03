@@ -8,7 +8,6 @@ import logging
 import os
 from pathlib import Path
 import stat
-import tempfile
 import time
 from typing import Any, Callable
 import weakref
@@ -3701,24 +3700,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     @staticmethod
     def _write_profile_atomically(path: Path, text: str) -> None:
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(text)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        except Exception:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        from xrd_tools.io.export import write_exports_atomically
+        write_exports_atomically(((path, text),))
 
     def _save_run_intent_profile(self) -> None:
         if not self._profile_action_permitted():

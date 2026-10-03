@@ -5,12 +5,46 @@ Data export helpers for integrated diffraction results.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
+import stat
+from uuid import uuid4
 
 import h5py
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def write_exports_atomically(parts) -> None:
+    """Prepare all export files, then replace each destination atomically.
+
+    New files use ordinary 0666-and-umask permissions without changing the process
+    umask; replacements retain the destination's mode. This is not a multi-file
+    transaction. Scientific NeXus publication has its own writer.
+    """
+    prepared = []
+    try:
+        for path, content in parts:
+            path = Path(path)
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+            except FileNotFoundError:
+                mode = None
+            temporary = path.with_name(f'.{path.name}.{uuid4().hex}.tmp')
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o666)
+            prepared.append((temporary, path))
+            with os.fdopen(descriptor, 'wb') as stream:
+                if mode is not None:
+                    os.chmod(temporary, mode)
+                stream.write(content.encode('utf-8') if isinstance(content, str) else content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        for temporary, path in prepared:
+            os.replace(temporary, path)
+    finally:
+        for temporary, _path in prepared:
+            temporary.unlink(missing_ok=True)
 
 
 def _as_path(path: Path | str) -> Path:
