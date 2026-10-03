@@ -123,6 +123,22 @@ def test_with_result_2d_is_dimension_pure():
     assert stored.has_2d and not stored.has_1d
 
 
+def test_record_merge_keeps_other_modes_and_upserts_incoming_active_views():
+    existing = FrameRecord.from_view(_view(), mode_1d="q_total", mode_2d="q_chi")
+    incoming = FrameRecord.from_view(_view(scale=3), mode_1d="q_total", mode_2d="qip_qoop")
+    incoming = incoming.with_result_1d("q_ip", _view(scale=2), make_active=False)
+    merged = existing.merged_with(incoming)
+    assert merged.modes_1d == ("q_total", "q_ip")
+    assert merged.modes_2d == ("q_chi", "qip_qoop")
+    assert (merged.active_mode_1d, merged.active_mode_2d) == ("q_total", "qip_qoop")
+    assert merged.view_1d().intensity_1d is incoming.view_1d().intensity_1d
+    assert merged.view_2d("q_chi").intensity_2d is existing.view_2d().intensity_2d
+    assert existing.modes_1d == ("q_total",) and existing.modes_2d == ("q_chi",)
+    assert merged.merged_with(FrameRecord(label=0)) is merged
+    with pytest.raises(ValueError, match="cannot merge FrameRecords with labels"):
+        merged.merged_with(FrameRecord(label=1))
+
+
 # --------------------------------------------------------------------------- #
 # validation + immutability
 # --------------------------------------------------------------------------- #

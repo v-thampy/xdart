@@ -562,6 +562,21 @@ class FrameRecord:
         """The display view for the currently active 1D + 2D modes."""
         return self.project()
 
+    def merged_with(self, incoming: "FrameRecord") -> "FrameRecord":
+        """Accumulate this frame's modes; incoming values and active selections win.
+
+        An empty incoming dimension retains its existing modes and selection. Arrays
+        remain shared; a publication's latest display view stays separate from this union.
+        """
+        if self.label != incoming.label:
+            raise ValueError(f"cannot merge FrameRecords with labels {self.label!r} and {incoming.label!r}")
+        merged = self
+        for mode, view in incoming.results_1d.items():
+            merged = merged.with_result_1d(mode, view, make_active=(mode == incoming.active_mode_1d))
+        for mode, view in incoming.results_2d.items():
+            merged = merged.with_result_2d(mode, view, make_active=(mode == incoming.active_mode_2d))
+        return merged
+
     def with_result_1d(
         self, mode: str, view: FrameView, *, make_active: bool = True
     ) -> "FrameRecord":
