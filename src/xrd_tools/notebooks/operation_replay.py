@@ -26,6 +26,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
 )
 from xrd_tools.core.scan import SourceSpec, SourceKind
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+from xrd_tools.sources.point_images import PointImagePolicy
 from xrd_tools.integrate.stitch_gi import StitchGI
 from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
@@ -33,7 +34,7 @@ from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 
 _SCHEMA = "operation-replay-v1"
 _TYPES = {cls.__name__: cls for cls in (
-    StitchToolForm, StitchFrameSelector, StitchSourceSelection, StitchConditioning, StitchGI,
+    StitchToolForm, StitchFrameSelector, StitchSourceSelection, StitchConditioning, StitchGI, PointImagePolicy,
     StitchFoilNormalization, MetadataColumnSelector, RSMToolFormV2, RSMScanMemberForm,
     RSMNexusMemberForm, RSMFrameSelector, RSMImageConditioning, RSMNormalizationPolicy,
     RSMFrameCorrections, RSMUBOverride, RSMGeometryAssetInput, RSMCalibrationGeometryInput, SourceSpec,
@@ -92,6 +93,12 @@ def _encode(value, project):
             item = getattr(value, field.name)
             if kind is StitchToolForm and field.name == "allow_extrapolation" and not item:
                 continue  # Preserve default replay payloads; old notebooks restore the strict default.
+            if field.name in {"point_images", "point_image_choices"} and not item:
+                continue  # Additive grouping options leave legacy replay payloads unchanged.
+            if kind is StitchSourceSelection and field.name == "point_image_choices":
+                settings[field.name] = {"$tuple": [{"$tuple": [
+                    _path(uri, project), scan, _encode(policy, project)]} for uri, scan, policy in item]}
+                continue
             settings[field.name] = (_path(item, project, output=field.name == "output_path")
                                     if field.name in _PATHS.get(kind, ()) else _encode(item, project))
         return {"$type": kind.__name__, "fields": settings}
@@ -133,6 +140,9 @@ def _decode(value, data_root, output_root):
         allowed = {field.name for field in fields(cls) if field.init}
         if cls is StitchToolForm and "allow_extrapolation" not in value["fields"]:
             allowed.remove("allow_extrapolation")
+        for name in ("point_images", "point_image_choices"):
+            if name in allowed and name not in value["fields"]:
+                allowed.remove(name)
         if set(value["fields"]) != allowed:
             raise ValueError("WORKFLOW_FIELDS_INVALID: operator fields must be exact")
         settings = {key: _decode(item, data_root, output_root) for key, item in value["fields"].items()}
