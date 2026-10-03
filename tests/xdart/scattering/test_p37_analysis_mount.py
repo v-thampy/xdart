@@ -1768,6 +1768,130 @@ def test_p37b_roi_preview_and_scan_share_slot_and_preserve_typed_diagnostics(
         _close_page(page, qapp)
 
 
+def _roi_navigation_table(tmp_path, *, changed_shape=False):
+    import tifffile
+    from xrd_tools.core import IntegrationResult1D
+    from xrd_tools.io.nexus import open_nexus_writer, write_integrated_stack
+    from xrd_tools.io.nexus_record import frame_record_key, write_frame_record
+    from xrd_tools.analysis.scan_operations import run_metadata_table
+
+    path = tmp_path / "navigation.nexus"
+    labels = (3, 7, 11)
+    with open_nexus_writer(path) as handle:
+        entry = handle["entry"]
+        write_integrated_stack(entry, frame_indices=labels, results_1d=[
+            IntegrationResult1D(radial=np.arange(3.0), intensity=np.ones(3),
+                                unit="q_A^-1") for _ in labels])
+        for label in labels:
+            raw = tmp_path / f"raw_{label}.tif"
+            shape = (5, 5) if changed_shape and label == 11 else (4, 4)
+            tifffile.imwrite(raw, np.full(shape, label, dtype=np.uint16))
+            write_frame_record(entry.require_group("frames"), frame_record_key(None, label),
+                               source_path=raw, source_frame_index=0)
+    table = run_metadata_table(MetadataTablePlan(
+        SourceSpec(path, SourceKind.PROCESSED_NEXUS)))
+    assert table.disposition is AnalysisDisposition.COMPLETED
+    assert table.labels == labels
+    return table
+
+
+@pytest.mark.parametrize("settlement", ("latest", "close", "source"))
+def test_roi_preview_navigation_keeps_marks_and_only_adopts_latest_real_frame(
+        tmp_path, monkeypatch, qapp, settlement):
+    import xrd_tools.analysis.scan_operations as operations
+
+    table = _roi_navigation_table(tmp_path)
+    page = _page()
+    release, ready = Event(), Event()
+    real_preview = operations.run_roi_preview
+    completed = []
+
+    def delayed(plan, **kwargs):
+        result = real_preview(plan, **kwargs)
+        completed.append(result)
+        if plan.label == 7:
+            ready.set()
+            assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(operations, "run_roi_preview", delayed)
+    try:
+        page._open_analysis_mount("scan_roi")
+        dialog = page._scan_roi_dialog
+        dialog.set_vnext_metadata(table)
+        dialog.roi_btn.click(); page._run_timer.stop()
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        picker = dialog._roi_dialog
+        assert picker is not None, completed[0].code
+        panel = picker.scientific.keyed_panel(picker._image_key)
+        assert tuple(panel.selector.itemText(i) for i in range(panel.selector.count())) == (
+            "3", "7", "11")
+        assert panel.selector.toolTip() and panel.previous.toolTip() and panel.next.toolTip()
+        picker.bg_check.setChecked(True)
+        signals = tuple(picker.roi_signals())
+        marks = (picker._rois[0].rect, picker._rois[0].bg_rect)
+        panel.next.click(); page._run_timer.stop()
+        identity = page._analysis_identity
+        assert ready.wait(5)
+        assert not picker.compute_btn.isEnabled()
+        panel.selector.setCurrentIndex(2); page._run_timer.stop()
+        if settlement == "close":
+            picker.close()
+        elif settlement == "source":
+            dialog.set_vnext_metadata(table)
+        release.set()
+        page._consume_analysis_update(_finish(page._analysis_slot, identity))
+        assert page._scan_roi_result is completed[0]
+        page._run_timer.timeout.emit(); page._run_timer.stop()
+        if settlement != "latest":
+            assert dialog._roi_dialog is None
+            assert page._analysis_identity is None
+            assert [result.label for result in completed] == [3, 7]
+            return
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        assert dialog._roi_dialog is picker
+        assert (picker._rois[0].rect, picker._rois[0].bg_rect) == marks
+        assert tuple(picker.roi_signals()) == signals
+        assert picker.compute_btn.isEnabled()
+        np.testing.assert_array_equal(picker._image, np.full((4, 4), 11))
+        assert page._roi_preview_binding[4] == 11
+        picker.scale_log_btn.click()
+        assert panel.selector.currentText() == "11" and panel.selector.count() == 3
+        picker.compute_btn.click(); page._run_timer.stop()
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        assert dialog._vnext_roi_result.disposition is AnalysisDisposition.COMPLETED
+        assert dialog._vnext_roi_result.completed_labels == table.labels
+    finally:
+        release.set()
+        _close_page(page, qapp)
+
+
+def test_roi_preview_shape_change_preserves_accepted_image_and_marks(tmp_path, qapp):
+    table = _roi_navigation_table(tmp_path, changed_shape=True)
+    page = _page()
+    try:
+        page._open_analysis_mount("scan_roi")
+        dialog = page._scan_roi_dialog
+        dialog.set_vnext_metadata(table)
+        dialog.roi_btn.click(); page._run_timer.stop()
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        picker = dialog._roi_dialog
+        panel = picker.scientific.keyed_panel(picker._image_key)
+        assert panel.selector.count() == 3
+        signals = tuple(picker.roi_signals())
+        previous = page._scan_roi_result
+        panel.selector.setCurrentIndex(2); page._run_timer.stop()
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        assert dialog._roi_dialog is picker and page._scan_roi_result is previous
+        assert tuple(picker.roi_signals()) == signals
+        np.testing.assert_array_equal(picker._image, np.full((4, 4), 3))
+        assert "shape" in picker.status.text().lower()
+        assert panel.selector.currentText() == "3" and picker.compute_btn.isEnabled()
+        assert page._roi_preview_binding[4] == 3
+    finally:
+        _close_page(page, qapp)
+
+
 def test_p37b_peak_uses_exact_current_trace_and_headless_selection_policy(
         monkeypatch, qapp) -> None:
     import xdart.gui.tabs.scattering.analysis_mount as mount

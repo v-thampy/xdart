@@ -305,6 +305,9 @@ class _KeyedImagePanel:
         self.next = QtWidgets.QToolButton()
         self.next.setObjectName("e4FrameNavigationButton")
         self.next.setText(">")
+        self.previous.setToolTip("Show the previous frame or slice, keeping the selected regions.")
+        self.next.setToolTip("Show the next frame or slice, keeping the selected regions.")
+        self.selector.setToolTip("Choose a frame or slice; use arrow keys or the mouse wheel to step.")
         navigation.addStretch(1)
         for widget in (self.previous, self.selector, self.next):
             navigation.addWidget(widget)
@@ -710,6 +713,7 @@ class ScientificView(QtWidgets.QFrame):
         self._install_share_geometry_hooks()
         if self._detector_picker:
             self._detector_picker_image = None
+            self._detector_picker_navigation = ((), 0, "")
             self._main_layout.itemAt(0).widget().hide()
             scale = QtWidgets.QHBoxLayout()
             scale.addWidget(QtWidgets.QLabel("Intensity"))
@@ -724,20 +728,23 @@ class ScientificView(QtWidgets.QFrame):
             self.default_scale.setChecked(True)
             scale.addStretch(1)
             self._main_layout.addLayout(scale)
-            self.detector_log.toggled.connect(lambda _on: self.reconcile_detector_image(self._detector_picker_image))
+            self.detector_log.toggled.connect(lambda _on: self.reconcile_detector_image(
+                self._detector_picker_image, *self._detector_picker_navigation))
 
-    def reconcile_detector_image(self, image) -> PanelKey:
+    def reconcile_detector_image(self, image, captions=(), index=0, title="") -> PanelKey:
         """Detector-picker profile: Int's image/scale owners, row-major pixel coordinates, independent ROI marks."""
         if not self._detector_picker:
             raise RuntimeError("reconcile_detector_image needs the detector_picker profile")
         self._detector_picker_image = image
+        self._detector_picker_navigation = (tuple(captions), index, title)
         key = PanelKey(PanelRole.SLICE_2D, "detector")
         if image is None:
             return key
         rows, columns = np.asarray(image).shape
-        panel = KeyedImageProjection(key, "", np.asarray(image),
+        panel = KeyedImageProjection(key, title, np.asarray(image),
             AxisProjection(np.arange(columns, dtype=float) + 0.5, "column", "px"),
-            AxisProjection(np.arange(rows, dtype=float) + 0.5, "row", "px"), 0, (), navigation=False,
+            AxisProjection(np.arange(rows, dtype=float) + 0.5, "row", "px"), index, tuple(captions),
+            navigation=bool(captions),
             presentation="own")
         self.reconcile_keyed(KeyedPanelsProjection(((key,),), (panel,), color_map="viridis",
                                                   log_scale=self.detector_log.isChecked()))

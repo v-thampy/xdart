@@ -957,8 +957,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if kind == "roi_preview":
                     if not table.labels: return None
                     from xrd_tools.analysis.scan_operations import RoiPreviewPlan
+                    label = dialog._roi_preview_label
+                    if label not in table.labels: return None
                     return analysis_request_facts(RoiPreviewPlan.from_table(
-                        table, label=table.labels[0]))
+                        table, label=label))
                 picker = dialog._roi_dialog
                 binding = self._roi_preview_binding
                 if (picker is None or binding is None or binding[0] is not table
@@ -1320,11 +1322,56 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._begin_analysis("scan_plot", plan, self._scan_roi_generation,
                 target="scan_roi", request=request, table=table, roi=roi); return
         if action == "roi_preview" and value is not None and value.labels:
-            from .analysis_mount import analysis_request_facts
-            from xrd_tools.analysis.scan_operations import RoiPreviewPlan
-            plan = RoiPreviewPlan.from_table(value, label=value.labels[0])
-            self._begin_analysis("roi_preview", plan, self._scan_roi_generation,
-                target="scan_roi", request=analysis_request_facts(plan))
+            dialog = self._scan_roi_dialog
+            if dialog is None or value is not dialog._vnext_table_result: return
+            dialog._roi_preview_label = value.labels[0]
+            dialog._roi_preview_waiting = True
+            self._dispatch_roi_preview()
+
+    def _request_roi_preview_frame(self, table, picker, label):
+        dialog = self._scan_roi_dialog
+        if (dialog is None or dialog._vnext_table_result is not table
+                or dialog._roi_dialog is not picker or label not in table.labels): return
+        if self._analysis_identity is not None and self._analysis_kind != "roi_preview":
+            picker.set_preview_pending(message="Wait for the current analysis to finish.")
+            return
+        dialog._roi_preview_label = label
+        dialog._roi_preview_waiting = True
+        picker.set_preview_pending(label)
+        if self._analysis_identity is not None:
+            from .analysis_mount import cancel_owned
+            cancel_owned(self._analysis_slot, self._analysis_identity)
+        self._dispatch_roi_preview()
+        self._ensure_timer()
+
+    def _dispatch_roi_preview(self):
+        dialog = self._scan_roi_dialog
+        if (dialog is None or not dialog._roi_preview_waiting
+                or self._closing or self._closed or self._analysis_identity is not None): return
+        table, label = dialog._vnext_table_result, dialog._roi_preview_label
+        if table is None or label not in table.labels: return
+        picker, binding = dialog._roi_dialog, self._roi_preview_binding
+        if (picker is not None and binding is not None and binding[0] is table
+                and binding[-1] is picker and binding[4] == label):
+            dialog._roi_preview_waiting = False
+            picker.set_preview_pending()
+            return
+        from .analysis_mount import analysis_request_facts
+        from xrd_tools.analysis.scan_operations import RoiPreviewPlan
+        plan = RoiPreviewPlan.from_table(table, label=label)
+        self._begin_analysis("roi_preview", plan, self._scan_roi_generation,
+            target="scan_roi", request=analysis_request_facts(plan))
+
+    def _roi_preview_closed(self, picker):
+        dialog = self._scan_roi_dialog
+        if dialog is None or dialog._roi_dialog is not picker: return
+        dialog._roi_dialog = None
+        dialog._roi_preview_label = None
+        dialog._roi_preview_waiting = False
+        self._roi_preview_binding = None
+        if self._analysis_kind == "roi_preview":
+            from .analysis_mount import cancel_owned
+            cancel_owned(self._analysis_slot, self._analysis_identity)
 
     def _refresh_fit_trace(self, kind):
         trace, _anchor = self._capture_analysis_trace(kind)
@@ -1377,6 +1424,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _roi_analysis_signals(self, table, picker, signals):
         binding = self._roi_preview_binding
         if (not signals or self._scan_roi_dialog is None
+                or self._scan_roi_dialog._roi_preview_waiting
                 or self._scan_roi_dialog._vnext_table_result is not table
                 or self._scan_roi_dialog._roi_dialog is not picker
                 or binding is None or binding[0] is not table
@@ -1577,6 +1625,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_request = None
         self._analysis_fingerprint = ""
         if payload is None:
+            if kind == "roi_preview" and current and self._scan_roi_dialog is not None:
+                dialog = self._scan_roi_dialog
+                dialog._roi_preview_waiting = False
+                picker = dialog._roi_dialog
+                dialog._roi_preview_label = None if picker is None else picker._frame_label
+                if picker is not None: picker.set_preview_pending(message=diagnostic)
             self._notice(diagnostic)
             return WorkspaceRefreshEffect.FULL
 
@@ -1593,12 +1647,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         admitted, reason = retention_admission(retained, replacing, payload)
         if not admitted:
+            if kind == "roi_preview" and self._scan_roi_dialog is not None:
+                self._scan_roi_dialog._roi_preview_waiting = False
+                picker = self._scan_roi_dialog._roi_dialog
+                if picker is not None: picker.set_preview_pending(message=reason)
             self._notice(reason)
             return WorkspaceRefreshEffect.FULL
+        if kind == "roi_preview" and self._scan_roi_dialog is not None:
+            picker = self._scan_roi_dialog._roi_dialog
+            if picker is not None and not picker.adopt_preview(payload.image, payload.label):
+                self._scan_roi_dialog._roi_preview_waiting = False
+                self._scan_roi_dialog._roi_preview_label = picker._frame_label
+                return WorkspaceRefreshEffect.FULL
         if kind in {"scan_plot", "roi_preview", "roi_scan"}:
             self._roi_preview_binding = None
             if self._scan_roi_dialog is not None:
-                self._scan_roi_dialog._retire_vnext_result()
+                self._scan_roi_dialog._retire_vnext_result(keep_picker=kind == "roi_preview")
         if kind == "scan_plot":
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None: self._scan_roi_dialog.set_vnext_scan_result(payload, request[2])
@@ -1606,17 +1670,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None and payload.image is not None:
                 from xdart.gui.analysis.roi_select_dialog import RoiSelectDialog
-                old = self._scan_roi_dialog._roi_dialog
-                if old is not None: old.close(); old.deleteLater()
                 table = self._scan_roi_dialog._vnext_table_result
-                picker = RoiSelectDialog(payload.image, parent=self._scan_roi_dialog)
-                picker.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
-                self._scan_roi_dialog._roi_dialog = picker
+                picker = self._scan_roi_dialog._roi_dialog
+                if picker is None:
+                    picker = RoiSelectDialog(payload.image, parent=self._scan_roi_dialog,
+                        frame_labels=payload.labels, frame_label=payload.label)
+                    picker.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                    self._scan_roi_dialog._roi_dialog = picker
+                    picker.sigCompute.connect(lambda signals, t=table, p=picker:
+                                              self._roi_analysis_signals(t, p, signals))
+                    picker.sigPreviewFrame.connect(lambda label, t=table, p=picker:
+                                              self._request_roi_preview_frame(t, p, label))
+                    picker.finished.connect(lambda _result, p=picker: self._roi_preview_closed(p))
+                self._scan_roi_dialog._roi_preview_label = payload.label
+                self._scan_roi_dialog._roi_preview_waiting = False
                 self._roi_preview_binding = (table, payload.receipt,
                     payload.table_fingerprint, payload.result_fingerprint,
                     payload.label, tuple(payload.labels), picker)
-                picker.sigCompute.connect(lambda signals, t=table, p=picker:
-                                          self._roi_analysis_signals(t, p, signals))
                 picker.show(); picker.raise_(); picker.activateWindow()
         elif kind == "roi_scan":
             self._scan_roi_result = payload
@@ -4996,6 +5066,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 force_scientific = True
 
         deferred_refresh = self._dispatch_deferred_metadata()
+        self._dispatch_roi_preview()
         if deferred_refresh is WorkspaceRefreshEffect.CONTROLS:
             controls_refresh = True
         elif deferred_refresh is WorkspaceRefreshEffect.FULL:
@@ -5853,6 +5924,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return True
         if (
             self._metadata_operations.polling_needed
+            or (self._scan_roi_dialog is not None and self._scan_roi_dialog._roi_preview_waiting)
             or self._admission is not None
             or getattr(self._context_controller, "viewer_1d_loading", False)
             or getattr(self._context_controller, "viewer_1d_cleanup_pending", False)

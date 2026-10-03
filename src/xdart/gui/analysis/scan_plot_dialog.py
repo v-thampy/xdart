@@ -79,6 +79,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._vnext_submit = vnext_submit
         self._vnext_rendering = False
         self._vnext_table_result = None
+        self._roi_preview_label = None
+        self._roi_preview_waiting = False
         self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
         self._table = {}
         self._columns = []
@@ -551,6 +553,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
 
     def _open_roi_dialog(self):
         if self._vnext:
+            if self._roi_dialog is not None:
+                self._roi_dialog.show(); self._roi_dialog.raise_(); return
             self._vnext_submit("roi_preview", self._vnext_table_result)
             return
         if not self._raw_reachable or self._source_spec is None:
@@ -713,9 +717,12 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._vnext_submit("close", None)
         super().closeEvent(event)
 
-    def _retire_vnext_result(self):
+    def _retire_vnext_result(self, *, keep_picker=False):
         picker = self._roi_dialog
-        if picker is not None:
+        if not keep_picker:
+            self._roi_preview_label = None
+            self._roi_preview_waiting = False
+        if picker is not None and not keep_picker:
             picker.close(); picker.deleteLater(); self._roi_dialog = None
         self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
         self._vnext_rendering = True

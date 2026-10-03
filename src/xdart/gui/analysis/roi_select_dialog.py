@@ -24,7 +24,7 @@ from .peak_fit_util import CURVE_PENS
 from xdart.gui.widgets.controls_panel import FormRow
 from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
-from xdart.gui.tabs.scattering.shell_values import RectRegion
+from xdart.gui.tabs.scattering.shell_values import RectRegion, ShellCommandKind
 
 logger = logging.getLogger(__name__)
 
@@ -59,16 +59,20 @@ class _RoiEntry:
 
 
 class RoiSelectDialog(QtWidgets.QDialog):
-    """Pick rectangular ROIs on the first frame; emit them as RoiSignals."""
+    """Pick rectangular ROIs in detector pixels; emit them as RoiSignals."""
 
     #: emitted on Compute with a list of
     #: :class:`xrd_tools.analysis.plans.RoiSignal`.
     sigCompute = QtCore.Signal(object)
+    sigPreviewFrame = QtCore.Signal(int)
 
-    def __init__(self, image, parent=None):
+    def __init__(self, image, parent=None, *, frame_labels=(), frame_label=None):
         super().__init__(parent)
         self._image = np.asarray(image, dtype=float)
         self._image_shape = self._image.shape       # (rows, cols)
+        self._frame_labels = tuple(frame_labels)
+        self._frame_label = frame_label
+        self._pending_label = None
         self._rois = []
         self._guard = False                         # region<->fields recursion guard
         self.setObjectName("roiSelectDialog")
@@ -85,7 +89,8 @@ class RoiSelectDialog(QtWidgets.QDialog):
 
         self.scientific = ScientificView(self, detector_picker=True)
         self.scientific.setMinimumHeight(300)
-        self._image_key = self.scientific.reconcile_detector_image(self._image)
+        self._image_key = self._apply_scale()
+        self.scientific.commandRequested.connect(self._preview_command)
         self.scientific.keyedNamedRegionChanged.connect(self._on_mark_changed)
         pane = self.scientific.keyed_panel(self._image_key).pane
         # Borrowed compatibility handles; the shared owner constructs and retains every display widget.
@@ -218,7 +223,37 @@ class RoiSelectDialog(QtWidgets.QDialog):
         super().keyPressEvent(event)
 
     def _apply_scale(self, *_args):
-        self.scientific.reconcile_detector_image(self._image)
+        label = self._frame_label if self._pending_label is None else self._pending_label
+        index = self._frame_labels.index(label) if self._frame_labels else 0
+        title = f"Frame {self._frame_label}" if self._frame_labels else ""
+        if self._pending_label is not None:
+            title += f" · loading frame {self._pending_label}…"
+        return self.scientific.reconcile_detector_image(
+            self._image, tuple(str(value) for value in self._frame_labels), index, title)
+
+    def _preview_command(self, command):
+        if (command.kind is ShellCommandKind.SET_PANEL_INDEX
+                and 0 <= command.value < len(self._frame_labels)):
+            self.sigPreviewFrame.emit(self._frame_labels[command.value])
+
+    def set_preview_pending(self, label=None, *, message=None):
+        """Keep accepted pixels and marks visible while another preview settles."""
+        self._pending_label = label
+        self.compute_btn.setEnabled(label is None)
+        self._apply_scale()
+        if message is not None:
+            self.status.setText(message)
+
+    def adopt_preview(self, image, label):
+        """Update the shared image in place; changed shapes cannot reinterpret marks."""
+        if np.asarray(image).shape != self._image_shape:
+            self.set_preview_pending(message="Frame shape differs; keeping the previous image and ROIs.")
+            return False
+        self._image = np.asarray(image, dtype=float)
+        self._frame_label = label
+        self.set_preview_pending()
+        self._update_status()
+        return True
 
     # ---- ROI lifecycle --------------------------------------------------
     def _default_box(self):
@@ -460,6 +495,8 @@ class RoiSelectDialog(QtWidgets.QDialog):
         return self.mask_sat_check.isChecked()
 
     def _on_compute(self):
+        if self._pending_label is not None:
+            return
         if not self._rois:
             self.status.setText("Add at least one ROI first.")
             return
