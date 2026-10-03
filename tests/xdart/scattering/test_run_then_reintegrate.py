@@ -61,6 +61,29 @@ def test_real_run_uses_metadata_energy_with_effective_persisted_calibration(tmp_
     assert selection['source'] == 'metadata'
     assert selection['energy_eV'] == pytest.approx(16000.)
 
+    # Use the page's real preparation builder and the successor execution owner.
+    # Repeat from the persisted Run: no current source-energy inference is allowed.
+    import numpy as np
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+    from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
+    before = open_scan(artifact).get_1d(1)
+    axis, intensity = before.q.copy(), before.intensity.copy()
+    for _ in range(2):
+        labels = tuple(int(v) for v in open_scan(artifact).frame_indices)
+        plan = ReintegrateSuccessorPlan.from_artifact(
+            artifact, entry='entry', dimension='1d', source_root=str(tmp_path),
+            expected_target_snapshot=capture_target_snapshot(artifact), expected_labels=labels,
+            preparation=ScatteringWorkspace._reintegrate_preparation(intent, '1d'))
+        result = run_reintegrate_successor(plan)
+        assert result.disposition == 'COMMITTED', result
+        output = Path(result.output_artifact)
+        scan = open_scan(output)
+        assert scan.metadata['wavelength_A'] == pytest.approx(selection['wavelength_m'] * 1e10)
+        np.testing.assert_array_equal(scan.get_1d(1).q, axis)
+        np.testing.assert_array_equal(scan.get_1d(1).intensity, intensity)
+        assert read_provenance(output)['config']['energy_selection'] == selection
+
 
 def test_a_real_run_output_carries_what_reintegrate_requires(tmp_path: Path) -> None:
     from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR

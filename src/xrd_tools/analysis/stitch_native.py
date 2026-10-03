@@ -277,7 +277,7 @@ def geometry_facts(plan):
         asset = plan.calibration.projection.value
         rotation = int(asset["acquisition"]["image_rotation_quarter_turns"]) * 90
         flip = asset["acquisition"].get("image_flip", False)  # a mirrored camera's (written only then)
-        return (float(asset["acquisition"]["xdart_wavelength_A"]),
+        return (plan.effective_geometry.runtime_xdart_wavelength_A,
                 tuple(asset["detector"]["shape"]), ImageOrientation(rotation=rotation, flip_horizontal=flip))
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
     diff, orientation = _runtime_geometry(plan.geometry, plan.geometry.content,
@@ -306,13 +306,17 @@ def native_plan_identity(plan):
 
 
 def native_energy_selection(plan, metadata_energy_eV=None):
-    """A pyFAI plan's acquisition term and the calibration's separate fitted offset."""
-    from xrd_tools.analysis.stitch_operation import _runtime_geometry
+    """Either backend's acquisition term and the calibration's separate fitted offset."""
+    from xrd_tools.analysis.stitch_operation import _runtime_geometry, XuStitchOperationPlan
     from xrd_tools.core.energy import resolve_acquisition_energy
-    base, _orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+    if type(plan) is XuStitchOperationPlan:
+        wavelength = float(plan.calibration.projection.value['acquisition']['xdart_wavelength_A']) * 1e-10
+    else:
+        base, _orientation = _runtime_geometry(plan.geometry, plan.geometry.content)
+        wavelength = base.calibration.poni.wavelength
     if metadata_energy_eV is None:
         metadata_energy_eV = () if plan.metadata_energy_eV is None else (plan.metadata_energy_eV,)
-    return resolve_acquisition_energy(base.calibration.poni.wavelength, metadata_energy_eV,
+    return resolve_acquisition_energy(wavelength, metadata_energy_eV,
                                       fitted_source_energy_eV=recorded_energy_eV(plan))
 
 
@@ -505,13 +509,13 @@ def native_provenance(value, source, output, plan, manifest, *, preparation=None
     value["wavelength_A"] = wavelength
     from xrd_tools.analysis.stitch_operation import StitchOperationPlan
     pyfai = type(plan) is StitchOperationPlan
-    if pyfai:
+    if pyfai or plan.metadata_energy_eV is not None:
         value['plan']['energy_selection'] = native_energy_selection(plan)
-        if 'effective_calibration' in value['geometry']:
+        if pyfai and 'effective_calibration' in value['geometry']:
             value['geometry']['effective_calibration']['wavelength'] = value['plan']['energy_selection']['wavelength_m']
     cached = None if preparation is None else preparation.get('energy_checks')
     value["source_energy_checks"] = cached if cached is not None else source_energy_checks(
-        source, wavelength, (plan.metadata_energy_eV if pyfai and plan.metadata_energy_eV is not None
+        source, wavelength, (plan.metadata_energy_eV if plan.metadata_energy_eV is not None
                             else recorded_energy_eV(plan)),
         tables=None if preparation is None else preparation.get("tables"))
     seeds, ceilings = _frame_facts(source, manifest, plan)

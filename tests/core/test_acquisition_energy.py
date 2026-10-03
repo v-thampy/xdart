@@ -197,3 +197,70 @@ def test_native_pyfai_stitch_mixed_member_metadata_energy_refuses(tmp_path):
                                                     kind=ModuleKind.STITCH)
     with pytest.raises(StitchOperationRefused, match='metadata energy'):
         prepare_stitch_operation(grouped, first.module.output, first.plan, project_root=tmp_path)
+
+
+@pytest.mark.parametrize('unit', ['q_A^-1', '2th_deg'])
+def test_native_xu_stitch_metadata_energy_and_axes(tmp_path, unit):
+    from tests.core.test_stitch_operation import _xu_prepared
+    from xrd_tools.analysis.scan_operations import MetadataTablePlan, run_metadata_table
+    from xrd_tools.analysis.module_transaction import ModuleSourceReceipt, ModuleKind, ModuleOutputRequest, ModuleDisposition
+    from xrd_tools.analysis.stitch_operation import prepare_stitch_operation, run_stitch_operation
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    original = _xu_prepared(tmp_path, energy_eV=None)
+    path = tmp_path / 'xu-source/scan_0001.txt'
+    path.write_text(path.read_text().replace('I0 = 2', 'I0 = 2, energy = 16000'))
+    table = run_metadata_table(MetadataTablePlan(original.module.source.analysis.source_spec))
+    source = ModuleSourceReceipt.from_metadata_table(table, kind=ModuleKind.STITCH,
+        selected_labels=(1,), resolved_selectors=original.module.source.resolved_selectors)
+    plan = replace(original.plan, native_records=True, unit=unit,
+                   q_min_A_inverse=None, q_max_A_inverse=None, radial_range=None)
+    target = resolve_finite_output_target(tmp_path, 'xu-energy', operation_token='stitch-2d')
+    plan = replace(plan, mode='2d', npt_rad_2d=32, npt_azim_2d=16)
+    request = prepare_stitch_operation(source, ModuleOutputRequest(target,
+        AnalysisArtifactKind.STITCH_2D, artifact_family='xu-energy'), plan, project_root=tmp_path)
+    assert request.provenance['plan']['energy_selection']['energy_eV'] == pytest.approx(16000.)
+    result = run_stitch_operation(request, workers=2)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    payload = read_analysis_artifact(target)
+    wavelength = energy_eV_to_wavelength_m(16000.) * 1e10
+    assert payload.wavelength_A == pytest.approx(wavelength)
+    from xrd_tools.io.analysis_stitch_auxiliary import native_stitch_companion
+    # The 2-D payload exposes its map and profile's stored native axes; the shared
+    # companion conversion supplies the alternate coordinate for either.
+    for radial, native_unit in ((payload.axis('q'), payload.native_unit),
+                               (payload.profile.axes[0][1], payload.profile.axis_units[0][1])):
+        _other_unit, other = native_stitch_companion(radial, native_unit, payload.wavelength_A)
+        q, tth = (radial, other) if native_unit == 'q_A^-1' else (other, radial)
+        np.testing.assert_allclose(q, 4 * np.pi / wavelength * np.sin(np.deg2rad(tth.astype(float) / 2)),
+                                  rtol=2 * np.finfo(q.dtype).eps)
+
+
+def test_xu_energy_changes_q_without_changing_pose_corrections_or_default_identity(tmp_path):
+    from tests.core.test_xu_stitch import _receipt
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.integrate.xu_stitch import resolve_xu_stitch_effective_geometry, XuPowderQProvider, _polarization_axes
+    receipt = _receipt(tmp_path)
+    acquisition = receipt.projection.value['acquisition']
+    axes = _polarization_axes(receipt.projection.value)
+    with xu_runtime_session() as session:
+        base = resolve_xu_stitch_effective_geometry(receipt, session)
+        same = resolve_xu_stitch_effective_geometry(receipt, session, metadata_energy_eV=17000.018)
+        assert same.projection.to_provenance() == base.projection.to_provenance()
+        shifted = resolve_xu_stitch_effective_geometry(receipt, session, metadata_energy_eV=16000.)
+        assert shifted.projection.fingerprint != base.projection.fingerprint
+        assert shifted.projection.asset_semantic_fingerprint == base.projection.asset_semantic_fingerprint
+        np.testing.assert_array_equal(base.mask, shifted.mask)
+        np.testing.assert_array_equal(base.solid_angle, shifted.solid_angle)
+        comparisons = []
+        for geometry in (base, shifted):
+            provider = XuPowderQProvider(geometry, acquisition)
+            lease = provider.frame(nu=16., del_=31.)
+            comparisons.append((lease.q_magnitude(), lease.chi(),
+                lease.polarization(.99, geometry.projection.runtime_xu_wavelength_A, *axes)))
+            lease.release()
+        q0, chi0, pol0 = comparisons[0]
+        q1, chi1, pol1 = comparisons[1]
+        np.testing.assert_allclose(q1, q0 * (16000. / 17000.018), rtol=2e-15)
+        np.testing.assert_allclose(chi1, chi0, atol=1e-12)
+        np.testing.assert_allclose(pol1, pol0, atol=2e-15)
