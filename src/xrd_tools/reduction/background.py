@@ -590,7 +590,7 @@ def _frame(value: tuple[object, ...], *, persisted=False) -> tuple[int, str, str
         raise ValueError("frame_fact exceeds its bounded encoding")
     return label, locator, selector, index, shape, metadata
 def _holds_its_pixels(path: Path) -> bool:
-    """Whether a Series member provably stores its own pixels, by its content, not its name. ``read_image``
+    """Whether a Background member provably stores its own pixels, by its content, not its name. ``read_image``
     decodes every non-container member through fabio, which detects EDF by content, so an EDF named ``.img``
     or ``.tif`` also reads its pixels from the file its header names in ``EDF_BinaryFileName``, and no stat
     of the member proves that file (Codex BG-SERIES F2 and its re-review F1). Header only (about 0.3 ms). A
@@ -694,6 +694,12 @@ def _prepare_single_frame_background(
         source_receipt = _json(source)
         metadata_items_receipt = _json(metadata_items)
         metadata_source_receipt = _json(metadata_source)
+        # The normal container read already proved a self-contained dataset.
+        # Other formats use Series' content check: an EDF can live behind any
+        # suffix and keep its pixels elsewhere, so neither hash nor stat of its
+        # header proves those pixels. Resolve it afresh for every frame.
+        if not source.get("hdf") and not _holds_its_pixels(Path(source["locator"])):
+            return None
     except (
         TypeError,
         ValueError,
@@ -721,7 +727,7 @@ def _rebind_single_frame_background(
     *,
     cancelled: Event | Callable[[], bool] | None = None,
 ) -> FrameBackgroundResult | None:
-    """Reuse one decoded Single-BG result after a full content proof."""
+    """Rebind by stat for a self-contained unnormalized source; normalized sources retain full proof."""
 
     if type(prepared) is not _PreparedSingleFrameBackground:
         raise TypeError("prepared frame-background capsule must be exact")
@@ -753,7 +759,10 @@ def _rebind_single_frame_background(
             return None
         source = json.loads(prepared.source_receipt.decode("utf-8", "strict"))
         path = Path(source["locator"])
-        state, digest = _digest(path, cancelled)
+        if plan.normalization_key is None:
+            state, digest = _source_state(path, cancelled), source["sha256"]
+        else:
+            state, digest = _digest(path, cancelled)
         if (
             list(state) != source["state"]
             or digest != source["sha256"]

@@ -33,6 +33,74 @@ def _payload(result: FrameBackgroundResult) -> dict:
 def _root(value):
     while isinstance(value, np.ndarray): value = value.base
     return value
+
+
+def test_real_single_rebind_uses_stat_proof_and_matches_cold(monkeypatch, tmp_path):
+    """Actual Rayonix TIFF, production decoder and Single capsule; timings are attribution only."""
+    from time import perf_counter
+    from xrd_tools.reduction import background as module
+
+    source = Path(os.environ.get("XDART_TEST_DATA", "/Users/vthampy/repos/test_data")) / "Tiff" / "LaB6_detz190_dety72_th5_03261554_0001.tif"
+    if not source.is_file():
+        pytest.skip("actual Rayonix TIFF is unavailable")
+    original = hashlib.sha256(source.read_bytes()).hexdigest()
+    image = module.read_image(source)
+    shape = tuple(image.shape)
+    del image
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=0.37)
+    first_fact = _fact(tmp_path / "first.tif", shape=shape)
+    started = perf_counter()
+    first = resolve_frame_background(plan, first_fact)
+    cold_seconds = perf_counter() - started
+    assert first.disposition == "RESOLVED"
+    prepared = module._prepare_single_frame_background(plan, first_fact, first)
+    assert prepared is not None
+    calls = []
+    real_digest = module._digest
+
+    def observed_digest(path, cancelled):
+        calls.append(path)
+        return real_digest(path, cancelled)
+
+    monkeypatch.setattr(module, "_digest", observed_digest)
+    started = perf_counter()
+    for label in range(1, 11):
+        fact = _fact(tmp_path / "next.tif", label=label, shape=shape)
+        rebound = module._rebind_single_frame_background(prepared, plan, fact)
+        assert rebound is not None and rebound.background is first.background
+    rebind_seconds = perf_counter() - started
+    repeated_hashes = len(calls)
+    expected = resolve_frame_background(plan, fact)
+    assert rebound.descriptor_bytes == expected.descriptor_bytes
+    assert rebound.fingerprint == expected.fingerprint
+    np.testing.assert_array_equal(rebound.background, expected.background)
+    assert (rebound.variance_factor, rebound.scale) == (expected.variance_factor, expected.scale)
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == original
+    print(f"SINGLE_BG_COLD_SECONDS={cold_seconds:.6f} TEN_REBINDS_SECONDS={rebind_seconds:.6f} REBIND_FILE_HASHES={repeated_hashes} RETAINED_BACKGROUND_BYTES={first.background.nbytes}")
+    assert repeated_hashes == 0
+
+
+@pytest.mark.parametrize("suffix", [".edf", ".img", ".tif"])
+def test_single_external_edf_pixels_never_keep_a_capsule(tmp_path, suffix):
+    """Real content-detected EDF reader must reread its external pixel file."""
+    import fabio
+    from xrd_tools.reduction import background as module
+
+    shape = (3, 4)
+    member, payload = tmp_path / f"bg_1{suffix}", tmp_path / "pixels.bin"
+    payload.write_bytes(np.full(shape, 3, dtype="<u2").tobytes())
+    fabio.edfimage.EdfImage(data=np.zeros(shape, dtype="<u2"), header={
+        "EDF_BinaryFileName": payload.name, "EDF_BinaryFileSize": "24", "EDF_BinaryFilePosition": "0",
+    }).write(str(member))
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(member))
+    fact = _fact(tmp_path / "target.tif", shape=shape)
+    initial = resolve_frame_background(plan, fact)
+    np.testing.assert_array_equal(initial.background, np.full(shape, 3.0))
+    assert module._prepare_single_frame_background(plan, fact, initial) is None
+    payload.write_bytes(np.full(shape, 9, dtype="<u2").tobytes())
+    np.testing.assert_array_equal(resolve_frame_background(plan, fact).background, np.full(shape, 9.0))
+
+
 def test_none_is_zero_io_and_identity_neutral(monkeypatch, tmp_path: Path) -> None:
     from xrd_tools.reduction import background as module
     fact = _fact(tmp_path / "absent.tif"); touched = []; event = Event(); event.set()
@@ -260,12 +328,12 @@ def test_prepared_single_rejects_same_content_path_replacement(
     )
     assert prepared is not None
 
-    real_digest = module._digest
+    real_state = module._source_state
     replaced = False
 
-    def replace_after_digest(path, cancelled):
+    def replace_after_state(path, cancelled):
         nonlocal replaced
-        receipt = real_digest(path, cancelled)
+        receipt = real_state(path, cancelled)
         if not replaced:
             replacement = path.with_name("replacement.tif")
             replacement.write_bytes(path.read_bytes())
@@ -273,7 +341,7 @@ def test_prepared_single_rejects_same_content_path_replacement(
             replaced = True
         return receipt
 
-    monkeypatch.setattr(module, "_digest", replace_after_digest)
+    monkeypatch.setattr(module, "_source_state", replace_after_state)
     assert module._rebind_single_frame_background(
         prepared, plan, _fact(target, label=2),
     ) is None
