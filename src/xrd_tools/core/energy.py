@@ -32,6 +32,7 @@ __all__ = [
     "calibration_recorded_energy_eV",
     "check_energy_consistency",
     "resolve_acquisition_energy",
+    "metadata_energy_values",
     # X1 Slice 3a0 (R3-P1): the one headless wavelength vocabulary.
     "WavelengthUnit",
     "canonical_wavelength_m",
@@ -148,6 +149,29 @@ def wavelength_m_to_energy_eV(wavelength_m: float) -> float:
     return _HC_EV_M / float(wavelength_m)
 
 
+def metadata_energy_values(row, *, wavelength=None, wavelength_unit=None) -> tuple:
+    """Read a metadata row's eV energy or explicitly unit-declared wavelength.
+
+    Missing evidence returns no values. Present invalid evidence refuses rather
+    than selecting the calibration fallback; units are never inferred by size.
+    """
+    names = {str(key).casefold(): value for key, value in row.items()}
+    if 'energy' in names:
+        return (names['energy'],)
+    values = [(names[name], unit) for name, unit in
+              (('wavelength_m', WavelengthUnit.METRE),
+               ('wavelength_a', WavelengthUnit.ANGSTROM)) if name in names]
+    if not values and wavelength is not None and wavelength_unit is not None:
+        values = [(wavelength, wavelength_unit)]
+    energies = []
+    for value, unit in values:
+        metres = canonical_wavelength_m(value, unit)
+        if isinstance(value, (bool, np.bool_)) or metres is None:
+            raise ValueError('metadata energy from wavelength must be finite and positive')
+        energies.append(wavelength_m_to_energy_eV(metres))
+    return tuple(energies)
+
+
 def resolve_acquisition_energy(calibration_wavelength_m, metadata_energy_eV=(), *,
                                fitted_source_energy_eV=None) -> dict:
     """Freeze one acquisition energy and its explicit fitted correction, without I/O.
@@ -156,7 +180,7 @@ def resolve_acquisition_energy(calibration_wavelength_m, metadata_energy_eV=(), 
     source-energy tolerance. An empty sequence selects the calibration fallback.
     The calibration itself remains immutable.
     """
-    values = []
+    first = None
     for value in metadata_energy_eV:
         if isinstance(value, (bool, np.bool_)):
             raise ValueError("metadata energy must be finite and positive")
@@ -166,28 +190,29 @@ def resolve_acquisition_energy(calibration_wavelength_m, metadata_energy_eV=(), 
             raise ValueError("metadata energy must be finite and positive") from error
         if not np.isfinite(number) or number <= 0:
             raise ValueError("metadata energy must be finite and positive")
-        values.append(number)
-    if values and any(abs(value - values[0]) > .001 * values[0] for value in values):
-        raise ValueError("metadata energy must be common across selected frames")
+        if first is None:
+            first = number
+        elif abs(number - first) > .001 * first:
+            raise ValueError("metadata energy must be common across selected frames")
     wavelength = canonical_wavelength_m(calibration_wavelength_m, WavelengthUnit.METRE)
     calibration = None if wavelength is None else wavelength_m_to_energy_eV(wavelength)
     if fitted_source_energy_eV is not None and calibration is None:
         raise ValueError('a fitted energy offset requires a positive calibration wavelength')
     offset = 0. if fitted_source_energy_eV is None else calibration - float(fitted_source_energy_eV)
-    base = values[0] if values else (calibration if fitted_source_energy_eV is None
+    base = first if first is not None else (calibration if fitted_source_energy_eV is None
                                    else float(fitted_source_energy_eV))
     effective = None if base is None else base + offset
     if effective is not None and (not np.isfinite(effective) or effective <= 0):
         raise ValueError("effective acquisition energy must be finite and positive")
     reference = calibration if fitted_source_energy_eV is None else float(fitted_source_energy_eV)
-    disagreement = bool(values and reference is not None and abs(base - reference) > .001 * reference)
+    disagreement = bool(first is not None and reference is not None and abs(base - reference) > .001 * reference)
     # Retain the exact accepted wavelength for the fallback and unchanged energy.
     # A hc/(hc/wavelength) round trip can otherwise move it by one ulp.
-    if not values or effective == calibration:
+    if first is None or effective == calibration:
         effective, selected_wavelength = calibration, wavelength
     else:
         selected_wavelength = None if effective is None else energy_eV_to_wavelength_m(effective)
-    return {"source": "metadata" if values else "calibration", "source_energy_eV": base,
+    return {"source": "metadata" if first is not None else "calibration", "source_energy_eV": base,
             "calibration_energy_eV": calibration, "fitted_energy_offset_eV": offset,
             "energy_eV": effective,
             "wavelength_m": selected_wavelength,

@@ -1073,19 +1073,14 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
     their existing interpretation. The returned calibration is an effective copy.
     """
     from dataclasses import replace
-    from xrd_tools.core.energy import resolve_acquisition_energy, wavelength_m_to_energy_eV
+    from xrd_tools.core.energy import resolve_acquisition_energy, metadata_energy_values, WavelengthUnit
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
     energies = list(metadata_energy_eV)
     for frame in scan.frames:
-        row = {str(key).casefold(): value for key, value in frame.metadata.items()}
-        if 'energy' in row:
-            energies.append(row['energy'])  # SPEC and metadata-provider motor energy: eV
-        else:
-            for name, factor in (('wavelength_m', 1.), ('wavelength_a', 1e-10)):
-                if name in row:
-                    energies.append(wavelength_m_to_energy_eV(float(row[name]) * factor))
+        energies.extend(metadata_energy_values(frame.metadata))
     if metadata_wavelength_A is not None:
-        energies.append(wavelength_m_to_energy_eV(float(metadata_wavelength_A) * 1e-10))
+        energies.extend(metadata_energy_values({}, wavelength=metadata_wavelength_A,
+                                              wavelength_unit=WavelengthUnit.ANGSTROM))
     selection = resolve_acquisition_energy(calibration.poni.wavelength, energies)
     if selection['disagreement']:
         logger.warning('X-ray energy mismatch: metadata=%.1f eV, PONI=%.1f eV; using metadata',

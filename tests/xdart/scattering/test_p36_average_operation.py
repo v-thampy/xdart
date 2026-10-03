@@ -1707,6 +1707,32 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
     assert len(calls) == 4
 
 
+def test_gui_average_freezes_real_source_energy_before_reduction(tmp_path):
+    from tests.core.test_int_workflow_replay import _fixture
+    from tests.core.test_acquisition_energy import _record_nexus_energy, _replay
+    from xrd_tools.core.provenance import read_provenance
+    from xrd_tools.io import open_scan
+    intent = _fixture(tmp_path / 'project')
+    intent.processing_mode = 'Int 1D'
+    intent.output_mode = 'Overwrite'
+    _record_nexus_energy(intent, [16000., 16000.])
+    expected = open_scan(_replay(intent, 'run'))
+    slot = OperationSlot()
+    try:
+        identity = slot.begin_average(intent.freeze(), tmp_path / 'average.nexus',
+                                      stamp=OperationContextStamp(0))
+        assert identity is not None
+        update = _join(slot, identity)
+        assert update.terminal.status is OperationTerminalStatus.RETURNED
+        result = update.terminal.payload
+        assert result.disposition == 'COMMITTED', result
+        np.testing.assert_array_equal(expected.get_1d(0).q,
+                                      open_scan(result.target).get_1d(1).q)
+        assert read_provenance(result.target)['config']['energy_selection']['energy_eV'] == 16000.
+    finally:
+        assert slot.close().cleanup_status is CleanupStatus.CLEANED
+
+
 def test_average_stop_stale_close_and_single_slot_truth(tmp_path, monkeypatch) -> None:
     entered, release = threading.Event(), threading.Event()
 

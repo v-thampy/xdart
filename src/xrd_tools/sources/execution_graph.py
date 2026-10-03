@@ -2074,6 +2074,13 @@ class _AverageSourceReadWindow:
         return dict(getattr(self._tiff, "metadata_for")(
             index + 1, max_input_bytes=1 << 16,
         ))
+    def metadata_wavelength(self):
+        """Declared wavelength from this already-qualified container owner."""
+        _cancelled(self._cancelled)
+        if self._cursor is None:
+            return None, None
+        provider = self._cursor.metadata_provider()
+        return provider.wavelength(), provider.wavelength_unit()
     def eiger_direct_chunk_layout(self):
         if self._cursor is None:
             return None, "direct decode requires a container source"
