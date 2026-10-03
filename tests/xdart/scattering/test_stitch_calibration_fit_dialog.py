@@ -434,6 +434,7 @@ def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp,
     seed_path.write_text(json.dumps(_five_parameter_seed(_ROW_ANGLES)))
     page, dialog = _page_with_dialog(tmp_path, spec, seed_path)
     try:
+        _wait(dialog)  # Source readiness uses the retained background operation owner.
         assert dialog.refine_seed.currentData() == 'file'
         assert dialog._text('refine_seed_path') == str(seed_path)
         assert not dialog.refine_seed_note.text()  # a detector arm: it can start the refinement

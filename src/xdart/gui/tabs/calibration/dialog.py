@@ -16,7 +16,7 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
-from xdart.gui.widgets.controls_panel import FormRow
+from xdart.gui.widgets.controls_panel import FormRow, SectionCard
 from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
 from xdart.gui.widgets.read_only_text import ReadOnlyTextPane
 from xrd_tools.core.scan import SourceKind, SourceSpec
@@ -32,6 +32,7 @@ from xrd_tools.integrate.stitch_calibration import (
     adopt_calibration_pair, automatic_arm_reason, capture_calibration_frames, direct_beam_pose, fit_calibration,
     load_calibration_session, pair_validation_angles, save_calibration_pair, save_calibration_session,
     scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
+    direct_beam_scan_motor, open_calibration_beam_scan,
 )
 from .fit_windows import (
     PARAMETER_LABELS, RECORD_LABELS, CalibrationFitWindow, DirectBeamFitWindow, calibration_fit_text, direct_beam_fit_text,
@@ -143,6 +144,12 @@ def _dispatch_job(request, cancelled, publish):
         from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
         prefix, spec, folder, stem = arguments
         energy = calibration_source_energy_eV(spec) if not prefix else None
+        source_ready = False
+        if not prefix:
+            try:
+                source_ready = bool(source_frame_choices(spec, ()))
+            except (ValueError, KeyError, OSError):
+                pass  # Energy discovery is independent of missing or incomplete images.
         automatic = None
         if spec.kind is SourceKind.SPEC and not stem:
             files = find_spec_image_files(folder, Path(spec.uri).stem, spec.options['scan'])
@@ -150,7 +157,7 @@ def _dispatch_job(request, cancelled, publish):
                 automatic = spec_image_stem(files[0], Path(spec.uri).stem, spec.options['scan'])
         if cancelled.is_set():
             raise OperationCancelled('source metadata cancelled')
-        return prefix, energy, automatic
+        return prefix, energy, automatic, source_ready
     if kind == 'refine':
         from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
         spec, seed, options = arguments
@@ -212,44 +219,32 @@ def _dispatch_job(request, cancelled, publish):
         fit, path, angles = arguments
         return save_calibration_pair(fit, path, validation_angles=angles, cancelled=cancelled,
                                      progress=_staged_progress(publish, _TRANSFER_STAGES))
-    if kind == 'distance':
-        from xrd_tools.sources import open_source
-        from xrd_tools.integrate.direct_beam import calibrate_direct_beam, open_direct_beam_scan
+    if kind in ('beam_detect', 'distance'):
+        from xrd_tools.integrate.direct_beam import calibrate_direct_beam, infer_direct_beam_motion
         from xrd_tools.core.geometry import ImageOrientation
-        spec, motor, options, held = arguments
+        if kind == 'beam_detect':
+            spec, detector_motors, options = arguments
+            motor = direct_beam_scan_motor(spec, detector_motors)
+        else:
+            spec, motor, options, held = arguments
         options = dict(options)
+        orientation = ImageOrientation(rotation=options.pop('rotation'),
+                                       flip_horizontal=options.pop('flip', False))
+        options['reader_options'] = dict(spec.options.get('read_image_kwargs', {}))
         if cancelled.is_set():
-            raise OperationCancelled('direct-beam calibration cancelled')
-        # the scan's one recorded energy (for the wavelength) and the other moving circle as the scan held
-        # it (the beam was seen there), from its metadata for every source kind
-        energy, held_readings = direct_beam_pose(spec, motor, held)
-        with ExitStack() as resources:
-            source_options = dict(motor=motor, entry=spec.entry or 'entry')
-            if spec.kind is SourceKind.SPEC:
-                source_options['scan'] = spec.options['scan']
-                options['reader_options'] = dict(spec.options.get('read_image_kwargs', {}))
-                if spec.options.get('image_file'):
-                    source_options['image_file'] = spec.options['image_file']
-                else:
-                    # Preserve the shared strict series discovery and exact
-                    # path/frame references; the loader owns SPEC angle pairing.
-                    choices = source_frame_choices(spec, (motor,))
-                    source = open_source(replace(spec, options={**spec.options,
-                                                              'require_complete_images': True}))
-                    if getattr(source, 'close', None) is not None:
-                        resources.callback(source.close)
-                    frames = (source.frame_for(index) for index, _, _ in choices)
-                    source_options['images'] = ((frame.source_path, frame.source_frame_index or 0)
-                        if frame.source_path is not None else None for frame in frames)
-            inputs = resources.enter_context(open_direct_beam_scan(spec.uri, **source_options))
+            raise OperationCancelled('direct-beam operation cancelled')
+        with open_calibration_beam_scan(spec, motor) as inputs:
+            if kind == 'beam_detect':
+                motion, delta, endpoints = infer_direct_beam_motion(list(inputs.images), orientation=orientation,
+                    cancelled=cancelled, return_details=True, **options)
+                return motor, motion, delta, tuple(float(inputs.angles_deg[index]) for index in endpoints)
+            energy, held_readings = direct_beam_pose(spec, motor, held)
             def images():
                 for frame in inputs.images:
                     if cancelled.is_set():
                         raise OperationCancelled('direct-beam calibration cancelled')
                     yield frame
-            result = calibrate_direct_beam(inputs.angles_deg, images(),
-                orientation=ImageOrientation(rotation=options.pop('rotation'),
-                                             flip_horizontal=options.pop('flip', False)),
+            result = calibrate_direct_beam(inputs.angles_deg, images(), orientation=orientation,
                 frame_ids=inputs.frame_ids, point_ids=inputs.point_ids, **options)
             if cancelled.is_set():
                 raise OperationCancelled('direct-beam calibration cancelled')
@@ -453,6 +448,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._job = None
         self._row_identity = None
         self._close_pending = False
+        self._beam_detection = None
+        self._beam_generation = 0
+        self._beam_problem = 'Select a direct-beam source and scan'
         self._distance_result = None
         self._distance_energy_eV = None  # the fitted direct-beam scan's recorded energy
         self._distance_held = {}  # its other moving circle's recorded reading
@@ -461,7 +459,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._calibration_fit_window = None
         self._fit_kind = 'fit'  # the job the current fit came from: 'fit' or 'refine'
         self._distance_key = self._distance_pending_key = None  # what the result was fitted from
-        self._source_energy_text = None
+        self._source_energy_eV = None
+        self._pending_source_details = None
+        self._calibrant_ready_key = None
         self._restoring_fields = False
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
         self._frame_motors = ('del', 'nu')
@@ -527,6 +527,22 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.camera.set_value(context.camera)
         self._pixel_detector = self._text('beam_detector')
         self._pixel_orientation = self._orientation()
+        self._beam_probe_timer = QtCore.QTimer(self)
+        self._beam_probe_timer.setSingleShot(True)
+        self._beam_probe_timer.setInterval(150)
+        self._beam_probe_timer.timeout.connect(self._detect_beam)
+        for key in ('beam_source', 'beam_scan', 'beam_entry', 'beam_images', 'beam_stem',
+                    'beam_image_file', 'beam_roi', 'mask', 'saturation', 'shape', 'dtype', 'header'):
+            self._fields[key].textChanged.connect(self._invalidate_beam_detection)
+        for key in ('beam_detector', 'beam_orientation'):
+            self._fields[key].currentIndexChanged.connect(self._invalidate_beam_detection)
+        self.camera.changed.connect(self._invalidate_beam_detection)
+        self._beam_arm = self.geometry_editor.value().stitch_arm()
+        self.geometry_editor.changed.connect(self._beam_geometry_changed)
+        self.beam_source_kind.currentIndexChanged.connect(self._invalidate_beam_detection)
+        self.rough_mode.currentIndexChanged.connect(self._invalidate_beam_detection)
+        self.tabs.currentChanged.connect(self._tab_readiness)
+        self._update_beam_readiness()
 
     def _form(self, title, key):
         widget = QtWidgets.QWidget()
@@ -666,12 +682,16 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _source_details(self, prefix=''):
         """Committed source fields only: reuse the worker for pixel-free metadata and naming."""
-        if self._owner.busy or self._restoring_fields:
+        if self._restoring_fields:
+            return
+        if self._owner.busy:
+            self._pending_source_details = prefix
             return
         if not prefix:
-            if self._source_energy_text == self._text('rough_energy'):
-                self._set_field_text('rough_energy', '')
-            self._source_energy_text = None
+            self._source_energy_eV = None
+            self._calibrant_ready_key = None
+            self._fields['rough_energy'].setPlaceholderText('Auto · scan energy unavailable')
+            self._source_details_key = self._energy_source_key()
         path = self._text(prefix + 'source')
         if not path:
             return
@@ -681,9 +701,84 @@ class CalibrationDialog(QtWidgets.QDialog):
         spec = SourceSpec(Path(path).expanduser().absolute(), kind,
                           entry=self._text(prefix + 'entry') or 'entry',
                           options={'scan': self._text(prefix + 'scan')} if kind is SourceKind.SPEC else {})
+        if not prefix:
+            spec = self._spec()
         folder = self._text(prefix + 'images') or str(Path(path).expanduser().absolute().parent)
         self._auto_placeholders(prefix)
+        self._source_details_inputs_key = self._source_details_input_key(prefix)
         self._start('source_details', (prefix, spec, folder, self._text(prefix + 'stem')))
+
+    def _source_details_input_key(self, prefix):
+        return tuple(self._text(prefix + key) for key in ('source', 'scan', 'entry', 'images', 'stem')) + (
+            self.beam_source_kind.currentData() if prefix else self.source_kind.currentData(),)
+
+    def _energy_source_key(self):
+        return (self._text('source'), self._text('scan'), self._text('entry'),
+                self._text('images'), self._text('stem'), self.source_kind.currentData())
+
+    def _invalidate_source_energy(self, *_args):
+        if self._restoring_fields:
+            return
+        self._source_energy_eV = None
+        self._calibrant_ready_key = None
+        self._choices = []
+        self._fields['rough_energy'].setPlaceholderText('Auto · scan energy unavailable')
+        self._update_fit_source_label()
+
+    def _calibrant_source_changed(self, *_args):
+        if self._restoring_fields:
+            return
+        # A new file has its own scan selection and image naming, never the previous file's overrides.
+        self._set_field_text('scan', '1')
+        self._set_field_text('images', '')
+        self._set_field_text('stem', '')
+        self._set_field_text('rough_energy', '')
+        self._invalidate_source_energy()
+
+    def _show_source_energy(self, energy):
+        self._source_energy_eV = energy
+        self._fields['rough_energy'].setPlaceholderText(
+            f'Auto · {energy / 1000:.4f} keV from '
+            + ('SPEC' if self.source_kind.currentData() != 'nexus_stack' else 'NeXus')
+            if energy is not None else 'Auto · scan energy unavailable')
+
+    def _calibrant_source_ready(self):
+        return self._calibrant_ready_key is not None and self._calibrant_ready_key == self._energy_source_key()
+
+    def _staged_source_mismatch(self):
+        if not self.frames or not self._text('source'):
+            return False
+        frame = self.frames[0]
+        try:
+            source = self._spec()
+            scan = str(source.options.get('scan', '1'))
+            staged_scan = str(frame.source_options.get('options', {}).get('scan', '1'))
+            if '.' not in scan:
+                scan += '.1'
+            if '.' not in staged_scan:
+                staged_scan += '.1'
+            return (str(source.uri) != frame.source_uri or source.kind.value != frame.source_kind
+                    or (source.kind is SourceKind.SPEC and scan != staged_scan)
+                    or source.entry != frame.source_options.get('entry', 'entry'))
+        except (ValueError, KeyError, OSError):
+            return True
+
+    def _update_fit_source_label(self):
+        if not hasattr(self, 'active_source_row'):
+            return
+        if self.frames:
+            frame = self.frames[0]
+            scan = frame.source_options.get('options', {}).get('scan')
+            text = f'Prepared: {frame.source_uri}' + (f' · scan {scan}' if scan is not None else '')
+            if self._staged_source_mismatch():
+                text += ' · Selected source differs; prepare matching frames in a new session'
+        elif self._calibrant_source_ready():
+            text = self._text('source') + (f' · scan {self._text("scan")}'
+                    if self.source_kind.currentData() != 'nexus_stack' else '')
+        else:
+            text = 'Select a valid calibrant source and read its metadata (3 · Calibrant scan)'
+        self.active_source_row.editor.setText(text)
+        self.active_source_row.editor.setToolTip(text)
 
     def _set_field_text(self, key, value):
         field, value = self._fields[key], str(value)
@@ -716,7 +811,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._attach('scan', 'source', 'Scan', '1', tip=self._SCAN_TIP, width=90)
         self._edit(form, 'images', 'Images folder', chooser='directory', tip=self._FOLDER_TIP)
         self._attach('stem', 'images', 'Stem', '', tip=self._STEM_TIP)
-        self._edit(form, 'entry', 'NeXus entry', 'entry', tip='The NeXus entry (group) holding the frames and angles.')
+        self._formrows['source_kind'] = self._row_of[self.source_kind]
+        self._rows['source_kind'] = (form, self._row_of[self.source_kind])
+        self._attach('entry', 'source_kind', 'NeXus entry', 'entry', width=120,
+                     tip='The NeXus entry (group) holding the frames and angles.')
         self.refine_calibrant = self._combo(form, 'Calibrant', [(name, None) for name in (
             'LaB6', 'CeO2', 'Si', 'Al2O3', 'Cr2O3', 'AgBh')],
             tip='The powder standard in this scan: pyFAI opens each frame with it, the table predicts its '
@@ -726,9 +824,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._formrows['calibrant'] = self._row_of[self.refine_calibrant]
         self._rows['calibrant'] = (form, self._row_of[self.refine_calibrant])
         self._attach('rough_energy', 'calibrant', 'Energy (keV)', '', width=300,
-                     placeholder='auto from scan',
-                     tip='The calibrant scan\'s X-ray energy, in keV, populated from its recorded energy or '
-                         'wavelength when the source is committed. Type it when metadata is absent. '
+                     placeholder='Auto · scan energy unavailable',
+                     tip='Blank uses the calibrant scan\'s recorded energy or wavelength; the grey Auto hint '
+                         'shows its energy in keV. Type a value to override it; clear it to restore Auto. '
                          'Wavelength is computed from this value; the direct-beam distance fit needs no energy. '
                          'Saving a rough calibration needs this or the direct-beam scan\'s recorded energy'
                          + _PAGE_USE.get(self.context.page, {}).get('energy_field', '') + '.')
@@ -746,6 +844,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._fields['saturation'].editingFinished.connect(self._show_threshold)
         self._show_threshold()
         self.source_kind.currentIndexChanged.connect(self._sync_source_rows)
+        self._fields['source'].textChanged.connect(self._calibrant_source_changed)
+        for key in ('scan', 'entry', 'images', 'stem'):
+            self._fields[key].textChanged.connect(self._invalidate_source_energy)
+        self.source_kind.currentIndexChanged.connect(self._invalidate_source_energy)
         for key in ('source', 'scan'):
             self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders())
         for key in ('source', 'scan', 'entry', 'images', 'stem'):
@@ -807,6 +909,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         elif result is not None:
             self._threshold_state = result
             self._show_threshold()
+            self._invalidate_beam_detection()
             self._ring_cache.clear()
             self._invalidate_fit()
             self._render_frames()
@@ -816,6 +919,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         # Calibrating the frames and fitting them are one loop: one tab (maintainer, 2026-09-29)
         layout, form = self._form('4 · Calibrate and fit', 'calibrate')
         self._calibrate_layout = layout
+        self.active_source_row = FormRow(label='Calibrant source', path=('Calibration', 'active_source'), value='')
+        self.active_source_row.editor.setReadOnly(True)
+        form.addRow(self.active_source_row.label, self.active_source_row)
         hint = QtWidgets.QLabel('Calibrate each frame in pyFAI: pick its rings, then press Save as PONI-file. xdart keeps the PONI and its enabled control points, closes pyFAI and selects the next frame. Completed rows and files remain when another frame is cancelled.')
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1095,14 +1201,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._auto_placeholders('beam_')
         for key in ('beam_source', 'beam_scan', 'beam_entry', 'beam_images', 'beam_stem'):
             self._fields[key].editingFinished.connect(lambda: self._source_details('beam_'))
-        self._edit(form, 'beam_motor', 'Two-theta motor (degrees)', 'del',
-                   tip='The motor that swings the detector in the direct-beam scan (del for psic\'s vertical arm).')
-        self.motion = self._combo(form, 'Beam direction', [('Auto (motor)', 'auto'),
-                                                          ('horizontal', None), ('vertical', None)],
-                                  host='beam_motor',
-                                  tip='The beam spot\'s direction in the oriented image. Auto uses the configured '
-                                      'circle: del (vertical) or nu (horizontal), including a single 2θ arm. '
-                                      'Choose an explicit direction to override it.')
+        self.beam_readiness = SectionCard('Direct-beam scan', collapsible=False)
+        self.beam_readiness.body.hide()
+        layout.insertWidget(0, self.beam_readiness)
         self._edit(form, 'beam_pixel', 'Direct beam pixel (x, y)', '',
                    tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (each '
                        'circle at its motor zero, beside its motor under 1 · Instrument), in the image as '
@@ -1155,7 +1256,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.save_rough_button)
         layout.addStretch(1)
         self.rough_mode.currentIndexChanged.connect(self._sync_rough_rows)
-        for key in ('rough_distance', 'beam_pixel', 'beam_motor', 'rough_mount'):
+        for key in ('rough_distance', 'beam_pixel', 'rough_mount'):
             self._fields[key].editingFinished.connect(self._render_frames)
         self._fields['rough_mount'].textChanged.connect(self._invalidate_fit)  # the fits' mount estimate
         self._fields['rough_mount'].textChanged.connect(self._bounds_edited)
@@ -1256,7 +1357,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                 '▸ Refine from the whole scan), or from the first frame you calibrate.',
     }
     #: Hidden by Skip. Calibrant scan owns the energy field for frames without recorded energy.
-    _GEOMETRY_ROWS = ('beam_motor', 'beam_pixel', 'rough_mount')
+    _GEOMETRY_ROWS = ('beam_pixel', 'rough_mount')
 
     _CAMERA_TIP = ('x± and z± refer to the same lab frame described in the Diffractometer section above. '
                    'They are the directions the stored image\'s rows (top to bottom) and columns (left to right) run '
@@ -1395,7 +1496,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         for key, shown in visible.items():
             self._show(key, shown)
         form.setRowVisible(self._row_of[self.beam_source_kind], scan)
-        self._row_of[self.motion].setVisible(scan)
+        self.beam_readiness.setVisible(scan)
         for widget in (self._fit_options, self.beam_button, self.beam_summary, self.show_fit_button,
                        self.apply_distance_button):
             widget.setVisible(scan)
@@ -1461,6 +1562,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             if not math.isfinite(energy) or energy <= 0:
                 raise ValueError('Energy must be finite and positive, in keV')
             return float(energy_eV_to_wavelength_m(energy)) * 1e10
+        if self._source_energy_eV is not None:
+            return float(energy_eV_to_wavelength_m(self._source_energy_eV)) * 1e10
         energies = {energy for _index, _values, energy in self._choices if energy is not None}
         if len(energies) == 1:
             return float(energy_eV_to_wavelength_m(energies.pop())) * 1e10
@@ -1470,13 +1573,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         return None
 
     def _beam_role(self):
-        """The arm circle the direct-beam motor names ("del", "tth", or a motor), by the
-        Geometry; a single 2θ arm has one circle, whatever the default text says."""
-        geometry = self.geometry_editor.value()
-        role = geometry.arm_role(self._text('beam_motor'))
-        if role is None and None in geometry.stitch_arm():
-            role = 'del' if geometry.stitch_arm()[0] else 'nu'
-        return role
+        motor = self._beam_detection[1] if self._beam_detection is not None else ''
+        return self.geometry_editor.value().arm_role(motor)
 
     def set_source_context(self, source: SourceSpec, *, image_rotation=0, del_motor=None, nu_motor=None,
                            geometry_path=None, image_flip=False):
@@ -1500,6 +1598,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                            ('dtype', reader.get('raw_dtype', 'int32')), ('header', reader.get('raw_header_skip', 0))]:
             self._fields[key].setText(str(value))
         self.raw_layout.setCurrentIndex(self.raw_layout.findData('manual' if self._custom_raw_layout() else 'factory'))
+        self._source_details()
         if image_rotation is None:  # the page turns no images of its own: the window's camera stays (item 10)
             return
         from xrd_tools.core.geometry import ImageOrientation
@@ -1531,7 +1630,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     #: Choices saved with the page's settings (Stitch's, RSM's). The calibrant-scan and same-detector
     #: confirmations are per use and never saved.
     _SAVED_CHOICES = ('source_kind', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
-                      'motion', 'rough_mode', 'raw_layout')
+                      'rough_mode', 'raw_layout')
 
     def settings(self):
         """This dialog's inputs as plain values, for the page's saved settings."""
@@ -1615,6 +1714,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         # after the del/nu fields an older file names its arm with: its normal-incidence zero
         self.geometry_editor.set_value(migrated_instrument(self.geometry_editor.value(), values))
         self._sync_arm_model()
+        self._pending_source_details = ''
+        self._beam_probe_timer.start()
 
     def _zeros(self):
         """The Diffractometer panel's motor zeros by arm circle ('del', 'nu'); a malformed box is
@@ -1806,7 +1907,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             return
         self._job = kind
         self._identity = self._owner.begin((kind, arguments))
-        self.tabs.setEnabled(False)
+        self.tabs.setEnabled(kind == 'beam_detect')
         self.cancel_button.setEnabled(True)
         self.status.setText(f'{kind.capitalize()} in progress…')
         self._timer.start()
@@ -2007,6 +2108,11 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _fit(self):
         def go():
+            if not self.frames or not all(frame.source_uri for frame in self.frames):
+                raise ValueError('Select a calibrant source and prepare its frames first (3 · Calibrant scan).')
+            if self._staged_source_mismatch():
+                raise ValueError('The prepared frames belong to another calibrant source; select their source '
+                                 'or start a new session and prepare the selected scan.')
             if self.frames and self.geometry_editor.value().stitch_arm() != self._frame_motors:
                 raise ValueError(self._staged_arm_message(self.geometry_editor.value().stitch_arm()))
             if self._staged_camera_message():
@@ -2040,6 +2146,8 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _refine(self):
         def go():
+            if not self._calibrant_source_ready():
+                raise ValueError('Select a valid calibrant source and read its metadata first (3 · Calibrant scan).')
             geometry = self.geometry_editor.value()
             delta, nu = geometry.stitch_arm()
             spec = self._spec()
@@ -2253,18 +2361,23 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _direct_beam_request(self, *, with_mask=True):
         """The direct-beam fit's (source, motor, options) from the window as it is now; without the
         mask's pixels its state stands in (for the result's identity)."""
+        if self._beam_detection is None or self._beam_detection[0] != self._beam_generation:
+            raise ValueError(self._beam_problem)
+        _, motor, motion, *_diagnostics = self._beam_detection
+        options = self._beam_fit_options(with_mask=with_mask)
+        options.update(motion=motion, angle_zero_deg=self._zeros().get(self._beam_role(), 0.))
+        arm = dict(zip(('del', 'nu'), self.geometry_editor.value().stitch_arm()))
+        held = tuple(name for circle, name in arm.items() if name and circle != self._beam_role())
+        return self._spec(beam=True), motor, options, held
+
+    def _beam_fit_options(self, *, with_mask=True):
+        """Detector and extraction settings, independent of source readiness."""
         orientation = int(self._text('beam_orientation'))
-        motion = self.motion.currentText()
-        if self.motion.currentData() == 'auto':
-            motion = {'del': 'vertical', 'nu': 'horizontal'}.get(self._beam_role())
-            if motion is None:
-                raise ValueError('Choose Horizontal or Vertical for a motor not mapped to the detector arm')
         options = dict(detector=self._text('beam_detector'),
             detector_config={'orientation': orientation} if orientation != 3 else None,
             beam_pixel=(tuple(float(v) for v in self._text('beam_pixel').split(','))
                         if self._text('beam_pixel') else None),  # blank: found at the zero
-            motion=motion, strip_half_width=int(self._text('beam_strip')),
-            model='tangent', angle_zero_deg=self._zeros().get(self._beam_role(), 0.),
+            strip_half_width=int(self._text('beam_strip')), model='tangent',
             rotation=self._orientation().rotation, flip=self._orientation().flip_horizontal)
         if self._text('beam_roi'):
             options['roi'] = tuple(int(v) for v in self._text('beam_roi').split(','))
@@ -2273,10 +2386,85 @@ class CalibrationDialog(QtWidgets.QDialog):
         saturation = self._saturation_value()
         if saturation is not None:
             options['saturation'] = saturation
-        arm = dict(zip(('del', 'nu'), self.geometry_editor.value().stitch_arm()))
-        motor = arm.get(self._beam_role())
-        held = tuple(name for circle, name in arm.items() if name and circle != self._beam_role())
-        return self._spec(beam=True), motor or self._text('beam_motor'), options, held
+        return options
+
+    def _invalidate_beam_detection(self, *_args):
+        if not hasattr(self, '_beam_probe_timer'):
+            return
+        self._beam_generation += 1
+        self._beam_detection = None
+        self._beam_problem = ('Checking direct-beam scan…' if self._text('beam_source')
+                              else 'Select a direct-beam source and scan')
+        if self._job == 'beam_detect' and self._identity is not None:
+            self._owner.cancel(self._identity)
+        self._update_beam_readiness()
+        self._beam_probe_timer.start()
+
+    def _beam_geometry_changed(self, *_args):
+        arm = self.geometry_editor.value().stitch_arm()
+        if arm != self._beam_arm:
+            self._beam_arm = arm
+            self._invalidate_beam_detection()
+
+    def _update_beam_readiness(self):
+        ready = self._beam_detection is not None and self._beam_detection[0] == self._beam_generation
+        text = (f'Motor {self._beam_detection[1]} · {self._beam_detection[2]} beam motion'
+                if ready else self._beam_problem)
+        if ready:
+            dx, row_delta = self._beam_detection[3]
+            dy = -row_delta  # Int's raw viewer mirrors detector Y once; +Y is up.
+            first, last = self._beam_detection[4]
+            text += (f' · {first:g}° → {last:g}°; viewer Δx {dx:+.2f}, Δy {dy:+.2f} px'
+                     f' ({"right" if dx > 0 else "left"}, {"up" if dy > 0 else "down"})')
+        self.beam_button.setEnabled(ready and not self._owner.busy)
+        self.beam_button.setToolTip(text)
+        self.beam_readiness.set_readiness(ready, text)
+        if hasattr(self, 'status') and self.tabs.currentWidget() is self._tab_pages['rough']:
+            self.status.setText(text)
+
+    def _tab_readiness(self, *_args):
+        if self.tabs.currentWidget() is self._tab_pages['rough']:
+            self._update_beam_readiness()
+        elif self.tabs.currentWidget() is self._tab_pages['select']:
+            self.status.setText('Select a calibrant scan; three to five frames are suggested.')
+        elif self.tabs.currentWidget() is self._tab_pages['instrument']:
+            self.status.setText('Describe the diffractometer, detector and camera.')
+
+    def _detect_beam(self):
+        if self._owner.busy:
+            self._beam_probe_timer.start()
+            return
+        if self._pending_source_details is not None:
+            prefix, self._pending_source_details = self._pending_source_details, None
+            self._source_details(prefix)
+            if self._owner.busy:
+                return
+        if self._restoring_fields or self.rough_mode.currentData() != 'scan' or not self._text('beam_source'):
+            return
+        if self._beam_detection is not None:
+            self._update_beam_readiness()
+            return
+        try:
+            options = dict(detector=self._text('beam_detector'),
+                detector_config=({'orientation': int(self._text('beam_orientation'))}
+                                 if int(self._text('beam_orientation')) != 3 else None),
+                rotation=self._orientation().rotation, flip=self._orientation().flip_horizontal)
+            if self._text('mask'):
+                options['mask'] = self._oriented_mask()
+            if self._text('beam_roi'):
+                options['roi'] = tuple(int(v) for v in self._text('beam_roi').split(','))
+                if len(options['roi']) != 4:
+                    raise ValueError('ROI requires x0, y0, x1, y1')
+            saturation = self._saturation_value()
+            if saturation is not None:
+                options['saturation'] = saturation
+            self._beam_probe_generation = self._beam_generation
+            self._start('beam_detect', (self._spec(beam=True),
+                tuple(name for name in self.geometry_editor.value().stitch_arm() if name), options))
+            self._update_beam_readiness()
+        except (ValueError, TypeError, KeyError, OSError) as error:
+            self._beam_problem = str(error)
+            self._update_beam_readiness()
 
     def _direct_beam_key(self):
         """What a direct-beam result was fitted from (source, motor, zero, detector, extraction), or
@@ -2352,7 +2540,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._distance_provenance = self._distance_record(result)
         self._distance_provenance_key = self._distance_key
         self._advanced_card.set_collapsed(False)  # where the seed is: Advanced ▸ Starting distance
-        self._show_tab('calibrate')
+        self._show_tab('calibrate' if self._calibrant_source_ready() else 'select')
 
     @staticmethod
     def _distance_record(result):
@@ -2378,6 +2566,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.frame_table.selectRow(next((row for row in rows if row > after), rows[0]))
 
     def _render_frames(self):
+        self._update_fit_source_label()
         self.frame_table.setRowCount(len(self.frames))
         for row, frame in enumerate(self.frames):
             # the frame's own detector image (and its frame number inside a multi-frame file)
@@ -2468,14 +2657,21 @@ class CalibrationDialog(QtWidgets.QDialog):
         if terminal.status is OperationTerminalStatus.RETURNED:
             result = terminal.payload
             try:
-                if kind == 'source_details':
-                    prefix, energy, automatic = result
-                    if energy is not None:
-                        self._source_energy_text = f'{energy / 1000:.4f}'
-                        self._set_field_text('rough_energy', self._source_energy_text)
-                    if automatic is not None:
-                        self._fields[prefix + 'stem'].setPlaceholderText(f'auto · {automatic}')
-                    self._render_frames()
+                if kind == 'beam_detect':
+                    if self._beam_probe_generation == self._beam_generation:
+                        self._beam_detection = (self._beam_generation, *result)
+                        self._beam_problem = ''
+                    self._update_beam_readiness()
+                elif kind == 'source_details':
+                    prefix, energy, automatic, source_ready = result
+                    if self._source_details_inputs_key == self._source_details_input_key(prefix):
+                        if not prefix and self._source_details_key == self._energy_source_key():
+                            self._show_source_energy(energy)
+                            self._calibrant_ready_key = self._source_details_key if source_ready else None
+                            self._update_fit_source_label()
+                        if automatic is not None:
+                            self._fields[prefix + 'stem'].setPlaceholderText(f'auto · {automatic}')
+                        self._render_frames()
                 elif kind == 'enumerate':
                     result, names, record = result
                     self.geometry_editor.set_available_motors(names)
@@ -2485,10 +2681,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.selection.setColumnCount(2 + len(read))
                     self.selection.setHorizontalHeaderLabels(['Use', 'Frame', *(f'{motor} (°)' for motor in read)])
                     self._choices = result
+                    self._calibrant_ready_key = self._energy_source_key()
                     energies = {energy for _index, _values, energy in result if energy is not None}
                     if len(energies) == 1:
-                        self._source_energy_text = f'{energies.pop() / 1000:.4f}'
-                        self._set_field_text('rough_energy', self._source_energy_text)
+                        self._show_source_energy(energies.pop())
                     suggested = suggested_frame_indices(result)
                     self.selection.setRowCount(len(result))
                     for row, (index, motors, _) in enumerate(result):
@@ -2557,6 +2753,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'save':
                     self.status.setText(saved_pair_text(result))
                     self.calibrationSaved.emit(result.pyfai_path, 'multigeometry')  # once, with both files written
+                elif kind == 'beam_detect':
+                    self._update_beam_readiness()
                 elif kind == 'distance':
                     self.status.setText(direct_beam_fit_text(self._distance_result, self._distance_energy_eV,
                                                              self._distance_held))
@@ -2570,11 +2768,22 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.status.setText('Cancelled. Previously completed frames and saved files are retained.')
         else:
             self.status.setText(terminal.failure_message)
+        if kind == 'beam_detect':
+            if (terminal.status is not OperationTerminalStatus.RETURNED
+                    and self._beam_probe_generation == self._beam_generation):
+                self._beam_problem = terminal.failure_message or 'Direct-beam detection cancelled'
+            self._update_beam_readiness()
+        elif self._beam_detection is None and not self._close_pending:
+            self._beam_probe_timer.start()
+        if self._pending_source_details is not None and not self._close_pending:
+            prefix, self._pending_source_details = self._pending_source_details, None
+            self._source_details(prefix)
         if self._close_pending:
             self._close_pending = False
             self.close()
 
     def closeEvent(self, event):
+        self._beam_probe_timer.stop()
         if self._owner.busy:
             self._close_pending = True
             self._cancel()
@@ -2600,6 +2809,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     def shutdown(self):
         """Host Exit: cancel and return the existing retryable close receipt."""
         from xdart.gui.pages.values import PageCleanup
+        self._beam_probe_timer.stop()
         self._timer.stop()
         receipt = self._owner.close()
         if receipt.status is PageCleanup.CLEAN:

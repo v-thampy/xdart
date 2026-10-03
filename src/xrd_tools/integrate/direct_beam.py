@@ -9,6 +9,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import copy
+import logging
+import os
 from pathlib import Path
 import warnings
 
@@ -216,6 +218,108 @@ def find_beam_spot(image, invalid=None, *, box: int = 5) -> tuple[float, float]:
     return float((weights * grid_cols).sum() / total), float((weights * grid_rows).sum() / total)
 
 
+def _load_beam_image(item, options):
+    if item is None:
+        raise ValueError('missing frame')
+    if isinstance(item,np.ndarray):
+        return item
+    if isinstance(item, ScanFrame):
+        return item.load_image()
+    opts = options.copy()
+    path = item
+    if isinstance(item,tuple):
+        if len(item) not in (2,3):
+            raise ValueError('frame reference must be (path,frame[,dataset])')
+        path,opts['frame'] = item[:2]
+        if len(item) == 3:
+            opts['dataset_path'] = item[2]
+    return read_image(path,preserve_dtype=True,exact_frame=True,**opts)
+
+
+def _prepare_beam_image(image, det, orient, mask, state):
+    if image.ndim != 2 or not all(image.shape):
+        raise ValueError('image shape must be nonempty 2-D')
+    if not state:
+        effective,pitches = _effective_detector(det,image.shape)
+        detector_mask = effective.mask
+        if detector_mask is not None:
+            if detector_mask.shape != image.shape:
+                raise ValueError('detector mask shape differs from image shape')
+            detector_mask = orient.apply(detector_mask).astype(bool)
+        if orient.swaps_axes:
+            pitches = pitches[::-1]
+        state.update(raw_shape=image.shape, effective=effective, detector_mask=detector_mask,
+                     pitches=pitches)
+    if image.shape != state['raw_shape']:
+        raise ValueError(f"image shape {image.shape} differs from {state['raw_shape']}")
+    oriented = orient.apply(image)
+    invalid = (np.zeros(oriented.shape,bool) if state['detector_mask'] is None
+               else state['detector_mask'].copy())
+    dummy, tolerance = state['effective'].get_dummies(image)
+    if dummy is not None:
+        invalid |= np.abs(oriented.astype(np.float32)-dummy) <= tolerance
+    if mask is not None:
+        if np.shape(mask) != oriented.shape:
+            raise ValueError('mask shape must match the oriented image')
+        invalid |= np.asarray(mask,dtype=bool)
+    return oriented, invalid
+
+
+def infer_direct_beam_motion(images: Sequence, *, detector, detector_config=None,
+        orientation=None, mask=None, saturation=None, roi=None, reader_options=None,
+        cancelled=None, return_details=False):
+    """Measure the dominant displacement between the first and last usable frames.
+
+    Items are lazy references, as in the fitter. Only endpoint candidates are decoded,
+    one at a time. Beam extraction shares the fitter's detector mask, orientation,
+    Gaussian peak checks and inclusive saturation rejection. A stationary or diagonal
+    trajectory cannot select a strip axis safely and is refused.
+    """
+    orient = orientation or ImageOrientation()
+    if detector_config is None:
+        det = get_detector(detector)
+    else:
+        from pyFAI.detectors import detector_factory
+        det = detector_factory(detector, config=dict(detector_config))
+    _uniform_flat(det)
+    state = {}
+
+    def endpoint(indices, excluded=None):
+        reason = 'no direct-beam spot'
+        for index in indices:
+            if index == excluded:
+                continue
+            if cancelled is not None and cancelled.is_set():
+                raise ValueError('direct-beam detection cancelled')
+            try:
+                image, invalid = _prepare_beam_image(
+                    _load_beam_image(images[index], dict(reader_options or {})), det, orient, mask, state)
+                if roi is not None:
+                    x0, y0, x1, y1 = roi
+                    outside = np.ones(image.shape, dtype=bool)
+                    outside[y0:y1, x0:x1] = False
+                    invalid |= outside
+                spot = find_beam_spot(image, invalid)
+                x, _ = _peak(image, invalid, spot, 'horizontal', 2, roi, saturation)
+                y, _ = _peak(image, invalid, spot, 'vertical', 2, roi, saturation)
+                return index, np.array((x, y))
+            except (ValueError, OSError, RuntimeError) as error:
+                reason = str(error)
+        raise ValueError('No usable direct-beam endpoint: ' + reason)
+
+    first, start = endpoint(range(len(images)))
+    last, stop = endpoint(range(len(images) - 1, -1, -1), first)
+    delta = stop - start
+    dx, dy = np.abs(delta)
+    if os.environ.get('XDART_DEBUG_DIRECT_BEAM'):
+        logging.getLogger(__name__).warning('direct_beam endpoints=%s,%s pixels=%s,%s '
+            'displacement=%g,%g orientation=%s', first, last, start, stop, dx, dy, orient)
+    if max(dx, dy) < 2 or max(dx, dy) < 3 * min(dx, dy):
+        raise ValueError('Ambiguous or insignificant direct-beam endpoint motion')
+    motion = 'horizontal' if dx > dy else 'vertical'
+    return (motion, tuple(float(value) for value in delta), (first, last)) if return_details else motion
+
+
 def calibrate_direct_beam(
     angles_deg: Sequence[float], images: Iterable, *, detector,
     beam_pixel: tuple[float, float] | None = None, detector_config: Mapping | None = None,
@@ -311,49 +415,12 @@ def calibrate_direct_beam(
     state = {}  # the first readable image's layout: raw shape, effective detector, its mask, the pitch
 
     def load(item):
-        if item is None:
-            raise ValueError('missing frame')
-        if isinstance(item,np.ndarray):
-            return item
-        if isinstance(item, ScanFrame):
-            return item.load_image()
-        opts = options.copy()
-        path = item
-        if isinstance(item,tuple):
-            if len(item) not in (2,3):
-                raise ValueError('frame reference must be (path,frame[,dataset])')
-            path,opts['frame'] = item[:2]
-            if len(item) == 3:
-                opts['dataset_path'] = item[2]
-        return read_image(path,preserve_dtype=True,exact_frame=True,**opts)
+        return _load_beam_image(item, options)
 
     def oriented_and_invalid(image):
-        if image.ndim != 2 or not all(image.shape):
-            raise ValueError('image shape must be nonempty 2-D')
-        if not state:
-            effective,pitches = _effective_detector(det,image.shape)
-            detector_mask = effective.mask
-            if detector_mask is not None:
-                if detector_mask.shape != image.shape:
-                    raise ValueError('detector mask shape differs from image shape')
-                detector_mask = orient.apply(detector_mask).astype(bool)
-            if orient.swaps_axes:
-                pitches = pitches[::-1]
-            state.update(raw_shape=image.shape, effective=effective, detector_mask=detector_mask,
-                         pitch=float(pitches[1 if motion == 'horizontal' else 0]))
-        if image.shape != state['raw_shape']:
-            raise ValueError(f"image shape {image.shape} differs from {state['raw_shape']}")
-        oriented = orient.apply(image)
-        invalid = (np.zeros(oriented.shape,bool) if state['detector_mask'] is None
-                   else state['detector_mask'].copy())
-        dummy, tolerance = state['effective'].get_dummies(image)
-        if dummy is not None:
-            invalid |= np.abs(oriented.astype(np.float32)-dummy) <= tolerance
-        if mask is not None:
-            if np.shape(mask) != oriented.shape:
-                raise ValueError('mask shape must match the oriented image')
-            invalid |= np.asarray(mask,dtype=bool)
-        return oriented, invalid
+        result = _prepare_beam_image(image, det, orient, mask, state)
+        state['pitch'] = float(state['pitches'][1 if motion == 'horizontal' else 0])
+        return result
 
     iterator = iter(images)  # streamed: no frame is kept past its row
     if beam is None:  # the zero frame first: the rows' items are gathered (lazy references stay undecoded)
@@ -420,6 +487,10 @@ def calibrate_direct_beam(
     intercept = float(y.mean()-slope*x.mean())
     regression_residual = y-(intercept+slope*x)
     slope_std = float(np.sqrt((regression_residual@regression_residual)/(len(x)-2)/ss))
+    if os.environ.get('XDART_DEBUG_DIRECT_BEAM'):
+        logging.getLogger(__name__).warning('direct_beam motion=%s orientation=%s shape=%s '
+            'used=%s centre_span_px=%g slope=%g slope_std=%g', motion, orient,
+            state['raw_shape'], int(used.sum()), float(np.ptp(centres[used])), slope, slope_std)
     if abs(slope) <= max(1e-12,3*slope_std) or np.ptp(centres[used]) < 1e-6:
         raise ValueError('degenerate or insignificant beam motion')
     if model == 'tangent':

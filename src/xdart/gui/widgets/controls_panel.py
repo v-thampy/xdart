@@ -330,6 +330,16 @@ class SectionCard(QtWidgets.QFrame):
         self.valid_marker.setVisible(visible)
         self.valid_marker.setToolTip(tooltip)
 
+    def set_readiness(self, ready: bool, text: str) -> None:
+        """A passive readiness header, using the shared green/red section accents."""
+        self.status.setWordWrap(True)
+        self.set_status_text(text)
+        self.valid_marker.setText("✓" if ready else "!")
+        self.valid_marker.setProperty("accent", "source" if ready else "processing")
+        self.set_valid_marker(True, text)
+        self.valid_marker.style().unpolish(self.valid_marker)
+        self.valid_marker.style().polish(self.valid_marker)
+
     def clear_rows(self) -> None:
         while self.body_layout.count():
             item = self.body_layout.takeAt(0)

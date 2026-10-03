@@ -39,18 +39,25 @@ def test_the_direct_beam_and_the_rough_arm_read_the_panels_zeros(qapp, tmp_path)
         record = dialog._rough_arm()
         assert Diffractometer.from_pyfai_goniometer(record, source_motors=SOURCES).stacked_arm.motor_zeros() \
             == pytest.approx({'del': 2.3, 'nu': -.8})
-        started = []
-        dialog._start = lambda kind, arguments: started.append((kind, arguments))
+        from tests.xdart.scattering.test_stitch_guided_calibration import _beam_container
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        import h5py
+        nexus, _, _ = _beam_container(tmp_path)
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))
-        dialog._fields['beam_source'].setText(str(tmp_path / 'beam'))
-        dialog._distance()
-        (kind, (_spec, motor, options, held)), = started
-        assert kind == 'distance' and motor == 'del' and options['angle_zero_deg'] == 2.3
-        assert held == ('nu',)  # its reading during the scan places the beam (the other circle)
-        dialog._fields['beam_motor'].setText('nu')  # a nu scan: nu's zero
-        started.clear()
-        dialog._distance()
-        assert started[0][1][2]['angle_zero_deg'] == -.8 and started[0][1][3] == ('del',)
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog._set_field_text('beam_source', nexus)
+        detect(dialog)
+        _spec, motor, options, held = dialog._direct_beam_request()
+        assert motor == 'del' and options['angle_zero_deg'] == 2.3 and held == ('nu',)
+        other = tmp_path / 'nu'; other.mkdir()
+        nu_scan, _, _ = _beam_container(other, nu=None)
+        with h5py.File(nu_scan, 'r+') as handle:
+            handle.move('entry/data/del', 'entry/data/nu')
+        dialog._set_field_text('beam_source', nu_scan)
+        detect(dialog)
+        _spec, motor, options, held = dialog._direct_beam_request()
+        assert motor == 'nu' and options['angle_zero_deg'] == -.8 and held == ('del',)
     finally:
         dialog.close()
         page.shutdown()
@@ -264,7 +271,8 @@ def test_a_direct_beam_result_is_used_only_with_the_inputs_it_was_fitted_from(qa
                                beam_detector='Pilatus100k', beam_pixel=', '.join(map(str, beam)),
                                rough_energy=str(wavelength_m_to_energy_eV(.7293e-10) / 1000)).items():
             dialog._set_field_text(key, str(value))
-        dialog.motion.setCurrentText('horizontal')  # synthetic spot direction
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        detect(dialog)
         dialog.beam_button.click()
         _wait(dialog)
         assert dialog._distance_result is not None and dialog._distance_fresh(), dialog.status.text()

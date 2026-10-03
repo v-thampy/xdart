@@ -7,7 +7,7 @@ image/PONI/NPT hashes; fitting never guesses a filename-to-angle association.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import hashlib
 import json
 import math
@@ -259,6 +259,51 @@ def direct_beam_pose(spec: SourceSpec, motor: str, held=()) -> tuple[float | Non
     energies = {float(value) for value in energies if value is not None}
     energies = {value for value in energies if math.isfinite(value) and value > 0}
     return (energies.pop() if len(energies) == 1 else None), readings
+
+
+def direct_beam_scan_motor(spec: SourceSpec, detector_motors) -> str:
+    """One actual scanned detector axis, never a counter or a held motor."""
+    if spec.kind is SourceKind.SPEC:
+        from xrd_tools.io.spec import get_spec_scanned_axes
+        key = str(spec.options.get('scan', ''))
+        if '.' not in key:
+            key += '.1'
+        axes = get_spec_scanned_axes(spec.uri, key)
+    else:
+        from xrd_tools.io.nexus import read_nexus
+        metadata = read_nexus(spec.uri, spec.entry or 'entry')
+        axes = tuple(name for name, values in metadata.angles.items()
+                     if name != 'energy' and np.asarray(values).size > 1
+                     and np.isfinite(values).all() and np.ptp(values) > _HELD_TOLERANCE_DEG)
+    if not axes:
+        raise ValueError('No scanned motor in the selected direct-beam scan')
+    if len(axes) != 1:
+        raise ValueError('Ambiguous direct-beam scan: multiple scanned motors (' + ', '.join(axes) + ')')
+    if axes[0] not in detector_motors:
+        raise ValueError(f'Unsupported direct-beam motor {axes[0]}: select a detector arm scan')
+    return axes[0]
+
+
+@contextmanager
+def open_calibration_beam_scan(spec: SourceSpec, motor: str):
+    """Exact lazy SPEC/container association shared by detection and distance fitting."""
+    from xrd_tools.sources import open_source
+    from xrd_tools.integrate.direct_beam import open_direct_beam_scan
+    with ExitStack() as resources:
+        options = dict(motor=motor, entry=spec.entry or 'entry')
+        if spec.kind is SourceKind.SPEC:
+            options['scan'] = spec.options['scan']
+            if spec.options.get('image_file'):
+                options['image_file'] = spec.options['image_file']
+            else:
+                choices = source_frame_choices(spec, (motor,))
+                source = open_source(_exact_source(spec))
+                if getattr(source, 'close', None) is not None:
+                    resources.callback(source.close)
+                frames = (source.frame_for(index) for index, _, _ in choices)
+                options['images'] = ((frame.source_path, frame.source_frame_index or 0)
+                                    if frame.source_path is not None else None for frame in frames)
+        yield resources.enter_context(open_direct_beam_scan(spec.uri, **options))
 
 
 def scan_motor_names(spec: SourceSpec) -> tuple[str, ...]:

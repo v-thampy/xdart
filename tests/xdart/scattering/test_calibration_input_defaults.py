@@ -48,7 +48,8 @@ def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path)
         assert index >= 0
         dialog.source_kind.setCurrentIndex(index)
         commit(dialog, 'source', spec)
-        assert dialog._text('rough_energy') == '7.0007'
+        assert dialog._text('rough_energy') == ''
+        assert 'Auto · 7.0007 keV from SPEC' in dialog._fields['rough_energy'].placeholderText()
         assert dialog._fields['rough_energy'].maximumWidth() == 300
         assert dialog._row_visible('images') and dialog._row_visible('entry')
         assert 'beam_scan001_' in dialog._fields['stem'].placeholderText()
@@ -76,19 +77,19 @@ def test_rough_rows_share_existing_controls_and_keep_mode_visibility(qapp, tmp_p
     try:
         assert dialog._parts['beam_entry'][0] == 'beam_source_kind'
         assert dialog._parts['rough_mount'][0] == 'beam_pixel'
-        assert dialog._formrows['beam_motor'].isAncestorOf(dialog.motion)
+        assert 'beam_motor' not in dialog._fields and not hasattr(dialog, 'motion')
         assert dialog._label('beam_pixel').text() == 'Direct beam pixel (x, y)'
-        assert dialog._row_of[dialog.motion].label.text() == 'Beam direction'
+        assert 'DIRECT-BEAM' in dialog.beam_readiness.title.text()
         for kind in ('spec_series', 'spec_container', 'nexus'):
             dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(kind))
             assert dialog._row_visible('beam_entry') == (kind != 'spec_series')
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         assert dialog._row_visible('beam_pixel') and dialog._row_visible('rough_mount')
-        assert not dialog._row_visible('beam_entry') and dialog._row_of[dialog.motion].isHidden()
+        assert not dialog._row_visible('beam_entry') and dialog.beam_readiness.isHidden()
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
         assert not dialog._row_visible('beam_pixel') and not dialog._row_visible('rough_mount')
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))
-        assert dialog._row_visible('beam_entry') and not dialog._row_of[dialog.motion].isHidden()
+        assert dialog._row_visible('beam_entry') and not dialog.beam_readiness.isHidden()
     finally:
         dialog.close()
 
@@ -171,14 +172,14 @@ def test_saturation_shows_the_documented_auto_value_and_keeps_manual_overrides(q
         field = dialog._fields['saturation']
         assert dialog._text('saturation') == ''  # the hint is Auto, as in Int's threshold
         assert '1048575' in field.placeholderText()
-        assert dialog._direct_beam_request()[2]['saturation'] == 1048575
+        assert dialog._beam_fit_options()['saturation'] == 1048575
         dialog._set_field_text('saturation', '12345')
         dialog._set_field_text('beam_detector', 'Eiger2_500k')
         assert field.text() == '12345'
-        assert dialog._direct_beam_request()[2]['saturation'] == 12345
+        assert dialog._beam_fit_options()['saturation'] == 12345
         dialog._set_field_text('saturation', '')
         assert 'acquisition' in field.placeholderText()
-        assert 'saturation' not in dialog._direct_beam_request()[2]
+        assert 'saturation' not in dialog._beam_fit_options()
         again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
         try:
             again.apply_settings(dialog.settings())
@@ -258,10 +259,12 @@ def test_committed_spec_scan_updates_energy_without_reading_images(qapp, tmp_pat
     dialog.show()
     try:
         commit(dialog, 'source', spec)
-        assert float(dialog._text('rough_energy')) == 11.27
+        assert dialog._text('rough_energy') == ''
+        assert dialog._source_energy_eV == 11270
         assert dialog._rough_wavelength_A() == pytest.approx(float(energy_eV_to_wavelength_m(11270)) * 1e10)
         commit(dialog, 'scan', '2')
-        assert float(dialog._text('rough_energy')) == 16
+        assert dialog._text('rough_energy') == ''
+        assert dialog._source_energy_eV == 16000
         commit(dialog, 'scan', '99')
         assert dialog._text('rough_energy') == ''  # no stale scan energy or first-scan fallback
     finally:
@@ -278,7 +281,8 @@ def test_committed_nexus_wavelength_updates_energy(qapp, tmp_path):
     try:
         dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('nexus_stack'))
         commit(dialog, 'source', nexus)
-        assert float(dialog._text('rough_energy')) == pytest.approx(float(wavelength_m_to_energy_eV(1.1e-10))/1000)
+        assert dialog._text('rough_energy') == ''
+        assert dialog._source_energy_eV == pytest.approx(float(wavelength_m_to_energy_eV(1.1e-10)))
         assert dialog._rough_wavelength_A() == pytest.approx(1.1)
     finally:
         dialog.close()
@@ -304,7 +308,8 @@ def test_spec_container_uses_auto_folder_and_padded_stem(qapp, tmp_path):
         assert source.options['image_dir'] == str(tmp_path)
         assert source.options.get('image_file') is None  # the shared source chooses the actual container
         dialog._set_field_text('beam_detector', 'Pilatus100k')
-        dialog.motion.setCurrentText('horizontal')  # the synthetic spot moves horizontally
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        detect(dialog)
         dialog.beam_button.click()
         settle(dialog)
         assert dialog._distance_result is not None, dialog.status.text()
@@ -325,30 +330,6 @@ def test_direct_beam_source_does_not_overwrite_the_calibrants_energy(qapp, tmp_p
         dialog.close()
 
 
-@pytest.mark.parametrize('geometry,plane,motor,expected', [
-    ('psic', 'vertical', 'delta', 'vertical'), ('psic', 'vertical', 'nu', 'horizontal'),
-    ('fourc', 'vertical', 'tth', 'vertical'), ('twoc', 'horizontal', 'tth', 'horizontal'),
-])
-def test_auto_motion_uses_the_configured_circle_and_keeps_an_override(qapp, tmp_path, geometry, plane, motor, expected):
-    from xrd_tools.session.instrument import InstrumentGeometry
-    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
-    try:
-        dialog.set_instrument(InstrumentGeometry(geometry, (('del', 'delta'),) if geometry == 'psic' else (), plane))
-        dialog._set_field_text('beam_source', tmp_path / 'source')
-        dialog._set_field_text('beam_motor', motor)
-        assert dialog._direct_beam_request()[2]['motion'] == expected
-        dialog.motion.setCurrentText('horizontal' if expected == 'vertical' else 'vertical')
-        assert dialog._direct_beam_request()[2]['motion'] != expected
-        again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
-        try:
-            again.apply_settings(dialog.settings())
-            assert again._direct_beam_request()[2]['motion'] == dialog._direct_beam_request()[2]['motion']
-        finally:
-            again.close()
-    finally:
-        dialog.close()
-
-
 def test_the_real_eiger_del_scan_fits_with_auto_motion_and_no_energy(qapp, tmp_path):
     root = Path(os.environ.get('XDART_TEST_DATA', '/nonexistent')) / 'stitching/GIXRD_Fatigue_Radha'
     if not (root / 'direct_beam_dist_p33m_scan001_master.h5').is_file():
@@ -359,6 +340,8 @@ def test_the_real_eiger_del_scan_fits_with_auto_motion_and_no_energy(qapp, tmp_p
         dialog._set_field_text('beam_detector', 'Eiger2_500k')
         dialog._set_field_text('beam_source', root / 'direct_beam_dist_p33m')
         assert dialog._text('rough_energy') == ''
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        detect(dialog)
         dialog.beam_button.click()
         settle(dialog, timeout=30)
         assert dialog._distance_result is not None, dialog.status.text()

@@ -106,7 +106,7 @@ def test_the_calibration_band_masks_pyfai_and_prediction_without_rewriting_pixel
         dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec'))
         dialog._set_field_text('beam_source', tmp_path / 'source' / 'beam')
         dialog._set_field_text('beam_images', tmp_path / 'source')
-        _, _, options, _ = dialog._direct_beam_request()
+        options = dialog._beam_fit_options()
         assert 'conditioning' not in options
         np.testing.assert_array_equal(options['mask'], static)
     finally:

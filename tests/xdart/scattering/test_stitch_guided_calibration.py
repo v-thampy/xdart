@@ -566,7 +566,8 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
     assert dialog._fields['beam_pixel'].placeholderText().startswith('auto · where the direct beam hits')
     assert dialog._fields['beam_scan'].isHidden() == (source_kind == 'nexus')
     assert dialog._row_visible('beam_images') == (source_kind == 'spec_container')
-    dialog.motion.setCurrentText('horizontal')  # synthetic spot direction
+    from tests.xdart.scattering.test_direct_beam_readiness import detect
+    detect(dialog)
     dialog.beam_button.click()
     for _ in range(100):
         QtWidgets.QApplication.processEvents()
@@ -597,7 +598,8 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
 
 def _fit_direct_beam(dialog):
     from pyqtgraph.Qt import QtWidgets, QtTest
-    dialog.motion.setCurrentText('horizontal')  # synthetic spot direction
+    from tests.xdart.scattering.test_direct_beam_readiness import detect
+    detect(dialog)
     dialog.beam_button.click()
     for _ in range(1500):
         QtWidgets.QApplication.processEvents()
@@ -879,7 +881,8 @@ def test_the_rough_geometry_puts_the_beam_where_the_fit_says_it_is_at_the_zero(t
         for key, value in dict(beam_source=nexus, beam_entry='measurement', beam_detector='Pilatus100k',
                                beam_pixel='', rough_energy='12.39841984').items():
             dialog._set_field_text(key, value)
-        dialog.motion.setCurrentText('horizontal')  # synthetic spot direction
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        detect(dialog)
         dialog.beam_button.click()
         for _ in range(1500):
             QtWidgets.QApplication.processEvents()
