@@ -1281,6 +1281,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             host='beam_detector', tip='Detector default: its rows and columns, with the RAW reader default int32. '
                 'Manual: override the stored RAW layout; the physical detector model and pixel pitch stay selected. '
                 'TIFF, Eiger and NeXus carry their own layout.')
+        self._row_of[self.raw_layout].setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum,
+                                                   QtWidgets.QSizePolicy.Policy.Preferred)
         self._attach('header', 'beam_detector', 'Header (bytes)', '0', width=75,
                      tip='Bytes to skip before pixels in a headerless RAW file; unused for TIFF, Eiger and NeXus.')
         reader = QtWidgets.QWidget()
