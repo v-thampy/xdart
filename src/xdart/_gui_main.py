@@ -1054,6 +1054,10 @@ class Main(QMainWindow):
         if (PageCapability.RUN_ACTIVITY in self.page_descriptor.capabilities
                 and self._page_run_active()):
             return ActionRefused(PAGE_ACTIVE)
+        browser = self.page_handle.browser_directory
+        directory = browser.directory if browser is not None else None
+        project = self.page_handle.project_location
+        location = project.location() if project is not None else None
         if self.page_descriptor.lifecycle is not PageLifecycle.RETAINED:
             receipt = self._close_page()
             if receipt.status is PageCleanup.PENDING:
@@ -1062,6 +1066,10 @@ class Main(QMainWindow):
             self._page_stack.removeWidget(previous.widget)
             previous.widget.deleteLater()
         self._mount_page(target)
+        if location is not None and self.page_handle.project_location is not None:
+            self.page_handle.project_location.inherit(location)
+        if directory and self.page_handle.browser_directory is not None:
+            self.page_handle.browser_directory.set_directory(directory)
         _app_settings().setValue("page.selected", str(target.key))
         return ActionCompleted(str(target.key))
 

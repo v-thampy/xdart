@@ -16,6 +16,23 @@ class OpenFolderPort(Protocol):
     def request(self) -> ActionOutcome: ...
 
 
+class BrowserDirectoryPort(Protocol):
+    """The current browser location, carried between retained workspaces."""
+
+    @property
+    def directory(self) -> str | None: ...
+
+    def set_directory(self, path: str) -> ActionOutcome: ...
+
+
+class ProjectLocationPort(Protocol):
+    """Project and output folder defaults, used only when a page has no Project."""
+
+    def location(self) -> tuple[str, str]: ...
+
+    def inherit(self, location: tuple[str, str]) -> None: ...
+
+
 class SettingsPersistencePort(Protocol):
     def load(self) -> ActionOutcome: ...
     def save(self) -> ActionOutcome: ...
@@ -92,6 +109,8 @@ class PageHandle:
     app_menus: AppMenusPort | None = None
     diagnostics: LayoutDiagnosticsPort | None = None
     processing_mode: ProcessingModePort | None = None
+    browser_directory: BrowserDirectoryPort | None = None
+    project_location: ProjectLocationPort | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key:

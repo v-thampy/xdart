@@ -142,6 +142,35 @@ class _WorkspaceOpenFolder:
         _dispatch(self.widget, "MENU", "File:Open Folder")
         return ActionCompleted("browser-directory")
 
+    @property
+    def directory(self):
+        return self.widget._processed_browser.directory
+
+    def set_directory(self, path):
+        if path != self.directory:
+            self.widget._set_browser_directory(path, explicit=True)
+        return ActionCompleted("browser-directory")
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceProjectDefaults:
+    widget: "ScatteringWorkspace"
+
+    def location(self):
+        from pathlib import Path
+        intent = self.widget._intents.snapshot().thaw()
+        output = intent.save_path
+        if output and not Path(output).is_absolute():
+            output = str(Path(intent.project_root).expanduser() / output)
+        return intent.project_root, output
+
+    def inherit(self, location):
+        from xdart.gui.tabs.scattering.controls_inventory import PROJECT_ROOT, SAVE_PATH
+        if not self.location()[0] and location[0]:
+            self.widget._on_field_value(PROJECT_ROOT, location[0])
+            if location[1]:
+                self.widget._on_field_value(SAVE_PATH, location[1])
+
 
 @dataclass(frozen=True, slots=True)
 class _WorkspaceRunControl:
@@ -549,6 +578,8 @@ def build_scattering_workspace(
         widget=widget,
         close=_WorkspaceCloser(widget, persist_session=persist_session),
         open_folder=_WorkspaceOpenFolder(widget),
+        browser_directory=_WorkspaceOpenFolder(widget),
+        project_location=_WorkspaceProjectDefaults(widget),
         settings_io=_WorkspaceSettings(widget),
         run_control=_WorkspaceRunControl(widget),
         write_mode=_WorkspaceWriteMode(widget),

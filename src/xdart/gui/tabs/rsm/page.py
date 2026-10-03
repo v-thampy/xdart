@@ -43,7 +43,7 @@ from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
 from xdart.gui.tabs.rsm.settings import RSM_SETTINGS, apply_page_settings, page_settings
 from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindow
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
-from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView
+from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView, ResultDirectoryBrowser
 from xdart.gui.tabs.scattering.context_projection import apply_keyed_presentation_background
 from xdart.gui.tabs.scattering.operation_values import OperationContextStamp
 from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
@@ -97,9 +97,9 @@ _RSM_MODES = ("RSM",)
 #: Int's Data Browser as a results profile: the page's File actions, Config and Help for the host's menus, the
 #: Results list and Open… (hard rule 14; Codex's RSM reuse audit R1)
 _BROWSER = BrowserProfile(
-    menus=(("File", ("Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
-    raw_resolution_menus=False, list_caption="Results", directory=False, frames=False, actions=("Open…",),
-    date_sort=False, refresh=False, results=True,
+    menus=(("File", ("Open Folder", "Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
+    raw_resolution_menus=False, list_caption="Results", directory=True, frames=False, actions=("Open…",),
+    date_sort=False, refresh=True, results=True,
 )
 #: The operation's stages in words (its progress counts frames plus the masks and four steps).
 _STAGE_TEXT = {"revalidate": "Checking the inputs", "static-mask": "Masking hot pixels", "science": "Gridding",
@@ -396,6 +396,9 @@ class RSMPage(QtWidgets.QWidget):
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         outer.addWidget(self.splitter)
         self.browser = BrowserView(profile=_BROWSER)  # Int's Data Browser (hard rule 14)
+        self._result_browser = ResultDirectoryBrowser(self.browser)
+        self._result_browser.changed.connect(self._publish_results)
+        self._result_browser.notice.connect(self._notice)
         self.browser.commandRequested.connect(self._browser_command)
         from xdart.gui.tabs.scattering.tools_view import BrowserToolsColumn, ToolsView
         self.tools = ToolsView(page_tools=(
@@ -1933,7 +1936,13 @@ class RSMPage(QtWidgets.QWidget):
         return self.browser.scans
 
     def _browser_command(self, command):
-        if command.kind is ShellCommandKind.SELECT_RESULT:
+        if command.kind is ShellCommandKind.SELECT_SCAN and command.path == ("directory",):
+            self._result_browser.set_directory(command.value)
+        elif command.kind is ShellCommandKind.REFRESH_BROWSER:
+            self._result_browser.refresh()
+        elif command.kind is ShellCommandKind.MENU and command.value == "File:Open Folder":
+            self._result_browser.request()
+        elif command.kind is ShellCommandKind.SELECT_RESULT:
             self._result_selected(command.value)
         elif command.kind is ShellCommandKind.OPEN_RESULT or (
                 command.kind is ShellCommandKind.MENU and command.value == "File:Open result…"):
@@ -1942,8 +1951,9 @@ class RSMPage(QtWidgets.QWidget):
             self.toolRequested.emit(str(SCATTERING_PAGE_KEY))
 
     def _publish_results(self):
+        self.browser.directory_label.set_path(self._result_browser.directory or "")
         self.browser.reconcile_results(
-            tuple(BrowserResult(path, Path(path).name, path) for path in self._listed),
+            self._result_browser.entries(self._listed),
             self._requested if self._requested in self._listed else None)
 
     def open_result(self):
@@ -1952,6 +1962,7 @@ class RSMPage(QtWidgets.QWidget):
                                current=str(self._value("output_path") or ""),
                                fallback=str(self._value("project_root") or ""))
         if picks:
+            self._result_browser.set_directory(str(Path(picks[0]).absolute().parent))
             self.reopen(picks[0])
 
     def reopen(self, path):
@@ -2013,6 +2024,7 @@ class RSMPage(QtWidgets.QWidget):
                 excess -= 1
         if path not in self._listed:
             self._listed.append(path)
+        self._result_browser.follow_result(path)
         self._publish_results()
         if show:
             self._show(path, payload)
@@ -2204,7 +2216,7 @@ class RSMPage(QtWidgets.QWidget):
         from xrd_tools.analysis.trend_values import read_trend_values
         from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
         from xrd_tools.notebooks.inputs import SourceReference
-        paths = self.browser.selected_results() or tuple(self._listed)
+        paths = self.browser.selected_results() or self.browser.listed_results()
         root = self._value("project_root")
         generation = self._form_revision
         selected = dict(selection)
@@ -2355,8 +2367,7 @@ class RSMPage(QtWidgets.QWidget):
                             mode_requested=self.modeRequested)
 
     def request(self):
-        self.open_result()
-        return ActionAccepted("open-rsm-result")
+        return self._result_browser.request()
 
     def run_pause(self):
         self.begin_run()
@@ -2371,6 +2382,9 @@ class RSMPage(QtWidgets.QWidget):
         receipts = (self._owner.close(), self._reader.close(), self._resolver.close(),
                     *(dialog.shutdown() for dialog in self._authoring_dialogs),
                     *(window.shutdown() for window in self._tool_windows.values()))
+        if not self._result_browser.close():
+            self._closing = False
+            return CloseReceipt(PageCleanup.PENDING, "RSM browser is closing")
         pending = [receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN]
         if pending:
             self._closing = False
@@ -2401,9 +2415,12 @@ class _RSMProcessingMode:
 
 
 def build_rsm_page(services, parent):
+    from xdart.gui.pages.project_defaults import ProjectDefaults
     page = RSMPage(services, parent)
     page.restore_last_settings()
     return PageHandle(key=RSM_TOOL_KEY, widget=page, close=page.close_and_remember, open_folder=page,
+                      browser_directory=page._result_browser,
+                      project_location=ProjectDefaults(page._value, page.set_field, output_file=True),
                       settings_io=page, run_control=page, activity=page, app_menus=page,
                       processing_mode=_RSMProcessingMode(page), write_mode=RunBarWriteMode(page.run_bar))
 

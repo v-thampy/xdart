@@ -543,16 +543,19 @@ class StitchPage(QtWidgets.QWidget):
         # Help for the host's menus, the Results (several selected for an overlay), each result's contributing
         # Frames, and Open… · Metadata · Raw image. Stitch publishes its results and frames to it and acts on
         # its commands, as the lists' own signals did.
-        from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserView
+        from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserView, ResultDirectoryBrowser
         from xdart.gui.tabs.scattering.tools_view import BrowserToolsColumn, ToolsView
         self.browser = BrowserView(profile=BrowserProfile(
-            menus=(("File", ("Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
-            raw_resolution_menus=False, list_caption="Results", directory=False, frames=True,
-            frames_caption="Frames", actions=("Open…", "Metadata", "Raw image"), date_sort=False, refresh=False,
+            menus=(("File", ("Open Folder", "Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
+            raw_resolution_menus=False, list_caption="Results", directory=True, frames=True,
+            frames_caption="Frames", actions=("Open…", "Metadata", "Raw image"), date_sort=False, refresh=True,
             results=True, result_selection="extended", result_frames=True,
         ))
         self.browser.commandRequested.connect(self._browser_command)
         self._listed = []  # the results listed, in the order they came
+        self._result_browser = ResultDirectoryBrowser(self.browser)
+        self._result_browser.changed.connect(lambda: self._publish_results(self.browser.current_result()))
+        self._result_browser.notice.connect(lambda text: self._status(text, ready=False))
         self.tools = ToolsView(page_tools=(
             ("peak_fit", "∧ Peak Fitting", "Fit the current linear trace. Batch fits selected results, or all "
              "listed results when none are selected. Overlay selects displayed slices for a slice batch."),
@@ -2231,6 +2234,7 @@ class StitchPage(QtWidgets.QWidget):
             path = picks[0] if picks else ""
         if not path:
             return
+        self._result_browser.set_directory(str(Path(path).absolute().parent))
         self._view_revision += 1
         self._start("Opening saved result…", lambda: self._owner.begin_reopen(path))
 
@@ -2412,7 +2416,13 @@ class StitchPage(QtWidgets.QWidget):
         (its frames and the view), a new selection (the overlay), a frame for the raw image, the actions."""
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         kind, value = command.kind, command.value
-        if kind is ShellCommandKind.SELECT_RESULT:
+        if kind is ShellCommandKind.SELECT_SCAN and command.path == ("directory",):
+            self._result_browser.set_directory(value)
+        elif kind is ShellCommandKind.REFRESH_BROWSER:
+            self._result_browser.refresh()
+        elif kind is ShellCommandKind.MENU and value == "File:Open Folder":
+            self._result_browser.request()
+        elif kind is ShellCommandKind.SELECT_RESULT:
             self._update_residency()
             self._current_result_changed()
         elif kind is ShellCommandKind.SELECT_RESULTS:
@@ -2432,9 +2442,12 @@ class StitchPage(QtWidgets.QWidget):
 
     def _publish_results(self, current):
         """The Data Browser's Results: every result listed, ``current`` current (silent, as a blocked list)."""
-        from xdart.gui.tabs.scattering.browser_view import BrowserResult
+        previous = self.browser.current_result()
+        self.browser.directory_label.set_path(self._result_browser.directory or "")
         self.browser.reconcile_results(
-            tuple(BrowserResult(path, Path(path).name, path) for path in self._listed), current)
+            self._result_browser.entries(self._listed), current)
+        if previous is not None and self.browser.current_result() is None:
+            self._current_result_changed()
 
     def _current_payload(self):
         key = self.browser.current_result()
@@ -2717,6 +2730,7 @@ class StitchPage(QtWidgets.QWidget):
         if key not in self._listed:
             self._listed.append(key)
             self._result_key(key)
+        self._result_browser.follow_result(key)
         if payload.gi:  # a GI result opens on the axis Grazing chose (I(q) or a cut), else on a cut it has
             modes = {mode for mode, _cut in payload.gi}
             chosen = _GI_AXES.get(self._value("unit")) if self._gi["enabled"] else None
@@ -2767,7 +2781,7 @@ class StitchPage(QtWidgets.QWidget):
             del self._payloads[path]
             self._payload_bytes.pop(path, None)
         self._recent = [path for path in self._recent if path in self._payloads or path in resident]
-        self._reload_pending = [path for path in dict.fromkeys(self._reload_pending + self._listed)
+        self._reload_pending = [path for path in dict.fromkeys(self._reload_pending + self._listed + sorted(resident))
                                 if path in resident and path not in self._payloads]
         if self._reload_pending:
             QtCore.QTimer.singleShot(0, self._request_reload)
@@ -2793,6 +2807,9 @@ class StitchPage(QtWidgets.QWidget):
         """A reloaded result back in memory: the list and its selection stay as they are."""
         self._payloads[path] = payload
         self._payload_bytes[path] = payload.resident_bytes
+        if path not in self._listed:
+            self._listed.append(path)
+            self._result_key(path)
         if self.browser.current_result() == path:
             self._current_result_changed()  # its frames, and the view
         else:
@@ -2851,7 +2868,7 @@ class StitchPage(QtWidgets.QWidget):
     def _navigation(self):
         """Every result's key, the current result's and the selected results' (the view's footer)."""
         from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
-        keys = tuple(self._result_key(path) for path in self._listed)
+        keys = tuple(self._result_key(path) for path in self.browser.listed_results())
         current = self.browser.current_result()
         return keys, FrameNavigationProjection(
             frames=keys, current=None if current is None else self._result_key(current),
@@ -3106,7 +3123,7 @@ class StitchPage(QtWidgets.QWidget):
         return self._fit_target(self.browser.current_result(), kind, current=True)
 
     def _fit_batch(self, kind):
-        paths = tuple(self.browser.selected_results()) or tuple(self._listed)
+        paths = tuple(self.browser.selected_results()) or self.browser.listed_results()
         return tuple(self._fit_target(path, kind) for path in paths)
 
     def _open_fit(self, kind):
@@ -3369,6 +3386,9 @@ class StitchPage(QtWidgets.QWidget):
         child_receipts = [dialog.shutdown() for dialog in self._authoring_dialogs]
         child_receipts.append(self._source_observer.shutdown())
         child_receipts.extend(host.shutdown() for host in self._fit_hosts.values())
+        if not self._result_browser.close():
+            from xdart.gui.pages.values import CloseReceipt
+            return CloseReceipt(PageCleanup.PENDING, "Stitch browser is closing")
         if any(child.status is PageCleanup.PENDING for child in child_receipts):
             from xdart.gui.pages.values import CloseReceipt
             return CloseReceipt(PageCleanup.PENDING, "Stitch analysis window is closing")
@@ -3431,8 +3451,7 @@ class StitchPage(QtWidgets.QWidget):
                             tool_requested=self.toolRequested, mode_requested=self.modeRequested)
 
     def request(self):
-        self.open_result()
-        return ActionAccepted("open-stitch-result")
+        return self._result_browser.request()
 
     def run_pause(self):
         self.begin_run()
@@ -3454,9 +3473,12 @@ class _StitchProcessingMode:
 
 
 def build_stitch_page(services, parent):
+    from xdart.gui.pages.project_defaults import ProjectDefaults
     page = StitchPage(services, parent)
     page.restore_last_settings()
     return PageHandle(key=STITCH_TOOL_KEY, widget=page, close=page.close_and_remember,
-                      open_folder=page, settings_io=page, run_control=page, activity=page,
+                      open_folder=page, browser_directory=page._result_browser,
+                      project_location=ProjectDefaults(page._value, page.set_field),
+                      settings_io=page, run_control=page, activity=page,
                       app_menus=page, processing_mode=_StitchProcessingMode(page),
                       write_mode=RunBarWriteMode(page.run_bar))

@@ -371,6 +371,92 @@ class BrowserResult:
     label: str
     detail: str = ""
     muted: bool = False
+    is_directory: bool = False
+
+
+class ResultDirectoryBrowser(QtCore.QObject):
+    """Mount Int's catalog owner for a native results BrowserView.
+
+    Folder reads, cancellation and stale-completion refusal remain in
+    ProcessedBrowserOwner; this bridge only delivers its projection on Qt.
+    """
+
+    changed = QtCore.Signal()
+    notice = QtCore.Signal(str)
+    _catalogReady = QtCore.Signal(object)
+
+    def __init__(self, browser):
+        super().__init__(browser)
+        from .processed_browser import ProcessedBrowserOwner
+        self.browser = browser
+        self._active = False
+        self._owner = ProcessedBrowserOwner(save_path="", processing_mode="Int 2D",
+                                            deliver=self._catalogReady.emit)
+        self._catalogReady.connect(self._consume)
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(1500)
+        self._timer.timeout.connect(self._poll)
+
+    @property
+    def directory(self):
+        return self._owner.directory if self._active else None
+
+    def set_directory(self, path, *, explicit=True):
+        from xdart.gui.pages.values import ActionCompleted
+        path = os.path.abspath(os.path.expanduser(path))
+        if path != self.directory:
+            self._active = True
+            self._owner.set_directory(path, explicit=explicit)
+            self._timer.start()
+            self.changed.emit()
+        return ActionCompleted("browser-directory")
+
+    def request(self):
+        from xdart.gui.widgets.file_dialogs import browse
+        from xdart.gui.pages.values import ActionAccepted
+        picks = browse(self.browser, "Open Folder", folder=True, current=self.directory or "")
+        if picks:
+            self.set_directory(picks[0])
+        return ActionAccepted("browser-directory")
+
+    def follow_result(self, path):
+        if not self._active or not self._owner.explicit_directory:
+            self.set_directory(os.path.dirname(os.path.abspath(path)), explicit=False)
+        else:
+            self._owner.request_catalog()
+
+    def refresh(self):
+        self._owner.request_catalog()
+
+    @property
+    def busy(self):
+        return self._owner.active_request is not None or self._owner.queued_request is not None
+
+    def entries(self, loaded):
+        entries = [BrowserResult(entry.artifact, entry.label, entry.artifact,
+                                 is_directory=entry.is_directory) for entry in self._owner.catalog]
+        known = {entry.identifier for entry in entries}
+        entries.extend(BrowserResult(path, os.path.basename(path), path) for path in loaded
+                       if path not in known and (not self._active
+                       or os.path.dirname(os.path.abspath(path)) == self.directory))
+        return tuple(entries)
+
+    def _consume(self, wake):
+        self._apply(self._owner.consume_catalog(wake))
+
+    def _poll(self):
+        self._apply(self._owner.poll_catalog())
+
+    def _apply(self, transition):
+        from .processed_browser import BrowserRefreshEffect
+        if transition.notice:
+            self.notice.emit(transition.notice)
+        if transition.refresh is not BrowserRefreshEffect.NONE:
+            self.changed.emit()
+
+    def close(self):
+        self._timer.stop()
+        return self._owner.begin_close()
 
 
 class BrowserView(QtWidgets.QFrame):
@@ -446,7 +532,8 @@ class BrowserView(QtWidgets.QFrame):
         self._artifact_navigation_filter = _ArtifactNavigationFilter(
             self.scans, self._activate_directory, self._visit_artifact,
         )
-        if not self.profile.results or self.profile.result_selection == "extended":
+        if (not self.profile.results or self.profile.result_selection == "extended"
+                or self.profile.directory):
             self.scans.installEventFilter(self._artifact_navigation_filter)
             self.scans.viewport().installEventFilter(self._artifact_navigation_filter)
         scan_pane_layout.addWidget(scan_labels)
@@ -745,18 +832,27 @@ class BrowserView(QtWidgets.QFrame):
         if any(type(entry) is not BrowserResult for entry in entries):
             raise TypeError("results must be exact BrowserResult entries")
         blocker = QtCore.QSignalBlocker(self.scans)
+        selected = {item.data(_USER_ROLE) for item in self.scans.selectedItems()}
+        previous = self.current_result()
         # against the list itself, not what was last published: a list cleared from outside is filled again
-        if _listed_entries(self.scans) != entries:
+        rebuilt = _listed_entries(self.scans) != entries
+        if rebuilt:
             _fill(self.scans, entries)
         self._results = entries
         target = next((self.scans.item(index) for index in range(self.scans.count())
                        if self.scans.item(index).data(_USER_ROLE) == current), None)
         if self.scans.currentItem() is not target:
-            self.scans.setCurrentItem(target)
+            if rebuilt and current == previous:
+                self.scans.setCurrentItem(target, QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+                for index in range(self.scans.count()):
+                    item = self.scans.item(index)
+                    item.setSelected(item.data(_USER_ROLE) in selected)
+            else:
+                self.scans.setCurrentItem(target)
         del blocker
 
     def _result_selected(self, current, _previous) -> None:
-        if current is not None:
+        if current is not None and not current.data(_DIRECTORY_ROLE):
             self._emit(ShellCommandKind.SELECT_RESULT, current.data(_USER_ROLE))
 
     def reconcile_checked_results(self, entries: tuple[BrowserResult, ...], checked=()) -> None:
@@ -781,7 +877,7 @@ class BrowserView(QtWidgets.QFrame):
     def current_result(self) -> str | None:
         """A results list's current entry's identity (None: none)."""
         item = self.scans.currentItem()
-        return None if item is None else item.data(_USER_ROLE)
+        return None if item is None or item.data(_DIRECTORY_ROLE) else item.data(_USER_ROLE)
 
     def current_result_row(self) -> int:
         """A results list's current row (-1: none)."""
@@ -794,7 +890,13 @@ class BrowserView(QtWidgets.QFrame):
 
     def selected_results(self) -> tuple[str, ...]:
         """A results list's selected entries' identities, in the order Qt reports them (an overlay's order)."""
-        return tuple(item.data(_USER_ROLE) for item in self.scans.selectedItems())
+        return tuple(item.data(_USER_ROLE) for item in self.scans.selectedItems()
+                     if not item.data(_DIRECTORY_ROLE))
+
+    def listed_results(self) -> tuple[str, ...]:
+        """The visible artifact identities; directory rows are navigation only."""
+        return tuple(self.scans.item(i).data(_USER_ROLE) for i in range(self.scans.count())
+                     if not self.scans.item(i).data(_DIRECTORY_ROLE))
 
     def set_result_plot_mode(self, plot_mode: str) -> None:
         """Use Int's visit/toggle/range gestures when this results list presents an overlay."""
@@ -1436,7 +1538,7 @@ def _listed_entries(widget: QtWidgets.QListWidget) -> tuple[BrowserResult, ...]:
     """What a results list shows, as entries (its identities, texts, tooltips and muted marks)."""
     return tuple(
         BrowserResult(item.data(_USER_ROLE), item.text(), item.toolTip(),
-                      item.data(_MUTED_ROLE) is True)
+                      item.data(_MUTED_ROLE) is True, item.data(_DIRECTORY_ROLE) is True)
         for item in (widget.item(index) for index in range(widget.count()))
     )
 
@@ -1448,6 +1550,7 @@ def _fill(widget: QtWidgets.QListWidget, entries: tuple[BrowserResult, ...]) -> 
     for entry in entries:
         item = QtWidgets.QListWidgetItem(entry.label)
         item.setData(_USER_ROLE, entry.identifier)
+        item.setData(_DIRECTORY_ROLE, entry.is_directory)
         item.setToolTip(entry.detail)
         if entry.muted:
             item.setData(_MUTED_ROLE, True)

@@ -807,6 +807,28 @@ def test_a_failed_older_read_still_reads_the_newer_selection(qapp, tmp_path):
         qapp.processEvents()
 
 
+def test_a_catalog_result_opens_through_the_native_rsm_reader(qapp, tmp_path):
+    from tests.core.test_analysis_artifact import (
+        test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch as write_record,
+    )
+    write_record(tmp_path, False)
+    path = str(tmp_path / "rsm-artifact-v2.nexus")
+    page = _page(qapp)
+    try:
+        page._result_browser.set_directory(str(tmp_path))
+        _wait(page, qapp, lambda: not page._result_browser.busy)
+        assert path in page.browser.listed_results()
+        assert page.browser.current_result() is None and page.shown is None
+        page.browser.set_current_result(path, keep_selection=False)
+        _wait(page, qapp, lambda: page.shown is not None and not page.active())
+        assert page.browser.current_result() == path and page._shown_path == path
+        assert _curves(page.view) and all(curve.getData()[0] is not None for curve in _curves(page.view))
+    finally:
+        _wait(page, qapp, lambda: page.close_page().status is PageCleanup.CLEAN)
+        page.deleteLater()
+        qapp.processEvents()
+
+
 def test_a_late_read_does_not_override_the_newer_selection(qapp, tmp_path):
     """F4: real saved records on the shared single-worker reader. An evicted result A is selected (its
     read held back, as a slow disk would), then a kept B: A's read, when it returns, is kept but neither

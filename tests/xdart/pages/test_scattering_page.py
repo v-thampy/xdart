@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from threading import current_thread
 
@@ -398,6 +399,104 @@ def _mounted_host(selected_key=None):
     from xdart import _gui_main
 
     return _gui_main.Main(selected_page_key=selected_key)
+
+
+def test_mode_switch_keeps_current_browser_folder(qapp, isolated_settings, tmp_path):
+    from pyqtgraph.Qt import QtTest
+
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (selected / "scan.nexus").touch()
+    nested = selected / "nested"
+    nested.mkdir()
+    (nested / "inside.nexus").touch()
+    role = QtCore.Qt.ItemDataRole.UserRole
+
+    def paths(browser):
+        return tuple(browser.scans.item(i).data(role) for i in range(browser.scans.count()))
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            if predicate():
+                return
+            time.sleep(.005)
+        assert predicate(), "browser folder/catalog did not settle"
+
+    window = _mounted_host(DEFAULT_PAGE_KEY)
+    try:
+        integration = window.main_widget
+        integration._shell.run_controls.modeCombo.setCurrentText("Int 2D")
+        integration._set_browser_directory(str(selected), explicit=True)
+        wait_for(lambda: str(selected / "scan.nexus") in paths(integration._shell.browser))
+        expected = paths(integration._shell.browser)
+        prior_intent = integration._intents.snapshot()
+        integration._shell.run_controls.modeCombo.setCurrentText("Stitch 2D")
+        stitch = window.main_widget
+        wait_for(lambda: stitch.browser.directory_label._path == str(selected)
+                 and paths(stitch.browser) == expected)
+        assert not stitch.browser.directory_label.isHidden()
+        assert stitch.browser.current_result() is None  # catalog transfer does not open a file
+        assert integration._intents.snapshot() == prior_intent
+
+        # A real directory gesture navigates, never attempts to open a result.
+        row = paths(stitch.browser).index(str(nested))
+        stitch.browser.scans.setCurrentRow(row)
+        QtTest.QTest.keyClick(stitch.browser.scans, QtCore.Qt.Key.Key_Return)
+        wait_for(lambda: stitch.browser.directory_label._path == str(nested)
+                 and str(nested / "inside.nexus") in paths(stitch.browser))
+        expected_nested = paths(stitch.browser)
+        stitch.run_bar.modeCombo.setCurrentText("RSM")
+        rsm = window.main_widget
+        wait_for(lambda: rsm.browser.directory_label._path == str(nested)
+                 and paths(rsm.browser) == expected_nested)
+        assert not rsm.browser.directory_label.isHidden()
+        window.select_page(DEFAULT_PAGE_KEY)
+        wait_for(lambda: integration._shell.browser.directory_label._path == str(nested)
+                 and paths(integration._shell.browser) == expected_nested)
+        assert integration._intents.snapshot() == prior_intent
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_a_fresh_mode_inherits_project_and_save_folder_but_keeps_its_own(qapp, isolated_settings, tmp_path):
+    from xdart.gui.tabs.scattering.controls_inventory import PROJECT_ROOT, SAVE_PATH
+
+    project = tmp_path / "project"
+    project.mkdir()
+    save = project / "processed"
+    window = _mounted_host(DEFAULT_PAGE_KEY)
+    try:
+        integration = window.main_widget
+        integration._on_field_value(PROJECT_ROOT, str(project))
+        integration._on_field_value(SAVE_PATH, "processed")
+        prior_intent = integration._intents.snapshot()
+        integration._shell.run_controls.modeCombo.setCurrentText("Stitch 2D")
+        stitch = window.main_widget
+        assert stitch._value("project_root") == str(project)
+        assert stitch._value("output_path") == str(save)
+        stitch.run_bar.modeCombo.setCurrentText("RSM")
+        rsm = window.main_widget
+        assert rsm._value("project_root") == str(project)
+        assert Path(rsm._value("output_path")).parent == save
+        assert Path(rsm._value("output_path")).name.endswith("_rsm.nexus")
+        own = tmp_path / "rsm-project"
+        own.mkdir()
+        rsm.set_field("project_root", str(own))
+        rsm.set_field("output_path", str(own / "chosen.nexus"))
+        window.select_page(DEFAULT_PAGE_KEY)
+        integration._shell.run_controls.modeCombo.setCurrentText("RSM")
+        assert window.main_widget is rsm
+        assert rsm._value("project_root") == str(own)
+        assert rsm._value("output_path") == str(own / "chosen.nexus")
+        assert integration._intents.snapshot() == prior_intent
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
 
 
 def test_host_hides_only_the_redundant_vnext_application_statusbar(

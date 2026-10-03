@@ -3,6 +3,7 @@ the page mounts ``BrowserView`` with a results profile (several results for an o
 contributing frames, Open… · Metadata · Raw image) instead of its copied menus, heading and two lists. Each row
 keeps one item of Codex's preservation list, now through the owner."""
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,10 @@ _ROLE = QtCore.Qt.ItemDataRole.UserRole
 
 
 def _close(page, qapp):
+    deadline = time.monotonic() + 5
+    while page.shutdown().status is PageCleanup.PENDING and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.005)
     assert page.shutdown().status is PageCleanup.CLEAN
     page.deleteLater()
     qapp.processEvents()
@@ -39,11 +44,11 @@ def test_stitch_mounts_ints_data_browser_with_its_menus_lists_and_actions(qapp, 
         for name in ("stitchResults", "stitchFrames", "browserHeading"):  # the copies are gone
             assert page.findChild(QtWidgets.QWidget, name) is None
         assert [action.text() for action in page.browser.menus["File"].actions()] == [
-            "Open result…", "Integration workspace"]
+            "Open Folder", "Open result…", "Integration workspace"]
         hosts = page.mount_points()
         assert hosts.config_menu is page.browser.menus["Config"] and hosts.help_menu is page.browser.menus["Help"]
+        page.browser.menus["File"].actions()[2].trigger()
         page.browser.menus["File"].actions()[1].trigger()
-        page.browser.menus["File"].actions()[0].trigger()
         page.browser.open_result.click()
         assert tools == [str(SCATTERING_PAGE_KEY)] and opened == [None, None]
         assert (page.open_button, page.metadata_button, page.raw_button) == (
@@ -102,15 +107,32 @@ def test_stitch_overlay_selection_stepping_and_read_back_live_in_ints_browser(qa
         _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        paths = [page.results.item(row).data(_ROLE) for row in range(page.results.count())]
-        assert len(paths) == 3 and page.browser.current_result() == paths[-1]
+        deadline = time.monotonic() + 5
+        while page._result_browser.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert not page._result_browser.busy
+        paths = page.browser.listed_results()
+        assert len(paths) == 3
+        def select_path(path, flag):
+            row = next(i for i in range(page.results.count()) if page.results.item(i).data(_ROLE) == path)
+            page.results.setCurrentRow(row, flag)
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
-        page.results.setCurrentRow(2, select.ClearAndSelect)
-        page.results.setCurrentRow(0, select.Select)  # a user adding a result to the overlay
+        select_path(paths[2], select.ClearAndSelect)
+        select_path(paths[0], select.Select)  # a user adding a result to the overlay
         _wait(page, qapp)  # the one Single let go is read back, the selection kept
         assert page.browser.current_result() == paths[0]
         assert set(page.browser.selected_results()) == {paths[0], paths[2]}
         assert set(page._payloads) == {paths[0], paths[2]} and len(page.curve.listDataItems()) == 2
+        (Path(paths[0]).parent / "new-folder").mkdir()
+        page._result_browser.refresh()
+        deadline = time.monotonic() + 5
+        while page._result_browser.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert not page._result_browser.busy
+        assert set(page.browser.selected_results()) == {paths[0], paths[2]}
+        assert page.browser.current_result() == paths[0] and len(page.curve.listDataItems()) == 2
         page.scientific.next_frame.click()  # Overlay visits add the current curve, as Int's do
         _wait(page, qapp)
         assert page.browser.current_result() == paths[1]
@@ -123,6 +145,27 @@ def test_stitch_overlay_selection_stepping_and_read_back_live_in_ints_browser(qa
         page.clear_plot()
         assert page.browser.current_result() is None and page.browser.selected_results() == ()
         assert page.frames.count() == 0 and not page.raw_button.isEnabled()
+    finally:
+        _close(page, qapp)
+
+
+def test_a_catalog_result_opens_through_the_native_stitch_reader(qapp, tmp_path):
+    from tests.core.test_analysis_stitch_auxiliary import _publish
+    path, _raw, _project, _receipt = _publish(tmp_path)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page._result_browser.set_directory(str(Path(path).parent))
+        deadline = time.monotonic() + 5
+        while page._result_browser.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert str(path) in page.browser.listed_results()
+        assert page.browser.current_result() is None and not page._payloads
+        page.browser.set_current_result(str(path), keep_selection=False)
+        _wait(page, qapp)
+        assert str(path) in page._payloads and page.browser.current_result() == str(path)
+        assert page.browser.result_frames.item(0).text() == "Full"
+        assert len(page.curve.listDataItems()) == 1
     finally:
         _close(page, qapp)
 
