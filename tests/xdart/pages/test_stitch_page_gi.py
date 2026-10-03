@@ -323,6 +323,7 @@ def test_an_edit_reads_no_scan_table_and_lists_no_image_folder(qapp, tmp_path, m
     import xrd_tools.io.image as image
     import xrd_tools.io.spec as spec_io
     from xdart.gui.tabs.stitch import page as page_module
+    from xrd_tools.analysis import stitch_sources
     calls = []
     for module, name in ((spec_io, "read_spec_scan_columns"), (spec_io, "list_spec_scans"),
                          (image, "find_image_files"), (spec_io, "read_spec_scan_motor_names"),
@@ -331,16 +332,16 @@ def test_an_edit_reads_no_scan_table_and_lists_no_image_folder(qapp, tmp_path, m
         monkeypatch.setattr(module, name, lambda *args, real=real, name=name, **kwargs:
                             (calls.append(name), real(*args, **kwargs))[1])
     page_module._spec_motor_names.cache_clear()
-    page_module._spec_frame_counts.cache_clear()
+    stitch_sources._spec_frame_counts.cache_clear()
     page = _page(tmp_path, "multigeometry")
     try:
         _click(page, "Grazing")
         assert page._gi_catalog == _MOTORS
+        page.set_field("image_stem", "sample_scan{scan}_")  # a committed source edit may refresh its headers
         calls.clear()
         page_module._spec_motor_names.cache_clear()  # a warm cache would hide a read on a draft
-        page_module._spec_frame_counts.cache_clear()
+        stitch_sources._spec_frame_counts.cache_clear()
         page._rows["scan"].draftChanged.emit(("Stitch", "scan"), "1, 2")  # a draft: no read
-        page.set_field("image_stem", "sample_scan{scan}_")
         page.set_field("unit", "Qip (Å⁻¹)")
         page.build_form()
         assert calls == []

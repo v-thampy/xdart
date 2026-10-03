@@ -296,20 +296,6 @@ def camera_orientation(text) -> ImageOrientation:
     return stitch_orientation(DetectorCamera(*parts))
 
 
-@functools.lru_cache(maxsize=8)
-def _spec_frame_counts(path, _state, scans):
-    """Each selected scan's frames (its SPEC points; ``scans`` None: every scan's), or None when the file
-    cannot be read. On a committed source or scan edit only, as the incidence choices (maintainer,
-    2026-09-30: "display the number of images in a scan in the readiness tab the moment it is selected like
-    in int ... only if it is quick": measured about 0.5 ms a scan)."""
-    from silx.io.specfile import SfError
-    from xrd_tools.io.spec import count_spec_scan_points
-    try:
-        return count_spec_scan_points(path, scans)
-    except (OSError, ValueError, LookupError, SfError):
-        return None
-
-
 #: The frames-per-scan tooltip's most lines; a longer selection's (Stitch All over a long file) ends "… N more".
 _FRAME_TIP_LINES = 40
 
@@ -319,17 +305,6 @@ def _source_admission_job(request, _cancel, _progress):
     from xrd_tools.analysis.stitch_sources import resolve_stitch_sources
     selection, options, _states = request
     return resolve_stitch_sources(selection, dict(options))
-
-
-def _output_frames(members, counts):
-    """One output's line in the frames-per-scan tooltip: its scan's frames, or a bracketed group's scans,
-    each one's frames and their sum. A scan is named as a selection names it (N for its first run, N.1)."""
-    names = [scan[:-2] if scan.endswith(".1") else scan for scan in members]
-    frames = sum(counts[scan] for scan in members)
-    if len(members) == 1:
-        return f"scan {names[0]}: {frames} frame{'s' * (frames != 1)}"
-    return (f"scans {', '.join(names)} (one output): "
-            f"{' + '.join(str(counts[scan]) for scan in members)} = {frames} frames")
 
 
 def _file_states(*paths):
@@ -1512,29 +1487,14 @@ class StitchPage(QtWidgets.QWidget):
         return (self._value("source_kind"), self._source_paths, self._value("scan_mode"), str(self._value("scan")))
 
     def _selection_frames(self):
-        """The frames a SPEC selection's scans record (a scan in two results counts twice, as it is
-        stitched twice) and each output's line for the frames-per-scan tooltip (a file's name above its
-        own when there are several): (total, lines), or None for another kind or a scan a file lacks."""
-        from xrd_tools.sources.grouping import parse_stitch_scan_groups
-        kind, paths, mode, scans = self._selection_key()
-        if kind != "Spec" or not paths:
+        """Counts from the shared Stitch/RSM selection owner, on a committed source edit."""
+        from xrd_tools.analysis.stitch_sources import stitch_selection_frames
+        if not self._source_paths:
             return None
         try:
-            groups = None if mode == "Stitch All" else parse_stitch_scan_groups(scans)
-        except ValueError:
+            return stitch_selection_frames(self._source_selection())
+        except (TypeError, ValueError):
             return None
-        wanted = None if groups is None else tuple(sorted({scan for group in groups for scan in group}))
-        total, lines = 0, []
-        for path in paths:
-            counts = _spec_frame_counts(path, _file_states(path), wanted)
-            if counts is None or None in counts.values():
-                return None
-            lines += [f"{Path(path).name}:"] * (len(paths) > 1)
-            for group in ([(scan,) for scan in counts] if groups is None else groups):
-                members = tuple(dict.fromkeys(group))
-                total += sum(counts[scan] for scan in members)
-                lines.append(("  " if len(paths) > 1 else "") + _output_frames(members, counts))
-        return total, tuple(lines)
 
     def _committed_frames(self):
         """(total, lines) of the committed selection shown, else None (a draft, or unknown)."""
@@ -1549,7 +1509,7 @@ class StitchPage(QtWidgets.QWidget):
             return ""
         admitted = self._source_admission
         checked = admitted is not None and admitted[1] is not None and not admitted[1].skipped
-        noun = "frame" if checked else "SPEC point"
+        noun = "frame" if checked or self._value("source_kind") == "NeXus" else "SPEC point"
         return f" · {frames[0]} {noun}{'s' * (frames[0] != 1)}"
 
     def _frames_tooltip(self):
@@ -1562,9 +1522,10 @@ class StitchPage(QtWidgets.QWidget):
         more = len(frames[1]) - len(lines)
         admitted = self._source_admission
         checked = admitted is not None and admitted[1] is not None and not admitted[1].skipped
-        if not checked:
+        if not checked and self._value("source_kind") == "Spec":
             lines = tuple(line.replace("frames", "SPEC points").replace("frame", "SPEC point") for line in lines)
-        return "\n".join(["Frames per scan:" if checked else "SPEC points per scan:", *lines]
+        return "\n".join(["Frames per scan:" if checked or self._value("source_kind") != "Spec"
+                         else "SPEC points per scan:", *lines]
                          + [f"… {more} more"] * (more > 0))
 
     def _refresh_gi_catalog(self, *_args):

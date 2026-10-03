@@ -151,7 +151,13 @@ def _page(qapp, **owners):
 
 
 def _close(page, qapp):
-    assert page.close_page().status is PageCleanup.CLEAN
+    until = time.monotonic() + 5
+    receipt = page.close_page()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+        qapp.processEvents()
+        time.sleep(.005)
+        receipt = page.close_page()
+    assert receipt.status is PageCleanup.CLEAN
     page.deleteLater()
     qapp.processEvents()
 
@@ -320,6 +326,29 @@ def test_rsm_notebook_conditioning_is_advanced_and_explained(qapp):
         assert "unchanged" in page._rows["static_hot"].toolTip()
         assert "0 disables" in page._rows["offset"].toolTip()
         assert "without gridding again" in page.retry_button.toolTip()
+    finally:
+        _close(page, qapp)
+
+
+def test_rsm_opens_with_six_empty_native_panels_and_labels(qapp):
+    """Selecting RSM shows its own layout before any source or result is loaded."""
+    page = _page(qapp)
+    try:
+        assert page.shown is None
+        assert page.view.vertical_splitter.isHidden()
+        assert [key.instance for key in _keys(page.view)] == ["HK", "HL", "KL", "H", "K", "L"]
+        assert all(not pane.canvas.raw_image.size for pane in _slices(page.view))
+        assert all(selector.isHidden() for selector in _selectors(page.view))
+        assert all(curve.getData()[0] is None or not curve.getData()[0].size for curve in _curves(page.view))
+        assert page.view.keyed_panel(_keys(page.view)[0]).pane.plot.getAxis("bottom").labelText == "H"
+        page.view.color_map.setCurrentText("magma")
+        page.view.log_scale.click()
+        page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
+        assert [key.instance for key in _keys(page.view)] == ["QxQy", "QxQz", "QyQz", "Qx", "Qy", "Qz"]
+        assert page.view.keyed_panel(_keys(page.view)[0]).pane.plot.getAxis("bottom").labelText == (
+            RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.axis_labels[0])
+        assert page.view.color_map.currentText() == "magma" and page.view.log_scale.isChecked()
+        assert page.shown is None
     finally:
         _close(page, qapp)
 
@@ -1401,7 +1430,7 @@ def test_a_bracket_selection_is_one_rsm_and_a_comma_selection_is_queued(qapp, tm
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path, scans="1,2")
         assert page._readiness[1], page._readiness
-        assert page.controls.source_card.status.text() == "1 SPEC file · 2 RSMs"
+        assert page.controls.source_card.status.text() == "1 SPEC file · 2 RSMs · 4 frames"
         with pytest.raises(ValueError, match="2 RSMs in the Source: Preview and Run queue them"):
             page.build_form()
         forms = page.build_forms()
@@ -1419,7 +1448,7 @@ def test_a_bracket_selection_is_one_rsm_and_a_comma_selection_is_queued(qapp, tm
         page.resolve_source()
         assert [member.scan for member in page.build_form().members] == ["2.1"]
         page.set_field("scan_mode", "All Scans")
-        assert page._readiness[1] and page.controls.source_card.status.text() == "1 SPEC file · all scans"
+        assert page._readiness[1] and page.controls.source_card.status.text() == "1 SPEC file · all scans · 4 SPEC points"
         page.resolve_source()
         with pytest.raises(ValueError, match="2 RSMs in the Source"):
             page.build_form()
@@ -1848,6 +1877,10 @@ def test_a_raw_nexus_source_is_one_rsm_named_by_its_entry(qapp, tmp_path):
         page.set_field("normalization", "None")
         assert page._readiness[1], page._readiness
         assert Path(page._value("output_path")).name == "member_ub_rsm.nexus"
+        assert "5 frames" in page.controls.source_card.status.text()
+        assert "5 frames" in page.run_bar.readinessLabel.full_text()
+        for key, count in zip(("grid_h", "grid_k", "grid_l"), (12, 16, 20), strict=True):
+            page.set_field(key, count)
         page.begin_preview()
         _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
         member, = page.build_form().members
@@ -1855,6 +1888,7 @@ def test_a_raw_nexus_source_is_one_rsm_named_by_its_entry(qapp, tmp_path):
         assert "member_ub.nxs · NeXus entry entry · 5 frames" in page.preview_text.toPlainText()
         page.begin_run()  # gridded for real: five frames
         _wait(page, qapp, lambda: page.shown is not None and not page.active(), seconds=300)
+        assert page.shown[0].shape == (12, 16, 20)
         output = Path(page._value("output_path"))
         assert page.run_bar.readinessLabel.full_text() == f"Saved {output.name}" and output.is_file()
         page.begin_run()  # Append: the output already holds this RSM

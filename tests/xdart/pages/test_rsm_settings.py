@@ -51,7 +51,8 @@ def _every_input(root):
         "ub_from": "Typed", "ub_row1": "1 0 0", "ub_row2": "0 1 0", "ub_row3": "0 0 1",
         "ub_spec_path": "ub.spec", "ub_scan": "7",
         "project_root": str(root), "output_path": str(root / "named_rsm.nexus"),
-        "coordinates": RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name, "grid": "Full 200×200×200",
+        "coordinates": RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name,
+        "grid_h": "60", "grid_k": "70", "grid_l": "80",
         "offset": "0.5", "static_hot": "", "normalization": "Monitor", "monitor": "I0",
         "foil_column": "filters", "exposure_column": "sec", "foil_lengths": "1, 2, 3, 4",
         "adv_rows": "4", "adv_columns": "5", "adv_dtype": "uint16", "adv_header": "8",
@@ -142,7 +143,8 @@ def test_an_older_or_partial_document_loads_what_it_holds(qapp, tmp_path):
         before = page.settings()
         page.apply_settings({"kind": "xdart-rsm-settings", "version": 1, "retired_section": {"x": 1},
                              "fields": {"grid": "Full 200×200×200", "retired_row": "x"}})
-        assert page.settings() == {**before, "fields": {**before["fields"], "grid": "Full 200×200×200"}}
+        assert page.settings() == {**before, "fields": {**before["fields"],
+                                                       "grid_h": "200", "grid_k": "200", "grid_l": "200"}}
     finally:
         _close(page, qapp)
 
@@ -227,7 +229,8 @@ def test_the_last_session_is_restored_and_a_fresh_start_neither_reads_nor_writes
     assert first.close().status is PageCleanup.CLEAN
     first.widget.deleteLater()
     remembered = json.loads(session.read_text())[SESSION_KEY]
-    assert remembered["fields"]["grid"] == "Full 200×200×200" and remembered["threshold"]["threshold_max"] == 50000.0
+    assert [remembered["fields"][f"grid_{axis}"] for axis in "hkl"] == ["200"] * 3
+    assert remembered["threshold"]["threshold_max"] == 50000.0
 
     second = build_rsm_page(empty_host_services(_Status()), None)
     try:

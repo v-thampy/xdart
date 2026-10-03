@@ -3,8 +3,8 @@ Append ⇄ Replace, as one versioned JSON document (G12, ledger row 3: "File ▸
 restore covering every input, the Advanced options and any calibration panel ... mirror the Stitch page").
 
 The inputs are every row of Project, Experiment (the Calibration, the Mask File and the refinement toggle),
-Source (with the Selection and the UB group), Processing (Coordinates, Grid, Offset, All-frame hot and the
-Normalization group) and Advanced (the decoder, Angle mapping, frames, the column occurrences, Corrections, chunk
+Source (with the Selection and the UB group), Processing (Coordinates, three grid counts and the
+Normalization group) and Advanced (Offset, All-frame hot, the decoder, Angle mapping, frames, column occurrences, Corrections, chunk
 and memory). The Threshold is Int's policy, kept as one state; the calibration window's own ``settings()`` never
 hold a per-use confirmation.
 
@@ -48,6 +48,13 @@ def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
     document = RSM_SETTINGS.validate(document)
     fields = saved_fields(page, document, _NOT_FIELDS)
+    legacy = document.get("fields", {}).get("grid")
+    if legacy is not None:
+        from xdart.gui.tabs.rsm.page import _GRID_FIELDS, _GRIDS
+        if legacy not in _GRIDS:
+            raise ValueError(f"Grid: {legacy!r} is not one of its choices")
+        for key, value in zip(_GRID_FIELDS, _GRIDS[legacy], strict=True):
+            fields.setdefault(key, str(value))
     check_fields(page, fields, _OPEN_CHOICES)
     if "source_kind" in fields:  # first: a kind shows its own rows
         page.set_field("source_kind", fields["source_kind"])

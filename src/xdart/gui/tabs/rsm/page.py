@@ -39,7 +39,7 @@ from xdart.gui.pages.values import (
     ActionAccepted, ActionCompleted, ActionRefused, CloseReceipt, PageCleanup,
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
 )
-from xdart.gui.tabs.rsm.display import rsm_keyed_projection, rsm_slice_normals
+from xdart.gui.tabs.rsm.display import rsm_empty_projection, rsm_keyed_projection, rsm_slice_normals
 from xdart.gui.tabs.rsm.settings import RSM_SETTINGS, apply_page_settings, page_settings
 from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindow
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
@@ -121,18 +121,16 @@ _FIELDS = (
     (SectionId.PROJECT, "output_path", "Save Path", "", (), True),
     (SectionId.PROCESSING, "coordinates", "Coordinates", RSMCoordinateFrame.HKL.display_name, tuple(_FRAMES),
      False),
-    (SectionId.PROCESSING, "grid", "Grid", "Quick 40×40×40", tuple(_GRIDS), False),
 )
+_GRID_FIELDS = ("grid_h", "grid_k", "grid_l")
 #: The Conditioning rows Int's processing composer lays out (design §2; the maintainer: "Other processing
 #: options like thresholding, monitor etc should also apply"): Int's Threshold (its RangeRow; "High → NaN" is
-#: its Manual maximum now), RSM's Offset and All-frame hot, and the one Normalization group Stitch has
+#: its Manual maximum now) and the one Normalization group Stitch has. Offset and All-frame hot are Advanced's
 #: (``normalization_values``; decision 4's four choices). (key, path, label, default).
 _CONDITIONING = (
     ("threshold_enabled", THRESHOLD_ENABLED, "Threshold", True),
     ("threshold_min", THRESHOLD_MIN, "Threshold Low", 0.0),
     ("threshold", THRESHOLD_MAX, "Threshold High", None),
-    ("offset", ("RSM", "offset"), "Offset", "1e-06"),
-    ("static_hot", ("RSM", "static_hot"), "All-frame hot", "100"),
     ("normalization", ("RSM", "normalization"), "Normalization", normalization.FOIL_EXPOSURE),
     ("monitor", ("RSM", "monitor"), "Monitor", "None"),
     ("foil_column", ("RSM", "foil_column"), "Foil column", normalization.DEFAULT_FOIL_COLUMN),
@@ -148,6 +146,7 @@ _NORMALIZATION_MODES = {normalization.NONE: RSMNormalizationMode.IDENTITY,
 #: text; ``rsm_values`` stays the authority that refuses it (Codex's stage-1 review F1). The frame range is
 #: Stitch's one range for every member, in Advanced (design §2).
 _INTEGER_FIELDS = {"frame_first": (0, None, False), "frame_last": (0, None, True), "frame_step": (1, None, False),
+                   **{key: (2, 1_000_000, False) for key in _GRID_FIELDS},
                    # Advanced (the classic RSM dialog's spin-box ranges, as rows)
                    "adv_rows": (2, 1_000_000, False), "adv_columns": (2, 1_000_000, False),
                    "adv_header": (0, 1 << 30, False),
@@ -325,6 +324,7 @@ class RSMPage(QtWidgets.QWidget):
         self._resolver = SingleWorkerOwner(_resolve_rsm_groups) if resolver is None else resolver
         self._resolving = None
         self._groups = None
+        self._selection_counts = None
         self._fields, self._rows = {}, {}
         self._source_paths = ()  # Stitch's selection: the SPEC or NeXus files, or the folder, as chosen
         self._source_shown = ""  # the SPEC files row's text for them ("3 files selected")
@@ -380,6 +380,7 @@ class RSMPage(QtWidgets.QWidget):
         self._saved_settings = PageSettings(self, RSM_SETTINGS, document=page_settings, apply=apply_page_settings,
                                             busy=self.active, close=self.close_page)
         self._build_ui()
+        self._show_empty_view()
         self._authoring_timer = QtCore.QTimer(self)
         self._authoring_timer.setInterval(50)
         self._authoring_timer.timeout.connect(self._sync_actions)
@@ -498,6 +499,12 @@ class RSMPage(QtWidgets.QWidget):
         self._build_source()  # and its Source rows
         for section, key, label, value, choices, browse in _FIELDS:
             cards[section].add_row(self._row(section, key, label, value, choices, browse))
+        fields = tuple(self._new_field(SectionId.PROCESSING, key, axis, "40")
+                       for key, axis in zip(_GRID_FIELDS, "HKL", strict=True))
+        rows = self.controls.render_count_row(self.controls.processing_card, "Grid", fields)
+        for key, field in zip(_GRID_FIELDS, fields, strict=True):
+            self._bind(key, field, rows[field.path])
+        self._render_grid_labels()
         self._build_conditioning()
         self._render_ub()  # the Coordinates row is built: what the UB rows read
         buttons = self.controls.render_actions(self.controls.processing_card, tuple(
@@ -508,7 +515,8 @@ class RSMPage(QtWidgets.QWidget):
             buttons[action] for action in (ControlAction.PREVIEW, ControlAction.RETRY,
                                            ControlAction.ADVANCED_PROCESSING))
         self.preview_button.setToolTip("Check the inputs and list every exact identity, without gridding.")
-        self.retry_button.setToolTip("Retry the last result's saving or its check.")
+        self.retry_button.setToolTip("Retry saving or verifying the last result after that step failed, "
+                                    "without gridding again. Enabled when a result needs a retry.")
         self._build_advanced()
         # Preview's lines: the shared read-only text window (Codex's combined stage-2b review F2)
         self.preview_dialog = ReadOnlyTextWindow("RSM preview", (760, 560), self)
@@ -538,9 +546,6 @@ class RSMPage(QtWidgets.QWidget):
         self.threshold_range.setToolTip(
             "Int's Threshold: Auto masks each frame's saturated pixels (the calibrated detector's ceiling); a "
             "Low or High makes it manual, masking what lies outside; off masks nothing.")
-        self._tip("offset", "Added to every pixel before the threshold and the divisor (the notebook's step).")
-        self._tip("static_hot", "Masks a pixel hot in every selected frame (counts above this in all of them); "
-                                "blank: none.")
         for key in normalization.NORMALIZATION_KEYS:
             self._tip(key, normalization.TIPS[key])
             self._rows[key].setVisible(fields[key].enabled)
@@ -853,6 +858,9 @@ class RSMPage(QtWidgets.QWidget):
                 ("adv_monitor_occurrence", "Monitor column occurrence", "0", ()))),
             ("Corrections", SectionId.PROCESSING, tuple(
                 (spec.key, spec.label, spec.value, spec.choices) for spec in corrections)),
+            ("Image conditioning", SectionId.PROCESSING, (
+                ("offset", "Offset", "1e-06", ()),
+                ("static_hot", "All-frame hot", "100", ()))),
             ("Chunk and memory", SectionId.PROCESSING, (
                 ("adv_chunk", "Frames per chunk", str(preset.chunk_size), ()),
                 ("adv_max_frame_mib", "Max frame MiB", str(preset.max_frame_bytes // _MIB), ()),
@@ -877,9 +885,37 @@ class RSMPage(QtWidgets.QWidget):
         self._tip("adv_max_chunk_mib", "Blank is Auto: 256 MiB, or one frame's need when larger (an Eiger 4M), "
                                        "the chunk then holding as many frames as fit. A number is your cap; one "
                                        "below a frame's need is named.")
+        self._tip("offset", "Adds this constant to each detector pixel before normalization. The notebook's "
+                  "1e-6 default is a tiny positive pedestal; 0 disables it. It does not change geometry.")
+        self._tip("static_hot", "Masks a detector pixel whose value is exactly unchanged in every selected "
+                  "frame of a scan and above this cutoff (counts plus Offset, before normalization). Each "
+                  "scan is checked separately. Blank disables it; 0 is invalid. A constant reflection "
+                  "can also be removed.")
 
     def _tip(self, key, text):
-        self._rows[key].setToolTip(text)
+        row = self._rows[key]
+        self._fields[key] = replace(self._fields[key], reason=text, value=row.current_value())
+        row.apply_field(self._fields[key])
+
+    def _render_grid_labels(self):
+        """Project the coordinate names onto Int's grouped count editors."""
+        names = ("H", "K", "L") if self._value("coordinates") == RSMCoordinateFrame.HKL.display_name else (
+            "Qx", "Qy", "Qz")
+        for key, name in zip(_GRID_FIELDS, names, strict=True):
+            self._rows[key].label.setText(name)
+            self._tip(key, f"Number of {name} grid points, including both endpoints (at least 2). "
+                      "Preview determines the range from the selected frames and calibration. "
+                      "The three counts together may contain at most 8,000,000 voxels.")
+
+    def _grid_bins(self):
+        for key in _GRID_FIELDS:
+            refused = self._rows[key].refusal()
+            if refused:
+                raise ValueError(f"Grid {self._rows[key].label.text()}: {refused}")
+        bins = tuple(int(self._value(key)) for key in _GRID_FIELDS)
+        if bins[0] * bins[1] * bins[2] > 8_000_000:
+            raise ValueError("Grid must contain at most 8,000,000 voxels")
+        return bins
 
     def _advanced_refusal(self, section=None):
         """The first refused Advanced whole-number row, as readiness and ``build_form`` name it ("" if none)."""
@@ -891,9 +927,20 @@ class RSMPage(QtWidgets.QWidget):
 
     # ── values ──
     def _value(self, key):
+        if key == "grid":  # old scripted callers and saved presets
+            bins = tuple(int(self._rows[name].current_value()) for name in _GRID_FIELDS)
+            return next((name for name, value in _GRIDS.items() if bins == value), "Custom")
         return self._rows[key].current_value()
 
     def set_field(self, key, value):
+        if key == "grid":  # old presets become the same three editable counts
+            if value not in _GRIDS:
+                raise ValueError(f"Grid: {value!r} is not one of its choices")
+            for name, count in zip(_GRID_FIELDS, _GRIDS[value], strict=True):
+                self._fields[name] = replace(self._fields[name], value=str(count))
+                self._rows[name].apply_field(self._fields[name])
+            self._edited()
+            return
         self._fields[key] = replace(self._fields[key], value=value)
         self._rows[key].apply_field(self._fields[key])
         self._committed(key)
@@ -917,6 +964,10 @@ class RSMPage(QtWidgets.QWidget):
             self._refresh_normalization()  # a kind's own files come through set_sources
         if key in {"coordinates", "ub_from"}:
             self._render_ub()
+        if key == "coordinates" or key in _GRID_FIELDS:
+            self._render_grid_labels()
+        if key == "coordinates" and self._shown is None:
+            self._show_empty_view()
         self._edited()
 
     # ── the Source (Stitch's rows and owner) ──
@@ -1221,7 +1272,7 @@ class RSMPage(QtWidgets.QWidget):
             str(self._value("project_root")).strip(), geometry, members,
             # "High → NaN" is Int's threshold's Manual High now (design §2)
             RSMImageConditioning(float(self._value("offset")), None, optional("static_hot")),
-            policy, tuple(_GRIDS[self._value("grid")]), int(self._value("adv_chunk")),
+            policy, self._grid_bins(), int(self._value("adv_chunk")),
             int(self._value("adv_max_frame_mib")) * _MIB, self._max_chunk_bytes(), output,
             AnalysisArtifactOverwrite.REPLACE,  # Append is the page's skip, as Stitch's (_start_run)
             coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family, corrections=corrections,
@@ -1315,7 +1366,11 @@ class RSMPage(QtWidgets.QWidget):
                 text = str(self._value(key)).strip()
                 if text and not self._inside(root, text, what).is_file():
                     need("processing", f"the {what} ({Path(text).name} not found)")
-        grid = "×".join(str(size) for size in _GRIDS[self._value("grid")])
+        try:
+            grid = "×".join(str(size) for size in self._grid_bins())
+        except ValueError as error:
+            need("processing", str(error))
+            grid = "invalid"
         ready_detail = {"project": "Project folder and Output are ready.",
                         "experiment": "The Calibration (and any Mask File) is ready.",
                         "source": "The source, its Selection and the frames are ready; Preview finds the scans.",
@@ -1326,6 +1381,9 @@ class RSMPage(QtWidgets.QWidget):
                  "processing": f"{self._value('coordinates')} · grid {grid}"}
         details = {key: ready_detail[key] if not sections[key] else "Needs " + ", ".join(sections[key])
                    for key in sections}
+        counts_tip = self._frames_tooltip()
+        if counts_tip:
+            details["source"] += "\n\n" + counts_tip
         if warned:  # the Source header warns in the brief's words, naming the scans, whatever else it needs
             warning = no_ub_warning(missing)
             details["source"] = warning if not sections["source"] else f"{warning} {details['source']}"
@@ -1354,13 +1412,49 @@ class RSMPage(QtWidgets.QWidget):
             return (Path(self._source_paths[0]).name + (" + subfolders" if self._value("subdirs") else "")
                     + (" · filtered" if str(self._value("name_filter")).strip() else ""))
         if kind == "NeXus":
-            return f"{count} NeXus file{'s' * (count != 1)}"
+            return f"{count} NeXus file{'s' * (count != 1)}" + self._frames_text()
         try:
             groups = self._selected_groups()
         except ValueError:
             groups = 0
         return f"{count} SPEC file{'s' * (count != 1)} · " + (
-            "all scans" if groups is None else f"{groups} RSM{'s' * (groups != 1)}")
+            "all scans" if groups is None else f"{groups} RSM{'s' * (groups != 1)}") + self._frames_text()
+
+    def _selection_frames(self):
+        """Stitch's same pixel-free count owner, once per committed source selection."""
+        from xrd_tools.analysis.stitch_sources import stitch_selection_frames
+        key = self._group_key()
+        if self._selection_counts is None or self._selection_counts[0] != key:
+            try:
+                selection, _options, _queue = self._resolution_request(outputs=False)
+                counts = stitch_selection_frames(selection)
+            except (TypeError, ValueError, OSError):
+                counts = None
+            self._selection_counts = key, counts
+        return self._selection_counts[1]
+
+    def _frames_confirmed(self):
+        return (self._value("source_kind") == "NeXus" or self._groups is not None
+                and self._groups[0] == self._group_key() and bool(self._groups[1]) and not self._groups[2])
+
+    def _frames_text(self):
+        counts = self._selection_frames()
+        if counts is None:
+            return ""
+        noun = "frame" if self._frames_confirmed() else "SPEC point"
+        return f" · {counts[0]} {noun}{'s' * (counts[0] != 1)}"
+
+    def _frames_tooltip(self):
+        counts = self._selection_frames()
+        if counts is None:
+            return ""
+        lines = counts[1][:40]
+        confirmed = self._frames_confirmed()
+        if not confirmed:
+            lines = tuple(line.replace("frames", "SPEC points").replace("frame", "SPEC point") for line in lines)
+        more = len(counts[1]) - len(lines)
+        return "\n".join(["Frames per scan:" if confirmed else "SPEC points per scan:", *lines]
+                         + [f"… {more} more"] * (more > 0))
 
     def _source_needs(self, root):
         """What the Source still needs, without reading a file (the disk is asked only whether the chosen
@@ -1415,7 +1509,8 @@ class RSMPage(QtWidgets.QWidget):
 
     def _show_readiness(self):
         text, ready = self._readiness
-        self.run_bar.set_readiness_summary(text, ready=ready)
+        frames = self._frames_tooltip()
+        self.run_bar.set_readiness_summary(text, ready=ready, tooltip=f"{text}\n\n{frames}" if frames else "")
         cards = {"project": self.controls.project_card, "experiment": self.controls.experiment_card,
                  "source": self.controls.source_card, "processing": self.controls.processing_card}
         for key, header in getattr(self, "_headers", {}).items():  # Int's header adapter
@@ -2048,6 +2143,11 @@ class RSMPage(QtWidgets.QWidget):
     def shown(self):
         """The result drawn now: (its viewer values, the viewer-model snapshot drawn), or None."""
         return self._shown
+
+    def _show_empty_view(self):
+        self.view.reconcile_keyed(replace(rsm_empty_projection(_FRAMES[self._value("coordinates")]),
+                                         color_map=self._color_map, log_scale=self._log_scale,
+                                         share_axis=self._share_axis))
 
     def _viewer(self, path, payload):
         """The result's viewer values and model, built once while it stays resident."""

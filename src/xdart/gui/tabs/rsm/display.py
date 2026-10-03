@@ -28,6 +28,24 @@ def slice_normal(horizontal: int, vertical: int) -> int:
     return 3 - horizontal - vertical
 
 
+def rsm_empty_projection(coordinate_frame) -> KeyedPanelsProjection:
+    """The native six-panel layout before an RSM result is loaded, with no invented data."""
+    layout = rsm_viewer_layout(coordinate_frame)
+    labels, symbols = coordinate_frame.axis_labels, coordinate_frame.axis_symbols
+    empty = np.array([], dtype=float)
+    panels = []
+    for key, (horizontal, vertical) in zip((key for row in layout for key in row), _AXES, strict=True):
+        x_axis = AxisProjection(empty, labels[horizontal], "")
+        if vertical is not None:
+            panels.append(KeyedImageProjection(
+                key, f"{symbols[horizontal]}{symbols[vertical]} slice", np.empty((0, 0)), x_axis,
+                AxisProjection(empty, labels[vertical], ""), 0, (), navigation=False))
+        else:
+            panels.append(KeyedTraceProjection(
+                key, f"{symbols[horizontal]} mean projection", x_axis, empty, "Mean I"))
+    return KeyedPanelsProjection(layout, tuple(panels), title="RSM", status="Open or calculate an RSM result")
+
+
 def rsm_slice_normals(values) -> dict[str, int]:
     """Each slice panel's instance, by the axis its index steps along (0 H, 1 K, 2 L; or Qx, Qy, Qz)."""
     keys = [key for row in rsm_viewer_layout(values.coordinate_frame) for key in row]
@@ -78,4 +96,4 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
                                  background_set=background_set, share_axis=bool(share_axis))
 
 
-__all__ = ["rsm_keyed_projection", "rsm_slice_normals", "slice_normal"]
+__all__ = ["rsm_empty_projection", "rsm_keyed_projection", "rsm_slice_normals", "slice_normal"]

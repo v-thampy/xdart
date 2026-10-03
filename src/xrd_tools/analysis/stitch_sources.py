@@ -1,6 +1,7 @@
 """Finite Stitch source selections, resolved by the existing format owners."""
 
 from dataclasses import dataclass
+import functools
 from pathlib import Path
 
 from xrd_tools.core.filters import compile_filter
@@ -78,6 +79,62 @@ class StitchSourceResolution:
     skipped: tuple[tuple[str, str, str], ...]
     #: each group's members' scan names, as Int names them (``int_scan_name``)
     names: tuple[tuple[str, ...], ...] = ()
+
+
+@functools.lru_cache(maxsize=8)
+def _spec_frame_counts(path, _state, scans):
+    """Cheap SPEC point counts, invalidated when the source file changes."""
+    from silx.io.specfile import SfError
+    from xrd_tools.io.spec import count_spec_scan_points
+    try:
+        return count_spec_scan_points(path, scans)
+    except (OSError, ValueError, LookupError, SfError):
+        return None
+
+
+def _output_frames(members, counts):
+    names = [scan[:-2] if scan.endswith(".1") else scan for scan in members]
+    frames = sum(counts[scan] for scan in members)
+    if len(members) == 1:
+        return f"scan {names[0]}: {frames} frame{'s' * (frames != 1)}"
+    return (f"scans {', '.join(names)} (one output): "
+            f"{' + '.join(str(counts[scan]) for scan in members)} = {frames} frames")
+
+
+def stitch_selection_frames(selection: StitchSourceSelection):
+    """Selection's point/frame count and per-scan lines, without decoding images.
+
+    SPEC counts remain metadata points until strict source admission confirms the images.
+    An unknown selection returns None; Directory discovery stays on its existing worker.
+    """
+    if selection.kind == "Directory":
+        return None
+    if selection.kind == "NeXus":
+        try:
+            counts = tuple((Path(path).name, describe_container(path).frame_count) for path in selection.paths)
+        except (OSError, ValueError, LookupError):
+            return None
+        return sum(count for _name, count in counts), tuple(f"{name}: {count} frames" for name, count in counts)
+    try:
+        groups = None if selection.stitch_all else parse_stitch_scan_groups(selection.scans)
+    except ValueError:
+        return None
+    wanted = None if groups is None else tuple(sorted({scan for group in groups for scan in group}))
+    total, lines = 0, []
+    for path in selection.paths:
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return None
+        counts = _spec_frame_counts(path, (stat.st_mtime_ns, stat.st_size), wanted)
+        if counts is None or None in counts.values():
+            return None
+        lines += [f"{Path(path).name}:"] * (len(selection.paths) > 1)
+        for group in ([(scan,) for scan in counts] if groups is None else groups):
+            members = tuple(dict.fromkeys(group))
+            total += sum(counts[scan] for scan in members)
+            lines.append(("  " if len(selection.paths) > 1 else "") + _output_frames(members, counts))
+    return total, tuple(lines)
 
 
 def int_scan_name(path) -> str:

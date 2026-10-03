@@ -329,7 +329,13 @@ class _KeyedImagePanel:
 
     def draw(self, panel: KeyedImageProjection, color_map: str, log_scale: bool) -> None:
         signed = panel.presentation == "signed"
-        if self.detector_picker:
+        if not panel.image.size:
+            self.clear()
+            for side, axis in (("bottom", panel.x_axis), ("left", panel.y_axis)):
+                label, unit = _axis_presentation(axis.label, axis.unit)
+                self.pane.plot.setLabel(side, label, units=unit or None)
+            rendered = False
+        elif self.detector_picker:
             # Detector selection uses pixel edges 0..N and row zero at the top, without the raw viewer's mirror.
             rows, columns = panel.image.shape
             rect = QtCore.QRectF(0, 0, columns, rows)
@@ -367,6 +373,7 @@ class _KeyedImagePanel:
                 self.set_named_region(name, None, None)
         self.axes = axes
         self.pane.plot.setTitle(panel.title)
+        self.pane.setToolTip(f"{panel.title}. Drag to zoom into this map; right-click for plot controls.")
         for widget in (self.previous, self.selector, self.next):  # a plane with no index to step has none
             widget.setVisible(panel.navigation)
         if not panel.navigation:
@@ -470,6 +477,7 @@ class _KeyedTracePanel:
         self.curve.setData(np.asarray(panel.axis.values, dtype=float), np.asarray(panel.intensity, dtype=float))
         self.curve.setPen(pg.mkPen(color=color, width=1.4, style=QtCore.Qt.PenStyle.SolidLine))
         self.plot.setTitle(panel.title)
+        self.plot.setToolTip(f"{panel.title}. Drag to zoom into this curve; right-click for plot controls.")
         label, unit = _axis_presentation(panel.axis.label, panel.axis.unit)
         self.plot.setLabel("bottom", label, units=unit or None)
         self.plot.setLabel("left", panel.y_label)
