@@ -283,6 +283,21 @@ def apply_application_font(app, scale=DEFAULT_FONT_SCALE) -> str:
     return scale
 
 
+def application_fonts_match(app, scale=DEFAULT_FONT_SCALE) -> bool:
+    """Compare live application/class fonts with the immutable tier baseline."""
+    from pyqtgraph.Qt import QtGui
+    scale = normalize_font_scale(scale)
+    if app.font() != scaled_application_font(app, scale):
+        return False
+    offset = FONT_SCALE_TOKENS[scale].app_offset_pt
+    for name, (class_font, class_pt) in _BASELINE_CLASS_FONTS.items():
+        shifted = QtGui.QFont(class_font)
+        shifted.setPointSize(max(1, class_pt + offset))
+        if app.font(name) != shifted:
+            return False
+    return True
+
+
 def restore_platform_class_fonts(app, scale=None) -> int:
     """Put the platform's per-class fonts back, shifted by the tier's offset.
 

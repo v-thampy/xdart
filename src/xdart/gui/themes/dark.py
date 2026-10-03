@@ -20,12 +20,14 @@ from .accent import (
 )
 from .corners import (
     DEFAULT_CONTROLS_CARD_CORNERS,
+    current_controls_card_corners,
     normalize_controls_card_corners,
     rounded_container_radius,
     set_current_controls_card_corners,
 )
 from .spacing import (
     DEFAULT_SPACING,
+    current_spacing,
     normalize_spacing,
     set_current_spacing,
     spacing_tokens,
@@ -34,6 +36,7 @@ from .typography import (
     DEFAULT_FONT_SCALE,
     FONT_SCALE_TOKENS,
     apply_application_font,
+    application_fonts_match,
     calibration_button_font,
     current_font_scale,
     normalize_font_scale,
@@ -1457,10 +1460,9 @@ def apply_theme(
     1. ``QApplication.setFont`` first.  On its own it does NOT reach widgets
        while an application stylesheet is installed -- Qt's stylesheet style
        caches each widget's resolved font and only re-resolves on a re-polish.
-    2. ``setStyleSheet`` second, which forces exactly that re-polish.  Qt
-       re-polishes even for an identical stylesheet string, so reapplying the
-       same tier stays correct rather than becoming a no-op that strands the
-       new font.
+    2. ``setStyleSheet`` second, which forces exactly that re-polish. A complete
+       appearance already present in the live application skips this pass;
+       changed fonts or stylesheet state still require it.
     3. The platform per-class fonts third -- AFTER the stylesheet, because the
        first ``setStyleSheet`` on the application resets that hash to the
        platform theme's values (measured; see
@@ -1472,11 +1474,8 @@ def apply_theme(
     """
     font_scale = normalize_font_scale(font_scale)
     accent_color = normalize_accent_color(accent_color)
-    spacing = set_current_spacing(normalize_spacing(spacing))
-    controls_card_corners = set_current_controls_card_corners(
-        normalize_controls_card_corners(controls_card_corners)
-    )
-    apply_application_font(app, font_scale)
+    spacing = normalize_spacing(spacing)
+    controls_card_corners = normalize_controls_card_corners(controls_card_corners)
     qss = render_qss(
         name,
         font_scale=font_scale,
@@ -1507,17 +1506,30 @@ def apply_theme(
         # hard-coding 8.5pt here would have frozen them at Extra Large.
         qss += ("\nQPushButton#pyfai_calib, QPushButton#get_mask "
                 f"{{ font-size: {calibration_button_font(font_scale)}; }}\n")
+    try:
+        import pyqtgraph as pg
+    except ImportError:  # pragma: no cover
+        pg = None
+    if (app.styleSheet() == qss and current_font_scale() == font_scale
+            and current_spacing() == spacing
+            and current_controls_card_corners() == controls_card_corners
+            and application_fonts_match(app, font_scale)
+            and (pg is None or (
+                pg.getConfigOption("background") == SEABORN_BG
+                and pg.getConfigOption("foreground") == SEABORN_FG
+                and pg.getConfigOption("antialias") is True))):
+        return
+    set_current_spacing(spacing)
+    set_current_controls_card_corners(controls_card_corners)
+    apply_application_font(app, font_scale)
     app.setStyleSheet(qss)
     # After the stylesheet, never before: the first setStyleSheet on the
     # application resets the per-class font hash to the platform theme's sizes.
     restore_platform_class_fonts(app, font_scale)
-    try:
-        import pyqtgraph as pg
+    if pg is not None:
         pg.setConfigOption("background", SEABORN_BG)
         pg.setConfigOption("foreground", SEABORN_FG)
         pg.setConfigOption("antialias", True)
-    except ImportError:  # pragma: no cover
-        pass
     restyle_live_plots(font_scale)
 
 
