@@ -32,6 +32,7 @@ def test_only_the_shown_results_stay_in_memory_and_the_others_reload(qapp, tmp_p
     role = QtCore.Qt.ItemDataRole.UserRole
     try:
         page.load_form(_native_form(tmp_path, "multigeometry"))  # three outputs
+        _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
         paths = [page.results.item(row).data(role) for row in range(page.results.count())]
@@ -40,7 +41,7 @@ def test_only_the_shown_results_stay_in_memory_and_the_others_reload(qapp, tmp_p
         assert set(page._payloads) == {paths[-1]}
         page.results.setCurrentRow(0)
         _wait(page, qapp)
-        assert set(page._payloads) == {paths[0]} and page.frames.count() == 2
+        assert set(page._payloads) == {paths[0]} and page.frames.count() == 3
         # Overlay: the selected results
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
         page.results.setCurrentRow(2, select.ClearAndSelect)

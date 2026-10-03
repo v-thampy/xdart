@@ -20,6 +20,7 @@ from xrd_tools.analysis.stitch_operation import (
     StitchOperationExecution,
     StitchOperationResult,
     StitchOperationVerificationError,
+    read_stitch_contributor_view,
 )
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
@@ -207,13 +208,14 @@ class _FrameReadRequest:
     scan: str | None = None
     source_root: str | None = None
     full_raw: bool = False
+    scientific: bool = False
 
     def __post_init__(self):
         if (type(self.payload) is not AnalysisArtifactPayload
             or type(self.frame_index) is not int or self.frame_index < 0
             or (self.scan is not None and type(self.scan) is not str)
             or (self.source_root is not None and type(self.source_root) is not str)
-            or type(self.full_raw) is not bool):
+            or type(self.full_raw) is not bool or type(self.scientific) is not bool):
             raise TypeError("Stitch frame read request is invalid")
 
 
@@ -447,10 +449,10 @@ class StitchToolOwner:
                 artifact_path=shown,
             ))
 
-    def begin_frame_read(self, payload, frame_index, *, scan=None, source_root=None, full_raw=False):
+    def begin_frame_read(self, payload, frame_index, *, scan=None, source_root=None, full_raw=False, scientific=False):
         """Hydrate only a selected contributor on the existing serial worker."""
         request = _FrameReadRequest(payload, frame_index, scan,
-                                    None if source_root is None else str(source_root), full_raw)
+                                    None if source_root is None else str(source_root), full_raw, scientific)
         path = payload.inspection.path
         with self._lock:
             if self._finalization is not StitchOwnerFinalization.NONE:
@@ -578,9 +580,11 @@ class StitchToolOwner:
         if request.action is StitchOwnerAction.FRAME_READ:
             selected = request.frame_request
             publish("raw-frame", 0, 1)
-            view = read_contributing_frame_view(request.artifact_path, selected.frame_index,
+            view = (read_stitch_contributor_view(selected.payload, selected.frame_index,
+                scan=selected.scan, source_root=selected.source_root, cancel_token=cancel)
+                if selected.scientific else read_contributing_frame_view(request.artifact_path, selected.frame_index,
                 scan=selected.scan, source_root=selected.source_root, full_raw=selected.full_raw,
-                artifact_payload=selected.payload)
+                artifact_payload=selected.payload))
             publish("raw-frame", 1, 1)
             return StitchOwnerOutcome(StitchOwnerOutcomeKind.FRAME_READ,
                 frame_view=view, artifact_path=request.artifact_path)

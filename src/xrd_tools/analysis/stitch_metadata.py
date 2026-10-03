@@ -28,7 +28,7 @@ class StitchMetadataTable:
     table: MetadataTableResult
 
 
-def read_stitch_metadata(payload, *, source_root=None, cancel_token=None):
+def read_stitch_metadata(payload, *, source_root=None, cancel_token=None, source_id=None):
     """Read full experimental columns, retaining exact selected rows per source.
 
     Existing files have no persisted full experimental table. Missing or changed
@@ -50,6 +50,8 @@ def read_stitch_metadata(payload, *, source_root=None, cancel_token=None):
     results = []
     total_bytes = 0
     for member in members:
+        if source_id is not None and member["source"]["module_source_fingerprint"] != source_id:
+            continue
         if cancel_token is not None and cancel_token.is_set():
             break
         source = member["source"]
