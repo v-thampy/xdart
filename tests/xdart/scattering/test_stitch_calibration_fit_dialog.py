@@ -274,9 +274,9 @@ def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero
         page.shutdown()
 
 
-def test_a_twoc_arms_xrayutilities_file_covers_the_typed_range_with_nu_at_zero(qapp, tmp_path, monkeypatch):
+def test_a_twoc_arms_xrayutilities_file_covers_the_frames_with_nu_at_zero(qapp, tmp_path, monkeypatch):
     """Was: the window's xrayutilities fit of a twoc arm. Now every save writes the partner, checked
-    over the typed range; the held circle stays at zero."""
+    over the calibrated frames; the held circle stays at zero."""
     from xrd_tools.session.instrument import InstrumentGeometry
     (tmp_path / 'frames').mkdir()
     frames = _single_arm_frames(tmp_path)
@@ -285,7 +285,6 @@ def test_a_twoc_arms_xrayutilities_file_covers_the_typed_range_with_nu_at_zero(q
         dialog.set_instrument(InstrumentGeometry('twoc'))
         dialog.frames, dialog._frame_motors = frames, ('tth', None)
         dialog._render_frames()
-        dialog._fields['del_domain'].setText('0, 50')  # the typed range covers 2θ; nu stays at zero
         dialog.fit_button.click()
         _wait(dialog)
         page.set_field("backend", "xrayutilities histogram")
@@ -295,7 +294,7 @@ def test_a_twoc_arms_xrayutilities_file_covers_the_typed_range_with_nu_at_zero(q
         _wait(dialog)
         asset = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())
         assert asset['version'] == 3 and asset['acquisition']['source_motors'] == {'del': 'tth', 'nu': None}
-        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 50.], 'nu': [0., 0.]}
+        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [6., 42.], 'nu': [0., 0.]}
         # adoption keeps the backend; the Calibration names the pyFAI file, xrayutilities reads its partner
         assert page._value("backend") == "xrayutilities histogram"
         assert Path(page._value("geometry_path")) == target
@@ -309,7 +308,7 @@ def test_a_twoc_arms_xrayutilities_file_covers_the_typed_range_with_nu_at_zero(q
         page.shutdown()
 
 
-def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_typed_range_with_del_at_zero(qapp, tmp_path, monkeypatch):
+def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_frames_with_del_at_zero(qapp, tmp_path, monkeypatch):
     from xrd_tools.session.instrument import InstrumentGeometry
     (tmp_path / 'frames').mkdir()
     frames = _horizontal_frames(tmp_path)
@@ -318,7 +317,6 @@ def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_typed_range_with_d
         dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
         dialog.frames, dialog._frame_motors = frames, (None, 'tth')
         dialog._render_frames()
-        dialog._fields['nu_domain'].setText('0, 50')  # the typed range covers 2θ; del stays at zero
         dialog.fit_button.click()
         _wait(dialog)
         page.set_field("backend", "xrayutilities histogram")
@@ -328,7 +326,7 @@ def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_typed_range_with_d
         _wait(dialog)
         asset = json.loads((tmp_path / 'calibration' / 'twoc-horizontal.xu.json').read_text())
         assert asset['acquisition']['source_motors'] == {'del': None, 'nu': 'tth'}
-        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 0.], 'nu': [0., 50.]}
+        assert asset['validation']['validated_scan_domain_source_deg'] == {'del': [0., 0.], 'nu': [6., 42.]}
         assert page._value("backend") == "xrayutilities histogram"
         assert page._value("source_motors") == "nu=tth"
         assert page._arm_problem() is None
@@ -609,7 +607,6 @@ def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit
         _wait(dialog)
         assert 'Energy (keV)' in dialog.status.text() and not target.exists()
         dialog._fields['rough_energy'].setText(str(wavelength_m_to_energy_eV(.7293e-10) / 1000))
-        dialog._fields['del_domain'].setText('0, 40')  # nu stays at 0: only del's range is typed
         adopted = []
         dialog.calibrationSaved.connect(lambda path, backend: adopted.append((path, backend)))
         dialog.save_rough_button.click()
@@ -623,7 +620,7 @@ def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit
         saved = Diffractometer.from_pyfai_goniometer(
             json.loads(target.read_text()), source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
         assert saved.calibration.poni.dist == pytest.approx(.15)
-        assert saved.calibration.poni.wavelength == pytest.approx(.7293e-10, abs=0)  # metres: no 1e-12 abs
+        assert saved.calibration.poni.wavelength == pytest.approx(.7293e-10, rel=1e-15, abs=0)  # keV round trip
         assert not saved.stacked_arm.extended  # the mount held at 0, 0
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
         assert dialog.save_rough_button.isHidden()

@@ -90,6 +90,8 @@ def _encode(value, project):
             if not field.init:
                 continue  # fingerprints are recomputed by the exact form constructors
             item = getattr(value, field.name)
+            if kind is StitchToolForm and field.name == "allow_extrapolation" and not item:
+                continue  # Preserve default replay payloads; old notebooks restore the strict default.
             settings[field.name] = (_path(item, project, output=field.name == "output_path")
                                     if field.name in _PATHS.get(kind, ()) else _encode(item, project))
         return {"$type": kind.__name__, "fields": settings}
@@ -129,6 +131,8 @@ def _decode(value, data_root, output_root):
     if set(value) == {"$type", "fields"} and value["$type"] in _TYPES and type(value["fields"]) is dict:
         cls = _TYPES[value["$type"]]
         allowed = {field.name for field in fields(cls) if field.init}
+        if cls is StitchToolForm and "allow_extrapolation" not in value["fields"]:
+            allowed.remove("allow_extrapolation")
         if set(value["fields"]) != allowed:
             raise ValueError("WORKFLOW_FIELDS_INVALID: operator fields must be exact")
         settings = {key: _decode(item, data_root, output_root) for key, item in value["fields"].items()}

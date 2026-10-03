@@ -201,12 +201,14 @@ class SectionCard(QtWidgets.QFrame):
         number: str = "",
         accent: str = "neutral",
         collapsible: bool = True,
+        compact: bool = False,
     ):
         super().__init__(parent)
         self.setObjectName("controlsSectionCard")
         self.setProperty("accent", accent)
         self._collapsed = False
         self._collapsible = bool(collapsible)
+        self._compact = bool(compact)
         outer = QtWidgets.QVBoxLayout(self)
         self._outer_layout = outer
         outer.setContentsMargins(0, 0, 0, 0)
@@ -264,6 +266,13 @@ class SectionCard(QtWidgets.QFrame):
         self.embedded_layout.setSpacing(0)
         self.embedded.hide()
         self.body_layout.addWidget(self.embedded)
+        if self._compact:
+            self.setObjectName("controlsInlineReadiness")
+            self.header.setObjectName("controlsInlineReadinessHeader")
+            for widget in (self.toggle, self.chip, self.title, self.body):
+                widget.hide()
+            header_lay.setStretchFactor(self.status, 1)
+            self.status.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self._apply_spacing(current_spacing_tokens())
 
     def changeEvent(self, event) -> None:
@@ -276,10 +285,10 @@ class SectionCard(QtWidgets.QFrame):
 
     def _apply_spacing(self, tokens: SpacingTokens) -> None:
         self._header_layout.setContentsMargins(
-            _spaced(7, tokens),
-            _spaced(5, tokens),
-            _spaced(8, tokens),
-            _spaced(5, tokens),
+            0 if self._compact else _spaced(7, tokens),
+            0 if self._compact else _spaced(5, tokens),
+            0 if self._compact else _spaced(8, tokens),
+            0 if self._compact else _spaced(5, tokens),
         )
         self._header_layout.setSpacing(_spaced(7, tokens))
         self.body_layout.setContentsMargins(

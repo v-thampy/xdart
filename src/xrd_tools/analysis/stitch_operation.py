@@ -1550,6 +1550,7 @@ class XuStitchOperationPlan:
     azimuth_range_1d: tuple[float, float] | None = None
     #: Decision 4's foil choices (``StitchFoilNormalization``); None: the monitor alone, or none.
     foil_normalization: StitchFoilNormalization | None = None
+    allow_extrapolation: bool = False
     _mask_receipt: object = field(init=False, default=None, repr=False)
     _dark_receipt: object = field(init=False, default=None, repr=False)
     _flat_receipt: object = field(init=False, default=None, repr=False)
@@ -1562,6 +1563,8 @@ class XuStitchOperationPlan:
 
     def __post_init__(self) -> None:
         _native_plan_fields(self)
+        if type(self.allow_extrapolation) is not bool:
+            raise TypeError("allow_extrapolation must be an exact bool")
         if type(self.frame_screen) is not FrameScreenPolicy:
             raise TypeError("frame screen must be an exact FrameScreenPolicy")
         if not self.native_records and (self.dark_path is not None or self.flat_path is not None):
@@ -1628,7 +1631,8 @@ class XuStitchOperationPlan:
                 # a 1-D plan keeps the identity it had
                 + (() if self.mode == "1d" else (("xu-map-v1",) + _xu_map_grid(self),))
                 + _map_axis_identity(self) + _chi_window_identity(self)
-                + _foil_normalization_identity(self),
+                + _foil_normalization_identity(self)
+                + ((("xu-allow-extrapolation", True),) if self.allow_extrapolation else ()),
             ),
         )
 
@@ -1935,6 +1939,7 @@ def _xu_observations(
     nu_values: list[float] = []
     energy_values: list[float] = []
     extrapolation_count = 0
+    validated_extrapolation_count = 0
     validated = validation["validated_scan_domain_source_deg"]
     control = validation["control_domain_source_deg"]
     # a refined calibration's scans are checked against the energy they recorded
@@ -1960,10 +1965,12 @@ def _xu_observations(
             <= nu_value
             <= float(validated["nu"][1])
         ):
-            raise StitchOperationRefused(
-                "XU_CALIBRATION_DOMAIN_EXCEEDED",
-                "selected source angles exceed the validated XU domain",
-            )
+            if not plan.allow_extrapolation:
+                raise StitchOperationRefused(
+                    "XU_CALIBRATION_DOMAIN_EXCEEDED",
+                    "selected source angles exceed the validated XU domain",
+                )
+            validated_extrapolation_count += 1
         if not (
             float(control["del"][0])
             <= del_value
@@ -2000,11 +2007,8 @@ def _xu_observations(
             else (float(min(energy_values)), float(max(energy_values)))
         ),
         extrapolation_count,
-        (
-            ()
-            if extrapolation_count == 0
-            else ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",)
-        ),
+        XuStitchScienceObservations.extrapolation_warnings(extrapolation_count, validated_extrapolation_count),
+        validated_extrapolation_count,
     )
 
 
@@ -2217,6 +2221,7 @@ def _xu_provenance(
         "corrections": _portable_json_value(asset["corrections"]),
         "plan": {
             "backend": plan.backend,
+            **({"allow_extrapolation": True} if plan.allow_extrapolation else {}),
             "mode": plan.mode,
             "unit": plan.unit,
             "method": plan.method,
@@ -3147,6 +3152,7 @@ class StitchOperationExecution:
                                                         map_radial_range=plan.map_radial_range)),
                     **({} if plan.azimuth_range_1d is None else dict(azimuth_range_1d=plan.azimuth_range_1d)),
                     workers=workers,
+                    allow_extrapolation=plan.allow_extrapolation,
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts)

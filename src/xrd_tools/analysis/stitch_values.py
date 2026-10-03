@@ -293,6 +293,8 @@ class StitchToolForm:
     #: transmission (the monitor before the foils). None: the monitor alone, or none, with the identity a
     #: form without the foil choices had.
     foil_normalization: StitchFoilNormalization | None = None
+    #: Explicitly permit XU frames outside the poses validated at calibration export.
+    allow_extrapolation: bool = False
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -308,6 +310,10 @@ class StitchToolForm:
         output = _absolute_path(self.output_path, "output path")
         if self.backend not in {"multigeometry", "xu_hist"}:
             raise ValueError("Stitch backend must be multigeometry or xu_hist")
+        if type(self.allow_extrapolation) is not bool:
+            raise TypeError("allow_extrapolation must be an exact bool")
+        if self.allow_extrapolation and self.backend != "xu_hist":
+            raise ValueError("calibration extrapolation is an XU option")
         native = self.source_selection is not None
         if native and type(self.source_selection) is not StitchSourceSelection:
             raise TypeError("native source selection must be exact StitchSourceSelection")
@@ -561,11 +567,9 @@ class StitchToolForm:
                                      None if foil.exposure_selector is None
                                      else (foil.exposure_selector.name, foil.exposure_selector.occurrence),
                                      foil.absorption_lengths))
-        object.__setattr__(
-            self,
-            "fingerprint",
-            analysis_canonical_fingerprint(domain, canonical),
-        )
+        if self.allow_extrapolation:
+            canonical = (canonical, ("xu-allow-extrapolation", True))
+        object.__setattr__(self, "fingerprint", analysis_canonical_fingerprint(domain, canonical))
 
     def _native_options(self, native: bool) -> None:
         if self.frame_screen not in EXCLUDE_CHOICES:
@@ -1057,6 +1061,7 @@ def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
                 npt_1d=form.npt_1d,
                 monitor_selector=form.monitor_selector,
                 max_frame_bytes=form.max_frame_bytes,
+                allow_extrapolation=form.allow_extrapolation,
             )
         output = ModuleOutputRequest(
             form.output_path,

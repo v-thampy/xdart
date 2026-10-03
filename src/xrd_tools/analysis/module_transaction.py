@@ -728,7 +728,7 @@ def _validate_xu_stitch_v2_intent(
         or type(corrections) is not dict
         or not corrections
         or type(plan) is not dict
-        or set(plan) - {"frame_screen", "corrections", "gi", "map", "azimuth_range_1d", "foil_normalization"}
+        or set(plan) - {"frame_screen", "corrections", "gi", "map", "azimuth_range_1d", "foil_normalization", "allow_extrapolation"}
         != {
             "backend",
             "mode",
@@ -744,6 +744,7 @@ def _validate_xu_stitch_v2_intent(
             "plan_fingerprint",
         } | ({"native_records", "conditioning", "mask"} if native else set())
         or ("frame_screen" in plan and type(plan["frame_screen"]) is not dict)
+        or ("allow_extrapolation" in plan and plan["allow_extrapolation"] is not True)
         or ("gi" in plan and (not native or type(plan["gi"]) is not dict))
         # I(q)'s χ window: native, only when it has one
         or ("azimuth_range_1d" in plan and (not native or type(plan["azimuth_range_1d"]) is not list

@@ -174,6 +174,9 @@ def test_real_eiger_scan_fits_after_a_quarter_turn(qapp, tmp_path):
         detect(dialog)
         assert dialog._direct_beam_request()[1] == 'del'
         assert dialog._direct_beam_request()[2]['motion'] == 'horizontal'
+        summary = dialog.beam_readiness.status.text()
+        assert summary.startswith('del scan (-1, 1) · 51 pts · Δx ')
+        assert ' px, Δy ' in summary and summary.endswith(')')
         dialog.beam_button.click()
         settle(dialog)
         result = dialog._distance_result

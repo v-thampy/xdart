@@ -325,9 +325,7 @@ def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
 
 
 def test_the_tabs_hold_the_instrument_then_advanced_above_the_fits_and_the_ranges_beside_save(tmp_path):
-    """The maintainer's four tabs (2026-09-30): the Diffractometer above the Detector; Advanced, collapsed
-    and holding the energy option, above both fits; Refine from the whole scan open; the xrayutilities
-    ranges, which only the saves read, beside Save."""
+    """Shared Advanced holds conditioning; scan coverage replaces the manual export ranges."""
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     instrument = dialog._tab_pages['instrument'].widget().layout()
     assert instrument.indexOf(dialog._diffractometer_box) < instrument.indexOf(dialog._detector_box)
@@ -337,12 +335,16 @@ def test_the_tabs_hold_the_instrument_then_advanced_above_the_fits_and_the_range
     assert (calibrate.indexOf(dialog._advanced_card) < calibrate.indexOf(dialog.fit_button)
             < calibrate.indexOf(dialog._refine_card))
     assert all(dialog._advanced_card.isAncestorOf(widget)
-               for widget in (dialog.refine_energy, dialog._fields['energy_bound'], dialog.scales))
+               for widget in (dialog.refine_energy, dialog._fields['energy_bound'], dialog.scales,
+                              dialog.threshold_range))
     assert dialog._advanced_card.body.isHidden() and not dialog._refine_card.body.isHidden()
-    assert calibrate.indexOf(dialog._xu_ranges) == calibrate.indexOf(dialog.save_button) - 1
-    for key in ('del_domain', 'nu_domain'):
-        assert dialog._xu_ranges.isAncestorOf(dialog._fields[key])
-        assert not dialog._advanced_card.isAncestorOf(dialog._fields[key])
+    assert not {'del_domain', 'nu_domain'} & dialog._fields.keys()
+    assert dialog.show_calibration_fit_button.parentWidget() is dialog.save_button.parentWidget()
+    buttons = calibrate.itemAt(calibrate.count() - 1).layout()
+    assert buttons.indexOf(dialog.show_calibration_fit_button) == 0
+    assert buttons.indexOf(dialog.save_button) == 1
+    assert dialog._row_of[dialog.refine_seed].isAncestorOf(dialog._fields['refine_frames'])
+    assert dialog.fit_button.text() == 'Global fit of calibrated frames'
     # Skip keeps the wavelength: a frame whose scan records no energy is calibrated at it
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
     assert dialog._row_visible('rough_energy') and not dialog._row_visible('beam_pixel')
@@ -1020,20 +1022,8 @@ def test_each_page_opens_the_shared_calibration_window_with_its_own_context(tmp_
             dialog.deleteLater()
 
 
-def test_only_stitchs_window_says_pyfai_multigeometry_has_no_range_limit(tmp_path):
-    """G8c's residual: the del/nu range tips' closing sentence is about Stitch's Backend choice, so an RSM
-    window (which grids with the xrayutilities file alone) leaves it out."""
-    from pyqtgraph import QtWidgets
-
-    def range_tips(page):
+def test_shared_calibration_windows_derive_xu_coverage_from_the_scan(tmp_path):
+    for page in ('Stitch', 'RSM'):
         dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
-        found = [dialog._fields[key].toolTip() or dialog._fields[key].parentWidget().toolTip()
-                 for key in ('del_domain', 'nu_domain')]
-        everything = [widget.toolTip() for widget in dialog.findChildren(QtWidgets.QWidget) if widget.toolTip()]
+        assert not {'del_domain', 'nu_domain'} & dialog._fields.keys()
         dialog.close()
-        return found, everything
-    stitch, _ = range_tips('Stitch')
-    assert all(tip.endswith('pyFAI MultiGeometry has no such limit.') for tip in stitch)
-    rsm, everything = range_tips('RSM')
-    assert all(tip.endswith("Blank: the calibrant scan's span.") for tip in rsm)
-    assert not [tip for tip in everything if 'MultiGeometry' in tip]

@@ -103,6 +103,39 @@ def test_form_refuses_pyfai_options_outside_native_pyfai(tmp_path):
         replace(legacy, frame_screen="partial")
 
 
+def test_xu_extrapolation_choice_reaches_plan_settings_and_replay(qapp, tmp_path):
+    from xrd_tools.notebooks.operation_replay import capture_stitch_form, _restore_forms
+    form = _native_form(tmp_path, "xu_hist", scans="1")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        assert not page.build_form().allow_extrapolation
+        page.set_field("xu_coverage", "Allow extrapolation (warn)")
+        enabled = page.build_form()
+        assert enabled.allow_extrapolation and enabled.fingerprint != form.fingerprint
+        prepared = prepare_stitch_tool(enabled)
+        assert prepared.request.plan.allow_extrapolation
+        assert any("extrapolation" in warning.lower() for warning in prepared.warnings)
+        settings = page.settings()
+        page.set_field("xu_coverage", "Validated angles only")
+        page.apply_settings(settings)
+        assert page.build_form().allow_extrapolation
+        page.load_form(enabled)
+        assert page.build_form().fingerprint == enabled.fingerprint
+        configuration = capture_stitch_form(enabled)
+        restored, = _restore_forms("stitch", configuration, data_root=tmp_path, output_root=tmp_path)
+        assert restored.fingerprint == enabled.fingerprint and restored.allow_extrapolation
+        legacy = capture_stitch_form(form)
+        legacy["forms"][0]["fields"].pop("allow_extrapolation", None)
+        restored, = _restore_forms("stitch", legacy, data_root=tmp_path, output_root=tmp_path)
+        assert restored.fingerprint == form.fingerprint and not restored.allow_extrapolation
+        page.set_field("backend", "pyFAI MultiGeometry")
+        assert not page._rows["xu_coverage"].editor.isEnabled()
+        assert not page.build_form().allow_extrapolation
+    finally:
+        _close(page, qapp)
+
+
 def test_frame_screen_note_names_excluded_and_kept_partial_frames():
     assert frame_screen_note(None) == ""
     assert frame_screen_note({"excluded": [], "partial": []}) == ""

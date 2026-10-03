@@ -221,6 +221,7 @@ def _xu_prepared(
     del_value: float = 14.0,
     nu_value: float = -10.0,
     energy_eV: float | None = 17000.018,
+    allow_extrapolation: bool = False,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     root = tmp_path / "xu-source"
@@ -277,10 +278,11 @@ def _xu_prepared(
         calibration,
         effective,
         1.0,
-        5.2,
+        9.0 if allow_extrapolation else 5.2,
         npt_1d=64,
         monitor_selector=MetadataColumnSelector("I0"),
         max_frame_bytes=4 * 1024 * 1024,
+        **({"allow_extrapolation": True} if allow_extrapolation else {}),
     )
     output_root = tmp_path / "xu-output"
     output_root.mkdir()
@@ -606,6 +608,34 @@ def test_xu_prepare_refuses_energy_and_domain_before_operation_request(tmp_path)
     with pytest.raises(StitchOperationRefused) as domain:
         _xu_prepared(tmp_path / "domain", del_value=46.0)
     assert domain.value.code == "XU_CALIBRATION_DOMAIN_EXCEEDED"
+
+
+def test_xu_extrapolation_opt_in_commits_with_coverage_warning_and_immutable_asset(tmp_path):
+    request = _xu_prepared(tmp_path, del_value=46.0, allow_extrapolation=True)
+    asset = Path(request.plan.calibration.project_root, request.plan.calibration.lexical_relative_path)
+    before = asset.read_bytes()
+    assert request.provenance["plan"]["allow_extrapolation"] is True
+    assert request.provenance["observations"]["validated_domain_extrapolation_frame_count"] == 1
+    assert request.provenance["observations"]["warnings"] == ["XU_CALIBRATION_DOMAIN_EXCEEDED_ALLOWED"]
+    strict = replace(request.plan, allow_extrapolation=False)
+    assert strict.fingerprint != request.plan.fingerprint
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    persisted = json.loads(result.payload.provenance_json)
+    assert persisted["plan"]["allow_extrapolation"] is True
+    assert persisted["observations"]["validated_domain_extrapolation_frame_count"] == 1
+    assert asset.read_bytes() == before
+
+
+def test_xu_extrapolation_opt_in_keeps_energy_refusal_and_default_observations(tmp_path):
+    with pytest.raises(StitchOperationRefused) as energy:
+        _xu_prepared(tmp_path / "energy", energy_eV=18000.0, allow_extrapolation=True)
+    assert energy.value.code == "XU_SOURCE_ENERGY_CONFLICT"
+    request = _xu_prepared(tmp_path / "default")
+    assert replace(request.plan, allow_extrapolation=False).fingerprint == request.plan.fingerprint
+    assert "allow_extrapolation" not in request.provenance["plan"]
+    assert "validated_domain_extrapolation_frame_count" not in request.provenance["observations"]
+    assert request.provenance["observations"]["warnings"] == []
 
 
 def test_xu_asset_drift_after_prepare_refuses_before_science_or_output(tmp_path):

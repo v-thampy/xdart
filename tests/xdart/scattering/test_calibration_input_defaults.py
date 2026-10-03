@@ -54,6 +54,9 @@ def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path)
         assert dialog._row_visible('images') and dialog._row_visible('entry')
         assert 'beam_scan001_' in dialog._fields['stem'].placeholderText()
         assert dialog._spec().kind is SourceKind.SPEC
+        assert dialog.frames == ()  # Refine reads the scan without staged manual-calibration frames.
+        assert dialog._calibrant_source_ready()
+        assert '5 images' in dialog.active_source_row.editor.text()
         dialog.list_button.click()
         settle(dialog)
         assert len(dialog._choices) == 5, dialog.status.text()
@@ -72,6 +75,26 @@ def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path)
         dialog.close()
 
 
+def test_calibrant_metadata_only_spec_is_not_ready_for_refinement(qapp, tmp_path):
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#O0 nu  energy\n#S 1 ascan del 1 -1 2 1\n#P0 0 11000\n'
+                    '#N 1\n#L del\n1\n0\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('spec_container'))
+        commit(dialog, 'source', spec)
+        assert '11.0000 keV from SPEC' in dialog._fields['rough_energy'].placeholderText()
+        assert not dialog._calibrant_source_ready()
+        assert '0 images' in dialog.active_source_row.editor.text()
+        assert 'folder' in dialog.active_source_row.editor.text().lower()
+        dialog.refine_button.click()
+        assert not dialog.active()
+        assert dialog.fit is None
+        assert 'calibrant source' in dialog.status.text().lower()
+    finally:
+        dialog.close()
+
+
 def test_rough_rows_share_existing_controls_and_keep_mode_visibility(qapp, tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
@@ -79,7 +102,9 @@ def test_rough_rows_share_existing_controls_and_keep_mode_visibility(qapp, tmp_p
         assert dialog._parts['rough_mount'][0] == 'beam_pixel'
         assert 'beam_motor' not in dialog._fields and not hasattr(dialog, 'motion')
         assert dialog._label('beam_pixel').text() == 'Direct beam pixel (x, y)'
-        assert 'DIRECT-BEAM' in dialog.beam_readiness.title.text()
+        assert dialog.beam_readiness.title.isHidden()
+        assert dialog.beam_readiness.objectName() == 'controlsInlineReadiness'
+        assert dialog.tabs.cornerWidget().text() == '?'
         for kind in ('spec_series', 'spec_container', 'nexus'):
             dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(kind))
             assert dialog._row_visible('beam_entry') == (kind != 'spec_series')

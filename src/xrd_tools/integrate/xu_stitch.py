@@ -1064,6 +1064,13 @@ class XuStitchScienceObservations:
     source_energy_range_eV: tuple[float, float] | None
     control_domain_extrapolation_frame_count: int
     warnings: tuple[str, ...]
+    validated_domain_extrapolation_frame_count: int = 0
+
+    @staticmethod
+    def extrapolation_warnings(control_count, validated_count):
+        if validated_count:
+            return ("XU_CALIBRATION_DOMAIN_EXCEEDED_ALLOWED",)
+        return ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",) if control_count else ()
 
     def __post_init__(self) -> None:
         ranges = (self.source_del_range_deg, self.source_nu_range_deg)
@@ -1092,14 +1099,11 @@ class XuStitchScienceObservations:
             )
             or type(self.control_domain_extrapolation_frame_count) is not int
             or self.control_domain_extrapolation_frame_count < 0
+            or type(self.validated_domain_extrapolation_frame_count) is not int
+            or not 0 <= self.validated_domain_extrapolation_frame_count <= self.control_domain_extrapolation_frame_count
             or type(self.warnings) is not tuple
-            or self.warnings
-            not in {
-                (),
-                ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",),
-            }
-            or bool(self.control_domain_extrapolation_frame_count)
-            != bool(self.warnings)
+            or self.warnings != self.extrapolation_warnings(
+                self.control_domain_extrapolation_frame_count, self.validated_domain_extrapolation_frame_count)
         ):
             raise TypeError("XU Stitch observations are invalid")
 
@@ -1116,6 +1120,8 @@ class XuStitchScienceObservations:
                 self.control_domain_extrapolation_frame_count
             ),
             "warnings": list(self.warnings),
+            **({"validated_domain_extrapolation_frame_count": self.validated_domain_extrapolation_frame_count}
+               if self.validated_domain_extrapolation_frame_count else {}),
         }
 
 
@@ -1193,8 +1199,12 @@ def run_xu_hist_stitch_1d(
     map_radial_range: tuple[float, float] | None = None,
     workers: int = 1,
     azimuth_range_1d: tuple[float, float] | None = None,
+    allow_extrapolation: bool = False,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
+
+    ``allow_extrapolation`` admits poses beyond the export validation envelope,
+    recording their count and warning; all other scientific checks still apply.
 
     ``workers`` above 1 bins that many frames at once on threads (``frame_workers``): every
     xrayutilities call stays on this thread, the one its runtime session belongs to, and only the
@@ -1247,6 +1257,8 @@ def run_xu_hist_stitch_1d(
             or any(type(v) not in {int, float} or not math.isfinite(v) for v in azimuth_range_1d)
             or azimuth_range_1d[0] >= azimuth_range_1d[1]):
         raise ValueError("I(q)'s χ window must be finite and increasing")
+    if type(allow_extrapolation) is not bool:
+        raise TypeError("allow_extrapolation must be an exact bool")
     if type(receipt) is not XuStitchCalibrationReceipt:
         raise TypeError("XU Stitch science requires exact calibration receipt")
     if unit not in {"q_A^-1", "2th_deg"}:
@@ -1323,6 +1335,7 @@ def run_xu_hist_stitch_1d(
     nu_values: list[float] = []
     energy_values: list[float] = []
     extrapolation_count = 0
+    validated_extrapolation_count = 0
     validated_domain = validation["validated_scan_domain_source_deg"]
     control_domain = validation["control_domain_source_deg"]
     for label in labels:
@@ -1354,10 +1367,12 @@ def run_xu_hist_stitch_1d(
             <= nu_value
             <= float(validated_domain["nu"][1])
         ):
-            raise XuStitchScienceRefused(
-                "XU_CALIBRATION_DOMAIN_EXCEEDED",
-                "frame lies outside the validated SURFACE angle domain",
-            )
+            if not allow_extrapolation:
+                raise XuStitchScienceRefused(
+                    "XU_CALIBRATION_DOMAIN_EXCEEDED",
+                    "frame lies outside the validated SURFACE angle domain",
+                )
+            validated_extrapolation_count += 1
         if not (
             float(control_domain["del"][0])
             <= del_value
@@ -1438,11 +1453,8 @@ def run_xu_hist_stitch_1d(
             else (float(min(energy_values)), float(max(energy_values)))
         ),
         extrapolation_count,
-        (
-            ()
-            if extrapolation_count == 0
-            else ("XU_CALIBRATION_EXTRAPOLATION_WITHIN_VALIDATED_SCAN",)
-        ),
+        XuStitchScienceObservations.extrapolation_warnings(extrapolation_count, validated_extrapolation_count),
+        validated_extrapolation_count,
     )
     # [signal, normalization, count] of I(q) and, for GI, of the cut, and of a Stitch 2D's map
     totals = [np.zeros(npt, dtype=np.float64) for _ in range(3)]

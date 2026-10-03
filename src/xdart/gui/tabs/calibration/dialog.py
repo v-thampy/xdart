@@ -144,12 +144,13 @@ def _dispatch_job(request, cancelled, publish):
         from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
         prefix, spec, folder, stem = arguments
         energy = calibration_source_energy_eV(spec) if not prefix else None
-        source_ready = False
+        frame_count, source_problem = None, ''
         if not prefix:
             try:
-                source_ready = bool(source_frame_choices(spec, ()))
-            except (ValueError, KeyError, OSError):
-                pass  # Energy discovery is independent of missing or incomplete images.
+                frame_count = len(source_frame_choices(spec, ()))
+            except (ValueError, KeyError, OSError) as error:
+                frame_count, source_problem = 0, str(error)
+                # Energy discovery is independent of missing or incomplete images.
         automatic = None
         if spec.kind is SourceKind.SPEC and not stem:
             files = find_spec_image_files(folder, Path(spec.uri).stem, spec.options['scan'])
@@ -157,7 +158,7 @@ def _dispatch_job(request, cancelled, publish):
                 automatic = spec_image_stem(files[0], Path(spec.uri).stem, spec.options['scan'])
         if cancelled.is_set():
             raise OperationCancelled('source metadata cancelled')
-        return prefix, energy, automatic, source_ready
+        return prefix, energy, automatic, frame_count, source_problem
     if kind == 'refine':
         from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
         spec, seed, options = arguments
@@ -237,7 +238,8 @@ def _dispatch_job(request, cancelled, publish):
             if kind == 'beam_detect':
                 motion, delta, endpoints = infer_direct_beam_motion(list(inputs.images), orientation=orientation,
                     cancelled=cancelled, return_details=True, **options)
-                return motor, motion, delta, tuple(float(inputs.angles_deg[index]) for index in endpoints)
+                return (motor, motion, delta, tuple(float(inputs.angles_deg[index]) for index in endpoints),
+                        len(inputs.angles_deg))
             energy, held_readings = direct_beam_pose(spec, motor, held)
             def images():
                 for frame in inputs.images:
@@ -462,6 +464,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._source_energy_eV = None
         self._pending_source_details = None
         self._calibrant_ready_key = None
+        self._calibrant_frame_count = None
+        self._calibrant_source_problem = ''
         self._restoring_fields = False
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
         self._frame_motors = ('del', 'nu')
@@ -482,12 +486,16 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._rows = {}
         self._parts = {}
         outer = QtWidgets.QVBoxLayout(self)
-        heading = QtWidgets.QLabel('Describe the instrument, start from a rough geometry (a direct-beam scan, a typed '
-                                   'distance, or skip), select representative frames of a calibrant scan, calibrate '
-                                   'each image, then fit and save one geometry.')
-        heading.setWordWrap(True)
-        outer.addWidget(heading)
         self.tabs = QtWidgets.QTabWidget()
+        help_button = QtWidgets.QToolButton()
+        help_button.setText('?')
+        help_text = ('Describe the instrument, start from a rough geometry (a direct-beam scan, a typed '
+                     'distance, or skip), select representative frames of a calibrant scan, calibrate '
+                     'each image, then fit and save one geometry.')
+        help_button.setToolTip(help_text)
+        help_button.clicked.connect(lambda: QtWidgets.QToolTip.showText(
+            help_button.mapToGlobal(help_button.rect().bottomLeft()), help_text, help_button))
+        self.tabs.setCornerWidget(help_button, QtCore.Qt.TopRightCorner)
         self._tab_pages = {}
         outer.addWidget(self.tabs, 1)
         # Four tabs (maintainer, 2026-09-30): the instrument, a rough geometry (it predicts every
@@ -690,6 +698,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         if not prefix:
             self._source_energy_eV = None
             self._calibrant_ready_key = None
+            self._calibrant_frame_count = None
+            self._calibrant_source_problem = ''
             self._fields['rough_energy'].setPlaceholderText('Auto · scan energy unavailable')
             self._source_details_key = self._energy_source_key()
         path = self._text(prefix + 'source')
@@ -721,6 +731,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             return
         self._source_energy_eV = None
         self._calibrant_ready_key = None
+        self._calibrant_frame_count = None
+        self._calibrant_source_problem = ''
         self._choices = []
         self._fields['rough_energy'].setPlaceholderText('Auto · scan energy unavailable')
         self._update_fit_source_label()
@@ -777,6 +789,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                     if self.source_kind.currentData() != 'nexus_stack' else '')
         else:
             text = 'Select a valid calibrant source and read its metadata (3 · Calibrant scan)'
+        if self._calibrant_frame_count is not None:
+            text += f' · {self._calibrant_frame_count} images'
+        if self._calibrant_source_problem:
+            text += f' · {self._calibrant_source_problem}'
         self.active_source_row.editor.setText(text)
         self.active_source_row.editor.setToolTip(text)
 
@@ -832,17 +848,6 @@ class CalibrationDialog(QtWidgets.QDialog):
                          + _PAGE_USE.get(self.context.page, {}).get('energy_field', '') + '.')
         self._fields['rough_energy'].setMinimumWidth(300)
         self._fields['rough_energy'].editingFinished.connect(self._render_frames)
-        from xdart.gui.widgets.controls_panel import RangeRow
-        self.threshold_range = RangeRow(label='Threshold',
-            low={'path': ('Calibration', 'min'), 'value': 0},
-            high={'path': ('Calibration', 'max'), 'value': None, 'placeholder': 'Auto'},
-            toggle={'path': ('Calibration', 'enabled'), 'value': False,
-                    'tooltip': 'Enable calibration-only pixel filtering; raw images and Stitch thresholds stay unchanged.'},
-            display_decimals=0)
-        self.threshold_range.valueChanged.connect(self._threshold_edited)
-        form.addRow(self.threshold_range.label, self.threshold_range)
-        self._fields['saturation'].editingFinished.connect(self._show_threshold)
-        self._show_threshold()
         self.source_kind.currentIndexChanged.connect(self._sync_source_rows)
         self._fields['source'].textChanged.connect(self._calibrant_source_changed)
         for key in ('scan', 'entry', 'images', 'stem'):
@@ -985,6 +990,18 @@ class CalibrationDialog(QtWidgets.QDialog):
         # Above both buttons, as both fits take its options; collapsed (maintainer, 2026-09-30:
         # "Advanced should Move above 'Fit the Calibrated frames'", the energy option inside it).
         self._advanced_card, options = self._card(layout, 'Advanced')
+        from xdart.gui.widgets.controls_panel import RangeRow
+        self.threshold_range = RangeRow(label='Threshold',
+            low={'path': ('Calibration', 'min'), 'value': 0},
+            high={'path': ('Calibration', 'max'), 'value': None, 'placeholder': 'Auto'},
+            toggle={'path': ('Calibration', 'enabled'), 'value': False,
+                    'tooltip': 'Filter pixels for calibrant ring finding and automatic refinement; '
+                               'raw images and Stitch processing thresholds stay unchanged.'},
+            display_decimals=0)
+        self.threshold_range.valueChanged.connect(self._threshold_edited)
+        options.addRow(self.threshold_range.label, self.threshold_range)
+        self._fields['saturation'].editingFinished.connect(self._show_threshold)
+        self._show_threshold()
         # The energy, refined within ± a bound of the recorded one (maintainer, 2026-09-29: "add a
         # refine energy toggle. If selected there should be an option to set the constraint - just
         # one number for +-that number"); Fit and Refine both take it. On by default, ±100 eV
@@ -1043,7 +1060,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                                             '± 0.05 mm for each sample displacement, ± 5 % for the distance.')
         self.reset_bounds_button.clicked.connect(self._reset_bounds)
         options.addRow(self.reset_bounds_button)
-        self.fit_button = QtWidgets.QPushButton('Fit the calibrated frames')
+        self.fit_button = QtWidgets.QPushButton('Global fit of calibrated frames')
         self.fit_button.setToolTip('Fits one detector-arm geometry to the ring points picked on the frames '
                                    'marked Complete above. Needs three of them.')
         self.fit_button.clicked.connect(self._fit)
@@ -1056,6 +1073,10 @@ class CalibrationDialog(QtWidgets.QDialog):
             tip='Current fit: the fit just made above. Geometry file: a geometry this window saved. Rough '
                 'geometry: the distance and direct-beam pixel of 2 · Rough geometry, with no frame calibrated '
                 '(on 17-2\'s LaB6 scan it refines about as well as from a ring fit).')
+        self._formrows['refine_seed'] = self._row_of[self.refine_seed]
+        self._attach('refine_frames', 'refine_seed', 'Frame budget', '48', width=90,
+                     tip='At most this many frames of the calibrant scan are searched for ring points, '
+                         'spread across its angles. More: better coverage, slower.')
         self._edit(auto, 'refine_seed_path', 'Geometry file', chooser='JSON (*.json);;All files (*)',
                    tip='A geometry this window saved (a stacked or single detector arm). Until this session '
                        'has its own fit, it also predicts each frame\'s rings.')
@@ -1066,9 +1087,6 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._fields['refine_seed_path'].editingFinished.connect(self._render_frames)
         self._fields['refine_seed_path'].textChanged.connect(self._sync_refine_rows)
         self.refine_seed.currentIndexChanged.connect(self._sync_refine_rows)
-        self._edit(auto, 'refine_frames', 'Frame budget', '48',
-                   tip='At most this many frames of the calibrant scan are searched for ring points, spread '
-                       'across its angles. More: better coverage, slower.')
         self.refine_button = QtWidgets.QPushButton('Refine automatically')
         self.refine_button.setToolTip('Finds ring points on frames across the whole calibrant scan, starting '
                                       'from the geometry above, and keeps the detector mount and sample offset '
@@ -1084,21 +1102,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                                                     'its ring (opened after every Fit or Refine).')
         self.show_calibration_fit_button.clicked.connect(self._show_calibration_fit)
         self.show_calibration_fit_button.setEnabled(False)
-        layout.addWidget(self.show_calibration_fit_button)
-        # Only the saves read these, so they sit beside Save (maintainer, 2026-09-30)
-        self._xu_ranges = QtWidgets.QWidget()
-        ranges = QtWidgets.QFormLayout(self._xu_ranges)
-        ranges.setContentsMargins(0, 0, 0, 0)
-        ranges.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        ranges.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
         use = _PAGE_USE.get(self.context.page, {})
-        range_tip = (f'The {{}} angles {self.context.page} may use this calibration\'s xrayutilities file for: it is '
-                     'checked on every pixel over this range (with the calibrant frames and the scan\'s '
-                     f'frames){use.get("range", "")}. Blank: the calibrant scan\'s span.'
-                     f'{use.get("range_backend", "")}')  # Stitch's Backend choice; RSM grids with the one file
-        self._edit(ranges, 'del_domain', 'del range for xrayutilities (min, max °)', '', tip=range_tip.format('del'))
-        self._edit(ranges, 'nu_domain', 'nu range for xrayutilities (min, max °)', '', tip=range_tip.format('nu'))
-        layout.addWidget(self._xu_ranges)
         self.save_button = QtWidgets.QPushButton(f'Save geometry and use in {self.context.page}')
         self.save_button.setToolTip('Saves the fitted geometry inside the project as a pyFAI goniometer JSON and, '
                                     'beside it, the same calibration for xrayutilities (<name>.xu.json, checked '
@@ -1106,7 +1110,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                                     f'{self.context.page}\'s calibration{use.get("backend", "")}.')
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self._save)
-        layout.addWidget(self.save_button)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addWidget(self.show_calibration_fit_button, 1)
+        buttons.addWidget(self.save_button, 1)
+        layout.addLayout(buttons)
         for key in ('rms', 'distance_seed', 'distance_bounds', 'energy_bound', *self._BOUND_DEFAULTS):
             self._fields[key].textChanged.connect(self._invalidate_fit)
         for key in self._BOUND_DEFAULTS:
@@ -1176,6 +1183,13 @@ class CalibrationDialog(QtWidgets.QDialog):
                 'place and the table lists which rings to expect. A direct-beam scan measures the distance; '
                 'or type it. Rough values are enough: once one frame is calibrated, the others are predicted '
                 'from it instead.')
+        rough_help = QtWidgets.QToolButton()
+        rough_help.setText('?')
+        rough_help.setToolTip('Explain the selected rough geometry method')
+        rough_help.clicked.connect(lambda: QtWidgets.QToolTip.showText(
+            rough_help.mapToGlobal(rough_help.rect().bottomLeft()),
+            self._ROUGH_NOTES[self.rough_mode.currentData()], rough_help))
+        self._row_of[self.rough_mode].add_trailing_widget(rough_help)
         self._edit(form, 'rough_distance', 'Sample–detector distance (mm)', '',
                    tip='Sample to detector, in millimetres, with the detector facing the beam squarely.')
         self.beam_source_kind = self._combo(form, 'Source', [('SPEC + image series', 'spec_series'),
@@ -1201,9 +1215,6 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._auto_placeholders('beam_')
         for key in ('beam_source', 'beam_scan', 'beam_entry', 'beam_images', 'beam_stem'):
             self._fields[key].editingFinished.connect(lambda: self._source_details('beam_'))
-        self.beam_readiness = SectionCard('Direct-beam scan', collapsible=False)
-        self.beam_readiness.body.hide()
-        layout.insertWidget(0, self.beam_readiness)
         self._edit(form, 'beam_pixel', 'Direct beam pixel (x, y)', '',
                    tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (each '
                        'circle at its motor zero, beside its motor under 1 · Instrument), in the image as '
@@ -1220,9 +1231,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                    tip='The beam spot is searched in a strip this many pixels either side of its path.')
         self._edit(options, 'beam_roi', 'ROI x0, y0, x1, y1 (optional)', '',
                    tip='Search only this pixel box (columns x0–x1, rows y0–y1).')
-        self.rough_note = QtWidgets.QLabel()
-        self.rough_note.setWordWrap(True)
-        layout.addWidget(self.rough_note)
+        self.beam_readiness = SectionCard('', collapsible=False, compact=True)
+        layout.addWidget(self.beam_readiness)
         self.beam_button = QtWidgets.QPushButton('Fit direct-beam distance')
         self.beam_button.setToolTip('Finds the beam spot in each image and fits the distance from how far '
                                     'it moves per degree.')
@@ -1236,12 +1246,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                                         'residuals, with the distance (it opens after every fit).')
         self.show_fit_button.clicked.connect(self._show_direct_beam_fit)
         self.show_fit_button.setEnabled(False)
-        layout.addWidget(self.show_fit_button)
         self.apply_distance_button = QtWidgets.QPushButton('Use result as distance seed')
         self.apply_distance_button.setToolTip('Starts the final fit from this distance: it becomes 4 · Calibrate and '
                                               'fit ▸ Advanced ▸ Starting distance.')
         self.apply_distance_button.clicked.connect(self._apply_distance)
-        layout.addWidget(self.apply_distance_button)
         # A calibration from this geometry alone (maintainer, 2026-09-29: "a quick multigeometry
         # calibration json file from just the sample detector distance, and direct beam pixel")
         self.save_rough_button = QtWidgets.QPushButton('Save as calibration…')
@@ -1250,10 +1258,13 @@ class CalibrationDialog(QtWidgets.QDialog):
             'pixel '
             'above, the rotations held as typed, one degree per degree. As Save does, it writes the pyFAI '
             'file and, beside it, the xrayutilities file, checked on the direct-beam scan\'s angles, the '
-            'calibrant scan\'s and the xrayutilities ranges beside Save (4 · Calibrate and fit). Useful when '
+            'calibrant scan\'s angles. With no scan, it checks a small grid around zero. Useful when '
             'nu stays at 0; the file records that it is a direct-beam calibration.')
         self.save_rough_button.clicked.connect(self._save_rough)
-        layout.addWidget(self.save_rough_button)
+        actions = QtWidgets.QHBoxLayout()
+        for button in (self.show_fit_button, self.apply_distance_button, self.save_rough_button):
+            actions.addWidget(button)
+        layout.addLayout(actions)
         layout.addStretch(1)
         self.rough_mode.currentIndexChanged.connect(self._sync_rough_rows)
         for key in ('rough_distance', 'beam_pixel', 'rough_mount'):
@@ -1502,7 +1513,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             widget.setVisible(scan)
         self.save_rough_button.setVisible(mode != 'skip')
         self._label('beam_source').setText('NeXus file' if kind == 'nexus' else 'SPEC file')
-        self.rough_note.setText(self._ROUGH_NOTES[mode])
+        self.rough_mode.setToolTip(self._ROUGH_NOTES[mode])
         self._beam_pixel_hint()
         if hasattr(self, 'frame_table'):
             self._render_frames()
@@ -2200,7 +2211,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             if selected is not None:
                 self._saving = self.fit
                 self._start('save', (self.fit, selected, pair_validation_angles(
-                    self.fit, scan_angles=self._scan_angles(self.fit), domain=self._typed_domain())))
+                    self.fit, scan_angles=self._scan_angles(self.fit))))
         self._guard(go)
 
     def _default_name(self, beam):
@@ -2250,7 +2261,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                                for angle in self._distance_result.angles_deg.tolist()]
                 self._saving = fit
                 self._start('save', (fit, selected, pair_validation_angles(
-                    fit, scan_angles=angles, domain=self._typed_domain())))
+                    fit, scan_angles=angles)))
         self._guard(go)
 
     def _rough_fit(self):
@@ -2288,18 +2299,6 @@ class CalibrationDialog(QtWidgets.QDialog):
         return [(values.get(del_motor, 0.) if del_motor else 0., values.get(nu_motor, 0.) if nu_motor else 0.)
                 for _index, values, _energy in self._choices
                 if all(motor is None or motor in values for motor in (del_motor, nu_motor))]
-
-    def _typed_domain(self):
-        """The supported del/nu ranges typed beside Save ({} when blank: the scan's span)."""
-        domain = {}
-        for circle in ('del', 'nu'):
-            text = self._text(circle + '_domain')
-            if text:
-                low, high = (float(value) for value in text.split(','))
-                if not low <= high:
-                    raise ValueError(f'the supported {circle} range needs min ≤ max')
-                domain[circle] = [low, high]
-        return domain
 
     def _oriented_mask(self):
         """The Detector panel's mask, drawn on the stored image, turned and mirrored as the images are."""
@@ -2409,14 +2408,14 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _update_beam_readiness(self):
         ready = self._beam_detection is not None and self._beam_detection[0] == self._beam_generation
-        text = (f'Motor {self._beam_detection[1]} · {self._beam_detection[2]} beam motion'
-                if ready else self._beam_problem)
+        text = self._beam_problem
         if ready:
             dx, row_delta = self._beam_detection[3]
             dy = -row_delta  # Int's raw viewer mirrors detector Y once; +Y is up.
             first, last = self._beam_detection[4]
-            text += (f' · {first:g}° → {last:g}°; viewer Δx {dx:+.2f}, Δy {dy:+.2f} px'
-                     f' ({"right" if dx > 0 else "left"}, {"up" if dy > 0 else "down"})')
+            text = (f'{self._beam_detection[1]} scan ({first:g}, {last:g}) · '
+                    f'{self._beam_detection[5]} pts · Δx {dx:+.2f} px, Δy {dy:+.2f} px'
+                    f' ({"right" if dx > 0 else "left"}, {"up" if dy > 0 else "down"})')
         self.beam_button.setEnabled(ready and not self._owner.busy)
         self.beam_button.setToolTip(text)
         self.beam_readiness.set_readiness(ready, text)
@@ -2667,11 +2666,13 @@ class CalibrationDialog(QtWidgets.QDialog):
                         self._beam_problem = ''
                     self._update_beam_readiness()
                 elif kind == 'source_details':
-                    prefix, energy, automatic, source_ready = result
+                    prefix, energy, automatic, frame_count, source_problem = result
                     if self._source_details_inputs_key == self._source_details_input_key(prefix):
                         if not prefix and self._source_details_key == self._energy_source_key():
                             self._show_source_energy(energy)
-                            self._calibrant_ready_key = self._source_details_key if source_ready else None
+                            self._calibrant_ready_key = self._source_details_key if frame_count else None
+                            self._calibrant_frame_count = frame_count
+                            self._calibrant_source_problem = source_problem
                             self._update_fit_source_label()
                         if automatic is not None:
                             self._fields[prefix + 'stem'].setPlaceholderText(f'auto · {automatic}')
@@ -2685,6 +2686,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.selection.setColumnCount(2 + len(read))
                     self.selection.setHorizontalHeaderLabels(['Use', 'Frame', *(f'{motor} (°)' for motor in read)])
                     self._choices = result
+                    self._calibrant_frame_count = len(result)
+                    self._calibrant_source_problem = ''
                     self._calibrant_ready_key = self._energy_source_key()
                     energies = {energy for _index, _values, energy in result if energy is not None}
                     if len(energies) == 1:

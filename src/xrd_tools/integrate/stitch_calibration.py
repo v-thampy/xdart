@@ -171,6 +171,8 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
     spec = _exact_source(spec)
     source = open_source(spec)
     try:
+        if not source.capabilities.has_raw_references:
+            raise ValueError('No detector images found; check the images folder and stem for the selected scan')
         indices = source.frame_indices
         if len(indices) > 100000:
             raise ValueError('calibration scan exceeds the frame selection limit')
@@ -1082,6 +1084,11 @@ def pair_validation_angles(fit: CalibrationFit, *, scan_angles=(), domain=None, 
     angles = [(circle(frame['motors'], del_motor), circle(frame['motors'], nu_motor))
               for frame in fit.asset['provenance']['frames']]
     angles += [(0.0 if del_motor is None else float(d), 0.0 if nu_motor is None else float(n)) for d, n in scan_angles]
+    if not angles and not domain:
+        # A manually typed rough geometry has no scan coverage. Check its analytical transfer
+        # near zero; use the run's explicit extrapolation option for unvalidated poses.
+        angles = [(d, n) for d in ((-1., 0., 1.) if del_motor else (0.,))
+                  for n in ((-1., 0., 1.) if nu_motor else (0.,))]
     if domain:
         steps = {}
         for column, (name, motor) in enumerate((('del', del_motor), ('nu', nu_motor))):

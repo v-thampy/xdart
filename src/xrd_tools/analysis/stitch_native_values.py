@@ -234,7 +234,8 @@ def prepare_native_stitch_tool(form, project):
             raise StitchToolPreflightRefused("XU_RUNTIME_CONFIG_RESTORE_FAILED")
         plan = XuStitchOperationPlan(calibration, effective, polarization_factor=form.polarization_factor,
                                      dark_path=form.dark_path, flat_path=form.flat_path,
-                                     flat_min_fraction=form.flat_min_fraction, **common)
+                                     flat_min_fraction=form.flat_min_fraction,
+                                     allow_extrapolation=form.allow_extrapolation, **common)
         acquisition = calibration.projection.value["acquisition"]
         motors = tuple(name for name in acquisition["source_motors"].values()
                        if name is not None)  # a single 2θ arm reads no nu
@@ -242,6 +243,8 @@ def prepare_native_stitch_tool(form, project):
     if gi is not None:  # every frame's sample circles: the incidence, the tilt, mu and phi
         motors += gi.metadata_names()
     requests, preview_members, warnings = [], [], []
+    if form.allow_extrapolation:
+        warnings.append("XU calibration extrapolation allowed: accuracy outside the validated motor range is unverified.")
     if unrecorded:
         warnings.append(f"Grazing: no selected scan records {', '.join(unrecorded)}; read as 0")
     cached = {}

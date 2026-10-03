@@ -886,6 +886,12 @@ class StitchPage(QtWidgets.QWidget):
         self._rows["frame_check"].setToolTip(
             "Compares each frame's counts with its neighbours on the same outer-circle row: "
             "below 1 % is an empty (dropped) frame, below 20 % a partial one.")
+        self._field(frames_card, SectionId.PROCESSING, "xu_coverage", "XU calibration coverage",
+                    "Validated angles only", choices=("Validated angles only", "Allow extrapolation (warn)"))
+        self._rows["xu_coverage"].setToolTip(
+            "Allow frames outside the motor poses checked at calibration export. Preview warns once and "
+            "the output records the choice and affected frame count. Accuracy there is unverified; "
+            "invalid geometry and metadata still refuse.")
         self._field(frames_card, SectionId.PROCESSING, "sample_position", "Sample",
                     "As calibrated", choices=tuple(_SAMPLE_POSITIONS))
         self._rows["sample_position"].setToolTip(
@@ -1639,7 +1645,7 @@ class StitchPage(QtWidgets.QWidget):
         """XU always applies its solid angle and has no uncertainty or sample-position
         model; polarization, dark, flat and the frame check apply to both backends."""
         xu = self._value("backend") == "xrayutilities histogram"
-        for key, enabled in (("frame_check", True), ("sample_position", not xu),
+        for key, enabled in (("frame_check", True), ("xu_coverage", xu), ("sample_position", not xu),
                              ("solid_angle", not xu), ("error_model", not xu)):
             self._fields[key] = replace(self._fields[key], enabled=enabled)
             self._rows[key].apply_field(self._fields[key])
@@ -1928,6 +1934,8 @@ class StitchPage(QtWidgets.QWidget):
                           map_unit=STANDARD_2D_AXES.get(value("map_axis"), "q_A^-1"),  # Grazing's maps: Q
                           map_radial_range=None if value("map_auto")
                           else (float(value("map_min")), float(value("map_max"))))
+        if value("backend") == "xrayutilities histogram":
+            native.update(allow_extrapolation=self._value("xu_coverage") == "Allow extrapolation (warn)")
         return StitchToolForm(
             project_root=value("project_root"),
             spec_path=self._source_paths[0], scan=value("scan"),
@@ -1975,6 +1983,7 @@ class StitchPage(QtWidgets.QWidget):
             frame_stop="" if form.frame_selector.stop_label is None else form.frame_selector.stop_label,
             frame_step=form.frame_selector.step, radial_auto=form.q_range is None,
             frame_check=_choice(_FRAME_CHECKS, form.frame_screen),
+            xu_coverage="Allow extrapolation (warn)" if form.allow_extrapolation else "Validated angles only",
             sample_position=_choice(_SAMPLE_POSITIONS, form.sample_position),
             solid_angle="On" if form.correct_solid_angle else "Off",
             polarization="" if form.polarization_factor is None else form.polarization_factor,

@@ -551,8 +551,7 @@ def test_scan43_from_a_rough_calibration_authored_in_the_window_runs_and_reopens
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData("manual"))
         for key, value in (("beam_detector", "Pilatus100k"), ("rough_distance", "1014.7173"),
                            ("beam_pixel", "97, 243"),  # row B's (row 97, column 243) stored, turned: column, row
-                           ("rough_energy", "13.000007"),  # 13 000.007 eV, row B's energy
-                           ("del_domain", "-50, 50"), ("nu_domain", "-35, 35")):
+                           ("rough_energy", "13.000007")):
             dialog._set_field_text(key, value)
         hint = dialog._image_size.text()  # said last: the window's frame (item 8)
         monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
