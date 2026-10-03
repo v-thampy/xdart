@@ -265,6 +265,65 @@ def _with_source(page, root, scans="[1-2]"):
     page.resolve_source()
 
 
+def test_rsm_source_counts_match_stitch_and_follow_the_selected_scan(qapp, tmp_path):
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        assert "4 frames" in page.controls.source_card.status.text()
+        assert "4 frames" in page.run_bar.readinessLabel.full_text()
+        assert "scan" in page.run_bar.readinessLabel.toolTip()
+        page.set_field("scan", "1")
+        assert "2 SPEC points" in page.controls.source_card.status.text()
+        page.resolve_source()
+        assert "2 frames" in page.controls.source_card.status.text()
+        assert "2 frames" in page.run_bar.readinessLabel.full_text()
+    finally:
+        _close(page, qapp)
+
+
+def test_rsm_grid_uses_independent_axis_counts_and_keeps_legacy_presets(qapp, tmp_path):
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        for axis, count in zip("hkl", (12, 16, 20), strict=True):
+            page.set_field(f"grid_{axis}", str(count))
+        assert page.build_form().bins == (12, 16, 20)
+        assert "grid 12×16×20" in page.run_bar.readinessLabel.full_text()
+        assert [page._rows[f"grid_{axis}"].label.text() for axis in "hkl"] == ["H", "K", "L"]
+        page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
+        assert [page._rows[f"grid_{axis}"].label.text() for axis in "hkl"] == ["Qx", "Qy", "Qz"]
+        assert page.build_form().bins == (12, 16, 20)
+        assert all(page._rows[f"grid_{axis}"].toolTip() for axis in "hkl")
+        page.set_field("grid_h", "0")
+        assert not page.run_bar.startButton.isEnabled()
+        with pytest.raises(ValueError, match="Grid"):
+            page.build_form()
+        page.set_field("grid", "Full 200×200×200")
+        assert page.build_form().bins == (200, 200, 200)
+        page.set_field("grid_l", "201")
+        assert not page.run_bar.startButton.isEnabled()
+        with pytest.raises(ValueError, match="8,000,000"):
+            page.build_form()
+    finally:
+        _close(page, qapp)
+
+
+def test_rsm_notebook_conditioning_is_advanced_and_explained(qapp):
+    page = _page(qapp)
+    try:
+        for key in ("offset", "static_hot"):
+            assert page.advanced.isAncestorOf(page._rows[key])
+            assert not page.controls.processing_card.isAncestorOf(page._rows[key])
+            assert page._rows[key].editor.toolTip()
+        assert "unchanged" in page._rows["static_hot"].toolTip()
+        assert "0 disables" in page._rows["offset"].toolTip()
+        assert "without gridding again" in page.retry_button.toolTip()
+    finally:
+        _close(page, qapp)
+
+
 class _Committed:
     """A committed RSM v2 result as the owner and the page read one (the dialog tests' _Result): a real
     commit needs the publisher's receipt."""
