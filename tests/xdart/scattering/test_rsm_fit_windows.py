@@ -95,7 +95,7 @@ def test_joint_3d_fit_navigation_preserves_outcome_and_matched_signed_comparison
             settle(qapp, window)
             assert destination.is_file(), window.card.status.text()
             assert 'rsm_region' in destination.read_text('utf-8')
-        assert not (tmp_path/'before_fit.input.npz').exists()
+        assert not tuple(tmp_path.glob('before_fit*.input.npz'))
         window.fit()
         settle(qapp, window)
         assert isinstance(window.view, ScientificView) and isinstance(window.table, ResultsTable)
