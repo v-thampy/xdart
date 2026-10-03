@@ -100,7 +100,7 @@ def test_calibration_stages_conditioned_point_and_reopens_exact_policy(tmp_path)
     assert reopened == frames
 
 
-def test_native_stitch_manifest_has_every_used_constituent(tmp_path):
+def _point_stitch(tmp_path, operation='average', mode='1d'):
     import json
     import tifffile
     from tests.core.test_point_images import _spec_images, _confirmed
@@ -110,12 +110,12 @@ def test_native_stitch_manifest_has_every_used_constituent(tmp_path):
     from xrd_tools.analysis.stitch_operation import StitchOperationPlan, StitchGeometryInput, StitchGeometryKind, capture_stitch_geometry, prepare_stitch_operation
     from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactOverwrite
     from xrd_tools.io.output_path import resolve_finite_output_target
-    from xrd_tools.analysis.stitch_native import frame_seeds
     inputs = tmp_path / 'inputs'
     inputs.mkdir()
-    spec = _confirmed(_spec_images(inputs), PointImagePolicy(2, 'average'))
+    spec = _confirmed(_spec_images(inputs), PointImagePolicy(2, operation))
     for index in range(4):
-        tifffile.imwrite(inputs / f'calibrant_scan001_{index:04}.tif', np.full((195, 487), index + 10, np.uint16))
+        value = (20 if index % 2 == 0 else 10) if operation == 'difference' else index + 10
+        tifffile.imwrite(inputs / f'calibrant_scan001_{index:04}.tif', np.full((195, 487), value, np.uint16))
     table = run_metadata_table(MetadataTablePlan(spec))
     source = ModuleSourceReceipt.from_metadata_table(table, kind=ModuleKind.STITCH,
         selected_labels=(0, 1), resolved_selectors=(MetadataColumnSelector('del'), MetadataColumnSelector('nu')))
@@ -123,13 +123,87 @@ def test_native_stitch_manifest_has_every_used_constituent(tmp_path):
     path.write_text(json.dumps(_goniometer_record()))
     geometry = capture_stitch_geometry(StitchGeometryInput(path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
         source_motors=(('del_angle', 'del'), ('nu_angle', 'nu'))))
-    plan = StitchOperationPlan(geometry, native_records=True)
-    target = resolve_finite_output_target(tmp_path, 'native', operation_token='stitch-1d')
-    output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D, AnalysisArtifactOverwrite.CREATE_NEW, artifact_family='native')
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    plan = StitchOperationPlan(geometry, native_records=True, mode=mode, npt_1d=24, npt_rad_2d=24, npt_azim_2d=16,
+        conditioning=StitchConditioning('manual', 0, 100))
+    target = resolve_finite_output_target(tmp_path, 'native', operation_token=f'stitch-{mode}')
+    kind = AnalysisArtifactKind.STITCH_1D if mode == '1d' else AnalysisArtifactKind.STITCH_2D
+    output = ModuleOutputRequest(target, kind, AnalysisArtifactOverwrite.CREATE_NEW, artifact_family='native')
     request = prepare_stitch_operation(source, output, plan, project_root=tmp_path)
+    return spec, request
+
+
+def test_native_stitch_manifest_has_every_used_constituent(tmp_path):
+    from xrd_tools.analysis.stitch_native import frame_seeds
+    spec, request = _point_stitch(tmp_path)
+    source = request.module.source
     records = frame_seeds(source, request.manifest, request.plan)
     for index, record in enumerate(records):
         assert record['point_images']['operation'] == 'average'
         assert [item['source_frame_index'] for item in record['source_constituents']] == [0, 0]
         assert [item['source_path'].split('_')[-1] for item in record['source_constituents']] == [f'{2*index:04}.tif', f'{2*index+1:04}.tif']
         assert 'source_path' not in record
+
+
+def test_native_point_contributor_reduces_saved_operands(tmp_path):
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation, read_stitch_contributor_view, _runtime_geometry, _runtime_plan
+    from xrd_tools.analysis.plans import run_stitch
+    from xrd_tools.sources.registry import open_source
+    spec, request = _point_stitch(tmp_path, 'difference', '2d')
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    row = result.payload.contributing_frames[0]
+    scan = row['key'].split('/')[0][5:]
+    view = read_stitch_contributor_view(result.payload, 0, scan=scan)
+    diff, _ = _runtime_geometry(request.plan.geometry, request.plan.geometry.content)
+    expected = run_stitch(_runtime_plan(request.plan, diff, None), open_source(spec), frame_indices=(0,), collect_frame_records=False)
+    np.testing.assert_allclose(view.intensity_1d, expected.profile[0].intensity)
+    np.testing.assert_allclose(view.intensity_2d, expected.payload.intensity.T)
+    assert (view.intensity_1d[view.intensity_1d != 0] < 0).all()
+
+
+def test_automatic_calibration_masks_each_average_operand(tmp_path):
+    from tests.core.test_stitch_autocalibration import ring_scan, five_parameter_seed, ROW_ANGLES
+    from xrd_tools.integrate.stitch_autocalibration import extract_scan_ring_points
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    spec = ring_scan(tmp_path / 'scan', [(d, 0.) for d in (6., 20., 34.)])
+    files = sorted((tmp_path / 'scan/images').glob('*.raw'))
+    images = [np.fromfile(path, dtype='<i4').reshape(195, 1475) for path in files]
+    for path in files:
+        path.unlink()
+    for point, image in enumerate(images):
+        first = image.copy()
+        first[:, :700] = 0  # mean would be positive, but one used exposure is invalid
+        for offset, pixels in enumerate((first, image)):
+            pixels.tofile(tmp_path / f'scan/images/ring_scan1_{2*point+offset:04}.raw')
+    spec = replace(spec, options={**spec.options, 'point_images': PointImagePolicy(2, 'average').to_dict()})
+    points = extract_scan_ring_points(spec, five_parameter_seed(ROW_ANGLES), max_frames=3,
+        conditioning=StitchConditioning('manual', 1.))
+    assert points.controls
+    assert all(control.col_positions.min() >= 699 for control in points.controls)
+
+
+def test_xu_difference_cancels_shared_dark_and_its_invalid_mask(tmp_path):
+    from tests.core.test_xu_stitch import _receipt
+    from xrd_tools.sources.registry import open_source
+    from xrd_tools.integrate.xu_stitch import run_xu_hist_stitch_1d
+    spec = _source(tmp_path)
+    for index, value in enumerate((10, 4, 20, 8)):
+        np.full((195, 1475), value, dtype=np.uint16).tofile(tmp_path / f'sample_scan1_{index:04}.raw')
+    spec = replace(spec, options={**spec.options, 'point_images': PointImagePolicy(2, 'difference').to_dict(),
+        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': 'uint16'}})
+    source = open_source(spec)
+    receipt = _receipt(tmp_path)
+    try:
+        kwargs = dict(frame_indices=(0, 1), q_min_A_inverse=1., q_max_A_inverse=5.2,
+            npt=32, monitor_key=None, max_frame_bytes=4*1024*1024, allow_extrapolation=True)
+        plain = run_xu_hist_stitch_1d(receipt, source, **kwargs)
+        dark = np.full((195, 1475), 2.)
+        dark[:20] = np.nan
+        corrected = run_xu_hist_stitch_1d(receipt, source, dark=dark, **kwargs)
+        np.testing.assert_array_equal(corrected.payload.intensity, plain.payload.intensity)
+        np.testing.assert_array_equal(corrected.diagnostics.coverage, plain.diagnostics.coverage)
+        assert (plain.payload.intensity[plain.diagnostics.coverage > 0] < 0).all()
+    finally:
+        getattr(source, 'close', lambda: None)()

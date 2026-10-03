@@ -179,6 +179,9 @@ def prepare_native_stitch_tool(form, project):
     read_options = dict(detector_shape=form.detector_shape, raw_dtype=form.raw_dtype,
                         raw_header_skip=form.raw_header_skip, rotation=0)
     resolution = resolve_stitch_sources(form.source_selection, read_options)
+    if resolution.pending:
+        from xrd_tools.sources.point_images import PointImagesRequired
+        raise PointImagesRequired(resolution.pending[0])
     if not resolution.groups:
         return StitchToolPreflight(form, None, None, _PREFLIGHT_FACTORY,
                                    requests=(), skipped=resolution.skipped)
