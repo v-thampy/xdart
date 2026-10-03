@@ -63,7 +63,7 @@ def _known():
 def automatic(guided):
     from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
     return refine_arm_from_scan(_spec(guided['root']), guided['five_path'], max_counts=8e5, bounds=_known(),
-                                energy_bound_eV=_ENERGY_BOUND_EV)
+                                energy_bound_eV=_ENERGY_BOUND_EV, image_rotation=180)
 
 
 @pytest.fixture(scope='module')
@@ -84,7 +84,7 @@ def held_out(guided, tmp_path_factory):
     train = tuple(int(i) for i in np.flatnonzero(
         np.isin(column['nu'], (-10., 3., 16., 29.)) & np.isin(column['del'], np.arange(5., 46., 5.))))
     fit = refine_arm_from_scan(_spec(guided['root']), guided['five_path'], frame_indices=train, max_counts=8e5,
-                               bounds=_known(), energy_bound_eV=_ENERGY_BOUND_EV)
+                               bounds=_known(), energy_bound_eV=_ENERGY_BOUND_EV, image_rotation=180)
     path = Path(save_calibration_fit(fit, guided['root'] / 'fits/held-out.json'))
     centres = _row_centres(guided['root'], path, tmp_path_factory.mktemp('held-out'), rows=(-3.5, 9.5, 22.5), count=6)
     return fit, [value for ring in centres.values() for value in ring.values()]
@@ -113,6 +113,8 @@ def _spec(root):
 
 @pytest.fixture(scope='module')
 def guided(tmp_path_factory):
+    import pyFAI
+    from pyFAI.control_points import ControlPoints
     from xrd_tools.integrate.stitch_calibration import (
         adopt_calibration_pair, capture_calibration_frames, fit_calibration, save_calibration_fit,
     )
@@ -127,11 +129,25 @@ def guided(tmp_path_factory):
     assert len(images) == 287
     for image in images:
         shutil.copy2(image, project / 'data/images' / image.name)
-    staged = capture_calibration_frames(_spec(project), _NPT_FRAMES, project / 'session')
+    # Archived images and controls use x-/z+; turn both into native x+/z-.
+    staged = capture_calibration_frames(_spec(project), _NPT_FRAMES, project / 'session', rotation=180)
     controls = root / 'data/LaB6_Calibration_Poni_and_Data'
-    frames = tuple(adopt_calibration_pair(
-        frame, controls / f'LaB6_17keV_scan14_{frame.index:04d}.poni',
-        controls / f'LaB6_17keV_scan14_{frame.index:04d}.npt') for frame in staged)
+    frames = []
+    for frame in staged:
+        ai = pyFAI.load(str(controls / f'LaB6_17keV_scan14_{frame.index:04d}.poni'))
+        rows, cols = frame.shape
+        ai.poni1, ai.poni2 = rows * ai.pixel1 - ai.poni1, cols * ai.pixel2 - ai.poni2
+        ai.rot1, ai.rot2 = -ai.rot1, -ai.rot2
+        path = Path(frame.image_path).parent
+        ai.save(str(path / 'native.poni'))
+        points = ControlPoints(str(controls / f'LaB6_17keV_scan14_{frame.index:04d}.npt'))
+        native = ControlPoints(calibrant=points.calibrant, wavelength=points.calibrant.wavelength)
+        for label in points.get_labels():
+            group = points.get(lbl=label)
+            native.append(points=[[rows - 1 - y, cols - 1 - x] for y, x in group.points], ring=group.ring)
+        native.save(str(path / 'native.npt'))
+        frames.append(adopt_calibration_pair(frame, path / 'native.poni', path / 'native.npt'))
+    frames = tuple(frames)
     five = fit_calibration(frames, bounds=_known(), energy_bound_eV=_ENERGY_BOUND_EV)
     extended = fit_calibration(frames, arm_model='stacked_extended', bounds=_known(),
                                energy_bound_eV=_ENERGY_BOUND_EV)
@@ -155,7 +171,7 @@ def _row_centres(root, geometry_path, output_dir, rows=None, count=3, xu_receipt
         calibrant.wavelength = record['wavelength']
         geometry = capture_stitch_geometry(StitchGeometryInput(
             geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
-            source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))
+            source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=180))
         plan = StitchOperationPlan(geometry, mode='1d', npt_1d=1500, radial_range=(1.0, 6.2),
                                    use_detector_mask=True, max_frame_bytes=64 * 1024 * 1024)
         selectors = (MetadataColumnSelector('del'), MetadataColumnSelector('nu'))
@@ -263,7 +279,7 @@ def test_scan14_the_automatic_fit_aligns_the_nu_rows(automatic_spread):
 def test_scan14_small_frame_budget_still_spans_every_nu_row(guided):
     from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
     fit = refine_arm_from_scan(_spec(guided['root']), guided['five_path'], max_frames=7, max_counts=8e5,
-                               bounds=_known(), energy_bound_eV=_ENERGY_BOUND_EV)
+                               bounds=_known(), energy_bound_eV=_ENERGY_BOUND_EV, image_rotation=180)
     provenance = fit.asset['provenance']
     validation = provenance['automatic_refinement']['validation']
     assert validation['coverage'] == {'nu_rows_available': 7, 'nu_rows_selected': 7}
@@ -329,7 +345,7 @@ def test_scan14_a_fixed_energy_leaves_the_nu_rows_apart(guided, tmp_path):
     train = tuple(int(i) for i in np.flatnonzero(
         np.isin(column['nu'], (-10., 3., 16., 29.)) & np.isin(column['del'], np.arange(5., 46., 5.))))
     fit = refine_arm_from_scan(_spec(guided['root']), guided['five_path'], frame_indices=train, max_counts=8e5,
-                               bounds=_known())
+                               bounds=_known(), image_rotation=180)
     validation = fit.asset['provenance']['automatic_refinement']['validation']
     held = Path(save_calibration_fit(fit, guided['root'] / 'fits/default-held-out.json'))
     centres = _row_centres(guided['root'], held, tmp_path / 'held', rows=(-3.5, 9.5, 22.5), count=6)
@@ -349,7 +365,7 @@ def _stitch(root, geometry_path, labels, target, **plan_fields):
         resolved_selectors=(MetadataColumnSelector('del'), MetadataColumnSelector('nu')))
     geometry = capture_stitch_geometry(StitchGeometryInput(
         geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
-        source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=0))
+        source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')), image_rotation=180))
     plan = StitchOperationPlan(geometry, mode='1d', npt_1d=1500, radial_range=(1.0, 6.2),
                                use_detector_mask=True, max_frame_bytes=64 * 1024 * 1024, **plan_fields)
     output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D, AnalysisArtifactOverwrite.CREATE_NEW)
@@ -387,7 +403,8 @@ def test_scan14_xu_transfer_holds_on_every_pixel_and_aligns_the_nu_rows(guided, 
     table = run_metadata_table(MetadataTablePlan(_spec(guided['root'])))
     column = {c.name: np.asarray(c.numeric, dtype=float) for c in table.columns if c.name in ('nu', 'del')}
     angles = list(zip(column['del'], column['nu']))
-    asset, transfer = transfer_arm_to_xu(guided['extended'].asset['calibration'], validation_angles=angles)
+    asset, transfer = transfer_arm_to_xu(guided['extended'].asset['calibration'], validation_angles=angles,
+                                        image_rotation=180)
     print(f"XU transfer: max |dq| {transfer['max_abs_dq_A^-1']:.3g} over {transfer['validation_frames']} frames")
     assert transfer['validation_frames'] == 287 and transfer['max_abs_dq_A^-1'] <= 1e-8
     target = guided['root'] / 'calibration/xu/extended-v3.json'
