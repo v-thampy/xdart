@@ -359,7 +359,7 @@ class RSMPage(QtWidgets.QWidget):
         self._shown = None  # (values, snapshot) drawn now
         self._color_map = "Default"  # Int's top bar: viridis
         self._log_scale = False
-        self._share_axis = False  # Int's Share Axis: the panels drawing one coordinate pan and zoom together
+        self._share_axis = True  # Corresponding slices and projections pan and zoom together by default.
         # Set BG (the maintainer: "Other quick toggles like switching to log scale set bg, etc should also be
         # there"): Int's background owner, its keyed path. The background is a result (its path, its viewer
         # values and its own viewer model), drawn minus at every draw until Clear BG, the result re-admitted,

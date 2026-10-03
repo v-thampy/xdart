@@ -335,6 +335,7 @@ def test_rsm_opens_with_six_empty_native_panels_and_labels(qapp):
     page = _page(qapp)
     try:
         assert page.shown is None
+        assert page.view.share_axis.isChecked() and page.view.keyed_projection.share_axis
         assert page.view.vertical_splitter.isHidden()
         assert [key.instance for key in _keys(page.view)] == ["HK", "HL", "KL", "H", "K", "L"]
         assert all(not pane.canvas.raw_image.size for pane in _slices(page.view))
@@ -1191,8 +1192,6 @@ def test_ints_intensity_controls_and_share_axis_drive_the_six(qapp, monkeypatch)
         levels = {tuple(pane.canvas.histogram.levels()) for pane in _slices(view)}
         assert len(levels) == 1 and tuple(view.viewer_intensity.values()) == levels.pop()
         assert not view.viewer_intensity.isHidden() and not view.share_axis.isHidden()
-        assert not view.keyed_projection.share_axis
-        view.share_axis.click()
         assert view.keyed_projection.share_axis and view.share_axis.isChecked()
         hk, hl, _kl = _slices(view)
         hk.canvas.imageViewBox.setXRange(0.2, 0.6, padding=0)
