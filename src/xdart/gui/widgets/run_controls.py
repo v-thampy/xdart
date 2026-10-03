@@ -240,15 +240,16 @@ class RunControlsBar(QtWidgets.QWidget):
                               live=False):
         text = str(text or '').strip()
         original = text
-        if text.startswith('Ready · '):
+        if text == 'Ready':
+            text = ''
+        elif text.startswith('Ready · '):
             text = text[len('Ready · '):]
-            for mode in ('Int 1D', 'Int 2D', 'Stitch 1D', 'Stitch 2D', 'RSM'):
-                if text.startswith(mode + ' · '):
-                    text = text[len(mode + ' · '):]
-                    break
+            mode, _separator, context = text.partition(' · ')
+            if self.modeCombo.findText(mode) >= 0:
+                text = context
         was_hidden = self.readinessRow.isHidden()
-        self.readinessRow.setVisible(bool(text))
-        self.readinessLive.setVisible(bool(text) and bool(live))
+        self.readinessRow.setVisible(bool(original))
+        self.readinessLive.setVisible(bool(original) and bool(live))
         self.readinessDot.setProperty('ready', bool(ready))
         setter = getattr(self.readinessLabel, 'set_full_text', None)
         if callable(setter):
