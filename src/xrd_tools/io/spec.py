@@ -116,6 +116,49 @@ def read_spec_scan_table(
     return columns, dict(motor_positions), npts
 
 
+_SPEC_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
+    """Guard silx's permissive conversion using the selected scan's physical rows.
+
+    silx remains the format/value reader. It can extract digits from malformed
+    tokens (``np.float64(1.0)`` becomes ``0.641``), so validate complete decimal
+    tokens before requesting its array. Header comments and MCA records, including
+    their backslash continuations, are not table rows.
+    """
+    scan_index = -1
+    in_table = False
+    mca_continuation = False
+    with Path(spec_file).open(encoding="utf-8", errors="replace") as stream:
+        for physical_row, raw_line in enumerate(stream, 1):
+            line = raw_line.strip()
+            if raw_line.startswith("#S") and raw_line[2:3].isspace():
+                scan_index += 1
+                if scan_index > scan_data.index:
+                    break
+                in_table = False
+            if scan_index != scan_data.index:
+                continue
+            if line.startswith("#L"):
+                in_table = True
+            if not in_table or not line or line.startswith("#"):
+                continue
+            if mca_continuation or line.startswith("@"):
+                mca_continuation = line.endswith("\\")
+                continue
+            tokens = line.split()
+            for index in range(max(len(tokens), len(labels))):
+                token = tokens[index] if index < len(tokens) else None
+                label = labels[index] if index < len(labels) else "<extra>"
+                if index >= len(labels) or token is None or not _SPEC_NUMBER.fullmatch(token):
+                    raise ValueError(
+                        f"SPEC {spec_file}, scan {scan_data.number}.{scan_data.order}, "
+                        f"physical row {physical_row}, column {index + 1} ({label!r}): "
+                        f"expected a complete decimal/scientific numeric token, got {token!r}"
+                    )
+
+
 def read_spec_scan_columns(
     spec_file: Path | str, scan_num: str
 ) -> tuple[
@@ -133,8 +176,9 @@ def read_spec_scan_columns(
     """
 
     scan_data = _get_spec_scan(spec_file, scan_num)
-    data = np.asarray(scan_data.data)
     labels = tuple(str(label) for label in scan_data.labels)
+    _validate_spec_numeric_tokens(spec_file, scan_data, labels)
+    data = np.asarray(scan_data.data)
     if data.ndim != 2 or data.shape[0] != len(labels):
         raise ValueError("SPEC #L labels do not match the physical data table")
     npts = int(data.shape[1])
@@ -275,16 +319,14 @@ def get_from_spec_file(
     scan_number: str,
     cols: list[str],
 ) -> dict[str, np.ndarray]:
-    scan_data = _get_spec_scan(fname, scan_number)
+    columns, motors, npts = read_spec_scan_table(fname, scan_number)
     spec_data: dict[str, np.ndarray] = {}
 
-    npts = scan_data.data.shape[1]
-
     for col in cols:
-        if col in scan_data.labels:
-            spec_data[col] = np.asarray(scan_data.data_column_by_name(col))
-        elif col in scan_data.motor_names:
-            spec_data[col] = np.full(npts, scan_data.motor_position_by_name(col))
+        if col in columns:
+            spec_data[col] = columns[col]
+        elif col in motors:
+            spec_data[col] = np.full(npts, motors[col])
         else:
             logger.warning(
                 "Column/motor %s does not exist in scan %s",
@@ -300,15 +342,14 @@ def get_angles(
     scan_num: str,
     diff_motors: list[str] | tuple[str, ...],
 ) -> list[list[float]]:
-    scan_data = _get_spec_scan(spec_file, scan_num)
-    npts = scan_data.data.shape[1]
+    columns, motors, npts = read_spec_scan_table(spec_file, scan_num)
     angles: list[list[float]] = []
 
     for motor in diff_motors:
-        if motor in scan_data.labels:
-            vals = scan_data.data_column_by_name(motor)
+        if motor in columns:
+            vals = columns[motor]
         else:
-            vals = np.full(npts, scan_data.motor_position_by_name(motor))
+            vals = np.full(npts, motors[motor])
         angles.append(list(vals))
 
     return angles
