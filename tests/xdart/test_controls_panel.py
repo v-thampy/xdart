@@ -2,6 +2,7 @@
 
 import gc
 import os
+from dataclasses import replace
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -1213,6 +1214,32 @@ def test_form_row_combo_restores_a_previously_blocked_signal_state(qapp):
         row.editor.blockSignals(True)
         assert row.apply_field(_combo_field(("Manual", "eta"), value="eta"))
         assert row.editor.signalsBlocked() is True
+    finally:
+        row.close()
+        row.deleteLater()
+
+
+def test_form_row_mounting_captions_commit_and_restore_signed_axis_values(qapp):
+    from xdart.gui.widgets.camera_editor import CAMERA_LABELS
+    path = ('Stitch', 'camera')
+    row = FormRow(label='Camera orientation', path=path, value='x-, z+', kind='combo',
+                  choices=tuple(CAMERA_LABELS), choice_labels=CAMERA_LABELS)
+    emitted = []
+    row.valueChanged.connect(lambda *values: emitted.append(values))
+    try:
+        assert row.editor.currentText() == 'upright'
+        assert row.current_value() == 'x-, z+'
+        row.editor.setCurrentIndex(row.editor.findData('z+, x+'))
+        row.editor.textActivated.emit(row.editor.currentText())
+        qapp.processEvents()
+        assert emitted == [(path, 'z+, x+')]
+        field = ControlFormField(SectionId.SOURCE, 'Camera orientation', path, 'x+, z-',
+                                 ControlFieldKind.COMBO, tuple(CAMERA_LABELS))
+        assert row.apply_field(field)
+        assert row.editor.currentText() == '180° CW' and row.current_value() == 'x+, z-'
+        assert row.apply_field(replace(field, value='invalid'))
+        assert row.current_value() == row.editor.currentText() == 'invalid'
+        assert emitted == [(path, 'z+, x+')]
     finally:
         row.close()
         row.deleteLater()

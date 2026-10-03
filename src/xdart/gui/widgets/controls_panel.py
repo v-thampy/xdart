@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import PurePath
 
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -649,6 +649,7 @@ class FormRow(QtWidgets.QWidget):
         value,
         kind: str = "line",
         choices: Sequence[str] = (),
+        choice_labels: Mapping[str, str] | None = None,
         browse: bool = False,
         enabled: bool = True,
         reason: str = "",
@@ -661,6 +662,7 @@ class FormRow(QtWidgets.QWidget):
         self.setObjectName("controlsFormRow")
         self._path = tuple(path)
         self._kind = kind
+        self._choice_labels = dict(choice_labels or {})
         self._enabled = bool(enabled)
         #: "int" rows: the bounds their text is checked against (``integer_field_refusal``)
         self._bounds = (minimum, maximum, bool(allow_blank))
@@ -704,14 +706,21 @@ class FormRow(QtWidgets.QWidget):
             values = [str(choice) for choice in choices]
             if not values and value not in (None, ""):
                 values = [str(value)]
-            editor.addItems(values)
+            if self._choice_labels:
+                for item in values:
+                    editor.addItem(self._choice_labels.get(item, item), item)
+            else:
+                editor.addItems(values)
             text = "" if value is None else str(value)
-            idx = editor.findText(text)
+            idx = editor.findData(text) if self._choice_labels else editor.findText(text)
             if idx >= 0:
                 editor.setCurrentIndex(idx)
             elif text:
-                editor.addItem(text)
-                editor.setCurrentText(text)
+                if self._choice_labels:
+                    editor.addItem(text, text)
+                else:
+                    editor.addItem(text)
+                editor.setCurrentIndex(editor.count() - 1)
             # ``currentTextChanged`` also fires for programmatic reconciliation,
             # and rebuilding the passive Controls form synchronously from that
             # signal can destroy a native popup while it is still open.  Accept
@@ -720,7 +729,7 @@ class FormRow(QtWidgets.QWidget):
             editor.textActivated.connect(
                 lambda text: QtCore.QTimer.singleShot(
                     0,
-                    lambda selected=str(text): self._emit_edit(selected),
+                    lambda selected=str(editor.currentData() if self._choice_labels else text): self._emit_edit(selected),
                 )
             )
             lay.addWidget(editor, 1)
@@ -803,7 +812,7 @@ class FormRow(QtWidgets.QWidget):
         if self._kind == "bool":
             return bool(self.editor.isChecked())
         if self._kind == "combo":
-            return self.editor.currentText()
+            return self.editor.currentData() if self._choice_labels else self.editor.currentText()
         if self._file_name_only and not self._editor_dirty:
             return self._model_value
         return self.editor.text()
@@ -837,14 +846,18 @@ class FormRow(QtWidgets.QWidget):
                 if value and value not in desired:
                     desired.append(value)
                 current_items = [
-                    self.editor.itemText(index)
+                    self.editor.itemData(index) if self._choice_labels else self.editor.itemText(index)
                     for index in range(self.editor.count())
                 ]
                 if current_items != desired:
                     self.editor.clear()
-                    self.editor.addItems(desired)
-                if self.editor.currentText() != value:
-                    idx = self.editor.findText(value)
+                    if self._choice_labels:
+                        for item in desired:
+                            self.editor.addItem(self._choice_labels.get(item, item), item)
+                    else:
+                        self.editor.addItems(desired)
+                if self.current_value() != value:
+                    idx = self.editor.findData(value) if self._choice_labels else self.editor.findText(value)
                     if idx >= 0:
                         self.editor.setCurrentIndex(idx)
             else:

@@ -1323,12 +1323,12 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._tip(raw_tip, form.labelForField(reader))
         self.raw_layout.currentIndexChanged.connect(self._sync_raw_layout)
         self._sync_raw_layout()
-        # The detector's camera, as xrayutilities gives it (maintainer, 2026-09-30: "two drop-down boxes
-        # linked together ... x+, x-, z+, z-"): it turns and mirrors every image into Stitch's frame.
+        # The shared mounting editor keeps signed lab axes internally (maintainer, 2026-10-02).
         from xdart.gui.widgets.camera_editor import CameraEditor
         self.camera = CameraEditor()
         form.addRow('Camera orientation (lab frame)', self.camera)
-        self._tip(self._CAMERA_TIP, self.camera.rows, self.camera.columns, form.labelForField(self.camera))
+        self._tip(self._CAMERA_TIP, self.camera.rotation, self.camera.fliplr, self.camera.flipud,
+                  form.labelForField(self.camera))
         self._image_size = self.camera.image_size
         corners = {3: 'bottom right (pyFAI default)', 1: 'top left', 2: 'top right', 4: 'bottom left'}
         self._choice(form, 'beam_orientation', 'First pixel (pyFAI orientation)',
@@ -1373,15 +1373,13 @@ class CalibrationDialog(QtWidgets.QDialog):
     #: Hidden by Skip. Calibrant scan owns the energy field for frames without recorded energy.
     _GEOMETRY_ROWS = ('beam_pixel', 'rough_mount')
 
-    _CAMERA_TIP = ('x± and z± refer to the same lab frame described in the Diffractometer section above. '
-                   'They are the directions the stored image\'s rows (top to bottom) and columns (left to right) run '
-                   'along with every circle at zero, the detector facing the beam: x up, z to the left looking '
-                   'downstream (xrayutilities\' detectorDir1, detectorDir2). Every image is turned and mirrored '
-                   'into pyFAI\'s frame, rows x+, columns z−, once before calibration. Default selects that '
-                   'reference; it does not determine the detector\'s physical mounting. Choose the directions '
-                   'the stored rows and columns actually run along. The header describes their orientation '
-                   'relative to pyFAI, with rotation before mirroring. '
-                   '17-2\'s Pilatus 300K-W is rows x−, columns z−, with nu x−.')
+    _CAMERA_TIP = ('Detector mounting looking downstream, with every circle at zero. Rotation is clockwise '
+                   'from upright, then Flip L/R reverses stored columns and Flip U/D reverses stored rows. '
+                   'Both flips equal a 180° turn; the controls cover eight distinct orientations. Upright is '
+                   'stored rows x−, columns z+, as in the upright Pilatus 300K-W and Eiger2 500K datasets. '
+                   'The lab axes are those in the Diffractometer section: x up, z to the left looking '
+                   'downstream. Every image is converted once into pyFAI\'s frame, rows x+, columns z−. '
+                   'Reset chooses upright; it does not determine an unknown detector\'s physical mounting.')
 
     def _orientation(self):
         """The camera's transform into Stitch's frame: a turn, then a left-right mirror."""

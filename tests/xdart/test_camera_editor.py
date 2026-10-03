@@ -1,11 +1,9 @@
-"""The detector camera's two linked boxes (maintainer, 2026-09-30: "two drop-down boxes linked together. The first
-has options x+, x-, z+, z-. Once the first ... is selected, the other box shows the remaining two transverse
-options")."""
+"""Mounting controls keep all eight signed cameras and pyFAI image transforms intact."""
 import numpy as np
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
-from xdart.gui.widgets.camera_editor import CameraEditor
+from xdart.gui.widgets.camera_editor import CameraEditor, UPRIGHT_CAMERA
 from xrd_tools.core.geometry.camera import STITCH_CAMERA, DetectorCamera, stitch_orientation
 
 
@@ -14,49 +12,45 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def test_the_columns_box_offers_the_two_directions_transverse_to_the_rows(qapp):
-    editor = CameraEditor()
-    items = lambda combo: [combo.itemData(i) for i in range(combo.count())]  # noqa: E731
-    assert items(editor.rows) == ['x+', 'x-', 'z+', 'z-'] and items(editor.columns) == ['z+', 'z-']
-    assert editor.value() == STITCH_CAMERA  # Stitch's frame, the default
-    changed = []
-    editor.changed.connect(lambda: changed.append(True))
-    editor.rows.setCurrentIndex(editor.rows.findData('z-'))  # rows along z: columns along x, their sign kept
-    assert changed and items(editor.columns) == ['x+', 'x-'] and editor.value() == DetectorCamera('z-', 'x-')
-    editor.columns.setCurrentIndex(editor.columns.findData('x-'))
-    assert editor.value() == DetectorCamera('z-', 'x-')
-    editor.set_value(DetectorCamera('x-', 'z-'))  # 17-2's Pilatus 300K-W, mirrored left-right
-    assert (editor.rows.currentData(), editor.columns.currentData()) == ('x-', 'z-')
-    editor.deleteLater()
-
-
-def test_camera_descriptions_keep_all_eight_axis_values(qapp):
+def test_rotations_and_independent_flips_cover_eight_cameras(qapp):
     editor = CameraEditor()
     try:
-        captions = {'x+': 'vert ↑', 'x-': 'vert ↓', 'z+': 'horz ←', 'z-': 'horz →'}
-        for rows in captions:
-            editor.rows.setCurrentIndex(editor.rows.findData(rows))
-            assert captions[rows] in editor.rows.currentText()
-            for index in range(editor.columns.count()):
-                editor.columns.setCurrentIndex(index)
-                columns = editor.columns.currentData()
-                assert captions[columns] in editor.columns.currentText()
-                assert editor.value() == DetectorCamera(rows, columns)
+        assert [editor.rotation.itemData(i) for i in range(editor.rotation.count())] == [0, 90, 180, 270]
+        assert editor.value() == UPRIGHT_CAMERA
+        cameras = set()
+        for rotation, axes in ((0, ('x-', 'z+')), (90, ('z+', 'x+')),
+                               (180, ('x+', 'z-')), (270, ('z-', 'x-'))):
+            editor.rotation.setCurrentIndex(editor.rotation.findData(rotation))
+            for lr in (False, True):
+                for ud in (False, True):
+                    editor.fliplr.setChecked(lr)
+                    editor.flipud.setChecked(ud)
+                    expected = tuple(axis[0] + ('-' if axis[1] == '+' else '+') if flip else axis
+                                     for axis, flip in zip(axes, (ud, lr)))
+                    assert editor.value() == DetectorCamera(*expected)
+                    cameras.add(editor.value())
+        assert len(cameras) == 8
+        editor.rotation.setCurrentIndex(0)
+        editor.fliplr.setChecked(True)
+        editor.flipud.setChecked(True)
+        assert editor.value() == STITCH_CAMERA  # both flips equal a half turn
     finally:
         editor.deleteLater()
 
 
-def test_default_click_restores_unturned_unflipped_stitch_camera(qapp):
+def test_default_click_restores_upright_without_changing_the_native_frame(qapp):
     editor = CameraEditor()
     try:
         editor.set_value(DetectorCamera('z-', 'x+'))
         changed = []
         editor.changed.connect(lambda: changed.append(editor.value()))
         editor.default_button.click()
-        assert changed == [STITCH_CAMERA]
-        assert editor.value() == DetectorCamera('x+', 'z-')
+        assert changed == [UPRIGHT_CAMERA]
+        assert editor.value() == DetectorCamera('x-', 'z+')
+        assert (editor.rotation.currentData(), editor.fliplr.isChecked(), editor.flipud.isChecked()) == (0, False, False)
         transform = stitch_orientation(editor.value())
-        assert transform.rotation == 0 and not transform.flip_horizontal and not transform.flip_vertical
+        assert transform.rotation == 180 and not transform.flip_horizontal and not transform.flip_vertical
+        assert STITCH_CAMERA == DetectorCamera('x+', 'z-')
         assert editor.default_button.text() == '↺'
         assert editor.default_button.accessibleName() == 'Reset camera orientation'
         assert editor.layout().itemAt(editor.layout().count() - 2).widget() is editor.default_button
@@ -65,7 +59,7 @@ def test_default_click_restores_unturned_unflipped_stitch_camera(qapp):
         editor.deleteLater()
 
 
-def test_fresh_stitch_page_window_and_camera_editor_share_native_default(qapp, tmp_path):
+def test_fresh_stitch_page_window_and_camera_editor_share_upright_default(qapp, tmp_path):
     from xdart.gui.pages.services import empty_host_services
     from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
     from xdart.gui.tabs.stitch.page import StitchPage, camera_orientation
@@ -78,7 +72,9 @@ def test_fresh_stitch_page_window_and_camera_editor_share_native_default(qapp, t
     try:
         for orientation in (camera_orientation(page._value('camera')),
                 stitch_orientation(dialog.camera.value()), stitch_orientation(editor.value())):
-            assert (orientation.rotation, orientation.flip_horizontal, orientation.flip_vertical) == (0, False, False)
+            assert (orientation.rotation, orientation.flip_horizontal, orientation.flip_vertical) == (180, False, False)
+        assert page._rows['camera'].editor.currentText() == 'upright'
+        assert page._rows['camera'].current_value() == 'x-, z+'
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
@@ -88,14 +84,14 @@ def test_fresh_stitch_page_window_and_camera_editor_share_native_default(qapp, t
 
 
 @pytest.mark.parametrize('axes,description,turn,mirror', [
-    (('x+', 'z-'), 'standard', 0, ''),
-    (('x+', 'z+'), 'horizontal flip', 0, 'horizontal'),
-    (('x-', 'z-'), 'vertical flip', 0, 'vertical'),
-    (('x-', 'z+'), '180° rotation', 2, ''),
-    (('z-', 'x-'), '90° CCW', 1, ''),
-    (('z+', 'x-'), '90° CCW, then horizontal flip', 1, 'horizontal'),
+    (('x+', 'z-'), '180° CW', 0, ''),
+    (('x+', 'z+'), '180° CW, horizontal flip', 0, 'horizontal'),
+    (('x-', 'z-'), 'upright, horizontal flip', 0, 'vertical'),
+    (('x-', 'z+'), 'upright', 2, ''),
+    (('z-', 'x-'), '270° CW', 1, ''),
+    (('z+', 'x-'), '90° CW, horizontal flip', 1, 'horizontal'),
     (('z+', 'x+'), '90° CW', -1, ''),
-    (('z-', 'x+'), '90° CW, then horizontal flip', -1, 'horizontal'),
+    (('z-', 'x+'), '270° CW, horizontal flip', -1, 'horizontal'),
 ])
 def test_camera_image_correction_matches_the_labelled_transform(qapp, axes, description, turn, mirror):
     editor = CameraEditor()

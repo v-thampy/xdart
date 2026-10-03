@@ -38,6 +38,7 @@ from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm
 from xdart.gui.widgets.controls_panel import (
     PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
 )
+from xdart.gui.widgets.camera_editor import CAMERA_LABELS
 from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.run_controls import RunControlsBar
@@ -270,11 +271,8 @@ _INTEGER_FIELDS = {
 }
 
 
-#: The detector camera's eight values, "rows, columns" (xrayutilities' detectorDir1, detectorDir2), Stitch's
-#: native pyFAI frame first: no image rotation or flip.
-CAMERAS = tuple(f"{rows}, {columns}" for rows, columns in (
-    ("x+", "z-"), ("x-", "z+"), ("x-", "z-"), ("x+", "z+"),
-    ("z-", "x-"), ("z-", "x+"), ("z+", "x+"), ("z+", "x-")))
+#: Signed-axis values stay in settings; the shared mounting captions are shown in the GUI.
+CAMERAS = tuple(CAMERA_LABELS)
 
 
 def camera_text(orientation, *, frame=None) -> str:
@@ -670,11 +668,11 @@ class StitchPage(QtWidgets.QWidget):
             self._draw()  # the mode's layout, as Int's follows its run-bar mode
         return True
 
-    def _field(self, card, section, key, label, value="", *, choices=(), browse=False):
+    def _field(self, card, section, key, label, value="", *, choices=(), browse=False, choice_labels=None):
         field = self._new_field(section, key, label, value, choices=choices, browse=browse)
         row = FormRow(label=label, path=field.path, value=value, kind=field.kind.value,
                       choices=choices, browse=browse, minimum=field.minimum, maximum=field.maximum,
-                      allow_blank=field.allow_blank)
+                      allow_blank=field.allow_blank, choice_labels=choice_labels)
         if card is not None:
             card.add_row(row)
         return self._bind(key, field, row)
@@ -866,7 +864,7 @@ class StitchPage(QtWidgets.QWidget):
             ("raw_dtype", "Data type", "int32"), ("raw_header_skip", "Header bytes", "0"),
             ("source_motors", "Angle mapping", "del_angle=del, nu_angle=nu"),
             ("poni_references", "PONI reference", "del=0, nu=0"),
-            ("camera", "Camera (rows, columns)", CAMERAS[0]),
+            ("camera", "Camera orientation", CAMERAS[0]),
             ("frame_start", "First frame", "0"), ("frame_stop", "Last frame", ""),
             ("frame_step", "Frame step", "1"), ("max_frame_mib", "Max frame MiB", "256"),
         )
@@ -874,12 +872,13 @@ class StitchPage(QtWidgets.QWidget):
                     "Goniometer JSON", choices=("Goniometer JSON", "PONI + offsets"))
         for key, label, value in fields:
             self._field(advanced_card, SectionId.SOURCE, key, label, value,
-                        choices=CAMERAS if key == "camera" else ())
+                        choices=CAMERAS if key == "camera" else (),
+                        choice_labels=CAMERA_LABELS if key == "camera" else None)
         self._rows["camera"].setToolTip(
             "The detector's camera, as Calibrate ▸ 1 · Instrument ▸ Detector gives it: the lab directions the "
-            "stored images' rows and columns run along (x up, z to the left looking downstream). Stitch turns "
-            "and mirrors every frame, its mask, dark and flat into its frame (x-, z+, the default) as the "
-            "calibration was made.")
+            "mounting looking downstream. Upright is stored rows x−, columns z+; rotation is clockwise, "
+            "then horizontal flip reverses stored columns. Stitch converts every frame, its mask, dark and "
+            "flat into the calibration's recorded frame (native pyFAI for new calibrations).")
         self._field(advanced_card, SectionId.SOURCE, "output_family", "Result names")
         self._rows["output_family"].setToolTip(
             "Blank names are automatic: <file>-<scan> for one scan, and the scans listed for a "

@@ -183,11 +183,11 @@ def test_camera_names_the_diffractometers_lab_frame(qapp, tmp_path):
     try:
         label = dialog.camera.parentWidget().layout().labelForField(dialog.camera)
         assert 'lab frame' in label.text().lower()
-        assert 'Diffractometer' in dialog.camera.rows.toolTip()
-        assert 'x up' in dialog.camera.rows.toolTip()
-        assert 'z to the left' in dialog.camera.columns.toolTip()
-        assert 'pyFAI\'s frame, rows x+, columns z−' in dialog.camera.rows.toolTip()
-        assert 'does not determine' in dialog.camera.rows.toolTip()
+        assert 'Diffractometer' in dialog.camera.rotation.toolTip()
+        assert 'x up' in dialog.camera.rotation.toolTip()
+        assert 'z to the left' in dialog.camera.fliplr.toolTip()
+        assert 'pyFAI\'s frame, rows x+, columns z−' in dialog.camera.rotation.toolTip()
+        assert 'does not determine' in dialog.camera.rotation.toolTip()
     finally:
         dialog.close()
 
@@ -197,10 +197,10 @@ def test_detector_header_tracks_the_model_and_camera_image_correction(qapp, tmp_
     dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
     try:
         dialog._set_field_text('beam_detector', 'Eiger2_500k')
-        assert dialog._detector_panel.title() == 'Detector · Eiger2 500k · 1028 × 512 px (W × H) · orientation: standard'
+        assert dialog._detector_panel.title() == 'Detector · Eiger2 500k · 1028 × 512 px (W × H) · orientation: upright'
         dialog.camera.set_value(DetectorCamera('z+', 'x-'))
         assert '512 × 1028 px (W × H)' in dialog._detector_panel.title()
-        assert dialog._detector_panel.title().endswith('orientation: 90° CCW, then horizontal flip')
+        assert dialog._detector_panel.title().endswith('orientation: 90° CW, horizontal flip')
         assert dialog._image_size.text() == '512 × 1028 px (W × H)'
         title = dialog._detector_panel.title()
         dialog._set_field_text('beam_orientation', '1')
@@ -208,7 +208,7 @@ def test_detector_header_tracks_the_model_and_camera_image_correction(qapp, tmp_
         dialog._set_field_text('beam_detector', 'Pilatus100k')
         assert dialog._detector_panel.title().startswith('Detector · Pilatus 100k ·')
         dialog.camera.default_button.click()
-        assert dialog._detector_panel.title().endswith('orientation: standard')
+        assert dialog._detector_panel.title().endswith('orientation: upright')
         assert dialog._text('beam_orientation') == '1'
     finally:
         dialog.close()
