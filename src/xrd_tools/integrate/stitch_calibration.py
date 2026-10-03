@@ -1171,17 +1171,63 @@ class SavedCalibration:
 
 
 def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cancelled=None,
-                          progress=None) -> SavedCalibration:
+                          progress=None, overwrite=False) -> SavedCalibration:
     """Save a pyFAI fit and its xrayutilities partner beside it (``xu_partner_path``).
 
     The pyFAI file is saved first and stays saved when the transfer is refused (fitted
     motor scales, another detector orientation, parallax or a sensor model), fails its
     gates or is cancelled: ``xu_refusal`` says why. The partner's provenance records the
     pyFAI file's SHA-256, which binds the pair (``paired_xu_calibration``).
+    Explicit replacement stages and validates the new files first. Cancellation or
+    invalid input leaves the previous files intact; a refused transfer removes its
+    old companion instead of leaving a stale pair.
     """
     from xrd_tools.integrate.xu_transfer import XuTransferRefused, transfer_arm_to_xu
     if fit.backend != 'multigeometry':
         raise ValueError('a calibration pair starts from a pyFAI fit')
+    if overwrite:
+        from tempfile import TemporaryDirectory
+        from xrd_tools.io.output_transaction import replace_into_place
+        target = Path(path).resolve()
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError('calibration save cancelled')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix='.xdart-calibration-', dir=target.parent) as scratch:
+            staged = Path(scratch) / target.name
+            saved = save_calibration_pair(fit, staged, validation_angles=validation_angles,
+                                         cancelled=cancelled, progress=progress)
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('calibration save cancelled')
+            partner = xu_partner_path(target)
+            # Publish the primary last; hash binding refuses any temporarily mixed pair.
+            destinations = (partner.with_suffix(partner.suffix + '.provenance.json'), partner,
+                            target.with_suffix(target.suffix + '.provenance.json'), target)
+            prior = {}
+            for destination in destinations:
+                if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+                    raise ValueError(f'{destination.name} is not a regular calibration file')
+                prior[destination] = destination.read_bytes() if destination.exists() else None
+            changed = []
+            try:
+                for destination in destinations:
+                    prepared = Path(scratch) / destination.name
+                    if prepared.exists():
+                        replace_into_place(prepared, destination)
+                        changed.append(destination)
+                    elif destination.exists():
+                        destination.unlink()
+                        changed.append(destination)
+            except OSError:
+                for destination in reversed(changed):
+                    if prior[destination] is None:
+                        destination.unlink(missing_ok=True)
+                    else:
+                        backup = Path(scratch) / destination.name
+                        backup.write_bytes(prior[destination])
+                        replace_into_place(backup, destination, verb='restore calibration')
+                raise
+            return replace(saved, pyfai_path=str(target),
+                           xu_path=str(partner) if saved.xu_path is not None else None)
     partner = xu_partner_path(Path(path).resolve())
     if partner.exists() or partner.with_suffix(partner.suffix + '.provenance.json').exists():
         raise FileExistsError('choose a new calibration filename; existing files are preserved')

@@ -1,5 +1,8 @@
 """The refinement popup mounts Int's full view and uses the calibration worker for a real scan."""
 import time
+from dataclasses import replace
+import copy
+import json
 
 import numpy as np
 from pyqtgraph.Qt import QtWidgets
@@ -8,6 +11,35 @@ from tests.core.test_calibrant_preview import refined_scan
 from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+
+
+def test_confirmed_save_replaces_the_current_geometry_and_companion_through_the_worker(refined_scan, tmp_path, monkeypatch):
+    from xrd_tools.integrate.stitch_calibration import paired_xu_calibration
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    _spec, fit = refined_scan
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    target = tmp_path / 'confirmed.json'
+    monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
+                        staticmethod(lambda *args: (str(target), '')))
+    try:
+        for index in range(2):
+            if index:
+                asset = copy.deepcopy(fit.asset)
+                record = asset['calibration']
+                record['param'][record['param_names'].index('dist')] += .001
+                fit = replace(fit, asset=asset)
+            dialog.fit = fit
+            dialog._save()
+            until = time.monotonic() + 15
+            while dialog.active() and time.monotonic() < until:
+                app.processEvents()
+                time.sleep(.01)
+            assert not dialog.active()
+            assert json.loads(target.read_text()) == fit.asset['calibration'], dialog.status.text()
+            assert paired_xu_calibration(target).exists()
+    finally:
+        dialog.shutdown()
+        dialog.close()
 
 
 def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(refined_scan, tmp_path):

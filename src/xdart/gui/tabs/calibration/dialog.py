@@ -228,7 +228,7 @@ def _dispatch_job(request, cancelled, publish):
     if kind == 'save':  # the pyFAI file, then its xrayutilities partner beside it
         fit, path, angles = arguments
         return save_calibration_pair(fit, path, validation_angles=angles, cancelled=cancelled,
-                                     progress=_staged_progress(publish, _TRANSFER_STAGES))
+                                     progress=_staged_progress(publish, _TRANSFER_STAGES), overwrite=True)
     if kind in ('beam_detect', 'distance'):
         from xrd_tools.integrate.direct_beam import calibrate_direct_beam, infer_direct_beam_motion
         from xrd_tools.core.geometry import ImageOrientation
@@ -2264,8 +2264,16 @@ class CalibrationDialog(QtWidgets.QDialog):
         selected = Path(path).resolve()
         if not selected.is_relative_to(self.project_root):
             raise ValueError(f'save the geometry inside the {self.context.page} project')
-        if selected.exists() or xu_partner_path(selected).exists():
-            raise ValueError(f'{selected.name} or {xu_partner_path(selected).name} exists: choose a new name')
+        partner = xu_partner_path(selected)
+        companions = (partner, selected.with_suffix(selected.suffix + '.provenance.json'),
+                      partner.with_suffix(partner.suffix + '.provenance.json'))
+        if not selected.exists() and any(companion.exists() for companion in companions):
+            # Qt confirms an existing primary. Orphan companions need the same explicit choice.
+            answer = QtWidgets.QMessageBox.question(self, 'Replace calibration files?',
+                f'Replace the existing companion files for {selected.name}?',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+            if answer != QtWidgets.QMessageBox.Yes:
+                return None
         return selected
 
     def _save_rough(self):

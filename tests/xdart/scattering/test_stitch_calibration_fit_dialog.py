@@ -826,6 +826,10 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
         monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
                             staticmethod(lambda _parent, _title, start, _filter: proposed.append(start) or ('', '')))
         assert dialog._save_path() is None and proposed == [str(folder / 'LaB6_17keV_scan14_3.json')]
+        target = folder / 'LaB6_17keV_scan14.json'
+        # Qt's Save dialog has already confirmed this existing primary file.
+        _save_to(monkeypatch, target)
+        assert dialog._save_path() == target
         dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('nexus_stack'))
         dialog._set_field_text('source', str(folder / 'master.h5'))
         assert dialog._default_name(False).parent == folder

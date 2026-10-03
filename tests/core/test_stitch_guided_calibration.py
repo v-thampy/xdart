@@ -327,6 +327,48 @@ def test_a_saved_fit_writes_its_xrayutilities_partner_bound_by_hash(tmp_path):
     assert not (tmp_path / 'calibration' / 'taken.json').exists()
 
 
+def test_confirmed_replacement_updates_the_pair_and_preserves_it_on_invalid_or_cancelled_save(tmp_path):
+    import copy
+    from threading import Event
+    from tests.core.test_stitch_autocalibration import ROW_ANGLES, five_parameter_seed, ring_scan
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    from xrd_tools.integrate.stitch_calibration import paired_xu_calibration, save_calibration_pair
+    source = ring_scan(tmp_path / 'scan', [(d, 0.) for d in (6., 20., 34.)])
+    fit = refine_arm_from_scan(source, five_parameter_seed(ROW_ANGLES), max_frames=3)
+    target = tmp_path / 'saved.json'
+    angles = [(6., -10.), (15., 3.), (25., 6.)]
+    save_calibration_pair(fit, target, validation_angles=angles)
+    files = (target, target.with_suffix('.json.provenance.json'),
+             tmp_path / 'saved.xu.json', tmp_path / 'saved.xu.json.provenance.json')
+    original = {path: path.read_bytes() for path in files}
+    changed = copy.deepcopy(fit.asset)
+    changed['calibration']['param'][changed['calibration']['param_names'].index('dist')] += .001
+    newer = replace(fit, asset=changed)
+    saved = save_calibration_pair(newer, target, validation_angles=angles, overwrite=True)
+    assert saved.pyfai_path == str(target) and paired_xu_calibration(target) == files[2]
+    assert target.read_bytes() != original[target] and files[2].read_bytes() != original[files[2]]
+    assert json.loads(files[1].read_text()) == newer.asset['provenance']
+    current = {path: path.read_bytes() for path in files}
+    invalid = copy.deepcopy(changed)
+    invalid['calibration']['wavelength'] = float('nan')
+    with pytest.raises(ValueError):
+        save_calibration_pair(replace(newer, asset=invalid), target, validation_angles=angles, overwrite=True)
+    assert {path: path.read_bytes() for path in files} == current
+    cancel = Event()
+    cancel.set()
+    with pytest.raises(InterruptedError):
+        save_calibration_pair(fit, target, validation_angles=angles, cancelled=cancel, overwrite=True)
+    assert {path: path.read_bytes() for path in files} == current
+    scaled = copy.deepcopy(changed)
+    names = scaled['calibration']['param_names']
+    scaled['calibration']['param'][names.index('del_scale')] *= 1.01
+    refused = save_calibration_pair(replace(newer, asset=scaled), target, validation_angles=angles, overwrite=True)
+    assert refused.xu_path is None and 'motor scales' in refused.xu_refusal
+    assert not files[2].exists() and not files[3].exists()
+    with pytest.raises(ValueError, match='has no xrayutilities partner'):
+        paired_xu_calibration(target)
+
+
 def test_a_fit_xrayutilities_cannot_express_saves_the_pyfai_file_alone(tmp_path):
     from tests.core.test_stacked_arm import _independent_stacked_controls
     from xrd_tools.integrate.stitch_calibration import paired_xu_calibration, save_calibration_pair
