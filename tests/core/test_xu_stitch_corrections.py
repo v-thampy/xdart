@@ -218,3 +218,132 @@ def test_xu_stitch_checks_its_flat_against_its_calibrations_detector_mask(tmp_pa
     assert (plan._flat_receipt.flat_masked_pixels, plan._flat_receipt.warnings) == (0, ())
     assert plan._flat_receipt.fingerprint == blind.fingerprint  # the identity is the file's, not its counts'
     assert native_detector_image(plan, plan._flat_receipt).shape == detector.shape  # the re-capture is Preview's
+
+
+def _raw_point_source(directory, images, policy=None):
+    """Real SPEC/raw inputs with one recorded metadata row per logical point."""
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.sources.registry import open_source
+
+    directory.mkdir()
+    count = len(images) if policy is None else len(images) // policy.images_per_point
+    spec_path = directory / 'sample'
+    rows = ''.join(f'{10 + index} 0 2\n' for index in range(count))
+    spec_path.write_text('#F sample\n#E 1\n#D today\n#O0 del nu\n'
+                         f'#S 1 ascan del 10 {9 + count} {count - 1} 1\n'
+                         '#P0 10 0\n#N 3\n#L del  nu  monitor\n' + rows)
+    for index, image in enumerate(images):
+        image.tofile(directory / f'sample_scan1_{index:04}.raw')
+    options = {'scan': '1.1', 'image_dir': str(directory), 'require_complete_images': True,
+               'read_image_kwargs': {'detector_shape': SHAPE, 'raw_dtype': str(images[0].dtype)}}
+    if policy is not None:
+        options['point_images'] = policy.to_dict()
+    return open_source(SourceSpec(spec_path, SourceKind.SPEC, options=options))
+
+
+def _run_point_source(receipt, source, **kwargs):
+    return run_xu_hist_stitch_1d(receipt, source, frame_indices=tuple(source.frame_indices),
+        q_min_A_inverse=1., q_max_A_inverse=5.2, npt=32, monitor_key='monitor',
+        max_frame_bytes=4 * 1024 * 1024, allow_extrapolation=True, **kwargs)
+
+
+@pytest.mark.parametrize('operation', ['average', 'difference', 'select'])
+@pytest.mark.parametrize('source_kind', ['spec', 'composite', 'frame_statistics'])
+def test_xu_point_images_native_masks_dark_and_divisor_match_explicit_images(
+        tmp_path, operation, source_kind):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    from xrd_tools.sources.composite import CompositeFrameSource
+    from xrd_tools.sources.memory import MemoryFrameSource
+    from xrd_tools.sources.point_images import PointImagePolicy
+
+    policy = PointImagePolicy(2, operation, image_index=2)
+    raw = [np.full(SHAPE, value, dtype=np.uint16) for value in (10, 4, 20, 8, 30, 12)]
+    raw[0][50, 50] = np.iinfo(np.uint16).max  # unused Select image must not mask its chosen image
+    grouped = _raw_point_source(tmp_path / 'grouped', raw, policy)
+    source = grouped
+    if source_kind == 'composite':
+        source = CompositeFrameSource([grouped])
+    elif source_kind == 'frame_statistics':
+        # The saved-contributor path mounts actual source loaders on canonical frames.
+        source = MemoryFrameSource([ScanFrame(index=index, metadata=grouped.metadata_for(index),
+            loader=lambda frame: grouped.load_frame(frame.index),
+            point_statistics_loader=lambda index=index, **kwargs:
+                grouped.load_point_statistics(index, **kwargs)) for index in grouped.frame_indices])
+    expected_images = []
+    for first, second in zip(raw[::2], raw[1::2]):
+        a, b = first.astype(np.float64), second.astype(np.float64)
+        a[first == np.iinfo(np.uint16).max] = np.nan
+        b[second == np.iinfo(np.uint16).max] = np.nan
+        expected_images.append((a + b) / 2 if operation == 'average' else
+                               b - a if operation == 'difference' else b)
+    expected_source = _raw_point_source(tmp_path / 'expected', expected_images)
+    receipt = _receipt(tmp_path)
+    dark = np.full(SHAPE, 2.)
+    dark[:20] = np.nan  # cancels, including its invalid mask, only for Difference
+    flat = np.full(SHAPE, 2.)
+    flat[60, 60] = 0.
+    mask = np.zeros(SHAPE, dtype=bool)
+    mask[70, 70] = True
+    try:
+        actual = _run_point_source(receipt, source, conditioning=StitchConditioning('auto'),
+                                   dark=dark, flat=flat, mask=mask)
+        expected = _run_point_source(receipt, expected_source, conditioning=StitchConditioning('off'),
+            dark=None if operation == 'difference' else dark, flat=flat, mask=mask)
+        np.testing.assert_array_equal(actual.payload.intensity, expected.payload.intensity)
+        np.testing.assert_array_equal(actual.diagnostics.coverage, expected.diagnostics.coverage)
+        np.testing.assert_array_equal(actual.diagnostics.normalization, expected.diagnostics.normalization)
+        assert actual.release_check_frame_count == 3
+        if operation == 'difference':
+            occupied = actual.diagnostics.coverage > 0
+            assert (actual.payload.intensity[occupied] < 0).all()
+    finally:
+        for member in (grouped, expected_source):
+            getattr(member, 'close', lambda: None)()
+
+
+@pytest.mark.parametrize('operation', ['average', 'select', 'difference'])
+def test_xu_point_images_screening_is_per_label_in_mixed_sources(tmp_path, operation):
+    from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    from xrd_tools.sources.composite import CompositeFrameSource
+    from xrd_tools.sources.point_images import PointImagePolicy
+
+    grouped_values = (10, 0, 10, 30, 10, 30) if operation == 'difference' else (20, 20, 0, 0, 20, 20)
+    grouped = _raw_point_source(tmp_path / 'grouped',
+        [np.full(SHAPE, value, dtype=np.uint16) for value in grouped_values], PointImagePolicy(2, operation))
+    ordinary = _raw_point_source(tmp_path / 'ordinary',
+        [np.full(SHAPE, value, dtype=np.uint16) for value in (20, 0, 20)])
+    source = CompositeFrameSource([grouped, ordinary])
+    labels = tuple(source.frame_indices)
+    screen = FrameScreen(FrameScreenPolicy(window=8), labels, (0.,) * len(labels))
+    try:
+        _run_point_source(_receipt(tmp_path), source, conditioning=StitchConditioning('off'),
+                          frame_screen=screen)
+        expected = [4] if operation == 'difference' else [1, 4]
+        assert screen.summary()['excluded'] == expected
+        if operation == 'difference':
+            assert all(verdict.status == 'unscreened' and np.isnan(verdict.total)
+                       for verdict in screen.verdicts[:3])
+        else:
+            assert all(np.isfinite(verdict.total) for verdict in screen.verdicts[:3])
+    finally:
+        for member in (grouped, ordinary):
+            getattr(member, 'close', lambda: None)()
+
+
+@pytest.mark.parametrize('grouped', [False, True])
+def test_xu_point_images_keeps_ordinary_callback_native_dtype(tmp_path, grouped):
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    from xrd_tools.sources.point_images import PointImagePolicy
+
+    images = [np.full(SHAPE, value, dtype=np.uint16) for value in ((10, 4) if grouped else (10,))]
+    source = _raw_point_source(tmp_path / 'source', images,
+                               PointImagePolicy(2, 'difference') if grouped else None)
+    captured = []
+    try:
+        _run_point_source(_receipt(tmp_path), source, conditioning=StitchConditioning('auto'),
+            frame_record_callback=lambda label, image: captured.append((label, image.dtype, image[50, 50])))
+        assert captured == [(0, np.dtype('float64' if grouped else 'uint16'), -6. if grouped else 10)]
+    finally:
+        getattr(source, 'close', lambda: None)()
