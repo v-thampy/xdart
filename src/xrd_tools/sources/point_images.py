@@ -1,0 +1,273 @@
+"""Explicit, confirmed grouping of consecutive detector images per scan point.
+
+Count ratios describe a possible grouping; they never authorize it. This source
+policy does no normalization, geometry, or variance estimation. Value policies
+are applied to native contributing images before their bounded combination.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec
+from xrd_tools.sources.base import BaseFrameSource
+
+
+@dataclass(frozen=True, slots=True)
+class PointImagePolicy:
+    """A confirmed operation on each consecutive group of raw images."""
+
+    images_per_point: int
+    operation: str
+    image_index: int = 1
+    reverse: bool = False
+
+    def __post_init__(self):
+        if type(self.images_per_point) is not int or self.images_per_point < 1:
+            raise ValueError("images per point must be a positive whole count")
+        if self.operation not in {"average", "difference", "select"}:
+            raise ValueError("point image operation must be average, difference or select")
+        if (type(self.image_index) is not int or self.image_index < 1
+                or self.image_index > self.images_per_point):
+            raise ValueError("selected image index must be between 1 and images per point")
+        if type(self.reverse) is not bool:
+            raise TypeError("difference reversal must be a boolean")
+        if self.operation == "difference" and self.images_per_point != 2:
+            raise ValueError("difference requires exactly two images per point")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PointImagePolicy:
+        if not isinstance(value, Mapping):
+            raise TypeError("point image policy must be a mapping")
+        return cls(**dict(value))
+
+    def compatible_with(self, count: int) -> bool:
+        """Whether the operation may be re-confirmed for another group size."""
+        return (type(count) is int and count > 0 and (
+            self.operation == "average"
+            or self.operation == "select" and self.image_index <= count
+            or self.operation == "difference" and count == 2))
+
+    def raw_indices(self, point: int) -> range | tuple[int]:
+        first = point * self.images_per_point
+        if self.operation == "select":
+            return (first + self.image_index - 1,)
+        return range(first, first + self.images_per_point)
+
+
+@dataclass(frozen=True, slots=True)
+class PointImageDetection:
+    """Pixel-free evidence of a possible uniform consecutive grouping."""
+
+    scan_label: str
+    point_count: int
+    image_count: int
+    images_per_point: int
+    source_spec: SourceSpec
+
+
+class PointImagesRequired(ValueError):
+    """A strict source needs explicit confirmation of a detected grouping."""
+
+    def __init__(self, detection: PointImageDetection):
+        self.detection = detection
+        super().__init__(f"{detection.image_count} images for {detection.point_count} scan points "
+                         f"({detection.images_per_point} images per point); confirm consecutive "
+                         "grouping and choose average, difference or one image")
+
+
+def detect_point_images(spec: SourceSpec, scan_label: str, point_count: int,
+                        image_count: int) -> PointImageDetection | None:
+    """Return a ratio greater than one, without applying a source policy."""
+    if point_count > 0 and image_count > point_count and image_count % point_count == 0:
+        return PointImageDetection(str(scan_label), point_count, image_count,
+                                   image_count // point_count, spec)
+    return None
+
+
+def _nexus_point_count(spec: SourceSpec, image_count: int) -> int | None:
+    """Declared point counts only; never derive points from motor positions."""
+    options = dict(spec.options)
+    explicit = options.get("scan_point_count")
+    if explicit is not None:
+        if type(explicit) is not int or explicit <= 0:
+            raise ValueError("scan point count must be a positive whole count")
+        return explicit
+    import h5py
+    from xrd_tools.io.bluesky_nexus import resolve_nxentry
+
+    with h5py.File(spec.uri, "r") as stream:
+        entry = resolve_nxentry(stream, spec.entry or "entry")
+        if entry is None:
+            return None
+        path = options.get("scan_point_count_path")
+        if path is not None:
+            if type(path) is not str or not path:
+                raise ValueError("scan point count path must be a dataset path")
+            dataset = entry.get(path)
+            if dataset is None or dataset.shape != () or dataset.dtype.kind not in "iu":
+                raise ValueError("scan point count dataset must be one positive whole count")
+            value = int(dataset[()])
+            if value <= 0:
+                raise ValueError("scan point count dataset must be one positive whole count")
+            return value
+        specific = entry.get("instrument/detector/detectorSpecific")
+        if specific is None:
+            return None
+        counts = []
+        for name in ("nimages", "ntrigger"):
+            dataset = specific.get(name)
+            if dataset is None or dataset.shape != () or dataset.dtype.kind not in "iu":
+                return None
+            counts.append(int(dataset[()]))
+        exposures, points = counts
+        return points if exposures > 0 and points > 0 and exposures * points == image_count else None
+
+
+def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
+    """Inspect recorded SPEC points / declared NeXus counts and image layouts.
+
+    No detector pixels are decoded. Unknown point counts and non-integral
+    ratios yield no suggestion; source opening still applies its strict checks.
+    """
+    if not isinstance(spec, SourceSpec):
+        raise TypeError("point image inspection requires a SourceSpec")
+    if spec.kind is SourceKind.SPEC:
+        from xrd_tools.io.image import read_detector_image_layout
+        from xrd_tools.sources.spec import SpecSource, find_spec_image_files
+
+        options = dict(spec.options)
+        metadata = SpecSource(spec.uri, scan=options.get("scan"))
+        directory = options.get("image_dir")
+        if not directory or metadata.scan_key is None:
+            return None
+        files = find_spec_image_files(directory, Path(spec.uri).stem, metadata.scan_key,
+                                     options.get("image_stem"))
+        decode = {key: value for key, value in dict(options.get("read_image_kwargs") or {}).items()
+                  if key in {"detector_shape", "detector", "raw_dtype", "raw_header_skip"}}
+        count = sum(read_detector_image_layout(path, **decode).frame_count for path in files)
+        return detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), count)
+    if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+        from xrd_tools.sources.descriptor import describe_container
+
+        descriptor = describe_container(Path(spec.uri), entry=spec.entry or "entry")
+        points = _nexus_point_count(spec, descriptor.frame_count)
+        if points is not None:
+            return detect_point_images(spec, descriptor.scan_name, points, descriptor.frame_count)
+    return None
+
+
+def combine_point_images(loader, raw_indices, policy: PointImagePolicy,
+                         conditioning=None, saturation: int | None = None) -> np.ndarray:
+    """Combine one decoded image at a time; NaN in any contributor propagates."""
+    from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+
+    result = None
+    for position, raw_index in enumerate(raw_indices):
+        image = condition_stitch_frame(loader(raw_index), conditioning, saturation)
+        if result is None:
+            result = image
+        else:
+            if image.shape != result.shape:
+                raise ValueError("images within a scan point must have identical detector shapes")
+            if policy.operation == "difference":
+                # The visible default is Image 2 - Image 1; reverse is Image 1 - Image 2.
+                if policy.reverse:
+                    np.subtract(result, image, out=result)
+                else:
+                    np.subtract(image, result, out=result)
+            else:
+                np.add(result, image, out=result)
+    if result is None:
+        raise ValueError("scan point has no contributing images")
+    if policy.operation == "average":
+        result /= policy.images_per_point
+    return result
+
+
+def point_image_metadata(policy: PointImagePolicy, locators) -> dict[str, Any]:
+    """A JSON-safe source policy plus every exact contributing raw locator."""
+    return {**policy.to_dict(), "raw_locators": [
+        {"path": str(path), "frame": int(frame)} for path, frame in locators]}
+
+
+class PointImageSource(BaseFrameSource):
+    """Confirmed grouping wrapper for a raw NeXus source; base remains unchanged."""
+
+    def __init__(self, source, spec: SourceSpec):
+        self.source = source
+        self.path = Path(spec.uri)
+        self.entry = spec.entry or "entry"
+        self.kind = spec.kind
+        self.point_image_policy = PointImagePolicy.from_dict(spec.options["point_images"])
+        count = len(source.frame_indices)
+        points = _nexus_point_count(spec, count)
+        if points is None or points <= 0:
+            raise ValueError("confirmed NeXus grouping requires an explicit scan point count")
+        if points * self.point_image_policy.images_per_point != count:
+            raise ValueError("confirmed images per point does not match image and point counts")
+        super().__init__(name=source.name, frame_indices=range(points), spec=spec,
+                         capabilities=SourceCapabilities(supports_random_access=True,
+                             supports_chunks=True, has_metadata=True, has_raw_references=True,
+                             has_scan_manifest=True))
+
+    def _raw_indices(self, index):
+        if type(index) is not int or index not in range(len(self._frame_indices)):
+            raise IndexError("scan point index is outside the source")
+        return self.point_image_policy.raw_indices(index)
+
+    def point_raw_locators(self, index):
+        return tuple((self.path, raw) for raw in self._raw_indices(index))
+
+    def raw_locator_for(self, index):
+        return self.point_raw_locators(index)[0]
+
+    def load_point_frame(self, index, conditioning=None, saturation=None):
+        return combine_point_images(self.source.load_frame, self._raw_indices(index),
+                                    self.point_image_policy, conditioning, saturation)
+
+    def load_frame(self, index):
+        return self.load_point_frame(index)
+
+    def load_native_frame(self, index):
+        return self.load_point_frame(index)
+
+    def metadata_for(self, index):
+        raw = next(iter(self._raw_indices(index)))
+        result = dict(self.source.metadata_for(raw))
+        result["point_images"] = point_image_metadata(self.point_image_policy, self.point_raw_locators(index))
+        return result
+
+    @property
+    def motors(self):
+        out = {}
+        for name, values in self.source.motors.items():
+            values = np.asarray(values)
+            if len(values) == len(self._frame_indices):
+                out[name] = values
+            elif len(values) == len(self.source.frame_indices):
+                out[name] = values[::self.point_image_policy.images_per_point]
+            else:
+                raise ValueError("NeXus motor metadata does not match image or point count")
+        return out
+
+    def frame_for(self, index):
+        path, raw = self.raw_locator_for(index)
+        return ScanFrame(index=index, metadata=self.metadata_for(index), source_path=path,
+                         source_frame_index=raw, loader=lambda frame: self.load_frame(frame.index),
+                         source_identity=self.name)
+
+    def close(self):
+        self.source.close()
+
+
+__all__ = ["PointImagePolicy", "PointImageDetection", "PointImagesRequired",
+           "inspect_point_images", "PointImageSource"]
