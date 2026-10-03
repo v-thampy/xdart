@@ -76,55 +76,26 @@ class DetectorCamera:
         raise ValueError('not an image transform')  # the eight above are every flip and turn
 
 
-#: The camera of the image Stitch calibrates and integrates in, its xrayutilities asset's: rows run down
-#: (x-), columns to the left looking downstream (z+). A raw image from another camera is turned into it
-#: first (:func:`stitch_orientation`); this one needs nothing (an image rotation of 0, as before). Scan 14 is
-#: consistent with it (2026-09-30): 17-2's direct-beam images put its rows down and its columns the way +nu
-#: swings the detector, to the right, so its camera is ('x-', 'z-'), and with the maintainer's senses (nu x-,
-#: del z-) the arm fits only with the columns mirrored, as this frame says. (A fit fixes only a circle's
-#: sense times the image's mirror, and the asset's camera was checked on |q| alone, which no mirror changes:
-#: the absolute frame rests on those images.) It is 180° from ``_PYFAI_TRANSFORM``'s ('x+', 'z-'), the frame
-#: an untilted pyFAI geometry takes; Stitch's arm is fitted in this one, so its pyFAI χ is its xrayutilities
-#: χ pixel for pixel (``test_xu_stitch_2d``; a χ window takes the same side on both, ``test_stitch_chi_window``).
-STITCH_CAMERA = DetectorCamera('x-', 'z+')
+#: New Stitch/RSM calibrations share pyFAI's native frame. Frozen XU assets retain their recorded frame.
+STITCH_CAMERA = DetectorCamera('x+', 'z-')
 
 
-def _in_stitch_frame(array: np.ndarray, camera: DetectorCamera) -> np.ndarray:
-    """A raw ``camera`` array with its rows along x- and its columns along z+ (a view)."""
-    rows, columns = camera.rows, camera.columns
-    if rows[0] == 'z':  # its rows run along z: transposed, they run along x
-        array, rows, columns = array.T, columns, rows
-    if rows == 'x+':
-        array = array[::-1, :]
-    if columns == 'z-':
-        array = array[:, ::-1]
-    return array
+def stitch_orientation(camera: DetectorCamera, *, frame: DetectorCamera = STITCH_CAMERA) -> ImageOrientation:
+    """Bring raw images into the native calibration frame, or an asset's explicitly recorded frame."""
+    native = camera.image_orientation()
+    if frame == STITCH_CAMERA:
+        return native
+    if frame == DetectorCamera('x-', 'z+'):
+        return ImageOrientation(rotation=(native.rotation + 180) % 360,
+                                flip_horizontal=native.flip_horizontal)
+    raise ValueError('unsupported calibration image frame')
 
 
-def _effect(transform) -> tuple[tuple[int, ...], bytes]:
-    """What a transform does to a small non-square array (its shape and values)."""
-    out = np.ascontiguousarray(transform(np.arange(6).reshape(2, 3)))
-    return out.shape, out.tobytes()
-
-
-#: Every image transform Stitch applies: a counterclockwise turn, then a horizontal flip.
-_STITCH_TRANSFORMS = tuple(ImageOrientation(rotation=rotation, flip_horizontal=flip)
-                           for flip in (False, True) for rotation in (0, 90, 180, 270))
-
-
-def stitch_orientation(camera: DetectorCamera) -> ImageOrientation:
-    """The image transform (a turn, then a horizontal flip) bringing a raw image from ``camera`` into
-    Stitch's frame (``STITCH_CAMERA``)."""
-    effect = _effect(lambda array: _in_stitch_frame(array, camera))
-    return next(orientation for orientation in _STITCH_TRANSFORMS if _effect(orientation.apply) == effect)
-
-
-def stitch_camera(orientation: ImageOrientation) -> DetectorCamera:
-    """The camera whose raw images Stitch turns by ``orientation``: an image rotation saved before the
-    camera existed is ``stitch_camera(ImageOrientation(rotation=R))`` (R = 0: ``STITCH_CAMERA``)."""
-    effect = _effect(orientation.apply)
-    for rows in CAMERA_AXES:
-        for columns in CAMERA_AXES:
-            if rows[0] != columns[0] and _effect(stitch_orientation(DetectorCamera(rows, columns)).apply) == effect:
-                return DetectorCamera(rows, columns)
-    raise ValueError('not an image transform')  # a transpose alone, say: no camera is one
+def stitch_camera(orientation: ImageOrientation, *, frame: DetectorCamera = STITCH_CAMERA) -> DetectorCamera:
+    """The raw camera whose transformed images have the calibration's recorded frame."""
+    camera = DetectorCamera.from_image_orientation(orientation)
+    if frame == STITCH_CAMERA:
+        return camera
+    if frame == DetectorCamera('x-', 'z+'):
+        return DetectorCamera(*(axis[0] + ('-' if axis[1] == '+' else '+') for axis in camera.to_xu()))
+    raise ValueError('unsupported calibration image frame')

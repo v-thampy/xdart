@@ -197,7 +197,7 @@ def test_detector_header_tracks_the_model_and_camera_image_correction(qapp, tmp_
         dialog._set_field_text('beam_detector', 'Eiger2_500k')
         assert dialog._detector_panel.title() == 'Detector · Eiger2 500k · image correction: standard'
         dialog.camera.set_value(DetectorCamera('z+', 'x-'))
-        assert dialog._detector_panel.title().endswith('image correction: 90° CW, then horizontal flip')
+        assert dialog._detector_panel.title().endswith('image correction: 90° CCW, then horizontal flip')
         assert dialog._image_size.text() == '512 × 1028 px (W × H)'
         title = dialog._detector_panel.title()
         dialog._set_field_text('beam_orientation', '1')

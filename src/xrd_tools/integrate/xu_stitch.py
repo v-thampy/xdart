@@ -183,7 +183,8 @@ class XuStitchEffectiveGeometryProjection:
             # psic's nu x+ and del z-, either reversed for a circle turning the other way
             or self.detector_axes not in {(nu, delta) for nu in ("x+", "x-") for delta in ("z-", "z+")}
             or (self.asset_version != 3 and self.detector_axes != ("x+", "z-"))
-            or self.camera != ("x-", "z+")
+            or self.camera not in ({("x-", "z+"), ("x+", "z-")} if self.asset_version == 3
+                                   else {("x-", "z+")})
         ):
             raise TypeError("XU effective geometry projection is invalid")
         if self.asset_version == 1 and (
@@ -626,7 +627,8 @@ def _ultimate_ndarray_root(value: np.ndarray) -> np.ndarray:
 
 
 class XuPowderQFrameLease:
-    def __init__(self, area_result: object, shape: tuple[int, int]):
+    def __init__(self, area_result: object, shape: tuple[int, int], *, camera=("x+", "z-")):
+        self._camera = camera
         if type(area_result) is not tuple or len(area_result) != 3:
             raise XuStitchScienceRefused(
                 "XU_Q_ROOT_UNSUPPORTED", "XU area result is not an exact triple"
@@ -678,15 +680,17 @@ class XuPowderQFrameLease:
             ) from None
 
     def chi(self) -> np.ndarray:
-        """Each pixel's azimuth about the beam (degrees, −180 to 180), pyFAI's χ: −atan2(qx, qz) in the
-        SURFACE asset's frame (x vertical, the beam along y), the asset's own validation convention.
-        Pinned to pyFAI's χ on scan 14's calibration pair (0.8° and 1.0° at single-circle poses; a
-        mirrored or quarter-turned χ is off by 90° or more)."""
+        """pyFAI χ in the asset's image frame: native atan2(qx,-qz), frozen old frame -atan2(qx,qz)."""
         if self._released:
             raise RuntimeError("XU q-frame lease is released")
         qx, _qy, qz = self._values
-        chi = np.arctan2(qx, qz)
-        np.negative(chi, out=chi)
+        if self._camera == ("x+", "z-"):
+            chi = np.empty_like(qz)
+            np.negative(qz, out=chi)
+            np.arctan2(qx, chi, out=chi)
+        else:
+            chi = np.arctan2(qx, qz)
+            np.negative(chi, out=chi)
         return np.degrees(chi, out=chi)
 
     def gi_coordinates(self, normal, axis) -> tuple[np.ndarray, np.ndarray]:
@@ -748,7 +752,7 @@ class XuPowderQProvider:
             float(del_) - self._del_offset,
             **displaced,
         )
-        return XuPowderQFrameLease(area, self.geometry.projection.shape)
+        return XuPowderQFrameLease(area, self.geometry.projection.shape, camera=self.geometry.projection.camera)
 
 
 def _polarization_axes(asset) -> tuple[np.ndarray, np.ndarray]:

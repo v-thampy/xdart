@@ -2,9 +2,7 @@
 options x+, x-, z+, z-. Once the first ... is selected, the other box shows the remaining two transverse options";
 given in xrayutilities' form it "should account for the mirroring".
 
-Stitch turns and mirrors every raw image into its frame, whose camera is its xrayutilities asset's (x-, z+): an
-image rotation of 0 before. 17-2's Pilatus 300K-W is (x-, z-), mirrored left-right: with the maintainer's senses
-(nu x-, del z-) scan 14 fits only so (rms 0.00614 Å⁻¹ against 0.916 unmirrored).
+Stitch and RSM calibration turn raw images into pyFAI's native reference, rows x+, columns z-.
 """
 import json
 from dataclasses import replace
@@ -24,22 +22,53 @@ CAMERAS = [DetectorCamera(rows, columns) for rows in CAMERA_AXES for columns in 
 def test_each_camera_is_one_turn_and_mirror_into_stitchs_frame():
     table = {camera.to_xu(): (stitch_orientation(camera).rotation, stitch_orientation(camera).flip_horizontal)
              for camera in CAMERAS}
-    assert table == {('x-', 'z+'): (0, False), ('x-', 'z-'): (0, True), ('x+', 'z-'): (180, False),
-                     ('x+', 'z+'): (180, True), ('z+', 'x+'): (90, False), ('z-', 'x+'): (90, True),
-                     ('z-', 'x-'): (270, False), ('z+', 'x-'): (270, True)}
-    assert STITCH_CAMERA.to_xu() == ('x-', 'z+') and stitch_orientation(STITCH_CAMERA).is_identity
+    assert table == {('x+', 'z-'): (0, False), ('x+', 'z+'): (0, True), ('x-', 'z+'): (180, False),
+                     ('x-', 'z-'): (180, True), ('z-', 'x-'): (90, False), ('z+', 'x-'): (90, True),
+                     ('z+', 'x+'): (270, False), ('z-', 'x+'): (270, True)}
+    assert STITCH_CAMERA.to_xu() == ('x+', 'z-') and stitch_orientation(STITCH_CAMERA).is_identity
     raw = np.arange(12).reshape(3, 4)
-    np.testing.assert_array_equal(stitch_orientation(DetectorCamera('x-', 'z-')).apply(raw), raw[:, ::-1])
-    np.testing.assert_array_equal(stitch_orientation(DetectorCamera('x+', 'z+')).apply(raw), raw[::-1, :])
-    # rows along z: the array is transposed so its rows run along x- and its columns along z+
-    np.testing.assert_array_equal(stitch_orientation(DetectorCamera('z+', 'x-')).apply(raw), raw.T)
+    np.testing.assert_array_equal(stitch_orientation(DetectorCamera('x+', 'z+')).apply(raw), raw[:, ::-1])
+    np.testing.assert_array_equal(stitch_orientation(DetectorCamera('x-', 'z-')).apply(raw), raw[::-1, :])
+    np.testing.assert_array_equal(stitch_orientation(DetectorCamera('z-', 'x+')).apply(raw), raw.T)
     for rotation in (0, 90, 180, 270):  # an image rotation saved before the camera: its unmirrored camera
         assert stitch_orientation(stitch_camera(ImageOrientation(rotation=rotation))) == ImageOrientation(rotation=rotation)
-    # half a turn from the pyFAI-frame table (DetectorCamera.image_orientation, pinned against xrayutilities and
-    # pyFAI untilted); Stitch's arm is fitted in Stitch's frame, so its two backends' χ agree (test_xu_stitch_2d)
     for camera in CAMERAS:
         np.testing.assert_array_equal(stitch_orientation(camera).apply(raw),
-                                      ImageOrientation(rotation=180).apply(camera.image_orientation().apply(raw)))
+                                      camera.image_orientation().apply(raw))
+        assert stitch_camera(stitch_orientation(camera)) == camera
+
+
+@pytest.mark.parametrize('camera', CAMERAS, ids=lambda camera: ','.join(camera.to_xu()))
+@pytest.mark.parametrize('nu_sense', [1, -1])
+def test_native_rough_arm_preserves_signed_physical_q_for_every_camera(camera, nu_sense):
+    """Independent XU physical-circle oracle at combined angles, not just |q| or zero pose."""
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.integrate.calibration_seed import rough_arm_record
+    from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
+    orientation = stitch_orientation(camera)
+    raw_shape, raw_beam = (195, 487), (200.25, 80.75)
+    with xu_runtime_session() as runtime:
+        xu = runtime.xu
+        wavelength_A = float(xu.en2lam(17000.004))
+        qconv = xu.QConversion(['x+', 'z-', 'y+', 'z-'], ['x+' if nu_sense == 1 else 'x-', 'z-'], [0, 1, 0])
+        hxrd = xu.HXRD([0, 1, 0], [0, 0, 1], en=17000.004, geometry='real', qconv=qconv)
+        hxrd.Ang2Q.init_area(*camera.to_xu(), cch1=raw_beam[1], cch2=raw_beam[0], Nch1=195, Nch2=487,
+                             pwidth1=.172, pwidth2=.172, distance=350.)
+        expected = np.stack(hxrd.Ang2Q.area(0., 0., 0., 0., 11., 23.))
+        record = rough_arm_record(distance_m=.35, detector='Pilatus100k',
+            beam_px=orientation.apply_pixel(raw_beam, raw_shape), wavelength_m=wavelength_A * 1e-10,
+            camera=orientation, senses={'nu': nu_sense})
+        diff = Diffractometer.from_pyfai_goniometer(record, source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+        ai, = create_multigeometry_integrators_from_geometry(diff, {'nu': [11.], 'del': [23.]})
+        raw_points = [(4, 0), (240, 100), (480, 194)]
+        x, y = np.array([orientation.apply_pixel(point, raw_shape) for point in raw_points]).T
+        theta, chi = ai.tth(y, x), ai.chi(y, x)
+        k = 2 * np.pi / wavelength_A
+        actual = k * np.stack((np.sin(theta) * np.sin(chi), np.cos(theta) - 1,
+                                -np.sin(theta) * np.cos(chi)))
+        target = expected[:, [p[1] for p in raw_points], [p[0] for p in raw_points]]
+        np.testing.assert_allclose(actual, target, atol=4e-13, rtol=0)
 
 
 def _mirrored_run(tmp_path, monkeypatch, name, *, flip, mirror_on_disk):
@@ -110,7 +139,7 @@ def test_a_mirrored_calibration_keeps_its_camera_through_the_save(tmp_path):
     )
     from tests.core.test_arm_fit_bounds import SOURCES, ZEROS, _controls_from, _seed, _subpixel_frames, replace_dist
     from tests.core.test_stacked_arm_extension import ANGLES, WAVELENGTH
-    arm = StackedDetectorArm(nu_offset=-np.deg2rad(ZEROS['nu']), del_offset=-np.deg2rad(ZEROS['del']))
+    arm = StackedDetectorArm(nu_offset=np.deg2rad(ZEROS['nu']), del_offset=np.deg2rad(ZEROS['del']))
     truth = Diffractometer.from_pyfai_goniometer(arm.to_pyfai_goniometer(
         DetectorCalibration(replace_dist(_seed(3), .39), detector_config={'orientation': 3})), source_motors=SOURCES)
     calibrant = get_calibrant('LaB6')

@@ -1480,7 +1480,7 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
 
     from dataclasses import replace
 
-    from xrd_tools.core.geometry.camera import STITCH_CAMERA, stitch_camera, stitch_orientation
+    from xrd_tools.core.geometry.camera import DetectorCamera, stitch_camera, stitch_orientation
     from xrd_tools.core.geometry.diffractometer import Diffractometer, ImageOrientation
     from xrd_tools.core.geometry.pixel_q import DetectorHeader
     from xrd_tools.core.geometry.xu_runtime import (
@@ -1491,14 +1491,13 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
     revalidate_rsm_geometry_source(receipt)
     value = receipt.calibration.projection.value
     xu_value, detector, acquisition = value["xrayutilities"], value["detector"], value["acquisition"]
-    if tuple(xu_value["camera"]) != STITCH_CAMERA.to_xu():
-        _refuse("RSM_CALIBRATION_UNSUPPORTED", "the calibration's camera is not the window's frame")
+    frame = DetectorCamera(*xu_value["camera"])
     orientation = ImageOrientation(
         rotation=90 * int(acquisition["image_rotation_quarter_turns"]),
         flip_horizontal=bool(acquisition.get("image_flip", False)),
     )
-    camera = stitch_camera(orientation)
-    check = stitch_orientation(camera)  # the turn back to this camera must be the partner's own
+    camera = stitch_camera(orientation, frame=frame)
+    check = stitch_orientation(camera, frame=frame)  # the turn must be the partner's own
     if (check.rotation, check.flip_horizontal) != (orientation.rotation, orientation.flip_horizontal):
         _refuse("RSM_CALIBRATION_UNSUPPORTED", "the calibration's image turn has no camera")
     turned_shape = tuple(int(item) for item in detector["shape"])
@@ -1583,7 +1582,7 @@ def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEf
             area_mount = (
                 float(detector["detrot_deg"]),
                 float(detector["tilt_deg"]),
-                _raw_tiltazimuth(STITCH_CAMERA.to_xu(), camera.to_xu(), float(detector["tiltazimuth_deg"]),
+                _raw_tiltazimuth(frame.to_xu(), camera.to_xu(), float(detector["tiltazimuth_deg"]),
                                  xu_value["incident_beam"]),
             )
         if "source_energy_eV" in acquisition:

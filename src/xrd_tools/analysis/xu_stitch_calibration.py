@@ -400,14 +400,18 @@ def _validate_extended_surface(value):
         return type(v) in {int, float} and math.isfinite(v)
     require(value['schema'] == reference['schema'] and value['preset'] == reference['preset'],
             'unsupported extended calibration model')
-    # psic's detector circles, either one turning the other way (its axis reversed, its scale negative)
+    # Physical psic detector circles, either reversed; Euler scales also depend on the recorded camera frame.
     conventions, standard = dict(value['xrayutilities']), dict(reference['xrayutilities'])
     axes, standard_axes = conventions.pop('detector_axes', None), standard.pop('detector_axes')
-    require(conventions == standard and type(axes) is list and len(axes) == len(standard_axes)
+    camera = conventions.pop('camera', None)
+    standard.pop('camera')
+    require(conventions == standard and camera in (['x+', 'z-'], ['x-', 'z+'])
+            and type(axes) is list and len(axes) == len(standard_axes)
             and all(axis in (psic, psic[0] + ('-' if psic[1] == '+' else '+'))
                     for axis, psic in zip(axes, standard_axes)),
             'SURFACE circle/camera/runtime conventions must match')
     senses = [1 if axis == psic else -1 for axis, psic in zip(axes, standard_axes)]  # nu, del
+    frame_sign = -1 if camera == ['x+', 'z-'] else 1
     detector, acquisition, correction, validation = (value[k] for k in ('detector', 'acquisition', 'corrections', 'validation'))
     require(type(detector) is dict and set(detector) == set(reference['detector']) | _EXTENDED_DETECTOR_KEYS,
             'extended detector keys differ')
@@ -473,7 +477,8 @@ def _validate_extended_surface(value):
             'the solid-angle arm must be a compact extended stacked arm')
     require(all(number(arm[k]) for k in _EXTENDED_ARM_KEYS - {'marker', 'detector', 'detector_config', 'source_motors'}),
             'the solid-angle arm has a non-numeric parameter')
-    require(arm['nu_scale'] == senses[0] * math.pi / 180 and arm['del_scale'] == senses[1] * math.pi / 180
+    require(arm['nu_scale'] == frame_sign * senses[0] * math.pi / 180
+            and arm['del_scale'] == frame_sign * senses[1] * math.pi / 180
             and arm['beam_rotation'] == 0,
             'the transfer supports degree motor scales, turning as the detector axes say, and no beam rotation')
     require(arm['detector'] == detector['detector_factory_name'] and arm['detector_config'] == cfg,
@@ -527,6 +532,7 @@ def extended_surface_calibration(*, detector, xu_parameters, arm, energy_eV, xu_
     from xrd_tools.core.energy import energy_eV_to_wavelength_m
     value = json.loads(canonical_surface_resource_bytes())
     value['version'] = 3
+    value['xrayutilities']['camera'] = ['x+', 'z-']
     if detector_axes is not None:
         value['xrayutilities']['detector_axes'] = [str(axis) for axis in detector_axes]
     shape = tuple(int(v) for v in detector.shape)

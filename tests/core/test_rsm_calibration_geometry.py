@@ -135,7 +135,8 @@ from tests.core.test_rsm_operation_r2_real_data import _form, rsm_r2_project  # 
 def _canonical_partner(project: Path) -> str:
     from pyFAI.detectors import Detector
     raw_shape, raw_cch = (195, 487), (97.0, 243.0)
-    orientation = stitch_orientation(DetectorCamera("z-", "x-"))
+    # This partner deliberately represents the frozen canonical asset's recorded camera frame.
+    orientation = stitch_orientation(DetectorCamera("z-", "x-"), frame=DetectorCamera("x-", "z+"))
     turned = (raw_shape[1], raw_shape[0]) if orientation.swaps_axes else raw_shape
     origin = np.array(_raw_frame_pixel(orientation, raw_shape, (0.0, 0.0)))
     matrix = np.column_stack([np.array(_raw_frame_pixel(orientation, raw_shape, point)) - origin

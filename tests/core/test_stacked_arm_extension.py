@@ -48,8 +48,8 @@ def _ray(params, cal, delta, nu, rows, cols, beam_rotation=0.):
     p = cal.poni
     v = np.stack(((rows + .5) * 172e-6 - p.poni1, (cols + .5) * 172e-6 - p.poni2,
                   np.full(np.shape(rows), p.dist)))
-    pose = (_r1(params.get('nu_offset', 0.) + np.deg2rad(nu))
-            @ _r2(params.get('del_offset', 0.) + np.deg2rad(delta))
+    pose = (_r1(params.get('nu_offset', 0.) - np.deg2rad(nu))
+            @ _r2(params.get('del_offset', 0.) - np.deg2rad(delta))
             @ _r3(params.get('mount_roll', 0.)) @ _r1(params.get('mount_tilt', 0.)))
     s = np.array([params.get(f'sample_offset{i}', 0.) for i in (1, 2, 3)])
     lab = np.einsum('ij,j...->i...', _r3(beam_rotation) @ pose, v)
