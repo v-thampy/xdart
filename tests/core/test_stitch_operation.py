@@ -1348,3 +1348,59 @@ def test_plan_rejects_unbounded_or_unsupported_science(tmp_path):
     # the old Stitch 2D layout was removed (maintainer, 2026-09-30: "Remove old format")
     with pytest.raises(ValueError, match="a Stitch 2D is a native record"):
         StitchOperationPlan(geometry, mode="2d", radial_range=(0.1, 1.0), azimuth_range=(-1.0, 1.0))
+
+
+def _form(tmp_path, backend):
+    from xrd_tools.analysis.stitch_values import StitchFrameSelector, StitchToolForm
+    source = tmp_path / "source"
+    source.mkdir()
+    spec = source / "sample"
+    spec.write_text(
+        "#F sample\n#E 1\n#D today\n#O0 del  nu  energy\n\n"
+        "#S 1 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
+        "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n"
+    )
+    images = source / "images"
+    images.mkdir()
+    shape = (195, 1475) if backend == "xu_hist" else (195, 487)
+    for i in range(2):
+        array = np.full(shape, i + 10, dtype=np.int32) if backend == "xu_hist" else _ring(i).astype(np.int32)
+        array.tofile(images / f"sample_scan1_{i:04d}.raw")
+    geometry = source / "geometry.json"
+    if backend == "xu_hist":
+        geometry.write_bytes(canonical_surface_resource_bytes())
+    else:
+        geometry.write_text(json.dumps(_goniometer_record()))
+    (tmp_path / "output").mkdir()
+    return StitchToolForm(
+        project_root=tmp_path, spec_path=spec, scan="1", image_dir=images,
+        image_stem="sample_scan1_", frame_selector=StitchFrameSelector(),
+        detector_shape=shape, raw_dtype="int32", threshold=800000,
+        geometry_path=geometry, geometry_kind=StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+        source_motors=(("del", "del"), ("nu", "nu")) if backend == "xu_hist"
+            else (("del_angle", "del"), ("nu_angle", "nu")),
+        q_range=(1., 5.2), npt_1d=64, output_path=tmp_path / "output" / "sample_stitch1d.nexus",
+        backend=backend,
+    )
+
+
+def _native_form(tmp_path, backend, *, scans="1,2,[1,2]", unit="q_A^-1"):
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    form = _form(tmp_path, backend)
+    path = Path(form.spec_path)
+    text = path.read_text()
+    # The MG test calibration is 1 Angstrom; no independent energy was measured
+    # for this synthetic source. XU uses its canonical recorded energy.
+    if backend == "multigeometry":
+        text = text.replace("  energy", "").replace(" 17000.018", "").replace("#N 3", "#N 2")
+    second = text[text.index("#S 1"):].replace("#S 1", "#S 2", 1)
+    empty = second.replace("#S 2", "#S 3", 1)
+    path.write_text(text + "\n" + second + "\n" + empty)
+    for source in Path(form.image_dir).glob("*scan1_*"):
+        destination = source.with_name(source.name.replace("scan1_", "scan2_"))
+        destination.write_bytes(source.read_bytes())
+    return replace(form, source_selection=StitchSourceSelection(
+        "Spec", (str(path),), scans=scans, image_dir=str(form.image_dir)),
+        unit=unit, q_range=None, conditioning=StitchConditioning("auto"),
+        output_family="combined" if "[" in scans and "," in scans else None)

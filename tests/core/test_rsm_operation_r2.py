@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from xdart.gui.tools.rsm_values import (
+from xrd_tools.analysis.rsm_values import (
     RSMFrameSelector,
     RSMScanMemberForm,
     RSMToolFormV2,

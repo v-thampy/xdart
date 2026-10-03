@@ -21,7 +21,7 @@ from xrd_tools.analysis.rsm_operation import (
     RSMNormalizationPolicy, RSMUBOverride, rsm_output_current, run_rsm_operation_v2,
 )
 from xrd_tools.core.scan import SourceKind
-from xdart.gui.tools.rsm_values import (
+from xrd_tools.analysis.rsm_values import (
     RSMFrameSelector, RSMNexusMemberForm, RSMToolFormV2, RSMToolPreflightRefused, prepare_rsm_tool_v2,
     rsm_tool_preset,
 )
@@ -132,7 +132,7 @@ def test_a_psic_role_mapped_to_a_column_the_entry_lacks_is_named(nexus_project):
 
 @pytest.mark.slow
 def test_the_preview_names_a_nexus_members_entry_and_its_ub_convention(nexus_project):
-    from xdart.gui.tools.rsm_values import rsm_preflight_summary_lines
+    from xrd_tools.analysis.rsm_values import rsm_preflight_summary_lines
     lines = rsm_preflight_summary_lines(prepare_rsm_tool_v2(_form(nexus_project, "member_ub.nxs")).summary)
     member = next(line for line in lines if line.startswith("Member 1:"))
     assert "member_ub.nxs · NeXus entry entry · 5 frames" in member

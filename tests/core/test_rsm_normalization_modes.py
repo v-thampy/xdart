@@ -109,7 +109,7 @@ def test_a_monitor_before_the_foils_grids_as_the_foils_with_its_counts_as_the_ex
     exposure does with that column as the exposure, so the two volumes are byte-identical; Monitor alone divides
     by the counts (the Preview's divisor range is theirs) and is its own identity."""
     import xrd_tools.analysis.rsm_operation as rsm_operation
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
     from xrd_tools.analysis.rsm_operation import run_rsm_operation_v2
     from xrd_tools.sources.spec import SpecSource
     from tests.core.test_rsm_operation_r2 import _form, _write_member

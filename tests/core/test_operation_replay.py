@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 import tifffile
 
-from xdart.gui.tools.stitch_values import prepare_stitch_tool
-from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+from xrd_tools.analysis.stitch_values import prepare_stitch_tool
+from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.stitch_operation import run_stitch_operation
 from xrd_tools.analysis.rsm_operation import run_rsm_operation_v2
@@ -28,7 +28,7 @@ def _rsm_form(root):
 
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_capture_round_trip_keeps_stitch_form_and_prepared_fingerprints(tmp_path, backend):
-    from tests.xdart.tools.test_stitch_native_values import _native_form
+    from tests.core.test_stitch_operation import _native_form
     from xrd_tools.notebooks.operation_replay import capture_stitch_form, _restore_forms
     form = _native_form(tmp_path, backend, scans="1")
     configuration = json.loads(json.dumps(capture_stitch_form(form)))
@@ -52,7 +52,7 @@ def test_capture_round_trip_keeps_rsm_v2_geometry_and_scientific_settings(tmp_pa
 
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_native_stitch_replay_matches_science_and_keeps_original_bytes(tmp_path, backend):
-    from tests.xdart.tools.test_stitch_native_values import _native_form
+    from tests.core.test_stitch_operation import _native_form
     from xrd_tools.notebooks.operation_replay import capture_stitch_form, run_operation_replay
     form = _native_form(tmp_path, backend, scans="1")
     original = run_stitch_operation(prepare_stitch_tool(form).requests[0])
@@ -89,7 +89,7 @@ def test_real_rsm_v2_replay_uses_the_original_owner_and_fresh_namespace(tmp_path
 
 
 def test_external_inputs_stay_explicit_and_external_outputs_are_refused(tmp_path):
-    from tests.xdart.tools.test_stitch_native_values import _native_form
+    from tests.core.test_stitch_operation import _native_form
     from xrd_tools.notebooks.operation_replay import capture_stitch_form, run_operation_replay, _restore_forms
     form = _native_form(tmp_path, "multigeometry", scans="1")
     outside = tmp_path.parent / "external-mask.edf"
@@ -108,10 +108,14 @@ def test_external_inputs_stay_explicit_and_external_outputs_are_refused(tmp_path
 def test_replay_import_and_concrete_type_transport_are_headless(tmp_path):
     command = """
 import sys
+from pathlib import Path
 from xrd_tools.notebooks.operation_replay import capture_stitch_form, capture_rsm_forms, run_operation_replay
 from xrd_tools.analysis.stitch_values import StitchToolForm
 from xrd_tools.analysis.rsm_values import RSMToolFormV2
+from tests.core.test_stitch_operation import _native_form
+form = _native_form(Path(sys.argv[1]), 'multigeometry', scans='1')
+assert capture_stitch_form(form)['forms']
 assert not any(n == 'xdart' or n.startswith(('xdart.', 'PySide', 'PyQt', 'pyqtgraph')) for n in sys.modules)
 """
-    result = subprocess.run([sys.executable, "-c", command], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-c", command, str(tmp_path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

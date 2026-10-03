@@ -178,8 +178,8 @@ def test_an_xrayutilities_frame_missing_a_foil_column_is_refused_for_that_column
 def _foil_form(tmp_path, backend, *, name="sample_stitch1d.nexus"):
     """The native Stitch fixture with a monitor before the foils (I0), the foil status, the counting time and
     each choice's divisor as columns."""
-    from xdart.gui.tools.stitch_values import prepare_stitch_tool
-    from tests.xdart.tools.test_stitch_native_values import _native_form
+    from xrd_tools.analysis.stitch_values import prepare_stitch_tool
+    from tests.core.test_stitch_operation import _native_form
     tmp_path.mkdir(parents=True, exist_ok=True)
     form = _native_form(tmp_path, backend, scans="1")
     spec = Path(form.spec_path)

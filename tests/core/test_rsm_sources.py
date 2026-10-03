@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from xdart.gui.tools.rsm_values import (
+from xrd_tools.analysis.rsm_values import (
     RSMFrameSelector,
     RSMToolPreflightRefused,
     prepare_rsm_tool_v2,
@@ -98,7 +98,7 @@ def test_a_psic_role_mapped_to_a_column_the_scan_lacks_is_named(tmp_path):
 
 def test_an_explicit_nexus_selection_is_a_nexus_member_since_c5c():
     """C5c: a raw NeXus stack is an RSM member (its path, kind and entry), where C5b refused it."""
-    from xdart.gui.tools.rsm_values import RSMNexusMemberForm
+    from xrd_tools.analysis.rsm_values import RSMNexusMemberForm
     root = Path(os.environ.get("XDART_TEST_DATA", "")) / "nexus"
     masters = sorted(root.glob("*_master.h5")) if root.is_dir() else []
     if not masters:
@@ -113,7 +113,7 @@ def test_directory_mode_maps_a_folders_nexus_files_beside_its_spec_scans(tmp_pat
     """C5c: in Directory mode a folder's raw NeXus stacks are members beside its SPEC scans (C5b skipped them).
     Stitch's resolver is given one NeXus group beside the SPEC ones (the mapping's branch; the resolver itself
     is Stitch's, tested there)."""
-    from xdart.gui.tools.rsm_values import RSMNexusMemberForm
+    from xrd_tools.analysis.rsm_values import RSMNexusMemberForm
     import xrd_tools.analysis.stitch_sources as stitch_sources
     from xrd_tools.core.scan import SourceKind, SourceSpec
     spec = _pair(tmp_path / "data")

@@ -168,7 +168,7 @@ def test_row_b_a_calibration_encoding_the_canonical_geometry_agrees_with_the_ref
     from xrd_tools.analysis.module_transaction import ModuleDisposition
     from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
     from xrd_tools.analysis.rsm_operation import run_rsm_operation_v2
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
 
     locator = _canonical_partner(rsm_r2_project)
     canonical_form = _form(rsm_r2_project, (43,), 40)
@@ -183,7 +183,7 @@ def test_row_b_a_calibration_encoding_the_canonical_geometry_agrees_with_the_ref
             prepared = prepare_rsm_tool_v2(form)
             request = prepared.request
             if form is calibration_form:  # the Preview names the source and the energy it maps with
-                from xdart.gui.tools.rsm_values import rsm_preflight_summary_lines
+                from xrd_tools.analysis.rsm_values import rsm_preflight_summary_lines
                 lines = rsm_preflight_summary_lines(prepared.summary)
                 assert any(line.startswith("Geometry: the calibration on the Calibration row, refinement on")
                            for line in lines)
@@ -305,7 +305,7 @@ def test_the_energy_offset_scales_q_as_its_energy(tmp_path, v3_asset):
 def test_the_preview_energy_lines_and_the_far_energy_warning():
     """The Preview carries each scan's recorded energy, the offset and the energy used, and warns when a scan was
     recorded more than 2 % from the calibration's energy (the maintainer's offset decision; design §3.2)."""
-    from xdart.gui.tools.rsm_values import _rsm_member_energy_lines
+    from xrd_tools.analysis.rsm_values import _rsm_member_energy_lines
     assert _rsm_member_energy_lines(13_000.0, None) == ("  energy: 13000 eV",)
     assert _rsm_member_energy_lines(13_000.0, (False, 3.0, 13_000.0)) == ("  energy: 13000 eV",)
     near = _rsm_member_energy_lines(13_100.0, (True, 3.0, 13_000.0))
@@ -396,7 +396,7 @@ def test_the_run_hands_its_calibration_to_the_solid_angle(rsm_r2_project, monkey
     from xrd_tools.analysis.module_transaction import ModuleDisposition
     from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
     from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
 
     seen, real = [], rsm_operation.rsm_calibration_solid_angle
 
@@ -482,7 +482,7 @@ def test_the_run_applies_each_members_ceiling_from_the_calibration(rsm_r2_projec
     from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
     from xrd_tools.core.invalid import PILATUS_COUNTER_LIMIT
     from xrd_tools.integrate.stitch_conditioning import StitchConditioning
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
 
     looked_up, applied = [], []
     original_lookup, original_apply = rsm_operation._rsm_calibration_detector, rsm_operation._apply_rsm_frame_corrections
@@ -573,7 +573,7 @@ def test_rsm_checks_its_flat_against_the_calibrations_mask_and_the_run_recapture
     from xrd_tools.analysis.module_transaction import ModuleDisposition
     from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
     from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
 
     gaps = np.zeros((195, 487), dtype=bool)
     gaps[60:72] = True  # 6.2 % of the detector
@@ -672,7 +672,7 @@ def test_scan_43_under_a_partial_reversal_of_mu_and_chi_misindexes_specs_labels(
     from silx.io.specfile import SpecFile
 
     from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2, rsm_preflight_summary_lines
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2, rsm_preflight_summary_lines
 
     locator = _canonical_partner(rsm_r2_project)
     pyfai = rsm_r2_project / locator
@@ -810,7 +810,7 @@ def test_scan_43_with_17_2s_whole_record_maps_through_the_mirror_as_spec_does(rs
     from xrd_tools.analysis.module_transaction import ModuleDisposition
     from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
     from xrd_tools.analysis.rsm_operation import run_rsm_operation_v2
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2, rsm_preflight_summary_lines
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2, rsm_preflight_summary_lines
 
     canonical_form = _form(rsm_r2_project, (43,), 40)
     mirror_form = replace(canonical_form,
@@ -894,7 +894,7 @@ def test_the_calibrations_detector_mask_masks_every_frame_beside_the_mask_file(r
     from xrd_tools.analysis.module_transaction import ModuleDisposition
     from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
     from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
     from tests.core.test_rsm_operation_r2_real_data import _SCIENCE
 
     gaps = np.zeros((195, 487), dtype=bool)
@@ -945,7 +945,7 @@ def test_scan_43_in_q_with_17_2s_whole_record_is_q_in_specs_handedness(rsm_r2_pr
     from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
     from xrd_tools.analysis.rsm_operation import run_rsm_operation_v2
     from xrd_tools.rsm import RSMCoordinateFrame
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
 
     canonical_form = replace(_form(rsm_r2_project, (43,), 40),
                              coordinate_frame=RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,

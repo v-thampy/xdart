@@ -1013,7 +1013,7 @@ def test_rsm_v2_module_commit_binds_group_and_exact_attestation(
     monkeypatch,
 ):
     from tests.core.test_rsm_operation_r2 import _form, _write_member
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
     import xrd_tools.analysis.rsm_operation as rsm_operation
 
     monkeypatch.setattr(
@@ -1283,7 +1283,7 @@ def test_rsm_v2_mask_facts_require_the_factory_execution_receipts(
     monkeypatch,
 ):
     from tests.core.test_rsm_operation_r2 import _form, _write_member
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
     import xrd_tools.analysis.rsm_operation as rsm_operation
     from xrd_tools.analysis.rsm_operation import RSMImageConditioning
 
@@ -1377,7 +1377,7 @@ def test_rsm_v2_factory_owner_refuses_retagged_nested_provenance(
     monkeypatch,
 ):
     from tests.core.test_rsm_operation_r2 import _form, _write_member
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
     import xrd_tools.analysis.rsm_operation as rsm_operation
 
     monkeypatch.setattr(

@@ -13,6 +13,7 @@ from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.stitch_sources import StitchSourceSelection
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from tests.xdart.pages.test_stitch_page import _form
+from tests.core.test_stitch_operation import _native_form
 from tests.xdart.tools.test_stitch_owner import _poll_terminal
 
 
@@ -313,24 +314,6 @@ def test_native_eiger_missing_angles_names_source_and_entry(tmp_path):
     assert "entry entry" in str(error.value)
 
 
-def _native_form(tmp_path, backend, *, scans="1,2,[1,2]", unit="q_A^-1"):
-    form = _form(tmp_path, backend)
-    path = Path(form.spec_path)
-    text = path.read_text()
-    # The MG test calibration is 1 Angstrom; no independent energy was measured
-    # for this synthetic source. XU uses its canonical recorded energy.
-    if backend == "multigeometry":
-        text = text.replace("  energy", "").replace(" 17000.018", "").replace("#N 3", "#N 2")
-    second = text[text.index("#S 1"):].replace("#S 1", "#S 2", 1)
-    empty = second.replace("#S 2", "#S 3", 1)
-    path.write_text(text + "\n" + second + "\n" + empty)
-    for source in Path(form.image_dir).glob("*scan1_*"):
-        destination = source.with_name(source.name.replace("scan1_", "scan2_"))
-        destination.write_bytes(source.read_bytes())
-    return replace(form, source_selection=StitchSourceSelection(
-        "Spec", (str(path),), scans=scans, image_dir=str(form.image_dir)),
-        unit=unit, q_range=None, conditioning=StitchConditioning("auto"),
-        output_family="combined" if "[" in scans and "," in scans else None)
 
 
 @pytest.mark.parametrize("mode", ("1d", "2d"))

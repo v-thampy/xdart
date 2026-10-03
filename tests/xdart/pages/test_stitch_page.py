@@ -22,7 +22,7 @@ from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xdart.gui.widgets.scientific_plot import scaled_intensity
-from tests.core.test_stitch_operation import _goniometer_record, _ring
+from tests.core.test_stitch_operation import _form, _goniometer_record, _ring
 
 
 class _Status:
@@ -47,37 +47,6 @@ def _wait(page, qapp, timeout=30):
     assert not page._owner.busy, page.run_bar.readinessLabel.full_text()
 
 
-def _form(tmp_path, backend):
-    source = tmp_path / "source"
-    source.mkdir()
-    spec = source / "sample"
-    spec.write_text(
-        "#F sample\n#E 1\n#D today\n#O0 del  nu  energy\n\n"
-        "#S 1 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
-        "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n"
-    )
-    images = source / "images"
-    images.mkdir()
-    shape = (195, 1475) if backend == "xu_hist" else (195, 487)
-    for i in range(2):
-        array = np.full(shape, i + 10, dtype=np.int32) if backend == "xu_hist" else _ring(i).astype(np.int32)
-        array.tofile(images / f"sample_scan1_{i:04d}.raw")
-    geometry = source / "geometry.json"
-    if backend == "xu_hist":
-        geometry.write_bytes(canonical_surface_resource_bytes())
-    else:
-        geometry.write_text(json.dumps(_goniometer_record()))
-    (tmp_path / "output").mkdir()
-    return StitchToolForm(
-        project_root=tmp_path, spec_path=spec, scan="1", image_dir=images,
-        image_stem="sample_scan1_", frame_selector=StitchFrameSelector(),
-        detector_shape=shape, raw_dtype="int32", threshold=800000,
-        geometry_path=geometry, geometry_kind=StitchGeometryKind.PYFAI_GONIOMETER_JSON,
-        source_motors=(("del", "del"), ("nu", "nu")) if backend == "xu_hist"
-            else (("del_angle", "del"), ("nu_angle", "nu")),
-        q_range=(1., 5.2), npt_1d=64, output_path=tmp_path / "output" / "sample_stitch1d.nexus",
-        backend=backend,
-    )
 
 
 def _as_native(form, scans="1"):

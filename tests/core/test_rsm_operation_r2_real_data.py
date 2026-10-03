@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from xrd_tools.analysis.rsm_operation import RSMFrameCorrections
-from xdart.gui.tools.rsm_values import (
+from xrd_tools.analysis.rsm_values import (
     RSMFrameSelector,
     RSMScanMemberForm,
     RSMToolFormV2,

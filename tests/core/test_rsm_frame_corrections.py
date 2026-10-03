@@ -18,7 +18,7 @@ import pytest
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.rsm_operation import RSMFrameCorrections, run_rsm_operation_v2
 from xrd_tools.corrections.frame_preparation import flat_detector_solid_angle
-from xdart.gui.tools.rsm_values import RSMToolPreflightRefused, prepare_rsm_tool_v2
+from xrd_tools.analysis.rsm_values import RSMToolPreflightRefused, prepare_rsm_tool_v2
 from tests.core.test_rsm_operation_r2_real_data import _form, rsm_r2_project  # noqa: F401 (the fixture)
 
 REFERENCE = "8a88826f85eda95bf9fb4eb9cd043b7b822e0827e4ec3d285203f9256f43b324"

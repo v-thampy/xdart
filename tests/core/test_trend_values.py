@@ -126,7 +126,7 @@ def _spec_column(path: Path, scan: int, column: str) -> list[float]:
 @pytest.mark.slow  # copies scans 42 and 43's raw frames (about 85 MB), as the sibling real-data RSM rows do
 def test_grouped_spec_rsm_result_scan_42_and_43_through_its_saved_contributors(tmp_path):
     root = _data_root()
-    from xdart.gui.tools.rsm_values import (
+    from xrd_tools.analysis.rsm_values import (
         RSMFrameSelector, RSMScanMemberForm, RSMToolFormV2, prepare_rsm_tool_v2, rsm_tool_preset,
     )
     from xrd_tools.analysis.module_transaction import ModuleDisposition
@@ -184,7 +184,7 @@ def test_grouped_spec_rsm_result_scan_42_and_43_through_its_saved_contributors(t
 
 def test_nexus_rsm_result_through_its_saved_contributors(tmp_path):
     from tests.core.test_rsm_nexus_members import _write_rsm_nexus
-    from xdart.gui.tools.rsm_values import (
+    from xrd_tools.analysis.rsm_values import (
         RSMFrameSelector, RSMNexusMemberForm, RSMToolFormV2, prepare_rsm_tool_v2, rsm_tool_preset,
     )
     from xrd_tools.analysis.module_transaction import ModuleDisposition

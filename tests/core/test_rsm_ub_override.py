@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from xdart.gui.tools.rsm_values import RSMToolPreflightRefused, prepare_rsm_tool_v2
+from xrd_tools.analysis.rsm_values import RSMToolPreflightRefused, prepare_rsm_tool_v2
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.rsm_operation import (
     RSMFrameCorrections,
