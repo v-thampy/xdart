@@ -812,13 +812,13 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
     direct-beam geometry), the first free name, since a saved calibration is never overwritten."""
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
-        for key, value in (('source', tmp_path / 'LaB6_17keV'), ('scan', '14'),
+        folder = tmp_path / 'scans'
+        folder.mkdir()
+        for key, value in (('source', folder / 'LaB6_17keV'), ('scan', '14'),
                            ('beam_source', tmp_path / 'direct_beam'), ('beam_scan', '3.1')):
             dialog._set_field_text(key, str(value))
-        folder = tmp_path / 'calibration'
         assert dialog._default_name(False) == folder / 'LaB6_17keV_scan14.json'
-        assert dialog._default_name(True) == folder / 'direct_beam_scan3.json'
-        folder.mkdir()
+        assert dialog._default_name(True) == tmp_path / 'direct_beam_scan3.json'
         (folder / 'LaB6_17keV_scan14.json').write_text('{}')
         (folder / 'LaB6_17keV_scan14_2.xu.json').write_text('{}')  # its partner taken: that name too
         assert dialog._default_name(False) == folder / 'LaB6_17keV_scan14_3.json'
@@ -826,6 +826,13 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
         monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
                             staticmethod(lambda _parent, _title, start, _filter: proposed.append(start) or ('', '')))
         assert dialog._save_path() is None and proposed == [str(folder / 'LaB6_17keV_scan14_3.json')]
+        dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('nexus_stack'))
+        dialog._set_field_text('source', str(folder / 'master.h5'))
+        assert dialog._default_name(False).parent == folder
+        dialog._set_field_text('source', 'relative/scan.spec')
+        assert dialog._default_name(False).parent == tmp_path / 'relative'
+        dialog._set_field_text('source', '')
+        assert dialog._default_name(False).parent == tmp_path
     finally:
         dialog.close()
 

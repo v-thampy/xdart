@@ -2239,11 +2239,13 @@ class CalibrationDialog(QtWidgets.QDialog):
         geometry) SPEC file and scan, or its NeXus file; the first free name, since a saved calibration
         is never overwritten."""
         prefix = 'beam_' if beam else ''
-        source = Path(self._text(prefix + 'source') or 'calibration')
+        source_text = self._text(prefix + 'source')
+        source = Path(source_text or 'calibration')
         scan = re.match(r'\d+', self._text(prefix + 'scan') or '')
         stem = (f'{source.stem}_scan{scan[0]}' if scan and not (beam and self.beam_source_kind.currentData() == 'nexus')
                 else source.stem)
-        folder = self.project_root / 'calibration'
+        folder = ((source if source.is_absolute() else self.project_root / source).parent
+                  if source_text else self.project_root)
         for count in range(1, 1000):
             name = folder / (f'{stem}.json' if count == 1 else f'{stem}_{count}.json')
             if not name.exists() and not xu_partner_path(name).exists():
@@ -2253,8 +2255,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _save_path(self, *, beam=False):
         """The new calibration file the person chooses inside the project, or None."""
         from xdart.gui.widgets import file_dialogs
-        # the managed name in the Project's calibration folder, offered as it is (the checks below keep a
-        # save inside the Project and new); the pick joins the shared last-folder rule
+        # Offer beside the selected scan; the checks below keep the save inside the Project and new.
         picks = file_dialogs.browse(self, 'Save calibrated geometry', save=True, file_filter='JSON (*.json)',
                                     default_name=str(self._default_name(beam)))
         path = picks[0] if picks else ''
