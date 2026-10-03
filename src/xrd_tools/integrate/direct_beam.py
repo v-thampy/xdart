@@ -133,7 +133,8 @@ def _gaussian_line(x, background, gradient, amplitude, centre, sigma):
     return background + gradient*x + amplitude*np.exp(-.5*((x-centre)/sigma)**2)
 
 
-def _peak(image, invalid, beam, motion, half_width, roi, saturation):
+def _peak(image, invalid, beam, motion, half_width, roi, saturation, *,
+          native_saturated=None, signed=False):
     h,w = image.shape
     x0,y0,x1,y1 = (0,0,w,h) if roi is None else roi
     if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
@@ -142,19 +143,24 @@ def _peak(image, invalid, beam, motion, half_width, roi, saturation):
         raise ValueError('beam_pixel must be inside the oriented image/ROI')
     if motion == 'vertical':
         image, invalid = image.T, invalid.T
+        if native_saturated is not None:
+            native_saturated = native_saturated.T
         x0,y0,x1,y1 = y0,x0,y1,x1
         beam = beam[::-1]
     row = int(np.floor(beam[1]+.5))
     lo,hi = max(y0,row-half_width), min(y1,row+half_width+1)
     strip = image[lo:hi,x0:x1]
-    bad = invalid[lo:hi,x0:x1] | ~np.isfinite(strip) | (strip < 0)
+    bad = invalid[lo:hi,x0:x1] | ~np.isfinite(strip)
+    if not signed:
+        bad |= strip < 0
     # Static invalid pixels are not measurements. Still reject unmasked saturation
     # rather than masking it and fitting the remaining wings as a valid beam.
     limit = saturation
     if np.issubdtype(image.dtype,np.integer):
         native_limit = np.iinfo(image.dtype).max
         limit = native_limit if limit is None else min(limit,native_limit)
-    if limit is not None and np.any((strip >= limit) & ~bad):
+    if ((native_saturated is not None and native_saturated[lo:hi,x0:x1].any())
+            or limit is not None and np.any((strip >= limit) & ~bad)):
         raise ValueError('saturated pixels in beam strip/ROI')
     valid = ~bad.any(axis=0)
     x = np.arange(x0,x1,dtype=float)
@@ -218,12 +224,16 @@ def find_beam_spot(image, invalid=None, *, box: int = 5) -> tuple[float, float]:
     return float((weights * grid_cols).sum() / total), float((weights * grid_rows).sum() / total)
 
 
-def _load_beam_image(item, options):
+def _load_beam_image(item, options, *, native_transform=None):
     if item is None:
         raise ValueError('missing frame')
     if isinstance(item,np.ndarray):
         return item
     if isinstance(item, ScanFrame):
+        if native_transform is not None:
+            if not callable(item.point_statistics_loader):
+                raise ValueError('grouped direct-beam frame has no native point loader')
+            return item.point_statistics_loader(native_transform=native_transform).signal
         return item.load_image()
     opts = options.copy()
     path = item
@@ -236,7 +246,7 @@ def _load_beam_image(item, options):
     return read_image(path,preserve_dtype=True,exact_frame=True,**opts)
 
 
-def _prepare_beam_image(image, det, orient, mask, state):
+def _prepare_beam_image(image, det, orient, mask, state, *, native_values=True):
     if image.ndim != 2 or not all(image.shape):
         raise ValueError('image shape must be nonempty 2-D')
     if not state:
@@ -255,14 +265,46 @@ def _prepare_beam_image(image, det, orient, mask, state):
     oriented = orient.apply(image)
     invalid = (np.zeros(oriented.shape,bool) if state['detector_mask'] is None
                else state['detector_mask'].copy())
-    dummy, tolerance = state['effective'].get_dummies(image)
-    if dummy is not None:
-        invalid |= np.abs(oriented.astype(np.float32)-dummy) <= tolerance
+    if native_values:
+        dummy, tolerance = state['effective'].get_dummies(image)
+        if dummy is not None:
+            invalid |= np.abs(oriented.astype(np.float32)-dummy) <= tolerance
     if mask is not None:
         if np.shape(mask) != oriented.shape:
             raise ValueError('mask shape must match the oriented image')
         invalid |= np.asarray(mask,dtype=bool)
     return oriented, invalid
+
+
+def _prepared_beam_image(item, options, det, orient, mask, state, saturation):
+    """Prepare used native operands, retaining saturation independently of their sum.
+
+    A saturated strip is refused even when averaging hides its native count.
+    Invalid native pixels propagate through the point combiner; detector dummy
+    values and a positive-count cutoff do not reinterpret a signed Difference.
+    """
+    policy = item.metadata.get('point_images') if isinstance(item, ScanFrame) else None
+    grouped = isinstance(policy, Mapping)
+    saturated = None
+
+    def native_transform(native):
+        nonlocal saturated
+        oriented, invalid = _prepare_beam_image(native, det, orient, mask, state)
+        bad = invalid | ~np.isfinite(oriented) | (oriented < 0)
+        limit = saturation
+        if np.issubdtype(native.dtype, np.integer):
+            native_limit = np.iinfo(native.dtype).max
+            limit = native_limit if limit is None else min(limit, native_limit)
+        if limit is not None:
+            hits = (oriented >= limit) & ~bad
+            saturated = hits if saturated is None else np.logical_or(saturated, hits)
+        image = np.array(native, dtype=np.float64, copy=True)
+        image[orient.unapply(bad)] = np.nan
+        return image
+
+    image = _load_beam_image(item, options, native_transform=native_transform if grouped else None)
+    oriented, invalid = _prepare_beam_image(image, det, orient, mask, state, native_values=not grouped)
+    return oriented, invalid, saturated, grouped and policy.get('operation') == 'difference'
 
 
 def infer_direct_beam_motion(images: Sequence, *, detector, detector_config=None,
@@ -292,16 +334,18 @@ def infer_direct_beam_motion(images: Sequence, *, detector, detector_config=None
             if cancelled is not None and cancelled.is_set():
                 raise ValueError('direct-beam detection cancelled')
             try:
-                image, invalid = _prepare_beam_image(
-                    _load_beam_image(images[index], dict(reader_options or {})), det, orient, mask, state)
+                image, invalid, native_saturated, signed = _prepared_beam_image(
+                    images[index], dict(reader_options or {}), det, orient, mask, state, saturation)
                 if roi is not None:
                     x0, y0, x1, y1 = roi
                     outside = np.ones(image.shape, dtype=bool)
                     outside[y0:y1, x0:x1] = False
                     invalid |= outside
                 spot = find_beam_spot(image, invalid)
-                x, _ = _peak(image, invalid, spot, 'horizontal', 2, roi, saturation)
-                y, _ = _peak(image, invalid, spot, 'vertical', 2, roi, saturation)
+                x, _ = _peak(image, invalid, spot, 'horizontal', 2, roi,
+                    None if signed else saturation, native_saturated=native_saturated, signed=signed)
+                y, _ = _peak(image, invalid, spot, 'vertical', 2, roi,
+                    None if signed else saturation, native_saturated=native_saturated, signed=signed)
                 return index, np.array((x, y))
             except (ValueError, OSError, RuntimeError) as error:
                 reason = str(error)
@@ -359,9 +403,11 @@ def calibrate_direct_beam(
     ``angle_zero_deg`` (the middle angle without a zero), a missing or unreadable
     frame passing to the next nearest; the result's ``beam_pixel`` says which.
 
-    Negative/nonfinite pixels and masks exclude whole strip-profile bins; invalid
+    Negative/nonfinite native pixels and masks exclude whole strip-profile bins; invalid
     beam cores and saturation reject a frame. Set ``saturation`` to the detector's
     acquisition limit (inclusive); integer dtype maximum is also rejected.
+    Confirmed grouped frames check used native operands before combination;
+    finite negative Difference values remain valid background for a positive peak.
     Unknown clipping/count-rate effects cannot be inferred from intensity alone.
     At least three usable rows at distinct angles and significant motion are required.
     """
@@ -414,11 +460,8 @@ def calibrate_direct_beam(
     reasons, references = [],[]
     state = {}  # the first readable image's layout: raw shape, effective detector, its mask, the pitch
 
-    def load(item):
-        return _load_beam_image(item, options)
-
-    def oriented_and_invalid(image):
-        result = _prepare_beam_image(image, det, orient, mask, state)
+    def prepared(item):
+        result = _prepared_beam_image(item, options, det, orient, mask, state, saturation)
         state['pitch'] = float(state['pitches'][1 if motion == 'horizontal' else 0])
         return result
 
@@ -431,7 +474,9 @@ def calibrate_direct_beam(
         problems = []
         for index in np.argsort(np.abs(angles-zero), kind='stable'):
             try:
-                beam = np.asarray(find_beam_spot(*oriented_and_invalid(load(items[index]))), dtype=float)
+                oriented, invalid, _saturated, _signed = prepared(items[index])
+                beam = np.asarray(find_beam_spot(oriented, invalid), dtype=float)
+                oriented = invalid = _saturated = None
                 break
             except (OSError,ValueError,IndexError,KeyError,RuntimeError) as exc:
                 problems.append(f'row {int(index)}: {exc}')
@@ -453,15 +498,16 @@ def calibrate_direct_beam(
                      else index if isinstance(item, np.ndarray) or item is None else item)
         references.append(reference)
         try:
-            oriented, invalid = oriented_and_invalid(load(item))
+            oriented, invalid, native_saturated, signed = prepared(item)
             centres[index],errors[index] = _peak(oriented,invalid,beam,motion,
-                strip_half_width,roi,saturation)
+                strip_half_width,roi,None if signed else saturation,
+                native_saturated=native_saturated,signed=signed)
         except (OSError,ValueError,IndexError,KeyError,RuntimeError,OptimizeWarning) as exc:
             reasons.append(f'{type(exc).__name__}: {exc}')
         else:
             reasons.append(None)
         # No scan stack or array-valued frame identifiers are retained.
-        item = oriented = invalid = None
+        item = oriented = invalid = native_saturated = None
     sentinel = object()
     if next(iterator,sentinel) is not sentinel:
         raise ValueError('image and angle lengths differ')
@@ -556,12 +602,14 @@ def open_direct_beam_scan(
     with ExitStack() as resources:
         key = None
         references = False
+        frame_source = None
         if isinstance(scan_file, FrameSource):
             if scan is not None or images is not None or image_file is not None or template_input:
                 raise ValueError('FrameSource already supplies images; no scan or image options allowed')
             labels = tuple(scan_file.frame_indices)
             identity = getattr(scan_file, 'path', getattr(scan_file, 'name', 'source'))
             load = scan_file.load_frame
+            frame_source = scan_file
             if angles_deg is None:
                 motors = getattr(scan_file, 'motors', {})
                 if motor in motors:
@@ -640,8 +688,16 @@ def open_direct_beam_scan(
             image_items = (load(label) for label in selected)
             ids = None
         else:
-            image_items = (ScanFrame(index=label, source_identity=str(identity),
-                loader=lambda frame: load(frame.index)) for label in selected)
+            def frame_item(label):
+                metadata = {} if frame_source is None else dict(frame_source.metadata_for(label))
+                statistics = None
+                if isinstance(metadata.get('point_images'), Mapping):
+                    point_loader = getattr(frame_source, 'load_point_statistics', None)
+                    statistics = (lambda **kwargs: point_loader(label, **kwargs)) if callable(point_loader) else (
+                        frame_source.frame_for(label).point_statistics_loader)
+                return ScanFrame(index=label, source_identity=str(identity), metadata=metadata,
+                    loader=lambda frame: load(frame.index), point_statistics_loader=statistics)
+            image_items = (frame_item(label) for label in selected)
             ids = tuple((identity, label) for label in selected)
         yield DirectBeamScanInput(angles[rows], image_items, ids, points)
 
