@@ -1174,15 +1174,20 @@ class CalibrationDialog(QtWidgets.QDialog):
         panel = QtWidgets.QGroupBox('Detector')
         form = QtWidgets.QFormLayout(panel)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self._choice(form, 'beam_detector', 'Model', [(label, name) for label, name in detector_choices()],
+        self._choice(form, 'beam_detector', 'Model', list(detector_choices(raw_details=True)),
                      'Pilatus300kw', tip='The detector model (pyFAI); it sets the pixel size and shape.')
+        self.raw_layout = self._combo(form, 'RAW layout', [('Detector default', 'factory'), ('Manual', 'manual')],
+            host='beam_detector', tip='Detector default: its rows and columns, with the RAW reader default int32. '
+                'Manual: override the stored RAW layout; the physical detector model and pixel pitch stay selected. '
+                'TIFF, Eiger and NeXus carry their own layout.')
+        self._attach('header', 'beam_detector', 'Header (bytes)', '0', width=75,
+                     tip='Bytes to skip before pixels in a headerless RAW file; unused for TIFF, Eiger and NeXus.')
         reader = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(reader)
         row.setContentsMargins(0, 0, 0, 0)
         raw_tip = ('Only for headerless .raw images (the calibrant and direct-beam scans): the frame\'s rows '
                    'and columns (set from the model), pixel type and header size.')
-        for key, label, default, stretch in [('shape', 'rows, cols', '195, 1475', 3), ('dtype', 'type', 'int32', 2),
-                                             ('header', 'header', '0', 1)]:
+        for key, label, default, stretch in [('shape', 'rows, cols', '195, 1475', 3), ('dtype', 'type', 'int32', 2)]:
             part = FormRow(label=label, path=('Calibration', key), value=default)
             part.label.setMinimumWidth(0)
             edit = part.editor
@@ -1194,11 +1199,13 @@ class CalibrationDialog(QtWidgets.QDialog):
         form.addRow('RAW images', reader)
         self._rows['raw'] = (form, reader)
         self._tip(raw_tip, form.labelForField(reader))
+        self.raw_layout.currentIndexChanged.connect(self._sync_raw_layout)
+        self._sync_raw_layout()
         # The detector's camera, as xrayutilities gives it (maintainer, 2026-09-30: "two drop-down boxes
         # linked together ... x+, x-, z+, z-"): it turns and mirrors every image into Stitch's frame.
         from xdart.gui.widgets.camera_editor import CameraEditor
         self.camera = CameraEditor()
-        form.addRow('Camera (lab frame)', self.camera)
+        form.addRow('Camera orientation (lab frame)', self.camera)
         self._tip(self._CAMERA_TIP, self.camera.rows, self.camera.columns, form.labelForField(self.camera))
         self._image_size = QtWidgets.QLabel()
         self._image_size.setWordWrap(True)
@@ -1323,10 +1330,28 @@ class CalibrationDialog(QtWidgets.QDialog):
         if not self._restoring_fields and model != getattr(self, '_pixel_detector', model):
             self._set_field_text('beam_pixel', '')  # a pixel belongs to one detector, not another model
         self._pixel_detector = model
-        shape = detector_shape(self._text('beam_detector'))
-        if shape is not None and 'shape' in self._fields:
-            self._fields['shape'].setText(f'{shape[0]}, {shape[1]}')
+        if not self._restoring_fields:
+            self.raw_layout.setCurrentIndex(self.raw_layout.findData('factory'))
+        self._sync_raw_layout()
         self._show_saturation_hint()
+
+    def _sync_raw_layout(self, *_args):
+        manual = self.raw_layout.currentData() == 'manual'
+        if not manual and not self._restoring_fields:
+            shape = detector_shape(self._text('beam_detector'))
+            if shape is not None:
+                self._set_field_text('shape', f'{shape[0]}, {shape[1]}')
+            self._set_field_text('dtype', 'int32')
+        for key in ('shape', 'dtype'):
+            self._fields[key].setReadOnly(not manual)
+        self._show('raw', manual)
+
+    def _custom_raw_layout(self):
+        try:
+            shape = tuple(int(v) for v in self._text('shape').split(','))
+            return shape != detector_shape(self._text('beam_detector')) or self._text('dtype') != 'int32'
+        except ValueError:
+            return True  # preserve a draft; the action validates the reader
 
     def _show_saturation_hint(self):
         """The shared documented limit without disk reads; the grey hint keeps Auto, like Int."""
@@ -1470,9 +1495,11 @@ class CalibrationDialog(QtWidgets.QDialog):
             if value is not None:  # psic's del/nu motors, when given (set_instrument names them all)
                 self._fields[key].setText(str(value))
         reader = opts.get('read_image_kwargs', {})
-        for key, value in [('shape', ', '.join(map(str, reader.get('detector_shape', (195, 1475))))),
+        for key, value in [('shape', ', '.join(map(str, reader.get('detector_shape',
+                                     detector_shape(self._text('beam_detector')) or (195, 1475))))),
                            ('dtype', reader.get('raw_dtype', 'int32')), ('header', reader.get('raw_header_skip', 0))]:
             self._fields[key].setText(str(value))
+        self.raw_layout.setCurrentIndex(self.raw_layout.findData('manual' if self._custom_raw_layout() else 'factory'))
         if image_rotation is None:  # the page turns no images of its own: the window's camera stays (item 10)
             return
         from xrd_tools.core.geometry import ImageOrientation
@@ -1504,7 +1531,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     #: Choices saved with the page's settings (Stitch's, RSM's). The calibrant-scan and same-detector
     #: confirmations are per use and never saved.
     _SAVED_CHOICES = ('source_kind', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
-                      'motion', 'rough_mode')
+                      'motion', 'rough_mode', 'raw_layout')
 
     def settings(self):
         """This dialog's inputs as plain values, for the page's saved settings."""
@@ -1582,6 +1609,9 @@ class CalibrationDialog(QtWidgets.QDialog):
                 pass
         self._show_threshold()
         self._restoring_fields = False
+        if 'raw_layout' not in (values.get('choices') or {}) and self._custom_raw_layout():
+            self.raw_layout.setCurrentIndex(self.raw_layout.findData('manual'))  # legacy reader overrides
+        self._sync_raw_layout()
         # after the del/nu fields an older file names its arm with: its normal-incidence zero
         self.geometry_editor.set_value(migrated_instrument(self.geometry_editor.value(), values))
         self._sync_arm_model()

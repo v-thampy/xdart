@@ -136,7 +136,7 @@ DETECTOR_ORIENTATIONS = ((3, 'BottomRight (pyFAI default)'), (1, 'TopLeft'), (2,
 
 
 @lru_cache(maxsize=1)
-def detector_choices() -> tuple[tuple[str, str], ...]:
+def detector_choices(*, raw_details=False) -> tuple[tuple[str, str], ...]:
     """pyFAI's detectors as (label, factory name): the common ones first, then the rest by label.
     Only detectors built from their name alone are listed (not the generic pixel-size one)."""
     from pyFAI.detectors import ALL_DETECTORS, detector_factory
@@ -149,7 +149,9 @@ def detector_choices() -> tuple[tuple[str, str], ...]:
             continue
         if detector.shape is None or not detector.pixel1 or not detector.pixel2:
             continue
-        labels[name] = _DETECTOR_LABELS.get(name, (getattr(cls, 'aliases', None) or [name])[0])
+        label = _DETECTOR_LABELS.get(name, (getattr(cls, 'aliases', None) or [name])[0])
+        labels[name] = (f'{label} [{detector.shape[0]} × {detector.shape[1]} rows × cols; RAW int32]'
+                        if raw_details else label)  # int32 is the RAW reader's default, not a detector property
     first = [(labels[name], name) for name in _PREFERRED_DETECTORS if name in labels]
     rest = sorted(((label, name) for name, label in labels.items() if name not in _PREFERRED_DETECTORS),
                   key=lambda item: item[0].casefold())

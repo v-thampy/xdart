@@ -104,6 +104,41 @@ def test_calibrant_nexus_context_still_selects_the_nexus_choice(qapp, tmp_path):
         dialog.close()
 
 
+def test_detector_picker_describes_raw_defaults_and_manual_header_reads_pixels(qapp, tmp_path):
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.integrate.stitch_calibration import capture_calibration_frames
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Eiger2_500k'))
+    again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        picker = dialog._fields['beam_detector']
+        assert dialog._text('beam_detector') == 'Eiger2_500k'
+        assert '512 × 1028' in picker.currentText() and 'RAW int32' in picker.currentText()
+        assert not dialog._row_visible('raw')
+        assert dialog._fields['shape'].isReadOnly() and dialog._fields['dtype'].isReadOnly()
+        assert dialog._parts['header'][0] == 'beam_detector'
+        assert dialog.camera.parent().layout().labelForField(dialog.camera).text() == 'Camera orientation (lab frame)'
+        spec = tmp_path / 'small'
+        spec.write_text('#F small\n#O0 nu\n#S 1 ascan del 0 0 0 1\n#P0 0\n#N 1\n#L del\n0\n')
+        image = np.arange(24, dtype='<u2').reshape(4, 6)
+        (tmp_path / 'small_scan1_0000.raw').write_bytes(b'header16bytes!!!' + image.tobytes())
+        source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(tmp_path),
+            'read_image_kwargs': {'detector_shape': image.shape, 'raw_dtype': 'uint16', 'raw_header_skip': 16}})
+        dialog.set_source_context(source)
+        assert dialog.raw_layout.currentData() == 'manual' and dialog._row_visible('raw')
+        assert not dialog._fields['shape'].isReadOnly() and not dialog._fields['dtype'].isReadOnly()
+        staged = capture_calibration_frames(dialog._spec(), [0], tmp_path / 'staged')
+        import fabio
+        np.testing.assert_array_equal(fabio.open(staged[0].image_path).data, image)
+        again.apply_settings(dialog.settings())
+        assert again.raw_layout.currentData() == 'manual' and again._reader() == dialog._reader()
+        again.raw_layout.setCurrentIndex(again.raw_layout.findData('factory'))
+        assert again._text('shape') == '512, 1028' and again._text('dtype') == 'int32'
+        assert again._text('header') == '16'  # byte offset is independent of the detector model
+    finally:
+        dialog.close()
+        again.close()
+
+
 def test_detector_change_drops_the_previous_detectors_beam_pixel(qapp, tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
