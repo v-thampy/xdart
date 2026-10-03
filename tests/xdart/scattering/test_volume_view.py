@@ -88,8 +88,11 @@ def test_manual_percentiles_apply_repeatedly_then_follow_the_cropped_volume(qapp
         QtTest.QTest.keyClick(high, QtCore.Qt.Key.Key_Escape)
         qapp.processEvents()
         assert not popup.isVisible()
-        view.axis_ranges[0]._low.setText(str(projection.axes[0][1]))
-        view.axis_ranges[0]._low.editingFinished.emit()
+        editor = view.axis_ranges[0]._low
+        editor.setFocus()
+        editor.selectAll()
+        QtTest.QTest.keyClicks(editor, str(projection.axes[0][1]))
+        editor.editingFinished.emit()
         _settled(view)
         cropped = projection.values[1:]
         expected = np.percentile(cropped[np.isfinite(cropped)], (20, 90))

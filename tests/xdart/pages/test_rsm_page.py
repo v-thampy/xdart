@@ -1190,7 +1190,11 @@ def test_ints_intensity_controls_and_share_axis_drive_the_six(qapp, monkeypatch)
         page._add_result("/tmp/x_rsm.nexus", "payload")
         view = page.view
         levels = {tuple(pane.canvas.histogram.levels()) for pane in _slices(view)}
-        assert len(levels) == 1 and tuple(view.viewer_intensity.values()) == levels.pop()
+        assert view.viewer_intensity.percentile_values() == (0.5, 99.5)
+        mapped = [np.nanpercentile(pane.canvas.displayed_image, (0.5, 99.5)) for pane in _slices(view)]
+        span = (min(pair[0] for pair in mapped), max(pair[1] for pair in mapped))
+        assert len(levels) == 1
+        np.testing.assert_allclose(levels.pop(), span)
         assert not view.viewer_intensity.isHidden() and not view.share_axis.isHidden()
         assert view.keyed_projection.share_axis and view.share_axis.isChecked()
         hk, hl, _kl = _slices(view)
