@@ -1,4 +1,4 @@
-"""Upstream PR2905 serialization and xdart's normal PONI readback boundary."""
+"""Native upstream Rayonix serialization and xdart's normal PONI readback boundary."""
 from __future__ import annotations
 
 import io
@@ -7,11 +7,9 @@ import tomllib
 from pathlib import Path
 
 import numpy as np
-import pyFAI
 import pytest
 from pyFAI import units
 from pyFAI.detectors import detector_factory
-from pyFAI.detectors._rayonix import _Rayonix
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 from pyFAI.io._json import PyFAIEncoder
 from pyFAI.io.ponifile import PoniFile
@@ -24,21 +22,6 @@ _CONFIG = {
     "orientation": 3,
     "sensor": _SENSOR,
 }
-
-
-@pytest.fixture(autouse=True)
-def restore_upstream_methods(monkeypatch):
-    # Applying the backport is process-local. Do not affect later test files.
-    monkeypatch.setattr(_Rayonix, "get_config", _Rayonix.get_config)
-    monkeypatch.setattr(PyFAIEncoder, "default", PyFAIEncoder.default)
-
-
-def _install():
-    from xrd_tools.integrate._pyfai_rayonix import (
-        apply_rayonix_serialization_backport,
-    )
-
-    return apply_rayonix_serialization_backport()
 
 
 def _poni_text(parallax):
@@ -54,10 +37,7 @@ def _poni_text(parallax):
 
 @pytest.mark.parametrize("parallax", [False, True])
 def test_rayonix_poni_v3_normal_load_and_reconstruction(tmp_path, parallax):
-    """No explicit installer: the ordinary application readback must work.
-
-    This row also runs against the exact parent source for fail-before evidence.
-    """
+    """The ordinary application readback uses upstream's native sensor serialization."""
     from xrd_tools.integrate.calibration import (
         detector_calibration_to_integrator,
         load_detector_calibration,
@@ -80,7 +60,6 @@ def test_exact_upstream_rayonix_save_and_encoder_behavior():
     pixels_before = detector.pixel1, detector.pixel2, detector.orientation
     eiger = detector_factory("Eiger4M")
     eiger_config = eiger.get_config()
-    _install()
     assert detector.get_config() == _CONFIG
     assert json.loads(json.dumps(detector.get_config())) == _CONFIG
     assert (detector.pixel1, detector.pixel2, detector.orientation) == pixels_before
@@ -100,24 +79,12 @@ def test_exact_upstream_rayonix_save_and_encoder_behavior():
     assert '"sensor"' in output.getvalue()
 
 
-def test_rayonix_without_sensor_and_idempotent_install():
+def test_rayonix_without_sensor():
     detector = detector_factory("RayonixMx225")
     detector.sensor = None
     before = detector.get_config()
-    _install()
-    methods = _Rayonix.get_config, PyFAIEncoder.default
-    _install()
-    assert (_Rayonix.get_config, PyFAIEncoder.default) == methods
     assert detector.get_config() == before
     assert "sensor" not in detector.get_config()
-
-
-@pytest.mark.parametrize("version", ["2026.5.1", "2026.9.0"])
-def test_other_releases_are_not_patched(monkeypatch, version):
-    before = _Rayonix.get_config, PyFAIEncoder.default
-    monkeypatch.setattr(pyFAI, "version", version)
-    assert _install() is False
-    assert (_Rayonix.get_config, PyFAIEncoder.default) == before
 
 
 def test_legacy_sensor_schema_is_not_silently_reinterpreted(tmp_path):

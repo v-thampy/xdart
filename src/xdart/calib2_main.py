@@ -163,14 +163,9 @@ def apply_calibration_backports() -> bool:
     """Preserve explicit parallax on the qualified releases before the GUI starts."""
     import pyFAI
 
-    from xrd_tools.integrate._pyfai_rayonix import (
-        apply_rayonix_serialization_backport,
-    )
-
-    # The serializer fixes remain specific to 2026.5.0.  The GUI still omits
-    # disabled parallax with a selected sensor in the qualified 2026.9.0.
-    apply_rayonix_serialization_backport()
-    if pyFAI.version not in {"2026.5.0", "2026.9.0"}:
+    # The qualified 2026.9.0 serializers are native, but its GUI still omits
+    # disabled parallax with a selected sensor.
+    if pyFAI.version != "2026.9.0":
         return False
     from pyFAI.gui.tasks.IntegrationTask import IntegrationTask
 

@@ -48,11 +48,10 @@ def orientation_signs(orientation=3) -> tuple[int, int]:
     """The signs of rot1 (nu's) and rot2 (del's) that keep the arm physical in pyFAI's
     detector ``orientation``.
 
-    pyFAI reflects the pixel coordinates before rotating and the transverse output after
-    (F·R·F; Codex R18-F1), so the same rot1/rot2/rot3 tilt the detector another way in another
-    orientation: rot1 turns the other way in 1 and 4, rot2 in 1 and 2, and the induced rot3
-    follows their product. Motor scales carrying these signs give orientation 3's geometry in
-    every orientation, which then changes only how the PONI and the arm are written.
+    Converting the PONI origin reverses rot1 in 1 and 4, rot2 in 1 and 2, and the
+    induced rot3 follows their product. Motor scales carrying these signs preserve the
+    arm's radial geometry for unchanged image indices. In pyFAI 2026.9, the transverse
+    laboratory coordinates and χ also follow the chosen first-pixel orientation.
     """
     orientation = int(orientation)
     if orientation not in (1, 2, 3, 4):

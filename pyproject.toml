@@ -40,10 +40,10 @@ dependencies = [
     "nexusformat",
     "fabio",
     "silx",              # io.spec / io.metadata SPEC parsing
-    # Keep the audited 2026.5 API/serialization line bounded: PONI v3,
+    # Keep the audited 2026.9 API/serialization line bounded: PONI v3,
     # MultiGeometry union, and GI convention compatibility are versioned xdart
     # contracts rather than an unconstrained dependency upgrade.
-    "pyFAI>=2026.5,<2026.6",
+    "pyFAI>=2026.9,<2026.10",
     "pyyaml",            # core/hdf5.py imports yaml directly
     "joblib",
     "natsort",
@@ -146,7 +146,7 @@ hdf5 = "*"
 blosc = "*"
 c-blosc2 = "*"
 lz4-c = "*"
-pyfai = ">=2026.5,<2026.6"
+pyfai = ">=2026.9,<2026.10"
 silx = "*"
 # The Qt binding must come from the SAME provenance as the natives above: the
 # PySide6 wheel SIGABRTs when loaded into a process already holding

@@ -76,11 +76,32 @@ def test_each_camera_is_one_image_transform_into_pyfais_frame(camera):
     assert DetectorCamera.from_image_orientation(camera.image_orientation()) == camera
 
 
-def test_untilted_pyfais_detector_orientation_moves_only_the_poni_origin():
-    camera = DetectorCamera('x-', 'z+')
-    reference = _pyfai_maps(camera.image_orientation())
-    for code in (1, 2, 4):
-        assert max(_differences(reference, _pyfai_maps(camera.image_orientation(), code))) < 1e-9
+@pytest.mark.parametrize('code', [1, 2, 3, 4])
+def test_first_pixel_orientation_reindexes_the_same_physical_pixels(code):
+    """2026.9 orientation reindexes pixels; the PONI and physical rays stay fixed."""
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    poni = PONI(dist=.5, poni1=.01, poni2=.02, rot1=.13, rot2=-.09,
+                rot3=.21, wavelength=1e-10, detector='Pilatus100k')
+    reference = detector_calibration_to_integrator(
+        DetectorCalibration(poni, {'orientation': 3}))
+    actual = detector_calibration_to_integrator(
+        DetectorCalibration(poni, {'orientation': code}))
+    rows, columns = np.array([12.25, 61.5, 170.75]), np.array([33.5, 231.25, 450.75])
+    mapped_rows = SHAPE[0] - 1 - rows if code in (1, 2) else rows
+    mapped_columns = SHAPE[1] - 1 - columns if code in (1, 4) else columns
+    for use_cython in (False, True):
+        np.testing.assert_allclose(
+            actual.calc_pos_zyx(d1=mapped_rows, d2=mapped_columns, use_cython=use_cython),
+            reference.calc_pos_zyx(d1=rows, d2=columns, use_cython=use_cython),
+            rtol=0, atol=1e-12)
+    np.testing.assert_allclose(actual.tth(mapped_rows, mapped_columns),
+                               reference.tth(rows, columns), rtol=0, atol=1e-12)
+    np.testing.assert_allclose(actual.qFunction(mapped_rows, mapped_columns),
+                               reference.qFunction(rows, columns), rtol=0, atol=1e-9)
+    np.testing.assert_allclose(actual.chi(mapped_rows, mapped_columns),
+                               reference.chi(rows, columns), rtol=0, atol=1e-12)
 
 
 def test_the_cameras_in_use_and_equivalent_transforms():
@@ -96,9 +117,8 @@ def test_the_cameras_in_use_and_equivalent_transforms():
 
 
 def test_tilted_another_pyfai_orientation_is_another_geometry():
-    """Codex R18-F1: pyFAI reflects the pixel coordinates before rotating and the transverse output
-    after (F·R·F), so with the detector tilted another orientation changes 2θ and χ, even with the
-    true direct beam on the same pixel. The untilted equivalence above does not extend to arm poses."""
+    """Changing orientation for unchanged image indices changes their physical interpretation,
+    even when the PONI is moved to keep the direct beam on the same pixel."""
     from pyFAI.detectors import Detector
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
     maps = {}

@@ -79,7 +79,7 @@ requirements:
     - chardet
     - fabio
     - silx
-    - pyfai >=2026.5,<2026.6     # conda-forge lowercase; audited 2026.5 line
+    - pyfai >=2026.9,<2026.10    # conda-forge lowercase; audited 2026.9 line
     # pyFAI's bare NumExpr calls omit VML buffering metadata. Use the non-MKL
     # build (py*, not mkl_py*) to keep strided/broadcast geometry correct.
     - numexpr * py*

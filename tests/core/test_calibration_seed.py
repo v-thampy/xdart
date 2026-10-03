@@ -124,10 +124,8 @@ def test_the_detector_orientation_reaches_the_seed_pyfai_opens(tmp_path, orienta
 
 
 @pytest.mark.parametrize('orientation', [1, 2, 4])
-def test_every_orientation_predicts_orientation_3s_geometry_with_the_arm_tilted(orientation):
-    """pyFAI reflects before rotating and after (F·R·F, Codex R18-F1): with one-degree scales the
-    seed turned the detector the wrong way once the arm moved (24° off at nu 12°). The scales
-    carry the orientation's signs, so every orientation predicts orientation 3's geometry."""
+def test_every_orientation_preserves_radial_arm_geometry_and_reindexes_chi(orientation):
+    """PONI-origin signs preserve rings; 2026.9 χ follows the reflected transverse frame."""
     shape, (x, y) = (195, 1475), (100, 40)
 
     def seed(orientation, motors, **zero):
@@ -142,7 +140,15 @@ def test_every_orientation_predicts_orientation_3s_geometry_with_the_arm_tilted(
         (tth3, chi3), (tth, chi) = ([s.integrator.center_array(shape, unit=unit, scale=False)
                                      for unit in ('2th_rad', 'chi_rad')] for s in seeds)
         assert np.abs(tth - tth3)[away].max() < 1e-9
-        assert np.abs(np.angle(np.exp(1j * (chi - chi3))))[away].max() < 1e-9
+        slow_sign = -1 if orientation in (1, 2) else 1
+        fast_sign = -1 if orientation in (1, 4) else 1
+        expected_chi = np.arctan2(slow_sign * np.sin(chi3), fast_sign * np.cos(chi3))
+        assert np.abs(np.angle(np.exp(1j * (chi - expected_chi))))[away].max() < 1e-9
+        rows, cols = np.array([10.25, 87.5, 180.75]), np.array([21.5, 700.25, 1450.75])
+        positions = np.asarray(seeds[0].integrator.calc_pos_zyx(d1=rows, d2=cols))
+        positions *= np.array([1, slow_sign, fast_sign])[:, None]
+        np.testing.assert_allclose(
+            seeds[1].integrator.calc_pos_zyx(d1=rows, d2=cols), positions, rtol=0, atol=1e-12)
         assert seeds[0].rings == seeds[1].rings
     # a known normal-incidence zero on a reversed circle still puts the beam on its pixel
     for circle in ('del', 'nu'):

@@ -193,9 +193,8 @@ def test_refine_stacked_arm_recovers_an_extended_truth():
 
 @pytest.mark.parametrize('orientation', [1, 2, 4])
 def test_every_pyfai_orientation_fits_the_same_physical_arm(orientation):
-    """pyFAI reflects before rotating and after (F·R·F, Codex R18-F1), so one-degree scales in
-    orientation 1, 2 or 4 turned the detector the wrong way and no tilted frame could fit. The
-    scales carry the orientation's signs: every fit recovers what it does in orientation 3."""
+    """The motor scales carry the PONI origin's signs, so every orientation recovers
+    orientation 3's radial arm geometry, with either the five-parameter or extended model."""
     from pyFAI.detectors import detector_factory
     from xrd_tools.integrate.refine import refine_goniometer
     truth = _calibration()

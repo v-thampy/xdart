@@ -436,11 +436,11 @@ def resolve_xu_stitch_effective_geometry(
         from xrd_tools.integrate.turned_detector import partner_detector
 
         if (
-            importlib.metadata.version("pyFAI") != "2026.5.0"
-            or pyFAI.version != "2026.5.0"
+            pyFAI.version not in ("2026.5.0", "2026.9.0")
+            or importlib.metadata.version("pyFAI") != pyFAI.version
         ):
             raise XuStitchScienceRefused(
-                "XU_RUNTIME_UNSUPPORTED", "pyFAI 2026.5.0 is required"
+                "XU_RUNTIME_UNSUPPORTED", "pyFAI 2026.5.0 or 2026.9.0 is required"
             )
         # the named model, or (a quarter-turned partner, AUD-9 item 8) pyFAI's generic detector of the partner's
         # shape with the model's own mask turned as the images are

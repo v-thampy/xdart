@@ -1352,7 +1352,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                      tip='pyFAI\'s detector orientation: the corner holding the image\'s first pixel, seen '
                          'from behind the detector looking at the sample. It is not a rotation: it never turns '
                          'the image or swaps x and y (the camera above does). It changes how the PONIs '
-                         'are written, not the geometry: the arm\'s motor scales take its signs. Keep 3, '
+                         'are written and how pixel indices map to physical positions, including χ. '
+                         'The arm\'s motor scales take its signs. Keep 3, '
                          'pyFAI\'s default, unless pyFAI shows this detector\'s images mirrored. It is saved '
                          'with every PONI and fit.')
         for combo in (self._fields['beam_detector'], self._fields['beam_orientation']):

@@ -167,7 +167,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pthread-stubs-0.4-hb9d3cd8_1002.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pulseaudio-client-17.0-h9a6aba3_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pydantic-core-2.46.4-py313h843e2db_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/pyfai-base-2026.5.0-py313h08cd8bf_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/pyfai-base-2026.9.0-py313h08cd8bf_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyopencl-2026.1.1-py313hfaae9d9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyqt-5.15.11-py313h938ae94_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyqt5-sip-12.17.0-py313h7033f15_2.conda
@@ -270,7 +270,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/ptyprocess-0.7.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pure_eval-0.2.3-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pydantic-2.13.4-pyhcf101f3_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/pyfai-2026.5.0-hd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyfai-2026.9.0-hd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pygments-2.20.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyopengl-3.1.10-pyha804496_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyparsing-3.3.2-pyhcf101f3_0.conda
@@ -488,7 +488,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/ptyprocess-0.7.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pure_eval-0.2.3-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pydantic-2.13.4-pyhcf101f3_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/pyfai-2026.5.0-hd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyfai-2026.9.0-hd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pygments-2.20.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyopengl-3.1.10-pyh534df25_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyparsing-3.3.2-pyhcf101f3_0.conda
@@ -637,7 +637,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/psutil-7.2.2-py313h6688731_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pthread-stubs-0.4-hd74edd7_1002.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pydantic-core-2.46.4-py313h212e517_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyfai-base-2026.5.0-py313h668f763_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyfai-base-2026.9.0-py313h668f763_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyopencl-2026.1.1-py313h1f8fd7f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyqt-5.15.11-py313h003178d_2.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyqt5-sip-12.17.0-py313h0e822ff_2.conda
@@ -844,7 +844,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/prompt-toolkit-3.0.53-pyha770c72_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pure_eval-0.2.4-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pydantic-2.13.5-pyhcf101f3_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/pyfai-2026.5.0-hd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/pyfai-2026.9.0-hd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pygments-2.21.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyopengl-3.1.10-pyh7428d3b_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyparsing-3.3.2-pyhcf101f3_0.conda
@@ -972,7 +972,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/win-64/pixman-0.46.4-h5112557_3.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/psutil-7.2.2-py313h5fd188c_3.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pydantic-core-2.46.5-py313hfbe8231_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/win-64/pyfai-base-2026.5.0-py313hc90dcd4_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/win-64/pyfai-base-2026.9.0-py313hc90dcd4_0.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyopencl-2026.1.3-py313h7084e01_0.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyqt-5.15.11-py313h1048830_2.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/pyqt5-sip-12.17.0-py313hfe59770_2.conda
@@ -3502,9 +3502,9 @@ packages:
   run_exports: {}
   size: 1893749
   timestamp: 1778084222642
-- conda: https://conda.anaconda.org/conda-forge/linux-64/pyfai-base-2026.5.0-py313h08cd8bf_0.conda
-  sha256: 7de5f201480e31a8fc78f5f7c697a6390b2d67bc1af92a7318f253c7ee8c36ed
-  md5: 4d94c3558daf31a334d5ccb3a00b2ff5
+- conda: https://conda.anaconda.org/conda-forge/linux-64/pyfai-base-2026.9.0-py313h08cd8bf_0.conda
+  sha256: 0cbcd4f7dedf6480e4ba1d7bbe97d53530554d5405281aab063bbbf857aaa128
+  md5: 0188853ef04d2e32488a0ce22bacf3e4
   depends:
   - __glibc >=2.17,<3.0.a0
   - fabio
@@ -3513,7 +3513,7 @@ packages:
   - libstdcxx >=14
   - matplotlib-base
   - numexpr
-  - numpy >=1.23,<3
+  - numpy >=1.25,<3
   - python >=3.13,<3.14.0a0
   - python_abi 3.13.* *_cp313
   - scipy
@@ -3521,10 +3521,10 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/pyfai?source=hash-mapping
+  - pkg:pypi/pyfai?source=compressed-mapping
   run_exports: {}
-  size: 4672031
-  timestamp: 1779242745313
+  size: 4808930
+  timestamp: 1789544969314
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pyopencl-2026.1.1-py313hfaae9d9_0.conda
   sha256: 07ebfd6cb6b7ba2e97cd7e41161a45f08a5f4207236357aaa9821a7df5131525
   md5: 9a4a2cd7ffe254171d7c4d769b054973
@@ -5039,7 +5039,7 @@ packages:
   license: BSD-2-Clause
   license_family: BSD
   purls:
-  - pkg:pypi/imageio?source=compressed-mapping
+  - pkg:pypi/imageio?source=hash-mapping
   run_exports: {}
   size: 310465
   timestamp: 1788865642221
@@ -5651,20 +5651,21 @@ packages:
   run_exports: {}
   size: 346633
   timestamp: 1787941273167
-- conda: https://conda.anaconda.org/conda-forge/noarch/pyfai-2026.5.0-hd8ed1ab_0.conda
-  sha256: b43e01a43b7d4ea65da304b33b1438b71783e53d3136052c014413f65b1f95cf
-  md5: c4941a66f249813a277609d2e957e5fd
+- conda: https://conda.anaconda.org/conda-forge/noarch/pyfai-2026.9.0-hd8ed1ab_0.conda
+  sha256: f4ff28f914150f55da5245d6f76e9d4a15eb2bb1d27f4877aa9a5778e36c5e83
+  md5: abe16dd11fb3425a8db82fba91624283
   depends:
   - hdf5plugin
   - matplotlib
-  - pyfai-base >=2026.5.0,<2026.5.1.0a0
+  - pyfai-base >=2026.9.0,<2026.9.1.0a0
   - silx >=1.1
   license: MIT
   license_family: MIT
-  purls: []
+  purls:
+  - pkg:pypi/pyfai?source=compressed-mapping
   run_exports: {}
-  size: 10112
-  timestamp: 1779242063044
+  size: 9356
+  timestamp: 1789544893461
 - conda: https://conda.anaconda.org/conda-forge/noarch/pygments-2.20.0-pyhd8ed1ab_0.conda
   sha256: cf70b2f5ad9ae472b71235e5c8a736c9316df3705746de419b59d442e8348e86
   md5: 16c18772b340887160c79a6acc022db0
@@ -6280,7 +6281,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/vcs-versioning?source=compressed-mapping
+  - pkg:pypi/vcs-versioning?source=hash-mapping
   run_exports: {}
   size: 89186
   timestamp: 1788463774792
@@ -8214,9 +8215,9 @@ packages:
   run_exports: {}
   size: 1720475
   timestamp: 1778084300413
-- conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyfai-base-2026.5.0-py313h668f763_0.conda
-  sha256: 805794a1098d56f9d083d0312444334dca87ef916cbb78e4d8de94a1863d5ee1
-  md5: 3ee400fd7467b4cc4d5ed91cca67a798
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyfai-base-2026.9.0-py313h668f763_0.conda
+  sha256: 58d8315e3448036b6b53b84553e99a10546a7952ce7e3345f154bbc1e1e168e2
+  md5: 70b5e53b7730fe1296f252afef9caceb
   depends:
   - __osx >=11.0
   - fabio
@@ -8224,7 +8225,7 @@ packages:
   - libcxx >=19
   - matplotlib-base
   - numexpr
-  - numpy >=1.23,<3
+  - numpy >=1.25,<3
   - python >=3.13,<3.14.0a0
   - python >=3.13,<3.14.0a0 *_cp313
   - python_abi 3.13.* *_cp313
@@ -8233,10 +8234,10 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/pyfai?source=hash-mapping
+  - pkg:pypi/pyfai?source=compressed-mapping
   run_exports: {}
-  size: 4044481
-  timestamp: 1779242518829
+  size: 4239213
+  timestamp: 1789545707243
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyopencl-2026.1.1-py313h1f8fd7f_0.conda
   sha256: b680cc542b5b6f9832f5ca9ff20e1e22b681016888471e889bfa301076662f37
   md5: edf06782a7a9336c178d3cd297dd0731
@@ -9321,7 +9322,7 @@ packages:
   license: BSD-3-Clause
   license_family: BSD
   purls:
-  - pkg:pypi/kiwisolver?source=compressed-mapping
+  - pkg:pypi/kiwisolver?source=hash-mapping
   run_exports: {}
   size: 73459
   timestamp: 1788505726845
@@ -10362,15 +10363,15 @@ packages:
   run_exports: {}
   size: 1865505
   timestamp: 1787928988442
-- conda: https://conda.anaconda.org/conda-forge/win-64/pyfai-base-2026.5.0-py313hc90dcd4_0.conda
-  sha256: 74edd524e05fdd906c9e94e6634b801b235c9f073b12924d1a4091515b6beb9f
-  md5: 77b67d13e7dd40bf5e02f80b18f5f1f6
+- conda: https://conda.anaconda.org/conda-forge/win-64/pyfai-base-2026.9.0-py313hc90dcd4_0.conda
+  sha256: 6c582176f122cd49059516e0f7669eac60ccef5aa5f96d787876c7e9775dad07
+  md5: 7a1b7a97306436eb3eb7e6370fddb503
   depends:
   - fabio
   - h5py
   - matplotlib-base
   - numexpr
-  - numpy >=1.23,<3
+  - numpy >=1.25,<3
   - python >=3.13,<3.14.0a0
   - python_abi 3.13.* *_cp313
   - scipy
@@ -10381,10 +10382,10 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/pyfai?source=hash-mapping
+  - pkg:pypi/pyfai?source=compressed-mapping
   run_exports: {}
-  size: 4033868
-  timestamp: 1779242370562
+  size: 4181142
+  timestamp: 1789545286574
 - conda: https://conda.anaconda.org/conda-forge/win-64/pyopencl-2026.1.3-py313h7084e01_0.conda
   sha256: 9e640d84b56b9e4f8b8a45cc98d074962209529590c3668c68023c0aa30e076a
   md5: 3ec99666d3b2f670e62343f4ae00e29b
@@ -10512,7 +10513,7 @@ packages:
   license: PSF-2.0
   license_family: PSF
   purls:
-  - pkg:pypi/pywin32?source=compressed-mapping
+  - pkg:pypi/pywin32?source=hash-mapping
   run_exports: {}
   size: 4466676
   timestamp: 1787374335274
@@ -10895,7 +10896,7 @@ packages:
   - nexusformat
   - fabio
   - silx
-  - pyfai>=2026.5,<2026.6
+  - pyfai>=2026.9,<2026.10
   - pyyaml
   - joblib
   - natsort
