@@ -49,6 +49,7 @@ class ScanRingPoints:
     excluded: tuple[dict, ...]
     calibrant: object
     coverage: dict
+    screening_bypassed_labels: tuple[int, ...] = ()
 
 
 def _row_of(nu_motor, del_motor):
@@ -292,6 +293,9 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     motors = {name: np.array([by_index[i][1][name] for i in selected]) for name in _arm_motors(arm)}
     source = open_source(exact)
     try:
+        policy = getattr(source, 'point_image_policy', None)
+        bypassed = (tuple(int(row[0]) for row in rows)
+                    if policy is not None and policy.operation == 'difference' else ())
         def pixels(index, integrator):
             image, grouped = _calibration_pixels(source, index, orientation, conditioning, max_counts)
             if image.shape != tuple(integrator.detector.shape):
@@ -338,7 +342,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
             close()
     if len(controls) < 3:
         raise ValueError('automatic refinement found ring points on fewer than three frames')
-    return ScanRingPoints(tuple(controls), tuple(frames), tuple(excluded), cal, coverage)
+    return ScanRingPoints(tuple(controls), tuple(frames), tuple(excluded), cal, coverage, bypassed)
 
 
 def _held_out(result, controls, calibrant, nu_motor, del_motor):
@@ -508,6 +512,10 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                       'frame_screen': frame_screen.to_provenance(), 'excluded_frames': list(points.excluded),
                       'outlier_threshold_sigma': reject_outliers, 'rejected_points': result.rejected_points,
                       'validation': validation}}
+    if points.screening_bypassed_labels:
+        provenance['automatic_refinement']['frame_screen'].update(
+            positive_total_screening=False,
+            positive_total_screening_bypassed_labels=list(points.screening_bypassed_labels))
     if conditioning is not None and conditioning.mode != 'off':
         provenance['automatic_refinement']['conditioning'] = conditioning.to_dict()
     if instrument_geometry is not None:  # which motor drives which circle, as the guided fit records it

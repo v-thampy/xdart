@@ -236,7 +236,7 @@ def test_a_tampered_frame_verdict_refuses_an_attested_xu_result(tmp_path):
 
 def test_a_result_saved_without_verdicts_still_reads(tmp_path, monkeypatch):
     from xrd_tools.analysis import stitch_operation
-    monkeypatch.setattr(stitch_operation, '_record_frame_screen', lambda records, verdicts: None)
+    monkeypatch.setattr(stitch_operation, '_record_frame_screen', lambda *args: None)
     target = test_grouped_scans_are_screened_only_against_themselves(tmp_path)
     verdicts = _verdicts(target)
     assert all(screen is None and excluded is None for _s, _f, screen, excluded in verdicts)

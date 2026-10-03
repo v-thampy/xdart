@@ -16,7 +16,8 @@ import numpy as np
 _MAX_FRAMES = 100_000
 _MAX_MANIFEST_BYTES = 64 << 20
 _MAX_TEXT = 4096
-_SCREEN_KEYS = frozenset({"screen", "excluded"})
+_SCREEN_VERDICT_KEYS = frozenset({"screen", "excluded"})
+_SCREEN_KEYS = _SCREEN_VERDICT_KEYS | {"positive_total_screening"}
 _SCREEN_STATUSES = frozenset({"ok", "empty", "partial", "unscreened"})
 _SNAPSHOT_ATTRS = {
     "adapter_id": "adapter_id", "size": "file_size", "mtime_ns": "file_mtime_ns",
@@ -135,10 +136,17 @@ def _screen_fields(value):
     if not present:
         return {}
     screen, excluded = value.get("screen"), value.get("excluded")
-    if (present != _SCREEN_KEYS or screen not in _SCREEN_STATUSES or type(excluded) is not bool
+    if (not _SCREEN_VERDICT_KEYS <= present or screen not in _SCREEN_STATUSES or type(excluded) is not bool
             or (excluded and screen not in {"empty", "partial"})):
         raise ValueError("contributing frame screen verdict is invalid")
-    return {"screen": screen, "excluded": excluded}
+    fields = {"screen": screen, "excluded": excluded}
+    if "positive_total_screening" in present:
+        if (value["positive_total_screening"] is not False
+                or value.get("point_images", {}).get("operation") != "difference"
+                or screen != "unscreened" or excluded):
+            raise ValueError("contributing frame positive-total screening bypass is invalid")
+        fields["positive_total_screening"] = False
+    return fields
 
 
 def analysis_contributing_frames_manifest(records, *, source_base):

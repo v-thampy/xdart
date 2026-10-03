@@ -2676,7 +2676,8 @@ class _SelectedStitchSource(BaseFrameSource):
     def motors(self):
         rows = [self.metadata_for(index) for index in self.frame_indices]
         keys = set.intersection(*(set(row) for row in rows)) if rows else set()
-        return {key: np.asarray([row[key] for row in rows]) for key in keys}
+        return {key: np.asarray([row[key] for row in rows]) for key in keys
+                if all(not isinstance(row[key], Mapping) for row in rows)}
 
 
 @contextmanager
@@ -3145,21 +3146,30 @@ def _protected_stitch_inputs(request: StitchOperationRequest) -> tuple[Path, ...
     return tuple(dict.fromkeys(inputs))
 
 
-def _record_frame_screen(records, verdicts):
+def _record_frame_screen(records, verdicts, summary, source):
     """Stamp each captured frame record with its dropped-frame verdict.
 
     Verdicts join on stream position, which is the record's contribution index;
     grouped sources repeat frame labels across members.
     """
+    bypassed = [verdict.label for verdict in verdicts
+                if source.metadata_for(verdict.label).get("point_images", {}).get("operation") == "difference"]
+    if bypassed:
+        summary["positive_total_screening_bypassed_labels"] = bypassed
+        if len(bypassed) == len(verdicts):
+            summary["positive_total_screening"] = False
     if not records:
         return
     by_position = {verdict.position: verdict for verdict in verdicts}
     if sorted(by_position) != list(range(len(records))):
         raise StitchOperationRefused("FRAME_SCREEN_VERDICT_MISMATCH",
                                      "frame check verdicts differ from the captured frames")
+    bypassed = set(bypassed)
     for record in records:
         verdict = by_position[record["identity"]["contribution_index"]]
         record["screen"], record["excluded"] = verdict.status, verdict.excluded
+        if verdict.label in bypassed:
+            record["positive_total_screening"] = False
 
 
 def _native_artifact_args(request, records):
@@ -3433,7 +3443,7 @@ class StitchOperationExecution:
                     allow_extrapolation=plan.allow_extrapolation,
                 )
                 self._frame_screen = screen.summary()
-                _record_frame_screen(records, screen.verdicts)
+                _record_frame_screen(records, screen.verdicts, self._frame_screen, source)
             revalidate_xu_stitch_calibration(plan.calibration)
             revalidate_mask(plan._mask_receipt)
         except XuStitchCancelled:
@@ -3696,7 +3706,7 @@ class StitchOperationExecution:
                     workers=reduction_worker_cap(workers),
                 )
                 self._frame_screen = screen.summary()
-                _record_frame_screen(records, screen.verdicts)
+                _record_frame_screen(records, screen.verdicts, self._frame_screen, oriented)
             _revalidate_geometry(self.request.plan.geometry)
             revalidate_mask(self.request.plan._mask_receipt)
         except StitchCancelled:

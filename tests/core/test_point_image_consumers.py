@@ -153,6 +153,9 @@ def test_native_point_contributor_reduces_saved_operands(tmp_path):
     spec, request = _point_stitch(tmp_path, 'difference', '2d')
     result = run_stitch_operation(request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert result.frame_screen['positive_total_screening'] is False
+    assert result.frame_screen['positive_total_screening_bypassed_labels'] == [0, 1]
+    assert all(row['positive_total_screening'] is False for row in result.payload.contributing_frames)
     row = result.payload.contributing_frames[0]
     scan = row['key'].split('/')[0][5:]
     view = read_stitch_contributor_view(result.payload, 0, scan=scan)
@@ -207,3 +210,65 @@ def test_xu_difference_cancels_shared_dark_and_its_invalid_mask(tmp_path):
         assert (plain.payload.intensity[plain.diagnostics.coverage > 0] < 0).all()
     finally:
         getattr(source, 'close', lambda: None)()
+
+
+@pytest.mark.parametrize('operation', ['average', 'select'])
+def test_native_positive_point_screening_summary_is_unchanged(tmp_path, operation):
+    from xrd_tools.analysis.module_transaction import ModuleDisposition
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    _, request = _point_stitch(tmp_path, operation)
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert set(result.frame_screen) == {'policy', 'screened', 'excluded', 'empty', 'partial', 'frames'}
+    assert all('positive_total_screening' not in row for row in result.payload.contributing_frames)
+
+
+def test_mixed_point_screening_bypass_is_recorded_per_label(tmp_path):
+    from xrd_tools.analysis.module_transaction import ModuleDisposition, ModuleKind, ModuleOutputRequest, ModuleSourceGroupReceipt
+    from xrd_tools.analysis.stitch_operation import prepare_stitch_operation, run_stitch_operation
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    members = []
+    for operation in ('difference', 'average'):
+        root = tmp_path / operation
+        root.mkdir()
+        _, request = _point_stitch(root, operation)
+        members.append(request.module.source)
+    source = ModuleSourceGroupReceipt.from_members(tuple(members), kind=ModuleKind.STITCH)
+    output = ModuleOutputRequest(resolve_finite_output_target(tmp_path, 'mixed', operation_token='stitch-1d'),
+        AnalysisArtifactKind.STITCH_1D, artifact_family='mixed')
+    request = prepare_stitch_operation(source, output, request.plan, project_root=tmp_path)
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert result.frame_screen['positive_total_screening_bypassed_labels'] == [0, 1]
+    assert 'positive_total_screening' not in result.frame_screen
+    records = result.payload.contributing_frames
+    assert [row['identity']['frame_index'] for row in records] == [0, 1, 0, 1]
+    assert [row['identity']['contribution_index'] for row in records] == [0, 1, 2, 3]
+    assert [row.get('positive_total_screening') for row in records] == [False, False, None, None]
+
+
+@pytest.mark.parametrize('operation', ['difference', 'average', 'select'])
+def test_automatic_refinement_records_effective_point_screening(tmp_path, operation):
+    from tests.core.test_stitch_autocalibration import ring_scan, five_parameter_seed, ROW_ANGLES
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    spec = ring_scan(tmp_path / 'scan', [(delta, 0.) for delta in (6., 20., 34.)])
+    files = sorted((tmp_path / 'scan/images').glob('*.raw'))
+    images = [np.fromfile(path, dtype='<i4').reshape(195, 1475) for path in files]
+    for path in files:
+        path.unlink()
+    for index, image in enumerate(images):
+        operands = ((np.full_like(image, 10), image + 10) if operation == 'difference'
+                    else (image, image))
+        for offset, pixels in enumerate(operands):
+            pixels.tofile(tmp_path / f'scan/images/ring_scan1_{2*index+offset:04}.raw')
+    spec = replace(spec, options={**spec.options, 'point_images': PointImagePolicy(2, operation, image_index=2).to_dict()})
+    fit = refine_arm_from_scan(spec, five_parameter_seed(ROW_ANGLES), max_frames=3)
+    automatic = fit.asset['provenance']['automatic_refinement']
+    assert fit.rms_q < .01
+    assert automatic['source']['options']['point_images'] == PointImagePolicy(2, operation, image_index=2).to_dict()
+    if operation == 'difference':
+        assert automatic['frame_screen']['positive_total_screening'] is False
+        assert automatic['frame_screen']['positive_total_screening_bypassed_labels'] == [0, 1, 2]
+    else:
+        assert set(automatic['frame_screen']) == {'exclude', 'empty_ratio', 'partial_ratio', 'window', 'statistic'}
