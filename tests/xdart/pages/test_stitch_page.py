@@ -39,7 +39,7 @@ def _wait(page, qapp, timeout=30):
     until = time.monotonic() + timeout
     qapp.processEvents()
     # a shown result the page dropped from memory is reloaded between its other work (C12)
-    while (page._owner.busy or page._raw_pending or page._queued_jobs
+    while (page._owner.busy or page._source_observer.computing or page._raw_pending or page._queued_jobs
            or getattr(page, "_reload_pending", None)) and time.monotonic() < until:
         qapp.processEvents()
         time.sleep(.005)
@@ -262,9 +262,10 @@ def test_clearing_the_source_box_clears_the_selection_and_refuses_run(qapp, tmp_
         assert "source path" in page.run_bar.readinessLabel.full_text() and not page._owner.busy
         # a typed path is the selection, and the readiness line follows it at once
         _commit_source_box(page, qapp, spec[0], key="Return")
+        _wait(page, qapp)
         assert page._source_paths == spec and page.settings()["sources"]["Spec"] == list(spec)
         assert (page.run_bar.readinessLabel.full_text()  # with its frames, as Int's (maintainer, 2026-09-30)
-                == "Ready · Stitch 1D · sample, scan 1 · 2 frames · pyFAI MultiGeometry")
+                == "sample, scan 1 · 2 frames · pyFAI MultiGeometry")
         assert page.run_bar.startButton.isEnabled() and row.toolTip() == spec[0]
         for kind, paths in (("NeXus", (str(tmp_path / "one.nxs"), str(tmp_path / "two.nxs"))),
                             ("Directory", (str(tmp_path),))):
@@ -726,8 +727,10 @@ def test_run_checks_the_inputs_itself_and_stops_when_nothing_is_left_to_stitch(q
     try:
         _fill_native(page, form)
         page.set_field("image_stem", "missing_")  # scan 1 has no images under this stem
-        assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
-        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        assert not page.run_bar.startButton.isEnabled()
+        assert "No detector images named *missing_*" in page.run_bar.readinessLabel.full_text()
+        page.begin_run()  # direct API admission keeps the exact no-output diagnostic too
         _wait(page, qapp)
         assert page.run_bar.readinessLabel.full_text() == "Nothing to stitch · 1 scan skipped (Preview lists them)"
         assert page._owner.prepared is not None and not page._owner.prepared.requests

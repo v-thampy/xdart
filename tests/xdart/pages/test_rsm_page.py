@@ -1004,7 +1004,7 @@ def test_each_section_header_shows_its_readiness_as_ints_do(qapp, tmp_path):
         assert cards["project"].valid_marker.toolTip() == "Needs a Project folder"
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
-        assert page.run_bar.readinessLabel.full_text().startswith("Ready · RSM · 1 SPEC file · 1 RSM")
+        assert page.run_bar.readinessLabel.full_text().startswith("1 SPEC file · 1 RSM")
         assert all(card.valid_marker.isVisibleTo(page) for card in cards.values())
         assert cards["source"].status.text() == "1 SPEC file · 1 RSM"  # Stitch's Source status
         assert cards["processing"].status.text().endswith(" · grid 40×40×40")  # Coordinates is Processing's (G8a)

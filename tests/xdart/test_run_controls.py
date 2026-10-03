@@ -126,7 +126,6 @@ def test_getters(qapp):
 def test_readiness_summary_toggles_compact_status_row(qapp):
     c = RunControlsBar()
     assert c.readinessRow.isHidden()
-
     changed = c.set_readiness_summary(
         "Ready · Int 2D · 50 frames",
         ready=True,
@@ -135,9 +134,25 @@ def test_readiness_summary_toggles_compact_status_row(qapp):
 
     assert changed is True
     assert not c.readinessRow.isHidden()
-    assert c.readinessLabel.text() == "Ready · Int 2D · 50 frames"
+    assert c.readinessLabel.text() == "50 frames"
     assert c.readinessLabel.toolTip() == "Everything is ready."
     assert c.readinessDot.property("ready") is True
 
     assert c.set_readiness_summary("", ready=False) is True
     assert c.readinessRow.isHidden()
+
+
+@pytest.mark.parametrize("mode", ["Int 1D", "Int 2D", "Stitch 1D", "Stitch 2D", "RSM"])
+def test_ready_summary_keeps_scan_context_warnings_and_failure_reasons(qapp, mode):
+    bar = RunControlsBar()
+    context = "sample, scan 1 · 201 frames · 1 scan skipped (Preview lists them)"
+    original = f"Ready · {mode} · {context}"
+    bar.set_readiness_summary(original, live=True)
+    assert bar.readinessLabel.full_text() == context
+    assert bar.readinessDot.property("ready") is True
+    assert not bar.readinessLive.isHidden()
+    assert bar.readinessLabel.toolTip() == original
+    refusal = "No detector images named *sample_scan1_* in /selected/folder"
+    bar.set_readiness_summary(refusal, ready=False)
+    assert bar.readinessLabel.full_text() == refusal
+    assert bar.readinessDot.property("ready") is False
