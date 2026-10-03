@@ -39,23 +39,8 @@ def _index(value, name):
     return value
 
 
-def _member(record, source_base):
-    from xrd_tools.io.nexus_record import frame_record_key
+def _source_member(record, source_base):
     from xrd_tools.io.read import relative_source_path
-    frame = _index(record["frame_index"], "frame index")
-    scan = record.get("scan_label")
-    if scan is not None:
-        scan = _text(str(scan), "scan label")
-        if "/" in scan or scan in {".", ".."}:
-            raise ValueError("contributing scan label must be one path component")
-    identity = dict(record["identity"])
-    if set(identity) != {"source_id", "scan_id", "frame_index", "contribution_index"}:
-        raise ValueError("contributing frame identity fields differ")
-    for key in ("source_id", "scan_id"):
-        _text(identity[key], key)
-    if _index(identity["frame_index"], "original frame") != frame:
-        raise ValueError("contributing frame original identity differs")
-    _index(identity["contribution_index"], "contribution index")
     source_path = _text(str(record["source_path"]), "source path")
     snapshot = dict(record.get("source_snapshot") or {})
     if set(snapshot) - set(_SNAPSHOT_ATTRS):
@@ -78,10 +63,49 @@ def _member(record, source_base):
             raise ValueError("invalid raw detector dtype")
     if snapshot.get("rotation", 0) not in {0, 90, 180, 270}:
         raise ValueError("invalid raw detector rotation")
-    return {"key": frame_record_key(scan, frame), "identity": identity,
-            "source_path": relative_source_path(source_path, source_base),
+    return {"source_path": relative_source_path(source_path, source_base),
             "source_frame_index": _index(record.get("source_frame_index", 0), "source frame index"),
             "source_snapshot": snapshot}
+
+
+def _member(record, source_base):
+    from xrd_tools.io.nexus_record import frame_record_key
+    frame = _index(record["frame_index"], "frame index")
+    scan = record.get("scan_label")
+    if scan is not None:
+        scan = _text(str(scan), "scan label")
+        if "/" in scan or scan in {".", ".."}:
+            raise ValueError("contributing scan label must be one path component")
+    identity = dict(record["identity"])
+    if set(identity) != {"source_id", "scan_id", "frame_index", "contribution_index"}:
+        raise ValueError("contributing frame identity fields differ")
+    for key in ("source_id", "scan_id"):
+        _text(identity[key], key)
+    if _index(identity["frame_index"], "original frame") != frame:
+        raise ValueError("contributing frame original identity differs")
+    _index(identity["contribution_index"], "contribution index")
+    result = {"key": frame_record_key(scan, frame), "identity": identity}
+    if {"source_constituents", "point_images"} & set(record):
+        from xrd_tools.sources.point_images import PointImagePolicy
+        if not {"source_constituents", "point_images"} <= set(record) or {
+                "source_path", "source_frame_index", "source_snapshot"} & set(record):
+            raise ValueError("contributing point source is partial or has a first-image pointer")
+        policy = PointImagePolicy.from_dict(record["point_images"])
+        if set(record["point_images"]) != set(policy.to_dict()):
+            raise ValueError("contributing point image policy is partial")
+        operands = record["source_constituents"]
+        count = 1 if policy.operation == "select" else policy.images_per_point
+        if type(operands) not in {list, tuple} or len(operands) != count or not 1 <= count <= _MAX_FRAMES:
+            raise ValueError("contributing point source operand count differs")
+        if any(set(operand) != {"source_path", "source_frame_index", "source_snapshot"} for operand in operands):
+            raise ValueError("contributing point source operand fields differ")
+        sources = [_source_member(operand, source_base) for operand in operands]
+        if len({(source["source_path"], source["source_frame_index"]) for source in sources}) != count:
+            raise ValueError("contributing point source operands collide")
+        result.update(point_images=policy.to_dict(), source_constituents=sources)
+    else:
+        result.update(_source_member(record, source_base))
+    return result
 
 
 def analysis_contributing_frame_members(records, *, source_base):
@@ -212,7 +236,10 @@ def inspect_contributing_frames(entry, provenance):
         fail("contributing frame screen verdicts are partial")
     originals = []
     for row in rows:
-        if set(row) - _SCREEN_KEYS != {"key", "identity", "source_path", "source_frame_index", "source_snapshot", "mask_baked", "thumbnail"}:
+        grouped = "source_constituents" in row or "point_images" in row
+        source_keys = {"source_constituents", "point_images"} if grouped else {
+            "source_path", "source_frame_index", "source_snapshot"}
+        if set(row) - _SCREEN_KEYS != {"key", "identity", "mask_baked", "thumbnail", *source_keys}:
             fail("contributing manifest fields differ")
         try:
             _screen_fields(row)
@@ -221,10 +248,17 @@ def inspect_contributing_frames(entry, provenance):
         parts = row["key"].split("/")
         if len(parts) not in {1, 2} or (len(parts) == 2 and not parts[0].startswith("scan_")):
             fail("contributing record address is invalid")
-        originals.append(dict(frame_index=row["identity"]["frame_index"],
+        original = dict(frame_index=row["identity"]["frame_index"],
             scan_label=parts[0][5:] if len(parts) == 2 else None,
-            identity=row["identity"], source_path=str(Path(base) / row["source_path"]),
-            source_frame_index=row["source_frame_index"], source_snapshot=row["source_snapshot"]))
+            identity=row["identity"])
+        if grouped:
+            original.update(point_images=row["point_images"], source_constituents=[
+                dict(operand, source_path=str(Path(base) / operand["source_path"]))
+                for operand in row["source_constituents"]])
+        else:
+            original.update(source_path=str(Path(base) / row["source_path"]),
+                source_frame_index=row["source_frame_index"], source_snapshot=row["source_snapshot"])
+        originals.append(original)
     if analysis_contributing_frame_members(originals, source_base=base) != members:
         fail("contributing source identities are not canonical")
     if not analysis_contributing_frame_binding_matches(provenance.get("frame_members"), members):
@@ -236,6 +270,21 @@ def inspect_contributing_frames(entry, provenance):
     def collection(group, extra=()):
         if set(group.attrs) != {"NX_class", *extra} or _bounded_attr_text(group, "NX_class") != "NXcollection":
             fail("contributing frame collection attributes differ")
+    def inspect_source(source, operand):
+        collection(source, tuple(_SNAPSHOT_ATTRS[k] for k in operand["source_snapshot"]))
+        if set(source) != {"path", "frame_index"} or text(_direct(source, "path", h5py.Dataset)) != operand["source_path"]:
+            fail("contributing source locator differs")
+        index = _direct(source, "frame_index", h5py.Dataset)
+        if index.shape != () or index.dtype.kind not in "iu" or index.dtype.itemsize > 8 or len(index.attrs) or int(index[()]) != operand["source_frame_index"]:
+            fail("contributing source frame index differs")
+        for key, expected_value in operand["source_snapshot"].items():
+            attr = _SNAPSHOT_ATTRS[key]
+            if type(expected_value) is str:
+                actual = _bounded_attr_text(source, attr)
+            else:
+                actual = number(source, attr, shape=(2,) if key == "raw_shape" else (), kinds="biu")
+            if actual != expected_value:
+                fail("contributing source descriptor differs")
     collection(frames)
     for parent in expected_parents:
         if parent.startswith("scan_"):
@@ -259,20 +308,18 @@ def inspect_contributing_frames(entry, provenance):
         if set(frame) != expected or json.loads(text(_direct(frame, "identity_json", h5py.Dataset))) != row["identity"]:
             fail("contributing frame identity or graph differs")
         source = _direct(frame, "source", h5py.Group)
-        collection(source, tuple(_SNAPSHOT_ATTRS[k] for k in row["source_snapshot"]))
-        if set(source) != {"path", "frame_index"} or text(_direct(source, "path", h5py.Dataset)) != row["source_path"]:
-            fail("contributing source locator differs")
-        index = _direct(source, "frame_index", h5py.Dataset)
-        if index.shape != () or index.dtype.kind not in "iu" or index.dtype.itemsize > 8 or len(index.attrs) or int(index[()]) != row["source_frame_index"]:
-            fail("contributing source frame index differs")
-        for key, expected_value in row["source_snapshot"].items():
-            attr = _SNAPSHOT_ATTRS[key]
-            if type(expected_value) is str:
-                actual = _bounded_attr_text(source, attr)
-            else:
-                actual = number(source, attr, shape=(2,) if key == "raw_shape" else (), kinds="biu")
-            if actual != expected_value:
-                fail("contributing source descriptor differs")
+        if "source_constituents" in row:
+            collection(source, ("point_images",))
+            if set(source) != {"constituents"} or _bounded_attr_text(source, "point_images") != canonical_frame_manifest(row["point_images"]):
+                fail("contributing point image policy or source graph differs")
+            operands = _direct(source, "constituents", h5py.Group)
+            collection(operands)
+            if set(operands) != {f"{index:04d}" for index in range(len(row["source_constituents"]))}:
+                fail("contributing point source operand membership differs")
+            for index, operand in enumerate(row["source_constituents"]):
+                inspect_source(_direct(operands, f"{index:04d}", h5py.Group), operand)
+        else:
+            inspect_source(source, row)
         thumb = _direct(frame, "thumbnail", h5py.Dataset)
         if thumb.ndim != 2 or min(thumb.shape) < 1 or max(thumb.shape) > 256 or thumb.dtype not in (np.dtype("uint8"), np.dtype("uint16")) or set(thumb.attrs) != {"vmin", "vmax", "dtype", "mask_baked"}:
             fail("contributing thumbnail exceeds its bounded schema")

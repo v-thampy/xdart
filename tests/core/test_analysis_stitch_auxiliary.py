@@ -26,7 +26,7 @@ from tests.core.test_analysis_artifact import _execution_attestation
 
 
 def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fractional=False, source_stamp=True,
-             legacy_members=False):
+             legacy_members=False, point_images=None):
     project = tmp_path / "project"
     project.mkdir()
     raw = np.arange(24, dtype=np.int32).reshape(4, 6)
@@ -41,6 +41,20 @@ def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fracti
         identity=dict(source_id="sample.spec", scan_id=str(scan), frame_index=index,
                       contribution_index=global_index))
         for global_index, (scan, index) in enumerate(((2, 0), (2, 1), (3, 0)))]
+    if point_images is not None:
+        from xrd_tools.sources.point_images import PointImagePolicy
+        policy = PointImagePolicy.from_dict(point_images)
+        second_file = project / "second.raw"
+        (raw + 10).tofile(second_file)
+        second_state = second_file.stat()
+        for record in records:
+            first = {key: record.pop(key) for key in (
+                "source_path", "source_frame_index", "source_snapshot")}
+            second = dict(source_path=str(second_file), source_frame_index=0,
+                source_snapshot=dict(first["source_snapshot"], size=second_state.st_size,
+                                     mtime_ns=second_state.st_mtime_ns))
+            record["source_constituents"] = [second] if policy.operation == "select" else [first, second]
+            record["point_images"] = policy.to_dict()
     members = analysis_contributing_frame_members(records, source_base=project)
     provenance = {"frame_members": members if legacy_members else analysis_contributing_frame_binding(members)}
     radial = np.linspace(0.1, 5.0, 40) if unit == "q_A^-1" else np.linspace(1, 100, 40)
@@ -213,3 +227,85 @@ def test_unstamped_source_preserves_curve_and_thumbnail_but_cannot_claim_origina
     assert view.thumbnail.shape == raw.shape
     assert view.extra["raw_unavailable_reason"] == "saved raw source identity unavailable"
     assert read_analysis_artifact(path).intensity.size == 40
+
+
+@pytest.mark.parametrize("operation,reverse,delta", [
+    ("average", False, 5), ("difference", False, 10),
+    ("difference", True, -10), ("select", False, 10),
+])
+def test_grouped_native_artifact_real_writer_and_full_raw(tmp_path, operation, reverse, delta):
+    policy = dict(images_per_point=2, operation=operation, image_index=2, reverse=reverse)
+    path, raw, project, receipt = _publish(tmp_path, point_images=policy)
+    payload = read_analysis_artifact(path, expected_receipt=receipt)
+    row = payload.contributing_frames[0]
+    assert row["point_images"] == policy
+    assert "source_path" not in row and "source_frame_index" not in row
+    expected_paths = ["second.raw"] if operation == "select" else ["frame.raw", "second.raw"]
+    assert [member["source_path"] for member in row["source_constituents"]] == expected_paths
+    view = read_contributing_frame_view(path, 0, scan="2", full_raw=True, artifact_payload=payload)
+    np.testing.assert_array_equal(view.raw, np.full(raw.shape, delta) if operation == "difference" else raw + delta)
+    assert not view.raw.flags.writeable
+    assert view.metadata_raw["point_images"] == policy
+    assert view.source_path is None and view.source_frame_index is None
+    with h5py.File(path, "r") as handle:
+        source = handle["entry/stitch/frames/scan_2/frame_0000/source"]
+        assert set(source) == {"constituents"}
+        assert json.loads(source.attrs["point_images"]) == policy
+        members = source["constituents"]
+        assert list(members) == [f"{index:04d}" for index in range(len(expected_paths))]
+        assert [members[name]["path"].asstr()[()] for name in members] == expected_paths
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing", "extra", "external", "reordered", "policy", "snapshot", "manifest-policy", "first-pointer",
+])
+def test_grouped_bound_artifact_rejects_partial_or_changed_operands(tmp_path, mutation):
+    policy = dict(images_per_point=2, operation="difference", image_index=1, reverse=False)
+    path, _, _, _ = _publish(tmp_path, point_images=policy)
+    with h5py.File(path, "r+") as handle:
+        stitch = handle["entry/stitch"]
+        source = stitch["frames/scan_2/frame_0000/source"]
+        members = source["constituents"]
+        if mutation == "missing":
+            del members["0001"]
+        elif mutation == "extra":
+            members["0002"] = members["0000"]
+        elif mutation == "external":
+            del members["0001"]
+            members["0001"] = h5py.ExternalLink("not-opened.h5", "/operand")
+        elif mutation == "reordered":
+            members.move("0000", "temporary")
+            members.move("0001", "0000")
+            members.move("temporary", "0001")
+        elif mutation == "policy":
+            source.attrs.modify("point_images", np.bytes_(canonical_frame_manifest(dict(policy, reverse=True)).encode()))
+        elif mutation == "snapshot":
+            members["0001"].attrs.modify("file_size", 7)
+        elif mutation == "first-pointer":
+            source.create_dataset("path", data=np.bytes_(b"frame.raw"))
+        else:
+            manifest = json.loads(bytes(stitch["contributing_frames_json"][()]))
+            manifest["records"][0]["point_images"]["reverse"] = True
+            del stitch["contributing_frames_json"]
+            stitch.create_dataset("contributing_frames_json", data=np.bytes_(canonical_frame_manifest(manifest).encode()))
+    with pytest.raises(AnalysisArtifactInvalid):
+        read_analysis_artifact(path)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "changed"])
+def test_grouped_original_operand_unavailable_never_returns_partial_raw(tmp_path, mutation):
+    import os
+    policy = dict(images_per_point=2, operation="average", image_index=1, reverse=False)
+    path, raw, project, receipt = _publish(tmp_path, point_images=policy)
+    payload = read_analysis_artifact(path, expected_receipt=receipt)
+    original = project / "second.raw"
+    if mutation == "missing":
+        original.unlink()
+    else:
+        state = original.stat()
+        (raw + 1000).tofile(original)
+        os.utime(original, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+    view = read_contributing_frame_view(path, 0, scan="2", full_raw=True, artifact_payload=payload)
+    assert view.raw is None
+    assert view.thumbnail.shape == raw.shape
+    np.testing.assert_array_equal(read_analysis_artifact(path).intensity, payload.intensity)

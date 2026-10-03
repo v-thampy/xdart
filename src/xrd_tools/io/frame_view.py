@@ -3538,11 +3538,12 @@ def read_contributing_frame_view(
         inspect_analysis_artifact,
         _stat_revision, _opened_hdf_revision,
     )
-    from xrd_tools.io.nexus_record import frame_record_key
+    from xrd_tools.io.nexus_record import frame_record_key, read_point_source_ref
     from xrd_tools.io.stitch_record import STITCH_GROUP
     from xrd_tools.io.read import (
         _raw_frame_parts_from_entry, _frame_group_for_label,
         _frame_source_read_options, _raw_frame_or_thumbnail, resolve_source_master,
+        _point_raw_frame,
     )
     from xrd_tools.sources.execution_graph import SourceFileState
     import json
@@ -3582,12 +3583,16 @@ def read_contributing_frame_view(
         )
         group = _frame_group_for_label(container, frame, scan=scan)
         options = _frame_source_read_options(group)
+        point = read_point_source_ref(group.get("source"))
     raw = None
     raw_reason = ""
     if full_raw:
-        snapshot = selected["source_snapshot"]
-        expected = [(master, snapshot.get("size"), snapshot.get("mtime_ns"))]
-        if snapshot.get("self_contained") is False:
+        operands = selected["source_constituents"] if point is not None else (selected,)
+        expected = [(resolve_source_master(operand["source_path"], scan_file=path,
+            source_base=frame_manifest["source_base"], source_root=source_root) if point is not None else master,
+            operand["source_snapshot"].get("size"), operand["source_snapshot"].get("mtime_ns"))
+            for operand in operands]
+        if any(operand["source_snapshot"].get("self_contained") is False for operand in operands):
             # The primary NeXus file can stay unchanged while its linked detector
             # data changes. Reuse this exact member's existing dependency stamps
             # and the same relocatable Project resolver as its raw link.
@@ -3615,17 +3620,26 @@ def read_contributing_frame_view(
                     break
                 states.append(state)
             if not raw_reason:
-                raw = _raw_frame_or_thumbnail(path, frame, master, index, thumbnail,
-                    allow_thumbnail=False, preserve_dtype=True, raw_options=options)
+                raw = (_point_raw_frame(path, point, source_base=frame_manifest["source_base"],
+                    source_root=source_root) if point is not None else
+                    _raw_frame_or_thumbnail(path, frame, master, index, thumbnail,
+                        allow_thumbnail=False, preserve_dtype=True, raw_options=options))
                 if not all(state.matches_disk() for state in states):
                     raw, raw_reason = None, "raw source changed during reading"
+                elif point is not None:
+                    raw.setflags(write=False)
         except (KeyError, OSError):
+            raw, raw_reason = None, "raw source unavailable"
+        except ValueError:
+            if point is None:
+                raise
             raw, raw_reason = None, "raw source unavailable"
     if _stat_revision(os.stat(path)) != inspection.storage_revision:
         raise AnalysisArtifactInvalid("artifact changed during frame hydration")
     return FrameView(label=frame, raw=raw, thumbnail=thumbnail,
-        mask_baked=selected["mask_baked"], metadata_raw=selected["identity"],
-        source_path=None if master is None else str(master), source_frame_index=index,
+        mask_baked=selected["mask_baked"], metadata_raw=(dict(selected["identity"],
+            point_images=selected["point_images"]) if point is not None else selected["identity"]),
+        source_path=None if master is None else str(master), source_frame_index=None if point is not None else index,
         extra={"raw_unavailable_reason": raw_reason} if raw_reason else {})
 
 
