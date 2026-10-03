@@ -5,7 +5,8 @@ its slices and pins as Int 2D makes them from the same map, and the contributing
 """
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtCore
+from dataclasses import replace
+from pyqtgraph.Qt import QtCore, QtTest
 
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
@@ -20,6 +21,76 @@ from tests.xdart.tools.test_stitch_native_values import _native_form
 
 def _command(page, kind, value=None):
     page._view_command(ShellCommand(kind, value))
+
+
+@pytest.mark.parametrize("plot_mode", ["Single", "Overlay"])
+def test_saved_stitch_2d_navigation_keeps_the_requested_curves(qapp, tmp_path, plot_mode, monkeypatch):
+    """Real result clicks and footer visits agree with Int's selected scientific traces."""
+    from xdart.gui.tabs.stitch import page as module
+    monkeypatch.setattr(module, "_RECENT_BYTES", 0)
+    page = StitchPage(empty_host_services(_Status()))
+    page.resize(1400, 900)
+    page.show()
+    try:
+        page.load_form(replace(_native_form(tmp_path, "multigeometry"), mode="2d",
+                               npt_rad_2d=48, npt_azim_2d=32))
+        _wait(page, qapp)
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        paths = [page.results.item(row).data(QtCore.Qt.ItemDataRole.UserRole)
+                 for row in range(page.results.count())]
+        assert len(paths) == 3
+        saved = {path: read_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_2D)
+                 for path in paths}
+        keys = dict(page._result_keys)
+        page.clear_plot()
+        _command(page, ShellCommandKind.SET_PLOT_MODE, plot_mode)
+
+        def click(row, modifier=QtCore.Qt.KeyboardModifier.NoModifier):
+            item = page.results.item(row)
+            QtTest.QTest.mouseClick(page.results.viewport(), QtCore.Qt.MouseButton.LeftButton,
+                                   modifier, page.results.visualItemRect(item).center())
+            _wait(page, qapp)
+
+        def shown(rows):
+            expected = {paths[row] for row in rows}
+            assert set(page.browser.selected_results()) == expected
+            assert set(page._payloads) == expected | {page.browser.current_result()}
+            traces = page._last_map_state.traces
+            assert len(traces) == len(expected) == len(page.curve.listDataItems())
+            for trace in traces:
+                path = next(path for path, key in keys.items() if trace.frame is key)
+                assert path in expected
+                np.testing.assert_array_equal(trace.intensity, saved[path].profile.intensity)
+
+        click(0)
+        shown([0])
+        click(1)
+        shown([1] if plot_mode == "Single" else [0, 1])
+        if plot_mode == "Single":
+            click(2, QtCore.Qt.KeyboardModifier.ControlModifier)
+            shown([1, 2])  # explicit selection is useful in Single too
+            page.scientific.previous_frame.click()
+            _wait(page, qapp)
+            shown([1])
+        else:
+            page.scientific.next_frame.click()
+            _wait(page, qapp)
+            shown([0, 1, 2])
+            click(1, QtCore.Qt.KeyboardModifier.ControlModifier)
+            shown([0, 2])  # toggling membership keeps the current map separate
+            QtTest.QTest.keyClick(page.results, QtCore.Qt.Key.Key_Up)
+            _wait(page, qapp)
+            shown([0, 2])  # revisiting a member never duplicates it
+        assert all(page._result_keys[path] is key for path, key in keys.items())
+        _command(page, ShellCommandKind.CLEAR_1D)
+        assert page.browser.current_result() is None and page.browser.selected_results() == ()
+        assert page._last_map_state.traces == () and page.curve.listDataItems() == []
+        assert page._view.plot_mode == plot_mode
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
 
 
 @pytest.mark.parametrize("backend", ["multigeometry", "xu_hist"])

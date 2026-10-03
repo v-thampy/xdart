@@ -99,6 +99,7 @@ def test_stitch_overlay_selection_stepping_and_read_back_live_in_ints_browser(qa
     select = QtCore.QItemSelectionModel.SelectionFlag
     try:
         page.load_form(_native_form(tmp_path, "multigeometry"))  # three outputs
+        _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
         paths = [page.results.item(row).data(_ROLE) for row in range(page.results.count())]
@@ -110,10 +111,11 @@ def test_stitch_overlay_selection_stepping_and_read_back_live_in_ints_browser(qa
         assert page.browser.current_result() == paths[0]
         assert set(page.browser.selected_results()) == {paths[0], paths[2]}
         assert set(page._payloads) == {paths[0], paths[2]} and len(page.curve.listDataItems()) == 2
-        page.scientific.next_frame.click()  # an overlay stepping: the current moves, the selection stays
+        page.scientific.next_frame.click()  # Overlay visits add the current curve, as Int's do
         _wait(page, qapp)
         assert page.browser.current_result() == paths[1]
-        assert set(page.browser.selected_results()) == {paths[0], paths[2]}
+        assert set(page.browser.selected_results()) == set(paths)
+        assert set(page._payloads) == set(paths) and len(page.curve.listDataItems()) == 3
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Single"))
         _wait(page, qapp)  # Single: the current result alone, read back if it was let go
         assert page.browser.selected_results() == (paths[1],) and page.browser.current_result() == paths[1]

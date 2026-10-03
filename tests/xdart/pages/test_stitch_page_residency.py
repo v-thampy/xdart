@@ -69,6 +69,7 @@ def test_a_pin_survives_selecting_another_result(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(replace(_native_form(tmp_path, "multigeometry"), mode="2d", npt_rad_2d=48, npt_azim_2d=32))
+        _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
         assert page.results.count() == 3
