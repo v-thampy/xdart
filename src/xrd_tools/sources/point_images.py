@@ -366,8 +366,8 @@ class PointImageSource(BaseFrameSource):
     def take_direct_chunk_fact(self):
         return self.source.take_direct_chunk_fact()
 
-    def note_direct_chunk_bypass(self, reason):
-        return self.source.note_direct_chunk_bypass(reason)
+    def note_direct_chunk_bypass(self, reason, observed_frames=0):
+        return self.source.note_direct_chunk_bypass(reason, observed_frames)
 
     def load_frame(self, index):
         return self.load_point_frame(index)
