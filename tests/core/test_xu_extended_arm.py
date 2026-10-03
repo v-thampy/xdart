@@ -20,6 +20,39 @@ from tests.core.test_stacked_arm_extension import ANGLES, TRUTH, _calibration
 SHAPE = (195, 1475)
 
 
+def test_native_gi_default_keeps_the_physical_vertical_q_sign():
+    """The chi-90 mount uses native pyFAI orientation 2, including its Qoop sign."""
+    from dataclasses import replace
+    from pyFAI.units import get_unit_fiber
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.integrate.gid import _fiber_from_integrator
+    from xrd_tools.integrate.stitch_gi import StitchGI
+
+    calibration = DetectorCalibration(PONI(dist=.39, poni1=.0168, poni2=.1268,
+        wavelength=.7293e-10, detector='Pilatus300kw'), detector_config={'orientation': 3})
+    arm = StackedDetectorArm(nu_motor='nu', del_motor='del')
+    diff = Diffractometer.from_pyfai_goniometer(arm.to_pyfai_goniometer(calibration),
+        source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
+    integrator, = create_multigeometry_integrators_from_geometry(
+        diff, {'del': np.array([20.]), 'nu': np.array([0.])})
+    gi = StitchGI(('q_oop',), incidence_motor='eta', tilt_motor='chi')
+    normal = gi.normal({'eta': .4, 'chi': 90.})
+    assert gi.sample_orientation == 2
+    incidence, tilt = gi.pyfai_angles(normal)
+    options = dict(incident_angle=incidence, tilt_angle=tilt,
+        sample_orientation=gi.sample_orientation, angle_unit='deg')
+    qoop = _fiber_from_integrator(integrator, **options).array_from_unit(
+        SHAPE, 'center', get_unit_fiber('qoop_A^-1', **options), scale=True)
+    tth = integrator.center_array(SHAPE, unit='2th_rad', scale=False)
+    chi = integrator.center_array(SHAPE, unit='chi_rad', scale=False)
+    # Native detector t1 is lab +x; this pose scatters upward.
+    assert np.median(np.sin(tth) * np.sin(chi)) > 0
+    assert np.median(qoop) > 0
+    with pytest.raises(ValueError, match='choose the orientation of this mounting'):
+        replace(gi, sample_orientation=4).pyfai_angles(normal)
+
+
 def _record(**changes):
     params = {**TRUTH, **changes}
     arm = StackedDetectorArm(nu_motor='nu', del_motor='del', **params)
@@ -123,7 +156,7 @@ class _OneFrame:
         return self.image
 
 
-def test_v3_keeps_uniform_radiance_uniform_at_every_pose(tmp_path, transferred):
+def test_v3_keeps_uniform_radiance_uniform_at_every_pose(tmp_path):
     """A sample offset changes each frame's distance; its solid angle must follow.
 
     Counts from a uniform radiance integrate to one level at every pose, as in
@@ -132,11 +165,14 @@ def test_v3_keeps_uniform_radiance_uniform_at_every_pose(tmp_path, transferred):
     """
     from xrd_tools.integrate.xu_stitch import run_xu_hist_stitch_1d
 
-    asset = transferred[0]
+    # Opposite motor poses keep the sample-offset displacement large in the native
+    # frame; qualify both before exercising their per-frame solid-angle correction.
+    poses = [(-60., -40.), (60., 40.), (0., 0.)]
+    asset, _ = transfer_arm_to_xu(_record(), validation_angles=poses)
     receipt = _receipt(tmp_path, asset)
     diff = Diffractometer.from_pyfai_goniometer(_record(), source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
     radiance, distances = 1e7, []
-    for delta, nu in ((6., -10.), (42., 18.)):
+    for delta, nu in poses:
         integrator, = create_multigeometry_integrators_from_geometry(
             diff, {'del': np.array([delta]), 'nu': np.array([nu])})
         pixel_area = integrator.detector.pixel1 * integrator.detector.pixel2
@@ -262,7 +298,7 @@ def test_a_guided_xu_extended_fit_saves_a_v3_asset_the_runtime_admits(tmp_path):
 def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, transferred, pose):
     """GI Stitch 1D with xrayutilities (maintainer, 2026-09-29): every frame's sample normal comes
     from psic's four sample circles (17-2's mounting: chi 90, eta the incidence; here also tilted by
-    chi and mu), and each cut bins exactly the pixels pyFAI's fiber model puts there (orientation 4,
+    chi and mu), and each cut bins exactly the pixels pyFAI's fiber model puts there (orientation 2,
     the incidence and tilt solved from the same normal), sample offset and all; Qip + Qoop gives
     exactly the two single-cut results; I(q) beside them is unchanged."""
     from pyFAI.units import get_unit_fiber
@@ -300,9 +336,9 @@ def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, tr
     assert abs(tilt) == pytest.approx(0. if pose['chi'] == 90. else 2., abs=.01)
     for (delta, nu) in angles.values():
         integrator, = create_multigeometry_integrators_from_geometry(diff, {'del': np.array([delta]), 'nu': np.array([nu])})
-        fiber = _fiber_from_integrator(integrator, incident_angle=incidence, tilt_angle=tilt, sample_orientation=4,
+        fiber = _fiber_from_integrator(integrator, incident_angle=incidence, tilt_angle=tilt, sample_orientation=2,
                                        angle_unit='deg')
-        unit = dict(incident_angle=incidence, tilt_angle=tilt, sample_orientation=4, angle_unit='deg')
+        unit = dict(incident_angle=incidence, tilt_angle=tilt, sample_orientation=2, angle_unit='deg')
         values = {'q_ip': np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber('qip_A^-1', **unit), scale=True)),
                   'q_oop': np.asarray(fiber.array_from_unit(SHAPE, 'center', get_unit_fiber('qoop_A^-1', **unit), scale=True))}
         mask = integrator.detector.mask
@@ -319,10 +355,10 @@ def test_xu_gi_cuts_bin_pyfais_fiber_coordinates_and_leave_iq_alone(tmp_path, tr
 
 
 @pytest.mark.parametrize('orientation, poses', [
-    (4, [(0., .4, 90., 0.), (.5, .4, 88., -1.7), (0., .3, 85., 3.)]),  # 17-2: chi 90, eta incidence
-    (3, [(0., .4, 88., 0.)]),  # the same mounting, q_ip the other way
-    (7, [(.4, 0., 0., 0.), (.4, .5, -1.5, -1.7)]),  # chi 0, mu incidence
-    (6, [(.4, 0., 2., 0.)])])
+    (2, [(0., .4, 90., 0.), (.5, .4, 88., -1.7), (0., .3, 85., 3.)]),  # 17-2: chi 90, eta incidence
+    (1, [(0., .4, 88., 0.)]),  # the same mounting, q_ip the other way
+    (5, [(.4, 0., 0., 0.), (.4, .5, -1.5, -1.7)]),  # chi 0, mu incidence
+    (8, [(.4, 0., 2., 0.)])])
 def test_pyfai_takes_the_incidence_and_tilt_that_give_the_circles_surface_normal(tmp_path, transferred, orientation,
                                                                                poses):
     """Maintainer, 2026-09-29: "pyfai should get the tilt from the data as well just like the incidence

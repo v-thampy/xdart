@@ -708,24 +708,24 @@ def test_the_camera_turns_and_mirrors_the_frames_and_older_settings_keep_their_r
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
-        assert page._value("camera") == "x-, z+"  # Stitch's frame: an image rotation of 0
+        assert page._value("camera") == "x+, z-"  # Native pyFAI frame: no rotation
         form = page.build_form()
         assert (form.image_rotation, form.image_flip) == (0, False)
         unmirrored = form.fingerprint
-        page.set_field("camera", "x-, z-")  # 17-2's Pilatus 300K-W: mirrored left-right
+        page.set_field("camera", "x+, z+")  # horizontal mirror relative to the native frame
         form = page.build_form()
         assert (form.image_rotation, form.image_flip) == (0, True) and form.fingerprint != unmirrored
         page.load_form(form)
-        assert page._value("camera") == "x-, z-"
+        assert page._value("camera") == "x+, z+"
         document = page.settings()
-        assert document["fields"]["camera"] == "x-, z-" and "image_rotation" not in document["fields"]
+        assert document["fields"]["camera"] == "x+, z+" and "image_rotation" not in document["fields"]
         older = dict(document, fields={**{k: v for k, v in document["fields"].items() if k != "camera"},
                                         "image_rotation": "90"})
         page.apply_settings(older)
-        assert page._value("camera") == "z+, x+"  # the rotation's unmirrored camera
+        assert page._value("camera") == "z-, x-"  # the rotation's unmirrored camera
         assert (page.build_form().image_rotation, page.build_form().image_flip) == (90, False)
         page._calibrate()  # Calibrate opens with the page's camera
-        assert page._calibration_dialog.camera.value().to_xu() == ("z+", "x+")
+        assert page._calibration_dialog.camera.value().to_xu() == ("z-", "x-")
         page._calibration_dialog.close()
     finally:
         _close(page, qapp)

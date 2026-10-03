@@ -271,16 +271,16 @@ _INTEGER_FIELDS = {
 
 
 #: The detector camera's eight values, "rows, columns" (xrayutilities' detectorDir1, detectorDir2), Stitch's
-#: frame first: an image rotation of 0 before the camera (maintainer, 2026-09-30).
+#: native pyFAI frame first: no image rotation or flip.
 CAMERAS = tuple(f"{rows}, {columns}" for rows, columns in (
-    ("x-", "z+"), ("x-", "z-"), ("x+", "z-"), ("x+", "z+"),
+    ("x+", "z-"), ("x-", "z+"), ("x-", "z-"), ("x+", "z+"),
     ("z-", "x-"), ("z-", "x+"), ("z+", "x+"), ("z+", "x-")))
 
 
-def camera_text(orientation) -> str:
+def camera_text(orientation, *, frame=None) -> str:
     """The camera ("rows, columns") whose images Stitch turns and mirrors by ``orientation``."""
     from xrd_tools.core.geometry.camera import stitch_camera
-    camera = stitch_camera(orientation)
+    camera = stitch_camera(orientation) if frame is None else stitch_camera(orientation, frame=frame)
     return f"{camera.rows}, {camera.columns}"
 
 
@@ -294,7 +294,7 @@ def camera_orientation(text) -> ImageOrientation:
     from xrd_tools.core.geometry.camera import DetectorCamera, stitch_orientation
     parts = tuple(part.strip() for part in str(text or "").split(","))
     if len(parts) != 2:
-        raise ValueError("choose the detector camera (Advanced): its rows' and columns' directions, e.g. x-, z+")
+        raise ValueError("choose the detector camera (Advanced): its rows' and columns' directions, e.g. x+, z-")
     return stitch_orientation(DetectorCamera(*parts))
 
 
@@ -746,7 +746,7 @@ class StitchPage(QtWidgets.QWidget):
         # Grazing incidence as Int sets it, in the Experiment section (maintainer, 2026-09-29):
         # Int's own rows, rebuilt from this page's values (_render_gi).
         # tilt_motor None: the default (chi, gonchi, else Manual) once the scan's motors are known
-        self._gi = dict(enabled=False, motor=None, angle="0.1", orientation="4", tilt_motor=None, tilt_angle="0")
+        self._gi = dict(enabled=False, motor=None, angle="0.1", orientation="2", tilt_motor=None, tilt_angle="0")
         self._gi_catalog = None
         self._gi_host = QtWidgets.QWidget()
         QtWidgets.QVBoxLayout(self._gi_host).setContentsMargins(0, 0, 0, 0)
@@ -1925,10 +1925,12 @@ class StitchPage(QtWidgets.QWidget):
             values = {"source_motors": "", "camera": ""}
             tip = "Select a valid XU calibration to inspect its angle mapping and camera."
         else:
+            from xrd_tools.core.geometry.camera import DetectorCamera
             values = dict(source_motors=", ".join(  # a single 2θ arm's asset names no nu motor
                 f"{name}={source}" for name, source in acquisition["source_motors"].items() if source),
                 camera=camera_text(ImageOrientation(rotation=90 * acquisition["image_rotation_quarter_turns"],
-                                                    flip_horizontal=acquisition.get("image_flip", False))))
+                                                    flip_horizontal=acquisition.get("image_flip", False)),
+                    frame=DetectorCamera(*calibration.projection.value["xrayutilities"]["camera"])))
             tip = "Defined by the selected XU calibration; change it in Calibrate."
         values.update(geometry_kind="Goniometer JSON", poni_references="")
         for key, value in values.items():

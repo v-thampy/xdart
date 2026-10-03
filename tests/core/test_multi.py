@@ -757,6 +757,7 @@ def test_the_streaming_gi_cuts_equal_pyfais_multigeometryfiber_and_leave_iq_alon
     the two single-cut results; I(q) beside them is the plain streaming result."""
     import numpy as np
     from pyFAI.multi_geometry import MultiGeometryFiber
+    from pyFAI.units import get_unit_fiber
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
     from xrd_tools.integrate.gid import _fiber_from_integrator
@@ -783,8 +784,20 @@ def test_the_streaming_gi_cuts_equal_pyfais_multigeometryfiber_and_leave_iq_alon
     assert none == () and len(both) == 2
     np.testing.assert_array_equal(payload.intensity, plain.intensity)
     incidence, tilt = angles
-    fibers = [_fiber_from_integrator(ai, incident_angle=incidence, tilt_angle=tilt, sample_orientation=4)
+    fibers = [_fiber_from_integrator(ai, incident_angle=incidence, tilt_angle=tilt, sample_orientation=2)
               for ai in series]
+    # pyFAI's histogram admits a fractional index below the first bin. Apply the same
+    # closed physical window as Stitch rather than crediting those outside pixels.
+    window_masks = []
+    options = dict(incident_angle=incidence, tilt_angle=tilt, sample_orientation=2, angle_unit='deg')
+    for fiber in fibers:
+        outside = np.zeros(images[0].shape, dtype=bool)
+        for name, limits in (('qip_A^-1', ranges['ip_range']), ('qoop_A^-1', ranges['oop_range'])):
+            values = fiber.array_from_unit(images[0].shape, 'center', get_unit_fiber(name, **options), scale=True)
+            outside |= (values < limits[0]) | (values > limits[1])
+        if fiber.detector.mask is not None:
+            outside |= np.asarray(fiber.detector.mask, dtype=bool)
+        window_masks.append(outside)
     for name, (cut, cut_diagnostics) in zip(('q_ip', 'q_oop'), both):
         (single, single_diagnostics), = stitch(name)[2]
         for mine, theirs in ((cut.radial, single.radial), (cut.intensity, single.intensity),
@@ -792,10 +805,11 @@ def test_the_streaming_gi_cuts_equal_pyfais_multigeometryfiber_and_leave_iq_alon
                              (cut_diagnostics.normalization, single_diagnostics.normalization)):
             np.testing.assert_array_equal(mine, theirs)
         reference = MultiGeometryFiber(fibers, unit=('qip_A^-1', 'qoop_A^-1'), incident_angle=np.radians(incidence),
-                                       tilt_angle=np.radians(tilt), sample_orientation=4, **ranges
+                                       tilt_angle=np.radians(tilt), sample_orientation=2, **ranges
                                        ).integrate1d_grazing_incidence(images, npt_ip=64, npt_oop=64,
                                                                        vertical_integration=name == 'q_oop',
-                                                                       polarization_factor=.99)
+                                                                       polarization_factor=.99,
+                                                                       lst_mask=window_masks)
         assert cut.unit == GI_UNITS[name]
         np.testing.assert_allclose(cut.radial, reference.radial, rtol=0, atol=1e-12)
         filled = np.asarray(reference.count) > 0
@@ -878,7 +892,7 @@ def _window_probe_integrator(detector_mask=None):
 
 
 def _window_probe_coordinates(angles):
-    """Every pixel's (Qip, Qoop) in Å⁻¹ at pyFAI's (incidence, tilt) in degrees, orientation 4, from pyFAI's
+    """Every pixel's (Qip, Qoop) in Å⁻¹ at pyFAI's (incidence, tilt) in degrees, orientation 2, from pyFAI's
     own FiberIntegrator and fiber units rather than the kernel's."""
     from pyFAI.integrator.fiber import FiberIntegrator
     from pyFAI.units import get_unit_fiber
@@ -886,7 +900,7 @@ def _window_probe_coordinates(angles):
     fiber = FiberIntegrator(dist=source.dist, poni1=source.poni1, poni2=source.poni2, rot1=source.rot1,
                             rot2=source.rot2, rot3=source.rot3, wavelength=source.wavelength,
                             detector=source.detector)
-    angle = dict(incident_angle=angles[0], tilt_angle=angles[1], sample_orientation=4, angle_unit="deg")
+    angle = dict(incident_angle=angles[0], tilt_angle=angles[1], sample_orientation=2, angle_unit="deg")
     return tuple(np.asarray(fiber.array_from_unit((29, 43), "center", get_unit_fiber(name, **angle), scale=True))
                  for name in ("qip_A^-1", "qoop_A^-1"))
 
@@ -969,12 +983,12 @@ def test_the_gi_window_holds_for_auto_and_explicit_ranges_under_every_correction
     corrections = dict(polarization_factor=.67, dark=dark, flat=flat)
     thin = _window_sums(gi, bins, mask, image, correct_solid_angle=solid_angle, monitor=3.7, **corrections)
     fiber = _fiber_from_integrator(_window_probe_integrator(), incident_angle=angles[0], tilt_angle=angles[1],
-                                   sample_orientation=4)
+                                   sample_orientation=2)
     square = fiber.integrate2d_fiber(
         image, npt_ip=37, unit_ip="qip_A^-1", ip_range=bins["q_ip"], npt_oop=37, unit_oop="qoop_A^-1",
         oop_range=bins["q_oop"], correctSolidAngle=solid_angle, mask=~inside, normalization_factor=3.7,
         method=("no", "histogram", "cython"), incident_angle=angles[0], tilt_angle=angles[1],
-        sample_orientation=4, angle_unit="deg", **corrections)
+        sample_orientation=2, angle_unit="deg", **corrections)
     scale = fiber.pixel1 * fiber.pixel2 / fiber.dist ** 2 if solid_angle else 1.
     for (signal, normalization, count, axis), cut in zip(thin, gi.cuts):
         other = -2 if cut == "q_ip" else -1

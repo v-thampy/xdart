@@ -20,9 +20,9 @@ level, and n̂ then tilts by the angle. With q the lab-frame scattering vector:
 xrayutilities bins these directly. pyFAI's fiber model takes the incident angle and tilt that give the
 same n̂ in its sample orientation's frame (q_sample = Rx(−t)·Ry(α)·q_lab, so n̂ = (−sin α cos t,
 −sin t, cos α cos t) in (beam, horizontal, vertical)). Probe G1-tilt: per pixel ≤ 1.8e-9 Å⁻¹ for
-orientations 3, 4, 6 and 7, off-nominal poses (chi 85–92.5°, mu 0.5°, phi −1.7°) included; the
-level-sample results of the earlier rule (signed along n̂ × beam) are unchanged at orientations 4
-and 7.
+native orientations 1, 2, 8 and 5, off-nominal poses (chi 85–92.5°, mu 0.5°, phi −1.7°) included;
+the level-sample results of the earlier rule (signed along n̂ × beam) are unchanged at orientations
+2 and 5.
 """
 from __future__ import annotations
 
@@ -42,11 +42,11 @@ GI_SAMPLE_ROLES = ("mu", "phi")
 _PSIC_SAMPLE_AXES = ((0, 1), (2, -1), (1, 1), (2, -1))
 _BEAM = np.array((0.0, 1.0, 0.0))
 #: Each pyFAI sample orientation's vertical axis (the level surface normal) and horizontal axis in
-#: that frame, measured from pyFAI's own fiber coordinates at zero incidence and tilt (probe G1-tilt).
+#: the native detector frame (rows x+, columns z-), measured from pyFAI's fiber coordinates.
 _ORIENTATION_AXES = {
-    1: ((-1, 0, 0), (0, 0, 1)), 2: ((-1, 0, 0), (0, 0, -1)), 3: ((1, 0, 0), (0, 0, -1)),
-    4: ((1, 0, 0), (0, 0, 1)), 5: ((0, 0, -1), (1, 0, 0)), 6: ((0, 0, 1), (1, 0, 0)),
-    7: ((0, 0, 1), (-1, 0, 0)), 8: ((0, 0, -1), (-1, 0, 0)),
+    1: ((1, 0, 0), (0, 0, -1)), 2: ((1, 0, 0), (0, 0, 1)), 3: ((-1, 0, 0), (0, 0, 1)),
+    4: ((-1, 0, 0), (0, 0, -1)), 5: ((0, 0, 1), (-1, 0, 0)), 6: ((0, 0, -1), (-1, 0, 0)),
+    7: ((0, 0, -1), (1, 0, 0)), 8: ((0, 0, 1), (1, 0, 0)),
 }
 #: The largest incidence or tilt (degrees) a sample orientation is taken to describe.
 _MAX_ORIENTATION_ANGLE = 45.0
@@ -112,7 +112,7 @@ class StitchGI:
     incident_angle_deg: float | None = None
     tilt_motor: str | None = None
     tilt_angle_deg: float | None = None
-    sample_orientation: int = 4
+    sample_orientation: int = 2
     sample_motors: tuple[tuple[str, str | None], ...] = tuple((role, None) for role in GI_SAMPLE_ROLES)
     ip_range: tuple[float, float] | None = None
     oop_range: tuple[float, float] | None = None
@@ -194,7 +194,7 @@ class StitchGI:
 
     def circles(self, metadata) -> tuple[float, float, float, float]:
         """This frame's psic sample circles (mu, eta, chi, phi) in degrees; with a Manual tilt chi is the
-        level one for the sample orientation (90° for 3 and 4), which :meth:`normal` then tilts."""
+        level one for the sample orientation (90° for 1 and 2), which :meth:`normal` then tilts."""
         motors, zeros = dict(self.sample_motors), dict(self.motor_zeros)
         values = tuple(
             manual if motor is None and manual is not None else 0.0 if motor is None
@@ -242,14 +242,14 @@ class StitchGI:
 
 def _level_chi(sample_orientation: int) -> float:
     """The chi that makes a sample level in a pyFAI sample orientation (eta, mu, phi zero): its surface
-    normal along the orientation's vertical axis (90° for orientations 3 and 4, a chi-90 mounting)."""
+    normal along the orientation's vertical axis (90° for orientations 1 and 2, a chi-90 mounting)."""
     vertical = _ORIENTATION_AXES[sample_orientation][0]
     return math.degrees(math.atan2(vertical[0], vertical[2]))
 
 
 def tilt_angle_from_chi(chi_deg: float, sample_orientation: int) -> float:
     """The Manual tilt angle (pyFAI's) of an older Manual χ: the tilt that χ gave with eta, mu and phi at
-    zero (orientation 4: χ − 90, orientation 3: 90 − χ); 0 where that χ was no level-ish mounting."""
+    zero (orientation 2: χ − 90, orientation 1: 90 − χ); 0 where that χ was no level-ish mounting."""
     horizontal = np.asarray(_ORIENTATION_AXES[sample_orientation][1], dtype=np.float64)
     tilt = math.degrees(-math.asin(max(-1.0, min(1.0, float(psic_normal(0.0, 0.0, float(chi_deg), 0.0) @ horizontal)))))
     return tilt if abs(tilt) < _MAX_ORIENTATION_ANGLE else 0.0

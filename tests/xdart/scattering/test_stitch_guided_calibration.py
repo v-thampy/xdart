@@ -159,7 +159,6 @@ def test_the_window_s_tips_name_the_page_it_serves(tmp_path):
     assert any(tip.endswith("RSM's calibration: RSM grids with the xrayutilities one.") for tip in rsm)
     stitch = tips('Stitch')
     assert any(tip.endswith("which Stitch checks the scans' energies against.") for tip in stitch)
-    assert any("and Stitch refuses frames outside what was checked." in tip for tip in stitch)
     assert any(tip.endswith("Stitch's grazing incidence takes it.") for tip in stitch)
 
 
@@ -771,23 +770,25 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
     from pyqtgraph.Qt import QtWidgets
     from xdart.gui.tabs.calibration.dialog import _pyfai_arguments
     from tests.core.test_stacked_arm_extension import _calibration, _ring_controls
-    from tests.core.test_stitch_guided_calibration import _frames
+    from tests.core.test_stitch_guided_calibration import _frames, _turn_controls
     from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
     from xrd_tools.integrate.calibration_seed import predict_frame_seed, ring_summary
-    truth = {'nu_offset': .02, 'del_offset': -.05}
-    controls, _calibrant = _ring_controls(truth, _calibration(), [(5., -10.), (45., -10.), (25., 9.5), (5., 29.)])
+    truth = {'nu_offset': -.02, 'del_offset': .05}
+    _unused, poni = _turn_controls((), _calibration().poni)
+    calibration = replace(_calibration(), poni=poni)
+    controls, _calibrant = _ring_controls(truth, calibration, [(5., -10.), (45., -10.), (25., 9.5), (5., 29.)])
     (tmp_path / 'frames').mkdir()
-    calibrated = _frames(tmp_path / 'frames', controls, _calibration().poni)
+    calibrated = _frames(tmp_path / 'frames', controls, poni)
     waiting = tuple(replace(frame, poni_path='', poni_sha256='', npt_path='', npt_sha256='', pairing_policy='',
                             control_image_sha256='') for frame in calibrated[1:])
-    true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(_calibration())
+    true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(calibration)
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
-        # the truth's motor zeros (del 2.86°, nu −1.15°), typed beside the motors: every fit starts there
+        # The native arm's physical motor zeros, typed beside the motors.
         dialog.geometry_editor.zero_edit('del').setText(f'{np.rad2deg(.05):.12g}')
         dialog.geometry_editor.zero_edit('nu').setText(f'{-np.rad2deg(.02):.12g}')
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
-        for key, value in (('rough_distance', '390'), ('beam_pixel', f'{.045 / 172e-6 + 200:.1f}, {.035 / 172e-6:.1f}')):
+        for key, value in (('rough_distance', '390'), ('beam_pixel', f'{poni.poni2 / 172e-6 + 200:.1f}, {poni.poni1 / 172e-6:.1f}')):
             dialog._set_field_text(key, value)
         dialog.frames = (calibrated[0], *waiting)
         dialog._render_frames()
@@ -842,7 +843,7 @@ def test_the_detector_mask_reaches_pyfai_turned_as_the_frames_are(tmp_path):
     try:
         dialog._fields['mask'].setText(str(tmp_path / 'mask.npy'))
         from xrd_tools.core.geometry.camera import DetectorCamera
-        dialog.camera.set_value(DetectorCamera('z+', 'x+'))  # turned 90° counterclockwise into Stitch's frame
+        dialog.camera.set_value(DetectorCamera('z-', 'x-'))  # turned 90° counterclockwise into the native frame
         path = dialog._pyfai_mask()
         # 90° counterclockwise; with the Pilatus 300K-W's own gaps turned too, since pyFAI is given the detector
         # turned with the images, which holds none (AUD-9 stage 2b item 8)

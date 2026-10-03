@@ -381,8 +381,6 @@ _PAGE_USE = {
     "Stitch": {
         "energy": " The saved calibration keeps the recorded energy, which Stitch checks the scans' energies against.",
         "energy_field": " (Stitch checks each scan's energy against it)",
-        "range": ", and Stitch refuses frames outside what was checked",
-        "range_backend": " pyFAI MultiGeometry has no such limit.",
         "backend": ": the Backend under Processing chooses which of the two Stitch uses",
     },
     "RSM": {
@@ -390,7 +388,6 @@ _PAGE_USE = {
                    "to each scan's own energy when it applies the refinement, and warns of a scan recorded more "
                    "than 2 % from it."),
         "energy_field": " (RSM warns of a scan recorded more than 2 % from it)",
-        "range": "",
         "backend": ": RSM grids with the xrayutilities one",
     },
 }
@@ -800,7 +797,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                     if self.source_kind.currentData() != 'nexus_stack' else '')
         else:
             text = 'Select a valid calibrant source and read its metadata (3 · Calibrant scan)'
-        if self._calibrant_frame_count is not None:
+        if self._calibrant_frame_count is not None and not (self.frames and self._staged_source_mismatch()):
             text += f' · {self._calibrant_frame_count} images'
         if self._calibrant_source_problem:
             text += f' · {self._calibrant_source_problem}'

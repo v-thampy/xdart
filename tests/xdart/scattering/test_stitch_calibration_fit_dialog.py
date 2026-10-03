@@ -88,10 +88,10 @@ def _horizontal_frames(tmp_path):
 
 def _truth_bounds(dialog, sample_mm='5'):
     """As a user would for TRUTH (ARM-ZERO-BOUNDS-20260929): its motor zeros typed beside the motors
-    (del 2.86°, nu −1.15°) and, its sample sitting 0.5–2.2 mm off the rotation centre, a displacement
+    (del −2.86°, nu 1.15°) and, its sample sitting 0.5–2.2 mm off the rotation centre, a displacement
     limit under Advanced that allows it."""
-    dialog.geometry_editor.zero_edit('del').setText(f"{-np.rad2deg(TRUTH['del_offset']):.12g}")
-    dialog.geometry_editor.zero_edit('nu').setText(f"{-np.rad2deg(TRUTH['nu_offset']):.12g}")
+    dialog.geometry_editor.zero_edit('del').setText(f"{np.rad2deg(TRUTH['del_offset']):.12g}")
+    dialog.geometry_editor.zero_edit('nu').setText(f"{np.rad2deg(TRUTH['nu_offset']):.12g}")
     dialog._fields['displacement_limit'].setText(sample_mm)
 
 
@@ -202,7 +202,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
-        dialog.geometry_editor.zero_edit('tth').setText(f'{np.rad2deg(.05):.12g}')  # the truth's del zero
+        dialog.geometry_editor.zero_edit('tth').setText(f'{-np.rad2deg(.05):.12g}')  # native arm's del zero
         dialog.frames, dialog._frame_motors = frames, ('tth', None)
         dialog._render_frames()
         assert 'without the extension' in dialog.arm_note.text()
@@ -217,7 +217,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         provenance, record = dialog.fit.asset['provenance'], dialog.fit.asset['calibration']
         assert provenance['source_motors'] == {'del_angle': 'tth'}
         assert provenance['instrument_geometry'] == InstrumentGeometry(
-            'twoc', zeros=(('tth', float(f'{np.rad2deg(.05):.12g}')),)).to_record()
+            'twoc', zeros=(('tth', float(f'{-np.rad2deg(.05):.12g}')),)).to_record()
         assert is_single_arm(record) and record['pos_names'] == ['del_angle']
         fitted = dict(zip(record['param_names'], record['param']))
         assert fitted['nu_offset'] == pytest.approx(.02, abs=2e-3)  # the arm's yaw
@@ -231,7 +231,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         _wait(dialog)
         assert Path(page._value("geometry_path")) == target
         assert page._value("mask_path") == str(mask)
-        assert page._instrument() == InstrumentGeometry('twoc', zeros=(('tth', float(f'{np.rad2deg(.05):.12g}')),))
+        assert page._instrument() == InstrumentGeometry('twoc', zeros=(('tth', float(f'{-np.rad2deg(.05):.12g}')),))
         assert page._value("source_motors") == "del_angle=tth"
         assert page._arm_problem() is None
         partner = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())
@@ -363,7 +363,7 @@ def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_p
         assert dialog.fit is None and not dialog.save_button.isEnabled()
         dialog.fit_button.click()
         assert dialog.fit is None and not dialog.active()
-        assert ('staged with the camera rows x-, columns z+; the Detector panel now says rows x-, columns z-'
+        assert ('staged with the camera rows x+, columns z-; the Detector panel now says rows x-, columns z-'
                 in dialog.status.text())
         dialog.camera.set_value(STITCH_CAMERA)
         dialog.fit_button.click()
@@ -640,7 +640,7 @@ def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_
     try:
         ring_fit = _five_parameter_seed(_ROW_ANGLES)
         # the beam pixel at normal incidence: both circles at their motor zeros (typed below)
-        zeros = {'del': -np.rad2deg(TRUTH['del_offset']), 'nu': -np.rad2deg(TRUTH['nu_offset'])}
+        zeros = {'del': np.rad2deg(TRUTH['del_offset']), 'nu': np.rad2deg(TRUTH['nu_offset'])}
         beam = predict_frame_seed(ring_fit, _frame(zeros)).integrator.getFit2D()
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         # a rough geometry: 2 % off in distance, a few pixels off in the beam spot
