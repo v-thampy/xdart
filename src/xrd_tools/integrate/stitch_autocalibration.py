@@ -377,7 +377,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     ``conditioning`` is Int's calibration-only pixel band, applied during screening and ring extraction;
     it never changes the source pixels. None/off preserves the prior extraction path.
     """
-    from xrd_tools.core.geometry.stacked_arm import arm_senses, orientation_signs
+    from xrd_tools.core.geometry.stacked_arm import arm_senses, arm_signs
     from xrd_tools.integrate.refine import ArmFitBounds
     from xrd_tools.session.instrument import PSIC_AXES, InstrumentGeometry, signed_axis
     record, diff, digest = _seed(geometry, source_motors)
@@ -393,7 +393,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                 for circle in differ) + ': start from a geometry fitted with these senses')
     held = None
     if arm.held is not None:  # its fixed pitch or yaw: offset = (signed scale) × angle
-        signs = dict(zip(('nu', 'del'), orientation_signs(diff.calibration.detector_config.get('orientation', 3))))
+        signs = dict(zip(('nu', 'del'), arm_signs(diff.calibration.detector_config.get('orientation', 3))))
         held = getattr(arm, f'{arm.held}_offset') / (signs[arm.held] * math.pi / 180)
     bounds = (ArmFitBounds() if bounds is None else bounds).resolved(
         list(arm.motor_zeros()), seed_zeros=arm.motor_zeros(), seed_held=held)

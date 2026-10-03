@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from xrd_tools.core.geometry import DetectorCalibration, Diffractometer, StackedDetectorArm
+from xrd_tools.core.geometry.stacked_arm import arm_signs
 from xrd_tools.integrate.refine import ArmFitBounds
 from xrd_tools.session.instrument import InstrumentGeometry
 from tests.core.test_arm_fit_bounds import SOURCES, ZEROS, _controls_from, _seed, _subpixel_frames, replace_dist
@@ -46,9 +47,11 @@ def test_a_reversed_detector_circle_is_fitted_saved_and_transferred_to_xrayutili
     from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
     from xrd_tools.integrate.stitch_calibration import fit_calibration, save_calibration_pair
     senses = {circle: -1 if circle in flipped else 1 for circle in ('nu', 'del')}
-    arm = StackedDetectorArm(nu_scale=senses['nu'] * np.pi / 180, del_scale=senses['del'] * np.pi / 180,
-                             nu_offset=-senses['nu'] * np.deg2rad(ZEROS['nu']),
-                             del_offset=-senses['del'] * np.deg2rad(ZEROS['del']),
+    signs = dict(zip(('nu', 'del'), arm_signs(3)))
+    arm = StackedDetectorArm(nu_scale=signs['nu'] * senses['nu'] * np.pi / 180,
+                             del_scale=signs['del'] * senses['del'] * np.pi / 180,
+                             nu_offset=-signs['nu'] * senses['nu'] * np.deg2rad(ZEROS['nu']),
+                             del_offset=-signs['del'] * senses['del'] * np.deg2rad(ZEROS['del']),
                              mount_tilt=np.deg2rad(.4), mount_roll=np.deg2rad(-.3),
                              sample_offset1=2e-5, sample_offset2=-1e-5, sample_offset3=3e-5)
     assert arm.motor_zeros() == pytest.approx(ZEROS)

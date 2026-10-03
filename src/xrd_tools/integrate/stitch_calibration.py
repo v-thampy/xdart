@@ -171,7 +171,8 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
     spec = _exact_source(spec)
     source = open_source(spec)
     try:
-        if not source.capabilities.has_raw_references:
+        if not source.capabilities.has_raw_references and not (
+                spec.kind is SourceKind.SPEC and spec.options.get('image_file')):
             raise ValueError('No detector images found; check the images folder and stem for the selected scan')
         indices = source.frame_indices
         if len(indices) > 100000:

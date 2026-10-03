@@ -152,9 +152,12 @@ def test_the_fit_and_seeds_take_a_horizontal_arm():
     from xrd_tools.integrate.calibration_seed import predict_frame_seed, rough_arm_record
     from xrd_tools.integrate.refine import refine_goniometer
     from tests.core.test_stacked_arm_extension import _calibration as _truth_calibration, _ring_controls
+    from tests.core.test_stitch_guided_calibration import _turn_controls
+    # Generate the archived physical truth, then turn its points and seed into native x+/z-.
     controls, calibrant = _ring_controls({'nu_offset': -.03, 'del_offset': .012}, _truth_calibration(),
-                                         [(0., nu) for nu in (4., 15., 26., 37.)])
-    poni = _truth_calibration().poni
+                                         [(0., -nu) for nu in (4., 15., 26., 37.)])
+    controls = [replace(c, motors={**c.motors, 'nu': -c.motors['nu']}) for c in controls]
+    controls, poni = _turn_controls(controls, _truth_calibration().poni)
     kwargs = dict(calibrant=calibrant, fit_scales=False, model='stacked_del_on_nu', detector='Pilatus300kw',
                   detector_config={'orientation': 3})
     single = refine_goniometer(poni, [replace(c, motors={'tth': c.motors['nu']}) for c in controls],
@@ -164,8 +167,8 @@ def test_the_fit_and_seeds_take_a_horizontal_arm():
     assert single.success and single.diffractometer.stacked_arm.held == 'del'
     assert {key: psic.params[key] for key in single.params} == single.params
     # this fit reads whole-pixel control points, so it recovers the truth approximately
-    assert single.params['nu_offset'] == pytest.approx(-.03, abs=2e-3)
-    assert single.params['del_offset'] == pytest.approx(.012, abs=2e-3)  # the detector's fixed pitch
+    assert single.params['nu_offset'] == pytest.approx(.03, abs=2e-3)
+    assert single.params['del_offset'] == pytest.approx(-.012, abs=2e-3)  # the detector's fixed pitch
     record = single.diffractometer.stacked_arm.to_pyfai_goniometer(single.diffractometer.calibration)
     frame = _frame({'tth': 20.})
     seeded = predict_frame_seed(record, frame, del_motor=None, nu_motor='tth')
@@ -177,7 +180,7 @@ def test_the_fit_and_seeds_take_a_horizontal_arm():
     rough = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zeros_deg={'nu': 2.},
                              del_motor=None, nu_motor='tth')
     assert rough['pos_names'] == ['nu_angle']
-    assert dict(zip(rough['param_names'], rough['param']))['nu_offset'] == pytest.approx(-math.radians(2.))
+    assert dict(zip(rough['param_names'], rough['param']))['nu_offset'] == pytest.approx(math.radians(2.))
 
 
 def _affine(positions, detector='Pilatus100k'):
@@ -321,7 +324,7 @@ def test_frame_seeds_and_the_rough_geometry_take_a_single_arm():
     rough = rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zeros_deg={'del': 1.5},
                              del_motor='tth', nu_motor=None)
     assert is_single_arm(rough) and rough['pos_names'] == ['del_angle']
-    assert dict(zip(rough['param_names'], rough['param']))['del_offset'] == pytest.approx(-math.radians(1.5))
+    assert dict(zip(rough['param_names'], rough['param']))['del_offset'] == pytest.approx(math.radians(1.5))
     with pytest.raises(ValueError, match='nu is held at zero by this arm: it has no motor zero'):
         rough_arm_record(distance_m=.5, detector='Pilatus300kw', beam_px=(737, 97), zeros_deg={'nu': 1.},
                          del_motor='tth', nu_motor=None)
@@ -401,7 +404,7 @@ def _del_only_root():
     return root
 
 
-def _scan7_controls(root, *, nu):
+def _scan7_controls(root, *, nu, native=True):
     """BL 17-2 LaB6 16 keV, a psic whose nu stayed at zero: scan 7's saved control points."""
     from pyFAI.control_points import ControlPoints
     from xrd_tools.integrate.refine import ControlFrame
@@ -412,15 +415,21 @@ def _scan7_controls(root, *, nu):
         points = ControlPoints(str(root / f'processed_data/b_thampy_LaB6_16keV_scan7_{index:04d}.npt'))
         values = np.asarray([(y, x, points.get(lbl=label).ring) for label in points.get_labels()
                              for y, x in points.get(lbl=label).points], float)
+        if native:  # archived .npt pixels were rows x-/columns z+, before the 180° native turn
+            values[:, 0], values[:, 1] = 194 - values[:, 0], 1474 - values[:, 1]
         motors = {'del': float(columns['del'][index]), **({'nu': 0.} if nu else {})}
         controls.append(ControlFrame(values[:, 0], values[:, 1], values[:, 2], motors))
     return controls, points.calibrant
 
 
 def _fit_scan7(root, *, nu):
+    from xrd_tools.integrate.calibration import load_detector_calibration
     from xrd_tools.integrate.refine import refine_goniometer
+    from tests.core.test_stitch_guided_calibration import _turn_controls
     controls, calibrant = _scan7_controls(root, nu=nu)
-    return refine_goniometer(str(root / 'processed_data/b_thampy_LaB6_16keV_scan7_0002.poni'), controls,
+    calibration = load_detector_calibration(root / 'processed_data/b_thampy_LaB6_16keV_scan7_0002.poni')
+    _unused, poni = _turn_controls((), calibration.poni)
+    return refine_goniometer(poni, controls, detector_config=dict(calibration.detector_config),
                              rot1_motor='nu' if nu else None, rot2_motor='del', calibrant=calibrant,
                              fit_scales=False, model='stacked_del_on_nu')
 
@@ -442,7 +451,7 @@ def _scan7_frames(root, directory, *, nu):
     the frames carry none: only the points and the angles matter to a fit)."""
     from xrd_tools.integrate.calibration import load_detector_calibration
     from tests.core.test_stitch_guided_calibration import _frames
-    controls, _calibrant = _scan7_controls(root, nu=nu)
+    controls, _calibrant = _scan7_controls(root, nu=nu, native=False)  # the frozen v2 fit stays former-frame
     directory.mkdir(parents=True)
     poni = load_detector_calibration(root / 'processed_data/b_thampy_LaB6_16keV_scan7_0002.poni').poni
     return _frames(directory, controls, poni)
@@ -493,7 +502,9 @@ def test_an_xu_calibration_holds_a_horizontal_arms_del_at_zero(tmp_path):
     from tests.core.test_stacked_arm_extension import _calibration as _truth_calibration, _ring_controls
     from tests.core.test_stitch_guided_calibration import _frames
     controls, _calibrant = _ring_controls({'nu_offset': -.02, 'del_offset': .01}, _truth_calibration(),
-                                          [(0., nu) for nu in (6., 18., 30., 42.)])
+                                          [(0., -nu) for nu in (6., 18., 30., 42.)])
+    # _fit_xu is the frozen former-frame v2 fitter; its fixture must keep that camera.
+    controls = [replace(c, motors={**c.motors, 'nu': -c.motors['nu']}) for c in controls]
     fits = {}
     for held in (True, False):  # a horizontal arm (del held), and psic reading a del of zero
         directory = tmp_path / str(held)
@@ -611,7 +622,8 @@ def test_the_real_del_only_scan_stitches_the_same_as_a_2theta_arm_and_as_psic(tm
             table, kind=ModuleKind.STITCH, selected_labels=labels,
             resolved_selectors=tuple(MetadataColumnSelector(motor) for _position, motor in motors))
         geometry = capture_stitch_geometry(StitchGeometryInput(
-            project / f'{name}.json', StitchGeometryKind.PYFAI_GONIOMETER_JSON, source_motors=motors))
+            project / f'{name}.json', StitchGeometryKind.PYFAI_GONIOMETER_JSON, source_motors=motors,
+            image_rotation=180))
         plan = StitchOperationPlan(geometry, mode='1d', npt_1d=1500, radial_range=(1.0, 6.2),
                                    use_detector_mask=True, max_frame_bytes=64 << 20)
         request = prepare_stitch_operation(receipt, ModuleOutputRequest(
