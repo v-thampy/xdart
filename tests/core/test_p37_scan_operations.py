@@ -43,6 +43,55 @@ _PUBLIC_RUNNERS = {
 }
 
 
+def test_scan_table_alignment_and_streaming_csv_preserve_legacy_policy(tmp_path):
+    import csv
+
+    table = {
+        "frame_index": np.array([5.0, np.nan, 7.4, 5.0]),
+        "roi": np.array([10.0, 20.0, np.nan, 40.0]),
+        "label": np.array(['a,"b', "line\nbreak"], dtype=object),
+        "scalar": 8.0,
+        "not_a_column": np.ones((2, 2)),
+    }
+    before = {name: np.array(value, copy=True) for name, value in table.items()}
+    assert analysis.scan_frame_rows(table) == {5: 3, 7: 2}
+    assert analysis.scan_frame_rows({"short": [1], "long": [1, 2, 3]}) == {
+        0: 0, 1: 1, 2: 2,
+    }
+    assert analysis.scan_frame_rows({}) == {}
+    columns = ["frame_index", "roi", "label", "scalar"]
+    assert analysis.scan_table_columns(table) == columns
+    path = tmp_path / "scan.csv"
+    analysis.write_scan_table_csv(table, path)
+    with path.open(newline="") as stream:
+        rows = list(csv.reader(stream))
+    assert rows == [columns, ["5.0", "10.0", 'a,"b', "8.0"],
+                    ["nan", "20.0", "line\nbreak", ""],
+                    ["7.4", "nan", "", ""], ["5.0", "40.0", "", ""]]
+    for name, value in table.items():
+        np.testing.assert_equal(value, before[name])
+    empty = tmp_path / "empty.csv"
+    analysis.write_scan_table_csv({}, empty)
+    assert empty.read_bytes() == b"\r\n"
+    with pytest.raises(IsADirectoryError):
+        analysis.write_scan_table_csv(table, tmp_path)
+
+
+def test_scan_table_policy_public_imports_and_execution_remain_qt_free(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from xrd_tools.analysis import scan_frame_rows, scan_table_columns, write_scan_table_csv
+assert scan_frame_rows({'frame_index': [2.5, 3.5, 2.49, float('inf')]}) == {2: 2, 4: 1}
+assert scan_table_columns({'text': ['one'], 'matrix': [[1, 2]]}) == ['text']
+write_scan_table_csv({'text': ['one']}, sys.argv[1])
+assert not any(name.startswith(('PySide', 'PyQt', 'pyqtgraph', 'xdart.gui')) for name in sys.modules)
+""", str(tmp_path / "headless.csv")], capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "headless.csv").read_bytes() == b"text\r\none\r\n"
+
+
 def test_scan_plot_default_axes_are_headless_numeric_motor_policy():
     defaults = _public("scan_plot_defaults")
     table = {

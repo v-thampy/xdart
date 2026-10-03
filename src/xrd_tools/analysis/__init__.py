@@ -81,6 +81,9 @@ _EXPORTS = {
     "run_scan_plot": ("xrd_tools.analysis.scan_operations", "run_scan_plot"),
     "numeric_scan_columns": ("xrd_tools.analysis.scan_operations", "numeric_scan_columns"),
     "scan_plot_defaults": ("xrd_tools.analysis.scan_operations", "scan_plot_defaults"),
+    "scan_frame_rows": ("xrd_tools.analysis.scan_operations", "scan_frame_rows"),
+    "scan_table_columns": ("xrd_tools.analysis.scan_operations", "scan_table_columns"),
+    "write_scan_table_csv": ("xrd_tools.analysis.scan_operations", "write_scan_table_csv"),
     "run_roi_preview": ("xrd_tools.analysis.scan_operations", "run_roi_preview"),
     "run_roi_scan": ("xrd_tools.analysis.scan_operations", "run_roi_scan"),
     # Shared standalone Stitch/RSM transaction values.

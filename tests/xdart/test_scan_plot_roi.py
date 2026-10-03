@@ -476,6 +476,38 @@ def test_scan_plot_roi_column_normalizes_and_csv_roundtrips(qapp, tmp_path):
         dlg.close()
 
 
+def test_scan_plot_table_policy_delegates_to_headless_owner(qapp, tmp_path, monkeypatch):
+    import csv
+    import xrd_tools.analysis.scan_operations as operations
+    import xdart.gui.analysis.scan_plot_dialog as dialog_module
+
+    observed = []
+    for name in ("scan_frame_rows", "scan_table_columns", "write_scan_table_csv"):
+        original = getattr(operations, name)
+
+        def observe(*args, _name=name, _original=original, **kwargs):
+            observed.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(dialog_module, name, observe)
+    dlg = dialog_module.ScanPlotDialog()
+    try:
+        dlg.set_table("s", {"frame_index": np.array([7.0, np.nan, 3.0, 7.0]),
+                            "roi": np.array([1.0, 2.0, 3.0, 4.0]),
+                            "label": np.array(["short"], dtype=object)})
+        assert dlg._frame_row_map() == {7: 3, 3: 2}
+        assert dlg._csv_columns() == ["frame_index", "roi", "label"]
+        out = tmp_path / "scan.csv"
+        dlg._write_csv(out)
+        with out.open(newline="") as stream:
+            rows = list(csv.reader(stream))
+        assert rows[1] == ["7.0", "1.0", "short"]
+        assert rows[4] == ["7.0", "4.0", ""]
+        assert observed == ["scan_frame_rows", "scan_table_columns", "write_scan_table_csv"]
+    finally:
+        dlg.close()
+
+
 def test_scan_plot_roi_abort_on_source_swap(qapp, monkeypatch):
     """Loading a new source mid-run stops the worker + forgets the run state, so
     a stale worker can't stream into the replaced table."""

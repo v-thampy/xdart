@@ -20,7 +20,10 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.sources.probe import probe_first_frame, raw_is_reachable  # noqa: F401
-from xrd_tools.analysis.scan_operations import numeric_scan_columns, scan_plot_defaults
+from xrd_tools.analysis.scan_operations import (
+    numeric_scan_columns, scan_plot_defaults, scan_frame_rows,
+    scan_table_columns, write_scan_table_csv,
+)
 
 from xdart.gui.widgets.controls_panel import FormRow
 from xdart.gui.widgets.file_dialogs import browse
@@ -487,14 +490,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
     def _frame_row_map(self):
         """``{frame_index: table row}`` for aligning streamed ROI stats to the
         table; positional when there is no ``frame_index`` column."""
-        fi = self._table.get("frame_index")
-        if fi is None:
-            return {i: i for i in range(self._table_len())}
-        out = {}
-        for r, v in enumerate(np.asarray(fi, dtype=float)):
-            if np.isfinite(v):
-                out[int(round(v))] = r
-        return out
+        return scan_frame_rows(self._table)
 
     def _unique_col_name(self, base):
         base = base or "roi"
@@ -797,26 +793,12 @@ class ScanPlotDialog(QtWidgets.QDialog):
         """Every 1-D column of the assembled table — including non-numeric (e.g.
         string motor) and all-NaN columns the plot selectors omit, so the CSV is
         the full per-frame table the user sees + computed."""
-        out = []
-        for name, arr in self._table.items():
-            a = np.atleast_1d(np.asarray(arr, dtype=object))
-            if a.ndim == 1:
-                out.append(name)
-        return out
+        return scan_table_columns(self._table)
 
     def _write_csv(self, path):
         """Write the assembled table to ``path`` (one column per key, blanks for
         ragged rows).  Separated from the file dialog so it's unit-testable."""
-        import csv
-        cols = self._csv_columns()
-        arrays = {c: np.atleast_1d(self._table[c]) for c in cols}
-        n = max((len(a) for a in arrays.values()), default=0)
-        with open(path, "w", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(cols)
-            for r in range(n):
-                writer.writerow([arrays[c][r] if r < len(arrays[c]) else ""
-                                 for c in cols])
+        write_scan_table_csv(self._table, path)
 
     def _save_csv(self):
         if not self._table:

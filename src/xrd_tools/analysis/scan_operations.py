@@ -51,7 +51,8 @@ __all__ = [
     "MetadataTableRequalificationResult", "ScanPlotPlan", "ScanPlotResult", "RoiPreviewPlan",
     "RoiPreviewResult", "RoiScanPlan", "RoiScanResult", "run_metadata_table",
     "run_metadata_table_requalification", "run_scan_plot", "run_roi_preview", "run_roi_scan",
-    "numeric_scan_columns", "scan_plot_defaults",
+    "numeric_scan_columns", "scan_plot_defaults", "scan_frame_rows",
+    "scan_table_columns", "write_scan_table_csv",
     "analysis_canonical_fingerprint", "requalified_analysis_source",
 ]
 # SSRL SPEC scans commonly expose roughly 60 point columns plus the complete
@@ -1105,6 +1106,46 @@ def _columns(
             raise _Refusal("METADATA_TABLE_LIMIT_EXCEEDED")
         result.append(column)
     return tuple(result)
+
+
+def scan_frame_rows(table: Mapping[str, Any]) -> dict[int, int]:
+    """Align streamed ROI labels to rows of an assembled scan table.
+
+    Without frame labels, rows are positional through the longest column.
+    Finite labels round to integers; the last duplicate owns the row.
+    """
+    labels = table.get("frame_index")
+    if labels is None:
+        count = max((len(np.atleast_1d(value)) for value in table.values()), default=0)
+        return {index: index for index in range(count)}
+    return {int(round(value)): row for row, value in enumerate(np.asarray(labels, dtype=float))
+            if np.isfinite(value)}
+
+
+def scan_table_columns(table: Mapping[str, Any]) -> list[str]:
+    """CSV columns in table order, including scalar, text and all-missing values."""
+    return [name for name, values in table.items()
+            if np.atleast_1d(np.asarray(values, dtype=object)).ndim == 1]
+
+
+def write_scan_table_csv(table: Mapping[str, Any], path: str | Path) -> None:
+    """Stream an assembled scan table to CSV, padding ragged rows with blanks.
+
+    Multidimensional values are omitted. File errors propagate to the caller.
+    """
+    import csv
+
+    columns = scan_table_columns(table)
+    arrays = {name: np.atleast_1d(table[name]) for name in columns}
+    count = max((len(values) for values in arrays.values()), default=0)
+    with open(path, "w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(columns)
+        for row in range(count):
+            writer.writerow([arrays[name][row] if row < len(arrays[name]) else ""
+                             for name in columns])
+
+
 def numeric_scan_columns(table: Mapping[str, np.ndarray]) -> list[str]:
     """Plottable scan columns: one-dimensional numeric, with finite values."""
     return [name for name, values in table.items()
