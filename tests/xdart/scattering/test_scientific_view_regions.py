@@ -66,6 +66,8 @@ def test_a_residual_is_linear_signed_and_symmetric_whatever_log_says_and_data_an
         np.testing.assert_allclose(canvas.displayed_image, residual.T)
         assert _levels(view, _DATA) == _levels(view, _MODEL)  # data and model: one set of levels
         typed = (1.2, 1.8) if log_scale else (20.0, 60.0)
+        view.viewer_intensity._open_entry()
+        view.viewer_intensity._entry_popup.findChild(QtWidgets.QComboBox, "intensityMode").setCurrentText("Absolute")
         view.viewer_intensity.autoscale.setChecked(False)
         view.viewer_intensity.slider.setValues(*typed, emit=True)  # dragged: data and model, not the residual
         assert _levels(view, _DATA) == _levels(view, _MODEL) == pytest.approx(typed)
@@ -81,6 +83,8 @@ def test_a_panel_on_its_own_keeps_its_automatic_levels_and_a_zero_residual_still
         state, _residual = _fit(own_model=True, residual_scale=0.0)
         view.reconcile_keyed(state)
         own = _levels(view, _MODEL)
+        view.viewer_intensity._open_entry()
+        view.viewer_intensity._entry_popup.findChild(QtWidgets.QComboBox, "intensityMode").setCurrentText("Absolute")
         view.viewer_intensity.autoscale.setChecked(False)
         view.viewer_intensity.slider.setValues(20.0, 60.0, emit=True)
         assert _levels(view, _MODEL) == own and _levels(view, _DATA) == pytest.approx((20.0, 60.0))

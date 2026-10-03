@@ -4,7 +4,7 @@ from threading import Event
 
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtCore, QtTest
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from test_viewer_1d_selection import viewer as viewer_1d, _ready, _mode
 from test_viewer_2d_navigation import viewer as viewer_2d, _wait
@@ -325,9 +325,13 @@ def test_hdf_manual_color_range_survives_next_frame(viewer_2d):
     view = page._shell.scientific
     controls = view.viewer_intensity
     assert controls.isVisible() and controls.autoscale.isChecked()
-    controls.sync((0, 1600), (100, 150))
-    controls.autoscale.setChecked(False)
-    controls.rangeChanged.emit(*controls.values())
+    QtTest.QTest.mouseDClick(controls.label, QtCore.Qt.MouseButton.LeftButton)
+    app.processEvents()
+    controls._entry_popup.findChild(QtWidgets.QComboBox, "intensityMode").setCurrentText("Absolute")
+    for editor, value in zip(controls._entry_editors(), (100, 150)):
+        editor.setText(str(value))
+    controls._entry_popup.findChild(QtWidgets.QPushButton, "intensityApply").click()
+    controls._entry_popup.close()
     QtTest.QTest.mouseClick(view.next_frame, QtCore.Qt.LeftButton)
     _wait(page, app, lambda: page._context_controller.viewer_2d_frame is not None
           and page._context_controller.viewer_2d_frame.label == 1
@@ -348,13 +352,13 @@ def test_hdf_auto_intensity_bar_matches_actual_display_levels(viewer_2d, log_sca
     controls = view.viewer_intensity
     active = tuple(view.raw.image.levels)
     assert controls.autoscale.isChecked()
-    assert controls.values() == controls.slider.domain() == active
-    assert controls.slider.toolTip().startswith(
-        f"Intensity: {active[0]:.8g} to {active[1]:.8g}\n")
+    assert controls.percentile_values() == ((0.1, 99.9) if log_scale else (2, 98))
+    assert controls.slider.domain() == (0, 100)
+    assert f"Absolute display limits: {active[0]:.8g} to {active[1]:.8g}" in controls.slider.toolTip()
     before = tuple(view.raw.image.levels)
-    QtTest.QTest.mouseClick(controls.label, QtCore.Qt.MouseButton.LeftButton)
+    QtTest.QTest.mouseDClick(controls.label, QtCore.Qt.MouseButton.LeftButton)
     app.processEvents()
     assert controls._entry_popup.isVisible()
     assert tuple(view.raw.image.levels) == before
-    assert controls.values() == active and controls.autoscale.isChecked()
+    assert controls.percentile_values() is not None and controls.autoscale.isChecked()
     controls._entry_popup.close()

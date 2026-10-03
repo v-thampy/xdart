@@ -22,8 +22,48 @@ def _control(qapp):
 
 
 def _click(button, qapp):
-    QtTest.QTest.mouseClick(button, QtCore.Qt.MouseButton.LeftButton)
+    if isinstance(button, QtWidgets.QLabel):
+        QtTest.QTest.mouseDClick(button, QtCore.Qt.MouseButton.LeftButton)
+    else:
+        QtTest.QTest.mouseClick(button, QtCore.Qt.MouseButton.LeftButton)
     qapp.processEvents()
+
+
+def test_percentile_popup_repeated_apply_mode_and_escape(qapp):
+    from xdart.gui.widgets.intensity_controls import IntensityControls
+
+    control = IntensityControls(percentiles=(2, 98))
+    control.show()
+    control.sync((-50, 500), (-20, 400))
+    assert control.percentile_values() == (2, 98)
+    assert "Absolute display limits: -20 to 400" in control.label.toolTip()
+    QtTest.QTest.mouseClick(control.label, QtCore.Qt.MouseButton.LeftButton)
+    assert control._entry_popup is None
+    QtTest.QTest.mouseDClick(control.label, QtCore.Qt.MouseButton.LeftButton)
+    QtTest.QTest.mouseRelease(control.label, QtCore.Qt.MouseButton.LeftButton)
+    qapp.processEvents()
+    popup = control._entry_popup
+    for values in ((10, 90), (20, 80)):
+        for editor, value in zip(control._entry_editors(), values):
+            editor.setText(str(value))
+        _click(popup.findChild(QtWidgets.QPushButton, "intensityApply"), qapp)
+        assert popup.isVisible() and control.percentile_values() == values
+        assert not control.autoscale.isChecked()
+    control.sync((-500, 5000), (-200, 4000))
+    assert control.percentile_values() == (20, 80)
+    mode = popup.findChild(QtWidgets.QComboBox, "intensityMode")
+    mode.setCurrentText("Absolute")
+    assert control.percentile_values() is None and control.values() == (-200, 4000)
+    mode.setCurrentText("Percentile")
+    assert control.percentile_values() == (20, 80)
+    QtTest.QTest.keyClick(control._entry_editors()[0], QtCore.Qt.Key.Key_Escape)
+    qapp.processEvents()
+    assert not popup.isVisible()
+    QtTest.QTest.mouseDClick(control.label, QtCore.Qt.MouseButton.LeftButton)
+    QtTest.QTest.mouseClick(popup, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(-20, -20))
+    qapp.processEvents()
+    assert not popup.isVisible()
+    control.close()
 
 
 def test_default_auto_and_sync_are_signal_silent(qapp):
@@ -139,7 +179,7 @@ def test_real_label_click_entry_applies_exact_displayed_limits(qapp):
     high.selectAll()
     QtTest.QTest.keyClicks(high, "5000")
     _click(popup.findChild(QtWidgets.QPushButton, "intensityApply"), qapp)
-    assert not popup.isVisible()
+    assert popup.isVisible()
     assert not control.autoscale.isChecked()
     assert control.values() == (-50, 5000)
     assert control.slider.domain() == (-50, 5000)

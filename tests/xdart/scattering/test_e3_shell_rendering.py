@@ -35,6 +35,46 @@ def qapp() -> QtWidgets.QApplication:
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+@pytest.mark.parametrize("mode", ("Int 1D", "Int 2D"))
+def test_main_and_popup_images_use_shared_manual_percentile_controls(qapp, mode):
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection()
+    state = replace(state, scientific=replace(state.scientific, processing_mode=mode))
+    try:
+        shell.show()
+        shell.apply_state(state)
+        view = shell.scientific
+        controls = view.viewer_intensity
+        pane = view.cake if mode == "Int 2D" else None
+        assert not controls.isHidden()
+        assert controls.percentile_values() == ((0.5, 99.5) if mode == "Int 2D" else None)
+        pixels = pane.image.image if pane is not None else None
+        controls._open_entry()
+        for editor, value in zip(controls._entry_editors(), (10, 90)):
+            editor.setText(str(value))
+        controls._entry_popup.findChild(QtWidgets.QPushButton, "intensityApply").click()
+        if pane is not None:
+            expected = np.nanpercentile(pane.canvas.displayed_image, (10, 90))
+            np.testing.assert_allclose(pane.canvas.histogram.levels(), expected)
+            assert pane.image.image is pixels
+        else:
+            np.testing.assert_allclose(view.curve.getViewBox().viewRange()[1], (10, 90))
+        view.show_raw_popup("Contributing raw")
+        raw = np.array([[-5., 0., 10.], [20., np.nan, 65535.]])
+        view.show_raw_image(raw, status="source", color_map="Default", log_scale=False)
+        popup_controls = view.raw_popup_intensity
+        popup_controls._open_entry()
+        for editor, value in zip(popup_controls._entry_editors(), (0, 100)):
+            editor.setText(str(value))
+        popup_controls._entry_popup.findChild(QtWidgets.QPushButton, "intensityApply").click()
+        np.testing.assert_allclose(view.raw_popup_image.canvas.histogram.levels(), (-5, 20))
+        assert "Absolute display limits: -5 to 20" in popup_controls.label.toolTip()
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
 def test_e3_ui2_renders_raw_cake_axes_and_all_retained_overlay_rows(
     qapp: QtWidgets.QApplication,
 ) -> None:

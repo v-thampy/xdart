@@ -234,6 +234,35 @@ def _slice_levels(view):
     return [tuple(view.keyed_panel(key).pane.canvas.histogram.levels()) for key in (_HK, _HL, _KL)]
 
 
+def test_shared_percentiles_map_each_slice_and_keep_pixels_across_manual_edits(qapp):
+    view = ScientificView()
+    try:
+        state = _rsm_state()
+        for panel in state.panels:
+            if isinstance(panel, KeyedImageProjection):
+                panel.image[0, :3] = (-5, 0, np.nan)
+        view.reconcile_keyed(state)
+        controls = view.viewer_intensity
+        assert controls.percentile_values() == (0.5, 99.5)
+        canvases = [view.keyed_panel(key).pane.canvas for key in (_HK, _HL, _KL)]
+        pixels = [canvas.imageItem.image for canvas in canvases]
+        controls._open_entry()
+        for editor, value in zip(controls._entry_editors(), (25, 75)):
+            editor.setText(str(value))
+        controls._entry_popup.findChild(QtWidgets.QPushButton, "intensityApply").click()
+        mapped = [np.nanpercentile(canvas.displayed_image, (25, 75)) for canvas in canvases]
+        span = (min(pair[0] for pair in mapped), max(pair[1] for pair in mapped))
+        np.testing.assert_allclose(_slice_levels(view), [span] * 3)
+        assert all(canvas.imageItem.image is pixels[index] for index, canvas in enumerate(canvases))
+        assert "Absolute display limits" in controls.label.toolTip()
+        view.reconcile_keyed(_rsm_state(scales=(2, 20, 200)))
+        assert controls.percentile_values() == (25, 75)
+        assert not controls.autoscale.isChecked()
+    finally:
+        view.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize("log_scale", (False, True))
 def test_the_intensity_controls_set_one_level_for_every_keyed_slice_and_autoscale_spans_them(qapp, log_scale):
     """G13 unit 1a (decision 1's toolbar, G7's choice 2 undone): Int's intensity controls, on the keyed layout's
@@ -253,10 +282,11 @@ def test_the_intensity_controls_set_one_level_for_every_keyed_slice_and_autoscal
         assert view.viewer_intensity_row.isAncestorOf(controls) and not view.viewer_intensity_row.isHidden()
         assert not controls.isHidden() and controls.autoscale.isChecked() and controls.slider.isEnabled()
         np.testing.assert_allclose(_slice_levels(view), [span] * 3)
-        np.testing.assert_allclose(controls.values(), span)
-        np.testing.assert_allclose(controls.slider.domain(), span)
+        assert controls.percentile_values() == ((0.1, 99.9) if log_scale else (0.5, 99.5))
+        np.testing.assert_allclose(controls.slider.domain(), (0, 100))
         typed = (0.8, 2.5) if log_scale else (30.0, 600.0)
         controls._open_entry()  # typed, as Int's viewer takes them
+        controls._entry_popup.findChild(QtWidgets.QComboBox, "intensityMode").setCurrentText("Absolute")
         low, high = controls._entry_editors()
         low.setText(f"{typed[0]:g}")
         high.setText(f"{typed[1]:g}")
@@ -365,7 +395,7 @@ def test_leaving_the_keyed_layout_gives_share_axis_and_the_intensity_controls_ba
         assert view.plot_bar.indexOf(view.share_axis) == -1
         view._apply_processing_layout("Int 2D")
         assert view.plot_bar.indexOf(view.share_axis) == home and view.viewer_intensity_row.isHidden()
-        assert view.viewer_intensity.isHidden()
+        assert not view.viewer_intensity.isHidden()
         view.reconcile_keyed(_rsm_state())
         view._apply_processing_layout("2D Viewer")
         assert view.viewer_intensity_row_layout.indexOf(view.viewer_intensity) >= 0

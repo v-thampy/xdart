@@ -303,10 +303,26 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         self._level_cache = {"key": key, "time": now, "levels": levels}
         return levels, False
 
+    def percentile_levels(self, pair=None):
+        """Map display percentiles through this image's existing finite, ceiling-safe population.
+
+        Retain the mapped pair until pixels change; no image upload or source read.
+        """
+        pair = tuple(float(value) for value in (self._automatic_percentiles if pair is None else pair))
+        cached = getattr(self, "_percentile_cache", None)
+        if cached is not None and cached[0] == pair:
+            return cached[1]
+        levels, _hit = self._cached_levels(
+            "display", "", pair, self._display_domain,
+            expand_degenerate=self._expand_degenerate_levels)
+        self._percentile_cache = (pair, levels)
+        return levels
+
     def update_image(self, scale='Linear', cmap='viridis', **kwargs):
         perf = bool(os.environ.get("XDART_PERF"))
         t0 = time.perf_counter() if perf else 0.0
         self.displayed_image = self._display_array_for_scale(scale)
+        self._percentile_cache = None
         t_copy = time.perf_counter() if perf else 0.0
         # All-NaN / empty images poison every nanpercentile below (RuntimeWarning
         # + NaN levels -> pyqtgraph autoscale weirdness).  Higher layers normally
@@ -333,6 +349,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         linear_pct = tuple(kwargs.pop("linear_percentiles", (2, 98)))
         expand_degenerate = bool(
             kwargs.pop("expand_degenerate_levels", False))
+        self._expand_degenerate_levels = expand_degenerate
         if scale == 'Log':
             min_val = np.nanmin(self.displayed_image)
             if min_val < 1:
@@ -364,12 +381,14 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
 
             self.histogram.axis.setLogMode(False)
 
+        self._automatic_percentiles = pct
         t_transform = time.perf_counter() if perf else 0.0
         # This min/max is also needed for the colorbar limits below. Include it
         # in the short-lived cache key so an async replacement or reused frame
         # label with a radically different intensity range cannot inherit stale
         # levels for the rest of the pause/scan. Identical re-renders still hit.
         low, high = _finite_minmax(self.displayed_image)
+        self._display_domain = (low, high)
         levels, cache_hit = self._cached_levels(
             scale, cmap, pct, (low, high),
             expand_degenerate=expand_degenerate)

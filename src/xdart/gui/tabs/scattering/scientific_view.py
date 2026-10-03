@@ -954,6 +954,10 @@ class ScientificView(QtWidgets.QFrame):
             self.raw_popup_mode_group.addButton(button)
             controls.addWidget(button)
         controls.addStretch(1)
+        self.raw_popup_intensity = IntensityControls(dialog, percentiles=(2, 98))
+        controls.addWidget(self.raw_popup_intensity)
+        self.raw_popup_intensity.rangeChanged.connect(lambda _lo, _hi: self._refresh_raw_popup_intensity())
+        self.raw_popup_intensity.autoToggled.connect(lambda _on: self._refresh_raw_popup_intensity())
         layout.addLayout(controls)
         self.raw_popup_image = ScientificImagePane(lock_aspect=True)
         layout.addWidget(self.raw_popup_image, 1)
@@ -981,6 +985,7 @@ class ScientificView(QtWidgets.QFrame):
         if self.raw_popup_image is not None:
             self.raw_popup_image.clear_image_buffers()
         if hasattr(self, "raw_popup_status"): self.raw_popup_status.setText("")
+        self.raw_popup_intensity.sync(None, None, reset=True)
         if self._raw_popup_host:
             self.rawPopupClosed.emit()
         elif self._processing_mode == "Int 1D":
@@ -1020,7 +1025,25 @@ class ScientificView(QtWidgets.QFrame):
             return
         self.raw_popup_image.render(image, detector_shape=detector_shape, color_map=color_map,
                                     log_scale=log_scale)
+        self.raw_popup_intensity.set_percentile_defaults((0.1, 99.9) if log_scale else (2, 98))
+        self._refresh_raw_popup_intensity()
         self.raw_popup_status.setText(status)
+
+    def _refresh_raw_popup_intensity(self) -> None:
+        """The shared intensity owner maps the popup's already-displayed detector pixels."""
+        pane, controls = self.raw_popup_image, self.raw_popup_intensity
+        if pane.image.image is None or not np.isfinite(pane.canvas.displayed_image).any():
+            controls.sync(None, None)
+            return
+        percentile = controls.percentile_values()
+        levels = pane.canvas.percentile_levels(percentile) if percentile is not None else (
+            pane.canvas.percentile_levels() if controls.autoscale.isChecked()
+            else controls.values())
+        domain = pane.canvas._display_domain
+        pane.canvas.histogram.lo_lim = min(domain[0], levels[0])
+        pane.canvas.histogram.hi_lim = max(domain[1], levels[1])
+        pane.canvas.histogram.setLevels(levels)
+        controls.sync(domain, levels)
 
     def show_raw_status(self, status: str, *, clear_image: bool = False) -> None:
         """The line below a host page's open raw pop-up; ``clear_image`` empties the image too."""
@@ -1047,6 +1070,8 @@ class ScientificView(QtWidgets.QFrame):
             color_map=state.color_map, log_scale=state.log_scale,
             level_scan_token=(id(heavy.frame), id(heavy.raw)),
         )
+        self.raw_popup_intensity.set_percentile_defaults((0.1, 99.9) if state.log_scale else (2, 98))
+        self._refresh_raw_popup_intensity()
         self.raw_popup_thumbnail.setChecked(state.detector_mode == "thumbnail")
         self.raw_popup_full.setChecked(state.detector_mode == "full")
         self.raw_popup_full.setEnabled(state.detector_available)
@@ -3312,6 +3337,7 @@ class ScientificView(QtWidgets.QFrame):
         kept across draws. A slice's own colour bar stays, for a look at it alone until the next draw. A panel
         presented on its own ("own", "signed": ``KeyedImageProjection.presentation``) keeps its own levels."""
         controls = self.viewer_intensity
+        controls.set_percentile_defaults((0.1, 99.9) if self.log_scale.isChecked() else (0.5, 99.5))
         drawn = [widgets.levels for widgets in self._keyed_panels.values()
                  if type(widgets) is _KeyedImagePanel and widgets.levels is not None
                  and widgets.presentation == "shared"]
@@ -3321,10 +3347,16 @@ class ScientificView(QtWidgets.QFrame):
             return
         self._viewer_intensity_domain = (min(found[0] for found, _levels in drawn),
                                          max(found[1] for found, _levels in drawn))
-        self._viewer_auto_levels = (min(levels[0] for _found, levels in drawn),
-                                    max(levels[1] for _found, levels in drawn))
+        percentile = controls.percentile_values()
+        mapped = [widgets.pane.canvas.percentile_levels(percentile)
+                  for widgets in self._keyed_panels.values()
+                  if type(widgets) is _KeyedImagePanel and widgets.levels is not None
+                  and widgets.presentation == "shared"] if percentile is not None else [levels for _found, levels in drawn]
+        self._viewer_auto_levels = (min(levels[0] for levels in mapped), max(levels[1] for levels in mapped))
         controls.sync(self._viewer_intensity_domain, self._viewer_auto_levels)
-        self._set_keyed_levels(self._viewer_auto_levels if controls.autoscale.isChecked() else controls.values())
+        chosen = self._viewer_auto_levels if percentile is not None or controls.autoscale.isChecked() else controls.values()
+        self._set_keyed_levels(chosen)
+        controls.sync(self._viewer_intensity_domain, chosen)
 
     def _set_keyed_levels(self, levels) -> None:
         """Every drawn slice's colour bar to ``levels``, its limits widened to take them."""
@@ -3499,7 +3531,7 @@ class ScientificView(QtWidgets.QFrame):
                     else self.plot_bar)
             host.addWidget(self.viewer_intensity)
         self.viewer_intensity_row.setVisible(normalized == "2D Viewer")
-        self.viewer_intensity.setVisible(viewer)
+        self.viewer_intensity.setVisible(True)
         self.axis_display_group.setVisible(not viewer)
         self.plot_axis.setVisible(not viewer)
         if changed:
@@ -3581,16 +3613,24 @@ class ScientificView(QtWidgets.QFrame):
             return self.raw
         if self._processing_mode == "1D Viewer" and self._bottom_waterfall_active:
             return self.waterfall
+        if self._processing_mode == "Int 2D":
+            return self.cake
         return None
 
     def _refresh_viewer_intensity(self) -> None:
         """Synchronize scalar display limits, never retain another pixel buffer."""
-        if self._processing_mode not in {"1D Viewer", "2D Viewer"}:
+        if self._layout_mode == "keyed":
+            self._refresh_keyed_intensity()
             return
         controls = self.viewer_intensity
+        if self._processing_mode in {"1D Viewer", "Int 1D"}:
+            controls.set_percentile_defaults(None)
+        else:
+            defaults = (0.5, 99.5) if self._processing_mode == "Int 2D" else (2, 98)
+            controls.set_percentile_defaults((0.1, 99.9) if self.log_scale.isChecked() else defaults)
         pane = self._viewer_intensity_image()
         if pane is not None:
-            if pane.image.image is None:
+            if pane.image.image is None or not np.isfinite(pane.canvas.displayed_image).any():
                 controls.sync(None, None)
                 return
             contract = (self._processing_mode, pane._render_contract)
@@ -3599,9 +3639,11 @@ class ScientificView(QtWidgets.QFrame):
                 histogram = pane.canvas.histogram
                 self._viewer_intensity_domain = (histogram.lo_lim, histogram.hi_lim)
                 self._viewer_auto_levels = tuple(histogram.levels())
-            controls.sync(self._viewer_intensity_domain, pane.canvas.histogram.levels())
-            if not controls.autoscale.isChecked():
-                self._set_viewer_intensity(*controls.values())
+            percentile = controls.percentile_values()
+            levels = pane.canvas.percentile_levels(percentile) if percentile is not None else (
+                self._viewer_auto_levels if controls.autoscale.isChecked() else controls.values())
+            controls.sync(self._viewer_intensity_domain, levels)
+            self._set_viewer_intensity(*controls.values())
             return
         ranges = []
         for item in self.curve.listDataItems():
@@ -3624,24 +3666,27 @@ class ScientificView(QtWidgets.QFrame):
 
     def _set_viewer_intensity(self, lo, hi) -> None:
         if self._layout_mode == "keyed":  # the keyed slices' one set of levels
-            self._set_keyed_levels((lo, hi))
+            self._refresh_keyed_intensity()
             return
-        if (self._processing_mode not in {"1D Viewer", "2D Viewer"}
-                or not np.isfinite((lo, hi)).all() or hi <= lo):
+        if (not np.isfinite((lo, hi)).all() or hi <= lo):
             return
         pane = self._viewer_intensity_image()
         if pane is None:
             self.curve.getViewBox().setYRange(lo, hi, padding=0)
         elif pane.image.image is not None:
+            percentile = self.viewer_intensity.percentile_values()
+            if percentile is not None:
+                lo, hi = pane.canvas.percentile_levels(percentile)
             histogram = pane.canvas.histogram
             domain = self._viewer_intensity_domain or (lo, hi)
             histogram.lo_lim = min(domain[0], lo)
             histogram.hi_lim = max(domain[1], hi)
             histogram.setLevels((lo, hi))
+            self.viewer_intensity.sync(domain, (lo, hi))
 
     def _toggle_viewer_autoscale(self, enabled) -> None:
         if self._layout_mode == "keyed":  # Autoscale's span of the keyed slices, or the levels shown, kept
-            self._set_keyed_levels(self._viewer_auto_levels if enabled else self.viewer_intensity.values())
+            self._refresh_keyed_intensity()
             return
         if not enabled:
             self._set_viewer_intensity(*self.viewer_intensity.values())
