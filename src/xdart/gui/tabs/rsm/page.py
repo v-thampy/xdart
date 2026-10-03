@@ -540,6 +540,7 @@ class RSMPage(QtWidgets.QWidget):
                                 "blank: none.")
         for key in normalization.NORMALIZATION_KEYS:
             self._tip(key, normalization.TIPS[key])
+            self._rows[key].setVisible(fields[key].enabled)
 
     def _conditioning_fields(self):
         """The Conditioning fields as Int's composer and rows take them: the Threshold from Int's transitions'
@@ -633,6 +634,7 @@ class RSMPage(QtWidgets.QWidget):
         for key in normalization.NORMALIZATION_KEYS:
             self._fields[key] = fields[key]
             self._rows[key].apply_field(fields[key])
+            self._rows[key].setVisible(fields[key].enabled)
 
     def _normalization_policy(self):
         """The Normalization group's choice as RSM's policy (decision 4); the columns' occurrences are Advanced's.

@@ -154,20 +154,23 @@ def test_every_orientation_predicts_orientation_3s_geometry_with_the_arm_tilted(
 def test_one_calibrated_frame_predicts_the_other_frames_rings(tmp_path):
     """A rough guess 200 px off misnumbers a far frame's rings; the arm fitted to the first
     calibrated frame places every frame's rings as the true arm does."""
+    from dataclasses import replace
     from tests.core.test_stacked_arm_extension import _calibration, _ring_controls
-    from tests.core.test_stitch_guided_calibration import _frames
+    from tests.core.test_stitch_guided_calibration import _frames, _turn_controls
     from xrd_tools.core.geometry.stacked_arm import StackedDetectorArm
     from xrd_tools.integrate.calibration_seed import session_prediction
-    truth = {'nu_offset': .02, 'del_offset': -.05}
-    controls, _calibrant = _ring_controls(truth, _calibration(), [(5., -10.), (45., -10.), (25., 9.5), (5., 29.)])
-    frames = _frames(tmp_path, controls, _calibration().poni)
-    true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(_calibration())
+    truth = {'nu_offset': -.02, 'del_offset': .05}
+    _unused, poni = _turn_controls((), _calibration().poni)
+    calibration = replace(_calibration(), poni=poni)
+    controls, _calibrant = _ring_controls(truth, calibration, [(5., -10.), (45., -10.), (25., 9.5), (5., 29.)])
+    frames = _frames(tmp_path, controls, poni)
+    true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(calibration)
 
     def two_theta(record, frame):
         seed = predict_frame_seed(record, frame)
         return np.degrees(seed.integrator.center_array(frame.shape, unit='2th_rad', scale=False))
 
-    rough = rough_arm_record(distance_m=.39, detector='Pilatus300kw', beam_px=(.045 / 172e-6 + 200, .035 / 172e-6))
+    rough = rough_arm_record(distance_m=.39, detector='Pilatus300kw', beam_px=(poni.poni2 / 172e-6 + 200, poni.poni1 / 172e-6))
     assert (ring_summary(predict_frame_seed(rough, frames[1]).rings)
             != ring_summary(predict_frame_seed(true_arm, frames[1]).rings))
     assert session_prediction(frames[:0]) is None
@@ -215,7 +218,7 @@ def test_a_circle_with_no_frames_and_no_range_is_checked_at_zero():
         'del_angle': 'del', 'nu_angle': 'nu'}}}, 0., 0., 0, '')
     angles = pair_validation_angles(fit, domain={'del': [0., 30.]}, grid=4)
     assert angles == [(0., 0.), (10., 0.), (20., 0.), (30., 0.)]
-    assert pair_validation_angles(fit) == []
+    assert pair_validation_angles(fit) == [(delta, nu) for delta in (-1., 0., 1.) for nu in (-1., 0., 1.)]
 
 
 @pytest.mark.parametrize('orientation', [3, 1, 2, 4])

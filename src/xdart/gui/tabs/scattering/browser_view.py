@@ -446,7 +446,7 @@ class BrowserView(QtWidgets.QFrame):
         self._artifact_navigation_filter = _ArtifactNavigationFilter(
             self.scans, self._activate_directory, self._visit_artifact,
         )
-        if not self.profile.results:  # a results list has no directories or artifacts to visit
+        if not self.profile.results or self.profile.result_selection == "extended":
             self.scans.installEventFilter(self._artifact_navigation_filter)
             self.scans.viewport().installEventFilter(self._artifact_navigation_filter)
         scan_pane_layout.addWidget(scan_labels)
@@ -796,12 +796,19 @@ class BrowserView(QtWidgets.QFrame):
         """A results list's selected entries' identities, in the order Qt reports them (an overlay's order)."""
         return tuple(item.data(_USER_ROLE) for item in self.scans.selectedItems())
 
+    def set_result_plot_mode(self, plot_mode: str) -> None:
+        """Use Int's visit/toggle/range gestures when this results list presents an overlay."""
+        self._plot_mode = plot_mode
+
     def set_current_result(self, identifier: str | None, *, keep_selection: bool) -> None:
         """Make an entry current as a user would (its commands are emitted): ``keep_selection`` keeps the other
-        selected entries (an overlay stepping through them), else the selection becomes this entry alone.
+        selected entries and visits this one in Overlay, else the selection becomes this entry alone.
         None, or an entry not listed: no current entry."""
         row = next((index for index in range(self.scans.count())
                     if self.scans.item(index).data(_USER_ROLE) == identifier), -1)
+        if (self.profile.results and keep_selection and row >= 0
+                and self._visit_artifact(self.scans.item(row))):
+            return
         flag = (QtCore.QItemSelectionModel.SelectionFlag.NoUpdate if keep_selection
                 else QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
         self.scans.setCurrentRow(row, flag)
@@ -1075,10 +1082,26 @@ class BrowserView(QtWidgets.QFrame):
                 if not (candidate := self.scans.item(row)).data(_DIRECTORY_ROLE)
             )
         blocker = QtCore.QSignalBlocker(self.scans)
-        self.scans.setCurrentItem(
-            item, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        if self.profile.results:
+            # The existing result selection owns trace membership; changing the current map never
+            # clears it during a visit. Single's native ExtendedSelection still reports exact choices.
+            self.scans.setCurrentItem(item, QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+            for row in range(self.scans.count()):
+                candidate = self.scans.item(row)
+                if candidate.data(_USER_ROLE) in artifacts:
+                    candidate.setSelected(
+                        not candidate.isSelected() if intent is FrameSelectionIntent.TOGGLE_TRACE
+                        else intent is not FrameSelectionIntent.REMOVE_TRACE_RANGE)
+        else:
+            self.scans.setCurrentItem(
+                item, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
         del blocker
-        if intent is FrameSelectionIntent.VISIT:
+        if self.profile.results:
+            self.commandRequested.emit(ShellCommand(
+                ShellCommandKind.SELECT_RESULT, item.data(_USER_ROLE),
+                artifacts=self.selected_results(), intent=intent,
+            ))
+        elif intent is FrameSelectionIntent.VISIT:
             self._scan_selected(intent)
         else:
             self.commandRequested.emit(ShellCommand(

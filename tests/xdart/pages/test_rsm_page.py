@@ -1004,7 +1004,7 @@ def test_each_section_header_shows_its_readiness_as_ints_do(qapp, tmp_path):
         assert cards["project"].valid_marker.toolTip() == "Needs a Project folder"
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
-        assert page.run_bar.readinessLabel.full_text().startswith("Ready · RSM · 1 SPEC file · 1 RSM")
+        assert page.run_bar.readinessLabel.full_text().startswith("1 SPEC file · 1 RSM")
         assert all(card.valid_marker.isVisibleTo(page) for card in cards.values())
         assert cards["source"].status.text() == "1 SPEC file · 1 RSM"  # Stitch's Source status
         assert cards["processing"].status.text().endswith(" · grid 40×40×40")  # Coordinates is Processing's (G8a)
@@ -1830,6 +1830,9 @@ def test_processing_takes_ints_threshold_and_the_shared_normalization_group(qapp
     page = _page(qapp)
     try:
         assert isinstance(page.threshold_range, RangeRow)  # Int's composer's row
+        assert page._rows['normalization'].label.text() == 'Normalize'
+        assert page._rows['monitor'].isHidden()
+        assert all(not page._rows[key].isHidden() for key in ('foil_column', 'exposure_column', 'foil_lengths'))
         assert page._threshold_policy() == StitchConditioning("auto")  # Auto by default, as Stitch's
         default = page._normalization_policy()  # the preset's foil transmission × exposure
         assert (default.mode, default.foil_selector, default.exposure_selector, default.absorption_lengths) == (
@@ -1853,6 +1856,8 @@ def test_processing_takes_ints_threshold_and_the_shared_normalization_group(qapp
         page.set_field("normalization", normalization.MONITOR)
         assert "Normalization: a monitor column" in page._headers["processing"].detail
         assert not page._fields["foil_column"].enabled  # the rows the choice does not read, greyed
+        assert not page._rows['monitor'].isHidden()
+        assert all(page._rows[key].isHidden() for key in ('foil_column', 'exposure_column', 'foil_lengths'))
         page.controls.set_editors_enabled(False)  # a run locks the rows and unlocks them (Codex's F2) ...
         page.controls.set_editors_enabled(True)
         foil, monitor = page._rows["foil_column"].editor, page._rows["monitor"].editor
@@ -1864,6 +1869,8 @@ def test_processing_takes_ints_threshold_and_the_shared_normalization_group(qapp
             RSMNormalizationMode.MONITOR, None, None, (0.0, 0.0, 0.0, 0.0),
             monitor_selector=MetadataColumnSelector("Seconds", 1))
         page.set_field("normalization", normalization.MONITOR_FOIL)  # a monitor before the foils
+        assert page._rows['exposure_column'].isHidden()
+        assert all(not page._rows[key].isHidden() for key in ('monitor', 'foil_column', 'foil_lengths'))
         policy = page.build_form().normalization
         assert (policy.mode, policy.foil_selector, policy.exposure_selector, policy.monitor_selector) == (
             RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION, MetadataColumnSelector("foil status", 0), None,

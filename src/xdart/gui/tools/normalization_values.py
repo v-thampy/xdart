@@ -28,8 +28,8 @@ NORMALIZATION_KEYS = ("normalization", "monitor", "foil_column", "exposure_colum
 #: RSM's preset (the example notebook's second set): the lengths depend on the X-ray energy.
 DEFAULT_FOIL_LENGTHS = "1.06, 3.04, 4.65, 9.5"
 DEFAULT_FOIL_COLUMN, DEFAULT_EXPOSURE_COLUMN = "foil status", "Seconds"
-LABELS = {"normalization": "Normalization", "monitor": "Monitor", "foil_column": "Foil column",
-          "exposure_column": "Exposure column", "foil_lengths": "Foil absorption"}
+LABELS = {"normalization": "Normalize", "monitor": "Monitor", "foil_column": "Foil",
+          "exposure_column": "Exposure", "foil_lengths": "Foil abs"}
 TIPS = {
     "normalization": (
         "Each frame's divisor. Monitor: a monitor after the foils (its counts include their attenuation). "

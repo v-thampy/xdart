@@ -734,7 +734,7 @@ def _mirror_partner(project: Path, asset, reversed_circles) -> str:
     validation = asset["validation"]
     # the solid-angle arm (off in these forms) as this file's own: nu's scale reversed with the detector axes
     arm = json.loads(json.dumps(asset["corrections"]["solid_angle_arm"]))
-    arm.update(detector="Detector", nu_scale=-math.pi / 180, del_scale=math.pi / 180, beam_rotation=0.0,
+    arm.update(detector="Detector", nu_scale=math.pi / 180, del_scale=-math.pi / 180, beam_rotation=0.0,
                wavelength_m=energy_eV_to_wavelength_m(13_000.007), source_motors={"del_angle": "del", "nu_angle": "nu"})
     value = extended_surface_calibration(
         detector=Detector(pixel1=172e-6, pixel2=172e-6, max_shape=turned),

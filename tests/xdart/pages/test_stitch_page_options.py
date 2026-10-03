@@ -18,6 +18,7 @@ from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
 def _close(page, qapp):
+    _wait(page, qapp)
     assert page.shutdown().status is PageCleanup.CLEAN
     page.deleteLater()
     qapp.processEvents()
@@ -613,14 +614,14 @@ def test_inputs_view_follows_int(qapp, tmp_path):
         # and shows the names; the page lists no folder on an edit (Codex audit G-F2)
         assert names.editor.placeholderText() == "auto · as Int names the scan's images"
         page.set_field("scan", "[14,15]")
+        _wait(page, qapp)
         assert names.editor.placeholderText() == "auto · as Int names the scan's images"
         cards = page.controls
-        for card in (cards.project_card, cards.experiment_card, cards.source_card, cards.processing_card):
+        for card in (cards.project_card, cards.experiment_card, cards.processing_card):
             assert not card.valid_marker.isHidden(), card.title.text()
         assert cards.source_card.status.text() == "1 SPEC file · 1 output"
-        assert (page.run_bar.readinessLabel.full_text()
-                == "Ready · Stitch 1D · LaB6_17keV, scans [14,15] · pyFAI MultiGeometry")
-        assert page.run_bar.startButton.isEnabled()
+        assert cards.source_card.valid_marker.isHidden()  # this controls-only fixture has no raw scan
+        assert not page.run_bar.startButton.isEnabled()
     finally:
         _close(page, qapp)
 
@@ -707,24 +708,24 @@ def test_the_camera_turns_and_mirrors_the_frames_and_older_settings_keep_their_r
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
-        assert page._value("camera") == "x-, z+"  # Stitch's frame: an image rotation of 0
+        assert page._value("camera") == "x+, z-"  # Native pyFAI frame: no rotation
         form = page.build_form()
         assert (form.image_rotation, form.image_flip) == (0, False)
         unmirrored = form.fingerprint
-        page.set_field("camera", "x-, z-")  # 17-2's Pilatus 300K-W: mirrored left-right
+        page.set_field("camera", "x+, z+")  # horizontal mirror relative to the native frame
         form = page.build_form()
         assert (form.image_rotation, form.image_flip) == (0, True) and form.fingerprint != unmirrored
         page.load_form(form)
-        assert page._value("camera") == "x-, z-"
+        assert page._value("camera") == "x+, z+"
         document = page.settings()
-        assert document["fields"]["camera"] == "x-, z-" and "image_rotation" not in document["fields"]
+        assert document["fields"]["camera"] == "x+, z+" and "image_rotation" not in document["fields"]
         older = dict(document, fields={**{k: v for k, v in document["fields"].items() if k != "camera"},
                                         "image_rotation": "90"})
         page.apply_settings(older)
-        assert page._value("camera") == "z+, x+"  # the rotation's unmirrored camera
+        assert page._value("camera") == "z-, x-"  # the rotation's unmirrored camera
         assert (page.build_form().image_rotation, page.build_form().image_flip) == (90, False)
         page._calibrate()  # Calibrate opens with the page's camera
-        assert page._calibration_dialog.camera.value().to_xu() == ("z+", "x+")
+        assert page._calibration_dialog.camera.value().to_xu() == ("z-", "x-")
         page._calibration_dialog.close()
     finally:
         _close(page, qapp)
@@ -807,17 +808,19 @@ def test_the_selected_scans_frames_show_once_committed(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        _wait(page, qapp)
         header, line = page.controls.source_card.status, page.run_bar.readinessLabel
         assert header.text() == "1 SPEC file · 1 output · 2 frames"
-        assert line.full_text().startswith("Ready · Stitch 1D · ") and " · 2 frames · " in line.full_text()
+        assert line.full_text().startswith("sample, scan 1 · ") and " · 2 frames · " in line.full_text()
         editor = page._rows["scan"].editor
         editor.setText("1,2,[1,2]")  # typed, not committed: no count yet
         page._rows["scan"].draftChanged.emit(page._fields["scan"].path, "1,2,[1,2]")
         assert header.text() == "1 SPEC file · 3 outputs" and "frames" not in line.full_text()
         page.set_field("scan", "1,2,[1,2]")
+        _wait(page, qapp)
         assert header.text() == "1 SPEC file · 3 outputs · 8 frames" and " · 8 frames · " in line.full_text()
         page.set_field("scan_mode", "Stitch All")
-        assert header.text() == "1 SPEC file · all scans · 6 frames"
+        assert header.text() == "1 SPEC file · all scans · 6 SPEC points"
         page.set_field("scan_mode", "Select Scans")
         page.set_field("scan", "1,9")  # a scan the file lacks: Preview says so; no count
         assert "frames" not in header.text() + line.full_text()
@@ -868,18 +871,18 @@ def test_hovering_the_frame_count_lists_each_scans_frames(qapp, tmp_path):
         page.load_form(form)
         header, line = page.controls.source_card.status, page.run_bar.readinessLabel
         page.set_field("scan", "1,4,[2,4]")
-        frames = "Frames per scan:\nscan 1: 2 frames\nscan 4: 3 frames\nscans 2, 4 (one output): 2 + 3 = 5 frames"
-        assert header.text() == "1 SPEC file · 3 outputs · 10 frames" and " · 10 frames · " in line.full_text()
-        assert header.toolTip() == frames and line.toolTip() == f"{line.full_text()}\n\n{frames}"
+        frames = "SPEC points per scan:\nscan 1: 2 SPEC points\nscan 4: 3 SPEC points\nscans 2, 4 (one output): 2 + 3 = 5 SPEC points"
+        assert header.text() == "1 SPEC file · 3 outputs · 10 SPEC points"
+        assert header.toolTip() == frames
         page.set_field("scan_mode", "Stitch All")  # every scan by itself
-        assert header.toolTip() == "Frames per scan:\n" + "\n".join(
-            f"scan {scan}: {points} frames" for scan, points in ((1, 2), (2, 2), (3, 2), (4, 3)))
+        assert header.toolTip() == "SPEC points per scan:\n" + "\n".join(
+            f"scan {scan}: {points} SPEC points" for scan, points in ((1, 2), (2, 2), (3, 2), (4, 3)))
         page.set_field("scan_mode", "Select Scans")
         page.set_field("scan", ",".join(["4"] * 45))  # a long selection: its first 40 outputs
-        assert header.toolTip().splitlines()[1:] == ["scan 4: 3 frames"] * 40 + ["… 5 more"]
+        assert header.toolTip().splitlines()[1:] == ["scan 4: 3 SPEC points"] * 40 + ["… 5 more"]
         page.set_field("project_root", "")  # not ready: the line counts no frames, so lists none
         assert line.toolTip() == line.full_text() and line.full_text().startswith("Needs ")
-        assert header.toolTip().startswith("Frames per scan:\nscan 4: 3 frames")
+        assert header.toolTip().startswith("SPEC points per scan:\nscan 4: 3 SPEC points")
         page.set_field("project_root", str(form.project_root))
         page._rows["scan"].editor.setText("1")  # typed, not committed: no count and no list
         page._rows["scan"].draftChanged.emit(page._fields["scan"].path, "1")
@@ -888,10 +891,10 @@ def test_hovering_the_frame_count_lists_each_scans_frames(qapp, tmp_path):
         other.write_bytes(spec.read_bytes())
         page.load_form(replace(form, source_selection=replace(form.source_selection, paths=(str(spec), str(other)),
                                                               scans="1,[2,4]")))
-        assert header.toolTip() == ("Frames per scan:\n"
-                                    + f"{spec.name}:\n  scan 1: 2 frames\n  scans 2, 4 (one output): 2 + 3 = 5 frames\n"
-                                    + "other.spec:\n  scan 1: 2 frames\n  scans 2, 4 (one output): 2 + 3 = 5 frames")
-        assert " · 14 frames · " in line.full_text()
+        assert header.toolTip() == ("SPEC points per scan:\n"
+                                    + f"{spec.name}:\n  scan 1: 2 SPEC points\n  scans 2, 4 (one output): 2 + 3 = 5 SPEC points\n"
+                                    + "other.spec:\n  scan 1: 2 SPEC points\n  scans 2, 4 (one output): 2 + 3 = 5 SPEC points")
+        assert "14 SPEC points" in header.text()
     finally:
         _close(page, qapp)
 
@@ -904,15 +907,16 @@ def test_a_typed_path_asks_the_disk_nothing_until_it_is_committed(qapp, tmp_path
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        _wait(page, qapp)
         line = page.run_bar.readinessLabel
-        assert line.full_text().startswith("Ready")
+        assert page.run_bar.readinessDot.property("ready") is True
         asked, real = [], os.stat
         monkeypatch.setattr(os, "stat", lambda *args, **kwargs: (asked.append(str(args[0])), real(*args, **kwargs))[1])
         row = page._rows["geometry_path"]
         typed = str(tmp_path / "missing.json")
         row.editor.setText(typed)
         row.draftChanged.emit(row._path, typed)  # a keystroke
-        assert asked == [] and line.full_text().startswith("Ready")  # the last committed calibration's facts
+        assert asked == [] and page.run_bar.readinessDot.property("ready") is True
         page.set_field("geometry_path", typed)  # committed: asked
         assert any(path.endswith("missing.json") for path in asked)
         assert "the calibration missing.json (not found)" in line.full_text()
@@ -1079,9 +1083,12 @@ def test_the_normalization_group_takes_each_choice_to_the_plan(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_with_foil_columns(_native_form(tmp_path, "multigeometry", scans="1")))
+        _wait(page, qapp)  # readiness assertions follow the real asynchronous image admission
         assert page._value("normalization") == "None" and page.build_form().foil_normalization is None
         assert page._fields["foil_column"].choices == ("None", "I0", "foil status", "Seconds")  # the scan's counters
         assert not page._rows["monitor"].editor.isEnabled() and not page._rows["foil_lengths"].editor.isEnabled()
+        assert page._rows['normalization'].label.text() == 'Normalize'
+        assert all(page._rows[key].isHidden() for key in ('monitor', 'foil_column', 'exposure_column', 'foil_lengths'))
         expected = {
             "Monitor": ("I0", None),
             "Foil transmission × exposure": (None, ("foil status", "Seconds")),
@@ -1093,6 +1100,9 @@ def test_the_normalization_group_takes_each_choice_to_the_plan(qapp, tmp_path):
             page.set_field("foil_column", "foil status")
             page.set_field("exposure_column", "Seconds")
             assert page._value("normalization") == choice  # naming a monitor under a foil choice keeps it
+            visible = {'monitor': monitor is not None, 'foil_column': foil is not None,
+                       'exposure_column': foil is not None and foil[1] is not None, 'foil_lengths': foil is not None}
+            assert all(page._rows[key].isHidden() != needed for key, needed in visible.items())
             form = page.build_form()
             assert (form.monitor_selector.name if form.monitor_selector else None) == monitor
             got = form.foil_normalization
@@ -1102,6 +1112,9 @@ def test_the_normalization_group_takes_each_choice_to_the_plan(qapp, tmp_path):
                 assert got.absorption_lengths == (1.06, 3.04, 4.65, 9.5)
             plan = prepare_stitch_tool(form).request.plan
             assert plan.foil_normalization == got and plan.monitor_selector == form.monitor_selector
+        assert page._value('exposure_column') == 'Seconds'  # hidden inputs survive a mode switch
+        assert [page._rows[key].label.text() for key in ('foil_column', 'exposure_column', 'foil_lengths')] == [
+            'Foil', 'Exposure', 'Foil abs']
         page.set_field("foil_column", "None")
         assert page.run_bar.readinessLabel.full_text() == "Needs a foil column"
         page.set_field("foil_column", "foil status")

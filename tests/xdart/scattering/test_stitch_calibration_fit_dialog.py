@@ -88,10 +88,10 @@ def _horizontal_frames(tmp_path):
 
 def _truth_bounds(dialog, sample_mm='5'):
     """As a user would for TRUTH (ARM-ZERO-BOUNDS-20260929): its motor zeros typed beside the motors
-    (del 2.86°, nu −1.15°) and, its sample sitting 0.5–2.2 mm off the rotation centre, a displacement
+    (del −2.86°, nu 1.15°) and, its sample sitting 0.5–2.2 mm off the rotation centre, a displacement
     limit under Advanced that allows it."""
-    dialog.geometry_editor.zero_edit('del').setText(f"{-np.rad2deg(TRUTH['del_offset']):.12g}")
-    dialog.geometry_editor.zero_edit('nu').setText(f"{-np.rad2deg(TRUTH['nu_offset']):.12g}")
+    dialog.geometry_editor.zero_edit('del').setText(f"{np.rad2deg(TRUTH['del_offset']):.12g}")
+    dialog.geometry_editor.zero_edit('nu').setText(f"{np.rad2deg(TRUTH['nu_offset']):.12g}")
     dialog._fields['displacement_limit'].setText(sample_mm)
 
 
@@ -202,7 +202,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
-        dialog.geometry_editor.zero_edit('tth').setText(f'{np.rad2deg(.05):.12g}')  # the truth's del zero
+        dialog.geometry_editor.zero_edit('tth').setText(f'{-np.rad2deg(.05):.12g}')  # native arm's del zero
         dialog.frames, dialog._frame_motors = frames, ('tth', None)
         dialog._render_frames()
         assert 'without the extension' in dialog.arm_note.text()
@@ -217,7 +217,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         provenance, record = dialog.fit.asset['provenance'], dialog.fit.asset['calibration']
         assert provenance['source_motors'] == {'del_angle': 'tth'}
         assert provenance['instrument_geometry'] == InstrumentGeometry(
-            'twoc', zeros=(('tth', float(f'{np.rad2deg(.05):.12g}')),)).to_record()
+            'twoc', zeros=(('tth', float(f'{-np.rad2deg(.05):.12g}')),)).to_record()
         assert is_single_arm(record) and record['pos_names'] == ['del_angle']
         fitted = dict(zip(record['param_names'], record['param']))
         assert fitted['nu_offset'] == pytest.approx(.02, abs=2e-3)  # the arm's yaw
@@ -231,7 +231,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         _wait(dialog)
         assert Path(page._value("geometry_path")) == target
         assert page._value("mask_path") == str(mask)
-        assert page._instrument() == InstrumentGeometry('twoc', zeros=(('tth', float(f'{np.rad2deg(.05):.12g}')),))
+        assert page._instrument() == InstrumentGeometry('twoc', zeros=(('tth', float(f'{-np.rad2deg(.05):.12g}')),))
         assert page._value("source_motors") == "del_angle=tth"
         assert page._arm_problem() is None
         partner = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())
@@ -363,7 +363,7 @@ def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_p
         assert dialog.fit is None and not dialog.save_button.isEnabled()
         dialog.fit_button.click()
         assert dialog.fit is None and not dialog.active()
-        assert ('staged with the camera rows x-, columns z+; the Detector panel now says rows x-, columns z-'
+        assert ('staged with the camera rows x+, columns z-; the Detector panel now says rows x-, columns z-'
                 in dialog.status.text())
         dialog.camera.set_value(STITCH_CAMERA)
         dialog.fit_button.click()
@@ -640,7 +640,7 @@ def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_
     try:
         ring_fit = _five_parameter_seed(_ROW_ANGLES)
         # the beam pixel at normal incidence: both circles at their motor zeros (typed below)
-        zeros = {'del': -np.rad2deg(TRUTH['del_offset']), 'nu': -np.rad2deg(TRUTH['nu_offset'])}
+        zeros = {'del': np.rad2deg(TRUTH['del_offset']), 'nu': np.rad2deg(TRUTH['nu_offset'])}
         beam = predict_frame_seed(ring_fit, _frame(zeros)).integrator.getFit2D()
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         # a rough geometry: 2 % off in distance, a few pixels off in the beam spot
@@ -812,13 +812,13 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
     direct-beam geometry), the first free name, since a saved calibration is never overwritten."""
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
-        for key, value in (('source', tmp_path / 'LaB6_17keV'), ('scan', '14'),
+        folder = tmp_path / 'scans'
+        folder.mkdir()
+        for key, value in (('source', folder / 'LaB6_17keV'), ('scan', '14'),
                            ('beam_source', tmp_path / 'direct_beam'), ('beam_scan', '3.1')):
             dialog._set_field_text(key, str(value))
-        folder = tmp_path / 'calibration'
         assert dialog._default_name(False) == folder / 'LaB6_17keV_scan14.json'
-        assert dialog._default_name(True) == folder / 'direct_beam_scan3.json'
-        folder.mkdir()
+        assert dialog._default_name(True) == tmp_path / 'direct_beam_scan3.json'
         (folder / 'LaB6_17keV_scan14.json').write_text('{}')
         (folder / 'LaB6_17keV_scan14_2.xu.json').write_text('{}')  # its partner taken: that name too
         assert dialog._default_name(False) == folder / 'LaB6_17keV_scan14_3.json'
@@ -826,6 +826,17 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
         monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
                             staticmethod(lambda _parent, _title, start, _filter: proposed.append(start) or ('', '')))
         assert dialog._save_path() is None and proposed == [str(folder / 'LaB6_17keV_scan14_3.json')]
+        target = folder / 'LaB6_17keV_scan14.json'
+        # Qt's Save dialog has already confirmed this existing primary file.
+        _save_to(monkeypatch, target)
+        assert dialog._save_path() == target
+        dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('nexus_stack'))
+        dialog._set_field_text('source', str(folder / 'master.h5'))
+        assert dialog._default_name(False).parent == folder
+        dialog._set_field_text('source', 'relative/scan.spec')
+        assert dialog._default_name(False).parent == tmp_path / 'relative'
+        dialog._set_field_text('source', '')
+        assert dialog._default_name(False).parent == tmp_path
     finally:
         dialog.close()
 

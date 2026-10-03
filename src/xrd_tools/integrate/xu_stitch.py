@@ -1000,6 +1000,9 @@ def _xu_frame_histograms(
                 inside = np.logical_and(valid, np.isfinite(cut))
                 if window is not None:
                     np.logical_and(inside, (other >= window[0]) & (other <= window[1]), out=inside)
+                # Exclude unbinned weights before NumPy's cumulative weighted histogram:
+                # an Auto and a covering window must sum the same pixels identically.
+                np.logical_and(inside, (cut >= gi_edges[0]) & (cut <= gi_edges[-1]), out=inside)
                 histograms.append((np.histogram(cut[inside], gi_edges, weights=image[inside])[0],
                                    np.histogram(cut[inside], gi_edges, weights=weights[inside])[0],
                                    np.histogram(cut[inside], gi_edges)[0].astype(np.float64, copy=False)))

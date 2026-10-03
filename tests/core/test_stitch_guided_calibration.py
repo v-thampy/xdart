@@ -22,6 +22,21 @@ def _digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _turn_controls(controls, poni, shape=(195, 1475)):
+    """The archived Pilatus frame's 180° turn: retain its rays, rings and motor readings."""
+    rows, cols = shape
+    return [replace(c, rows=rows - 1 - c.rows, cols=cols - 1 - c.cols) for c in controls], replace(
+        poni, poni1=rows * 172e-6 - poni.poni1, poni2=cols * 172e-6 - poni.poni2,
+        rot1=-poni.rot1, rot2=-poni.rot2)
+
+
+def _native_stacked_controls():
+    from tests.core.test_stacked_arm import _independent_stacked_controls
+    controls, calibration = _independent_stacked_controls()
+    controls, poni = _turn_controls(controls, calibration.poni)
+    return controls, replace(calibration, poni=poni)
+
+
 def _frames(tmp_path, controls, poni, shape=(195, 1475), orientation=3):
     from pyFAI.control_points import ControlPoints
     from pyFAI.calibrant import get_calibrant
@@ -100,11 +115,10 @@ def test_resumed_control_points_require_retained_image_binding(tmp_path):
 
 
 def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_path):
-    from tests.core.test_stacked_arm import _independent_stacked_controls
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
     from pyFAI.goniometer import Goniometer
-    controls, calibration = _independent_stacked_controls()
+    controls, calibration = _native_stacked_controls()
     frames = _frames(tmp_path, controls, calibration.poni)
     geometry = {'geometry': 'psic', 'motors': {'mu': 'mu', 'eta': 'halpha', 'chi': 'chi', 'phi': 'phi',
                                                'nu': 'nu', 'del': 'del'}}
@@ -150,8 +164,7 @@ def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_pat
 def test_a_fit_pins_the_beam_rotation_at_zero_whatever_the_first_poni_holds(tmp_path, arm_model):
     """pyFAI-calib2 leaves each frame's rot3 wherever its seed put it, and |q| cannot measure it:
     the guided fit takes the design value 0, not the first frame's rot3."""
-    from tests.core.test_stacked_arm import _independent_stacked_controls
-    controls, calibration = _independent_stacked_controls()
+    controls, calibration = _native_stacked_controls()
     frames = _frames(tmp_path, controls, replace(calibration.poni, rot3=np.radians(-.87)))
     record = fit_calibration(frames, distance_bounds_m=(.37, .41), arm_model=arm_model).asset['calibration']
     assert dict(zip(record['param_names'], record['param']))['beam_rotation'] == 0.
@@ -284,12 +297,11 @@ def test_calibration_refuses_same_count_missing_interior_raw_frame(tmp_path):
 def test_a_saved_fit_writes_its_xrayutilities_partner_bound_by_hash(tmp_path):
     """Always both (maintainer, 2026-09-29): the pyFAI file, then its xrayutilities partner beside it,
     checked on the calibrant frames, the scan's frames and the typed range, and bound to the pyFAI bytes."""
-    from tests.core.test_stacked_arm import _independent_stacked_controls
     from xrd_tools.analysis.xu_stitch_calibration import XuStitchCalibrationInput, capture_xu_stitch_calibration
     from xrd_tools.integrate.stitch_calibration import (
         pair_validation_angles, paired_xu_calibration, save_calibration_pair,
     )
-    controls, calibration = _independent_stacked_controls()
+    controls, calibration = _native_stacked_controls()
     frames = _frames(tmp_path, controls, calibration.poni)
     fit = fit_calibration(frames, distance_bounds_m=(.37, .41))
     domain = {'del': [5., 42.], 'nu': [-11., 17.]}
@@ -327,10 +339,51 @@ def test_a_saved_fit_writes_its_xrayutilities_partner_bound_by_hash(tmp_path):
     assert not (tmp_path / 'calibration' / 'taken.json').exists()
 
 
-def test_a_fit_xrayutilities_cannot_express_saves_the_pyfai_file_alone(tmp_path):
-    from tests.core.test_stacked_arm import _independent_stacked_controls
+def test_confirmed_replacement_updates_the_pair_and_preserves_it_on_invalid_or_cancelled_save(tmp_path):
+    import copy
+    from threading import Event
+    from tests.core.test_stitch_autocalibration import ROW_ANGLES, five_parameter_seed, ring_scan
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
     from xrd_tools.integrate.stitch_calibration import paired_xu_calibration, save_calibration_pair
-    controls, calibration = _independent_stacked_controls()
+    source = ring_scan(tmp_path / 'scan', [(d, 0.) for d in (6., 20., 34.)])
+    fit = refine_arm_from_scan(source, five_parameter_seed(ROW_ANGLES), max_frames=3)
+    target = tmp_path / 'saved.json'
+    angles = [(6., -10.), (15., 3.), (25., 6.)]
+    save_calibration_pair(fit, target, validation_angles=angles)
+    files = (target, target.with_suffix('.json.provenance.json'),
+             tmp_path / 'saved.xu.json', tmp_path / 'saved.xu.json.provenance.json')
+    original = {path: path.read_bytes() for path in files}
+    changed = copy.deepcopy(fit.asset)
+    changed['calibration']['param'][changed['calibration']['param_names'].index('dist')] += .001
+    newer = replace(fit, asset=changed)
+    saved = save_calibration_pair(newer, target, validation_angles=angles, overwrite=True)
+    assert saved.pyfai_path == str(target) and paired_xu_calibration(target) == files[2]
+    assert target.read_bytes() != original[target] and files[2].read_bytes() != original[files[2]]
+    assert json.loads(files[1].read_text()) == newer.asset['provenance']
+    current = {path: path.read_bytes() for path in files}
+    invalid = copy.deepcopy(changed)
+    invalid['calibration']['wavelength'] = float('nan')
+    with pytest.raises(ValueError):
+        save_calibration_pair(replace(newer, asset=invalid), target, validation_angles=angles, overwrite=True)
+    assert {path: path.read_bytes() for path in files} == current
+    cancel = Event()
+    cancel.set()
+    with pytest.raises(InterruptedError):
+        save_calibration_pair(fit, target, validation_angles=angles, cancelled=cancel, overwrite=True)
+    assert {path: path.read_bytes() for path in files} == current
+    scaled = copy.deepcopy(changed)
+    names = scaled['calibration']['param_names']
+    scaled['calibration']['param'][names.index('del_scale')] *= 1.01
+    refused = save_calibration_pair(replace(newer, asset=scaled), target, validation_angles=angles, overwrite=True)
+    assert refused.xu_path is None and 'motor scales' in refused.xu_refusal
+    assert not files[2].exists() and not files[3].exists()
+    with pytest.raises(ValueError, match='has no xrayutilities partner'):
+        paired_xu_calibration(target)
+
+
+def test_a_fit_xrayutilities_cannot_express_saves_the_pyfai_file_alone(tmp_path):
+    from xrd_tools.integrate.stitch_calibration import paired_xu_calibration, save_calibration_pair
+    controls, calibration = _native_stacked_controls()
     fit = fit_calibration(_frames(tmp_path, controls, calibration.poni), fit_scales=True)
     saved = save_calibration_pair(fit, tmp_path / 'calibration' / 'scaled.json',
                                   validation_angles=[(6., -10.), (15., 3.), (25., 6.)])
@@ -380,9 +433,8 @@ def test_the_automatic_arm_model_takes_the_extension_when_it_applies_and_says_wh
 
 
 def test_stitch_with_xrayutilities_reads_an_xu_file_itself_and_a_pyfai_files_partner(tmp_path):
-    from tests.core.test_stacked_arm import _independent_stacked_controls
     from xrd_tools.integrate.stitch_calibration import save_calibration_pair, xu_calibration_path
-    controls, calibration = _independent_stacked_controls()
+    controls, calibration = _native_stacked_controls()
     fit = fit_calibration(_frames(tmp_path, controls, calibration.poni), distance_bounds_m=(.37, .41))
     saved = save_calibration_pair(fit, tmp_path / 'calibration' / 'arm.json',
                                   validation_angles=[(6., -10.), (15., 3.), (25., 6.)])

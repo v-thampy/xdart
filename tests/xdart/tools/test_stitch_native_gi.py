@@ -29,7 +29,7 @@ def test_a_manual_tilt_is_ints_tilt_angle_in_every_orientation():
     "Tilt angle", pyFAI's tilt with 0 level, whatever the frame's incidence and the sample orientation."""
     import numpy as np
     from xrd_tools.integrate.stitch_gi import tilt_angle_from_chi
-    for orientation in (1, 2, 3, 4):  # a Manual χ of 90 was refused in 1 and 2 (their level χ is -90)
+    for orientation in (1, 2, 3, 4):  # a Manual χ of 90 was refused in 3 and 4 (their level χ is -90)
         for angle in (0., 1.8, -2.5):
             gi = StitchGI(("q_ip",), incident_angle_deg=.37, tilt_angle_deg=angle, sample_orientation=orientation)
             incidence, tilt = gi.pyfai_angles(gi.normal({}))
@@ -37,7 +37,7 @@ def test_a_manual_tilt_is_ints_tilt_angle_in_every_orientation():
     mu = StitchGI(("q_ip",), incident_angle_deg=.37, tilt_angle_deg=1.8, sample_motors=(("mu", "mu"), ("phi", None)))
     assert mu.pyfai_angles(mu.normal({"mu": .5}))[1] == pytest.approx(1.8, abs=1e-9)  # mu off zero: still the angle
     # an older Manual χ is the same surface as its tilt angle, at any incidence (mu zero)
-    for orientation, chi, angle in ((4, 88.2, -1.8), (3, 88.2, 1.8), (4, 90., 0.)):
+    for orientation, chi, angle in ((2, 88.2, -1.8), (1, 88.2, 1.8), (2, 90., 0.)):
         assert tilt_angle_from_chi(chi, orientation) == pytest.approx(angle, abs=1e-12)
         read = StitchGI(("q_ip",), incident_angle_deg=.37, tilt_motor="chi", sample_orientation=orientation)
         manual = StitchGI(("q_ip",), incident_angle_deg=.37, tilt_angle_deg=angle, sample_orientation=orientation)

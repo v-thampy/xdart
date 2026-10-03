@@ -65,6 +65,28 @@ def test_default_click_restores_unturned_unflipped_stitch_camera(qapp):
         editor.deleteLater()
 
 
+def test_fresh_stitch_page_window_and_camera_editor_share_native_default(qapp, tmp_path):
+    from xdart.gui.pages.services import empty_host_services
+    from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
+    from xdart.gui.tabs.stitch.page import StitchPage, camera_orientation
+    from xdart.gui.pages.values import PageCleanup
+    from tests.xdart.pages.test_stitch_page import _Status
+
+    page = StitchPage(empty_host_services(_Status()))
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    editor = CameraEditor()
+    try:
+        for orientation in (camera_orientation(page._value('camera')),
+                stitch_orientation(dialog.camera.value()), stitch_orientation(editor.value())):
+            assert (orientation.rotation, orientation.flip_horizontal, orientation.flip_vertical) == (0, False, False)
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        dialog.close()
+        editor.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize('axes,description,turn,mirror', [
     (('x+', 'z-'), 'standard', 0, ''),
     (('x+', 'z+'), 'horizontal flip', 0, 'horizontal'),

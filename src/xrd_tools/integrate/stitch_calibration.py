@@ -171,7 +171,8 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
     spec = _exact_source(spec)
     source = open_source(spec)
     try:
-        if not source.capabilities.has_raw_references:
+        if not source.capabilities.has_raw_references and not (
+                spec.kind is SourceKind.SPEC and spec.options.get('image_file')):
             raise ValueError('No detector images found; check the images folder and stem for the selected scan')
         indices = source.frame_indices
         if len(indices) > 100000:
@@ -638,6 +639,67 @@ class CalibrationFit:
     #: the fit's control points, for display only (never saved): ``RefineResult.point_residuals``
     #: and "frames", each control frame's scan index and circle readings
     point_residuals: dict = field(default_factory=dict, compare=False, repr=False)
+
+
+def stitch_calibrant_preview(fit: CalibrationFit, spec: SourceSpec, *, mask=None, conditioning=None,
+                            saturation=None, npt_rad=500, npt_azim=180, npt_1d=1500,
+                            radial_range=None, cancelled=None, progress=None):
+    """Stitch the complete calibrant scan at its fitted geometry, without writing a result.
+
+    The existing streaming Stitch owner produces the map and profile in one pass. Images and
+    masks are in the fitted camera frame; ``mask`` is already oriented. The source's recorded
+    energy is checked against the calibration's recorded energy, while integration keeps the
+    fitted wavelength. No monitor normalization is inferred. Standard Stitch solid-angle
+    correction is applied; polarization is off.
+    """
+    from xrd_tools.analysis.plans import StitchCancelled, StitchPlan, run_stitch
+    from xrd_tools.analysis.stitch_operation import _OrientedSource, _detector_mask
+    from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.sources import open_source
+    if cancelled is not None and cancelled.is_set():
+        raise StitchCancelled('calibrant preview cancelled')
+    if fit.backend != 'multigeometry':
+        raise ValueError('calibrant preview requires a fitted pyFAI arm')
+    record, provenance = fit.asset['calibration'], fit.asset['provenance']
+    diff = Diffractometer.from_pyfai_goniometer(record, source_motors=provenance['source_motors'])
+    expected_energy = record.get('source_energy_eV') or float(wavelength_m_to_energy_eV(diff.calibration.poni.wavelength))
+    rows = source_frame_choices(spec, tuple(provenance['source_motors'].values()))
+    if not rows:
+        raise ValueError('calibrant source has no detector images')
+    for index, _motors, energy in rows:
+        if energy is not None and not math.isclose(energy, expected_energy, rel_tol=1e-3):
+            raise ValueError(f'frame {index}: source energy and recorded calibration energy differ')
+    geometric = _detector_mask(diff)
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        if geometric is not None and mask.shape != geometric.shape:
+            raise ValueError('calibrant mask shape differs from the fitted detector')
+        mask = mask if geometric is None else mask | geometric
+    else:
+        mask = geometric
+    indices = tuple(row[0] for row in rows)
+    plan = StitchPlan(diffractometer=diff, backend='multigeometry', streaming_multigeometry=True,
+        mode='2d', stitch_profile=True, unit='q_A^-1', npt_rad_2d=npt_rad,
+        npt_azim_2d=npt_azim, npt_1d=npt_1d, radial_range=radial_range,
+        azimuth_range=(-180., 180.), mask=mask, conditioning=conditioning,
+        saturation=None if saturation is None else {i: saturation for i in indices})
+    source = open_source(_exact_source(spec))
+    try:
+        oriented = _OrientedSource(source, ImageOrientation(rotation=provenance.get('image_rotation', 0),
+            flip_horizontal=provenance.get('image_flip', False)), 512 << 20)
+        result = run_stitch(plan, oriented, frame_indices=indices, workers=1,
+            collect_frame_records=False, cancel_token=cancelled, progress_callback=progress)
+        result.provenance['calibrant_preview'] = {'frame_count': len(indices),
+            'source': str(spec.uri), 'scan': spec.options.get('scan'),
+            'label': spec.uri.name + (f" · scan {spec.options['scan']}" if 'scan' in spec.options else ''),
+            'wavelength_m': diff.calibration.poni.wavelength, 'normalization': 'None',
+            'solid_angle': True, 'polarization': False}
+        return result
+    finally:
+        close = getattr(source, 'close', None)
+        if close is not None:
+            close()
 
 
 def fit_point_residuals(result, controls, indices) -> dict:
@@ -1110,17 +1172,63 @@ class SavedCalibration:
 
 
 def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cancelled=None,
-                          progress=None) -> SavedCalibration:
+                          progress=None, overwrite=False) -> SavedCalibration:
     """Save a pyFAI fit and its xrayutilities partner beside it (``xu_partner_path``).
 
     The pyFAI file is saved first and stays saved when the transfer is refused (fitted
     motor scales, another detector orientation, parallax or a sensor model), fails its
     gates or is cancelled: ``xu_refusal`` says why. The partner's provenance records the
     pyFAI file's SHA-256, which binds the pair (``paired_xu_calibration``).
+    Explicit replacement stages and validates the new files first. Cancellation or
+    invalid input leaves the previous files intact; a refused transfer removes its
+    old companion instead of leaving a stale pair.
     """
     from xrd_tools.integrate.xu_transfer import XuTransferRefused, transfer_arm_to_xu
     if fit.backend != 'multigeometry':
         raise ValueError('a calibration pair starts from a pyFAI fit')
+    if overwrite:
+        from tempfile import TemporaryDirectory
+        from xrd_tools.io.output_transaction import replace_into_place
+        target = Path(path).resolve()
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError('calibration save cancelled')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix='.xdart-calibration-', dir=target.parent) as scratch:
+            staged = Path(scratch) / target.name
+            saved = save_calibration_pair(fit, staged, validation_angles=validation_angles,
+                                         cancelled=cancelled, progress=progress)
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('calibration save cancelled')
+            partner = xu_partner_path(target)
+            # Publish the primary last; hash binding refuses any temporarily mixed pair.
+            destinations = (partner.with_suffix(partner.suffix + '.provenance.json'), partner,
+                            target.with_suffix(target.suffix + '.provenance.json'), target)
+            prior = {}
+            for destination in destinations:
+                if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+                    raise ValueError(f'{destination.name} is not a regular calibration file')
+                prior[destination] = destination.read_bytes() if destination.exists() else None
+            changed = []
+            try:
+                for destination in destinations:
+                    prepared = Path(scratch) / destination.name
+                    if prepared.exists():
+                        replace_into_place(prepared, destination)
+                        changed.append(destination)
+                    elif destination.exists():
+                        destination.unlink()
+                        changed.append(destination)
+            except OSError:
+                for destination in reversed(changed):
+                    if prior[destination] is None:
+                        destination.unlink(missing_ok=True)
+                    else:
+                        backup = Path(scratch) / destination.name
+                        backup.write_bytes(prior[destination])
+                        replace_into_place(backup, destination, verb='restore calibration')
+                raise
+            return replace(saved, pyfai_path=str(target),
+                           xu_path=str(partner) if saved.xu_path is not None else None)
     partner = xu_partner_path(Path(path).resolve())
     if partner.exists() or partner.with_suffix(partner.suffix + '.provenance.json').exists():
         raise FileExistsError('choose a new calibration filename; existing files are preserved')

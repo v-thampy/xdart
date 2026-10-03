@@ -39,7 +39,7 @@ def _wait(page, qapp, timeout=30):
     until = time.monotonic() + timeout
     qapp.processEvents()
     # a shown result the page dropped from memory is reloaded between its other work (C12)
-    while (page._owner.busy or page._raw_pending or page._queued_jobs
+    while (page._owner.busy or page._source_observer.computing or page._raw_pending or page._queued_jobs
            or getattr(page, "_reload_pending", None)) and time.monotonic() < until:
         qapp.processEvents()
         time.sleep(.005)
@@ -262,9 +262,10 @@ def test_clearing_the_source_box_clears_the_selection_and_refuses_run(qapp, tmp_
         assert "source path" in page.run_bar.readinessLabel.full_text() and not page._owner.busy
         # a typed path is the selection, and the readiness line follows it at once
         _commit_source_box(page, qapp, spec[0], key="Return")
+        _wait(page, qapp)
         assert page._source_paths == spec and page.settings()["sources"]["Spec"] == list(spec)
         assert (page.run_bar.readinessLabel.full_text()  # with its frames, as Int's (maintainer, 2026-09-30)
-                == "Ready · Stitch 1D · sample, scan 1 · 2 frames · pyFAI MultiGeometry")
+                == "sample, scan 1 · 2 frames · pyFAI MultiGeometry")
         assert page.run_bar.startButton.isEnabled() and row.toolTip() == spec[0]
         for kind, paths in (("NeXus", (str(tmp_path / "one.nxs"), str(tmp_path / "two.nxs"))),
                             ("Directory", (str(tmp_path),))):
@@ -346,7 +347,7 @@ def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp,
     try:
         page.open_result(path)
         _wait(page, qapp)
-        assert [page.frames.item(i).text() for i in range(page.frames.count())] == ["2-0", "2-1", "3-0"]
+        assert [page.frames.item(i).text() for i in range(page.frames.count())] == ["Full", "2-0", "2-1", "3-0"]
         original_y = page.curve.listDataItems()[0].yData.copy()
         page.scientific.plot_axis.setCurrentIndex(page.scientific.plot_axis.findData("2theta"))
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
@@ -357,14 +358,14 @@ def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp,
         page.scientific.raw_popup_full.click()
         _wait(page, qapp)
         np.testing.assert_array_equal(page._raw_frame_view.raw, raw)
-        page.frames.setCurrentRow(2)
+        page.frames.setCurrentRow(3)
         assert page.scientific.raw_popup_image.canvas.raw_image.size == 0
         assert page.scientific.raw_popup_status.text() == "Loading selected frame…"
         _wait(page, qapp)
         assert "3-0" in page.scientific.raw_popup_status.text()
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
         project.rename(tmp_path / "unavailable")
-        page.frames.setCurrentRow(1)
+        page.frames.setCurrentRow(2)
         _wait(page, qapp)
         assert page._raw_frame_view.raw is None
         assert "Thumbnail · raw source unavailable" in page.scientific.raw_popup_status.text()
@@ -726,8 +727,10 @@ def test_run_checks_the_inputs_itself_and_stops_when_nothing_is_left_to_stitch(q
     try:
         _fill_native(page, form)
         page.set_field("image_stem", "missing_")  # scan 1 has no images under this stem
-        assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
-        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        assert not page.run_bar.startButton.isEnabled()
+        assert "No detector images named *missing_*" in page.run_bar.readinessLabel.full_text()
+        page.begin_run()  # direct API admission keeps the exact no-output diagnostic too
         _wait(page, qapp)
         assert page.run_bar.readinessLabel.full_text() == "Nothing to stitch · 1 scan skipped (Preview lists them)"
         assert page._owner.prepared is not None and not page._owner.prepared.requests
@@ -781,7 +784,7 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         grouped = read_analysis_artifact(requests[1].module.output.target)
         assert grouped.native_unit == "2th_deg"
         assert len(grouped.contributing_frames) == 4
-        assert [page.frames.item(i).text() for i in range(page.frames.count())] == ["1-0", "1-1", "2-0", "2-1"]
+        assert [page.frames.item(i).text() for i in range(page.frames.count())] == ["Full", "1-0", "1-1", "2-0", "2-1"]
         assert page.build_form().unit == "2th_deg"
         assert page.scientific.plot_axis.currentData() == "Q"
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, grouped.intensity)
@@ -883,6 +886,7 @@ def test_a_result_is_shown_once_when_it_is_mounted(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
         target = page._owner.prepared.request.module.output.target
@@ -893,7 +897,7 @@ def test_a_result_is_shown_once_when_it_is_mounted(qapp, tmp_path):
         page._draw = lambda *args: (draws.append(1), draw(*args))[1]
         page.open_result(target)
         _wait(page, qapp)
-        assert page.results.count() == 1 and page.frames.count() == 2
+        assert page.results.count() == 1 and page.frames.count() == 3
         assert (len(rebuilds), len(draws)) == (1, 1)
         page.open_result(target)  # already the current result: shown again, once
         _wait(page, qapp)
@@ -1004,7 +1008,7 @@ def test_reopened_result_marks_the_frames_the_check_excluded(qapp, tmp_path, mon
     try:
         page.open_result(target)
         _wait(page, qapp)
-        items = [page.frames.item(i) for i in range(page.frames.count())]
+        items = [page.frames.item(i) for i in range(1, page.frames.count())]
         status = page.run_bar.readinessLabel.full_text()
         if recorded:
             assert [item.text() for item in items][-2:] == ["dim-3", "dim-4 · excluded"]

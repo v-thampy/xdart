@@ -125,8 +125,8 @@ def test_getters(qapp):
 
 def test_readiness_summary_toggles_compact_status_row(qapp):
     c = RunControlsBar()
+    c.apply_profile(modes=['Int 2D'])
     assert c.readinessRow.isHidden()
-
     changed = c.set_readiness_summary(
         "Ready · Int 2D · 50 frames",
         ready=True,
@@ -135,9 +135,29 @@ def test_readiness_summary_toggles_compact_status_row(qapp):
 
     assert changed is True
     assert not c.readinessRow.isHidden()
-    assert c.readinessLabel.text() == "Ready · Int 2D · 50 frames"
+    assert c.readinessLabel.text() == "50 frames"
     assert c.readinessLabel.toolTip() == "Everything is ready."
     assert c.readinessDot.property("ready") is True
 
     assert c.set_readiness_summary("", ready=False) is True
     assert c.readinessRow.isHidden()
+
+
+@pytest.mark.parametrize("mode", ["Int 1D", "Int 2D", "Int 1D (XYE)", "Stitch 1D", "Stitch 2D", "RSM", "1D Viewer", "2D Viewer"])
+def test_ready_summary_keeps_scan_context_warnings_and_failure_reasons(qapp, mode):
+    bar = RunControlsBar()
+    bar.apply_profile(modes=[mode])
+    context = "sample, scan 1 · 201 frames · 1 scan skipped (Preview lists them)"
+    original = f"Ready · {mode} · {context}"
+    bar.set_readiness_summary(original, live=True)
+    assert bar.readinessLabel.full_text() == context
+    assert bar.readinessDot.property("ready") is True
+    assert not bar.readinessLive.isHidden()
+    assert bar.readinessLabel.toolTip() == original
+    bar.set_readiness_summary(f"Ready · {mode}")
+    assert bar.readinessLabel.full_text() == ""
+    assert not bar.readinessRow.isHidden() and bar.readinessDot.property("ready") is True
+    refusal = "No detector images named *sample_scan1_* in /selected/folder"
+    bar.set_readiness_summary(refusal, ready=False)
+    assert bar.readinessLabel.full_text() == refusal
+    assert bar.readinessDot.property("ready") is False
