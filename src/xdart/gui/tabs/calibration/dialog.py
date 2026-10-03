@@ -1485,11 +1485,14 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _saturation_value(self):
         """An explicit cutoff, else the existing detector limit; unknown models keep dtype fallback."""
-        from xrd_tools.core.invalid import resolve_detector_saturation
+        from xrd_tools.core.invalid import resolve_detector_saturation, saturation_count
         if self._text('saturation'):
-            return float(self._text('saturation'))
+            value = saturation_count(float(self._text('saturation')))
+            if value is None:
+                raise ValueError('saturation must be a positive whole count')
+            return value
         ceiling = resolve_detector_saturation(detector=self._text('beam_detector'))
-        return None if ceiling is None else float(ceiling.value)
+        return None if ceiling is None else ceiling.value
 
     def _beam_camera_changed(self):
         orientation, old = self._orientation(), getattr(self, '_pixel_orientation', self._orientation())

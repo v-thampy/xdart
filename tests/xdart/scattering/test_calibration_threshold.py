@@ -76,6 +76,40 @@ def test_calibration_threshold_uses_shared_transitions_and_restores_its_session(
         again.close()
 
 
+def test_detector_selection_supplies_whole_auto_counts_to_frame_prediction(qapp, tmp_path):
+    from xrd_tools.integrate.calibration_seed import rough_arm_record
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Eiger2_500k'))
+    staged, image = frame(tmp_path / 'source')
+    try:
+        picker = dialog._fields['beam_detector']
+        picker.setCurrentIndex(picker.findData('Pilatus100k'))
+        assert dialog._text('beam_detector') == 'Pilatus100k'
+        assert 'Auto' in dialog._fields['saturation'].placeholderText()
+        assert '1048575' in dialog._fields['saturation'].placeholderText()
+        dialog.frames = (staged,)
+        dialog.session_dir = tmp_path / 'source' / 'staged'
+        edit(dialog.threshold_range, 'enabled', True)
+        record = rough_arm_record(distance_m=.05, detector='Pilatus100k', beam_px=(243, 97),
+                                  wavelength_m=.7293e-10)
+        dialog._prediction = (dialog._calibrated_key(), record)
+        dialog._render_frames()  # the actual ring prediction path from the live traceback
+        assert dialog.frame_table.item(0, 5).text() not in ('—', 'none')
+        assert type(dialog._saturation_value()) is int
+        assert dialog._saturation_value() == 1048575
+        assert type(dialog._beam_fit_options()['saturation']) is int
+        assert dialog._beam_fit_options()['saturation'] == 1048575
+        dialog._set_field_text('saturation', '12345.0')
+        assert dialog._saturation_value() == 12345
+        assert type(dialog._saturation_value()) is int
+        for malformed in ('1.5', '0', '-1', 'nan', 'inf'):
+            dialog._set_field_text('saturation', malformed)
+            with pytest.raises(ValueError, match='positive whole count'):
+                dialog._saturation_value()
+        np.testing.assert_array_equal(fabio.open(staged.image_path).data, image)
+    finally:
+        dialog.close()
+
+
 def test_the_calibration_band_masks_pyfai_and_prediction_without_rewriting_pixels(qapp, tmp_path):
     from xrd_tools.integrate.calibration_seed import rough_arm_record
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Pilatus100k'))
