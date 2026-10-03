@@ -679,10 +679,7 @@ class StitchPage(QtWidgets.QWidget):
         return row
 
     def _tip(self, key, text):
-        """A tooltip on the row and its editor and label (Int's composer sets its own on all three)."""
-        row = self._rows[key]
-        for widget in (row, row.editor, row.label):
-            widget.setToolTip(text)
+        self._rows[key].set_purpose_tooltip(text)
 
     @staticmethod
     def _align_to_ranges(row):

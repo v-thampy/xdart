@@ -667,6 +667,8 @@ class FormRow(QtWidgets.QWidget):
         #: "int" rows: the bounds their text is checked against (``integer_field_refusal``)
         self._bounds = (minimum, maximum, bool(allow_blank))
         self._reason = reason
+        self._purpose_tooltip = ""
+        self._browse = bool(browse)
         self._file_name_only = (
             kind == "line"
             and browse
@@ -763,19 +765,29 @@ class FormRow(QtWidgets.QWidget):
             btn.setEnabled(self._enabled)
             lay.addWidget(btn)
             self.browse_button = btn
-        tip = (
-            self._model_value
-            if browse and self._model_value and not reason
-            else _field_tooltip(self._path, reason)
-        )
-        for widget in (self, self.editor, self.label):
-            widget.setToolTip(tip)
+        self._refresh_tooltip()
         if kind == "int":
             self._show_validity()
 
     @property
     def path(self) -> tuple[str, ...]:
         return self._path
+
+    def set_purpose_tooltip(self, text: str) -> None:
+        """Keep descriptive help separate from temporary refusal/disabled reasons."""
+        self._purpose_tooltip = str(text)
+        if self._kind == "int":
+            self._show_validity()
+        else:
+            self._refresh_tooltip()
+
+    def _refresh_tooltip(self, refusal: str = "") -> None:
+        tip = (f"{self.label.text()}: {refusal}" if refusal else
+               self._reason or (self._model_value if self._browse and self._model_value else
+                                self._purpose_tooltip or _field_tooltip(self._path)))
+        for widget in (self, self.editor, self.label):
+            if widget.toolTip() != tip:
+                widget.setToolTip(tip)
 
     def refusal(self) -> str:
         """Why an ``int`` row's text is no whole number within its bounds ("" when it is, and for
@@ -795,11 +807,7 @@ class FormRow(QtWidgets.QWidget):
             style = self.editor.style()
             style.unpolish(self.editor)
             style.polish(self.editor)
-        tip = (f"{self.label.text()}: {refusal}" if refusal
-               else _field_tooltip(self._path, self._reason))
-        for widget in (self, self.editor, self.label):
-            if widget.toolTip() != tip:
-                widget.setToolTip(tip)
+        self._refresh_tooltip(refusal)
 
     def add_trailing_widget(self, widget: QtWidgets.QWidget, stretch: int = 0) -> None:
         """Append a widget to the right of the row (after the editor).  Used to
@@ -879,17 +887,13 @@ class FormRow(QtWidgets.QWidget):
         finally:
             self.editor.blockSignals(was_blocked)
 
-        if field.browse and field.value and not field.reason:
-            tip = str(field.value)
-        else:
-            tip = _field_tooltip(field.path, field.reason)
-        for widget in (self, self.editor, self.label):
-            if widget is not None and widget.toolTip() != tip:
-                widget.setToolTip(tip)
         self._reason = field.reason
+        self._browse = bool(field.browse)
         if self._kind == "int":
             self._bounds = (field.minimum, field.maximum, bool(field.allow_blank))
             self._show_validity()
+        else:
+            self._refresh_tooltip()
         return True
 
     def _line_display_value(self, value) -> str:

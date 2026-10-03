@@ -325,6 +325,11 @@ def test_rsm_notebook_conditioning_is_advanced_and_explained(qapp):
             assert page._rows[key].editor.toolTip()
         assert "unchanged" in page._rows["static_hot"].toolTip()
         assert "0 disables" in page._rows["offset"].toolTip()
+        offset_tip = page._rows["offset"].toolTip()
+        page.set_field("offset", "0")
+        assert all(widget.toolTip() == offset_tip for widget in
+                   (page._rows["offset"], page._rows["offset"].editor, page._rows["offset"].label))
+        assert "The UB an HKL map uses" in page._rows["ub_from"].toolTip()
         assert "without gridding again" in page.retry_button.toolTip()
     finally:
         _close(page, qapp)

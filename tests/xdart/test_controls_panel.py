@@ -1340,6 +1340,25 @@ def test_an_integer_row_keeps_refused_text_marks_it_and_names_why(qapp):
         row.deleteLater()
 
 
+def test_form_purpose_tip_survives_reconcile_and_recovers_after_a_refusal(qapp):
+    row = FormRow(label="Bins", path=("RSM", "grid_h"), value="12", kind="int", minimum=2)
+    field = ControlFormField(SectionId.PROCESSING, "Bins", row.path, "12", ControlFieldKind.INT, minimum=2)
+    try:
+        row.set_purpose_tooltip("Number of H grid points.")
+        row.apply_field(field)
+        assert all(widget.toolTip() == "Number of H grid points." for widget in (row, row.editor, row.label))
+        row.apply_field(replace(field, enabled=False, reason="Unavailable while running"))
+        assert row.toolTip() == "Unavailable while running"
+        row.apply_field(field)
+        assert row.editor.toolTip() == "Number of H grid points."
+        row.editor.setText("0")
+        assert row.editor.toolTip() == "Bins: must be at least 2"
+        row.editor.setText("12")
+        assert row.editor.toolTip() == "Number of H grid points."
+    finally:
+        row.deleteLater()
+
+
 def test_a_file_row_set_by_code_while_unfocused_takes_the_value_without_a_draft_or_commit(qapp):
     """A window that drives its rows directly rather than through a projection (the shared calibration window,
     AUD-9 stage 2b G6) sets a file row's text in code and reads the value back: the row adopts it, shows it

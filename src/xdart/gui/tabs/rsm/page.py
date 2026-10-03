@@ -894,7 +894,8 @@ class RSMPage(QtWidgets.QWidget):
 
     def _tip(self, key, text):
         row = self._rows[key]
-        self._fields[key] = replace(self._fields[key], reason=text, value=row.current_value())
+        row.set_purpose_tooltip(text)
+        self._fields[key] = replace(self._fields[key], value=row.current_value())
         row.apply_field(self._fields[key])
 
     def _render_grid_labels(self):
