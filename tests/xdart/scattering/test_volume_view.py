@@ -45,6 +45,87 @@ def _projection(shape=(4, 5, 6)):
     return VolumeProjection(values, axes, ("H", "K", "L"), "a_rsm.nexus")
 
 
+@pytest.mark.parametrize("descending", (False, True))
+def test_display_ranges_crop_three_axes_without_changing_the_result(qapp, descending):
+    from xdart.gui.widgets.controls_panel import RangeRow
+
+    view = VolumeView()
+    projection = _projection()
+    if descending:
+        projection = VolumeProjection(projection.values, tuple(axis[::-1] for axis in projection.axes),
+                                      ("Qx", "Qy", "Qz"), projection.title)
+    before = projection.values.copy()
+    try:
+        view.show()
+        view.reconcile(projection)
+        _settled(view)
+        assert len(view.axis_ranges) == 3
+        for index, row in enumerate(view.axis_ranges):
+            assert isinstance(row, RangeRow) and row.label.text() == projection.labels[index]
+            assert row._low.toolTip() and row._high.toolTip()
+            for editor, value in ((row._low, np.min(projection.axes[index][1:-1])),
+                                  (row._high, np.max(projection.axes[index][1:-1]))):
+                editor.setFocus()
+                editor.selectAll()
+                QtTest.QTest.keyClicks(editor, str(value))
+                editor.editingFinished.emit()
+        _settled(view)
+        selected = projection.values[1:-1, 1:-1, 1:-1]
+        assert view.drawn_shape == selected.shape
+        np.testing.assert_array_equal(view.rgba, volume_rgba(selected, "Default", False))
+        assert view.projection is projection
+        assert np.shares_memory(view._display[0], projection.values)
+        np.testing.assert_array_equal(projection.values, before)
+        editor = view.axis_ranges[0]._low
+        editor.setFocus()
+        editor.selectAll()
+        QtTest.QTest.keyClicks(editor, "not a number")
+        editor.editingFinished.emit()
+        _settled(view)
+        assert "finite number" in view.notice.text()
+        view.set_color_map("magma")
+        assert "finite number" in view.notice.text()
+        view.reconcile(_projection())
+        _settled(view)
+        assert view.drawn_shape == before.shape
+        assert all(not row._low.text() and not row._high.text() for row in view.axis_ranges)
+        assert [row.label.text() for row in view.axis_ranges] == ["H", "K", "L"]
+        view.release()
+        assert view.projection is None and view.rgba is None
+    finally:
+        view.shutdown()
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_rsm_volume_window_projects_coordinate_labels_and_releases_ranges(qapp):
+    from xdart.gui.tabs.rsm.tool_windows import RSMVolumeWindow
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, project_analysis_artifact_result
+    from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+    from xrd_tools.session.rsm_viewer_model import make_rsm_viewer_values
+
+    window = RSMVolumeWindow()
+    try:
+        window.show()
+        for frame in (RSMCoordinateFrame.HKL, RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU):
+            projection = _projection()
+            result = project_analysis_artifact_result(
+                kind=AnalysisArtifactKind.RSM, axes=tuple(zip(frame.axis_names, projection.axes, strict=True)),
+                axis_units=tuple(zip(frame.axis_names, frame.axis_units, strict=True)),
+                intensity=projection.values, sigma=None, coverage=None, normalization=None)
+            values = make_rsm_viewer_values(result)
+            window.show_result("shown.nexus", values)
+            _settled(window.view)
+            assert [row.label.text() for row in window.view.axis_ranges] == list(frame.axis_labels)
+            assert np.shares_memory(window.view.projection.values, values.intensity)
+        window.hide()
+        assert window.view.projection is None and not window.view.range_card.isEnabled()
+    finally:
+        window.shutdown()
+        window.deleteLater()
+        qapp.processEvents()
+
+
 def test_the_volume_is_drawn_through_volume_rgba_under_ints_colour_map_and_log(qapp):
     """The view's RGBA is ``volume_rgba`` at Int's auto levels; its colour-map list is Int's own (shared
     builder); the colour map and Log draw it again, Log resetting the levels to their automatic ones."""
