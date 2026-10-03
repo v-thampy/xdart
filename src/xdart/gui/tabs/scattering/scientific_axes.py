@@ -22,6 +22,7 @@ from xrd_tools.session.display_logic import (
     nanmean_slice,
 )
 from xrd_tools.session.gi_derived_view import derive_q_chi
+from xrd_tools.session.rsm_viewer_model import rsm_axis_bounds
 from xrd_tools.session.scan_norm import (
     ScanNormAggregate,
     channel_is_partial,
@@ -631,6 +632,7 @@ def heavy_projection(
                 requested_axis=requested_axis,
                 wavelength_m=payload.wavelength_m,
             )
+        x_axis, y_axis = (_cake_bin_axis(axis) for axis in (x_axis, y_axis))
         complete_cake = (
             cake is not None
             and x_axis is not None
@@ -651,6 +653,18 @@ def heavy_projection(
         )
     except Exception:
         return None
+
+
+def _cake_bin_axis(axis: AxisProjection | None) -> AxisProjection | None:
+    """Cake axes are bin centres; share RSM's outer-edge calculation."""
+    if axis is None or axis.values.size < 2:
+        return axis
+    values = axis.values
+    increasing = values[::-1] if values[0] > values[-1] else values
+    try:
+        return replace(axis, edges=rsm_axis_bounds(increasing))
+    except ValueError:
+        return axis  # Keep the existing presentation of non-monotonic axes.
 
 
 def _present_radial_axis(
