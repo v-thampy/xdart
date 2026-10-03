@@ -780,6 +780,19 @@ def _external_member(stops, ranges, ordinal):
     return position, start, stop, value
 
 
+def _point_native_facts(fact):
+    from xrd_tools.sources.point_images import PointImagePolicy
+    policy = PointImagePolicy.from_dict(fact["point_images"])
+    first = fact["source_execution"]["first_label"]
+    ordinal = (fact["label"] - first) * policy.images_per_point
+    offsets = (policy.image_index - 1,) if policy.operation == "select" else range(policy.images_per_point)
+    return tuple(MappingProxyType({**fact, "label": first + ordinal + offset,
+        "path": member["source_path"], "frame_index": member["source_frame_index"],
+        "snapshot": member["source_snapshot"], "point_images": None,
+        "source_constituents": ()})
+        for offset, member in zip(offsets, fact["source_constituents"]))
+
+
 def _admit_source_topology(fact, *, full_inventory, token=None,
                            selected_labels=None):
     from xrd_tools.io.append import _lineage_labels
@@ -788,6 +801,15 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
     )
 
     _event(token)
+    point_policy = None
+    if fact.get("point_images") is not None:
+        from xrd_tools.sources.point_images import PointImagePolicy
+        policy = PointImagePolicy.from_dict(fact["point_images"])
+        point_policy = policy
+        labels = (fact["label"],) if selected_labels is None else tuple(selected_labels)
+        first = fact["source_execution"]["first_label"]
+        selected_labels = tuple(first + raw for label in labels for raw in policy.raw_indices(label - first))
+        fact = _point_native_facts(fact)[0]
     execution = fact["source_execution"]
     try:
         execution = _validate_replacement_execution(execution)
@@ -817,9 +839,13 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
                 )
                 for label in labels:
-                    _reject(label in epoch_sources,
-                            "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
-                    epoch_sources[label] = epoch["source"]
+                    raw_labels = ((label,) if point_policy is None else
+                        tuple(execution["first_label"] + raw for raw in
+                              point_policy.raw_indices(label - execution["first_label"])))
+                    for raw_label in raw_labels:
+                        _reject(raw_label in epoch_sources,
+                                "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+                        epoch_sources[raw_label] = epoch["source"]
         except (TypeError, ValueError, KeyError) as error:
             if (type(error) is ValueError
                     and str(error).startswith("REPLACEMENT_")):
@@ -1929,6 +1955,12 @@ def _source_fact_inner(fact, *, raw_options=None, read=False, token=None,
 def _source_fact(fact, *, raw_options=None, read=False, token=None,
                  expected_shape=None, expected_dtype=None, topology=None,
                  qualification=None, direct_hdf=None):
+    if fact.get("point_images") is not None:
+        topology = topology or _admit_source_topology(fact, full_inventory=False, token=token)
+        results = [_source_fact(member, raw_options=raw_options, read=False, token=token, expected_shape=expected_shape, expected_dtype=expected_dtype, topology=topology) for member in _point_native_facts(fact)]
+        _reject(any(result[:2] != results[0][:2] for result in results), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+        _reject(read, "grouped source reads require the native point reduction owner")
+        return results[0]
     try: return _source_fact_inner(fact, raw_options=raw_options, read=read, token=token, expected_shape=expected_shape, expected_dtype=expected_dtype, topology=topology, qualification=qualification, direct_hdf=direct_hdf)
     except Exception as error: raise (error if isinstance(error, ReintegrateCancelled) or type(error) is ValueError and str(error).startswith("REPLACEMENT_") else ValueError("REPLACEMENT_HDF5_DEPENDENCY_TOPOLOGY_UNSUPPORTED" if Path(str(fact.get("path", ""))).suffix.lower() in {".h5", ".hdf5", ".nxs", ".cxi"} else "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"))
 def _background_fact(fact, shared, shape, path, token):
@@ -1961,6 +1993,20 @@ def _load_fact(fact, shape, dtype, shared, token, raw_options=None,
                topology=None, direct_hdf=None):
     topology = topology or _admit_source_topology(
         fact, full_inventory=False, token=token)
+    if fact.get("point_images") is not None:
+        from xrd_tools.sources.point_images import PointImagePolicy, combine_point_statistics
+        from xrd_tools.reduction.core import ReductionPlan, _condition_point_operand
+        members = _point_native_facts(fact)
+        threshold = shared["threshold"]
+        native_plan = ReductionPlan(threshold_min=threshold["threshold_min"] if threshold["apply_threshold"] else None,
+            threshold_max=threshold["threshold_max"] if threshold["apply_threshold"] else None,
+            mask_saturation=threshold["mask_saturation"], saturation=threshold.get("saturation"))
+        def native(ordinal):
+            return _source_fact(members[ordinal], raw_options=raw_options, read=True, token=token, expected_shape=shape, expected_dtype=dtype, topology=topology, direct_hdf=direct_hdf)[3]
+        statistics = combine_point_statistics(native, range(len(members)), PointImagePolicy.from_dict(fact["point_images"]), poisson=True, native_transform=lambda image: _condition_point_operand(image, native_plan))
+        path = _qualified_fact(members[0], topology)[0]
+        background, pair = _background_fact(fact, shared, shape, path, token)
+        return path, statistics, background, pair
     _event(token); qualification = _qualified_fact(fact, topology); path = qualification[0]; _event(token); background, pair = _background_fact(fact, shared, shape, path, token); _event(token); final_shape, final_dtype, _path, image = _source_fact(fact, raw_options=raw_options, read=True, token=token, expected_shape=shape, expected_dtype=dtype, topology=topology, qualification=qualification, direct_hdf=direct_hdf); _event(token); _reject(final_shape != tuple(shape) or final_dtype != dtype, "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED"); return path, image, background, pair
 def _geometry_fact(fact, shared):
     value = dict(fact["geometry"]); active = shared["geometry"] is not None; _reject(active != bool(value) or active and (set(value) != {"rot1", "rot2", "rot3", "incident_angle"} or any(type(v) is not float or not math.isfinite(v) for v in value.values())), "replacement geometry differs"); return None if not active else __import__("xrd_tools.core.scan", fromlist=["FrameGeometry"]).FrameGeometry(**value)
@@ -1993,7 +2039,7 @@ def _calibration(shared, incidence=None):
     )
     return calibration, ai, fi
 def _validated_shared_science(run: Mapping[str, Any], requested: Mapping[str, Any] | None = None, *, geometry=None, energy_selection=None):
-    outer = dict(run); signed = outer.pop("scientific_signature", None); _reject(type(signed) is not dict, "persisted scientific signature is missing"); signed = dict(signed); assets = signed.pop("accepted_scientific_assets", None); _reject(signed != outer, "persisted duplicated scientific signature differs"); expected = {"schema_version", "generation", "fingerprint", "source", "processing_mode", "output_mode", "live_mode", "batch_mode", "max_cores", "gi", "threshold", "poni_file", "poni_values", "mask_file", "project_root", "save_path", "bai_1d_args", "bai_2d_args", "run_options"}; optional = ({"background"} if "background" in outer else set()) | ({"poni_v3_override"} if "poni_v3_override" in outer else set()) | {key for key in ("flat_file", "flat_min_fraction", "dark_file", "background_dark") if key in outer}; _reject(set(outer) != expected | optional, "persisted run configuration has a noncanonical keyset")
+    outer = dict(run); signed = outer.pop("scientific_signature", None); _reject(type(signed) is not dict, "persisted scientific signature is missing"); signed = dict(signed); assets = signed.pop("accepted_scientific_assets", None); _reject(signed != outer, "persisted duplicated scientific signature differs"); expected = {"schema_version", "generation", "fingerprint", "source", "processing_mode", "output_mode", "live_mode", "batch_mode", "max_cores", "gi", "threshold", "poni_file", "poni_values", "mask_file", "project_root", "save_path", "bai_1d_args", "bai_2d_args", "run_options"}; optional = ({"background"} if "background" in outer else set()) | ({"poni_v3_override"} if "poni_v3_override" in outer else set()) | {key for key in ("flat_file", "flat_min_fraction", "dark_file", "background_dark", "point_images") if key in outer}; _reject(set(outer) != expected | optional, "persisted run configuration has a noncanonical keyset")
     background = outer.get("background", {"version": 1, "mode": "None"}); both = type(background) is dict and background.get("mode") != "None" and "dark_file" in outer
     _reject("background_dark" in outer and (not both or outer["background_dark"] not in ("subtracted", "as_is") or (outer["background_dark"] == "as_is") != (background.get("dark_corrected") is True)), "persisted Background dark rule is malformed")
     # Earlier test builds combined the two without recording how, and not all the same way.
@@ -2015,10 +2061,15 @@ def _validated_shared_science(run: Mapping[str, Any], requested: Mapping[str, An
     if decoded_gi.enabled: gi_projection["gi_exit_angle_convention"] = decoded_gi.gi_exit_angle_convention
     projection = {"version": 1, "gi": gi_projection, "threshold": outer.get("threshold"), "poni_values": accepted_poni if persisted_poni is None else persisted_poni, "accepted_scientific_assets": assets, "geometry": geometry, "background": background}
     if both: projection["background_dark"] = outer["background_dark"]
+    if "point_images" in outer:
+        from xrd_tools.sources.point_images import PointImagePolicy
+        point = PointImagePolicy.from_dict(outer["point_images"]).to_dict()
+        _reject(point != outer["source"]["options"].get("point_images"), "persisted point image policy differs from the source")
+        projection["point_images"] = point
     if energy_selection is not None: projection["energy_selection"] = energy_selection
     _reject(requested is not None and projection != _plain(requested), "requested shared science differs from acquisition"); return projection
 def _validate_science(selected, shared, dimension):
-    from xrd_tools.reduction.background import FrameBackgroundPlan; _keys(selected, {"version", "dimension", "bai_args", "gi_mode"}, "selected_plan"); _keys(shared, {"version", "gi", "threshold", "poni_values", "accepted_scientific_assets", "geometry", "background"} | ({"background_dark"} if "background_dark" in shared else set()) | ({"energy_selection"} if "energy_selection" in shared else set()), "requested_shared_science"); _reject("background_dark" in shared and shared["background_dark"] not in ("subtracted", "as_is"), "Background dark rule is malformed")
+    from xrd_tools.reduction.background import FrameBackgroundPlan; _keys(selected, {"version", "dimension", "bai_args", "gi_mode"}, "selected_plan"); _keys(shared, {"version", "gi", "threshold", "poni_values", "accepted_scientific_assets", "geometry", "background"} | ({"background_dark"} if "background_dark" in shared else set()) | ({"energy_selection"} if "energy_selection" in shared else set()) | ({"point_images"} if "point_images" in shared else set()), "requested_shared_science"); _reject("background_dark" in shared and shared["background_dark"] not in ("subtracted", "as_is"), "Background dark rule is malformed")
     _reject(type(dimension) is not str or dimension not in {"1d", "2d"} or type(selected["version"]) is not int or selected["version"] != 1 or type(selected["dimension"]) is not str or selected["dimension"] != dimension or type(selected["bai_args"]) is not dict or {"gi_mode_1d", "gi_mode_2d"} & set(selected["bai_args"]) or type(shared["version"]) is not int or shared["version"] != 1, "preparation version/dimension")
     gi, threshold, assets = shared["gi"], shared["threshold"], shared["accepted_scientific_assets"]; geometry = shared["geometry"]
     if geometry is not None:
@@ -2043,11 +2094,24 @@ def _validate_science(selected, shared, dimension):
         try: __import__("xrd_tools.integrate.calibration", fromlist=["detector_calibration_from_projection"]).detector_calibration_from_projection(assets["poni_values"], detector_config=parsed)
         except (TypeError, ValueError) as error: raise ValueError("accepted PONI values are malformed") from error
         _calibration(shared, gi["th_val"] if gi["enabled"] else None)
+    if "point_images" in shared:
+        from xrd_tools.sources.point_images import PointImagePolicy
+        policy = PointImagePolicy.from_dict(shared["point_images"])
+        _reject(policy.operation == "difference" and shared["background"]["mode"] != "None", "Difference does not support an external frame background")
     FrameBackgroundPlan.from_mapping(shared["background"]); plan = _core_plan(selected, shared); from xrd_tools.reduction.provenance_config import _integration_1d_args, _integration_2d_args; normalized = (_integration_1d_args(plan.integration_1d, plan.gi) if dimension == "1d" else _integration_2d_args(plan.integration_2d, plan.gi)); normalized.pop(f"gi_mode_{dimension}", None)
     domains = {"1d": {"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"}, "2d": {"qip_qoop", "q_chi", "exit_angles"}}; _reject(gi["enabled"] != (selected["gi_mode"] is not None) or selected["gi_mode"] is not None and selected["gi_mode"] not in domains[dimension] or normalized != selected["bai_args"], "selected GI mode/BAI differs"); return plan
 def _dimension_audit(*, dimension: str, operation_identity: str, science_identity: str, acquisition_fingerprint: str, requested_shared_science: Mapping[str, Any], selected_plan: Mapping[str, Any], append_lineage: bytes | None): return {"schema_version": 1, "operation": "existing_dimension_replacement", "dimension": dimension, "operation_identity": operation_identity, "science_identity": science_identity, "acquisition_fingerprint": acquisition_fingerprint, "shared_science_fingerprint": science_fingerprint(_plain(requested_shared_science)), "selected_plan": _plain(selected_plan), "selected_gi_mode": selected_plan.get("gi_mode"), "append_lineage_action": ("already_absent" if append_lineage is None else "preserved_append_disabled"), "append_lineage_sha256": (None if append_lineage is None else hashlib.sha256(append_lineage).hexdigest())}
 def _audit_identity(audit: Mapping[str, Any]) -> str: return hashlib.sha256(_canonical(audit)).hexdigest()
-def _scrub_frame(frame): frame.image = frame.background = frame.background_variance_factor = frame.background_scale = frame.geometry = frame.source_identity = frame.source_path = frame.loader = frame.mask = None; frame.source_frame_index = frame.normalization_factor = None; frame.background_dependency_bytes = frame.background_dependency_fingerprint = None; frame.metadata.clear()
+def _install_point_statistics(frame, image):
+    from xrd_tools.sources.point_images import PointImageResult
+    if isinstance(image, PointImageResult):
+        frame.point_variance = image.variance
+        frame.point_exposure_multiplier = image.exposure_multiplier
+        return image.signal
+    return image
+
+
+def _scrub_frame(frame): frame.point_variance = frame.point_statistics_loader = None; frame.image = frame.background = frame.background_variance_factor = frame.background_scale = frame.geometry = frame.source_identity = frame.source_path = frame.loader = frame.mask = None; frame.source_frame_index = frame.normalization_factor = None; frame.background_dependency_bytes = frame.background_dependency_fingerprint = None; frame.metadata.clear()
 
 
 def _target_stat_revision(value):
@@ -2504,6 +2568,7 @@ def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, targ
             path, image, (background, variance_factor, background_scale), pair = _load_fact(fact, observed.detector_shape, observed.native_dtype, shared, cancel_token, observed.raw_options, observed.topology)
             current.source_path, current.source_frame_index, current.source_identity = path, fact["frame_index"], fact; current.metadata.update(fact["metadata"]); current.background = background; current.background_variance_factor = variance_factor; current.background_scale = background_scale; current.geometry = _geometry_fact(fact, shared)
             if pair is not None: current.background_dependency_bytes, current.background_dependency_fingerprint = pair
+            image = _install_point_statistics(current, image)
             holder["frame"] = current; return image
         frame.loader = load
     calibration, integrator, fi = _calibration(shared, bootstrap)
@@ -2518,7 +2583,7 @@ def _requirements(shape, dtype, selected, shared):
     return requirements_from(
         descriptor, _core_plan(selected, shared),
         background_bytes=terms[0], resolver_background_bytes=terms[1],
-        worker_background_bytes=terms[2],
+        worker_background_bytes=terms[2] + (16 * int(shape[0]) * int(shape[1]) if "point_images" in shared else 0),
         background_binding_bytes=terms[3],
     )
 def _allocation_recipe(allocation: SessionResourceAllocation) -> dict[str, Any]: return {"requirements": {f.name: getattr(allocation.requirements, f.name) for f in fields(SessionResourceRequirements)}, "envelope_bytes": allocation.envelope_bytes, "counts": dict(allocation.counts), "categories": dict(allocation.categories), "minimum_bytes": allocation.minimum_bytes, "floor_bytes": allocation.floor_bytes, "assigned_bytes": allocation.assigned_bytes, "origin": allocation.origin, "oversize_excess_bytes": allocation.oversize_excess_bytes}
@@ -2888,7 +2953,7 @@ class _ReintegrateFrameSource:
             owner.close(validate=validate)
             self._direct_hdf = None
     def container_descriptor(self):
-        import numpy as np; terms = _background_resource_terms(self.plan.requested_shared_science["background"]["mode"], self.plan.detector_shape); return SimpleNamespace(frame_shape=self.plan.detector_shape, dtype=np.dtype(self.plan.native_dtype), background_bytes=terms[0], resolver_background_bytes=terms[1], worker_background_bytes=terms[2], background_binding_bytes=terms[3])
+        import numpy as np; terms = _background_resource_terms(self.plan.requested_shared_science["background"]["mode"], self.plan.detector_shape); point_bytes = 16 * math.prod(self.plan.detector_shape) if "point_images" in self.plan.requested_shared_science else 0; return SimpleNamespace(frame_shape=self.plan.detector_shape, dtype=np.dtype(self.plan.native_dtype), background_bytes=terms[0], resolver_background_bytes=terms[1], worker_background_bytes=terms[2] + point_bytes, background_binding_bytes=terms[3])
     def to_scan(self, **kwargs):
         from xrd_tools.reduction.core import Frame, Scan, _REINTEGRATE_SCAN_MARKER; calibration, integrator, fi = _calibration(self.plan.requested_shared_science, self.plan.gi_bootstrap_incidence); gi = self.plan.requested_shared_science["gi"]; frames = [Frame(label, metadata=({gi["resolved_motor"]: self.plan.gi_bootstrap_incidence} if label == self.plan.labels[0] and gi["enabled"] and gi["resolved_motor"] != "Manual" else {})) for label in self.plan.labels]; self._frames = {frame.index: frame for frame in frames}
         scan = Scan("reintegrate", frames, poni=None if calibration is None else calibration.poni, integrator=fi or integrator, **kwargs); scan.extra["_reintegrate_marker"] = _REINTEGRATE_SCAN_MARKER; return scan
@@ -2915,6 +2980,7 @@ class _ReintegrateFrameSource:
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
             _require_fact_topology(fact, self._topology)
             path, image, (background, variance_factor, background_scale), pair = _load_fact(fact, self.plan.detector_shape, self.plan.native_dtype, self.plan.requested_shared_science, self.token, self.raw_options, self._topology, self._direct_hdf)
+            image = _install_point_statistics(frame, image)
             revision = int(fact["snapshot"]["mtime_ns"]); gi = self.plan.requested_shared_science["gi"]; incidence = fact["metadata"].get(gi["resolved_motor"]); _reject(gi["enabled"] and gi["resolved_motor"] != "Manual" and (type(incidence) is not float or not math.isfinite(incidence) or frame.index == self.plan.labels[0] and incidence != self.plan.gi_bootstrap_incidence), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
             frame.source_path, frame.source_frame_index, frame.source_identity = path, fact["frame_index"], fact; frame.metadata.update(fact["metadata"]); frame.background = background; frame.background_variance_factor = variance_factor; frame.background_scale = background_scale
             frame.geometry = _geometry_fact(fact, self.plan.requested_shared_science)

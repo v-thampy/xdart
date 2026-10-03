@@ -2633,7 +2633,8 @@ class NexusSink:
         drop_1d = result_1d is not None and not np.isfinite(
             np.asarray(result_1d.intensity, dtype=float)
         ).any()
-        drop_2d = result_2d is not None and self._unusable_2d(result_2d)
+        signed = _signed_point_difference(frame.metadata)
+        drop_2d = result_2d is not None and self._unusable_2d(result_2d, signed=signed)
         dropped = tuple(
             mode for mode, dropped in (
                 (ResultMode.one_d(mode_1d), drop_1d),
@@ -2654,7 +2655,7 @@ class NexusSink:
         if extras:
             companions = []
             for key, extra in extras.items():
-                if self._unusable_2d(extra):
+                if self._unusable_2d(extra, signed=signed):
                     dropped += (ResultMode.two_d(str(key)),)
                     continue
                 companions.append(self._write_frame_record(
@@ -2667,11 +2668,11 @@ class NexusSink:
         return record, dropped
 
     @staticmethod
-    def _unusable_2d(result_2d: IntegrationResult2D) -> bool:
+    def _unusable_2d(result_2d: IntegrationResult2D, *, signed: bool = False) -> bool:
         intensity_2d = np.asarray(result_2d.intensity, dtype=float)
         return bool(
             not np.isfinite(intensity_2d).any()
-            or (intensity_2d == -1.0).mean() >= 0.95
+            or (not signed and (intensity_2d == -1.0).mean() >= 0.95)
             or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
             or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
         )
@@ -2807,6 +2808,17 @@ class NexusSink:
         configuration = self._run_configuration or {}; active = configuration.get("background") if "background" in configuration else None
         if active is not None and (None in dependency or __import__("json").loads(dependency[0])["policy"] != active): raise ValueError("active Background policy requires its exact frame dependency")
         if active is None and any(value is not None for value in dependency): raise ValueError("inactive Background policy forbids a frame dependency")
+        point = (frame.metadata or {}).get("point_images")
+        constituents = ()
+        policy = None
+        if isinstance(point, Mapping):
+            from xrd_tools.sources.point_images import PointImagePolicy
+            policy = PointImagePolicy.from_dict({key: point[key] for key in ("images_per_point", "operation", "image_index", "reverse")}).to_dict()
+            fact = getattr(frame, "source_identity", None)
+            constituents = (tuple({**member, "source_snapshot": {key: value for key, value in member["source_snapshot"].items() if value is not None}} for member in fact.get("source_constituents", ())) if isinstance(fact, Mapping) else ())
+            if not constituents:
+                constituents = tuple({"source_path": locator["path"], "source_frame_index": int(locator["frame"]), "source_snapshot": self._source_snapshots.get(str(locator["path"]), {})} for locator in point["raw_locators"])
+            path, source_snapshot = None, {}
         return RecordWrite(
             label=int(frame.index),
             result_1d=result_1d,
@@ -2817,8 +2829,10 @@ class NexusSink:
             thumbnail_mask_baked=mask_baked,
             mask_baked=mask_baked,
             source_path=path,
-            source_frame_index=int(getattr(frame, "source_frame_index", None) or 0),
+            source_frame_index=0 if constituents else int(getattr(frame, "source_frame_index", None) or 0),
             source_snapshot=source_snapshot,
+            source_constituents=constituents,
+            point_images=policy,
             timestamp=(getattr(frame, "metadata", None) or {}).get("timestamp"),
             metadata=dict(
                 getattr(reduction, "metadata", None)
@@ -3617,7 +3631,7 @@ class ReductionSession:
         try:
             if frames_or_chunk is None:
                 for chunk, chunk_images in _iter_reduction_chunks(
-                    self.source, self.scan, self.chunk_size,
+                    self.source, self.scan, self.chunk_size, self.plan,
                 ):
                     self._process_chunk(chunk, chunk_images)
                     if self._is_cancelled():
@@ -3999,7 +4013,7 @@ class ReductionSession:
             elif kind == "failed" or (kind == "prep_failed" and emitted):
                 self._record_failure(error)
             if self.clear_frame_images:
-                frame.image = None
+                frame.image = None; frame.point_variance = None
                 frame.background = None
         finally:
             self._complete_stream_publication(ticket)
@@ -4016,7 +4030,7 @@ class ReductionSession:
                 self._record_failure(exc)
                 outcomes_ok = False
                 if self.clear_frame_images:
-                    frame.image = None
+                    frame.image = None; frame.point_variance = None
                     frame.background = None
         try:
             if not outcomes_ok:
@@ -4060,7 +4074,7 @@ class ReductionSession:
                         _emit(self.progress_cb, self.scan.name, "write",
                               frame.index, self._completed, len(self.scan))
                         if self.clear_frame_images:
-                            frame.image = None
+                            frame.image = None; frame.point_variance = None
                             frame.background = None
                             _clear_source_frame_image(self.source, frame.index)
                     except BaseException as exc:
@@ -4574,7 +4588,7 @@ class ReductionSession:
                 self._written_attempts += 1
                 _emit(self.progress_cb, self.scan.name, "write", frame.index, self._completed, len(self.scan))
                 if self.clear_frame_images:
-                    frame.image = None
+                    frame.image = None; frame.point_variance = None
                     frame.background = None
                     _clear_source_frame_image(self.source, frame.index)
                 if _cancel_requested(self.cancel_token):
@@ -4599,7 +4613,7 @@ class ReductionSession:
                 _wait_pending_futures(pending[pos + 1:], worker=self._worker)
                 for _frame, _ in pending:
                     try:
-                        _frame.image = None
+                        _frame.image = None; _frame.point_variance = None
                         _frame.background = None
                     except Exception:
                         pass
@@ -4734,7 +4748,7 @@ def run_reduction(
             # (in-memory / lazy) load behavior unchanged.
             stop = False
             for chunk_frames, chunk_images in _iter_reduction_chunks(
-                    session.source, session.scan, chunk_size):
+                    session.source, session.scan, chunk_size, plan):
                 for frame, image in zip(chunk_frames, chunk_images):
                     if _cancel_requested(session.cancel_token):
                         stop = True
@@ -4992,11 +5006,11 @@ def _apply_gi_freeze_policy(
         if reduction.result_1d is not None:
             scout_results_1d.append(reduction.result_1d)
         if reduction.result_2d is not None:
-            if _is_all_dummy_2d(reduction.result_2d):
+            if _is_all_dummy_2d(reduction.result_2d, signed=_signed_point_difference(reduction.metadata)):
                 continue
             scout_results_2d.append(reduction.result_2d)
         if was_empty:
-            frame.image = None
+            frame.image = None; frame.point_variance = None
 
     out = plan
     if needs_1d is not None and scout_results_1d:
@@ -5046,7 +5060,12 @@ def _apply_gi_freeze_policy(
     return out
 
 
-def _is_all_dummy_2d(result: IntegrationResult2D, *, dummy: float = -1.0) -> bool:
+def _signed_point_difference(metadata: Mapping[str, Any]) -> bool:
+    point = metadata.get("point_images")
+    return isinstance(point, Mapping) and point.get("operation") == "difference"
+
+
+def _is_all_dummy_2d(result: IntegrationResult2D, *, dummy: float = -1.0, signed: bool = False) -> bool:
     intensity = getattr(result, "intensity", None)
     if intensity is None:
         return False
@@ -5056,7 +5075,7 @@ def _is_all_dummy_2d(result: IntegrationResult2D, *, dummy: float = -1.0) -> boo
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return True
-    return bool(np.all(finite <= dummy))
+    return not signed and bool(np.all(finite <= dummy))
 
 
 def _gi_freeze_scout_indices(
@@ -5706,10 +5725,30 @@ def _reduce_frame(
 ) -> FrameReduction:
     if _cancel_requested(cancel_token):
         raise _ReductionCancelled
+    point_policy = (frame.metadata or {}).get("point_images")
+    grouped = isinstance(point_policy, Mapping)
+    signed_point = _signed_point_difference(frame.metadata)
+    if signed_point:
+        frame.metadata = {**frame.metadata, "point_images": {
+            **point_policy, "positive_total_screening": False,
+        }}
+    if grouped and frame.point_statistics_loader is not None:
+        statistics = frame.point_statistics_loader(
+            frame.index,
+            poisson=_wants_poisson(plan),
+            native_transform=lambda native: _condition_point_operand(native, plan),
+        )
+        raw_image = statistics.signal
+        frame.point_variance = statistics.variance
+        frame.point_exposure_multiplier = statistics.exposure_multiplier
+    if grouped and float(frame.point_exposure_multiplier) == 0.0:
+        if frame.background is not None:
+            raise ValueError("Difference does not support an external frame background")
+        plan = replace(plan, dark=None)
     if raw_image is not None:
         frame.image = np.asarray(raw_image)
     raw_image_arr = np.asarray(frame.load_image())  # pre-float: integer dtype for the saturation ceiling
-    use_float32_csr = _can_use_owned_float32_csr(
+    use_float32_csr = not grouped and _can_use_owned_float32_csr(
         raw_image_arr,
         frame.background,
         plan,
@@ -5737,7 +5776,7 @@ def _reduce_frame(
     # converted to float32. Explicit bounds already suppress saturation in the
     # plan, and both policies reject into the same owned integration buffer.
     value_mask = _threshold_mask(raw_image_arr, plan) if use_float32_csr else None
-    if value_mask is None:
+    if value_mask is None and not grouped:
         value_mask = detector_value_mask(
             None, raw_image_arr, enabled=bool(plan.mask_saturation),
             saturation=plan.saturation,
@@ -5749,7 +5788,8 @@ def _reduce_frame(
         image[value_mask] = np.nan
     variance = None
     if not use_float32_csr:
-        image = _apply_thresholds_owned(image, plan)
+        if not grouped:
+            image = _apply_thresholds_owned(image, plan)
         variance = _poisson_variance(image, frame, plan, plan_derived)
         image = _subtract_background(image, background)
     # Poisson plans with a dark or background integrate with an explicit variance.
@@ -5967,7 +6007,8 @@ def _reduce_frame(
     # dropped per-frame downstream (the publication gate / writer), never
     # aborting a whole-scan save.
     if (strict is not None and strict.gi_all_dummy
-            and r2d is not None and _is_all_dummy_2d(r2d)):
+            and r2d is not None and (_is_all_dummy_2d(r2d, signed=signed_point)
+                                    or signed_point and not np.isfinite(image).any())):
         raise GIAllDummyError(
             f"frame {frame.index}: the 2D integration is entirely dummy "
             "(no usable data); pass StrictPolicy.graceful() to drop it "
@@ -5994,6 +6035,20 @@ def _reduce_frame(
     return reduction
 
 
+def _wants_poisson(plan: ReductionPlan) -> bool:
+    return any(item is not None and item.error_model == "poisson" and "variance" not in item.extra
+               for item in (plan.integration_1d, plan.integration_2d))
+
+
+def _condition_point_operand(native, plan: ReductionPlan):
+    native = np.asarray(native)
+    image = native.astype(float)
+    invalid = detector_value_mask(None, native, enabled=bool(plan.mask_saturation), saturation=plan.saturation)
+    if invalid is not None:
+        image[invalid] = np.nan
+    return _apply_thresholds_owned(image, plan)
+
+
 def _poisson_variance(image, frame, plan: ReductionPlan, derived=None) -> np.ndarray | None:
     """Poisson variance of raw − dark − background, for plans that ask for Poisson sigma.
 
@@ -6008,16 +6063,16 @@ def _poisson_variance(image, frame, plan: ReductionPlan, derived=None) -> np.nda
     """
     factor = getattr(frame, "background_variance_factor", None)
     background = None if factor is None else frame.background
-    if (background is None and plan.dark is None) or not any(
-            item is not None and item.error_model == "poisson" and "variance" not in item.extra
-            for item in (plan.integration_1d, plan.integration_2d)):
+    point_variance = getattr(frame, "point_variance", None)
+    if (background is None and plan.dark is None and point_variance is None) or not _wants_poisson(plan):
         return None
-    variance = np.maximum(image, 1.0)
+    variance = np.maximum(image, 1.0) if point_variance is None else np.array(point_variance, dtype=float, copy=True)
     if plan.dark is not None:
         # raw − dark − scale·(background − dark) holds the dark with weight 1 − scale.
         scale = (None if frame.background is None
                  else getattr(frame, "background_scale", None))
-        weight = 1.0 if scale is None else (1.0 - float(scale)) ** 2
+        multiplier = float(getattr(frame, "point_exposure_multiplier", 1.0))
+        weight = (multiplier - (0.0 if scale is None else float(scale))) ** 2
         if weight == 1.0:
             variance += _clipped_dark(plan, derived)
         elif weight:
@@ -6654,6 +6709,7 @@ def _iter_reduction_chunks(
     source: Scan | FrameSource,
     scan: Scan,
     chunk_size: int,
+    plan: ReductionPlan | None = None,
 ) -> Iterator[tuple[list[Frame], list[np.ndarray | None]]]:
     """Yield scan frames paired with optional source-loaded image arrays.
 
@@ -6666,6 +6722,16 @@ def _iter_reduction_chunks(
 
     frame_by_index = {int(frame.index): frame for frame in scan.frames}
     if not isinstance(source, Scan):
+        statistics_iterator = getattr(source, "iter_point_statistics", None)
+        if callable(statistics_iterator) and plan is not None:
+            for statistics, labels in statistics_iterator(chunk_size, poisson=_wants_poisson(plan), native_transform=lambda native: _condition_point_operand(native, plan)):
+                frames = [frame_by_index[int(label)] for label in labels]
+                for frame, result in zip(frames, statistics):
+                    frame.point_statistics_loader = None
+                    frame.point_variance = result.variance
+                    frame.point_exposure_multiplier = result.exposure_multiplier
+                yield frames, [result.signal for result in statistics]
+            return
         iter_chunks = getattr(source, "iter_chunks", None)
         if callable(iter_chunks):
             for images, labels in iter_chunks(chunk_size):

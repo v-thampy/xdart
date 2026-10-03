@@ -703,6 +703,64 @@ def write_frame_source_ref(
             )
 
 
+def write_point_source_ref(frame_grp, point_images, source_constituents, *, source_base=None):
+    """Ordered additive native references; old readers cannot pick one operand."""
+    from xrd_tools.sources.point_images import PointImagePolicy
+    policy = PointImagePolicy.from_dict(point_images)
+    contributors = tuple(source_constituents)
+    expected = 1 if policy.operation == "select" else policy.images_per_point
+    if len(contributors) != expected:
+        raise ValueError("point source constituents do not match the policy")
+    source = _nxcollection(frame_grp, "source")
+    source.attrs["point_images"] = json.dumps(policy.to_dict(), sort_keys=True, separators=(",", ":"))
+    members = _nxcollection(source, "constituents")
+    for ordinal, member in enumerate(contributors):
+        record = _nxcollection(members, f"{ordinal:04d}")
+        write_frame_source_ref(record, member["source_path"], member["source_frame_index"], source_base=source_base, source_snapshot=member.get("source_snapshot"))
+        # Reuse the existing pointer encoding without an extra nested source owner.
+        encoded = record["source"]
+        for name in tuple(encoded):
+            record.move(f"source/{name}", name)
+        for name, value in encoded.attrs.items():
+            record.attrs[name] = value
+        del record["source"]
+
+
+def read_point_source_ref(source):
+    """Read the exact ordered point references without decoding any pixels."""
+    from xrd_tools.sources.point_images import PointImagePolicy
+    if not isinstance(source, h5py.Group) or "constituents" not in source:
+        return None
+    value = source.attrs.get("point_images")
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    policy = PointImagePolicy.from_dict(json.loads(value))
+    members = source["constituents"]
+    expected = 1 if policy.operation == "select" else policy.images_per_point
+    if (not isinstance(members, h5py.Group) or set(source) != {"constituents"}
+            or tuple(members) != tuple(f"{index:04d}" for index in range(expected))):
+        raise ValueError("point source constituents are malformed")
+    snapshots = {"adapter_id": "adapter_id", "size": "file_size", "mtime_ns": "file_mtime_ns", "frame_count": "frame_count", "dataset_path": "dataset_path", "self_contained": "self_contained", "raw_shape": "raw_shape", "raw_dtype": "raw_dtype", "raw_header_bytes": "raw_header_bytes", "rotation": "rotation"}
+    constituents = []
+    for name, member in members.items():
+        if not isinstance(member, h5py.Group) or set(member) != {"path", "frame_index"}:
+            raise ValueError("point source constituent is malformed")
+        if (not isinstance(members.get(name, getlink=True), h5py.HardLink)
+                or any(not isinstance(member.get(key, getlink=True), h5py.HardLink) for key in member)
+                or not isinstance(member["path"], h5py.Dataset) or member["path"].shape != ()
+                or h5py.check_string_dtype(member["path"].dtype) is None
+                or not isinstance(member["frame_index"], h5py.Dataset) or member["frame_index"].shape != ()
+                or member["frame_index"].dtype.kind not in "iu"):
+            raise ValueError("point source constituent pointer is malformed")
+        path = member["path"].asstr()[()]
+        index = int(member["frame_index"][()])
+        if not path or index < 0:
+            raise ValueError("point source constituent is malformed")
+        snapshot = {key: tuple(int(part) for part in value) if key == "raw_shape" else value.item() if hasattr(value, "item") else value for key, attr in snapshots.items() if (value := member.attrs.get(attr)) is not None}
+        constituents.append({"source_path": path, "source_frame_index": index, "source_snapshot": snapshot})
+    return policy.to_dict(), tuple(constituents)
+
+
 def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                        thumbnail=None, thumbnail_dtype: str = "uint8",
                        thumbnail_mask_baked: bool = True,
@@ -710,7 +768,8 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                        source_path=None, source_frame_index: int = 0,
                        timestamp=None, source_base=None,
                        source_snapshot=None, background_dependency_bytes=None,
-                       background_dependency_fingerprint=None) -> h5py.Group:
+                       background_dependency_fingerprint=None,
+                       source_constituents=(), point_images=None) -> h5py.Group:
     """Write one complete per-frame record group (idempotent per key).
 
     Per the v2 schema, per-frame groups carry *only* metadata + thumbnail —
@@ -727,7 +786,9 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
             mask_baked=thumbnail_mask_baked,
             thumbnail_mask=thumbnail_mask,
         )
-    if source_path and "source" not in fg:
+    if source_constituents and "source" not in fg:
+        write_point_source_ref(fg, point_images, source_constituents, source_base=source_base)
+    elif source_path and "source" not in fg:
         write_frame_source_ref(fg, source_path, source_frame_index,
                                source_base=source_base,
                                source_snapshot=source_snapshot)
@@ -745,6 +806,7 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                          timestamp=None, source_base=None,
                          source_snapshot=None, background_dependency_bytes=None,
                          background_dependency_fingerprint=None,
+                         source_constituents=(), point_images=None,
                          _prepared_thumbnail: _PreparedThumbnail | None = None,
                          ) -> h5py.Group:
     """Replace one direct per-frame record through an atomic sibling stage."""
@@ -771,6 +833,8 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
             timestamp=timestamp,
             source_base=source_base,
             source_snapshot=source_snapshot,
+            source_constituents=source_constituents,
+            point_images=point_images,
             background_dependency_bytes=background_dependency_bytes,
             background_dependency_fingerprint=background_dependency_fingerprint,
         )
@@ -845,6 +909,8 @@ def write_contributing_frames(entry_grp: h5py.Group, records, *,
             source_frame_index=int(r.get("source_frame_index") or 0),
             thumbnail=r.get("thumbnail"), source_base=source_base,
             source_snapshot=r.get("source_snapshot"),
+            source_constituents=r.get("source_constituents", ()),
+            point_images=r.get("point_images"),
             thumbnail_dtype=r.get("thumbnail_dtype", "uint8"),
             thumbnail_mask_baked=r.get("thumbnail_mask_baked", True),
             mask_baked=r.get("mask_baked", True),
