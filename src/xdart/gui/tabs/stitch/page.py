@@ -2655,6 +2655,7 @@ class StitchPage(QtWidgets.QWidget):
 
     def _set_view(self, **changes):
         self._view = replace(self._view, **changes)
+        self.browser.set_result_plot_mode(self._view.plot_mode)
 
     def _mount_payload(self, path, payload):
         if type(payload) is not AnalysisArtifactPayload or payload.inspection.kind not in {
@@ -2691,15 +2692,11 @@ class StitchPage(QtWidgets.QWidget):
     def _selected(self):
         """The selected results in memory (a reloading one joins when it is back)."""
         keys = self.browser.selected_results()
-        if self._view.plot_mode == "Single":
-            current = self.browser.current_result()
-            keys = () if current is None else (current,)
         return [(key, self._payloads[key]) for key in keys if key in self._payloads]
 
     def _resident_paths(self):
-        """The results shown: the current one, the selected ones (Single shows the current one only)
-        and those holding a slice pin."""
-        paths = set(self.browser.selected_results()) if self._view.plot_mode != "Single" else set()
+        """The results shown: the current map, every explicitly selected curve and any slice pin."""
+        paths = set(self.browser.selected_results())
         current = self.browser.current_result()
         if current is not None:
             paths.add(current)
@@ -3133,7 +3130,7 @@ class StitchPage(QtWidgets.QWidget):
         if kind in {ShellCommandKind.SELECT_FRAME, ShellCommandKind.HYDRATE_FRAME}:
             path = next((path for path, key in self._result_keys.items() if key is command.frame), None)
             if path in self._listed and path != self.browser.current_result():
-                # Single: the result alone; an overlay steps through its selection, which stays
+                # Single visits replace; Overlay visits add this result through Int's browser owner.
                 self.browser.set_current_result(path, keep_selection=view.plot_mode != "Single")
             return
         if kind is ShellCommandKind.SET_BACKGROUND:
@@ -3161,9 +3158,9 @@ class StitchPage(QtWidgets.QWidget):
             return
         self._set_view(**updates)
         if kind is ShellCommandKind.SET_PLOT_MODE:
-            if command.value == "Single":
+            if command.value == "Single" and view.plot_mode != "Single":
                 self.browser.set_current_result(self.browser.current_result(), keep_selection=False)
-            self._update_residency()  # Overlay shows the selected results, Single the current one
+            self._update_residency()
         elif kind in {ShellCommandKind.SET_COLOR_MAP, ShellCommandKind.SET_LOG_SCALE}:
             self._render_raw()  # the raw popup's image too
         self._draw()
