@@ -27,10 +27,12 @@ import threading
 import numpy as np
 
 from xrd_tools.analysis.scan_operations import (
-    AnalysisDisposition, MetadataColumn, MetadataTablePlan, MetadataTableResult, _path_revision,
+    AnalysisDisposition, MetadataColumn, MetadataTablePlan, MetadataTableResult,
     run_metadata_table,
 )
-from xrd_tools.analysis.stitch_metadata import StitchMetadataTable, read_stitch_metadata
+from xrd_tools.analysis.stitch_metadata import (
+    StitchMetadataTable, _check_source_revisions, read_stitch_metadata,
+)
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload, _stat_revision
 from xrd_tools.io.read import resolve_source_master
@@ -216,22 +218,15 @@ def read_rsm_metadata(
                 raise ValueError(f"Source unavailable: {stored}")
             return path
 
-        def check_sources(member=member, relative=relative, observed=observed):
-            for item in ({"relative_path": relative, "revision": member["primary_revision"]},
-                         *member["dependency_files"]):
-                if item["revision"] is not None:
-                    path = resolve(item["relative_path"])
-                    state = _path_revision(path)
-                    # as for Stitch: size/mtime admit a relocated tree; full identity must hold during the read
-                    if (state is None or state[3:5] != tuple(item["revision"][3:5])
-                            or state != observed.setdefault(path, state)):
-                        raise ValueError(f"Source changed since processing: {item['relative_path']}")
-
         try:
-            check_sources()
+            revisions = ({"relative_path": relative, "revision": member["primary_revision"]},
+                         *member["dependency_files"])
+            _check_source_revisions(revisions, resolve, observed,
+                                    changed_prefix="Source changed since processing")
             table = run_metadata_table(MetadataTablePlan(_member_source_spec(member, resolve)),
                                        cancel_token=cancel_token)
-            check_sources()
+            _check_source_revisions(revisions, resolve, observed,
+                                    changed_prefix="Source changed since processing")
             if table.disposition is AnalysisDisposition.COMPLETED:
                 if not set(labels).issubset(table.labels):
                     raise ValueError("Experimental metadata no longer contains the contributing frames")

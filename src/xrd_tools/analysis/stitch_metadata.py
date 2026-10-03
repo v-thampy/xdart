@@ -28,6 +28,17 @@ class StitchMetadataTable:
     table: MetadataTableResult
 
 
+def _check_source_revisions(items, resolve, observed, *, changed_prefix):
+    """Admit saved size/mtime after relocation; fence full identity during this read."""
+    for item in items:
+        if item["revision"] is not None:
+            path = resolve(item["relative_path"])
+            state = _path_revision(path)
+            if (state is None or state[3:5] != tuple(item["revision"][3:5])
+                    or state != observed.setdefault(path, state)):
+                raise ValueError(f"{changed_prefix}: {item['relative_path']}")
+
+
 def read_stitch_metadata(payload, *, source_root=None, cancel_token=None, source_id=None):
     """Read full experimental columns, retaining exact selected rows per source.
 
@@ -69,22 +80,11 @@ def read_stitch_metadata(payload, *, source_root=None, cancel_token=None, source
                 raise ValueError(f"Source unavailable: {relative}")
             return path
 
-        def check_sources():
-            # Qualify metadata and frame association against saved revisions,
-            # including linked NeXus dependencies, before and after the read.
-            for item in ({"relative_path": source["relative_path"],
-                          "revision": source["primary_revision"]}, *member["files"]):
-                if item["revision"] is not None:
-                    path = resolve(item["relative_path"])
-                    state = _path_revision(path)
-                    # Like Full Raw, size/mtime admit an explicitly relocated
-                    # tree. Full identity must also remain stable during this read.
-                    if (state is None or state[3:5] != tuple(item["revision"][3:5])
-                            or state != observed.setdefault(path, state)):
-                        raise ValueError(f"Source changed since stitching: {item['relative_path']}")
-
         try:
-            check_sources()
+            revisions = ({"relative_path": source["relative_path"],
+                          "revision": source["primary_revision"]}, *member["files"])
+            _check_source_revisions(revisions, resolve, observed,
+                                    changed_prefix="Source changed since stitching")
             options = dict(source["options"])
             for key in ("image_dir", "selected_file", "meta_dir"):
                 if options.get(key):
@@ -97,7 +97,8 @@ def read_stitch_metadata(payload, *, source_root=None, cancel_token=None, source
             spec = SourceSpec(resolve(source["relative_path"]), SourceKind(source["kind"]),
                               entry=source.get("entry"), options=options)
             table = run_metadata_table(MetadataTablePlan(spec), cancel_token=cancel_token)
-            check_sources()
+            _check_source_revisions(revisions, resolve, observed,
+                                    changed_prefix="Source changed since stitching")
             if table.disposition is AnalysisDisposition.COMPLETED:
                 if not set(labels).issubset(table.labels):
                     raise ValueError("Experimental metadata no longer contains the contributing frames")

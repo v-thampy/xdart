@@ -66,7 +66,7 @@ def test_contributing_row_mean_rules():
     assert contributing_row_mean((twice,), "T").value == 2.0
 
 
-def test_grouped_stitch_result_through_its_saved_contributors(tmp_path):
+def test_grouped_stitch_result_through_its_saved_contributors(tmp_path, monkeypatch):
     from dataclasses import replace
 
     from tests.core.test_stitch_operation import _prepared, _source_receipt
@@ -90,6 +90,13 @@ def test_grouped_stitch_result_through_its_saved_contributors(tmp_path):
                                  AnalysisArtifactKind.STITCH_1D, artifact_family="trend")
     result = run_stitch_operation(prepare_stitch_operation(source, output, plan, project_root=tmp_path))
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    import xrd_tools.analysis.stitch_metadata as metadata
+    real_check = metadata._check_source_revisions
+    checks = []
+    def observe(*args, **kwargs):
+        checks.append(kwargs["changed_prefix"])
+        return real_check(*args, **kwargs)
+    monkeypatch.setattr(metadata, "_check_source_revisions", observe)
     rows = read_trend_values((("first", result.payload), ("again", result.payload)), "I0")
     assert [key for key, _value in rows] == ["first", "again"]  # one row per result, the same x kept twice
     for _key, value in rows:
@@ -98,6 +105,7 @@ def test_grouped_stitch_result_through_its_saved_contributors(tmp_path):
         assert value.value != pytest.approx(10.75) and value.value != pytest.approx(11.0)  # member means; scan
     ((_key, delta),) = read_trend_values((("first", result.payload),), "del")
     assert delta.value == pytest.approx(10.0 / 3.0, rel=1e-15, abs=0)  # (0 + 5) | (5)
+    assert checks == ["Source changed since stitching"] * 12
 
 
 def _data_root() -> Path:
@@ -182,7 +190,7 @@ def test_grouped_spec_rsm_result_scan_42_and_43_through_its_saved_contributors(t
     assert (rootless.status, rootless.code) == ("unavailable", "SOURCE_ROOT_REQUIRED")
 
 
-def test_nexus_rsm_result_through_its_saved_contributors(tmp_path):
+def test_nexus_rsm_result_through_its_saved_contributors(tmp_path, monkeypatch):
     from tests.core.test_rsm_nexus_members import _write_rsm_nexus
     from xrd_tools.analysis.rsm_values import (
         RSMFrameSelector, RSMNexusMemberForm, RSMToolFormV2, prepare_rsm_tool_v2, rsm_tool_preset,
@@ -207,6 +215,15 @@ def test_nexus_rsm_result_through_its_saved_contributors(tmp_path):
                          None, tmp_path / "nexus-trend.nexus")
     result = run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    import xrd_tools.analysis.stitch_metadata as metadata
+    import xrd_tools.analysis.trend_values as trends
+    assert trends._check_source_revisions is metadata._check_source_revisions
+    real_check = metadata._check_source_revisions
+    checks = []
+    def observe(*args, **kwargs):
+        checks.append(kwargs["changed_prefix"])
+        return real_check(*args, **kwargs)
+    monkeypatch.setattr(trends, "_check_source_revisions", observe)
     ((_key, eta),) = read_trend_values((("nexus", result.payload),), "eta", source_root=tmp_path)
     votes = np.linspace(42.34, 42.44, 5)[[1, 4]]
     assert (eta.status, eta.count) == ("available", 2)
@@ -216,3 +233,37 @@ def test_nexus_rsm_result_through_its_saved_contributors(tmp_path):
     os.utime(nexus, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000_000))
     ((_key, changed),) = read_trend_values((("nexus", result.payload),), "eta", source_root=tmp_path)
     assert (changed.status, changed.code, changed.value) == ("unavailable", "MEMBER_METADATA_UNAVAILABLE", None)
+    assert checks == ["Source changed since processing"] * 3
+
+
+def test_shared_metadata_revision_check_preserves_relocation_and_detects_replacement(tmp_path):
+    from xrd_tools.analysis.scan_operations import _path_revision
+    from xrd_tools.analysis.stitch_metadata import _check_source_revisions
+
+    original = tmp_path / "original"
+    original.write_bytes(b"1234")
+    saved = _path_revision(original)
+    relocated = tmp_path / "relocated"
+    shutil.copy2(original, relocated)
+    dependency = tmp_path / "dependency"
+    dependency.write_bytes(b"dep")
+    items = ({"relative_path": "original", "revision": saved},
+             {"relative_path": "absent", "revision": None},
+             {"relative_path": "dependency", "revision": _path_revision(dependency)})
+    calls, observed = [], {}
+    def resolve(relative):
+        calls.append(relative)
+        return relocated if relative == "original" else dependency
+    _check_source_revisions(items, resolve, observed, changed_prefix="Source changed since stitching")
+    _check_source_revisions(items, resolve, observed, changed_prefix="Source changed since stitching")
+    assert calls == ["original", "dependency"] * 2
+    assert tuple(observed) == (relocated, dependency)
+    replacement = tmp_path / "replacement"
+    shutil.copy2(relocated, replacement)
+    os.replace(replacement, relocated)
+    assert _path_revision(relocated)[3:5] == saved[3:5]
+    with pytest.raises(ValueError, match="^Source changed since stitching: original$"):
+        _check_source_revisions(items, resolve, observed, changed_prefix="Source changed since stitching")
+    relocated.write_bytes(b"longer")
+    with pytest.raises(ValueError, match="^Source changed since processing: original$"):
+        _check_source_revisions(items, resolve, {}, changed_prefix="Source changed since processing")
