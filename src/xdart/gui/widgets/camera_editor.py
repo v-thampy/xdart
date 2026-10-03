@@ -15,6 +15,10 @@ from xdart.gui.widgets.controls_panel import ControlsComboBox
 from xrd_tools.core.geometry.camera import CAMERA_AXES, STITCH_CAMERA, DetectorCamera
 
 
+_AXIS_LABELS = {'x+': 'x+ (vertical up)', 'x-': 'x- (vertical down)',
+                'z+': 'z+ (horizontal left)', 'z-': 'z- (horizontal right)'}
+
+
 class CameraEditor(QtWidgets.QWidget):
     """Rows along one of x+, x-, z+, z-; columns along one of the two directions transverse to them."""
 
@@ -26,7 +30,7 @@ class CameraEditor(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.rows, self.columns = ControlsComboBox(), ControlsComboBox()
         for axis in CAMERA_AXES:
-            self.rows.addItem(axis, axis)
+            self.rows.addItem(_AXIS_LABELS[axis], axis)
         for caption, combo in (('rows', self.rows), ('columns', self.columns)):
             layout.addWidget(QtWidgets.QLabel(caption))
             layout.addWidget(combo, 1)
@@ -50,7 +54,7 @@ class CameraEditor(QtWidgets.QWidget):
         blocker = QtCore.QSignalBlocker(self.columns)
         self.columns.clear()
         for sign in '+-':
-            self.columns.addItem(axis + sign, axis + sign)
+            self.columns.addItem(_AXIS_LABELS[axis + sign], axis + sign)
         self.columns.setCurrentIndex(self.columns.findData(axis + (keep or '++')[1]))
         del blocker
 

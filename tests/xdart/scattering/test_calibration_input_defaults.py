@@ -33,6 +33,112 @@ def commit(dialog, key, text):
     settle(dialog)
 
 
+def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path):
+    from tests.xdart.scattering.test_stitch_guided_calibration import _beam_container
+    from xrd_tools.sources import SourceKind
+    nexus, _, _ = _beam_container(tmp_path)
+    nexus.rename(tmp_path / 'beam_scan001_master.h5')
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#O0 nu  energy\n#S 1 ascan del 1 -1 4 1\n#P0 4 7000.6716669638\n'
+                    '#N 1\n#L del\n1\n.5\n0\n-.5\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    try:
+        index = dialog.source_kind.findData('spec_container')
+        assert index >= 0
+        dialog.source_kind.setCurrentIndex(index)
+        commit(dialog, 'source', spec)
+        assert dialog._text('rough_energy') == '7.0007'
+        assert dialog._fields['rough_energy'].maximumWidth() == 300
+        assert dialog._row_visible('images') and dialog._row_visible('entry')
+        assert 'beam_scan001_' in dialog._fields['stem'].placeholderText()
+        assert dialog._spec().kind is SourceKind.SPEC
+        dialog.list_button.click()
+        settle(dialog)
+        assert len(dialog._choices) == 5, dialog.status.text()
+        dialog.prepare_button.click()
+        settle(dialog)
+        assert len(dialog.frames) == 5, dialog.status.text()
+        assert all(Path(frame.image_path).is_file() for frame in dialog.frames)
+        again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+        try:
+            again.apply_settings(dialog.settings())
+            assert again.source_kind.currentData() == 'spec_container'
+            assert again._spec() == dialog._spec()
+        finally:
+            again.close()
+    finally:
+        dialog.close()
+
+
+def test_rough_rows_share_existing_controls_and_keep_mode_visibility(qapp, tmp_path):
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        assert dialog._parts['beam_entry'][0] == 'beam_source_kind'
+        assert dialog._parts['rough_mount'][0] == 'beam_pixel'
+        assert dialog._formrows['beam_motor'].isAncestorOf(dialog.motion)
+        assert dialog._label('beam_pixel').text() == 'Direct beam pixel (x, y)'
+        assert dialog._row_of[dialog.motion].label.text() == 'Beam direction'
+        for kind in ('spec_series', 'spec_container', 'nexus'):
+            dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(kind))
+            assert dialog._row_visible('beam_entry') == (kind != 'spec_series')
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        assert dialog._row_visible('beam_pixel') and dialog._row_visible('rough_mount')
+        assert not dialog._row_visible('beam_entry') and dialog._row_of[dialog.motion].isHidden()
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        assert not dialog._row_visible('beam_pixel') and not dialog._row_visible('rough_mount')
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))
+        assert dialog._row_visible('beam_entry') and not dialog._row_of[dialog.motion].isHidden()
+    finally:
+        dialog.close()
+
+
+def test_calibrant_nexus_context_still_selects_the_nexus_choice(qapp, tmp_path):
+    from xrd_tools.sources import SourceKind, SourceSpec
+    dialog = CalibrationDialog(CalibrationContext('RSM', tmp_path))
+    try:
+        dialog.set_source_context(SourceSpec(tmp_path / 'scan.nxs', SourceKind.NEXUS_STACK))
+        assert dialog.source_kind.currentData() == 'nexus_stack'
+        assert not dialog._row_visible('images') and dialog._row_visible('entry')
+    finally:
+        dialog.close()
+
+
+def test_detector_picker_describes_raw_defaults_and_manual_header_reads_pixels(qapp, tmp_path):
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.integrate.stitch_calibration import capture_calibration_frames
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Eiger2_500k'))
+    again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        picker = dialog._fields['beam_detector']
+        assert dialog._text('beam_detector') == 'Eiger2_500k'
+        assert '512 × 1028' in picker.currentText() and 'RAW int32' in picker.currentText()
+        assert not dialog._row_visible('raw')
+        assert dialog._fields['shape'].isReadOnly() and dialog._fields['dtype'].isReadOnly()
+        assert dialog._parts['header'][0] == 'beam_detector'
+        assert dialog.camera.parent().layout().labelForField(dialog.camera).text() == 'Camera orientation (lab frame)'
+        spec = tmp_path / 'small'
+        spec.write_text('#F small\n#O0 nu\n#S 1 ascan del 0 0 0 1\n#P0 0\n#N 1\n#L del\n0\n')
+        image = np.arange(24, dtype='<u2').reshape(4, 6)
+        (tmp_path / 'small_scan1_0000.raw').write_bytes(b'header16bytes!!!' + image.tobytes())
+        source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(tmp_path),
+            'read_image_kwargs': {'detector_shape': image.shape, 'raw_dtype': 'uint16', 'raw_header_skip': 16}})
+        dialog.set_source_context(source)
+        assert dialog.raw_layout.currentData() == 'manual' and dialog._row_visible('raw')
+        assert not dialog._fields['shape'].isReadOnly() and not dialog._fields['dtype'].isReadOnly()
+        staged = capture_calibration_frames(dialog._spec(), [0], tmp_path / 'staged')
+        import fabio
+        np.testing.assert_array_equal(fabio.open(staged[0].image_path).data, image)
+        again.apply_settings(dialog.settings())
+        assert again.raw_layout.currentData() == 'manual' and again._reader() == dialog._reader()
+        again.raw_layout.setCurrentIndex(again.raw_layout.findData('factory'))
+        assert again._text('shape') == '512, 1028' and again._text('dtype') == 'int32'
+        assert again._text('header') == '16'  # byte offset is independent of the detector model
+    finally:
+        dialog.close()
+        again.close()
+
+
 def test_detector_change_drops_the_previous_detectors_beam_pixel(qapp, tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
@@ -131,8 +237,8 @@ def test_saved_wavelength_migrates_to_energy_with_the_same_physical_value(qapp, 
         assert dialog._formrows['rough_energy'].label.text() == 'Energy (keV)'
         assert dialog._parts['rough_energy'][0] == 'calibrant'
         assert dialog._formrows['rough_energy'].isAncestorOf(dialog._fields['rough_energy'])
-        assert float(dialog._text('rough_energy')) == pytest.approx(energy, rel=1e-12)
-        assert dialog._rough_wavelength_A() == pytest.approx(.7293, rel=1e-12)
+        assert dialog._text('rough_energy') == f'{energy:.4f}'
+        assert dialog._rough_wavelength_A() == pytest.approx(.7293, rel=5e-6)
         assert 'rough_wavelength' not in dialog.settings()['fields']
         again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
         try:

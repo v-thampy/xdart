@@ -72,7 +72,8 @@ def expected_rings(integrator, calibrant, shape, mask=None) -> tuple[ExpectedRin
     return tuple(rings)
 
 
-def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_motor='nu', mask=None) -> FrameSeed:
+def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_motor='nu', mask=None,
+                       conditioning=None, saturation=None) -> FrameSeed:
     """The frame's geometry predicted from a goniometer calibration, with its rings (none on
     ``mask``, the calibration's mask in the frame's image)."""
     from pyFAI import units
@@ -97,6 +98,8 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     energy_eV = frame.energy_eV or calibration_recorded_energy_eV(record)
     if energy_eV:
         integrator.wavelength = units.hc / (float(energy_eV) / 1000.) * 1e-10
+    from xrd_tools.integrate.stitch_calibration import calibration_frame_mask
+    mask = calibration_frame_mask(frame, mask, conditioning=conditioning, saturation=saturation)
     return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape, mask))
 
 
@@ -133,7 +136,7 @@ DETECTOR_ORIENTATIONS = ((3, 'BottomRight (pyFAI default)'), (1, 'TopLeft'), (2,
 
 
 @lru_cache(maxsize=1)
-def detector_choices() -> tuple[tuple[str, str], ...]:
+def detector_choices(*, raw_details=False) -> tuple[tuple[str, str], ...]:
     """pyFAI's detectors as (label, factory name): the common ones first, then the rest by label.
     Only detectors built from their name alone are listed (not the generic pixel-size one)."""
     from pyFAI.detectors import ALL_DETECTORS, detector_factory
@@ -146,7 +149,9 @@ def detector_choices() -> tuple[tuple[str, str], ...]:
             continue
         if detector.shape is None or not detector.pixel1 or not detector.pixel2:
             continue
-        labels[name] = _DETECTOR_LABELS.get(name, (getattr(cls, 'aliases', None) or [name])[0])
+        label = _DETECTOR_LABELS.get(name, (getattr(cls, 'aliases', None) or [name])[0])
+        labels[name] = (f'{label} [{detector.shape[0]} × {detector.shape[1]} rows × cols; RAW int32]'
+                        if raw_details else label)  # int32 is the RAW reader's default, not a detector property
     first = [(labels[name], name) for name in _PREFERRED_DETECTORS if name in labels]
     rest = sorted(((label, name) for name, label in labels.items() if name not in _PREFERRED_DETECTORS),
                   key=lambda item: item[0].casefold())

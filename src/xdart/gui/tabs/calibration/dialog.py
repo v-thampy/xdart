@@ -24,6 +24,10 @@ from xrd_tools.integrate.calibration_seed import (
     DETECTOR_ORIENTATIONS, detector_choices, detector_shape, ring_summary, rough_arm_record,
 )
 from xrd_tools.session.instrument import InstrumentGeometry
+from xrd_tools.session.threshold_editing import (
+    ThresholdEditRefusal, ThresholdState, auto_ceiling_hint, threshold_transition,
+)
+from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.integrate.stitch_calibration import (
     adopt_calibration_pair, automatic_arm_reason, capture_calibration_frames, direct_beam_pose, fit_calibration,
     load_calibration_session, pair_validation_angles, save_calibration_pair, save_calibration_session,
@@ -443,6 +447,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._prediction = None
         #: Predicted rings per (frame, calibrant, calibration): see _expected_rings.
         self._ring_cache = {}
+        self._threshold_state = ThresholdState(mask_saturation=False)
         self._choices = []
         self._identity = None
         self._job = None
@@ -549,7 +554,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             if tip and widget is not None:
                 widget.setToolTip(tip)
 
-    def _combo(self, form, label, items, *, tip=''):
+    def _combo(self, form, label, items, *, tip='', host=None):
         """One Controls combo row (Int's ``FormRow``) of ``(text, data)`` items; returns its editor. The
         items are added here with their data (a factory name, a code), which FormRow's text choices do
         not carry: this window drives its rows directly, never through ``apply_field``. The row's label
@@ -558,7 +563,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         combo = row.editor
         for text, value in items:
             combo.addItem(text, value)
-        form.addRow(row.label, row)
+        if host is None:
+            form.addRow(row.label, row)
+        else:
+            row.label.setMinimumWidth(0)
+            self._formrows[host].add_trailing_widget(row, 1)
         self._row_of[combo] = row
         self._tip(tip, combo, row.label)
         return combo
@@ -667,7 +676,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         if not path:
             return
         kind = (SourceKind.NEXUS_STACK if self.beam_source_kind.currentData() == 'nexus'
-                else SourceKind.SPEC) if prefix else SourceKind(self.source_kind.currentData())
+                else SourceKind.SPEC) if prefix else (
+                    SourceKind.NEXUS_STACK if self.source_kind.currentData() == 'nexus_stack' else SourceKind.SPEC)
         spec = SourceSpec(Path(path).expanduser().absolute(), kind,
                           entry=self._text(prefix + 'entry') or 'entry',
                           options={'scan': self._text(prefix + 'scan')} if kind is SourceKind.SPEC else {})
@@ -695,12 +705,13 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _build_source(self):
         layout, form = self._form('3 · Calibrant scan', 'select')
-        self.source_kind = self._combo(form, 'Source type', [('SPEC + scan + images', 'spec'),
+        self.source_kind = self._combo(form, 'Source type', [('SPEC + image series', 'spec'),
+                                                             ('SPEC + Eiger / NeXus', 'spec_container'),
                                                              ('NeXus images + metadata', 'nexus_stack')],
-            tip='SPEC + images: a SPEC file lists each frame\'s angles and image files hold the frames. '
-                'NeXus: one file holds both.')
+            tip='SPEC supplies each frame\'s angles; an image series or an Eiger/NeXus container supplies '
+                'the frames. Standalone NeXus holds both images and metadata.')
         self._edit(form, 'source', 'SPEC file',
-                   chooser=lambda: 'spec' if self.source_kind.currentData() == 'spec' else NEXUS_FILTER,
+                   chooser=lambda: NEXUS_FILTER if self.source_kind.currentData() == 'nexus_stack' else 'spec',
                    tip='The calibrant scan: its SPEC file, or its NeXus file.')
         self._attach('scan', 'source', 'Scan', '1', tip=self._SCAN_TIP, width=90)
         self._edit(form, 'images', 'Images folder', chooser='directory', tip=self._FOLDER_TIP)
@@ -714,14 +725,26 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.refine_calibrant.currentTextChanged.connect(self._render_frames)
         self._formrows['calibrant'] = self._row_of[self.refine_calibrant]
         self._rows['calibrant'] = (form, self._row_of[self.refine_calibrant])
-        self._attach('rough_energy', 'calibrant', 'Energy (keV)', '', width=150,
+        self._attach('rough_energy', 'calibrant', 'Energy (keV)', '', width=300,
                      placeholder='auto from scan',
                      tip='The calibrant scan\'s X-ray energy, in keV, populated from its recorded energy or '
                          'wavelength when the source is committed. Type it when metadata is absent. '
                          'Wavelength is computed from this value; the direct-beam distance fit needs no energy. '
                          'Saving a rough calibration needs this or the direct-beam scan\'s recorded energy'
                          + _PAGE_USE.get(self.context.page, {}).get('energy_field', '') + '.')
+        self._fields['rough_energy'].setMinimumWidth(300)
         self._fields['rough_energy'].editingFinished.connect(self._render_frames)
+        from xdart.gui.widgets.controls_panel import RangeRow
+        self.threshold_range = RangeRow(label='Threshold',
+            low={'path': ('Calibration', 'min'), 'value': 0},
+            high={'path': ('Calibration', 'max'), 'value': None, 'placeholder': 'Auto'},
+            toggle={'path': ('Calibration', 'enabled'), 'value': False,
+                    'tooltip': 'Enable calibration-only pixel filtering; raw images and Stitch thresholds stay unchanged.'},
+            display_decimals=0)
+        self.threshold_range.valueChanged.connect(self._threshold_edited)
+        form.addRow(self.threshold_range.label, self.threshold_range)
+        self._fields['saturation'].editingFinished.connect(self._show_threshold)
+        self._show_threshold()
         self.source_kind.currentIndexChanged.connect(self._sync_source_rows)
         for key in ('source', 'scan'):
             self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders())
@@ -743,10 +766,51 @@ class CalibrationDialog(QtWidgets.QDialog):
         layout.addWidget(self.prepare_button)
 
     def _sync_source_rows(self, *_args):
-        spec = self.source_kind.currentData() == 'spec'
-        for key, shown in (('scan', spec), ('images', spec), ('entry', not spec)):
+        kind = self.source_kind.currentData()
+        spec = kind != 'nexus_stack'
+        for key, shown in (('scan', spec), ('images', spec), ('entry', kind != 'spec')):
             self._show(key, shown)
         self._label('source').setText('SPEC file' if spec else 'NeXus file')
+
+    def _conditioning(self):
+        state = self._threshold_state
+        return (StitchConditioning('manual', state.threshold_min, state.threshold_max) if state.apply_threshold
+                else StitchConditioning('auto' if state.mask_saturation else 'off'))
+
+    def _show_threshold(self):
+        if not hasattr(self, 'threshold_range'):
+            return
+        from xrd_tools.session.readiness import ControlFormField, SectionId
+        try:
+            ceiling = self._saturation_value()
+            if ceiling is not None and (not math.isfinite(ceiling) or ceiling <= 0):
+                ceiling = None
+        except ValueError:
+            ceiling = None
+        self._threshold_default_max, hint = auto_ceiling_hint(
+            [None if ceiling is None else (ceiling, 'saturation')])
+        state = self._threshold_state
+        automatic = state.mask_saturation and not state.apply_threshold
+        values = {'min': 0 if automatic or state.threshold_min is None else state.threshold_min,
+                  'max': None if automatic else state.threshold_max,
+                  'enabled': state.apply_threshold or state.mask_saturation}
+        self.threshold_range.apply_fields({('Calibration', key): ControlFormField(
+            SectionId.PROCESSING, 'Threshold', ('Calibration', key), value=value,
+            placeholder=hint if key == 'max' else None) for key, value in values.items()})
+
+    def _threshold_edited(self, path, value):
+        result = threshold_transition(self._threshold_state, path[-1], value, self._threshold_default_max)
+        if result is None or isinstance(result, ThresholdEditRefusal):
+            self._show_threshold()
+        if isinstance(result, ThresholdEditRefusal):
+            self.status.setText(result.reason)
+        elif result is not None:
+            self._threshold_state = result
+            self._show_threshold()
+            self._ring_cache.clear()
+            self._invalidate_fit()
+            self._render_frames()
+            self._save_session_quietly()
 
     def _build_frames(self):
         # Calibrating the frames and fitting them are one loop: one tab (maintainer, 2026-09-29)
@@ -1012,6 +1076,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                                                              ('SPEC + Eiger / NeXus', 'spec_container'),
                                                              ('NeXus images + metadata', 'nexus')],
             tip='Where the direct-beam scan\'s angles and images come from.')
+        self._formrows['beam_source_kind'] = self._row_of[self.beam_source_kind]
+        self._rows['beam_source_kind'] = (form, self._row_of[self.beam_source_kind])
+        self._attach('beam_entry', 'beam_source_kind', 'NeXus entry', 'entry',
+                     tip='The NeXus entry (group) holding the images.')
         self._edit(form, 'beam_source', 'SPEC file',
                    chooser=lambda: NEXUS_FILTER if self.beam_source_kind.currentData() == 'nexus' else 'spec',
                    tip='The direct-beam scan: its SPEC file (the angles), or its NeXus file.')
@@ -1021,7 +1089,6 @@ class CalibrationDialog(QtWidgets.QDialog):
                    tip='The Eiger master or NeXus file holding this scan\'s images.')
         self._edit(form, 'beam_images', 'Images folder', chooser='directory', tip=self._FOLDER_TIP)
         self._attach('beam_stem', 'beam_images', 'Stem', '', tip=self._STEM_TIP)
-        self._edit(form, 'beam_entry', 'NeXus entry', 'entry', tip='The NeXus entry (group) holding the images.')
         self.beam_source_kind.currentIndexChanged.connect(self._sync_rough_rows)
         for key in ('beam_source', 'beam_scan'):
             self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders('beam_'))
@@ -1030,7 +1097,13 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._fields[key].editingFinished.connect(lambda: self._source_details('beam_'))
         self._edit(form, 'beam_motor', 'Two-theta motor (degrees)', 'del',
                    tip='The motor that swings the detector in the direct-beam scan (del for psic\'s vertical arm).')
-        self._edit(form, 'beam_pixel', 'Approximate beam pixel x, y (oriented image)', '',
+        self.motion = self._combo(form, 'Beam direction', [('Auto (motor)', 'auto'),
+                                                          ('horizontal', None), ('vertical', None)],
+                                  host='beam_motor',
+                                  tip='The beam spot\'s direction in the oriented image. Auto uses the configured '
+                                      'circle: del (vertical) or nu (horizontal), including a single 2θ arm. '
+                                      'Choose an explicit direction to override it.')
+        self._edit(form, 'beam_pixel', 'Direct beam pixel (x, y)', '',
                    tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (each '
                        'circle at its motor zero, beside its motor under 1 · Instrument), in the image as '
                        'displayed; it is not necessarily the centre. '
@@ -1038,12 +1111,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                        'brightest spot, a lone hot pixel ignored). Typed: along the beam\'s motion it can be '
                        'rough; across it (the row for horizontal motion, the column for vertical) it must be '
                        'within the strip half width, because the spot is searched only in that strip.')
-        self.motion = self._combo(form, 'Beam motion', [('Auto (motor)', 'auto'),
-                                                       ('horizontal', None), ('vertical', None)],
-                                  tip='The beam spot\'s direction in the oriented image. Auto uses the configured '
-                                      'circle: del (vertical) or nu (horizontal), including a single 2θ arm. '
-                                      'Choose an explicit direction to override it.')
-        self._edit(form, 'rough_mount', 'Detector mount tilt, roll (°)', '0, 0',
+        self._attach('rough_mount', 'beam_pixel', 'Detector mount tilt, roll (°)', '0, 0', width=180,
                    tip='The detector mount\'s tilt and roll, held fixed (the arm\'s mount extension; a '
                        'single 2θ arm has none). 0, 0: the detector faces the beam squarely at every angle.')
         self._fit_options, options = self._card(layout, 'Fit options')
@@ -1106,15 +1174,20 @@ class CalibrationDialog(QtWidgets.QDialog):
         panel = QtWidgets.QGroupBox('Detector')
         form = QtWidgets.QFormLayout(panel)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self._choice(form, 'beam_detector', 'Model', [(label, name) for label, name in detector_choices()],
+        self._choice(form, 'beam_detector', 'Model', list(detector_choices(raw_details=True)),
                      'Pilatus300kw', tip='The detector model (pyFAI); it sets the pixel size and shape.')
+        self.raw_layout = self._combo(form, 'RAW layout', [('Detector default', 'factory'), ('Manual', 'manual')],
+            host='beam_detector', tip='Detector default: its rows and columns, with the RAW reader default int32. '
+                'Manual: override the stored RAW layout; the physical detector model and pixel pitch stay selected. '
+                'TIFF, Eiger and NeXus carry their own layout.')
+        self._attach('header', 'beam_detector', 'Header (bytes)', '0', width=75,
+                     tip='Bytes to skip before pixels in a headerless RAW file; unused for TIFF, Eiger and NeXus.')
         reader = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(reader)
         row.setContentsMargins(0, 0, 0, 0)
         raw_tip = ('Only for headerless .raw images (the calibrant and direct-beam scans): the frame\'s rows '
                    'and columns (set from the model), pixel type and header size.')
-        for key, label, default, stretch in [('shape', 'rows, cols', '195, 1475', 3), ('dtype', 'type', 'int32', 2),
-                                             ('header', 'header', '0', 1)]:
+        for key, label, default, stretch in [('shape', 'rows, cols', '195, 1475', 3), ('dtype', 'type', 'int32', 2)]:
             part = FormRow(label=label, path=('Calibration', key), value=default)
             part.label.setMinimumWidth(0)
             edit = part.editor
@@ -1126,11 +1199,13 @@ class CalibrationDialog(QtWidgets.QDialog):
         form.addRow('RAW images', reader)
         self._rows['raw'] = (form, reader)
         self._tip(raw_tip, form.labelForField(reader))
+        self.raw_layout.currentIndexChanged.connect(self._sync_raw_layout)
+        self._sync_raw_layout()
         # The detector's camera, as xrayutilities gives it (maintainer, 2026-09-30: "two drop-down boxes
         # linked together ... x+, x-, z+, z-"): it turns and mirrors every image into Stitch's frame.
         from xdart.gui.widgets.camera_editor import CameraEditor
         self.camera = CameraEditor()
-        form.addRow('Camera (lab frame)', self.camera)
+        form.addRow('Camera orientation (lab frame)', self.camera)
         self._tip(self._CAMERA_TIP, self.camera.rows, self.camera.columns, form.labelForField(self.camera))
         self._image_size = QtWidgets.QLabel()
         self._image_size.setWordWrap(True)
@@ -1255,10 +1330,28 @@ class CalibrationDialog(QtWidgets.QDialog):
         if not self._restoring_fields and model != getattr(self, '_pixel_detector', model):
             self._set_field_text('beam_pixel', '')  # a pixel belongs to one detector, not another model
         self._pixel_detector = model
-        shape = detector_shape(self._text('beam_detector'))
-        if shape is not None and 'shape' in self._fields:
-            self._fields['shape'].setText(f'{shape[0]}, {shape[1]}')
+        if not self._restoring_fields:
+            self.raw_layout.setCurrentIndex(self.raw_layout.findData('factory'))
+        self._sync_raw_layout()
         self._show_saturation_hint()
+
+    def _sync_raw_layout(self, *_args):
+        manual = self.raw_layout.currentData() == 'manual'
+        if not manual and not self._restoring_fields:
+            shape = detector_shape(self._text('beam_detector'))
+            if shape is not None:
+                self._set_field_text('shape', f'{shape[0]}, {shape[1]}')
+            self._set_field_text('dtype', 'int32')
+        for key in ('shape', 'dtype'):
+            self._fields[key].setReadOnly(not manual)
+        self._show('raw', manual)
+
+    def _custom_raw_layout(self):
+        try:
+            shape = tuple(int(v) for v in self._text('shape').split(','))
+            return shape != detector_shape(self._text('beam_detector')) or self._text('dtype') != 'int32'
+        except ValueError:
+            return True  # preserve a draft; the action validates the reader
 
     def _show_saturation_hint(self):
         """The shared documented limit without disk reads; the grey hint keeps Auto, like Int."""
@@ -1267,6 +1360,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._fields['saturation'].setPlaceholderText(
             f'Auto · {ceiling.value} (detector)' if ceiling is not None else
             'Auto · image type maximum; acquisition cutoff varies')
+        self._show_threshold()
 
     def _saturation_value(self):
         """An explicit cutoff, else the existing detector limit; unknown models keep dtype fallback."""
@@ -1301,7 +1395,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         for key, shown in visible.items():
             self._show(key, shown)
         form.setRowVisible(self._row_of[self.beam_source_kind], scan)
-        form.setRowVisible(self._row_of[self.motion], scan)
+        self._row_of[self.motion].setVisible(scan)
         for widget in (self._fit_options, self.beam_button, self.beam_summary, self.show_fit_button,
                        self.apply_distance_button):
             widget.setVisible(scan)
@@ -1392,7 +1486,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._fields['refine_seed_path'].setText(str(geometry_path))
             if self.fit is None and self._seed_file_problem(geometry_path) is None:  # an arm it can start from
                 self.refine_seed.setCurrentIndex(self.refine_seed.findData('file'))
-        self.source_kind.setCurrentIndex(0 if source.kind is SourceKind.SPEC else 1)
+        self.source_kind.setCurrentIndex(self.source_kind.findData(
+            'spec' if source.kind is SourceKind.SPEC else 'nexus_stack'))
         opts = source.options
         for key, value in [('source', source.uri), ('scan', opts.get('scan', '1')),
                            ('images', opts.get('image_dir', '')), ('stem', opts.get('image_stem', '')),
@@ -1400,9 +1495,11 @@ class CalibrationDialog(QtWidgets.QDialog):
             if value is not None:  # psic's del/nu motors, when given (set_instrument names them all)
                 self._fields[key].setText(str(value))
         reader = opts.get('read_image_kwargs', {})
-        for key, value in [('shape', ', '.join(map(str, reader.get('detector_shape', (195, 1475))))),
+        for key, value in [('shape', ', '.join(map(str, reader.get('detector_shape',
+                                     detector_shape(self._text('beam_detector')) or (195, 1475))))),
                            ('dtype', reader.get('raw_dtype', 'int32')), ('header', reader.get('raw_header_skip', 0))]:
             self._fields[key].setText(str(value))
+        self.raw_layout.setCurrentIndex(self.raw_layout.findData('manual' if self._custom_raw_layout() else 'factory'))
         if image_rotation is None:  # the page turns no images of its own: the window's camera stays (item 10)
             return
         from xrd_tools.core.geometry import ImageOrientation
@@ -1434,7 +1531,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     #: Choices saved with the page's settings (Stitch's, RSM's). The calibrant-scan and same-detector
     #: confirmations are per use and never saved.
     _SAVED_CHOICES = ('source_kind', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
-                      'motion', 'rough_mode')
+                      'motion', 'rough_mode', 'raw_layout')
 
     def settings(self):
         """This dialog's inputs as plain values, for the page's saved settings."""
@@ -1448,6 +1545,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             'refine_energy': self.refine_energy.isChecked(),
             'instrument_geometry': self.geometry_editor.value().to_record(),
             'camera': list(self.camera.value().to_xu()),
+            'calibration_threshold': asdict(self._threshold_state),
         }
 
     def set_instrument(self, geometry: InstrumentGeometry):
@@ -1466,7 +1564,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         from xrd_tools.core.energy import wavelength_m_to_energy_eV
         if fields.get('rough_wavelength') and not fields.get('rough_energy'):
             try:
-                fields['rough_energy'] = f"{float(wavelength_m_to_energy_eV(float(fields['rough_wavelength']) * 1e-10)) / 1000:.15g}"
+                fields['rough_energy'] = f"{float(wavelength_m_to_energy_eV(float(fields['rough_wavelength']) * 1e-10)) / 1000:.4f}"
             except (TypeError, ValueError):
                 pass
         if fields.get('beam_image_file') and not fields.get('beam_images') and not fields.get('beam_stem'):
@@ -1498,7 +1596,22 @@ class CalibrationDialog(QtWidgets.QDialog):
         if isinstance(values.get('refine_energy'), bool):
             self.refine_energy.setChecked(values['refine_energy'])
         self._apply_camera(values)
+        self._threshold_state = ThresholdState(mask_saturation=False)
+        if isinstance(values.get('calibration_threshold'), dict):
+            try:
+                state = ThresholdState(**values['calibration_threshold'])
+                if type(state.apply_threshold) is not bool or type(state.mask_saturation) is not bool:
+                    raise ValueError('invalid calibration threshold flags')
+                if state.apply_threshold or state.threshold_max is not None:
+                    StitchConditioning('manual', state.threshold_min, state.threshold_max)
+                self._threshold_state = state
+            except (TypeError, ValueError):
+                pass
+        self._show_threshold()
         self._restoring_fields = False
+        if 'raw_layout' not in (values.get('choices') or {}) and self._custom_raw_layout():
+            self.raw_layout.setCurrentIndex(self.raw_layout.findData('manual'))  # legacy reader overrides
+        self._sync_raw_layout()
         # after the del/nu fields an older file names its arm with: its normal-incidence zero
         self.geometry_editor.set_value(migrated_instrument(self.geometry_editor.value(), values))
         self._sync_arm_model()
@@ -1580,7 +1693,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                 'distance_bounds_m': None if limits is None else list(limits),
                 'refine_energy': self.refine_energy.isChecked(), 'energy_bound_eV': energy,
                 'fit_motor_scales': self.scales.isChecked(),
-                'instrument_geometry': self.geometry_editor.value().to_record()}
+                'instrument_geometry': self.geometry_editor.value().to_record(),
+                **({'conditioning': self._conditioning().to_dict()} if self._conditioning().mode != 'off' else {})}
 
     def _save_session(self, policy=None):
         """Record the session's frames with the fit policy (combined Stitch review F2): when frames are
@@ -1598,6 +1712,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         from xrd_tools.integrate.refine import ArmFitBounds
         if 'instrument_geometry' in policy:
             self.geometry_editor.set_value(InstrumentGeometry.from_record(policy['instrument_geometry']))
+        band = StitchConditioning(**policy.get('conditioning', {'mode': 'off'}))
+        self._threshold_state = ThresholdState(band.mode == 'manual', band.threshold_min, band.threshold_max,
+                                               band.mode == 'auto')
+        self._show_threshold()
         bounds = ArmFitBounds.from_record(policy['bounds'])
         geometry, zeros = self.geometry_editor.value(), dict(bounds.zeros_deg)
         for role, motor in zip(('del', 'nu'), geometry.stitch_arm()):
@@ -1668,7 +1786,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if beam:
             kind = SourceKind.NEXUS_STACK if self.beam_source_kind.currentData() == 'nexus' else SourceKind.SPEC
         else:
-            kind = SourceKind(self.source_kind.currentData())
+            kind = SourceKind.NEXUS_STACK if self.source_kind.currentData() == 'nexus_stack' else SourceKind.SPEC
         options = {}
         if kind is SourceKind.SPEC:
             if (beam and self.beam_source_kind.currentData() == 'spec_container'
@@ -1730,7 +1848,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         def start():
             if self._staged_camera_message():  # the mask would be turned for this camera, the frame for its own
                 raise ValueError(self._staged_camera_message())  # (Codex round-2 review F3; the Fit's refusal)
-            frame, seed = self._selected_frame(), {**self._seed_options(), 'mask': self._pyfai_mask()}
+            frame = self._selected_frame()
+            seed = {**self._seed_options(), 'mask': self._pyfai_mask(frame)}
             if not _frame_energy_known(frame, seed):
                 raise ValueError(f'frame {frame.identity}: its scan records no energy; type Energy (keV) '
                                  '(3 · Calibrant scan) so pyFAI calibrates it at the right one')
@@ -1781,15 +1900,21 @@ class CalibrationDialog(QtWidgets.QDialog):
                        if value is not None), None)
         if record is None:
             return None
+        band = self._conditioning()
+        try:
+            saturation = self._saturation_value() if band.mode != 'off' else None
+        except ValueError:
+            return None  # a draft saturation is not a predicted pixel range
         import hashlib
         key = (frame.identity, seed['calibrant'], hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
-               if isinstance(record, dict) else record, self._mask_state())
+               if isinstance(record, dict) else record, self._mask_state(), band, saturation)
         if key not in self._ring_cache:
             from xrd_tools.integrate.calibration_seed import predict_frame_seed
             try:
                 self._ring_cache[key] = predict_frame_seed(
                     record, frame, calibrant=seed['calibrant'], del_motor=seed['del_motor'],
-                    nu_motor=seed['nu_motor'], mask=self._loaded_mask()).rings
+                    nu_motor=seed['nu_motor'], mask=self._loaded_mask(), conditioning=band,
+                    saturation=saturation).rings
             except (ValueError, KeyError, OSError):
                 self._ring_cache[key] = None
         return self._ring_cache[key]
@@ -1949,6 +2074,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                            calibrant=self.refine_calibrant.currentText().strip() or 'LaB6',
                            max_frames=int(self._text('refine_frames')),
                            max_counts=max_counts,
+                           conditioning=None if self._conditioning().mode == 'off' else self._conditioning(),
                            mask=self._oriented_mask() if self._text('mask') else None,
                            max_rms_q=float(self._text('rms')), energy_bound_eV=self._energy_bound(),
                            bounds=self._bounds(), **self._distance_options())
@@ -2094,12 +2220,16 @@ class CalibrationDialog(QtWidgets.QDialog):
                 self._mask_cache = (state, None)
         return self._mask_cache[1]
 
-    def _pyfai_mask(self):
+    def _pyfai_mask(self, frame=None):
         """The turned mask as a file pyFAI-calib2 reads (non-zero: masked), in the session folder; under a quarter
         turn with the model's own gaps turned too, which pyFAI's generic detector there does not hold (item 8)."""
         mask = self._loaded_mask()
         if mask is None and self._text('mask'):
             raise ValueError(f"the Detector panel's mask cannot be read: {self._text('mask')}")
+        if self._conditioning().mode != 'off':
+            from xrd_tools.integrate.stitch_calibration import calibration_frame_mask
+            mask = calibration_frame_mask(frame or self._selected_frame(), mask,
+                                          conditioning=self._conditioning(), saturation=self._saturation_value())
         turned = self._turned_detector()
         if turned is not None:
             from xrd_tools.integrate.turned_detector import turned_model_mask
@@ -2341,7 +2471,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                 if kind == 'source_details':
                     prefix, energy, automatic = result
                     if energy is not None:
-                        self._source_energy_text = f'{energy / 1000:.15g}'
+                        self._source_energy_text = f'{energy / 1000:.4f}'
                         self._set_field_text('rough_energy', self._source_energy_text)
                     if automatic is not None:
                         self._fields[prefix + 'stem'].setPlaceholderText(f'auto · {automatic}')
@@ -2357,7 +2487,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self._choices = result
                     energies = {energy for _index, _values, energy in result if energy is not None}
                     if len(energies) == 1:
-                        self._source_energy_text = f'{energies.pop() / 1000:.15g}'
+                        self._source_energy_text = f'{energies.pop() / 1000:.4f}'
                         self._set_field_text('rough_energy', self._source_energy_text)
                     suggested = suggested_frame_indices(result)
                     self.selection.setRowCount(len(result))
@@ -2386,6 +2516,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self._prediction = result
                     self._render_frames()
                 elif kind in ('fit', 'refine'):
+                    if self._job_policy and 'conditioning' in self._job_policy:
+                        result.asset['provenance']['calibration_conditioning'] = self._job_policy['conditioning']
                     summary = fit_summary_text(result)  # before adopting: a failure leaves no fit
                     self.fit = result  # Start from keeps the person's choice (maintainer, 2026-09-29)
                     self._fit_kind = kind

@@ -275,7 +275,8 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
     assert dialog._fit_options.isHidden()
     # the Detector panel serves every step: its rows stay, whatever the rough geometry
-    assert all(visible(key) for key in ('beam_detector', 'raw', 'beam_size', 'beam_orientation', 'saturation', 'mask'))
+    assert all(visible(key) for key in ('beam_detector', 'beam_size', 'beam_orientation', 'saturation', 'mask'))
+    assert not visible('raw')  # standard RAW layout is described by the detector picker
     folder = tmp_path / 'frame-20'
     folder.mkdir()
     dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20',

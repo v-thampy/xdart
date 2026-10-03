@@ -404,6 +404,26 @@ def _session_row(frame):
     return row
 
 
+def calibration_frame_mask(frame, mask=None, *, conditioning=None, saturation=None):
+    """Combine the calibration's static mask with its Int threshold band, in staged pixel coordinates.
+
+    The staged image stays unchanged. None/off preserves the existing static mask without reading pixels.
+    """
+    if conditioning is None or conditioning.mode == 'off':
+        return mask
+    from xrd_tools.io.image import read_image
+    from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+    image = read_image(frame.image_path)
+    if tuple(image.shape) != tuple(frame.shape):
+        raise ValueError('the staged calibration image changed shape')
+    bad = np.isnan(condition_stitch_frame(image, conditioning, saturation))
+    if mask is not None:
+        if np.shape(mask) != bad.shape:
+            raise ValueError('the calibration mask does not match the staged image')
+        bad |= np.asarray(mask, dtype=bool)
+    return bad
+
+
 def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
     """``arm`` (del, nu motors; None for a held circle) makes it version 3: a resumed
     session then knows which circle a single arm's one motor is (vertical or horizontal).
@@ -411,7 +431,8 @@ def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
     version 4: a resumed session fits and predicts from its own estimates and bounds (Codex review F6).
     With the energy choice ('refine_energy', 'energy_bound_eV'), the motor scales ('fit_motor_scales')
     and the Diffractometer the zeros are read by ('instrument_geometry') it is version 5: a resumed
-    session fits with its own choices and circles (combined Stitch review F1, F3)."""
+    session fits with its own choices and circles (combined Stitch review F1, F3).
+    With calibration-only ``conditioning`` it is version 6; older policies retain their version."""
     path = Path(directory) / 'calibration-session.json'
     payload = {'schema': 'xdart.stitch_calibration_session', 'version': 2,
                'frames': [_session_row(frame) for frame in frames]}
@@ -421,7 +442,8 @@ def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
         if arm is None:
             raise ValueError('a session records its fit policy with its arm')
         policy = _session_policy(fit_policy)
-        payload.update(version=5 if 'refine_energy' in policy else 4, fit_policy=policy)
+        payload.update(version=6 if 'conditioning' in policy else 5 if 'refine_energy' in policy else 4,
+                       fit_policy=policy)
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False))
     temporary.replace(path)
@@ -430,17 +452,19 @@ def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
 
 _POLICY_V4 = frozenset({'bounds', 'distance_seed_m', 'distance_bounds_m'})
 _POLICY_V5 = _POLICY_V4 | {'refine_energy', 'energy_bound_eV', 'fit_motor_scales', 'instrument_geometry'}
+_POLICY_V6 = _POLICY_V5 | {'conditioning'}
 
 
 def _session_policy(policy):
     """A session's fit policy, checked: an ArmFitBounds record and the distance seed and bounds; from
-    version 5 also the energy choice and bound, the motor-scale choice and the instrument."""
+    version 5 also the energy choice and bound, the motor-scale choice and the instrument;
+    version 6 also the calibration-only pixel conditioning."""
     from xrd_tools.integrate.refine import ArmFitBounds
     from xrd_tools.session.instrument import InstrumentGeometry
-    if not isinstance(policy, dict) or set(policy) not in (_POLICY_V4, _POLICY_V5):
+    if not isinstance(policy, dict) or set(policy) not in (_POLICY_V4, _POLICY_V5, _POLICY_V6):
         raise ValueError('unsupported calibration session fit policy')
     extra = {}
-    if set(policy) == _POLICY_V5:
+    if set(policy) in (_POLICY_V5, _POLICY_V6):
         energy = policy['energy_bound_eV']
         if (type(policy['refine_energy']) is not bool or type(policy['fit_motor_scales']) is not bool
                 or energy is not None and (isinstance(energy, bool) or not isinstance(energy, (int, float))
@@ -450,6 +474,9 @@ def _session_policy(policy):
                  'energy_bound_eV': None if energy is None else float(energy),
                  'fit_motor_scales': policy['fit_motor_scales'],
                  'instrument_geometry': InstrumentGeometry.from_record(policy['instrument_geometry']).to_record()}
+    if 'conditioning' in policy:
+        from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+        extra['conditioning'] = StitchConditioning(**policy['conditioning']).to_dict()
     bounds = ArmFitBounds.from_record(policy['bounds']).to_record()
     seed, limits = policy['distance_seed_m'], policy['distance_bounds_m']
     if seed is not None and (isinstance(seed, bool) or not isinstance(seed, (int, float)) or not 0 < seed < math.inf):
@@ -464,18 +491,19 @@ def _session_policy(policy):
 def load_calibration_session(path, *, with_arm=False, with_policy=False):
     """The session's frames; with ``with_arm``, also its arm (None before version 3); with
     ``with_policy``, also its fit policy (None before version 4; the energy, scale and instrument
-    choices from version 5)."""
+    choices from version 5, calibration-only conditioning from version 6)."""
     path = Path(path)
     if path.stat().st_size > 1 << 20:
         raise ValueError('calibration session exceeds the size limit')
     value = json.loads(path.read_text())
     version = value.get('version')
-    keys = ({'schema', 'version', 'frames'} | ({'arm'} if version in (3, 4, 5) else set())
-            | ({'fit_policy'} if version in (4, 5) else set()))
-    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or version not in (1, 2, 3, 4, 5):
+    keys = ({'schema', 'version', 'frames'} | ({'arm'} if version in (3, 4, 5, 6) else set())
+            | ({'fit_policy'} if version in (4, 5, 6) else set()))
+    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or version not in (1, 2, 3, 4, 5, 6):
         raise ValueError('unsupported calibration session')
-    policy = _session_policy(value['fit_policy']) if version in (4, 5) else None
-    if policy is not None and ('refine_energy' in policy) != (version == 5):
+    policy = _session_policy(value['fit_policy']) if version in (4, 5, 6) else None
+    if policy is not None and (('refine_energy' in policy) != (version in (5, 6))
+                               or ('conditioning' in policy) != (version == 6)):
         raise ValueError('unsupported calibration session fit policy')
     if not 1 <= len(value['frames']) <= 32:
         raise ValueError('invalid calibration frame count')
@@ -484,7 +512,7 @@ def load_calibration_session(path, *, with_arm=False, with_policy=False):
         # Legacy rows retain their files, but absent model/image binding means
         # they are incomplete until the user recalibrates or explicitly imports.
         validate_frame_files(frame, require_points=frame.complete)
-    arm = _session_arm(value, frames) if version in (3, 4, 5) else None
+    arm = _session_arm(value, frames) if version in (3, 4, 5, 6) else None
     if with_policy:
         return frames, arm, policy
     return (frames, arm) if with_arm else frames
