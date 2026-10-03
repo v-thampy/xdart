@@ -35,6 +35,70 @@ def qapp() -> QtWidgets.QApplication:
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+def test_dense_nan_slice_render_retains_at_most_one_mask_byte_per_pixel(qapp):
+    """A maximum-size CustomSlice plane must not retain two indices per empty pixel."""
+    import time
+    import tracemalloc
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+
+    data = np.arange(4_000_000, dtype=np.float32).reshape(2000, 2000)
+    data[data % 10 != 0] = np.nan
+    data.flags.writeable = False
+    pane = ScientificImagePane(lock_aspect=False)
+    try:
+        pane.render(data, x_axis=AxisProjection(np.arange(2000), "H", ""),
+                    y_axis=AxisProjection(np.arange(2000), "L", ""))
+        tracemalloc.start()
+        start = time.perf_counter()
+        pane.image.render()  # Force the actual upstream QImage conversion, beyond setImage.
+        elapsed = time.perf_counter() - start
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        locations = pane.image._imageNanLocations
+        retained = (locations.nbytes if isinstance(locations, np.ndarray)
+                    else sum(array.nbytes for array in locations))
+        print(f"render={elapsed:.6f}s traced_peak={peak}B retained_nan_locations={retained}B")
+        assert retained <= data.size
+        assert isinstance(locations, np.ndarray) and locations.dtype == np.bool_
+        assert locations.shape == data.shape
+        pane.image.setLevels((100, 3_000_000))
+        pane.image.render()
+        assert pane.image._imageNanLocations is locations
+        np.testing.assert_array_equal(pane.canvas.raw_image.T, data)
+        pane.clear_image_buffers()
+        assert pane.image._imageNanLocations is None
+        assert pane.image.qimage is None
+    finally:
+        tracemalloc.stop()
+        pane.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize("axis_order", ("col-major", "row-major"))
+@pytest.mark.parametrize("dense", (True, False))
+def test_nan_transparency_matches_upstream_pixels_and_preserves_source(qapp, axis_order, dense):
+    from xdart.gui.widgets.image_widget import pgXDImageItem
+
+    data = np.arange(120, dtype=np.float32).reshape(10, 12)
+    data[::2 if dense else 10, ::2 if dense else 12] = np.nan
+    original = data.copy()
+    item = pgXDImageItem()
+    reference = pg.ImageItem()
+    for target in (item, reference):
+        target.setOpts(axisOrder=axis_order)
+        target.setLookupTable(pg.colormap.get("viridis", source="matplotlib").getLookupTable(nPts=256))
+        target.setImage(data, autoLevels=False, levels=(0, 119), autoDownsample=False)
+    for levels in ((0, 119), (20, 80)):
+        for target in (item, reference):
+            target.setLevels(levels)
+            target.render()
+        np.testing.assert_array_equal(pg.functions.ndarray_from_qimage(item.qimage),
+                                      pg.functions.ndarray_from_qimage(reference.qimage))
+    assert isinstance(item._imageNanLocations, np.ndarray if dense else tuple)
+    np.testing.assert_array_equal(data, original)
+    assert np.shares_memory(item.image, data)
+
+
 @pytest.mark.parametrize("mode", ("Int 1D", "Int 2D"))
 def test_main_and_popup_images_use_shared_manual_percentile_controls(qapp, mode):
     shell = ScatteringWorkspaceShell()

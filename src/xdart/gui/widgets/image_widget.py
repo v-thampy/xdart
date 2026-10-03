@@ -434,6 +434,23 @@ class pgXDImageItem(pg.ImageItem):
         self.pos_label = pg.LabelItem(justify='right')
         self.raw = raw
 
+    def render(self):
+        # Upstream accepts either indices or a Boolean mask for transparentLocations.
+        # Empty RSM slices can have millions of NaNs: two intp coordinates per
+        # pixel cost much more than a mask. Keep sparse indices and delegate all
+        # QImage/LUT conversion, downsampling and non-scalar/GPU paths upstream.
+        if (self.image is not None and self.image.size and self._xp is np
+                and self.image.ndim == 2 and self.image.dtype.kind == 'f'
+                and not self.autoDownsample and self._imageNanLocations is None
+                and (self._imageHasNans is None or self._imageHasNans)):
+            self._imageHasNans = bool(np.isnan(self.image.min()))
+            if self._imageHasNans:
+                image = self.image.T if self.axisOrder == 'col-major' else self.image
+                mask = np.isnan(image)
+                index_bytes = np.count_nonzero(mask) * 2 * np.dtype(np.intp).itemsize
+                self._imageNanLocations = mask if index_bytes > mask.nbytes else mask.nonzero()
+        super().render()
+
     def hoverEvent(self, ev):
         """Show the position, pixel, and value under the mouse cursor.
         """
