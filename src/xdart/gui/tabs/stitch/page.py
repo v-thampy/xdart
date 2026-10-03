@@ -851,6 +851,7 @@ class StitchPage(QtWidgets.QWidget):
         for key in normalization.NORMALIZATION_KEYS:
             self._align_to_ranges(self._rows[key])
             self._tip(key, normalization.TIPS[key])
+            self._rows[key].setVisible(fields[key].enabled)
         self._rows["normalization"].valueChanged.connect(self._normalization_edited)
         for key in ("unit", "map_axis"):
             self._rows[key].valueChanged.connect(self._processing_axis_changed)
@@ -991,6 +992,7 @@ class StitchPage(QtWidgets.QWidget):
         for key in normalization.NORMALIZATION_KEYS:
             self._fields[key] = fields[key]
             self._rows[key].apply_field(fields[key])
+            self._rows[key].setVisible(fields[key].enabled)
 
     def _normalization_selection(self):
         """The Normalization group's selection (``normalization_values``); ValueError names what it needs."""

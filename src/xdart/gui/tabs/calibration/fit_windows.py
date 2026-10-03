@@ -144,20 +144,26 @@ class CalibrationFitWindow(FitWindow):
         self.panels = QtWidgets.QTabWidget(self)
         self.layout().removeWidget(self.view)
         self.layout().addWidget(self.panels)
-        self.panels.addTab(self.view, 'Fit residuals')
         self.pattern_view = ScientificView(self)
         self.pattern_view.set_hidden_tools('norm', 'background', 'raw', 'slice')
         self.pattern_view.set_page_tools(('preview', 'Stitch calibrant',
             'Stitch the complete calibrant scan with the fitted geometry (no files are written).'))
         self.pattern_view.commandRequested.connect(self._pattern_command)
         self.panels.addTab(self.pattern_view, 'Stitched calibrant')
+        self.panels.addTab(self.view, 'Fit residuals')
         self.panels.currentChanged.connect(self._panel_changed)
         self._fit = None
         self._preview_busy = False
 
     def _panel_changed(self, index):
-        if index == 1 and self.pattern_view.keyed_projection is None and not self._preview_busy:
+        if (self.panels.widget(index) is self.pattern_view
+                and self.pattern_view.keyed_projection is None and not self._preview_busy):
             self.previewRequested.emit()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Queue until the fit worker's completion has retired before starting its preview.
+        QtCore.QTimer.singleShot(0, lambda: self.isVisible() and self._panel_changed(self.panels.currentIndex()))
 
     def _pattern_command(self, command):
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
@@ -208,6 +214,8 @@ class CalibrationFitWindow(FitWindow):
         self.setWindowTitle('Automatic refinement' if kind == 'refine' else 'Calibration fit')
         if fit is not self._fit:
             self.clear_preview()
+            self.panels.setCurrentWidget(self.pattern_view)
+            QtCore.QTimer.singleShot(0, lambda: self.isVisible() and self._panel_changed(self.panels.currentIndex()))
         self._fit = fit
         provenance = fit.asset.get('provenance', {})
         lines = [calibration_fit_text(fit, kind)]

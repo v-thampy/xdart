@@ -60,7 +60,8 @@ def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(r
         assert 'calculated |q| − expected ring |q|' in window.summary.text()
         assert window.plot.getPlotItem().getAxis('bottom').labelText == 'del motor angle (°)'
         assert isinstance(window.pattern_view, ScientificView)
-        window.previewRequested.emit()
+        assert window.panels.tabText(0) == 'Stitched calibrant'
+        assert window.panels.currentWidget() is window.pattern_view
         until = time.monotonic() + 15
         while window.pattern_view.keyed_projection is None and time.monotonic() < until:
             app.processEvents()
@@ -71,8 +72,27 @@ def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(r
         image, trace = state.panels
         assert image.image.shape == (image.y_axis.values.size, image.x_axis.values.size)
         assert np.nanmax(trace.intensity) > 0
+        app.processEvents()
+        rows = window.pattern_view._keyed_area
+        assert isinstance(rows, QtWidgets.QSplitter) and rows.count() == 2
+        before = rows.sizes()
+        assert abs(before[0] - before[1]) <= 3
+        rows.moveSplitter(sum(before) // 3, 1)
+        resized = rows.sizes()
+        assert resized[0] < resized[1]
         window.pattern_view.commandRequested.emit(ShellCommand(ShellCommandKind.SET_LOG_SCALE, True))
         assert window.pattern_view.keyed_projection.log_scale
+        assert rows.sizes() == resized
+        window.panels.setCurrentWidget(window.view)
+        fit = replace(fit)
+        dialog.fit = fit
+        dialog._show_calibration_fit()
+        assert window.panels.currentWidget() is window.pattern_view
+        until = time.monotonic() + 15
+        while window.pattern_view.keyed_projection is None and time.monotonic() < until:
+            app.processEvents()
+            time.sleep(.02)
+        assert window.pattern_view.keyed_projection is not None
         window.clear_preview()
         window.previewRequested.emit()
         window.close()  # actual worker cancellation; completion must not reopen/adopt a hidden view

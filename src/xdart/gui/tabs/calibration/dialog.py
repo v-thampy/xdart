@@ -1380,9 +1380,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                    'They are the directions the stored image\'s rows (top to bottom) and columns (left to right) run '
                    'along with every circle at zero, the detector facing the beam: x up, z to the left looking '
                    'downstream (xrayutilities\' detectorDir1, detectorDir2). Every image is turned and mirrored '
-                   'into the calibration\'s frame, rows x−, columns z+, once before calibration; that is the default (an '
-                   'image rotation of 0 before). The header describes this stored-image correction, with '
-                   'rotation before mirroring, not the detector\'s physical mounting. '
+                   'into pyFAI\'s frame, rows x+, columns z−, once before calibration. Default selects that '
+                   'reference; it does not determine the detector\'s physical mounting. Choose the directions '
+                   'the stored rows and columns actually run along. The header describes their orientation '
+                   'relative to pyFAI, with rotation before mirroring. '
                    '17-2\'s Pilatus 300K-W is rows x−, columns z−, with nu x−.')
 
     def _orientation(self):
@@ -1418,16 +1419,18 @@ class CalibrationDialog(QtWidgets.QDialog):
         """The detector image's width × height, as the beam pixel is read (turned by the Detector panel's camera); a
         quarter turn also says the stored image's size and the turn."""
         model = self._fields['beam_detector'].currentText().partition(' [')[0]
-        self._detector_panel.setTitle(f'Detector · {model} · image correction: '
-                                      f'{self.camera.transform_description()}')
         shape = detector_shape(self._text('beam_detector'))
         if shape is None:
+            self._detector_panel.setTitle(f'Detector · {model} · orientation: '
+                                          f'{self.camera.transform_description()}')
             self._image_size.setText('unknown detector')
             self._fields['beam_pixel'].setPlaceholderText('column, row')
             return
         rows, columns = shape
         orientation = self._orientation()
         width, height = (rows, columns) if orientation.swaps_axes else (columns, rows)
+        self._detector_panel.setTitle(f'Detector · {model} · {width} × {height} px (W × H) · '
+                                      f'orientation: {self.camera.transform_description()}')
         # a quarter turn: the window's image is the stored one turned, and so is its detector (item 8)
         stored = (f' in the window (the stored image is {columns} × {rows}, turned {orientation.rotation}°'
                   f'{" and mirrored left-right" if orientation.flip_horizontal else ""})'

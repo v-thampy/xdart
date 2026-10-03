@@ -501,7 +501,7 @@ class ScientificView(QtWidgets.QFrame):
         self._hidden_tools: frozenset[str] = frozenset()
         # the keyed layout (``reconcile_keyed``): built on its first draw, so Int's and Stitch's views never
         # allocate it
-        self._keyed_area: QtWidgets.QWidget | None = None
+        self._keyed_area: QtWidgets.QSplitter | None = None
         self._keyed_layout: tuple[tuple[PanelKey, ...], ...] = ()
         self._keyed_panels: dict[PanelKey, _KeyedImagePanel | _KeyedTracePanel] = {}
         self._keyed_shown: KeyedPanelsProjection | None = None
@@ -3336,30 +3336,37 @@ class ScientificView(QtWidgets.QFrame):
             widgets.container.setParent(None)
             widgets.container.deleteLater()
         self._keyed_panels, self._keyed_layout = {}, ()
-        grid = self._keyed_area.layout()
-        width = max(len(row) for row in layout)
+        while self._keyed_area.count():
+            old_row = self._keyed_area.widget(0)
+            old_row.setParent(None)
+            old_row.deleteLater()
         for row_index, row in enumerate(layout):
-            for column, key in enumerate(row):
+            container = QtWidgets.QWidget()
+            across = QtWidgets.QHBoxLayout(container)
+            across.setContentsMargins(0, 0, 0, 0)
+            across.setSpacing(4)
+            for key in row:
                 if key.role is PanelRole.SLICE_2D:
                     widgets = _KeyedImagePanel(self, key)
                 elif key.role is PanelRole.PROJ_1D:
                     widgets = _KeyedTracePanel(key)
                 else:
                     raise ValueError(f"a keyed layout draws SLICE_2D and PROJ_1D panels, not {key.role.value}")
-                # a row of one panel spans the widest row (Custom Slice's plane over its two projections)
-                grid.addWidget(widgets.container, row_index, column, 1, width if len(row) == 1 else 1)
+                across.addWidget(widgets.container, 1)
                 self._keyed_panels[key] = widgets
+            self._keyed_area.addWidget(container)
+            self._keyed_area.setStretchFactor(row_index, 1)
+        self._keyed_area.setSizes([500] * len(layout))
         self._keyed_layout = layout
 
     def _enter_keyed_layout(self) -> None:
         if self._layout_mode == "keyed":
             return
         if self._keyed_area is None:
-            self._keyed_area = QtWidgets.QWidget(self)
+            self._keyed_area = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical, self)
             self._keyed_area.setObjectName("e7KeyedPanels")
-            grid = QtWidgets.QGridLayout(self._keyed_area)
-            grid.setContentsMargins(0, 0, 0, 0)
-            grid.setSpacing(4)
+            self._keyed_area.setChildrenCollapsible(False)
+            self._keyed_area.setHandleWidth(8)
             self._main_layout.insertWidget(self._main_layout.indexOf(self.vertical_splitter) + 1,
                                            self._keyed_area, 1)
         self.drop_viewer_loading_snapshot()

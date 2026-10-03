@@ -1083,9 +1083,12 @@ def test_the_normalization_group_takes_each_choice_to_the_plan(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_with_foil_columns(_native_form(tmp_path, "multigeometry", scans="1")))
+        _wait(page, qapp)  # readiness assertions follow the real asynchronous image admission
         assert page._value("normalization") == "None" and page.build_form().foil_normalization is None
         assert page._fields["foil_column"].choices == ("None", "I0", "foil status", "Seconds")  # the scan's counters
         assert not page._rows["monitor"].editor.isEnabled() and not page._rows["foil_lengths"].editor.isEnabled()
+        assert page._rows['normalization'].label.text() == 'Normalize'
+        assert all(page._rows[key].isHidden() for key in ('monitor', 'foil_column', 'exposure_column', 'foil_lengths'))
         expected = {
             "Monitor": ("I0", None),
             "Foil transmission × exposure": (None, ("foil status", "Seconds")),
@@ -1097,6 +1100,9 @@ def test_the_normalization_group_takes_each_choice_to_the_plan(qapp, tmp_path):
             page.set_field("foil_column", "foil status")
             page.set_field("exposure_column", "Seconds")
             assert page._value("normalization") == choice  # naming a monitor under a foil choice keeps it
+            visible = {'monitor': monitor is not None, 'foil_column': foil is not None,
+                       'exposure_column': foil is not None and foil[1] is not None, 'foil_lengths': foil is not None}
+            assert all(page._rows[key].isHidden() != needed for key, needed in visible.items())
             form = page.build_form()
             assert (form.monitor_selector.name if form.monitor_selector else None) == monitor
             got = form.foil_normalization
@@ -1106,6 +1112,9 @@ def test_the_normalization_group_takes_each_choice_to_the_plan(qapp, tmp_path):
                 assert got.absorption_lengths == (1.06, 3.04, 4.65, 9.5)
             plan = prepare_stitch_tool(form).request.plan
             assert plan.foil_normalization == got and plan.monitor_selector == form.monitor_selector
+        assert page._value('exposure_column') == 'Seconds'  # hidden inputs survive a mode switch
+        assert [page._rows[key].label.text() for key in ('foil_column', 'exposure_column', 'foil_lengths')] == [
+            'Foil', 'Exposure', 'Foil abs']
         page.set_field("foil_column", "None")
         assert page.run_bar.readinessLabel.full_text() == "Needs a foil column"
         page.set_field("foil_column", "foil status")

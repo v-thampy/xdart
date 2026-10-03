@@ -173,14 +173,17 @@ def test_a_plane_with_no_index_to_step_spans_its_row_and_draws_no_navigation(qap
     view = ScientificView()
     try:
         view.reconcile_keyed(state)
-        grid = view._keyed_area.layout()
         panel = view.keyed_panel(plane)
-        assert grid.getItemPosition(grid.indexOf(panel.container)) == (0, 0, 1, 2)
+        rows = view._keyed_area
+        assert isinstance(rows, QtWidgets.QSplitter) and rows.count() == 2
+        assert rows.widget(0).layout().count() == 1
+        assert rows.widget(0).layout().itemAt(0).widget() is panel.container
+        assert rows.widget(1).layout().count() == 2
         assert all(widget.isHidden() for widget in (panel.previous, panel.selector, panel.next))
         np.testing.assert_array_equal(panel.pane.canvas.raw_image, np.arange(6.0).reshape(2, 3).T)
         view.reconcile_keyed(_state())  # the 2×3-style layout: each panel one column, navigation drawn
-        grid = view._keyed_area.layout()
-        assert grid.getItemPosition(grid.indexOf(view.keyed_panel(_HK).container)) == (0, 0, 1, 1)
+        assert rows.widget(0).layout().itemAt(0).widget() is view.keyed_panel(_HK).container
+        assert rows.widget(0).layout().count() == 2
         assert not view.keyed_panel(_HK).selector.isHidden()
     finally:
         view.deleteLater()
