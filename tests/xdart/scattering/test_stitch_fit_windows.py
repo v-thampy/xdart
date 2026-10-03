@@ -57,7 +57,7 @@ def test_the_calibration_fit_window_groups_rows_in_the_1d_plots_colours_and_mark
     assert _names(window.plot) == ['nu 0°', 'nu 1.5°', 'rejected']
     colours = [tuple(item.opts['symbolBrush']) for item in window.plot.listDataItems()[:2]]
     assert colours == [tuple(colour) for colour in trace_colors('Default', 2)]
-    assert window.plot.getPlotItem().getAxis('bottom').labelText == 'del (°)'
+    assert window.plot.getPlotItem().getAxis('bottom').labelText == 'del motor angle (°)'
     assert len(window.residuals.listDataItems()) == 3  # the two rows and the rejected crosses, unnamed
     window.show_result(SimpleNamespace(asset={}, point_residuals=None, rms_q=0., n_points=0, message=''))
     assert not window.plot.listDataItems()

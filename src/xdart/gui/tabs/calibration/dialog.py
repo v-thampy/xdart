@@ -164,6 +164,15 @@ def _dispatch_job(request, cancelled, publish):
         spec, seed, options = arguments
         return refine_arm_from_scan(spec, seed, cancelled=cancelled,
                                     progress=_staged_progress(publish, _REFINE_STAGES), **options)
+    if kind == 'stitch_preview':
+        from xrd_tools.integrate.stitch_calibration import stitch_calibrant_preview
+        from xrd_tools.analysis.plans import StitchCancelled
+        fit, spec, options = arguments
+        try:
+            return stitch_calibrant_preview(fit, spec, cancelled=cancelled,
+                progress=lambda done, total: publish(f'Stitching calibrant {done}/{total}', done, total), **options)
+        except StitchCancelled as error:
+            raise OperationCancelled(str(error)) from error
     if kind == 'enumerate':
         spec, record = arguments
         names = scan_motor_names(spec)
@@ -460,6 +469,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._direct_beam_fit_window = None
         self._calibration_fit_window = None
         self._fit_kind = 'fit'  # the job the current fit came from: 'fit' or 'refine'
+        self._fit_source = self._pending_fit_source = None
+        self._preview_key = None
         self._distance_key = self._distance_pending_key = None  # what the result was fitted from
         self._source_energy_eV = None
         self._pending_source_details = None
@@ -1917,10 +1928,13 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._owner.busy:
             return
         self._job = kind
+        if self._calibration_fit_window is not None:
+            self._calibration_fit_window.preview_busy(True)
         self._identity = self._owner.begin((kind, arguments))
         self.tabs.setEnabled(kind == 'beam_detect')
         self.cancel_button.setEnabled(True)
-        self.status.setText('Checking direct-beam scan…' if kind == 'beam_detect'
+        self.status.setText('Stitching calibrant preview…' if kind == 'stitch_preview' else
+                            'Checking direct-beam scan…' if kind == 'beam_detect'
                             else f'{kind.capitalize()} in progress…')
         self._timer.start()
 
@@ -2048,12 +2062,15 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._guard(go)
 
     def _invalidate_fit(self):
+        self._cancel_preview()
+        self._fit_source = None
         self.fit = None
         self._fit_instrument = None
         self.save_button.setEnabled(False)
         self.fit_summary.clear()
         self.show_calibration_fit_button.setEnabled(False)
         if self._calibration_fit_window is not None:  # it showed the fit that is gone
+            self._calibration_fit_window.clear_preview()
             self._calibration_fit_window.close()
 
     def _geometry_edited(self):
@@ -2141,6 +2158,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                 turned_from=self._turned_detector())  # a quarter turn's model: the record carries it (item 8)
             self._invalidate_fit()
             self._job_policy = self._fit_policy()
+            self._pending_fit_source = self._spec()
             self._start('fit', (frames, options))
         self._guard(go)
 
@@ -2200,6 +2218,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                            bounds=self._bounds(), **self._distance_options())
             self._invalidate_fit()
             self._job_policy = self._fit_policy()
+            self._pending_fit_source = spec
             self._start('refine', (spec, seed, options))
         self._guard(go)
 
@@ -2510,10 +2529,33 @@ class CalibrationDialog(QtWidgets.QDialog):
             return
         if self._calibration_fit_window is None:
             self._calibration_fit_window = CalibrationFitWindow(self)
+            self._calibration_fit_window.previewRequested.connect(self._stitch_preview)
+            self._calibration_fit_window.previewClosed.connect(self._cancel_preview)
         self._calibration_fit_window.show_result(self.fit, self._fit_kind)
         self._calibration_fit_window.show()
         self._calibration_fit_window.raise_()
         self.show_calibration_fit_button.setEnabled(True)
+
+    def _preview_inputs(self):
+        return (id(self.fit), self._spec(), self._orientation(), self._text('mask'),
+                self._conditioning(), self._saturation_value())
+
+    def _stitch_preview(self):
+        def go():
+            if self._owner.busy or self.fit is None:
+                return
+            if self._fit_source is None or self._spec() != self._fit_source:
+                raise ValueError('Select the calibrant source used for this fit before stitching its preview.')
+            self._preview_key = self._preview_inputs()
+            self._start('stitch_preview', (self.fit, self._fit_source,
+                dict(mask=self._oriented_mask() if self._text('mask') else None,
+                     conditioning=self._conditioning(), saturation=self._saturation_value())))
+        self._guard(go)
+
+    def _cancel_preview(self):
+        self._preview_key = None
+        if self._owner.busy and self._job == 'stitch_preview':
+            self._cancel()
 
     def hideEvent(self, event):
         """The fit windows go with this window (closed, hidden, or shut down by the host)."""
@@ -2657,6 +2699,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.tabs.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self._timer.stop()
+        if self._calibration_fit_window is not None:
+            self._calibration_fit_window.preview_busy(False)
         if terminal.status is OperationTerminalStatus.RETURNED:
             result = terminal.payload
             try:
@@ -2723,12 +2767,19 @@ class CalibrationDialog(QtWidgets.QDialog):
                         result.asset['provenance']['calibration_conditioning'] = self._job_policy['conditioning']
                     summary = fit_summary_text(result)  # before adopting: a failure leaves no fit
                     self.fit = result  # Start from keeps the person's choice (maintainer, 2026-09-29)
+                    self._fit_source = self._pending_fit_source
                     self._fit_kind = kind
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
                     self.fit_summary.setPlainText(summary)
                     self.save_button.setEnabled(True)
                     self._save_session_quietly(self._job_policy)  # the policy it took; never unadopts it
                     self._show_calibration_fit()
+                elif kind == 'stitch_preview':
+                    window = self._calibration_fit_window
+                    if (not self._close_pending and window is not None and window.isVisible()
+                            and self._preview_key == self._preview_inputs()):
+                        window.show_preview(result)
+                    self._preview_key = None
                 elif kind == 'save':  # the ring fit, or the direct-beam geometry (_save_rough)
                     provenance = self._saving.asset['provenance']
                     self.saved_source_motors = provenance['source_motors']
@@ -2767,6 +2818,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                                                              self._distance_held))
                 elif kind in ('fit', 'refine'):  # what it found, as the direct-beam fit says its distance
                     self.status.setText(calibration_fit_text(result, kind))
+                elif kind == 'stitch_preview':
+                    self.status.setText('Calibrant preview complete.')
                 else:
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:
@@ -2775,6 +2828,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.status.setText('Cancelled. Previously completed frames and saved files are retained.')
         else:
             self.status.setText(terminal.failure_message)
+        if kind == 'stitch_preview' and self._calibration_fit_window is not None:
+            self._calibration_fit_window.preview_busy(False, self.status.text())
         if kind == 'beam_detect':
             if (terminal.status is not OperationTerminalStatus.RETURNED
                     and self._beam_probe_generation == self._beam_generation):

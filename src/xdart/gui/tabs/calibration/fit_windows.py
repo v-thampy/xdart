@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView
 
@@ -129,18 +129,89 @@ class CalibrationFitWindow(FitWindow):
     """A ring fit (Fit or Refine): each control point's |q| residual across the arm's angles, grouped by
     the other circle's row, and against its ring's q; the points the fit rejected are crosses."""
 
-    _UPPER = FitPanel(y_label='|q| residual (10⁻³ Å⁻¹)', zero_line=True)
-    _LOWER = FitPanel(x_label='Ring q (Å⁻¹)', y_label='|q| residual (10⁻³ Å⁻¹)', zero_line=True)
+    previewRequested = QtCore.Signal()
+    previewClosed = QtCore.Signal()
+    _UPPER = FitPanel(title='Ring residuals versus motor angle',
+                      y_label='Δ|q| (10⁻³ Å⁻¹)', zero_line=True)
+    _LOWER = FitPanel(title='Ring residuals versus expected ring Q',
+                      x_label='Expected ring Q (Å⁻¹)', y_label='Δ|q| (10⁻³ Å⁻¹)', zero_line=True)
 
     def __init__(self, parent=None):
         super().__init__(parent, 'calibrationFitWindow', 'Calibration fit')
         self.view.reconcile(FitProjection(self._UPPER, self._LOWER))
+        from xdart.gui.tabs.scattering.scientific_view import ScientificView
+        self.resize(900, 720)
+        self.panels = QtWidgets.QTabWidget(self)
+        self.layout().removeWidget(self.view)
+        self.layout().addWidget(self.panels)
+        self.panels.addTab(self.view, 'Fit residuals')
+        self.pattern_view = ScientificView(self)
+        self.pattern_view.set_hidden_tools('norm', 'background', 'raw', 'slice')
+        self.pattern_view.set_page_tools(('preview', 'Stitch calibrant',
+            'Stitch the complete calibrant scan with the fitted geometry (no files are written).'))
+        self.pattern_view.commandRequested.connect(self._pattern_command)
+        self.panels.addTab(self.pattern_view, 'Stitched calibrant')
+        self.panels.currentChanged.connect(self._panel_changed)
+        self._fit = None
+        self._preview_busy = False
+
+    def _panel_changed(self, index):
+        if index == 1 and self.pattern_view.keyed_projection is None and not self._preview_busy:
+            self.previewRequested.emit()
+
+    def _pattern_command(self, command):
+        from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
+        if command.kind is ShellCommandKind.PAGE_TOOL and command.value == 'preview':
+            self.previewRequested.emit()
+            return
+        state = self.pattern_view.keyed_projection
+        field = {ShellCommandKind.SET_COLOR_MAP: 'color_map',
+                 ShellCommandKind.SET_LOG_SCALE: 'log_scale',
+                 ShellCommandKind.SET_SHARE_AXIS: 'share_axis'}.get(command.kind)
+        if state is not None and field is not None:
+            self.pattern_view.reconcile_keyed(replace(state, **{field: command.value}))
+
+    def preview_busy(self, busy, detail=''):
+        self._preview_busy = bool(busy)
+        self.pattern_view.page_tool('preview').setEnabled(not busy)
+        self.pattern_view.page_tool('preview').setText('Stitching…' if busy else 'Stitch calibrant')
+        if detail:
+            self.pattern_view.status.setText(detail)
+
+    def clear_preview(self):
+        self.pattern_view.clear_keyed()
+
+    def show_preview(self, result):
+        from xdart.gui.tabs.scattering.shell_values import (
+            AxisProjection, KeyedImageProjection, KeyedTraceProjection, KeyedPanelsProjection)
+        from xrd_tools.session.display_logic import PanelKey, PanelRole
+        from xrd_tools.session.rsm_viewer_model import rsm_axis_bounds
+        image_key, trace_key = PanelKey(PanelRole.SLICE_2D, 'calibrant'), PanelKey(PanelRole.PROJ_1D, 'calibrant')
+        cake, profile = result.payload, result.profile[0]
+        axis = lambda values, label: AxisProjection(np.asarray(values), label,
+            edges=rsm_axis_bounds(values))
+        preview = result.provenance['calibrant_preview']
+        count = preview['frame_count']
+        self.pattern_view.reconcile_keyed(KeyedPanelsProjection(((image_key,), (trace_key,)), (
+            KeyedImageProjection(image_key, 'Stitched calibrant', cake.intensity.T,
+                axis(cake.radial, 'Q (Å⁻¹)'), axis(cake.azimuthal, 'χ (°)'), 0, (), navigation=False),
+            KeyedTraceProjection(trace_key, 'Stitched intensity profile',
+                axis(profile.radial, 'Q (Å⁻¹)'), profile.intensity, 'I (a.u.)')),
+            title=f"{preview['label']} · fitted geometry", status=f'{count} frames · solid angle on · polarization off · normalization None'))
+
+    def closeEvent(self, event):
+        self.previewClosed.emit()
+        super().closeEvent(event)
 
     def show_result(self, fit, kind='fit'):
         """Plot ``fit`` (a ``CalibrationFit``; ``kind`` 'fit' or 'refine') and say what it found."""
         self.setWindowTitle('Automatic refinement' if kind == 'refine' else 'Calibration fit')
+        if fit is not self._fit:
+            self.clear_preview()
+        self._fit = fit
         provenance = fit.asset.get('provenance', {})
         lines = [calibration_fit_text(fit, kind)]
+        lines.append('Both panels show Δ|q| = calculated |q| − expected ring |q|; the upper x axis is a motor angle, not 2θ.')
         validation = (provenance.get('automatic_refinement') or {}).get('validation') or {}
         sigma = validation.get('held_out_sigma_A^-1')
         if sigma:
@@ -174,5 +245,5 @@ class CalibrationFitWindow(FitWindow):
             upper.append(FitSeries(x[~kept], dq[~kept], 'rejected', 'rejected'))
             below.append(FitSeries(q[~kept], dq[~kept], 'rejected'))
         self.view.reconcile(FitProjection(
-            replace(self._UPPER, series=tuple(upper), x_label=f'{along} (°)' if along else 'Frame'),
+            replace(self._UPPER, series=tuple(upper), x_label=f'{along} motor angle (°)' if along else 'Frame'),
             replace(self._LOWER, series=tuple(below)), '\n'.join(lines)))
