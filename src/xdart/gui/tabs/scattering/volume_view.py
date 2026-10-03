@@ -176,6 +176,10 @@ class VolumeView(QtWidgets.QFrame):
                 label=label,
                 low={"path": ("volume_range", str(index), "low"), "value": "", "placeholder": "Auto"},
                 high={"path": ("volume_range", str(index), "high"), "value": "", "placeholder": "Auto"})
+            for widget in (row, row.label, row._low, row._high):
+                widget.setToolTip(
+                    "Minimum and maximum displayed coordinates only. Blank bounds use the full axis; "
+                    "the scientific result is unchanged. Available when a volume is shown.")
             row.valueChanged.connect(self._range_edited)
             self.range_card.add_row(row)
             self.axis_ranges.append(row)
