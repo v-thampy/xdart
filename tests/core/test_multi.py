@@ -393,10 +393,7 @@ def test_streaming_multigeometry_matches_native_union_result(
 
     assert streamed.intensity.dtype == eager.intensity.dtype == np.dtype(np.float32)
     assert streamed.error_model == eager.error_model
-    if mode == "1d":
-        assert np.isnan(eager.dummy)
-    else:
-        assert eager.dummy == np.float32(0.0)
+    assert eager.dummy == np.float32(0.0)
     if np.isnan(eager.dummy):
         assert np.isnan(streamed.dummy)
     else:
@@ -805,7 +802,7 @@ def test_the_streaming_gi_cuts_equal_pyfais_multigeometryfiber_and_leave_iq_alon
                              (cut_diagnostics.normalization, single_diagnostics.normalization)):
             np.testing.assert_array_equal(mine, theirs)
         reference = MultiGeometryFiber(fibers, unit=('qip_A^-1', 'qoop_A^-1'), incident_angle=np.radians(incidence),
-                                       tilt_angle=np.radians(tilt), sample_orientation=2, **ranges
+                                       tilt_angle=np.radians(tilt), sample_orientation=2, threadpoolsize=0, **ranges
                                        ).integrate1d_grazing_incidence(images, npt_ip=64, npt_oop=64,
                                                                        vertical_integration=name == 'q_oop',
                                                                        polarization_factor=.99,
@@ -914,17 +911,18 @@ def _window_sums(gi, bins, mask, image=None, integrator=None, **corrections):
 
 def test_codex_f1_a_pixel_below_the_other_window_counts_in_neither_gi_cut():
     """Codex final review F1: a thin pass's one-bin coordinate admitted pixels up to the whole window
-    width below it (pyFAI's histogram truncates a bin index in (-1, 0) to bin 0). Its row: only pixel
-    (28, 0) unmasked, its Qip 0.0907 inside the (-0.4, 0.4) window and its Qoop -0.4357 below it; the Qip
-    cut counted it once (signal 100), the 37 × 37 square not at all. It counts in neither cut."""
+    width below it (pyFAI's histogram truncates a bin index in (-1, 0) to bin 0). Only pixel (28, 0)
+    is unmasked: native 2026.9 Qip -0.0900 lies inside (-0.4, 0.4), Qoop 0.4359 below (0.5, 1.3).
+    A thin pass would count it once (signal 100), the 37 × 37 square not at all. Neither may count it.
+    The window retains the original low-edge discriminator after upstream's position sign fix."""
     from xrd_tools.integrate.stitch_gi import StitchGI
     q_ip, q_oop = _window_probe_coordinates((.37, 1.8))
-    assert -.4 < q_ip[28, 0] < .4 and q_oop[28, 0] < -.4
+    assert -.4 < q_ip[28, 0] < .4 and 0 < .5 - q_oop[28, 0] < .8
     gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_angle_deg=1.8, ip_range=(-.4, .4),
-                  oop_range=(-.4, .4))
+                  oop_range=(.5, 1.3))
     mask = np.ones((29, 43), dtype=np.int8)
     mask[28, 0] = 0
-    sums = _window_sums(gi, {"q_ip": (-.4, .4), "q_oop": (-.4, .4)}, mask)
+    sums = _window_sums(gi, {"q_ip": (-.4, .4), "q_oop": (.5, 1.3)}, mask)
     assert [(values[0].sum(), values[2].sum()) for values in sums] == [(0., 0.), (0., 0.)]
 
 
@@ -956,8 +954,8 @@ def test_a_gi_pixel_counts_in_both_cuts_only_inside_the_closed_window(coordinate
 
 
 @pytest.mark.parametrize("solid_angle", [False, True])
-@pytest.mark.parametrize("ranges", [{}, {"ip_range": (.2, .45)}, {"oop_range": (-.35, -.2)},
-                                    {"ip_range": (.2, .45), "oop_range": (-.35, -.2)}],
+@pytest.mark.parametrize("ranges", [{}, {"ip_range": (-.45, -.2)}, {"oop_range": (.2, .35)},
+                                    {"ip_range": (-.45, -.2), "oop_range": (.2, .35)}],
                          ids=["auto", "explicit_ip", "explicit_oop", "explicit_both"])
 def test_the_gi_window_holds_for_auto_and_explicit_ranges_under_every_correction(ranges, solid_angle):
     """Each Auto/explicit combination, with an asymmetric mask, dark, flat, polarization, a monitor and
@@ -1009,10 +1007,10 @@ def test_the_gi_window_keeps_the_detectors_own_mask():
     detector_mask = np.zeros((29, 43), dtype=np.int8)
     detector_mask[::3, ::5] = 1
     q_ip, q_oop = _window_probe_coordinates((.37, 1.8))
-    window = (q_ip >= .2) & (q_ip <= .45) & (q_oop >= -.35) & (q_oop <= -.2)
+    window = (q_ip >= -.45) & (q_ip <= -.2) & (q_oop >= .2) & (q_oop <= .35)
     assert (window & (detector_mask == 1)).any()
-    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_angle_deg=1.8, ip_range=(.2, .45),
-                  oop_range=(-.35, -.2))
-    sums = _window_sums(gi, {"q_ip": (.2, .45), "q_oop": (-.35, -.2)}, None,
+    gi = StitchGI(("q_ip", "q_oop"), incident_angle_deg=.37, tilt_angle_deg=1.8, ip_range=(-.45, -.2),
+                  oop_range=(.2, .35))
+    sums = _window_sums(gi, {"q_ip": (-.45, -.2), "q_oop": (.2, .35)}, None,
                         integrator=_window_probe_integrator(detector_mask))
     assert [values[2].sum() for values in sums] == [float((window & (detector_mask == 0)).sum())] * 2

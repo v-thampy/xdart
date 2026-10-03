@@ -238,6 +238,8 @@ def _streaming_multigeometry(
     unit and ``profile_radial_range`` (None: its frames' extent), as Int's 1-D and 2-D integrations do."""
     from pyFAI.multi_geometry import MultiGeometry
 
+    pyfai_numexpr.guard_result_means()
+
     if type(image_count) is not int or image_count < 1:
         raise ValueError("streaming Stitch image count must be positive")
     if type(workers) is not int or workers < 1:
@@ -1239,6 +1241,8 @@ def stitch_1d(
     """
     from pyFAI.multi_geometry import MultiGeometry
 
+    pyfai_numexpr.guard_result_means()
+
     img_list = _prepare_images(images, None)
     factors = _normalization_factors(normalization, len(img_list))
     if "normalization_factor" in kwargs:
@@ -1318,6 +1322,8 @@ def stitch_2d(
         Intensity has shape ``(npt_rad, npt_azim)`` (transposed from pyFAI).
     """
     from pyFAI.multi_geometry import MultiGeometry
+
+    pyfai_numexpr.guard_result_means()
 
     img_list = _prepare_images(images, None)
     factors = _normalization_factors(normalization, len(img_list))

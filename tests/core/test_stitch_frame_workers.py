@@ -147,15 +147,18 @@ class _OwnedLock:
     """The shared lock, knowing which thread holds it."""
 
     def __init__(self):
-        self._lock, self.owner = threading.Lock(), None
+        self._lock, self.owner, self.depth = threading.RLock(), None, 0
 
     def __enter__(self):
         self._lock.acquire()
         self.owner = threading.get_ident()
+        self.depth += 1
         return self
 
     def __exit__(self, *_exc):
-        self.owner = None
+        self.depth -= 1
+        if not self.depth:
+            self.owner = None
         self._lock.release()
 
 
@@ -171,6 +174,28 @@ class _Formula:
 
     def __getattr__(self, name):
         return getattr(self._compiled, name)
+
+
+def test_result_means_hold_the_process_lock(monkeypatch):
+    """The real 2026.9 class-shared compiled means are protected for each frame and union."""
+    from pyFAI.containers import IntegrateResult
+    lock = _OwnedLock()
+    monkeypatch.setattr(pyfai_numexpr, "PYFAI_NUMEXPR_LOCK", lock)
+    calls, unlocked = [], []
+
+    def check(site):
+        calls.append(site)
+        if lock.owner != threading.get_ident():
+            unlocked.append(site)
+
+    for name in ("EXPR_AVG", "EXPR_STD", "EXPR_SEM"):
+        monkeypatch.setattr(IntegrateResult, name, _Formula(getattr(IntegrateResult, name), check))
+    for workers in (1, 4):
+        _stitch("1d-corrections", workers)
+    guarded = IntegrateResult.__recalculate_means__
+    pyfai_numexpr.guard_result_means()
+    assert IntegrateResult.__recalculate_means__ is guarded
+    assert calls and unlocked == []
 
 
 @pytest.mark.parametrize("config", CONFIGS)
