@@ -51,6 +51,7 @@ __all__ = [
     "MetadataTableRequalificationResult", "ScanPlotPlan", "ScanPlotResult", "RoiPreviewPlan",
     "RoiPreviewResult", "RoiScanPlan", "RoiScanResult", "run_metadata_table",
     "run_metadata_table_requalification", "run_scan_plot", "run_roi_preview", "run_roi_scan",
+    "numeric_scan_columns", "scan_plot_defaults",
     "analysis_canonical_fingerprint", "requalified_analysis_source",
 ]
 # SSRL SPEC scans commonly expose roughly 60 point columns plus the complete
@@ -1104,6 +1105,43 @@ def _columns(
             raise _Refusal("METADATA_TABLE_LIMIT_EXCEEDED")
         result.append(column)
     return tuple(result)
+def numeric_scan_columns(table: Mapping[str, np.ndarray]) -> list[str]:
+    """Plottable scan columns: one-dimensional numeric, with finite values."""
+    return [name for name, values in table.items()
+            if (array := np.asarray(values)).ndim == 1
+            and array.dtype.kind in "fiu" and np.any(np.isfinite(array))]
+
+
+def scan_plot_defaults(
+    table: Mapping[str, np.ndarray], positioner_names=(), *, x: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Choose a varying declared motor and an intensity-like counter.
+
+    Motor ties retain declaration order; counters are matched case-insensitively.
+    Frame index is the fallback. ROI columns are never selected as default Y.
+    An explicit X retains authority, including the runner's nonnumeric refusal.
+    """
+    columns = numeric_scan_columns(table)
+    if x is None:
+        spread = 0.0
+        for name in positioner_names:
+            if name not in columns:
+                continue
+            values = np.asarray(table[name], dtype=float)
+            values = values[np.isfinite(values)]
+            variation = float(np.max(values) - np.min(values))
+            if variation > spread:
+                spread, x = variation, name
+        if x is None:
+            x = "frame_index" if "frame_index" in columns else next(iter(columns), None)
+    by_lower = {name.lower(): name for name in columns}
+    y = next((by_lower[name] for name in ("photod", "bs", "mon", "i2", "i1", "i0")
+              if name in by_lower and by_lower[name] != x), None)
+    if y is None and "frame_index" in columns and x != "frame_index":
+        y = "frame_index"
+    return x, y
+
+
 def run_metadata_table(
     plan: MetadataTablePlan, *, cancel_token: threading.Event | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -1131,7 +1169,11 @@ def run_metadata_table(
             snapshot.catalog, snapshot.receipt.labels, cancel_token=cancel_token,
         )
         declared = snapshot.scanned[0] if snapshot.scanned else None
-        selected = declared if declared in {column.name for column in columns} else None
+        numeric = {column.name: column.numeric for column in columns
+                   if column.numeric is not None}
+        selected, _ = scan_plot_defaults(numeric, snapshot.scanned)
+        if selected not in snapshot.scanned:
+            selected = None
         policy = _digest(("metadata-table-v1", _MAX_TABLE_ROWS, _MAX_TABLE_COLUMNS,
                           _MAX_TABLE_BYTES))
         table_fp = _digest((snapshot.receipt.source_fingerprint, declared, selected,
@@ -1226,11 +1268,10 @@ def run_scan_plot(
         names = {column.name for column in table.columns}
         x_name = plan.x or table.selected_scanned_positioner or "frame_index"
         x = _numeric_column(table, x_name)
-        requested = plan.y or next(
-            ((name,) for name in ("Photod", "bs", "mon", "i2", "i1", "i0")
-             if name != x_name and name in names),
-            ("frame_index",) if x_name != "frame_index" else (),
-        )
+        _, default_y = scan_plot_defaults(
+            {column.name: column.numeric for column in table.columns
+             if column.numeric is not None}, x=x_name)
+        requested = plan.y or (() if default_y is None else (default_y,))
         if not requested:
             raise _Refusal("SCAN_PLOT_Y_REQUIRED")
         if len(requested) > _MAX_PLOT_TRACES:

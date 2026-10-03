@@ -43,6 +43,45 @@ _PUBLIC_RUNNERS = {
 }
 
 
+def test_scan_plot_default_axes_are_headless_numeric_motor_policy():
+    defaults = _public("scan_plot_defaults")
+    table = {
+        "frame_index": np.arange(3, dtype=float),
+        "parked": np.ones(3),
+        "th": np.array([0.0, np.nan, 2.0]),
+        "tie": np.arange(3, dtype=float),
+        "ROI1": np.array([1.0, 2.0, 90000.0]),
+        "PHOTOD": np.array([10.0, 11.0, 12.0]),
+        "mon": np.ones(3),
+        "empty": np.full(3, np.nan),
+        "text": np.array(["a", "b", "c"]),
+    }
+    assert defaults(table, ("parked", "th", "tie", "empty", "text")) == (
+        "th", "PHOTOD")
+    assert defaults(table, ("tie", "th")) == ("tie", "PHOTOD")
+    assert defaults(table, ("parked",)) == ("frame_index", "PHOTOD")
+    assert defaults(table, ("th",), x="PHOTOD") == ("PHOTOD", "mon")
+    assert defaults({k: table[k] for k in ("frame_index", "th", "ROI1")},
+                    ("th",)) == ("th", "frame_index")
+    assert defaults({"empty": table["empty"], "text": table["text"]}) == (None, None)
+
+
+def test_scan_plot_real_spec_default_counter_is_case_insensitive(tmp_path):
+    source = tmp_path / "default_axes_spec"
+    source.write_text(
+        "#F default_axes_spec\n#E 1\n#S 1 ascan th 0 2 2 1\n"
+        "#N 3\n#L th  PHOTOD  ROI1\n0 10 900\n1 11 800\n2 12 700\n",
+        encoding="utf-8",
+    )
+    table = analysis.run_metadata_table(analysis.MetadataTablePlan(
+        SourceSpec(source, SourceKind.SPEC, options={"scan": "1.1"})))
+    _assert_terminal(table, "COMPLETED", "OK")
+    plot = analysis.run_scan_plot(analysis.ScanPlotPlan(), table)
+    _assert_terminal(plot, "COMPLETED", "OK")
+    assert plot.trace_names == ("PHOTOD",)
+    np.testing.assert_array_equal(plot.x, [0, 1, 2])
+
+
 class _CanonicalMode(Enum):
     SELECTED = 2
 
@@ -2039,11 +2078,14 @@ import sys
 from pathlib import Path
 import numpy as np
 import tifffile
-from xrd_tools.analysis import MetadataTablePlan, run_metadata_table
+from xrd_tools.analysis import MetadataTablePlan, run_metadata_table, scan_plot_defaults
 source = Path(sys.argv[1]) / "metadata_0001.tif"
 tifffile.imwrite(source, np.ones((2, 2), dtype=np.uint16))
 result = run_metadata_table(MetadataTablePlan(source=source, selection="image_series"))
 assert result.disposition.value == "completed", result
+assert scan_plot_defaults({"frame_index": np.arange(2), "mon": np.ones(2)}) == ("frame_index", "mon")
+assert not any(name.startswith(("xdart", "PySide6", "PyQt5", "PyQt6", "pyqtgraph"))
+               for name in sys.modules)
 assert not any(name.startswith(("xrd_tools.io.record_writer", "xrd_tools.io.output_transaction"))
                for name in sys.modules)
 '''

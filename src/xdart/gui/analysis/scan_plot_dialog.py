@@ -20,6 +20,7 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xrd_tools.sources.probe import probe_first_frame, raw_is_reachable  # noqa: F401
+from xrd_tools.analysis.scan_operations import numeric_scan_columns, scan_plot_defaults
 
 from xdart.gui.widgets.controls_panel import FormRow
 from xdart.gui.widgets.file_dialogs import browse
@@ -65,16 +66,6 @@ def _table_from_source(src):
             except (TypeError, ValueError):
                 pass
         out[k] = col
-    return out
-
-
-def _numeric_columns(table):
-    """Plottable columns: 1-D, numeric, finite-bearing."""
-    out = []
-    for name, arr in table.items():
-        a = np.asarray(arr)
-        if a.ndim == 1 and a.dtype.kind in "fiu" and np.any(np.isfinite(a)):
-            out.append(name)
     return out
 
 
@@ -370,7 +361,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
     def set_table(self, label, table):
         """Load a per-frame column table + populate the X/Y/Normalize selectors."""
         self._table = dict(table or {})
-        self._columns = _numeric_columns(self._table)
+        self._columns = numeric_scan_columns(self._table)
         cols = self._columns
 
         self.x_combo.blockSignals(True)
@@ -385,7 +376,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self.norm_combo.addItem(c, c)
         # Defaults: X = the scanned positioner, Y = an intensity-like column.
         if cols:
-            x_default, y_default = self._guess_axes(cols)
+            x_default, y_default = scan_plot_defaults(self._table, self._positioner_names)
             if x_default:
                 self.x_combo.setCurrentText(x_default)
             if y_default is not None:
@@ -409,55 +400,6 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self.status.setText(
                 f"{len(cols)} plottable column(s). Pick X and check Y column(s).")
         self._redraw()
-
-    #: Default-Y counter preference (first present wins; matched
-    #: case-insensitively).  ROI columns are deliberately absent — neither a
-    #: beamline ROI counter nor a computed ROI is ever auto-selected as the
-    #: default (a frame-0 ROI says nothing about the scan).
-    _Y_PRIORITY = ("Photod", "bs", "mon", "i2", "i1", "i0")
-
-    def _guess_axes(self, cols):
-        """(x_default, y_default).
-
-        X = the scanned NeXus positioner (the recorded scanned motor) when one
-        is present and actually varies, else ``frame_index``.  Y = the first
-        present column of :attr:`_Y_PRIORITY` (case-insensitive), never an ROI
-        column, else ``frame_index``."""
-        x = self._scanned_positioner(cols)
-        if x is None:
-            x = "frame_index" if "frame_index" in cols else (cols[0] if cols else None)
-        y = self._priority_y(cols, exclude=x)
-        return x, y
-
-    def _scanned_positioner(self, cols):
-        """The X default: among the declared positioners present as plottable
-        columns, the one that varies the most (a constant positioner was not an
-        active scan axis).  ``None`` when none are present or vary."""
-        best, spread = None, 0.0
-        for name in self._positioner_names:
-            if name not in cols:
-                continue
-            a = np.asarray(self._table[name], dtype=float)
-            a = a[np.isfinite(a)]
-            if a.size < 2:
-                continue
-            s = float(np.nanmax(a) - np.nanmin(a))
-            if s > spread:
-                spread, best = s, name
-        return best
-
-    def _priority_y(self, cols, *, exclude):
-        """The Y default: first present of :attr:`_Y_PRIORITY` (case-insensitive
-        column match), skipping ``exclude``; never an ROI column.  Falls back to
-        ``frame_index`` then ``None``."""
-        by_lower = {c.lower(): c for c in cols}
-        for name in self._Y_PRIORITY:
-            col = by_lower.get(name.lower())
-            if col is not None and col != exclude:
-                return col
-        if "frame_index" in cols and exclude != "frame_index":
-            return "frame_index"
-        return None
 
     def _sync_column_lists(self, names, checked_y=(), checked_right=()):
         self._selector_columns = list(names)
@@ -792,7 +734,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             for column in result.columns:
                 if column.numeric is not None:
                     table[column.name] = column.numeric
-            self._table = table; self._columns = list(table)
+            self._table = table; self._columns = numeric_scan_columns(table)
             for widget in (self.x_combo, self.norm_combo):
                 widget.blockSignals(True); widget.clear()
             self.x_combo.addItems(self._columns)
@@ -800,9 +742,9 @@ class ScanPlotDialog(QtWidgets.QDialog):
             for name in self._columns:
                 self.norm_combo.addItem(name, name)
 
-            self._sync_column_lists(self._columns)
-            selected = result.selected_scanned_positioner or (
-                "frame_index" if "frame_index" in table else None)
+            selected, default_y = scan_plot_defaults(
+                table, x=result.selected_scanned_positioner)
+            self._sync_column_lists(self._columns, () if default_y is None else (default_y,))
             if selected is not None: self.x_combo.setCurrentText(selected)
             self.status.setText(result.code)
             self.roi_btn.setEnabled(result.receipt is not None)

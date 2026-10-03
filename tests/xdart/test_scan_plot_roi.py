@@ -779,6 +779,40 @@ def test_scan_plot_default_y_priority_counter(qapp):
         dlg.close()
 
 
+def test_scan_plot_shared_default_projection_matches_runner(qapp, tmp_path):
+    from xrd_tools.analysis import (
+        MetadataTablePlan, ScanPlotPlan, run_metadata_table, run_scan_plot,
+    )
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    from tests.xdart.scattering.test_p37_analysis_mount import _page, _close_page
+
+    source = tmp_path / "shared_defaults"
+    source.write_text(
+        "#F shared_defaults\n#E 1\n#S 1 ascan th 0 2 2 1\n"
+        "#N 3\n#L th  PHOTOD  ROI1\n0 10 900\n1 11 800\n2 12 700\n")
+    table = run_metadata_table(MetadataTablePlan(
+        SourceSpec(source, SourceKind.SPEC, options={"scan": "1.1"})))
+    assert table.code == "OK"
+    page = _page()
+    page._open_analysis_mount("scan_roi")
+    mounted = page._scan_roi_dialog
+    standalone = ScanPlotDialog()
+    try:
+        mounted.set_vnext_metadata(table)
+        numeric = {c.name: c.numeric for c in table.columns if c.numeric is not None}
+        standalone._positioner_names = ["th"]
+        standalone.set_table("same source", numeric)
+        assert mounted.x_combo.currentText() == standalone.x_combo.currentText() == "th"
+        assert mounted._checked_y() == standalone._checked_y() == ["PHOTOD"]
+        plot = run_scan_plot(ScanPlotPlan(), table)
+        assert plot.trace_names == tuple(mounted._checked_y())
+        assert all(not array.flags.writeable for array in numeric.values())
+    finally:
+        _close_page(page, qapp)
+        standalone.close()
+
+
 def test_scan_plot_default_y_never_roi(qapp):
     """10.1: with only ROI columns present (no priority counter), default Y falls
     back to frame_index — never an ROI column."""
