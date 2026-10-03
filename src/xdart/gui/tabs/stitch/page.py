@@ -2831,7 +2831,7 @@ class StitchPage(QtWidgets.QWidget):
         current = self.browser.current_result()
         return keys, FrameNavigationProjection(
             frames=keys, current=None if current is None else self._result_key(current),
-            selected=tuple(self._result_key(path) for path, _ in self._selected()))
+            selected=() if current is None else tuple(self._result_key(path) for path, _ in self._selected()))
 
     def _display_payload(self, path, payload, with_map=True):
         """A result as Int's frame (``StandardDisplayPayload``), through Int's conversion

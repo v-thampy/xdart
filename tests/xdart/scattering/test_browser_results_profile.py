@@ -146,6 +146,29 @@ def test_an_extended_results_list_reports_the_current_result_and_the_selection(q
         _close(qapp, browser)
 
 
+def test_extended_selection_never_notifies_nonempty_results_without_a_current(qapp):
+    from pyqtgraph.Qt import QtCore
+
+    browser = BrowserView(profile=_STITCH_LIKE)
+    observed = []
+    browser.commandRequested.connect(lambda command: observed.append(
+        (command, browser.current_result(), browser.selected_results())))
+    try:
+        browser.reconcile_results(tuple(BrowserResult(key, key.upper()) for key in "ab"), None)
+        browser.scans.setCurrentRow(0, QtCore.QItemSelectionModel.SelectionFlag.Select)
+        assert browser.current_result() == "a" and browser.selected_results() == ("a",)
+        assert any(command.kind is ShellCommandKind.SELECT_RESULT for command, _, _ in observed)
+        assert all(current is not None or not selected for command, current, selected in observed
+                   if command.kind is ShellCommandKind.SELECT_RESULTS)
+        observed.clear()
+        browser.clear_result_selection()
+        assert browser.current_result() is None and browser.selected_results() == ()
+        assert any(command.kind is ShellCommandKind.SELECT_RESULTS and not selected
+                   for command, _, selected in observed)
+    finally:
+        _close(qapp, browser)
+
+
 def test_a_results_list_cleared_from_outside_is_filled_again(qapp):
     browser = BrowserView(profile=_RESULTS)
     try:

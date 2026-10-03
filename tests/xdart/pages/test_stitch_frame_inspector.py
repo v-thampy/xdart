@@ -144,7 +144,10 @@ def test_full_restores_file_overlay_options_and_pins(qapp, tmp_path):
     page, _form, _target = _saved_page(tmp_path, qapp, scans="1,2,[1,2]")
     try:
         _command(page, ShellCommandKind.SET_PLOT_MODE, "Overlay")
-        page.results.setCurrentRow(0, QtCore.QItemSelectionModel.SelectionFlag.Select)
+        first = page.browser.listed_results()[0]
+        page.results.setCurrentRow(next(row for row in range(page.results.count())
+            if page.results.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == first),
+            QtCore.QItemSelectionModel.SelectionFlag.Select)
         _wait(page, qapp)
         _command(page, ShellCommandKind.SET_SLICE_CENTER, -120.)
         _command(page, ShellCommandKind.SET_SLICE_WIDTH, 20.)
@@ -165,6 +168,28 @@ def test_full_restores_file_overlay_options_and_pins(qapp, tmp_path):
         for old, new in zip(before.traces, after.traces, strict=True):
             assert old.frame is new.frame
             np.testing.assert_array_equal(old.intensity, new.intensity)
+    finally:
+        _close(page, qapp)
+
+
+def test_directory_cursor_keeps_file_selection_without_active_scientific_navigation(qapp, tmp_path):
+    page, _form, target = _saved_page(tmp_path, qapp, scans="1,2,[1,2]")
+    try:
+        _command(page, ShellCommandKind.SET_PLOT_MODE, "Overlay")
+        selected = page.browser.selected_results()
+        assert selected and page.results.item(0).text().startswith("..")
+        page.results.setCurrentRow(0, QtCore.QItemSelectionModel.SelectionFlag.Select)
+        _wait(page, qapp)
+        assert page.browser.current_result() is None
+        assert page.browser.selected_results() == selected
+        _keys, navigation = page._navigation()
+        assert navigation.current is None and navigation.selected == ()
+        assert page._last_map_state.traces == ()
+        page.browser.set_current_result(target, keep_selection=True)
+        _wait(page, qapp)
+        assert page.browser.selected_results() == selected
+        np.testing.assert_array_equal(page._last_map_state.traces[0].intensity,
+                                      read_analysis_artifact(target).profile.intensity)
     finally:
         _close(page, qapp)
 
