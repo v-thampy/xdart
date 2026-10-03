@@ -136,6 +136,10 @@ class DisplayArtifact:
     #: successful tail of :meth:`RunDisplayState.retain_frame`, so revision 0
     #: is never observable and a failed retain leaves the prior value.
     norm_aggregate: ScanNormAggregate | None = None
+    #: Accepted reduction bounds, retained for this artifact's Full Raw reads.
+    #: Later page edits never reinterpret an earlier run's detector preview.
+    threshold_min: float | None = None
+    threshold_max: float | None = None
 
 
 class RunDisplayState:
@@ -301,6 +305,8 @@ class RunDisplayState:
         gi_mode_2d: str = "",
         wavelength_m: float | None = None,
         source_base: str | None = None,
+        threshold_min: float | None = None,
+        threshold_max: float | None = None,
     ) -> DisplayArtifact:
         if not self._configured:
             self.configure(
@@ -335,6 +341,8 @@ class RunDisplayState:
             mask_saturation=bool(mask_saturation),
             saturation=saturation,
             measurement_mode=measurement_mode,
+            threshold_min=None if threshold_min is None else float(threshold_min),
+            threshold_max=None if threshold_max is None else float(threshold_max),
             gi_incidence_motor=gi_incidence_motor,
             gi_resolved_motor=gi_resolved_motor,
             gi_mode_1d=gi_mode_1d,
@@ -1160,6 +1168,9 @@ class RunDisplayState:
                 return DetectorPreviewProjection.unavailable(), key
             projection_mask = art.mask
             policy = {
+                "apply_threshold": art.threshold_min is not None or art.threshold_max is not None,
+                "threshold_min": art.threshold_min,
+                "threshold_max": art.threshold_max,
                 "mask_saturation": bool(art.mask_saturation),
                 "saturation_ceiling": art.saturation_ceiling,
             }

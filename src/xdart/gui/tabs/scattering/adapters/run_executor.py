@@ -1535,6 +1535,8 @@ class StandardRunExecutor:
                     getattr(plan, "mask_saturation", False)
                 ),
                 saturation=getattr(plan, "saturation", None),
+                threshold_min=plan.threshold_min,
+                threshold_max=plan.threshold_max,
                 measurement_mode=(
                     "GI" if configuration.gi.enabled else "Standard"
                 ),

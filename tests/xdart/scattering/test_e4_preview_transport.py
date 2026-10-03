@@ -785,6 +785,34 @@ def test_full_after_thumbnail_preview_performs_distinct_detector_read(
     assert outcomes.count((2, HydrationOutcome.HYDRATED)) == 2
 
 
+def test_full_raw_keeps_accepted_manual_bounds_and_preserves_thumbnail_and_cake(tmp_path):
+    processed, raw_path = _write_processed(tmp_path)
+    state = RunDisplayState(RunIdentity(1, "manual-threshold"), max_payload_items=4)
+    owner = state.add_artifact(processed, "scan", mask=None, mask_saturation=False,
+                               measurement_mode="Standard", threshold_min=3.0, threshold_max=12.0)
+    state.bind_transport(event_sink=lambda event: None)
+    try:
+        keys = _catalog(state, owner, (1, 2, 3))
+        owner_value, gate = _acquisition_identity(state)
+        preview = _typed_request(state, owner_value, gate, processed, 2, HydrationPurpose.PREVIEW, 6)
+        assert state.transport.submit(preview) is not None
+        assert _wait_transport_idle(state)
+        before = owner.publications.get(2).view
+        thumbnail, cake = before.thumbnail.copy(), before.intensity_2d.copy()
+        assert state.request_full(keys[2], 7, owner=owner_value, commit_gate=gate) is not None
+        assert _wait_transport_idle(state)
+        after = owner.publications.get(2).view
+        original = tifffile.imread(raw_path)
+        outside = (original < 3) | (original > 12)
+        assert np.isnan(after.raw[outside]).all()
+        np.testing.assert_array_equal(after.raw[~outside], original[~outside])
+        np.testing.assert_array_equal(after.thumbnail, thumbnail)
+        np.testing.assert_array_equal(after.intensity_2d, cake)
+        np.testing.assert_array_equal(tifffile.imread(raw_path), original)
+    finally:
+        assert state.transport.retire(join_timeout=2)
+
+
 def test_same_read_coalesces_and_every_admitted_token_terminates(
     monkeypatch, tmp_path
 ):
