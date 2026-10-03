@@ -5,7 +5,7 @@ import pytest
 from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.widgets.camera_editor import CameraEditor
-from xrd_tools.core.geometry.camera import STITCH_CAMERA, DetectorCamera
+from xrd_tools.core.geometry.camera import STITCH_CAMERA, DetectorCamera, stitch_orientation
 
 
 @pytest.fixture(scope="module")
@@ -42,5 +42,21 @@ def test_camera_descriptions_keep_all_eight_axis_values(qapp):
                 columns = editor.columns.currentData()
                 assert captions[columns] in editor.columns.currentText()
                 assert editor.value() == DetectorCamera(rows, columns)
+    finally:
+        editor.deleteLater()
+
+
+def test_default_click_restores_unturned_unflipped_stitch_camera(qapp):
+    editor = CameraEditor()
+    try:
+        editor.set_value(DetectorCamera('z-', 'x+'))
+        changed = []
+        editor.changed.connect(lambda: changed.append(editor.value()))
+        editor.default_button.click()
+        assert changed == [STITCH_CAMERA]
+        assert editor.value() == DetectorCamera('x-', 'z+')
+        transform = stitch_orientation(editor.value())
+        assert transform.rotation == 0 and not transform.flip_horizontal and not transform.flip_vertical
+        assert editor.layout().itemAt(editor.layout().count() - 1).widget() is editor.default_button
     finally:
         editor.deleteLater()

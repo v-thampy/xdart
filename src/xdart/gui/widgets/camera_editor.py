@@ -37,6 +37,12 @@ class CameraEditor(QtWidgets.QWidget):
         self.rows.currentIndexChanged.connect(self._rows_changed)
         self.columns.currentIndexChanged.connect(self._edited)
         self.set_value(STITCH_CAMERA)
+        self.default_button = QtWidgets.QPushButton('Default')
+        self.default_button.setAutoDefault(False)
+        self.default_button.setToolTip('Reset to xdart\'s reference camera: rows x− (down), columns z+ '
+                                      '(left looking downstream). Image rotation 0°, no flip.')
+        self.default_button.clicked.connect(lambda: self.set_value(STITCH_CAMERA))
+        layout.addWidget(self.default_button)
 
     def value(self) -> DetectorCamera:
         return DetectorCamera(self.rows.currentData(), self.columns.currentData())

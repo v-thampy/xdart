@@ -192,8 +192,9 @@ def test_saturation_shows_the_documented_auto_value_and_keeps_manual_overrides(q
 
 
 @pytest.mark.parametrize('rotation,flip', [(r, f) for r in (0, 90, 180, 270) for f in (False, True)])
-def test_typed_beam_pixel_follows_the_camera_but_not_pyfais_origin(qapp, tmp_path, rotation, flip):
-    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+@pytest.mark.parametrize('page', ['Stitch', 'RSM'])
+def test_typed_beam_pixel_follows_the_camera_but_not_pyfais_origin(qapp, tmp_path, rotation, flip, page):
+    dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
     try:
         dialog._set_field_text('beam_detector', 'Pilatus100k')
         dialog.camera.set_value(stitch_camera(ImageOrientation()))
@@ -206,6 +207,10 @@ def test_typed_beam_pixel_follows_the_camera_but_not_pyfais_origin(qapp, tmp_pat
         assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (x, y)
         dialog._set_field_text('beam_orientation', '1')
         assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (x, y)
+        dialog.camera.default_button.click()
+        assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (280, 97)
+        assert dialog._orientation() == ImageOrientation()
+        assert dialog._text('beam_orientation') == '1'
     finally:
         dialog.close()
 
