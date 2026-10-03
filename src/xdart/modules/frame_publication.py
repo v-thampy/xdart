@@ -157,8 +157,15 @@ class FramePublication:
             object.__setattr__(self, "record", FrameRecord.from_view(self.view))
         raw = self.metadata_raw or self.view.metadata_raw
         numeric = self.metadata_numeric or self.view.metadata_numeric or numeric_metadata(raw)
-        object.__setattr__(self, "metadata_raw", _readonly_mapping(raw))
-        object.__setattr__(self, "metadata_numeric", _readonly_mapping(numeric))
+        # FrameView already snapshots these mappings. Explicit overrides still
+        # need their own snapshot; only the exact owning view can supply one.
+        frozen_view = type(self.view) is FrameView
+        object.__setattr__(self, "metadata_raw", (
+            raw if frozen_view and raw is self.view.metadata_raw else _readonly_mapping(raw)
+        ))
+        object.__setattr__(self, "metadata_numeric", (
+            numeric if frozen_view and numeric is self.view.metadata_numeric else _readonly_mapping(numeric)
+        ))
 
     @property
     def label(self) -> int | str:
