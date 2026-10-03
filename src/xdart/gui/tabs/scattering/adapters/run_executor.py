@@ -1410,13 +1410,14 @@ class StandardRunExecutor:
                     thickness_m=override.thickness_m,
                     parallax=override.parallax,
                 )
-            poni = getattr(calibration, "poni", calibration)
-            integrator = poni_to_integrator(calibration)
-            run.scan = run.source.to_scan(
-                poni=poni,
-                integrator=integrator,
-                output_path=artifact,
-            )
+            from xrd_tools.session.readiness import bind_native_int_source_energy
+            run.scan = run.source.to_scan(output_path=artifact)
+            calibration = bind_native_int_source_energy(run.scan, calibration,
+                metadata_wavelength_A=(None if item is None or item.descriptor is None
+                                       else item.descriptor.wavelength),
+                metadata_energy_eV=getattr(run.source, 'motors', {}).get('energy', ()))
+            integrator = run.scan.integrator
+            poni = run.scan.poni
             if calibration.parallax is not None:
                 extra = dict(getattr(run.scan, "extra", None) or {})
                 extra["detector_calibration"] = detector_calibration_record(
@@ -1470,7 +1471,8 @@ class StandardRunExecutor:
                     assets is None or getattr(assets, f"{key}_bytes") is None):
                 raise ValueError(f"the configured {name} was not admitted")
         plan = replace(
-            native_int_reduction_plan(configuration, companion_modes_2d=True),
+            native_int_reduction_plan(configuration, companion_modes_2d=True,
+                energy_selection=run.scan.extra['energy_selection']),
             mask=None if assets is None else assets.mask,
             flat=None if assets is None else assets.flat,
             dark=None if assets is None else assets.dark,

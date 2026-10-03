@@ -1,15 +1,14 @@
-"""Finite Experiment values and their revision-qualified editor."""
+"""Finite immutable Experiment values."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-import threading
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping
 
 from xrd_tools.core import energy as _energy
 
@@ -510,75 +509,3 @@ class ExperimentState:
         if payload.get("content_fingerprint") != state.content_fingerprint:
             raise ValueError("experiment content fingerprint mismatch")
         return state
-
-class CasStatus(str, Enum):
-    ACCEPTED = "accepted"
-    NO_CHANGE = "no_change"
-    FOREIGN_IDENTITY = "foreign_identity"
-    STALE_REVISION = "stale_revision"
-
-@dataclass(frozen=True, slots=True)
-class CasOutcome:
-    status: CasStatus
-    state: ExperimentState
-    reason: str = ""
-    @property
-    def accepted(self) -> bool:
-        return self.status is CasStatus.ACCEPTED
-
-@runtime_checkable
-class ExperimentEditorPort(Protocol):
-    def current(self) -> ExperimentState: ...
-    def propose_calibration(self, candidate: CalibrationState, *, experiment_id: str,
-                            expected_revision: int) -> CasOutcome: ...
-    def propose_mask(self, candidate: MaskState, *, experiment_id: str,
-                     expected_revision: int) -> CasOutcome: ...
-class ExperimentEditor:
-    """One locked owner for identity-and-revision-qualified proposals."""
-    def __init__(self, initial: ExperimentState):
-        if not isinstance(initial, ExperimentState):
-            raise TypeError("initial must be ExperimentState")
-        self._state, self._lock = initial, threading.Lock()
-    def current(self) -> ExperimentState:
-        with self._lock:
-            return self._state
-    def _refusal(self, experiment_id: str, revision: int) -> CasOutcome | None:
-        if not isinstance(experiment_id, str) or experiment_id != self._state.experiment_id:
-            return CasOutcome(CasStatus.FOREIGN_IDENTITY, self._state,
-                              "foreign experiment identity")
-        if type(revision) is not int or revision != self._state.revision:
-            return CasOutcome(CasStatus.STALE_REVISION, self._state,
-                              "stale experiment revision")
-        return None
-    def propose_calibration(self, candidate: CalibrationState, *, experiment_id: str,
-                            expected_revision: int) -> CasOutcome:
-        if not isinstance(candidate, CalibrationState):
-            raise TypeError("candidate must be CalibrationState")
-        with self._lock:
-            refusal = self._refusal(experiment_id, expected_revision)
-            if refusal:
-                return refusal
-            if candidate == self._state.calibration:
-                return CasOutcome(CasStatus.NO_CHANGE, self._state)
-            self._state = replace(
-                self._state, revision=self._state.revision + 1, calibration=candidate,
-                energy=self._state.energy.with_calibration_evidence(
-                    candidate.imported_wavelength_m
-                ),
-            )
-            return CasOutcome(CasStatus.ACCEPTED, self._state)
-    def propose_mask(self, candidate: MaskState, *, experiment_id: str,
-                     expected_revision: int) -> CasOutcome:
-        if not isinstance(candidate, MaskState):
-            raise TypeError("candidate must be MaskState")
-        with self._lock:
-            refusal = self._refusal(experiment_id, expected_revision)
-            if refusal:
-                return refusal
-            if candidate == self._state.calibration.mask:
-                return CasOutcome(CasStatus.NO_CHANGE, self._state)
-            self._state = replace(
-                self._state, revision=self._state.revision + 1,
-                calibration=replace(self._state.calibration, mask=candidate),
-            )
-            return CasOutcome(CasStatus.ACCEPTED, self._state)

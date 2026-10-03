@@ -85,6 +85,9 @@ def build_reduction_config(
         if scan is not None else None
     if isinstance(run_configuration, Mapping) and run_configuration:
         config["run_configuration"] = dict(run_configuration)
+    energy_selection = _plan_extra(plan).get('energy_selection')
+    if energy_selection is not None:
+        config['energy_selection'] = dict(energy_selection)
 
     return config, (_inputs_from_scan(scan) if include_inputs else {})
 

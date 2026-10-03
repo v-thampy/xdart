@@ -310,6 +310,11 @@ def prepare_native_stitch_tool(form, project):
                 f"Output {len(requests) + 1} ({family}), {len(receipts)} sources, {count} frames: {reason}") from error
         requests.append(request)
         preview_members.append(members)
+        energy = request.provenance['plan'].get('energy_selection')
+        if energy is not None and energy['disagreement']:
+            warnings.append(f"{family}: metadata energy {energy['source_energy_eV']:.1f} eV overrides "
+                f"calibration energy {energy['calibration_energy_eV']:.1f} eV; "
+                f"fitted offset {energy['fitted_energy_offset_eV']:+.1f} eV retained")
         warning = _affine_geometry_warning(request)
         if warning is not None:
             warnings.append(warning)
