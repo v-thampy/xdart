@@ -219,7 +219,7 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
         self._values = self._slice = None
         self._offsets = (0.0, 0.0)
         self._name = ""
-        self._color_map, self._log_scale, self._share_axis = "Default", False, False
+        self._color_map, self._log_scale, self._share_axis = "Default", False, True
         # the planes, on the shared latest-request owner (the cut bound late, so a test can hold its result); the
         # plane drawn is its ``shown`` request, so asking for it again cuts nothing
         self._requests = LatestRequestOwner(

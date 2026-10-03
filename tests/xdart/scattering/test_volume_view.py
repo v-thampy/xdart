@@ -226,7 +226,7 @@ def test_the_volume_is_drawn_through_volume_rgba_under_ints_colour_map_and_log(q
         assert view.intensity.values() == (0.5, 99.5)
         assert view.intensity.slider.domain() == (0.0, 100.0)
         before = view.rgba
-        QtTest.QTest.mouseClick(view.intensity.label, QtCore.Qt.MouseButton.LeftButton)
+        QtTest.QTest.mouseDClick(view.intensity.label, QtCore.Qt.MouseButton.LeftButton)
         qapp.processEvents()
         assert view.intensity._entry_popup.isVisible()
         assert view.rgba is before and view.intensity.values() == (0.5, 99.5)

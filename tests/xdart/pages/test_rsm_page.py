@@ -2610,6 +2610,7 @@ def test_custom_slice_opens_on_hh_l_through_the_centre_follows_the_result_and_cl
         centre = volume_centre(axes)
         expected = custom_slice(values["A"].intensity, axes)  # HH–L through the centre
         drawn = window.view.keyed_projection
+        assert drawn.share_axis and window.view.share_axis.isChecked()
         plane, along_hh, along_l = drawn.panels
         assert drawn.layout == ((plane.key,), (along_hh.key, along_l.key)) and not plane.navigation
         np.testing.assert_array_equal(plane.image, expected.values.T)
@@ -2620,7 +2621,6 @@ def test_custom_slice_opens_on_hh_l_through_the_centre_follows_the_result_and_cl
         np.testing.assert_array_equal(along_hh.intensity, expected.projection_t)
         np.testing.assert_array_equal(along_l.intensity, expected.projection_s)
         assert "interpolated from the gridded volume" in window.note.text()
-        window.view.share_axis.click()  # G13 unit 1: the plane's HH with the HH projection, its L with the L one
         assert window.view.keyed_projection.share_axis
         plane_box = window.view.keyed_panel(plane.key).pane.canvas.imageViewBox
         plane_box.setRange(xRange=(-0.2, 0.1), yRange=(-0.3, 0.4), padding=0)
