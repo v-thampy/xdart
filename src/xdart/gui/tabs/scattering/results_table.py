@@ -9,9 +9,9 @@ projections below (or its own rows); it builds no table of its own (``test_gui_r
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 #: A displayed peak fit's parameters, as Int shows them (``peak_parameter_rows``).
 PEAK_PARAMETER_HEADERS = ("Parameter", "Value", "StdErr")
@@ -24,28 +24,56 @@ PHASE_OUTCOME_HEADERS = ("Phase", "Fraction", "a", "b", "c")
 
 
 class ResultsTable(QtWidgets.QTableWidget):
-    """Rows of values under headers, read-only: no row numbers, the last column stretched, each value shown as its
-    text. ``show_rows`` replaces what is shown; ``clear_rows`` empties it, keeping the headers."""
+    """Read-only text rows with optional checkboxes and help. Defaults hide row numbers and stretch the last
+    column; calibration can request row selection and six rows of space. ``show_rows`` replaces the projection."""
 
     def __init__(self, headers: Sequence[str] = (), parent=None, *, name: str = "resultsTable",
-                 max_height: int | None = None) -> None:
+                 max_height: int | None = None, row_numbers: bool = False,
+                 stretch_columns: bool = False, row_selection: bool = False, minimum_rows: int = 0,
+                 header_tooltips: Mapping[int, str] | None = None) -> None:
         super().__init__(0, len(headers), parent)
         self.setObjectName(name)
         self.setHorizontalHeaderLabels(list(headers))
-        self.verticalHeader().setVisible(False)
+        self._header_tooltips = dict(header_tooltips or {})
+        self.verticalHeader().setVisible(row_numbers)
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         if max_height is not None:
             self.setMaximumHeight(max_height)
         self.horizontalHeader().setStretchLastSection(True)
+        if stretch_columns:
+            self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        if row_selection:
+            self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        if minimum_rows:
+            self.setMinimumHeight(self.verticalHeader().defaultSectionSize() * minimum_rows
+                                  + self.horizontalHeader().sizeHint().height() + 4)
+        self._show_header_tooltips()
 
-    def show_rows(self, headers: Sequence[str], rows: Sequence[Sequence[object]]) -> None:
-        """Show ``rows`` under ``headers``: each value as ``str(value)`` (an unknown error reads "None")."""
+    def _show_header_tooltips(self) -> None:
+        for column, tip in self._header_tooltips.items():
+            if column < self.columnCount():
+                self.horizontalHeaderItem(column).setToolTip(tip)
+
+    def show_rows(self, headers: Sequence[str], rows: Sequence[Sequence[object]], *,
+                  check_states: Mapping[tuple[int, int], bool] | None = None,
+                  cell_tooltips: Mapping[tuple[int, int], str] | None = None) -> None:
+        """Replace text rows, optionally projecting enabled checkboxes and per-cell help."""
         self.setColumnCount(len(headers))
         self.setHorizontalHeaderLabels(list(headers))
+        self._show_header_tooltips()
         self.setRowCount(len(rows))
         for row, values in enumerate(rows):
             for column, value in enumerate(values):
-                self.setItem(row, column, QtWidgets.QTableWidgetItem(str(value)))
+                item = QtWidgets.QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                if check_states is not None and (row, column) in check_states:
+                    item.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+                    item.setCheckState(QtCore.Qt.CheckState.Checked if check_states[row, column]
+                                       else QtCore.Qt.CheckState.Unchecked)
+                if cell_tooltips is not None:
+                    item.setToolTip(cell_tooltips.get((row, column), ""))
+                self.setItem(row, column, item)
 
     def clear_rows(self) -> None:
         """No rows; the headers stay."""

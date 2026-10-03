@@ -19,6 +19,7 @@ from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelle
 from xdart.gui.widgets.controls_panel import FormRow, SectionCard
 from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
 from xdart.gui.widgets.read_only_text import ReadOnlyTextPane
+from xdart.gui.tabs.scattering.results_table import ResultsTable
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration_seed import (
     DETECTOR_ORIENTATIONS, detector_choices, detector_shape, ring_summary, rough_arm_record,
@@ -871,9 +872,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.list_button.setToolTip('Lists the scan\'s frames with their angles and ticks five that span them.')
         self.list_button.clicked.connect(self._enumerate)
         layout.addWidget(self.list_button)
-        self.selection = QtWidgets.QTableWidget(0, 4)
-        self.selection.setHorizontalHeaderLabels(['Use', 'Frame', 'Delta (°)', 'Nu (°)'])
-        self.selection.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.selection = ResultsTable(('Use', 'Frame', 'Delta (°)', 'Nu (°)'),
+                                      row_numbers=True, stretch_columns=True,
+                                      header_tooltips={0: 'Prepare the checked frames.',
+                                                       1: 'Frame index in the detector scan.'})
+        self.selection.setToolTip('Check representative frames to prepare for calibration; angles come from the scan.')
         layout.addWidget(self.selection, 1)
         self.prepare_button = QtWidgets.QPushButton('Prepare selected images')
         self.prepare_button.setToolTip('Copies the ticked frames into this session\'s folder, ready for pyFAI.')
@@ -938,20 +941,17 @@ class CalibrationDialog(QtWidgets.QDialog):
         hint = QtWidgets.QLabel('Calibrate each frame in pyFAI: pick its rings, then press Save as PONI-file. xdart keeps the PONI and its enabled control points, closes pyFAI and selects the next frame. Completed rows and files remain when another frame is cancelled.')
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        self.frame_table = QtWidgets.QTableWidget(0, 6)
-        self.frame_table.setHorizontalHeaderLabels(['Frame', 'Delta / Nu (°)', 'Image', 'PONI / points', 'Status',
-                                                    'Expected rings'])
-        self.frame_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.frame_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.frame_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        for column, tip in ((1, 'The detector circles\' angles for this frame.'),
-                            (3, 'The PONI and control points pyFAI saved for this frame.'),
-                            (5, 'The calibrant rings predicted to reach this frame; hover a cell for each '
-                                'ring\'s 2θ.')):
-            self.frame_table.horizontalHeaderItem(column).setToolTip(tip)
         # the fit shares the tab: the table keeps room for about six frames, the tab scrolls
-        self.frame_table.setMinimumHeight(self.frame_table.verticalHeader().defaultSectionSize() * 6
-                                          + self.frame_table.horizontalHeader().sizeHint().height() + 4)
+        self.frame_table = ResultsTable(
+            ('Frame', 'Delta / Nu (°)', 'Image', 'PONI / points', 'Status', 'Expected rings'),
+            row_numbers=True, stretch_columns=True, row_selection=True, minimum_rows=6,
+            header_tooltips={0: 'Frame index in the detector scan.',
+                             1: 'The detector circles\' angles for this frame.',
+                             2: 'Original detector image and staged pyFAI image; hover for their paths.',
+                             3: 'The PONI and control points pyFAI saved for this frame.',
+                             4: 'Whether this frame has a matched PONI and control points.',
+                             5: 'The calibrant rings predicted to reach this frame; hover a cell for each ring\'s 2θ.'})
+        self.frame_table.setToolTip('Select a frame to calibrate it or import its matched PONI and control points.')
         layout.addWidget(self.frame_table, 1)
         buttons = QtWidgets.QHBoxLayout()
         self.calibrate_button = QtWidgets.QPushButton('Calibrate selected frame…')
@@ -2622,7 +2622,7 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _render_frames(self):
         self._update_fit_source_label()
-        self.frame_table.setRowCount(len(self.frames))
+        rows, tips = [], {}
         for row, frame in enumerate(self.frames):
             # the frame's own detector image (and its frame number inside a multi-frame file)
             image = Path(frame.raw_path).name + (f' #{frame.raw_index}' if frame.raw_index else '')
@@ -2637,11 +2637,11 @@ class CalibrationDialog(QtWidgets.QDialog):
                         else '\n'.join(f'Ring {ring.number} · 2θ {ring.two_theta_deg:.2f}° · d {ring.d_spacing_A:.4f} Å'
                                         for ring in rings) or 'No calibrant ring reaches this frame.')
             for column, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip(f'{frame.raw_path}\nstaged for pyFAI: {frame.image_path}' if column == 2
-                                else ring_tip if column == 5 else f'{frame.poni_path}\n{frame.npt_path}')
-                self.frame_table.setItem(row, column, item)
+                tips[row, column] = (f'{frame.raw_path}\nstaged for pyFAI: {frame.image_path}' if column == 2
+                                     else ring_tip if column == 5 else f'{frame.poni_path}\n{frame.npt_path}')
+            rows.append(values)
+        self.frame_table.show_rows(('Frame', 'Delta / Nu (°)', 'Image', 'PONI / points', 'Status',
+                                    'Expected rings'), rows, cell_tooltips=tips)
         if self.frames:
             self.frame_table.selectRow(0)
         self.session_label.setText(f'Session: {self.session_dir / "calibration-session.json"}')
@@ -2737,8 +2737,6 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.geometry_editor.set_value(InstrumentGeometry.from_record(record))
                     self._enumerated_motors = InstrumentGeometry.from_record(record).stitch_arm()
                     read = [motor for motor in self._enumerated_motors if motor]
-                    self.selection.setColumnCount(2 + len(read))
-                    self.selection.setHorizontalHeaderLabels(['Use', 'Frame', *(f'{motor} (°)' for motor in read)])
                     self._choices = result
                     self._calibrant_frame_count = len(result)
                     self._calibrant_source_problem = ''
@@ -2747,14 +2745,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                     if len(energies) == 1:
                         self._show_source_energy(energies.pop())
                     suggested = suggested_frame_indices(result)
-                    self.selection.setRowCount(len(result))
-                    for row, (index, motors, _) in enumerate(result):
-                        item = QtWidgets.QTableWidgetItem('')
-                        item.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled)
-                        item.setCheckState(QtCore.Qt.CheckState.Checked if index in suggested else QtCore.Qt.CheckState.Unchecked)
-                        self.selection.setItem(row, 0, item)
-                        for column, text in enumerate([str(index), *(f'{motors[key]:g}' for key in read)], 1):
-                            self.selection.setItem(row, column, QtWidgets.QTableWidgetItem(text))
+                    self.selection.show_rows(
+                        ['Use', 'Frame', *(f'{motor} (°)' for motor in read)],
+                        [('', str(index), *(f'{motors[key]:g}' for key in read)) for index, motors, _ in result],
+                        check_states={(row, 0): index in suggested for row, (index, _, _) in enumerate(result)})
                 elif kind == 'prepare':
                     self.frames = result
                     self._frame_motors = self._enumerated_motors

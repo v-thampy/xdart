@@ -6,7 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.results_table import (
     PEAK_OUTCOME_HEADERS, PEAK_PARAMETER_HEADERS, PHASE_OUTCOME_HEADERS, PHASE_RESULT_HEADERS, ResultsTable,
@@ -39,6 +39,39 @@ def test_a_results_table_is_read_only_rows_of_text_under_its_headers() -> None:
         table.clear_rows()
         assert _shown(table) == (["Name", "Value", "Err"], [])
     finally:
+        table.deleteLater()
+
+
+def test_results_table_owns_checkboxes_tips_and_calibration_row_selection() -> None:
+    app = _app()
+    table = ResultsTable(("Use", "Frame"), row_numbers=True, stretch_columns=True,
+                         row_selection=True, minimum_rows=6, header_tooltips={0: "Prepare checked frames."})
+    try:
+        table.show_rows(("Use", "Frame"), (("", 10), ("", 20)),
+                        check_states={(0, 0): True, (1, 0): False},
+                        cell_tooltips={(0, 1): "Original detector frame 10."})
+        table.resize(500, 300)
+        table.show()
+        app.processEvents()
+        assert table.verticalHeader().isVisible()
+        assert table.selectionBehavior() == QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        assert table.selectionMode() == QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        assert table.horizontalHeader().sectionResizeMode(0) == QtWidgets.QHeaderView.ResizeMode.Stretch
+        assert table.minimumHeight() >= 6 * table.verticalHeader().defaultSectionSize()
+        assert table.horizontalHeaderItem(0).toolTip() == "Prepare checked frames."
+        assert table.item(0, 1).toolTip() == "Original detector frame 10."
+        assert table.item(0, 0).checkState() == QtCore.Qt.CheckState.Checked
+        checkbox = table.visualItemRect(table.item(1, 0)).topLeft() + QtCore.QPoint(10, 14)
+        QtTest.QTest.mouseClick(table.viewport(), QtCore.Qt.MouseButton.LeftButton, pos=checkbox)
+        assert table.item(1, 0).checkState() == QtCore.Qt.CheckState.Checked
+        table.selectRow(1)
+        assert table.currentRow() == 1
+        table.show_rows(("Use", "Frame"), (("", 30),), check_states={(0, 0): False})
+        assert table.item(0, 0).checkState() == QtCore.Qt.CheckState.Unchecked
+        assert not table.item(0, 1).toolTip()
+        assert table.horizontalHeaderItem(0).toolTip() == "Prepare checked frames."
+    finally:
+        table.close()
         table.deleteLater()
 
 

@@ -381,6 +381,7 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
         dialog.set_source_context(source)
+        _finish(dialog)  # source-details reading disables the metadata button until it finishes
         dialog._enumerate()
         _finish(dialog)
         assert dialog.selection.columnCount() == 3, dialog.status.text()  # Use, Frame, tth: no nu
@@ -391,11 +392,11 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         assert dialog._frame_motors == ('tth', None)
         assert [frame.motors for frame in dialog.frames] == [{'tth': 10.}, {'tth': 20.}, {'tth': 30.}]
         assert 'holds one circle at zero' in dialog.arm_note.text()
-        # the direct-beam zero "del" names twoc's 2θ: the rough geometry is a single arm
+        # the selected instrument owns twoc's 2θ: the rough geometry is a single arm
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):
             dialog._set_field_text(key, value)
-        assert dialog._text('beam_motor') == 'del' and is_single_arm(dialog._rough_record())
+        assert is_single_arm(dialog._rough_record())
         # renaming the 2θ motor after staging: the frames read tth, so Fit refuses
         dialog.set_instrument(InstrumentGeometry('twoc', (('tth', 'ttheta'),)))
         dialog._fit()

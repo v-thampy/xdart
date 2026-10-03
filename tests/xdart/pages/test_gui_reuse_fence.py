@@ -65,10 +65,7 @@ _STRINGS: dict[str, str] = dict.fromkeys(
     ("DATA BROWSER", "fileMenuButton", "configMenuButton", "helpMenuButton"), _BROWSER_OWNER,
 )
 
-_DEBT: dict[str, dict[str, int]] = {
-    #: the calibration window's frame selection and frame tables, which predate the table fence (FIT-TOOLS-2026-10)
-    "tabs/calibration/dialog.py": {"QTableWidget": 2},
-}
+_DEBT: dict[str, dict[str, int]] = {}
 
 
 def _fenced_modules() -> list[Path]:
