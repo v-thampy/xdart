@@ -208,3 +208,69 @@ def test_eiger_acquisition_count_mismatch_refuses_explicit_grouping(tmp_path):
     assert inspect_point_images(spec) is None
     with pytest.raises(ValueError, match="point count"):
         open_source(_confirmed(spec, PointImagePolicy(2, "average")))
+
+
+@pytest.mark.parametrize("operation,expected_signal,expected_variance,multiplier", [
+    ("average", 8., 4., 1.), ("difference", -4., 16., 0.), ("select", 6., 6., 1.),
+])
+def test_point_statistics_use_native_counts_before_combination(
+        tmp_path, operation, expected_signal, expected_variance, multiplier):
+    from xrd_tools.sources.point_images import PointImagePolicy
+    source = open_source(_confirmed(_spec_images(tmp_path), PointImagePolicy(
+        2, operation, image_index=2 if operation == "select" else 1)))
+    try:
+        result = source.load_point_statistics(0, StitchConditioning("auto"), poisson=True)
+        np.testing.assert_equal(result.signal, expected_signal)
+        np.testing.assert_equal(result.variance, expected_variance)
+        assert result.exposure_multiplier == multiplier
+    finally:
+        getattr(source, "close", lambda: None)()
+
+
+def test_native_transform_runs_before_difference_and_invalidates_variance(tmp_path):
+    from xrd_tools.sources.point_images import PointImagePolicy
+    source = open_source(_confirmed(_spec_images(tmp_path), PointImagePolicy(2, "difference")))
+    def prepare(raw):
+        image = raw.astype(float) + 5.
+        image[raw > 9] = np.nan
+        return image
+    try:
+        result = source.load_point_statistics(0, poisson=True, native_transform=prepare)
+        assert np.isnan(result.signal).all() and np.isnan(result.variance).all()
+        result = source.load_point_statistics(1, poisson=True,
+            native_transform=lambda raw: raw.astype(float) + 5.)
+        np.testing.assert_equal(result.signal, -4.)
+        np.testing.assert_equal(result.variance, 20.)
+    finally:
+        getattr(source, "close", lambda: None)()
+
+
+def test_one_based_names_are_acquisition_ordinals_not_spec_row_numbers(tmp_path):
+    from xrd_tools.sources.point_images import PointImagePolicy
+    spec = _spec_images(tmp_path)
+    for index in reversed(range(4)):
+        (tmp_path / f"calibrant_scan001_{index:04}.tif").rename(
+            tmp_path / f"calibrant_scan001_{index + 1:04}.tif")
+    source = open_source(_confirmed(spec, PointImagePolicy(2, "average")))
+    np.testing.assert_equal(source.load_frame(0), 8.)
+    np.testing.assert_equal(source.load_frame(1), 10.)
+    assert source.metadata_for(0)["i0"] == 100.
+    assert source.metadata_for(1)["i0"] == 200.
+
+
+def test_container_point_statistics_cross_native_blocks_without_losing_operands(tmp_path):
+    from xrd_tools.sources.point_images import PointImagePolicy
+    spec, images = _eiger(tmp_path)
+    source = open_source(_confirmed(spec, PointImagePolicy(2, "average")))
+    try:
+        chunks = list(source.iter_point_statistics(1, poisson=True,
+                                                   conditioning=StitchConditioning("auto")))
+        assert [labels for _results, labels in chunks] == [[0], [1]]
+        for point, (results, _labels) in enumerate(chunks):
+            assert len(results) == 1
+            expected = images[point * 2:point * 2 + 2].astype(float)
+            expected[expected >= 65535] = np.nan
+            np.testing.assert_equal(results[0].signal, expected.mean(axis=0))
+            np.testing.assert_equal(results[0].variance, np.maximum(expected, 1.).sum(axis=0) / 4.)
+    finally:
+        source.close()

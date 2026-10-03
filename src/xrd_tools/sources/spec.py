@@ -331,21 +331,29 @@ class SpecSource(BaseFrameSource):
         labels = policy.raw_indices(index) if policy is not None else (index,)
         return tuple(self._frame_map[raw] for raw in labels)
 
-    def load_point_frame(self, index: int, conditioning=None, saturation=None) -> np.ndarray:
+    def load_point_statistics(self, index: int, conditioning=None, saturation=None, *,
+                              poisson=False, native_transform=None):
         """Apply value rules to each native input before the confirmed operation."""
-        from xrd_tools.sources.point_images import combine_point_images
+        from xrd_tools.sources.point_images import combine_point_statistics, PointImagePolicy
         from xrd_tools.io.image import read_image
         policy = self.point_image_policy
         if policy is None:
-            from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
-            return condition_stitch_frame(self.load_native_frame(index), conditioning, saturation)
+            return combine_point_statistics(lambda _: self.load_native_frame(index), (0,),
+                PointImagePolicy(1, 'select'), conditioning, saturation,
+                poisson=poisson, native_transform=native_transform)
         locators = self.point_raw_locators(index)
         options = {key: value for key, value in self._read_image_kwargs.items()
                    if key not in {"threshold", "mask", "preserve_dtype", "exact_frame"}}
         def native(position):
             path, frame = locators[position]
             return read_image(path, frame=frame, preserve_dtype=True, exact_frame=True, **options)
-        return combine_point_images(native, range(len(locators)), policy, conditioning, saturation)
+        return combine_point_statistics(native, range(len(locators)), policy, conditioning, saturation,
+                                        poisson=poisson, native_transform=native_transform)
+
+    def load_point_frame(self, index: int, conditioning=None, saturation=None, *,
+                         native_transform=None) -> np.ndarray:
+        return self.load_point_statistics(index, conditioning, saturation,
+                                         native_transform=native_transform).signal
 
     def raw_locator_for(self, index: int) -> tuple[Path | None, int | None]:
         """Return one raw member locator without constructing frame metadata."""

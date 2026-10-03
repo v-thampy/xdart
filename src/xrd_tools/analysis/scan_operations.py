@@ -589,6 +589,9 @@ def _metadata_scalar(value: Any) -> Any:
 def _metadata_row(values: Mapping[str, Any]) -> dict[str, Any]:
     row: dict[str, Any] = {}
     for key, value in values.items():
+        if key == "point_images":
+            # Structured source provenance lives in SourceSpec/ScanFrame, not a scalar motor table.
+            continue
         if type(key) is not str:
             raise _Refusal("INVALID_CANONICAL_VALUE")
         row[key] = _metadata_scalar(value)
@@ -787,11 +790,17 @@ def _snapshot(
         discovery_states: list[tuple[Path, FileRevision | None]] = []
         member_states: list[tuple[Path, FileRevision | None]] = []
         member_revisions: dict[Path, FileRevision | None] = {}
+        qualified_raw: set[Path] = set()
+        grouped_aliases: set[Path] = set()
         container_graph = None
-        if isinstance(source, _CursorSource):
+        from xrd_tools.sources.point_images import PointImageSource
+        if isinstance(source, (_CursorSource, PointImageSource)):
             from xrd_tools.sources.execution_graph import qualify_source_execution_graph
             container_graph = qualify_source_execution_graph(
-                spec, cancelled=None if cancel_token is None else cancel_token.is_set,
+                SourceSpec(spec.uri, spec.kind, metadata_uri=spec.metadata_uri,
+                    entry=spec.entry, options={key: value for key, value in spec.options.items()
+                        if key not in {"point_images", "scan_point_count", "scan_point_count_path"}}),
+                cancelled=None if cancel_token is None else cancel_token.is_set,
             )
             stamp = container_graph.stamp
             for state in (stamp.file, *stamp.members,
@@ -917,6 +926,31 @@ def _snapshot(
                     (int(label), None if locator is None else str(locator),
                      source_frame_index, revision)
                 )
+                grouped_locators = getattr(source, "point_raw_locators", None)
+                if callable(grouped_locators) and getattr(source, "point_image_policy", None) is not None:
+                    for raw_path, _raw_index in grouped_locators(label):
+                        raw_lexical = _lexical_absolute(raw_path)
+                        candidate = raw_lexical.resolve(strict=False)
+                        if candidate not in member_revisions:
+                            member_revision = _path_revision(candidate)
+                            member_revisions[candidate] = member_revision
+                        if raw_lexical not in grouped_aliases:
+                            member_states.append((raw_lexical, member_revisions[candidate]))
+                            grouped_aliases.add(raw_lexical)
+                        # Reuse the raw-container dependency owner for external/VDS shards.
+                        if candidate.suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus", ".cxi"} and candidate not in qualified_raw:
+                            from xrd_tools.sources.execution_graph import qualify_source_execution_graph
+                            from xrd_tools.sources.descriptor import describe_container
+                            native = describe_container(candidate, entry=getattr(source, "_read_image_kwargs", {}).get("entry", "entry"))
+                            graph = qualify_source_execution_graph(SourceSpec(raw_lexical, native.kind, entry=native.resolved_entry),
+                                cancelled=None if cancel_token is None else cancel_token.is_set)
+                            stamp = graph.stamp
+                            for state in (stamp.file, *stamp.members,
+                                *(member.file for member in stamp.external_members), *stamp.dependency_files):
+                                if not state.matches_disk():
+                                    raise _Refusal("SOURCE_REVISION_CHANGED")
+                                member_states.append((Path(state.path), _path_revision(Path(state.path))))
+                            qualified_raw.add(candidate)
         else:
             method = source.metadata_for
             try:

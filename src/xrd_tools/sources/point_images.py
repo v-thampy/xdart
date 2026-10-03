@@ -165,16 +165,41 @@ def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
     return None
 
 
-def combine_point_images(loader, raw_indices, policy: PointImagePolicy,
-                         conditioning=None, saturation: int | None = None) -> np.ndarray:
-    """Combine one decoded image at a time; NaN in any contributor propagates."""
+@dataclass(frozen=True, slots=True)
+class PointImageResult:
+    """One owning logical signal and optional native-count Poisson estimate."""
+
+    signal: np.ndarray
+    variance: np.ndarray | None
+    exposure_multiplier: float
+
+
+def combine_point_statistics(loader, raw_indices, policy: PointImagePolicy,
+                             conditioning=None, saturation: int | None = None, *,
+                             poisson: bool = False, native_transform=None) -> PointImageResult:
+    """Mask native operands before combining, with independent counting variance.
+
+    A tool may supply its existing native conditioning function. Common dark,
+    background and normalization are applied later by that tool, with their
+    correction coefficients squared for variance. Only used operands are read.
+    """
     from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
 
-    result = None
+    result = variance = None
     for position, raw_index in enumerate(raw_indices):
-        image = condition_stitch_frame(loader(raw_index), conditioning, saturation)
+        native = np.asarray(loader(raw_index))
+        image = (condition_stitch_frame(native, conditioning, saturation)
+                 if native_transform is None else native_transform(native))
+        image = np.array(image, dtype=np.float64, copy=True, order="C")
+        if image.ndim != 2 or image.shape != native.shape:
+            raise ValueError("native conditioning must preserve the detector frame shape")
+        current_variance = None
+        if poisson:
+            current_variance = np.maximum(np.asarray(native, dtype=np.float64), 1.)
+            current_variance[~np.isfinite(image)] = np.nan
         if result is None:
             result = image
+            variance = current_variance
         else:
             if image.shape != result.shape:
                 raise ValueError("images within a scan point must have identical detector shapes")
@@ -186,11 +211,23 @@ def combine_point_images(loader, raw_indices, policy: PointImagePolicy,
                     np.subtract(image, result, out=result)
             else:
                 np.add(result, image, out=result)
+            if variance is not None:
+                np.add(variance, current_variance, out=variance)
     if result is None:
         raise ValueError("scan point has no contributing images")
     if policy.operation == "average":
         result /= policy.images_per_point
-    return result
+        if variance is not None:
+            variance /= policy.images_per_point ** 2
+    return PointImageResult(result, variance, 0. if policy.operation == "difference" else 1.)
+
+
+def combine_point_images(loader, raw_indices, policy: PointImagePolicy,
+                         conditioning=None, saturation: int | None = None, *,
+                         native_transform=None) -> np.ndarray:
+    """Combine bounded native operands without allocating an uncertainty array."""
+    return combine_point_statistics(loader, raw_indices, policy, conditioning, saturation,
+                                    native_transform=native_transform).signal
 
 
 def point_image_metadata(policy: PointImagePolicy, locators) -> dict[str, Any]:
@@ -230,9 +267,83 @@ class PointImageSource(BaseFrameSource):
     def raw_locator_for(self, index):
         return self.point_raw_locators(index)[0]
 
-    def load_point_frame(self, index, conditioning=None, saturation=None):
-        return combine_point_images(self.source.load_frame, self._raw_indices(index),
-                                    self.point_image_policy, conditioning, saturation)
+    def load_point_statistics(self, index, conditioning=None, saturation=None, *,
+                              poisson=False, native_transform=None):
+        native = getattr(self.source, 'load_native_frame', self.source.load_frame)
+        return combine_point_statistics(native, self._raw_indices(index),
+            self.point_image_policy, conditioning, saturation,
+            poisson=poisson, native_transform=native_transform)
+
+    def load_point_frame(self, index, conditioning=None, saturation=None, *, native_transform=None):
+        return self.load_point_statistics(index, conditioning, saturation,
+                                         native_transform=native_transform).signal
+
+    def iter_point_statistics(self, chunk_size, *, poisson=False, native_transform=None,
+                              conditioning=None, saturation=None, cancelled=None):
+        """Combine serial native blocks through the existing sustained cursor.
+
+        Only one native block and one unfinished point are held. Detector block
+        boundaries may split a point; all used operands are consumed before
+        publishing it. The caller charges logical outputs and scratch space.
+        """
+        if type(chunk_size) is not int or chunk_size <= 0:
+            raise ValueError('point chunk size must be a positive whole count')
+        stop = (lambda: False) if cancelled is None else cancelled
+        k = self.point_image_policy.images_per_point
+        method = getattr(self.source, '_iter_vnext_chunks', None)
+        blocks = (method(chunk_size * k, stop) if callable(method)
+                  else self.source.iter_chunks(chunk_size * k))
+        def operands():
+            for array, labels in blocks:
+                for image, label in zip(array, labels, strict=True):
+                    yield int(label), image
+        native = operands()
+        last, held = -1, None
+        def take(wanted):
+            nonlocal last, held
+            while last < wanted:
+                if stop():
+                    raise InterruptedError('point-image consumption cancelled')
+                try:
+                    ordinal, image = next(native)
+                except StopIteration as error:
+                    raise ValueError('container ended within a confirmed scan point') from error
+                if ordinal != last + 1:
+                    raise ValueError('container point operands must be contiguous acquisition ordinals')
+                last = ordinal
+                held = image
+            return held
+        results, labels = [], []
+        try:
+            for point in self.frame_indices:
+                results.append(combine_point_statistics(take, self._raw_indices(point),
+                    self.point_image_policy, conditioning, saturation,
+                    poisson=poisson, native_transform=native_transform))
+                take((point + 1) * k - 1)
+                labels.append(point)
+                if len(labels) == chunk_size:
+                    yield results, labels
+                    results, labels = [], []
+            if labels:
+                yield results, labels
+        finally:
+            native.close()
+            close = getattr(blocks, 'close', None)
+            if callable(close):
+                close()
+
+    @property
+    def allocation(self):
+        return self.source.allocation
+
+    def bind_allocation(self, allocation):
+        self.source.bind_allocation(allocation)
+
+    def bind_eiger_direct_chunk(self, allocation):
+        self.source.bind_eiger_direct_chunk(allocation)
+
+    def take_direct_chunk_fact(self):
+        return self.source.take_direct_chunk_fact()
 
     def load_frame(self, index):
         return self.load_point_frame(index)
@@ -243,8 +354,17 @@ class PointImageSource(BaseFrameSource):
     def metadata_for(self, index):
         raw = next(iter(self._raw_indices(index)))
         result = dict(self.source.metadata_for(raw))
+        for name, values in self.motors.items():
+            result[name] = np.asarray(values)[index].item()
         result["point_images"] = point_image_metadata(self.point_image_policy, self.point_raw_locators(index))
         return result
+
+    @property
+    def descriptor(self):
+        return self.source.container_descriptor()
+
+    def container_descriptor(self):
+        return self.source.container_descriptor()
 
     @property
     def motors(self):

@@ -79,6 +79,23 @@ class CompositeFrameSource(BaseFrameSource):
         member = self._members[mi]
         return getattr(member, "load_native_frame", member.load_frame)(label)
 
+    def load_point_statistics(self, index, conditioning=None, saturation=None, *,
+                              poisson=False, native_transform=None):
+        from xrd_tools.sources.point_images import combine_point_statistics, PointImagePolicy
+        mi, label = self._map[int(index)]
+        member = self._members[mi]
+        method = getattr(member, 'load_point_statistics', None)
+        if callable(method):
+            return method(label, conditioning, saturation, poisson=poisson,
+                          native_transform=native_transform)
+        loader = getattr(member, 'load_native_frame', member.load_frame)
+        return combine_point_statistics(loader, (label,), PointImagePolicy(1, 'select'),
+            conditioning, saturation, poisson=poisson, native_transform=native_transform)
+
+    def load_point_frame(self, index, conditioning=None, saturation=None, *, native_transform=None):
+        return self.load_point_statistics(index, conditioning, saturation,
+                                         native_transform=native_transform).signal
+
     def frame_for(self, index: int) -> ScanFrame:
         mi, label = self._map[int(index)]
         frame = self._members[mi].frame_for(label)
