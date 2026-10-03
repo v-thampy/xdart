@@ -372,6 +372,11 @@ class ScientificImagePane(QtWidgets.QWidget):
         if x_axis is not None and y_axis is not None:
             x0, x1 = axis_span(x_axis)
             y0, y1 = axis_span(y_axis)
+            # Explicit bin edges retain the centres' direction without reordering pixels.
+            if x_axis.edges is not None and x_axis.values[0] > x_axis.values[-1]:
+                x0, x1 = x1, x0
+            if y_axis.edges is not None and y_axis.values[0] > y_axis.values[-1]:
+                y0, y1 = y1, y0
             rect = QtCore.QRectF(x0, y0, x1 - x0, y1 - y0)
             linear_percentiles = (0.5, 99.5)
             expand_degenerate = True

@@ -1501,6 +1501,41 @@ def test_e3_ui2_status_fallback_and_non_string_rejection_are_exact(
         qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 
 
+@pytest.mark.parametrize('descending', [False, True])
+def test_int_cake_projection_places_pixels_at_q_chi_bin_centres(qapp, descending) -> None:
+    """Int's FrameView adapter supplies bin edges to the mounted scientific view."""
+    state = make_shell_projection(frame_count=1, selected_index=0, plot_mode='Single')
+    frame = state.navigation.current
+    q = np.array([1., 2., 3.])
+    chi = np.array([-3., -1., 1., 3.])
+    if descending:
+        q, chi = q[::-1], chi[::-1]
+    cake = np.arange(12, dtype=float).reshape(4, 3)
+    payload = StandardDisplayPayload(0, frame, 'calibrant', FrameView(
+        frame.local_frame_label, axis_2d_x=Axis('Q', 'q_A^-1', values=q),
+        axis_2d_y=Axis('chi', 'chi_deg', values=chi), intensity_2d=cake,
+        two_d_kind=TwoDKind.Q_CHI), wavelength_m=1e-10)
+    scientific = build_scientific_projection(
+        (payload,), state.navigation, frozenset({frame}),
+        ScientificPreferences(image_axis='Q-Chi', plot_mode='Single'), '')
+    shell = ScatteringWorkspaceShell()
+    try:
+        shell.apply_state(replace(state, scientific=scientific))
+        item = shell.scientific.cake.image
+        np.testing.assert_array_equal(item.image, cake.T)
+        assert scientific.heavy.cake_x.unit == 'q_A^-1'
+        assert scientific.heavy.cake_y.unit == 'chi_deg'
+        np.testing.assert_array_equal(scientific.heavy.cake_x.values, q)
+        np.testing.assert_array_equal(scientific.heavy.cake_y.values, chi)
+        for column, row in ((0, 0), (2, 3)):
+            position = item.mapToParent(QtCore.QPointF(column + .5, row + .5))
+            assert (position.x(), position.y()) == pytest.approx((q[column], chi[row]), abs=1e-9)
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
 def test_an_image_spans_its_axes_edges_so_each_pixel_sits_at_its_bin_centre(qapp) -> None:
     """``AxisProjection.edges`` (Codex's RSM stage-1 review F3, now in Int's pane): an axis of bin centres
     with its bins' outer edges draws each pixel at its bin's centre; without them the image spans the first
