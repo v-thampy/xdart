@@ -20,6 +20,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from xrd_tools.core.metadata import numeric_metadata
+from xrd_tools.core.scan import FrameGeometry
 
 
 class TwoDKind(str, Enum):
@@ -56,21 +57,6 @@ class Axis:
                 values = values.copy()
                 values.setflags(write=False)
         object.__setattr__(self, "values", values)
-
-
-@dataclass(frozen=True, slots=True)
-class FrameGeometry:
-    """Per-frame geometry needed by GI, stitching, and RSM pipelines."""
-
-    rot1: float | None = None
-    rot2: float | None = None
-    rot3: float | None = None
-    incident_angle: float | None = None
-    poni: Mapping[str, Any] | None = None
-
-    def __post_init__(self) -> None:
-        if self.poni is not None:
-            object.__setattr__(self, "poni", MappingProxyType(dict(self.poni)))
 
 
 def _readonly_array(value: Any, *, dtype: Any = float) -> np.ndarray | None:
