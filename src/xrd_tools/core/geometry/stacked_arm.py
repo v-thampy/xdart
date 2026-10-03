@@ -61,21 +61,22 @@ def orientation_signs(orientation=3) -> tuple[int, int]:
 
 
 def arm_signs(orientation=3, senses=None) -> tuple[int, int]:
-    """The signs of nu's and del's motor scales: the detector orientation's
-    (:func:`orientation_signs`), each reversed for a circle that turns opposite to psic's
+    """The signs of nu's and del's motor scales in pyFAI's native frame:
+    negative :func:`orientation_signs`, each reversed for a circle that turns opposite to psic's
     (``senses``: {'nu': -1, 'del': -1}, as ``InstrumentGeometry.arm_senses`` gives them; a
     circle not named turns as psic's, nu about x+ and del about z-)."""
     senses = dict(senses or {})
     if set(senses) - {'nu', 'del'} or any(value not in (1, -1) for value in senses.values()):
         raise ValueError(f"a circle's sense is 1 or -1 for nu and del, not {senses}")
     nu, delta = orientation_signs(orientation)
-    return nu * senses.get('nu', 1), delta * senses.get('del', 1)
+    # pyFAI's native t1=x, t2=-z frame: standard physical nu x+ and del z- have negative Euler scales.
+    return -nu * senses.get('nu', 1), -delta * senses.get('del', 1)
 
 
 def arm_senses(arm, orientation=3) -> dict[str, int]:
     """The senses an arm's moving circles turn with (:func:`arm_signs`'s ``senses``), read from
     its motor scales' signs in this detector orientation."""
-    signs = dict(zip(('nu', 'del'), orientation_signs(orientation)))
+    signs = dict(zip(('nu', 'del'), arm_signs(orientation)))
     return {circle: (1 if getattr(arm, f'{circle}_scale') > 0 else -1) * signs[circle]
             for circle, motor in (('nu', arm.nu_motor), ('del', arm.del_motor)) if motor is not None}
 
@@ -173,9 +174,9 @@ class StackedDetectorArm:
     nu_motor: str | None = 'nu'
     del_motor: str | None = 'del'
     nu_offset: float = 0.
-    nu_scale: float = math.pi / 180
+    nu_scale: float = -math.pi / 180
     del_offset: float = 0.
-    del_scale: float = math.pi / 180
+    del_scale: float = -math.pi / 180
     beam_rotation: float = 0.
     mount_tilt: float = 0.
     mount_roll: float = 0.

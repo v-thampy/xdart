@@ -17,7 +17,7 @@ import tifffile
 
 from xrd_tools.core.containers import PONI
 from xrd_tools.core.geometry import DetectorCalibration, Diffractometer, StackedDetectorArm
-from xrd_tools.core.geometry.stacked_arm import orientation_signs
+from xrd_tools.core.geometry.stacked_arm import arm_signs
 from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
 from xrd_tools.integrate.refine import ArmFitBounds, ControlFrame, refine_stacked_arm
 from tests.core.test_stacked_arm_extension import ANGLES, TRUTH, WAVELENGTH, _calibration, _ring_controls
@@ -29,7 +29,7 @@ PIXEL = 172e-6
 
 def _offsets(zeros=ZEROS, orientation=3):
     """The internal offsets these motor zeros give: −(signed scale) × zero."""
-    nu_sign, del_sign = orientation_signs(orientation)
+    nu_sign, del_sign = arm_signs(orientation)
     return {'nu_offset': -nu_sign * np.deg2rad(zeros['nu']), 'del_offset': -del_sign * np.deg2rad(zeros['del'])}
 
 
@@ -78,7 +78,7 @@ def test_a_zero_outside_its_freedom_stops_at_the_bound_and_says_so():
 @pytest.mark.parametrize('limit_mm', [.05, .02])
 def test_each_sample_displacement_is_held_within_its_limit(limit_mm):
     """TRUTH's sample sits 0.5–2.2 mm off the rotation centre; the fit may not follow it there."""
-    zeros = {'nu': -np.rad2deg(TRUTH['nu_offset']), 'del': -np.rad2deg(TRUTH['del_offset'])}
+    zeros = {'nu': np.rad2deg(TRUTH['nu_offset']), 'del': np.rad2deg(TRUTH['del_offset'])}
     controls, calibrant = _ring_controls(TRUTH, _calibration(), ANGLES)
     fit = _fit(controls, calibrant, extended=True,
                bounds=ArmFitBounds(zeros_deg=zeros, sample_offset_mm=limit_mm))
@@ -115,7 +115,7 @@ def replace_dist(poni, dist):
 def test_a_single_arm_keeps_its_held_circle_as_a_fixed_angle():
     """A vertical 2θ arm moves del; its held nu is the arm's fixed yaw, not a motor zero: the table
     names it so, and the arm stores it as +scale × angle (no motor reading to subtract)."""
-    held = {'nu_offset': np.deg2rad(-.5), 'del_offset': -np.deg2rad(1.)}  # yaw −0.5°, del zero +1°
+    held = {'nu_offset': np.deg2rad(.5), 'del_offset': np.deg2rad(1.)}  # native scale: yaw −0.5°, del zero +1°
     controls, calibrant = _ring_controls(held, _calibration(), [(d, 0.) for d in (6., 18., 30., 42., 54.)])
     controls = [ControlFrame(c.row_positions, c.col_positions, c.rings, {'del': c.motors['del']})
                 for c in controls]
@@ -128,7 +128,7 @@ def test_a_single_arm_keeps_its_held_circle_as_a_fixed_angle():
     assert table['del_zero_deg']['fitted'] == pytest.approx(1., abs=1e-6)
     assert table['nu_held_deg']['fitted'] == pytest.approx(-.5, abs=1e-6)
     assert (table['nu_held_deg']['lower'], table['nu_held_deg']['upper']) == pytest.approx((-2., 2.))
-    assert fit.diffractometer.stacked_arm.nu_offset == pytest.approx(np.deg2rad(-.5), abs=1e-9)
+    assert fit.diffractometer.stacked_arm.nu_offset == pytest.approx(np.deg2rad(.5), abs=1e-9)
 
 
 @pytest.mark.parametrize('orientation', [3, 2])
@@ -164,7 +164,7 @@ def _least_squares_calls(monkeypatch):
 
 def _assert_boxed(calls, bounds, orientation=3):
     """Each solve's angles and displacements are boxed about the estimates (in internal units)."""
-    nu_sign, del_sign = orientation_signs(orientation)
+    nu_sign, del_sign = arm_signs(orientation)
     zeros = dict(bounds.zeros_deg)
     half = np.deg2rad(bounds.zero_freedom_deg)
     assert calls
@@ -303,7 +303,7 @@ def test_a_saved_fit_with_nonzero_zeros_reloads_with_the_same_2theta_and_chi(tmp
     again); xrayutilities pairs orientation 3 and still refuses another by name."""
     from pyFAI.calibrant import get_calibrant
     from xrd_tools.integrate.stitch_calibration import fit_calibration, save_calibration_pair
-    nu_sign, del_sign = orientation_signs(orientation)
+    nu_sign, del_sign = arm_signs(orientation)
     arm = StackedDetectorArm(nu_scale=nu_sign * np.pi / 180, del_scale=del_sign * np.pi / 180,
                              mount_tilt=np.deg2rad(.4), mount_roll=np.deg2rad(-.3),
                              sample_offset1=2e-5, sample_offset2=-1e-5, sample_offset3=3e-5,
@@ -314,7 +314,8 @@ def test_a_saved_fit_with_nonzero_zeros_reloads_with_the_same_2theta_and_chi(tmp
         source_motors=SOURCES)
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = WAVELENGTH
-    angles = ANGLES[::2]
+    # Preserve the original well-sampled internal poses with the native negative scales.
+    angles = [(2 * ZEROS['del'] - d, 2 * ZEROS['nu'] - n) for d, n in ANGLES[::2]]
     frames = _subpixel_frames(tmp_path / 'frames', _controls_from(truth, angles, calibrant), _seed(orientation),
                               orientation)
     fit = fit_calibration(frames, arm_model='stacked_extended', bounds=ArmFitBounds(zeros_deg=ZEROS))

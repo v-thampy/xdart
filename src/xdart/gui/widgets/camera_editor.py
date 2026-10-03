@@ -41,8 +41,8 @@ class CameraEditor(QtWidgets.QWidget):
         self.default_button.setAutoDefault(False)
         self.default_button.setAccessibleName('Reset camera orientation')
         self.default_button.setFixedWidth(self.default_button.sizeHint().height())
-        self.default_button.setToolTip('Reset to xdart\'s reference camera: rows x− (down), columns z+ '
-                                      '(left looking downstream). Image rotation 0°, no flip.')
+        self.default_button.setToolTip('Reset to pyFAI\'s native camera: rows x+ (up), columns z− '
+                                      '(right looking downstream). Image rotation 0°, no flip.')
         self.default_button.clicked.connect(lambda: self.set_value(STITCH_CAMERA))
         layout.addWidget(self.default_button)
         self.image_size = QtWidgets.QLabel()
@@ -52,7 +52,7 @@ class CameraEditor(QtWidgets.QWidget):
         return DetectorCamera(self.rows.currentData(), self.columns.currentData())
 
     def transform_description(self) -> str:
-        """The stored image's correction into xdart's reference, with the turn before the mirror."""
+        """The stored image's correction into pyFAI's native frame, with the turn before the mirror."""
         transform = stitch_orientation(self.value())
         if transform.rotation == 0:
             return 'horizontal flip' if transform.flip_horizontal else 'standard'

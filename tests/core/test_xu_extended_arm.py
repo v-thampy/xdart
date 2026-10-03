@@ -54,14 +54,14 @@ def test_the_transfer_passes_its_gate_on_every_pixel(transferred):
     assert detector['detrot_deg'] == pytest.approx(np.degrees(TRUTH['mount_roll']), abs=1e-6)
     assert detector['tilt_deg'] == pytest.approx(np.degrees(TRUTH['mount_tilt']), abs=1e-6)
     assert asset['acquisition']['detector_offsets_deg'] == pytest.approx(
-        {'del': -np.degrees(TRUTH['del_offset']), 'nu': -np.degrees(TRUTH['nu_offset'])}, abs=1e-12)
+        {'del': np.degrees(TRUTH['del_offset']), 'nu': np.degrees(TRUTH['nu_offset'])}, abs=1e-12)
     # and Stitch's own XU path agrees with pyFAI in |q| and in the polarization factor
     assert diagnostics['stitch_path_max_abs_dq_A^-1'] <= 1e-8
     assert diagnostics['polarization_max_relative'] <= 1e-6 == diagnostics['polarization_gate']
     assert asset['validation']['validation_pixel_count'] == len(ANGLES) * SHAPE[0] * SHAPE[1]
     assert asset['corrections']['solid_angle_policy'] == 'per_frame_pyfai_extended_arm_v1'
-    # xrayutilities' sample displacement is the arm's sample offset, (−s1, s3, s2) in mm
-    expected = [-TRUTH['sample_offset1'] * 1e3, TRUTH['sample_offset3'] * 1e3, TRUTH['sample_offset2'] * 1e3]
+    # Native pyFAI t1=x, t2=-z, t3=y: sample displacement is (s1, s3, -s2) in mm.
+    expected = [TRUTH['sample_offset1'] * 1e3, TRUTH['sample_offset3'] * 1e3, -TRUTH['sample_offset2'] * 1e3]
     np.testing.assert_allclose(asset['acquisition']['sampledis_mm'], expected, atol=1e-6)
     parse_xu_stitch_calibration_bytes(_canonical_bytes(asset))
 
@@ -179,7 +179,7 @@ def test_a_failed_gate_refuses(monkeypatch):
 
 
 def test_a_five_parameter_arm_transfers_by_formula(tmp_path):
-    """No fit: cch = poni/pitch − 0.5, the same distance, the offsets negated (was refused: the
+    """No fit: cch = poni/pitch − 0.5, the same distance, offsets converted by scale sign (was refused: the
     transfer took only the extended arm)."""
     five = StackedDetectorArm(nu_motor='nu', del_motor='del', nu_offset=.02, del_offset=-.05)
     asset, diagnostics = transfer_arm_to_xu(five.to_pyfai_goniometer(_calibration()), validation_angles=ANGLES)
@@ -188,7 +188,7 @@ def test_a_five_parameter_arm_transfers_by_formula(tmp_path):
     detector, acquisition = asset['detector'], asset['acquisition']
     assert detector['tilt_deg'] == detector['detrot_deg'] == 0 and acquisition['sampledis_mm'] == [0, 0, 0]
     assert detector['cch1_px'] == pytest.approx(.035 / 172e-6 - .5, abs=1e-9)
-    assert acquisition['detector_offsets_deg'] == pytest.approx({'del': 180 / np.pi * .05, 'nu': -180 / np.pi * .02})
+    assert acquisition['detector_offsets_deg'] == pytest.approx({'del': -180 / np.pi * .05, 'nu': 180 / np.pi * .02})
     _receipt(tmp_path, asset)  # the runtime admits it
 
 

@@ -2,8 +2,8 @@
 
 A five-parameter arm, or a single 2θ arm (one circle held at zero), follows by
 formula: XU's centre pixel is ``cch = poni / pitch − 0.5`` (measured: 1e-9 Å⁻¹
-against 3e-3 for ``poni / pitch``), the distance is the same and the motor offsets
-are negated. An extended arm's detector mount (``detrot``, ``tilt``,
+against 3e-3 for ``poni / pitch``), the distance is the same and each motor zero
+is ``−sign(scale) × degrees(offset)``. An extended arm's detector mount (``detrot``, ``tilt``,
 ``tiltazimuth``), centre and sample displacement (``sampledis``) are fitted to
 the arm's per-pixel q on frames spread over the scan, on a coarse virtual
 detector whose pixels are exactly the compared ones (every 6th row, 23rd
@@ -17,7 +17,7 @@ validation frame, through Stitch's own XU path (the admitted asset, its runtime
 geometry and q provider), |q| within 1e-8 Å⁻¹ and the polarization factor within
 1e-6 (relative, f 0.99) of pyFAI. The sample displacement is in the detector
 distance's units (mm here): the fit recovers the arm's offsets exactly as
-``(−s1, s3, s2)``.
+``(s1, s3, −s2)`` in pyFAI's native camera frame.
 """
 from __future__ import annotations
 
@@ -94,7 +94,8 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     ``geometry`` is a pyFAI goniometer record (mapping or path) of a stacked arm: the
     five-parameter arm, the extended arm, or a single 2θ arm, with degree motor
     scales, no beam rotation, no parallax and pyFAI's default detector orientation. A
-    negative scale is a circle turning opposite to psic's: its XU axis is reversed.
+    positive scale in the native camera frame is a circle turning opposite to
+    psic's: its XU axis is reversed. Physical circle directions are unchanged.
     ``source_motors`` is (del motor, nu motor), None for the circle a single arm
     holds at zero. ``validation_angles`` are (del, nu) circle angles (a held circle
     at 0), normally every frame the asset will serve; ``fit_angles`` (an extended
@@ -107,6 +108,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     )
     from xrd_tools.core.energy import calibration_recorded_energy_eV, wavelength_m_to_energy_eV
     from xrd_tools.core.geometry import Diffractometer
+    from xrd_tools.core.geometry.camera import STITCH_CAMERA
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
     from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry
     from xrd_tools.integrate.xu_stitch import XuStitchScienceRefused
@@ -137,8 +139,8 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
                                 'orientation (3): fit the arm in orientation 3 to transfer it')
     if abs(arm.nu_scale) != math.pi / 180 or abs(arm.del_scale) != math.pi / 180:
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', 'XU takes angles in degrees: fitted motor scales cannot be transferred')
-    # psic's nu x+ and del z-, each reversed for a circle that turns the other way (a negative scale)
-    detector_axes = [signed_axis(axis, 1 if scale > 0 else -1)
+    # In pyFAI's native frame, negative scales are psic's physical nu x+ and del z-.
+    detector_axes = [signed_axis(axis, -1 if scale > 0 else 1)
                      for axis, scale in (('x+', arm.nu_scale), ('z-', arm.del_scale))]
     if arm.beam_rotation != 0:
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED', "XU's azimuth reference is fixed: a beam rotation cannot be transferred")
@@ -184,7 +186,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
             hxrd = xu.HXRD([0, 1, 0], [0, 0, 1], geometry='real', en=energy, qconv=qconv)
             # the coarse detector's pixel i is the full detector's pixel i·step, exactly
             step1, step2 = _SUBGRID if coarse else (1, 1)
-            hxrd.Ang2Q.init_area('x-', 'z+', cch1=c1 / step1, cch2=c2 / step2,
+            hxrd.Ang2Q.init_area(*STITCH_CAMERA.to_xu(), cch1=c1 / step1, cch2=c2 / step2,
                                  Nch1=len(rows_sub) if coarse else shape[0],
                                  Nch2=len(cols_sub) if coarse else shape[1],
                                  pwidth1=pitch1 * 1e3 * step1, pwidth2=pitch2 * 1e3 * step2, distance=dist,

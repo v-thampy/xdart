@@ -22,7 +22,7 @@ def test_the_columns_box_offers_the_two_directions_transverse_to_the_rows(qapp):
     changed = []
     editor.changed.connect(lambda: changed.append(True))
     editor.rows.setCurrentIndex(editor.rows.findData('z-'))  # rows along z: columns along x, their sign kept
-    assert changed and items(editor.columns) == ['x+', 'x-'] and editor.value() == DetectorCamera('z-', 'x+')
+    assert changed and items(editor.columns) == ['x+', 'x-'] and editor.value() == DetectorCamera('z-', 'x-')
     editor.columns.setCurrentIndex(editor.columns.findData('x-'))
     assert editor.value() == DetectorCamera('z-', 'x-')
     editor.set_value(DetectorCamera('x-', 'z-'))  # 17-2's Pilatus 300K-W, mirrored left-right
@@ -54,7 +54,7 @@ def test_default_click_restores_unturned_unflipped_stitch_camera(qapp):
         editor.changed.connect(lambda: changed.append(editor.value()))
         editor.default_button.click()
         assert changed == [STITCH_CAMERA]
-        assert editor.value() == DetectorCamera('x-', 'z+')
+        assert editor.value() == DetectorCamera('x+', 'z-')
         transform = stitch_orientation(editor.value())
         assert transform.rotation == 0 and not transform.flip_horizontal and not transform.flip_vertical
         assert editor.default_button.text() == '↺'
@@ -66,14 +66,14 @@ def test_default_click_restores_unturned_unflipped_stitch_camera(qapp):
 
 
 @pytest.mark.parametrize('axes,description,turn,mirror', [
-    (('x-', 'z+'), 'standard', 0, ''),
-    (('x-', 'z-'), 'horizontal flip', 0, 'horizontal'),
-    (('x+', 'z+'), 'vertical flip', 0, 'vertical'),
-    (('x+', 'z-'), '180° rotation', 2, ''),
-    (('z+', 'x+'), '90° CCW', 1, ''),
-    (('z+', 'x-'), '90° CW, then horizontal flip', -1, 'horizontal'),
-    (('z-', 'x-'), '90° CW', -1, ''),
-    (('z-', 'x+'), '90° CCW, then horizontal flip', 1, 'horizontal'),
+    (('x+', 'z-'), 'standard', 0, ''),
+    (('x+', 'z+'), 'horizontal flip', 0, 'horizontal'),
+    (('x-', 'z-'), 'vertical flip', 0, 'vertical'),
+    (('x-', 'z+'), '180° rotation', 2, ''),
+    (('z-', 'x-'), '90° CCW', 1, ''),
+    (('z+', 'x-'), '90° CCW, then horizontal flip', 1, 'horizontal'),
+    (('z+', 'x+'), '90° CW', -1, ''),
+    (('z-', 'x+'), '90° CW, then horizontal flip', -1, 'horizontal'),
 ])
 def test_camera_image_correction_matches_the_labelled_transform(qapp, axes, description, turn, mirror):
     editor = CameraEditor()

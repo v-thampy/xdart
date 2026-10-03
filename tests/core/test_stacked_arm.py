@@ -123,7 +123,9 @@ def test_imported_stacked_q_and_chi_match_canonical_xu(tmp_path):
         poni2=(det['cch2_px'] + .5) * det['pixel2_m'],
         wavelength=acq['xu_mapping_wavelength_A'] * 1e-10, detector='Pilatus300kw'),
         detector_config={'orientation': 3})
-    model = StackedDetectorArm(nu_offset=-np.deg2rad(offsets['nu']),
+    # The immutable canonical asset records the former camera frame and positive scales.
+    model = StackedDetectorArm(nu_scale=np.pi / 180, del_scale=np.pi / 180,
+                              nu_offset=-np.deg2rad(offsets['nu']),
                               del_offset=-np.deg2rad(offsets['del']))
     geometry = Diffractometer.from_pyfai_goniometer(model.to_pyfai_goniometer(cal),
         source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
@@ -190,6 +192,8 @@ def test_legacy_affine_serialization_does_not_gain_model_field():
 
 @pytest.mark.slow
 def test_real_guided_stacked_fit_save_reload_and_holdout(tmp_path):
+    import pyFAI
+    from pyFAI.control_points import ControlPoints
     from pyFAI.goniometer import Goniometer
     from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.integrate.stitch_calibration import (
@@ -206,11 +210,25 @@ def test_real_guided_stacked_fit_save_reload_and_holdout(tmp_path):
                  'read_image_kwargs': {'detector_shape': (195, 1475),
                                        'raw_dtype': 'int32', 'threshold': 8e5}})
     indices = (0, 9, 18, 27, 35, 55, 65, 75, 130)
-    staged = capture_calibration_frames(source, indices, tmp_path / 'session')
+    # The archived images/points use the former x-/z+ frame: rotate both into native x+/z-.
+    staged = capture_calibration_frames(source, indices, tmp_path / 'session', rotation=180)
     control_dir = data / 'LaB6_Calibration_Poni_and_Data'
-    frames = tuple(adopt_calibration_pair(frame,
-        control_dir / f'LaB6_17keV_scan14_{frame.index:04d}.poni',
-        control_dir / f'LaB6_17keV_scan14_{frame.index:04d}.npt') for frame in staged)
+    frames = []
+    for frame in staged:
+        ai = pyFAI.load(str(control_dir / f'LaB6_17keV_scan14_{frame.index:04d}.poni'))
+        rows, cols = frame.shape
+        ai.poni1, ai.poni2 = rows * ai.pixel1 - ai.poni1, cols * ai.pixel2 - ai.poni2
+        ai.rot1, ai.rot2 = -ai.rot1, -ai.rot2
+        path = Path(frame.image_path).parent
+        ai.save(str(path / 'native.poni'))
+        points = ControlPoints(str(control_dir / f'LaB6_17keV_scan14_{frame.index:04d}.npt'))
+        native = ControlPoints(calibrant=points.calibrant, wavelength=points.calibrant.wavelength)
+        for label in points.get_labels():
+            group = points.get(lbl=label)
+            native.append(points=[[rows - 1 - y, cols - 1 - x] for y, x in group.points], ring=group.ring)
+        native.save(str(path / 'native.npt'))
+        frames.append(adopt_calibration_pair(frame, path / 'native.poni', path / 'native.npt'))
+    frames = tuple(frames)
     fit = fit_calibration(frames)
     assert fit.rms_q < .012, fit.rms_q
     assert fit.n_points == 2074
@@ -218,8 +236,8 @@ def test_real_guided_stacked_fit_save_reload_and_holdout(tmp_path):
     loaded = Diffractometer.from_pyfai_goniometer(path,
         source_motors={'del_angle': 'del', 'nu_angle': 'nu'})
     assert loaded.stacked_arm is not None
-    assert loaded.stacked_arm.nu_scale == np.deg2rad(1.)
-    assert loaded.stacked_arm.del_scale == np.deg2rad(1.)
+    assert loaded.stacked_arm.nu_scale == -np.deg2rad(1.)
+    assert loaded.stacked_arm.del_scale == -np.deg2rad(1.)
     native = Goniometer.sload(path)
     for frame in frames:
         motors = {key: np.array([value]) for key, value in frame.motors.items()}
