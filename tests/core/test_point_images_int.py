@@ -272,6 +272,22 @@ def test_real_average_flat_masks_native_pixels_and_scales_sigma_by_coefficient(t
             np.testing.assert_array_equal(first.sigma, second.sigma / 2)
 
 
+def test_real_difference_thumbnail_cancels_one_shared_dark(tmp_path):
+    from xrd_tools.io.nexus_record import make_thumbnail_array, quantize_thumbnail
+    source, native, calibration = _fixture(tmp_path, "difference")
+    target = tmp_path / "difference-dark.nexus"
+    _run(source, calibration, _plan(dark=np.full((16, 16), 3.), threshold_min=5., threshold_max=65534.), target)
+    with h5py.File(target, "r") as document:
+        for point in range(3):
+            a, b = native[2 * point].astype(float), native[2 * point + 1].astype(float)
+            signal = b - a
+            signal[(a < 5) | (b < 5) | (a > 65534) | (b > 65534)] = np.nan
+            expected, lut = quantize_thumbnail(make_thumbnail_array(signal))
+            thumbnail = document[f"entry/frames/frame_{point:04d}/thumbnail"]
+            np.testing.assert_array_equal(thumbnail[()], expected)
+            assert (thumbnail.attrs["vmin"], thumbnail.attrs["vmax"], thumbnail.attrs["dtype"]) == lut
+
+
 @pytest.mark.parametrize("operation", ["average", "difference", "select"])
 def test_reintegrate_grouped_real_int_is_bit_exact_and_refuses_secondary_mutation(tmp_path, operation):
     from xrd_tools.io.output_transaction import capture_target_snapshot

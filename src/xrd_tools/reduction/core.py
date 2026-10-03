@@ -2743,6 +2743,8 @@ class NexusSink:
             # plan's flat and dark here as the reduction does, with the
             # background the reduction subtracted when it is given (AUD-7).
             plan = self._plan
+            if plan is not None and _signed_point_difference(frame.metadata):
+                plan = replace(plan, dark=None)
             if background is _THUMBNAIL_BACKGROUND_UNSET:
                 background = (frame.background if plan is None
                               else _dark_corrected_background(frame, plan))
