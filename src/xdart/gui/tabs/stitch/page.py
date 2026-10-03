@@ -39,6 +39,7 @@ from xdart.gui.widgets.controls_panel import (
     PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
 )
 from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
+from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
@@ -315,6 +316,13 @@ def _spec_frame_counts(path, _state, scans):
 _FRAME_TIP_LINES = 40
 
 
+def _source_admission_job(request, _cancel, _progress):
+    """The existing strict source binding, without image pixels, off the GUI thread."""
+    from xrd_tools.analysis.stitch_sources import resolve_stitch_sources
+    selection, options, _states = request
+    return resolve_stitch_sources(selection, dict(options))
+
+
 def _output_frames(members, counts):
     """One output's line in the frames-per-scan tooltip: its scan's frames, or a bracketed group's scans,
     each one's frames and their sum. A scan is named as a selection names it (N for its first run, N.1)."""
@@ -437,6 +445,9 @@ class StitchPage(QtWidgets.QWidget):
         self.setObjectName("stitchPage")
         self._services = services
         self._owner = StitchToolOwner()
+        self._source_admission = None
+        self._source_observer = LatestRequestOwner(_source_admission_job, self._source_admitted,
+                                                  same=lambda a, b: a == b, parent=self)
         self._source_paths = ()
         self._source_shown = ""  # the source box's display of the selection ("3 files selected")
         self._paths_by_kind = {}
@@ -481,6 +492,7 @@ class StitchPage(QtWidgets.QWidget):
         self._skip_note = ""
         #: Int's readiness line: (summary, ready) from the section checks.
         self._readiness = ("", False)
+        self._run_ready = False
         #: The committed SPEC selection and the frames its scans record (None: unknown), as Int's "N frames".
         self._frames = None
         self._action_revision = None
@@ -1286,7 +1298,12 @@ class StitchPage(QtWidgets.QWidget):
         if not self._threshold_manual:
             self._fields["threshold"] = replace(self._fields["threshold"], value=None)
             self._render_ranges()
-        self._source_paths = tuple(str(path) for path in paths)
+        paths = tuple(str(path) for path in paths)
+        if self._value("source_kind") == "Spec" and paths != self._paths_by_kind.get("Spec", ()):
+            for key, value in (("scan", "1"), ("image_stem", "")):
+                self._fields[key] = replace(self._fields[key], value=value)
+                self._rows[key].apply_field(self._fields[key])
+        self._source_paths = paths
         self._paths_by_kind[self._value("source_kind")] = self._source_paths
 
     def _show_source_tip(self):
@@ -1354,7 +1371,8 @@ class StitchPage(QtWidgets.QWidget):
             self._source_path_edited(field.path, value)
         elif key in {"source_kind", "scan_mode"}:
             self._source_changed(field.path, value)
-        elif key == "scan":
+        elif key in {"scan", "image_dir", "image_stem", "detector_rows", "detector_cols",
+                     "raw_dtype", "raw_header_skip"}:
             self._source_committed()
         elif key in {"unit", "map_axis"}:
             self._processing_axis_changed()
@@ -1376,6 +1394,11 @@ class StitchPage(QtWidgets.QWidget):
         self._revision += 1
         self._prepared_revision = None
         self._queued_jobs.clear()
+        if (_args and not self._drafting and tuple(_args[0]) in {
+                self._fields[key].path for key in ("image_dir", "image_stem", "detector_rows",
+                                                   "detector_cols", "raw_dtype", "raw_header_skip")
+                if key in self._fields}):
+            self._observe_source()
         if hasattr(self, "run_bar"):
             self._refresh_inputs_view()
             self._show_readiness()
@@ -1408,14 +1431,60 @@ class StitchPage(QtWidgets.QWidget):
     def _source_committed(self, *_args):
         """A committed source or scan edit, never a draft (Codex audit G-F2: the page's source reads):
         the frames the selection's scans record, and the first scan's motors."""
-        frames = self._frames
         self._frames = (self._selection_key(), self._selection_frames())
-        if self._frames != frames and hasattr(self, "run_bar"):  # the run bar is built after the sections
+        self._observe_source()
+        if hasattr(self, "run_bar"):  # source admission may be pending even when the point count is unchanged
             self._refresh_inputs_view()
             self._show_readiness()
+            self._sync_actions()
         self._refresh_gi_catalog()
         self._refresh_monitor_choices()
         self._show_early_ceiling()
+
+    def _source_selection(self):
+        value = self._value
+        directory = value("source_kind") == "Directory"
+        return StitchSourceSelection(value("source_kind"), self._source_paths,
+            scans=str(value("scan")), stitch_all=value("scan_mode") == "Stitch All",
+            image_dir=str(value("image_dir")), image_stem=str(value("image_stem")),
+            recursive=directory and bool(value("subdirs")),
+            name_filter=str(value("name_filter")).strip() if directory else "")
+
+    def _observe_source(self):
+        """Committed SPEC inputs only; edits to processing reuse the last admission."""
+        if self._closing or "raw_dtype" not in self._rows:
+            return
+        if self._value("source_kind") != "Spec" or not self._source_paths:
+            self._source_admission = None
+            self._source_observer.release()
+            return
+        try:
+            selection = self._source_selection()
+            folders = (selection.image_dir,) if selection.image_dir else tuple(
+                str(Path(path).parent) for path in selection.paths)
+            options = (('detector_shape', tuple(int(str(self._value(key))) for key in
+                                               ("detector_rows", "detector_cols"))),
+                       ('raw_dtype', str(self._value("raw_dtype"))),
+                       ('raw_header_skip', int(str(self._value("raw_header_skip")))), ('rotation', 0))
+            request = selection, options, _file_states(*selection.paths, *folders)
+        except (ValueError, TypeError, OSError) as error:
+            self._source_observer.release()
+            self._source_admission = None, None, str(error)
+            return
+        if self._source_admission is not None and self._source_admission[0] == request:
+            return
+        self._source_admission = None
+        self._source_observer.forget()
+        self._source_observer.ask(request)
+
+    def _source_admitted(self, request, terminal):
+        problem = terminal.failure_message if terminal.status is OperationTerminalStatus.FAILED else ""
+        self._source_admission = request, terminal.payload, problem
+        self._refresh_inputs_view()
+        if not self._owner.busy and self._action_revision != self._revision:
+            self._show_readiness()
+        self._sync_actions()
+        return True
 
     def _show_early_ceiling(self, *_args):
         """Threshold Auto's ceiling as soon as the selection is committed, as Int shows it (maintainer,
@@ -1473,7 +1542,10 @@ class StitchPage(QtWidgets.QWidget):
         frames = self._committed_frames()
         if frames is None:
             return ""
-        return f" · {frames[0]} frame{'s' * (frames[0] != 1)}"
+        admitted = self._source_admission
+        checked = admitted is not None and admitted[1] is not None and not admitted[1].skipped
+        noun = "frame" if checked else "SPEC point"
+        return f" · {frames[0]} {noun}{'s' * (frames[0] != 1)}"
 
     def _frames_tooltip(self):
         """Each output's frames for the committed selection shown (maintainer, 2026-09-30: "a tooltip when
@@ -1483,7 +1555,12 @@ class StitchPage(QtWidgets.QWidget):
             return ""
         lines = frames[1][:_FRAME_TIP_LINES]
         more = len(frames[1]) - len(lines)
-        return "\n".join(["Frames per scan:", *lines] + [f"… {more} more"] * (more > 0))
+        admitted = self._source_admission
+        checked = admitted is not None and admitted[1] is not None and not admitted[1].skipped
+        if not checked:
+            lines = tuple(line.replace("frames", "SPEC points").replace("frame", "SPEC point") for line in lines)
+        return "\n".join(["Frames per scan:" if checked else "SPEC points per scan:", *lines]
+                         + [f"… {more} more"] * (more > 0))
 
     def _refresh_gi_catalog(self, *_args):
         """On a committed source or scan edit, never a draft: another first scan's motors are the
@@ -1553,6 +1630,16 @@ class StitchPage(QtWidgets.QWidget):
         else:
             text = f"{len(sources)} {'NeXus file' if kind == 'NeXus' else f'{kind} source'}{'s' * (len(sources) != 1)}"
         source_ready = present and groups != 0
+        source_problem = ""
+        if kind == "Spec" and source_ready:
+            if self._source_admission is None:
+                source_ready, source_problem = False, "Checking detector images…"
+            else:
+                _request, resolution, source_problem = self._source_admission
+                source_ready = resolution is not None and bool(resolution.groups)
+                if resolution is not None and resolution.skipped:
+                    path, scan, reason = resolution.skipped[0]
+                    source_problem = f"{Path(path).name} · scan {scan}: {reason}"
         refused = next((f"{self._fields[key].label}: {self._rows[key].refusal()}" for key in _INTEGER_FIELDS
                         if key in self._rows and self._rows[key].refusal()), "")
         self.controls.source_card.set_status_text(text if sources else "")
@@ -1581,7 +1668,7 @@ class StitchPage(QtWidgets.QWidget):
                                    if not calibration_found
                                    else f"the mask {Path(mask).name} (not found)")
         if not source_ready:
-            needs["source"] = ({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "a source folder"}
+            needs["source"] = source_problem or ({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "a source folder"}
                                .get(kind, "a source") if not sources else f"{gone[0]} (not found)" if gone
                                else "a scan selection such as 1,2,[3-5]")
         elif refused:  # an Advanced whole number (its row outlines it and says why)
@@ -1591,12 +1678,20 @@ class StitchPage(QtWidgets.QWidget):
         checks = ((self.controls.project_card, "project"), (self.controls.experiment_card, "experiment"),
                   (self.controls.source_card, "source"), (self.controls.processing_card, "processing"))
         for card, key in checks:
-            problem = arm_problem if key == "experiment" and arm_problem else (
-                f"Needs {needs[key]}" if key in needs else "")
+            problem = f"Needs {needs[key]}" if key in needs else ""
+            if key == "source" and source_problem:
+                problem = source_problem
+            elif key == "experiment" and arm_problem:
+                problem = arm_problem
             card.set_valid_marker(not problem, problem)
         # As Int's readiness line; Run then checks the inputs in full (Preview's preflight).
+        self._run_ready = not arm_problem and not needs
         if arm_problem:  # the calibration's arm and the Geometry disagree: a sentence of its own
             self._readiness = (arm_problem, False)
+        elif any(key != "source" for key in needs):
+            self._readiness = ("Needs " + ", ".join(needs.values()), False)
+        elif source_problem:
+            self._readiness = (source_problem, False)
         elif needs:
             self._readiness = ("Needs " + ", ".join(needs.values()), False)
         else:
@@ -1884,12 +1979,7 @@ class StitchPage(QtWidgets.QWidget):
         foil_normalization = None if chosen.foil is None else StitchFoilNormalization(
             MetadataColumnSelector(chosen.foil), chosen.lengths,
             None if chosen.exposure is None else MetadataColumnSelector(chosen.exposure))
-        directory = value("source_kind") == "Directory"
-        selection = StitchSourceSelection(value("source_kind"), self._source_paths,
-            scans=str(value("scan")), stitch_all=value("scan_mode") == "Stitch All",
-            image_dir=str(value("image_dir")), image_stem=str(value("image_stem")),
-            recursive=directory and bool(value("subdirs")),
-            name_filter=str(value("name_filter")).strip() if directory else "")
+        selection = self._source_selection()
         conditioning = StitchConditioning(self._threshold_mode,
             value("threshold_min") if self._threshold_mode == "manual" else None,
             value("threshold") if self._threshold_mode == "manual" else None)
@@ -3168,7 +3258,7 @@ class StitchPage(QtWidgets.QWidget):
         self.browser.set_action_enabled("Metadata", idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)
-        self.run_bar.startButton.setEnabled(idle and self._readiness[1])  # Run prepares the inputs itself
+        self.run_bar.startButton.setEnabled(idle and self._run_ready)  # partial selections still run their admitted groups
         action = self._owner.current_identity.request.action if busy else None
         self.run_bar.set_stop_enabled(action is StitchOwnerAction.RUN or (
             action is StitchOwnerAction.PREFLIGHT and self._after_prepare == "run"))
@@ -3207,6 +3297,7 @@ class StitchPage(QtWidgets.QWidget):
         self._authoring_timer.stop()
         receipt = self._owner.close()
         child_receipts = [dialog.shutdown() for dialog in self._authoring_dialogs]
+        child_receipts.append(self._source_observer.shutdown())
         child_receipts.extend(host.shutdown() for host in self._fit_hosts.values())
         if any(child.status is PageCleanup.PENDING for child in child_receipts):
             from xdart.gui.pages.values import CloseReceipt

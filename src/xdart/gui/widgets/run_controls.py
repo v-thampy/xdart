@@ -239,6 +239,13 @@ class RunControlsBar(QtWidgets.QWidget):
     def set_readiness_summary(self, text='', *, ready=True, tooltip='',
                               live=False):
         text = str(text or '').strip()
+        original = text
+        if text.startswith('Ready · '):
+            text = text[len('Ready · '):]
+            for mode in ('Int 1D', 'Int 2D', 'Stitch 1D', 'Stitch 2D', 'RSM'):
+                if text.startswith(mode + ' · '):
+                    text = text[len(mode + ' · '):]
+                    break
         was_hidden = self.readinessRow.isHidden()
         self.readinessRow.setVisible(bool(text))
         self.readinessLive.setVisible(bool(text) and bool(live))
@@ -248,7 +255,7 @@ class RunControlsBar(QtWidgets.QWidget):
             setter(text)
         else:
             self.readinessLabel.setText(text)
-        self.readinessLabel.setToolTip(tooltip or text)
+        self.readinessLabel.setToolTip(tooltip or original)
         self.readinessDot.style().unpolish(self.readinessDot)
         self.readinessDot.style().polish(self.readinessDot)
         return was_hidden != self.readinessRow.isHidden()
