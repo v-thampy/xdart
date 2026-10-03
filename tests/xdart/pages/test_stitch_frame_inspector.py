@@ -33,11 +33,17 @@ def _click(page, row, qapp, *, settle=True):
         _wait(page, qapp)
 
 
-def _saved_page(tmp_path, qapp, backend="multigeometry", scans="1", mode="2d"):
+def _saved_page(tmp_path, qapp, backend="multigeometry", scans="1", mode="2d", *, conditioning=None,
+                edge_pixels=None):
     form = replace(_native_form(tmp_path, backend, scans=scans), mode=mode, npt_1d=39,
                    npt_rad_2d=23, npt_azim_2d=19, q_range=(1., 5.2),
                    map_radial_range=(1., 5.2), chi_range=(-180., 180.),
-                   conditioning=StitchConditioning("manual", threshold_max=50000))
+                   conditioning=conditioning or StitchConditioning("manual", threshold_max=50000))
+    if edge_pixels is not None:
+        original = next(Path(form.image_dir).glob("*scan1_0000.raw"))
+        pixels = np.fromfile(original, dtype=form.raw_dtype)
+        pixels[:len(edge_pixels)] = edge_pixels
+        pixels.tofile(original)
     page = StitchPage(empty_host_services(_Status()))
     page.resize(1400, 900)
     page.show()
@@ -79,13 +85,14 @@ def test_reopened_stitch_frame_inspector_matches_single_frame_reduction(qapp, tm
         assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
         raw = read_contributing_frame_view(target, 0, scan=saved.contributing_frames[0]["key"].split("/")[0][5:],
                                           artifact_payload=saved, full_raw=True).raw
+        expected_raw = np.where(raw <= 50000, raw, np.nan)
         page.set_field("npt_1d", "7")  # editable intent cannot change inspection science
         page.set_field("npt_rad_2d", "9")
         _click(page, 1, qapp)
         state = page._last_map_state
         assert not page.scientific.raw.isHidden() and not page.scientific.cake.isHidden()
         assert len(state.traces) == len(page.curve.listDataItems()) == 1
-        np.testing.assert_array_equal(state.heavy.raw, raw)
+        np.testing.assert_array_equal(state.heavy.raw, expected_raw)
         # The public artifact quantizes scientific intensities to float32.
         np.testing.assert_array_equal(state.heavy.cake.astype(np.float32), result.payload.intensity.T)
         np.testing.assert_array_equal(state.traces[0].intensity.astype(np.float32), result.payload.profile.intensity)
@@ -93,6 +100,42 @@ def test_reopened_stitch_frame_inspector_matches_single_frame_reduction(qapp, tm
         _click(page, 0, qapp)
         assert page.scientific.raw.isHidden()
         np.testing.assert_array_equal(page._last_map_state.heavy.cake, saved.intensity.T)
+    finally:
+        _close(page, qapp)
+
+
+@pytest.mark.parametrize("backend", ["multigeometry", "xu_hist"])
+@pytest.mark.parametrize("mode", ["manual", "auto", "off"])
+def test_full_raw_preview_uses_saved_conditioning_without_changing_native_reader(qapp, tmp_path, backend, mode):
+    edges = [-1, 0, 10, 50000, 50001, 1048574, 1048575, np.iinfo(np.int32).max]
+    policy = (StitchConditioning("manual", 10, 50000) if mode == "manual" else StitchConditioning(mode))
+    page, form, target = _saved_page(tmp_path, qapp, backend, mode="1d", conditioning=policy,
+                                    edge_pixels=edges)
+    try:
+        saved = read_analysis_artifact(target)
+        row = saved.contributing_frames[0]
+        scan = row["key"].split("/")[0][5:]
+        native = read_contributing_frame_view(target, 0, scan=scan, full_raw=True, artifact_payload=saved)
+        original = next(Path(form.image_dir).glob("*scan1_0000.raw"))
+        np.testing.assert_array_equal(native.raw.ravel()[:len(edges)], edges)
+        thumbnail = native.thumbnail.copy()
+        curve = page.curve.listDataItems()[0].yData.copy()
+        page.set_field("threshold_min", "2")
+        page.set_field("threshold", "3")  # current intent must not change a saved preview
+        page._show_raw()
+        _wait(page, qapp)
+        page.scientific.raw_popup_full.click()
+        _wait(page, qapp)
+        actual = page._raw_frame_view.raw.ravel()[:len(edges)]
+        finite = ([False, False, True, True, False, False, False, False] if mode == "manual" else
+                  [False, True, True, True, True, True, False, False] if mode == "auto" else [True] * len(edges))
+        np.testing.assert_array_equal(np.isfinite(actual), finite)
+        np.testing.assert_array_equal(actual[finite], np.asarray(edges)[finite])
+        np.testing.assert_array_equal(page._raw_frame_view.thumbnail, thumbnail)
+        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, curve)
+        np.testing.assert_array_equal(np.fromfile(original, dtype=form.raw_dtype)[:len(edges)], edges)
+        np.testing.assert_array_equal(read_analysis_artifact(target).intensity, saved.intensity)
+        assert "saved" in page.scientific.raw_popup_full.toolTip().lower()
     finally:
         _close(page, qapp)
 

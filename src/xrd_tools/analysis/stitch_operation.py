@@ -2833,6 +2833,34 @@ def _runtime_plan(plan: StitchOperationPlan, diffractometer, saturation=None) ->
     )
 
 
+def stitch_contributor_raw_preview(payload, raw, frame_index, *, scan=None):
+    """Apply the saved member's detector-value policy to display pixels only.
+
+    Scientific readers retain native values. Thumbnails and legacy artifacts
+    without a recorded conditioning policy are left unchanged.
+    """
+    from xrd_tools.io.nexus_record import frame_record_key
+    from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+
+    if raw is None:
+        return None
+    provenance = json.loads(payload.provenance_json)
+    saved = provenance.get("plan", {}).get("conditioning")
+    if not saved or saved["mode"] == "off":
+        return raw
+    policy = StitchConditioning(**saved)
+    saturation = None
+    if policy.saturation is not None:
+        row = next(item for item in payload.contributing_frames
+                   if item["key"] == frame_record_key(scan, frame_index))
+        manifest = provenance["source"]["input_manifest"]
+        members = manifest.get("members", (manifest,))
+        member_index = next(i for i, item in enumerate(members)
+            if item["source"]["module_source_fingerprint"] == row["identity"]["source_id"])
+        saturation = policy.saturation[member_index]
+    return condition_stitch_frame(raw, policy, saturation)
+
+
 def read_stitch_contributor_view(payload, frame_index, *, scan=None, source_root=None, cancel_token=None):
     """Reduce one saved contributor without publishing or consulting editable operator intent.
 
@@ -2981,7 +3009,8 @@ def read_stitch_contributor_view(payload, frame_index, *, scan=None, source_root
     _revalidate_geometry(receipt) if backend == "multigeometry" else revalidate_xu_stitch_calibration(receipt)
     for role in ("mask", "dark", "flat"):
         revalidate_mask(getattr(plan, f"_{role}_receipt")) if role == "mask" else native_detector_image(plan, getattr(plan, f"_{role}_receipt"))
-    return FrameView.from_results(label=frame_index, result_1d=one, result_2d=two, raw=raw,
+    preview = stitch_contributor_raw_preview(payload, raw, frame_index, scan=scan)
+    return FrameView.from_results(label=frame_index, result_1d=one, result_2d=two, raw=preview,
         metadata_raw=metadata, source_path=view.source_path, source_frame_index=view.source_frame_index,
         extra={"wavelength_m": _wavelength * 1e-10, "saved_screen": row.get("screen"), "saved_excluded": row.get("excluded", False)})
 

@@ -954,6 +954,10 @@ class ScientificView(QtWidgets.QFrame):
         controls = QtWidgets.QHBoxLayout()
         self.raw_popup_thumbnail = QtWidgets.QPushButton("Thumbnail")
         self.raw_popup_full = QtWidgets.QPushButton("Full Raw")
+        self.raw_popup_full.setToolTip(
+            "Read the full-resolution detector image with the saved reduction's value masking. "
+            "The original file is unchanged; unavailable originals fall back to the saved thumbnail.")
+        self.raw_popup_thumbnail.setToolTip("Show the saved detector thumbnail without reading the original image.")
         self.raw_popup_mode_group = QtWidgets.QButtonGroup(dialog)
         self.raw_popup_mode_group.setExclusive(True)
         for button in (self.raw_popup_thumbnail, self.raw_popup_full):

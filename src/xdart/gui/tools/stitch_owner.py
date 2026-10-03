@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from threading import Lock
@@ -21,6 +21,7 @@ from xrd_tools.analysis.stitch_operation import (
     StitchOperationResult,
     StitchOperationVerificationError,
     read_stitch_contributor_view,
+    stitch_contributor_raw_preview,
 )
 from xrd_tools.io.analysis_artifact import (
     AnalysisArtifactKind,
@@ -585,6 +586,9 @@ class StitchToolOwner:
                 if selected.scientific else read_contributing_frame_view(request.artifact_path, selected.frame_index,
                 scan=selected.scan, source_root=selected.source_root, full_raw=selected.full_raw,
                 artifact_payload=selected.payload))
+            if not selected.scientific and view.raw is not None:
+                view = replace(view, raw=stitch_contributor_raw_preview(selected.payload, view.raw,
+                    selected.frame_index, scan=selected.scan))
             publish("raw-frame", 1, 1)
             return StitchOwnerOutcome(StitchOwnerOutcomeKind.FRAME_READ,
                 frame_view=view, artifact_path=request.artifact_path)

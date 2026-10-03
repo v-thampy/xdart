@@ -118,7 +118,8 @@ def test_native_real_scan14_five_member_preview_keeps_full_members_with_compact_
     assert not Path(output.target).exists()
 
 
-def test_native_nexus_group_keeps_exact_external_dataset_and_raw_dtype(tmp_path):
+@pytest.mark.parametrize("cutoffs", [None, (40000, 80000)])
+def test_native_nexus_group_keeps_exact_external_dataset_and_raw_dtype(tmp_path, cutoffs):
     import h5py
     from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
     from tests.core.test_stitch_operation import _goniometer_record
@@ -126,6 +127,7 @@ def test_native_nexus_group_keeps_exact_external_dataset_and_raw_dtype(tmp_path)
     from xrd_tools.analysis.module_transaction import ModuleSourceReceipt, MetadataColumnSelector
     from xrd_tools.analysis.stitch_operation import (
         StitchOperationPlan, StitchGeometryInput, StitchGeometryKind, capture_stitch_geometry,
+        stitch_contributor_raw_preview,
     )
     from xrd_tools.core.scan import SourceSpec, SourceKind
     members = []
@@ -138,6 +140,9 @@ def test_native_nexus_group_keeps_exact_external_dataset_and_raw_dtype(tmp_path)
             cfg = stream["sample/instrument/bluesky/metadata/configuration/eiger/data"]
             cfg["eiger_cam_wavelength"][()] = 1.0
             cfg["eiger_cam_photon_energy"][()] = 12398.41984
+            if cutoffs is not None:
+                stream.require_group("sample/instrument/detector").create_dataset(
+                    "saturation_value", data=cutoffs[index])
             stream["sample/data"].create_dataset("del", data=np.linspace(5., 10., 5))
             stream["sample/data"].create_dataset("nu", data=np.zeros(5))
             for name in ("del", "nu"):
@@ -189,6 +194,11 @@ def test_native_nexus_group_keeps_exact_external_dataset_and_raw_dtype(tmp_path)
         frame = read_contributing_frame_view(output.target, row["identity"]["frame_index"],
             scan=row["key"].split("/")[0][5:], full_raw=True, artifact_payload=result.payload)
         np.testing.assert_array_equal(frame.raw, originals[index // 2][(0, 4)[index % 2]])
+        preview = stitch_contributor_raw_preview(result.payload, frame.raw,
+            row["identity"]["frame_index"], scan=row["key"].split("/")[0][5:])
+        ceiling = np.iinfo(np.uint32).max if cutoffs is None else cutoffs[index // 2]
+        np.testing.assert_array_equal(np.isfinite(preview), frame.raw < ceiling)
+        np.testing.assert_array_equal(preview[frame.raw < ceiling], frame.raw[frame.raw < ceiling])
     # A changed external detector segment must not inherit the unchanged master
     # stamp. The same saved result still supplies its original thumbnail/curve.
     import os
