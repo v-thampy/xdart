@@ -103,7 +103,8 @@ class CompositeFrameSource(BaseFrameSource):
                          source_path=frame.source_path,
                          source_frame_index=frame.source_frame_index,
                          source_identity=frame.source_identity,
-                         loader=lambda value: self.load_frame(value.index))
+                         loader=lambda value: self.load_frame(value.index),
+                         point_statistics_loader=(self.load_point_statistics if frame.point_statistics_loader is not None else None))
 
     @property
     def motors(self) -> dict[str, np.ndarray]:

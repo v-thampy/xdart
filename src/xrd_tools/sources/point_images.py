@@ -383,7 +383,8 @@ class PointImageSource(BaseFrameSource):
         path, raw = self.raw_locator_for(index)
         return ScanFrame(index=index, metadata=self.metadata_for(index), source_path=path,
                          source_frame_index=raw, loader=lambda frame: self.load_frame(frame.index),
-                         source_identity=self.name)
+                         source_identity=self.name,
+                         point_statistics_loader=self.load_point_statistics)
 
     def close(self):
         self.source.close()

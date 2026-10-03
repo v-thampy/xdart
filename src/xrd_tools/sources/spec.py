@@ -381,6 +381,7 @@ class SpecSource(BaseFrameSource):
             source_frame_index=frame_in_file,
             loader=lambda fr: self.load_frame(fr.index),
             source_identity=self.name,
+            point_statistics_loader=(self.load_point_statistics if self.point_image_policy is not None else None),
         )
 
 
