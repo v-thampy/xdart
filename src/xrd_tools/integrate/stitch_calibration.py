@@ -650,7 +650,7 @@ def stitch_calibrant_preview(fit: CalibrationFit, spec: SourceSpec, *, mask=None
     masks are in the fitted camera frame; ``mask`` is already oriented. The source's recorded
     energy is checked against the calibration's recorded energy, while integration keeps the
     fitted wavelength. No monitor normalization is inferred. Standard Stitch solid-angle
-    correction is applied; polarization is off.
+    correction is applied; polarization is off. The map uses Stitch's automatic χ extent.
     """
     from xrd_tools.analysis.plans import StitchCancelled, StitchPlan, run_stitch
     from xrd_tools.analysis.stitch_operation import _OrientedSource, _detector_mask
@@ -682,7 +682,7 @@ def stitch_calibrant_preview(fit: CalibrationFit, spec: SourceSpec, *, mask=None
     plan = StitchPlan(diffractometer=diff, backend='multigeometry', streaming_multigeometry=True,
         mode='2d', stitch_profile=True, unit='q_A^-1', npt_rad_2d=npt_rad,
         npt_azim_2d=npt_azim, npt_1d=npt_1d, radial_range=radial_range,
-        azimuth_range=(-180., 180.), mask=mask, conditioning=conditioning,
+        mask=mask, conditioning=conditioning,
         saturation=None if saturation is None else {i: saturation for i in indices})
     source = open_source(_exact_source(spec))
     try:
