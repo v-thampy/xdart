@@ -1308,14 +1308,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.camera = CameraEditor()
         form.addRow('Camera orientation (lab frame)', self.camera)
         self._tip(self._CAMERA_TIP, self.camera.rows, self.camera.columns, form.labelForField(self.camera))
-        self._image_size = QtWidgets.QLabel()
-        self._image_size.setWordWrap(True)
-        form.addRow('Image size', self._image_size)
-        self._rows['beam_size'] = (form, self._image_size)
-        self._tip('The detector image\'s width (x, columns) and height (y, rows) in pixels, as the beam '
-                  'pixel is read: the detector\'s own layout, turned as the camera above says (a camera '
-                  'whose rows run along z swaps x and y). The first-pixel corner below does not change it.',
-                  self._image_size, form.labelForField(self._image_size))
+        self._image_size = self.camera.image_size
         corners = {3: 'bottom right (pyFAI default)', 1: 'top left', 2: 'top right', 4: 'bottom left'}
         self._choice(form, 'beam_orientation', 'First pixel (pyFAI orientation)',
                      [(f'{code} · first pixel {corners[code]}', code) for code, _name in DETECTOR_ORIENTATIONS], 3,
@@ -1396,7 +1389,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             pass  # an unknown camera: the default stays
 
     def _update_image_size(self, *_args):
-        """The detector image's x × y size, as the beam pixel is read (turned by the Detector panel's camera); a
+        """The detector image's width × height, as the beam pixel is read (turned by the Detector panel's camera); a
         quarter turn also says the stored image's size and the turn."""
         shape = detector_shape(self._text('beam_detector'))
         if shape is None:
@@ -1406,13 +1399,13 @@ class CalibrationDialog(QtWidgets.QDialog):
         rows, columns = shape
         orientation = self._orientation()
         width, height = (rows, columns) if orientation.swaps_axes else (columns, rows)
-        camera = self.camera.value()
         # a quarter turn: the window's image is the stored one turned, and so is its detector (item 8)
         stored = (f' in the window (the stored image is {columns} × {rows}, turned {orientation.rotation}°'
                   f'{" and mirrored left-right" if orientation.flip_horizontal else ""})'
                   if orientation.swaps_axes else '')
-        self._image_size.setText(f'{width} × {height} px (x × y){stored}: x 0–{width - 1}, y 0–{height - 1} · '
-                                 f'camera rows {camera.rows}, columns {camera.columns}')
+        self._image_size.setText(f'{width} × {height} px (W × H)')
+        self._image_size.setToolTip(f'Image size: Width × Height in pixels{stored}. '
+                                   'The first-pixel corner below does not change the image size.')
         self._beam_pixel_hint()
 
     def _beam_pixel_hint(self, *_args):

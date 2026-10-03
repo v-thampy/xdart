@@ -32,8 +32,7 @@ def test_the_columns_box_offers_the_two_directions_transverse_to_the_rows(qapp):
 def test_camera_descriptions_keep_all_eight_axis_values(qapp):
     editor = CameraEditor()
     try:
-        captions = {'x+': 'vertical up', 'x-': 'vertical down',
-                    'z+': 'horizontal left', 'z-': 'horizontal right'}
+        captions = {'x+': 'vert ↑', 'x-': 'vert ↓', 'z+': 'horz ←', 'z-': 'horz →'}
         for rows in captions:
             editor.rows.setCurrentIndex(editor.rows.findData(rows))
             assert captions[rows] in editor.rows.currentText()
@@ -57,6 +56,9 @@ def test_default_click_restores_unturned_unflipped_stitch_camera(qapp):
         assert editor.value() == DetectorCamera('x-', 'z+')
         transform = stitch_orientation(editor.value())
         assert transform.rotation == 0 and not transform.flip_horizontal and not transform.flip_vertical
-        assert editor.layout().itemAt(editor.layout().count() - 1).widget() is editor.default_button
+        assert editor.default_button.text() == '↺'
+        assert editor.default_button.accessibleName() == 'Reset camera orientation'
+        assert editor.layout().itemAt(editor.layout().count() - 2).widget() is editor.default_button
+        assert editor.layout().itemAt(editor.layout().count() - 1).widget() is editor.image_size
     finally:
         editor.deleteLater()

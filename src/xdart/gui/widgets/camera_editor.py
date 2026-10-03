@@ -15,8 +15,8 @@ from xdart.gui.widgets.controls_panel import ControlsComboBox
 from xrd_tools.core.geometry.camera import CAMERA_AXES, STITCH_CAMERA, DetectorCamera
 
 
-_AXIS_LABELS = {'x+': 'x+ (vertical up)', 'x-': 'x- (vertical down)',
-                'z+': 'z+ (horizontal left)', 'z-': 'z- (horizontal right)'}
+_AXIS_LABELS = {'x+': 'x+ (vert ↑)', 'x-': 'x- (vert ↓)',
+                'z+': 'z+ (horz ←)', 'z-': 'z- (horz →)'}
 
 
 class CameraEditor(QtWidgets.QWidget):
@@ -37,12 +37,16 @@ class CameraEditor(QtWidgets.QWidget):
         self.rows.currentIndexChanged.connect(self._rows_changed)
         self.columns.currentIndexChanged.connect(self._edited)
         self.set_value(STITCH_CAMERA)
-        self.default_button = QtWidgets.QPushButton('Default')
+        self.default_button = QtWidgets.QPushButton('↺')
         self.default_button.setAutoDefault(False)
+        self.default_button.setAccessibleName('Reset camera orientation')
+        self.default_button.setFixedWidth(self.default_button.sizeHint().height())
         self.default_button.setToolTip('Reset to xdart\'s reference camera: rows x− (down), columns z+ '
                                       '(left looking downstream). Image rotation 0°, no flip.')
         self.default_button.clicked.connect(lambda: self.set_value(STITCH_CAMERA))
         layout.addWidget(self.default_button)
+        self.image_size = QtWidgets.QLabel()
+        layout.addWidget(self.image_size)
 
     def value(self) -> DetectorCamera:
         return DetectorCamera(self.rows.currentData(), self.columns.currentData())

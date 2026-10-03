@@ -88,19 +88,14 @@ def _save_rough(dialog, monkeypatch, tmp_path, model, orientation):
 
 #: the Pilatus 100K's image-size hint under each camera
 HINTS = {
-    "270": "195 × 487 px (x × y) in the window (the stored image is 487 × 195, turned 270°): x 0–194, y 0–486 · "
-           "camera rows z-, columns x-",
-    "90": "195 × 487 px (x × y) in the window (the stored image is 487 × 195, turned 90°): x 0–194, y 0–486 · "
-          "camera rows z+, columns x+",
-    "270m": "195 × 487 px (x × y) in the window (the stored image is 487 × 195, turned 270° and mirrored "
-            "left-right): x 0–194, y 0–486 · camera rows z+, columns x-",
-    "90m": "195 × 487 px (x × y) in the window (the stored image is 487 × 195, turned 90° and mirrored "
-           "left-right): x 0–194, y 0–486 · camera rows z-, columns x+",
-    # a camera keeping the axes: the hint as it always read
-    "0": "487 × 195 px (x × y): x 0–486, y 0–194 · camera rows x-, columns z+",
-    "180": "487 × 195 px (x × y): x 0–486, y 0–194 · camera rows x+, columns z-",
-    "0m": "487 × 195 px (x × y): x 0–486, y 0–194 · camera rows x-, columns z-",
-    "180m": "487 × 195 px (x × y): x 0–486, y 0–194 · camera rows x+, columns z+",
+    "270": "195 × 487 px (W × H)",
+    "90": "195 × 487 px (W × H)",
+    "270m": "195 × 487 px (W × H)",
+    "90m": "195 × 487 px (W × H)",
+    "0": "487 × 195 px (W × H)",
+    "180": "487 × 195 px (W × H)",
+    "0m": "487 × 195 px (W × H)",
+    "180m": "487 × 195 px (W × H)",
 }
 
 
@@ -111,6 +106,10 @@ def test_the_image_size_hint_says_the_frame_the_window_works_in(qapp, tmp_path, 
         dialog._set_field_text("beam_detector", "Pilatus100k")
         dialog.camera.set_value(stitch_camera({**QUARTER, **KEEPING}[turn]))
         assert dialog._image_size.text() == HINTS[turn]
+        assert dialog._image_size is dialog.camera.image_size
+        assert dialog.camera.layout().itemAt(dialog.camera.layout().count() - 1).widget() is dialog._image_size
+        if turn in QUARTER:
+            assert f'turned {QUARTER[turn].rotation}°' in dialog._image_size.toolTip()
     finally:
         dialog.close()
 
@@ -278,7 +277,7 @@ def test_stitchs_calibration_window_keeps_its_own_starting_detector_and_camera(q
     try:
         assert (dialog._text("beam_detector"), tuple(dialog.camera.value().to_xu()), dialog._text("shape")) == (
             "Pilatus300kw", ("x-", "z+"), "195, 1475")
-        assert dialog._image_size.text() == "1475 × 195 px (x × y): x 0–1474, y 0–194 · camera rows x-, columns z+"
+        assert dialog._image_size.text() == "1475 × 195 px (W × H)"
     finally:
         dialog.close()
         page.shutdown()

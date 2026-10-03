@@ -605,7 +605,7 @@ def test_scan43_from_a_rough_calibration_authored_in_the_window_runs_and_reopens
     spans = {name: (float(values[0]), float(values[-1])) for name, values in committed.axes}
     assert spans["h"][0] <= 1 <= spans["h"][1] and spans["k"][0] <= 1 <= spans["k"][1]
     assert spans["l"][0] <= 3 <= spans["l"][1]
-    assert hint.startswith("195 × 487 px (x × y) in the window (the stored image is 487 × 195, turned 270°)")
+    assert hint == "195 × 487 px (W × H)"
 
 
 # Codex's stage-1 review (2026-10-01, REWORK), its reproductions adapted
@@ -1218,8 +1218,7 @@ def test_rsms_calibration_window_starts_on_rsms_detector_and_camera_unless_saved
         assert (dialog._text("beam_detector"), tuple(dialog.camera.value().to_xu())) == (
             "Pilatus100k", tuple(canonical["diffractometer"]["camera"]))
         assert dialog._text("shape") == "195, 487"
-        assert dialog._image_size.text() == ("195 × 487 px (x × y) in the window (the stored image is 487 × 195, "
-                                             "turned 270°): x 0–194, y 0–486 · camera rows z-, columns x-")
+        assert dialog._image_size.text() == "195 × 487 px (W × H)"
         dialog._set_field_text("beam_detector", "Pilatus300kw")
         dialog.camera.set_value(DetectorCamera("x-", "z-"))  # a mirror, the saved window's own
         saved = page.settings()

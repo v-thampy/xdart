@@ -275,7 +275,8 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
     assert dialog._fit_options.isHidden()
     # the Detector panel serves every step: its rows stay, whatever the rough geometry
-    assert all(visible(key) for key in ('beam_detector', 'beam_size', 'beam_orientation', 'saturation', 'mask'))
+    assert all(visible(key) for key in ('beam_detector', 'beam_orientation', 'saturation', 'mask'))
+    assert not dialog.camera.isHidden() and not dialog._image_size.isHidden()
     assert not visible('raw')  # standard RAW layout is described by the detector picker
     folder = tmp_path / 'frame-20'
     folder.mkdir()
@@ -721,9 +722,9 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         assert dialog._text('beam_detector') == 'Pilatus300kw' and dialog._text('beam_orientation') == '3'
         # the image the beam pixel is read in: width (x, columns) × height (y, rows)
         assert (dialog._image_size.text()
-                == '1475 × 195 px (x × y): x 0–1474, y 0–194 · camera rows x-, columns z+')
+                == '1475 × 195 px (W × H)')
         # the hint does not suggest the centre: the beam need not be there (the 17-2 nu scan's is at 279, 97)
-        assert dialog._row_visible('beam_size') and 'direct beam' in dialog._fields['beam_pixel'].placeholderText()
+        assert not dialog._image_size.isHidden() and 'direct beam' in dialog._fields['beam_pixel'].placeholderText()
         # the first-pixel corner is not a rotation: it never swaps x and y
         assert [orientation.itemText(row).split(' · ')[1].startswith('first pixel') for row in range(4)] == [True] * 4
         dialog._set_field_text('beam_orientation', '2')
@@ -734,8 +735,7 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         assert dialog._image_size.text().startswith('487 × 195 px')
         from xrd_tools.core.geometry.camera import STITCH_CAMERA, DetectorCamera
         dialog.camera.set_value(DetectorCamera('z+', 'x+'))  # rows along z: a turned image swaps x and y
-        assert (dialog._image_size.text().startswith('195 × 487 px')
-                and 'camera rows z+, columns x+' in dialog._image_size.text())
+        assert dialog._image_size.text() == '195 × 487 px (W × H)'
         dialog.camera.set_value(DetectorCamera('x-', 'z-'))  # a mirror does not
         assert dialog._image_size.text().startswith('487 × 195 px')
         dialog.camera.set_value(STITCH_CAMERA)
