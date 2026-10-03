@@ -172,6 +172,32 @@ def numeric_metadata(metadata: Mapping[str, Any] | None) -> dict[str, float]:
     return out
 
 
+def finite_motor_metadata(raw: Mapping[str, Any]) -> dict[str, float]:
+    """Project ordered finite image-metadata motors, excluding Boolean/ROI/PD values."""
+    filtered = {key: value for key, value in raw.items()
+                if not isinstance(value, (bool, np.bool_))}
+    return {name: value for name, value in numeric_metadata(filtered).items()
+            if name and "roi" not in name.casefold() and "pd" not in name.casefold()}
+
+
+def ordered_motor_intersection(
+    catalogs: Iterable[tuple[str, ...] | None],
+) -> tuple[str, ...] | None:
+    """Intersect known catalogs in first-catalog order.
+
+    ``None`` means at least one catalog is unknown. ``()`` means every
+    catalog was inspected and there is no common motor.
+    """
+    values = tuple(catalogs)
+    if not values or any(value is None for value in values):
+        return None
+    first = values[0] or ()
+    common = set(first)
+    for catalog in values[1:]:
+        common.intersection_update(catalog or ())
+    return tuple(name for name in first if name and name != "Manual" and name in common)
+
+
 @dataclass(frozen=True, slots=True)
 class HeterogeneousMetadata:
     """Per-frame metadata preserving raw values plus a numeric view."""

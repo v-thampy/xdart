@@ -18,6 +18,28 @@ from xrd_tools.core.metadata import (
 from xrd_tools.core.strictness import StrictnessError
 
 
+def test_public_finite_motor_metadata_keeps_image_policy_without_mutating_values():
+    from xrd_tools.core.metadata import finite_motor_metadata
+
+    vector = np.array([1., 2.])
+    raw = {"eta": "0.25", "th": np.float64(.1), "ROI1": 9, "sample_PD": 8,
+           "bool": True, "npbool": np.bool_(False), "text": "missing", "vector": vector,
+           "nan": np.nan, "inf": np.inf, "": 1, "zero": 0, "negative": -3}
+    assert finite_motor_metadata(raw) == {"eta": .25, "th": .1, "zero": 0., "negative": -3.}
+    assert raw["vector"] is vector and raw["eta"] == "0.25"
+
+
+@pytest.mark.parametrize("catalogs,expected", [
+    ((), None), ((None, ("th",)), None), (((), ("th",)), ()),
+    ((("eta", "th", "Manual", ""), ("th", "eta", "Manual")), ("eta", "th")),
+    ((("manual", "Manual", "th"),), ("manual", "th")),
+])
+def test_public_motor_intersection_keeps_order_and_unknown_empty_distinction(catalogs, expected):
+    from xrd_tools.core.metadata import ordered_motor_intersection
+
+    assert ordered_motor_intersection(iter(catalogs)) == expected
+
+
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 
@@ -87,6 +109,8 @@ def test_metadata_resolvers_import_without_gui_or_heavy_reader_stack() -> None:
         before = set(sys.modules)
         module = importlib.import_module("xrd_tools.core.metadata")
         assert module.resolve_incident_angle({"th": 0.1}, None) == 0.1
+        assert module.finite_motor_metadata({"th": "0.1", "ROI": 4}) == {"th": 0.1}
+        assert module.ordered_motor_intersection((("th", "eta"), ("eta",))) == ("eta",)
         loaded = set(sys.modules) - before
         forbidden_roots = (
             "PySide",
