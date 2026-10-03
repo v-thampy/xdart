@@ -1374,7 +1374,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     _GEOMETRY_ROWS = ('beam_pixel', 'rough_mount')
 
     _CAMERA_TIP = ('Detector mounting looking downstream, with every circle at zero. Rotation is clockwise '
-                   'from upright, then Flip L/R reverses stored columns and Flip U/D reverses stored rows. '
+                   'from upright, then Flip ↔ (left/right) reverses stored columns and Flip ↕ (up/down) reverses stored rows. '
                    'Both flips equal a 180° turn; the controls cover eight distinct orientations. Upright is '
                    'stored rows x−, columns z+, as in the upright Pilatus 300K-W and Eiger2 500K datasets. '
                    'The lab axes are those in the Diffractometer section: x up, z to the left looking '
