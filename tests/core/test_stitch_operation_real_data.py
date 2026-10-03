@@ -230,6 +230,20 @@ def test_scan14_native_records_preserve_legacy_science_and_raw_links(
     labels = tuple(range(0, 287, 19))
     assert len(labels) == 16
     legacy = _scan14_request(project, project / f"{backend}-legacy.nexus", labels)
+    if backend == "multigeometry":
+        from xrd_tools.core.energy import energy_eV_to_wavelength_m
+        # Compare record formats at the same physical energy: native admission
+        # takes scan 14's metadata, while the legacy path takes the calibration.
+        # The authenticated original stays untouched; align a separate copy.
+        path = project / "data/calibration/scan14-metadata-energy.json"
+        record = json.loads(legacy.plan.geometry.content)
+        record["wavelength"] = energy_eV_to_wavelength_m(17000.018)
+        path.write_text(json.dumps(record))
+        geometry = capture_stitch_geometry(StitchGeometryInput(
+            path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+            source_motors=(("del_angle", "del"), ("nu_angle", "nu")), image_rotation=0))
+        legacy = prepare_stitch_operation(legacy.module.source, legacy.module.output,
+            replace(legacy.plan, geometry=geometry), project_root=project)
     if backend == "xu_hist":
         calibration = install_canonical_xu_stitch_calibration(project_root=project)
         with xu_runtime_session() as runtime:
@@ -272,6 +286,11 @@ def test_scan14_native_records_preserve_legacy_science_and_raw_links(
 
     reference = read_analysis_artifact(legacy.module.output.target)
     payload = read_analysis_artifact(native_output.target)
+    if backend == "multigeometry":
+        selection = json.loads(payload.provenance_json)["plan"]["energy_selection"]
+        assert selection["source"] == "metadata"
+        assert selection["source_energy_eV"] == pytest.approx(17000.018)
+        assert selection["wavelength_m"] == energy_eV_to_wavelength_m(17000.018)
     assert reference.schema_version == (5 if backend == "xu_hist" else 4)
     assert payload.schema_version == (7 if backend == "xu_hist" else 6)
     assert payload.native_unit == "q_A^-1"

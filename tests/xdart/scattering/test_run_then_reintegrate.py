@@ -85,6 +85,44 @@ def test_real_run_uses_metadata_energy_with_effective_persisted_calibration(tmp_
         assert read_provenance(output)['config']['energy_selection'] == selection
 
 
+def test_wavelengthless_two_theta_run_reintegrates_with_admitted_calibration(tmp_path):
+    import numpy as np
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xrd_tools.io import open_scan
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+    from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
+
+    raw = tmp_path / 'no-energy_0001.tif'
+    _write_tiff(raw, 1)
+    poni = tmp_path / 'cal.poni'
+    write_poni(poni)
+    poni.write_text('\n'.join(line for line in poni.read_text().splitlines()
+                              if not line.startswith('Wavelength:')) + '\n')
+    intent = _intent(raw, tmp_path / 'no-energy.nexus', poni)
+    intent.bai_1d_args['unit'] = '2th_deg'
+    executor, identity, events = _run_to_terminal(intent, request_value=9103)
+    try:
+        terminal = next(event for event in events if event.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.primary
+    finally:
+        executor.close(identity)
+
+    artifact = written(tmp_path / 'no-energy.nexus', 'Int 1D')
+    predecessor = open_scan(artifact)
+    before = predecessor.get_1d(1)
+    axis, intensity = before.q.copy(), before.intensity.copy()
+    plan = ReintegrateSuccessorPlan.from_artifact(
+        artifact, entry='entry', dimension='1d', source_root=str(tmp_path),
+        expected_target_snapshot=capture_target_snapshot(artifact),
+        expected_labels=tuple(int(label) for label in predecessor.frame_indices),
+        preparation=ScatteringWorkspace._reintegrate_preparation(intent, '1d'))
+    result = run_reintegrate_successor(plan)
+    assert result.disposition == 'COMMITTED', result
+    after = open_scan(result.output_artifact).get_1d(1)
+    np.testing.assert_array_equal(after.q, axis)
+    np.testing.assert_array_equal(after.intensity, intensity)
+
+
 def test_a_real_run_output_carries_what_reintegrate_requires(tmp_path: Path) -> None:
     from xrd_tools.io.schema import ARTIFACT_FAMILY_ATTR
     from xrd_tools.reduction import ReintegrateSuccessorPlan

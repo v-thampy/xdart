@@ -221,7 +221,7 @@ def test_native_rejects_energy_conflict_in_later_group_member(tmp_path):
     plan = replace(original.plan, native_records=True)
     output = ModuleOutputRequest(resolve_finite_output_target(tmp_path, "conflict", operation_token="stitch-1d"),
         AnalysisArtifactKind.STITCH_1D, artifact_family="conflict")
-    with pytest.raises(StitchOperationRefused, match="selected member energy"):
+    with pytest.raises(StitchOperationRefused, match="metadata energy must be common across selected frames"):
         prepare_stitch_operation(group, output, plan, project_root=tmp_path)
 
 

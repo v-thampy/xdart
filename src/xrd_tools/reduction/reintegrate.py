@@ -1972,7 +1972,7 @@ def _calibration(shared, incidence=None):
     try: parsed = json.loads(config); calibration = detector_calibration_from_projection(values, detector_config=parsed)
     except (TypeError, ValueError, json.JSONDecodeError) as error: raise ValueError("accepted PONI calibration is malformed") from error
     selection = shared.get("energy_selection")
-    if selection is not None:
+    if selection is not None and (not isinstance(selection, Mapping) or selection.get("wavelength_m") is not None):
         from dataclasses import replace
         wavelength = selection.get("wavelength_m") if isinstance(selection, Mapping) else None
         _reject(type(wavelength) not in (int, float) or not math.isfinite(wavelength)
