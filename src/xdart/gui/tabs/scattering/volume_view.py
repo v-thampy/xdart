@@ -24,6 +24,10 @@ Log and levels are this view's own state, since a 3D Viewer's presentation is no
 draws itself again when they change. A volume above the 3D Viewer's limit is refused with the reason and a
 "Show the 2× view" button (``downsample_volume_2x``). Where OpenGL is not available (an offscreen display) no GL
 widget is built: the view says so and still computes ``rgba``, so the pipeline is testable everywhere.
+
+Three shared RangeRows select displayed bin centres along the projection's labeled axes. Blank bounds use
+the full axis; a crop shares the existing volume buffer and changes neither the scientific result nor its grid.
+Each new result resets these presentation ranges, and closing the view releases their selected buffer.
 """
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.pages.operation_owner import OperationCancelled, OperationTerminalStatus
+from xdart.gui.widgets.controls_panel import RangeRow, SectionCard
 from xdart.gui.widgets.intensity_controls import IntensityControls
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xrd_tools.rsm.volume_render import (
@@ -162,6 +167,20 @@ class VolumeView(QtWidgets.QFrame):
         bar.addWidget(self.color_map)
         bar.addWidget(self.log_scale)
         layout.addLayout(bar)
+        self.range_card = SectionCard("Display ranges", collapsible=True)
+        self.range_card.setToolTip("Crop the displayed volume by coordinate; the scientific result is unchanged.")
+        self.axis_ranges = []
+        self._range_settings = {}
+        for index, label in enumerate(("H", "K", "L")):
+            row = RangeRow(
+                label=label,
+                low={"path": ("volume_range", str(index), "low"), "value": "", "placeholder": "Auto"},
+                high={"path": ("volume_range", str(index), "high"), "value": "", "placeholder": "Auto"})
+            row.valueChanged.connect(self._range_edited)
+            self.range_card.add_row(row)
+            self.axis_ranges.append(row)
+        self.range_card.setEnabled(False)
+        layout.addWidget(self.range_card)
         self.notice = QtWidgets.QLabel("")
         self.notice.setObjectName("volumeViewNotice")
         self.notice.setWordWrap(True)
@@ -189,6 +208,9 @@ class VolumeView(QtWidgets.QFrame):
         #: the 3D Viewer's limit (``volume_render.MAX_RENDER_VOXELS``: 256³, 64 MiB of RGBA)
         self.max_voxels = MAX_RENDER_VOXELS
         self._projection: VolumeProjection | None = None
+        self._display = None
+        self._crop_key = None
+        self._range_refusal = False
         self._half = None  # the 2× view of the projection, once asked for
         # the drawn image's index and opacity (2 B a voxel), what they were made from and at, and its colour map: a
         # colour-map change applies another table to them
@@ -236,14 +258,75 @@ class VolumeView(QtWidgets.QFrame):
         if type(projection) is not VolumeProjection:
             raise TypeError("a volume view draws a VolumeProjection")
         self._projection, self._half = projection, None
+        self._range_settings.clear()
+        self._crop_key = None
+        self.range_card.setEnabled(True)
+        for label, axis, row in zip(projection.labels, projection.axes, self.axis_ranges, strict=True):
+            row.label.setText(label)
+            tip = f"Displayed {label} coordinate range only. Blank bounds use the full axis; bin centres are selected."
+            for widget in (row, row.label, row._low, row._high):
+                widget.setToolTip(tip)
+            for editor, bound in ((row._low, np.min(axis)), (row._high, np.max(axis))):
+                editor.setText("")
+                editor.setPlaceholderText(f"Auto · {float(bound):.6g}")
         self.title.setText(projection.title)
+        self._apply_ranges()
+
+    def _range_edited(self, path, value) -> None:
+        text = str(value).strip()
+        if self._range_settings.get(tuple(path), "") == text:
+            return
+        self._range_settings[tuple(path)] = text
+        self._apply_ranges()
+
+    def _apply_ranges(self) -> None:
+        """Select existing bin centres with array views; never read or regrid the source."""
+        if self._projection is None:
+            return
+        slices = []
+        try:
+            for index, (axis, label) in enumerate(zip(self._projection.axes, self._projection.labels, strict=True)):
+                bounds = []
+                for side, default in (("low", np.min(axis)), ("high", np.max(axis))):
+                    text = self._range_settings.get(("volume_range", str(index), side), "")
+                    try:
+                        value = float(text) if text else float(default)
+                    except ValueError:
+                        raise ValueError(f"{label} {side} needs a finite number") from None
+                    if not np.isfinite(value):
+                        raise ValueError(f"{label} {side} needs a finite number")
+                    bounds.append(value)
+                if bounds[0] > bounds[1]:
+                    raise ValueError(f"{label} minimum must not exceed maximum")
+                selected = np.flatnonzero((axis >= bounds[0]) & (axis <= bounds[1]))
+                if not selected.size:
+                    raise ValueError(f"{label} range contains no bin centres")
+                slices.append(slice(int(selected[0]), int(selected[-1]) + 1))
+        except ValueError as error:
+            self._range_refusal = True
+            self._ask(None)  # an earlier draw cannot clear this refusal when it returns
+            self._show_notice(str(error), offer_half=False)
+            return
+        self._range_refusal = False
+        key = tuple((selection.start, selection.stop) for selection in slices)
+        if key == self._crop_key:
+            self._show_notice("", offer_half=False)
+            self._draw()
+            return
+        self._crop_key = key
+        full = all(selection.start == 0 and selection.stop == size
+                   for selection, size in zip(slices, self._projection.values.shape, strict=True))
+        self._display = (self._projection.values if full else self._projection.values[tuple(slices)],
+                         tuple(axis[selection] for axis, selection in zip(self._projection.axes, slices, strict=True)))
+        self._half = None
         self._draw(reset_levels=True)
 
     def show_half_view(self) -> None:
         """Draw the 2× view (2×2×2 block means) of a volume above the 3D Viewer's limit."""
         if self._projection is None:
             return
-        self._half = downsample_volume_2x(self._projection.axes, self._projection.values)
+        values, axes = self._display
+        self._half = downsample_volume_2x(axes, values)
         self._draw(reset_levels=True)
 
     def set_color_map(self, name: str) -> None:
@@ -254,6 +337,10 @@ class VolumeView(QtWidgets.QFrame):
         and its buffers freed, when it returns."""
         self._requests.release()
         self._projection = self._half = self.rgba = None
+        self._display = self._crop_key = None
+        self._range_refusal = False
+        self._range_settings.clear()
+        self.range_card.setEnabled(False)
         self._forget_index()
         self.title.setText("")
         self._clear_items()
@@ -268,13 +355,13 @@ class VolumeView(QtWidgets.QFrame):
     def _drawn(self):
         if self._half is not None:
             return self._half.values, self._half.axes
-        return self._projection.values, self._projection.axes
+        return self._display
 
     def _draw(self, *, reset_levels: bool = False) -> None:
         """Ask for a draw of the volume shown under the controls now (the size check here, the colouring on the
         worker): a new index for a new volume, Log or levels, the kept index under another colour map, nothing
         when the image shown is already this draw."""
-        if self._projection is None:
+        if self._projection is None or self._range_refusal:
             return
         values, axes = self._drawn()
         try:
