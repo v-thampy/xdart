@@ -165,7 +165,8 @@ def _masked(valid, mask):
     return valid
 
 
-def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen, cancelled, progress, mask=None):
+def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen, cancelled, progress, mask=None,
+                        conditioning=None):
     """Frames of the whole scan that the dropped-frame check excludes, before any selection."""
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
     from xrd_tools.sources import open_source  # noqa: PLC0415
@@ -188,7 +189,12 @@ def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen
         for index in labels:
             if cancelled is not None and cancelled.is_set():
                 raise InterruptedError('automatic refinement cancelled')
-            image = np.asarray(orientation.apply(loader(index)), dtype=np.float64)
+            image = orientation.apply(loader(index))
+            if conditioning is not None and conditioning.mode != 'off':
+                from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+                image = condition_stitch_frame(image, conditioning,
+                                               None if max_counts is None else max_counts + 1)
+            image = np.asarray(image, dtype=np.float64)
             valid = np.isfinite(image) & (image >= 0)
             if detector_mask is not None and detector_mask.shape == image.shape:
                 valid &= ~detector_mask
@@ -210,7 +216,8 @@ def _screen_scan_frames(exact, rows, diff, orientation, max_counts, frame_screen
 def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_rotation=0,
                              calibrant='LaB6', frame_indices=None, max_frames=48,
                              points_per_degree=2.0, max_counts=None, frame_screen=_CALIBRATION_SCREEN,
-                             cancelled=None, progress=None, mask=None, image_flip=False) -> ScanRingPoints:
+                             cancelled=None, progress=None, mask=None, image_flip=False,
+                             conditioning=None) -> ScanRingPoints:
     """Extract calibrant ring points from frames across the scan's angle grid.
 
     Every frame of the scan is screened for dropped frames first, then frames
@@ -241,7 +248,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     # is compared with all of its nu-row neighbours, not with a sparse selection.
     mask = None if mask is None else np.asarray(mask, dtype=bool)
     scan_excluded = _screen_scan_frames(exact, rows, diff, orientation, max_counts,
-                                        frame_screen, cancelled, progress, mask)
+                                        frame_screen, cancelled, progress, mask, conditioning)
     dropped = {item['index'] for item in scan_excluded}
     if frame_indices is None:
         selected, coverage = stratified_frame_indices(
@@ -270,7 +277,12 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
         loader = getattr(source, 'load_native_frame', source.load_frame)
 
         def pixels(index, integrator):
-            image = np.asarray(orientation.apply(loader(index)), dtype=np.float64)
+            image = orientation.apply(loader(index))
+            if conditioning is not None and conditioning.mode != 'off':
+                from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+                image = condition_stitch_frame(image, conditioning,
+                                               None if max_counts is None else max_counts + 1)
+            image = np.asarray(image, dtype=np.float64)
             if image.shape != tuple(integrator.detector.shape):
                 raise ValueError(f'frame {index}: image shape differs from the calibration detector')
             valid = np.isfinite(image) & (image >= 0)
@@ -340,7 +352,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                          min_improvement=0.2, max_rms_q=0.03, cancelled=None,
                          progress=None, instrument_geometry=None, mask=None,
                          energy_bound_eV=None, bounds=None, distance_seed_m=None,
-                         distance_bounds_m=None, image_flip=False) -> CalibrationFit:
+                         distance_bounds_m=None, image_flip=False, conditioning=None) -> CalibrationFit:
     """Refine a stacked-arm calibration from its calibrant scan, automatically.
 
     Returns a MultiGeometry :class:`CalibrationFit` for :func:`save_calibration_fit`.
@@ -362,6 +374,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
     ``distance_seed_m`` / ``distance_bounds_m`` (metres) replace the seed calibration's distance and
     its ±``bounds.distance_fraction`` box in every fit, as the guided fit takes them (Codex review F3);
     bounds that exclude the seed are refused, never widened.
+    ``conditioning`` is Int's calibration-only pixel band, applied during screening and ring extraction;
+    it never changes the source pixels. None/off preserves the prior extraction path.
     """
     from xrd_tools.core.geometry.stacked_arm import arm_senses, orientation_signs
     from xrd_tools.integrate.refine import ArmFitBounds
@@ -387,7 +401,7 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
         spec, record, source_motors=source_motors, image_rotation=image_rotation, image_flip=image_flip,
         calibrant=calibrant, frame_indices=frame_indices, max_frames=max_frames,
         points_per_degree=points_per_degree, max_counts=max_counts,
-        frame_screen=frame_screen, cancelled=cancelled, progress=progress, mask=mask)
+        frame_screen=frame_screen, cancelled=cancelled, progress=progress, mask=mask, conditioning=conditioning)
     poni = diff.calibration.poni
     recorded = calibration_recorded_energy_eV(record)
     if energy_bound_eV is not None and recorded is not None:  # ± the recorded energy, not a refined seed's
@@ -481,6 +495,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                       'frame_screen': frame_screen.to_provenance(), 'excluded_frames': list(points.excluded),
                       'outlier_threshold_sigma': reject_outliers, 'rejected_points': result.rejected_points,
                       'validation': validation}}
+    if conditioning is not None and conditioning.mode != 'off':
+        provenance['automatic_refinement']['conditioning'] = conditioning.to_dict()
     if instrument_geometry is not None:  # which motor drives which circle, as the guided fit records it
         provenance['instrument_geometry'] = dict(instrument_geometry)
     if energy:

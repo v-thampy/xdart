@@ -56,6 +56,26 @@ def test_a_partial_frame_is_screened_against_the_whole_scan_before_selection(tmp
     assert partial not in used and len(used) == 8
 
 
+def test_calibration_threshold_filters_the_scan_search_and_records_the_band(tmp_path):
+    from xrd_tools.integrate.stitch_autocalibration import extract_scan_ring_points, refine_arm_from_scan
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    spec = ring_scan(tmp_path / 'scan', [(d, 0.) for d in (6., 20., 34.)])
+    originals = {}
+    for path in (tmp_path / 'scan' / 'images').glob('*.raw'):
+        image = np.fromfile(path, dtype='<i4').reshape(195, 1475)
+        image[:, :700] = 0  # left out by the lower bound, independently of detector gaps
+        image.tofile(path)
+        originals[path] = path.read_bytes()
+    band = StitchConditioning('manual', 1., 6000.)
+    seed = five_parameter_seed(ROW_ANGLES)
+    points = extract_scan_ring_points(spec, seed, max_frames=3, conditioning=band)
+    assert all(control.col_positions.min() >= 699 for control in points.controls)
+    result = refine_arm_from_scan(spec, seed, max_frames=3, conditioning=band)
+    policy = result.asset['provenance']['automatic_refinement']['conditioning']
+    assert policy == band.to_dict()
+    assert all(path.read_bytes() == raw for path, raw in originals.items())
+
+
 def test_automatic_refinement_is_reproducible_and_leaves_the_global_generator_alone(tmp_path):
     from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
     spec = ring_scan(tmp_path / 'scan')
