@@ -56,6 +56,7 @@ from xrd_tools.sources.selection import (
 from xdart.utils.browse import browse_start_dir, remember_browse_path
 from xdart.gui.widgets.file_dialogs import MASK_FILTER, PONI_FILTER
 from .advanced_editor import AdvancedSettingsDialog
+from .point_images_editor import PointImagesSettings
 from .adapters.browse_loader import BrowseLoader
 from .adapters.external_operation import OperationSlot
 from .batch_terminal_presentation import (
@@ -642,6 +643,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else self._choose_results_notebook_dialog
         )
         self._advanced_dialog: AdvancedSettingsDialog | None = None
+        self.point_images = PointImagesSettings(self)
+        self.point_images.restore_intent(intents.snapshot().thaw())
         # Decoded dark/flat images for the open Advanced dialog's checks.
         self._correction_inspections: dict = {}
         self._advanced_settings_editor = (
@@ -3843,6 +3846,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._reconcile_snapshot(prior, result.snapshot)
 
     def _begin_run(self) -> None:
+        self.point_images.finish_run()
         pipeline = self._pipeline
         if self._closing or self._closed or pipeline is None:
             self._notice("Standard execution is unavailable.")
@@ -3933,6 +3937,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(f"Output admission failed: {result.reason}")
             if released.cleanup_status is not CleanupStatus.CLEANED:
                 self._notice("Output cleanup remains pending.")
+            elif result.point_images is not None:
+                prior = self._intents.snapshot()
+                if prior.revision != token.revision:
+                    self._notice('The Source changed; press Run again to confirm the current scan.')
+                elif self.point_images.confirm((result.point_images,), self):
+                    candidate = self.point_images.apply_intent(prior.thaw())
+                    committed = self._intents.commit(candidate, expected_revision=prior.revision)
+                    if type(committed) is IntentCommitAccepted:
+                        self._reconcile_snapshot(prior, committed.snapshot)
+                        self._begin_run()
+                    else:
+                        self.point_images.restore_intent(self._intents.snapshot().thaw())
+                        self._notice('The Source changed; press Run again to confirm the current scan.')
+                else:
+                    self._notice('Grouping not confirmed; scan unprocessed.')
+                self.point_images.finish_run()
             elif result.append_refused:
                 self._confirm_append_overwrite(result)
             else:
@@ -7528,9 +7548,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self, correction_inspector=self._inspect_detector_correction,
             )
             self._advanced_dialog = dialog
+            dialog.add_section(self.point_images)
         self._correction_inspections = {}
+        original = self.point_images.document()
         try:
-            return dialog.edit(snapshot)
+            result = dialog.edit(snapshot)
+            if result is None:
+                self.point_images.restore(original)
+            return result
         finally:
             self._correction_inspections = {}
 
@@ -7678,13 +7703,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(reduced.reason)
             self._refresh_shell()
             return
-        if isinstance(reduced, EditNoChange):
+        candidate = self.point_images.apply_intent(snapshot.thaw() if isinstance(reduced, EditNoChange) else reduced)
+        if (isinstance(reduced, EditNoChange)
+                and candidate.run_options == snapshot.thaw().run_options
+                and candidate.source_spec == snapshot.thaw().source_spec):
             self._notice("")
             self._refresh_shell()
             return
         try:
             result = self._intents.commit(
-                reduced,
+                candidate,
                 expected_revision=snapshot.revision,
             )
         except Exception as error:
@@ -8030,6 +8058,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         *,
         preserve_terminal: bool = False,
     ) -> None:
+        self.point_images.restore_intent(current.thaw())
         source_transition = self._apply_snapshot_effects(
             prior,
             current,

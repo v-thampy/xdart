@@ -38,6 +38,7 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources import open_source
+from xrd_tools.sources.point_images import PointImagesRequired
 from xrd_tools.sources.cursor import open_container_cursor
 from xrd_tools.sources.nexus import NexusStackSource
 from xrd_tools.sources.point_images import PointImageSource
@@ -921,10 +922,14 @@ class StandardRunExecutor:
                     display_retirement=proof,
                 )
         except Exception as error:
+            point_images = error.detection if isinstance(error, PointImagesRequired) else None
+            live_point_images = point_images is not None and operation.capture.intent_snapshot.thaw().live_mode
             result = AdmissionFailure(
                 operation.token,
-                detach_exception(error, 'admission').message,
+                ('Multiple images per point are unavailable in Live; choose a finite run.'
+                 if live_point_images else detach_exception(error, 'admission').message),
                 append_refused=isinstance(error, AppendRefused),
+                point_images=None if live_point_images else point_images,
             )
         finally:
             operation.finish_worker(result)

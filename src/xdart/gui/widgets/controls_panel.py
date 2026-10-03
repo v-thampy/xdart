@@ -798,6 +798,13 @@ class FormRow(QtWidgets.QWidget):
         return integer_field_refusal(self.editor.text(), minimum=minimum, maximum=maximum,
                                      allow_blank=allow_blank)
 
+    def set_integer_bounds(self, minimum: int | None, maximum: int | None) -> None:
+        """Change a whole-number row's bounds without changing its entered text."""
+        if self._kind != "int":
+            raise TypeError("integer bounds require a whole-number row")
+        self._bounds = (minimum, maximum, self._bounds[2])
+        self._show_validity()
+
     def _show_validity(self) -> None:
         """An ``int`` row marks refused text (the theme's ``invalid`` property) and says why in its
         tooltip; the text itself stays as typed."""

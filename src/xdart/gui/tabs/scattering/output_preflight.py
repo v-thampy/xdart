@@ -43,6 +43,7 @@ from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.run_plan import RunCandidatePlan
 from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.point_images import PointImagePolicy, PointImagesRequired, inspect_point_images
 from xrd_tools.sources.execution_graph import (
     _CapturedSourceTopology,
     _capture_source_topology,
@@ -484,6 +485,15 @@ def prepare_output(
         raise TypeError("admission requires typed StartCapture")
     snapshot = capture.intent_snapshot
     intent = snapshot.thaw()
+    if type(intent.source_spec) is SourceSpec:
+        detection = inspect_point_images(intent.source_spec)
+        if detection is not None:
+            if intent.live_mode:
+                raise ValueError('Multiple images per point are unavailable in Live; choose a finite run.')
+            raw_policy = intent.source_spec.options.get('point_images')
+            policy = None if raw_policy is None else PointImagePolicy.from_dict(raw_policy)
+            if policy is None or policy.images_per_point != detection.images_per_point:
+                raise PointImagesRequired(detection)
     assets = _load_scientific_assets(intent, cancelled=cancelled)
     candidate = OutputCandidate.from_start_capture(capture, assets)
     source, choices, deferred = candidate.source, None, None

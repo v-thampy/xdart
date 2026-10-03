@@ -24,7 +24,7 @@ from xdart.gui.tools.page_settings import (
 )
 
 #: The document's kind and version, and its key in the session file.
-RSM_SETTINGS = SettingsKind("xdart-rsm-settings", 1, "rsm_settings", "RSM")
+RSM_SETTINGS = SettingsKind("xdart-rsm-settings", 1, "rsm_settings", "RSM", sections=("point_images",))
 SESSION_KEY = RSM_SETTINGS.session_key
 #: Not saved field by field: the SPEC files row shows the source selection, and the Threshold is one policy.
 _NOT_FIELDS = frozenset({"spec_path", "threshold_enabled", "threshold_min", "threshold"})
@@ -38,6 +38,7 @@ def page_settings(page) -> dict[str, Any]:
         page, (key for key in page._fields if key not in _NOT_FIELDS),
         # Append skips an output already gridded with these settings; "Overwrite" is Replace
         write_mode=page.run_bar.write_mode(),
+        point_images=page.point_images.document(),
     )
     if page._output_suggested:  # the Output follows the Source until a name is chosen, and so it does restored
         document["fields"]["output_path"] = ""
@@ -47,6 +48,8 @@ def page_settings(page) -> dict[str, Any]:
 def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
     document = RSM_SETTINGS.validate(document)
+    if "point_images" in document:
+        page.point_images.restore(document["point_images"])
     fields = saved_fields(page, document, _NOT_FIELDS)
     legacy = document.get("fields", {}).get("grid")
     if legacy is not None:

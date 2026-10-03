@@ -44,6 +44,7 @@ from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_widgets import foldable
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
@@ -834,6 +835,9 @@ class StitchPage(QtWidgets.QWidget):
         self._map_card.setVisible(False)
         # Int's Advanced dialog, its groups the page's shared rows (Codex's reuse audits, 2026-10-01)
         self.advanced = AdvancedDialog(self, title="Advanced — Stitch 1D", object_name="stitchAdvancedDialog")
+        self.point_images = PointImagesSettings()
+        self.advanced.add_section(self.point_images)
+        self.point_images.changed.connect(self._point_images_edited)
         advanced_card = self.advanced.add_group("Source and geometry")
         fields = (
             ("detector_rows", "Rows", "195"), ("detector_cols", "Columns", "1475"),
@@ -1426,13 +1430,19 @@ class StitchPage(QtWidgets.QWidget):
             scans=str(value("scan")), stitch_all=value("scan_mode") == "Stitch All",
             image_dir=str(value("image_dir")), image_stem=str(value("image_stem")),
             recursive=directory and bool(value("subdirs")),
-            name_filter=str(value("name_filter")).strip() if directory else "")
+            name_filter=str(value("name_filter")).strip() if directory else "",
+            point_image_choices=self.point_images.choices)
+
+    def _point_images_edited(self):
+        self._source_admission = None
+        self._observe_source()
+        self._edited()
 
     def _observe_source(self):
         """Committed SPEC inputs only; edits to processing reuse the last admission."""
         if self._closing or "raw_dtype" not in self._rows:
             return
-        if self._value("source_kind") != "Spec" or not self._source_paths:
+        if self._value("source_kind") not in {"Spec", "NeXus"} or not self._source_paths:
             self._source_admission = None
             self._source_observer.release()
             return
@@ -1457,6 +1467,14 @@ class StitchPage(QtWidgets.QWidget):
 
     def _source_admitted(self, request, terminal):
         problem = terminal.failure_message if terminal.status is OperationTerminalStatus.FAILED else ""
+        resolution = terminal.payload
+        if resolution is not None and resolution.pending:
+            if self.point_images.confirm(resolution.pending, self):
+                self.point_images.finish_run()
+                self._point_images_edited()
+                return True
+            problem = "Multiple images per point: grouping was not confirmed; scan unprocessed"
+        self.point_images.finish_run()
         self._source_admission = request, terminal.payload, problem
         self._refresh_inputs_view()
         if not self._owner.busy and self._action_revision != self._revision:
@@ -2079,6 +2097,8 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field(key, fields[key])
         self._adopt_mapping(form.source_motors)  # the form's motors become the geometry's
         selection = form.source_selection
+        self.point_images.restore({'choices': [dict(uri=uri, scan=scan, policy=policy.to_dict())
+                                               for uri, scan, policy in selection.point_image_choices]})
         self.set_field("source_kind", selection.kind)
         self.set_sources(selection.paths)
         self.set_field("scan_mode", "Stitch All" if selection.stitch_all else "Select Scans")

@@ -41,6 +41,8 @@ from xdart.gui.pages.values import (
 )
 from xdart.gui.tabs.rsm.display import rsm_empty_projection, rsm_keyed_projection, rsm_slice_normals
 from xdart.gui.tabs.rsm.settings import RSM_SETTINGS, apply_page_settings, page_settings
+from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
+from xrd_tools.sources.point_images import PointImagesRequired, PointImageDetection
 from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindow
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView, ResultDirectoryBrowser
@@ -208,7 +210,10 @@ def _resolve_rsm_groups(arguments, cancel, _progress):
     if cancel.is_set():
         return None
     selection, options, queue = arguments
-    groups, skipped = rsm_member_groups(selection, **options)
+    try:
+        groups, skipped = rsm_member_groups(selection, **options)
+    except PointImagesRequired as error:
+        return error.detection
     return groups, skipped, _source_ubs(groups), _queue_refusals(queue, groups, cancel)
 
 
@@ -841,6 +846,9 @@ class RSMPage(QtWidgets.QWidget):
         and one frame range for every scan, as Stitch's."""
         preset = rsm_tool_preset()
         self.advanced = AdvancedDialog(self, title="Advanced — RSM", object_name="rsmAdvancedDialog")
+        self.point_images = PointImagesSettings()
+        self.advanced.add_section(self.point_images)
+        self.point_images.changed.connect(self._edited)
         corrections = correction_rows()  # Stitch's Corrections rows (``correction_values``), on by default (decision 5)
         groups = (
             ("Source and geometry", SectionId.SOURCE, (
@@ -1023,7 +1031,7 @@ class RSMPage(QtWidgets.QWidget):
                 *(str(self._value(key)) for key in (
                     "source_kind", "scan_mode", "scan", "image_dir", "image_stem", "subdirs", "name_filter",
                     "frame_first", "frame_last", "frame_step", "adv_rows", "adv_columns", "adv_dtype",
-                    "adv_header", "adv_angle_mapping")))
+                    "adv_header", "adv_angle_mapping")), self.point_images.choices)
 
     def _resolution_request(self, *, outputs=True):
         """(Stitch's source selection, the members' options, the outputs' place) for the resolver: the selection
@@ -1050,7 +1058,8 @@ class RSMPage(QtWidgets.QWidget):
             image_dir=str(self._inside(root, images, "Images")) if images and kind != "NeXus" else "",
             image_stem=str(self._value("image_stem")).strip() if kind != "NeXus" else "",
             recursive=directory and bool(self._value("subdirs")),
-            name_filter=str(self._value("name_filter")).strip() if directory else "")
+            name_filter=str(self._value("name_filter")).strip() if directory else "",
+            point_image_choices=self.point_images.choices)
         options = dict(
             frame_selector=rsm_frame_selector(self._value("frame_first"), self._value("frame_last"),
                                               self._value("frame_step")),
@@ -1701,12 +1710,14 @@ class RSMPage(QtWidgets.QWidget):
     def begin_preview(self):
         """Preview: find the Source's scans, check the inputs and list every exact identity, without
         gridding."""
+        self.point_images.finish_run()
         self._commit_typing()
         self._find_scans("preview")
 
     def begin_run(self):
         """Run: find the Source's scans again, then grid them, Previewing first unless the prepared Preview is
         still the current form (as Stitch's Run prepares first)."""
+        self.point_images.finish_run()
         self._commit_typing()
         if not self._readiness[1]:
             self._notice(self._readiness[0])
@@ -1743,11 +1754,24 @@ class RSMPage(QtWidgets.QWidget):
             return
         self._resolving = None
         terminal = update.terminal
+        if key != self._group_key():
+            self.point_images.finish_run()
+            self._notice('The Source changed; Preview again to confirm its scans.')
+            return
         if action is None:  # stopped: whatever was found is dropped
+            self.point_images.finish_run()
             self._notice("RSM stopped")
         elif terminal.status is OperationTerminalStatus.FAILED:
+            self.point_images.finish_run()
             self._notice(f"Source refused: {terminal.failure_message or terminal.failure_type}")
         elif terminal.status is OperationTerminalStatus.RETURNED and terminal.payload is not None:
+            if type(terminal.payload) is PointImageDetection:
+                if self.point_images.confirm((terminal.payload,), self):
+                    self._find_scans(action)
+                else:
+                    self._notice("Multiple images per point: grouping was not confirmed; scan unprocessed")
+                return
+            self.point_images.finish_run()
             groups, skipped, ubs, checked = terminal.payload
             if key != self._group_key():
                 self._notice("The scans were found, but the Source changed: Preview again")
@@ -1755,6 +1779,7 @@ class RSMPage(QtWidgets.QWidget):
             self._found(key, groups, skipped, ubs, checked)
             self._continue(action)
         else:
+            self.point_images.finish_run()
             self._notice("RSM stopped")
 
     def _continue(self, action):

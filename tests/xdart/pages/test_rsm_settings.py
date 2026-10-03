@@ -155,7 +155,8 @@ def test_file_save_and_load_through_the_settings_port_and_what_is_refused(qapp, 
     document, a choice this version lacks, or a value its row cannot hold is refused with its reason, the inputs
     left as they were; a load while the page works is refused before any chooser. No confirmation is asked."""
     assert PageCapability.SETTINGS_PERSISTENCE in RSM_PAGE.capabilities
-    assert RSM_SETTINGS == SettingsKind("xdart-rsm-settings", 1, "rsm_settings", "RSM")
+    assert RSM_SETTINGS == SettingsKind("xdart-rsm-settings", 1, "rsm_settings", "RSM",
+                                        sections=("point_images",))
     page = _page(qapp, owner=_Owner())
     handle = build_rsm_page(empty_host_services(_Status()), None)
     other = handle.widget
