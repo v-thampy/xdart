@@ -4,7 +4,8 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 
 @pytest.mark.parametrize('accept', [False, True])
-def test_int_run_confirms_tiff_spec_grouping_before_output(qapp, tmp_path, accept):
+@pytest.mark.parametrize('layout', ['single_spec', 'multi_spec', 'multi_auto'])
+def test_int_run_confirms_tiff_spec_grouping_before_output(qapp, tmp_path, accept, layout):
     from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
     from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
     from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
@@ -23,10 +24,15 @@ def test_int_run_confirms_tiff_spec_grouping_before_output(qapp, tmp_path, accep
     paths = [tmp_path / f'calibrant_scan001_{index:04}.tif' for index in range(4)]
     for path, value in zip(paths, (10, 6, 12, 8)):
         _write_tiff(path, value)
+    if layout.startswith('multi'):
+        spec.write_text(spec.read_text() + '\n#S 2 ascan del 20 21 1 1\n#P0 20 0\n#N 3\n'
+                        '#L del  nu  i0\n20 0 300\n21 0 400\n')
+        for index in range(2):
+            _write_tiff(tmp_path / f'calibrant_scan002_{index:04}.tif', 30)
     poni, output = tmp_path / 'cal.poni', tmp_path / 'processed'
     write_poni(poni)
     intent = _intent(paths[0], output, poni)
-    intent.source_spec = image_series_spec(paths[0], metadata_format='spec')
+    intent.source_spec = image_series_spec(paths[0], metadata_format='auto' if layout == 'multi_auto' else 'spec')
     lifecycle = ScatteringCoordinator()
     store = RunIntentStore(intent)
     page = ScatteringWorkspace(intents=store, lifecycle=lifecycle,
@@ -53,7 +59,8 @@ def test_int_run_confirms_tiff_spec_grouping_before_output(qapp, tmp_path, accep
     try:
         _wait(qapp, lambda: page._shell.run_controls.startButton.isEnabled())
         page._shell.run_controls.startButton.click()
-        _wait(qapp, lambda: bool(seen), timeout=15)
+        _wait(qapp, lambda: bool(seen) or lifecycle.phase is RunPhase.FAILED, timeout=15)
+        assert seen, page._notice_text
         assert not errors
         _wait(qapp, lambda: lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED} and page._admission is None, timeout=20)
         assert len(seen) == 1
@@ -67,6 +74,48 @@ def test_int_run_confirms_tiff_spec_grouping_before_output(qapp, tmp_path, accep
             assert not list(output.glob('*.nexus'))
     finally:
         timer.stop()
+        _wait(qapp, lambda: page.close_workspace().cleanup_status.value == 'cleaned')
+        page.close()
+
+
+def test_int_run_accepts_ordinary_raw_auto_sidecars(qapp, tmp_path):
+    import numpy as np
+    from tests.core.test_metadata import _PDI_V1_CONTENT
+    from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+    from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.sources.selection import image_series_spec
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from tests.xdart.scattering.test_e3_join_oracle import _wait
+    from tests.xdart.scattering.test_p1b_output_graph import _intent, _nexus_rows
+
+    paths = [tmp_path / f'ordinary_scan1_{index:04}.raw' for index in range(2)]
+    for path, value in zip(paths, (10, 20)):
+        np.full((195, 487), value, np.int32).tofile(path)
+        path.with_suffix('.raw.pdi').write_text(_PDI_V1_CONTENT)
+    poni, output = tmp_path / 'cal.poni', tmp_path / 'processed'
+    write_poni(poni)
+    intent = _intent(paths[0], output, poni)
+    intent.source_spec = image_series_spec(paths[0], metadata_format='auto')
+    lifecycle = ScatteringCoordinator()
+    store = RunIntentStore(intent)
+    page = ScatteringWorkspace(intents=store, lifecycle=lifecycle,
+                               sources=FilesystemSourceAdapter(), executor=StandardRunExecutor())
+    page.show()
+    try:
+        _wait(qapp, lambda: page._shell.run_controls.startButton.isEnabled())
+        page._shell.run_controls.startButton.click()
+        _wait(qapp, lambda: bool(list(output.glob('*.nexus'))) or bool(page._notice_text), timeout=20)
+        assert lifecycle.phase is not RunPhase.FAILED, page._notice_text
+        _wait(qapp, lambda: lifecycle.phase is RunPhase.IDLE and page._admission is None, timeout=20)
+        written = tuple(output.glob('*.nexus'))
+        assert len(written) == 1
+        assert _nexus_rows(written[0]) == (1, 2)
+        assert 'point_images' not in store.snapshot().thaw().source_spec.options
+    finally:
         _wait(qapp, lambda: page.close_workspace().cleanup_status.value == 'cleaned')
         page.close()
 

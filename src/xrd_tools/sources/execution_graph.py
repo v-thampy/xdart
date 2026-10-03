@@ -627,7 +627,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         from xrd_tools.sources import open_source
         if reader_binding:
             from xrd_tools.io.metadata import read_image_metadata_observed
-            read_image_metadata_observed(files[0], qualified.get("metadata_format", "auto"),
+            read_image_metadata_observed(files[0], "spec",
                 meta_dir=qualified.get("meta_dir"), max_input_bytes=1 << 16)
         grouped_source = open_source(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
     members: list[SourceFileState] = []; metadata_sources: list[AdmittedMetadataSource] = []
@@ -635,7 +635,8 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     observed_motor_count = 0
     selected_motor_complete = selected_motor is not None
     common: list[str] | None = None; layout = None
-    metadata_format = qualified.get("metadata_format", "auto")
+    metadata_format = (grouped_source.metadata_format if grouped_source is not None
+                       else qualified.get("metadata_format", "auto"))
     from xrd_tools.io.metadata import ImageMetadataRead, read_image_metadata_observed
     for index, value in enumerate(files):
         _cancelled(cancelled); path = Path(value); before = SourceFileState.capture(path)

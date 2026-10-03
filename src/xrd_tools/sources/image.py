@@ -180,22 +180,22 @@ class TiffSeriesSource(BaseFrameSource):
         self.point_image_policy = None
         self._point_source = None
         if point_images is not None:
-            from xrd_tools.io.metadata import _extract_scan_info
-            from xrd_tools.sources.spec import SpecSource
+            from xrd_tools.sources.spec import SpecSource, resolve_spec_image_scan
             from xrd_tools.sources.point_images import PointImagePolicy
             if not self.files or self.metadata_format not in {"spec", "auto"}:
                 raise ValueError("TIFF point grouping requires recorded SPEC point metadata")
-            observed = read_image_metadata_observed(self.files[0], self.metadata_format, meta_dir=self.meta_dir)
-            _stem, scan_number, _image_number = _extract_scan_info(self.files[0])
-            if observed.source_path is None or scan_number is None:
+            resolved = resolve_spec_image_scan(self.files[0], meta_dir=self.meta_dir)
+            if resolved is None:
                 raise ValueError("TIFF point grouping requires recorded SPEC point metadata")
+            spec_path, scan_number = resolved
             self.point_image_policy = PointImagePolicy.from_dict(point_images)
-            self._point_source = SpecSource(observed.source_path, scan=scan_number,
+            self._point_source = SpecSource(spec_path, scan=scan_number,
                 image_dir=self.files[0].parent, require_complete_images=True, point_images=point_images,
                 read_image_kwargs={"detector_shape": detector_shape, "detector": detector,
                     "raw_dtype": raw_dtype, "raw_header_skip": raw_header_skip})
             if tuple(Path(path) for path, _frame in self._point_source._frame_map) != tuple(self.files):
                 raise ValueError("TIFF point grouping must cover the exact recorded scan image series")
+            self.metadata_format = "spec"
         super().__init__(
             name=name or (self.files[0].stem if self.files else "tiff_series"),
             frame_indices=range(1, (len(self._point_source.frame_indices) if self._point_source is not None else len(self.files)) + 1),

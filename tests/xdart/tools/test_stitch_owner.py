@@ -40,6 +40,39 @@ def _poll_terminal(owner: StitchToolOwner, *, timeout: float = 3.0):
     raise AssertionError("Stitch owner terminal did not arrive")
 
 
+def test_grouped_full_raw_worker_replays_relocated_source_root(tmp_path):
+    import shutil
+    from tests.core.test_point_image_consumers import _point_stitch
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.io.analysis_artifact import read_analysis_artifact
+    from xrd_tools.io.frame_view import read_contributing_frame_view
+
+    project = tmp_path / 'project'
+    project.mkdir()
+    _spec, request = _point_stitch(project)
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    moved = tmp_path / 'relocated'
+    moved.mkdir()
+    shutil.move(project / 'inputs', moved / 'inputs')
+    payload = read_analysis_artifact(request.module.output.target)
+    row = payload.contributing_frames[0]
+    scan = row['key'].split('/')[0][5:]
+    expected = read_contributing_frame_view(payload.inspection.path, 0, scan=scan,
+        source_root=moved, full_raw=True, artifact_payload=payload)
+    assert expected.raw is not None and len(row['source_constituents']) == 2
+    owner = StitchToolOwner()
+    try:
+        assert owner.begin_frame_read(payload, 0, scan=scan, source_root=moved, full_raw=True)
+        terminal = _poll_terminal(owner, timeout=10)
+        assert terminal.terminal_status is OperationTerminalStatus.RETURNED, terminal.failure_message
+        assert terminal.outcome.kind is StitchOwnerOutcomeKind.FRAME_READ
+        np.testing.assert_array_equal(terminal.outcome.frame_view.raw, expected.raw)
+        np.testing.assert_equal(terminal.outcome.frame_view.raw, 10.5)
+    finally:
+        assert owner.close().status is PageCleanup.CLEAN
+
+
 @pytest.fixture
 def preflight(stitch_form):
     return prepare_stitch_tool(stitch_form)

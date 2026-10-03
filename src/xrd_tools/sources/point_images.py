@@ -156,8 +156,7 @@ def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
         count = sum(read_detector_image_layout(path, **decode).frame_count for path in files)
         return detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), count)
     if spec.kind is SourceKind.TIFF_SERIES:
-        from xrd_tools.io.metadata import _extract_scan_info, read_image_metadata_observed
-        from xrd_tools.sources.spec import SpecSource, find_spec_image_files
+        from xrd_tools.sources.spec import SpecSource, find_spec_image_files, resolve_spec_image_scan
 
         options = dict(spec.options)
         if options.get("metadata_format", "auto") not in {"spec", "auto"}:
@@ -165,17 +164,15 @@ def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
         files = tuple(Path(value).expanduser() for value in options.get("files", ()))
         if not files:
             return None
-        observed = read_image_metadata_observed(files[0], options.get("metadata_format", "auto"),
-                                                meta_dir=options.get("meta_dir"))
-        stem, scan, _image = _extract_scan_info(files[0])
-        if observed.source_path is None or scan is None:
+        resolved = resolve_spec_image_scan(files[0], meta_dir=options.get("meta_dir"))
+        if resolved is None:
             return None
-        metadata = SpecSource(observed.source_path, scan=scan)
+        spec_path, scan = resolved
+        metadata = SpecSource(spec_path, scan=scan, require_complete_images=True)
         detection = detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), len(files))
         if detection is None:
             return None
-        recorded = tuple(find_spec_image_files(files[0].parent, Path(observed.source_path).stem,
-                                              metadata.scan_key, stem))
+        recorded = tuple(find_spec_image_files(files[0].parent, spec_path.stem, metadata.scan_key))
         if tuple(Path(value) for value in recorded) != files:
             raise ValueError("TIFF point grouping must cover the exact recorded scan image series")
         return detection
