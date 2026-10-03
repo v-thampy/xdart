@@ -730,6 +730,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._background_owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_identity: OperationIdentity | None = None
         self._metadata_dialog = self._scan_roi_dialog = None
+        self._metadata_plot_dialog = None
         self._peak_dialog = self._phase_dialog = None
         self._scan_roi_generation = 0
         self._peak_generation = self._phase_generation = 0
@@ -1241,8 +1242,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         created = dialog is None
         if created:
             if target == "metadata":
-                from .analysis_mount import MetadataResultDialog
+                from .analysis_mount import MetadataResultDialog, open_metadata_plot
                 dialog = MetadataResultDialog(self)
+                dialog.plotRequested.connect(lambda source: open_metadata_plot(self, source))
             elif target == "scan_roi":
                 from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
                 dialog = ScanPlotDialog(parent=self, vnext_submit=self._scan_analysis_action)
@@ -2819,7 +2821,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._metadata_operations.begin_close()
             self._processed_browser.retire_terminal(force=True)
-            for dialog in (self._metadata_dialog, self._scan_roi_dialog,
+            for dialog in (self._metadata_dialog, self._metadata_plot_dialog, self._scan_roi_dialog,
                            self._peak_dialog, self._phase_dialog):
                 if dialog is not None: dialog.close()
             ScatteringWorkspace._clear_presentation_targets(self)

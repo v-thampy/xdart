@@ -406,6 +406,17 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 f"{len(cols)} plottable column(s). Pick X and check Y column(s).")
         self._redraw()
 
+    def set_metadata_rows(self, source):
+        """Plot a detached popup selection; source discovery and ROI remain separate tools."""
+        from xrd_tools.analysis.scan_operations import metadata_plot_columns
+        self.source_widget.hide()
+        self.roi_btn.hide()
+        self._positioner_names = [source.table.selected_scanned_positioner]
+        self.set_table(source.label, metadata_plot_columns(source.table, source.selected_labels))
+        self.setWindowTitle(f"Scan Plot · {source.label}")
+        self.status.setToolTip("Detached experimental metadata rows selected in the Metadata popup.")
+        self.save_btn.setToolTip("Save these selected metadata rows and all their columns as CSV.")
+
     def _sync_column_lists(self, names, checked_y=(), checked_right=()):
         self._selector_columns = list(names)
         entries = tuple(BrowserResult(name, name) for name in self._selector_columns)

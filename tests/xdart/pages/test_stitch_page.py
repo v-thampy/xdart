@@ -189,6 +189,67 @@ def test_native_source_controls_ranges_and_threshold_semantics(qapp, tmp_path):
         page.shutdown()
 
 
+def test_grouped_metadata_plot_uses_only_displayed_contributors(qapp, tmp_path):
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    form = replace(_form(tmp_path, "multigeometry"),
+                   frame_selector=StitchFrameSelector(0, 1))
+    spec = Path(form.spec_path)
+    content = spec.read_text().replace("17000.018", "12398.41984")
+    content = content.replace("del 14 15 1", "del 14 16 2")
+    content = content.replace("#N 3", "#N 4").replace("#L del  nu  energy", "#L del  nu  energy  diode")
+    content = content.replace("14 -10 12398.41984\n", "14 -10 12398.41984 123\n")
+    content = content.replace("15 -10 12398.41984\n", "15 -10 12398.41984 456\n")
+    content += "16 -10 12398.41984 999\n"
+    second = content[content.index("#S 1"):].replace("#S 1", "#S 2").replace(" 123\n", " 789\n")
+    spec.write_text(content + "\n" + second)
+    images = Path(form.image_dir)
+    (images / "sample_scan1_0002.raw").write_bytes((images / "sample_scan1_0001.raw").read_bytes())
+    for index in range(3):
+        image = images / f"sample_scan1_{index:04d}.raw"
+        image.with_name(f"sample_scan2_{index:04d}.raw").write_bytes(image.read_bytes())
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        page.set_field("image_stem", "sample_scan{scan}_")
+        page.set_field("scan", "[1,2]")
+        page.set_field("output_family", "combined")
+        page.begin_preview(); _wait(page, qapp)
+        page.run_bar.startButton.click(); _wait(page, qapp)
+        assert page._current_payload() is not None
+        page.metadata_button.click()
+        popup = page._metadata_dialog
+        assert not popup.plot_button.isEnabled()
+        _wait(page, qapp)
+        assert popup.table.rowCount() == 2
+        popup.plot_button.click()
+        plot = page._metadata_plot_dialog
+        assert isinstance(plot, ScanPlotDialog) and plot.parentWidget() is page
+        np.testing.assert_array_equal(plot._table["diode"], [123, 456])
+        popup.source_selector.setCurrentIndex(1)
+        popup.plot_button.click()
+        assert page._metadata_plot_dialog is plot
+        np.testing.assert_array_equal(plot._table["diode"], [789, 456])
+        plot._write_csv(tmp_path / "metadata.csv")
+        import csv
+        with (tmp_path / "metadata.csv").open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        assert [float(row["diode"]) for row in rows] == [789, 456]
+        popup.close(); qapp.processEvents()
+        assert plot.isVisible()
+        plot.norm_combo.setCurrentText("diode")
+        assert plot.isVisible() and len(plot._table["diode"]) == 2
+        spec.write_text(content + "\n" + second + "\n#C changed\n")
+        page.metadata_button.click(); _wait(page, qapp)
+        assert not page._metadata_dialog.plot_button.isEnabled()
+        assert "changed" in page._metadata_dialog.status.text().lower()
+        page.shutdown(); qapp.processEvents()
+        assert page._metadata_plot_dialog is None
+    finally:
+        until = time.monotonic() + 5
+        while page.shutdown().status is PageCleanup.PENDING and time.monotonic() < until:
+            qapp.processEvents(); time.sleep(.01)
+
+
 def _commit_source_box(page, qapp, text, *, key="Tab"):
     """Edit the source box as a user does: select all, type (or Backspace), commit with Tab/Return."""
     from PySide6.QtTest import QTest

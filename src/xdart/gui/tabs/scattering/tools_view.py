@@ -20,7 +20,6 @@ class ToolsView(QtWidgets.QFrame):
     _TOOLS = (
         ("∧ Peak Fitting", "peak_fitting"),
         ("≈ Phase Fitting", "phase_fitting"),
-        ("▤ Plot Metadata", "plot_metadata"),
         ("▣ ROI Statistics", "roi_statistics"),
     )
     _EXTERNAL_VIEWERS = (

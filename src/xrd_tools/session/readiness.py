@@ -523,6 +523,7 @@ class ControlAction(str, Enum):
     #: inputs and list the outputs; retry a finalization that did not complete).
     PREVIEW = "preview"
     RETRY = "retry"
+    PLOT_METADATA = "plot_metadata"
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 import struct
 from typing import Mapping
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 from .operation_values import OperationTerminalStatus, OperationUpdate
 from .shell_values import ShellCommandKind
 MOUNT_TARGETS = {
@@ -254,13 +254,41 @@ class MetadataSource:
     note: str = ""
 
 
+def open_metadata_plot(parent, source: MetadataSource) -> None:
+    """One shared detached plot per page, independently owned from its metadata reader."""
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    dialog = parent._metadata_plot_dialog
+    if dialog is None:
+        dialog = ScanPlotDialog(parent=parent)
+        dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        parent._metadata_plot_dialog = dialog
+
+        def closed(_value):
+            if parent._metadata_plot_dialog is dialog:
+                parent._metadata_plot_dialog = None
+        dialog.finished.connect(closed)
+    dialog.set_metadata_rows(source)
+    dialog.show(); dialog.raise_(); dialog.activateWindow()
+
+
 class MetadataResultDialog(QtWidgets.QDialog):
+    plotRequested = QtCore.Signal(object)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Metadata"); self.setObjectName("p37MetadataDialog")
         layout = QtWidgets.QVBoxLayout(self)
         self.table = QtWidgets.QTableWidget(0, 0, self); self.status = QtWidgets.QLabel("")
         layout.addWidget(self.table); layout.addWidget(self.status)
+        from xdart.gui.widgets.controls_panel import ActionButton
+        from xrd_tools.session.readiness import ControlAction, ControlActionSpec, SectionId
+        self.plot_button = ActionButton(ControlActionSpec(
+            ControlAction.PLOT_METADATA, "Plot Metadata…", SectionId.PROCESSING,
+            enabled=False, reason="Plot exactly the experimental metadata rows shown above; "
+            "the detached plot remains available after this popup closes."), self)
+        layout.addWidget(self.plot_button)
+        self._adopted_source = None
+        self.plot_button.actionRequested.connect(self._plot)
         #: Built by ``adopt_sources`` only, for a result read from several sources.
         self.source_selector = None
         self._sources: tuple[MetadataSource, ...] = ()
@@ -271,6 +299,7 @@ class MetadataResultDialog(QtWidgets.QDialog):
         if self.source_selector is None:
             self.source_selector = QtWidgets.QComboBox(self)
             self.source_selector.setObjectName("p37MetadataSourceSelector")
+            self.source_selector.setToolTip("Choose the member scan whose contributing metadata rows are shown and plotted.")
             self.source_selector.currentIndexChanged.connect(self._select_source)
             self.layout().insertWidget(0, self.source_selector)
         self._sources = tuple(sources)
@@ -285,16 +314,25 @@ class MetadataResultDialog(QtWidgets.QDialog):
         if source.table.disposition is AnalysisDisposition.COMPLETED:
             self.adopt_result(source.table, selected_labels=source.selected_labels,
                               row_labels=source.row_labels)
+            self._adopted_source = source
             if source.note:
                 self.status.setText(source.note)
         else:
             self.status.setText(source.table.code)
     def clear_result(self) -> None:
+        self._adopted_source = None
+        self.plot_button.setEnabled(False)
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self.status.clear()
+    def _plot(self, _action) -> None:
+        if self._adopted_source is not None:
+            self.plotRequested.emit(self._adopted_source)
     def adopt_result(self, result: object, *, selected_labels=None, row_labels=None) -> None:
+        from xrd_tools.analysis.scan_operations import AnalysisDisposition
+        self._adopted_source = None
+        self.plot_button.setEnabled(False)
         columns = tuple(getattr(result, "columns", ()))
         labels = tuple(getattr(result, "labels", ()))
         selected = labels if selected_labels is None else tuple(selected_labels)
@@ -311,3 +349,8 @@ class MetadataResultDialog(QtWidgets.QDialog):
                 self.table.setItem(row, col, QtWidgets.QTableWidgetItem(
                     "" if value is None else str(value)))
         self.status.setText(getattr(result, "code", ""))
+        if result.disposition is AnalysisDisposition.COMPLETED and rows:
+            self._adopted_source = MetadataSource("Experimental metadata", result,
+                None if selected_labels is None else tuple(selected_labels),
+                None if row_labels is None else tuple(row_labels))
+            self.plot_button.setEnabled(True)

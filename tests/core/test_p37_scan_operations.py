@@ -43,6 +43,31 @@ _PUBLIC_RUNNERS = {
 }
 
 
+def test_metadata_plot_columns_detach_the_selected_rows_and_preserve_text(tmp_path):
+    from dataclasses import replace
+    from xrd_tools.analysis.scan_operations import (
+        MetadataColumn, MetadataTablePlan, metadata_plot_columns, run_metadata_table,
+    )
+    spec = tmp_path / "scan"
+    spec.write_text("#F scan\n#E 1\n#D today\n#O0 del\n\n"
+                    "#S 1 ascan del 0 2 2 1\n#D today\n#P0 0\n"
+                    "#N 2\n#L del  diode\n0 10\n1 20\n2 30\n")
+    result = run_metadata_table(MetadataTablePlan(spec, kind="spec", scan="1"))
+    assert result.code == "OK"
+    result = replace(result, columns=(*result.columns,
+        MetadataColumn("note", "text", "none", None, ('a, b', None, 'c\n"d"'), 0)))
+    projected = metadata_plot_columns(result, (2, 0))
+    assert tuple(projected) == tuple(column.name for column in result.columns)
+    np.testing.assert_array_equal(projected["frame_index"], [2, 0])
+    np.testing.assert_array_equal(projected["diode"], [30, 10])
+    assert list(projected["note"]) == ['c\n"d"', 'a, b']
+    assert not projected["diode"].flags.writeable
+    assert not np.shares_memory(projected["diode"], result.columns[2].numeric)
+    np.testing.assert_array_equal(metadata_plot_columns(result)["diode"], [10, 20, 30])
+    with pytest.raises(KeyError):
+        metadata_plot_columns(result, (99,))
+
+
 def test_scan_table_alignment_and_streaming_csv_preserve_legacy_policy(tmp_path):
     import csv
 

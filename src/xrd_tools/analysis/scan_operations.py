@@ -52,7 +52,7 @@ __all__ = [
     "RoiPreviewResult", "RoiScanPlan", "RoiScanResult", "run_metadata_table",
     "run_metadata_table_requalification", "run_scan_plot", "run_roi_preview", "run_roi_scan",
     "numeric_scan_columns", "scan_plot_defaults", "scan_frame_rows",
-    "scan_table_columns", "write_scan_table_csv",
+    "scan_table_columns", "write_scan_table_csv", "metadata_plot_columns",
     "analysis_canonical_fingerprint", "requalified_analysis_source",
 ]
 # SSRL SPEC scans commonly expose roughly 60 point columns plus the complete
@@ -1294,6 +1294,33 @@ def _numeric_column(table: MetadataTableResult, name: str) -> np.ndarray:
     if len(matches) != 1 or matches[0].kind != "numeric" or matches[0].numeric is None:
         raise _Refusal("SCAN_PLOT_NONNUMERIC_COLUMN")
     return matches[0].numeric
+
+
+def metadata_plot_columns(
+    table: MetadataTableResult, selected_labels: tuple[int, ...] | None = None,
+) -> Mapping[str, np.ndarray]:
+    """Detach displayed metadata rows for plotting/CSV without changing source receipts.
+
+    Selection is by original frame label in the requested order, including repeats.
+    Text columns stay available to CSV; numeric selectors retain their existing policy.
+    """
+    if table.disposition is not AnalysisDisposition.COMPLETED:
+        raise ValueError("completed metadata table required")
+    positions = {label: index for index, label in enumerate(table.labels)}
+    labels = table.labels if selected_labels is None else selected_labels
+    rows = [positions[label] for label in labels]
+    columns = {}
+    for column in table.columns:
+        values = column.numeric if column.numeric is not None else column.text
+        if values is None:
+            continue
+        array = np.array([values[index] for index in rows],
+                         dtype=float if column.numeric is not None else object)
+        array.flags.writeable = False
+        columns[column.name] = array
+    return MappingProxyType(columns)
+
+
 def run_scan_plot(
     plan: ScanPlotPlan, table: MetadataTableResult, *, roi_result: RoiScanResult | None = None,
     cancel_token: threading.Event | None = None,

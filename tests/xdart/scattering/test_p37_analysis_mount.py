@@ -248,12 +248,11 @@ def test_metadata_row_headers_remain_default_unless_explicitly_selected(qapp):
 
 
 def test_p37b_literal_commands_open_four_singletons_and_share_scan_roi_mount() -> None:
-    # This is the genuine parent RED: the terminal P3-7A parent has only three
-    # tools and no ROI route.  The production fix adds the literal fourth row.
+    # Plot Metadata is in the shared popup; ROI remains a tool. Literal routes
+    # remain accepted for existing command consumers.
     assert ToolsView._TOOLS == (
         ("\u2227 Peak Fitting", "peak_fitting"),
         ("\u2248 Phase Fitting", "phase_fitting"),
-        ("\u25a4 Plot Metadata", "plot_metadata"),
         ("\u25a3 ROI Statistics", "roi_statistics"),
     )
     from xdart.gui.tabs.scattering.analysis_mount import MOUNT_TARGETS
@@ -2829,3 +2828,38 @@ def test_metadata_dialog_selects_among_a_results_sources(qapp):
         assert dialog.table.rowCount() == 0 and dialog.status.text() == "SOURCE_CHANGED"
     finally:
         dialog.close()
+
+
+def test_int_metadata_popup_plot_uses_detached_rows_and_outlives_popup(qapp, tmp_path):
+    from xrd_tools.analysis.scan_operations import run_metadata_table
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    spec = tmp_path / "scan"
+    spec.write_text("#F scan\n#E 1\n#D today\n#O0 del\n\n"
+                    "#S 1 ascan del 0 2 2 1\n#D today\n#P0 0\n"
+                    "#N 2\n#L del  diode\n0 10\n1 20\n2 30\n")
+    result = run_metadata_table(MetadataTablePlan(spec, kind="spec", scan="1"))
+    page = _page()
+    try:
+        page._open_analysis_mount("metadata")
+        popup = page._metadata_dialog
+        assert not popup.plot_button.isEnabled()
+        assert popup.plot_button.toolTip()
+        popup.adopt_result(result, selected_labels=(2, 0), row_labels=("2", "0"))
+        popup.plot_button.click()
+        plot = page._metadata_plot_dialog
+        assert isinstance(plot, ScanPlotDialog)
+        assert plot.parentWidget() is page and plot.isVisible()
+        assert plot.source_widget.isHidden() and plot.roi_btn.isHidden()
+        np.testing.assert_array_equal(plot._table["diode"], [30, 10])
+        popup.clear_result()
+        assert not popup.plot_button.isEnabled()
+        popup.close(); qapp.processEvents()
+        assert plot.isVisible()
+        _check_item(plot.y_list, "diode")
+        plot.x_combo.setCurrentText("frame_index")
+        assert any(np.array_equal(curve.getData()[1], [30, 10])
+                   for curve in plot.plot.listDataItems())
+        page.close_workspace(); qapp.processEvents()
+        assert page._metadata_plot_dialog is None
+    finally:
+        _close_page(page, qapp)

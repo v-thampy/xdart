@@ -447,6 +447,7 @@ class StitchPage(QtWidgets.QWidget):
                                             apply=apply_page_settings, busy=self._settings_busy,
                                             close=self.shutdown)
         self._metadata_dialog = None
+        self._metadata_plot_dialog = None
         self._metadata_request_dialog = None
         self._metadata_view_revision = None
         self._authoring_dialogs = []
@@ -3248,6 +3249,8 @@ class StitchPage(QtWidgets.QWidget):
         if self._metadata_dialog is not None:
             self._metadata_dialog.close()
         dialog = StitchMetadataDialog(payload.provenance_json, self)
+        from xdart.gui.tabs.scattering.analysis_mount import open_metadata_plot
+        dialog.plotRequested.connect(lambda source: open_metadata_plot(self, source))
         self._metadata_dialog = self._metadata_request_dialog = dialog
         self._metadata_view_revision = self._view_revision
         dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
