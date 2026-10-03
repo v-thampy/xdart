@@ -617,6 +617,15 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     if not files or compact and sum(Path(value) == selected for value in files) != 1:
         raise ValueError("TIFF source enumeration is empty or ambiguous")
     qualified.pop("admitted_motor_values", None)
+    if "point_images" not in qualified:
+        from xrd_tools.sources.point_images import inspect_point_images, PointImagesRequired
+        detection = inspect_point_images(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
+        if detection is not None:
+            raise PointImagesRequired(detection)
+    grouped_source = None
+    if "point_images" in qualified:
+        from xrd_tools.sources import open_source
+        grouped_source = open_source(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
     members: list[SourceFileState] = []; metadata_sources: list[AdmittedMetadataSource] = []
     motor_rows: list[AdmittedMotorValue] = []
     observed_motor_count = 0
@@ -627,7 +636,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     for index, value in enumerate(files):
         _cancelled(cancelled); path = Path(value); before = SourceFileState.capture(path)
         current = None
-        if compact:
+        if compact or grouped_source is not None:
             current = read_detector_image_layout(path,
                 detector_shape=qualified.get("detector_shape"), detector=qualified.get("detector"),
                 raw_dtype=str(qualified.get("raw_dtype", "int32")),
@@ -646,6 +655,10 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         second = (ImageMetadataRead({}, None) if metadata_format is None else
                   read_image_metadata_observed(path, metadata_format, meta_dir=qualified.get("meta_dir"),
                     max_input_bytes=(1 << 16) if reader_binding else None))
+        if grouped_source is not None:
+            point = index // grouped_source.point_image_policy.images_per_point + 1
+            first = ImageMetadataRead(dict(grouped_source.metadata_for(point)), first.source_path)
+            second = ImageMetadataRead(dict(grouped_source.metadata_for(point)), second.source_path)
         _cancelled(cancelled)
         second_state = None if second.source_path is None else SourceFileState.capture(second.source_path)
         _cancelled(cancelled)
@@ -862,6 +875,39 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
         if _drain_qualification(handle, slot):
             continue
         return complete()
+def _qualify_spec(source, *, selected_motor=None, cancelled=None):
+    from xrd_tools.sources import open_source
+    before = SourceFileState.capture(Path(source.uri))
+    opened = open_source(source)
+    files = tuple(path for path, _frame in opened._frame_map)
+    if not files:
+        raise ValueError("Int SPEC source requires recorded detector images")
+    members, rows, metadata, layout = [], [], [], None
+    policy = opened.point_image_policy
+    count = 1 if policy is None else policy.images_per_point
+    for ordinal, path in enumerate(files):
+        _cancelled(cancelled)
+        state = SourceFileState.capture(path)
+        current = read_detector_image_layout(path, **{key: value for key, value in dict(source.options.get("read_image_kwargs") or {}).items() if key in {"detector_shape", "detector", "raw_dtype", "raw_header_skip"}})
+        if current.frame_count != 1 or layout is not None and (current.shape, current.dtype) != (layout.shape, layout.dtype):
+            raise ValueError("Int SPEC native image layouts differ")
+        layout = current
+        members.append(state)
+        metadata.append(AdmittedMetadataSource(state.path, before))
+        if selected_motor is not None:
+            values = _finite_motors(dict(opened.metadata_for(ordinal // count)))
+            if selected_motor not in values:
+                raise ValueError("selected SPEC motor is absent")
+            rows.append(AdmittedMotorValue(state.path, selected_motor, values[selected_motor]))
+        _same(SourceFileState.capture(path), state, "SPEC detector image changed during admission")
+    _same(SourceFileState.capture(Path(source.uri)), before, "SPEC metadata changed during admission")
+    return freeze_source_execution_graph(source, source, source_path=files[0], group_key=opened.name,
+        file=members[0], adapter_id="tiff_series", frame_count=len(members), first_label=0,
+        detector_shape=tuple(layout.shape), native_dtype=layout.dtype,
+        members=tuple(members), admitted_motor_values=tuple(rows), metadata_sources=tuple(metadata),
+        motor_names=tuple(opened.motors), scanned_motor_names=None)
+
+
 def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | None = None,
         reader_binding: str | None = None,
         selected_container: SelectedContainerInput | None = None,
@@ -874,6 +920,10 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
         or source.kind not in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER)
     ):
         raise TypeError("selected container facts require ordinary container qualification")
+    if source.kind is SourceKind.SPEC:
+        if reader_binding is not None:
+            raise ValueError("SPEC source is unavailable to the bounded Average reader")
+        return _qualify_spec(source, selected_motor=selected_motor, cancelled=cancelled)
     if source.kind is SourceKind.TIFF_SERIES:
         return _qualify_tiff(source, selected_motor=selected_motor,
             reader_binding=reader_binding, cancelled=cancelled)
@@ -890,7 +940,10 @@ def requalify_source_execution_graph(source: SourceSpec, expected: PreparedSourc
     if reader_binding != expected.reader_binding or source.kind is not expected.execution_source.kind:
         raise SourceRevisionChanged("source reader binding or kind changed")
     validate_source_aliases(expected.stamp, cancelled=cancelled, check_candidate_owner=reader_binding is None)
-    if source.kind is SourceKind.TIFF_SERIES:
+    if source.kind is SourceKind.SPEC:
+        actual = _qualify_spec(source, selected_motor=selected_motor, cancelled=cancelled)
+        _same(actual, expected, "SPEC source graph changed")
+    elif source.kind is SourceKind.TIFF_SERIES:
         _qualify_tiff(source, selected_motor=selected_motor, reader_binding=reader_binding,
             cancelled=cancelled, expected=expected)
     elif source.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
@@ -904,7 +957,11 @@ def validate_source_execution_graph(value: PreparedSourceExecutionGraph, *,
         raise TypeError("source graph must be exact")
     validate_source_aliases(value.stamp, cancelled=cancelled, check_candidate_owner=value.reader_binding is None)
     source = value.execution_source
-    if source.kind is SourceKind.TIFF_SERIES:
+    if source.kind is SourceKind.SPEC:
+        rows = value.stamp.admitted_motor_values
+        actual = _qualify_spec(source, selected_motor=rows[0].motor if rows else None, cancelled=cancelled)
+        _same(actual, value, "SPEC source graph changed")
+    elif source.kind is SourceKind.TIFF_SERIES:
         rows = value.stamp.admitted_motor_values
         selected_motor = rows[0].motor if rows else None
         _qualify_tiff(source, selected_motor=selected_motor, reader_binding=value.reader_binding,
@@ -926,7 +983,7 @@ def source_snapshots_projection(value: PreparedSourceExecutionGraph, *, writer: 
         for metadata in stamp.metadata_sources:
             state = metadata.metadata_file
             if state is not None:
-                if state.path in snapshots and snapshots[state.path] != state.as_dict():
+                if state.path in snapshots and {key: snapshots[state.path].get(key) for key in state.as_dict()} != state.as_dict():
                     raise ValueError("conflicting source snapshot state")
                 snapshots[state.path] = {"adapter_id": "image_metadata", **state.as_dict(),
                     "frame_count": 0, "self_contained": True,

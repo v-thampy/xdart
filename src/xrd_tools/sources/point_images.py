@@ -155,6 +155,27 @@ def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
                   if key in {"detector_shape", "detector", "raw_dtype", "raw_header_skip"}}
         count = sum(read_detector_image_layout(path, **decode).frame_count for path in files)
         return detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), count)
+    if spec.kind is SourceKind.TIFF_SERIES:
+        from xrd_tools.io.metadata import _extract_scan_info, read_image_metadata_observed
+        from xrd_tools.sources.spec import SpecSource, find_spec_image_files
+
+        options = dict(spec.options)
+        if options.get("metadata_format", "auto") not in {"spec", "auto"}:
+            return None
+        files = tuple(Path(value).expanduser() for value in options.get("files", ()))
+        if not files:
+            return None
+        observed = read_image_metadata_observed(files[0], options.get("metadata_format", "auto"),
+                                                meta_dir=options.get("meta_dir"))
+        stem, scan, _image = _extract_scan_info(files[0])
+        if observed.source_path is None or scan is None:
+            return None
+        metadata = SpecSource(observed.source_path, scan=scan)
+        recorded = tuple(find_spec_image_files(files[0].parent, Path(observed.source_path).stem,
+                                              metadata.scan_key, stem))
+        if tuple(Path(value) for value in recorded) != files:
+            raise ValueError("TIFF point grouping must cover the exact recorded scan image series")
+        return detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), len(files))
     if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
         from xrd_tools.sources.descriptor import describe_container
 
