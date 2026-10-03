@@ -11,7 +11,7 @@ from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
 from xrd_tools.core.energy import energy_eV_to_wavelength_m, wavelength_m_to_energy_eV
 from xrd_tools.core.geometry import ImageOrientation
-from xrd_tools.core.geometry.camera import stitch_camera
+from xrd_tools.core.geometry.camera import DetectorCamera, stitch_camera
 
 
 @pytest.fixture(scope='module')
@@ -161,6 +161,27 @@ def test_camera_names_the_diffractometers_lab_frame(qapp, tmp_path):
         assert 'Diffractometer' in dialog.camera.rows.toolTip()
         assert 'x up' in dialog.camera.rows.toolTip()
         assert 'z to the left' in dialog.camera.columns.toolTip()
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize('page', ['Stitch', 'RSM'])
+def test_detector_header_tracks_the_model_and_camera_image_correction(qapp, tmp_path, page):
+    dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
+    try:
+        dialog._set_field_text('beam_detector', 'Eiger2_500k')
+        assert dialog._detector_panel.title() == 'Detector · Eiger2 500k · image correction: standard'
+        dialog.camera.set_value(DetectorCamera('z+', 'x-'))
+        assert dialog._detector_panel.title().endswith('image correction: 90° CW, then horizontal flip')
+        assert dialog._image_size.text() == '512 × 1028 px (W × H)'
+        title = dialog._detector_panel.title()
+        dialog._set_field_text('beam_orientation', '1')
+        assert dialog._detector_panel.title() == title
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        assert dialog._detector_panel.title().startswith('Detector · Pilatus 100k ·')
+        dialog.camera.default_button.click()
+        assert dialog._detector_panel.title().endswith('image correction: standard')
+        assert dialog._text('beam_orientation') == '1'
     finally:
         dialog.close()
 

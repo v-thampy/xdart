@@ -12,7 +12,7 @@ from __future__ import annotations
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.widgets.controls_panel import ControlsComboBox
-from xrd_tools.core.geometry.camera import CAMERA_AXES, STITCH_CAMERA, DetectorCamera
+from xrd_tools.core.geometry.camera import CAMERA_AXES, STITCH_CAMERA, DetectorCamera, stitch_orientation
 
 
 _AXIS_LABELS = {'x+': 'x+ (vert ↑)', 'x-': 'x- (vert ↓)',
@@ -50,6 +50,16 @@ class CameraEditor(QtWidgets.QWidget):
 
     def value(self) -> DetectorCamera:
         return DetectorCamera(self.rows.currentData(), self.columns.currentData())
+
+    def transform_description(self) -> str:
+        """The stored image's correction into xdart's reference, with the turn before the mirror."""
+        transform = stitch_orientation(self.value())
+        if transform.rotation == 0:
+            return 'horizontal flip' if transform.flip_horizontal else 'standard'
+        if transform.rotation == 180 and transform.flip_horizontal:
+            return 'vertical flip'
+        turn = {90: '90° CCW', 180: '180° rotation', 270: '90° CW'}[transform.rotation]
+        return turn + (', then horizontal flip' if transform.flip_horizontal else '')
 
     def set_value(self, camera: DetectorCamera):
         blocker = QtCore.QSignalBlocker(self.rows)

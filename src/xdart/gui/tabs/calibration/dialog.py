@@ -433,7 +433,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.setWindowTitle(f'{context.page} calibration')
         self.setObjectName('calibrationDialog')
         self.setModal(False)
-        self.resize(940, 730)
+        self.resize(940, 876)
         self.project_root = Path(context.project_root).resolve()
         self.session_dir = self.project_root / 'calibration' / f'session-{uuid.uuid4().hex[:12]}'
         self.frames = ()
@@ -1272,7 +1272,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _build_detector(self):
         """The detector every step reads the images with: its model, the stored image's layout and
         turn, its saturation and one mask for the whole calibration (maintainer, 2026-09-29)."""
-        panel = QtWidgets.QGroupBox('Detector')
+        panel = self._detector_panel = QtWidgets.QGroupBox('Detector')
         form = QtWidgets.QFormLayout(panel)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self._choice(form, 'beam_detector', 'Model', list(detector_choices(raw_details=True)),
@@ -1359,7 +1359,9 @@ class CalibrationDialog(QtWidgets.QDialog):
                    'along with every circle at zero, the detector facing the beam: x up, z to the left looking '
                    'downstream (xrayutilities\' detectorDir1, detectorDir2). Every image is turned and mirrored '
                    'into the calibration\'s frame, rows x−, columns z+, once before calibration; that is the default (an '
-                   'image rotation of 0 before). 17-2\'s Pilatus 300K-W is rows x−, columns z−, with nu x−.')
+                   'image rotation of 0 before). The header describes this stored-image correction, with '
+                   'rotation before mirroring, not the detector\'s physical mounting. '
+                   '17-2\'s Pilatus 300K-W is rows x−, columns z−, with nu x−.')
 
     def _orientation(self):
         """The camera's transform into Stitch's frame: a turn, then a left-right mirror."""
@@ -1393,6 +1395,9 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _update_image_size(self, *_args):
         """The detector image's width × height, as the beam pixel is read (turned by the Detector panel's camera); a
         quarter turn also says the stored image's size and the turn."""
+        model = self._fields['beam_detector'].currentText().partition(' [')[0]
+        self._detector_panel.setTitle(f'Detector · {model} · image correction: '
+                                      f'{self.camera.transform_description()}')
         shape = detector_shape(self._text('beam_detector'))
         if shape is None:
             self._image_size.setText('unknown detector')
@@ -1904,7 +1909,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._identity = self._owner.begin((kind, arguments))
         self.tabs.setEnabled(kind == 'beam_detect')
         self.cancel_button.setEnabled(True)
-        self.status.setText(f'{kind.capitalize()} in progress…')
+        self.status.setText('Checking direct-beam scan…' if kind == 'beam_detect'
+                            else f'{kind.capitalize()} in progress…')
         self._timer.start()
 
     def _guard(self, operation):
@@ -2424,6 +2430,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.status.setText('Select a calibrant scan; three to five frames are suggested.')
         elif self.tabs.currentWidget() is self._tab_pages['instrument']:
             self.status.setText('Describe the diffractometer, detector and camera.')
+        elif self.tabs.currentWidget() is self._tab_pages['calibrate']:
+            self.status.setText(calibration_fit_text(self.fit, self._fit_kind) if self.fit is not None
+                                else 'Calibrate selected frames or refine the calibrant scan.')
 
     def _detect_beam(self):
         if self._owner.busy:
@@ -2768,6 +2777,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                     and self._beam_probe_generation == self._beam_generation):
                 self._beam_problem = terminal.failure_message or 'Direct-beam detection cancelled'
             self._update_beam_readiness()
+            if (terminal.status is OperationTerminalStatus.RETURNED
+                    and self._beam_detection is not None
+                    and self._beam_detection[0] == self._beam_generation):
+                self._tab_readiness()
         elif self._beam_detection is None and not self._close_pending:
             self._beam_probe_timer.start()
         if self._pending_source_details is not None and not self._close_pending:

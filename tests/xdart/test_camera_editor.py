@@ -1,6 +1,7 @@
 """The detector camera's two linked boxes (maintainer, 2026-09-30: "two drop-down boxes linked together. The first
 has options x+, x-, z+, z-. Once the first ... is selected, the other box shows the remaining two transverse
 options")."""
+import numpy as np
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
@@ -60,5 +61,31 @@ def test_default_click_restores_unturned_unflipped_stitch_camera(qapp):
         assert editor.default_button.accessibleName() == 'Reset camera orientation'
         assert editor.layout().itemAt(editor.layout().count() - 2).widget() is editor.default_button
         assert editor.layout().itemAt(editor.layout().count() - 1).widget() is editor.image_size
+    finally:
+        editor.deleteLater()
+
+
+@pytest.mark.parametrize('axes,description,turn,mirror', [
+    (('x-', 'z+'), 'standard', 0, ''),
+    (('x-', 'z-'), 'horizontal flip', 0, 'horizontal'),
+    (('x+', 'z+'), 'vertical flip', 0, 'vertical'),
+    (('x+', 'z-'), '180° rotation', 2, ''),
+    (('z+', 'x+'), '90° CCW', 1, ''),
+    (('z+', 'x-'), '90° CW, then horizontal flip', -1, 'horizontal'),
+    (('z-', 'x-'), '90° CW', -1, ''),
+    (('z-', 'x+'), '90° CCW, then horizontal flip', 1, 'horizontal'),
+])
+def test_camera_image_correction_matches_the_labelled_transform(qapp, axes, description, turn, mirror):
+    editor = CameraEditor()
+    try:
+        editor.set_value(DetectorCamera(*axes))
+        assert editor.transform_description() == description
+        marked = np.arange(15).reshape(3, 5)
+        expected = np.rot90(marked, turn)
+        if mirror == 'horizontal':
+            expected = np.fliplr(expected)
+        elif mirror == 'vertical':
+            expected = np.flipud(expected)
+        np.testing.assert_array_equal(stitch_orientation(editor.value()).apply(marked), expected)
     finally:
         editor.deleteLater()

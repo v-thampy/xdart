@@ -53,6 +53,25 @@ def test_blank_source_and_rough_tab_use_the_shared_readiness_header(qapp, tmp_pa
         dialog.close()
 
 
+@pytest.mark.parametrize('tab,context', [('instrument', 'diffractometer'), ('select', 'calibrant scan'),
+                                       ('calibrate', 'Calibrate')])
+def test_background_detection_finishes_with_the_current_tabs_context(qapp, tmp_path, tab, context):
+    nexus, _, _ = _beam_container(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog._set_field_text('beam_source', nexus)
+        dialog._show_tab(tab)
+        detect(dialog)
+        assert dialog._beam_detection is not None, dialog.beam_readiness.status.text()
+        assert context in dialog.status.text()
+        assert 'progress' not in dialog.status.text().lower()
+        assert 'beam_detect' not in dialog.status.text().lower()
+    finally:
+        dialog.close()
+
+
 @pytest.mark.parametrize('command,columns,reason', [
     ('timescan 1 1', '#L Seconds\n0\n1', 'No scanned motor'),
     ('ascan eta -1 1 1 1', '#L eta\n-1\n1', 'Unsupported direct-beam motor eta'),
