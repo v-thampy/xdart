@@ -81,8 +81,12 @@ def test_stitch_native_statistics_sigma_and_signed_screen(tmp_path, operation, s
     expected = MultiGeometry([ai] * 3, unit='q_A^-1', radial_range=(0., 2.),
         azimuth_range=(-180., 180.), threadpoolsize=0).integrate1d([image] * 3, 24,
         correctSolidAngle=False, lst_variance=[supplied + dark] * 3, method='full')
-    np.testing.assert_allclose(actual.intensity, expected.intensity, rtol=1e-12)
-    np.testing.assert_allclose(actual.sigma, expected.sigma, rtol=1e-12)
+    covered = expected.count > 0
+    assert covered.any() and (~covered).any()
+    np.testing.assert_array_equal(np.isnan(actual.intensity), ~covered)
+    np.testing.assert_array_equal(np.isnan(actual.sigma), ~covered)
+    np.testing.assert_allclose(actual.intensity[covered], expected.intensity[covered], rtol=1e-12)
+    np.testing.assert_allclose(actual.sigma[covered], expected.sigma[covered], rtol=1e-12)
     assert not any(row.excluded for row in screen.verdicts)
 
 
