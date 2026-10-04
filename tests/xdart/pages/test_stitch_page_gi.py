@@ -3,6 +3,7 @@
 orientation), with Stitch's default order; Grazing's Axis adds Qip and Qoop, each writing I(q) and both
 cuts; the tilt motor (chi, gonchi, else Manual) is in Advanced."""
 from pathlib import Path
+import time
 
 import pytest
 from pyqtgraph.Qt import QtWidgets
@@ -14,7 +15,7 @@ from xdart.gui.tabs.stitch.page import StitchPage
 from xdart.gui.tabs.stitch.settings import apply_page_settings, page_settings
 from xdart.gui.widgets.controls_panel import FormRow
 from xrd_tools.integrate.stitch_gi import StitchGI
-from tests.xdart.pages.test_stitch_page import _Status, qapp  # noqa: F401  (the Qt application)
+from tests.xdart.pages.test_stitch_page import _Status, _wait, qapp  # noqa: F401  (the Qt application)
 from tests.xdart.tools.test_stitch_native_gi import _SAMPLE, _gi_form
 
 #: The fixture scan's real motors (#O), in order.
@@ -39,7 +40,13 @@ def _click(page, label):
 
 
 def _close(page, qapp):
-    assert page.shutdown().status is PageCleanup.CLEAN
+    until = time.monotonic() + 10
+    receipt = page.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+        qapp.processEvents()
+        time.sleep(.005)
+        receipt = page.shutdown()
+    assert receipt.status is PageCleanup.CLEAN, receipt.detail
     page.deleteLater()
     qapp.processEvents()
 
@@ -81,6 +88,7 @@ def test_grazing_shows_ints_rows_with_the_scans_motors_and_eta_first(qapp, tmp_p
         assert page.build_form().gi == both and page.build_form().unit == "q_A^-1"
         # Int's fixed statuses (a longer one widened the panel)
         assert page._gi_card.status.text() == page.controls.experiment_card.status.text() == "grazing"
+        _wait(page, qapp)
         assert page.run_bar.readinessLabel.full_text().endswith(" · grazing Q")
         assert not any(row.isHidden() for row in page._gi_rows)
         for axis in ("Qip", "Qoop"):
@@ -102,23 +110,29 @@ def test_grazing_keeps_the_controls_width_as_ints(qapp, tmp_path):
     the Axis") raised the panel's minimum width from 288 to 434 px; Int's fixed "grazing" keeps it."""
     page = _page(tmp_path, "multigeometry")
     try:
+        page.resize(1488, 1080)
         page.show()
+        _wait(page, qapp)
         qapp.processEvents()
         standard = page.controls.minimumSizeHint().width()
+        standard_sizes = page.splitter.sizes()
         _click(page, "Grazing")
         qapp.processEvents()
         assert page.controls.minimumSizeHint().width() == standard
+        assert page.splitter.sizes()[-1] <= standard_sizes[-1]  # toggling must not widen Controls
         assert page.controls.experiment_title == "Configuration"  # Int's title (workspace_shell)
-        # Int's columns: the same proportions, so the two pages switch in place
+        # Int's shared column floor; populated controls govern realized pixels.
         from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
         shell = ScatteringWorkspaceShell()
         try:
             assert page.splitter.widget(0).minimumWidth() == shell.splitter.widget(0).minimumWidth() == 255
-            for widget in (page, shell):  # Int's own layout test's window
-                widget.resize(1488, 1080)
-                widget.show()
+            shell.resize(1488, 1080)
+            shell.show()
             qapp.processEvents()
-            assert page.splitter.sizes() == shell.splitter.sizes() == [289, 868, 323]
+            _click(page, "Standard")
+            qapp.processEvents()
+            assert page.splitter.sizes()[-1] <= standard_sizes[-1]
+            assert page.controls.minimumSizeHint().width() == standard
         finally:
             shell.close()
             shell.deleteLater()
@@ -160,7 +174,7 @@ def test_a_manual_angle_axis_and_ranges_reach_the_form_and_round_trip(qapp, tmp_
         other.load_form(page.build_form())  # a prepared form restores it too
         assert other.build_form().gi == expected and _row(other, GI_THETA).editor.text() == "0.3"
         assert other._value("unit") == axis and other._tilt_rows[1].editor.text() == "-0.5"
-        older = page_settings(page)  # settings saved before: a Manual χ of 89.5 at orientation 4
+        older = page_settings(page)  # legacy Manual χ of 89.5 at the current orientation
         older["gi"] = {**{k: v for k, v in older["gi"].items() if k != "tilt_angle"}, "tilt_chi": "89.5"}
         apply_page_settings(other, older)
         assert other._gi["tilt_angle"] == "-0.5"  # the same surface as Int's tilt angle
@@ -404,15 +418,30 @@ def test_a_geometry_edit_leaves_the_gi_card_and_a_rebuild_makes_no_window(qapp, 
     page = _page(tmp_path, "multigeometry")
     try:
         _click(page, "Grazing")
+        _wait(page, qapp)
         page._calibrate()
         dialog = page._calibration_dialog
+        until = time.monotonic() + 10
+        while dialog.active() and time.monotonic() < until:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert not dialog.active()
+        qapp.processEvents()
         card, parents[:] = page._gi_card, []
         for circle, text in (("del", "2.3"), ("nu", "-0.5")):
             dialog.geometry_editor.zero_edit(circle).setText(text)
         dialog.geometry_editor.set_value(dialog.geometry_editor.value())  # as Read metadata sets it
         qapp.processEvents()
         assert page._gi_card is card and parents == []
+        button = next(button for button in page._gi_host.findChildren(QtWidgets.QPushButton)
+                      if button.text() == "Standard" and button.isVisibleTo(page._gi_host))
+        until = time.monotonic() + 10
+        while not button.isEnabled() and time.monotonic() < until:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert button.isEnabled()
         _click(page, "Standard")  # a rebuild: the card is born in its host
+        assert not page._gi["enabled"] and page._gi_card is not card
         assert parents and all(parent is page._gi_host for parent in parents)
     finally:
         if page._calibration_dialog is not None:

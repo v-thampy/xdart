@@ -37,8 +37,7 @@ def test_saved_stitch_2d_navigation_keeps_the_requested_curves(qapp, tmp_path, p
         _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        paths = [page.results.item(row).data(QtCore.Qt.ItemDataRole.UserRole)
-                 for row in range(page.results.count())]
+        paths = page.browser.listed_results()  # directory rows are Browse navigation
         assert len(paths) == 3
         saved = {path: read_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_2D)
                  for path in paths}
@@ -47,7 +46,8 @@ def test_saved_stitch_2d_navigation_keeps_the_requested_curves(qapp, tmp_path, p
         _command(page, ShellCommandKind.SET_PLOT_MODE, plot_mode)
 
         def click(row, modifier=QtCore.Qt.KeyboardModifier.NoModifier):
-            item = page.results.item(row)
+            item = next(page.results.item(index) for index in range(page.results.count())
+                        if page.results.item(index).data(QtCore.Qt.ItemDataRole.UserRole) == paths[row])
             QtTest.QTest.mouseClick(page.results.viewport(), QtCore.Qt.MouseButton.LeftButton,
                                    modifier, page.results.visualItemRect(item).center())
             _wait(page, qapp)
@@ -256,6 +256,8 @@ def test_grazing_2d_axis_is_the_map_a_result_opens_on(qapp, tmp_path):
         assert [axis.editor.itemText(index) for index in range(axis.editor.count())] == ["Qip-Qoop", "Q-χ"]
         page.set_field("map_axis", "Qip-Qoop")
         assert page.build_form().map_unit == "q_A^-1"
+        _wait(page, qapp)
+        assert page.run_bar.startButton.isEnabled()
         page.run_bar.startButton.click()
         _wait(page, qapp)
         payload = page._current_payload()
@@ -280,6 +282,8 @@ def test_a_gi_stitch_2d_shows_both_maps_as_ints_gi_view(qapp, tmp_path, backend)
             ("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)),
             mode="2d", npt_rad_2d=48, npt_azim_2d=32))
         assert page._mode == "Stitch 2D" and page._gi["enabled"]
+        _wait(page, qapp)
+        assert page.run_bar.startButton.isEnabled()
         page.run_bar.startButton.click()
         _wait(page, qapp)
         payload = page._current_payload()

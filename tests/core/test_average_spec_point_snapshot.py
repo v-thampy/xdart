@@ -1,7 +1,9 @@
 """Average metadata admission uses bounded SPEC points, with real parser custody."""
 from dataclasses import replace
+import hashlib
 import os
 from pathlib import Path
+import time
 
 import numpy as np
 import pytest
@@ -13,6 +15,104 @@ from xrd_tools.sources.execution_graph import (
 )
 from xrd_tools.sources.point_images import PointImagePolicy
 from xrd_tools.sources.selection import image_series_spec
+
+
+@pytest.mark.parametrize("relative,sha,scan,index,epoch", [
+    ("RSM/STO_align", "12e0d05219cb0309f7fb5f170c8fb12c507e7603dcd71b3954721d1b6e0c90b1", 43, 0, 10055.891),
+    ("RSM/STO_align", "12e0d05219cb0309f7fb5f170c8fb12c507e7603dcd71b3954721d1b6e0c90b1", 43, 1, 10057.903),
+    ("RSM/STO_align", "12e0d05219cb0309f7fb5f170c8fb12c507e7603dcd71b3954721d1b6e0c90b1", 43, 60, 10177.966),
+    ("RSM/STO_align", "12e0d05219cb0309f7fb5f170c8fb12c507e7603dcd71b3954721d1b6e0c90b1", 1196, 0, 285619.647),
+    ("RSM/STO_align", "12e0d05219cb0309f7fb5f170c8fb12c507e7603dcd71b3954721d1b6e0c90b1", 1196, 60, 286238.813),
+    ("stitching/data/efield/R2C1_extralong", "529fcc8c3800961a6eb8437639005c26926d48b05f9f03a84afdf37dafecd927", 1, 0, 23.776),
+    ("stitching/data/efield/R2C1_extralong", "529fcc8c3800961a6eb8437639005c26926d48b05f9f03a84afdf37dafecd927", 1, 40, 47.584),
+    ("stitching/data/efield/R2C1_extralong", "529fcc8c3800961a6eb8437639005c26926d48b05f9f03a84afdf37dafecd927", 10, 0, 703.972),
+    ("stitching/data/efield/R2C1_extralong", "529fcc8c3800961a6eb8437639005c26926d48b05f9f03a84afdf37dafecd927", 10, 1238, 6509.799),
+    ("stitching/data/efield/R2C1", "8623222fed86dca0edc77f9b632dd5241ef06886b780501989a3c38d8422df77", 7, 0, 2042.762),
+    ("stitching/data/efield/R2C1", "8623222fed86dca0edc77f9b632dd5241ef06886b780501989a3c38d8422df77", 7, 314, 2663.617),
+])
+def test_real_spec_points_match_ordinary_reader_and_recorded_epochs(
+        relative, sha, scan, index, epoch):
+    """Real inherited headers, duplicate columns and final rows, through the public metadata API."""
+    root = Path(os.environ.get("XDART_TEST_DATA", "/Users/vthampy/repos/test_data"))
+    path = root / relative
+    if not path.is_file():
+        pytest.skip("authenticated real SPEC input is unavailable")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == sha
+    # Metadata-only final scans need no detector payload; the recorded image name selects the point.
+    image = path.parent / "images" / f"b_thampy_{path.name}_scan{scan}_{index:04}.raw"
+    reference = read_image_metadata_observed(image, "spec", meta_dir=path.parent)
+    assert reference.source_path == path and reference.values["Epoch"] == epoch
+    actual = read_image_metadata_observed(image, "spec", meta_dir=path.parent,
+        max_input_bytes=1 << 16, spec_point_snapshot=True)
+    assert actual == reference  # all values, inherited motors, source path and byte revision
+
+
+def test_actual_sto_scan43_average_preserves_mean_counts_and_metadata(tmp_path):
+    """Named real large-SPEC workload, through Average's ordinary public execution path."""
+    from xrd_tools.core import PONI
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.core.geometry import DetectorCalibration
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    from xrd_tools.io.read import get_1d, get_metadata
+    from xrd_tools.io.spec import read_spec_scan_table
+    from xrd_tools.reduction import AverageScanRecipe, Integration1DPlan, ReductionPlan
+    from xrd_tools.reduction.average import AverageScanRunner, get_average_finite_counts
+    from xrd_tools.reduction.core import integrate_1d
+    from xrd_tools.session.experiment_state import CalibrationState, FactStatus, PoniValues
+
+    root = Path(os.environ.get("XDART_TEST_DATA", "/Users/vthampy/repos/test_data")) / "RSM"
+    spec = root / "STO_align"
+    selected = root / "images/b_thampy_STO_align_scan43_0000.raw"
+    if not spec.is_file() or not selected.is_file():
+        pytest.skip("authenticated actual STO Average workload is unavailable")
+    assert hashlib.sha256(spec.read_bytes()).hexdigest() == "12e0d05219cb0309f7fb5f170c8fb12c507e7603dcd71b3954721d1b6e0c90b1"
+    source = image_series_spec(selected, metadata_format="spec")
+    files = source.options["files"]
+    assert tuple(Path(path).name for path in files) == tuple(
+        f"b_thampy_STO_align_scan43_{index:04}.raw" for index in range(61))
+    shape = (195, 487)
+    source = replace(source, options={**source.options, "meta_dir": str(root),
+        "detector_shape": shape, "raw_dtype": "int32", "raw_header_skip": 0})
+    config = {"pixel1": .000172, "pixel2": .000172, "max_shape": list(shape), "orientation": 3}
+    values = PoniValues(1.0147173, 97 * .000172, 243 * .000172, 0., 0., 0., 1e-10)
+    calibration = CalibrationState(values, "Detector", config, status=FactStatus.PRESENT)
+    runner = AverageScanRunner(AverageScanRecipe(source, tmp_path / "sto_scan43.nxs",
+        ReductionPlan(integration_1d=Integration1DPlan(npt=256, method="numpy"), mask_saturation=False),
+        calibration=calibration))
+    started = time.monotonic()
+    progress = []
+    result = runner.start(progress_cb=lambda row: progress.append(
+        (row.stage, row.completed, row.total, time.monotonic() - started)))
+    elapsed = time.monotonic() - started
+    close_started = time.monotonic()
+    assert runner.close() is result
+    close_elapsed = time.monotonic() - close_started
+    print(f"STO_SCAN43_AVERAGE start={elapsed:.6f}s close={close_elapsed:.6f}s disposition={result.disposition}")
+    for stage in dict.fromkeys(row[0] for row in progress):
+        rows = [row for row in progress if row[0] == stage]
+        print(f"STO_SCAN43_PROGRESS {stage} first={rows[0]} last={rows[-1]}")
+    assert result.disposition == "COMMITTED", result
+    assert result.contributor_extent == 61 and result.committed_labels == (1,)
+    np.testing.assert_array_equal(get_average_finite_counts(result.target).values,
+                                  np.full(shape, 61, np.uint32))
+    # The independently accumulated actual RAW mean is reduced by the trusted integration owner.
+    summed = np.zeros(shape, np.float64)
+    for path in files:
+        assert Path(path).stat().st_size == 379860
+        summed += np.fromfile(path, dtype=np.int32).reshape(shape)
+    columns, motors, points = read_spec_scan_table(spec, "43.1")
+    assert points == 61 and motors["energy"] == 13000.007
+    integrator = detector_calibration_to_integrator(DetectorCalibration(
+        PONI(values.dist, values.poni1, values.poni2, 0., 0., 0.,
+             energy_eV_to_wavelength_m(motors["energy"]), "Detector"), config))
+    expected = integrate_1d(summed / 61, integrator, npt=256, method="numpy", unit="q_A^-1",
+                            mask=np.zeros(shape, bool))
+    actual = get_1d(result.target, 1)
+    # The persisted schema stores axes, intensity and numeric scan-data as float32.
+    np.testing.assert_array_equal(actual.q, expected.radial.astype(np.float32))
+    np.testing.assert_array_equal(actual.intensity, expected.intensity.astype(np.float32))
+    np.testing.assert_array_equal(get_metadata(result.target)["scan_data"]["Epoch"],
+                                  np.asarray([np.mean(columns["Epoch"])], np.float32))
 
 
 def _images(root, name="experiment", count=2, scan=1):
