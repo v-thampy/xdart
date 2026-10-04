@@ -152,6 +152,9 @@ class ScientificImagePane(QtWidgets.QWidget):
         """Shade zero-support bins separately from the scientific image and its color scale."""
         if coverage is None:
             self.coverage_overlay.clear()
+            # ImageItem.clear drops pixels, but its rendered QImage/buffers can still own them.
+            for name in ("qimage", "_displayBuffer", "_processingBuffer", "_imageNanLocations", "_imageHasNans"):
+                setattr(self.coverage_overlay, name, None)
             self.coverage_overlay.hide()
             return
         if self.image.image is None or coverage.T.shape != self.image.image.shape[:2]:

@@ -47,8 +47,11 @@ def test_shared_pane_shades_zero_support_in_image_orientation(qapp):
         assert [reference() for reference in pane.color_scale.img_list] == [pane.image]
         np.testing.assert_array_equal(data, before[0])
         np.testing.assert_array_equal(coverage, before[1])
+        overlay.render()  # force the real pyqtgraph QImage path without native painting
+        assert overlay.qimage is not None
         pane.render_coverage(None)
         assert overlay.image is None and not overlay.isVisible()
+        assert overlay.qimage is None and overlay._displayBuffer is None
         pane.render_coverage(coverage)
         pane.clear_image_buffers()
         assert overlay.image is None and not overlay.isVisible()
@@ -125,8 +128,11 @@ def test_saved_stitch_coverage_follows_options_diagnostic_and_mode(qapp, tmp_pat
         reopened = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_2D)
         np.testing.assert_array_equal(reopened.intensity, intensity)
         np.testing.assert_array_equal(reopened.coverage, coverage)
+        overlay.render()
+        assert overlay.qimage is not None
         assert page.shutdown().status is PageCleanup.CLEAN
         assert overlay.image is None and not overlay.isVisible()
+        assert overlay.qimage is None and overlay._displayBuffer is None
     finally:
         page.shutdown()
         page.deleteLater()
