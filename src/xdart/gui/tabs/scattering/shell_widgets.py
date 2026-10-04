@@ -126,6 +126,12 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.plot = self.canvas.image_plot
         self.image = self.canvas.imageItem
         self.color_scale = self.canvas.histogram
+        self.coverage_overlay = pg.ImageItem(axisOrder="col-major")
+        self.coverage_overlay.setZValue(1)
+        self.coverage_overlay.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+        self.coverage_overlay.setAcceptHoverEvents(False)
+        self.plot.addItem(self.coverage_overlay)
+        self.coverage_overlay.hide()
         self._render_contract: tuple[object, ...] | None = None
         self._geometry_contract: tuple[object, ...] | None = None
         self._axis_presentation_contract: tuple[object, ...] | None = None
@@ -140,6 +146,23 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.canvas._level_cache = None
         self.canvas._level_scan_token = None
         self.image.clear()
+        self.render_coverage(None)
+
+    def render_coverage(self, coverage: np.ndarray | None) -> None:
+        """Shade zero-support bins separately from the scientific image and its color scale."""
+        if coverage is None:
+            self.coverage_overlay.clear()
+            self.coverage_overlay.hide()
+            return
+        if self.image.image is None or coverage.T.shape != self.image.image.shape[:2]:
+            raise ValueError("coverage must match the rendered image")
+        rgba = np.zeros((*coverage.T.shape, 4), dtype=np.uint8)
+        rgba[..., :3] = 128
+        rgba[..., 3] = (coverage.T == 0) * 180
+        self.coverage_overlay.setImage(rgba, autoLevels=False)
+        self.coverage_overlay.setTransform(self.image.transform())
+        self.coverage_overlay.setPos(self.image.pos())
+        self.coverage_overlay.show()
 
     def clear_image_buffers(self, *, keep_chrome: bool = True) -> None:
         """Release pyqtgraph image state while leaving failures observable."""

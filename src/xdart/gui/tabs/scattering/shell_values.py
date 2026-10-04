@@ -601,6 +601,7 @@ class HeavyProjection:
     cake_y: AxisProjection | None = None
     detector_shape: tuple[int, int] | None = None
     detector_source: str = "none"
+    cake_coverage: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if type(self.frame) is not DisplayFrameKey:
@@ -628,6 +629,15 @@ class HeavyProjection:
             raise TypeError("detector shape must be an exact positive pair")
         if self.detector_source not in {"none", "thumbnail", "full"}:
             raise ValueError("detector source must be exact")
+        if self.cake_coverage is not None and (
+            type(self.cake_coverage) is not np.ndarray
+            or self.cake is None
+            or self.cake_coverage.shape != self.cake.shape
+            or self.cake_coverage.dtype.kind not in "fiu"
+            or not np.isfinite(self.cake_coverage).all()
+            or (self.cake_coverage < 0).any()
+        ):
+            raise ValueError("cake coverage must be finite nonnegative counts matching the image")
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,6 +649,7 @@ class ScientificPlotOptions:
     overlay_offset: float = 5.0
     show_legend: bool = True
     intensity_scale: str = "Linear"
+    show_coverage_holes: bool = False
 
     def __post_init__(self) -> None:
         if type(self.waterfall_y_axis) is not str or not self.waterfall_y_axis:
@@ -658,6 +669,8 @@ class ScientificPlotOptions:
             raise TypeError("legend visibility must be boolean")
         if self.intensity_scale not in {"Linear", "Sqrt", "Log"}:
             raise ValueError("unsupported 1-D intensity scale")
+        if type(self.show_coverage_holes) is not bool:
+            raise TypeError("coverage shading must be boolean")
 
 
 @dataclass(frozen=True, slots=True)

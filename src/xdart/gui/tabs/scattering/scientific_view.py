@@ -1239,6 +1239,17 @@ class ScientificView(QtWidgets.QFrame):
         detail: str,
     ) -> None:
         self.reconcile_action_availability(state)
+        coverage = (
+            state.heavy.cake_coverage
+            if state.heavy is not None
+            and state.processing_mode == "Int 2D"
+            and state.image_axis in {"Q-Chi", "q_chi"}
+            and not state.derived_2d
+            else None
+        )
+        self.plot_options_dialog.set_coverage_available(coverage is not None)
+        if coverage is None or not state.plot_options.show_coverage_holes:
+            self.cake.render_coverage(None)
         self.background.setText(("Clear" if state.background_set else "Set") + " " + {"Int 1D": "1D", "1D Viewer": "1D", "Int 2D": "2D", "2D Viewer": "Raw"}.get(state.processing_mode, "BG") + " BG")
         self._rendered_background_key = self._expected_background_key if state.background_set else None
         if state.processing_mode == "2D Viewer":
@@ -1434,6 +1445,9 @@ class ScientificView(QtWidgets.QFrame):
                             id(state.heavy.frame),
                             id(state.heavy.cake),
                         ),
+                    )
+                    self.cake.render_coverage(
+                        coverage if state.plot_options.show_coverage_holes else None
                     )
                     self._rendered_cake_axis_key = self._axis_key(
                         state.heavy.cake_x

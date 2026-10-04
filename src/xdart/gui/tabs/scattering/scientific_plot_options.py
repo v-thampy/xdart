@@ -1,4 +1,4 @@
-"""Passive 1-D plot options and the production waterfall activation policy."""
+"""Passive scientific plot options and the production waterfall activation policy."""
 
 from __future__ import annotations
 
@@ -16,6 +16,10 @@ WATERFALL_Y_AXIS_CHOICES = (
     "Time (minutes)",
 )
 INTENSITY_SCALE_CHOICES = ("Linear", "Sqrt", "Log")
+COVERAGE_TOOLTIP = (
+    "Shade Q–χ bins that received no contributing pixels. Coverage includes pixel splitting "
+    "and does not measure angular completeness."
+)
 
 #: Every 1-D plot option: its command path and its ``ScientificPlotOptions`` field, the one table the
 #: view emits and every page applies (Codex general audit AUD-8).
@@ -27,6 +31,7 @@ PLOT_OPTION_BINDINGS = (
     (("overlay", "offset"), "overlay_offset"),
     (("other", "legend"), "show_legend"),
     (("other", "intensity_scale"), "intensity_scale"),
+    (("other", "coverage_holes"), "show_coverage_holes"),
 )
 
 
@@ -55,7 +60,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("e4PlotOptionsDialog")
-        self.setWindowTitle("1-D Plot Options")
+        self.setWindowTitle("Plot Options")
         self.setModal(False)
         self._projection = ScientificPlotOptions()
 
@@ -93,6 +98,12 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.intensity_scale.addItems(INTENSITY_SCALE_CHOICES)
         other.addWidget(self.show_legend, 0, 0)
         other.addWidget(self.intensity_scale, 0, 1)
+
+        support = self._section(layout, "2-D Support")
+        support.parentWidget().setToolTip(COVERAGE_TOOLTIP)
+        self.show_coverage_holes = QtWidgets.QCheckBox("Shade uncovered bins")
+        support.addWidget(self.show_coverage_holes, 0, 0)
+        self.set_coverage_available(False)
 
         buttons = QtWidgets.QHBoxLayout()
         buttons.addStretch(1)
@@ -134,6 +145,13 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     def set_waterfall_visible(self, visible: bool) -> None:
         self._waterfall_group.setVisible(bool(visible))
 
+    def set_coverage_available(self, available: bool) -> None:
+        self.show_coverage_holes.setEnabled(available)
+        self.show_coverage_holes.setToolTip(
+            COVERAGE_TOOLTIP if available else COVERAGE_TOOLTIP +
+            " Available on a Stitch Q–χ intensity map with stored coverage."
+        )
+
     def add_choice(self, label: str, choices: tuple[str, ...], value: str) -> QtWidgets.QComboBox:
         """A host's own choice among ``choices``, built here above the buttons (Codex's Stitch/Int reuse
         audit R3: Stitch's Diagnostic was a combo box the page built). Returns the editor; the host
@@ -164,6 +182,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             self.overlay_offset,
             self.show_legend,
             self.intensity_scale,
+            self.show_coverage_holes,
         )
         blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
         self.waterfall_y_axis.clear()
@@ -177,6 +196,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.overlay_offset.setValue(options.overlay_offset)
         self.show_legend.setChecked(options.show_legend)
         self.intensity_scale.setCurrentText(options.intensity_scale)
+        self.show_coverage_holes.setChecked(options.show_coverage_holes)
         self._projection = options
         del blockers
 
@@ -189,6 +209,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             overlay_offset=float(self.overlay_offset.value()),
             show_legend=self.show_legend.isChecked(),
             intensity_scale=self.intensity_scale.currentText(),
+            show_coverage_holes=self.show_coverage_holes.isChecked(),
         )
 
     def reject(self) -> None:

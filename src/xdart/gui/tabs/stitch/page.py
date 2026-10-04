@@ -2942,6 +2942,12 @@ class StitchPage(QtWidgets.QWidget):
                         title=label or "Current", status=status)
         from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
         state = apply_presentation_background(state, self._background.projection())
+        if (state.heavy is not None and map_mode and self._diagnostic == "Intensity"
+                and state.image_axis in {"Q-Chi", "q_chi"} and not state.derived_2d):
+            # Stored counts already have the result's (q, chi) axes; Int renders (chi, q).
+            payload = items.get(id(state.heavy.frame))
+            if payload is not None and payload[1].kind is AnalysisArtifactKind.STITCH_2D:
+                state = replace(state, heavy=replace(state.heavy, cake_coverage=payload[1].coverage.T))
         self._last_map_state = state if map_mode else None
         fit_traces = state.traces
         # Int removes an identical live slice from the overlay when it is already pinned. That pin is
@@ -3378,6 +3384,7 @@ class StitchPage(QtWidgets.QWidget):
             for dialog in self.findChildren(QtWidgets.QDialog):
                 dialog.close()
             self.curve.clear()
+            self.scientific.cake.render_coverage(None)
             self._payloads.clear()
             self._payload_bytes.clear()
             self._recent.clear()

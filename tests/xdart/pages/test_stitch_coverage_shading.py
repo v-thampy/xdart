@@ -8,6 +8,7 @@ from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.scattering.scientific_plot_options import PlotOptionsDialog, plot_option_update
 from xdart.gui.tabs.scattering.shell_values import AxisProjection, HeavyProjection, ScientificPlotOptions
+from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
 from xdart.gui.tabs.stitch.page import StitchPage
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
@@ -43,7 +44,7 @@ def test_shared_pane_shades_zero_support_in_image_orientation(qapp):
         np.testing.assert_array_equal(overlay.image[..., 3] > 0, coverage.T == 0)
         np.testing.assert_array_equal(overlay.transform().mapRect(overlay.boundingRect()),
                                       pane.image.transform().mapRect(pane.image.boundingRect()))
-        assert pane.color_scale.imageItem() is pane.image
+        assert [reference() for reference in pane.color_scale.img_list] == [pane.image]
         np.testing.assert_array_equal(data, before[0])
         np.testing.assert_array_equal(coverage, before[1])
         pane.render_coverage(None)
@@ -128,5 +129,34 @@ def test_saved_stitch_coverage_follows_options_diagnostic_and_mode(qapp, tmp_pat
         assert overlay.image is None and not overlay.isVisible()
     finally:
         page.shutdown()
+        page.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("backend", ["multigeometry", "xu_hist"])
+def test_gi_coverage_stays_on_primary_map_only(qapp, tmp_path, backend):
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from tests.xdart.tools.test_stitch_native_gi import _SAMPLE, _gi_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(replace(_gi_form(tmp_path, backend, StitchGI(
+            ("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)),
+            mode="2d", npt_rad_2d=24, npt_azim_2d=16))
+        _wait(page, qapp)  # actual current readiness includes the detector observer
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        assert page._current_payload().gi_map is not None
+        dialog = page.scientific.plot_options_dialog
+        overlay = page.scientific.cake.coverage_overlay
+        dialog.show_coverage_holes.setChecked(True)
+        dialog.accept_button.click()
+        assert overlay.isVisible() and dialog.show_coverage_holes.isEnabled()
+        page._view_command(ShellCommand(ShellCommandKind.SET_IMAGE_AXIS, "qip_qoop"))
+        assert overlay.image is None and not dialog.show_coverage_holes.isEnabled()
+        page._view_command(ShellCommand(ShellCommandKind.SET_IMAGE_AXIS, "q_chi"))
+        assert overlay.isVisible() and dialog.show_coverage_holes.isEnabled()
+    finally:
+        _wait(page, qapp)
+        assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()
