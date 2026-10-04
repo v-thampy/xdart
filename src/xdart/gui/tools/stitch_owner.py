@@ -588,7 +588,7 @@ class StitchToolOwner:
                 artifact_payload=selected.payload))
             if not selected.scientific and view.raw is not None:
                 view = replace(view, raw=stitch_contributor_raw_preview(selected.payload, view.raw,
-                    selected.frame_index, scan=selected.scan))
+                    selected.frame_index, scan=selected.scan, source_root=selected.source_root))
             publish("raw-frame", 1, 1)
             return StitchOwnerOutcome(StitchOwnerOutcomeKind.FRAME_READ,
                 frame_view=view, artifact_path=request.artifact_path)

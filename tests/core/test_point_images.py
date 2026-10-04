@@ -30,6 +30,100 @@ def _confirmed(spec, policy):
     return replace(spec, options={**spec.options, "point_images": policy.to_dict()})
 
 
+@pytest.mark.parametrize("spec_state", ["absent", "not-spec", "other-scan"])
+def test_auto_raw_sidecars_without_matching_spec_keep_run_and_average_admission(tmp_path, spec_state):
+    from tests.core.test_metadata import _PDI_V1_CONTENT
+    from xrd_tools.io.metadata import read_image_metadata_observed
+    from xrd_tools.sources.execution_graph import qualify_source_execution_graph
+    from xrd_tools.sources.point_images import inspect_point_images
+    from xrd_tools.sources.selection import image_series_spec
+
+    paths = [tmp_path / f"ordinary_scan1_{index:04}.raw" for index in range(2)]
+    for path, value in zip(paths, (10, 20)):
+        np.full((2, 3), value, np.int32).tofile(path)
+        path.with_suffix(".raw.pdi").write_text(_PDI_V1_CONTENT)
+    if spec_state == "not-spec":
+        (tmp_path / "ordinary").write_text("ordinary metadata, not a SPEC file\n")
+    elif spec_state == "other-scan":
+        (tmp_path / "ordinary").write_text("#F ordinary\n#E 1\n#O0 del\n\n"
+            "#S 2 ascan del 10 11 1 1\n#P0 10\n#N 2\n#L del  i0\n10 100\n11 100\n")
+    spec = image_series_spec(paths[0], metadata_format="auto")
+    spec = replace(spec, options={**spec.options, "detector_shape": (2, 3)})
+    observed = read_image_metadata_observed(paths[0], "auto")
+    assert observed.source_path == paths[0].with_suffix(".raw.pdi")
+    assert inspect_point_images(spec) is None
+    for reader_binding in (None, "average_closed_v1"):
+        qualified = qualify_source_execution_graph(spec, reader_binding=reader_binding)
+        assert qualified is not None
+    source = open_source(spec)
+    assert source.frame_indices == [1, 2]
+    assert source.metadata_for(1)["i0"] == 100
+    np.testing.assert_array_equal(source.load_frame(2), np.full((2, 3), 20))
+
+
+@pytest.mark.parametrize("metadata_format", ["spec", "auto"])
+def test_tiff_grouping_in_multiscan_folder_uses_exact_spec_scan(tmp_path, metadata_format):
+    from xrd_tools.sources.execution_graph import qualify_source_execution_graph
+    from xrd_tools.sources.point_images import inspect_point_images, PointImagePolicy, PointImagesRequired
+    from xrd_tools.sources.selection import image_series_spec
+
+    _spec_images(tmp_path)
+    spec_path = tmp_path / "calibrant"
+    spec_path.write_text(spec_path.read_text() + "\n#S 2 ascan del 20 21 1 1\n"
+        "#P0 20 0\n#N 3\n#L del  nu  i0\n20 0 300\n21 0 400\n")
+    for index in range(2):
+        tifffile.imwrite(tmp_path / f"calibrant_scan002_{index:04}.tif", np.ones((2, 3), np.uint16))
+    spec = image_series_spec(tmp_path / "calibrant_scan001_0000.tif", metadata_format=metadata_format)
+    detection = inspect_point_images(spec)
+    assert (detection.scan_label, detection.point_count, detection.image_count) == ("1.1", 2, 4)
+    with pytest.raises(PointImagesRequired):
+        qualify_source_execution_graph(spec)
+    confirmed = _confirmed(spec, PointImagePolicy(2, "average"))
+    source = open_source(confirmed)
+    assert source.frame_indices == [1, 2]
+    np.testing.assert_equal(source.load_frame(1), 8.)
+    np.testing.assert_equal(source.load_frame(2), 10.)
+    assert source.metadata_for(2)["del"] == 11
+    assert inspect_point_images(image_series_spec(tmp_path / "calibrant_scan002_0000.tif",
+                                                  metadata_format=metadata_format)) is None
+    subset = replace(spec, options={**spec.options, "files": spec.options["files"][:2]})
+    with pytest.raises(ValueError, match="exact recorded scan image series"):
+        open_source(_confirmed(subset, PointImagePolicy(2, "average")))
+
+
+def test_confirmed_auto_grouping_binds_matching_spec_and_source_mutations(tmp_path):
+    from tests.core.test_metadata import _PDI_V1_CONTENT
+    from xrd_tools.analysis.scan_operations import (
+        AnalysisDisposition, AnalysisSourceLeaseRefused, MetadataTablePlan,
+        requalified_analysis_source, run_metadata_table,
+    )
+    from xrd_tools.io.metadata import read_image_metadata_observed
+    from xrd_tools.sources.execution_graph import (
+        SourceRevisionChanged, qualify_source_execution_graph, validate_source_execution_graph,
+    )
+    from xrd_tools.sources.point_images import PointImagePolicy
+    from xrd_tools.sources.selection import image_series_spec
+
+    _spec_images(tmp_path)
+    first = tmp_path / "calibrant_scan001_0000.tif"
+    sidecar = first.with_suffix(".tif.pdi")
+    sidecar.write_text(_PDI_V1_CONTENT)
+    assert read_image_metadata_observed(first, "auto").source_path == sidecar
+    spec_path = tmp_path / "calibrant"
+    confirmed = _confirmed(image_series_spec(first, metadata_format="auto"), PointImagePolicy(2, "average"))
+    graph = qualify_source_execution_graph(confirmed)
+    assert {row.metadata_file.path for row in graph.stamp.metadata_sources} == {str(spec_path)}
+    table = run_metadata_table(MetadataTablePlan(confirmed))
+    assert table.disposition is AnalysisDisposition.COMPLETED, table.diagnostics
+    assert spec_path in {path for path, _resolved, _revision in table.receipt.dependency_revisions}
+    spec_path.write_text(spec_path.read_text() + "\n#C source changed after admission\n")
+    with pytest.raises(SourceRevisionChanged):
+        validate_source_execution_graph(graph)
+    with pytest.raises(AnalysisSourceLeaseRefused):
+        with requalified_analysis_source(table.receipt):
+            pass
+
+
 def _eiger(tmp_path):
     master = tmp_path / "two_per_point_master.h5"
     shard = tmp_path / "two_per_point_data_000001.h5"
