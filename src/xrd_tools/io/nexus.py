@@ -3807,13 +3807,7 @@ def write_rsm(
                 else coordinate_frame
             ),
         )
-    if bounded_artifact:
-        if frame_records is not None or source_base is not None:
-            raise ValueError(
-                "bounded analysis artifact does not accept unbound frame records"
-            )
-        prov = _bounded_artifact_provenance(provenance)
-    elif provenance is not None:
+    if provenance is not None:
         prov = provenance if isinstance(provenance, str) else json.dumps(
             provenance, default=str)
     else:
@@ -3842,19 +3836,11 @@ def write_rsm(
     # 2b: schema-routed group + datasets (byte-identical).  h/k/l carry NO units
     # (no units_from in the schema) — do not add any, it would change the bytes.
     g = _create_group_from_schema(entry_grp, "rsm")
-    if bounded_artifact:
-        _bound_analysis_nxdata(g, ("h", "k", "l"))
     _schema_dataset(g, "rsm", "intensity", intensity, ck=ck)
     for name, axis in (("h", volume.h), ("k", volume.k), ("l", volume.l)):
         _schema_dataset(g, "rsm", name, axis, ck=ck)
     if prov is not None:
-        if bounded_artifact:
-            g.create_dataset(
-                "provenance_json",
-                data=np.bytes_(prov.encode("utf-8")),
-            )
-        else:
-            g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
+        g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
 
     if frame_records:
         from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
