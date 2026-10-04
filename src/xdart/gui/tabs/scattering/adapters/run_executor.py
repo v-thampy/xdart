@@ -2927,6 +2927,12 @@ class StandardRunExecutor:
             ("writer_batch", "sink_nexus_write"),
             ("writer_flush", "sink_nexus_flush"),
             ("xye", "sink_xye_write"),
+            ("xye_worker_format", "sink_xye_worker_format"),
+            ("xye_enqueue_wait", "sink_xye_enqueue_wait"),
+            ("xye_queue_high_water", "sink_xye_queue_high_water"),
+            ("xye_drain", "sink_xye_drain"),
+            ("xye_promotion", "sink_xye_promotion"),
+            ("xye_generated", "sink_xye_generated"),
             ("finish_wait", "finish_wait"),
             ("finish_writer_seal", "finish_writer_seal"),
             ("finish_display_drain", "finish_display_drain"),
@@ -3058,6 +3064,18 @@ class StandardRunExecutor:
                 perf.get("session_frame_listeners", 0.0),
                 perf.get("session_progress_listeners", 0.0),
             )
+            if "sink_xye_generated" in perf:
+                logger.info(
+                    "[PERF-XYE] worker-format=%.3fs enqueue-wait=%.3fs "
+                    "queue-high-water=%d drain=%.3fs promotion=%.3fs "
+                    "files=%d (parallel timers may overlap)",
+                    perf.get("sink_xye_worker_format", 0.0),
+                    perf.get("sink_xye_enqueue_wait", 0.0),
+                    perf.get("sink_xye_queue_high_water", 0),
+                    perf.get("sink_xye_drain", 0.0),
+                    perf.get("sink_xye_promotion", 0.0),
+                    perf["sink_xye_generated"],
+                )
         if quartile_timing is not None:
             logger.info(
                 "[PERF-QUARTILES] frames=%s",

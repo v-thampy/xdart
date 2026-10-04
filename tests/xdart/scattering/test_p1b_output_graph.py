@@ -3797,6 +3797,61 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
         executor.close(identity)
 
 
+@pytest.mark.parametrize("save_xye", (True, False))
+def test_terminal_xye_details_match_owned_worker_counters(
+    monkeypatch, tmp_path, caplog, save_xye,
+) -> None:
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.reduction import TransactionalXYESink
+
+    monkeypatch.setenv("XDART_PERF_QUARTILES", "1")
+    raw, poni = tmp_path / "timing_0001.tif", tmp_path / "timing.poni"
+    _write_tiff(raw, 7)
+    write_poni(poni)
+    intent = _intent(raw, tmp_path / "timing.nexus", poni)
+    intent.run_options["_post_g2_output_diagnostics_v1"] = {
+        "save_xye": save_xye, "durable_fsync": True,
+    }
+    sinks = []
+    open_session = dynamic_output.open_headless_scan_session
+
+    def observe_session(*args, **kwargs):
+        sink = kwargs["sink"]
+        sinks.extend(child for child in getattr(sink, "output_sink_children", (sink,))
+                     if isinstance(child, TransactionalXYESink))
+        return open_session(*args, **kwargs)
+
+    monkeypatch.setattr(dynamic_output, "open_headless_scan_session", observe_session)
+    caplog.set_level(logging.INFO)
+    executor, identity, events = _run_to_terminal(intent, request_value=1712)
+    try:
+        terminal = next(event for event in events if event.kind in _TERMINAL)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+        assert terminal.cleanup_status is CleanupStatus.CLEANED
+        details = dict(terminal.terminal_timing.details)
+        reported = {key: value for key, value in details.items()
+                    if key.startswith("xye_")}
+        logs = [record.getMessage() for record in caplog.records
+                if record.getMessage().startswith("[PERF-XYE]")]
+        assert _nexus_rows(_written(tmp_path / "timing.nexus")) == (1,)
+        assert len(tuple(tmp_path.rglob("*.xye"))) == int(save_xye)
+        if save_xye:
+            assert len(sinks) == 1
+            measured = sinks[0].perf_snapshot()
+            assert reported == {key.removeprefix("sink_"): value
+                                for key, value in measured.items()
+                                if key != "sink_xye_write"}
+            assert reported["xye_worker_format"] > 0
+            assert reported["xye_promotion"] > 0
+            assert reported["xye_generated"] == 1
+            assert 0 <= reported["xye_queue_high_water"] <= 16
+            assert len(logs) == 1 and "parallel timers may overlap" in logs[0]
+        else:
+            assert not sinks and not reported and not logs
+    finally:
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+
+
 @pytest.mark.parametrize("verification_recovers", (True, False))
 def test_no_xye_terminal_verification_failure_preserves_terminal_truth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verification_recovers,
