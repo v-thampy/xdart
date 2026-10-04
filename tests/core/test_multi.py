@@ -101,6 +101,39 @@ def test_create_integrators_mismatched_lengths(poni_fixture):
 # stitch_1d / stitch_2d
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("dimension", (1, 2))
+def test_eager_stitch_disables_native_geometry_pool(poni_fixture, monkeypatch, dimension):
+    """Cold eager geometry must not race shared compiled NumExpr expressions."""
+    from pyFAI.multi_geometry import MultiGeometry
+
+    method_name = f"integrate{dimension}d"
+    native_integrate = getattr(MultiGeometry, method_name)
+    pools = []
+
+    def observe_pool(owner, *args, **kwargs):
+        pools.append(owner.threadpool)
+        assert owner.threadpool is None
+        return native_integrate(owner, *args, **kwargs)
+
+    monkeypatch.setattr(MultiGeometry, method_name, observe_pool)
+    images = _synthetic_images(n=3)
+    integrators = _make_small_integrators(poni_fixture, [0.0, 5.0, 10.0])
+    try:
+        if dimension == 1:
+            result = stitch_1d(images, integrators, npt=120)
+            assert result.intensity.shape == (120,)
+        else:
+            result = stitch_2d(images, integrators, npt_rad=80, npt_azim=36)
+            assert result.intensity.shape == (80, 36)
+        assert np.isfinite(result.intensity).any()
+        assert pools == [None]
+    finally:
+        for pool in pools:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+
 def test_stitch_1d_runs(poni_fixture):
     integrators = _make_small_integrators(poni_fixture, rot1_angles=[0.0, 5.0, 10.0])
     images = _synthetic_images(n=3, shape=(100, 100), seed=1)

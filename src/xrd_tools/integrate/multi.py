@@ -1255,7 +1255,10 @@ def stitch_1d(
     lst_mask = ([mask_with_detector(ai, mask) for ai in integrators]
                 if mask is not None else None)
 
-    mg = MultiGeometry(integrators, unit=unit, radial_range=radial_range)
+    # Cold geometry evaluates shared compiled NumExpr; serialize the eager API.
+    mg = MultiGeometry(
+        integrators, unit=unit, radial_range=radial_range, threadpoolsize=0,
+    )
     result = mg.integrate1d(
         img_list,
         npt,
@@ -1335,6 +1338,7 @@ def stitch_2d(
         unit=unit,
         radial_range=radial_range,
         azimuth_range=azimuth_range,
+        threadpoolsize=0,
     )
     result = mg.integrate2d(
         img_list,
