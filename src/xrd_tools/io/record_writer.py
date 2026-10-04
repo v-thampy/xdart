@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import struct
+import time
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 import uuid
@@ -2220,6 +2221,11 @@ class NexusRecordWriter:
         self._vector = {name: 0 for name in _VECTOR_FIELDS}
         self._pending_owner: str | None = None
         self._finish_step = -1
+        self._perf_enabled = (
+            bool(os.environ.get("XDART_PERF"))
+            or os.environ.get("XDART_PERF_QUARTILES", "").strip() == "1"
+        )
+        self._perf_finish: dict[str, float] = {}
         self._finalization = WriterFinalization()
         self._fresh = False
         self._dirty_modes: dict[tuple[str, int], _ExpectedModeRow] = {}
@@ -4250,6 +4256,17 @@ class NexusRecordWriter:
     def operation_vector(self) -> WriterOperationVector:
         return WriterOperationVector(**self._vector)
 
+    def perf_snapshot(self) -> dict[str, float]:
+        """Opt-in finish timings; science readback is included in close."""
+        return dict(self._perf_finish)
+
+    def _record_finish_perf(self, owner: str, started: float) -> None:
+        if self._perf_enabled:
+            key = "writer_finish_" + owner.replace("-", "_")
+            self._perf_finish[key] = self._perf_finish.get(key, 0.0) + max(
+                0.0, time.perf_counter() - started,
+            )
+
     def reset_operation_vector(self) -> None:
         self._vector = {name: 0 for name in _VECTOR_FIELDS}
 
@@ -5709,6 +5726,7 @@ class NexusRecordWriter:
                     self._h5 = None
                     return
             if self._fast_regenerable and self._stream_close_attempt is not None:
+                started = time.perf_counter() if self._perf_enabled else 0.0
                 try:
                     fast_evidence = self._verify_fast_integrated_results()
                 except BaseException:
@@ -5717,6 +5735,8 @@ class NexusRecordWriter:
                         lease=binding.lease,
                     )
                     raise
+                finally:
+                    self._record_finish_perf("science_readback", started)
         if self._h5 is not None:
             try:
                 self._h5.close()
@@ -6421,7 +6441,11 @@ class NexusRecordWriter:
                 while self._finish_step < len(steps):
                     owner, action = steps[self._finish_step]
                     self._pending_owner = owner
-                    action()
+                    started = time.perf_counter() if self._perf_enabled else 0.0
+                    try:
+                        action()
+                    finally:
+                        self._record_finish_perf(owner, started)
                     if owner == "flush":
                         self._bump("flush_boundaries")
                     self._finish_step += 1

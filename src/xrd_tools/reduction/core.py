@@ -2878,10 +2878,13 @@ class NexusSink:
         if not self._perf_nexus_enabled:
             return {}
         with self._perf_nexus_lock:
-            return {
+            values = {
                 "sink_nexus_write": self._perf_nexus_write,
                 "sink_nexus_flush": self._perf_nexus_flush,
             }
+        if self._writer is not None:
+            values.update(self._writer.perf_snapshot())
+        return values
 
     def _writer_finalization(self, writer: NexusRecordWriter) -> WriterFinalization:
         if self._replacement is not None: return WriterFinalization()
