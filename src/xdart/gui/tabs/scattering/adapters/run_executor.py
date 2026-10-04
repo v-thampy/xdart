@@ -2939,6 +2939,10 @@ class StandardRunExecutor:
         ):
             if key in perf:
                 timing_details.append((name, float(perf[key])))
+        timing_details.extend(
+            (key, float(value)) for key, value in perf.items()
+            if key.startswith("writer_finish_")
+        )
         display_keys = ("display_callback", "display_projection")
         if any(key in perf for key in display_keys):
             timing_details.append((
@@ -3075,6 +3079,13 @@ class StandardRunExecutor:
                     perf.get("sink_xye_drain", 0.0),
                     perf.get("sink_xye_promotion", 0.0),
                     perf["sink_xye_generated"],
+                )
+            if "writer_finish_close" in perf:
+                logger.info(
+                    "[PERF-WRITER-FINISH] %s (science-readback is included in close)",
+                    " ".join(f"{key.removeprefix('writer_finish_')}={value:.3f}s"
+                             for key, value in perf.items()
+                             if key.startswith("writer_finish_")),
                 )
         if quartile_timing is not None:
             logger.info(

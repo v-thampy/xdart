@@ -3798,13 +3798,17 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
 
 
 @pytest.mark.parametrize("save_xye", (True, False))
+@pytest.mark.parametrize("profiled", (True, False), ids=("profiled", "unprofiled"))
 def test_terminal_xye_details_match_owned_worker_counters(
-    monkeypatch, tmp_path, caplog, save_xye,
+    monkeypatch, tmp_path, caplog, save_xye, profiled,
 ) -> None:
     from xdart.gui.tabs.scattering.adapters import dynamic_output
-    from xrd_tools.reduction import TransactionalXYESink
+    from xrd_tools.reduction import NexusSink, TransactionalXYESink
 
-    monkeypatch.setenv("XDART_PERF_QUARTILES", "1")
+    monkeypatch.delenv("XDART_PERF", raising=False)
+    monkeypatch.delenv("XDART_PERF_QUARTILES", raising=False)
+    if profiled:
+        monkeypatch.setenv("XDART_PERF_QUARTILES", "1")
     raw, poni = tmp_path / "timing_0001.tif", tmp_path / "timing.poni"
     _write_tiff(raw, 7)
     write_poni(poni)
@@ -3813,22 +3817,46 @@ def test_terminal_xye_details_match_owned_worker_counters(
         "save_xye": save_xye, "durable_fsync": True,
     }
     sinks = []
+    nexus_sinks = []
     open_session = dynamic_output.open_headless_scan_session
 
     def observe_session(*args, **kwargs):
         sink = kwargs["sink"]
         sinks.extend(child for child in getattr(sink, "output_sink_children", (sink,))
                      if isinstance(child, TransactionalXYESink))
+        nexus_sinks.extend(child for child in getattr(sink, "output_sink_children", (sink,))
+                           if isinstance(child, NexusSink))
         return open_session(*args, **kwargs)
 
     monkeypatch.setattr(dynamic_output, "open_headless_scan_session", observe_session)
     caplog.set_level(logging.INFO)
     executor, identity, events = _run_to_terminal(intent, request_value=1712)
     try:
+        # The event is queued before terminal logging; join its real worker
+        # before inspecting caplog, rather than racing the final log emission.
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
         terminal = next(event for event in events if event.kind in _TERMINAL)
         assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
         assert terminal.cleanup_status is CleanupStatus.CLEANED
         details = dict(terminal.terminal_timing.details)
+        (nexus,) = nexus_sinks
+        measured_finish = nexus._writer.perf_snapshot()
+        if not profiled:
+            assert not measured_finish and not nexus.perf_snapshot()
+            assert not any(key.startswith("writer_finish_") for key in details)
+            assert not any(record.getMessage().startswith("[PERF-WRITER-FINISH]")
+                           for record in caplog.records)
+            assert _nexus_rows(_written(tmp_path / "timing.nexus")) == (1,)
+            assert len(tuple(tmp_path.rglob("*.xye"))) == int(save_xye)
+            return
+        assert measured_finish
+        assert {key: value for key, value in details.items()
+                if key.startswith("writer_finish_")} == measured_finish
+        assert {key: value for key, value in nexus.perf_snapshot().items()
+                if key.startswith("writer_finish_")} == measured_finish
+        assert 0 < measured_finish["writer_finish_science_readback"] <= measured_finish["writer_finish_close"]
+        assert any(record.getMessage().startswith("[PERF-WRITER-FINISH]")
+                   for record in caplog.records)
         reported = {key: value for key, value in details.items()
                     if key.startswith("xye_")}
         logs = [record.getMessage() for record in caplog.records
