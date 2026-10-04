@@ -12,6 +12,7 @@ class StitchMetadataDialog(MetadataResultDialog):
     def __init__(self, provenance_json, parent=None):
         super().__init__(parent)
         self.provenance_button = QtWidgets.QPushButton("Provenance…", self)
+        self.provenance_button.setToolTip("Show the provenance saved with this Stitch result.")
         self.layout().addWidget(self.provenance_button)
         # the saved provenance: the shared read-only text window (Codex's combined stage-2b review F2)
         self.provenance_dialog = ReadOnlyTextWindow("Saved Stitch provenance", (720, 520), self)

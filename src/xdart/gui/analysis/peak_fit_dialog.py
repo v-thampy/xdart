@@ -78,7 +78,6 @@ class PeakFitDialog(QtWidgets.QDialog):
         self._allow_batch = bool(allow_batch)
         self._export_trace = None
         self._export_snapshot_provider = None
-        self._analysis_context = analysis_context
         self._provider = (
             analysis_context.current_pattern_tuple
             if analysis_context is not None else pattern_provider)

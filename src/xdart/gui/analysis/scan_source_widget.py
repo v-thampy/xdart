@@ -120,7 +120,6 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
     def __init__(self, mode="roi", parent=None, *, async_probe=False):
         super().__init__(parent)
-        self._mode = mode
         self._controls_source = mode == "controls_source"
         self._external_execution = mode == "vnext_analysis"
         self._external_candidates = ()

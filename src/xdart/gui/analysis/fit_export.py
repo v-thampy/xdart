@@ -69,6 +69,7 @@ class FitExportActions(QtCore.QObject):
         self.buttons = {}
         for format, label in (('jupyter', 'Export Jupyter…'), ('marimo', 'Export marimo…')):
             button = QtWidgets.QPushButton(label, parent)
+            button.setToolTip(f"Export the current fitting workflow as a {format} notebook.")
             button.clicked.connect(lambda _checked=False, format=format: self.choose(format))
             row.addWidget(button)
             self.buttons[format] = button
