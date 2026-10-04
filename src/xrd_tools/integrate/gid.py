@@ -393,8 +393,8 @@ def create_fiber_integrator(
     return fi
 
 
-def _nan_empty_1d(result):
-    """Return a 1D result's intensity with EMPTY bins set to NaN.
+def _nan_empty_1d(result, arr=None):
+    """Return a 1D result's intensity (or ``arr``) with EMPTY bins set to NaN.
 
     pyFAI fills bins with no contributing pixels (``count == 0``) with 0, so a
     frozen output range wider than the data (the GI-freeze coverage pad) — and
@@ -402,10 +402,10 @@ def _nan_empty_1d(result):
     (the points-at-negative-Q artifact).  NaN-marking those bins keeps them out
     of the plot; the aggregations are NaN-aware (nanmean/nansum) and the
     equivalence spine compares with equal_nan.  Defensive: if no per-bin
-    ``count`` is exposed (some fiber methods), the intensity is returned
+    ``count`` is exposed (some fiber methods), the array is returned
     unchanged.
     """
-    intensity = np.asarray(result.intensity, dtype=float)
+    intensity = np.asarray(result.intensity if arr is None else arr, dtype=float)
     count = getattr(result, "count", None)
     if count is not None:
         count = np.asarray(count)

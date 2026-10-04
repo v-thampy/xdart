@@ -110,3 +110,24 @@ def test_a_native_stitch_2d_record_is_an_int_2d_record(tmp_path):
         del handle["entry/stitch/map"]
     with pytest.raises(AnalysisArtifactInvalid):
         read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_2D)
+
+
+@pytest.mark.parametrize("mode", ("1d", "2d"))
+def test_native_stitch_save_reload_preserves_missing_pattern_bins(tmp_path, mode):
+    """Actual native artifacts and Int's reader retain missing-data NaNs in I(q)."""
+    native = _native(tmp_path, _prepared(tmp_path), mode=mode)
+    native = prepare_stitch_operation(
+        native.module.source, native.module.output, replace(native.plan, error_model="poisson"),
+        project_root=tmp_path,
+    )
+    result = run_stitch_operation(native)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal.diagnostic
+    payload = read_analysis_artifact(native.module.output.target)
+    pattern = payload if mode == "1d" else payload.profile
+    empty = pattern.coverage == 0
+    assert np.any(empty) and np.any(~empty)
+    assert np.isnan(pattern.intensity[empty]).all()
+    assert pattern.sigma is not None
+    assert np.isnan(pattern.sigma[empty]).all()
+    view = read_frame_view(native.module.output.target, 1, include_thumbnail=False)
+    np.testing.assert_array_equal(view.intensity_1d, pattern.intensity)

@@ -31,6 +31,7 @@ from xrd_tools.integrate import pyfai_numexpr
 from xrd_tools.integrate.frame_workers import parallel_frames
 from xrd_tools.integrate.detector_mask import mask_with_detector
 from xrd_tools.integrate.calibration import poni_to_integrator
+from xrd_tools.integrate.gid import _nan_empty_1d
 from xrd_tools.integrate.stitch_gi import GI_CUTS, GI_UNITS
 
 if TYPE_CHECKING:
@@ -770,13 +771,13 @@ def stitch_1d_streaming(
 
 
 def _stitch_1d_payload(result, unit: str) -> tuple[IntegrationResult1D, StitchDiagnostics]:
-    """A merged 1-D result as Stitch returns it: I(q) and its per-bin coverage and weight."""
+    """Stitch I(q), uncertainty, coverage and weight; uncovered 1-D bins are NaN."""
     sigma = result.sigma if result.sigma is not None else None
     radial_unit = str(result.unit) if result.unit is not None else unit
     payload = IntegrationResult1D(
         radial=np.asarray(result.radial, dtype=float),
-        intensity=np.asarray(result.intensity, dtype=float),
-        sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
+        intensity=_nan_empty_1d(result),
+        sigma=_nan_empty_1d(result, sigma) if sigma is not None else None,
         unit=radial_unit,
     )
     return payload, StitchDiagnostics(result.count, result.sum_normalization)
@@ -1264,14 +1265,7 @@ def stitch_1d(
         **kwargs,
     )
 
-    sigma = result.sigma if result.sigma is not None else None
-    unit_str = str(result.unit) if result.unit is not None else unit
-    return IntegrationResult1D(
-        radial=np.asarray(result.radial, dtype=float),
-        intensity=np.asarray(result.intensity, dtype=float),
-        sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
-        unit=unit_str,
-    )
+    return _stitch_1d_payload(result, unit)[0]
 
 
 def stitch_2d(

@@ -266,8 +266,11 @@ def test_one_ai_streaming_matches_multigeometry_raw_accumulators(
             error_model="poisson",
         )
         np.testing.assert_array_equal(streamed.radial, eager.radial)
-        np.testing.assert_array_equal(streamed.intensity, eager.intensity)
-        np.testing.assert_array_equal(streamed.sigma, eager.sigma)
+        empty = eager.count == 0
+        assert np.isnan(streamed.intensity[empty]).all()
+        assert np.isnan(streamed.sigma[empty]).all()
+        np.testing.assert_array_equal(streamed.intensity[~empty], eager.intensity[~empty])
+        np.testing.assert_array_equal(streamed.sigma[~empty], eager.sigma[~empty])
         np.testing.assert_array_equal(diagnostics.coverage, eager.count)
         np.testing.assert_array_equal(
             diagnostics.normalization,
@@ -416,6 +419,62 @@ def test_streaming_multigeometry_matches_native_union_result(
         assert streamed.sigma is not None
         assert streamed.sum_variance is not None
         assert streamed.sum_normalization2 is not None
+
+
+@pytest.mark.parametrize("route", ("eager", "streaming", "2d-profile"))
+@pytest.mark.parametrize("error_model", (None, "poisson", "azimuthal"))
+@pytest.mark.parametrize("counts", (0.0, 10.0))
+def test_native_stitch_patterns_mark_only_uncovered_bins_nan(
+    poni_fixture, route, error_model, counts,
+):
+    """Public native patterns preserve covered data and mark missing measurements NaN."""
+    from pyFAI.multi_geometry import MultiGeometry
+    from xrd_tools.integrate.multi import stitch_2d_with_1d_streaming
+
+    angles = [0.0, 4.0, 9.0]
+    images = [np.full((100, 100), counts) for _ in angles]
+    radial_range = (0.1, 6.0)
+    options = dict(method="BBox", error_model=error_model)
+    reference = MultiGeometry(
+        _make_small_integrators(poni_fixture, angles), unit="q_A^-1",
+        radial_range=radial_range, threadpoolsize=0,
+    ).integrate1d(images, 120, correctSolidAngle=False, **options)
+    if route == "eager":
+        result = stitch_1d(
+            images, _make_small_integrators(poni_fixture, angles), npt=120,
+            radial_range=radial_range, correctSolidAngle=False, **options,
+        )
+    else:
+        def factory():
+            return iter(_make_small_integrators(poni_fixture, angles))
+
+        if route == "streaming":
+            result, diagnostics, _cuts = stitch_1d_streaming(
+                images, len(images), factory, npt=120, radial_range=radial_range,
+                correct_solid_angle=False, **options,
+            )
+        else:
+            _map, _map_diagnostics, result, diagnostics, _cuts, _gi_map = (
+                stitch_2d_with_1d_streaming(
+                    images, len(images), factory, npt_rad=80, npt_azim=36,
+                    npt_1d=120, radial_range=radial_range,
+                    radial_range_1d=radial_range, correct_solid_angle=False, **options,
+                )
+            )
+        np.testing.assert_array_equal(diagnostics.coverage, reference.count)
+        np.testing.assert_array_equal(diagnostics.normalization, reference.sum_normalization)
+    empty = reference.count == 0
+    assert np.any(empty) and np.any(~empty)
+    np.testing.assert_array_equal(result.radial, reference.radial)
+    assert np.isnan(result.intensity[empty]).all()
+    np.testing.assert_array_equal(result.intensity[~empty], reference.intensity[~empty])
+    if counts == 0:
+        assert (result.intensity[~empty] == 0).all()
+    if error_model is None:
+        assert result.sigma is None
+    else:
+        assert np.isnan(result.sigma[empty]).all()
+        np.testing.assert_array_equal(result.sigma[~empty], reference.sigma[~empty])
 
 
 def test_streaming_multigeometry_preserves_native_mixed_variance_union(
@@ -912,9 +971,10 @@ def _window_sums(gi, bins, mask, image=None, integrator=None, **corrections):
 def test_codex_f1_a_pixel_below_the_other_window_counts_in_neither_gi_cut():
     """Codex final review F1: a thin pass's one-bin coordinate admitted pixels up to the whole window
     width below it (pyFAI's histogram truncates a bin index in (-1, 0) to bin 0). Only pixel (28, 0)
-    is unmasked: native 2026.9 Qip -0.0900 lies inside (-0.4, 0.4), Qoop 0.4359 below (0.5, 1.3).
+    is unmasked: sample-orientation 2 Qip -0.0900 lies inside (-0.4, 0.4), Qoop 0.4359 below (0.5, 1.3).
     A thin pass would count it once (signal 100), the 37 × 37 square not at all. Neither may count it.
-    The window retains the original low-edge discriminator after upstream's position sign fix."""
+    The window matches the fixture's sample orientation and retains the low-edge discriminator;
+    these coordinates are unchanged between pyFAI 2026.5 and 2026.9."""
     from xrd_tools.integrate.stitch_gi import StitchGI
     q_ip, q_oop = _window_probe_coordinates((.37, 1.8))
     assert -.4 < q_ip[28, 0] < .4 and 0 < .5 - q_oop[28, 0] < .8
