@@ -24,8 +24,10 @@ weighted fit over the joint finite-positive-sigma mask. Uncertainties come from 
 reduced chi-square, lmfit's default) and the delta method; they are unavailable (None), never zero, when a
 parameter sits on a bound or the normal matrix is singular.
 
-Bounds: centres inside the region, positive heights, each Cholesky diagonal (the conditional width of its axis)
-at least ``WIDTH_FLOOR_BINS`` of that axis's median bin spacing. Caps, checked before any mesh, box copy or
+Bounds: centres inside the region, positive heights and numerically positive Cholesky diagonals.
+After solving, every principal model-shape scale in median-bin units must be at least
+``WIDTH_FLOOR_BINS`` (Gaussian sigma; the other profiles' shape scale). This resolution policy is invariant
+under axis permutation and unit scaling; unresolved components are refused by name. Caps, checked before any mesh, box copy or
 Jacobian exists: ``MAX_POINTS`` region points, ``MAX_COMPONENTS`` components, ``MAX_PARAMETERS`` free parameters.
 A fit needs at least twice as many usable samples as free parameters. A ``cancel_token`` is checked at every
 model and Jacobian evaluation, so an active solve stops (``RegionFitCancelled``) rather than draining.
@@ -541,7 +543,7 @@ def _fit_region(
     base = float(np.percentile(y, 5)) if layout.n_background else 0.0
     if layout.n_background:
         x0[0] = base
-    floors = np.array([WIDTH_FLOOR_BINS * np.median(np.abs(np.diff(axis.values))) for axis in axes]) / half
+    spacing = np.array([np.median(np.abs(np.diff(axis.values))) for axis in axes])
     r_half = _HALF_HEIGHT_RADIUS[profile]
     if not seeds:
         peak = np.unravel_index(int(np.nanargmax(masked)), shape)
@@ -571,7 +573,7 @@ def _fit_region(
             position = o + 1 + ndim + k
             if a == b:
                 x0[position] = widths[a]
-                lower_bound[position], upper_bound[position] = floors[a], _SHAPE_BOUND
+                lower_bound[position], upper_bound[position] = np.sqrt(np.finfo(float).eps), _SHAPE_BOUND
             else:
                 lower_bound[position], upper_bound[position] = -_SHAPE_BOUND, _SHAPE_BOUND
         if profile == "pseudovoigt":
@@ -621,6 +623,16 @@ def _fit_region(
     solution = least_squares(residuals, x0, bounds=(lower_bound, upper_bound), method="trf",
                              ftol=1e-10, xtol=1e-10, gtol=1e-10, **options)
     p = solution.x
+    # Conditional Cholesky widths depend on axis order. Judge resolution using
+    # principal shape scales after expressing every axis in its own bin units.
+    for j, seed in enumerate(seeds):
+        _height, _center, lower, _eta = layout.unpack(p, j)
+        in_bins = lower * (half / spacing)[:, None]
+        minimum = math.sqrt(max(0.0, float(np.linalg.eigvalsh(in_bins @ in_bins.T)[0])))
+        if minimum < WIDTH_FLOOR_BINS:
+            raise RegionFitRefused("PEAK_UNDERSAMPLED",
+                f"component {seed.id!r} has minimum principal {profile} shape scale "
+                f"{minimum:.6g} bins; at least {WIDTH_FLOOR_BINS:g} bins are required")
     success = bool(solution.status > 0)
     message, nfev, at_bound = str(solution.message), int(solution.nfev), bool(np.any(solution.active_mask != 0))
     chisqr = float(2.0 * solution.cost)
