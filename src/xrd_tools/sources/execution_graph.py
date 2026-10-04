@@ -628,7 +628,8 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         if reader_binding:
             from xrd_tools.io.metadata import read_image_metadata_observed
             read_image_metadata_observed(files[0], "spec",
-                meta_dir=qualified.get("meta_dir"), max_input_bytes=1 << 16)
+                meta_dir=qualified.get("meta_dir"), max_input_bytes=1 << 16,
+                spec_point_snapshot=True)
         grouped_source = open_source(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
     members: list[SourceFileState] = []; metadata_sources: list[AdmittedMetadataSource] = []
     motor_rows: list[AdmittedMotorValue] = []
@@ -653,13 +654,15 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         _cancelled(cancelled)
         first = (ImageMetadataRead({}, None) if metadata_format is None else
                  read_image_metadata_observed(path, metadata_format, meta_dir=qualified.get("meta_dir"),
-                    max_input_bytes=(1 << 16) if reader_binding else None))
+                    max_input_bytes=(1 << 16) if reader_binding else None,
+                    spec_point_snapshot=bool(reader_binding)))
         _cancelled(cancelled)
         first_state = None if first.source_path is None else SourceFileState.capture(first.source_path)
         _cancelled(cancelled)
         second = (ImageMetadataRead({}, None) if metadata_format is None else
                   read_image_metadata_observed(path, metadata_format, meta_dir=qualified.get("meta_dir"),
-                    max_input_bytes=(1 << 16) if reader_binding else None))
+                    max_input_bytes=(1 << 16) if reader_binding else None,
+                    spec_point_snapshot=bool(reader_binding)))
         if grouped_source is not None:
             point = index // grouped_source.point_image_policy.images_per_point + 1
             first = ImageMetadataRead(dict(grouped_source.metadata_for(point)), first.source_path)
@@ -2157,7 +2160,7 @@ class _AverageSourceReadWindow:
         if self._cursor is not None:
             return dict(self._cursor.metadata_provider().complete_metadata_for(index))
         return dict(getattr(self._tiff, "metadata_for")(
-            index + 1, max_input_bytes=1 << 16,
+            index + 1, max_input_bytes=1 << 16, spec_point_snapshot=True,
         ))
     def metadata_wavelength(self):
         """Declared wavelength from this already-qualified container owner."""

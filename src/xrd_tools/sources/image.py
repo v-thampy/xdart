@@ -13,7 +13,7 @@ import numpy as np
 
 from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec
 from xrd_tools.io.image import count_frames, find_image_files, read_image
-from xrd_tools.io.metadata import read_image_metadata, read_image_metadata_observed
+from xrd_tools.io.metadata import read_image_metadata_observed
 from xrd_tools.sources.base import BaseFrameSource
 
 
@@ -83,13 +83,15 @@ class ImageFileSource(BaseFrameSource):
 
     def metadata_for(
         self, index: int, *, max_input_bytes: int | None = None,
+        spec_point_snapshot: bool = False,
     ) -> Mapping[str, Any]:
         if self.metadata_format is None:
             return {}
-        return read_image_metadata(
+        return dict(read_image_metadata_observed(
             self.path, self.metadata_format, meta_dir=self.meta_dir,
             max_input_bytes=max_input_bytes,
-        )
+            spec_point_snapshot=spec_point_snapshot,
+        ).values)
 
     def frame_for(self, index: int) -> ScanFrame:
         return ScanFrame(
@@ -295,6 +297,7 @@ class TiffSeriesSource(BaseFrameSource):
 
     def metadata_for(
         self, index: int, *, max_input_bytes: int | None = None,
+        spec_point_snapshot: bool = False,
     ) -> Mapping[str, Any]:
         if self._point_source is not None:
             return self._point_source.metadata_for(int(index) - 1)
@@ -306,6 +309,7 @@ class TiffSeriesSource(BaseFrameSource):
             observed = read_image_metadata_observed(
                 path, self.metadata_format, meta_dir=self.meta_dir,
                 max_input_bytes=max_input_bytes,
+                spec_point_snapshot=spec_point_snapshot,
             )
             metadata = dict(observed.values)
             self._observed_metadata_sources[int(index)] = observed.source_path

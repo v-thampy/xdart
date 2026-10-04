@@ -514,6 +514,9 @@ def _bounded_metadata_snapshot(
     if fence_revision(before) != fence_revision(after):
         raise OSError(f"metadata input changed during bounded read: {path}")
     if len(payload) > limit:
+        if os.environ.get("XDART_METADATA_DEBUG") == "1":
+            logger.warning("metadata_snapshot_refused path=%s limit_bytes=%d",
+                           path, limit, stack_info=True)
         raise MetadataInputTooLarge(f"metadata input exceeds {limit} bytes: {path}")
     if _with_revision:
         # A descriptor view: comparable with the pathname revisions above
@@ -524,6 +527,83 @@ def _bounded_metadata_snapshot(
             identity_ctime_ns(after.st_ctime_ns),
         )
     return payload
+
+
+_SPEC_POINT_FILE_MAX_BYTES = 1 << 25
+
+
+def _bounded_spec_point_snapshot(path: Path, scan_number: int, image_number: int,
+                                 limit: int) -> tuple[bytes, MetadataSourceRevision]:
+    """Copy one SPEC point for silx, retaining the original descriptor revision.
+
+    SPEC is a multi-scan input, unlike a per-image sidecar. The parser payload
+    and each scanned line retain the caller's bound; physical scanning has its
+    own 32 MiB bound. Motor-name updates preceding the first matching scan are
+    inherited. Keeping the last requested-or-earlier row preserves clamping.
+    """
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("max_input_bytes must be a positive integer")
+    headers: dict[bytes, bytes] = {}
+    selected = bytearray()
+    point = b""
+    active = False
+    file_header = True
+    row_index = 0
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        if before.st_size > _SPEC_POINT_FILE_MAX_BYTES:
+            raise MetadataInputTooLarge(
+                f"SPEC file exceeds {_SPEC_POINT_FILE_MAX_BYTES} bytes: {path}")
+        scanned = 0
+        mca_continuation = False
+        while raw := stream.readline(limit + 1):
+            scanned += len(raw)
+            if len(raw) > limit:
+                raise MetadataInputTooLarge(f"SPEC line exceeds {limit} bytes: {path}")
+            if scanned > _SPEC_POINT_FILE_MAX_BYTES:
+                raise MetadataInputTooLarge(
+                    f"SPEC file exceeds {_SPEC_POINT_FILE_MAX_BYTES} bytes: {path}")
+            line = raw.strip()
+            marker = line.split(None, 1)[0] if line else b""
+            if active and marker == b"#F":
+                break
+            if marker == b"#S":
+                if active:
+                    break
+                fields = line.split(None, 2)
+                file_header = False
+                active = len(fields) > 1 and fields[1] == str(scan_number).encode("ascii")
+                if active:
+                    selected.extend(raw)
+            elif active:
+                if line.startswith(b"@") or mca_continuation:
+                    mca_continuation = line.endswith(b"\\")
+                    continue
+                if line.startswith(b"#"):
+                    selected.extend(raw)
+                elif line:
+                    if line.endswith(b"\\"):
+                        raise MetadataInputTooLarge("bounded SPEC point requires an unwrapped data row")
+                    if row_index <= image_number:
+                        point = raw if raw.endswith(b"\n") else raw + b"\n"
+                    row_index += 1
+            elif marker == b"#F":
+                headers = {marker: raw}
+                file_header = True
+            elif file_header and (marker == b"#E" or re.fullmatch(rb"#[Oo]\d+", marker)):
+                headers[marker] = raw
+            if sum(map(len, headers.values())) + len(selected) + len(point) > limit:
+                raise MetadataInputTooLarge(f"SPEC point snapshot exceeds {limit} bytes: {path}")
+        after = os.fstat(stream.fileno())
+    descriptor_fence = lambda value: (
+        value.st_mode, value.st_dev, value.st_ino, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    )
+    if descriptor_fence(before) != descriptor_fence(after):
+        raise OSError(f"metadata input changed during bounded read: {path}")
+    revision = (int(after.st_mode), int(after.st_dev), int(after.st_ino),
+                int(after.st_size), int(after.st_mtime_ns), identity_ctime_ns(after.st_ctime_ns))
+    return b"".join(headers.values()) + bytes(selected) + point, revision
 
 
 def _read_auto_candidate_metadata(
@@ -940,12 +1020,15 @@ def read_image_metadata_observed(
     meta_dir: Path | str | None = None,
     *,
     max_input_bytes: int | None = None,
+    spec_point_snapshot: bool = False,
 ) -> ImageMetadataRead:
     """Read image metadata and report the exact accepted metadata file.
 
     The parsing and discovery policy is identical to :func:`read_image_metadata`.
     The additional path is intended for admission, collision protection, and
     provenance owners that must retain the file actually consumed.
+    ``spec_point_snapshot`` selects Average's bounded single-point SPEC policy;
+    it requires ``max_input_bytes`` and leaves other formats unchanged.
     """
 
     image_path = _lexical_absolute(image_path)
@@ -1017,6 +1100,7 @@ def read_image_metadata_observed(
                 image_path,
                 search_dir=search_dir,
                 max_input_bytes=max_input_bytes,
+                spec_point_snapshot=spec_point_snapshot,
             ),
             discovery_revisions,
         )
@@ -1065,6 +1149,7 @@ def _read_spec_metadata_observed(
     search_dir: Path | None = None,
     *,
     max_input_bytes: int | None = None,
+    spec_point_snapshot: bool = False,
 ) -> ImageMetadataRead:
     """Extract per-image counters and motor positions from a SPEC file.
 
@@ -1138,9 +1223,10 @@ def _read_spec_metadata_observed(
             )
             return ImageMetadataRead({}, None)
 
-        observed = _bounded_metadata_snapshot(
-            spec_file, max_input_bytes, _with_revision=True,
-        )
+        observed = (_bounded_spec_point_snapshot(spec_file, scan_number, image_number,
+                                                max_input_bytes)
+                    if spec_point_snapshot else _bounded_metadata_snapshot(
+                        spec_file, max_input_bytes, _with_revision=True))
         if observed is None:
             revision = _metadata_path_revision(spec_file)
             sf = SpecFile(str(spec_file))
@@ -1172,7 +1258,7 @@ def _read_spec_metadata_observed(
             parser = SpecFile(str(scratch))
             scan = parser[f"{scan_number}.1"]
             npts = scan.data.shape[1]
-            img_idx = min(image_number, npts - 1)
+            img_idx = min(0 if spec_point_snapshot else image_number, npts - 1)
             counters = {label: float(scan.data_column_by_name(label)[img_idx])
                         for label in scan.labels}
             motors = {name: float(scan.motor_position_by_name(name))
@@ -1225,6 +1311,8 @@ def _read_spec_metadata_observed(
     except (MetadataInputTooLarge, MetadataScratchCleanupFailed):
         raise
     except Exception as error:
+        if spec_point_snapshot and isinstance(error, OSError):
+            raise
         if isinstance(error.__cause__, MetadataScratchCleanupFailed):
             raise
         logger.warning(
