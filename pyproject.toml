@@ -37,7 +37,7 @@ dependencies = [
     # reader to load Dectris Eiger data and to read/write lz4-compressed
     # integrated stacks.  Lightweight, so kept in the base deps (not just GUI).
     "hdf5plugin",
-    "nexusformat",
+    "nexusformat==2.0.3",
     "fabio",
     "silx",              # io.spec / io.metadata SPEC parsing
     # Keep the audited 2026.9 API/serialization line bounded: PONI v3,
@@ -64,8 +64,8 @@ gui = [
     # which raises "PyOpenGL is not installed" unless silx[full] was chosen.
     "PyOpenGL",
     # External NeXus GUI; reuse our PySide6 (not nexpy[qt], which adds PyQt5).
-    # Keep this release on the tested nexusformat 2.0.2 dependency line.
-    "nexpy==2.0.1",
+    # Keep the viewer and NeXus reader on the qualified 2.0.3 dependency line.
+    "nexpy==2.0.3",
     "imagecodecs",
     "imageio",
     "packaging",         # Help → Check for Updates… version comparison (updater.py)

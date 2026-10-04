@@ -74,7 +74,7 @@ requirements:
     - xarray
     - h5py
     - hdf5plugin
-    - nexusformat
+    - nexusformat ==2.0.3
     # nexusformat 2.0.3 requires this, but its conda-forge recipe omits it.
     - chardet
     - fabio
@@ -93,7 +93,7 @@ requirements:
     - pyside6 >=6.5
     - pyqtgraph >=0.13.7
     - qtawesome
-    - nexpy ==2.0.1               # external NeXus browser; silx view is already included
+    - nexpy ==2.0.3               # external NeXus browser; silx view is already included
     - imagecodecs
     - imageio
     - packaging
