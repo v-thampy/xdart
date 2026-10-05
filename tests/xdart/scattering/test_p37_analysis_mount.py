@@ -2544,7 +2544,7 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
     try:
         page._open_analysis_mount("scan_roi"); dialog = page._scan_roi_dialog
         table = replace(_table(fingerprint="retained-table"),
-                        storage_bytes=64 << 20)
+                        storage_bytes=32 << 20)
         page._metadata_result = table; dialog.set_vnext_metadata(table)
         dialog._vnext_rendering = True
         try: _check_item(dialog.r_list, "signal")
@@ -2614,7 +2614,7 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
             table_fingerprint=table.table_fingerprint, x_name="motor",
             x=np.arange(3.0), trace_names=("signal",),
             original_identities=("signal",), traces=(np.arange(3.0),),
-            storage_bytes=64 << 20)
+            storage_bytes=32 << 20)
         assert consume("scan_plot", scan, scan_request)
         old_items = tuple(dialog.plot.listDataItems()); old_right = tuple(
             dialog.right_vb.addedItems); old_request = dialog._vnext_scan_request
@@ -2633,27 +2633,27 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
         assert (tuple(dialog.plot.listDataItems()), tuple(dialog.right_vb.addedItems)) == (
             old_items, old_right)
 
-        roi = replace(over_roi, storage_bytes=64 << 20)
+        roi = replace(over_roi, storage_bytes=32 << 20)
         assert consume("roi_scan", roi, roi_request)
         assert page._scan_roi_result is dialog._vnext_roi_result is roi
-        assert dialog._vnext_scan_result is dialog._vnext_scan_request is None
-        assert not dialog.plot.listDataItems() and not dialog.right_vb.addedItems
+        assert dialog._vnext_scan_result is scan and dialog._vnext_scan_request is old_request
+        assert (tuple(dialog.plot.listDataItems()), tuple(dialog.right_vb.addedItems)) == (old_items, old_right)
         retained = (page._metadata_result, page._scan_roi_result,
                     dialog._vnext_table_result, dialog._vnext_scan_result,
                     dialog._vnext_roi_result)
         unique = {id(value): value for value in retained if value is not None}
-        assert sum(value.storage_bytes for value in unique.values()) == 128 << 20
+        assert sum(value.storage_bytes for value in unique.values()) == 96 << 20
 
         assert consume("scan_plot", scan, scan_request)
         assert (page._scan_roi_result is dialog._vnext_scan_result is scan
-                and dialog._vnext_roi_result is None)
+                and dialog._vnext_roi_result is roi)
         preview_request = ("roi_preview", (), (table.receipt,
                            table.table_fingerprint, table.labels, table.labels[0]))
         preview = RoiPreviewResult(
             AnalysisDisposition.COMPLETED, "OK", receipt=table.receipt,
             table_fingerprint=table.table_fingerprint, labels=table.labels,
             label=table.labels[0], image=np.ones((3, 3)),
-            result_fingerprint="retained-preview", storage_bytes=64 << 20)
+            result_fingerprint="retained-preview", storage_bytes=32 << 20)
         assert consume("roi_preview", preview, preview_request)
         picker = dialog._roi_dialog; binding = page._roi_preview_binding; destroyed = []
         picker.destroyed.connect(lambda *_args: destroyed.append(True))
@@ -2675,11 +2675,11 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
         assert consume("metadata", replacement, replacement_facts)
         assert page._metadata_result is dialog._vnext_table_result is replacement
         assert page._scan_roi_result is page._roi_preview_binding is None
-        assert dialog._roi_dialog is None
+        assert dialog._roi_dialog is picker and picker._image is None
         assert not dialog.plot.listDataItems() and not dialog.right_vb.addedItems
         QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
         qapp.processEvents()
-        assert destroyed == [True]
+        assert not destroyed
 
         page._scan_roi_result = scan
         dialog.set_vnext_scan_result(scan, scan_request[2])

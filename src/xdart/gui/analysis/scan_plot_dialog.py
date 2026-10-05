@@ -80,6 +80,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._roi_stale = False
         self._analysis_busy_kind = None
         self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
+        self._vnext_preview_result = None
         self._table = {}
         self._columns = []
         self._positioner_names = []         # scanned-motor names (X-default hint)
@@ -717,7 +718,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._roi_redraw_timer.stop()
         if self._roi_dialog is not None:
             if self._vnext:
-                self._roi_dialog.clear_source()
+                self._retire_vnext_result()
             else:
                 self._roi_dialog.close()
                 self._roi_dialog = None
@@ -739,6 +740,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._roi_stale = False
         self.roi_caption.setText("")
         self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
+        self._vnext_preview_result = None
         self._vnext_rendering = True
         try:
             self.trend.reconcile_series(SeriesProjection())

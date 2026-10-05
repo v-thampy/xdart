@@ -63,7 +63,7 @@ class RoiSelectionView(QtWidgets.QWidget):
 
     def __init__(self, image, parent=None, *, frame_labels=(), frame_label=None):
         super().__init__(parent)
-        self._image = np.asarray(image, dtype=float)
+        self._image = np.asarray(image)
         self._image_shape = self._image.shape       # (rows, cols)
         self._frame_labels = tuple(frame_labels)
         self._frame_label = frame_label
@@ -278,7 +278,7 @@ class RoiSelectionView(QtWidgets.QWidget):
         if not replacing and np.asarray(image).shape != self._image_shape:
             self.set_preview_pending(message="Frame shape differs; keeping the previous image and ROIs.")
             return False
-        self._image = np.asarray(image, dtype=float)
+        self._image = np.asarray(image)
         self._frame_label = label
         self.set_preview_pending()
         if reset: self._add_roi()

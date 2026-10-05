@@ -1661,6 +1661,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if kind in {"scan_plot", "roi_preview", "roi_scan"}
             else kind
         )
+        dialog = self._scan_roi_dialog
+        if dialog is not None:
+            retained.pop("scan_roi")
+            retained.update(scan_plot=dialog._vnext_scan_result, roi_scan=dialog._vnext_roi_result,
+                            roi_preview=dialog._vnext_preview_result)
+            if replacing == "scan_roi": replacing = kind
         admitted, reason = retention_admission(retained, replacing, payload)
         if not admitted:
             if target == "scan_roi" and self._scan_roi_dialog is not None:
@@ -1683,6 +1689,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         elif kind == "roi_preview":
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None and payload.image is not None:
+                self._scan_roi_dialog._vnext_preview_result = payload
                 table = self._scan_roi_dialog._vnext_table_result
                 created = self._scan_roi_dialog._roi_dialog is None
                 picker = self._scan_roi_dialog.mount_roi_view(payload)

@@ -138,6 +138,7 @@ def test_combined_roi_source_shape_policy_and_image_release(tmp_path, qapp, shap
             assert "reset" in picker.status.text().lower()
         dialog.close(); qapp.processEvents()
         assert picker._image is None and page._roi_preview_binding is None
+        assert dialog._vnext_preview_result is None
     finally:
         _close_page(page, qapp)
 
