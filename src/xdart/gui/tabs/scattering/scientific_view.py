@@ -719,6 +719,8 @@ class ScientificView(QtWidgets.QFrame):
             scale.addWidget(QtWidgets.QLabel("Intensity"))
             self.default_scale = QtWidgets.QPushButton("Default")
             self.detector_log = QtWidgets.QPushButton("Log")
+            self.default_scale.setToolTip("Show detector image intensity on a linear scale.")
+            self.detector_log.setToolTip("Show detector image intensity on a logarithmic scale; ROI values are unchanged.")
             group = self._detector_scale_group = QtWidgets.QButtonGroup(self)
             group.setExclusive(True)
             for button in (self.default_scale, self.detector_log):
@@ -739,6 +741,7 @@ class ScientificView(QtWidgets.QFrame):
         self._detector_picker_navigation = (tuple(captions), index, title)
         key = PanelKey(PanelRole.SLICE_2D, "detector")
         if image is None:
+            self.clear_keyed()
             return key
         rows, columns = np.asarray(image).shape
         panel = KeyedImageProjection(key, title, np.asarray(image),

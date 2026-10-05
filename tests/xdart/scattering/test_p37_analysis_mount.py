@@ -1836,15 +1836,16 @@ def test_roi_preview_navigation_keeps_marks_and_only_adopts_latest_real_frame(
         assert not picker.compute_btn.isEnabled()
         panel.selector.setCurrentIndex(2); page._run_timer.stop()
         if settlement == "close":
-            picker.close()
+            dialog.close()
         elif settlement == "source":
-            dialog.set_vnext_metadata(table)
+            dialog.source_widget.dir_check.setChecked(True)
         release.set()
         page._consume_analysis_update(_finish(page._analysis_slot, identity))
-        assert page._scan_roi_result is completed[0]
+        assert page._scan_roi_result is (completed[0] if settlement == "latest" else None)
         page._run_timer.timeout.emit(); page._run_timer.stop()
         if settlement != "latest":
-            assert dialog._roi_dialog is None
+            assert picker._image is None
+            if settlement == "source": assert dialog._roi_dialog is picker
             assert page._analysis_identity is None
             assert [result.label for result in completed] == [3, 7]
             return

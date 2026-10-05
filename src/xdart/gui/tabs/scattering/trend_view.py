@@ -111,6 +111,7 @@ class SeriesProjection:
     left_label: str = "value"
     right_label: str = "value (right)"
     log_left: bool = False
+    current_index: int | None = None
 
 
 class TrendView(QtWidgets.QWidget):
@@ -119,6 +120,8 @@ class TrendView(QtWidgets.QWidget):
 
     #: A line for the host's status: where the CSV was saved, or that it could not be.
     messageChanged = QtCore.Signal(str)
+    #: Original source rows hit by the gesture; multiple rows are ambiguous.
+    pointRowsClicked = QtCore.Signal(object)
 
     def __init__(self, parent=None, *, name: str = "trendView", x_label: str = "Frame", x_name: str = "frame",
                  order: bool = False, save_title: str = "Save parameters vs frame",
@@ -133,6 +136,8 @@ class TrendView(QtWidgets.QWidget):
         self._rows: dict[str, TrendRow] = {}
         self._families: tuple[str, ...] = ()
         self._value_unit = ""
+        self._point_series = []
+        self._frame_markers = []
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         bar = QtWidgets.QHBoxLayout()
@@ -191,10 +196,18 @@ class TrendView(QtWidgets.QWidget):
             x, y = np.asarray(series.x, dtype=float), np.asarray(series.y, dtype=float)
             if x.ndim != 1 or y.ndim != 1 or x.shape != y.shape:
                 raise ValueError("series axes must be equal-length 1-D arrays")
+            if projection.current_index is not None and (
+                    type(projection.current_index) is not int
+                    or not 0 <= projection.current_index < len(x)):
+                raise ValueError("current index must be an original row within every series")
             prepared.append((series, x, y))
+        for box, marker in self._frame_markers:
+            box.removeItem(marker)
+        self._frame_markers = []
         self.plot.clear()
         self.right_view_box.clear()
         self.legend.clear()
+        self._point_series = []
         any_left = any_right = False
         for index, (series, x, y) in enumerate(prepared):
             if not (np.isfinite(x).any() and np.isfinite(y).any()):
@@ -202,17 +215,42 @@ class TrendView(QtWidgets.QWidget):
             color = CURVE_PENS[index % len(CURVE_PENS)]
             pen = pg.mkPen(color, width=3)
             if series.right:
-                add_right_series(self.right_view_box, self.legend, x, y, pen=pen, name=series.name,
+                item = add_right_series(self.right_view_box, self.legend, x, y, pen=pen, name=series.name,
                                  symbol="o", symbol_size=7, symbol_brush=color)
                 any_right = True
             else:
-                self.plot.plot(x, y, pen=pen, name=series.name, symbol="o", symbolSize=7, symbolBrush=color)
+                item = self.plot.plot(x, y, pen=pen, name=series.name, symbol="o", symbolSize=7, symbolBrush=color)
                 any_left = True
+            item.setData(x, y, data=list(range(len(x))))
+            self._point_series.append(item)
+            item.sigPointsClicked.connect(self._point_click)
+            row = projection.current_index
+            if (row is not None and np.isfinite(x[row]) and np.isfinite(y[row])
+                    and (series.right or not projection.log_left or y[row] > 0)):
+                marker = pg.PlotDataItem([x[row]], [y[row]], pen=None, symbol="o", symbolSize=14,
+                    symbolPen=pg.mkPen("#ffdf00", width=3), symbolBrush=pg.mkBrush(0, 0, 0, 0), data=[row])
+                marker.setObjectName("currentFrameMarker")
+                marker.setToolTip("Selected image's exact source row; click a statistic point to request its frame.")
+                marker.setZValue(20)
+                box = self.right_view_box if series.right else self.plot.getPlotItem()
+                box.addItem(marker, ignoreBounds=True)
+                self._frame_markers.append((box, marker))
+                marker.sigPointsClicked.connect(self._point_click)
         self.plot.setLabel("bottom", projection.x_label)
         self.plot.setLabel("left", projection.left_label if any_left else "")
         set_right_axis_visible(self.right_view_box, self.right_axis, any_right, projection.right_label)
         self.plot.setLogMode(x=False, y=projection.log_left)
         self.right_axis.setLogMode(False)
+
+    def _point_click(self, _item, points, event):
+        # Scatter accepts the first curve's event. Check all visible symbol footprints
+        # to detect cross-curve ambiguity, in each axis's actual scene coordinates.
+        rows = {point.data() for point in points}
+        for curve in self._point_series:
+            scatter = curve.scatter
+            if scatter.isVisible() and scatter.isEnabled():
+                rows.update(point.data() for point in scatter.pointsAt(scatter.mapFromScene(event.scenePos())))
+        self.pointRowsClicked.emit(tuple(sorted(row for row in rows if type(row) is int)))
 
     @property
     def rows(self) -> tuple[TrendRow, ...]:

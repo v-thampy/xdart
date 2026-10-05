@@ -1,15 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Scan Plot popup (Direction-A Tools) — step 1: metadata plotting.
+"""Scan metadata and raw ROI statistics, composed from Int's shared GUI owners.
 
-Plot per-frame scan metadata: any column vs any column, several overlaid to
-compare, with an optional normalization column (y / norm).  NOT tied to the
-loaded processed ``.nexus`` — a source picker opens any "scan" the headless source layer
-classifies (processed NeXus / Eiger / TIFF-or-RAW sequence / SPEC) via
-``xrd_tools.sources``; the per-frame columns come from
-``xrd_tools.io.read_scan_data`` (processed NeXus) or the source's own metadata.
-
-Step 1 = metadata only.  The "Plot ROI" path (ROI stats as computed columns) is
-a later increment — see docs/design/design_scan_plotter_metadata_roi_jun2026.md.
+The mounted profile embeds image selection beside prepared scan curves; standalone
+metadata plots retain their callback-free table/ROI compatibility path.
 """
 
 import logging
@@ -84,6 +77,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._vnext_table_result = None
         self._roi_preview_label = None
         self._roi_preview_waiting = False
+        self._roi_stale = False
+        self._analysis_busy_kind = None
         self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
         self._table = {}
         self._columns = []
@@ -163,7 +158,9 @@ class ScanPlotDialog(QtWidgets.QDialog):
         lay.addLayout(axes_row)
 
         # Y multi-select (check several to overlay) + the plot, side by side.
-        body = QtWidgets.QHBoxLayout()
+        self.roi_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
+        right_pane = QtWidgets.QWidget(self.roi_splitter)
+        body = QtWidgets.QHBoxLayout(right_pane)
         body.setSpacing(7)
         y_col = QtWidgets.QVBoxLayout()
         y_col.setSpacing(2)
@@ -189,10 +186,17 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.plot, self.legend = self.trend.plot, self.trend.legend
         self.right_vb, self.right_axis = self.trend.right_view_box, self.trend.right_axis
         body.addWidget(self.trend, 1)
-        lay.addLayout(body, 1)
+        self.roi_splitter.addWidget(right_pane)
+        lay.addWidget(self.roi_splitter, 1)
+        self.roi_caption = QtWidgets.QLabel("")
+        self.roi_caption.setToolTip("Accepted image frame and the matching ROI statistic points; unavailable points are omitted.")
+        self.roi_caption.setWordWrap(True)
+        self.roi_caption.hide()
+        lay.addWidget(self.roi_caption)
 
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("peakFitStatus")
+        self.status.setToolTip("Analysis progress, cancellation and point-selection status.")
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
@@ -203,6 +207,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if self._vnext:
             self.source_widget.sigExternalSyntaxChanged.connect(
                 lambda value: self._vnext_submit("metadata", value))
+            self.trend.pointRowsClicked.connect(self._roi_point_clicked)
             self.save_btn.setEnabled(False)
             self.save_btn.setToolTip("P3_7_EXPORT_UNAVAILABLE")
         else:
@@ -560,8 +565,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
 
     def _open_roi_dialog(self):
         if self._vnext:
-            if self._roi_dialog is not None:
-                self._roi_dialog.show(); self._roi_dialog.raise_(); return
+            if self._roi_dialog is not None and self._roi_dialog._image is not None:
+                self.show(); self.raise_(); return
             self._vnext_submit("roi_preview", self._vnext_table_result)
             return
         if not self._raw_reachable or self._source_spec is None:
@@ -711,8 +716,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if hasattr(self, "_roi_redraw_timer"):
             self._roi_redraw_timer.stop()
         if self._roi_dialog is not None:
-            self._roi_dialog.close()
-            self._roi_dialog = None
+            if self._vnext:
+                self._roi_dialog.clear_source()
+            else:
+                self._roi_dialog.close()
+                self._roi_dialog = None
         # The source widget's probe executor is a NON-daemon thread and Qt
         # never delivers closeEvent to child widgets — without this, a probe
         # in flight at close survives as a live thread that concurrent.futures
@@ -724,13 +732,12 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._vnext_submit("close", None)
         super().closeEvent(event)
 
-    def _retire_vnext_result(self, *, keep_picker=False):
-        picker = self._roi_dialog
-        if not keep_picker:
-            self._roi_preview_label = None
-            self._roi_preview_waiting = False
-        if picker is not None and not keep_picker:
-            picker.close(); picker.deleteLater(); self._roi_dialog = None
+    def _retire_vnext_result(self):
+        self._roi_preview_label = None
+        self._roi_preview_waiting = False
+        if self._roi_dialog is not None: self._roi_dialog.clear_source()
+        self._roi_stale = False
+        self.roi_caption.setText("")
         self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
         self._vnext_rendering = True
         try:
@@ -789,16 +796,91 @@ class ScanPlotDialog(QtWidgets.QDialog):
                                                  result.traces, strict=True))
             label = f"value / {result.normalization}" if result.normalization else "value"
             self.trend.reconcile_series(SeriesProjection(series, result.x_name or "", label, f"{label} (right)",
-                                                        self.log_btn.isChecked()))
+                                                        self.log_btn.isChecked(), self._current_roi_index()))
             self.status.setText(result.code)
+            self._update_roi_caption()
         finally:
             self._vnext_rendering = False
 
     def set_vnext_roi_result(self, result):
+        first = self._vnext_roi_result is None
         self._vnext_roi_result = result
-        names = tuple(dict.fromkeys((*getattr(self, "_selector_columns", ()), *result.signal_names)))
-        self._sync_column_lists(names, self._checked_y(), self.r_browser.checked_results())
+        self._roi_stale = False
+        names = tuple(dict.fromkeys((*self._columns, *result.signal_names)))
+        right = self.r_browser.checked_results()
+        checked = tuple(dict.fromkeys((*self._checked_y(), *(name for name in result.signal_names if first and name not in right))))
+        self._vnext_rendering = True
+        self._sync_column_lists(names, checked, right)
+        self._vnext_rendering = False
         self.status.setText(result.code)
+        self._update_roi_caption()
+        self._redraw()
+
+    def mount_roi_view(self, payload):
+        if self._roi_dialog is None:
+            from xdart.gui.tabs.scattering.roi_selection_view import RoiSelectionView
+            picker = self._roi_dialog = RoiSelectionView(payload.image, self,
+                frame_labels=payload.labels, frame_label=payload.label)
+            self.roi_splitter.insertWidget(0, picker)
+            self.roi_splitter.setSizes([500, 650])
+            self.resize(1200, 760)
+            picker.definitionChanged.connect(self._roi_definition_changed)
+            picker.closeRequested.connect(self.close)
+            picker.cancelRequested.connect(lambda: self._vnext_submit("roi_cancel", None))
+            picker.cancel_btn.show()
+            self.roi_caption.show()
+        return self._roi_dialog
+
+    def set_analysis_busy(self, kind=None):
+        self._analysis_busy_kind = kind
+        if self._roi_dialog is not None: self._roi_dialog.set_busy(kind is not None, cancellable=kind == "roi_scan")
+        for widget in (self.x_row, self.norm_row, self.y_browser, self.r_browser, self.log_row):
+            widget.setEnabled(kind != "roi_scan")
+
+    def _roi_definition_changed(self):
+        if self._vnext_roi_result is not None:
+            self._roi_stale = True
+            self._update_roi_caption()
+        if self._analysis_busy_kind == "roi_scan": self._vnext_submit("roi_cancel", None)
+
+    def _current_roi_index(self):
+        table, picker = self._vnext_table_result, self._roi_dialog
+        if self._vnext and table is not None and picker is not None and picker._frame_label in table.labels:
+            return table.labels.index(picker._frame_label)
+        return None
+
+    def _update_roi_caption(self, detail=""):
+        index = self._current_roi_index()
+        if index is None: return
+        label = self._roi_dialog._frame_label
+        text = f"Frame {label}"
+        if self._vnext_roi_result is not None and label in self._vnext_roi_result.no_raw_labels:
+            text += " · raw unavailable; ROI point omitted"
+        elif self._vnext_scan_result is not None:
+            result = self._vnext_scan_result
+            finite = result.x is not None and np.isfinite(result.x[index]) and any(
+                np.isfinite(values[index]) and (name in self.r_browser.checked_results()
+                    or not self.log_btn.isChecked() or values[index] > 0)
+                for name, values in zip(result.original_identities, result.traces, strict=True))
+            if not finite: text += " · point unavailable (X, normalization or axis scale)"
+        if self._roi_stale: text += " · Out of date — Compute to update ROI statistics"
+        self.roi_caption.setText(text + (f" · {detail}" if detail else ""))
+
+    def refresh_roi_cursor(self, detail=""):
+        if self._vnext_scan_result is not None:
+            self.set_vnext_scan_result(self._vnext_scan_result)
+        self._update_roi_caption(detail)
+
+    def _roi_point_clicked(self, rows):
+        table = self._vnext_table_result
+        if table is None or self._roi_dialog is None or not rows: return
+        labels = tuple(table.labels[row] for row in rows)
+        if len(labels) != 1:
+            self.status.setText("Ambiguous point — frames " + ", ".join(map(str, labels)) + "; no frame selected.")
+        elif self._analysis_busy_kind == "roi_scan":
+            self.status.setText("ROI computation is running; wait before selecting another frame.")
+        else:
+            self._roi_dialog.sigPreviewFrame.emit(labels[0])
 
     def _csv_columns(self):
         """Every 1-D column of the assembled table — including non-numeric (e.g.

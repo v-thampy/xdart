@@ -37,7 +37,7 @@ def _open(page, path, qapp):
 
 
 def _markers(view):
-    items = (*view.plot.getPlotItem().listDataItems(), *view.right_view_box.addedItems)
+    items = (*view.plot.getPlotItem().listDataItems(), *view.right_view_box.childGroup.childItems())
     return [item for item in items if item.objectName() == "currentFrameMarker"]
 
 
@@ -64,7 +64,7 @@ def test_combined_roi_window_cursor_compute_tooltips_and_click(tmp_path, qapp):
         picker.scale_log_btn.click()
         assert tuple(picker.roi_signals()) == definitions
         for widget in (picker.add_btn, picker.remove_btn, picker.compute_btn, picker.close_btn,
-                       picker.status, dialog.roi_caption, picker.scale_default_btn, picker.scale_log_btn,
+                       picker.cancel_btn, picker.status, dialog.roi_caption, picker.scale_default_btn, picker.scale_log_btn,
                        dialog.log_btn, *picker._numeric_rows.values()):
             assert widget.toolTip(), widget.objectName()
         assert "image" in picker.scale_log_btn.toolTip().lower()
@@ -85,12 +85,27 @@ def test_combined_roi_window_cursor_compute_tooltips_and_click(tmp_path, qapp):
         assert picker._frame_label == 7 and page._roi_preview_binding[4] == 7
         assert "Frame 7" in dialog.roi_caption.text()
         assert all(marker.scatter.points()[0].data() == 1 for marker in _markers(dialog.trend))
+        dialog.norm_combo.setCurrentText("frame_index"); _settle(page, qapp)
+        assert all(float(marker.getOriginalDataset()[1][0]) == 1 for marker in _markers(dialog.trend)
+                   if marker.scatter.points()[0].data() == 1)
+        dialog.norm_combo.setCurrentIndex(0); _settle(page, qapp)
+        dialog.trend.reconcile_series(SeriesProjection((PlotSeries("a", [1, 2, 3], [10, 20, 30]),
+            PlotSeries("b", [2, 1, 3], [20, 10, 30])), current_index=1))
+        qapp.processEvents()
+        curve = next(item for item in dialog.plot.getPlotItem().listDataItems() if item.name() == "a")
+        _click(dialog.trend, curve, 0, qapp)
+        assert picker._frame_label == 7 and "3, 7" in dialog.status.text()
+        dialog.refresh_roi_cursor()
         picker.reducer_combo.setCurrentText("sum")
         assert "Out of date" in dialog.roi_caption.text()
         picker.reducer_combo.setCurrentText("mean")
         assert "Out of date" in dialog.roi_caption.text(), "staleness is latched until current adoption"
         picker.compute_btn.click(); _settle(page, qapp)
         assert "Out of date" not in dialog.roi_caption.text()
+        picker.add_btn.click(); picker.compute_btn.click(); _settle(page, qapp)
+        assert "roi2" in dialog._selector_columns
+        picker.remove_btn.click(); picker.compute_btn.click(); _settle(page, qapp)
+        assert "roi2" not in dialog._selector_columns
     finally:
         _close_page(page, qapp)
 
@@ -154,7 +169,7 @@ def test_combined_roi_latest_navigation_waits_for_real_plot(tmp_path, qapp, monk
         release.set(); _close_page(page, qapp)
 
 
-@pytest.mark.parametrize("action", ["edit", "source", "outer", "page"])
+@pytest.mark.parametrize("action", ["edit", "source", "outer", "page", "cancel"])
 def test_combined_roi_real_scan_cancellation_cleanup(tmp_path, qapp, monkeypatch, action):
     """C6/C7/T4/T5/T7/T9: pause a real reduction with its source open, then cancel through UI/owner."""
     import h5py
@@ -181,6 +196,7 @@ def test_combined_roi_real_scan_cancellation_cleanup(tmp_path, qapp, monkeypatch
         identity = page._analysis_identity
         assert ready.wait(5)
         assert not picker.compute_btn.isEnabled()
+        assert picker.cancel_btn.isEnabled()
         dialog.resize(1200, 800); dialog.show(); qapp.processEvents()
         curve = next(item for item in dialog.plot.getPlotItem().listDataItems() if item.name() == "roi1")
         _click(dialog.trend, curve, 1, qapp)
@@ -190,10 +206,12 @@ def test_combined_roi_real_scan_cancellation_cleanup(tmp_path, qapp, monkeypatch
             assert "Out of date" in dialog.roi_caption.text()
             assert not picker.compute_btn.isEnabled()
         elif action == "source":
-            dialog.source_widget.path_edit.clear()
+            dialog.source_widget.dir_check.setChecked(True)
             assert page._roi_preview_binding is None and picker._image is None
         elif action == "outer":
             dialog.close()
+        elif action == "cancel":
+            picker.cancel_btn.click()
         else:
             before = page._scan_roi_generation
             receipt = page.close_workspace()
@@ -210,6 +228,9 @@ def test_combined_roi_real_scan_cancellation_cleanup(tmp_path, qapp, monkeypatch
                 assert dialog._vnext_roi_result is accepted
                 assert picker.compute_btn.isEnabled()
                 assert "Out of date" in dialog.roi_caption.text()
+            elif action == "cancel":
+                assert dialog._vnext_roi_result is accepted and picker.compute_btn.isEnabled()
+                assert "cancel" in dialog.status.text().lower()
         assert not page._analysis_slot.owned
         assert h5py.h5f.get_obj_count() == handles
     finally:
@@ -256,12 +277,16 @@ def test_combined_roi_marker_axis_identity_and_ambiguous_real_click(qapp, log):
         left = next(item for item in view.plot.getPlotItem().listDataItems() if item.name() == "left")
         _click(view, left, 1, qapp)
         assert clicked[-1] == (1,), "duplicate X must use the point's own original row"
+        _click(view, view.right_view_box.addedItems[0], 0, qapp)
+        assert clicked[-1] == (0,), "right-axis negative data uses its exact source row"
         view.reconcile_series(SeriesProjection((PlotSeries("a", [1, 2], [10, 100]),
             PlotSeries("b", [2, 1], [100, 10])), log_left=log))
         qapp.processEvents()
         curve = next(item for item in view.plot.getPlotItem().listDataItems() if item.name() == "a")
         _click(view, curve, 0, qapp)
         assert clicked[-1] == (0, 1), "cross-curve hit must report ambiguity rather than jump"
+        view.reconcile_series(SeriesProjection())
+        assert not _markers(view), "right markers excluded from autorange still retire on redraw"
     finally:
         view.close(); view.deleteLater()
 
