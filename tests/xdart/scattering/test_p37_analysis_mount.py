@@ -1767,7 +1767,7 @@ def test_p37b_roi_preview_and_scan_share_slot_and_preserve_typed_diagnostics(
         _close_page(page, qapp)
 
 
-def _roi_navigation_table(tmp_path, *, changed_shape=False):
+def _roi_navigation_table(tmp_path, *, changed_shape=False, shape=(4, 4), missing_label=None):
     import tifffile
     from xrd_tools.core import IntegrationResult1D
     from xrd_tools.io.nexus import open_nexus_writer, write_integrated_stack
@@ -1783,8 +1783,9 @@ def _roi_navigation_table(tmp_path, *, changed_shape=False):
                                 unit="q_A^-1") for _ in labels])
         for label in labels:
             raw = tmp_path / f"raw_{label}.tif"
-            shape = (5, 5) if changed_shape and label == 11 else (4, 4)
-            tifffile.imwrite(raw, np.full(shape, label, dtype=np.uint16))
+            frame_shape = (5, 5) if changed_shape and label == 11 else shape
+            if label != missing_label:
+                tifffile.imwrite(raw, np.full(frame_shape, label, dtype=np.uint16))
             write_frame_record(entry.require_group("frames"), frame_record_key(None, label),
                                source_path=raw, source_frame_index=0)
     table = run_metadata_table(MetadataTablePlan(
