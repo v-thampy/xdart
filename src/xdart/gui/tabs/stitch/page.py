@@ -3464,9 +3464,13 @@ def build_stitch_page(services, parent):
     from xdart.gui.pages.project_defaults import ProjectDefaults
     page = StitchPage(services, parent)
     page.restore_last_settings()
+    project = ProjectDefaults(page._value, page.set_field)
+    root, directory = project.location()
+    if root and directory:
+        page._result_browser.set_directory(directory, explicit=False)
     return PageHandle(key=STITCH_TOOL_KEY, widget=page, close=page.close_and_remember,
                       open_folder=page, browser_directory=page._result_browser,
-                      project_location=ProjectDefaults(page._value, page.set_field),
+                      project_location=project,
                       settings_io=page, run_control=page, activity=page,
                       app_menus=page, processing_mode=_StitchProcessingMode(page),
                       write_mode=RunBarWriteMode(page.run_bar))

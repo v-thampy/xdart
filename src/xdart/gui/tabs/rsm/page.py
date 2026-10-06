@@ -2544,9 +2544,13 @@ def build_rsm_page(services, parent):
     from xdart.gui.pages.project_defaults import ProjectDefaults
     page = RSMPage(services, parent)
     page.restore_last_settings()
+    project = ProjectDefaults(page._value, page.set_field, output_file=True)
+    root, directory = project.location()
+    if root and directory:
+        page._result_browser.set_directory(directory, explicit=False)
     return PageHandle(key=RSM_TOOL_KEY, widget=page, close=page.close_and_remember, open_folder=page,
                       browser_directory=page._result_browser,
-                      project_location=ProjectDefaults(page._value, page.set_field, output_file=True),
+                      project_location=project,
                       settings_io=page, run_control=page, activity=page, app_menus=page,
                       processing_mode=_RSMProcessingMode(page), write_mode=RunBarWriteMode(page.run_bar))
 
