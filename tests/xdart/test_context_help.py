@@ -330,7 +330,7 @@ def test_real_rsm_authoritative_update_replaces_help_draft(tmp_path, qapp, dismi
     from xdart.gui.widgets.context_help import owner_for
     main = Main(selected_page_key=RSM_TOOL_KEY); page = main.page_handle.widget
     try:
-        page.set_field("project_root", str(tmp_path)); page.advanced.show()
+        page.set_field("project_root", str(tmp_path)); page.set_field("adv_rows", "333"); page.advanced.show()
         row = page._rows["adv_rows"]
         page.advanced.activateWindow(); row.editor.setFocus(); qapp.processEvents()
         assert row.editor.hasFocus()

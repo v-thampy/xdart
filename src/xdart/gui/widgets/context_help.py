@@ -104,6 +104,7 @@ class ContextHelpOwner(QtCore.QObject):
         self.root = root
         self.window = None
         self.shortcut = None
+        self._held_row = None
         root.installEventFilter(self)
         self._bind_shortcut()
 
@@ -118,13 +119,43 @@ class ContextHelpOwner(QtCore.QObject):
                 self.shutdown()
             elif event.type() == QtCore.QEvent.Type.Show:
                 self._bind_shortcut()
+            elif event.type() == QtCore.QEvent.Type.WindowActivate:
+                # Run after Qt restores the root's former focus widget.
+                QtCore.QTimer.singleShot(0, self, self._resume_draft)
+        elif watched is self.window and event.type() == QtCore.QEvent.Type.Hide:
+            self.root.activateWindow()
+            QtCore.QTimer.singleShot(0, self, self._resume_draft)
         return False
+
+    def hold_draft(self, row):
+        """One row reference for this visit; FormRow remains the sole value owner."""
+        if self._held_row is row:
+            return
+        self._resume_draft(restore=False)
+        self._held_row = row
+        row.destroyed.connect(self._forget_draft)
+
+    def _forget_draft(self):
+        if self.sender() is self._held_row:
+            self._held_row = None
+
+    def _resume_draft(self, *, restore=True):
+        row = self._held_row
+        if row is None:
+            return
+        self._held_row = None
+        row.destroyed.disconnect(self._forget_draft)
+        held = row._help_focus_transfer
+        row._help_focus_transfer = False
+        if restore and held and row.editor.isVisible() and row.editor.isEnabled():
+            row.editor.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def _open(self):
         preserve_focused_draft(self.root)
         self._bind_shortcut()
         if self.window is None:
             self.window = HelpWindow(self.root)
+            self.window.installEventFilter(self)
         self.window.show()
         self.window.raise_()
         self.window.activateWindow()
@@ -152,11 +183,13 @@ class ContextHelpOwner(QtCore.QObject):
 
     def shutdown(self):
         """Release callbacks/windows on actual retirement; ignored busy Close keeps both."""
+        self._resume_draft(restore=False)
         if self.shortcut is not None:
             self.shortcut.setEnabled(False)
             self.shortcut.deleteLater()
             self.shortcut = None
         if self.window is not None:
+            self.window.removeEventFilter(self)
             self.window.close()
             self.window.deleteLater()
             self.window = None

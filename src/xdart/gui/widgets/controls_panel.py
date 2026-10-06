@@ -159,6 +159,7 @@ class ActionButton(QtWidgets.QPushButton):
         from .context_help import bind_topic, owner_for
         bind_topic(context, topic_id)
         button = cls(ControlActionSpec(ControlAction.HELP, "?", SectionId.EXPERIMENT))
+        button.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         button.set_purpose_tooltip(f"Open offline help: {topic_id}. F1 opens help for the focused control.")
         button.clicked.connect(lambda: owner_for(context).show_context(context))
         return button
@@ -828,7 +829,9 @@ class FormRow(QtWidgets.QWidget):
 
     def preserve_help_draft(self) -> None:
         """Keep this draft across a read-only help visit; returning restores normal commits."""
+        from .context_help import owner_for
         self._help_focus_transfer = True
+        owner_for(self).hold_draft(self)
 
     def _refresh_tooltip(self, refusal: str = "") -> None:
         tip = (f"{self.label.text()}: {refusal}" if refusal else
@@ -925,7 +928,12 @@ class FormRow(QtWidgets.QWidget):
                     if idx >= 0:
                         self.editor.setCurrentIndex(idx)
             else:
-                focused = self.editor.hasFocus() or self._help_focus_transfer
+                # A changed model value is authoritative, including a load
+                # during help. An unchanged projection preserves typed text.
+                replaced = value != self._model_value
+                if replaced:
+                    self._help_focus_transfer = False
+                focused = (self.editor.hasFocus() or self._help_focus_transfer) and not replaced
                 if not focused:
                     shown = self._line_display_value(value)
                     if self.editor.text() != shown:
