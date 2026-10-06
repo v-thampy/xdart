@@ -655,6 +655,8 @@ def test_selecting_existing_result_fences_pending_reopen(qapp, tmp_path, monkeyp
     second_dir.mkdir()
     first, *_ = _publish(first_dir)
     second, *_ = _publish(second_dir)
+    first = first.rename(tmp_path / "first.nexus")
+    second = second.rename(tmp_path / "second.nexus")
     page = StitchPage(empty_host_services(_Status()))
     entered, release = Event(), Event()
     original = stitch_owner.read_analysis_artifact

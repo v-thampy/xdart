@@ -868,7 +868,7 @@ def test_a_failed_older_read_still_reads_the_newer_selection(qapp, tmp_path):
         root = tmp_path / str(index)
         root.mkdir()
         write_record(root, False)
-        paths.append(str(root / "rsm-artifact-v2.nexus"))
+        paths.append(str((root / "rsm-artifact-v2.nexus").rename(tmp_path / f"r{index}.nexus")))
     started, release, hold, reads = Event(), Event(), [], []
 
     def read(path, cancel, progress):
@@ -939,7 +939,7 @@ def test_a_late_read_does_not_override_the_newer_selection(qapp, tmp_path):
         root = tmp_path / f"r{index}"
         root.mkdir()
         write_record(root, False)
-        paths.append(str(root / "rsm-artifact-v2.nexus"))
+        paths.append(str((root / "rsm-artifact-v2.nexus").rename(tmp_path / f"r{index}.nexus")))
     started, released, hold = Event(), Event(), []
 
     def read(path, cancel, progress):
