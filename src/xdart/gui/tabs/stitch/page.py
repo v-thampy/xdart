@@ -484,6 +484,7 @@ class StitchPage(QtWidgets.QWidget):
         #: Shown results not in memory, to reload in order, and the one reloading.
         self._reload_pending = []
         self._reloading = None
+        self._open_complete_text = ""
         self._diagnostic = "Intensity"
         #: One display key per result, created once: the view compares keys by identity.
         self._result_keys = {}
@@ -2187,8 +2188,13 @@ class StitchPage(QtWidgets.QWidget):
                      ) if self.run_bar.write_mode() == "Append" else ()
         self._queued_jobs = [index for index in range(count) if index not in kept]
         if not self._queued_jobs:
-            self._status(f"Up to date · {count} {'output' if count == 1 else 'outputs'} already stitched "
-                         "with these settings (Replace ⇄ stitches again)" + self._prepared_notes)
+            message = (f"Up to date · {count} {'output' if count == 1 else 'outputs'} already stitched "
+                       "with these settings (Replace ⇄ stitches again)" + self._prepared_notes)
+            current = self.browser.current_result()
+            target = next((prepared.requests[index].module.output.target for index in kept
+                           if str(prepared.requests[index].module.output.target) == current),
+                          prepared.requests[kept[0]].module.output.target)
+            self.open_result(target, completion_message=message)
             return
         self._skip_note = f" · {len(kept)} already stitched, skipped" if kept else ""
         self._job_total = len(self._queued_jobs)
@@ -2205,7 +2211,7 @@ class StitchPage(QtWidgets.QWidget):
             self._queued_jobs.clear()
             self._prepared_revision = None  # the next Run prepares again
 
-    def open_result(self, path=None):
+    def open_result(self, path=None, *, completion_message=""):
         if path is None or isinstance(path, bool):
             from xdart.gui.widgets.file_dialogs import browse
             picks = browse(self, "Open stitched result", file_filter="NeXus (*.nexus)",
@@ -2213,9 +2219,11 @@ class StitchPage(QtWidgets.QWidget):
             path = picks[0] if picks else ""
         if not path:
             return
-        self._result_browser.set_directory(str(Path(path).absolute().parent))
+        if not completion_message:  # Append follows the existing browser policy when the result is mounted.
+            self._result_browser.set_directory(str(Path(path).absolute().parent))
         self._view_revision += 1
-        self._start("Opening saved result…", lambda: self._owner.begin_reopen(path))
+        if self._start("Opening saved result…", lambda: self._owner.begin_reopen(path)):
+            self._open_complete_text = completion_message
 
     def stop(self):
         self._queued_jobs.clear()
@@ -2344,10 +2352,12 @@ class StitchPage(QtWidgets.QWidget):
                 self._restore_payload(path, outcome.payload)
                 self._status(f"Ready · saved {_kind_name(outcome.payload)} result")
         elif outcome.kind is StitchOwnerOutcomeKind.REOPENED:
+            message, self._open_complete_text = self._open_complete_text, ""
             if self._action_view_revision == self._view_revision and not self._closing:
                 self._mount_payload(outcome.artifact_path, outcome.payload)
                 note = saved_frame_screen_note(outcome.payload.contributing_frames)
-                self._status(f"Ready · saved {_kind_name(outcome.payload)} result" + (f" · {note}" if note else ""))
+                self._status(message or (f"Ready · saved {_kind_name(outcome.payload)} result"
+                                         + (f" · {note}" if note else "")))
         elif outcome.kind is StitchOwnerOutcomeKind.RESULT:
             result = outcome.result
             if result.terminal.disposition is ModuleDisposition.COMMITTED:

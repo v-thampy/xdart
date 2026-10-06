@@ -326,7 +326,7 @@ class RSMPage(QtWidgets.QWidget):
         self._services = services
         self._owner = RSMToolOwner.v2() if owner is None else owner
         self._reader = SingleWorkerOwner(_read_rsm_record) if reader is None else reader
-        self._reading = None  # (identity, path) of the record being read
+        self._reading = None  # (identity, path, completion message) of the record being read
         # the Source's member groups, found on the shared single worker before Preview and Run (it reads the
         # SPEC files and lists the images): (identity, action, key) while found; (key, groups, skipped) after
         self._resolver = SingleWorkerOwner(_resolve_rsm_groups) if resolver is None else resolver
@@ -1850,6 +1850,7 @@ class RSMPage(QtWidgets.QWidget):
         every RSM's lines."""
         if not self._jobs:
             done, total, skipped = self._job_form is not None, self._job_total, self._job_skipped
+            last_form = self._job_form
             action, lines, warned = self._job_action, self._job_lines, len(self._job_warnings)
             self._clear_jobs()
             if not done:
@@ -1863,8 +1864,12 @@ class RSMPage(QtWidgets.QWidget):
                 self.preview_dialog.show()
             else:
                 gridded = total - skipped
-                self._status(f"Saved {gridded} of {total} RSMs" + (
-                    f" · {skipped} already gridded with these settings, skipped" if skipped else ""), ready=True)
+                message = f"Saved {gridded} of {total} RSMs" + (
+                    f" · {skipped} already gridded with these settings, skipped" if skipped else "")
+                if not gridded:
+                    self.reopen(last_form.output_path, completion_message=message)
+                else:
+                    self._status(message, ready=True)
             return
         self._job_form = self._jobs.pop(0)
         self._begin_preflight(run=self._job_action == "run", form=self._job_form)
@@ -1913,8 +1918,9 @@ class RSMPage(QtWidgets.QWidget):
                 self._job_skipped += 1
                 self._next_job()
                 return
-            self._status(f"Up to date · {Path(form.output_path).name} already gridded with these settings "
-                         "(Replace ⇄ grids again)")
+            self.reopen(form.output_path, completion_message=(
+                f"Up to date · {Path(form.output_path).name} already gridded with these settings "
+                "(Replace ⇄ grids again)"))
             return
         self._owner.set_form(form)
         if self._owner.begin_run() is None:
@@ -2104,13 +2110,13 @@ class RSMPage(QtWidgets.QWidget):
             self._result_browser.set_directory(str(Path(picks[0]).absolute().parent))
             self.reopen(picks[0])
 
-    def reopen(self, path):
+    def reopen(self, path, *, completion_message=""):
         """Read a saved RSM record on the shared single-worker reader, then show it."""
         identity = self._reader.begin(str(path))
         if identity is None:
             self._notice("A result is still being read")
             return False
-        self._reading = (identity, str(path))
+        self._reading = (identity, str(path), completion_message)
         self._requested = str(path)
         self._status(f"Reading {Path(path).name}…")
         self._timer.start()
@@ -2120,7 +2126,7 @@ class RSMPage(QtWidgets.QWidget):
     def _poll_reader(self):
         if self._reading is None:
             return
-        identity, path = self._reading
+        identity, path, message = self._reading
         update = self._reader.poll(identity)
         if update is None or update.terminal is None:
             return
@@ -2131,7 +2137,7 @@ class RSMPage(QtWidgets.QWidget):
             shown = path == self._requested
             self._add_result(path, terminal.payload, show=shown)
             if shown:
-                self._status(f"Opened {Path(path).name}", ready=True)
+                self._status(message or f"Opened {Path(path).name}", ready=True)
             else:
                 self._show_readiness()
         elif terminal.status is OperationTerminalStatus.FAILED:
