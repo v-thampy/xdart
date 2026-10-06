@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import PurePath
+import logging
+import os
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -150,12 +152,6 @@ class ActionButton(QtWidgets.QPushButton):
         """Describe an action separately from its temporary refusal reason."""
         self._purpose_tooltip = str(text)
         self.apply_spec(self._spec)
-
-    def mousePressEvent(self, event):
-        if self._spec.action is ControlAction.HELP:
-            from .context_help import preserve_focused_draft
-            preserve_focused_draft(self.window())
-        super().mousePressEvent(event)
 
     @classmethod
     def for_help(cls, context, topic_id: str):
@@ -963,6 +959,14 @@ class FormRow(QtWidgets.QWidget):
         return text
 
     def eventFilter(self, watched, event) -> bool:
+        if (watched is self.editor and os.environ.get("XDART_DEBUG_HELP_FOCUS")
+                and event.type() in (QtCore.QEvent.Type.FocusIn, QtCore.QEvent.Type.FocusOut)):
+            logging.getLogger(__name__).warning("help_focus event=%s reason=%s path=%s hold=%s destination=%s",
+                event.type(), event.reason(), self._path, self._help_focus_transfer, QtWidgets.QApplication.focusWidget())
+        if watched is self.editor and event.type() == QtCore.QEvent.Type.FocusOut:
+            destination = QtWidgets.QApplication.focusWidget()
+            if isinstance(destination, ActionButton) and destination.spec.action is ControlAction.HELP:
+                self.preserve_help_draft()  # before QLineEdit's focus-out handler can commit
         if watched is self.editor and event.type() == QtCore.QEvent.Type.FocusIn:
             self._help_focus_transfer = False
         if watched is self.editor and self._file_name_only:
@@ -1625,6 +1629,8 @@ class ControlsPanel(QtWidgets.QWidget):
             tuple[SectionId, ControlAction], ActionButton
         ] = {}
         for button in self.findChildren(ActionButton):
+            if button.spec.action is ControlAction.HELP:
+                continue  # header presentation actions never belong to the Controls projection
             key = (button.spec.section, button.spec.action)
             if key in mounted_actions:
                 return False

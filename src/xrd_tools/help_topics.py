@@ -287,7 +287,8 @@ normalization denominator handled by the selected reduction owner.
 Assumptions
 Detector geometric masks (gaps/nonpixels) are independent of opt-in value or
 saturation masks. Choosing corrections does not prove their scientific validity.
-Sample optical exposure and refraction corrections are unavailable in this version.
+Sample optical and refraction controls are unavailable in these GUI settings.
+Existing headless GI correction paths require their own scientific qualification.
 
 Expected observations
 Dark shifts intensity; flat, solid angle, polarization and normalization scale
