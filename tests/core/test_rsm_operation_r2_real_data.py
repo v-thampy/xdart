@@ -116,6 +116,64 @@ def _data_root() -> Path:
     return root
 
 
+def test_scan18_saved_direct_beam_calibration_runs_on_the_exact_planned_grid(tmp_path):
+    """Native October6 refusal: actual saved calibration, all 81 RAW frames, HKL 40³.
+
+    The producer must emit the frozen NumPy grid exactly; strict validation and
+    publication/readback remain part of this real-interface oracle.
+    """
+    from xrd_tools.analysis.rsm_geometry_asset import (
+        rsm_calibration_geometry_input, rsm_effective_pixel_q_map,
+    )
+    from xrd_tools.analysis.rsm_operation import RSMImageConditioning, RSMNormalizationPolicy
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.rsm.gridding import StreamingGridder
+
+    source = _data_root()
+    pins = {
+        "STO_align": _SPEC_SHA256,
+        "direct_beam_scan1.json": "a471ae8592daee9bf68431a0aac2b4932df36cd913102286863f0adbadd309d0",
+        "direct_beam_scan1.xu.json": "5abc0726fca454117db9f237fbe2f2595f901e0fed4ddfb31062ae7c48067d67",
+    }
+    for name, digest in pins.items():
+        if not (source / name).exists():
+            pytest.skip("native scan18 saved calibration is unavailable")
+        assert hashlib.sha256((source / name).read_bytes()).hexdigest() == digest
+        shutil.copy2(source / name, tmp_path / name)
+    images = tmp_path / "images"
+    images.mkdir()
+    stem = "b_thampy_STO_align_scan18_"
+    raws = tuple(sorted((source / "images").glob(f"{stem}*.raw")))
+    assert len(raws) == 81 and sum(path.stat().st_size for path in raws) == 30_768_660
+    for path in raws:
+        shutil.copy2(path, images / path.name)
+    preset = rsm_tool_preset()
+    member = RSMScanMemberForm(tmp_path / "STO_align", "18.1", images, stem,
+        RSMFrameSelector(0, 80, 1), preset.detector_shape, preset.raw_dtype,
+        preset.raw_header_skip, preset.motor_selectors)
+    form = RSMToolFormV2(tmp_path, rsm_calibration_geometry_input("direct_beam_scan1.json"),
+        (member,), RSMImageConditioning(0.0, None, None), RSMNormalizationPolicy.identity(),
+        (40, 40, 40), preset.chunk_size, preset.max_frame_bytes, None,
+        tmp_path / "native-scan18.nexus")
+    request = prepare_rsm_tool_v2(form).request
+    # Native kernel diagnostics identify any rounding disagreement before execution.
+    with xu_runtime_session(request.plan.effective_geometry.runtime_requirements) as session:
+        gridder = StreamingGridder(rsm_effective_pixel_q_map(request.plan.effective_geometry),
+            request.plan.bins, runtime_session=session)
+        gridder.set_bounds(*request.plan.common_grid.bounds)
+        for name, axis, bounds in zip("HKL", (gridder._grid_raw.xaxis, gridder._grid_raw.yaxis,
+            gridder._grid_raw.zaxis), request.plan.common_grid.bounds, strict=True):
+            expected = np.linspace(*bounds, 40, dtype=np.float64)
+            print(name, "bounds", bounds, "axis differences", np.flatnonzero(axis != expected),
+                  "max difference", float(np.max(np.abs(axis - expected))))
+    result = run_rsm_operation_v2(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert result.payload.intensity.shape == (40, 40, 40)
+    assert np.isfinite(result.payload.intensity).any()
+    for axis, bounds in zip(result.payload.axis_values, request.plan.common_grid.bounds, strict=True):
+        np.testing.assert_array_equal(axis, np.linspace(*bounds, 40, dtype=np.float64))
+
+
 def _raw_manifest(paths: tuple[Path, ...]) -> str:
     rows = (
         f"{path.name}\0{path.stat().st_size}\0"
