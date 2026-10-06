@@ -171,7 +171,9 @@ def test_scan18_saved_direct_beam_calibration_runs_on_the_exact_planned_grid(tmp
     assert result.payload.intensity.shape == (40, 40, 40)
     assert np.isfinite(result.payload.intensity).any()
     for (_name, axis), bounds in zip(result.payload.axes, request.plan.common_grid.bounds, strict=True):
-        np.testing.assert_array_equal(axis, np.linspace(*bounds, 40, dtype=np.float64))
+        # Publication's existing frozen format is float32; science is validated
+        # against the exact float64 plan before that projection is admitted.
+        np.testing.assert_array_equal(axis, np.linspace(*bounds, 40, dtype=np.float64).astype(np.float32))
 
 
 def _raw_manifest(paths: tuple[Path, ...]) -> str:

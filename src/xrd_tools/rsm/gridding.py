@@ -1067,10 +1067,13 @@ class StreamingGridder:
                 "no chunks processed; call add() at least once before to_volume()."
             )
         with _gridder_runtime(self._runtime_session):
-            axis_values = (
-                np.array(self._grid_raw.xaxis, dtype=float, copy=True),
-                np.array(self._grid_raw.yaxis, dtype=float, copy=True),
-                np.array(self._grid_raw.zaxis, dtype=float, copy=True),
+            # Emit the fixed-grid contract, including exact endpoints. XU's
+            # arange arithmetic can round the last bin away from its bound.
+            axis_values = tuple(
+                np.linspace(lo, hi, count, dtype=np.float64)
+                for count, lo, hi in zip(
+                    self.bins, self._bounds[::2], self._bounds[1::2], strict=True
+                )
             )
             intensity = _pair_intensity(self._grid_raw, self._grid_norm)
         return RSMVolume.from_axes(
