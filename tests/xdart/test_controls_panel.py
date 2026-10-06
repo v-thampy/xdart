@@ -324,6 +324,40 @@ def test_run_readiness_label_elides_without_widening_controls(qapp):
         controls.deleteLater()
 
 
+@pytest.mark.parametrize("kind", ["section", "subsection", "compact"])
+def test_shared_header_status_does_not_set_card_minimum_width(qapp, kind):
+    from xdart.gui.widgets.controls_panel import SectionCard
+
+    card = (SubsectionCard("Detector") if kind == "subsection" else
+            SectionCard("Processing", compact=kind == "compact"))
+    try:
+        if kind == "compact":
+            card.set_readiness(True, "ready")
+        else:
+            card.status.setText("ready")
+            card.status.show()
+        card.resize(360, 100)
+        card.show()
+        qapp.processEvents()
+        before = card.minimumSizeHint().width()
+        message = "Calibration, coordinate and grid details " * 40
+        if kind == "compact":
+            card.set_readiness(False, message)
+        else:
+            card.status.setText(message)
+        card.status.setToolTip(message)
+        qapp.processEvents()
+        assert card.minimumSizeHint().width() == before
+        assert card.status.text() == message
+        assert card.status.toolTip() == message
+        assert 0 < card.status.width() < card.width()
+        assert card.status.wordWrap() is (kind == "compact")
+    finally:
+        card.close()
+        card.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize(
     ("path", "value"),
     (
