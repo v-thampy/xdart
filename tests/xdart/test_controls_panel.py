@@ -342,7 +342,7 @@ def test_shared_header_status_does_not_set_card_minimum_width(qapp, kind):
         before = card.minimumSizeHint().width()
         message = "Calibration, coordinate and grid details " * 40
         if kind == "compact":
-            card.set_readiness(False, message)
+            card.set_readiness(True, message)
         else:
             card.status.setText(message)
         card.status.setToolTip(message)

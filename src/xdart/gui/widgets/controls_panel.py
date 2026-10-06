@@ -240,9 +240,12 @@ class SectionCard(QtWidgets.QFrame):
         header_lay.addWidget(self.title, 1)
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("controlsSectionStatus")
+        # Status detail uses the available header space, never the column's width floor.
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                  QtWidgets.QSizePolicy.Policy.Preferred)
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.status.hide()
-        header_lay.addWidget(self.status)
+        header_lay.addWidget(self.status, 1)
         self.valid_marker = QtWidgets.QLabel("✓")
         self.valid_marker.setObjectName("controlsSectionTick")
         self.valid_marker.setProperty("accent", accent)
@@ -471,9 +474,11 @@ class SubsectionCard(QtWidgets.QFrame):
         h_lay.addWidget(self.header_extra)
         self.status = QtWidgets.QLabel(status)
         self.status.setObjectName("controlsSubsectionStatus")
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                  QtWidgets.QSizePolicy.Policy.Preferred)
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.status.setVisible(bool(status))
-        h_lay.addWidget(self.status)
+        h_lay.addWidget(self.status, 1)
         self.header.mousePressEvent = self._header_mouse_press
         outer.addWidget(self.header)
         self.body = QtWidgets.QFrame()
