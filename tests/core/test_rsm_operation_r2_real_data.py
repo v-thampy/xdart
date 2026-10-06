@@ -170,7 +170,7 @@ def test_scan18_saved_direct_beam_calibration_runs_on_the_exact_planned_grid(tmp
     assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
     assert result.payload.intensity.shape == (40, 40, 40)
     assert np.isfinite(result.payload.intensity).any()
-    for axis, bounds in zip(result.payload.axis_values, request.plan.common_grid.bounds, strict=True):
+    for (_name, axis), bounds in zip(result.payload.axes, request.plan.common_grid.bounds, strict=True):
         np.testing.assert_array_equal(axis, np.linspace(*bounds, 40, dtype=np.float64))
 
 
