@@ -188,6 +188,11 @@ def test_the_layout_is_the_modes_as_int_2ds(qapp):
         assert not view.image_splitter.isHidden() and page._last_map_state.processing_mode == "Int 2D"
         top, bottom = view.vertical_splitter.sizes()
         assert top > 0 and abs(top - bottom) <= 1  # Int 2D's two equal rows
+        assert not view.viewer_intensity.isVisible()
+        view.options.click()
+        qapp.processEvents()
+        assert view.viewer_intensity.isVisible() and view.plot_options_dialog.isAncestorOf(view.viewer_intensity)
+        view.plot_options_dialog.close()
         page.run_bar.modeCombo.setCurrentText("Stitch 1D")
         qapp.processEvents()
         assert view.image_splitter.isHidden() and page._last_map_state is None

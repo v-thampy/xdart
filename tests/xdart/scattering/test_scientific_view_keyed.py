@@ -239,6 +239,41 @@ def _slice_levels(view):
     return [tuple(view.keyed_panel(key).pane.canvas.histogram.levels()) for key in (_HK, _HL, _KL)]
 
 
+@pytest.mark.parametrize("log_scale", (False, True))
+def test_each_shared_slice_colorbar_drives_all_slices_and_retains_manual_levels(qapp, log_scale):
+    view = ScientificView()
+    try:
+        state = _rsm_state(log_scale=log_scale)
+        view.reconcile_keyed(state)
+        curves = [view.keyed_panel(key).curve.getData()[1].copy() for key in (_H, _K, _L)]
+        automatic = _slice_levels(view)
+        for key in (_HK, _HL, _KL):
+            pixels = [view.keyed_panel(k).pane.image.image for k in (_HK, _HL, _KL)]
+            bar = view.keyed_panel(key).pane.canvas.histogram
+            # The actual upstream adjuster calculates limits and emits its user-change signal.
+            bar.region.setRegion((75, 179))
+            qapp.processEvents()
+            changed = bar.levels()
+            assert changed != automatic[0]
+            np.testing.assert_allclose(_slice_levels(view), [changed] * 3)
+            assert not view.viewer_intensity.autoscale.isChecked()
+            assert view.viewer_intensity.percentile_values() is None
+            np.testing.assert_allclose(view.viewer_intensity.values(), changed)
+            assert bar.toolTip()
+            assert all(view.keyed_panel(k).pane.image.image is image
+                       for k, image in zip((_HK, _HL, _KL), pixels))
+            view.reconcile_keyed(_rsm_state(log_scale=log_scale, scales=(2, 20, 200)))
+            np.testing.assert_allclose(_slice_levels(view), [changed] * 3)
+        for key, expected in zip((_H, _K, _L), curves):
+            np.testing.assert_array_equal(view.keyed_panel(key).curve.getData()[1], expected)
+        view.viewer_intensity.autoscale.setChecked(True)
+        assert view.viewer_intensity.autoscale.isChecked()
+        assert _slice_levels(view)[0] == _slice_levels(view)[1] == _slice_levels(view)[2]
+    finally:
+        view.deleteLater()
+        qapp.processEvents()
+
+
 def test_shared_percentiles_map_each_slice_and_keep_pixels_across_manual_edits(qapp):
     view = ScientificView()
     try:
@@ -401,6 +436,7 @@ def test_leaving_the_keyed_layout_gives_share_axis_and_the_intensity_controls_ba
         view._apply_processing_layout("Int 2D")
         assert view.plot_bar.indexOf(view.share_axis) == home and view.viewer_intensity_row.isHidden()
         assert not view.viewer_intensity.isHidden()
+        assert view.plot_options_dialog.isAncestorOf(view.viewer_intensity)
         view.reconcile_keyed(_rsm_state())
         view._apply_processing_layout("2D Viewer")
         assert view.viewer_intensity_row_layout.indexOf(view.viewer_intensity) >= 0
