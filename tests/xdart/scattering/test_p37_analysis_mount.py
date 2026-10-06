@@ -1760,7 +1760,9 @@ def test_p37b_roi_preview_and_scan_share_slot_and_preserve_typed_diagnostics(
         assert page._scan_roi_result is completed
         assert page._scan_roi_result.diagnostics == (
             "ROI_INVALID_MASK_IGNORED",)
-        assert dialog.status.text() == "OK"
+        assert dialog._vnext_roi_result is completed
+        assert page._analysis_kind == "scan_plot"
+        assert dialog.status.text() == "Running scan plot…"
         for name in completed.signal_names:
             assert dialog.y_list.findItems(name, QtCore.Qt.MatchFlag.MatchExactly)
     finally:
