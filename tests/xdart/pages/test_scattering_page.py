@@ -481,6 +481,47 @@ def test_cold_native_start_without_project_keeps_browser_unset(
         qapp.processEvents()
 
 
+@pytest.mark.parametrize("page_key", ["scattering-workspace", "stitch", "rsm"])
+def test_status_text_does_not_widen_any_native_controls_column(
+        qapp, isolated_settings, tmp_path, page_key):
+    from xdart.gui.tabs.scattering.controls_inventory import PROJECT_ROOT
+    from xdart.gui.widgets.controls_panel import SectionCard, SubsectionCard
+
+    window = _mounted_host(page_key)
+    try:
+        page = window.main_widget
+        if page_key == "scattering-workspace":
+            page._on_field_value(PROJECT_ROOT, str(tmp_path))
+            controls, splitter = page._shell.controls, page._shell.splitter
+        else:
+            page.set_field("project_root", str(tmp_path))
+            controls, splitter = page.controls, page.splitter
+        labels = [card.status for card in controls.findChildren(SectionCard)]
+        labels += [card.status for card in controls.findChildren(SubsectionCard)]
+        assert labels
+        for label in labels:
+            label.setText("ready")
+            label.show()
+        qapp.processEvents()
+        before = (controls.minimumSizeHint().width(),
+                  splitter.widget(2).minimumSizeHint().width())
+        message = "Calibration / source / grid diagnostic " * 40
+        for label in labels:
+            label.setText(message)
+            label.setToolTip(message)
+        qapp.processEvents()
+        after = (controls.minimumSizeHint().width(),
+                 splitter.widget(2).minimumSizeHint().width())
+        assert after == before, "status text changed the controls column's minimum width"
+        for label in labels:
+            assert label.text() == message  # retain the existing QLabel text contract
+            assert label.toolTip() == message
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
 def test_mode_switch_keeps_current_browser_folder(qapp, isolated_settings, tmp_path):
     from pyqtgraph.Qt import QtTest
 
