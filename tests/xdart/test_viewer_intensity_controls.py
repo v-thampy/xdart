@@ -29,6 +29,38 @@ def _click(button, qapp):
     qapp.processEvents()
 
 
+@pytest.mark.parametrize("mode", ("Int 1D", "Int 2D", "Stitch 1D", "Stitch 2D", "1D Viewer", "2D Viewer"))
+def test_processing_scale_lives_in_options_and_viewer_scale_stays_visible(qapp, mode):
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
+    view = ScientificView()
+    try:
+        view.resize(1200, 850)
+        view.show()
+        view._apply_processing_layout(mode)
+        qapp.processEvents()
+        controls = view.viewer_intensity
+        if "Viewer" in mode:
+            assert controls.isVisible()
+            assert not view.plot_options_dialog.isAncestorOf(controls)
+        else:
+            assert not controls.isVisible()
+            QtTest.QTest.mouseClick(view.options, QtCore.Qt.MouseButton.LeftButton)
+            qapp.processEvents()
+            assert view.plot_options_dialog.isVisible() and controls.isVisible()
+            assert view.plot_options_dialog.isAncestorOf(controls)
+            assert view.options.toolTip()
+            view.plot_options_dialog.close()
+            qapp.processEvents()
+            assert not controls.isVisible()
+        view._apply_processing_layout("1D Viewer")
+        qapp.processEvents()
+        assert controls is view.viewer_intensity and controls.isVisible()
+    finally:
+        view.plot_options_dialog.close()
+        view.deleteLater()
+        qapp.processEvents()
+
+
 def test_percentile_popup_repeated_apply_mode_and_escape(qapp):
     from xdart.gui.widgets.intensity_controls import IntensityControls
 
@@ -73,10 +105,8 @@ def test_default_auto_and_sync_are_signal_silent(qapp):
     control.autoToggled.connect(toggles.append)
     assert control.autoscale.isChecked()
     assert not control.slider.isEnabled()
-    assert control.label.text() == "Scale"
-    assert control.autoscale.text() == "Auto"
-    assert 100 <= control.slider.width() <= 113  # ~25% below the former 150px floor, even in a wide host.
-    assert control.autoscale.width() <= 56
+    assert control.label.text() == "Intensity"
+    assert control.autoscale.text() == "Autoscale"
     assert control.label.toolTip() and control.autoscale.toolTip() and control.slider.toolTip()
     control.sync((0, 1000), (100, 900))
     assert control.values() == (100, 900)

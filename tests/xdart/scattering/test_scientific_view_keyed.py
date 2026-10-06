@@ -53,9 +53,14 @@ def test_a_keyed_layout_draws_its_panels_under_ints_top_bar_and_gives_ints_layou
         np.testing.assert_array_equal(y, [1.0, 2.0, 4.0])
         assert view.color_map.currentText() == "magma" and view.log_scale.isChecked()
         assert view.title.text() == "result" and view.status.text() == "facts"
+        view.show()
+        qapp.processEvents()
+        assert view.viewer_intensity.isVisible()
+        assert not view.plot_options_dialog.isAncestorOf(view.viewer_intensity)
         view._apply_processing_layout("Int 1D")  # an Int mode: the keyed area goes, Int's layout comes back
         assert view._keyed_area.isHidden() and not view.vertical_splitter.isHidden()
         assert not view.frame_selector.isHidden()
+        assert view.plot_action_group.isAncestorOf(view.options)
     finally:
         view.deleteLater()
         qapp.processEvents()

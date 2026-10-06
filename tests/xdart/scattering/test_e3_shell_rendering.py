@@ -111,6 +111,10 @@ def test_main_and_popup_images_use_shared_manual_percentile_controls(qapp, mode)
         controls = view.viewer_intensity
         pane = view.cake if mode == "Int 2D" else None
         assert not controls.isHidden()
+        assert not controls.isVisible()
+        view.options.click()
+        qapp.processEvents()
+        assert controls.isVisible() and view.plot_options_dialog.isAncestorOf(controls)
         assert controls.percentile_values() == ((0.5, 99.5) if mode == "Int 2D" else None)
         pixels = pane.image.image if pane is not None else None
         controls._open_entry()

@@ -891,6 +891,11 @@ def test_stitch_run_exports_stored_profile_and_empty_click_keeps_it(qapp, tmp_pa
         target = Path(payload.inspection.path)
         xye = target.with_name(f"{prefix}_{target.stem}.xye")
         assert xye.is_file(), page.run_bar.readinessLabel.full_text()
+        # Ordinary browsing remains read-only; only Run/Append publishes companions.
+        xye_before = xye.stat().st_ino, xye.stat().st_mtime_ns, xye.read_bytes()
+        page.open_result(target)
+        _wait(page, qapp)
+        assert (xye.stat().st_ino, xye.stat().st_mtime_ns, xye.read_bytes()) == xye_before
         profile = payload if mode == "1d" else payload.profile
         x, y, sigma = read_xye(xye)
         radial = profile.axes[0][1]
@@ -916,6 +921,23 @@ def test_stitch_run_exports_stored_profile_and_empty_click_keeps_it(qapp, tmp_pa
         _wait(page, qapp, timeout=60)
         assert xye.is_file() and page.run_bar.readinessLabel.full_text().startswith("Up to date")
         assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == nexus_before
+        xye.unlink()
+        xye.mkdir()  # A real export failure keeps the committed science/display and reports it.
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        assert "XYE_EXPORT_FAILED" in page.run_bar.readinessLabel.full_text()
+        assert page._current_payload() is not None
+        assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == nexus_before
+        xye.rmdir()
+        if mode == "1d" and unit == "q_A^-1":
+            import os
+            os.link(target, xye)
+            page.run_bar.startButton.click()
+            _wait(page, qapp)
+            assert "XYE_EXPORT_FAILED" in page.run_bar.readinessLabel.full_text()
+            assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == nexus_before
+            assert os.path.samefile(target, xye)
+            xye.unlink()
     finally:
         _wait(page, qapp)
         assert page.shutdown().status is PageCleanup.CLEAN
@@ -946,11 +968,16 @@ def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_aga
             return [(os.stat(target).st_ino, os.stat(target).st_mtime_ns) for target in targets]
 
         stitched = revisions()
+        exports = [target.with_name(f"iq_{target.stem}.xye") for target in targets]
+        assert all(path.is_file() for path in exports)
+        for path in exports:
+            path.unlink()
         shown = []
         page.run_bar.set_readiness_summary = lambda text, **k: (shown.append(str(text)), summary(text, **k))[1]
         page.run_bar.startButton.click()  # nothing changed: nothing is stitched
         _wait(page, qapp)
         assert revisions() == stitched
+        assert all(path.is_file() for path in exports)
         assert page.run_bar.readinessLabel.full_text().startswith(
             "Up to date · 2 outputs already stitched with these settings (Replace ⇄ stitches again)")
         # The SPEC file grows by a later scan, and scan 2 now reads another angle: only its output changed.
@@ -959,10 +986,12 @@ def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_aga
         start, end = text.index("#S 2 "), text.index("#S 3 ")
         spec.write_text(text[:start] + text[start:end].replace("\n15 -10", "\n15.5 -10", 1) + text[end:]
                         + "\n#S 9 ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n#L del  nu\n14 -10\n15 -10\n")
+        exports[0].unlink()  # A mixed queue also backfills the unchanged output's companion.
         page.run_bar.startButton.click()
         _wait(page, qapp, timeout=60)
         now = revisions()
         assert now[0] == stitched[0] and now[1] != stitched[1]
+        assert all(path.is_file() for path in exports)
         assert any(text.startswith("Running · Stitch 1D · 1/1 · 1 already stitched, skipped") for text in shown), shown
         status = page.run_bar.readinessLabel.full_text()
         assert status.startswith("Complete · 2 frames") and "· 1 already stitched, skipped" in status, status
