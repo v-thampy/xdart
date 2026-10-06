@@ -56,6 +56,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     lower_rsm_effective_geometry,
     revalidate_rsm_geometry_asset,
     revalidate_rsm_geometry_source,
+    rsm_calibration_detector as _rsm_calibration_detector,
     rsm_calibration_detector_mask,
     rsm_calibration_solid_angle,
     rsm_effective_pixel_q_map,
@@ -3875,14 +3876,6 @@ def _rsm_v2_contribution_angles(
         array.setflags(write=False)
         values.append(array)
     return tuple(values)
-
-
-def _rsm_calibration_detector(receipt) -> str | None:
-    """The calibration's detector name (pyFAI's), as Stitch's ``calibration_detector``; None for the
-    canonical asset, which names none."""
-    if type(receipt) is not RSMCalibrationGeometryReceipt:
-        return None
-    return receipt.calibration.projection.value["detector"].get("detector_factory_name")
 
 
 def _rsm_member_saturation(threshold, members, detector):

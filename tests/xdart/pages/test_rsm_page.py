@@ -2145,8 +2145,11 @@ def test_a_saved_calibration_shows_the_numeric_auto_ceiling_before_preview(qapp,
         assert "Auto · 1048575 (saturation)" in hints()
         page.begin_preview()
         _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
-        assert page._owner.prepared.request.plan.corrections.saturation == (1048575, 1048575)
-        assert "Auto · 1048575 (saturation)" in hints()
+        # This fixture's uint16 ceiling is below the detector's counter limit:
+        # Preview retains the existing dtype rule (None), replacing the early hint.
+        assert page._owner.prepared.request.plan.corrections.saturation is None
+        assert page._auto_threshold_max is None
+        assert "Auto · the detector's saturation" in hints()
         page._threshold_edited(THRESHOLD_MAX, 10000.0)
         page.set_field("geometry_path", "calibration/missing.json")
         assert page._auto_threshold_max is None

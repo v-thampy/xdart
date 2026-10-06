@@ -1366,6 +1366,13 @@ def _raw_tiltazimuth(turned_camera, raw_camera, azimuth_deg: float, beam) -> flo
     return raw % 360.0
 
 
+def rsm_calibration_detector(receipt) -> str | None:
+    """The validated calibration's pyFAI detector name; unknown for the canonical asset."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt:
+        return None
+    return receipt.calibration.projection.value["detector"].get("detector_factory_name")
+
+
 def rsm_calibration_detector_mask(receipt) -> np.ndarray | None:
     """The calibrated detector's own mask (module gaps) in the raw frame RSM reads, read-only: Stitch's rebuild
     (``calibration_detector_mask``: pyFAI's detector from the partner, its count and digest checked), mapped back

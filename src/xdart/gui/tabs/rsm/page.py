@@ -72,7 +72,10 @@ from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, SubsectionC
 from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
-from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_geometry_input
+from xrd_tools.analysis.rsm_geometry_asset import (
+    RSMGeometryAssetRefused, capture_rsm_calibration_geometry,
+    rsm_calibration_detector, rsm_calibration_geometry_input,
+)
 from xrd_tools.analysis.rsm_operation import (
     RSMFrameCorrections, RSMImageConditioning, RSMNormalizationMode, RSMNormalizationPolicy, RSMOperationResultV2,
     RSMUBOverride,
@@ -549,8 +552,9 @@ class RSMPage(QtWidgets.QWidget):
                 self._bind(key, fields[key], rows[path])
         self._render_threshold()
         self.threshold_range.setToolTip(
-            "Int's Threshold: Auto masks each frame's saturated pixels (the calibrated detector's ceiling); a "
-            "Low or High makes it manual, masking what lies outside; off masks nothing.")
+            "Auto masks each frame's saturated pixels. Before Preview, the hint is the calibrated detector's "
+            "ceiling; Preview resolves it for the selected data. A Low or High makes it manual, masking what "
+            "lies outside; off masks nothing.")
         for key in normalization.NORMALIZATION_KEYS:
             self._tip(key, normalization.TIPS[key])
             self._rows[key].setVisible(fields[key].enabled)
@@ -579,12 +583,25 @@ class RSMPage(QtWidgets.QWidget):
         return fields
 
     def _show_auto_ceiling(self, ceilings):
-        """Stitch's Auto hint (``auto_ceiling_hint``) on the Threshold's High box once a Preview resolved each
-        member's ceiling (decision 39's calibrated-detector counter limit, on the worker: no file read here), and
-        the transitions' default maximum; the default words before one, or for a new selection."""
+        """The shared numeric Auto hint, replaced by source-bound ceilings when Preview completes."""
         self._auto_threshold_max, hint = auto_ceiling_hint(ceilings)
         self._auto_hint = hint if ceilings else _AUTO_HINT
         self._render_threshold()
+
+    def _show_early_ceiling(self):
+        """Pixel-free calibrated-detector hint; Preview remains the source-bound authority."""
+        from xrd_tools.core.invalid import resolve_detector_saturation
+
+        ceiling = None
+        project, named = str(self._value("project_root") or "").strip(), str(self._value("geometry_path") or "").strip()
+        if project and named:
+            try:
+                receipt = capture_rsm_calibration_geometry(named, project_root=project,
+                    refinement=bool(self._value("refinement")))
+                ceiling = resolve_detector_saturation(detector=rsm_calibration_detector(receipt))
+            except (RSMGeometryAssetRefused, OSError, ValueError, TypeError):
+                pass  # An unsupported calibration stays unknown; Preview explains its refusal.
+        self._show_auto_ceiling(() if ceiling is None else ((ceiling.value, "saturation"),))
 
     def _render_threshold(self):
         """The Threshold row from Int's transitions' state (Int's same-schema update)."""
@@ -967,8 +984,9 @@ class RSMPage(QtWidgets.QWidget):
             self._source_changed(key)
         if key == "output_path":
             self._output_suggested = not str(self._value("output_path")).strip()
-        if key == "geometry_path":  # another calibration: its detector's ceilings are Preview's to resolve
-            self._show_auto_ceiling(())
+        if key in {"geometry_path", "project_root", "refinement", "spec_path", "scan_mode", "scan",
+                   "source_kind", "image_dir", "image_stem"}:
+            self._show_early_ceiling()
         if key in {"project_root", "spec_path", "scan_mode", "scan", "normalization"} and "normalization" in self._rows:
             self._refresh_normalization()  # a kind's own files come through set_sources
         if key in {"coordinates", "ub_from"}:
@@ -983,8 +1001,8 @@ class RSMPage(QtWidgets.QWidget):
     def set_sources(self, paths):
         """The SPEC or NeXus files, or the folder (Directory), as Stitch's ``set_sources``: one is shown, more
         as "N files selected"."""
-        self._show_auto_ceiling(())  # a new selection: its ceilings are Preview's to resolve
         self._adopt_sources(paths)
+        self._show_early_ceiling()
         count = len(self._source_paths)
         self._source_shown = ("" if not count else self._source_paths[0] if count == 1
                               else f"{count} files selected")
