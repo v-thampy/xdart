@@ -2145,7 +2145,7 @@ def test_a_saved_calibration_shows_the_numeric_auto_ceiling_before_preview(qapp,
         assert "Auto · 1048575 (saturation)" in hints()
         page.begin_preview()
         _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
-        assert page._owner.prepared.request.plan.corrections.member_saturation == (1048575,)
+        assert page._owner.prepared.request.plan.corrections.saturation == (1048575, 1048575)
         assert "Auto · 1048575 (saturation)" in hints()
         page._threshold_edited(THRESHOLD_MAX, 10000.0)
         page.set_field("geometry_path", "calibration/missing.json")
