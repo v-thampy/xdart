@@ -203,6 +203,7 @@ def test_file_save_and_load_through_the_settings_port(qapp, tmp_path):
 
 
 def test_the_last_session_is_restored_and_a_fresh_start_ignores_it(qapp, tmp_path, monkeypatch):
+    import time
     session = tmp_path / "session.json"
     monkeypatch.setenv("XDART_SESSION_FILE", str(session))
     monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
@@ -218,7 +219,13 @@ def test_the_last_session_is_restored_and_a_fresh_start_ignores_it(qapp, tmp_pat
         assert str(second.widget._value("npt_1d")) == "77"
         assert str(second.widget._value("project_root")) == str(tmp_path)
     finally:
-        assert second.close().status is PageCleanup.CLEAN
+        deadline = time.monotonic() + 5
+        receipt = second.close()
+        while receipt.status is PageCleanup.PENDING and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+            receipt = second.close()
+        assert receipt.status is PageCleanup.CLEAN
         second.widget.deleteLater()
 
     before = session.read_bytes()

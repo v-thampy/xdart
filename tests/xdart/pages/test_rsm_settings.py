@@ -222,6 +222,7 @@ def test_the_last_session_is_restored_and_a_fresh_start_neither_reads_nor_writes
                                                                                       monkeypatch):
     """A clean close keeps the page's settings for the next session, which the page builder restores; a fresh
     start (``xdart -f``: XDART_SESSION_FRESH) restores nothing, and its close writes nothing."""
+    import time
     first = build_rsm_page(empty_host_services(_Status()), None)
     first.widget.set_field("project_root", str(tmp_path))
     first.widget.set_field("grid", "Full 200×200×200")
@@ -238,7 +239,13 @@ def test_the_last_session_is_restored_and_a_fresh_start_neither_reads_nor_writes
         assert second.widget._value("grid") == "Full 200×200×200"
         assert second.widget._value("project_root") == str(tmp_path) and second.widget._threshold_state == kept
     finally:
-        assert second.close().status is PageCleanup.CLEAN
+        deadline = time.monotonic() + 5
+        receipt = second.close()
+        while receipt.status is PageCleanup.PENDING and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+            receipt = second.close()
+        assert receipt.status is PageCleanup.CLEAN
         second.widget.deleteLater()
 
     before = session.read_bytes()

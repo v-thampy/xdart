@@ -879,15 +879,18 @@ def test_a_failed_older_read_still_reads_the_newer_selection(qapp, tmp_path):
         return page_module._read_rsm_record(path, cancel, progress)
 
     page = _page(qapp, owner=_Owner(), reader=SingleWorkerOwner(read))
+    def select(path):
+        page.results.setCurrentItem(next(page.results.item(index) for index in range(page.results.count())
+            if page.results.item(index).data(QtCore.Qt.ItemDataRole.UserRole) == path))
     try:
         for path in paths:
             assert page.reopen(path)
             _wait(page, qapp, lambda: not page.active())
         assert page._results[paths[0]] is page._results[paths[1]] is None
         hold.append(True)
-        page.results.setCurrentRow(0)
+        select(paths[0])
         assert started.wait(3)
-        page.results.setCurrentRow(1)
+        select(paths[1])
         Path(paths[0]).unlink()  # a real missing record: the held read fails
         release.set()
         _wait(page, qapp, lambda: not page.active())
@@ -947,15 +950,18 @@ def test_a_late_read_does_not_override_the_newer_selection(qapp, tmp_path):
 
     page = _page(qapp, owner=_Owner(), reader=SingleWorkerOwner(read))
     role = QtCore.Qt.ItemDataRole.UserRole
+    def select(path):
+        page.results.setCurrentItem(next(page.results.item(index) for index in range(page.results.count())
+            if page.results.item(index).data(role) == path))
     try:
         for path in paths:
             assert page.reopen(path)
             _wait(page, qapp, lambda: not page.active())
         assert page._results[paths[0]] is None and page._results[paths[1]] is not None
         hold.append(True)
-        page.results.setCurrentRow(0)
+        select(paths[0])
         assert started.wait(3)
-        page.results.setCurrentRow(1)
+        select(paths[1])
         shown = page.shown
         assert page.results.currentItem().data(role) == paths[1]
         released.set()
@@ -1042,44 +1048,40 @@ def test_append_on_a_blank_page_displays_the_existing_rsm(qapp, tmp_path, scans)
         _close(page, qapp)
 
 
-def test_append_skips_an_up_to_date_output_and_replace_grids_it_again(qapp, tmp_path, monkeypatch):
+def test_append_skips_an_up_to_date_output_and_replace_grids_it_again(qapp, tmp_path):
     """Stitch's semantics: the run bar's toggle (Append by default) is live. In Append a Run skips an output
     whose stored result is this request's (the preflight's rsm_output_current) and says so; a stale one is
     gridded again; in Replace every Run grids. The form is REPLACE throughout: Append is the page's skip."""
-    from xdart.gui.tools import rsm_values
-    _commit_instead_of_gridding(monkeypatch, _values())
-    committed_run, runs = RSMOperationExecutionV2.run, []
-
-    def counted(self, **kwargs):
-        runs.append(self.request.module.output.overwrite)
-        return committed_run(self, **kwargs)
-    monkeypatch.setattr(RSMOperationExecutionV2, "run", counted)
-    current = [True]
-    monkeypatch.setattr(rsm_values, "rsm_output_current", lambda _request: current[0])
     page = _page(qapp)
     label = page.run_bar.readinessLabel
     try:
-        _synthetic_source(tmp_path)
-        _with_source(page, tmp_path)
+        _synthetic_source(tmp_path, full=True)
+        _with_source(page, tmp_path, scans="1")
         output = Path(page._value("output_path"))
-        _rsm_result_at(output)  # a result already there
         toggle = page.run_bar.writeModeButton
         assert toggle.isEnabled() and page.run_bar.write_mode() == "Append"
         assert toggle.toolTip().startswith("Append: skip the output")
         page.begin_run()
-        _wait(page, qapp, lambda: "Up to date" in label.full_text())
-        assert runs == [] and label.full_text() == (
+        _wait(page, qapp, lambda: page.shown is not None and not page.active())
+        revision = (output.stat().st_ino, output.stat().st_mtime_ns, output.read_bytes())
+        fingerprint = page.shown[0].result_fingerprint
+        page.begin_run()
+        _wait(page, qapp, lambda: "Up to date" in label.full_text() and not page.active())
+        assert (output.stat().st_ino, output.stat().st_mtime_ns, output.read_bytes()) == revision
+        assert page.shown[0].result_fingerprint == fingerprint
+        assert label.full_text() == (
             f"Up to date · {output.name} already gridded with these settings (Replace ⇄ grids again)")
         assert "already gridded with these settings (Append skips it)" in page.preview_text.toPlainText()
-        current[0] = False  # stale: Append grids it again
+        page.set_field("grid_h", 32)  # changed settings: Append grids it again
         page.begin_run()
-        _wait(page, qapp, lambda: len(runs) == 1 and not page.active())
-        current[0] = True
+        _wait(page, qapp, lambda: page.shown[0].shape == (32, 40, 40) and not page.active())
+        assert output.stat().st_ino != revision[0]
+        changed = output.stat().st_ino
         toggle.click()  # Replace
         assert page.run_bar.write_mode() == "Overwrite" and toggle.toolTip().startswith("Replace: grid again")
         page.begin_run()
-        _wait(page, qapp, lambda: len(runs) == 2 and not page.active())
-        assert runs == [AnalysisArtifactOverwrite.REPLACE] * 2
+        _wait(page, qapp, lambda: output.stat().st_ino != changed and not page.active())
+        assert page.build_form().overwrite is AnalysisArtifactOverwrite.REPLACE
     finally:
         _close(page, qapp)
 
@@ -1154,7 +1156,7 @@ def test_each_section_header_shows_its_readiness_as_ints_do(qapp, tmp_path):
         _with_source(page, tmp_path)
         assert page.run_bar.readinessLabel.full_text().startswith("1 SPEC file · 1 RSM")
         assert all(card.valid_marker.isVisibleTo(page) for card in cards.values())
-        assert cards["source"].status.text() == "1 SPEC file · 1 RSM"  # Stitch's Source status
+        assert cards["source"].status.text() == "1 SPEC file · 1 RSM · 4 frames"  # Stitch's Source status
         assert cards["processing"].status.text().endswith(" · grid 40×40×40")  # Coordinates is Processing's (G8a)
         assert cards["experiment"].status.text() == "rsm_canonical.json"
         page.set_sources([str(tmp_path / "missing.spec")])

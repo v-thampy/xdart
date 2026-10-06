@@ -8,7 +8,7 @@ import time
 
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
@@ -658,13 +658,16 @@ def test_selecting_existing_result_fences_pending_reopen(qapp, tmp_path, monkeyp
     page = StitchPage(empty_host_services(_Status()))
     entered, release = Event(), Event()
     original = stitch_owner.read_analysis_artifact
+    def select(path):
+        page.results.setCurrentItem(next(page.results.item(index) for index in range(page.results.count())
+            if page.results.item(index).data(QtCore.Qt.ItemDataRole.UserRole) == str(path)))
     try:
         page.open_result(first)
         _wait(page, qapp)
         page.open_result(second)
         _wait(page, qapp)
         expected_y = page.curve.listDataItems()[0].yData.copy()  # the second result's
-        page.results.setCurrentRow(0)
+        select(first)
 
         def delayed(*args, **kwargs):
             entered.set()
@@ -674,11 +677,11 @@ def test_selecting_existing_result_fences_pending_reopen(qapp, tmp_path, monkeyp
         monkeypatch.setattr(stitch_owner, "read_analysis_artifact", delayed)
         page.open_result(first)
         assert entered.wait(5)
-        page.results.setCurrentRow(1)  # read back once the pending reopen is done (C12)
+        select(second)  # read back once the pending reopen is done (C12)
         release.set()
         _wait(page, qapp)
         assert page._current_payload().inspection.path == str(second)
-        assert page.results.currentRow() == 1
+        assert page.browser.current_result() == str(second)
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, expected_y)
     finally:
         release.set()
@@ -878,6 +881,7 @@ def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_aga
     summary = page.run_bar.set_readiness_summary
     try:
         page.load_form(form)
+        _wait(page, qapp)
         assert page.run_bar.writeModeButton.isEnabled()
         assert page.run_bar.write_mode() == "Append"
         assert page.run_bar.writeModeButton.toolTip().startswith("Append: skip each output already stitched")
@@ -958,7 +962,8 @@ def test_a_result_is_shown_once_when_it_is_mounted(qapp, tmp_path):
         page._draw = lambda *args: (draws.append(1), draw(*args))[1]
         page.open_result(target)
         _wait(page, qapp)
-        assert page.results.count() == 1 and page.frames.count() == 3
+        assert sum(page.results.item(index).data(QtCore.Qt.ItemDataRole.UserRole) == str(target)
+                   for index in range(page.results.count())) == 1 and page.frames.count() == 3
         assert (len(rebuilds), len(draws)) == (1, 1)
         page.open_result(target)  # already the current result: shown again, once
         _wait(page, qapp)
