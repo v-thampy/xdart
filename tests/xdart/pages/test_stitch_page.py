@@ -837,6 +837,34 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         qapp.processEvents()
 
 
+@pytest.mark.parametrize("mode", ("1d", "2d"))
+def test_append_on_a_blank_page_displays_the_existing_result(qapp, tmp_path, mode):
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1"), mode=mode,
+                   npt_rad_2d=32, npt_azim_2d=24)
+    request = prepare_stitch_tool(form).request
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    target = Path(request.module.output.target)
+    before = (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes())
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        assert page._current_payload() is None
+        page.run_bar.startButton.click()
+        _wait(page, qapp, timeout=60)
+        payload = page._current_payload()
+        assert payload is not None
+        assert payload.result_fingerprint == result.payload.result_fingerprint
+        assert page.frames.count() > 0 and page.curve.listDataItems()
+        assert page.run_bar.readinessLabel.full_text().startswith("Up to date")
+        assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == before
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
 def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_again(qapp, tmp_path):
     """Maintainer, 2026-09-29: "the append/overwrite button was disabled. all this should do is skip if
     something has already been processed with the same settings as before, else overwrite"."""

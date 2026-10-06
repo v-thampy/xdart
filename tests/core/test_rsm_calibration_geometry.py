@@ -491,9 +491,9 @@ def test_the_run_applies_each_members_ceiling_from_the_calibration(rsm_r2_projec
         looked_up.append((type(receipt).__name__, original_lookup(receipt)))
         return "Pilatus100k" if type(receipt) is RSMCalibrationGeometryReceipt else None
 
-    def apply(raw, conditioned, state, divisors, saturation=None):
+    def apply(raw, conditioned, state, divisors, saturation=None, point_images=None):
         applied.append(saturation)
-        return original_apply(raw, conditioned, state, divisors, saturation)
+        return original_apply(raw, conditioned, state, divisors, saturation, point_images)
 
     monkeypatch.setattr(rsm_operation, "_rsm_calibration_detector", lookup)
     monkeypatch.setattr(rsm_operation, "_apply_rsm_frame_corrections", apply)

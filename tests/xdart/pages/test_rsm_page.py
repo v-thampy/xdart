@@ -1010,6 +1010,38 @@ def _leaving_the_file(monkeypatch):
     monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
 
 
+@pytest.mark.parametrize("scans", ("1", "1,2"))
+def test_append_on_a_blank_page_displays_the_existing_rsm(qapp, tmp_path, scans):
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_operation import run_rsm_operation_v2
+
+    _synthetic_source(tmp_path, full=True)
+    page = _page(qapp)
+    try:
+        _with_source(page, tmp_path, scans=scans)
+        _wait(page, qapp, lambda: not page.active())
+        forms = page.build_forms()
+        assert len(forms) == (1 if scans == "1" else 2)
+        records = []
+        for form in forms:
+            result = run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
+            assert result.terminal.disposition is ModuleDisposition.COMMITTED
+            target = Path(form.output_path)
+            records.append((target, target.stat().st_ino, target.stat().st_mtime_ns,
+                            target.read_bytes(), result.payload.result_fingerprint))
+        assert page.shown is None
+        page.run_bar.startButton.click()
+        _wait(page, qapp, lambda: not page.active(), seconds=60)
+        assert page.shown is not None
+        assert page.shown[0].result_fingerprint == records[-1][-1]
+        assert _slices(page.view)[0].canvas.raw_image.size > 0
+        assert "already gridded with these settings" in page.run_bar.readinessLabel.full_text()
+        for target, inode, mtime, data, _fingerprint in records:
+            assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == (inode, mtime, data)
+    finally:
+        _close(page, qapp)
+
+
 def test_append_skips_an_up_to_date_output_and_replace_grids_it_again(qapp, tmp_path, monkeypatch):
     """Stitch's semantics: the run bar's toggle (Append by default) is live. In Append a Run skips an output
     whose stored result is this request's (the preflight's rsm_output_current) and says so; a stale one is
