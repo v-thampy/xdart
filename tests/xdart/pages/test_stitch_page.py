@@ -850,11 +850,15 @@ def test_append_on_a_blank_page_displays_the_existing_result(qapp, tmp_path, mod
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(form)
+        _wait(page, qapp)  # Source discovery must finish before the real Run button is enabled.
         assert page._current_payload() is None
+        assert page.run_bar.startButton.isEnabled()
         page.run_bar.startButton.click()
         _wait(page, qapp, timeout=60)
         payload = page._current_payload()
-        assert payload is not None
+        assert payload is not None, (page.run_bar.readinessLabel.full_text(),
+                                    page._action_view_revision, page._view_revision,
+                                    page._open_complete_text)
         assert payload.result_fingerprint == result.payload.result_fingerprint
         assert page.frames.count() > 0 and page.curve.listDataItems()
         assert page.run_bar.readinessLabel.full_text().startswith("Up to date")
