@@ -401,6 +401,86 @@ def _mounted_host(selected_key=None):
     return _gui_main.Main(selected_page_key=selected_key)
 
 
+@pytest.mark.parametrize("page_key,relative", [
+    ("stitch", True), ("stitch", False), ("rsm", True), ("rsm", False),
+])
+def test_cold_native_start_lists_saved_output_folder(
+        qapp, isolated_settings, tmp_path, monkeypatch, page_key, relative):
+    from xdart.gui.typography import application_settings
+    from xdart.utils.session import load_session, save_session
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    project = tmp_path / "project"
+    output = project / "processed"
+    output.mkdir(parents=True)
+    artifact = output / "scan.nexus"
+    artifact.touch()
+    nested = output / "nested"
+    nested.mkdir()
+    target = output / "chosen_rsm.nexus" if page_key == "rsm" else output
+    saved_output = str(target.relative_to(project) if relative else target)
+    document = {"kind": f"xdart-{page_key}-settings", "version": 1,
+                "fields": {"project_root": str(project), "output_path": saved_output}}
+    if page_key == "stitch":
+        document["mode"] = "Stitch 2D"
+    save_session({f"{page_key}_settings": document})
+    settings = application_settings()
+    settings.setValue("page.selected", page_key)
+    settings.sync()
+    role = QtCore.Qt.ItemDataRole.UserRole
+    window = _mounted_host()
+    try:
+        assert window.selected_page_key == page_key
+        assert tuple(window._page_handles) == (page_key,)  # Int was never mounted
+        page = window.main_widget
+        deadline = time.monotonic() + 5
+        expected = {str(artifact), str(nested)}
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            listed = {page.browser.scans.item(i).data(role)
+                      for i in range(page.browser.scans.count())}
+            if expected.issubset(listed):
+                break
+            time.sleep(.005)
+        assert expected.issubset(listed), "cold native browser did not list saved output"
+        assert page.browser.directory_label._path == str(output)
+        assert not page.browser.directory_label.isHidden()
+        assert page.browser.current_result() is None  # listing never opens an artifact
+        assert page._result_browser._owner.explicit_directory is False
+        assert page._value("output_path") == saved_output
+        assert load_session()[f"{page_key}_settings"] == document
+        assert window.page_handle.project_location.location() == (str(project), str(output))
+    finally:
+        window.close()
+        deadline = time.monotonic() + 5
+        while window.isVisible() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert not window.isVisible(), "native browser close did not reach CLEAN"
+        window.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("page_key", ["stitch", "rsm"])
+def test_cold_native_start_without_project_keeps_browser_unset(
+        qapp, isolated_settings, monkeypatch, page_key):
+    from xdart.gui.typography import application_settings
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    settings = application_settings()
+    settings.setValue("page.selected", page_key)
+    settings.sync()
+    window = _mounted_host()
+    try:
+        assert window.selected_page_key == page_key
+        assert window.page_handle.browser_directory.directory is None
+        assert window.main_widget.browser.scans.count() == 0
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
 def test_mode_switch_keeps_current_browser_folder(qapp, isolated_settings, tmp_path):
     from pyqtgraph.Qt import QtTest
 
