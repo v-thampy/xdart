@@ -406,7 +406,7 @@ def _mounted_host(selected_key=None):
 ])
 def test_cold_native_start_lists_saved_output_folder(
         qapp, isolated_settings, tmp_path, monkeypatch, page_key, relative):
-    from xdart.gui.typography import application_settings
+    from xdart.gui.themes.typography import application_settings
     from xdart.utils.session import load_session, save_session
 
     monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
@@ -464,7 +464,7 @@ def test_cold_native_start_lists_saved_output_folder(
 @pytest.mark.parametrize("page_key", ["stitch", "rsm"])
 def test_cold_native_start_without_project_keeps_browser_unset(
         qapp, isolated_settings, monkeypatch, page_key):
-    from xdart.gui.typography import application_settings
+    from xdart.gui.themes.typography import application_settings
 
     monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
     settings = application_settings()
