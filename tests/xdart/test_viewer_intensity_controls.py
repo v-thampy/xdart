@@ -73,7 +73,11 @@ def test_default_auto_and_sync_are_signal_silent(qapp):
     control.autoToggled.connect(toggles.append)
     assert control.autoscale.isChecked()
     assert not control.slider.isEnabled()
-    assert control.findChild(QtWidgets.QLabel).text() == "Intensity"
+    assert control.label.text() == "Scale"
+    assert control.autoscale.text() == "Auto"
+    assert 100 <= control.slider.width() <= 113  # ~25% below the former 150px floor, even in a wide host.
+    assert control.autoscale.width() <= 56
+    assert control.label.toolTip() and control.autoscale.toolTip() and control.slider.toolTip()
     control.sync((0, 1000), (100, 900))
     assert control.values() == (100, 900)
     assert control.slider.isEnabled()

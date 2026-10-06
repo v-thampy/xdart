@@ -8,7 +8,7 @@ import time
 
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
@@ -866,6 +866,58 @@ def test_append_on_a_blank_page_displays_the_existing_result(qapp, tmp_path, mod
         assert page.run_bar.readinessLabel.full_text().startswith("Up to date")
         assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == before
     finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("mode,unit,prefix", (("1d", "q_A^-1", "iq"), ("2d", "q_A^-1", "iq"),
+                                            ("1d", "2th_deg", "itth"), ("2d", "2th_deg", "itth")))
+def test_stitch_run_exports_stored_profile_and_empty_click_keeps_it(qapp, tmp_path, mode, unit, prefix):
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    from xrd_tools.io.export import read_xye
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1"), mode=mode, unit=unit,
+                   npt_rad_2d=32, npt_azim_2d=24)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.resize(1400, 850)
+        page.show()
+        page.load_form(form)
+        _wait(page, qapp)
+        page.run_bar.startButton.click()
+        _wait(page, qapp, timeout=60)
+        payload = page._current_payload()
+        assert payload is not None, page.run_bar.readinessLabel.full_text()
+        target = Path(payload.inspection.path)
+        xye = target.with_name(f"{prefix}_{target.stem}.xye")
+        assert xye.is_file(), page.run_bar.readinessLabel.full_text()
+        profile = payload if mode == "1d" else payload.profile
+        x, y, sigma = read_xye(xye)
+        radial = profile.axes[0][1]
+        for actual, expected in ((x, radial), (y, profile.intensity),
+                                 (sigma, np.sqrt(np.abs(profile.intensity)) if profile.sigma is None else profile.sigma)):
+            np.testing.assert_allclose(actual, expected, rtol=5e-9, atol=0, equal_nan=True)
+        nexus_before = target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()
+        curve_before = [(item.xData.copy(), item.yData.copy()) for item in page.curve.listDataItems()]
+        assert curve_before
+        chosen = page.browser.current_result(), page.browser.selected_results()
+        blank = QtCore.QPoint(15, page.results.viewport().height() - 10)
+        assert not page.results.indexAt(blank).isValid()
+        QtTest.QTest.mouseClick(page.results.viewport(), QtCore.Qt.MouseButton.LeftButton, pos=blank)
+        qapp.processEvents()
+        assert (page.browser.current_result(), page.browser.selected_results()) == chosen
+        after = [(item.xData, item.yData) for item in page.curve.listDataItems()]
+        assert len(after) == len(curve_before)
+        for actual, expected in zip(after, curve_before, strict=True):
+            for values, prior in zip(actual, expected, strict=True):
+                np.testing.assert_array_equal(values, prior)
+        xye.unlink()  # Append backfills the export without repeating scientific publication.
+        page.run_bar.startButton.click()
+        _wait(page, qapp, timeout=60)
+        assert xye.is_file() and page.run_bar.readinessLabel.full_text().startswith("Up to date")
+        assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == nexus_before
+    finally:
+        _wait(page, qapp)
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()

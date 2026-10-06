@@ -3,7 +3,7 @@ menus, captions and actions instead of copying them (hard rule 14; Codex's RSM r
 from __future__ import annotations
 
 import pytest
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.browser_view import (
     INT_BROWSER_MENUS,
@@ -107,6 +107,32 @@ _STITCH_LIKE = BrowserProfile(
     list_caption="Results", directory=False, actions=("Open…", "Metadata", "Raw image"), date_sort=False,
     refresh=False, results=True, result_selection="extended", result_frames=True,
 )
+
+
+@pytest.mark.parametrize("profile", (_RESULTS, _STITCH_LIKE))
+def test_empty_results_click_preserves_current_and_explicit_selection(qapp, profile):
+    browser = BrowserView(profile=profile)
+    commands = []
+    browser.commandRequested.connect(commands.append)
+    try:
+        browser.resize(400, 500)
+        browser.show()
+        browser.reconcile_results(tuple(BrowserResult(key, key) for key in "ab"), "a")
+        if profile.result_selection == "extended":
+            browser.scans.item(1).setSelected(True)
+        qapp.processEvents()
+        before = browser.current_result(), browser.selected_results()
+        commands.clear()
+        blank = QtCore.QPoint(15, browser.scans.viewport().height() - 10)
+        assert not browser.scans.indexAt(blank).isValid()
+        QtTest.QTest.mouseClick(browser.scans.viewport(), QtCore.Qt.MouseButton.LeftButton, pos=blank)
+        qapp.processEvents()
+        assert (browser.current_result(), browser.selected_results()) == before
+        assert commands == []
+        browser.clear_result_selection()  # Explicit Clear still has its existing meaning.
+        assert browser.current_result() is None and browser.selected_results() == ()
+    finally:
+        _close(qapp, browser)
 
 
 def test_an_extended_results_list_reports_the_current_result_and_the_selection(qapp):
