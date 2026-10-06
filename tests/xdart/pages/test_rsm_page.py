@@ -867,8 +867,9 @@ def test_a_failed_older_read_still_reads_the_newer_selection(qapp, tmp_path):
     for index in range(7):
         root = tmp_path / str(index)
         root.mkdir()
-        write_record(root, False)
-        paths.append(str((root / "rsm-artifact-v2.nexus").rename(tmp_path / f"r{index}.nexus")))
+        path = tmp_path / f"r{index}.nexus"
+        write_record(root, False, target=path)
+        paths.append(str(path))
     started, release, hold, reads = Event(), Event(), [], []
 
     def read(path, cancel, progress):
@@ -938,8 +939,9 @@ def test_a_late_read_does_not_override_the_newer_selection(qapp, tmp_path):
     for index in range(page_module._RESIDENT_RESULTS + 1):  # the first is evicted
         root = tmp_path / f"r{index}"
         root.mkdir()
-        write_record(root, False)
-        paths.append(str((root / "rsm-artifact-v2.nexus").rename(tmp_path / f"r{index}.nexus")))
+        path = tmp_path / f"r{index}.nexus"
+        write_record(root, False, target=path)
+        paths.append(str(path))
     started, released, hold = Event(), Event(), []
 
     def read(path, cancel, progress):

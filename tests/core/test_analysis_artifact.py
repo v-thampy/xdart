@@ -691,6 +691,7 @@ def test_analysis_artifact_v2_round_trip_binds_separate_execution_attestation(
 def test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch(
     tmp_path,
     observed_environment,
+    *, target=None,
 ):
     projection = project_analysis_artifact_result(
         kind=AnalysisArtifactKind.RSM,
@@ -722,7 +723,7 @@ def test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch(
         request_fingerprint=request_fingerprint,
     )
     request = AnalysisArtifactRequest(
-        tmp_path / "rsm-artifact-v2.nexus",
+        tmp_path / "rsm-artifact-v2.nexus" if target is None else target,
         AnalysisArtifactKind.RSM,
         AnalysisArtifactOverwrite.CREATE_NEW,
         request_fingerprint,

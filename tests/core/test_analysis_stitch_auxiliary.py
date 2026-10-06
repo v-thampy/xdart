@@ -26,7 +26,7 @@ from tests.core.test_analysis_artifact import _execution_attestation
 
 
 def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fractional=False, source_stamp=True,
-             legacy_members=False, point_images=None):
+             legacy_members=False, point_images=None, target=None):
     project = tmp_path / "project"
     project.mkdir()
     raw = np.arange(24, dtype=np.int32).reshape(4, 6)
@@ -71,7 +71,7 @@ def _publish(tmp_path, *, unit="q_A^-1", xu=False, science_frame_count=3, fracti
         extra = dict(execution_attestation=attestation,
             execution_attestation_digest=analysis_execution_attestation_digest(
                 AnalysisArtifactKind.STITCH_1D, attestation, request_fingerprint=digest))
-    request = AnalysisArtifactRequest(tmp_path / "stitched.nexus", AnalysisArtifactKind.STITCH_1D,
+    request = AnalysisArtifactRequest(tmp_path / "stitched.nexus" if target is None else target, AnalysisArtifactKind.STITCH_1D,
         AnalysisArtifactOverwrite.CREATE_NEW, digest, digest, digest, digest, provenance,
         schema_version=7 if xu else 6, **extra)
     output = admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator())
