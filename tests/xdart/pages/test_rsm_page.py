@@ -2110,6 +2110,57 @@ def test_preview_lists_the_shared_dark_and_flat_checks_warnings(qapp, tmp_path, 
         _close(page, qapp)
 
 
+def test_a_saved_calibration_shows_the_numeric_auto_ceiling_before_preview(qapp, tmp_path):
+    """The real calibration exporter supplies the detector, never the window's unsaved defaults."""
+    from xrd_tools.core.geometry.camera import DetectorCamera
+    from xrd_tools.integrate.stitch_calibration import save_calibration_pair, pair_validation_angles
+
+    _synthetic_source(tmp_path, full=True)
+    page = _page(qapp)
+    try:
+        _with_source(page, tmp_path)
+        page._threshold_edited(THRESHOLD_ENABLED, True)
+        page._calibrate()
+        dialog = page._calibration_dialog
+        dialog.camera.set_value(DetectorCamera("z-", "x-"))
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData("manual"))
+        for key, value in (("beam_detector", "Pilatus100k"), ("rough_distance", "1014.7173"),
+                           ("beam_pixel", "97, 243"), ("rough_energy", "13.000007")):
+            dialog._set_field_text(key, value)
+        fit = dialog._rough_fit()
+        target = tmp_path / "calibration" / "early.json"
+        saved = save_calibration_pair(fit, target, validation_angles=pair_validation_angles(fit))
+        assert saved.xu_path is not None, saved.xu_refusal
+        dialog.close()
+
+        def hints():
+            return {edit.placeholderText() for edit in page.threshold_range.findChildren(QtWidgets.QLineEdit)}
+
+        assert "Auto · the detector's saturation" in hints()  # unsaved window defaults do not leak
+        page.set_field("geometry_path", "calibration/early.json")
+        assert "Auto · 1048575 (saturation)" in hints()
+        assert page._auto_threshold_max == 1048574.0
+        assert page._threshold_state.threshold_max is None
+        page.set_sources(page._source_paths)
+        assert "Auto · 1048575 (saturation)" in hints()
+        page.begin_preview()
+        _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
+        assert page._owner.prepared.request.plan.corrections.member_saturation == (1048575,)
+        assert "Auto · 1048575 (saturation)" in hints()
+        page._threshold_edited(THRESHOLD_MAX, 10000.0)
+        page.set_field("geometry_path", "calibration/missing.json")
+        assert page._auto_threshold_max is None
+        assert page._threshold_state.threshold_max == 10000.0
+        assert "Auto · the detector's saturation" in hints()
+        page.set_field("geometry_path", "calibration/early.json")
+        assert page._auto_threshold_max == 1048574.0
+        page.set_field("project_root", str(tmp_path / "elsewhere"))
+        assert page._auto_threshold_max is None  # relative calibration is resolved against Project
+        assert page._threshold_state.threshold_max == 10000.0
+    finally:
+        _close(page, qapp)
+
+
 def test_preview_shows_stitchs_auto_ceiling_hint_on_the_threshold_row(qapp, tmp_path, monkeypatch):
     """G8c (G8b choice): once a Preview resolved each member's automatic ceiling (decision 39's calibrated-detector
     counter limit, on the worker), the Threshold's High box shows Stitch's hint (the shared ``auto_ceiling_hint``),
