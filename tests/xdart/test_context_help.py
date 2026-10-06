@@ -276,3 +276,99 @@ def test_calibration_busy_close_retains_help_until_worker_cleanup(tmp_path, qapp
         if dialog._owner._worker is not None:
             dialog._owner._worker.join(2)
         dialog.shutdown(); _dispose(dialog, qapp)
+
+
+@pytest.mark.parametrize("return_to_root", ("dismiss", "reactivate"))
+def test_real_int_help_visit_reconciles_draft_before_calibrate(tmp_path, qapp, monkeypatch, return_to_root):
+    """B1/H4/A2: opening help commits nothing; the next real action captures the display."""
+    from xdart._gui_main import Main
+    from xdart.gui.pages.values import SCATTERING_PAGE_KEY
+    from xdart.gui.widgets.context_help import owner_for
+    from xdart.gui.widgets.controls_panel import FormRow
+    from xdart.gui.tabs.scattering.controls_inventory import INT_1D_POINTS, integration_values
+    from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+    main = Main(selected_page_key=SCATTERING_PAGE_KEY)
+    page = main.page_handle.widget
+    captures = []
+    monkeypatch.setattr("xdart.gui.tabs.scattering.page.resolve_calibration_executable", lambda: "/unused/pyFAI-calib2")
+    # Cancel the actual chooser boundary after it sees the actual revisioned intent.
+    def chooser(*_args):
+        captures.append(page._intents.snapshot())
+        return ""
+    page._authoring_source_chooser = chooser
+    try:
+        snapshot = page._intents.snapshot(); intent = snapshot.thaw(); intent.project_root = str(tmp_path)
+        page._intents.commit(intent, expected_revision=snapshot.revision); page._refresh_shell()
+        controls = page._shell.controls
+        row = next(r for r in controls.findChildren(FormRow) if r.path == INT_1D_POINTS)
+        main.show(); main.activateWindow(); row.editor.setFocus(); qapp.processEvents()
+        assert row.editor.hasFocus()
+        before = page._intents.snapshot()
+        row.editor.selectAll(); QtTest.QTest.keyClicks(row.editor, "444")
+        QtTest.QTest.mouseClick(controls.processing_card.help_button, QtCore.Qt.MouseButton.LeftButton)
+        qapp.processEvents()
+        owner = owner_for(main)
+        assert owner.window.isVisible() and page._intents.snapshot().revision == before.revision
+        if return_to_root == "dismiss":
+            owner.window.close()
+        main.activateWindow(); qapp.processEvents()  # no manual editor refocus
+        print("B1 Int return", return_to_root, "hold", row._help_focus_transfer,
+              "focus", main.focusWidget(), "display", row.current_value())
+        page._shell.commandRequested.emit(ShellCommand(ShellCommandKind.CONTROL_ACTION, "calibrate"))
+        assert len(captures) == 1
+        assert integration_values(captures[0].thaw())[INT_1D_POINTS] == int(row.current_value()) == 444
+        assert not row._help_focus_transfer
+    finally:
+        _dispose(main, qapp)
+
+
+@pytest.mark.parametrize("dismiss", (False, True))
+def test_real_rsm_authoritative_update_replaces_help_draft(tmp_path, qapp, dismiss):
+    """B1: RSM's real model projection must replace a held presentation draft."""
+    from xdart._gui_main import Main
+    from xdart.gui.pages.values import RSM_TOOL_KEY
+    from xdart.gui.widgets.context_help import owner_for
+    main = Main(selected_page_key=RSM_TOOL_KEY); page = main.page_handle.widget
+    try:
+        page.set_field("project_root", str(tmp_path)); page.advanced.show()
+        row = page._rows["adv_rows"]
+        page.advanced.activateWindow(); row.editor.setFocus(); qapp.processEvents()
+        assert row.editor.hasFocus()
+        row.editor.selectAll(); QtTest.QTest.keyClicks(row.editor, "444")
+        _f1(page.advanced, row.editor, qapp)
+        owner = owner_for(page.advanced)
+        if dismiss:
+            owner.window.close(); page.advanced.activateWindow(); qapp.processEvents()
+        page.set_field("adv_rows", "555")
+        print("B1 RSM update", dismiss, "hold", row._help_focus_transfer,
+              "model", page._fields["adv_rows"].value, "display", row.current_value())
+        assert page._fields["adv_rows"].value == row.current_value() == row.editor.text() == "555"
+        assert not row._help_focus_transfer
+    finally:
+        _dispose(main, qapp)
+
+
+def test_real_stitch_busy_to_idle_keeps_advanced_help_available(tmp_path, qapp):
+    """T1/A2: exercise the real operation owner and page's Advanced lock projection."""
+    from xdart.gui.pages.services import empty_host_services
+    from xdart.gui.tabs.stitch.page import StitchPage
+    from xdart.gui.widgets.context_help import owner_for
+    from xdart.gui.widgets.controls_panel import SubsectionCard
+    from tests.xdart.pages.test_stitch_page import _Status, _wait
+    from tests.xdart.pages.test_stitch_page_options import _close
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        page.advanced.show(); qapp.processEvents()
+        group = next(c for c in page.advanced.findChildren(SubsectionCard)
+                     if c.property("helpTopic") == "corrections.existing")
+        assert group.body.isEnabled() and group.help_button.isEnabled()
+        page.begin_preview()
+        assert page._owner.busy and not group.body.isEnabled() and group.help_button.isEnabled()
+        group.help_button.click(); assert owner_for(page.advanced).window.topic_id == "corrections.existing"
+        _wait(page, qapp)
+        assert not page._owner.busy and group.body.isEnabled() and group.help_button.isEnabled()
+        page.preview_dialog.close()
+    finally:
+        _close(page, qapp)
