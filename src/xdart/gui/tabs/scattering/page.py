@@ -1640,6 +1640,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if payload is None:
             if target == "scan_roi" and self._scan_roi_dialog is not None:
                 self._scan_roi_dialog.status.setText(diagnostic)
+                self._scan_roi_dialog.set_help_diagnostic(diagnostic)
             if kind == "roi_preview" and current and self._scan_roi_dialog is not None:
                 dialog = self._scan_roi_dialog
                 dialog._roi_preview_waiting = False
@@ -1671,6 +1672,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not admitted:
             if target == "scan_roi" and self._scan_roi_dialog is not None:
                 self._scan_roi_dialog.status.setText(reason)
+                self._scan_roi_dialog.set_help_diagnostic(reason)
             if kind == "roi_preview" and self._scan_roi_dialog is not None:
                 self._scan_roi_dialog._roi_preview_waiting = False
                 picker = self._scan_roi_dialog._roi_dialog
@@ -1690,6 +1692,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None and payload.image is not None:
                 self._scan_roi_dialog._vnext_preview_result = payload
+                self._scan_roi_dialog.set_help_diagnostic(payload.code, payload.diagnostics)
                 table = self._scan_roi_dialog._vnext_table_result
                 created = self._scan_roi_dialog._roi_dialog is None
                 picker = self._scan_roi_dialog.mount_roi_view(payload)

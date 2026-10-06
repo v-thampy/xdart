@@ -26,14 +26,17 @@ def test_f1_nearest_context_unknown_fallback_and_shared_help_window(qapp):
     from xdart.gui.widgets.controls_panel import SectionCard, FormRow
     from xdart.gui.widgets.read_only_text import ReadOnlyTextPane
     from xdart.gui.tabs.scattering.browser_view import BrowserView
-    root = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(root)
-    card = SectionCard("2", "Experiment", "experiment"); layout.addWidget(card)
+    root = QtWidgets.QWidget(); root.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+    layout = QtWidgets.QVBoxLayout(root)
+    card = SectionCard("Experiment", number="2", accent="experiment"); layout.addWidget(card)
     card.set_help_topic("calibration.multi-step")
     row = FormRow(label="Detector", path=("test",), value="stable")
     card.body_layout.addWidget(row); row.set_help_topic("geometry.orientation")
     commits = []; row.valueChanged.connect(lambda *args: commits.append(args))
     owner = owner_for(root)
     try:
+        root.show(); root.activateWindow(); row.editor.setFocus(); qapp.processEvents()
+        QtTest.QTest.keyClicks(row.editor, " draft")
         _f1(root, row.editor, qapp)
         window = owner.window
         assert window.topic_id == "geometry.orientation" and not commits
@@ -58,6 +61,11 @@ def test_f1_nearest_context_unknown_fallback_and_shared_help_window(qapp):
             assert widget.toolTip()
         _f1(root, row.editor, qapp)
         assert owner.window is window
+        root.activateWindow(); row.editor.setFocus(); qapp.processEvents()
+        QtTest.QTest.keyClicks(row.editor, " more")
+        QtTest.QTest.mouseClick(card.help_button, QtCore.Qt.MouseButton.LeftButton)
+        qapp.processEvents()
+        assert not commits and "draft" in row.current_value()
         bind_topic(row, "unknown.β")
         _f1(root, row.editor, qapp)
         assert window.topic_id is None and "unknown.β" in window.pane.toPlainText()
@@ -81,7 +89,7 @@ def test_real_search_selection_and_f1_inside_help_return_to_index(qapp):
     try:
         root.show(); owner.show_index(); window = owner.window
         window.search_row.editor.setFocus()
-        QtTest.QTest.keyClicks(window.search_row.editor, "polarization flat")
+        QtTest.QTest.keyClicks(window.search_row.editor, "polarization flat cutoff")
         qapp.processEvents()
         assert window.browser.scans.count() == 1
         item = window.browser.scans.item(0)
@@ -148,6 +156,7 @@ def test_actual_main_menus_move_one_index_action_and_page_contexts(qapp):
             assert owner.window is window and window.topic_id == topic
             controls.processing_card.help_button.click()
             assert window.topic_id == "corrections.existing"
+            controls.experiment_card.show()  # the empty Project otherwise hides this bound control
             _f1(main, controls.experiment_card.help_button, qapp)
             assert window.topic_id == topic
             if key != SCATTERING_PAGE_KEY:
@@ -155,7 +164,11 @@ def test_actual_main_menus_move_one_index_action_and_page_contexts(qapp):
                 advanced.show(); qapp.processEvents()
                 group = next(c for c in advanced.findChildren(SubsectionCard)
                              if c.property("helpTopic") == "corrections.existing")
+                advanced.set_editors_enabled(False)
+                assert not group.body.isEnabled() and group.help_button.isEnabled()
                 group.help_button.click()
+                assert owner_for(advanced).window.topic_id == "corrections.existing"
+                _f1(advanced, group.help_button, qapp)
                 assert owner_for(advanced).window.topic_id == "corrections.existing"
         main.close(); qapp.processEvents()
         assert owner.window is None and owner.shortcut is None
@@ -195,7 +208,7 @@ def test_roi_result_warnings_survive_redraw_stale_and_refusal_then_retire(tmp_pa
     from xdart.gui.widgets.context_help import owner_for
     from tests.xdart.scattering.test_roi_combined_window import _open, _settle
     from tests.xdart.scattering.test_p37_analysis_mount import _page, _close_page, _roi_navigation_table
-    _roi_navigation_table(tmp_path); page = _page()
+    _roi_navigation_table(tmp_path, missing_label=7); page = _page()
     try:
         dialog, picker = _open(page, tmp_path / "navigation.nexus", qapp)
         picker.compute_btn.click(); _settle(page, qapp)
@@ -209,6 +222,10 @@ def test_roi_result_warnings_survive_redraw_stale_and_refusal_then_retire(tmp_pa
         dialog.help_button.click()
         assert "retained" in window.pane.toPlainText().lower() and "stale" in window.pane.toPlainText().lower()
         assert "literal β\nline 2" in window.pane.toPlainText() and "Out of date" in dialog.roi_caption.text()
+        picker.scientific.keyed_panel(picker._image_key).selector.setCurrentIndex(1)
+        _settle(page, qapp)  # actual refused raw preview, adopted through the page's terminal projection
+        dialog.help_button.click()
+        assert "ROI_RAW_UNAVAILABLE" in window.pane.toPlainText() and "!" in dialog.help_button.text()
         dialog.set_help_diagnostic("ROI_PREVIEW_LIMIT_EXCEEDED", ("literal refusal",))
         _f1(dialog, dialog.x_combo, qapp)
         assert "ROI_PREVIEW_LIMIT_EXCEEDED\nliteral refusal" in window.pane.toPlainText()
@@ -238,12 +255,13 @@ def test_calibration_busy_close_retains_help_until_worker_cleanup(tmp_path, qapp
     dialog = CalibrationDialog(CalibrationContext("RSM", tmp_path))
     # The science runner is outside the help seam; the actual operation/close owner is exercised.
     dialog._owner = SingleWorkerOwner(held_job)
-    dialog._identity = dialog._owner.begin("held")
+    dialog._start("held", ())
     assert entered.wait(2)
     owner = owner_for(dialog)
     try:
         dialog.show(); owner.show_topic("calibration.diagnostics")
         identity = dialog._owner.current_identity; window = owner.window
+        assert not dialog.tabs.tabBar().isEnabled() and dialog.tabs.cornerWidget().isEnabled()
         dialog.tabs.cornerWidget().click()
         assert dialog._owner.current_identity is identity and dialog.active()
         event = QtGui.QCloseEvent(); qapp.sendEvent(dialog, event)
@@ -254,5 +272,7 @@ def test_calibration_busy_close_retains_help_until_worker_cleanup(tmp_path, qapp
         assert dialog.shutdown().status is PageCleanup.CLEAN
         assert owner.window is None and owner.shortcut is None
     finally:
-        release.set(); dialog._owner._worker.join(2)
+        release.set()
+        if dialog._owner._worker is not None:
+            dialog._owner._worker.join(2)
         dialog.shutdown(); _dispose(dialog, qapp)

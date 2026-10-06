@@ -570,6 +570,7 @@ class StitchPage(QtWidgets.QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         self.controls = ControlsPanel(experiment_title="Configuration", show_section_numbers=False)  # as Int's
         self.controls.experiment_card.title.setText("EXPERIMENT")
+        self.controls.experiment_card.set_help_topic("calibration.multi-step")
         scroll = _HugWidthScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -3327,7 +3328,7 @@ class StitchPage(QtWidgets.QWidget):
         self.calibrate_button.setEnabled(idle)
         self.mask_button.setEnabled(idle)
         self.browser.set_action_enabled("Raw image", self.browser.result_frame_count() > 0 and not self._closing)
-        self.advanced.setEnabled(idle)
+        self.advanced.set_editors_enabled(idle)
         self.browser.set_action_enabled("Open…", idle)
         self.browser.set_action_enabled("Metadata", idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)

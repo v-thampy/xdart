@@ -317,7 +317,7 @@ class _ElidedDirectoryLabel(QtWidgets.QLabel):
 INT_BROWSER_MENUS = (
     ("File", ("Open Folder", "New", "Save As", "Export")),
     ("Config", ("Save", "Load", "Advanced", "Performance Diagnostics…")),
-    ("Help", ("Help", "Export Analyze Results Notebook")),
+    ("Help", ("Export Analyze Results Notebook",)),
 )
 
 

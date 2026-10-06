@@ -437,6 +437,7 @@ class RSMPage(QtWidgets.QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         self.controls = ControlsPanel(experiment_title="Configuration", show_section_numbers=False)  # Int's
         self.controls.experiment_card.title.setText("EXPERIMENT")
+        self.controls.experiment_card.set_help_topic("calibration.multi-step")
         self.controls.controlActionRequested.connect(self._control_action)
         scroll = _HugWidthScrollArea()
         scroll.setWidgetResizable(True)
@@ -1554,7 +1555,7 @@ class RSMPage(QtWidgets.QWidget):
         if not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs):
             self._authoring_timer.stop()
         self.run_bar.set_mode_row_enabled(idle)
-        self.advanced.setEnabled(idle)
+        self.advanced.set_editors_enabled(idle)
         self.browser.set_action_enabled("Open…", not busy and not reading and not self._closing)
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)

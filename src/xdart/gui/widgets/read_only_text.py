@@ -41,5 +41,9 @@ class ReadOnlyTextWindow(QtWidgets.QDialog):
         """Show ``text`` in the window's pane."""
         self.pane.set_text(text)
 
+    def insert_content(self, widget, index: int = 0) -> None:
+        """Mount another shared owner before the text, without changing the plain window contract."""
+        self.layout().insertWidget(index, widget)
+
 
 __all__ = ["ReadOnlyTextPane", "ReadOnlyTextWindow"]

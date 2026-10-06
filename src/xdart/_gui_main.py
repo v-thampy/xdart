@@ -498,6 +498,11 @@ class Main(QMainWindow):
         self.actionCheckForUpdates.triggered.connect(self._check_for_updates)
         self.actionOpenLogLocation = QtGui.QAction("Open Log Location", self)
         self.actionOpenLogLocation.triggered.connect(self._open_log_location)
+        from xdart.gui.widgets.context_help import owner_for
+        self._help_owner = owner_for(self)
+        self.actionHelpIndex = QtGui.QAction("Scientific help (F1)", self)
+        self.actionHelpIndex.setToolTip("Open the offline scientific help index; F1 uses the focused control's topic.")
+        self.actionHelpIndex.triggered.connect(self._help_owner.show_index)
         self.application_config_actions = (
             self._config_separator,
             self.themeMenu.menuAction(),
@@ -508,6 +513,7 @@ class Main(QMainWindow):
             self.debugMenu.menuAction(),
         )
         self.application_help_actions = (
+            self.actionHelpIndex,
             self.actionCheckForUpdates,
             self.actionOpenLogLocation,
         )
@@ -537,6 +543,7 @@ class Main(QMainWindow):
                 for action in self.application_config_actions:
                     self._attached_config_menu.removeAction(action)
             if self._attached_help_menu is not None:
+                self._attached_help_menu.aboutToShow.disconnect(self._help_owner.preserve_draft)
                 for action in self.application_help_actions:
                     self._attached_help_menu.removeAction(action)
             if self._attached_analysis_menu is not None:
@@ -548,7 +555,10 @@ class Main(QMainWindow):
             config_menu.addAction(action)
             action.setEnabled(True)
         for action in self.application_help_actions:
-            help_menu.addAction(action)
+            if action is self.actionHelpIndex and help_menu.actions():
+                help_menu.insertAction(help_menu.actions()[0], action)
+            else:
+                help_menu.addAction(action)
             action.setEnabled(True)
         if analysis_menu is not None:
             for action in self._tool_actions.values():
@@ -556,6 +566,7 @@ class Main(QMainWindow):
                 action.setEnabled(True)
         self._attached_config_menu = config_menu
         self._attached_help_menu = help_menu
+        help_menu.aboutToShow.connect(self._help_owner.preserve_draft)
         self._attached_analysis_menu = analysis_menu
         if tool_requested is not None:
             tool_requested.connect(self.open_tool)
@@ -1160,6 +1171,7 @@ class Main(QMainWindow):
                 QtCore.QTimer.singleShot(50, self._retry_close)
             return
         self._close_retry_scheduled = False
+        self._help_owner.shutdown()
         event.accept()
         if self._process_exit_requested:
             QtCore.QTimer.singleShot(0, self._terminate_process)

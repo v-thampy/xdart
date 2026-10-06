@@ -524,6 +524,9 @@ class ControlAction(str, Enum):
     PREVIEW = "preview"
     RETRY = "retry"
     PLOT_METADATA = "plot_metadata"
+    #: Presentation only: shared help buttons route directly to their context
+    #: owner, never through ControlsProjection or a scientific command.
+    HELP = "help"
 
 
 @dataclass(frozen=True, slots=True)

@@ -17,6 +17,8 @@ class RoiSelectDialog(QtWidgets.QDialog):
         self._view.sigCompute.connect(self.sigCompute)
         self._view.sigPreviewFrame.connect(self.sigPreviewFrame)
         self._view.closeRequested.connect(self.close)
+        from xdart.gui.widgets.context_help import owner_for
+        self._help_owner = owner_for(self)
 
     def __getattr__(self, name):
         view = self.__dict__.get("_view")

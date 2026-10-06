@@ -509,14 +509,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._parts = {}
         outer = QtWidgets.QVBoxLayout(self)
         self.tabs = QtWidgets.QTabWidget()
-        help_button = QtWidgets.QToolButton()
-        help_button.setText('?')
-        help_text = ('Describe the instrument, start from a rough geometry (a direct-beam scan, a typed '
-                     'distance, or skip), select representative frames of a calibrant scan, calibrate '
-                     'each image, then fit and save one geometry.')
-        help_button.setToolTip(help_text)
-        help_button.clicked.connect(lambda: QtWidgets.QToolTip.showText(
-            help_button.mapToGlobal(help_button.rect().bottomLeft()), help_text, help_button))
+        from xdart.gui.widgets.controls_panel import ActionButton
+        from xdart.gui.widgets.context_help import bind_topic, owner_for
+        help_button = ActionButton.for_help(self, 'calibration.multi-step')
         self.tabs.setCornerWidget(help_button, QtCore.Qt.TopRightCorner)
         self._tab_pages = {}
         outer.addWidget(self.tabs, 1)
@@ -530,6 +525,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._sync_rough_rows()
         self.status = QtWidgets.QLabel('Ready. Three to five frames are suggested; angle coverage and fit diagnostics determine sufficiency.')
         self.status.setWordWrap(True)
+        bind_topic(self, 'calibration.multi-step', details=lambda:
+                   self.status.text() + '\n' + self.fit_summary.toPlainText())
+        self._help_owner = owner_for(self)
         outer.addWidget(self.status)
         footer = QtWidgets.QHBoxLayout()
         self.cancel_button = QtWidgets.QPushButton('Cancel operation')
@@ -589,6 +587,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         page.setWidget(widget)
         self.tabs.addTab(page, title)
         self._tab_pages[key] = page
+        from xdart.gui.widgets.context_help import bind_topic
+        bind_topic(page, {'instrument': 'geometry.orientation', 'rough': 'geometry.orientation',
+                         'select': 'calibration.frame-choice', 'calibrate': 'calibration.diagnostics'}[key])
         return layout, form
 
     def _show_tab(self, key):
@@ -1207,13 +1208,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                 'place and the table lists which rings to expect. A direct-beam scan measures the distance; '
                 'or type it. Rough values are enough: once one frame is calibrated, the others are predicted '
                 'from it instead.')
-        rough_help = QtWidgets.QToolButton()
-        rough_help.setText('?')
-        rough_help.setToolTip('Explain the selected rough geometry method')
-        rough_help.clicked.connect(lambda: QtWidgets.QToolTip.showText(
-            rough_help.mapToGlobal(rough_help.rect().bottomLeft()),
-            self._ROUGH_NOTES[self.rough_mode.currentData()], rough_help))
-        self._row_of[self.rough_mode].add_trailing_widget(rough_help)
+        self._row_of[self.rough_mode].set_help_topic('geometry.orientation', button=True)
         self._edit(form, 'rough_distance', 'Sample–detector distance (mm)', '',
                    tip='Sample to detector, in millimetres, with the detector facing the beam squarely.')
         self.beam_source_kind = self._combo(form, 'Source', [('SPEC + image series', 'spec_series'),
@@ -1954,7 +1949,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._calibration_fit_window is not None:
             self._calibration_fit_window.preview_busy(True)
         self._identity = self._owner.begin((kind, arguments))
-        self.tabs.setEnabled(kind == 'beam_detect')
+        self._set_tabs_enabled(kind == 'beam_detect')
         self.cancel_button.setEnabled(True)
         self.status.setText('Stitching calibrant preview…' if kind == 'stitch_preview' else
                             'Checking direct-beam scan…' if kind == 'beam_detect'
@@ -2731,7 +2726,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             return
         terminal, kind = update.terminal, self._job
         self._identity = None
-        self.tabs.setEnabled(True)
+        self._set_tabs_enabled(True)
         self.cancel_button.setEnabled(False)
         self._timer.stop()
         if self._calibration_fit_window is not None:
@@ -2894,6 +2889,12 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._close_pending = False
             self.close()
 
+    def _set_tabs_enabled(self, enabled):
+        # Preserve the science/editor lock while the corner help action stays available.
+        self.tabs.tabBar().setEnabled(enabled)
+        for page in self._tab_pages.values():
+            page.setEnabled(enabled)
+
     def closeEvent(self, event):
         self._beam_probe_timer.stop()
         if self._owner.busy:
@@ -2903,6 +2904,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         else:
             self._timer.stop()
             self._save_session_quietly()
+            self._help_owner.shutdown()
             event.accept()
 
     def _save_session_quietly(self, policy=None):
@@ -2926,5 +2928,6 @@ class CalibrationDialog(QtWidgets.QDialog):
         receipt = self._owner.close()
         if receipt.status is PageCleanup.CLEAN:
             self._save_session_quietly()
+            self._help_owner.shutdown()
             self.hide()
         return receipt
