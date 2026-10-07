@@ -23,9 +23,9 @@ SCORE_POLICY = dict(arc_step_px=1., segment_px=32., ring_offsets=(-.75, 0., .75)
 SEEDS = tuple(range(16))
 BACKGROUNDS = (.5, 5., 50.)
 SIGNAL = 200.
-POSITIVE_CASES = (((-190., 229.), (0., 0., 0.), (0., 0.)),
-                  ((-190., 229.), (2., -1., 0.), (0., 0.)),
-                  ((-190., 229.), (0., 0., 0.), (15., 7.)))
+POSITIVE_CASES = (((-190., 229.), (0., 0.), (0., 0.)),
+                  ((-190., 229.), (2., -1.), (0., 0.)),
+                  ((-190., 229.), (0., 0.), (15., 7.)))
 
 
 def api():
@@ -33,7 +33,7 @@ def api():
     return geometry_figures
 
 
-def inputs(offset=(-190., 229.), tilt=(0., 0., 0.), pose=(0., 0.), shape=SHAPE):
+def inputs(offset=(-190., 229.), tilt=(0., 0.), pose=(0., 0.), shape=SHAPE):
     return api().GeometryInputs(shape=shape, detector='Pilatus1M', distance_m=.2,
                                 wavelength_m=1e-10, beam_offset_px=offset,
                                 mount_deg=tilt, readings=(('del', pose[0]), ('nu', pose[1])))
@@ -49,7 +49,7 @@ def reference(value, camera, senses=(1, 1)):
     centre = (np.array(oriented_shape)[::-1] - 1) / 2
     beam = centre + value.beam_offset_px
     record = rough_arm_record(detector=value.detector, distance_m=value.distance_m,
-                              wavelength=value.wavelength_m, beam_px=beam, camera=orientation,
+                              wavelength_m=value.wavelength_m, beam_px=beam, camera=orientation,
                               mount_deg=value.mount_deg, orientation=value.first_pixel,
                               senses=dict(zip(('del', 'nu'), senses)))
     frame = CalibrationFrame('f', 's', 'spec', {}, 0, 'raw', 0, 'i', 'sha', oriented_shape,
@@ -88,8 +88,8 @@ def test_first_pixel_corners_match_pyfai_orientation():
         assert 'separate' in figure.caption.lower()
 
 
-@pytest.mark.parametrize('tilt,pose', [((0., 0., 0.), (0., 0.)),
-                       ((3., -2., 1.), (0., 0.)), ((1., 2., 0.), (30., 12.))])
+@pytest.mark.parametrize('tilt,pose', [((0., 0.), (0., 0.)),
+                       ((3., -2.), (0., 0.)), ((1., 2.), (30., 12.))])
 def test_ring_curves_match_pyfai_contours_and_predicted_ring_metadata(tilt, pose):
     from scipy.ndimage import map_coordinates
     from contourpy import contour_generator
