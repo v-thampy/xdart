@@ -1,7 +1,7 @@
 """B-H: frozen real help/cache/display oracle, including pre-writer R1–R5."""
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 
 @pytest.fixture
@@ -31,7 +31,7 @@ def test_help_teaching_input_cache_ties_and_source_free_second_view(qapp, monkey
         overrides = []
         original = QtWidgets.QApplication.setOverrideCursor
         def track(cursor):
-            overrides.append(cursor.shape()); return original(cursor)
+            overrides.append(QtGui.QCursor(cursor).shape()); return original(cursor)
         monkeypatch.setattr(QtWidgets.QApplication, 'setOverrideCursor', track)
         window.show_orientation_check()
         assert QtCore.Qt.CursorShape.WaitCursor in overrides

@@ -47,6 +47,7 @@ def test_preview_caps_native_scores_scaled_rings_and_feature_click(qapp, tmp_pat
     record = rough_arm_record(detector=model, distance_m=value.distance_m,
         wavelength_m=value.wavelength_m, beam_px=centre+value.beam_offset_px,
         camera=orientation, mount_deg=tilt, orientation=3)
+    projected = gf.calibration_orientation_inputs(record, frame)
     before = hashlib.sha256(path.read_bytes()).hexdigest()
     finding, figure, physical = gf.diagnose_calibration_frames((frame,), record,
         mask=orientation.apply(static), saturation=1e6, preview_camera=camera)
@@ -58,8 +59,7 @@ def test_preview_caps_native_scores_scaled_rings_and_feature_click(qapp, tmp_pat
     assert figure.image.shape == tuple((n+b-1)//b for n in shape)
     assert physical.shape == value.shape and physical.detector == value.detector
     assert physical.first_pixel == value.first_pixel and physical.readings == value.readings
-    np.testing.assert_allclose((physical.distance_m, *physical.beam_offset_px, *physical.mount_deg),
-                               (value.distance_m, *value.beam_offset_px, *value.mount_deg), atol=1e-10, rtol=1e-12)
+    assert physical == projected
     assert physical.wavelength_m == value.wavelength_m
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
     native_frame = gf.OrientationFrame(image, physical, static, 1e6)
@@ -83,10 +83,10 @@ def test_preview_caps_native_scores_scaled_rings_and_feature_click(qapp, tmp_pat
                  (figure.image.shape[0]-1, figure.image.shape[1]-1)):
         block = image[y*b:min((y+1)*b, shape[0]), x*b:min((x+1)*b, shape[1])]
         allowed = admitted[y*b:min((y+1)*b, shape[0]), x*b:min((x+1)*b, shape[1])]
-        target = block[allowed].mean(dtype=np.float64) if allowed.any() else np.nan
+        target = np.float32(block[allowed].mean(dtype=np.float64)) if allowed.any() else np.nan
         np.testing.assert_allclose(figure.image[y, x], target, rtol=1e-6, equal_nan=True)
     # Native reference keeps its independent pyFAI 2theta contour oracle.
-    prediction = gf.predict_ring_curves(value, camera)
+    prediction = gf.predict_ring_curves(physical, camera)
     for theta in {c.two_theta_deg for c in prediction.curves}:
         expected = np.concatenate([c.xy for c in prediction.curves if c.two_theta_deg == theta])
         actual = np.concatenate([c.xy for c in figure.curves if c.two_theta_deg == theta])
