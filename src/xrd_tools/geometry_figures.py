@@ -172,7 +172,7 @@ class FirstPixelFigure(Figure):
     corner_name: str = ''
 
 
-def _geometry(value, camera, senses=(1, 1)):
+def _geometry(value, camera, senses=(1, 1), *, include_rings=True):
     from xrd_tools.integrate.calibration_seed import rough_arm_record, predict_frame_seed
     from xrd_tools.integrate.stitch_calibration import CalibrationFrame
     from xrd_tools.core.energy import wavelength_m_to_energy_eV
@@ -185,7 +185,7 @@ def _geometry(value, camera, senses=(1, 1)):
         senses=dict(zip(('del', 'nu'), senses)))
     frame = CalibrationFrame('synthetic', 'synthetic', 'spec', {}, 0, '', 0, '', '', shape,
                              0, dict(value.readings), wavelength_m_to_energy_eV(value.wavelength_m))
-    return record, predict_frame_seed(record, frame), shape
+    return record, predict_frame_seed(record, frame, include_rings=include_rings), shape
 
 
 @dataclass(frozen=True)
@@ -429,3 +429,273 @@ def help_figures(key, candidate_index=0):
     return (replace(prediction, image=observed.image, curves=reference+prediction.curves,
                     caption=note+'Synthetic LaB6 image: solid reference, dashed candidate. '
                     'First-pixel corner is fixed; no camera or motor setting is changed.'),)
+
+
+# Frozen measurement procedure: these are not confidence probabilities.
+_SCORE_POLICY = dict(arc_step_px=1., segment_px=32., ring_offsets=(-.75, 0., .75),
+    background_offsets=(-4.75, -4., -3.25, 3.25, 4., 4.75),
+    minimum_segments=4, minimum_support=.05, margin_se=3.)
+
+
+@dataclass(frozen=True)
+class RingScore:
+    number: int
+    support: float
+    segment_scores: tuple[float, ...]
+    score: float
+    standard_error: float
+
+
+@dataclass(frozen=True)
+class OrientationCandidate:
+    camera: DetectorCamera
+    senses: tuple[int, int]
+    ring_scores: tuple[RingScore, ...] = ()
+    score: float = float('nan')
+    standard_error: float = float('nan')
+    prediction: tuple[float, ...] = field(default=(), repr=False)
+
+
+@dataclass(frozen=True)
+class Exclusions:
+    geometric: int = 0
+    value: int = 0
+
+
+@dataclass(frozen=True)
+class OrientationFinding:
+    candidates: tuple[OrientationCandidate, ...]
+    best: OrientationCandidate | None
+    tied: tuple[OrientationCandidate, ...]
+    identifiable: bool
+    reason: str
+    margin: float = 0.
+    margin_standard_error: float = 0.
+    exclusions: Exclusions = Exclusions()
+    policy: tuple = tuple(_SCORE_POLICY.items())
+    evaluated_hypotheses: int = 0
+    worker_thread_id: int = 0
+
+
+@dataclass(frozen=True)
+class OrientationFrame:
+    image: np.ndarray = field(compare=False, repr=False)
+    geometry: GeometryInputs
+    mask: np.ndarray | None = field(default=None, compare=False, repr=False)
+    saturation: float | None = None
+
+
+def _raw_affine(camera, shape):
+    transform = stitch_orientation(camera)
+    origin = np.array(transform.unapply_pixel((0., 0.), shape))
+    matrix = np.column_stack([np.array(transform.unapply_pixel(p, shape))-origin
+                              for p in ((1., 0.), (0., 1.))])
+    return origin, matrix
+
+
+def _cone_plane(ai):
+    """Flat-detector cone intersections from pyFAI's physical pixel positions.
+
+    The detector owns first-pixel reindexing and the integrator owns rotations.
+    No second camera/sign or half-pixel correction is applied here.
+    """
+    positions = np.array(ai.calc_pos_zyx(d1=np.array([0., 1., 0.]),
+                                        d2=np.array([0., 0., 1.])))
+    origin = positions[:, 0]
+    row, column = positions[:, 1]-origin, positions[:, 2]-origin
+    basis = np.column_stack((column, row))
+    inverse = np.linalg.pinv(basis)
+    normal = np.cross(row, column)
+    numerator = normal @ origin
+    def points(theta, chi):
+        theta, chi = np.broadcast_arrays(theta, chi)
+        rays = np.array((np.cos(theta), np.sin(theta)*np.sin(chi),
+                         np.sin(theta)*np.cos(chi)))
+        denominator = normal @ rays.reshape(3, -1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            scale = numerator/denominator
+            xy = inverse @ (rays.reshape(3, -1)*scale-origin[:, None])
+        xy[:, scale <= 0] = np.nan
+        return xy.T
+    return points
+
+
+def _eligible_arcs(points, theta, shape):
+    """Visible contiguous arcs, sampled by length, with no off-detector bridge."""
+    chi = np.linspace(-math.pi, math.pi, 4097)
+    xy = points(theta, chi)
+    inside = np.isfinite(xy).all(axis=1) & (xy[:, 0] >= 5) & (xy[:, 1] >= 5)
+    inside &= (xy[:, 0] < shape[1]-6) & (xy[:, 1] < shape[0]-6)
+    changes = np.diff(np.r_[False, inside, False].astype(np.int8))
+    for start, end in zip(np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)):
+        if end-start < 2:
+            continue
+        length = np.r_[0., np.cumsum(np.linalg.norm(np.diff(xy[start:end], axis=0), axis=1))]
+        if length[-1] < _SCORE_POLICY['segment_px']:
+            continue
+        yield np.interp(np.arange(0., length[-1], _SCORE_POLICY['arc_step_px']),
+                        length, chi[start:end])
+
+
+def _auc(ring, background):
+    sorted_background = np.sort(background)
+    below = np.searchsorted(sorted_background, ring, side='left')
+    through = np.searchsorted(sorted_background, ring, side='right')
+    return float(np.mean((below+through)*.5/background.size))
+
+
+def _measure_candidate(frame, camera, senses, geometric, invalid):
+    from pyFAI.calibrant import get_calibrant
+    from scipy.ndimage import map_coordinates
+    value, image = frame.geometry, frame.image
+    _, seed, shape = _geometry(value, camera, senses, include_rings=False)
+    ai = seed.integrator
+    points = _cone_plane(ai)
+    origin, matrix = _raw_affine(camera, value.shape)
+    # A small fixed raw grid fingerprints predicted angle equality, including
+    # transpose/anti-transpose. It is not a hand-listed mirror taxonomy.
+    raw = np.array([(x, y) for y in np.linspace(0, value.shape[0]-1, 7)
+                    for x in np.linspace(0, value.shape[1]-1, 7)])
+    oriented = (raw-origin) @ matrix
+    signature = tuple(ai.tth(oriented[:, 1], oriented[:, 0]))
+    maximum = max(signature)
+    calibrant = get_calibrant('LaB6', value.wavelength_m)
+    ring_scores = []
+    for number, theta in enumerate(calibrant.get_2th(), 1):
+        if theta is None or theta > maximum:
+            continue
+        segments, angular_support = [], 0.
+        for chi in _eligible_arcs(points, theta, shape):
+            xy = points(theta, chi)
+            trow = ai.tth(xy[:, 1]+.5, xy[:, 0])-ai.tth(xy[:, 1]-.5, xy[:, 0])
+            tcol = ai.tth(xy[:, 1], xy[:, 0]+.5)-ai.tth(xy[:, 1], xy[:, 0]-.5)
+            size = np.hypot(trow, tcol)
+            offsets = _SCORE_POLICY['ring_offsets']+_SCORE_POLICY['background_offsets']
+            bands = []
+            valid = np.ones(len(chi), dtype=bool)
+            for offset in offsets:
+                band = points(theta+offset*size, chi) @ matrix.T+origin
+                coordinates = band[:, ::-1].T
+                valid &= np.isfinite(band).all(axis=1)
+                valid &= (band[:, 0] >= 0) & (band[:, 1] >= 0)
+                valid &= (band[:, 0] <= value.shape[1]-1) & (band[:, 1] <= value.shape[0]-1)
+                valid &= map_coordinates(geometric, coordinates, order=1, output=float,
+                                         mode='constant', cval=1., prefilter=False) == 0
+                valid &= map_coordinates(invalid, coordinates, order=1, output=float,
+                                         mode='constant', cval=1., prefilter=False) == 0
+                bands.append(map_coordinates(image, coordinates, order=1, output=float,
+                                             mode='constant', cval=np.nan, prefilter=False))
+            bands = np.array(bands)
+            valid &= np.isfinite(bands).all(axis=0)
+            width = int(_SCORE_POLICY['segment_px']/_SCORE_POLICY['arc_step_px'])
+            for start in range(0, len(chi)-width+1, width):
+                selected = valid[start:start+width]
+                if not selected.all():
+                    continue
+                samples = bands[:, start:start+width]
+                segments.append(_auc(samples[:3].ravel(), samples[3:].ravel()))
+                angular_support += abs(chi[start+width-1]-chi[start])
+        support = angular_support/(2*math.pi)
+        if len(segments) >= _SCORE_POLICY['minimum_segments'] and support >= _SCORE_POLICY['minimum_support']:
+            ring_scores.append(RingScore(number, support, tuple(segments), float(np.mean(segments)),
+                float(np.std(segments, ddof=1)/math.sqrt(len(segments)))))
+    # The AI and all sampled arrays are local and released before the next pose.
+    if not ring_scores:
+        return OrientationCandidate(camera, senses, prediction=signature)
+    weights = np.array([ring.support for ring in ring_scores]); weights /= weights.sum()
+    return OrientationCandidate(camera, senses, tuple(ring_scores),
+        float(sum(w*r.score for w, r in zip(weights, ring_scores))),
+        float(sum(w*r.standard_error for w, r in zip(weights, ring_scores))), signature)
+
+
+def _finding(candidates, exclusions, evaluated):
+    import threading
+    supported = sorted((c for c in candidates if c.ring_scores), key=lambda c: c.score, reverse=True)
+    if not supported:
+        return OrientationFinding(tuple(candidates), None, (), False,
+            'Insufficient unmasked ring support.', exclusions=exclusions,
+            evaluated_hypotheses=evaluated, worker_thread_id=threading.get_ident())
+    best = supported[0]
+    tied = [best]
+    margins = []
+    for other in supported[1:]:
+        margin, error = best.score-other.score, math.hypot(best.standard_error, other.standard_error)
+        margins.append((margin, error))
+        if np.allclose(best.prediction, other.prediction, atol=1e-11, rtol=0) or margin <= 3*error:
+            tied.append(other)
+    identifiable = len(tied) == 1
+    margin, error = margins[0] if margins else (0., 0.)
+    diagonal = any(stitch_orientation(c.camera).swaps_axes != stitch_orientation(best.camera).swaps_axes
+                   for c in tied[1:])
+    reason = ('One mounting is separated by more than three margin standard errors, conditional on '
+              'the declared beam, distance, energy, mount and motor zeros.' if identifiable else
+              'Orientation is not identifiable: '+('diagonal reflection, ' if diagonal else '')+
+              'camera flip and motor sense alternatives predict equivalent or insufficiently separated rings. '
+              'Use independent known-feature or multi-axis motion evidence; do not refit fixed inputs to choose a winner.')
+    return OrientationFinding(tuple(candidates), best, tuple(tied), identifiable, reason, margin, error,
+                              exclusions, evaluated_hypotheses=evaluated,
+                              worker_thread_id=threading.get_ident())
+
+
+def _frame_masks(frame):
+    image, value = np.asarray(frame.image), frame.geometry
+    if image.shape != value.shape:
+        raise ValueError('image shape does not match declared detector shape')
+    geometric = np.zeros(value.shape, dtype=bool)
+    if frame.mask is not None:
+        if np.shape(frame.mask) != value.shape:
+            raise ValueError('mask shape does not match detector shape')
+        geometric |= frame.mask
+    invalid = ~np.isfinite(image)
+    if frame.saturation is not None:
+        if not math.isfinite(frame.saturation):
+            raise ValueError('saturation must be finite')
+        invalid |= image >= frame.saturation
+    return geometric, invalid
+
+
+def score_orientation(image, geometry, *, mask=None, saturation=None):
+    """Compare eight camera hypotheses at trusted motor senses; never edit pixels."""
+    frame = OrientationFrame(np.asarray(image), geometry, mask, saturation)
+    geometric, invalid = _frame_masks(frame)
+    exclusions = Exclusions(int(geometric.sum()), int((invalid & ~geometric).sum()))
+    candidates = tuple(_measure_candidate(frame, c.camera, (1, 1), geometric, invalid)
+                       for c in camera_candidates())
+    return _finding(candidates, exclusions, len(candidates))
+
+
+def diagnose_orientation(frames, *, cancelled=None):
+    """Full eight-camera/four-sense comparison, with no retained source or AI."""
+    frames = tuple(frames)
+    if not frames:
+        return _finding((), Exclusions(), 32)
+    measurements = {}
+    geometric_count = value_count = 0
+    for frame in frames:
+        if cancelled and cancelled():
+            raise RuntimeError('Orientation check cancelled.')
+        geometric, invalid = _frame_masks(frame)
+        geometric_count += int(geometric.sum()); value_count += int((invalid & ~geometric).sum())
+        reuse = {}
+        for c in camera_candidates():
+            for senses in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+                if cancelled and cancelled():
+                    raise RuntimeError('Orientation check cancelled.')
+                effective = (c.camera, tuple(s*dict(frame.geometry.readings)[m]
+                                            for s, m in zip(senses, ('del', 'nu'))))
+                if effective not in reuse:
+                    reuse[effective] = _measure_candidate(frame, c.camera, senses, geometric, invalid)
+                measured = replace(reuse[effective], senses=senses)
+                measurements.setdefault((c.camera, senses), []).append(measured)
+    combined = []
+    for (camera, senses), poses in measurements.items():
+        rings = tuple(r for p in poses for r in p.ring_scores)
+        signature = tuple(v for p in poses for v in p.prediction)
+        if rings:
+            weights = np.array([r.support for r in rings]); weights /= weights.sum()
+            combined.append(OrientationCandidate(camera, senses, rings,
+                float(sum(w*r.score for w, r in zip(weights, rings))),
+                float(sum(w*r.standard_error for w, r in zip(weights, rings))), signature))
+        else:
+            combined.append(OrientationCandidate(camera, senses, prediction=signature))
+    return _finding(combined, Exclusions(geometric_count, value_count), 32)

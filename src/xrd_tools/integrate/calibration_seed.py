@@ -132,7 +132,7 @@ def expected_rings(integrator, calibrant, shape, mask=None) -> tuple[ExpectedRin
 
 
 def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_motor='nu', mask=None,
-                       conditioning=None, saturation=None) -> FrameSeed:
+                       conditioning=None, saturation=None, include_rings=True) -> FrameSeed:
     """The frame's geometry predicted from a goniometer calibration, with its rings (none on
     ``mask``, the calibration's mask in the frame's image)."""
     from pyFAI import units
@@ -158,6 +158,10 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     if energy_eV:
         integrator.wavelength = units.hc / (float(energy_eV) / 1000.) * 1e-10
     from xrd_tools.integrate.stitch_calibration import calibration_frame_mask
+    if not include_rings:
+        # Point-only consumers keep the same geometry/energy/shape validation,
+        # without allocating a detector-wide angle map or mask for ring discovery.
+        return FrameSeed(integrator, ())
     mask = calibration_frame_mask(frame, mask, conditioning=conditioning, saturation=saturation)
     return FrameSeed(integrator, expected_rings(integrator, calibrant, frame.shape, mask))
 
