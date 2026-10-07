@@ -3233,6 +3233,11 @@ class ScientificView(QtWidgets.QFrame):
         self._coordinate_range_bar.show()
 
     @property
+    def coordinate_range_bounds(self):
+        """Detached operator bounds; the scientific projection remains the page's authority."""
+        return tuple(row._bounds for row in self.coordinate_ranges)
+
+    @property
     def keyed_projection(self) -> KeyedPanelsProjection | None:
         """The keyed layout drawn now, or None."""
         return self._keyed_shown

@@ -2439,13 +2439,13 @@ def _grid_values(scale, *, shape=(5, 7, 9), axis_offset=0.0):
         intensity=intensity, sigma=None, coverage=None, normalization=None))
 
 
-def _panels_at(values, indices):
+def _panels_at(values, indices, *, projection=True):
     """``values``' six panels at ``indices``, as an independent RSMViewerModel draws them."""
     from xrd_tools.session.rsm_viewer_model import RSMViewerModel
     model = RSMViewerModel()
     model.snapshot(values)
     return rsm_keyed_projection(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
-                                                       l_index=indices[2])).panels
+                                                       l_index=indices[2], projection=projection)).panels
 
 
 def _drawn_arrays(view):
@@ -2481,7 +2481,8 @@ def test_set_bg_draws_every_panel_minus_the_background_at_the_same_indices(qapp,
         page._step_slice(instance, 2)
         stepped = page.shown[1].state.axis_indices
         assert stepped[2] == 2
-        want = np.subtract(_panels_at(values["B"], stepped)[0].image, _panels_at(values["A"], stepped)[0].image)
+        want = np.subtract(_panels_at(values["B"], stepped, projection=False)[0].image,
+                           _panels_at(values["A"], stepped, projection=False)[0].image)
         np.testing.assert_array_equal(page.view.keyed_projection.panels[0].image, want)
     finally:
         _close(page, qapp)
@@ -2766,7 +2767,7 @@ def test_an_axis_aligned_custom_slice_is_the_main_views_hk_slice(qapp, monkeypat
         for name, text in (("first", "1 0 0"), ("second", "0 1 0"), ("first_points", "5"), ("second_points", "7")):
             _typed(window, window.rows[name].editor, text)
         plane = window.view.keyed_projection.panels[0]
-        hk = next(panel for panel in _panels_at(values["A"], (0, 0, 4)) if panel.key == RSM_HK)
+        hk = next(panel for panel in _panels_at(values["A"], (0, 0, 4), projection=False) if panel.key == RSM_HK)
         assert plane.image.shape == hk.image.shape == (7, 5)
         # the viewer's axes are float32 (K = 1 + 5/6 is 1.8333334), the plane's coordinates float64
         np.testing.assert_allclose(plane.x_axis.values, hk.x_axis.values, rtol=0, atol=1e-6)

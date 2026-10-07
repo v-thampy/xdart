@@ -2262,7 +2262,7 @@ class RSMPage(QtWidgets.QWidget):
 
     def _accept_map_choice(self):
         self._mean_maps = self._map_choice.currentText() == "Mean over range"
-        bounds = tuple(row._bounds for row in self.view.coordinate_ranges)
+        bounds = self.view.coordinate_range_bounds
         if bounds:
             self._display_ranges_changed(bounds)
 
@@ -2273,9 +2273,13 @@ class RSMPage(QtWidgets.QWidget):
         indices = snapshot.state.axis_indices
         if any(index >= size for index, size in zip(indices, values.shape, strict=True)):
             return rsm_keyed_projection(values, model.current_snapshot)  # another grid: refused, not sliced
+        ranges = snapshot.state.ranges
+        if ranges and any(stop > size for (_first, stop), size in zip(ranges, values.shape, strict=True)):
+            return rsm_keyed_projection(values, model.current_snapshot)
+        bounds = tuple((float(axis[first]), float(axis[stop-1]))
+                       for (_, axis), (first, stop) in zip(values.axes, ranges, strict=True)) if ranges else None
         return rsm_keyed_projection(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
-            l_index=indices[2], projection=snapshot.state.projection,
-            coordinate_ranges=tuple(row._bounds for row in self.view.coordinate_ranges) or None))
+            l_index=indices[2], projection=snapshot.state.projection, coordinate_ranges=bounds))
 
     def _background_path(self):
         source = self._background.keyed_source()
@@ -2436,7 +2440,7 @@ class RSMPage(QtWidgets.QWidget):
         try:
             self._draw(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
                 l_index=indices[2], projection=False,
-                coordinate_ranges=tuple(row._bounds for row in self.view.coordinate_ranges) or None))
+                coordinate_ranges=self.view.coordinate_range_bounds or None))
         except Exception as error:  # the view keeps the six it drew
             _LOG.exception("RSM slice presentation failed")
             self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")

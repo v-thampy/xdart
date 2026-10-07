@@ -1024,9 +1024,13 @@ class CoordinateRangeControl(QtWidgets.QWidget):
         for editor, value in zip(self.editors, self._bounds, strict=True):
             editor.setText(format(value, '.9g'))
 
-    def _edited(self, _path, _value):
+    def _edited(self, path, value):
         try:
-            low, high = (float(editor.text()) for editor in self.editors)
+            low, high = self._bounds
+            if path[-1] == "low":
+                low = float(value)
+            else:
+                high = float(value)
             from math import isfinite
             if not isfinite(low) or not isfinite(high) or low > high:
                 raise ValueError

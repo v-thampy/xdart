@@ -1,9 +1,9 @@
 """The committed RSM's six products as Int's scientific view draws them (AUD-9 stage 2b G7).
 
 The page builds a ``KeyedPanelsProjection`` from the headless ``RSMViewerModel`` snapshot, the projection
-authority (its slices and finite mean projections unchanged), and ``ScientificView.reconcile_keyed`` draws
-it: the viewer model's 2×3 layout (``rsm_viewer_layout``: the three slices through the selected indices,
-then the three mean projections) on Int's image panes and 1-D plots, under Int's own top bar (colour map,
+authority, and ``ScientificView.reconcile_keyed`` draws it: the model's 2×3 layout
+(``rsm_viewer_layout``: mean maps over selected coordinate intervals by default, optional thin planes,
+then the three finite-voxel mean projections) on Int's image panes and 1-D plots, under Int's top bar (colour map,
 Log), with Int's intensity controls and Share Axis (each coordinate's axes named alike, so the view links H,
 K and L, or Qx, Qy and Qz, across the panels). Each slice spans its bins' outer edges (``rsm_axis_bounds``),
 so each pixel sits at its bin centre (Codex's stage-1 review F3). No widget is built here (hard rule 14).
