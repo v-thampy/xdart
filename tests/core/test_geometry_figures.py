@@ -12,6 +12,7 @@ import pytest
 
 from xrd_tools.core.geometry.camera import DetectorCamera, stitch_orientation
 from xrd_tools.core.geometry.diffractometer import ImageOrientation, Diffractometer
+from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from xrd_tools.integrate.calibration_seed import expected_rings, rough_arm_record, predict_frame_seed
 from xrd_tools.integrate.stitch_calibration import CalibrationFrame
 
@@ -53,7 +54,7 @@ def reference(value, camera, senses=(1, 1)):
                               mount_deg=value.mount_deg, orientation=value.first_pixel,
                               senses=dict(zip(('del', 'nu'), senses)))
     frame = CalibrationFrame('f', 's', 'spec', {}, 0, 'raw', 0, 'i', 'sha', oriented_shape,
-                             0, dict(value.readings), 12398.419843320026)
+                             0, dict(value.readings), wavelength_m_to_energy_eV(value.wavelength_m))
     seed = predict_frame_seed(record, frame)
     calibrant = get_calibrant('LaB6'); calibrant.wavelength = value.wavelength_m
     image = calibrant.fake_calibration_image(seed.integrator, shape=oriented_shape,
