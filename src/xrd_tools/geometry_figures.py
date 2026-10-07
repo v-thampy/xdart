@@ -699,3 +699,69 @@ def diagnose_orientation(frames, *, cancelled=None):
         else:
             combined.append(OrientationCandidate(camera, senses, prediction=signature))
     return _finding(combined, Exclusions(geometric_count, value_count), 32)
+
+
+def consistent_motion_candidates(result, measured_camera, *, detector, motor, held=None,
+                                 trusted_senses=None, first_pixel=3):
+    """Directional consistency, not a second direct-beam advisory or unique fit.
+
+    Re-express the same measured centres in each candidate's image frame before
+    calling the existing motion owner. One-axis data cannot observe the other
+    motor's sense or distinguish all camera reflections.
+    """
+    import threading
+    from xrd_tools.integrate.calibration_seed import rough_arm_record, direct_beam_motion_mismatch
+    used = np.flatnonzero(result.used)
+    if (motor not in ('del', 'nu') or len(used) < 2 or result.zero_beam_pixel is None
+            or result.motion not in ('horizontal', 'vertical')):
+        return OrientationFinding((), None, (), False, 'Insufficient direct-beam motion evidence.',
+                                  worker_thread_id=threading.get_ident())
+    low, high = used[np.argmin(result.angles_deg[used])], used[np.argmax(result.angles_deg[used])]
+    if abs(result.centres_px[high]-result.centres_px[low]) < 2:
+        return OrientationFinding((), None, (), False, 'Insufficient direct-beam motion evidence.',
+                                  worker_thread_id=threading.get_ident())
+    transform = stitch_orientation(measured_camera)
+    raw_shape = result.image_shape[::-1] if transform.swaps_axes else result.image_shape
+    original_axis = 1 if result.motion == 'vertical' else 0
+    raw_zero = transform.unapply_pixel(result.zero_beam_pixel, raw_shape)
+    raw_beam = transform.unapply_pixel(result.beam_pixel, raw_shape)
+    endpoints = []
+    for index in (low, high):
+        point = list(result.beam_pixel); point[original_axis] = result.centres_px[index]
+        endpoints.append(transform.unapply_pixel(point, raw_shape))
+    candidates = []
+    trusted = dict(trusted_senses or {})
+    if any(key not in ('del', 'nu') or sense not in (-1, 1) for key, sense in trusted.items()):
+        raise ValueError('trusted senses declare del/nu as +1 or −1')
+    for item in camera_candidates():
+        candidate_transform = item.orientation
+        candidate_shape = raw_shape[::-1] if candidate_transform.swaps_axes else raw_shape
+        start, end = (np.array(candidate_transform.apply_pixel(point, raw_shape)) for point in endpoints)
+        axis = int(np.argmax(abs(end-start)))
+        factor = float(np.sign((end-start)[axis]/(result.centres_px[high]-result.centres_px[low])))
+        zero = candidate_transform.apply_pixel(raw_zero, raw_shape)
+        beam = candidate_transform.apply_pixel(raw_beam, raw_shape)
+        shift = zero[axis]-factor*result.zero_beam_pixel[original_axis]
+        rebased = replace(result, image_shape=candidate_shape, beam_pixel=beam,
+            motion='horizontal' if axis == 0 else 'vertical',
+            centres_px=factor*result.centres_px+shift,
+            predictions_px=factor*result.predictions_px+shift,
+            residuals_px=factor*result.residuals_px,
+            intercept_px=factor*result.intercept_px+shift,
+            slope_deg_per_pixel=factor*result.slope_deg_per_pixel)
+        for senses in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+            sense_map = dict(zip(('del', 'nu'), senses))
+            if any(sense_map[key] != sense for key, sense in trusted.items()):
+                continue
+            record = rough_arm_record(detector=detector, distance_m=result.distance_m,
+                beam_px=zero, camera=candidate_transform, orientation=first_pixel,
+                zeros_deg={motor: result.angle_zero_deg or 0.}, senses=sense_map)
+            if direct_beam_motion_mismatch(record, rebased, motor=motor, del_motor='del', nu_motor='nu',
+                                            held=held) is None:
+                candidates.append(OrientationCandidate(item.camera, senses))
+    unobserved = 'nu' if motor == 'del' else 'del'
+    reason = (f'Single-axis {motor} motion: {unobserved} sense is unmeasured; camera reflection and '
+              'untrusted scanned-motor sense alternatives remain. This is directional consistency '
+              'with the existing direct-beam fit, not a unique mounting or a new advisory.')
+    return OrientationFinding(tuple(candidates), None, tuple(candidates), False, reason,
+                              evaluated_hypotheses=32, worker_thread_id=threading.get_ident())
