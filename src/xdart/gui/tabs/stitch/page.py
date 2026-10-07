@@ -720,6 +720,7 @@ class StitchPage(QtWidgets.QWidget):
         self.controls.controlActionRequested.connect(self._control_action)
         self._rows["geometry_path"].valueChanged.connect(self._refresh_xu_geometry)
         self._rows["geometry_path"].valueChanged.connect(self._show_early_ceiling)
+        self._rows["geometry_path"].valueChanged.connect(self._sync_calibration_window)
         # Grazing incidence as Int sets it, in the Experiment section (maintainer, 2026-09-29):
         # Int's own rows, rebuilt from this page's values (_render_gi).
         # tilt_motor None: the default (chi, gonchi, else Manual) once the scan's motors are known
@@ -1366,6 +1367,7 @@ class StitchPage(QtWidgets.QWidget):
             self._refresh_xu_geometry()
         if key == "geometry_path":
             self._show_early_ceiling()
+            self._sync_calibration_window()
         if key in {"geometry_path", "geometry_kind"}:
             self._sync_goniometer_mapping()
 
@@ -2633,11 +2635,16 @@ class StitchPage(QtWidgets.QWidget):
                     image_flip=orientation.flip_horizontal,
                     geometry_path=(self._value("geometry_path") or None
                                    if self._value("geometry_kind") == "Goniometer JSON" else None))
+            self._sync_calibration_window()
             self._calibration_dialog.show()
             self._calibration_dialog.raise_()
             self._authoring_timer.start()
         except (TypeError, ValueError, OSError) as error:
             self._status(str(error), ready=False)
+
+    def _sync_calibration_window(self, *_args):
+        if self._calibration_dialog is not None and self._value("geometry_kind") == "Goniometer JSON":
+            self._calibration_dialog.load_calibration(self._value("geometry_path"))
 
     def _release_calibration_dialog(self):
         """Let the retained calibration window go (a Project change, or a settings document with no window): it is

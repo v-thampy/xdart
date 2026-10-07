@@ -992,6 +992,8 @@ class RSMPage(QtWidgets.QWidget):
             self._source_changed(key)
         if key == "output_path":
             self._output_suggested = not str(self._value("output_path")).strip()
+        if key == "geometry_path":
+            self._sync_calibration_window()
         if key in {"geometry_path", "project_root", "refinement", "spec_path", "scan_mode", "scan",
                    "source_kind", "image_dir", "image_stem"}:
             self._show_early_ceiling()
@@ -1667,11 +1669,16 @@ class RSMPage(QtWidgets.QWidget):
             source = self._source_spec_for_tools() if unconfigured else None
             if source is not None:  # RSM turns no images of its own: the window's camera stays (item 10)
                 self._calibration_dialog.set_source_context(source, image_rotation=None)
+            self._sync_calibration_window()
             self._calibration_dialog.show()
             self._calibration_dialog.raise_()
             self._authoring_timer.start()
         except (TypeError, ValueError, OSError) as error:
             self._notice(str(error))
+
+    def _sync_calibration_window(self):
+        if self._calibration_dialog is not None:
+            self._calibration_dialog.load_calibration(self._value("geometry_path"))
 
     def _release_calibration_dialog(self):
         """Let the retained calibration window go (a Project change, or a settings document with no window): it is

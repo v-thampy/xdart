@@ -9,13 +9,65 @@ the rings; the same prediction lists which calibrant rings reach the detector.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from functools import lru_cache
 import json
 import math
 from pathlib import Path
 
 import numpy as np
+
+
+def calibration_file_identity(path):
+    """Path and bytes of a committed primary geometry and its optional provenance."""
+    path = Path(path).resolve()
+    provenance = path.with_suffix(path.suffix + '.provenance.json')
+    return (str(path), sha256(path.read_bytes()).hexdigest(),
+            sha256(provenance.read_bytes() if provenance.exists() else b'').hexdigest())
+
+
+def calibration_seed_inputs(path, *, fallback_instrument):
+    """Decode supported committed arm inputs, retaining the full file as the refinement seed.
+
+    The beam and distance are evaluated at the arm's motor zeros by the same
+    physical intersection used to construct rough geometries. No fit is recreated.
+    """
+    from xrd_tools.core.geometry import Diffractometer, ImageOrientation
+    from xrd_tools.core.geometry.camera import stitch_camera
+    from xrd_tools.session.instrument import InstrumentGeometry
+    path = Path(path).resolve()
+    record = json.loads(path.read_text(encoding='utf-8'))
+    sidecar = path.with_suffix(path.suffix + '.provenance.json')
+    provenance = json.loads(sidecar.read_text(encoding='utf-8')) if sidecar.exists() else {}
+    geometry = (InstrumentGeometry.from_record(provenance['instrument_geometry'])
+                if provenance.get('instrument_geometry') else fallback_instrument)
+    del_motor, nu_motor = geometry.stitch_arm()
+    mapping = provenance.get('source_motors') or {'del_angle': del_motor, 'nu_angle': nu_motor}
+    diff = Diffractometer.from_pyfai_goniometer(record, source_motors=mapping)
+    arm, calibration = diff.stacked_arm, diff.calibration
+    if arm is None:
+        raise ValueError('this older independent-angle geometry has no supported detector arm')
+    zeros = arm.motor_zeros()
+    motors, instrument_zeros = dict(geometry.motors), dict(geometry.zeros)
+    for circle in geometry.circles:
+        role = geometry.as_psic().get(circle, circle)
+        if role in ('del', 'nu'):
+            motor = getattr(arm, role + '_motor')
+            if motor is not None:
+                motors[circle], instrument_zeros[circle] = motor, zeros[role]
+    geometry = replace(geometry, motors=tuple(motors.items()), zeros=tuple(instrument_zeros.items()))
+    turned = calibration.turned_from or {}
+    orientation = ImageOrientation(rotation=turned.get('image_rotation', provenance.get('image_rotation', 0)),
+                                   flip_horizontal=turned.get('image_flip', provenance.get('image_flip', False)))
+    readings = {getattr(arm, role + '_motor'): zero for role, zero in zeros.items()}
+    (row, column), distance = _direct_beam_hit(record, del_motor=arm.del_motor,
+                                              nu_motor=arm.nu_motor, readings=readings)
+    return dict(identity=calibration_file_identity(path), instrument=geometry,
+                camera=stitch_camera(orientation), detector=turned.get('detector', calibration.poni.detector),
+                orientation=int(calibration.detector_config.get('orientation', 3)),
+                distance_m=distance, beam_px=(column, row), wavelength_m=calibration.poni.wavelength,
+                mount_deg=tuple(map(math.degrees, (arm.mount_tilt, arm.mount_roll))))
 
 
 @dataclass(frozen=True)

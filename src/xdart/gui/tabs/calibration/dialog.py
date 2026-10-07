@@ -489,6 +489,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._calibrant_frame_count = None
         self._calibrant_source_problem = ''
         self._restoring_fields = False
+        self._loaded_calibration_identity = None
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
         self._frame_motors = ('del', 'nu')
         #: The instrument the current fit recorded; any other value leaves it unsaveable.
@@ -1686,6 +1687,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             'camera': list(self.camera.value().to_xu()),
             'calibration_threshold': asdict(self._threshold_state),
             'point_images': self.point_images.document(),
+            'loaded_calibration': self._loaded_calibration_identity,
         }
 
     def set_instrument(self, geometry: InstrumentGeometry):
@@ -1696,6 +1698,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         """Restore saved inputs; unknown entries are ignored."""
         if not isinstance(values, dict):
             return
+        loaded = values.get('loaded_calibration')
+        self._loaded_calibration_identity = (tuple(loaded) if isinstance(loaded, (list, tuple))
+                                            and len(loaded) == 3 and all(isinstance(v, str) for v in loaded)
+                                            else None)
         if 'point_images' in values:
             self.point_images.restore(values['point_images'])
         try:
@@ -1759,6 +1765,51 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._sync_arm_model()
         self._pending_source_details = ''
         self._beam_probe_timer.start()
+
+    def load_calibration(self, path):
+        """Link the selected committed geometry to these shared controls, preserving same-file drafts.
+
+        Staged frames and their saved session remain available; changing geometry
+        invalidates derived fits rather than presenting the imported file as a fit.
+        """
+        from xrd_tools.integrate.calibration_seed import calibration_file_identity, calibration_seed_inputs
+        if self.active() or not path:
+            return
+        path = Path(path).expanduser()
+        if not path.is_absolute():
+            path = self.project_root / path
+        try:
+            identity = calibration_file_identity(path)
+            if identity == self._loaded_calibration_identity:
+                return
+            seed = calibration_seed_inputs(path, fallback_instrument=self.geometry_editor.value())
+        except (OSError, ValueError, TypeError, KeyError, NotImplementedError) as error:
+            self.status.setText(f'Cannot load calibration {path.name}: {error}')
+            return
+        self._invalidate_fit()
+        self._distance_result = self._distance_key = None
+        self._distance_energy_eV, self._distance_held = None, {}
+        self.beam_summary.clear()
+        self.show_fit_button.setEnabled(False)
+        if self._direct_beam_fit_window is not None:
+            self._direct_beam_fit_window.close()
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        values = self.settings()
+        values['fields'].update(beam_detector=seed['detector'], beam_orientation=str(seed['orientation']),
+            rough_distance=f"{seed['distance_m'] * 1000:.12g}",
+            beam_pixel=', '.join(f'{v:.12g}' for v in seed['beam_px']),
+            rough_mount=', '.join(f'{v:.12g}' for v in seed['mount_deg']),
+            rough_energy=f"{float(wavelength_m_to_energy_eV(seed['wavelength_m'])) / 1000:.12g}",
+            refine_seed_path=identity[0])
+        values.update(instrument_geometry=seed['instrument'].to_record(), camera=list(seed['camera'].to_xu()),
+                      loaded_calibration=identity)
+        values['choices'].update(rough_mode={'data': 'manual'}, refine_seed={'data': 'file'})
+        self.apply_settings(values)
+        self._prediction = None
+        self._ring_cache.clear()
+        self.setWindowTitle(f'{self.context.page} calibration · {path.name}')
+        self.setToolTip(f'Loaded calibration: {identity[0]}. The file is the refinement seed; edits are inputs for a new fit.')
+        self.status.setText(f'Loaded calibration: {path.name}. Calibrant source and fitting preferences retained.')
 
     def _zeros(self):
         """The Diffractometer panel's motor zeros by arm circle ('del', 'nu'); a malformed box is
@@ -2827,6 +2878,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                         window.show_preview(result)
                     self._preview_key = None
                 elif kind == 'save':  # the ring fit, or the direct-beam geometry (_save_rough)
+                    from xrd_tools.integrate.calibration_seed import calibration_file_identity
+                    self._loaded_calibration_identity = calibration_file_identity(result.pyfai_path)
                     provenance = self._saving.asset['provenance']
                     self.saved_source_motors = provenance['source_motors']
                     self.saved_instrument_geometry = provenance.get('instrument_geometry')
