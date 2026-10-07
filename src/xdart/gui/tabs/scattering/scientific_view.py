@@ -294,6 +294,7 @@ class _KeyedImagePanel:
         layout.setSpacing(2)
         self.pane = ScientificImagePane(lock_aspect=False)
         self.pane.setObjectName(f"e7KeyedImage_{key.instance}")
+        self.pane.canvas.histogram.sigLevelsChanged.connect(lambda bar: view._keyed_colorbar_changed(key, bar))
         layout.addWidget(self.pane, 1)
         navigation = QtWidgets.QHBoxLayout()
         navigation.setContentsMargins(0, 0, 0, 0)
@@ -368,6 +369,10 @@ class _KeyedImagePanel:
             self.levels = (((histogram.lo_lim, histogram.hi_lim), tuple(histogram.levels()))
                            if finite.any() else None)
         self.presentation = panel.presentation
+        self.pane.canvas.histogram.setToolTip(
+            "Adjust the common color scale of all shared slices; manual limits remain across slice changes."
+            if panel.presentation == "shared" else "Adjust this panel's independent color scale."
+        )
         axes = ((panel.x_axis.label, panel.x_axis.unit), (panel.y_axis.label, panel.y_axis.unit))
         if self.region is not None and axes != self.axes:  # its rectangle was in other coordinates: it goes
             self.set_region(None, None)
@@ -1119,6 +1124,7 @@ class ScientificView(QtWidgets.QFrame):
         self.plot_mode = ContentFitComboBox()
         self.plot_mode.addItems(list(self._PLOT_MODES))
         self.options = _CompactMenuButton("Options")
+        self.options.setToolTip("Edit plot options and display limits. Display limit changes apply immediately.")
         self.plot_options_dialog = PlotOptionsDialog(self)
         self.clear = QtWidgets.QPushButton("Clear")
         self.share_axis = QtWidgets.QPushButton("Share Axis")
@@ -3358,11 +3364,11 @@ class ScientificView(QtWidgets.QFrame):
         finally:
             self._share_axis_syncing = prior
 
-    def _refresh_keyed_intensity(self) -> None:
+    def _refresh_keyed_intensity(self, *, source=None) -> None:
         """Int's intensity controls over a keyed layout's slices: one set of levels for them all, in what each
         pane draws (log10 with Log, as Int's viewer's). Autoscale spans the slices' own automatic levels (each
         Int's rule over its finite values), and the controls' range their values; typed or dragged levels are
-        kept across draws. A slice's own colour bar stays, for a look at it alone until the next draw. A panel
+        kept across draws. A shared slice's colour bar edits this same manual range. A panel
         presented on its own ("own", "signed": ``KeyedImageProjection.presentation``) keeps its own levels."""
         controls = self.viewer_intensity
         controls.set_percentile_defaults((0.1, 99.9) if self.log_scale.isChecked() else (0.5, 99.5))
@@ -3383,10 +3389,10 @@ class ScientificView(QtWidgets.QFrame):
         self._viewer_auto_levels = (min(levels[0] for levels in mapped), max(levels[1] for levels in mapped))
         controls.sync(self._viewer_intensity_domain, self._viewer_auto_levels)
         chosen = self._viewer_auto_levels if percentile is not None or controls.autoscale.isChecked() else controls.values()
-        self._set_keyed_levels(chosen)
+        self._set_keyed_levels(chosen, source=source)
         controls.sync(self._viewer_intensity_domain, chosen)
 
-    def _set_keyed_levels(self, levels) -> None:
+    def _set_keyed_levels(self, levels, *, source=None) -> None:
         """Every drawn slice's colour bar to ``levels``, its limits widened to take them."""
         if levels is None or not np.isfinite(levels).all() or levels[1] <= levels[0]:
             return
@@ -3397,7 +3403,17 @@ class ScientificView(QtWidgets.QFrame):
                 histogram = widgets.pane.canvas.histogram
                 (own_low, own_high), _automatic = widgets.levels
                 histogram.lo_lim, histogram.hi_lim = min(own_low, low), max(own_high, high)
-                histogram.setLevels((low, high))
+                if histogram is not source:  # Keep the active drag's original anchor until release.
+                    histogram.setLevels((low, high))
+
+    def _keyed_colorbar_changed(self, key, bar) -> None:
+        """An operator's shared-slice colorbar edit drives the existing common scale."""
+        widgets = self._keyed_panels.get(key)
+        if (self._layout_mode == "keyed" and type(widgets) is _KeyedImagePanel
+                and widgets.presentation == "shared" and widgets.levels is not None
+                and bar is widgets.pane.canvas.histogram):
+            self.viewer_intensity.set_absolute_limits(*bar.levels(), emit=False)
+            self._refresh_keyed_intensity(source=bar)
 
     def _build_keyed(self, layout: tuple[tuple[PanelKey, ...], ...]) -> None:
         for widgets in self._keyed_panels.values():
@@ -3555,9 +3571,11 @@ class ScientificView(QtWidgets.QFrame):
         self._layout_mode = normalized
         viewer = normalized in {"1D Viewer", "2D Viewer"}
         if changed:
-            host = (self.viewer_intensity_row_layout if normalized == "2D Viewer"
-                    else self.plot_bar)
-            host.addWidget(self.viewer_intensity)
+            if viewer:
+                host = self.viewer_intensity_row_layout if normalized == "2D Viewer" else self.plot_bar
+                host.addWidget(self.viewer_intensity)
+            else:
+                self.plot_options_dialog.mount_display_scale(self.viewer_intensity)
         self.viewer_intensity_row.setVisible(normalized == "2D Viewer")
         self.viewer_intensity.setVisible(True)
         self.axis_display_group.setVisible(not viewer)

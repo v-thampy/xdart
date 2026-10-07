@@ -463,6 +463,7 @@ class StitchPage(QtWidgets.QWidget):
         self._after_prepare = None
         #: Skipped scans and warnings of the prepared plan, for the status line.
         self._prepared_notes = ""
+        self._kept_export_paths = ()
         #: The outputs a Run in Append mode skipped as already stitched, for the status line.
         self._skip_note = ""
         #: Int's readiness line: (summary, ready) from the section checks.
@@ -2187,6 +2188,7 @@ class StitchPage(QtWidgets.QWidget):
                      if Path(prepared.requests[index].module.output.target).is_file()
                      ) if self.run_bar.write_mode() == "Append" else ()
         self._queued_jobs = [index for index in range(count) if index not in kept]
+        self._kept_export_paths = tuple(str(prepared.requests[index].module.output.target) for index in kept)
         if not self._queued_jobs:
             message = (f"Up to date · {count} {'output' if count == 1 else 'outputs'} already stitched "
                        "with these settings (Replace ⇄ stitches again)" + self._prepared_notes)
@@ -2194,7 +2196,7 @@ class StitchPage(QtWidgets.QWidget):
             target = next((prepared.requests[index].module.output.target for index in kept
                            if str(prepared.requests[index].module.output.target) == current),
                           prepared.requests[kept[0]].module.output.target)
-            self.open_result(target, completion_message=message)
+            self.open_result(target, completion_message=message, export_paths=self._kept_export_paths)
             return
         self._skip_note = f" · {len(kept)} already stitched, skipped" if kept else ""
         self._job_total = len(self._queued_jobs)
@@ -2207,11 +2209,12 @@ class StitchPage(QtWidgets.QWidget):
         index = self._queued_jobs.pop(0)
         position = self._job_total - len(self._queued_jobs)
         if not self._start(f"Running · {self._mode} · {position}/{self._job_total}{self._skip_note}{self._prepared_notes}",
-                           lambda: self._owner.begin_run(job_index=index, workers=self.run_bar.get_cores())):
+                           lambda: self._owner.begin_run(job_index=index, workers=self.run_bar.get_cores(),
+                               export_paths=self._kept_export_paths if position == 1 else ())):
             self._queued_jobs.clear()
             self._prepared_revision = None  # the next Run prepares again
 
-    def open_result(self, path=None, *, completion_message=""):
+    def open_result(self, path=None, *, completion_message="", export_paths=()):
         if path is None or isinstance(path, bool):
             from xdart.gui.widgets.file_dialogs import browse
             picks = browse(self, "Open stitched result", file_filter="NeXus (*.nexus)",
@@ -2222,7 +2225,7 @@ class StitchPage(QtWidgets.QWidget):
         if not completion_message:  # Append follows the existing browser policy when the result is mounted.
             self._result_browser.set_directory(str(Path(path).absolute().parent))
         self._view_revision += 1
-        if self._start("Opening saved result…", lambda: self._owner.begin_reopen(path)):
+        if self._start("Opening saved result…", lambda: self._owner.begin_reopen(path, export_paths=export_paths)):
             self._open_complete_text = completion_message
 
     def stop(self):
@@ -2356,8 +2359,10 @@ class StitchPage(QtWidgets.QWidget):
             if self._action_view_revision == self._view_revision and not self._closing:
                 self._mount_payload(outcome.artifact_path, outcome.payload)
                 note = saved_frame_screen_note(outcome.payload.contributing_frames)
-                self._status(message or (f"Ready · saved {_kind_name(outcome.payload)} result"
+                self._status((message or (f"Ready · saved {_kind_name(outcome.payload)} result"
                                          + (f" · {note}" if note else "")))
+                             + (f" · {outcome.finalization_message}" if outcome.finalization_message else ""),
+                             ready=not bool(outcome.finalization_message))
         elif outcome.kind is StitchOwnerOutcomeKind.RESULT:
             result = outcome.result
             if result.terminal.disposition is ModuleDisposition.COMMITTED:
@@ -2366,8 +2371,11 @@ class StitchPage(QtWidgets.QWidget):
                 elapsed = time.monotonic() - (self._batch_started or self._started)
                 count = len(result.request.module.source.selected_labels)
                 note = frame_screen_note(result.frame_screen)
+                if outcome.finalization_message:
+                    self._prepared_notes += f" · {outcome.finalization_message}"
                 self._status(f"Complete · {count} frames · {elapsed:.2f} s" + (f" · {note}" if note else "")
-                             + self._skip_note + self._prepared_notes)
+                             + self._skip_note + self._prepared_notes,
+                             ready="XYE_EXPORT_FAILED" not in self._prepared_notes)
                 if self._queued_jobs and not update.stale and self._action_revision == self._revision:
                     self._run_next_job()
             else:

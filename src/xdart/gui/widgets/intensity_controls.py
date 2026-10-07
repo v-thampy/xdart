@@ -198,6 +198,22 @@ class IntensityControls(QtWidgets.QFrame):
         """Selected percentile pair, or None for the existing absolute display units."""
         return self.values() if self._mode == "Percentile" else None
 
+    def set_absolute_limits(self, low, high, *, emit=True):
+        """Commit a colorbar's displayed limits through the same manual range owner."""
+        pair = _interval((low, high))
+        if pair is None or self._domain is None:
+            return
+        self._mode = "Absolute"
+        self._current = pair
+        blocker = QtCore.QSignalBlocker(self.autoscale)
+        self.autoscale.setChecked(False)
+        del blocker
+        self._set_window(pair)
+        if self._entry_popup is not None:
+            self._entry_popup.hide()
+        if emit:
+            self.rangeChanged.emit(*pair)
+
     def set_percentile_defaults(self, pair):
         """Enable percentile entry; update automatic defaults while retaining manual choices.
 

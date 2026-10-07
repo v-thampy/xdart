@@ -210,7 +210,7 @@ class _ArtifactNavigationFilter(QtCore.QObject):
                 return False
             index = view.indexAt(event.position().toPoint())
             if not index.isValid():
-                return False
+                return True  # Empty space is not an instruction to remove displayed results.
             modifiers = event.modifiers()
             if modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier:
                 intent = FrameSelectionIntent.REMOVE_TRACE_RANGE
@@ -532,10 +532,8 @@ class BrowserView(QtWidgets.QFrame):
         self._artifact_navigation_filter = _ArtifactNavigationFilter(
             self.scans, self._activate_directory, self._visit_artifact,
         )
-        if (not self.profile.results or self.profile.result_selection == "extended"
-                or self.profile.directory):
-            self.scans.installEventFilter(self._artifact_navigation_filter)
-            self.scans.viewport().installEventFilter(self._artifact_navigation_filter)
+        self.scans.installEventFilter(self._artifact_navigation_filter)
+        self.scans.viewport().installEventFilter(self._artifact_navigation_filter)
         scan_pane_layout.addWidget(scan_labels)
         scan_pane_layout.addWidget(self.scans, 1)
 

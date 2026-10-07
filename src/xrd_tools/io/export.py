@@ -5,6 +5,7 @@ Data export helpers for integrated diffraction results.
 from __future__ import annotations
 
 import logging
+from io import StringIO
 import os
 from pathlib import Path
 import stat
@@ -98,6 +99,8 @@ def write_xye(
     xdata: np.ndarray | list[float],
     ydata: np.ndarray | list[float],
     variance: np.ndarray | list[float] | None = None,
+    *,
+    atomic: bool = False,
 ) -> None:
     """
     Write 1D data to ``.xye`` format.
@@ -113,6 +116,8 @@ def write_xye(
     variance : ndarray or list of float, optional
         Error or variance-like column to write as the third column. If omitted,
         ``sqrt(abs(ydata))`` is used for compatibility with existing notebooks.
+    atomic : bool, optional
+        Prepare and atomically replace the companion through the shared export writer.
     """
     out_path = _as_path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,12 +134,47 @@ def write_xye(
     # beyond any XRD precision.  Formatting is 89% of the XYE write cost and
     # XYE is about a third of a long Run's wall clock, so this is -39% on the
     # format and cuts a 3621-frame run's XYE from roughly 543 MB to 237 MB.
+    stream = StringIO() if atomic else out_path
     np.savetxt(
-        out_path,
+        stream,
         np.column_stack((x, y, sigma)),
         delimiter="\t",
         fmt="%.9g",
     )
+    if atomic:
+        write_exports_atomically(((out_path, stream.getvalue()),))
+
+
+def write_stitch_xye(payload) -> Path:
+    """Export the strictly admitted Stitch profile beside its scientific artifact."""
+    import json
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
+    from xrd_tools.io.output_safety import check_output_not_source
+    from xrd_tools.io.read import resolve_source_master
+    from xrd_tools.session.display_logic import xye_prefix_for_unit
+
+    if type(payload) is not AnalysisArtifactPayload or payload.kind not in {
+            AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
+        raise TypeError("XYE export requires a saved Stitch result")
+    profile = payload if payload.kind is AnalysisArtifactKind.STITCH_1D else payload.profile
+    if profile is None:
+        raise ValueError("saved Stitch result has no independent 1D profile")
+    nexus = Path(payload.inspection.path)
+    target = nexus.with_name(f"{xye_prefix_for_unit(payload.native_unit)}_{nexus.stem}.xye")
+    inputs = {nexus}
+    if payload.inspection.frame_manifest_json is not None:
+        manifest = json.loads(payload.inspection.frame_manifest_json)
+        for record in manifest["records"]:
+            for source in record.get("source_constituents", (record,)):
+                path = resolve_source_master(source["source_path"], scan_file=nexus,
+                                             source_base=manifest["source_base"])
+                if path is not None:
+                    inputs.add(path)
+    check_output_not_source(target, input_files=inputs)
+    if target.is_symlink():
+        raise ValueError("XYE companion cannot replace a symbolic link")
+    write_xye(target, dict(profile.axes)["q"], profile.intensity, profile.sigma, atomic=True)
+    return target
 
 
 def write_h5(
@@ -202,4 +242,4 @@ def write_h5(
     logger.debug("Wrote integrated data to %s [frame=%s]", out_path, frame)
 
 
-__all__ = ["write_h5", "write_xye"]
+__all__ = ["write_h5", "write_xye", "write_stitch_xye"]

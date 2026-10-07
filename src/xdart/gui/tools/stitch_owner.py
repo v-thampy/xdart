@@ -32,6 +32,8 @@ from xrd_tools.io.analysis_artifact import (
 from xrd_tools.core.frame_view import FrameView
 from xrd_tools.io.frame_view import read_contributing_frame_view
 from xrd_tools.analysis.stitch_metadata import StitchMetadataTable, read_stitch_metadata
+from xrd_tools.analysis.module_transaction import ModuleDisposition
+from xrd_tools.io.export import write_stitch_xye
 
 from .stitch_values import (
     StitchToolForm,
@@ -234,6 +236,7 @@ class _WorkerCommand:
     source_root: str | None = None
     #: a Run's frame workers (the run bar's Cores): the result is the same for any count
     workers: int = 1
+    export_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -245,6 +248,8 @@ class _WorkerCommand:
             or type(self.form_revision) is not int
             or self.form_revision < 1
             or type(self.artifact_path) is not str
+            or type(self.export_paths) is not tuple
+            or any(type(path) is not str or not path or "\0" in path for path in self.export_paths)
             or (self.form is not None and type(self.form) is not StitchToolForm)
             or (
                 self.preflight is not None
@@ -282,6 +287,9 @@ class _WorkerCommand:
             or (self.action is not StitchOwnerAction.METADATA and (self.metadata_payload is not None or self.source_root is not None))
             or (self.action is not StitchOwnerAction.RUN and self.workers != 1)):
             raise TypeError("Stitch worker command fields disagree")
+        if self.export_paths and self.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.RUN,
+                StitchOwnerAction.RETRY_CLEANUP, StitchOwnerAction.RETRY_VERIFICATION}:
+            raise TypeError("only Run or explicit Append may publish XYE companions")
 
 
 PreflightRunner = Callable[[StitchToolForm], StitchToolPreflight]
@@ -320,6 +328,7 @@ class StitchToolOwner:
         self._execution: StitchOperationExecution | None = None
         self._execution_preflight: StitchToolPreflight | None = None
         self._execution_form_revision: int | None = None
+        self._execution_export_paths: tuple[str, ...] = ()
         self._last_result: StitchOperationResult | None = None
         self._finalization = StitchOwnerFinalization.NONE
         self._active_identity: OperationIdentity | None = None
@@ -433,11 +442,12 @@ class StitchToolOwner:
                 self._prepared_revision = None
             return identity
 
-    def begin_reopen(self, path: str | Path) -> OperationIdentity | None:
+    def begin_reopen(self, path: str | Path, *, export_paths: tuple[str, ...] = ()) -> OperationIdentity | None:
         """Read one saved result on this owner's worker without run authority.
 
         The strict reader detaches arrays and closes its handles. Reopening does
         not reconstruct a source, preflight, execution or output transaction.
+        Explicit Append may additionally request XYE companions from saved profiles.
         """
         shown = str(Path(path).expanduser().absolute())
         if not str(path).strip() or "\0" in shown:
@@ -448,6 +458,7 @@ class StitchToolOwner:
             return self._begin_locked(_WorkerCommand(
                 StitchOwnerAction.REOPEN, shown, max(1, self._form_revision),
                 artifact_path=shown,
+                export_paths=export_paths,
             ))
 
     def begin_frame_read(self, payload, frame_index, *, scan=None, source_root=None, full_raw=False, scientific=False):
@@ -475,7 +486,7 @@ class StitchToolOwner:
                 source_root=None if source_root is None else str(source_root),
             ))
 
-    def begin_run(self, job_index: int = 0, workers: int = 1) -> OperationIdentity | None:
+    def begin_run(self, job_index: int = 0, workers: int = 1, *, export_paths: tuple[str, ...] = ()) -> OperationIdentity | None:
         """Run the prepared output ``job_index`` with ``workers`` frame workers (the run bar's Cores)."""
         if type(workers) is not int or workers < 1:
             raise TypeError("Stitch workers must be a positive int")
@@ -507,6 +518,7 @@ class StitchToolOwner:
                 preflight=preflight,
                 execution=execution,
                 workers=workers,
+                export_paths=export_paths,
             )
             identity = self._begin_locked(command)
             if identity is not None:
@@ -515,6 +527,7 @@ class StitchToolOwner:
                 self._execution = execution
                 self._execution_preflight = preflight
                 self._execution_form_revision = self._prepared_revision
+                self._execution_export_paths = export_paths
                 self._last_result = None
             return identity
 
@@ -542,6 +555,7 @@ class StitchToolOwner:
             form_revision,
             preflight=preflight,
             execution=execution,
+            export_paths=self._execution_export_paths,
         )
         return self._begin_locked(command, allow_closing=allow_closing)
 
@@ -603,6 +617,7 @@ class StitchToolOwner:
             return StitchOwnerOutcome(
                 StitchOwnerOutcomeKind.REOPENED,
                 payload=payload, artifact_path=request.artifact_path,
+                finalization_message=self._export_xyes(payload, request.export_paths) if request.export_paths else "",
             )
         if request.action is StitchOwnerAction.PREFLIGHT:
             publish("preflight", 0, 1)
@@ -656,7 +671,21 @@ class StitchToolOwner:
             return StitchOwnerOutcome(StitchOwnerOutcomeKind.VERIFICATION_PENDING)
         if type(result) is not StitchOperationResult or result.request is not execution.request:
             raise TypeError("Stitch execution returned an invalid result")
-        return StitchOwnerOutcome(StitchOwnerOutcomeKind.RESULT, result=result)
+        warning = (self._export_xyes(result.payload, request.export_paths)
+                   if result.terminal.disposition is ModuleDisposition.COMMITTED else "")
+        return StitchOwnerOutcome(StitchOwnerOutcomeKind.RESULT, result=result, finalization_message=warning)
+
+    @staticmethod
+    def _export_xyes(payload, paths):
+        """Companion errors do not revoke the already committed scientific result."""
+        warnings = []
+        for path in dict.fromkeys((payload.inspection.path, *paths)):
+            try:
+                selected = payload if path == payload.inspection.path else read_analysis_artifact(path)
+                write_stitch_xye(selected)
+            except Exception as error:
+                warnings.append(f"XYE_EXPORT_FAILED: {Path(path).name}: {error}")
+        return " · ".join(warnings)
 
     def _adopt(self, raw_update) -> StitchOwnerUpdate:
         identity = raw_update.identity
@@ -692,6 +721,7 @@ class StitchToolOwner:
                     self._execution = None
                     self._execution_preflight = None
                     self._execution_form_revision = None
+                    self._execution_export_paths = ()
                     self._finalization = StitchOwnerFinalization.NONE
                 elif outcome.kind is StitchOwnerOutcomeKind.CLEANUP_PENDING:
                     self._finalization = StitchOwnerFinalization.CLEANUP_PENDING
@@ -708,6 +738,7 @@ class StitchToolOwner:
                 self._execution = None
                 self._execution_preflight = None
                 self._execution_form_revision = None
+                self._execution_export_paths = ()
                 self._finalization = StitchOwnerFinalization.NONE
             self._active_identity = None
             self._active_action = None

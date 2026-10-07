@@ -145,6 +145,11 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     def set_waterfall_visible(self, visible: bool) -> None:
         self._waterfall_group.setVisible(bool(visible))
 
+    def mount_display_scale(self, controls: QtWidgets.QWidget) -> None:
+        """Mount the view's existing live display controls above Okay/Cancel."""
+        layout = self.layout()
+        layout.insertWidget(layout.count() - 1, controls)
+
     def set_coverage_available(self, available: bool) -> None:
         self.show_coverage_holes.setEnabled(available)
         self.show_coverage_holes.setToolTip(
