@@ -37,6 +37,7 @@ def test_help_figures_are_lazy_shared_and_source_free(qapp, monkeypatch):
     # The actual source boundary and job dispatch are tripwires, not replaced renderers.
     monkeypatch.setattr('xdart.gui.tabs.calibration.dialog._run_job', forbidden)
     monkeypatch.setattr(xrd_tools.io, 'read_image', forbidden)
+    monkeypatch.setattr('xrd_tools.io.image.read_image', forbidden)
     root = QtWidgets.QWidget(); owner = owner_for(root)
     try:
         root.show(); owner.show_index(); window = owner.window
@@ -61,7 +62,10 @@ def test_help_figures_are_lazy_shared_and_source_free(qapp, monkeypatch):
             if isinstance(widget, (QtWidgets.QPlainTextEdit, QtWidgets.QTextEdit,
                        QtWidgets.QAbstractItemView, QtWidgets.QLineEdit, QtWidgets.QComboBox,
                        QtWidgets.QAbstractButton)) or widget.inherits('PlotWidget'):
-                assert any(widget is o or o.isAncestorOf(widget) for o in owners), type(widget)
+                ancestor = widget
+                while ancestor is not None and not any(ancestor is o for o in owners):
+                    ancestor = ancestor.parent()
+                assert ancestor is not None, type(widget)
         assert all(w.toolTip() for w in (window.step_row, window.step_row.editor,
                                         window.figure_row, window.figure_row.editor, window.run_button))
         assert {t.identifier: t.text for t in TOPICS} == before
