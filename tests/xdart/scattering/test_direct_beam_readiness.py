@@ -149,6 +149,117 @@ def test_a_fit_whose_beam_runs_against_the_arm_says_how_the_detector_is_mounted(
         dialog.close()
 
 
+def _fit_container(dialog, tmp_path, rotation):
+    """The five-frame del container fitted under image turn ``rotation``; its result."""
+    nexus, _, _ = _beam_container(tmp_path)
+    dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+    dialog._set_field_text('beam_detector', 'Pilatus100k')
+    dialog.camera.set_value(stitch_camera(ImageOrientation(rotation=rotation)))
+    dialog._set_field_text('beam_source', nexus)
+    detect(dialog)
+    dialog.beam_button.click()
+    settle(dialog)
+    assert dialog._distance_result is not None, dialog.status.text()
+    return dialog._distance_result
+
+
+def _surfaces(dialog):
+    """The advice's three surfaces: the status line, the fit window's summary, the first distance row."""
+    return (dialog.status.text(), dialog._direct_beam_fit_window.summary.text(),
+            dialog.beam_summary.toPlainText().splitlines()[0])
+
+
+def _assert_advice(dialog, *phrases):
+    shown = _surfaces(dialog)
+    assert all(phrase in text for text in shown for phrase in phrases), shown
+
+
+def _assert_no_advice(dialog):
+    shown = _surfaces(dialog)
+    assert not any('direct beam moved' in text for text in shown), shown
+    assert shown[0].startswith('Direct-beam distance: 500 mm') and shown[2].startswith('Distance: 500 mm'), shown
+
+
+def _reverse(dialog, circle):
+    """The Diffractometer section's sense box for ``circle`` turned over (its data: 1 psic's, −1 reversed)."""
+    box = dialog.geometry_editor.axis_box(circle)
+    box.setCurrentIndex(box.findData(-box.currentData()))
+
+
+def test_a_sense_edit_after_the_fit_updates_its_advice_everywhere(qapp, tmp_path):
+    """Codex review B1: the advice is about the arm the controls describe now, not the one at the fit. Turn 270
+    (mounting 90° CW) agrees; reversed, del's arm moves the beam backwards; restored, it agrees again. The
+    fit itself (its distance, held reading and wavelength) never changes."""
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        result = _fit_container(dialog, tmp_path, 270)
+        wavelength = dialog._rough_wavelength_A()
+        _assert_no_advice(dialog)
+        _reverse(dialog, 'del')
+        _assert_advice(dialog, 'The direct beam moved the opposite way to this geometry', "or check del's sense")
+        _reverse(dialog, 'del')
+        _assert_no_advice(dialog)
+        assert dialog._distance_result is result and dialog._distance_fresh()
+        assert dialog._distance_held == {'nu': 4.} and dialog._rough_wavelength_A() == wavelength
+    finally:
+        dialog.close()
+
+
+def test_correcting_the_sense_clears_the_advice_everywhere(qapp, tmp_path):
+    """Turn 90 (mounting 270° CW) disagrees with the container's beam; with del reversed its arm agrees."""
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        _fit_container(dialog, tmp_path, 90)
+        _assert_advice(dialog, 'The direct beam moved the opposite way to this geometry',
+                       'try 90° CW rather than 270° CW')
+        _reverse(dialog, 'del')
+        _assert_no_advice(dialog)
+    finally:
+        dialog.close()
+
+
+def test_a_camera_edit_after_the_fit_asks_for_a_new_fit_not_old_advice(qapp, tmp_path):
+    """A camera edit leaves the fit stale (its extraction turned the images): the old mounting advice goes from
+    every surface and the status asks for a new fit, which the scan read again under the new camera still needs."""
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        _fit_container(dialog, tmp_path, 90)
+        _assert_advice(dialog, 'try 90° CW rather than 270° CW')
+        dialog.camera.set_value(stitch_camera(ImageOrientation(rotation=270)))
+        assert dialog.status.text() == dialog._STALE_DISTANCE
+        assert dialog._distance_warning is None
+        assert not dialog._direct_beam_fit_window.summary.text().startswith('⚠')
+        assert dialog.beam_summary.toPlainText().startswith('Distance: 500 mm')
+        detect(dialog)
+        assert not dialog._distance_fresh() and dialog._distance_warning is None
+        assert not dialog.beam_summary.toPlainText().startswith('⚠')
+    finally:
+        dialog.close()
+
+
+def test_saving_a_geometry_against_its_scan_keeps_the_advice_beside_the_saved_pair(qapp, tmp_path, monkeypatch):
+    """The rough save is of the arm the advice is about: a reversed del arm saved over a scan it contradicts says
+    so with the saved pair (advice only: the pair is written)."""
+    from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _save_to, _wait
+    # a fresh session keeps the saved folder out of the shared session's browse history, which
+    # test_a_saved_calibration_is_named_after_its_scan_and_never_over_another expects empty
+    monkeypatch.setenv('XDART_SESSION_FRESH', '1')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        _fit_container(dialog, tmp_path, 270)
+        _reverse(dialog, 'del')
+        target = (tmp_path / 'calibration' / 'reversed-del.json').resolve()
+        _save_to(monkeypatch, target)
+        dialog.save_rough_button.click()
+        _wait(dialog, timeout=120)
+        assert target.is_file(), dialog.status.text()
+        advice, saved = dialog.status.text().split('\n', 1)
+        assert advice.startswith('⚠ The direct beam moved the opposite way to this geometry'), advice
+        assert target.name in saved, saved
+    finally:
+        dialog.close()
+
+
 def test_a_motion_check_that_fails_leaves_the_fit_shown(qapp, tmp_path, monkeypatch):
     """The motion check is advice: if it cannot run, the distance, its rows and its window still appear."""
     import xdart.gui.tabs.calibration.dialog as calibration_dialog
