@@ -245,3 +245,120 @@ def synthetic_orientation_example(value=None, camera=None):
     return replace(prediction, image=stitch_orientation(camera).unapply(image),
                    caption='Synthetic LaB6 image from pyFAI; overlays are predicted, not measured control points. '
                    'Off-centre rings can discriminate only away from mirror lines and diagonals, with trusted inputs.')
+
+
+def residual_example():
+    """Evaluate three declared trial geometries at the same synthetic ring points.
+
+    These are mechanisms, not a classifier for residuals on a user's data. The
+    float64 point call is the existing calibration residual owner (qFunction/10).
+    """
+    from scipy.optimize import brentq
+    value = GeometryInputs(mount_deg=(2., -1.))
+    camera = DetectorCamera('x-', 'z+')
+    _, seed, _ = _geometry(value, camera)
+    ai = seed.integrator
+    transform = stitch_orientation(camera)
+    prediction = predict_ring_curves(value, camera)
+    points, targets = [], []
+    for curve in prediction.curves:
+        ring = next(r for r in prediction.rings if r.two_theta_deg == curve.two_theta_deg)
+        target = 2*math.pi/ring.d_spacing_A
+        for raw in curve.xy[::max(1, len(curve.xy)//8)]:
+            column, row = transform.apply_pixel(raw, value.shape)
+            residual = lambda t: float(ai.qFunction(np.array([row+t]), np.array([column]))[0]/10-target)
+            if residual(-1)*residual(1) > 0:
+                continue  # tangency: keep points for which the normal crosses a row
+            row += brentq(residual, -1., 1., xtol=1e-12)
+            points.append(transform.unapply_pixel((column, row), value.shape))
+            targets.append(target)
+    raw = np.asarray(points)
+    targets = np.asarray(targets)
+    examples = {}
+    trials = (('good fit', value, camera),
+              ('zero offset', replace(value, readings=(('del', 2.), ('nu', 0.))), camera),
+              ('wrong mounting', value, DetectorCamera('x+', 'z+')))
+    for name, trial, mounting in trials:
+        _, trial_seed, _ = _geometry(trial, mounting)
+        xy = np.asarray([stitch_orientation(mounting).apply_pixel(p, value.shape) for p in raw])
+        dq = trial_seed.integrator.qFunction(xy[:, 1], xy[:, 0])/10-targets
+        examples[name] = Figure(name, 'Ring q', 'q residual', 'Å⁻¹',
+            f'Synthetic {name}: the same LaB6 control points, fixed beam, distance and energy. '
+            'Crosses are illustrative rejected points; real residual trends do not uniquely identify a fault.',
+            curves=(Curve('q residual', np.column_stack((targets, dq)), 'observed',
+                          'Trial q minus calibrant q, using float64 calibration point evaluation.'),),
+            markers=tuple(Marker('rejected point', (targets[i], dq[i]), 'rejected',
+                                 'Illustrative exclusion, not an automatic rejection rule.')
+                          for i in range(0, len(targets), 11)))
+    return examples
+
+
+@dataclass(frozen=True)
+class InstrumentCircle:
+    name: str
+    axis: str
+    angle_deg: float
+    lab_axis: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class InstrumentFigure:
+    circles: tuple[InstrumentCircle, ...] = ()
+    panels: tuple[Figure, ...] = ()
+    reason: str = ''
+
+
+def instrument_figure(instrument, readings):
+    """Project the configured, separate sample and detector stacks in three views.
+
+    Schematic locations are illustrative. Axis directions and nested rotations
+    come from InstrumentGeometry and xrayutilities, never the drawing mockups.
+    """
+    from xrd_tools.session.instrument import InstrumentGeometry
+    from xrayutilities.math import getVector, ArbRotation, rotarb
+    if not isinstance(instrument, InstrumentGeometry):
+        return InstrumentFigure(reason='Unsupported schematic geometry: use psic, fourc or twoc.')
+    missing = [instrument.motor(c) for c in instrument.circles if instrument.motor(c) not in readings]
+    if missing:
+        return InstrumentFigure(reason='Missing motor readback: '+', '.join(missing))
+    if not all(math.isfinite(float(readings[instrument.motor(c)])) for c in instrument.circles):
+        return InstrumentFigure(reason='Nonfinite motor readback.')
+    axes = dict(instrument.circle_axes())
+    circles = []
+    for role in ('sample', 'detector'):
+        prefix = np.eye(3)
+        for name in instrument.circles:
+            if instrument.role(name) != role:
+                continue
+            axis = axes[name]
+            vector = getVector(axis)
+            angle = float(readings[instrument.motor(name)])-(instrument.zero(name) or 0.)
+            circles.append(InstrumentCircle(name, axis, angle, tuple(prefix @ vector)))
+            prefix = prefix @ ArbRotation(vector, angle).matrix
+    panels = []
+    for title, pair, labels in (('Side view', (1, 0), ('Lab y (beam)', 'Lab x (up)')),
+                               ('Top view', (1, 2), ('Lab y (beam)', 'Lab z')),
+                               ('Looking downstream', (2, 0), ('Lab z (left)', 'Lab x (up)'))):
+        project = lambda vector: tuple(np.asarray(vector)[list(pair)])
+        arrows = [Arrow('incident beam', project((0., -.8, 0.)), project((0., .8, 0.)),
+                        'beam', 'Lab +y points downstream along the incident beam.')]
+        curves, texts = [], []
+        for i, circle in enumerate(circles):
+            axis = np.asarray(circle.lab_axis)
+            base = np.array((0., .12*i, 0.))
+            arrows.append(Arrow(circle.name, project(base), project(base+.6*axis), 'predicted',
+                f'{circle.name}: signed axis {circle.axis}, readback minus zero {circle.angle_deg:g}°. '
+                'Positive sense follows the right-hand rule; sample and detector stacks are independent.'))
+            normal = np.eye(3)[int(np.argmin(abs(axis)))]
+            tangent = np.cross(axis, normal); tangent /= np.linalg.norm(tangent)
+            arc = [project(base+.15*rotarb(tangent, axis, angle)) for angle in np.linspace(0, 80, 25)]
+            curves.append(Curve(circle.name+' positive sense', arc, 'predicted',
+                                f'Positive rotation about the signed lab axis of {circle.name}.'))
+            texts.append(Text(circle.name, project(base+.7*axis),
+                              f'{circle.name} {circle.angle_deg:g}°', arrows[-1].tooltip))
+        panels.append(Figure(f'{instrument.geometry}: {title}', *labels, 'schematic',
+            'Computed schematic, looking in the declared lab view; positions are not to scale. '
+            'Configured conventions, not experimentally validated circle senses. '
+            'Zero is subtracted once; reversed sense is carried by the signed axis.',
+            curves=tuple(curves), arrows=tuple(arrows), texts=tuple(texts)))
+    return InstrumentFigure(tuple(circles), tuple(panels))
