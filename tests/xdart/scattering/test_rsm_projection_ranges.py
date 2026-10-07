@@ -5,7 +5,7 @@ from PySide6.QtTest import QTest
 
 from tests.core.test_rsm_viewer_model import _projection
 from xdart.gui.tabs.rsm.page import RSMPage
-from xdart.gui.pages.services import empty_host_services
+from tests.xdart.pages.test_rsm_page import _page
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xrd_tools.session.rsm_viewer_model import RSMViewerModel, make_rsm_viewer_values
 from xdart.gui.tabs.rsm.display import rsm_keyed_projection
@@ -32,7 +32,7 @@ def test_keyed_curves_inherit_int_data_style_including_markers(qapp):
 
 
 def test_actual_rsm_page_defaults_to_mean_and_shared_ranges_change_all_six(qapp):
-    page = RSMPage(empty_host_services())
+    page = _page(qapp)
     try:
         source = _projection(shape=(5, 7, 9))
         page._show('shown.nexus', source)
