@@ -297,11 +297,11 @@ class ContextHelpOwner(QtCore.QObject):
         self._resume_timer.setSingleShot(True)
         self._resume_timer.timeout.connect(self._resume_queued)
         root.installEventFilter(self)
-        QtWidgets.QApplication.instance().installEventFilter(self)
         QtWidgets.QApplication.instance().focusChanged.connect(self._focus_changed)
         self._bind_shortcut()
 
     def _bind_shortcut(self):
+        QtWidgets.QApplication.instance().installEventFilter(self)
         if self.shortcut is None:
             self.shortcut = QtGui.QShortcut(QtGui.QKeySequence("F1"), self.root)
             self.shortcut.activated.connect(self.show_focused)
@@ -315,6 +315,9 @@ class ContextHelpOwner(QtCore.QObject):
                 active_popup=QtWidgets.QApplication.activePopupWidget(), **details))
 
     def eventFilter(self, watched, event):
+        # Qt can deliver events while the Python wrapper is being created or disposed.
+        if not hasattr(self, '_held_row'):
+            return False
         if (self._held_row is not None and event.type() == QtCore.QEvent.Type.MouseButtonPress
                 and isinstance(watched, QtWidgets.QWidget) and watched.window() is self.root
                 and not _help_action(watched) and watched is not self._held_row.editor):
@@ -439,6 +442,7 @@ class ContextHelpOwner(QtCore.QObject):
 
     def shutdown(self):
         """Release callbacks/windows on actual retirement; ignored busy Close keeps both."""
+        QtWidgets.QApplication.instance().removeEventFilter(self)
         self._resume_timer.stop()
         self._resume_draft(restore=False)
         if self.shortcut is not None:
