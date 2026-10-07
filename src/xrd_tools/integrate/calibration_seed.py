@@ -70,7 +70,7 @@ def calibration_seed_inputs(path, *, fallback_instrument):
         raise ValueError('the calibration has no finite, positive direct-beam distance')
     if identity != calibration_file_identity(path):
         raise ValueError('the calibration changed while loading; select it again')
-    return dict(identity=identity, instrument=geometry,
+    return dict(identity=identity, instrument=geometry, calibration_kind=provenance.get('calibration_kind'),
                 camera=stitch_camera(orientation), detector=turned.get('detector', calibration.poni.detector),
                 orientation=int(calibration.detector_config.get('orientation', 3)),
                 distance_m=distance, beam_px=(column, row), energy_eV=energy_eV,

@@ -20,6 +20,9 @@ from xdart.utils.session import load_session, save_session
 logger = logging.getLogger(__name__)
 
 _SESSION_KEY = 'last_browse_dir'
+# A fresh session never reads/writes the saved session, but its successive dialogs
+# still share the last pick. Redirected sessions keep separate transient history.
+_FRESH_LAST_DIRS: dict[str, str] = {}
 
 
 def _existing_dir_of(path) -> str:
@@ -35,7 +38,9 @@ def _existing_dir_of(path) -> str:
 def last_browse_dir() -> str:
     """The persisted last-picked directory, '' when unset or vanished."""
     try:
-        return _existing_dir_of(load_session().get(_SESSION_KEY))
+        value = (_FRESH_LAST_DIRS.get(os.environ.get('XDART_SESSION_FILE', 'default'))
+                 if os.environ.get('XDART_SESSION_FRESH') else load_session().get(_SESSION_KEY))
+        return _existing_dir_of(value)
     except Exception:
         logger.debug("last_browse_dir read failed", exc_info=True)
         return ''
@@ -45,7 +50,10 @@ def remember_browse_path(path) -> None:
     """Record a successful pick (file or directory) as the shared last dir."""
     d = _existing_dir_of(path)
     if d:
-        save_session({_SESSION_KEY: d})
+        if os.environ.get('XDART_SESSION_FRESH'):
+            _FRESH_LAST_DIRS[os.environ.get('XDART_SESSION_FILE', 'default')] = d
+        else:
+            save_session({_SESSION_KEY: d})
 
 
 def browse_start_dir(current='', fallback='') -> str:

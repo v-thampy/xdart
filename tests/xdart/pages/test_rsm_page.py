@@ -342,7 +342,7 @@ def test_rsm_opens_with_six_empty_native_panels_and_labels(qapp):
         assert page.shown is None
         assert page.view.share_axis.isChecked() and page.view.keyed_projection.share_axis
         assert page.view.vertical_splitter.isHidden()
-        assert [key.instance for key in _keys(page.view)] == ["HK", "HL", "KL", "H", "K", "L"]
+        assert [key.instance for key in _keys(page.view)] == ["HK", "KL", "LH", "H", "K", "L"]
         assert all(not pane.canvas.raw_image.size for pane in _slices(page.view))
         assert all(selector.isHidden() for selector in _selectors(page.view))
         assert all(curve.getData()[0] is None or not curve.getData()[0].size for curve in _curves(page.view))
@@ -350,7 +350,7 @@ def test_rsm_opens_with_six_empty_native_panels_and_labels(qapp):
         page.view.color_map.setCurrentText("magma")
         page.view.log_scale.click()
         page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
-        assert [key.instance for key in _keys(page.view)] == ["QxQy", "QxQz", "QyQz", "Qx", "Qy", "Qz"]
+        assert [key.instance for key in _keys(page.view)] == ["QxQy", "QyQz", "QzQx", "Qx", "Qy", "Qz"]
         assert page.view.keyed_panel(_keys(page.view)[0]).pane.plot.getAxis("bottom").labelText == (
             RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.axis_labels[0])
         assert page.view.color_map.currentText() == "magma" and page.view.log_scale.isChecked()
@@ -405,8 +405,8 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
             x, y = curve.getData()
             np.testing.assert_array_equal(x, product.x_axis)
             np.testing.assert_array_equal(y, product.values)
-        assert [selector.currentIndex() for selector in _selectors(page.view)] == [4, 3, 2]  # L, K, H
-        _selectors(page.view)[2].setCurrentIndex(0)  # the KL slice's H index: it moves to H 0
+        assert [selector.currentIndex() for selector in _selectors(page.view)] == [4, 2, 3]  # L, H, K
+        _selectors(page.view)[1].setCurrentIndex(0)  # the KL slice's H index: it moves to H 0
         moved = page.shown[1]
         assert (moved.state.h_index, moved.state.k_index, moved.state.l_index) == (0, 3, 4)
         np.testing.assert_array_equal(_slices(page.view)[2].canvas.raw_image, np.asarray(moved.products[2].values).T)
@@ -545,14 +545,14 @@ def test_each_pane_carries_the_frames_own_axis_labels(qapp, make, names):
         view.reconcile_keyed(rsm_keyed_projection(values, RSMViewerModel().snapshot(values)))
         first, second, third = names
         assert [(pane.plot.getAxis("bottom").labelText, pane.plot.getAxis("left").labelText)
-                for pane in _slices(view)] == [(first, second), (first, third), (second, third)]
+                for pane in _slices(view)] == [(first, second), (second, third), (third, first)]
         assert [plot.getAxis("bottom").labelText for plot in _plots(view)] == list(names)
         assert {pane.plot.getAxis(side).labelUnits for pane in _slices(view) for side in ("bottom", "left")} | {
             plot.getAxis("bottom").labelUnits for plot in _plots(view)} == {""}
         symbols = values.coordinate_frame.axis_symbols
         normal = float(np.asarray(values.axes[2][1])[4])
         assert _slices(view)[0].plot.titleLabel.text == (
-            f"{symbols[0]}{symbols[1]} slice · {symbols[2]} = {normal:.6g} (index 4)")
+            f"{symbols[0]}{symbols[1]} slice · {symbols[2]} = {normal:.3f} (index 4)")
     finally:
         view.deleteLater()
         qapp.processEvents()
@@ -1224,7 +1224,7 @@ def test_ints_colour_map_and_log_redraw_the_six(qapp, monkeypatch):
 def test_ints_intensity_controls_and_share_axis_drive_the_six(qapp, monkeypatch):
     """G13 unit 1 (decision 1's toolbar: "colour map, Log, intensity, Set BG ... and Share Axis"): under the six,
     Int's intensity controls set one set of levels for the three slices, and Share Axis, a command the page keeps
-    and draws back, links each coordinate across the panels: H on the HK and HL slices and the H projection."""
+    and draws back, links each coordinate across the panels: H on the HK and LH slices and the H projection."""
     monkeypatch.setattr(page_module, "make_rsm_viewer_values", {"payload": _values()}.__getitem__)
     page = _page(qapp, owner=_Owner())
     try:
@@ -1238,16 +1238,16 @@ def test_ints_intensity_controls_and_share_axis_drive_the_six(qapp, monkeypatch)
         np.testing.assert_allclose(levels.pop(), span)
         assert not view.viewer_intensity.isHidden() and not view.share_axis.isHidden()
         assert view.keyed_projection.share_axis and view.share_axis.isChecked()
-        hk, hl, _kl = _slices(view)
+        hk, _kl, lh = _slices(view)
         hk.canvas.imageViewBox.setXRange(0.2, 0.6, padding=0)
         h_projection = next(panel for panel in view.keyed_projection.panels if not hasattr(panel, "image"))
         h_plot = view.keyed_panel(h_projection.key).plot.getViewBox()
-        for box in (hl.canvas.imageViewBox, h_plot):
-            np.testing.assert_allclose(box.viewRange()[0], (0.2, 0.6))
+        for box, axis in ((lh.canvas.imageViewBox, 1), (h_plot, 0)):
+            np.testing.assert_allclose(box.viewRange()[axis], (0.2, 0.6))
         view.share_axis.click()
         assert not view.keyed_projection.share_axis
         hk.canvas.imageViewBox.setXRange(0.3, 0.5, padding=0)
-        np.testing.assert_allclose(hl.canvas.imageViewBox.viewRange()[0], (0.2, 0.6))
+        np.testing.assert_allclose(lh.canvas.imageViewBox.viewRange()[1], (0.2, 0.6))
     finally:
         _close(page, qapp)
 

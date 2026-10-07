@@ -422,14 +422,29 @@ def rsm_member_source_ub(member) -> tuple[float, ...] | None:
     warning and the Preview only; the run reads its own. ``()``: a ``#G3`` line that does not parse, which counts
     as recorded (the run refuses it with its own reason in HKL, and Q never reads it)."""
     if type(member) is RSMNexusMemberForm:
-        from xrd_tools.io.nexus import read_nexus
-        ub = read_nexus(Path(member.nexus_path), entry=member.entry).ub_matrix
-        return None if ub is None else tuple(float(value) for value in np.asarray(ub, dtype=float).ravel())
+        return rsm_source_ub(SourceSpec(str(member.nexus_path), member.kind, entry=member.entry))
     if type(member) is not RSMScanMemberForm:
         raise TypeError("an RSM member is an exact SPEC scan or raw NeXus member form")
+    return rsm_source_ub(SourceSpec(str(member.spec_path), SourceKind.SPEC, options={"scan": member.scan}))
+
+
+def rsm_source_ub(source: SourceSpec) -> tuple[float, ...] | None:
+    """Image-free UB header read shared by member qualification and the selected-source display.
+
+    Values remain in the source's SPEC #G3 convention; the scientific run still
+    qualifies its own matrix. None is missing, () is a malformed recorded matrix.
+    """
+    if type(source) is not SourceSpec:
+        raise TypeError("UB display requires an exact source specification")
+    if source.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+        from xrd_tools.io.nexus import read_nexus
+        ub = read_nexus(Path(source.uri), entry=source.entry).ub_matrix
+        return None if ub is None else tuple(float(value) for value in np.asarray(ub, dtype=float).ravel())
     from xrd_tools.io.spec import get_UB
     try:
-        ub = get_UB(str(member.spec_path), member.scan)
+        scan = source.options.get("scan")
+        scan = (str(scan) if "." in str(scan) else f"{scan}.1") if scan is not None else 0
+        ub = get_UB(str(source.uri), scan)
     except KeyError as error:
         if error.args and error.args[0] == "G3":
             return None

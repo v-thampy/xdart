@@ -6,6 +6,24 @@ from xdart.gui.widgets.geometry_editor import GeometryEditor
 from xrd_tools.session.instrument import InstrumentGeometry
 
 
+@pytest.mark.parametrize('geometry,plane', [('psic', 'vertical'), ('fourc', 'vertical'), ('twoc', 'horizontal')])
+def test_default_senses_button_preserves_motors_zeros_and_plane(qapp, geometry, plane):
+    from dataclasses import replace
+    editor = GeometryEditor()
+    try:
+        standard = InstrumentGeometry(geometry, plane=plane)
+        edited = replace(standard, motors=tuple((c, 'motor_' + c) for c in standard.circles),
+                         zeros=((standard.circles[0], 1.25),), reversed_circles=standard.circles)
+        editor.set_value(edited)
+        changed = []
+        editor.changed.connect(lambda: changed.append(True))
+        editor.default_senses.click()
+        assert editor.value() == replace(edited, reversed_circles=())
+        assert len(changed) == 1 and editor.default_senses.toolTip()
+    finally:
+        editor.deleteLater()
+
+
 @pytest.fixture(scope="module")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])

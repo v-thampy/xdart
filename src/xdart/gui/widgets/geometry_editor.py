@@ -10,6 +10,7 @@ motor-zero reading (physical angle = motor readback − zero); a blank box gives
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
@@ -56,7 +57,18 @@ class GeometryEditor(QtWidgets.QWidget):
         self.geometry = ControlsComboBox()
         for key, label in GEOMETRY_LABELS.items():
             self.geometry.addItem(label, key)
-        self._form.addRow('Diffractometer', self.geometry)
+        picker = QtWidgets.QWidget(self)
+        picker_layout = QtWidgets.QHBoxLayout(picker)
+        picker_layout.setContentsMargins(0, 0, 0, 0)
+        picker_layout.addWidget(self.geometry)
+        self.default_senses = QtWidgets.QPushButton('↺', picker)
+        self.default_senses.setToolTip("Restore the selected diffractometer's standard motor senses. "
+                                      "Keep motor names, zero offsets and scattering plane.")
+        self.default_senses.setFixedWidth(32)
+        self.default_senses.clicked.connect(self._default_senses)
+        picker_layout.addWidget(self.default_senses)
+        picker_layout.addStretch(1)
+        self._form.addRow('Diffractometer', picker)
         self.plane = ControlsComboBox()
         for key, label in PLANE_LABELS.items():
             self.plane.addItem(label, key)
@@ -108,6 +120,9 @@ class GeometryEditor(QtWidgets.QWidget):
     def motor_edit(self, circle) -> QtWidgets.QLineEdit:
         """The text box of one circle's motor (a host may read or set it directly)."""
         return self._motors[circle].lineEdit()
+
+    def _default_senses(self):
+        self.set_value(replace(self.value(), reversed_circles=()))
 
     def zero_edit(self, circle) -> QtWidgets.QLineEdit:
         """The box of a detector circle's motor-zero reading (blank: none given)."""

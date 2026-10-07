@@ -18,8 +18,9 @@ def test_mean_maps_crop_existing_centres_keep_zero_nan_and_source(cartesian):
     model = RSMViewerModel()
     projected = model.snapshot(values, projection=True, coordinate_ranges=bounds)
     crop = values.intensity[1:, 1:, 1:]
-    for product, normal in zip(projected.products[:3], (2, 1, 0), strict=True):
-        np.testing.assert_array_equal(product.values, np.nanmean(crop, axis=normal, dtype=np.float64).astype('f4').T)
+    for product, normal in zip(projected.products[:3], (2, 0, 1), strict=True):
+        expected = np.nanmean(crop, axis=normal, dtype=np.float64).astype('f4')
+        np.testing.assert_array_equal(product.values, expected if normal == 1 else expected.T)
         assert product.source_indices == (None, None, None)
         assert not product.values.flags.writeable
     for product, retained in zip(projected.products[3:], range(3), strict=True):

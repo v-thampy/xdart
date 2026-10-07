@@ -103,7 +103,7 @@ _RSM_MODES = ("RSM",)
 #: Results list and Open… (hard rule 14; Codex's RSM reuse audit R1)
 _BROWSER = BrowserProfile(
     menus=(("File", ("Open Folder", "Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
-    raw_resolution_menus=False, list_caption="Results", directory=True, frames=False, actions=("Open…",),
+    raw_resolution_menus=False, list_caption="Results", directory=True, frames=False, actions=("Open…", "Metadata"),
     date_sort=False, refresh=True, results=True,
 )
 #: The operation's stages in words (its progress counts frames plus the masks and four steps).
@@ -279,6 +279,19 @@ def _progress_text(stage, completed, total):
     return f"{_STAGE_TEXT.get(stage, stage)}…"
 
 
+def _read_rsm_metadata(arguments, cancel, _progress):
+    """Reuse the experimental-table reader on the ordinary worker; no detector pixels."""
+    from xrd_tools.analysis.stitch_metadata import read_stitch_metadata, StitchMetadataTable
+    from xrd_tools.analysis.scan_operations import MetadataTablePlan, run_metadata_table
+    from xrd_tools.core.scan import SourceSpec
+    source, root = arguments
+    if type(source) is SourceSpec:
+        table = run_metadata_table(MetadataTablePlan(source), cancel_token=cancel)
+        label = f"{Path(source.uri).name} · scan {source.options.get('scan') or 'first'}"
+        return (StitchMetadataTable(label, table.labels, tuple(str(x) for x in table.labels), table),)
+    return read_stitch_metadata(source, source_root=root, cancel_token=cancel)
+
+
 def _family_pair(root, member):
     """A member's (source path, scan or None) as the slot policy names one: a SPEC scan's file and key, a NeXus
     stack's file alone (stage 2b C5c)."""
@@ -327,6 +340,9 @@ class RSMPage(QtWidgets.QWidget):
         self._owner = RSMToolOwner.v2() if owner is None else owner
         self._reader = SingleWorkerOwner(_read_rsm_record) if reader is None else reader
         self._reading = None  # (identity, path, completion message) of the record being read
+        self._metadata_reader = SingleWorkerOwner(_read_rsm_metadata)
+        self._metadata_reading = None
+        self._metadata_dialog = self._metadata_plot_dialog = None
         # the Source's member groups, found on the shared single worker before Preview and Run (it reads the
         # SPEC files and lists the images): (identity, action, key) while found; (key, groups, skipped) after
         self._resolver = SingleWorkerOwner(_resolve_rsm_groups) if resolver is None else resolver
@@ -334,6 +350,8 @@ class RSMPage(QtWidgets.QWidget):
         self._groups = None
         self._selection_counts = None
         self._fields, self._rows = {}, {}
+        self._ub_typed_rows = ("", "", "")
+        self._ub_rendered_choice = None
         self._source_paths = ()  # Stitch's selection: the SPEC or NeXus files, or the folder, as chosen
         self._source_shown = ""  # the SPEC files row's text for them ("3 files selected")
         self._paths_by_kind = {}
@@ -405,6 +423,8 @@ class RSMPage(QtWidgets.QWidget):
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         outer.addWidget(self.splitter)
         self.browser = BrowserView(profile=_BROWSER)  # Int's Data Browser (hard rule 14)
+        self.browser.metadata.setToolTip("Inspect and plot experimental metadata, including motor positions, "
+            "for the displayed RSM's contributors, or the first selected source scan when no result is shown.")
         self._result_browser = ResultDirectoryBrowser(self.browser)
         self._result_browser.changed.connect(self._publish_results)
         self._result_browser.notice.connect(self._notice)
@@ -802,9 +822,9 @@ class RSMPage(QtWidgets.QWidget):
         self.controls.source_card.add_row(self.ub_card)
         for key, label, value, choices, browse in (
                 ("ub_from", "UB", _UB_SOURCE, (_UB_SOURCE, _UB_TYPED, _UB_SPEC), False),
+                ("ub_spec_path", "SPEC file", "", (), True), ("ub_scan", "Scan", "", (), False),
                 ("ub_row1", "Row 1", "", (), False), ("ub_row2", "Row 2", "", (), False),
-                ("ub_row3", "Row 3", "", (), False),
-                ("ub_spec_path", "SPEC file", "", (), True), ("ub_scan", "Scan", "", (), False)):
+                ("ub_row3", "Row 3", "", (), False)):
             self.ub_card.add_row(self._row(SectionId.SOURCE, key, label, value, choices, browse))
         self.ub_card.set_collapsed(True)
         self._tip("ub_from", "The UB an HKL map uses: the source's own (a SPEC scan's #G3, a NeXus entry's "
@@ -820,18 +840,49 @@ class RSMPage(QtWidgets.QWidget):
         The group's status names the UB in use."""
         hkl = self._value("coordinates") == RSMCoordinateFrame.HKL.display_name
         choice = self._value("ub_from")
+        row_keys = ("ub_row1", "ub_row2", "ub_row3")
+        if self._ub_rendered_choice == _UB_TYPED:
+            self._ub_typed_rows = tuple(self._value(key) for key in row_keys)
+        shown = self._ub_typed_rows if choice == _UB_TYPED else ("", "", "")
+        note = ""
+        if choice != _UB_TYPED and hkl:
+            from xrd_tools.analysis.rsm_values import rsm_source_ub
+            from xrd_tools.core.scan import SourceSpec, SourceKind
+            try:
+                source = self._source_spec_for_tools() if choice == _UB_SOURCE else None
+                if choice == _UB_SPEC:
+                    override = self._ub_override(Path(str(self._value("project_root"))).expanduser())
+                    source = SourceSpec(override.spec_path, SourceKind.SPEC, options={"scan": override.scan})
+                matrix = rsm_source_ub(source) if source is not None else None
+                if matrix is not None:
+                    rows = tuple(" ".join(format(value, '.9g') for value in matrix[i:i+3]) for i in (0, 3, 6))
+                    parse_rsm_ub_rows(rows)  # no invalid matrix is presented as a usable UB
+                    shown = rows
+                    note = f"Displayed UB from {Path(source.uri).name} · scan {source.options.get('scan') or 'first'}"
+                    if self._groups is not None and self._groups[0] == self._group_key():
+                        if choice == _UB_SOURCE and any(ub != matrix for ub in self._groups[3]):
+                            note += " · matrices vary across scans; each scan uses its own UB"
+            except (OSError, KeyError, TypeError, ValueError):
+                note = "Selected source has no valid UB to display; Preview explains the refusal."
+        self._ub_rendered_choice = choice
         reads = {"ub_from": True, **{key: choice == _UB_TYPED for key in ("ub_row1", "ub_row2", "ub_row3")},
                  "ub_spec_path": choice == _UB_SPEC, "ub_scan": choice == _UB_SPEC}
         for key in _UB_KEYS:
             used = hkl and reads[key]
-            field = replace(self._fields[key], value=self._value(key), enabled=used, reason="" if used else (
+            value = shown[row_keys.index(key)] if key in row_keys else self._value(key)
+            field = replace(self._fields[key], value=value, enabled=used, reason="" if used else (
                 "Q coordinates use no UB" if not hkl else f"{self._fields[key].label} is not read by {choice}"))
             self._fields[key] = field
             self._rows[key].apply_field(field)
+            if key in {"ub_spec_path", "ub_scan"}:
+                self._rows[key].setVisible(choice == _UB_SPEC)
+            if key in row_keys and note:
+                self._rows[key].set_purpose_tooltip(note + ". Read-only display; it does not override the source.")
         status = "none in Q" if not hkl else {_UB_SOURCE: "the source's", _UB_TYPED: "typed",
                                               _UB_SPEC: "a SPEC scan's"}[choice]
         self.ub_card.status.setText(status)
         self.ub_card.status.setVisible(True)
+        self.ub_card.status.setToolTip(note or "The selected UB source; Q coordinates use no UB.")
 
     def _ub_override(self, root):
         """The UB given for an HKL map (``RSMUBOverride``), None for the source's own or in Q. ValueError names a
@@ -968,6 +1019,13 @@ class RSMPage(QtWidgets.QWidget):
         return self._rows[key].current_value()
 
     def set_field(self, key, value):
+        if key in {"ub_row1", "ub_row2", "ub_row3"} and self._value("ub_from") != _UB_TYPED:
+            rows = list(self._ub_typed_rows)
+            rows[int(key[-1])-1] = value
+            self._ub_typed_rows = tuple(rows)
+            self._render_ub()
+            self._edited()
+            return
         if key == "grid":  # old presets become the same three editable counts
             if value not in _GRIDS:
                 raise ValueError(f"Grid: {value!r} is not one of its choices")
@@ -1000,7 +1058,8 @@ class RSMPage(QtWidgets.QWidget):
             self._show_early_ceiling()
         if key in {"project_root", "spec_path", "scan_mode", "scan", "normalization"} and "normalization" in self._rows:
             self._refresh_normalization()  # a kind's own files come through set_sources
-        if key in {"coordinates", "ub_from"}:
+        if key in {"coordinates", "ub_from", "ub_spec_path", "ub_scan", "project_root", "spec_path",
+                   "scan", "scan_mode", "source_kind"}:
             self._render_ub()
         if key == "coordinates" or key in _GRID_FIELDS:
             self._render_grid_labels()
@@ -1022,6 +1081,7 @@ class RSMPage(QtWidgets.QWidget):
         self._show_source_tip()
         if "normalization" in self._rows:  # the new first scan's counters (Stitch's _source_committed)
             self._refresh_normalization()
+        self._render_ub()
         self._edited()
 
     def _adopt_sources(self, paths):
@@ -1120,6 +1180,7 @@ class RSMPage(QtWidgets.QWidget):
         Source header's warning) and, for several RSMs, each output's check (``_queue_refusals``); the suggested
         output follows them."""
         self._groups = (key, tuple(groups), tuple(skipped), tuple(ubs), dict(checked or {}))
+        self._render_ub()
         if self._apply_suggestion():
             self._edited()
         else:  # the found members' UBs: the Source header (no new form: a prepared Preview stays current)
@@ -1571,9 +1632,10 @@ class RSMPage(QtWidgets.QWidget):
         busy = bool(self._owner.busy)
         final = self._owner.finalization
         reading = self._reading is not None
+        metadata_reading = self._metadata_reading is not None
         authoring = self._authoring_active()
         resolving = self._resolving is not None
-        idle = (not busy and not reading and not authoring and not resolving and self._job_form is None
+        idle = (not busy and not reading and not metadata_reading and not authoring and not resolving and self._job_form is None
                 and final is RSMOwnerFinalization.NONE and not self._closing)
         self.controls.set_editors_enabled(idle)  # the action row stays usable: Retry (Codex F2)
         self.calibrate_button.setEnabled(idle)
@@ -1585,6 +1647,8 @@ class RSMPage(QtWidgets.QWidget):
         self.run_bar.set_mode_row_enabled(idle)
         self.advanced.set_editors_enabled(idle)
         self.browser.set_action_enabled("Open…", not busy and not reading and not self._closing)
+        self.browser.set_action_enabled("Metadata", idle and self._metadata_reading is None and (
+            self._results.get(self._shown_path) is not None or bool(self._source_paths)))
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)
         self.retry_button.setEnabled(not busy and final is not RSMOwnerFinalization.NONE and not self._closing)
@@ -1628,7 +1692,11 @@ class RSMPage(QtWidgets.QWidget):
         if kind == "NeXus":
             return SourceSpec(str(path), SourceKind.NEXUS_STACK)
         try:  # a Selection or stem readiness refuses opens the window without a scan
-            scan = parse_stitch_scan_groups(str(self._value("scan") or "1"))[0][0]
+            if self._value("scan_mode") == "All Scans":
+                from xrd_tools.io.spec import list_spec_scans
+                scan = tuple(list_spec_scans(path))[0]
+            else:
+                scan = parse_stitch_scan_groups(str(self._value("scan") or "1"))[0][0]
             stem = str(self._value("image_stem")).strip().format(spec=path.stem, scan=scan.split(".")[0],
                                                                   occurrence=scan)
         except (KeyError, IndexError, ValueError):
@@ -1981,10 +2049,11 @@ class RSMPage(QtWidgets.QWidget):
                 self._accept(update)
             self._poll_reader()
             self._poll_resolver()
+            self._poll_metadata()
         except Exception as error:
             _LOG.exception("RSM page update failed")
             self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")
-        if not self._owner.busy and self._reading is None and self._resolving is None:
+        if not self._owner.busy and self._reading is None and self._resolving is None and self._metadata_reading is None:
             self._timer.stop()
         self._sync_actions()
 
@@ -2110,12 +2179,72 @@ class RSMPage(QtWidgets.QWidget):
             self.open_result()
         elif command.kind is ShellCommandKind.MENU and command.value == "File:Integration workspace":
             self.toolRequested.emit(str(SCATTERING_PAGE_KEY))
+        elif command.kind is ShellCommandKind.SHOW_METADATA:
+            self._show_metadata()
 
     def _publish_results(self):
         self.browser.directory_label.set_path(self._result_browser.directory or "")
         self.browser.reconcile_results(
             self._result_browser.entries(self._listed),
             self._requested if self._requested in self._listed else None)
+
+    def _show_metadata(self):
+        from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog, open_metadata_plot
+        if self.active() or self._closing:
+            return
+        payload = self._results.get(self._shown_path)
+        try:
+            source = payload if payload is not None else self._source_spec_for_tools()
+        except (OSError, TypeError, ValueError) as error:
+            self._notice(f"Metadata unavailable: {error}")
+            return
+        if source is None:
+            self._notice("Select an RSM result or source scan to inspect its metadata")
+            return
+        if self._metadata_dialog is not None:
+            self._metadata_dialog.close()
+        dialog = MetadataResultDialog(self)
+        dialog.resize(760, 450)
+        dialog.status.setToolTip("Full experimental columns read from the original source. Missing or changed "
+                                "originals are reported as unavailable.")
+        dialog.plotRequested.connect(lambda item: open_metadata_plot(self, item))
+        dialog.finished.connect(lambda _result: self._metadata_closed(dialog))
+        self._metadata_dialog = dialog
+        dialog.status.setText("Loading experimental metadata…")
+        identity = self._metadata_reader.begin((source, self._value("project_root")))
+        self._metadata_reading = (identity, self._shown_path, payload, self._form_revision, dialog)
+        dialog.show()
+        self._timer.start()
+        self._sync_actions()
+
+    def _metadata_closed(self, dialog):
+        if self._metadata_dialog is dialog:
+            self._metadata_dialog = None
+            if self._metadata_reading is not None:
+                self._metadata_reader.cancel(self._metadata_reading[0])
+
+    def _poll_metadata(self):
+        if self._metadata_reading is None:
+            return
+        identity, path, payload, revision, dialog = self._metadata_reading
+        update = self._metadata_reader.poll(identity)
+        if update is None or update.terminal is None:
+            return
+        self._metadata_reading = None
+        if self._closing or self._metadata_dialog is not dialog:
+            return
+        current = (path == self._shown_path and self._results.get(path) is payload) if payload is not None else (
+            self._form_revision == revision and self._shown_path is None)
+        if not current:
+            dialog.status.setText("Selection changed; close and reopen Metadata")
+            return
+        terminal = update.terminal
+        if terminal.status is OperationTerminalStatus.RETURNED:
+            from xdart.gui.tabs.scattering.analysis_mount import MetadataSource
+            dialog.adopt_sources(tuple(MetadataSource(item.source_label, item.table,
+                item.selected_labels, item.row_labels) for item in terminal.payload))
+        else:
+            dialog.status.setText(terminal.failure_message or "Metadata read stopped")
 
     def open_result(self):
         from xdart.gui.widgets import file_dialogs as dialogs
@@ -2509,6 +2638,7 @@ class RSMPage(QtWidgets.QWidget):
 
     def active(self):
         return bool(self._owner.busy or self._reading is not None or self._resolving is not None
+                    or self._metadata_reading is not None
                     or self._job_form is not None  # a queue between its RSMs
                     or self._owner.finalization is not RSMOwnerFinalization.NONE or self._authoring_active()
                     or any(window.active() if hasattr(window, "active") else window.computing
@@ -2576,7 +2706,10 @@ class RSMPage(QtWidgets.QWidget):
         self._closing = True
         self._timer.stop()
         self._authoring_timer.stop()
-        receipts = (self._owner.close(), self._reader.close(), self._resolver.close(),
+        for dialog in (self._metadata_dialog, self._metadata_plot_dialog):
+            if dialog is not None:
+                dialog.close()
+        receipts = (self._owner.close(), self._reader.close(), self._resolver.close(), self._metadata_reader.close(),
                     *(dialog.shutdown() for dialog in self._authoring_dialogs),
                     *(window.shutdown() for window in self._tool_windows.values()))
         if not self._result_browser.close():
@@ -2595,6 +2728,7 @@ class RSMPage(QtWidgets.QWidget):
         self.view.clear_keyed("No RSM result shown")
         self._viewers.clear()
         self._shown_path = self._shown = None
+        self._metadata_reading = None
         return CloseReceipt(PageCleanup.CLEAN)
 
 

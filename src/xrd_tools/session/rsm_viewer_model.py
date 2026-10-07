@@ -19,6 +19,7 @@ from xrd_tools.rsm.coordinate_frame import (
 
 RSM_HK = PanelKey(PanelRole.SLICE_2D, "HK")
 RSM_HL = PanelKey(PanelRole.SLICE_2D, "HL")
+RSM_LH = PanelKey(PanelRole.SLICE_2D, "LH")
 RSM_KL = PanelKey(PanelRole.SLICE_2D, "KL")
 RSM_H = PanelKey(PanelRole.PROJ_1D, "H")
 RSM_K = PanelKey(PanelRole.PROJ_1D, "K")
@@ -26,20 +27,21 @@ RSM_L = PanelKey(PanelRole.PROJ_1D, "L")
 
 RSM_QX_QY = PanelKey(PanelRole.SLICE_2D, "QxQy")
 RSM_QX_QZ = PanelKey(PanelRole.SLICE_2D, "QxQz")
+RSM_QZ_QX = PanelKey(PanelRole.SLICE_2D, "QzQx")
 RSM_QY_QZ = PanelKey(PanelRole.SLICE_2D, "QyQz")
 RSM_QX = PanelKey(PanelRole.PROJ_1D, "Qx")
 RSM_QY = PanelKey(PanelRole.PROJ_1D, "Qy")
 RSM_QZ = PanelKey(PanelRole.PROJ_1D, "Qz")
 
 RSM_VIEWER_LAYOUT = (
-    (RSM_HK, RSM_HL, RSM_KL),
+    (RSM_HK, RSM_KL, RSM_LH),
     (RSM_H, RSM_K, RSM_L),
 )
 RSM_VIEWER_PANEL_ORDER = tuple(
     panel for row in RSM_VIEWER_LAYOUT for panel in row
 )
 RSM_Q_VIEWER_LAYOUT = (
-    (RSM_QX_QY, RSM_QX_QZ, RSM_QY_QZ),
+    (RSM_QX_QY, RSM_QY_QZ, RSM_QZ_QX),
     (RSM_QX, RSM_QY, RSM_QZ),
 )
 RSM_Q_VIEWER_PANEL_ORDER = tuple(
@@ -855,20 +857,20 @@ def _build_rsm_viewer_product(
     if panel_key is panel_order[1]:
         return product(
             panel_key,
-            axis0,
-            axis2,
-            _freeze_float32(_projection_values(intensity, retained_axis=(0, 2)).T)
-            if state.projection else _freeze_float32(intensity[:, indices[1], :].T),
-            (None, None, None) if state.projection else (None, state.k_index, None),
-        )
-    if panel_key is panel_order[2]:
-        return product(
-            panel_key,
             axis1,
             axis2,
             _freeze_float32(_projection_values(intensity, retained_axis=(1, 2)).T)
             if state.projection else _freeze_float32(intensity[indices[0], :, :].T),
             (None, None, None) if state.projection else (state.h_index, None, None),
+        )
+    if panel_key is panel_order[2]:
+        return product(
+            panel_key,
+            axis2,
+            axis0,
+            _freeze_float32(_projection_values(intensity, retained_axis=(0, 2)))
+            if state.projection else _freeze_float32(intensity[:, indices[1], :]),
+            (None, None, None) if state.projection else (None, state.k_index, None),
         )
     if panel_key is panel_order[3]:
         values = _projection_values(intensity, retained_axis=0)
@@ -905,8 +907,8 @@ def _component_keys(state: RSMViewerState) -> tuple[_ComponentKey, ...]:
     axis0, axis1, axis2 = state.coordinate_frame.axis_names
     keys = (
         (result, "slice", axis2, state.l_index),
-        (result, "slice", axis1, state.k_index),
         (result, "slice", axis0, state.h_index),
+        (result, "slice", axis1, state.k_index),
         (result, "projection", axis0),
         (result, "projection", axis1),
         (result, "projection", axis2),
@@ -1281,12 +1283,14 @@ __all__ = [
     "RSM_H",
     "RSM_HK",
     "RSM_HL",
+    "RSM_LH",
     "RSM_K",
     "RSM_KL",
     "RSM_L",
     "RSM_QX",
     "RSM_QX_QY",
     "RSM_QX_QZ",
+    "RSM_QZ_QX",
     "RSM_QY",
     "RSM_QY_QZ",
     "RSM_QZ",

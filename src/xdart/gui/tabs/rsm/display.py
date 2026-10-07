@@ -20,7 +20,7 @@ from xrd_tools.session.rsm_viewer_model import rsm_axis_bounds, rsm_viewer_layou
 
 #: each panel's (horizontal, vertical) axis indices, in the layout's order: the slices' pairs, then each
 #: projection's axis. A slice's normal is the axis it leaves out.
-_AXES = ((0, 1), (0, 2), (1, 2), (0, None), (1, None), (2, None))
+_AXES = ((0, 1), (1, 2), (2, 0), (0, None), (1, None), (2, None))
 
 
 def slice_normal(horizontal: int, vertical: int) -> int:
@@ -42,7 +42,7 @@ def rsm_empty_projection(coordinate_frame) -> KeyedPanelsProjection:
                 AxisProjection(empty, labels[vertical], ""), 0, (), navigation=False))
         else:
             panels.append(KeyedTraceProjection(
-                key, f"{symbols[horizontal]} mean projection", x_axis, empty, "Mean I"))
+                key, "", x_axis, empty, "Mean I"))
     return KeyedPanelsProjection(layout, tuple(panels), title="RSM", status="Open or calculate an RSM result")
 
 
@@ -73,8 +73,8 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
             normal = slice_normal(horizontal, vertical)
             at = indices[normal]
             span = snapshot.state.ranges[normal] if snapshot.state.ranges else (0, values.shape[normal])
-            caption = (f"{symbols[horizontal]}{symbols[vertical]} mean over {symbols[normal]} "
-                       f"{float(axes[normal][span[0]]):.3f}..{float(axes[normal][span[1]-1]):.3f}"
+            caption = (f"Mean over {symbols[normal]} "
+                       f"[{float(axes[normal][span[0]]):.3f}, {float(axes[normal][span[1]-1]):.3f}]"
                        if snapshot.state.projection else
                        f"{symbols[horizontal]}{symbols[vertical]} slice · {symbols[normal]} = "
                        f"{float(axes[normal][at]):.3f} (index {at})")
@@ -91,7 +91,7 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
             ))
         else:
             panels.append(KeyedTraceProjection(
-                key, f"{symbols[horizontal]} mean projection",
+                key, "",
                 AxisProjection(np.asarray(product.x_axis), labels[horizontal], ""),
                 np.asarray(product.values), "Mean I"))
     status = (f"{values.coordinate_frame.display_name} · shape {values.shape} · "

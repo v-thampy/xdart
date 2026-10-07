@@ -42,6 +42,10 @@ def page_settings(page) -> dict[str, Any]:
     )
     if page._output_suggested:  # the Output follows the Source until a name is chosen, and so it does restored
         document["fields"]["output_path"] = ""
+    from .page import _UB_TYPED
+    if page._value("ub_from") != _UB_TYPED:
+        for key, value in zip(("ub_row1", "ub_row2", "ub_row3"), page._ub_typed_rows, strict=True):
+            document["fields"][key] = value
     return document
 
 

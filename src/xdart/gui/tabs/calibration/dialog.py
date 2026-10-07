@@ -240,9 +240,10 @@ def _dispatch_job(request, cancelled, publish):
         return fit_calibration(frames, cancelled=cancelled,
                                progress=_staged_progress(publish, _TRANSFER_STAGES), **options)
     if kind == 'save':  # the pyFAI file, then its xrayutilities partner beside it
-        fit, path, angles = arguments
+        fit, path, angles, *overwrite = arguments
         return save_calibration_pair(fit, path, validation_angles=angles, cancelled=cancelled,
-                                     progress=_staged_progress(publish, _TRANSFER_STAGES), overwrite=True)
+                                     progress=_staged_progress(publish, _TRANSFER_STAGES),
+                                     overwrite=overwrite[0] if overwrite else True)
     if kind in ('beam_detect', 'distance'):
         from xrd_tools.integrate.direct_beam import calibrate_direct_beam, infer_direct_beam_motion
         from xrd_tools.core.geometry import ImageOrientation
@@ -490,6 +491,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._calibrant_source_problem = ''
         self._restoring_fields = False
         self._loaded_calibration_identity = None
+        self._saved_setup = None
+        self._loaded_calibration_kind = None
+        self._fit_setup = None
+        self._close_after_save = False
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
         self._frame_motors = ('del', 'nu')
         #: The instrument the current fit recorded; any other value leaves it unsaveable.
@@ -1192,6 +1197,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.geometry_editor.changed.connect(self._geometry_edited)
         self.geometry_editor.changed.connect(self.geometryChanged.emit)
         self.geometry_editor.changed.connect(self._bounds_edited)
+        self.geometry_editor.changed.connect(self._setup_edited)
+        self._fields['beam_detector'].currentIndexChanged.connect(self._setup_edited)
+        self._fields['beam_orientation'].currentIndexChanged.connect(self._setup_edited)
         # the arm's motors are these circles' (read by name as before)
         self._fields['del_motor'] = self.geometry_editor.motor_edit('del')
         self._fields['nu_motor'] = self.geometry_editor.motor_edit('nu')
@@ -1298,6 +1306,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.camera.changed.connect(self._update_image_size)  # the beam pixel's image turns
         self.camera.changed.connect(self._beam_camera_changed)
         self.camera.changed.connect(self._camera_edited)
+        self.camera.changed.connect(self._setup_edited)
         self._update_image_size()
 
     def _build_detector(self):
@@ -1776,6 +1785,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         try:
             identity = calibration_file_identity(path)
             if identity == self._loaded_calibration_identity:
+                if self._saved_setup is None:
+                    seed = calibration_seed_inputs(path, fallback_instrument=self.geometry_editor.value())
+                    self._saved_setup = (seed['instrument'], seed['camera'], seed['detector'], str(seed['orientation']))
+                    self._loaded_calibration_kind = seed['calibration_kind']
                 return
             seed = calibration_seed_inputs(path, fallback_instrument=self.geometry_editor.value())
         except (OSError, ValueError, TypeError, KeyError, NotImplementedError) as error:
@@ -1801,6 +1814,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.apply_settings(values)
         self._prediction = None
         self._ring_cache.clear()
+        self._saved_setup = self._setup_state()
+        self._loaded_calibration_kind = seed['calibration_kind']
         self.setWindowTitle(f'{self.context.page} calibration · {path.name}')
         self.setToolTip(f'Loaded calibration: {identity[0]}. The file is the refinement seed; edits are inputs for a new fit.')
         self.status.setText(f'Loaded calibration: {path.name}. Calibrant source and fitting preferences retained.')
@@ -2136,6 +2151,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._fit_source = None
         self.fit = None
         self._fit_instrument = None
+        self._fit_setup = None
         self.save_button.setEnabled(False)
         self.fit_summary.clear()
         self.show_calibration_fit_button.setEnabled(False)
@@ -2303,6 +2319,15 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.fit, scan_angles=self._scan_angles(self.fit))))
         self._guard(go)
 
+    def _setup_state(self):
+        """The instrument/detector setup that changes the meaning of a saved calibration."""
+        return (self.geometry_editor.value(), self.camera.value(),
+                self._text('beam_detector'), self._text('beam_orientation'))
+
+    def _setup_edited(self, *_args):
+        if self.fit is not None and self._fit_setup is not None and self._setup_state() != self._fit_setup:
+            self._invalidate_fit()
+
     def _default_name(self, beam):
         """The calibration's default file name, as Stitch names its results (maintainer, 2026-09-29:
         "spec_name_scan_no.json"): the calibrant scan's (the direct-beam scan's for a direct-beam
@@ -2322,12 +2347,14 @@ class CalibrationDialog(QtWidgets.QDialog):
                 return name
         return folder / f'{stem}-{uuid.uuid4().hex[:8]}.json'
 
-    def _save_path(self, *, beam=False):
+    def _save_path(self, *, beam=False, new_only=False):
         """The new calibration file the person chooses inside the project, or None."""
         from xdart.gui.widgets import file_dialogs
-        # Offer beside the selected scan; the checks below keep the save inside the Project and new.
+        # The shared last-folder rule precedes the source folder; checks keep it inside the Project and new.
+        suggested = self._default_name(beam)
         picks = file_dialogs.browse(self, 'Save calibrated geometry', save=True, file_filter='JSON (*.json)',
-                                    default_name=str(self._default_name(beam)))
+                                    current=str(suggested), fallback=str(self.project_root),
+                                    default_name=suggested.name)
         path = picks[0] if picks else ''
         if not path:
             return None
@@ -2337,6 +2364,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         partner = xu_partner_path(selected)
         companions = (partner, selected.with_suffix(selected.suffix + '.provenance.json'),
                       partner.with_suffix(partner.suffix + '.provenance.json'))
+        if new_only and (selected.exists() or any(path.exists() for path in companions)):
+            raise ValueError('Choose a new calibration filename; Save on close preserves the original pair')
         if not selected.exists() and any(companion.exists() for companion in companions):
             # Qt confirms an existing primary. Orphan companions need the same explicit choice.
             answer = QtWidgets.QMessageBox.question(self, 'Replace calibration files?',
@@ -2861,6 +2890,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self._fit_source = self._pending_fit_source
                     self._fit_kind = kind
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
+                    self._fit_setup = self._setup_state()
                     self.fit_summary.setPlainText(summary)
                     self.save_button.setEnabled(True)
                     self._save_session_quietly(self._job_policy)  # the policy it took; never unadopts it
@@ -2872,6 +2902,9 @@ class CalibrationDialog(QtWidgets.QDialog):
                         window.show_preview(result)
                     self._preview_key = None
                 elif kind == 'save':  # the ring fit, or the direct-beam geometry (_save_rough)
+                    if self._close_after_save:
+                        from xrd_tools.integrate.stitch_calibration import paired_xu_calibration
+                        paired_xu_calibration(result.pyfai_path)
                     from xrd_tools.integrate.calibration_seed import calibration_file_identity
                     self._loaded_calibration_identity = calibration_file_identity(result.pyfai_path)
                     provenance = self._saving.asset['provenance']
@@ -2880,6 +2913,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.saved_image_rotation = provenance['image_rotation']
                     self.saved_image_flip = provenance.get('image_flip', False)
                     self.saved_mask = self._text('mask')  # becomes Stitch's Mask File when set
+                    self._saved_setup = self._setup_state()
+                    self._loaded_calibration_kind = provenance.get('calibration_kind')
                     from xdart.utils.browse import remember_browse_path
                     remember_browse_path(Path(result.pyfai_path))
                     self.fit_summary.appendPlainText('\n' + saved_pair_text(result))
@@ -2904,6 +2939,9 @@ class CalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'save':
                     self.status.setText(saved_pair_text(result))
                     self.calibrationSaved.emit(result.pyfai_path, 'multigeometry')  # once, with both files written
+                    if self._close_after_save:
+                        self._close_after_save = False
+                        self.close()
                 elif kind == 'beam_detect':
                     self._update_beam_readiness()
                 elif kind == 'distance':
@@ -2916,10 +2954,13 @@ class CalibrationDialog(QtWidgets.QDialog):
                 else:
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:
+                self._close_after_save = False
                 self.status.setText(str(error))
         elif terminal.status is OperationTerminalStatus.CANCELLED:
+            self._close_after_save = False
             self.status.setText('Cancelled. Previously completed frames and saved files are retained.')
         else:
+            self._close_after_save = False
             self.status.setText(terminal.failure_message)
         if kind == 'stitch_preview' and self._calibration_fit_window is not None:
             self._calibration_fit_window.preview_busy(False, self.status.text())
@@ -2948,6 +2989,37 @@ class CalibrationDialog(QtWidgets.QDialog):
             page.setEnabled(enabled)
 
     def closeEvent(self, event):
+        if (not self._owner.busy and self._saved_setup is not None
+                and self._setup_state() != self._saved_setup):
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle('Unsaved calibration setup')
+            box.setText('Motor directions or detector orientation changed. RSM and Stitch still use the saved calibration.')
+            can_save = self.fit is not None or self._loaded_calibration_kind == 'direct_beam_not_ring_fitted'
+            box.setInformativeText('Save a new calibration pair and select it for this page, discard these setup edits, '
+                'or keep editing.' if can_save else 'The previous fit is invalidated. Fit the changed setup before '
+                'saving a new calibration pair, or discard these setup edits.')
+            save = box.addButton('Save new calibration…', QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            save.setEnabled(can_save)
+            save.setToolTip('Save a new valid pyFAI/xrayutilities pair; preserve the original calibration files.')
+            discard = box.addButton('Discard setup changes', QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+            discard.setToolTip('Restore the selected saved calibration’s instrument and detector setup, then close.')
+            cancel = box.addButton('Cancel', QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            cancel.setToolTip('Keep this window open to inspect or fit the edited setup.')
+            box.setDefaultButton(cancel)
+            box.exec()
+            if box.clickedButton() is save:
+                event.ignore()
+                self._save_setup_on_close()
+                return
+            if box.clickedButton() is not discard:
+                event.ignore()
+                return
+            path = self._loaded_calibration_identity[0]
+            self._loaded_calibration_identity = None
+            self.load_calibration(path)
+            if self._setup_state() != self._saved_setup:
+                event.ignore()
+                return
         self._beam_probe_timer.stop()
         if self._owner.busy:
             self._close_pending = True
@@ -2958,6 +3030,22 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._save_session_quietly()
             self._help_owner.shutdown()
             event.accept()
+
+    def _save_setup_on_close(self):
+        """Use the existing pair writer, requiring a new filename and a current fit/rough geometry."""
+        def go():
+            fit = self.fit
+            if fit is None:
+                if self._loaded_calibration_kind != 'direct_beam_not_ring_fitted':
+                    raise ValueError('fit the changed setup before saving')
+                fit = self._rough_fit()
+            selected = self._save_path(new_only=True)
+            if selected is not None:
+                self._saving = fit
+                self._close_after_save = True
+                self._start('save', (fit, selected, pair_validation_angles(
+                    fit, scan_angles=self._scan_angles(fit)), False))
+        self._guard(go)
 
     def _save_session_quietly(self, policy=None):
         """After a Fit or Refine (the policy it took) and at close (the policy last shown; combined Stitch
