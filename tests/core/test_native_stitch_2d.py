@@ -131,3 +131,21 @@ def test_native_stitch_save_reload_preserves_missing_pattern_bins(tmp_path, mode
     assert np.isnan(pattern.sigma[empty]).all()
     view = read_frame_view(native.module.output.target, 1, include_thumbnail=False)
     np.testing.assert_array_equal(view.intensity_1d, pattern.intensity)
+    from xrd_tools.io.export import read_xye, write_stitch_xye
+    from xrd_tools.io.read import resolve_source_master
+    import os
+    exported = write_stitch_xye(payload)
+    for actual, expected in zip(read_xye(exported), (dict(pattern.axes)["q"], pattern.intensity, pattern.sigma)):
+        np.testing.assert_allclose(actual, expected, rtol=5e-9, atol=0, equal_nan=True)
+    record = payload.contributing_frames[0]
+    source = record.get("source_constituents", (record,))[0]
+    raw = resolve_source_master(source["source_path"], scan_file=native.module.output.target,
+                                source_base=str(tmp_path))
+    assert raw is not None
+    before = raw.read_bytes()
+    exported.unlink()
+    os.link(raw, exported)
+    with pytest.raises(ValueError, match="source"):
+        write_stitch_xye(payload)
+    assert raw.read_bytes() == before and os.path.samefile(raw, exported)
+    exported.unlink()
