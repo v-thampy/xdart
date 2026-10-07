@@ -856,8 +856,9 @@ def calibration_orientation_inputs(record, frame, *, del_motor='del', nu_motor='
     finite checker and are refused, rather than silently dropped.
     """
     from xrd_tools.core.geometry import Diffractometer, ImageOrientation
-    from xrd_tools.integrate.calibration_seed import _source_motors, _direct_beam_hit
+    from xrd_tools.integrate.calibration_seed import _source_motors, _direct_beam_hit, load_calibration_record
     from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    record = load_calibration_record(record)
     diff = Diffractometer.from_pyfai_goniometer(record, source_motors=_source_motors(record, del_motor, nu_motor))
     arm, calibration = diff.stacked_arm, diff.calibration
     if arm is None:
@@ -900,11 +901,13 @@ def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu
     """
     from xrd_tools.core.geometry import ImageOrientation
     from xrd_tools.integrate.stitch_calibration import validate_frame_files, calibration_frame_mask
+    from xrd_tools.integrate.calibration_seed import load_calibration_record
     from xrd_tools.io.image import read_image
     from os import PathLike
     frames = tuple(frames)
     if not frames:
         return _finding((), Exclusions(), 32), None, None
+    record = load_calibration_record(record)
     static_mask = np.asarray(read_image(mask), bool) if isinstance(mask, (str, bytes, PathLike)) else mask
     def load(frame):
         if cancelled and cancelled():

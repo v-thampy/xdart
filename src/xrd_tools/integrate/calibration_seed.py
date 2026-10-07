@@ -27,6 +27,11 @@ def calibration_file_identity(path):
             sha256(provenance.read_bytes() if provenance.exists() else b'').hexdigest())
 
 
+def load_calibration_record(record):
+    """The committed JSON path or existing in-memory arm used by seed consumers."""
+    return record if isinstance(record, dict) else json.loads(Path(record).read_text(encoding='utf-8'))
+
+
 def calibration_seed_inputs(path, *, fallback_instrument):
     """Decode supported committed arm inputs, retaining the full file as the refinement seed.
 
@@ -39,7 +44,7 @@ def calibration_seed_inputs(path, *, fallback_instrument):
     from xrd_tools.session.instrument import InstrumentGeometry
     path = Path(path).resolve()
     identity = calibration_file_identity(path)
-    record = json.loads(path.read_text(encoding='utf-8'))
+    record = load_calibration_record(path)
     sidecar = path.with_suffix(path.suffix + '.provenance.json')
     provenance = json.loads(sidecar.read_text(encoding='utf-8')) if sidecar.exists() else {}
     geometry = (InstrumentGeometry.from_record(provenance['instrument_geometry'])
@@ -138,8 +143,7 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     from pyFAI import units
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
-    if not isinstance(record, dict):
-        record = json.loads(Path(record).read_text(encoding='utf-8'))
+    record = load_calibration_record(record)
     bound = _source_motors(record, del_motor, nu_motor)
     for circle, motor in (('del', del_motor), ('nu', nu_motor)):
         if motor is not None and motor not in bound.values() and float(frame.motors[motor]) != 0:
