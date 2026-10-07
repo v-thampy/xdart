@@ -35,8 +35,10 @@ def calibration_seed_inputs(path, *, fallback_instrument):
     """
     from xrd_tools.core.geometry import Diffractometer, ImageOrientation
     from xrd_tools.core.geometry.camera import stitch_camera
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
     from xrd_tools.session.instrument import InstrumentGeometry
     path = Path(path).resolve()
+    identity = calibration_file_identity(path)
     record = json.loads(path.read_text(encoding='utf-8'))
     sidecar = path.with_suffix(path.suffix + '.provenance.json')
     provenance = json.loads(sidecar.read_text(encoding='utf-8')) if sidecar.exists() else {}
@@ -48,6 +50,7 @@ def calibration_seed_inputs(path, *, fallback_instrument):
     arm, calibration = diff.stacked_arm, diff.calibration
     if arm is None:
         raise ValueError('this older independent-angle geometry has no supported detector arm')
+    energy_eV = float(wavelength_m_to_energy_eV(calibration.poni.wavelength))
     zeros = arm.motor_zeros()
     motors, instrument_zeros = dict(geometry.motors), dict(geometry.zeros)
     for circle in geometry.circles:
@@ -63,10 +66,14 @@ def calibration_seed_inputs(path, *, fallback_instrument):
     readings = {getattr(arm, role + '_motor'): zero for role, zero in zeros.items()}
     (row, column), distance = _direct_beam_hit(record, del_motor=arm.del_motor,
                                               nu_motor=arm.nu_motor, readings=readings)
-    return dict(identity=calibration_file_identity(path), instrument=geometry,
+    if not all(math.isfinite(v) for v in (row, column, distance)) or distance <= 0:
+        raise ValueError('the calibration has no finite, positive direct-beam distance')
+    if identity != calibration_file_identity(path):
+        raise ValueError('the calibration changed while loading; select it again')
+    return dict(identity=identity, instrument=geometry,
                 camera=stitch_camera(orientation), detector=turned.get('detector', calibration.poni.detector),
                 orientation=int(calibration.detector_config.get('orientation', 3)),
-                distance_m=distance, beam_px=(column, row), wavelength_m=calibration.poni.wavelength,
+                distance_m=distance, beam_px=(column, row), energy_eV=energy_eV,
                 mount_deg=tuple(map(math.degrees, (arm.mount_tilt, arm.mount_roll))))
 
 

@@ -1793,13 +1793,12 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.show_fit_button.setEnabled(False)
         if self._direct_beam_fit_window is not None:
             self._direct_beam_fit_window.close()
-        from xrd_tools.core.energy import wavelength_m_to_energy_eV
         values = self.settings()
         values['fields'].update(beam_detector=seed['detector'], beam_orientation=str(seed['orientation']),
             rough_distance=f"{seed['distance_m'] * 1000:.12g}",
             beam_pixel=', '.join(f'{v:.12g}' for v in seed['beam_px']),
             rough_mount=', '.join(f'{v:.12g}' for v in seed['mount_deg']),
-            rough_energy=f"{float(wavelength_m_to_energy_eV(seed['wavelength_m'])) / 1000:.12g}",
+            rough_energy=f"{seed['energy_eV'] / 1000:.12g}",
             refine_seed_path=identity[0])
         values.update(instrument_geometry=seed['instrument'].to_record(), camera=list(seed['camera'].to_xu()),
                       loaded_calibration=identity)

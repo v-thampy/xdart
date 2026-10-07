@@ -74,10 +74,10 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
             at = indices[normal]
             span = snapshot.state.ranges[normal] if snapshot.state.ranges else (0, values.shape[normal])
             caption = (f"{symbols[horizontal]}{symbols[vertical]} mean over {symbols[normal]} "
-                       f"{float(axes[normal][span[0]]):.6g}..{float(axes[normal][span[1]-1]):.6g}"
+                       f"{float(axes[normal][span[0]]):.3f}..{float(axes[normal][span[1]-1]):.3f}"
                        if snapshot.state.projection else
                        f"{symbols[horizontal]}{symbols[vertical]} slice · {symbols[normal]} = "
-                       f"{float(axes[normal][at]):.6g} (index {at})")
+                       f"{float(axes[normal][at]):.3f} (index {at})")
             panels.append(KeyedImageProjection(
                 key,
                 caption,
@@ -95,7 +95,7 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
                 AxisProjection(np.asarray(product.x_axis), labels[horizontal], ""),
                 np.asarray(product.values), "Mean I"))
     status = (f"{values.coordinate_frame.display_name} · shape {values.shape} · "
-              + " · ".join(f"{symbol} {axis[0]:.6g}..{axis[-1]:.6g}"
+              + " · ".join(f"{symbol} {axis[0]:.3f}..{axis[-1]:.3f}"
                            for symbol, axis in zip(symbols, axes, strict=True)))
     return KeyedPanelsProjection(layout, tuple(panels), title=title, status=status, color_map=color_map,
                                  log_scale=bool(log_scale), background_enabled=background_enabled,
