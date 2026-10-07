@@ -127,6 +127,110 @@ def test_staged_ring_run_uses_saved_calibration_json_cancels_and_closes_without_
         dialog.close(); dialog.deleteLater(); qapp.processEvents()
 
 
+def test_fourc_vertical_motion_run_lists_all_hypotheses_and_marks_only_existing_senses(qapp, tmp_path):
+    from xdart.gui.tabs.calibration.dialog import CalibrationDialog, CalibrationContext
+    from xrd_tools.session.instrument import InstrumentGeometry
+    from xrd_tools.core.geometry.camera import mounting_description
+    from tests.xdart.scattering.test_direct_beam_readiness import _fit_container
+
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path)); dialog.show()
+    try:
+        # The existing five-frame del scan is fourc's vertical 2theta arm motor.
+        geometry = InstrumentGeometry('fourc', motors=(('tth', 'del'),), plane='vertical')
+        dialog.set_instrument(geometry)
+        _fit_container(dialog, tmp_path, 270)
+        assert dialog.geometry_editor.value() == geometry
+        configured = geometry.arm_senses()
+        assert configured == {'del': 1}
+        dialog.open_orientation_check(); panel = dialog.orientation_panel
+        panel.run_button.click(); wait(dialog)
+        finding = panel.finding
+        assert finding is not None and finding.candidates and finding.unmeasured_motor == 'nu'
+        assert panel.candidate_row.editor.count() == len(finding.candidates), dialog.status.text()
+        assert panel.table.rowCount() == len(finding.candidates)
+        assert dialog.status.text() == 'Orientation complete.'
+        for i, candidate in enumerate(finding.candidates):
+            label = panel.candidate_row.editor.itemText(i)
+            assert panel.candidate_row.editor.itemData(i) == i
+            expected = mounting_description(candidate.camera)
+            marked = candidate.senses[0] == configured['del']
+            if marked:
+                expected += ' (keeps configured senses)'
+            assert label.startswith(expected + ' · del ')
+            assert ('keeps configured senses' in label) == marked
+            assert 'nu unmeasured' in label
+            assert panel.table.item(i, 0).text() == expected
+            assert panel.table.item(i, 1).text() == f'{candidate.senses[0]:+d}'
+            assert panel.table.item(i, 2).text() == f'unmeasured ({candidate.senses[1]:+d} hypothesis)'
+        assert {c.senses[1] for c in finding.candidates} == {-1, 1}
+    finally:
+        dialog.close(); dialog.deleteLater(); qapp.processEvents()
+
+
+def test_load_saved_calibration_then_run_keeps_finding_after_queued_refresh_and_real_edit_clears_it(qapp, tmp_path):
+    from dataclasses import replace
+    import hashlib
+    import json
+    from pathlib import Path
+    from xdart.gui.pages.values import PageCleanup
+    from xdart.gui.tabs.calibration.dialog import CalibrationDialog, CalibrationContext
+    from xrd_tools import geometry_figures as gf
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.core.geometry import ImageOrientation
+    from xrd_tools.core.geometry.camera import stitch_camera
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.integrate.calibration_seed import rough_arm_record
+    from tests.core.test_geometry_figures import reference
+
+    value = gf.GeometryInputs(); camera = stitch_camera(ImageOrientation())
+    images = tmp_path/'images'; images.mkdir()
+    for index, angle in enumerate((0., 15.)):
+        _, image = reference(replace(value, readings=(('del', angle), ('nu', 0.))), camera)
+        (images/f'rings_scan1_{index:04d}.raw').write_bytes(image.astype('<f4').tobytes())
+    spec = tmp_path/'rings'
+    spec.write_text('#F rings\n#O0 del nu energy\n#S 1 ascan del 0 15 1 1\n'
+                    f'#P0 0 0 {wavelength_m_to_energy_eV(value.wavelength_m)}\n'
+                    '#N 2\n#L del  nu\n0 0\n15 0\n')
+    record = rough_arm_record(detector=value.detector, distance_m=value.distance_m,
+        wavelength_m=value.wavelength_m, beam_px=(
+            (value.shape[1]-1)/2+value.beam_offset_px[0],
+            (value.shape[0]-1)/2+value.beam_offset_px[1]),
+        camera=ImageOrientation(), orientation=value.first_pixel)
+    saved = tmp_path/'fixed-arm.json'; saved.write_text(json.dumps(record))
+    source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
+        'image_stem': 'rings', 'read_image_kwargs': {'detector_shape': value.shape, 'raw_dtype': '<f4'}})
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path)); dialog.show()
+    try:
+        dialog.set_source_context(source, image_rotation=0); wait(dialog)
+        dialog._enumerate(); wait(dialog)
+        dialog._prepare(); wait(dialog)
+        assert len(dialog.frames) == 2, dialog.status.text()
+        dialog.load_calibration(saved)
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        seed = dialog._seed_options()
+        assert seed['file'] == str(saved) and all(seed[k] is None for k in ('record', 'prediction', 'rough'))
+        paths = (saved, spec, *(Path(f.image_path) for f in dialog.frames), *images.iterdir())
+        before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+        prior = geometry_state(dialog); owner = dialog._owner
+        dialog.open_orientation_check(); panel = dialog.orientation_panel
+        assert dialog._pending_source_details == ''
+        panel.run_button.click(); wait(dialog)
+        for _ in range(3):
+            qapp.processEvents()
+        assert not dialog.active() and dialog._pending_source_details is None
+        assert panel.finding is not None, dialog.status.text()
+        assert dialog._orientation_geometry is not None and panel.figure_view.keyed_projection
+        assert geometry_state(dialog) == prior
+        assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths} == before
+        original = dialog.camera.value()
+        dialog.camera.set_value(stitch_camera(ImageOrientation(rotation=90)))
+        assert dialog.camera.value() != original
+        assert panel.finding is None and dialog._orientation_geometry is None
+    finally:
+        dialog.camera.set_value(camera)  # restore our edit before the real unsaved-setup close guard
+        dialog.close(); dialog.deleteLater(); qapp.processEvents()
+
+
 def test_scoring_is_off_thread_with_frozen_reference_budget_and_bounded_frame_storage(qapp):
     from xrd_tools import geometry_figures as gf
     from tests.core.test_geometry_figures import inputs, reference

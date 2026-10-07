@@ -922,6 +922,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._owner.busy:
             self._pending_source_details = prefix
             return
+        self._source_details_orientation_inputs = (self._orientation_key(), self._source_energy_eV)
         if not prefix:
             self._source_energy_eV = None
             self._calibrant_ready_key = None
@@ -2983,8 +2984,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         if rows:
             self.frame_table.selectRow(next((row for row in rows if row > after), rows[0]))
 
-    def _render_frames(self):
-        self._invalidate_orientation()
+    def _render_frames(self, *, invalidate_orientation=True):
+        if invalidate_orientation:
+            self._invalidate_orientation()
         if self.orientation_panel is not None:
             self.orientation_panel.set_frames(self.frames)
         self._update_fit_source_label()
@@ -3125,7 +3127,9 @@ class CalibrationDialog(QtWidgets.QDialog):
                             self._update_fit_source_label()
                         if automatic is not None:
                             self._fields[prefix + 'stem'].setPlaceholderText(f'auto · {automatic}')
-                        self._render_frames()
+                        unchanged = self._source_details_orientation_inputs == (
+                            self._orientation_key(), self._source_energy_eV)
+                        self._render_frames(invalidate_orientation=not unchanged)
                 elif kind == 'enumerate':
                     result, names, record = result
                     self.geometry_editor.set_available_motors(names)

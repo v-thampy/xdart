@@ -114,8 +114,8 @@ class OrientationPanel(SectionCard):
         for i, c in enumerate(finding.candidates):
             support = sum(r.support for r in c.ring_scores)/len(c.ring_scores) if c.ring_scores else float('nan')
             label = mounting_description(c.camera)
-            if finding.unmeasured_motor and configured_senses and c.senses == tuple(
-                    configured_senses[role] for role in ('del', 'nu')):
+            if finding.unmeasured_motor and configured_senses and all(
+                    configured_senses.get(role, sense) == sense for role, sense in zip(('del', 'nu'), c.senses)):
                 label += ' (keeps configured senses)'
             senses = tuple(f'unmeasured ({sense:+d} hypothesis)' if role == finding.unmeasured_motor
                            else f'{sense:+d}' for role, sense in zip(('del', 'nu'), c.senses))
