@@ -104,7 +104,7 @@ def test_help_teaching_input_cache_ties_and_source_free_second_view(qapp, monkey
         stats = cache.stats()
         assert stats['findings'] <= 4 and stats['figures'] == 16
         assert stats['buffers'] <= 16*1024**2 and stats['figure_misses']-baseline['figure_misses'] >= 24
-        recent = cache.get_figures('off-centre', 0)
+        recent = cache.get_figures('coordinates', 0)
         before = cache.stats()
         owner_for(second).show_topic('geometry.orientation')
         again = owner_for(second).window.figure_view.keyed_projection.panels[0].figure
