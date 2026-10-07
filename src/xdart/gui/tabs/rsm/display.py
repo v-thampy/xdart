@@ -85,8 +85,8 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
                 x_axis,
                 AxisProjection(np.asarray(product.y_axis_or_none), labels[vertical], "",
                                edges=_cropped_bounds(product.y_axis_or_none, axes[vertical])),
-                at,
-                tuple(str(index) for index in range(values.shape[normal])),
+                0 if snapshot.state.projection else at,
+                () if snapshot.state.projection else tuple(str(index) for index in range(values.shape[normal])),
                 navigation=not snapshot.state.projection,
             ))
         else:

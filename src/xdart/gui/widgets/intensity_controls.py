@@ -23,13 +23,14 @@ class IntensityRangeSlider(QtWidgets.QWidget):
 
     sigRangeChanged = QtCore.Signal(float, float)
 
-    def __init__(self, parent=None, *, range_label="Intensity", range_hint=None):
+    def __init__(self, parent=None, *, range_label="Intensity", range_hint=None, continuous=True):
         super().__init__(parent)
         self._vmin, self._vmax = 0.0, 1.0
         self._lo, self._hi = 0.0, 1.0
         self._drag = None
         self._range_label = range_label
         self._range_hint = range_hint
+        self._continuous = continuous
         self.setMinimumSize(150, 24)
         self.setMaximumHeight(28)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
@@ -126,14 +127,17 @@ class IntensityRangeSlider(QtWidgets.QWidget):
             self._move_handle(event.position().x())
 
     def mouseReleaseEvent(self, event):
+        changed = self._drag is not None
         self._drag = None
+        if changed and not self._continuous:
+            self.sigRangeChanged.emit(*self.values())
 
     def _move_handle(self, x):
         value = self._value_for_x(x)
         if self._drag == "lo":
-            self.setValues(min(value, self._hi), self._hi)
+            self.setValues(min(value, self._hi), self._hi, emit=self._continuous)
         elif self._drag == "hi":
-            self.setValues(self._lo, max(value, self._lo))
+            self.setValues(self._lo, max(value, self._lo), emit=self._continuous)
 
 
 class IntensityControls(QtWidgets.QFrame):

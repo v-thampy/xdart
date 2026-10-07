@@ -999,8 +999,8 @@ class CoordinateRangeControl(QtWidgets.QWidget):
             high={"path": ("display_range", "high"), "value": ""})
         self.label, self.editors = self.row.label, self.row.editors
         self.label.setMinimumWidth(24)
-        self.slider = IntensityRangeSlider(self, range_label=label,
-            range_hint="Choose the included bin centres. This changes display projections only; saved science is unchanged.")
+        self.slider = IntensityRangeSlider(self, range_label=label, continuous=False,
+            range_hint="Release a handle to choose the included bin centres. This changes display projections only; saved science is unchanged.")
         layout.addWidget(self.row)
         layout.addWidget(self.slider)
         self._bounds = None

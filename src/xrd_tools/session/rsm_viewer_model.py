@@ -1135,6 +1135,8 @@ class RSMViewerModel:
             values = self._values
         if type(values) is not RSMViewerValues:
             raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
+        if type(projection) is not bool:
+            raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
         result = values.result_fingerprint
         if (
             self._result_fingerprint == result
@@ -1149,8 +1151,8 @@ class RSMViewerModel:
                 k_index=k_index,
                 l_index=l_index,
             )
-            source_axes = tuple(item[1] for item in values.axes)
-            ranges = _coordinate_crop(source_axes, coordinate_ranges)
+            source_axes = None if coordinate_ranges is None else tuple(item[1] for item in values.axes)
+            ranges = None if source_axes is None else _coordinate_crop(source_axes, coordinate_ranges)
             if ranges is not None:
                 indices = tuple(min(max(x, pair[0]), pair[1] - 1)
                                 for x, pair in zip(indices, ranges, strict=True))
@@ -1206,6 +1208,8 @@ class RSMViewerModel:
                 > _MAX_RSM_VIEWER_CACHE_BYTES
             ):
                 raise RSMViewerRefused("RSM_VIEW_PRODUCT_TOO_LARGE")
+            if source_axes is None:
+                source_axes = tuple(item[1] for item in values.axes)
             source_intensity = values.intensity
             if ranges is not None:
                 crop = tuple(slice(*pair) for pair in ranges)
