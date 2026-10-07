@@ -8,6 +8,7 @@ from xdart.gui.widgets.scientific_plot import (
     scaled_intensity_label as _scaled_intensity_label,
     overlay_step,
     trace_colors,
+    data_curve_style,
 )
 
 from dataclasses import dataclass, replace
@@ -482,8 +483,8 @@ class _KeyedTracePanel:
         self.curve = self.plot.plot(connect="finite")
 
     def draw(self, panel, color) -> None:
-        self.curve.setData(np.asarray(panel.axis.values, dtype=float), np.asarray(panel.intensity, dtype=float))
-        self.curve.setPen(pg.mkPen(color=color, width=1.4, style=QtCore.Qt.PenStyle.SolidLine))
+        self.curve.setData(np.asarray(panel.axis.values, dtype=float), np.asarray(panel.intensity, dtype=float),
+                           **data_curve_style(color))
         self.plot.setTitle(panel.title)
         self.plot.setToolTip(f"{panel.title}. Drag to zoom into this curve; right-click for plot controls.")
         label, unit = _axis_presentation(panel.axis.label, panel.axis.unit)
@@ -502,6 +503,7 @@ class ScientificView(QtWidgets.QFrame):
     keyedRegionChanged = QtCore.Signal(object, object)
     #: A named region's live move: panel key, region identity, and typed geometry.
     keyedNamedRegionChanged = QtCore.Signal(object, str, object)
+    coordinateRangesChanged = QtCore.Signal(object)
     #: The plot-options dialog was accepted. Emitted after the view has read its own options
     #: and before it emits their commands, so a host reads the choices it added
     #: (``plot_options_dialog.add_choice``) before any of its own redraws resets them.
@@ -518,6 +520,8 @@ class ScientificView(QtWidgets.QFrame):
         # the keyed layout (``reconcile_keyed``): built on its first draw, so Int's and Stitch's views never
         # allocate it
         self._keyed_area: QtWidgets.QSplitter | None = None
+        self._coordinate_range_bar = None
+        self.coordinate_ranges = []
         self._keyed_layout: tuple[tuple[PanelKey, ...], ...] = ()
         self._keyed_panels: dict[PanelKey, _KeyedImagePanel | _KeyedTracePanel] = {}
         self._keyed_shown: KeyedPanelsProjection | None = None
@@ -2625,11 +2629,6 @@ class ScientificView(QtWidgets.QFrame):
                     measured = slice(valid[0], valid[-1] + 1) if valid.size else slice(0, 0)
                     plot_x, plot_y = plot_x[measured], plot_y[measured]
             if item is None:
-                pen = pg.mkPen(
-                    color=style_contract,
-                    width=1.4,
-                    style=QtCore.Qt.PenStyle.SolidLine,
-                )
                 item = self.curve.plot(
                     plot_x,
                     _offset_intensity(
@@ -2638,12 +2637,7 @@ class ScientificView(QtWidgets.QFrame):
                         overlay_step,
                     ),
                     name=title,
-                    pen=pen,
-                    symbol="o",
-                    symbolBrush=style_contract,
-                    symbolPen=style_contract,
-                    symbolSize=4,
-                    connect="finite",
+                    **data_curve_style(style_contract),
                 )
                 self._curve_items_by_key[key] = item
             else:
@@ -2662,15 +2656,10 @@ class ScientificView(QtWidgets.QFrame):
                     prior_contract is None
                     or prior_contract[1] != style_contract
                 ):
-                    item.setPen(
-                        pg.mkPen(
-                            color=style_contract,
-                            width=1.4,
-                            style=QtCore.Qt.PenStyle.SolidLine,
-                        )
-                    )
-                    item.setSymbolBrush(style_contract)
-                    item.setSymbolPen(style_contract)
+                    style = data_curve_style(style_contract)
+                    item.setPen(style['pen'])
+                    item.setSymbolBrush(style['symbolBrush'])
+                    item.setSymbolPen(style['symbolPen'])
                 if (
                     prior_contract is None
                     or prior_contract[0][-1] != title
@@ -3218,6 +3207,31 @@ class ScientificView(QtWidgets.QFrame):
             raise
         self._keyed_shown = state
 
+    def set_coordinate_ranges(self, axes, labels, bounds=None):
+        """Mount Int's coordinate editors/handles; synchronization emits no edits."""
+        from xdart.gui.widgets.controls_panel import CoordinateRangeControl
+        if not axes:
+            if self._coordinate_range_bar is not None:
+                self._coordinate_range_bar.hide()
+            return
+        if self._coordinate_range_bar is None:
+            self._coordinate_range_bar = QtWidgets.QWidget(self)
+            layout = QtWidgets.QHBoxLayout(self._coordinate_range_bar)
+            layout.setContentsMargins(4, 0, 4, 0)
+            for label in labels:
+                control = CoordinateRangeControl(label)
+                control.rangeChanged.connect(lambda _low, _high: self.coordinateRangesChanged.emit(
+                    tuple(row._bounds for row in self.coordinate_ranges)))
+                layout.addWidget(control, 1)
+                self.coordinate_ranges.append(control)
+            self._main_layout.insertWidget(self._main_layout.indexOf(self.viewer_intensity_row),
+                                           self._coordinate_range_bar)
+        if len(axes) != len(self.coordinate_ranges):
+            raise ValueError("coordinate ranges must match their mounted axes")
+        for i, (row, axis, label) in enumerate(zip(self.coordinate_ranges, axes, labels, strict=True)):
+            row.reconcile(label, axis, None if bounds is None else bounds[i])
+        self._coordinate_range_bar.show()
+
     @property
     def keyed_projection(self) -> KeyedPanelsProjection | None:
         """The keyed layout drawn now, or None."""
@@ -3468,23 +3482,28 @@ class ScientificView(QtWidgets.QFrame):
         # gives them back (``_leave_keyed_layout``, ``_apply_mode_layout``)
         self._share_axis_home = self.plot_bar.indexOf(self.share_axis)
         self.viewer_intensity_row_layout.addWidget(self.share_axis)
+        self.viewer_intensity_row_layout.addWidget(self.options)
         self.viewer_intensity_row_layout.addWidget(self.viewer_intensity)
         self.viewer_intensity.sync(None, None, reset=True)
         self._viewer_intensity_contract = None
         self._viewer_intensity_domain = self._viewer_auto_levels = None
         for widget in (self.share_axis, self.viewer_intensity, self.viewer_intensity_row, self._keyed_area):
             widget.setVisible(True)
+        self.options.show()
         self._layout_mode = self._processing_mode = "keyed"
 
     def _leave_keyed_layout(self) -> None:
         self._link_keyed_axes(False)
         if self._keyed_area is not None:
             self._keyed_area.setVisible(False)
+        if self._coordinate_range_bar is not None:
+            self._coordinate_range_bar.hide()
         for widget in self._keyed_hidden:
             widget.setVisible(True)
         self._keyed_hidden = ()
         if self._share_axis_home >= 0:  # back where Int's plot bar keeps it; the controls go where the mode does
             self.plot_bar.insertWidget(self._share_axis_home, self.share_axis)
+        self.plot_bar.insertWidget(self.plot_bar.indexOf(self.share_axis), self.options)
         self.viewer_intensity_row.setVisible(False)
 
     def _emit_panel_index(self, key: PanelKey, index: int) -> None:

@@ -68,20 +68,26 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
         if product.panel_key != key:
             raise ValueError("an RSM snapshot's products follow its layout")
         x_axis = AxisProjection(np.asarray(product.x_axis), labels[horizontal], "",
-                                edges=rsm_axis_bounds(product.x_axis))
+                                edges=_cropped_bounds(product.x_axis, axes[horizontal]))
         if key.role is PanelRole.SLICE_2D:
             normal = slice_normal(horizontal, vertical)
             at = indices[normal]
+            span = snapshot.state.ranges[normal] if snapshot.state.ranges else (0, values.shape[normal])
+            caption = (f"{symbols[horizontal]}{symbols[vertical]} mean over {symbols[normal]} "
+                       f"{float(axes[normal][span[0]]):.6g}..{float(axes[normal][span[1]-1]):.6g}"
+                       if snapshot.state.projection else
+                       f"{symbols[horizontal]}{symbols[vertical]} slice · {symbols[normal]} = "
+                       f"{float(axes[normal][at]):.6g} (index {at})")
             panels.append(KeyedImageProjection(
                 key,
-                f"{symbols[horizontal]}{symbols[vertical]} slice · {symbols[normal]} = "
-                f"{float(axes[normal][at]):.6g} (index {at})",
+                caption,
                 np.asarray(product.values),
                 x_axis,
                 AxisProjection(np.asarray(product.y_axis_or_none), labels[vertical], "",
-                               edges=rsm_axis_bounds(product.y_axis_or_none)),
+                               edges=_cropped_bounds(product.y_axis_or_none, axes[vertical])),
                 at,
                 tuple(str(index) for index in range(values.shape[normal])),
+                navigation=not snapshot.state.projection,
             ))
         else:
             panels.append(KeyedTraceProjection(
@@ -94,6 +100,13 @@ def rsm_keyed_projection(values, snapshot, *, color_map: str = "Default", log_sc
     return KeyedPanelsProjection(layout, tuple(panels), title=title, status=status, color_map=color_map,
                                  log_scale=bool(log_scale), background_enabled=background_enabled,
                                  background_set=background_set, share_axis=bool(share_axis))
+
+
+def _cropped_bounds(axis, source):
+    if len(axis) > 1:
+        return rsm_axis_bounds(axis)
+    half = float(source[1] - source[0]) / 2
+    return float(axis[0] - half), float(axis[0] + half)
 
 
 __all__ = ["rsm_empty_projection", "rsm_keyed_projection", "rsm_slice_normals", "slice_normal"]

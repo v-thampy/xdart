@@ -423,6 +423,14 @@ class RSMPage(QtWidgets.QWidget):
         self.view = ScientificView()
         self.view.setObjectName("rsmPageView")
         self.view.set_hidden_tools("norm", "raw", "raw_pane", "slice")
+        self._mean_maps = True
+        self._map_choice = self.view.plot_options_dialog.add_choice(
+            "RSM maps", ("Mean over range", "Single plane"), "Mean over range")
+        self._map_choice.setToolTip(
+            "Mean over range averages finite voxels along the third coordinate. Single plane shows one bin.")
+        self._map_choice.parentWidget().setToolTip(self._map_choice.toolTip())
+        self.view.plotOptionsAccepted.connect(self._accept_map_choice)
+        self.view.coordinateRangesChanged.connect(self._display_ranges_changed)
         # the maintainer's two extra tools, "as extra tools that pop up separate windows to keep the scientific
         # view clean for now"; their windows come with G9
         self.view.set_page_tools(
@@ -2198,6 +2206,7 @@ class RSMPage(QtWidgets.QWidget):
         self.view.reconcile_keyed(replace(rsm_empty_projection(_FRAMES[self._value("coordinates")]),
                                          color_map=self._color_map, log_scale=self._log_scale,
                                          share_axis=self._share_axis))
+        self.view.set_coordinate_ranges((), ())
 
     def _viewer(self, path, payload):
         """The result's viewer values and model, built once while it stays resident."""
@@ -2205,7 +2214,7 @@ class RSMPage(QtWidgets.QWidget):
         if viewer is None or viewer[0] is not payload:  # a new result under the same path is built again
             values = make_rsm_viewer_values(payload)
             model = RSMViewerModel()
-            model.snapshot(values)
+            model.snapshot(values, projection=self._mean_maps)
             viewer = self._viewers[path] = (payload, values, model)
         return viewer
 
@@ -2231,7 +2240,31 @@ class RSMPage(QtWidgets.QWidget):
         state = apply_keyed_presentation_background(state, background, name or "")
         self.view.expect_display_background(self._background.active_key)
         self.view.reconcile_keyed(state)
+        axes = tuple(axis for _, axis in values.axes)
+        bounds = tuple((float(axis[pair[0]]), float(axis[pair[1]-1]))
+                       for axis, pair in zip(axes, snapshot.state.ranges, strict=True)) if snapshot.state.ranges else None
+        self.view.set_coordinate_ranges(axes, values.coordinate_frame.axis_symbols, bounds)
         self._shown = (values, snapshot)
+
+    def _display_ranges_changed(self, bounds):
+        viewer = self._viewers.get(self._shown_path)
+        if viewer is None:
+            return
+        _, values, model = viewer
+        try:
+            prior = model.current_snapshot.state
+            snapshot = model.snapshot(values, projection=self._mean_maps, coordinate_ranges=bounds,
+                h_index=prior.h_index, k_index=prior.k_index, l_index=prior.l_index)
+            self._draw(values, snapshot)
+        except Exception as error:
+            self._notice(f"Display range refused: {error}")
+            self._draw(values, model.current_snapshot)
+
+    def _accept_map_choice(self):
+        self._mean_maps = self._map_choice.currentText() == "Mean over range"
+        bounds = tuple(row._bounds for row in self.view.coordinate_ranges)
+        if bounds:
+            self._display_ranges_changed(bounds)
 
     def _background_panels(self, values, model, snapshot):
         """The background's panels at the indices ``snapshot`` draws, from its own viewer model (the same
@@ -2241,7 +2274,8 @@ class RSMPage(QtWidgets.QWidget):
         if any(index >= size for index, size in zip(indices, values.shape, strict=True)):
             return rsm_keyed_projection(values, model.current_snapshot)  # another grid: refused, not sliced
         return rsm_keyed_projection(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
-                                                           l_index=indices[2]))
+            l_index=indices[2], projection=snapshot.state.projection,
+            coordinate_ranges=tuple(row._bounds for row in self.view.coordinate_ranges) or None))
 
     def _background_path(self):
         source = self._background.keyed_source()
@@ -2401,7 +2435,8 @@ class RSMPage(QtWidgets.QWidget):
         indices[normal] = index
         try:
             self._draw(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
-                                              l_index=indices[2]))
+                l_index=indices[2], projection=False,
+                coordinate_ranges=tuple(row._bounds for row in self.view.coordinate_ranges) or None))
         except Exception as error:  # the view keeps the six it drew
             _LOG.exception("RSM slice presentation failed")
             self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")

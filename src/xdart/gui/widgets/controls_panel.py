@@ -984,6 +984,65 @@ class FormRow(QtWidgets.QWidget):
         self.valueChanged.emit(edit.path, edit.value)
 
 
+class CoordinateRangeControl(QtWidgets.QWidget):
+    """Int range editors and canonical two-handle slider for a display coordinate."""
+    rangeChanged = QtCore.Signal(float, float)
+
+    def __init__(self, label, parent=None):
+        super().__init__(parent)
+        from xdart.gui.widgets.intensity_controls import IntensityRangeSlider
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.row = RangeRow(label=label,
+            low={"path": ("display_range", "low"), "value": ""},
+            high={"path": ("display_range", "high"), "value": ""})
+        self.label, self.editors = self.row.label, self.row.editors
+        self.label.setMinimumWidth(24)
+        self.slider = IntensityRangeSlider(self, range_label=label,
+            range_hint="Choose the included bin centres. This changes display projections only; saved science is unchanged.")
+        layout.addWidget(self.row)
+        layout.addWidget(self.slider)
+        self._bounds = None
+        self.row.valueChanged.connect(self._edited)
+        self.slider.sigRangeChanged.connect(self._slid)
+
+    def reconcile(self, label, axis, bounds=None):
+        self.label.setText(label)
+        self.slider._range_label = label
+        low, high = float(axis[0]), float(axis[-1])
+        bounds = (low, high) if bounds is None else bounds
+        self._bounds = tuple(float(x) for x in bounds)
+        self.slider.setDomain(low, high, lower=bounds[0], upper=bounds[1])
+        self._sync_editors()
+        tip = (f"{label} bin centres included in all displayed maps and curves. "
+               "Edit bounds or drag the handles; saved science is unchanged.")
+        for widget in (self, self.label, self.row, *self.editors):
+            widget.setToolTip(tip)
+
+    def _sync_editors(self):
+        for editor, value in zip(self.editors, self._bounds, strict=True):
+            editor.setText(format(value, '.9g'))
+
+    def _edited(self, _path, _value):
+        try:
+            low, high = (float(editor.text()) for editor in self.editors)
+            from math import isfinite
+            if not isfinite(low) or not isfinite(high) or low > high:
+                raise ValueError
+        except ValueError:
+            self._sync_editors()
+            return
+        self._bounds = low, high
+        self.slider.setValues(low, high, emit=False)
+        self.rangeChanged.emit(low, high)
+
+    def _slid(self, low, high):
+        self._bounds = low, high
+        self._sync_editors()
+        self.rangeChanged.emit(low, high)
+
+
 class RangeRow(QtWidgets.QWidget):
     """A compact range row: ``[label] [low] – [high] [✦]`` on one line.
 

@@ -6,6 +6,12 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
 
 
+def data_curve_style(color):
+    """Universal Int style for measured 1-D data, including keyed projections."""
+    return dict(pen=pg.mkPen(color=color, width=1.4, style=QtCore.Qt.PenStyle.SolidLine),
+                symbol="o", symbolSize=4, symbolBrush=color, symbolPen=color, connect="finite")
+
+
 class PlotCursorReadout:
     """Keep the Int cursor label and scene-to-view behavior on one plot."""
 

@@ -23,11 +23,13 @@ class IntensityRangeSlider(QtWidgets.QWidget):
 
     sigRangeChanged = QtCore.Signal(float, float)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, range_label="Intensity", range_hint=None):
         super().__init__(parent)
         self._vmin, self._vmax = 0.0, 1.0
         self._lo, self._hi = 0.0, 1.0
         self._drag = None
+        self._range_label = range_label
+        self._range_hint = range_hint
         self.setMinimumSize(150, 24)
         self.setMaximumHeight(28)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
@@ -70,8 +72,8 @@ class IntensityRangeSlider(QtWidgets.QWidget):
         if changed:
             self._lo, self._hi = lo, hi
         self.setToolTip(
-            f"Intensity: {lo:.8g} to {hi:.8g}\n"
-            "Drag handles or click Intensity to enter exact minimum and maximum."
+            f"{self._range_label}: {lo:.8g} to {hi:.8g}\n"
+            + (self._range_hint or "Drag handles or click Intensity to enter exact minimum and maximum.")
         )
         if changed:
             self.update()
