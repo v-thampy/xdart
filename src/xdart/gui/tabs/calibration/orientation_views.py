@@ -1,0 +1,136 @@
+"""Read-only calibration consumers of Int's full controls and display owners."""
+from __future__ import annotations
+
+import math
+
+from pyqtgraph.Qt import QtCore
+
+from xdart.gui.widgets.controls_panel import ActionButton, FormRow, SectionCard
+from xdart.gui.widgets.read_only_text import ReadOnlyTextPane, ReadOnlyTextWindow
+from xdart.gui.tabs.scattering.results_table import ResultsTable
+from xdart.gui.tabs.scattering.scientific_view import ScientificView
+from xdart.gui.tabs.scattering.shell_values import KeyedFigureProjection, KeyedPanelsProjection
+from xrd_tools.session.display_logic import PanelKey, PanelRole
+from xrd_tools.session.readiness import ControlAction, ControlActionSpec, SectionId
+from xrd_tools.core.geometry.camera import mounting_description
+
+
+def show_figures(view, figures):
+    keys = tuple(PanelKey(PanelRole.FIGURE, f'geometry-{i}') for i in range(len(figures)))
+    view.reconcile_keyed(KeyedPanelsProjection(tuple(tuple(keys[i:i+2]) for i in range(0, len(keys), 2)),
+        tuple(KeyedFigureProjection(k, f.title, f) for k, f in zip(keys, figures))))
+
+
+def action(label, tip, parent):
+    button = ActionButton(ControlActionSpec(ControlAction.PREVIEW, label, SectionId.EXPERIMENT), parent)
+    button.set_purpose_tooltip(tip)
+    button.setAutoDefault(False)
+    return button
+
+
+class OrientationPanel(SectionCard):
+    """One advisory panel; the dialog owns execution, identity and editor focus."""
+
+    def __init__(self, parent, *, run, cancel, camera_focus, sign_focus):
+        super().__init__('Check detector orientation', parent, accent='experiment', collapsible=False)
+        self.set_help_topic('geometry.orientation')
+        self.setToolTip('Read-only orientation checks with fixed geometry; edit or refit only in the existing controls.')
+        self.status.setToolTip('Eligibility and lifecycle of this read-only orientation check.')
+        self.finding = None
+        self.frame_row = FormRow(label='Frame', path=('orientation', 'frame'), value=None, kind='combo')
+        self.frame_row.set_purpose_tooltip('Choose a staged calibration frame by its identity and motor pose.')
+        self.step_row = FormRow(label='Step', path=('orientation', 'step'), value='Beam and rings', kind='combo',
+            choices=('Beam and rings', 'Motion and signs', 'Known feature (optional)', 'Finding'))
+        self.step_row.set_purpose_tooltip('Select the check to run; a known feature requires its declared lab direction.')
+        self.candidate_row = FormRow(label='Candidate', path=('orientation', 'candidate'), value=None, kind='combo')
+        self.candidate_row.set_purpose_tooltip('Inspect a camera and motor-sense hypothesis; this never applies it.')
+        self.figure_view = ScientificView(self)
+        self.figure_view.setToolTip('Observed frame and predicted geometry in stored-pixel coordinates; right-click for Export.')
+        tips = {0: 'Camera hypothesis, looking downstream; not an applied setting.',
+                1: 'Candidate del motor sense.', 2: 'Candidate nu motor sense.',
+                3: 'Unitless ring-versus-background AUC; not a probability.',
+                4: 'Conservative segment standard error; excludes geometry uncertainty.',
+                5: 'Mean eligible per-ring angular support; unknown regions are excluded.'}
+        self.table = ResultsTable(('Mounting', 'del', 'nu', 'AUC', 'SE', 'Support'), self,
+                                   header_tooltips=tips, max_height=180)
+        self.table.setToolTip('All hypotheses, support and conditional scores; a tie never chooses an arbitrary winner.')
+        self.finding_pane = ReadOnlyTextPane(self)
+        self.finding_pane.setToolTip('Read-only finding, named ambiguities, refusals and the physical check needed.')
+        self.finding_pane.setMaximumHeight(110)
+        self.run_button = action('Run orientation check', 'Use staged frames or the existing direct-beam fit off-thread; no calibration values change.', self)
+        self.cancel_button = action('Cancel check', 'Cancel through the calibration worker and retain previously completed results.', self)
+        self.show_camera_button = action('Show in Camera editor', 'Resolve the held help draft and focus the existing Camera editor; apply nothing.', self)
+        self.show_sign_button = action('Show motor sign', 'Resolve the held help draft and focus the existing scanned circle direction; apply nothing.', self)
+        for widget in (self.frame_row, self.step_row, self.candidate_row, self.figure_view,
+                       self.table, self.finding_pane, self.run_button, self.cancel_button,
+                       self.show_camera_button, self.show_sign_button):
+            self.body_layout.addWidget(widget)
+        self.run_button.clicked.connect(run)
+        self.cancel_button.clicked.connect(cancel)
+        self.show_camera_button.clicked.connect(camera_focus)
+        self.show_sign_button.clicked.connect(sign_focus)
+        self.cancel_button.setEnabled(False)
+        self.figure_view.hide()
+        self.invalidate()
+
+    def set_frames(self, frames):
+        current = self.frame_row.editor.currentData()
+        blocked = QtCore.QSignalBlocker(self.frame_row.editor)
+        self.frame_row.editor.clear()
+        for frame in frames:
+            label = f'Frame {frame.index} · '+', '.join(f'{m} {v:g}°' for m, v in frame.motors.items())
+            self.frame_row.editor.addItem(label, frame.identity)
+        index = self.frame_row.editor.findData(current)
+        self.frame_row.editor.setCurrentIndex(max(0, index))
+        del blocked
+
+    def busy(self, value):
+        self.run_button.setEnabled(not value)
+        self.cancel_button.setEnabled(value)
+        self.set_status_text('Checking…' if value else '')
+
+    def invalidate(self, *_args):
+        self.finding = None
+        self.table.clear_rows()
+        self.finding_pane.set_text('Run a new check after changing geometry, frames or extraction inputs.')
+        self.figure_view.hide()
+
+    def show_finding(self, finding, figure=None):
+        self.finding = finding
+        self.finding_pane.set_text(finding.reason)
+        rows, tips = [], {}
+        self.candidate_row.editor.clear()
+        for i, c in enumerate(finding.candidates):
+            support = sum(r.support for r in c.ring_scores)/len(c.ring_scores) if c.ring_scores else float('nan')
+            label = mounting_description(c.camera)
+            self.candidate_row.editor.addItem(f'{label} · del {c.senses[0]:+d}, nu {c.senses[1]:+d}', i)
+            rows.append((label, *c.senses, *(f'{v:.4g}' if math.isfinite(v) else '—'
+                                           for v in (c.score, c.standard_error, support))))
+            for column in range(6):
+                tips[i, column] = ('Hypothesis only. Explicit geometric exclusions '
+                    f'{finding.exclusions.geometric}; value exclusions {finding.exclusions.value}. '
+                    'Detector gaps are excluded from ring support. Fixed inputs are not refitted.')
+        self.table.show_rows(('Mounting', 'del', 'nu', 'AUC', 'SE', 'Support'), rows, cell_tooltips=tips)
+        if figure is not None:
+            show_figures(self.figure_view, (figure,)); self.figure_view.show()
+
+
+class InstrumentSchematicWindow(ReadOnlyTextWindow):
+    def __init__(self, parent):
+        super().__init__('Instrument geometry', (960, 740), parent)
+        self.legend = self.pane
+        self.legend.setToolTip('Configured circle axes, motor readbacks, zeros and signed senses; structural agreement is not physical validation.')
+        self.figure_view = ScientificView(self)
+        self.figure_view.setToolTip('Computed side, top and downstream views from the current instrument; right-click for native Export.')
+        self.insert_content(self.figure_view)
+        self.projection = None
+
+    def show_geometry(self, geometry, readings):
+        from xrd_tools.geometry_figures import instrument_figure
+        self.projection = instrument_figure(geometry, readings)
+        if self.projection.reason:
+            self.legend.set_text(self.projection.reason); self.figure_view.hide()
+        else:
+            self.legend.set_text('\n'.join(f'{c.name}: {c.axis}, readback − zero {c.angle_deg:g}°'
+                                           for c in self.projection.circles))
+            show_figures(self.figure_view, self.projection.panels); self.figure_view.show()
