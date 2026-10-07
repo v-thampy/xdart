@@ -260,6 +260,81 @@ def test_saving_a_geometry_against_its_scan_keeps_the_advice_beside_the_saved_pa
         dialog.close()
 
 
+@pytest.mark.parametrize('key,value', [('beam_pixel', '117, 243'), ('beam_strip', '3')])
+def test_an_extraction_edit_after_the_fit_drops_its_advice_everywhere(qapp, tmp_path, key, value):
+    """Codex B1 re-review: the beam pixel and strip are the fit's extraction inputs, so editing either leaves
+    the fit stale; its mounting advice must go from every surface and the status ask for a new fit."""
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        _fit_container(dialog, tmp_path, 90)
+        _assert_advice(dialog, 'try 90° CW rather than 270° CW')
+        dialog._set_field_text(key, value)
+        assert not dialog._distance_fresh() and dialog._distance_warning is None
+        assert dialog.status.text() == dialog._STALE_DISTANCE
+        assert not dialog._direct_beam_fit_window.summary.text().startswith('⚠')
+        assert dialog.beam_summary.toPlainText().startswith('Distance: 500 mm')
+    finally:
+        dialog.close()
+
+
+def test_a_mount_edit_is_advice_about_the_arm_it_makes(qapp, tmp_path):
+    """The mount's tilt and roll are step 1's arm, not the fit's identity: the fit stays fresh. A mount the arm
+    cannot be built from leaves nothing to compare (no advice, the distance shown); a valid one brings it back."""
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        _fit_container(dialog, tmp_path, 90)
+        _assert_advice(dialog, 'try 90° CW rather than 270° CW')
+        dialog._set_field_text('rough_mount', '1, 2, 3')
+        assert dialog._distance_fresh() and dialog._distance_warning is None
+        _assert_no_advice(dialog)
+        dialog._set_field_text('rough_mount', '0, 0')
+        _assert_advice(dialog, 'try 90° CW rather than 270° CW')
+    finally:
+        dialog.close()
+
+
+def test_a_typed_rough_geometry_has_no_scan_to_compare(qapp, tmp_path):
+    """With Rough geometry typed rather than measured no scanned motor is known, so there is no advice to show."""
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        _fit_container(dialog, tmp_path, 90)
+        _assert_advice(dialog, 'try 90° CW rather than 270° CW')
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        assert dialog._distance_warning is None
+        assert not any(text.startswith('⚠') for text in _surfaces(dialog)), _surfaces(dialog)
+    finally:
+        dialog.close()
+
+
+def test_every_field_the_fit_identity_and_the_rough_arm_read_refreshes_the_advice(qapp, tmp_path):
+    """Codex B1 re-review owner checkpoint: the trigger list was hand-picked and missed fields. Record every
+    field the fit's identity (its source, reader and extraction options) and step 1's arm read, across the
+    source kinds and both rough modes, and require each to be one the advice follows."""
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        read, text = set(), dialog._text
+        dialog._text = lambda key: read.add(key) or text(key)
+        for key, value in (('beam_source', tmp_path / 'direct'), ('beam_scan', '1'), ('beam_images', tmp_path),
+                           ('beam_stem', 'direct_scan1_'), ('beam_roi', '0, 0, 10, 10'), ('mask', tmp_path / 'm.npy'),
+                           ('saturation', '1000'), ('beam_pixel', '97, 243'), ('rough_distance', '500'),
+                           ('rough_energy', '16')):
+            dialog._set_field_text(key, str(value))
+        for kind in ('spec', 'nexus'):
+            dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(kind))
+            dialog._spec(beam=True)
+            dialog._beam_fit_options(with_mask=False)
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec_container'))
+        for key, value in (('beam_images', ''), ('beam_stem', ''), ('beam_image_file', tmp_path / 'b.h5')):
+            dialog._set_field_text(key, str(value))
+        dialog._spec(beam=True)
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        assert dialog._rough_arm() is not None
+        assert read <= set(CalibrationDialog._DIRECT_BEAM_ADVICE_FIELDS), sorted(
+            read - set(CalibrationDialog._DIRECT_BEAM_ADVICE_FIELDS))
+    finally:
+        dialog.close()
+
+
 def test_a_motion_check_that_fails_leaves_the_fit_shown(qapp, tmp_path, monkeypatch):
     """The motion check is advice: if it cannot run, the distance, its rows and its window still appear."""
     import xdart.gui.tabs.calibration.dialog as calibration_dialog

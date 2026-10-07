@@ -575,9 +575,16 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.camera.changed.connect(self._invalidate_beam_detection)
         self._beam_arm = self.geometry_editor.value().stitch_arm()
         self.geometry_editor.changed.connect(self._beam_geometry_changed)
-        self.geometry_editor.changed.connect(self._render_direct_beam_advice)  # a sense or zero edit
         self.beam_source_kind.currentIndexChanged.connect(self._invalidate_beam_detection)
         self.rough_mode.currentIndexChanged.connect(self._invalidate_beam_detection)
+        # the motion advice follows every input of the fit's identity and of step 1's arm, after the handlers above
+        for key in self._DIRECT_BEAM_ADVICE_FIELDS:
+            field = self._fields[key]
+            (field.currentIndexChanged if isinstance(field, QtWidgets.QComboBox)
+             else field.textChanged).connect(self._render_direct_beam_advice)
+        for signal in (self.geometry_editor.changed, self.camera.changed, self.point_images.changed,
+                       self.beam_source_kind.currentIndexChanged, self.rough_mode.currentIndexChanged):
+            signal.connect(self._render_direct_beam_advice)
         self.tabs.currentChanged.connect(self._tab_readiness)
         self._update_beam_readiness()
 
@@ -1652,6 +1659,14 @@ class CalibrationDialog(QtWidgets.QDialog):
         from xrd_tools.core.geometry import ImageOrientation
         from xrd_tools.core.geometry.camera import stitch_camera
         self.camera.set_value(stitch_camera(ImageOrientation(rotation=image_rotation, flip_horizontal=image_flip)))
+
+    #: Every field the direct-beam fit's identity (``_direct_beam_key``: its source, reader and extraction options)
+    #: and step 1's arm (``_rough_arm``) read; each refreshes the motion advice (Codex B1 re-review: a hand-picked
+    #: list missed the beam pixel, strip and mount). test_direct_beam_readiness records the reads against it.
+    _DIRECT_BEAM_ADVICE_FIELDS = (
+        'beam_source', 'beam_entry', 'beam_scan', 'beam_image_file', 'beam_images', 'beam_stem', 'shape', 'dtype',
+        'header', 'beam_detector', 'beam_orientation', 'beam_pixel', 'beam_strip', 'beam_roi', 'mask', 'saturation',
+        'rough_distance', 'rough_mount', 'rough_energy')
 
     _STALE_DISTANCE = ('The direct-beam fit was made with other inputs (a motor zero, its motor, the source, the '
                        'detector or the search settings changed since): fit the direct-beam distance again.')
