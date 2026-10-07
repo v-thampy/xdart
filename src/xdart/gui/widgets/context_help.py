@@ -69,8 +69,22 @@ class HelpWindow(ReadOnlyTextWindow):
         self.browser.commandRequested.connect(lambda command:
             self.show_topic(command.value) if command.kind is ShellCommandKind.SELECT_RESULT else None)
         self._f1 = QtGui.QShortcut(QtGui.QKeySequence("F1"), self)
+        self._f1.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._f1.activated.connect(self.show_index)
+        self.pane.installEventFilter(self)
         self.show_index()
+
+    def eventFilter(self, watched, event):
+        # Read-only help keeps F1 local, including a directly delivered key
+        # while another native popup/window is settling its activation.
+        if watched is self.pane and event.type() in (QtCore.QEvent.Type.ShortcutOverride,
+                                                     QtCore.QEvent.Type.KeyPress):
+            if event.key() == QtCore.Qt.Key.Key_F1:
+                event.accept()
+                if event.type() == QtCore.QEvent.Type.KeyPress:
+                    self.show_index()
+                return True
+        return super().eventFilter(watched, event)
 
     def _search(self, query: str) -> None:
         topics = search_topics(query)
@@ -190,6 +204,9 @@ class HelpWindow(ReadOnlyTextWindow):
             return
         topic = get_topic(self.topic_id)
         if topic and topic.figures:
+            if self._walkthrough and self.sender() is self.candidate_row.editor:
+                self._draw_step()
+                return
             index = max(0, self.figure_row.editor.currentIndex())
             self._draw_figure_key(topic.figures[index])
 
