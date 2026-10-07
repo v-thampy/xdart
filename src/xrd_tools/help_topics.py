@@ -3,7 +3,7 @@
 Topic IDs are presentation identifiers, independent of settings or readiness.
 Diagnostic prose supplements the original strings; it never classifies a result.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True, slots=True)
@@ -11,6 +11,8 @@ class HelpTopic:
     identifier: str
     title: str
     text: str
+    figures: tuple[str, ...] = ()
+    run_key: str | None = None
 
 
 TOPICS = (
@@ -381,6 +383,20 @@ xrd_tools/analysis/plans.py — raw scan reduction and background handling.
 xrd_tools/analysis/scan_operations.py — identity, normalization and admission.
 """),
 )
+
+
+# Finite presentation references, resolved lazily by the help consumer. The
+# original scientific topic text remains unchanged and import-light.
+_FIGURES = {
+    'geometry.orientation': ('coordinates', 'mountings', 'first-pixel', 'off-centre',
+                             'centred', 'arm-motion', 'mirror-tie', 'tilt', 'psic', 'fourc'),
+    'calibration.multi-step': ('psic', 'off-centre'),
+    'calibration.frame-choice': ('arm-motion', 'centred'),
+    'calibration.diagnostics': ('residuals',),
+}
+TOPICS = tuple(replace(t, figures=_FIGURES.get(t.identifier, ()),
+                      run_key='orientation-check' if t.identifier == 'geometry.orientation' else None)
+               for t in TOPICS)
 
 
 def get_topic(identifier: str) -> HelpTopic | None:

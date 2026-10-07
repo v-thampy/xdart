@@ -362,3 +362,70 @@ def instrument_figure(instrument, readings):
             'Zero is subtracted once; reversed sense is carried by the signed axis.',
             curves=tuple(curves), arrows=tuple(arrows), texts=tuple(texts)))
     return InstrumentFigure(tuple(circles), tuple(panels))
+
+
+HELP_FIGURE_TITLES = (('coordinates', 'Array, public image and lab coordinates'),
+    ('mountings', 'Eight detector mountings'), ('first-pixel', 'First-pixel corners'),
+    ('off-centre', 'Off-centre powder rings'), ('centred', 'Centred rings cannot decide'),
+    ('arm-motion', 'Detector-arm motion'), ('mirror-tie', 'Flip or motor sense?'),
+    ('tilt', 'Tilt and elliptical rings'), ('psic', 'PSIC geometry'),
+    ('fourc', 'Four-circle and two-circle geometry'), ('residuals', 'Residual mechanisms'))
+
+
+def help_figures(key, candidate_index=0):
+    """Finite computed teaching catalogue; never load a file or dispatch a job."""
+    candidate = camera_candidates()[candidate_index]
+    camera = candidate.camera
+    if key in ('psic', 'fourc'):
+        from xrd_tools.session.instrument import InstrumentGeometry
+        names = ('psic',) if key == 'psic' else ('fourc', 'twoc')
+        return tuple(panel for name in names for panel in instrument_figure(
+            InstrumentGeometry(name), {c: 0. for c in InstrumentGeometry(name).circles}).panels)
+    if key == 'residuals':
+        return tuple(residual_example().values())
+    if key == 'first-pixel':
+        return tuple(first_pixel_figure(code, (5, 7)) for code in (1, 2, 3, 4))
+    if key in ('coordinates', 'mountings'):
+        image = np.arange(35).reshape(5, 7)
+        values = camera_candidates() if key == 'mountings' else (candidate,)
+        figures = []
+        for item in values:
+            origin = np.array((3., 2.))
+            arrows = tuple(Arrow(label, tuple(origin), tuple(origin+2*np.asarray(vector)), 'beam',
+                f'{label} in stored pixels, looking from behind towards the sample; '
+                'looking downstream reverses left and right.')
+                for label, vector in (('Lab +x (up)', item.lab_up), ('Lab +z', item.lab_z)))
+            figures.append(Figure(item.label, 'Stored column / public x', 'Stored row / public y', 'px',
+                'Synthetic numbered array: array[row, column]; public (x, y)=(column, row). '
+                'Lab x is up, y downstream, z left looking downstream. Mounting is separate from the corner.',
+                arrows=arrows, image=image))
+        if key == 'coordinates':
+            figures += [replace(figures[0], title='Public image (x, y)'),
+                        Figure('Canonical lab view', 'Canonical column', 'Canonical row', 'px',
+                            'Synthetic array transformed once through the selected camera. '
+                            'The canonical pyFAI frame has rows +x and columns −z.',
+                            image=candidate.orientation.apply(image))]
+        return tuple(figures)
+    if key == 'arm-motion':
+        return tuple(predict_ring_curves(replace(GeometryInputs(), readings=(('del', a), ('nu', 0.))), camera)
+                     for a in (0., 15., 30.))
+    value = GeometryInputs()
+    if key == 'centred':
+        value = replace(value, beam_offset_px=(0., 0.))
+    elif key == 'mirror-tie':
+        value = replace(value, beam_offset_px=(0., 229.), readings=(('del', 15.), ('nu', 0.)))
+    elif key == 'tilt':
+        value = replace(value, mount_deg=(2., -1.))
+    elif key != 'off-centre':
+        raise ValueError('Unknown computed help figure: '+str(key))
+    observed = synthetic_orientation_example(value, DetectorCamera('x-', 'z+'))
+    prediction = predict_ring_curves(value, camera)
+    reference = tuple(replace(c, name='Reference '+c.name, role='observed',
+                              tooltip='Computed synthetic truth; solid reference, not measured control points.')
+                      for c in observed.curves)
+    note = ('Centred untilted rings are not identifiable from this frame. '
+            if key == 'centred' else 'Mirror-line flips and corresponding motor-sense reversals can remain tied. '
+            if key == 'mirror-tie' else 'Ring discrimination is conditional on trusted geometry and adequate support. ')
+    return (replace(prediction, image=observed.image, curves=reference+prediction.curves,
+                    caption=note+'Synthetic LaB6 image: solid reference, dashed candidate. '
+                    'First-pixel corner is fixed; no camera or motor setting is changed.'),)

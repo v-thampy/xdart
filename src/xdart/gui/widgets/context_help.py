@@ -53,6 +53,9 @@ class HelpWindow(ReadOnlyTextWindow):
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         self._entry_type = BrowserResult
         self.topic_id = None
+        self.figure_view = None
+        self._walkthrough = False
+        self._details = ''
         self.search_row = FormRow(label="Search help", path=("help", "search"), value="")
         self.search_row.set_purpose_tooltip("Search topic IDs, titles and text; every entered word must match.")
         self.browser = BrowserView(self, profile=keyed_list_profile("Help topics"))
@@ -76,6 +79,9 @@ class HelpWindow(ReadOnlyTextWindow):
 
     def show_index(self, requested: str | None = None, details: str = "") -> None:
         self.topic_id = None
+        if self.figure_view is not None:
+            for widget in self._figure_widgets:
+                widget.hide()
         self.search_row.editor.clear()
         self._search("")
         text = "Scientific help\n\nSearch or select a topic. F1 opens help for the focused control.\n\n"
@@ -91,9 +97,116 @@ class HelpWindow(ReadOnlyTextWindow):
             self.show_index(identifier, details)
             return
         self.topic_id = identifier
+        self._details = details
+        self._walkthrough = identifier == 'geometry.orientation'
         self._search(self.search_row.editor.text())
         self.set_text(topic.title + "\n" + topic.identifier + "\n\n" + topic.text +
                       ("\n\nCurrent context\n" + details if details else ""))
+        if topic.figures:
+            self._ensure_figures()
+            from xrd_tools.geometry_figures import HELP_FIGURE_TITLES
+            labels = dict(HELP_FIGURE_TITLES)
+            with QtCore.QSignalBlocker(self.figure_row.editor):
+                self.figure_row.editor.clear()
+                self.figure_row.editor.addItems([labels[k] for k in topic.figures])
+            for widget in self._figure_widgets:
+                widget.show()
+            self.step_row.setVisible(self._walkthrough)
+            self.previous_button.setVisible(self._walkthrough)
+            self.next_button.setVisible(self._walkthrough)
+            self.check_button.setVisible(identifier == 'geometry.orientation')
+            self.run_button.setVisible(bool(topic.run_key))
+            capability = getattr(self.parentWidget(), 'open_orientation_check', None)
+            self.run_button.setEnabled(bool(topic.run_key and callable(capability)))
+            self.run_button.set_purpose_tooltip('Open the read-only orientation check in the originating calibration window; '
+                'open Calibrate first when this action is unavailable. Opening does not start a job.')
+            self._draw_figure()
+        elif self.figure_view is not None:
+            for widget in self._figure_widgets:
+                widget.hide()
+
+    def _ensure_figures(self):
+        if self.figure_view is not None:
+            return
+        from .controls_panel import FormRow, ActionButton
+        from xrd_tools.session.readiness import ControlActionSpec, ControlAction, SectionId
+        from xdart.gui.tabs.scattering.scientific_view import ScientificView
+        self.figure_view = ScientificView(self)
+        self.figure_view.setMinimumHeight(260)
+        self.figure_view.setToolTip('Computed synthetic figures in declared coordinates; native right-click Export is available.')
+        self.figure_row = FormRow(label='Figure', path=('help', 'figure'), kind='combo', value='')
+        self.figure_row.set_purpose_tooltip('Choose a computed example for this topic. No experimental file is read.')
+        self.step_row = FormRow(label='Orientation check', path=('help', 'step'), kind='combo',
+            value='1 · Zero-angle rings', choices=('1 · Zero-angle rings', '2 · Moved-arm evidence',
+                                                  '3 · Known-feature direction', '4 · Physical checks and ties'))
+        self.step_row.set_purpose_tooltip('Step through a synthetic orientation check; run on your own frames in calibration.')
+        from xrd_tools.geometry_figures import camera_candidates
+        self.candidate_row = FormRow(label='Candidate mounting', path=('help', 'camera'), kind='combo',
+            choices=tuple(c.label for c in camera_candidates()), value=camera_candidates()[0].label)
+        self.candidate_row.set_purpose_tooltip('Select a camera hypothesis to compare with the fixed synthetic truth; this changes only the illustration.')
+        self.previous_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Previous step', SectionId.EXPERIMENT), self)
+        self.next_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Next step', SectionId.EXPERIMENT), self)
+        self.check_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Check detector orientation', SectionId.EXPERIMENT), self)
+        self.run_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Run on my frames', SectionId.EXPERIMENT), self)
+        for button, tip in ((self.previous_button, 'Show the previous synthetic check step.'),
+                            (self.next_button, 'Show the next synthetic check step.'),
+                            (self.check_button, 'Start the four-step synthetic orientation walkthrough.'),
+                            (self.run_button, 'Open the check in the originating calibration window.')):
+            button.set_purpose_tooltip(tip)
+        self._figure_widgets = (self.figure_row, self.step_row, self.candidate_row,
+            self.check_button, self.previous_button, self.next_button, self.run_button, self.figure_view)
+        for index, widget in enumerate(self._figure_widgets, 2):
+            self.insert_content(widget, index)
+        self.figure_row.editor.currentIndexChanged.connect(self._draw_figure)
+        self.candidate_row.editor.currentIndexChanged.connect(self._draw_figure)
+        self.step_row.editor.currentIndexChanged.connect(self._draw_step)
+        self.previous_button.clicked.connect(lambda: self.step_row.editor.setCurrentIndex(max(0, self.step_row.editor.currentIndex()-1)))
+        self.next_button.clicked.connect(lambda: self.step_row.editor.setCurrentIndex(min(3, self.step_row.editor.currentIndex()+1)))
+        self.check_button.clicked.connect(self.show_orientation_check)
+        self.run_button.clicked.connect(self._run_on_frames)
+
+    def show_orientation_check(self):
+        self.show_topic('geometry.orientation', self._details)
+        self._walkthrough = True
+        self.step_row.editor.setCurrentIndex(0)
+        self._draw_step()
+
+    def _draw_step(self, *_):
+        if self.figure_view is None or not self._walkthrough:
+            return
+        key = ('off-centre', 'mirror-tie', 'coordinates', 'centred')[self.step_row.editor.currentIndex()]
+        topic = get_topic(self.topic_id)
+        if topic is None:
+            return
+        self.set_text(topic.title+'\n\n'+topic.text+'\n\nSynthetic check\n'+
+            ('Compare fixed-geometry ring candidates; trust the beam, wavelength, zeros and mount first.',
+             'Moved rings constrain motor sense only together with camera mounting. Mirror-line flips can remain tied.',
+             'Declare an asymmetric feature’s lab direction before checking χ. Powder rings alone cannot certify azimuth.',
+             'A centred or mirror/diagonal frame may not identify the mounting. Check the physical detector and obtain separating evidence.')[self.step_row.editor.currentIndex()])
+        self._draw_figure_key(key)
+
+    def _draw_figure(self, *_):
+        if self.figure_view is None:
+            return
+        topic = get_topic(self.topic_id)
+        if topic and topic.figures:
+            index = max(0, self.figure_row.editor.currentIndex())
+            self._draw_figure_key(topic.figures[index])
+
+    def _draw_figure_key(self, key):
+        from xrd_tools.geometry_figures import help_figures
+        from xrd_tools.session.display_logic import PanelKey, PanelRole
+        from xdart.gui.tabs.scattering.shell_values import KeyedFigureProjection, KeyedPanelsProjection
+        figures = help_figures(key, max(0, self.candidate_row.editor.currentIndex()))
+        keys = tuple(PanelKey(PanelRole.FIGURE, f'help-{i}') for i in range(len(figures)))
+        layout = tuple(tuple(keys[i:i+2]) for i in range(0, len(keys), 2))
+        self.figure_view.reconcile_keyed(KeyedPanelsProjection(layout,
+            tuple(KeyedFigureProjection(k, f.title, f) for k, f in zip(keys, figures))))
+
+    def _run_on_frames(self):
+        capability = getattr(self.parentWidget(), 'open_orientation_check', None)
+        if callable(capability):
+            capability()
 
 
 class ContextHelpOwner(QtCore.QObject):
