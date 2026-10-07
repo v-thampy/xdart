@@ -43,12 +43,15 @@ def test_f1_nearest_context_unknown_fallback_and_shared_help_window(qapp):
         assert isinstance(window.pane, ReadOnlyTextPane) and window.pane.isReadOnly()
         assert isinstance(window.browser, BrowserView) and not window.browser.menus
         assert isinstance(window.search_row, FormRow)
-        # Child census: all display/edit widgets are inside one of the three shared owners.
+        # Illustrated help mounts additional full shared owners; no page-built editor.
+        from xdart.gui.tabs.scattering.scientific_view import ScientificView
+        owners = (window.pane, window.browser, *window.findChildren(FormRow),
+                  *window.findChildren(ScientificView))
         for widget in window.findChildren(QtWidgets.QWidget):
             if isinstance(widget, (QtWidgets.QPlainTextEdit, QtWidgets.QTextEdit,
                                    QtWidgets.QListWidget, QtWidgets.QLineEdit, QtWidgets.QComboBox)):
                 ancestor = widget
-                while ancestor is not None and ancestor not in (window.pane, window.browser, window.search_row):
+                while ancestor is not None and ancestor not in owners:
                     ancestor = ancestor.parentWidget()
                 assert ancestor is not None, type(widget)
         original = window.pane.toPlainText()
