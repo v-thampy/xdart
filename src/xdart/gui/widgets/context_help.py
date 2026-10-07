@@ -64,6 +64,7 @@ class HelpWindow(ReadOnlyTextWindow):
         self.topic_id = None
         self.figure_view = None
         self._walkthrough = False
+        self._synthetic_findings = {}
         self._details = ''
         self.search_row = FormRow(label="Search help", path=("help", "search"), value="")
         self.search_row.set_purpose_tooltip("Search topic IDs, titles and text; every entered word must match.")
@@ -135,6 +136,8 @@ class HelpWindow(ReadOnlyTextWindow):
             for widget in self._figure_widgets:
                 widget.show()
             self.step_row.setVisible(self._walkthrough)
+            self.feature_row.setVisible(False)
+            self.score_table.setVisible(False)
             self.previous_button.setVisible(self._walkthrough)
             self.next_button.setVisible(self._walkthrough)
             self.check_button.setVisible(identifier == 'geometry.orientation')
@@ -154,6 +157,7 @@ class HelpWindow(ReadOnlyTextWindow):
         from .controls_panel import FormRow, ActionButton
         from xrd_tools.session.readiness import ControlActionSpec, ControlAction, SectionId
         from xdart.gui.tabs.scattering.scientific_view import ScientificView
+        from xdart.gui.tabs.scattering.results_table import ResultsTable
         self.figure_view = ScientificView(self)
         self.figure_view.setMinimumHeight(260)
         self.figure_view.setToolTip('Computed synthetic figures in declared coordinates; native right-click Export is available.')
@@ -167,6 +171,14 @@ class HelpWindow(ReadOnlyTextWindow):
         self.candidate_row = FormRow(label='Candidate mounting', path=('help', 'camera'), kind='combo',
             choices=tuple(c.label for c in camera_candidates()), value=camera_candidates()[0].label)
         self.candidate_row.set_purpose_tooltip('Select a camera hypothesis to compare with the fixed synthetic truth; this changes only the illustration.')
+        self.feature_row = FormRow(label='Known feature direction', path=('help', 'feature'), kind='combo',
+            value='Undeclared', choices=('Undeclared', 'x+', 'x-', 'z+', 'z-'))
+        self.feature_row.set_purpose_tooltip('Declare the synthetic feature’s transverse lab direction independently, then click it; this does not certify a mounting.')
+        self.score_table = ResultsTable(('Mounting', 'del', 'nu', 'AUC', 'SE'), self,
+            header_tooltips={i: tip for i, tip in enumerate(('Camera hypothesis; never applied.',
+                'Candidate del sense.', 'Candidate nu sense.', 'Ring/background AUC, not probability.',
+                'Conditional segment standard error; geometry uncertainty is excluded.'))}, max_height=150)
+        self.score_table.setToolTip('Computed synthetic scores, with fixed inputs and explicit ties; no file is read.')
         self.previous_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Previous step', SectionId.EXPERIMENT), self)
         self.next_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Next step', SectionId.EXPERIMENT), self)
         self.check_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Check detector orientation', SectionId.EXPERIMENT), self)
@@ -176,7 +188,7 @@ class HelpWindow(ReadOnlyTextWindow):
                             (self.check_button, 'Start the four-step synthetic orientation walkthrough.'),
                             (self.run_button, 'Open the check in the originating calibration window.')):
             button.set_purpose_tooltip(tip)
-        self._figure_widgets = (self.figure_row, self.step_row, self.candidate_row,
+        self._figure_widgets = (self.figure_row, self.step_row, self.candidate_row, self.feature_row, self.score_table,
             self.check_button, self.previous_button, self.next_button, self.run_button, self.figure_view)
         for index, widget in enumerate(self._figure_widgets, 2):
             self.insert_content(widget, index)
@@ -187,6 +199,8 @@ class HelpWindow(ReadOnlyTextWindow):
         self.next_button.clicked.connect(lambda: self.step_row.editor.setCurrentIndex(min(3, self.step_row.editor.currentIndex()+1)))
         self.check_button.clicked.connect(self.show_orientation_check)
         self.run_button.clicked.connect(self._run_on_frames)
+        self.figure_view.figureImageClicked.connect(self._feature_clicked)
+        self.feature_row.editor.currentIndexChanged.connect(lambda: self._feature_clicked(None, None, None))
 
     def show_orientation_check(self):
         self.show_topic('geometry.orientation', self._details)
@@ -197,7 +211,8 @@ class HelpWindow(ReadOnlyTextWindow):
     def _draw_step(self, *_):
         if self.figure_view is None or not self._walkthrough:
             return
-        key = ('off-centre', 'mirror-tie', 'coordinates', 'centred')[self.step_row.editor.currentIndex()]
+        step = self.step_row.editor.currentIndex()
+        key = ('off-centre', 'mirror-tie', 'off-centre', 'centred')[step]
         topic = get_topic(self.topic_id)
         if topic is None:
             return
@@ -207,6 +222,30 @@ class HelpWindow(ReadOnlyTextWindow):
              'Declare an asymmetric feature’s lab direction before checking χ. Powder rings alone cannot certify azimuth.',
              'A centred or mirror/diagonal frame may not identify the mounting. Check the physical detector and obtain separating evidence.')[self.step_row.editor.currentIndex()])
         self._draw_figure_key(key)
+        self.feature_row.setVisible(step == 2)
+        from xrd_tools.geometry_figures import synthetic_orientation_finding
+        if step not in self._synthetic_findings:
+            self._synthetic_findings[step] = synthetic_orientation_finding(step)
+        finding = self._synthetic_findings[step]
+        rows = tuple((c.camera.rows+'/'+c.camera.columns, *c.senses,
+                      f'{c.score:.4g}', f'{c.standard_error:.4g}') for c in finding.candidates)
+        self.score_table.show_rows(('Mounting', 'del', 'nu', 'AUC', 'SE'), rows,
+            cell_tooltips={(r, c): 'Synthetic fixed-input hypothesis. '+finding.reason
+                           for r in range(len(rows)) for c in range(5)})
+        self.score_table.setVisible(step != 2)
+        self.pane.appendPlainText('\n'+finding.reason)
+
+    def _feature_clicked(self, _key, column, row):
+        if not self._walkthrough or self.step_row.editor.currentIndex() != 2:
+            return
+        from xrd_tools.geometry_figures import GeometryInputs, camera_candidates, feature_azimuth
+        direction = self.feature_row.editor.currentText()
+        if column is None or direction == 'Undeclared':
+            self.pane.appendPlainText('Declare the known feature’s lab direction, then click it in the image.')
+            return
+        result = feature_azimuth(GeometryInputs(), camera_candidates()[self.candidate_row.editor.currentIndex()].camera,
+                                 (column, row), expected_lab=direction)
+        self.pane.appendPlainText(result.reason)
 
     def _draw_figure(self, *_):
         if self.figure_view is None:

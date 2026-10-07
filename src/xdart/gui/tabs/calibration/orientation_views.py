@@ -31,7 +31,7 @@ def action(label, tip, parent):
 class OrientationPanel(SectionCard):
     """One advisory panel; the dialog owns execution, identity and editor focus."""
 
-    def __init__(self, parent, *, run, cancel, camera_focus, sign_focus):
+    def __init__(self, parent, *, run, cancel, camera_focus, sign_focus, feature):
         super().__init__('Check detector orientation', parent, accent='experiment', collapsible=False)
         self.set_help_topic('geometry.orientation')
         self.setToolTip('Read-only orientation checks with fixed geometry; edit or refit only in the existing controls.')
@@ -44,6 +44,9 @@ class OrientationPanel(SectionCard):
         self.step_row.set_purpose_tooltip('Select the check to run; a known feature requires its declared lab direction.')
         self.candidate_row = FormRow(label='Candidate', path=('orientation', 'candidate'), value=None, kind='combo')
         self.candidate_row.set_purpose_tooltip('Inspect a camera and motor-sense hypothesis; this never applies it.')
+        self.feature_row = FormRow(label='Known feature direction', path=('orientation', 'feature'),
+            value='Undeclared', kind='combo', choices=('Undeclared', 'x+', 'x-', 'z+', 'z-'))
+        self.feature_row.set_purpose_tooltip('Declare an independently known transverse lab direction, then click that feature in the image; powder rings do not establish this direction.')
         self.figure_view = ScientificView(self)
         self.figure_view.setToolTip('Observed frame and predicted geometry in stored-pixel coordinates; right-click for Export.')
         tips = {0: 'Camera hypothesis, looking downstream; not an applied setting.',
@@ -61,7 +64,7 @@ class OrientationPanel(SectionCard):
         self.cancel_button = action('Cancel check', 'Cancel through the calibration worker and retain previously completed results.', self)
         self.show_camera_button = action('Show in Camera editor', 'Resolve the held help draft and focus the existing Camera editor; apply nothing.', self)
         self.show_sign_button = action('Show motor sign', 'Resolve the held help draft and focus the existing scanned circle direction; apply nothing.', self)
-        for widget in (self.frame_row, self.step_row, self.candidate_row, self.figure_view,
+        for widget in (self.frame_row, self.step_row, self.candidate_row, self.feature_row, self.figure_view,
                        self.table, self.finding_pane, self.run_button, self.cancel_button,
                        self.show_camera_button, self.show_sign_button):
             self.body_layout.addWidget(widget)
@@ -69,6 +72,8 @@ class OrientationPanel(SectionCard):
         self.cancel_button.clicked.connect(cancel)
         self.show_camera_button.clicked.connect(camera_focus)
         self.show_sign_button.clicked.connect(sign_focus)
+        self.figure_view.figureImageClicked.connect(feature)
+        self.feature_row.editor.currentIndexChanged.connect(lambda: self.finding_pane.set_text('Declare the known feature’s lab direction, then click it in the displayed frame.'))
         self.cancel_button.setEnabled(False)
         self.figure_view.hide()
         self.invalidate()
@@ -87,6 +92,10 @@ class OrientationPanel(SectionCard):
     def busy(self, value):
         self.run_button.setEnabled(not value)
         self.cancel_button.setEnabled(value)
+        for row in (self.frame_row, self.step_row, self.candidate_row, self.feature_row):
+            row.setEnabled(not value)
+        self.show_camera_button.setEnabled(not value)
+        self.show_sign_button.setEnabled(not value)
         self.set_status_text('Checking…' if value else '')
 
     def invalidate(self, *_args):

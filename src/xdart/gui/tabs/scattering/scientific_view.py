@@ -500,8 +500,10 @@ class _KeyedTracePanel:
 class _KeyedFigurePanel:
     """Typed figure rendering inside Int's keyed display owner, with native Export."""
 
-    def __init__(self, key):
+    def __init__(self, key, clicked):
         self.key = key
+        self._clicked = clicked
+        self._image_shape = None
         self.container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(self.container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -514,6 +516,17 @@ class _KeyedFigurePanel:
         layout.addWidget(self.plot, 1)
         layout.addWidget(self.caption)
         self.curves, self.overlay_items = {}, []
+        self.plot.scene().sigMouseClicked.connect(self._image_clicked)
+
+    def _image_clicked(self, event):
+        if self._image_shape is None or event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        if not self.viewbox.sceneBoundingRect().contains(event.scenePos()):
+            return
+        point = self.viewbox.mapSceneToView(event.scenePos())
+        rows, columns = self._image_shape
+        if 0 <= point.x() <= columns-1 and 0 <= point.y() <= rows-1:
+            self._clicked(self.key, float(point.x()), float(point.y()))
 
     def draw(self, panel, color):
         self.clear()
@@ -528,10 +541,11 @@ class _KeyedFigurePanel:
         self.plot.setLabel('left', figure.y_label, units=figure.units or None)
         self.viewbox.invertY(figure.units == 'px')
         if figure.image is not None:
+            self._image_shape = figure.image.shape
             item = pg.ImageItem(figure.image, axisOrder='row-major')
             item.setRect(QtCore.QRectF(-.5, -.5, figure.image.shape[1], figure.image.shape[0]))
             item.setZValue(-10)
-            item.setToolTip('Synthetic image, in stored pixel coordinates.')
+            item.setToolTip('Image in stored pixel coordinates. '+figure.caption)
             self.plot.addItem(item)
         for curve in figure.curves:
             style = (QtCore.Qt.PenStyle.DashLine if curve.role == 'predicted'
@@ -565,12 +579,15 @@ class _KeyedFigurePanel:
 
     def clear(self):
         self.plot.clear()
+        self._image_shape = None
         self.curves, self.overlay_items = {}, []
         self.caption.clear()
 
 
 class ScientificView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
+    #: Deliberate left click on a typed Figure image: key, column, row.
+    figureImageClicked = QtCore.Signal(object, float, float)
     #: The user moved or resized a keyed image panel's rectangle (``set_keyed_region``): its ``PanelKey`` and the
     #: ``RectRegion`` it now covers.
     keyedRegionChanged = QtCore.Signal(object, object)
@@ -3529,7 +3546,7 @@ class ScientificView(QtWidgets.QFrame):
                 elif key.role is PanelRole.PROJ_1D:
                     widgets = _KeyedTracePanel(key)
                 elif key.role is PanelRole.FIGURE:
-                    widgets = _KeyedFigurePanel(key)
+                    widgets = _KeyedFigurePanel(key, self.figureImageClicked.emit)
                 else:
                     raise ValueError(f"a keyed layout draws SLICE_2D and PROJ_1D panels, not {key.role.value}")
                 across.addWidget(widgets.container, 1)

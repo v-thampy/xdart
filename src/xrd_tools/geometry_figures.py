@@ -109,6 +109,7 @@ class GeometryInputs:
     mount_deg: tuple[float, float] = (0., 0.)
     readings: tuple[tuple[str, float], ...] = (('del', 0.), ('nu', 0.))
     first_pixel: int = 3
+    calibrant: str = 'LaB6'
 
     def __post_init__(self):
         if len(self.shape) != 2 or any(type(v) is not int or v < 2 for v in self.shape):
@@ -185,7 +186,7 @@ def _geometry(value, camera, senses=(1, 1), *, include_rings=True):
         senses=dict(zip(('del', 'nu'), senses)))
     frame = CalibrationFrame('synthetic', 'synthetic', 'spec', {}, 0, '', 0, '', '', shape,
                              0, dict(value.readings), wavelength_m_to_energy_eV(value.wavelength_m))
-    return record, predict_frame_seed(record, frame, include_rings=include_rings), shape
+    return record, predict_frame_seed(record, frame, calibrant=value.calibrant, include_rings=include_rings), shape
 
 
 @dataclass(frozen=True)
@@ -212,7 +213,7 @@ def predict_ring_curves(value, camera, senses=(1, 1)):
         for index, line in enumerate(contours.lines(math.radians(ring.two_theta_deg))):
             raw = tuple(transform.unapply_pixel(xy, value.shape) for xy in line)
             curves.append(Curve(f'Ring {ring.number}, arc {index+1}', raw, 'predicted',
-                f'Predicted LaB6 ring {ring.number}: 2θ {ring.two_theta_deg:.4g}°.', ring.two_theta_deg))
+                f'Predicted {value.calibrant} ring {ring.number}: 2θ {ring.two_theta_deg:.4g}°.', ring.two_theta_deg))
     (row, column), _ = _direct_beam_hit(record, del_motor='del', nu_motor='nu',
                                       readings=dict(value.readings))
     beam = transform.unapply_pixel((column, row), value.shape)
@@ -483,6 +484,7 @@ class OrientationFrame:
     geometry: GeometryInputs
     mask: np.ndarray | None = field(default=None, compare=False, repr=False)
     saturation: float | None = None
+    value_mask: np.ndarray | None = field(default=None, compare=False, repr=False)
 
 
 def _raw_affine(camera, shape):
@@ -656,6 +658,10 @@ def _frame_masks(frame):
             raise ValueError('mask shape does not match detector shape')
         geometric |= frame.mask
     invalid = ~np.isfinite(image)
+    if frame.value_mask is not None:
+        if np.shape(frame.value_mask) != value.shape:
+            raise ValueError('value mask shape does not match detector shape')
+        invalid |= frame.value_mask
     if frame.saturation is not None:
         if not math.isfinite(frame.saturation):
             raise ValueError('saturation must be finite')
@@ -772,3 +778,147 @@ def consistent_motion_candidates(result, measured_camera, *, detector, motor, he
               'with the existing direct-beam fit, not a unique mounting or a new advisory.')
     return OrientationFinding(tuple(candidates), None, tuple(candidates), False, reason,
                               evaluated_hypotheses=32, worker_thread_id=threading.get_ident())
+
+
+def synthetic_orientation_finding(step):
+    """Run the same conditional checker on finite, source-free teaching inputs."""
+    truth = DetectorCamera('x-', 'z+')
+    value = GeometryInputs()
+    if step == 2:
+        return OrientationFinding((), None, (), False, 'Declare the known feature’s lab direction, then click it in the synthetic image.')
+    if step == 3:
+        value = replace(value, beam_offset_px=(0., 0.))
+    if step == 1:
+        value = replace(value, beam_offset_px=(0., 229.))
+        def frames():
+            for angle in (0., 15.):
+                pose = replace(value, readings=(('del', angle), ('nu', 0.)))
+                example = synthetic_orientation_example(pose, truth)
+                yield OrientationFrame(example.image, pose)
+        return diagnose_orientation(frames())
+    example = synthetic_orientation_example(value, truth)
+    return score_orientation(example.image, value)
+
+
+@dataclass(frozen=True)
+class FeatureAzimuth:
+    pyfai_chi_deg: float | None = None
+    xrayutilities_chi_deg: float | None = None
+    pyfai_convention: str = 'pyFAI native χ = atan2(qx, −qz), in degrees'
+    xrayutilities_convention: str = 'House XU/SURFACE χ = −atan2(qx, qz), in degrees'
+    expected_lab: str | None = None
+    reason: str = ''
+
+
+def feature_azimuth(value, camera, raw_pixel, *, expected_lab=None):
+    """Report qualified backend conventions at a declared asymmetric feature."""
+    if expected_lab is None:
+        return FeatureAzimuth(reason='Declare the known feature’s lab direction.')
+    if expected_lab not in ('x+', 'x-', 'z+', 'z-'):
+        return FeatureAzimuth(expected_lab=expected_lab, reason='Declare a transverse lab direction: x+, x−, z+ or z−.')
+    if (len(raw_pixel) != 2 or not all(math.isfinite(float(v)) for v in raw_pixel)
+            or not 0 <= raw_pixel[0] <= value.shape[1]-1 or not 0 <= raw_pixel[1] <= value.shape[0]-1):
+        return FeatureAzimuth(expected_lab=expected_lab, reason='Select a finite feature on this detector.')
+    _, seed, _ = _geometry(value, camera, include_rings=False)
+    column, row = stitch_orientation(camera).apply_pixel(raw_pixel, value.shape)
+    ai = seed.integrator
+    native = float(np.degrees(ai.chi(np.array([row]), np.array([column]))[0]))
+    _, lab_x, negative_lab_z = ai.calc_pos_zyx(d1=np.array([row]), d2=np.array([column]))
+    house = -math.degrees(math.atan2(float(lab_x[0]), -float(negative_lab_z[0])))
+    return FeatureAzimuth(native, house, expected_lab=expected_lab,
+        reason=f'Known feature declared toward lab {expected_lab}. pyFAI χ {native:.4g}°; '
+               f'house XU/SURFACE χ {house:.4g}°. These are different stated conventions. '
+               'Confirm this feature’s physical lab direction; powder rings alone cannot certify azimuth.')
+
+
+def calibration_orientation_inputs(record, frame, *, del_motor='del', nu_motor='nu', calibrant='LaB6'):
+    """Project an existing nominal arm into fixed inputs, without fitting it.
+
+    Extended sample offsets or non-unit scales cannot be represented by this
+    finite checker and are refused, rather than silently dropped.
+    """
+    from xrd_tools.core.geometry import Diffractometer, ImageOrientation
+    from xrd_tools.integrate.calibration_seed import _source_motors, _direct_beam_hit
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    diff = Diffractometer.from_pyfai_goniometer(record, source_motors=_source_motors(record, del_motor, nu_motor))
+    arm, calibration = diff.stacked_arm, diff.calibration
+    if arm is None:
+        raise ValueError('Orientation check requires a nominal detector arm.')
+    if abs(arm.beam_rotation) > 1e-12 or any(
+            getattr(arm, role+'_motor') is None and abs(getattr(arm, role+'_offset')) > 1e-12
+            for role in ('del', 'nu')):
+        raise ValueError('Orientation check cannot drop beam rotation or a held-circle offset; use the calibrated residual windows.')
+    if any(abs(getattr(arm, f'sample_offset{i}', 0.)) > 1e-12 for i in (1, 2, 3)):
+        raise ValueError('Orientation check cannot drop a fitted sample offset; use the calibrated residual windows.')
+    if any(not math.isclose(abs(getattr(arm, role+'_scale')), math.pi/180, abs_tol=1e-12)
+           for role in ('del', 'nu') if getattr(arm, role+'_motor') is not None):
+        raise ValueError('Orientation check requires unit motor scales; use the calibrated residual windows.')
+    zeros = arm.motor_zeros()
+    zero_readings = {getattr(arm, role+'_motor'): zero for role, zero in zeros.items()
+                     if getattr(arm, role+'_motor') is not None}
+    (row, column), distance = _direct_beam_hit(record, del_motor=del_motor, nu_motor=nu_motor,
+                                             readings=zero_readings)
+    orientation = ImageOrientation(rotation=frame.rotation, flip_horizontal=frame.flip)
+    raw_shape = frame.shape[::-1] if orientation.swaps_axes else frame.shape
+    centre = (np.array(frame.shape)[::-1]-1)/2
+    readings = tuple((role, float(frame.motors[getattr(arm, role+'_motor')])-zeros[role])
+                     if getattr(arm, role+'_motor') is not None else (role, 0.) for role in ('del', 'nu'))
+    wavelength = (float(energy_eV_to_wavelength_m(frame.energy_eV)) if frame.energy_eV
+                  else calibration.poni.wavelength)
+    detector = (calibration.turned_from or {}).get('detector', calibration.poni.detector)
+    return GeometryInputs(shape=tuple(raw_shape), detector=detector, distance_m=distance,
+        wavelength_m=wavelength, beam_offset_px=tuple(np.array((column, row))-centre),
+        mount_deg=tuple(map(math.degrees, (arm.mount_tilt, arm.mount_roll))), readings=readings,
+        first_pixel=int(calibration.detector_config.get('orientation', 3)), calibrant=calibrant)
+
+
+def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu', mask=None,
+                                conditioning=None, saturation=None, cancelled=None, preview_camera=None,
+                                calibrant='LaB6'):
+    """Read only verified staged frames through the existing format-aware reader.
+
+    Frames stream through the numerical owner. The returned display contains one
+    observed frame; finding data contains no images, integrators or source handles.
+    """
+    from xrd_tools.core.geometry import ImageOrientation
+    from xrd_tools.integrate.stitch_calibration import validate_frame_files, calibration_frame_mask
+    from xrd_tools.io.image import read_image
+    from os import PathLike
+    frames = tuple(frames)
+    if not frames:
+        return _finding((), Exclusions(), 32), None
+    static_mask = np.asarray(read_image(mask), bool) if isinstance(mask, (str, bytes, PathLike)) else mask
+    def load(frame):
+        if cancelled and cancelled():
+            raise InterruptedError('Orientation check cancelled.')
+        validate_frame_files(frame, require_points=False)
+        image = read_image(frame.image_path, preserve_dtype=True)
+        if image.shape != frame.shape:
+            raise ValueError('staged calibration image shape changed')
+        validate_frame_files(frame, require_points=False)
+        transform = ImageOrientation(rotation=frame.rotation, flip_horizontal=frame.flip)
+        value_mask = None
+        staged_value_mask = calibration_frame_mask(frame, conditioning=conditioning, saturation=saturation)
+        if staged_value_mask is not None:
+            value_mask = transform.unapply(staged_value_mask)
+        if static_mask is not None and np.shape(static_mask) != frame.shape:
+            raise ValueError('static mask shape does not match staged calibration frame')
+        geometric = None if static_mask is None else transform.unapply(static_mask)
+        value = calibration_orientation_inputs(record, frame, del_motor=del_motor, nu_motor=nu_motor,
+                                               calibrant=calibrant)
+        return OrientationFrame(transform.unapply(image), value, geometric, saturation, value_mask)
+    def streamed():
+        for frame in frames:
+            observed = load(frame)
+            yield observed
+            del observed
+    finding = diagnose_orientation(streamed(), cancelled=cancelled)
+    if cancelled and cancelled():
+        raise InterruptedError('Orientation check cancelled.')
+    observed = load(frames[0])
+    camera = preview_camera or camera_candidates()[0].camera
+    prediction = predict_ring_curves(observed.geometry, camera)
+    figure = replace(prediction, image=observed.image,
+        caption=f'Observed staged frame {frames[0].index}; dashed rings are the displayed fixed mounting hypothesis. '
+                'No camera, motor sense, beam or PONI is applied or refitted. '+finding.reason)
+    return finding, figure
