@@ -15,6 +15,83 @@ from xrd_tools.core.geometry.camera import (
 )
 
 
+TEACHING_DISPLAY_CAP = 512
+ORIENTATION_PREVIEW_CAP = 512
+
+
+@dataclass(frozen=True)
+class DisplayBinning:
+    """Display pixel centres; scientific geometry and pixels remain native."""
+    native_shape: tuple[int, int]
+    cap: int
+
+    def __post_init__(self):
+        if (len(self.native_shape) != 2 or any(type(n) is not int or n < 1 for n in self.native_shape)
+                or type(self.cap) is not int or self.cap < 1):
+            raise ValueError('display shape and cap must be positive integers')
+
+    @property
+    def factor(self):
+        return (max(self.native_shape)+self.cap-1)//self.cap
+
+    @property
+    def display_shape(self):
+        return tuple((n+self.factor-1)//self.factor for n in self.native_shape)
+
+    def native_to_display(self, xy):
+        return (np.asarray(xy)-(self.factor-1)/2)/self.factor
+
+    def display_to_native(self, xy):
+        # A partial last block has padding, whose clicks belong to its nearest real pixel.
+        return tuple(np.clip(np.asarray(xy)*self.factor+(self.factor-1)/2,
+                             (0, 0), np.asarray(self.native_shape)[::-1]-1))
+
+
+def _display_mean(frame, camera, detector, mapping):
+    """Stream admitted native pixels into means, with bounded row temporaries."""
+    image = np.asarray(frame.image)
+    if image.shape != frame.geometry.shape:
+        raise ValueError('image shape does not match declared detector shape')
+    for mask in (frame.mask, frame.value_mask):
+        if mask is not None and np.shape(mask) != image.shape:
+            raise ValueError('mask shape does not match detector shape')
+    if frame.saturation is not None and not math.isfinite(frame.saturation):
+        raise ValueError('saturation must be finite')
+    from xrd_tools.integrate.turned_detector import turned_model_mask
+    transform = stitch_orientation(camera)
+    # Reuse the registry mask owner. Sampling through the camera's existing affine
+    # avoids materializing another detector-sized raw-mask copy for this display.
+    mask = turned_model_mask(frame.geometry.detector, transform)
+    if mask is not None and mask.shape != tuple(detector.shape):
+        raise ValueError('detector geometric mask shape does not match the predicted frame')
+    if mask is not None:
+        _, matrix = _raw_affine(camera, frame.geometry.shape)
+        # The existing affine is a signed permutation. Its inverse is a
+        # transpose/reversal view, retaining the registry buffer without copies
+        # or per-block integer index arrays.
+        mask = mask.T if matrix[0, 0] == 0 else mask
+        mask = mask[::int(matrix[1].sum()), ::int(matrix[0].sum())]
+    result = np.full(mapping.display_shape, np.nan, dtype=np.float32)
+    b = mapping.factor
+    starts = np.arange(0, image.shape[1], b)
+    for row in range(result.shape[0]):
+        section = slice(row*b, min((row+1)*b, image.shape[0]))
+        pixels = image[section]
+        admitted = np.isfinite(pixels)
+        if mask is not None:
+            admitted &= ~mask[section]
+        for excluded in (frame.mask, frame.value_mask):
+            if excluded is not None:
+                admitted &= ~np.asarray(excluded[section], dtype=bool)
+        if frame.saturation is not None:
+            admitted &= pixels < frame.saturation
+        sums = np.add.reduceat(np.where(admitted, pixels, 0.).sum(axis=0, dtype=np.float64), starts)
+        counts = np.add.reduceat(admitted.sum(axis=0), starts)
+        np.divide(sums, counts, out=result[row], where=counts > 0)
+    result.setflags(write=False)
+    return result
+
+
 def _points(value):
     points = np.array(value, dtype=float, copy=True)
     if points.ndim != 2 or points.shape[1] != 2:
@@ -85,6 +162,7 @@ class Figure:
     arrows: tuple[Arrow, ...] = ()
     texts: tuple[Text, ...] = ()
     image: np.ndarray | None = field(default=None, compare=False, repr=False)
+    display_binning: DisplayBinning | None = None
 
     def __post_init__(self):
         for values, kind in ((self.curves, Curve), (self.markers, Marker),
@@ -173,7 +251,7 @@ class FirstPixelFigure(Figure):
     corner_name: str = ''
 
 
-def _geometry(value, camera, senses=(1, 1), *, include_rings=True):
+def _geometry(value, camera, senses=(1, 1), *, include_rings=True, collect_garbage=True):
     from xrd_tools.integrate.calibration_seed import rough_arm_record, predict_frame_seed
     from xrd_tools.integrate.stitch_calibration import CalibrationFrame
     from xrd_tools.core.energy import wavelength_m_to_energy_eV
@@ -186,7 +264,8 @@ def _geometry(value, camera, senses=(1, 1), *, include_rings=True):
         senses=dict(zip(('del', 'nu'), senses)))
     frame = CalibrationFrame('synthetic', 'synthetic', 'spec', {}, 0, '', 0, '', '', shape,
                              0, dict(value.readings), wavelength_m_to_energy_eV(value.wavelength_m))
-    return record, predict_frame_seed(record, frame, calibrant=value.calibrant, include_rings=include_rings), shape
+    return record, predict_frame_seed(record, frame, calibrant=value.calibrant,
+        include_rings=include_rings, collect_garbage=collect_garbage), shape
 
 
 @dataclass(frozen=True)
@@ -373,8 +452,12 @@ HELP_FIGURE_TITLES = (('coordinates', 'Array, public image and lab coordinates')
     ('fourc', 'Four-circle and two-circle geometry'), ('residuals', 'Residual mechanisms'))
 
 
-def help_figures(key, candidate_index=0):
+def help_figures(key, candidate_index=0, *, display_cap=None, _observed=None):
     """Finite computed teaching catalogue; never load a file or dispatch a job."""
+    predict = predict_ring_curves if display_cap is None else lambda value, camera, senses=(1, 1): (
+        _display_prediction(value, camera, senses, DisplayBinning(value.shape, display_cap))[0])
+    compose = replace if display_cap is None else _display_replace
+    example = synthetic_orientation_example if display_cap is None else (_observed or _teaching_example)
     candidate = camera_candidates()[candidate_index]
     camera = candidate.camera
     if key in ('psic', 'fourc'):
@@ -401,14 +484,14 @@ def help_figures(key, candidate_index=0):
                 'Lab x is up, y downstream, z left looking downstream. Mounting is separate from the corner.',
                 arrows=arrows, image=image))
         if key == 'coordinates':
-            figures += [replace(figures[0], title='Public image (x, y)'),
+            figures += [compose(figures[0], title='Public image (x, y)'),
                         Figure('Canonical lab view', 'Canonical column', 'Canonical row', 'px',
                             'Synthetic array transformed once through the selected camera. '
                             'The canonical pyFAI frame has rows +x and columns −z.',
                             image=candidate.orientation.apply(image))]
         return tuple(figures)
     if key == 'arm-motion':
-        return tuple(predict_ring_curves(replace(GeometryInputs(), readings=(('del', a), ('nu', 0.))), camera)
+        return tuple(predict(replace(GeometryInputs(), readings=(('del', a), ('nu', 0.))), camera)
                      for a in (0., 15., 30.))
     if key == 'mirror-tie':
         panels = []
@@ -416,13 +499,13 @@ def help_figures(key, candidate_index=0):
         for offset, angle, title in (((-190., 0.), 15., 'U/D flip or reversed δ: mirror-line tie'),
                                      ((-190., 229.), 0., 'Off the mirror line: zero-angle evidence separates')):
             value = replace(GeometryInputs(), beam_offset_px=offset, readings=(('del', angle), ('nu', 0.)))
-            flip_prediction = predict_ring_curves(value, flipped)
-            reverse_prediction = predict_ring_curves(value, truth, (-1, 1))
-            observed = synthetic_orientation_example(replace(value, readings=(('del', -angle), ('nu', 0.))), truth)
+            flip_prediction = predict(value, flipped)
+            reverse_prediction = predict(value, truth, (-1, 1))
+            observed = example(replace(value, readings=(('del', -angle), ('nu', 0.))), truth)
             reverse_curves = tuple(replace(c, name='Reversed δ '+c.name, role='tie',
                 tooltip='Dotted: upright camera, reversed δ sense; fixed beam and geometry.')
                 for c in reverse_prediction.curves)
-            panels.append(replace(flip_prediction, title=title, image=observed.image,
+            panels.append(compose(flip_prediction, title=title, image=observed.image,
                 curves=flip_prediction.curves+reverse_curves,
                 caption='Synthetic LaB6: dashed U/D-flipped camera at the recorded δ, dotted upright camera '
                         'with reversed δ. The first case agrees on the row mirror line; the second uses a '
@@ -437,15 +520,15 @@ def help_figures(key, candidate_index=0):
         value = replace(value, mount_deg=(2., -1.))
     elif key != 'off-centre':
         raise ValueError('Unknown computed help figure: '+str(key))
-    observed = synthetic_orientation_example(value, DetectorCamera('x-', 'z+'))
-    prediction = predict_ring_curves(value, camera)
+    observed = example(value, DetectorCamera('x-', 'z+'))
+    prediction = predict(value, camera)
     reference = tuple(replace(c, name='Reference '+c.name, role='observed',
                               tooltip='Computed synthetic truth; solid reference, not measured control points.')
                       for c in observed.curves)
     note = ('Centred untilted rings are not identifiable from this frame. '
             if key == 'centred' else 'Mirror-line flips and corresponding motor-sense reversals can remain tied. '
             if key == 'mirror-tie' else 'Ring discrimination is conditional on trusted geometry and adequate support. ')
-    return (replace(prediction, image=observed.image, curves=reference+prediction.curves,
+    return (compose(prediction, image=observed.image, curves=reference+prediction.curves,
                     caption=note+'Synthetic LaB6 image: solid reference, dashed candidate. '
                     'First-pixel corner is fixed; no camera or motor setting is changed.'),)
 
@@ -804,7 +887,7 @@ def consistent_motion_candidates(result, measured_camera, *, detector, motor, he
                               unmeasured_motor=unobserved)
 
 
-def synthetic_orientation_finding(step):
+def synthetic_orientation_finding(step, *, _observe=None):
     """Run the same conditional checker on finite, source-free teaching inputs."""
     truth = DetectorCamera('x-', 'z+')
     value = GeometryInputs()
@@ -817,10 +900,15 @@ def synthetic_orientation_finding(step):
         def frames():
             for angle in (0., 15.):
                 pose = replace(value, readings=(('del', angle), ('nu', 0.)))
-                example = synthetic_orientation_example(replace(pose, readings=(('del', -angle), ('nu', 0.))), truth)
+                observed_value = replace(pose, readings=(('del', -angle), ('nu', 0.)))
+                example = synthetic_orientation_example(observed_value, truth)
+                if _observe is not None:
+                    _observe(observed_value, truth, example.image)
                 yield OrientationFrame(example.image, pose)
         return diagnose_orientation(frames())
     example = synthetic_orientation_example(value, truth)
+    if _observe is not None:
+        _observe(value, truth, example.image)
     return score_orientation(example.image, value)
 
 
@@ -948,8 +1036,213 @@ def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu
         raise InterruptedError('Orientation check cancelled.')
     observed = load(frames[0])
     camera = preview_camera or camera_candidates()[0].camera
-    prediction = predict_ring_curves(observed.geometry, camera, preview_senses)
-    figure = replace(prediction, image=observed.image,
+    prediction = orientation_display(observed, camera, preview_senses)
+    figure = replace(prediction,
         caption=f'Observed staged frame {frames[0].index}; dashed rings are the displayed fixed mounting hypothesis. '
-                'No camera, motor sense, beam or PONI is applied or refitted. '+finding.reason)
+                'No camera, motor sense, beam or PONI is applied or refitted. '+prediction.caption+' '+finding.reason)
     return finding, figure, observed.geometry
+
+
+
+def _display_arcs(points, theta, shape, factor):
+    """Contiguous cone intersections, clipped at native pixel-centre bounds."""
+    chi = np.linspace(-math.pi, math.pi, 16385)
+    xy = points(theta, chi)
+    upper = np.asarray(shape)[::-1]-1
+    def inside(values):
+        return np.isfinite(values).all(axis=1) & (values >= 0).all(axis=1) & (values <= upper).all(axis=1)
+    eligible = inside(xy)
+    changes = np.diff(np.r_[False, eligible, False].astype(np.int8))
+    for start, end in zip(np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)):
+        if end-start < 2:
+            continue
+        lo, hi = chi[start], chi[end-1]
+        # Refine each observed boundary; no pole/off-detector segment is bridged.
+        for valid, invalid, side in ((lo, chi[max(start-1, 0)], 0),
+                                     (hi, chi[min(end, len(chi)-1)], 1)):
+            for _ in range(24):
+                mid = (valid+invalid)/2
+                if inside(points(theta, np.array([mid])))[0]:
+                    valid = mid
+                else:
+                    invalid = mid
+            if side == 0:
+                lo = valid
+            else:
+                hi = valid
+        arc_chi = np.r_[lo, chi[start:end], hi]
+        arc = points(theta, arc_chi)
+        length = np.r_[0., np.cumsum(np.linalg.norm(np.diff(arc, axis=0), axis=1))]
+        count = max(2, int(math.ceil(length[-1]/(.4*factor)))+1)
+        sampled = np.interp(np.linspace(0., length[-1], count), length, arc_chi)
+        yield points(theta, sampled)
+
+
+def _display_prediction(value, camera, senses, mapping):
+    from pyFAI.calibrant import get_calibrant
+    from xrd_tools.integrate.calibration_seed import ExpectedRing, _direct_beam_hit
+    record, seed, shape = _geometry(value, camera, senses, include_rings=False, collect_garbage=False)
+    ai = seed.integrator
+    if not ai.detector.IS_FLAT or not ai.detector.uniform_pixel or ai.detector.spline is not None:
+        raise ValueError('Orientation display requires a uniform, flat, undistorted detector.')
+    points = _cone_plane(ai)
+    origin, matrix = _raw_affine(camera, value.shape)
+    reference = get_calibrant(value.calibrant); reference.wavelength = ai.wavelength
+    curves, rings = [], []
+    for number, (theta, d) in enumerate(zip(reference.get_2th(), reference.dspacing), 1):
+        if theta is None:
+            continue
+        arcs = tuple(_display_arcs(points, theta, shape, mapping.factor))
+        if not arcs:
+            continue
+        ring = ExpectedRing(number, math.degrees(theta), float(d)); rings.append(ring)
+        for index, arc in enumerate(arcs, 1):
+            raw = arc @ matrix.T+origin
+            curves.append(Curve(f'Ring {number}, arc {index}', mapping.native_to_display(raw), 'predicted',
+                f'Predicted {value.calibrant} ring {number}: 2θ {ring.two_theta_deg:.4g}°. '
+                'Display pixels only; native geometry and scoring are unchanged.', ring.two_theta_deg))
+    (row, column), _ = _direct_beam_hit(record, del_motor='del', nu_motor='nu', readings=dict(value.readings))
+    beam = stitch_orientation(camera).unapply_pixel((column, row), value.shape)
+    outside = not (0 <= beam[0] <= value.shape[1]-1 and 0 <= beam[1] <= value.shape[0]-1)
+    arrows = ()
+    if outside:
+        start = np.clip(beam, (0, 0), np.asarray(value.shape)[::-1]-1)
+        vector = np.asarray(beam)-start
+        end = start+vector/max(np.linalg.norm(vector), 1)*30
+        arrows = (Arrow('off-detector beam', mapping.native_to_display(start), mapping.native_to_display(end),
+                        'beam', 'Direct beam lies outside this detector; coordinates are display-binned.'),)
+    plotted_beam = tuple(mapping.native_to_display(beam))
+    figure = RingPrediction(mounting_description(camera), 'Binned stored column', 'Binned stored row', 'px',
+        f'Display binning {mapping.factor}×{mapping.factor}; native geometry and orientation scoring are unchanged. '
+        'Masked pixels, including module gaps when a detector mask exists, are excluded from display averages. '
+        'Fully masked blocks are blank; partial edge blocks contain only their real pixels.',
+        curves=tuple(curves), markers=(Marker('beam', plotted_beam, 'beam', 'Predicted native direct beam, mapped to display pixels.'),),
+        arrows=arrows, display_binning=mapping, rings=tuple(rings), beam_xy=plotted_beam, beam_off_detector=outside)
+    return figure, ai.detector
+
+
+def orientation_display(frame, camera, senses=(1, 1), *, cap=ORIENTATION_PREVIEW_CAP):
+    """Display projection only; never feed these pixels to orientation scoring."""
+    mapping = DisplayBinning(frame.geometry.shape, cap)
+    prediction, detector = _display_prediction(frame.geometry, camera, senses, mapping)
+    return replace(prediction, image=_display_mean(frame, camera, detector, mapping))
+
+
+def _teaching_example(value, camera=None, *, image=None):
+    from pyFAI.calibrant import get_calibrant
+    truth = camera or DetectorCamera('x-', 'z+')
+    _, seed, shape = _geometry(value, truth, include_rings=False, collect_garbage=False)
+    reference = get_calibrant(value.calibrant); reference.wavelength = value.wavelength_m
+    pitch = seed.integrator.detector.pixel1
+    if image is None:
+        pixels = reference.fake_calibration_image(seed.integrator, shape=shape, Imax=200.,
+                                                 resolution=np.degrees(pitch/value.distance_m))
+        image = stitch_orientation(truth).unapply(pixels)
+    mapping = DisplayBinning(value.shape, TEACHING_DISPLAY_CAP)
+    displayed = _display_mean(OrientationFrame(image, value), truth, seed.integrator.detector, mapping)
+    del image, seed
+    prediction, _ = _display_prediction(value, truth, (1, 1), mapping)
+    return _display_replace(prediction, image=displayed)
+
+
+def _display_replace(figure, **changes):
+    """Share only product-owned immutable display buffers, never caller raw data."""
+    image = changes.pop('image', figure.image)
+    if image is not None and image.flags.writeable:
+        raise ValueError('shared display pixels must be immutable')
+    result = replace(figure, image=None, **changes)
+    object.__setattr__(result, 'image', image)
+    return result
+
+
+class TeachingCache:
+    """One bounded, source-free cache for the finite catalogue during this session."""
+    MAX_FINDINGS = 4
+    MAX_FIGURES = 16
+    MAX_OBSERVATIONS = 6
+    MAX_BUFFER_BYTES = 16*1024**2
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        from collections import OrderedDict
+        self._findings = {}
+        self._figures = OrderedDict()
+        self._observations = OrderedDict()
+        self._counts = dict(finding_hits=0, finding_misses=0, figure_hits=0, figure_misses=0)
+
+    def has_finding(self, step):
+        return step in self._findings
+
+    def has_figures(self, key, candidate_index):
+        return (key, candidate_index, TEACHING_DISPLAY_CAP) in self._figures
+
+    def get_finding(self, step):
+        if type(step) is not int or step not in range(4):
+            raise ValueError('teaching step is 0–3')
+        if step not in self._findings:
+            self._counts['finding_misses'] += 1
+            self._findings[step] = synthetic_orientation_finding(step, _observe=self._remember)
+        else:
+            self._counts['finding_hits'] += 1
+        self._trim()
+        return self._findings[step]
+
+    def _remember(self, value, camera, image):
+        identity = (value, camera, TEACHING_DISPLAY_CAP)
+        self._observations[identity] = _teaching_example(value, camera, image=image)
+        self._observations.move_to_end(identity)
+        while len(self._observations) > self.MAX_OBSERVATIONS:
+            self._observations.popitem(last=False)
+
+    def _observed(self, value, camera):
+        key = (value, camera, TEACHING_DISPLAY_CAP)
+        if key not in self._observations:
+            self._observations[key] = _teaching_example(value, camera)
+        self._observations.move_to_end(key)
+        while len(self._observations) > self.MAX_OBSERVATIONS:
+            self._observations.popitem(last=False)
+        return self._observations[key]
+
+    def get_figures(self, key, candidate_index=0):
+        if key not in dict(HELP_FIGURE_TITLES) or type(candidate_index) is not int or candidate_index not in range(8):
+            raise ValueError('declare a catalogue key and one of its eight camera candidates')
+        identity = (key, candidate_index, TEACHING_DISPLAY_CAP)
+        if identity in self._figures:
+            self._counts['figure_hits'] += 1
+            self._figures.move_to_end(identity)
+            return self._figures[identity]
+        self._counts['figure_misses'] += 1
+        figures = help_figures(key, candidate_index, display_cap=TEACHING_DISPLAY_CAP, _observed=self._observed)
+        figures = tuple(_display_replace(f, caption=f.caption+f' Display binning {f.display_binning.factor}×{f.display_binning.factor}; '
+            'masked and gap pixels are excluded when the detector mask exists; blank blocks are unknown. '
+            'Orientation scoring and physical inputs remain native.') if f.display_binning else f for f in figures)
+        self._figures[identity] = figures
+        self._trim()
+        return figures
+
+    def _trim(self):
+        while len(self._figures) > self.MAX_FIGURES or self.stats()['buffers'] > self.MAX_BUFFER_BYTES:
+            self._figures.popitem(last=False)
+            if not self._figures:
+                break
+        while self.stats()['buffers'] > self.MAX_BUFFER_BYTES and self._observations:
+            self._observations.popitem(last=False)
+
+    def stats(self):
+        arrays = {}
+        for figures in (*self._figures.values(), *((f,) for f in self._observations.values())):
+            for figure in figures:
+                for array in (figure.image, *(curve.xy for curve in figure.curves)):
+                    if array is not None:
+                        arrays[id(array)] = array.nbytes
+        return dict(self._counts, findings=len(self._findings), figures=len(self._figures),
+                    observations=len(self._observations), buffers=sum(arrays.values()))
+
+
+_TEACHING_CACHE = TeachingCache()
+
+
+def teaching_cache():
+    return _TEACHING_CACHE

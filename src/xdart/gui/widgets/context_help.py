@@ -6,6 +6,7 @@ pages can be mounted in Main without creating a second shortcut or window.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 import os
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
@@ -51,6 +52,17 @@ def _help_action(widget):
     return isinstance(widget, ActionButton) and widget.spec.action is ControlAction.HELP
 
 
+@contextmanager
+def _teaching_busy(missing):
+    if missing:
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+    try:
+        yield
+    finally:
+        if missing:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+
 class HelpWindow(ReadOnlyTextWindow):
     """Compose Int's text, keyed browser and form row; no alternative editors."""
 
@@ -64,7 +76,6 @@ class HelpWindow(ReadOnlyTextWindow):
         self.topic_id = None
         self.figure_view = None
         self._walkthrough = False
-        self._synthetic_findings = {}
         self._details = ''
         self.search_row = FormRow(label="Search help", path=("help", "search"), value="")
         self.search_row.set_purpose_tooltip("Search topic IDs, titles and text; every entered word must match.")
@@ -160,7 +171,7 @@ class HelpWindow(ReadOnlyTextWindow):
         from xdart.gui.tabs.scattering.results_table import ResultsTable
         self.figure_view = ScientificView(self)
         self.figure_view.setMinimumHeight(380)
-        self.figure_view.setToolTip('Computed synthetic figures in declared coordinates; native right-click Export is available.')
+        self.figure_view.setToolTip('Computed synthetic figures; large images use display binning with masked/gap pixels excluded where a detector mask exists. Scoring and physical geometry remain native; right-click Export is available.')
         self.figure_row = FormRow(label='Figure', path=('help', 'figure'), kind='combo', value='')
         self.figure_row.set_purpose_tooltip('Choose a computed example for this topic. No experimental file is read.')
         self.step_row = FormRow(label='Orientation check', path=('help', 'step'), kind='combo',
@@ -173,7 +184,7 @@ class HelpWindow(ReadOnlyTextWindow):
         self.candidate_row.set_purpose_tooltip('Select a camera hypothesis to compare with the fixed synthetic truth; this changes only the illustration.')
         self.feature_row = FormRow(label='Known feature direction', path=('help', 'feature'), kind='combo',
             value='Undeclared', choices=('Undeclared', 'x+', 'x-', 'z+', 'z-'))
-        self.feature_row.set_purpose_tooltip('Declare the synthetic feature’s transverse lab direction independently, then click it; this does not certify a mounting.')
+        self.feature_row.set_purpose_tooltip('Declare the synthetic feature’s transverse lab direction independently, then click it; display-binned clicks map to native pixels and clamp at partial edges. This does not certify a mounting.')
         self.score_table = ResultsTable(('Mounting', 'del', 'nu', 'AUC', 'SE'), self,
             header_tooltips={i: tip for i, tip in enumerate(('Camera hypothesis; never applied.',
                 'Candidate del sense.', 'Candidate nu sense.', 'Ring/background AUC, not probability.',
@@ -225,10 +236,10 @@ class HelpWindow(ReadOnlyTextWindow):
              'Declare an asymmetric feature’s lab direction before checking χ. Powder rings alone cannot certify azimuth.',
              'A centred or mirror/diagonal frame may not identify the mounting. Check the physical detector and obtain separating evidence.')[self.step_row.editor.currentIndex()])
         self.feature_row.setVisible(step == 2)
-        from xrd_tools.geometry_figures import synthetic_orientation_finding
-        if step not in self._synthetic_findings:
-            self._synthetic_findings[step] = synthetic_orientation_finding(step)
-        finding = self._synthetic_findings[step]
+        from xrd_tools.geometry_figures import teaching_cache
+        cache = teaching_cache()
+        with _teaching_busy(not cache.has_finding(step)):
+            finding = cache.get_finding(step)
         with QtCore.QSignalBlocker(self.figure_row.editor):
             self.figure_row.editor.setCurrentIndex(topic.figures.index(key))
         self._draw_figure_key(key, finding.reason)
@@ -248,8 +259,10 @@ class HelpWindow(ReadOnlyTextWindow):
         if column is None or direction == 'Undeclared':
             self.pane.appendPlainText('Declare the known feature’s lab direction, then click it in the image.')
             return
+        mapping = self.figure_view.keyed_projection.panels[0].figure.display_binning
+        pixel = mapping.display_to_native((column, row)) if mapping else (column, row)
         result = feature_azimuth(GeometryInputs(), camera_candidates()[self.candidate_row.editor.currentIndex()].camera,
-                                 (column, row), expected_lab=direction)
+                                 pixel, expected_lab=direction)
         self.pane.appendPlainText(result.reason)
 
     def _draw_figure(self, *_):
@@ -264,10 +277,13 @@ class HelpWindow(ReadOnlyTextWindow):
             self._draw_figure_key(topic.figures[index])
 
     def _draw_figure_key(self, key, finding_reason=''):
-        from xrd_tools.geometry_figures import help_figures
+        from xrd_tools.geometry_figures import teaching_cache
         from xrd_tools.session.display_logic import PanelKey, PanelRole
         from xdart.gui.tabs.scattering.shell_values import KeyedFigureProjection, KeyedPanelsProjection
-        figures = help_figures(key, max(0, self.candidate_row.editor.currentIndex()))
+        cache = teaching_cache()
+        index = max(0, self.candidate_row.editor.currentIndex())
+        with _teaching_busy(not cache.has_figures(key, index)):
+            figures = cache.get_figures(key, index)
         if finding_reason:
             from dataclasses import replace
             figures = tuple(replace(f, caption=f.caption+' Synthetic result: '+finding_reason) for f in figures)

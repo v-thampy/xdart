@@ -46,9 +46,9 @@ class OrientationPanel(SectionCard):
         self.candidate_row.set_purpose_tooltip('Inspect a camera and motor-sense hypothesis; this never applies it.')
         self.feature_row = FormRow(label='Known feature direction', path=('orientation', 'feature'),
             value='Undeclared', kind='combo', choices=('Undeclared', 'x+', 'x-', 'z+', 'z-'))
-        self.feature_row.set_purpose_tooltip('Declare an independently known transverse lab direction, then click that feature in the image; powder rings do not establish this direction.')
+        self.feature_row.set_purpose_tooltip('Declare an independently known transverse lab direction, then click that feature in the image; binned clicks map to native pixels and clamp at partial edges. Powder rings do not establish this direction.')
         self.figure_view = ScientificView(self)
-        self.figure_view.setToolTip('Observed frame and predicted geometry in stored-pixel coordinates; right-click for Export.')
+        self.figure_view.setToolTip('Observed frame and rings use display binning for large detectors; masked/gap pixels are excluded where a detector mask exists and blank blocks are unknown. Geometry and scoring remain native; right-click for Export.')
         tips = {0: 'Camera hypothesis, looking downstream; not an applied setting.',
                 1: 'Candidate del motor sense.', 2: 'Candidate nu motor sense.',
                 3: 'Unitless ring-versus-background AUC; not a probability.',
