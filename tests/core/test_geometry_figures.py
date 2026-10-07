@@ -90,7 +90,7 @@ def test_first_pixel_corners_match_pyfai_orientation():
 
 
 @pytest.mark.parametrize('tilt,pose', [((0., 0.), (0., 0.)),
-                       ((3., -2.), (0., 0.)), ((1., 2.), (30., 12.))])
+                       ((3., -2.), (0., 0.)), ((1., 2.), (40., 12.))])
 def test_ring_curves_match_pyfai_contours_and_predicted_ring_metadata(tilt, pose):
     from scipy.ndimage import map_coordinates
     from contourpy import contour_generator
@@ -120,7 +120,7 @@ def test_ring_curves_match_pyfai_contours_and_predicted_ring_metadata(tilt, pose
             assert cKDTree(cloud).query(oriented)[0].max() <= .5
             assert np.isfinite(map_coordinates(tth, oriented[:, ::-1].T, order=1)).all()
         assert prediction.beam_xy is not None
-        if pose == (30., 12.):
+        if pose == (40., 12.):
             assert prediction.beam_off_detector and prediction.arrows
 
 
@@ -234,6 +234,7 @@ def test_known_feature_reports_explicit_backend_chi_or_refuses():
 
 def test_instrument_figures_match_presets_zeros_and_reversed_circle_stacks():
     from xrd_tools.session.instrument import InstrumentGeometry
+    from xrayutilities.math import getVector, ArbRotation
     gf = api()
     for geometry, preset in (('psic', Diffractometer.psic()), ('fourc', Diffractometer.fourc()),
                              ('twoc', Diffractometer.two_circle())):
@@ -244,10 +245,25 @@ def test_instrument_figures_match_presets_zeros_and_reversed_circle_stacks():
         assert len(figure.panels) == 3 and all(p.caption and p.arrows for p in figure.panels)
         reversed_value = replace(value, zeros=((value.circles[0], 3.),), reversed_circles=(value.circles[0],))
         readings = {m: 8. for _, m in value.motors}
+        forward = gf.instrument_figure(value, readings)
         reverse = gf.instrument_figure(reversed_value, readings)
         assert reverse.circles[0].angle_deg == 5.
         assert reverse.circles[0].axis != figure.circles[0].axis
-        assert not np.allclose(reverse.circles[-1].lab_axis, figure.circles[-1].lab_axis)
+        axes = dict(reversed_value.circle_axes())
+        for role in ('sample', 'detector'):
+            prefix = np.eye(3)
+            for circle, drawn, original in zip(value.circles, reverse.circles, forward.circles):
+                if value.role(circle) != role:
+                    continue
+                axis = getVector(axes[circle])
+                angle = readings[value.motor(circle)] - (reversed_value.zero(circle) or 0.)
+                assert drawn.angle_deg == angle
+                np.testing.assert_allclose(drawn.lab_axis, prefix @ axis, atol=1e-12, rtol=0)
+                prefix = prefix @ ArbRotation(axis, angle).matrix
+                if role == 'detector':
+                    np.testing.assert_allclose(drawn.lab_axis, original.lab_axis, atol=1e-12, rtol=0)
+        if geometry != 'twoc':
+            assert not np.allclose(reverse.circles[1].lab_axis, forward.circles[1].lab_axis)
     assert gf.instrument_figure(InstrumentGeometry('psic'), {}).reason.startswith('Missing motor readback:')
     assert gf.instrument_figure(Diffractometer.psic_halpha(), {}).reason.startswith('Unsupported schematic geometry:')
 
