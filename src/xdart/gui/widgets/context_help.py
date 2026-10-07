@@ -5,6 +5,9 @@ pages can be mounted in Main without creating a second shortcut or window.
 """
 from __future__ import annotations
 
+import logging
+import os
+
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xrd_tools.help_topics import TOPICS, get_topic, search_topics
@@ -40,6 +43,12 @@ def preserve_focused_draft(root):
             widget.preserve_help_draft()
             break
         widget = widget.parentWidget()
+
+
+def _help_action(widget):
+    from .controls_panel import ActionButton
+    from xrd_tools.session.readiness import ControlAction
+    return isinstance(widget, ActionButton) and widget.spec.action is ControlAction.HELP
 
 
 class HelpWindow(ReadOnlyTextWindow):
@@ -235,13 +244,25 @@ class ContextHelpOwner(QtCore.QObject):
         self.window = None
         self.shortcut = None
         self._held_row = None
+        self._focus_generation = 0
+        self._resume_generation = 0
+        self._resume_timer = QtCore.QTimer(self)
+        self._resume_timer.setSingleShot(True)
+        self._resume_timer.timeout.connect(self._resume_queued)
         root.installEventFilter(self)
+        QtWidgets.QApplication.instance().focusChanged.connect(self._focus_changed)
         self._bind_shortcut()
 
     def _bind_shortcut(self):
         if self.shortcut is None:
             self.shortcut = QtGui.QShortcut(QtGui.QKeySequence("F1"), self.root)
             self.shortcut.activated.connect(self.show_focused)
+
+    def _trace_focus(self, event, **details):
+        if os.environ.get('XDART_DEBUG_HELP_FOCUS'):
+            logging.getLogger(__name__).warning('help_owner %s', dict(event=event,
+                generation=self._focus_generation, held=self._held_row,
+                focus=QtWidgets.QApplication.focusWidget(), root_focus=self.root.focusWidget(), **details))
 
     def eventFilter(self, watched, event):
         if watched is self.root:
@@ -251,17 +272,55 @@ class ContextHelpOwner(QtCore.QObject):
                 self._bind_shortcut()
             elif event.type() == QtCore.QEvent.Type.WindowActivate:
                 # Run after Qt restores the root's former focus widget.
-                QtCore.QTimer.singleShot(0, self, self._resume_draft)
+                self._queue_resume()
         elif watched is self.window and event.type() == QtCore.QEvent.Type.Hide:
             self.root.activateWindow()
-            QtCore.QTimer.singleShot(0, self, self._resume_draft)
+            self._queue_resume()
         return False
+
+    def _queue_resume(self):
+        self._resume_generation = self._focus_generation
+        self._trace_focus('queue_resume')
+        self._resume_timer.start(0)
+
+    def _resume_queued(self):
+        generation = self._resume_generation
+        self._trace_focus('queued_callback', requested_generation=generation)
+        if generation == self._focus_generation:
+            self._resume_draft()
+
+    def _focus_changed(self, _previous, current):
+        self._trace_focus('focus_changed', previous=_previous, current=current)
+        row = self._held_row
+        if row is None or current is None or current.window() is not self.root:
+            return
+        # Qt has now restored root focus. Resolve this transition immediately;
+        # a zero timer can arrive after a synchronous root action captures its
+        # form. A help-button click *within* the root still preserves the draft.
+        if _previous is not None and _previous.window() is self.window:
+            self._resume_draft()
+            return
+        if current is row.editor or _help_action(current):
+            return
+        self.release_draft()
+
+    def release_draft(self):
+        """Resolve the held row once before a deliberate root focus action."""
+        row = self._held_row
+        self._trace_focus('release_draft')
+        if row is None:
+            return
+        self._focus_generation += 1
+        self._held_row = None
+        row.destroyed.disconnect(self._forget_draft)
+        row.resolve_help_draft()
 
     def hold_draft(self, row):
         """One row reference for this visit; FormRow remains the sole value owner."""
         if self._held_row is row:
             return
         self._resume_draft(restore=False)
+        self._focus_generation += 1
         self._held_row = row
         row.destroyed.connect(self._forget_draft)
 
@@ -271,8 +330,15 @@ class ContextHelpOwner(QtCore.QObject):
 
     def _resume_draft(self, *, restore=True):
         row = self._held_row
+        self._trace_focus('resume_draft', restore=restore)
         if row is None:
             return
+        current = QtWidgets.QApplication.focusWidget()
+        if (restore and current is not None and current.window() is self.root
+                and current is not row.editor and not _help_action(current)):
+            self.release_draft()
+            return
+        self._focus_generation += 1
         self._held_row = None
         row.destroyed.disconnect(self._forget_draft)
         held = row._help_focus_transfer
@@ -313,6 +379,7 @@ class ContextHelpOwner(QtCore.QObject):
 
     def shutdown(self):
         """Release callbacks/windows on actual retirement; ignored busy Close keeps both."""
+        self._resume_timer.stop()
         self._resume_draft(restore=False)
         if self.shortcut is not None:
             self.shortcut.setEnabled(False)

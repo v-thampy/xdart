@@ -838,6 +838,25 @@ class FormRow(QtWidgets.QWidget):
         self._help_focus_transfer = True
         owner_for(self).hold_draft(self)
 
+    def resolve_help_draft(self) -> bool:
+        """Release a help hold through this row's normal commit or visible refusal.
+
+        The caller selects a different focus destination. A repeated release
+        has no effect; an invalid integer keeps its text and refusal cue.
+        """
+        held = self._help_focus_transfer
+        self._help_focus_transfer = False
+        if not held or not self._editor_dirty:
+            return True
+        if self.refusal():
+            self._show_validity()
+            return False
+        self.editor.editingFinished.emit()
+        self._editor_dirty = False
+        self.editor.setModified(False)
+        self._collapse_path_editor()
+        return True
+
     def _refresh_tooltip(self, refusal: str = "") -> None:
         tip = (f"{self.label.text()}: {refusal}" if refusal else
                self._reason or (self._model_value if self._browse and self._model_value else
