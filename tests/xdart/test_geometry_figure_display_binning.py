@@ -82,7 +82,10 @@ def test_help_teaching_input_cache_ties_and_source_free_second_view(qapp, monkey
         beam = displayed.display_binning.display_to_native(displayed.beam_xy)
         native_prediction = gf.predict_ring_curves(physical, gf.camera_candidates()[0].camera)
         np.testing.assert_allclose(beam, native_prediction.beam_xy, atol=1e-12)
-        assert seed.integrator.wavelength == physical.wavelength_m
+        from pyFAI import units
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        recorded_energy = wavelength_m_to_energy_eV(physical.wavelength_m)
+        assert seed.integrator.wavelength == units.hc / (recorded_energy / 1000.) * 1e-10
         # R2: help's real signal uses the mapping before the native feature owner.
         window.step_row.editor.setCurrentIndex(2)
         window.feature_row.editor.setCurrentText('x+')

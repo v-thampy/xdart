@@ -115,8 +115,8 @@ def test_preview_caps_native_scores_scaled_rings_and_feature_click(qapp, tmp_pat
             raw = [200., 300.]; raw[1-axis] = edge_mapping.display_shape[axis]-1
             point = edge_mapping.display_to_native(raw)
             assert point[1-axis] == 4149
-            edge_value = replace(value, shape=edge_shape)
-            result = gf.feature_azimuth(edge_value, stitch_camera(transform), point, expected_lab='x+')
+            native_point = transform.unapply_pixel(point, shape)
+            result = gf.feature_azimuth(value, stitch_camera(transform), native_point, expected_lab='x+')
             assert np.isfinite((result.pyfai_chi_deg, result.xrayutilities_chi_deg)).all()
     else:
         from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
