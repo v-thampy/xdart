@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import PurePath
+import logging
+import os
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -100,6 +102,7 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
 
 # Descriptive hover tooltips for the producer/inspector action buttons.
 _ACTION_TOOLTIPS: dict[ControlAction, str] = {
+    ControlAction.HELP: "Open offline scientific help for this control; no settings or data change.",
     ControlAction.CALIBRATE: "Run pyFAI calibration to produce a PONI (detector geometry) file.",
     ControlAction.MAKE_MASK: "Build a detector mask from a chosen TIFF image.",
     ControlAction.ADVANCED_PROCESSING: "Open the advanced integration settings (full parameter tree).",
@@ -137,12 +140,29 @@ class ActionButton(QtWidgets.QPushButton):
         super().__init__(spec.label, parent)
         self.setObjectName("controlsActionButton")
         self._spec = spec
+        self._purpose_tooltip = ""
         self.clicked.connect(lambda: self.actionRequested.emit(self._spec.action))
         self.apply_spec(spec)
 
     @property
     def spec(self) -> ControlActionSpec:
         return self._spec
+
+    def set_purpose_tooltip(self, text: str) -> None:
+        """Describe an action separately from its temporary refusal reason."""
+        self._purpose_tooltip = str(text)
+        self.apply_spec(self._spec)
+
+    @classmethod
+    def for_help(cls, context, topic_id: str):
+        """A presentation action: its current top-level owner opens this context directly."""
+        from .context_help import bind_topic, owner_for
+        bind_topic(context, topic_id)
+        button = cls(ControlActionSpec(ControlAction.HELP, "?", SectionId.EXPERIMENT))
+        button.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        button.set_purpose_tooltip(f"Open offline help: {topic_id}. F1 opens help for the focused control.")
+        button.clicked.connect(lambda: owner_for(context).show_context(context))
+        return button
 
     def apply_spec(self, spec: ControlActionSpec) -> None:
         label = (
@@ -151,7 +171,7 @@ class ActionButton(QtWidgets.QPushButton):
             else _ACTION_LABELS.get(spec.action, spec.label)
         )
         enabled = bool(spec.enabled)
-        tooltip = spec.reason or _ACTION_TOOLTIPS.get(spec.action, "")
+        tooltip = spec.reason or self._purpose_tooltip or _ACTION_TOOLTIPS.get(spec.action, "")
         production_ready = bool(spec.production_ready)
         # Role drives a subtle tint: Reintegrate = green (run-like), Advanced =
         # red (the destructive/expert escape hatch); producers stay neutral.
@@ -188,6 +208,15 @@ class ActionButton(QtWidgets.QPushButton):
         if style_changed:
             self.style().unpolish(self)
             self.style().polish(self)
+
+
+def _card_help(card, topic_id: str) -> None:
+    from .context_help import bind_topic
+    bind_topic(card, topic_id)
+    if not hasattr(card, "help_button"):
+        card.help_button = ActionButton.for_help(card, topic_id)
+        card._header_layout.addWidget(card.help_button)
+    card.help_button.set_purpose_tooltip(f"Open offline help: {topic_id}; available while editors are locked.")
 
 
 class SectionCard(QtWidgets.QFrame):
@@ -277,6 +306,10 @@ class SectionCard(QtWidgets.QFrame):
             header_lay.setStretchFactor(self.status, 1)
             self.status.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self._apply_spacing(current_spacing_tokens())
+
+    def set_help_topic(self, topic_id: str) -> None:
+        """Keep contextual help in the header, outside editor/body locks."""
+        _card_help(self, topic_id)
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -411,6 +444,10 @@ class SectionCard(QtWidgets.QFrame):
 
 class SubsectionCard(QtWidgets.QFrame):
     """Compact collapsible subsection inside a workflow section."""
+
+    def set_help_topic(self, topic_id: str) -> None:
+        """Use the same header help action as the outer section."""
+        _card_help(self, topic_id)
 
     def __init__(
         self,
@@ -681,6 +718,7 @@ class FormRow(QtWidgets.QWidget):
         )
         self._model_value = "" if value is None else str(value)
         self._editor_dirty = False
+        self._help_focus_transfer = False
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
@@ -754,9 +792,9 @@ class FormRow(QtWidgets.QWidget):
             lay.addWidget(editor, 1)
 
         self.editor = editor
+        self.editor.installEventFilter(self)
         self.editor.setEnabled(self._enabled)
         if self._file_name_only:
-            self.editor.installEventFilter(self)
             # connected first, so a host's own ``textChanged`` slot reads the adopted value
             self.editor.textChanged.connect(self._adopt_set_text)
         # Path/browse fields should show the root of long paths by default; the
@@ -785,6 +823,20 @@ class FormRow(QtWidgets.QWidget):
             self._show_validity()
         else:
             self._refresh_tooltip()
+
+    def set_help_topic(self, topic_id: str, *, button: bool = False) -> None:
+        """Bind F1 without changing purpose/refusal/path tips; opt in to a trailing action."""
+        from .context_help import bind_topic
+        bind_topic(self, topic_id)
+        if button and not hasattr(self, "help_button"):
+            self.help_button = ActionButton.for_help(self, topic_id)
+            self.add_trailing_widget(self.help_button)
+
+    def preserve_help_draft(self) -> None:
+        """Keep this draft across a read-only help visit; returning restores normal commits."""
+        from .context_help import owner_for
+        self._help_focus_transfer = True
+        owner_for(self).hold_draft(self)
 
     def _refresh_tooltip(self, refusal: str = "") -> None:
         tip = (f"{self.label.text()}: {refusal}" if refusal else
@@ -881,7 +933,12 @@ class FormRow(QtWidgets.QWidget):
                     if idx >= 0:
                         self.editor.setCurrentIndex(idx)
             else:
-                focused = self.editor.hasFocus()
+                # A changed model value is authoritative, including a load
+                # during help. An unchanged projection preserves typed text.
+                replaced = value != self._model_value
+                if replaced:
+                    self._help_focus_transfer = False
+                focused = (self.editor.hasFocus() or self._help_focus_transfer) and not replaced
                 if not focused:
                     shown = self._line_display_value(value)
                     if self.editor.text() != shown:
@@ -915,6 +972,16 @@ class FormRow(QtWidgets.QWidget):
         return text
 
     def eventFilter(self, watched, event) -> bool:
+        if (watched is self.editor and os.environ.get("XDART_DEBUG_HELP_FOCUS")
+                and event.type() in (QtCore.QEvent.Type.FocusIn, QtCore.QEvent.Type.FocusOut)):
+            logging.getLogger(__name__).warning("help_focus event=%s reason=%s path=%s hold=%s destination=%s",
+                event.type(), event.reason(), self._path, self._help_focus_transfer, QtWidgets.QApplication.focusWidget())
+        if watched is self.editor and event.type() == QtCore.QEvent.Type.FocusOut:
+            destination = QtWidgets.QApplication.focusWidget()
+            if isinstance(destination, ActionButton) and destination.spec.action is ControlAction.HELP:
+                self.preserve_help_draft()  # before QLineEdit's focus-out handler can commit
+        if watched is self.editor and event.type() == QtCore.QEvent.Type.FocusIn:
+            self._help_focus_transfer = False
         if watched is self.editor and self._file_name_only:
             event_type = event.type()
             if event_type == QtCore.QEvent.Type.FocusIn:
@@ -951,7 +1018,7 @@ class FormRow(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, self, self._collapse_path_editor)
 
     def _collapse_path_editor(self) -> None:
-        if not self._file_name_only or self.editor.hasFocus():
+        if not self._file_name_only or self.editor.hasFocus() or self._help_focus_transfer:
             return
         blocked = self.editor.blockSignals(True)
         try:
@@ -965,6 +1032,8 @@ class FormRow(QtWidgets.QWidget):
         self.draftChanged.emit(self._path, text)
 
     def _emit_editor_edit(self) -> None:
+        if self._help_focus_transfer:
+            return
         value = self.current_value()
         if self._file_name_only:
             # A focused Return commit can precede any owner reconciliation,
@@ -1476,6 +1545,8 @@ class ControlsPanel(QtWidgets.QWidget):
         self.source_card = self._make_section(SectionId.SOURCE)
         self.experiment_card = self._make_section(SectionId.EXPERIMENT)
         self.processing_card = self._make_section(SectionId.PROCESSING)
+        self.experiment_card.set_help_topic("geometry.orientation")
+        self.processing_card.set_help_topic("corrections.existing")
         lay.addWidget(self.project_card)
         lay.addWidget(self.experiment_card)
         lay.addWidget(self.source_card)
@@ -1636,6 +1707,8 @@ class ControlsPanel(QtWidgets.QWidget):
             tuple[SectionId, ControlAction], ActionButton
         ] = {}
         for button in self.findChildren(ActionButton):
+            if button.spec.action is ControlAction.HELP:
+                continue  # header presentation actions never belong to the Controls projection
             key = (button.spec.section, button.spec.action)
             if key in mounted_actions:
                 return False

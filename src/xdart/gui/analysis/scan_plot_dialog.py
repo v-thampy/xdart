@@ -18,7 +18,9 @@ from xrd_tools.analysis.scan_operations import (
     scan_table_columns, write_scan_table_csv,
 )
 
-from xdart.gui.widgets.controls_panel import FormRow
+from xdart.gui.widgets.controls_panel import FormRow, ActionButton
+from xdart.gui.widgets.context_help import bind_topic, owner_for
+from xrd_tools.help_topics import diagnostic_text
 from xdart.gui.widgets.file_dialogs import browse
 from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
 from xdart.gui.tabs.scattering.trend_view import PlotSeries, SeriesProjection, TrendView
@@ -81,6 +83,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._analysis_busy_kind = None
         self._vnext_roi_result = self._vnext_scan_result = self._vnext_scan_request = None
         self._vnext_preview_result = None
+        self._help_roi_diagnostic = self._help_current_diagnostic = None
         self._table = {}
         self._columns = []
         self._positioner_names = []         # scanned-motor names (X-default hint)
@@ -108,6 +111,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.setWindowTitle("Scan Plot")
         self.resize(640, 620)
         self._build_ui()
+        bind_topic(self, "analysis.plot-roi", details=self._help_context)
+        self._help_owner = owner_for(self)
         self._roi_redraw_timer = QtCore.QTimer(self)
         self._roi_redraw_timer.setSingleShot(True)
         self._roi_redraw_timer.setInterval(50)
@@ -142,6 +147,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.norm_row.label.setMinimumWidth(0)
         axes_row.addWidget(self.norm_row)
         axes_row.addStretch(1)
+        self.help_button = ActionButton.for_help(self, "analysis.plot-roi")
+        axes_row.addWidget(self.help_button)
         self.roi_btn = QtWidgets.QPushButton("Plot ROI…")
         self.roi_btn.setObjectName("scanPlotRoiBtn")
         self.roi_btn.setEnabled(False)
@@ -712,6 +719,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
 
     def closeEvent(self, event):
         self._closing = True
+        self._help_roi_diagnostic = self._help_current_diagnostic = None
+        self._help_owner.shutdown()
         if self._roi_worker is not None:
             self._roi_worker.stop()
         if hasattr(self, "_roi_redraw_timer"):
@@ -734,6 +743,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
     def _retire_vnext_result(self):
+        self._help_roi_diagnostic = self._help_current_diagnostic = None
+        self._sync_help_cue()
         self._roi_preview_label = None
         self._roi_preview_waiting = False
         if self._roi_dialog is not None: self._roi_dialog.clear_source()
@@ -803,10 +814,14 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._update_roi_caption()
         finally:
             self._vnext_rendering = False
+        if result.code != "OK":
+            self.set_help_diagnostic(result.code, result.diagnostics)
 
     def set_vnext_roi_result(self, result):
         first = self._vnext_roi_result is None
         self._vnext_roi_result = result
+        self._help_roi_diagnostic = (result.code, tuple(result.diagnostics))
+        self._help_current_diagnostic = None
         self._roi_stale = False
         names = tuple(dict.fromkeys((*self._columns, *result.signal_names)))
         right = self.r_browser.checked_results()
@@ -817,6 +832,29 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.status.setText(result.code)
         self._update_roi_caption()
         self._redraw()
+        self._sync_help_cue()
+
+    def set_help_diagnostic(self, code, details=()):
+        """Copy only terminal strings for additive help; leave status/results untouched."""
+        self._help_current_diagnostic = (str(code), tuple(details)) if code and (code != "OK" or details) else None
+        self._sync_help_cue()
+
+    def _help_context(self):
+        parts = []
+        if self._help_roi_diagnostic is not None:
+            relation = "Retained ROI result (stale definitions; Compute to update)" if self._roi_stale else "Retained ROI result"
+            parts.append(relation + "\n" + diagnostic_text(*self._help_roi_diagnostic))
+        if self._help_current_diagnostic is not None:
+            parts.append("Current operation / preview\n" + diagnostic_text(*self._help_current_diagnostic))
+        return "\n\n".join(parts)
+
+    def _sync_help_cue(self):
+        retained = self._help_roi_diagnostic
+        warning = self._help_current_diagnostic is not None or (retained is not None and
+                  (retained[0] != "OK" or bool(retained[1])))
+        self.help_button.apply_spec(replace(self.help_button.spec, label="? !" if warning else "?"))
+        self.help_button.set_purpose_tooltip("Open Plot ROI help and retained diagnostics; ! marks a result warning or current refusal." +
+                                            ("\n" + self._help_context() if warning else ""))
 
     def mount_roi_view(self, payload):
         if self._roi_dialog is None:
@@ -843,6 +881,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         if self._vnext_roi_result is not None:
             self._roi_stale = True
             self._update_roi_caption()
+            self._sync_help_cue()
         if self._analysis_busy_kind == "roi_scan": self._vnext_submit("roi_cancel", None)
 
     def _current_roi_index(self):

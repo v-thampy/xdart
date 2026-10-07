@@ -80,6 +80,8 @@ class RoiSelectionView(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
+        self.help_button = ActionButton.for_help(self, "analysis.plot-roi")
+        lay.addWidget(self.help_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
 
         self.scientific = ScientificView(self, detector_picker=True)
         self.scientific.setMinimumHeight(300)

@@ -60,6 +60,7 @@ class AdvancedDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setObjectName(object_name)
         self.setWindowTitle(title)
+        self._accept_buttons = accept_buttons
         layout = QtWidgets.QVBoxLayout(self)
         self._sections = QtWidgets.QVBoxLayout()
         layout.addLayout(self._sections)
@@ -80,6 +81,10 @@ class AdvancedDialog(QtWidgets.QDialog):
         for row in rows:
             card.add_row(row)
         self._sections.addWidget(card)
+        if title == "Corrections" and not self._accept_buttons:
+            from xdart.gui.widgets.context_help import owner_for
+            card.set_help_topic("corrections.existing")
+            self._help_owner = owner_for(self)
         return card
 
     def add_section(self, item: QtWidgets.QWidget | QtWidgets.QLayout) -> None:
@@ -88,6 +93,14 @@ class AdvancedDialog(QtWidgets.QDialog):
             self._sections.addLayout(item)
         else:
             self._sections.addWidget(item)
+
+    def set_editors_enabled(self, enabled: bool) -> None:
+        """Lock nonmodal group bodies while leaving contextual header help available."""
+        for index in range(self._sections.count()):
+            card = self._sections.itemAt(index).widget()
+            if isinstance(card, SubsectionCard):
+                card.body.setEnabled(enabled)
+        self.buttons.setEnabled(enabled)
 
 
 class AdvancedSettingsDialog(AdvancedDialog):
