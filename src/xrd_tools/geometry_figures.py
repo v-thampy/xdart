@@ -550,6 +550,11 @@ def _measure_candidate(frame, camera, senses, geometric, invalid):
     value, image = frame.geometry, frame.image
     _, seed, shape = _geometry(value, camera, senses, include_rings=False)
     ai = seed.integrator
+    if not ai.detector.IS_FLAT or not ai.detector.uniform_pixel or ai.detector.spline is not None:
+        raise ValueError('Orientation scoring requires a uniform, flat, undistorted detector.')
+    detector_mask = ai.detector.mask
+    if detector_mask is not None and detector_mask.shape != shape:
+        raise ValueError('detector geometric mask shape does not match the predicted frame')
     points = _cone_plane(ai)
     origin, matrix = _raw_affine(camera, value.shape)
     # A small fixed raw grid fingerprints predicted angle equality, including
@@ -574,7 +579,8 @@ def _measure_candidate(frame, camera, senses, geometric, invalid):
             bands = []
             valid = np.ones(len(chi), dtype=bool)
             for offset in offsets:
-                band = points(theta+offset*size, chi) @ matrix.T+origin
+                oriented_band = points(theta+offset*size, chi)
+                band = oriented_band @ matrix.T+origin
                 coordinates = band[:, ::-1].T
                 valid &= np.isfinite(band).all(axis=1)
                 valid &= (band[:, 0] >= 0) & (band[:, 1] >= 0)
@@ -583,6 +589,9 @@ def _measure_candidate(frame, camera, senses, geometric, invalid):
                                          mode='constant', cval=1., prefilter=False) == 0
                 valid &= map_coordinates(invalid, coordinates, order=1, output=float,
                                          mode='constant', cval=1., prefilter=False) == 0
+                if detector_mask is not None:
+                    valid &= map_coordinates(detector_mask, oriented_band[:, ::-1].T,
+                        order=1, output=float, mode='constant', cval=1., prefilter=False) == 0
                 bands.append(map_coordinates(image, coordinates, order=1, output=float,
                                              mode='constant', cval=np.nan, prefilter=False))
             bands = np.array(bands)
@@ -666,9 +675,6 @@ def score_orientation(image, geometry, *, mask=None, saturation=None):
 
 def diagnose_orientation(frames, *, cancelled=None):
     """Full eight-camera/four-sense comparison, with no retained source or AI."""
-    frames = tuple(frames)
-    if not frames:
-        return _finding((), Exclusions(), 32)
     measurements = {}
     geometric_count = value_count = 0
     for frame in frames:
@@ -687,6 +693,7 @@ def diagnose_orientation(frames, *, cancelled=None):
                     reuse[effective] = _measure_candidate(frame, c.camera, senses, geometric, invalid)
                 measured = replace(reuse[effective], senses=senses)
                 measurements.setdefault((c.camera, senses), []).append(measured)
+        del frame, geometric, invalid, reuse, measured
     combined = []
     for (camera, senses), poses in measurements.items():
         rings = tuple(r for p in poses for r in p.ring_scores)
