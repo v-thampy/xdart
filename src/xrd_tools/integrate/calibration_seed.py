@@ -325,6 +325,60 @@ def _direct_beam_hit(record, *, del_motor, nu_motor, readings):
     return (float(rows), float(columns)), float(z[0] + (z[1] - z[0]) * rows + (z[2] - z[0]) * columns)
 
 
+@dataclass(frozen=True)
+class DirectBeamMotionMismatch:
+    """A geometry that does not move the direct beam the way its scan did (``direct_beam_motion_mismatch``): at the
+    scan's lowest and highest used angles of ``motor``, the measured beam centre along the scan's motion
+    (``axis``, in the fit's image) and the geometry's own direct beam along it and across it."""
+
+    quarter_turn: bool  # the geometry moves the beam across the measured motion, not along it
+    motor: str
+    angles_deg: tuple[float, float]
+    axis: str  # 'rows' or 'columns'
+    measured_px: tuple[float, float]
+    model_px: tuple[float, float]
+    model_across_px: tuple[float, float]
+
+    def __str__(self):
+        (low, high), (start, end) = self.angles_deg, self.measured_px
+        moved = f'{self.motor} {low:g} → {high:g}° moved it along the {self.axis} from {start:.0f} to {end:.0f} px'
+        if self.quarter_turn:
+            across = 'columns' if self.axis == 'rows' else 'rows'
+            return (f'The direct beam moved across this geometry: {moved}; the geometry moves it along the {across}, '
+                    f'from {self.model_across_px[0]:.0f} to {self.model_across_px[1]:.0f} px.')
+        return (f'The direct beam moved the opposite way to this geometry: {moved}; the geometry puts it at '
+                f'{self.model_px[0]:.0f} → {self.model_px[1]:.0f} px.')
+
+
+def direct_beam_motion_mismatch(record, result, *, motor, del_motor='del', nu_motor='nu', held=None):
+    """None when ``record`` (a goniometer calibration in the fit's image) moves the direct beam the way ``result``
+    (a ``DirectBeamResult``) measured it, else how it does not (``DirectBeamMotionMismatch``).
+
+    The fit keeps |slope| (``calibrate_direct_beam``), so a detector mounted the other way round fits its scan as
+    well as the right mounting, and a geometry built from it moves the beam backwards (maintainer, 2026-10-06: the
+    RSM Pilatus 100K fitted RSM/direct_beam scan 1 equally at 90° and 270°). The record's own direct beam
+    (``_direct_beam_hit``) is placed at the lowest and highest used angles, ``motor`` there and the other circle
+    as ``held`` read it. Less than 2 px of measured or predicted motion cannot tell, and is None."""
+    used = np.flatnonzero(np.asarray(result.used, dtype=bool))
+    if result.motion not in ('horizontal', 'vertical') or used.size < 2:
+        return None
+    angles = np.asarray(result.angles_deg, dtype=float)
+    low, high = int(used[np.argmin(angles[used])]), int(used[np.argmax(angles[used])])
+    along = 0 if result.motion == 'vertical' else 1  # a hit is (row, column)
+    hits = [_direct_beam_hit(record, del_motor=del_motor, nu_motor=nu_motor,
+                             readings={**dict(held or {}), motor: float(angles[index])})[0] for index in (low, high)]
+    measured = tuple(float(result.centres_px[index]) for index in (low, high))
+    model, across = (tuple(hit[axis] for hit in hits) for axis in (along, 1 - along))
+    moved, predicted, sideways = (end - start for start, end in (measured, model, across))
+    if abs(moved) < 2 or max(abs(predicted), abs(sideways)) < 2:
+        return None
+    quarter_turn = abs(sideways) > abs(predicted)
+    if not quarter_turn and predicted * moved > 0:
+        return None
+    return DirectBeamMotionMismatch(quarter_turn, str(motor), (float(angles[low]), float(angles[high])),
+                                    'rows' if along == 0 else 'columns', measured, model, across)
+
+
 def write_seed_poni(seed: FrameSeed, path, *, calibrant='LaB6') -> Path:
     """The predicted geometry as a PONI pyFAI-calib2 opens with (``--poni``)."""
     from pyFAI.io.ponifile import PoniFile
@@ -349,5 +403,5 @@ def ring_summary(rings) -> str:
     return ', '.join(parts)
 
 
-__all__ = ['ExpectedRing', 'FrameSeed', 'expected_rings', 'predict_frame_seed', 'ring_summary',
-           'rough_arm_record', 'write_seed_poni']
+__all__ = ['DirectBeamMotionMismatch', 'ExpectedRing', 'FrameSeed', 'direct_beam_motion_mismatch', 'expected_rings',
+           'predict_frame_seed', 'ring_summary', 'rough_arm_record', 'write_seed_poni']

@@ -114,6 +114,66 @@ def test_nexus_motion_comes_from_the_oriented_endpoints_and_ignores_old_settings
         dialog.close()
 
 
+@pytest.mark.parametrize('rotation,warning', [
+    (270, None),
+    (90, 'The direct beam moved the opposite way to this geometry: del -1 → 1° moved it along the rows from '),
+    (0, 'The direct beam moved across this geometry: del -1 → 1° moved it along the columns from '),
+])
+def test_a_fit_whose_beam_runs_against_the_arm_says_how_the_detector_is_mounted(qapp, tmp_path, rotation, warning):
+    """The container's beam moves to smaller stored columns as del rises. Image turn 270 (camera z+, x+: columns
+    up, the mounting rotation 90° CW) moves it with the arm; turn 90 (z−, x−, 270° CW) fits it as well, but its
+    geometry moves the beam the other way; turn 0 (x+, z−) moves it across the columns del moves it along. The
+    fit used to keep |slope| and say nothing (maintainer, 2026-10-06: "why 90 degrees doesn't work"); now the
+    fit's status, its window and the distance rows say so, with the mounting to try."""
+    nexus, _, _ = _beam_container(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog.camera.set_value(stitch_camera(ImageOrientation(rotation=rotation)))
+        dialog._set_field_text('beam_source', nexus)
+        detect(dialog)
+        dialog.beam_button.click()
+        settle(dialog)
+        assert dialog._distance_result is not None, dialog.status.text()
+        assert dialog._distance_result.distance_m == pytest.approx(.5, rel=1e-3)
+        shown = (dialog.status.text(), dialog._direct_beam_fit_window.summary.text(),
+                 dialog.beam_summary.toPlainText().splitlines()[0])
+        if warning is None:
+            assert not any('direct beam moved' in text for text in shown), shown
+        else:
+            assert all(warning in text for text in shown), shown
+        if rotation == 90:
+            assert all('try 90° CW rather than 270° CW' in text for text in shown), shown
+    finally:
+        dialog.close()
+
+
+def test_a_motion_check_that_fails_leaves_the_fit_shown(qapp, tmp_path, monkeypatch):
+    """The motion check is advice: if it cannot run, the distance, its rows and its window still appear."""
+    import xdart.gui.tabs.calibration.dialog as calibration_dialog
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError('motion check unavailable')
+    monkeypatch.setattr(calibration_dialog, 'direct_beam_motion_mismatch', broken)
+    nexus, _, _ = _beam_container(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog.camera.set_value(stitch_camera(ImageOrientation(rotation=90)))
+        dialog._set_field_text('beam_source', nexus)
+        detect(dialog)
+        dialog.beam_button.click()
+        settle(dialog)
+        assert dialog._distance_result is not None and dialog._distance_warning is None, dialog.status.text()
+        assert dialog.status.text().startswith('Direct-beam distance: 500 mm'), dialog.status.text()
+        assert dialog.beam_summary.toPlainText().startswith('Distance: 500 mm')
+        assert dialog._direct_beam_fit_window.summary.text().startswith('Direct-beam distance: 500 mm')
+    finally:
+        dialog.close()
+
+
 @pytest.mark.parametrize('fault', ['blank', 'stationary', 'diagonal', 'saturated'])
 def test_unusable_or_ambiguous_endpoints_refuse_an_axis(fault):
     angles = [-1., 0., 1.]

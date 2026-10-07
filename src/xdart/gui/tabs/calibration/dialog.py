@@ -24,7 +24,8 @@ from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.point_images import PointImagesRequired, PointImageDetection, inspect_point_images
 from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
 from xrd_tools.integrate.calibration_seed import (
-    DETECTOR_ORIENTATIONS, detector_choices, detector_shape, ring_summary, rough_arm_record,
+    DETECTOR_ORIENTATIONS, detector_choices, detector_shape, direct_beam_motion_mismatch, ring_summary,
+    rough_arm_record,
 )
 from xrd_tools.session.instrument import InstrumentGeometry
 from xrd_tools.session.threshold_editing import (
@@ -477,6 +478,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._distance_result = None
         self._distance_energy_eV = None  # the fitted direct-beam scan's recorded energy
         self._distance_held = {}  # its other moving circle's recorded reading
+        self._distance_warning = None  # its geometry moves the beam another way than it did (or None)
         self._job_policy = None  # the fit policy the running Fit or Refine took
         self._direct_beam_fit_window = None
         self._calibration_fit_window = None
@@ -1795,7 +1797,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.status.setText(f'Cannot load calibration {path.name}: {error}')
             return
         self._invalidate_fit()
-        self._distance_result = self._distance_key = None
+        self._distance_result = self._distance_key = self._distance_warning = None
         self._distance_energy_eV, self._distance_held = None, {}
         self.beam_summary.clear()
         self.show_fit_button.setEnabled(False)
@@ -2625,10 +2627,39 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._direct_beam_fit_window is None:
             self._direct_beam_fit_window = DirectBeamFitWindow(self)
         self._direct_beam_fit_window.show_result(self._distance_result, self._distance_energy_eV,
-                                                 self._distance_held)
+                                                 self._distance_held, self._distance_warning)
         self._direct_beam_fit_window.show()
         self._direct_beam_fit_window.raise_()
         self.show_fit_button.setEnabled(True)
+
+    def _direct_beam_motion_warning(self):
+        """What disagrees, and the mounting to try, when step 1's geometry moves the direct beam another way than
+        the fitted scan did; None when it agrees or cannot tell. The fit keeps |slope|, so a detector mounted the
+        other way round fits as well (maintainer, 2026-10-06: "why 90 degrees doesn't work")."""
+        from xrd_tools.core.geometry.camera import DetectorCamera
+        from xdart.gui.widgets.camera_editor import mounting_description
+        delta, nu = self.geometry_editor.value().stitch_arm()
+        motor = {'del': delta, 'nu': nu}.get(self._beam_role())
+        try:
+            record = self._rough_arm()
+            if record is None or motor is None:
+                return None
+            mismatch = direct_beam_motion_mismatch(record, self._distance_result, motor=motor, del_motor=delta,
+                                                   nu_motor=nu, held=self._distance_held)
+        except ValueError:  # step 1 has no arm to compare yet (stale, incomplete), or one it cannot place
+            return None
+        except Exception:  # noqa: BLE001 - an advisory: the fit and its display never depend on it
+            _LOG.warning('direct-beam motion check failed', exc_info=True)
+            return None
+        if mismatch is None:
+            return None
+        camera = self.camera.value()
+        if mismatch.quarter_turn:
+            return f'{mismatch} The camera is probably a quarter turn off from {mounting_description(camera)}.'
+        turned = DetectorCamera(*(axis[0] + ('-' if axis[1] == '+' else '+') for axis in camera.to_xu()))
+        return (f'{mismatch} The detector is probably mounted the other way round: try '
+                f"{mounting_description(turned)} rather than {mounting_description(camera)}, or check {motor}'s "
+                'sense in the Diffractometer section.')
 
     def _show_calibration_fit(self):
         """The ring fit (Fit or Refine) in its own window, with what it found (opened after every fit)."""
@@ -2921,7 +2952,9 @@ class CalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'distance':
                     result, self._distance_energy_eV, self._distance_held = result
                     self._distance_result, self._distance_key = result, self._distance_pending_key
-                    rows = [f'Distance: {result.distance_mm:.6g} mm; regression SE: {result.distance_std_m * 1000:.3g} mm',
+                    self._distance_warning = self._direct_beam_motion_warning()
+                    rows = [f'⚠ {self._distance_warning}'] if self._distance_warning else []
+                    rows += [f'Distance: {result.distance_mm:.6g} mm; regression SE: {result.distance_std_m * 1000:.3g} mm',
                             f'Beam pixel at the zero: {result.zero_beam_pixel[0]:.2f}, {result.zero_beam_pixel[1]:.2f} '
                             f'(strips placed at {result.beam_pixel[0]:.1f}, {result.beam_pixel[1]:.1f}'
                             + (')' if self._text('beam_pixel') else ', found on the frame nearest the zero)'),
@@ -2946,7 +2979,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self._update_beam_readiness()
                 elif kind == 'distance':
                     self.status.setText(direct_beam_fit_text(self._distance_result, self._distance_energy_eV,
-                                                             self._distance_held))
+                                                             self._distance_held, self._distance_warning))
                 elif kind in ('fit', 'refine'):  # what it found, as the direct-beam fit says its distance
                     self.status.setText(calibration_fit_text(result, kind))
                 elif kind == 'stitch_preview':

@@ -36,9 +36,10 @@ RECORD_LABELS = {
     'sample_offset3': 'sample offset, along the beam', 'energy_eV': 'energy', 'beam_rotation': 'beam rotation'}
 
 
-def direct_beam_fit_text(result, energy_eV=None, held=None):
+def direct_beam_fit_text(result, energy_eV=None, held=None, warning=None):
     """One line for a direct-beam fit: its distance and uncertainty, where the beam hits at the zero, the
-    other circle as the scan held it, and, when the scan records one, its energy."""
+    other circle as the scan held it, when the scan records one its energy, and a ``warning`` first (the
+    window's ``_direct_beam_motion_warning``: the geometry moves the beam another way than the scan did)."""
     text = (f'Direct-beam distance: {result.distance_mm:.6g} mm (regression SE '
             f'{result.distance_std_m * 1000:.3g} mm)')
     beam = result.zero_beam_pixel
@@ -48,7 +49,7 @@ def direct_beam_fit_text(result, energy_eV=None, held=None):
         text += f' · {motor} held at {reading:g}°'
     if energy_eV is not None:
         text += f' · the scan records {energy_eV:.6g} eV'
-    return text
+    return text if warning is None else f'⚠ {warning}\n{text}'
 
 
 def calibration_fit_text(fit, kind='fit'):
@@ -106,8 +107,8 @@ class DirectBeamFitWindow(FitWindow):
                          link_x=True)
         self.view.reconcile(FitProjection(self._UPPER, self._LOWER))
 
-    def show_result(self, result, energy_eV=None, held=None):
-        """Plot ``result`` (a ``DirectBeamResult``) and say its distance."""
+    def show_result(self, result, energy_eV=None, held=None, warning=None):
+        """Plot ``result`` (a ``DirectBeamResult``) and say its distance, after any ``warning``."""
         angles = np.asarray(result.angles_deg, dtype=float)
         centres = np.asarray(result.centres_px, dtype=float)
         used = np.asarray(result.used, dtype=bool)
@@ -119,7 +120,7 @@ class DirectBeamFitWindow(FitWindow):
         upper.append(FitSeries(angles[used][order], np.asarray(result.predictions_px, dtype=float)[used][order],
                                'fit', f'{result.model} fit'))
         residuals = FitSeries(angles[used], np.asarray(result.residuals_px, dtype=float)[used], 'residual_points')
-        summary = (direct_beam_fit_text(result, energy_eV, held)
+        summary = (direct_beam_fit_text(result, energy_eV, held, warning)
                    + f' · {result.model} model, {int(np.count_nonzero(used))} of {len(result.angles_deg)} frames used')
         self.view.reconcile(FitProjection(replace(self._UPPER, series=tuple(upper)),
                                           replace(self._LOWER, series=(residuals,)), summary))

@@ -639,8 +639,13 @@ def test_a_direct_beam_fit_shows_its_distance_and_the_scan_supplies_the_waveleng
         _fit_direct_beam(dialog)
         result = dialog._distance_result
         assert result is not None, dialog.status.text()
-        assert dialog.status.text().startswith(f'Direct-beam distance: {result.distance_mm:.6g} mm (regression SE')
-        assert dialog.status.text().endswith('nu held at 0° · the scan records 17000 eV')
+        # the upright camera turns this del scan's beam across the arm's direction, so a quarter-turn warning
+        # comes first (test_direct_beam_readiness pins it); the distance line below it is unchanged
+        warning, status = dialog.status.text().splitlines()
+        assert warning.startswith('⚠ The direct beam moved across this geometry: del -1 → 1° moved it along the '
+                                  'columns')
+        assert status.startswith(f'Direct-beam distance: {result.distance_mm:.6g} mm (regression SE')
+        assert status.endswith('nu held at 0° · the scan records 17000 eV')
         assert dialog._distance_held == {'nu': 0.}
         # the rough arm puts the beam on the fitted pixel where the scan saw it (del at its zero, nu at 0),
         # not at the zero pose (nu at 1.5): the exact angles are the core row's
@@ -651,10 +656,10 @@ def test_a_direct_beam_fit_shows_its_distance_and_the_scan_supplies_the_waveleng
         assert (row, column) == pytest.approx((y, x), abs=1e-6)
         (row, column), _ = _direct_beam_hit(seed, del_motor='del', nu_motor='nu', readings={'del': 0., 'nu': 1.5})
         assert abs(column - x) > 10
-        assert dialog.beam_summary.toPlainText().startswith('Distance: ')
+        assert dialog.beam_summary.toPlainText().splitlines()[1].startswith('Distance: ')
         window = dialog._direct_beam_fit_window
         assert window is not None and window.isVisible() and dialog.show_fit_button.isEnabled()
-        assert window.summary.text().startswith(f'Direct-beam distance: {result.distance_mm:.6g} mm')
+        assert window.summary.text().splitlines()[1].startswith(f'Direct-beam distance: {result.distance_mm:.6g} mm')
         assert 'of 5 frames used' in window.summary.text()
         wavelength = float(energy_eV_to_wavelength_m(17000.018))
         assert dialog._rough_wavelength_A() == pytest.approx(wavelength * 1e10, rel=1e-12, abs=0)
