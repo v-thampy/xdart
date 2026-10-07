@@ -434,13 +434,29 @@ class KeyedTraceProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class KeyedFigureProjection:
+    """A source-free computed figure, rendered by the full ScientificView."""
+
+    key: PanelKey
+    title: str
+    figure: object
+
+    def __post_init__(self):
+        from xrd_tools.geometry_figures import Figure
+        if type(self.key) is not PanelKey or self.key.role is not PanelRole.FIGURE:
+            raise TypeError('a keyed figure requires a FIGURE PanelKey')
+        if not isinstance(self.figure, Figure):
+            raise TypeError('a keyed figure requires a computed Figure')
+
+
+@dataclass(frozen=True, slots=True)
 class KeyedPanelsProjection:
     """A keyed layout for ``ScientificView.reconcile_keyed``: rows of ``PanelKey``s (``DisplayState.layout``),
     each drawn from its one panel, under the view's own top bar (colour map, Log, Set BG), with the view's own
     intensity controls and Share Axis (``share_axis``: the panels drawing one coordinate pan and zoom together)."""
 
     layout: tuple[tuple[PanelKey, ...], ...]
-    panels: tuple[KeyedImageProjection | KeyedTraceProjection, ...]
+    panels: tuple[KeyedImageProjection | KeyedTraceProjection | KeyedFigureProjection, ...]
     title: str = ""
     status: str = ""
     color_map: str = "Default"
@@ -462,7 +478,7 @@ class KeyedPanelsProjection:
                 or len(self.panels) != len(keys)):
             raise TypeError("a keyed layout draws each of its keys from exactly one panel")
 
-    def panel(self, key: PanelKey) -> KeyedImageProjection | KeyedTraceProjection:
+    def panel(self, key: PanelKey) -> KeyedImageProjection | KeyedTraceProjection | KeyedFigureProjection:
         return next(panel for panel in self.panels if panel.key == key)
 
 
@@ -901,6 +917,7 @@ __all__ = [
     "HeavyProjection",
     "KEYED_IMAGE_PRESENTATIONS",
     "KeyedImageProjection",
+    "KeyedFigureProjection",
     "KeyedPanelsProjection",
     "KeyedTraceProjection",
     "ProgressProjection",

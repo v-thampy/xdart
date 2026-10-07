@@ -73,6 +73,7 @@ from .shell_values import (
     FrameNavigationProjection,
     FrameSelectionIntent,
     KeyedImageProjection,
+    KeyedFigureProjection,
     KeyedPanelsProjection,
     RectRegion,
     ScientificPlotOptions,
@@ -494,6 +495,78 @@ class _KeyedTracePanel:
     def clear(self) -> None:
         self.curve.setData([], [])
         self.plot.setTitle("")
+
+
+class _KeyedFigurePanel:
+    """Typed figure rendering inside Int's keyed display owner, with native Export."""
+
+    def __init__(self, key):
+        self.key = key
+        self.container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(self.container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.viewbox = RectViewBox()
+        self.plot = pg.PlotWidget(viewBox=self.viewbox)
+        apply_seaborn_plot_style(self.plot.getPlotItem(), grid=False)
+        self.viewbox.setAspectLocked(True, ratio=1)
+        self.caption = QtWidgets.QLabel()
+        self.caption.setWordWrap(True)
+        layout.addWidget(self.plot, 1)
+        layout.addWidget(self.caption)
+        self.curves, self.overlay_items = {}, []
+
+    def draw(self, panel, color):
+        self.clear()
+        figure = panel.figure
+        self.plot.setTitle(panel.title or figure.title)
+        self.plot.setToolTip('Computed figure; axes and caption state its coordinate frame. '
+                             'Drag to zoom; right-click for native Export.')
+        self.caption.setText(figure.caption)
+        self.caption.setToolTip(figure.caption)
+        units = figure.units if figure.units == 'px' else None
+        self.plot.setLabel('bottom', figure.x_label, units=units)
+        self.plot.setLabel('left', figure.y_label, units=figure.units or None)
+        self.viewbox.invertY(figure.units == 'px')
+        if figure.image is not None:
+            item = pg.ImageItem(figure.image, axisOrder='row-major')
+            item.setRect(QtCore.QRectF(-.5, -.5, figure.image.shape[1], figure.image.shape[0]))
+            item.setZValue(-10)
+            item.setToolTip('Synthetic image, in stored pixel coordinates.')
+            self.plot.addItem(item)
+        for curve in figure.curves:
+            style = (QtCore.Qt.PenStyle.DashLine if curve.role == 'predicted'
+                     else QtCore.Qt.PenStyle.DotLine if curve.role == 'tie'
+                     else QtCore.Qt.PenStyle.SolidLine)
+            item = self.plot.plot(curve.xy[:, 0], curve.xy[:, 1],
+                                 pen=pg.mkPen(color, width=2, style=style), name=curve.name)
+            item.setToolTip(f'{curve.role}: {curve.tooltip}')
+            self.curves[curve.name] = item
+            self.overlay_items.append(item)
+        for marker in figure.markers:
+            item = pg.ScatterPlotItem([marker.xy[0]], [marker.xy[1]],
+                symbol='x' if marker.role == 'rejected' else '+', size=12, pen=pg.mkPen(color, width=2))
+            self._overlay(item, marker.tooltip)
+        for arrow in figure.arrows:
+            dx, dy = np.subtract(arrow.end, arrow.start)
+            item = pg.ArrowItem(pos=arrow.end, angle=180-math.degrees(math.atan2(dy, dx)),
+                headLen=10, tailLen=max(math.hypot(dx, dy)-10, 0), tailWidth=2,
+                pen=pg.mkPen(color), brush=pg.mkBrush(color))
+            self._overlay(item, arrow.tooltip)
+        for text in figure.texts:
+            item = pg.TextItem(text.text, color=color)
+            item.setPos(*text.xy)
+            self._overlay(item, text.tooltip)
+        self.viewbox.autoRange()
+
+    def _overlay(self, item, tooltip):
+        item.setToolTip(tooltip)
+        self.plot.addItem(item)
+        self.overlay_items.append(item)
+
+    def clear(self):
+        self.plot.clear()
+        self.curves, self.overlay_items = {}, []
+        self.caption.clear()
 
 
 class ScientificView(QtWidgets.QFrame):
@@ -3332,6 +3405,8 @@ class ScientificView(QtWidgets.QFrame):
                 if type(panel) is KeyedImageProjection:
                     box = widgets.pane.canvas.imageViewBox
                     drawn = ((box, 0, panel.x_axis), (box, 1, panel.y_axis))
+                elif type(panel) is KeyedFigureProjection:
+                    continue  # figure axes are declared locally, not linked as scientific slices
                 else:
                     drawn = ((widgets.plot.getViewBox(), 0, panel.axis),)
                 for box, axis, projection in drawn:
@@ -3453,6 +3528,8 @@ class ScientificView(QtWidgets.QFrame):
                     widgets = _KeyedImagePanel(self, key)
                 elif key.role is PanelRole.PROJ_1D:
                     widgets = _KeyedTracePanel(key)
+                elif key.role is PanelRole.FIGURE:
+                    widgets = _KeyedFigurePanel(key)
                 else:
                     raise ValueError(f"a keyed layout draws SLICE_2D and PROJ_1D panels, not {key.role.value}")
                 across.addWidget(widgets.container, 1)

@@ -10,35 +10,13 @@ from __future__ import annotations
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.widgets.controls_panel import ControlsComboBox
-from xrd_tools.core.geometry.camera import DetectorCamera
+from xrd_tools.core.geometry.camera import (
+    DetectorCamera, UPRIGHT_CAMERA, _ROTATIONS, mounting_camera, mounting_controls,
+    mounting_description,
+)
 
 
-UPRIGHT_CAMERA = DetectorCamera('x-', 'z+')
-_ROTATIONS = {0: ('x-', 'z+'), 90: ('z+', 'x+'), 180: ('x+', 'z-'), 270: ('z-', 'x-')}
 _ROTATION_LABELS = {0: '0° (upright)', 90: '90°', 180: '180°', 270: '270°'}
-
-
-def mounting_camera(rotation: int, flip: bool, flip_vertical: bool = False) -> DetectorCamera:
-    """Clockwise mounting rotation, then reversals of stored columns and rows."""
-    rows, columns = _ROTATIONS[rotation]
-    if flip:
-        columns = columns[0] + ('-' if columns[1] == '+' else '+')
-    if flip_vertical:
-        rows = rows[0] + ('-' if rows[1] == '+' else '+')
-    return DetectorCamera(rows, columns)
-
-
-def mounting_controls(camera: DetectorCamera) -> tuple[int, bool]:
-    for rotation, (rows, columns) in _ROTATIONS.items():
-        if camera.rows == rows:
-            return rotation, camera.columns != columns
-    raise ValueError('not a detector camera')
-
-
-def mounting_description(camera: DetectorCamera) -> str:
-    rotation, flip = mounting_controls(camera)
-    return ('upright' if rotation == 0 else f'{rotation}° CW') + (
-        ', horizontal flip' if flip else '')
 
 
 CAMERA_LABELS = {f'{camera.rows}, {camera.columns}': mounting_description(camera)

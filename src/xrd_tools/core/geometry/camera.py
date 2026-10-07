@@ -62,6 +62,14 @@ class DetectorCamera:
         """``Ang2Q.init_area``'s detectorDir1, detectorDir2."""
         return self.rows, self.columns
 
+    def raw_vector(self, lab_axis: str) -> tuple[int, int]:
+        """Unit lab direction as (column, row) in the stored image, at zero pose."""
+        if lab_axis not in CAMERA_AXES:
+            raise ValueError('a detector-plane direction is x± or z±')
+        sign = 1 if lab_axis[1] == '+' else -1
+        return tuple(sign * (1 if axis[1] == '+' else -1) if axis[0] == lab_axis[0] else 0
+                     for axis in (self.columns, self.rows))
+
     def image_orientation(self) -> ImageOrientation:
         """The transform that brings the raw array into pyFAI's frame (its orientation 3)."""
         rotation, flip = _PYFAI_TRANSFORM[(self.rows, self.columns)]
@@ -79,6 +87,33 @@ class DetectorCamera:
 
 #: New Stitch/RSM calibrations share pyFAI's native frame. Frozen XU assets retain their recorded frame.
 STITCH_CAMERA = DetectorCamera('x+', 'z-')
+
+# Mounting descriptions are headless values; editors and figures share this table.
+UPRIGHT_CAMERA = DetectorCamera('x-', 'z+')
+_ROTATIONS = {0: ('x-', 'z+'), 90: ('z+', 'x+'), 180: ('x+', 'z-'), 270: ('z-', 'x-')}
+
+
+def mounting_camera(rotation: int, flip: bool, flip_vertical: bool = False) -> DetectorCamera:
+    """Clockwise mounting looking downstream, then stored-column/row reversals."""
+    rows, columns = _ROTATIONS[rotation]
+    if flip:
+        columns = columns[0] + ('-' if columns[1] == '+' else '+')
+    if flip_vertical:
+        rows = rows[0] + ('-' if rows[1] == '+' else '+')
+    return DetectorCamera(rows, columns)
+
+
+def mounting_controls(camera: DetectorCamera) -> tuple[int, bool]:
+    for rotation, (rows, columns) in _ROTATIONS.items():
+        if camera.rows == rows:
+            return rotation, camera.columns != columns
+    raise ValueError('not a detector camera')
+
+
+def mounting_description(camera: DetectorCamera) -> str:
+    rotation, flip = mounting_controls(camera)
+    return ('upright' if rotation == 0 else f'{rotation}° CW') + (
+        ', horizontal flip' if flip else '')
 
 
 def stitch_orientation(camera: DetectorCamera, *, frame: DetectorCamera = STITCH_CAMERA) -> ImageOrientation:

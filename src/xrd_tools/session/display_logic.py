@@ -280,6 +280,7 @@ class PanelRole(Enum):
     STITCH_2D = "stitch_2d"      # reserved: stitched 2D image
     SLICE_2D = "slice_2d"        # reserved: RSM reciprocal-space 2D slice (repeats)
     PROJ_1D = "proj_1d"          # reserved: RSM 1D projection (repeats)
+    FIGURE = "figure"            # computed geometry with typed overlays
     RESULTS = "results"          # reserved: tables/scalars (non-array)
 
 
