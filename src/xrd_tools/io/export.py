@@ -160,7 +160,8 @@ def write_stitch_xye(payload) -> Path:
     if profile is None:
         raise ValueError("saved Stitch result has no independent 1D profile")
     nexus = Path(payload.inspection.path)
-    target = nexus.with_name(f"{xye_prefix_for_unit(payload.native_unit)}_{nexus.stem}.xye")
+    unit = payload.native_unit if profile is payload else dict(profile.axis_units)["q"]
+    target = nexus.with_name(f"{xye_prefix_for_unit(unit)}_{nexus.stem}.xye")
     inputs = {nexus}
     if payload.inspection.frame_manifest_json is not None:
         manifest = json.loads(payload.inspection.frame_manifest_json)

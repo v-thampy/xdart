@@ -900,7 +900,8 @@ def test_stitch_run_exports_stored_profile_and_empty_click_keeps_it(qapp, tmp_pa
         x, y, sigma = read_xye(xye)
         radial = profile.axes[0][1]
         for actual, expected in ((x, radial), (y, profile.intensity),
-                                 (sigma, np.sqrt(np.abs(profile.intensity)) if profile.sigma is None else profile.sigma)):
+                                 (sigma, np.sqrt(np.abs(np.asarray(profile.intensity, dtype=float)))
+                                  if profile.sigma is None else profile.sigma)):
             np.testing.assert_allclose(actual, expected, rtol=5e-9, atol=0, equal_nan=True)
         nexus_before = target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()
         curve_before = [(item.xData.copy(), item.yData.copy()) for item in page.curve.listDataItems()]
