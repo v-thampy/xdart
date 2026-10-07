@@ -4952,17 +4952,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     ScatteringWorkspace._flush_presentation_target(self)
                     self._retain_outgoing_display = False
                 batch_owner = self._batch_terminal.presentation
-                if (
-                    not was_batch
-                    or event.kind is not StandardEventKind.FINISHED
-                    or event.cleanup_status is not CleanupStatus.CLEANED
-                    or batch_owner is None
-                    or batch_owner.run_identity is not event.run_identity
-                    or batch_owner.frame is None
-                ):
-                    self._release_native_plot_axis_transition_for_retry(
-                        event.run_identity
-                    )
                 terminal_navigation = self._context_controller.navigation
                 batch_notice = (
                     self._notice_text
@@ -4983,6 +4972,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         selected=terminal_navigation.selected,
                     )
                 )
+                # A terminal Browse is still this run's first possible paint.
+                # Keep its axis receipt bound until that exact read settles.
+                if not defer_terminal_science and (
+                    not was_batch
+                    or event.kind is not StandardEventKind.FINISHED
+                    or event.cleanup_status is not CleanupStatus.CLEANED
+                    or batch_owner is None
+                    or batch_owner.run_identity is not event.run_identity
+                    or batch_owner.frame is None
+                ):
+                    self._release_native_plot_axis_transition_for_retry(
+                        event.run_identity
+                    )
                 handoff = self._processed_browser.terminal_handoff
                 terminal_science_complete = (
                     defer_terminal_science
@@ -5742,6 +5744,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             outcome, captured
         )
         if settlement is None:
+            self._release_native_plot_axis_transition_for_retry(handoff.run_identity)
             return False
         handoff = settlement.handoff
         navigation = self._context_controller.navigation
@@ -5760,6 +5763,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         elif current is not None:
             self._context_controller.select_navigation(current, selected)
+        self._consume_native_plot_axis_transition(handoff.run_identity)
         if not settlement.reuse_seal_authorized:
             # An ordinary terminal Browse may preserve its exact frame-label
             # choice, but only a writer-authenticated seal can authorize

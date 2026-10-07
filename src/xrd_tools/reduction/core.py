@@ -2774,6 +2774,11 @@ class NexusSink:
                 enabled=bool(plan is not None and plan.mask_saturation),
                 saturation=None if plan is None else plan.saturation,
             )
+            if plan is not None and not isinstance((frame.metadata or {}).get("point_images"), Mapping):
+                threshold_mask = _threshold_mask(raw, plan)
+                if threshold_mask is not None:
+                    resolved_mask = (threshold_mask if resolved_mask is None
+                                     else resolved_mask | threshold_mask)
         return (
             make_thumbnail_array(
                 image,
@@ -6031,10 +6036,16 @@ def _reduce_frame(
         corrected_image=corrected_image,
     )
     if include_worker_thumbnail_prep:
+        # Every execution backend must carry native threshold membership to
+        # the persisted preview. GI/non-CSR integrate a separate float64
+        # buffer; their corrected raw thumbnail has not received those NaNs.
+        # Grouped points were conditioned per operand, before composition.
+        thumbnail_values = (value_mask if value_mask is not None or grouped
+                            else _threshold_mask(raw_image_arr, plan))
         thumbnail_mask = (
-            mask if value_mask is None
-            else value_mask if mask is None
-            else mask | value_mask
+            mask if thumbnail_values is None
+            else thumbnail_values if mask is None
+            else mask | thumbnail_values
         )
         reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(thumbnail_mask, background, plan)
     return reduction
