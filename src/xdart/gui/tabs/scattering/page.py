@@ -4219,9 +4219,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _stop_run(self) -> None:
         if self._closing or self._closed:
             return
-        self._release_native_plot_axis_transition_for_retry()
         token = self._admission
         if token is not None:
+            self._release_native_plot_axis_transition_for_retry()
             released = self._release_admission(token)
             self._refuse_preparing(token)
             if released.cleanup_status is not CleanupStatus.CLEANED:
@@ -4230,6 +4230,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell()
             return
         try:
+            # A launched Stop can still publish and paint a saved partial.
+            # Terminal Browse owns consumption or release of its axis receipt.
             ScatteringWorkspace._flush_presentation_target(self)
             self._context_controller.stop()
         except Exception as error:

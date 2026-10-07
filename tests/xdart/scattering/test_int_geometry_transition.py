@@ -33,6 +33,97 @@ def test_stopped_gi_browse_keeps_raw_threshold_and_mask(tmp_path, monkeypatch):
     _exercise(tmp_path, gi=True, stop=True, monkeypatch=monkeypatch)
 
 
+@pytest.mark.parametrize("output_mode", ("Append", "Overwrite"), ids=("append", "replace"))
+def test_auto_last_stop_after_geometry_changes_keeps_the_saved_curve(
+    tmp_path, monkeypatch, output_mode,
+):
+    """Real paced reads, Run/Stop, partial publication and saved Browse."""
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    raw = np.arange(195 * 487, dtype=np.uint32).reshape(195, 487) % 1000
+    for label in range(1, 81):
+        tifffile.imwrite(tmp_path / f"raw_{label:04d}.tif", raw)
+    poni = tmp_path / "calibration.poni"
+    poni.write_text(
+        "poni_version: 2\nDetector: Pilatus100k\nDetector_config: {}\n"
+        "Distance: 0.1234\nPoni1: 0.01\nPoni2: 0.01\n"
+        "Rot1: 0.0\nRot2: 0.0\nRot3: 0.0\nWavelength: 1.0e-10\n",
+    )
+    entered, release = Event(), Event()
+    stop_before = [32]
+    read_path = TiffSeriesSource._read_path
+
+    def paced(source, path):
+        if Path(path).stem == f"raw_{stop_before[0]:04d}":
+            entered.set()
+            assert release.wait(20), "Stop pacing not released"
+        return read_path(source, path)
+
+    monkeypatch.setattr(TiffSeriesSource, "_read_path", paced)
+    output = tmp_path / "processed"
+    output.mkdir()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=image_series_spec(tmp_path / "raw_0001.tif"),
+            poni_file=str(poni), project_root=str(tmp_path),
+            save_path=str(output), output_mode=output_mode,
+            max_cores=1, processing_mode="Int 2D",
+            gi=GIIntent(enabled=False, incidence_motor="Manual", th_val=.1, mode_1d="q_ip"),
+            bai_1d_args={"npt": 16}, bai_2d_args={"npt_rad": 16, "npt_azim": 8},
+        )), lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+        executor=StandardRunExecutor(join_timeout=2),
+    )
+    page.resize(1280, 900)
+    page.show()
+    try:
+        shell = page._shell
+        shell.browser.auto_last.setChecked(True)
+        for gi, limit in ((True, 32), (False, 40), (True, 56), (False, 64)):
+            stop_before[0] = limit
+            entered.clear()
+            release.clear()
+            segment = next(row for row in shell.controls.findChildren(SegmentedControl)
+                           if row.path == ("GI", "Grazing"))
+            next(button for value, button in segment._segments if value is gi).click()
+            prior = page._capture_current_loaded_browse()
+            prior_request = None if prior is None else prior.request
+            assert _wait(app, shell.run_controls.startButton.isEnabled), page._notice_text
+            shell.run_controls.startButton.click()
+            assert _wait(app, entered.is_set), (gi, limit, page._notice_text)
+            assert page._processed_browser.auto_last
+            shell.run_controls.stopButton.click()
+            release.set()
+            assert _wait(app, lambda: (
+                page._capture_current_loaded_browse() is not None
+                and page._capture_current_loaded_browse().request is not prior_request
+                and shell.run_controls.startButton.isEnabled()
+            )), page._notice_text
+            current = page._context_controller.navigation.current
+            target = page._capture_current_loaded_browse().target
+            with FrameViewReader(target) as reader:
+                saved = reader.read(current.local_frame_label)
+            assert saved.intensity_1d.size > 0
+            assert _wait(app, lambda: (
+                bool(shell.scientific.curve.listDataItems())
+                and page._last_scientific_projection is not None
+                and bool(page._last_scientific_projection.traces)
+                and page._last_scientific_projection.traces[0].frame is current
+            )), (
+                gi, output_mode, page._notice_text, page._preferences,
+                page._native_plot_axis_transition, page._last_scientific_projection,
+            )
+            curve = shell.scientific.curve.listDataItems()[0]
+            np.testing.assert_allclose(curve.getData()[0], saved.axis_1d.values, rtol=1e-6)
+            np.testing.assert_allclose(curve.getData()[1], saved.intensity_1d, rtol=1e-6)
+            assert page._preferences.plot_axis == ("q_ip" if gi else "Q")
+            assert shell.scientific.raw.canvas.raw_image.size > 0
+            assert shell.scientific.cake.canvas.raw_image.size > 0
+    finally:
+        release.set()
+        assert _wait(app, lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)
+        page.deleteLater()
+        app.processEvents()
+
+
 @pytest.mark.skipif(not os.environ.get("XDART_TEST_DATA"), reason="needs real Eiger data")
 def test_real_eiger_completed_standard_survives_grazing_controls(tmp_path):
     """The reported 651-frame source/grid, with user Auto Last switched off."""
