@@ -575,6 +575,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.camera.changed.connect(self._invalidate_beam_detection)
         self._beam_arm = self.geometry_editor.value().stitch_arm()
         self.geometry_editor.changed.connect(self._beam_geometry_changed)
+        self.geometry_editor.changed.connect(self._render_direct_beam_advice)  # a sense or zero edit
         self.beam_source_kind.currentIndexChanged.connect(self._invalidate_beam_detection)
         self.rough_mode.currentIndexChanged.connect(self._invalidate_beam_detection)
         self.tabs.currentChanged.connect(self._tab_readiness)
@@ -2380,6 +2381,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _save_rough(self):
         """Save step 1's geometry as the calibration pair, without a ring fit."""
         def go():
+            self._render_direct_beam_advice()  # what is saved is the arm the advice is about
             fit = self._rough_fit()
             selected = self._save_path(beam=self.rough_mode.currentData() == 'scan')
             if selected is not None:
@@ -2528,6 +2530,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._owner.cancel(self._identity)
         self._update_beam_readiness()
         self._beam_probe_timer.start()
+        self._render_direct_beam_advice()  # the camera or an extraction input changed: the fit may be stale
 
     def _beam_geometry_changed(self, *_args):
         arm = self.geometry_editor.value().stitch_arm()
@@ -2624,6 +2627,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._distance_result is None:
             self.status.setText('Fit a direct-beam scan first.')
             return
+        self._render_direct_beam_advice()  # about the controls as they are now
         if self._direct_beam_fit_window is None:
             self._direct_beam_fit_window = DirectBeamFitWindow(self)
         self._direct_beam_fit_window.show_result(self._distance_result, self._distance_energy_eV,
@@ -2638,11 +2642,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         other way round fits as well (maintainer, 2026-10-06: "why 90 degrees doesn't work")."""
         from xrd_tools.core.geometry.camera import DetectorCamera
         from xdart.gui.widgets.camera_editor import mounting_description
-        delta, nu = self.geometry_editor.value().stitch_arm()
-        motor = {'del': delta, 'nu': nu}.get(self._beam_role())
         try:
-            record = self._rough_arm()
-            if record is None or motor is None:
+            delta, nu = self.geometry_editor.value().stitch_arm()
+            motor = {'del': delta, 'nu': nu}.get(self._beam_role())
+            record = None if motor is None else self._rough_arm()
+            if record is None:
                 return None
             mismatch = direct_beam_motion_mismatch(record, self._distance_result, motor=motor, del_motor=delta,
                                                    nu_motor=nu, held=self._distance_held)
@@ -2660,6 +2664,28 @@ class CalibrationDialog(QtWidgets.QDialog):
         return (f'{mismatch} The detector is probably mounted the other way round: try '
                 f"{mounting_description(turned)} rather than {mounting_description(camera)}, or check {motor}'s "
                 'sense in the Diffractometer section.')
+
+    def _render_direct_beam_advice(self, *_args):
+        """The motion advice for the controls as they are now, on its three surfaces together: the distance rows,
+        the direct-beam fit window and the status line (Codex review B1: a sense or camera edit after the fit
+        changes the geometry the advice is about). A fit that no longer matches its inputs keeps no advice, and
+        the status says to fit again. Nothing changes while the advice does not."""
+        if not hasattr(self, 'beam_summary') or self._distance_result is None:
+            return
+        advice = self._direct_beam_motion_warning()
+        if advice == self._distance_warning:
+            return
+        self._distance_warning = advice
+        rows = self.beam_summary.toPlainText().splitlines()
+        rows = rows[1:] if rows and rows[0].startswith('⚠ ') else rows  # the fit's own rows stay as fitted
+        self.beam_summary.setPlainText('\n'.join(([f'⚠ {advice}'] if advice else []) + rows))
+        self.beam_summary.verticalScrollBar().setValue(0)
+        if self._direct_beam_fit_window is not None:
+            self._direct_beam_fit_window.show_result(self._distance_result, self._distance_energy_eV,
+                                                     self._distance_held, advice)
+        self.status.setText(direct_beam_fit_text(self._distance_result, self._distance_energy_eV,
+                                                 self._distance_held, advice)
+                            if self._distance_fresh() else self._STALE_DISTANCE)
 
     def _show_calibration_fit(self):
         """The ring fit (Fit or Refine) in its own window, with what it found (opened after every fit)."""
@@ -2969,14 +2995,18 @@ class CalibrationDialog(QtWidgets.QDialog):
                     pending = [frame for frame in self.frames if not frame.complete]
                     self.status.setText(f'Frame {result.index} saved. ' + (
                         'Next: Calibrate selected frame…' if pending else 'All frames calibrated: fit them below, then save.'))
-                elif kind == 'save':
-                    self.status.setText(saved_pair_text(result))
+                elif kind == 'save':  # a direct-beam geometry saved against its scan's motion still says so
+                    advice = (self._distance_warning
+                              if self._loaded_calibration_kind == 'direct_beam_not_ring_fitted' else None)
+                    self.status.setText(saved_pair_text(result) if advice is None
+                                        else f'⚠ {advice}\n{saved_pair_text(result)}')
                     self.calibrationSaved.emit(result.pyfai_path, 'multigeometry')  # once, with both files written
                     if self._close_after_save:
                         self._close_after_save = False
                         self.close()
                 elif kind == 'beam_detect':
                     self._update_beam_readiness()
+                    self._render_direct_beam_advice()  # inputs restored: the fit, and its advice, apply again
                 elif kind == 'distance':
                     self.status.setText(direct_beam_fit_text(self._distance_result, self._distance_energy_eV,
                                                              self._distance_held, self._distance_warning))
