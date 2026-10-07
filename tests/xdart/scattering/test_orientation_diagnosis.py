@@ -53,6 +53,80 @@ def test_diagnosis_uses_calibration_worker_cancels_joins_and_changes_no_geometry
         dialog.close(); dialog.deleteLater(); qapp.processEvents()
 
 
+def test_staged_ring_run_uses_saved_calibration_json_cancels_and_closes_without_edits(qapp, tmp_path):
+    from dataclasses import replace
+    import hashlib
+    import json
+    from pathlib import Path
+    from xdart.gui.pages.values import PageCleanup
+    from xdart.gui.tabs.calibration.dialog import CalibrationDialog, CalibrationContext
+    from xrd_tools import geometry_figures as gf
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.core.geometry import ImageOrientation
+    from xrd_tools.core.geometry.camera import stitch_camera
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.integrate.calibration_seed import rough_arm_record
+    from tests.core.test_geometry_figures import reference
+
+    value = gf.GeometryInputs(); camera = stitch_camera(ImageOrientation())
+    images = tmp_path/'images'; images.mkdir()
+    for index, angle in enumerate((0., 15.)):
+        _, image = reference(replace(value, readings=(('del', angle), ('nu', 0.))), camera)
+        (images/f'rings_scan1_{index:04d}.raw').write_bytes(image.astype('<f4').tobytes())
+    spec = tmp_path/'rings'
+    spec.write_text('#F rings\n#O0 del nu energy\n#S 1 ascan del 0 15 1 1\n'
+                    f'#P0 0 0 {wavelength_m_to_energy_eV(value.wavelength_m)}\n'
+                    '#N 2\n#L del  nu\n0 0\n15 0\n')
+    record = rough_arm_record(detector=value.detector, distance_m=value.distance_m,
+        wavelength_m=value.wavelength_m, beam_px=(
+            (value.shape[1]-1)/2+value.beam_offset_px[0],
+            (value.shape[0]-1)/2+value.beam_offset_px[1]),
+        camera=ImageOrientation(), orientation=value.first_pixel)
+    saved = tmp_path/'fixed-arm.json'; saved.write_text(json.dumps(record))
+    source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
+        'image_stem': 'rings', 'read_image_kwargs': {'detector_shape': value.shape, 'raw_dtype': '<f4'}})
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path)); dialog.show()
+    try:
+        dialog.set_source_context(source, image_rotation=0); wait(dialog)
+        dialog._enumerate(); wait(dialog)
+        dialog._prepare(); wait(dialog)
+        assert len(dialog.frames) == 2, dialog.status.text()
+        dialog.load_calibration(saved)
+        dialog._source_details(); wait(dialog)
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        seed = dialog._seed_options()
+        assert seed['file'] == str(saved) and all(seed[k] is None for k in ('record', 'prediction', 'rough'))
+        paths = (saved, spec, *(Path(f.image_path) for f in dialog.frames), *images.iterdir())
+        before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+        prior = geometry_state(dialog); owner = dialog._owner
+        dialog.open_orientation_check(); panel = dialog.orientation_panel
+        panel.run_button.click(); worker = owner._worker
+        assert dialog.active() and worker is not None and dialog._job == 'orientation'
+        wait(dialog)
+        assert not worker.is_alive() and owner._identity is None
+        assert panel.finding is not None and panel.finding.worker_thread_id != threading.get_ident(), dialog.status.text()
+        assert dialog._orientation_geometry is not None and panel.figure_view.keyed_projection
+        reason = panel.finding.reason.lower()
+        assert 'declared beam' in reason and 'current calibration record' in reason
+        assert 'zero-angle' in reason and 'consistency check' in reason and 'not an independent identification' in reason
+        assert geometry_state(dialog) == prior
+        panel.run_button.click(); worker = owner._worker
+        panel.cancel_button.click()
+        assert owner._cancel_commanded, 'the real worker must accept cancellation before terminal delivery'
+        wait(dialog)
+        assert not worker.is_alive() and owner._identity is None and panel.finding is None
+        panel.run_button.click(); worker = owner._worker
+        dialog.close()
+        assert dialog._close_pending and owner._cancel_commanded
+        wait(dialog)
+        assert not worker.is_alive() and owner._identity is None
+        assert dialog.shutdown().status is PageCleanup.CLEAN and not dialog.isVisible()
+        assert geometry_state(dialog) == prior
+        assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths} == before
+    finally:
+        dialog.close(); dialog.deleteLater(); qapp.processEvents()
+
+
 def test_scoring_is_off_thread_with_frozen_reference_budget_and_bounded_frame_storage(qapp):
     from xrd_tools import geometry_figures as gf
     from tests.core.test_geometry_figures import inputs, reference
@@ -155,6 +229,8 @@ def test_existing_direct_beam_advice_is_in_the_consistent_set_after_camera_and_s
         dialog.open_orientation_check(); panel = dialog.orientation_panel
         panel.run_button.click(); wait(dialog)
         assert panel.finding and 'single-axis' in panel.finding.reason.lower()
+        original_camera = dialog.camera.value()
+        original_senses = dialog.geometry_editor.value().arm_senses()
         _reverse(dialog, 'del')
         assert panel.finding is None
         advice = _surfaces(dialog)
@@ -165,6 +241,14 @@ def test_existing_direct_beam_advice_is_in_the_consistent_set_after_camera_and_s
         current_senses = dialog.geometry_editor.value().arm_senses()
         assert any(c.camera == suggested and c.senses == (current_senses['del'], current_senses['nu'])
                    for c in panel.finding.candidates)
+        assert any(c.camera == original_camera and c.senses[0] == original_senses['del']
+                   for c in panel.finding.candidates)
+        assert {c.senses[0] for c in panel.finding.candidates} == {-1, 1}
+        assert {c.senses[1] for c in panel.finding.candidates} == {-1, 1}
+        assert 'nu sense is unmeasured' in panel.finding.reason.lower()
+        labels = [panel.candidate_row.editor.itemText(i) for i in range(panel.candidate_row.editor.count())]
+        assert all('nu unmeasured' in label for label in labels)
+        assert any('keeps configured senses' in label for label in labels)
         dialog.camera.set_value(suggested)
         assert panel.finding is None and dialog.status.text() == dialog._STALE_DISTANCE
         detect(dialog); dialog.beam_button.click(); wait(dialog)

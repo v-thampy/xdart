@@ -104,7 +104,7 @@ class OrientationPanel(SectionCard):
         self.finding_pane.set_text('Run a new check after changing geometry, frames or extraction inputs.')
         self.figure_view.hide()
 
-    def show_finding(self, finding, figure=None):
+    def show_finding(self, finding, figure=None, *, configured_senses=None):
         self.finding = finding
         self.finding_pane.set_text(finding.reason)
         rows, tips = [], {}
@@ -114,13 +114,23 @@ class OrientationPanel(SectionCard):
         for i, c in enumerate(finding.candidates):
             support = sum(r.support for r in c.ring_scores)/len(c.ring_scores) if c.ring_scores else float('nan')
             label = mounting_description(c.camera)
-            self.candidate_row.editor.addItem(f'{label} · del {c.senses[0]:+d}, nu {c.senses[1]:+d}', i)
-            rows.append((label, *c.senses, *(f'{v:.4g}' if math.isfinite(v) else '—'
+            if finding.unmeasured_motor and configured_senses and c.senses == tuple(
+                    configured_senses[role] for role in ('del', 'nu')):
+                label += ' (keeps configured senses)'
+            senses = tuple(f'unmeasured ({sense:+d} hypothesis)' if role == finding.unmeasured_motor
+                           else f'{sense:+d}' for role, sense in zip(('del', 'nu'), c.senses))
+            self.candidate_row.editor.addItem(f'{label} · del {senses[0]}, nu {senses[1]}', i)
+            self.candidate_row.editor.setItemData(i,
+                'Configured matches are a reference, not verified senses. An unmeasured circle has '
+                'both sense hypotheses listed; this scan cannot choose between them.',
+                QtCore.Qt.ItemDataRole.ToolTipRole)
+            rows.append((label, *senses, *(f'{v:.4g}' if math.isfinite(v) else '—'
                                            for v in (c.score, c.standard_error, support))))
             for column in range(6):
                 tips[i, column] = ('Hypothesis only. Explicit geometric exclusions '
                     f'{finding.exclusions.geometric}; value exclusions {finding.exclusions.value}. '
-                    'Detector gaps are excluded from ring support. Fixed inputs are not refitted.')
+                    'Detector gaps are excluded from ring support. Fixed inputs are not refitted. '
+                    'Configured matches are a reference, not verified senses; unmeasured senses are hypotheses.')
         index = self.candidate_row.editor.findData(previous)
         self.candidate_row.editor.setCurrentIndex(max(0, index))
         del blocked

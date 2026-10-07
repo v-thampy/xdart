@@ -494,6 +494,7 @@ class OrientationFinding:
     policy: tuple = tuple(_SCORE_POLICY.items())
     evaluated_hypotheses: int = 0
     worker_thread_id: int = 0
+    unmeasured_motor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -791,11 +792,16 @@ def consistent_motion_candidates(result, measured_camera, *, detector, motor, he
                                             held=held) is None:
                 candidates.append(OrientationCandidate(item.camera, senses))
     unobserved = 'nu' if motor == 'del' else 'del'
-    reason = (f'Single-axis {motor} motion: {unobserved} sense is unmeasured; camera reflection and '
-              'untrusted scanned-motor sense alternatives remain. This is directional consistency '
+    restrictions = ('Explicitly trusted senses restrict the list: '
+                    + ', '.join(f'{key} {sense:+d}' for key, sense in trusted.items()) + '. '
+                    if trusted else 'No motor senses are treated as verified; all consistent camera '
+                    'and motor-sense hypotheses are listed. ')
+    reason = (f'Single-axis {motor} motion: {unobserved} sense is unmeasured by this scan. '
+              + restrictions + 'This is directional consistency '
               'with the existing direct-beam fit, not a unique mounting or a new advisory.')
     return OrientationFinding(tuple(candidates), None, tuple(candidates), False, reason,
-                              evaluated_hypotheses=32, worker_thread_id=threading.get_ident())
+                              evaluated_hypotheses=32, worker_thread_id=threading.get_ident(),
+                              unmeasured_motor=unobserved)
 
 
 def synthetic_orientation_finding(step):
@@ -934,6 +940,10 @@ def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu
             yield observed
             del observed
     finding = diagnose_orientation(streamed(), cancelled=cancelled)
+    finding = replace(finding, reason='Declared beam: the zero-angle direct-beam intersection computed '
+        'from the current calibration record. If that record was fitted under the configured camera '
+        'and motor senses, a zero-angle match is a consistency check, not an independent identification. '
+        + finding.reason)
     if cancelled and cancelled():
         raise InterruptedError('Orientation check cancelled.')
     observed = load(frames[0])

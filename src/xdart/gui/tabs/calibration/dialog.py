@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING
@@ -653,6 +654,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                 self.camera.value(), self.geometry_editor.value(), id(self._distance_result), self._distance_key)
 
     def _invalidate_orientation(self, *_args):
+        if os.environ.get('XDART_DEBUG_ORIENTATION'):
+            field = next((k for k, v in self._fields.items() if v is self.sender()), None)
+            _LOG.warning('orientation invalidate generation=%s field=%s job=%s busy=%s',
+                         self._orientation_generation, field, self._job, self._owner.busy)
         self._orientation_generation += 1
         self._orientation_geometry = None
         if self.orientation_panel is not None:
@@ -697,7 +702,6 @@ class CalibrationDialog(QtWidgets.QDialog):
                         if name in self._distance_held}
                 mode, options = 'motion', dict(result=self._distance_result, measured_camera=measured,
                     detector=self._text('beam_detector'), motor=role, held=held,
-                    trusted_senses=self.geometry_editor.value().arm_senses(),
                     first_pixel=int(self._text('beam_orientation')))
             self._orientation_pending_key = self._orientation_key()
             panel.invalidate()
@@ -2209,6 +2213,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             entry=self._text('beam_entry' if beam else 'entry') or 'entry', options=options))
 
     def _start(self, kind, arguments):
+        if os.environ.get('XDART_DEBUG_ORIENTATION'):
+            _LOG.warning('calibration start kind=%s busy=%s pending_metadata=%r orientation_generation=%s',
+                         kind, self._owner.busy, self._pending_source_details, self._orientation_generation)
         if self._owner.busy:
             return
         self._job = kind
@@ -3065,6 +3072,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.status.setText(f'{self._job.capitalize()}: {update.progress.stage}…')
             return
         terminal, kind = update.terminal, self._job
+        if os.environ.get('XDART_DEBUG_ORIENTATION'):
+            _LOG.warning('calibration terminal kind=%s status=%s pending_metadata=%r orientation_generation=%s',
+                         kind, terminal.status, self._pending_source_details, self._orientation_generation)
         self._identity = None
         self._set_tabs_enabled(True)
         if self.orientation_panel is not None:
@@ -3097,7 +3107,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                     key, (finding, figure, geometry) = result
                     if not self._close_pending and key == self._orientation_key():
                         self._orientation_geometry = geometry
-                        self.orientation_panel.show_finding(finding, figure)
+                        self.orientation_panel.show_finding(finding, figure,
+                            configured_senses=self.geometry_editor.value().arm_senses())
                 elif kind == 'beam_detect':
                     if self._beam_probe_generation == self._beam_generation:
                         self._beam_detection = (self._beam_generation, *result)
