@@ -66,7 +66,7 @@ def calibration_seed_inputs(path, *, fallback_instrument):
     readings = {getattr(arm, role + '_motor'): zero for role, zero in zeros.items()}
     (row, column), distance = _direct_beam_hit(record, del_motor=arm.del_motor,
                                               nu_motor=arm.nu_motor, readings=readings)
-    if not all(math.isfinite(v) for v in (row, column, distance)) or distance <= 0:
+    if not all(math.isfinite(v) for v in (row, column, distance, energy_eV)) or min(distance, energy_eV) <= 0:
         raise ValueError('the calibration has no finite, positive direct-beam distance')
     if identity != calibration_file_identity(path):
         raise ValueError('the calibration changed while loading; select it again')

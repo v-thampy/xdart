@@ -72,7 +72,11 @@ class CameraEditor(QtWidgets.QWidget):
             button.setCheckable(True)
             button.ensurePolished()
             font = button.font()
-            font.setPointSizeF(font.pointSizeF() * (1.4 if button is self.flipud else 1.25))
+            scale = 1.4 if button is self.flipud else 1.25
+            if font.pointSizeF() > 0:
+                font.setPointSizeF(font.pointSizeF() * scale)
+            else:
+                font.setPixelSize(round(font.pixelSize() * scale))
             button.setFont(font)
             button.setMinimumWidth(round(button.sizeHint().width() * 1.25))
             button.toggled.connect(self._edited)
