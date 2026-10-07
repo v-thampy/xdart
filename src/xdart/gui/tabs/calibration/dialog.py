@@ -745,7 +745,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         index = panel.candidate_row.editor.currentData()
         camera = panel.finding.candidates[index].camera if index is not None else self.camera.value()
         direction = panel.feature_row.editor.currentText()
-        result = feature_azimuth(self._orientation_geometry, camera, (column, row),
+        projection = panel.figure_view.keyed_projection
+        mapping = projection.panels[0].figure.display_binning if projection else None
+        pixel = mapping.display_to_native((column, row)) if mapping else (column, row)
+        result = feature_azimuth(self._orientation_geometry, camera, pixel,
                                   expected_lab=None if direction == 'Undeclared' else direction)
         panel.finding_pane.set_text(result.reason)
 

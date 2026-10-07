@@ -137,9 +137,14 @@ def expected_rings(integrator, calibrant, shape, mask=None) -> tuple[ExpectedRin
 
 
 def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_motor='nu', mask=None,
-                       conditioning=None, saturation=None, include_rings=True) -> FrameSeed:
+                       conditioning=None, saturation=None, include_rings=True,
+                       collect_garbage=True) -> FrameSeed:
     """The frame's geometry predicted from a goniometer calibration, with its rings (none on
-    ``mask``, the calibration's mask in the frame's image)."""
+    ``mask``, the calibration's mask in the frame's image).
+
+    Temporary display callers may disable forced process-wide GC on this new
+    integrator; normal Python collection and all geometry resets remain active.
+    """
     from pyFAI import units
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
@@ -153,6 +158,7 @@ def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_m
     motors = {motor: np.array([0.0 if motor in _HELD.values() else float(frame.motors[motor])])
               for motor in bound.values()}
     integrator = next(iter(create_multigeometry_integrator_series_from_geometry(diff, motors)))
+    integrator.auto_gc = bool(collect_garbage)
     if tuple(integrator.detector.shape) != tuple(frame.shape):
         raise ValueError('the calibration detector does not match the staged frame')
     # the frame's own energy, as the scan recorded it; else an energy-refined calibration's recorded
