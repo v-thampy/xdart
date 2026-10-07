@@ -616,6 +616,7 @@ class ScientificView(QtWidgets.QFrame):
         self._keyed_panels: dict[PanelKey, _KeyedImagePanel | _KeyedTracePanel] = {}
         self._keyed_shown: KeyedPanelsProjection | None = None
         self._keyed_hidden: tuple[QtWidgets.QWidget, ...] = ()
+        self._figure_hidden: tuple[QtWidgets.QWidget, ...] = ()
         # Share Axis over it: the axes drawing each coordinate shared by two or more, the range links made, and
         # where Share Axis sits in Int's plot bar while the keyed row borrows it
         self._keyed_coordinates: dict[tuple[str, str], tuple[tuple[pg.ViewBox, int], ...]] = {}
@@ -3411,6 +3412,15 @@ class ScientificView(QtWidgets.QFrame):
         self._set_share_link(state.share_axis)
         self._refresh_keyed_intensity()
 
+        if all(type(panel) is KeyedFigureProjection for panel in state.panels):
+            if not self._figure_hidden:
+                self._figure_hidden = tuple(w for w in (self.norm, self.background, self.color_map,
+                    self.log_scale, self.title, self.status, self.viewer_intensity_row) if not w.isHidden())
+                for widget in self._figure_hidden:
+                    widget.hide()
+        else:
+            self._restore_figure_chrome()
+
     def _keyed_axes(self, state: KeyedPanelsProjection) -> dict[tuple[str, str], tuple[tuple[pg.ViewBox, int], ...]]:
         """The keyed panels' axes (view box, 0 for x or 1 for y) by the coordinate each draws, its label and unit,
         in the layout's order: those drawn by two or more, which Share Axis links. Not ``_axis_key``: Int's
@@ -3594,6 +3604,7 @@ class ScientificView(QtWidgets.QFrame):
         self._layout_mode = self._processing_mode = "keyed"
 
     def _leave_keyed_layout(self) -> None:
+        self._restore_figure_chrome()
         self._link_keyed_axes(False)
         if self._keyed_area is not None:
             self._keyed_area.setVisible(False)
@@ -3607,6 +3618,11 @@ class ScientificView(QtWidgets.QFrame):
         options_layout, options_index = self._options_home
         options_layout.insertWidget(options_index, self.options)
         self.viewer_intensity_row.setVisible(False)
+
+    def _restore_figure_chrome(self):
+        for widget in self._figure_hidden:
+            widget.show()
+        self._figure_hidden = ()
 
     def _emit_panel_index(self, key: PanelKey, index: int) -> None:
         self.commandRequested.emit(ShellCommand(ShellCommandKind.SET_PANEL_INDEX, int(index), (key.instance,)))

@@ -71,7 +71,7 @@ class HelpWindow(ReadOnlyTextWindow):
         self.browser = BrowserView(self, profile=keyed_list_profile("Help topics"))
         self.browser.scans_label.setToolTip("Select an offline topic to read its instructions.")
         self.browser.scans.setToolTip("Matching topics in catalogue order; selecting one changes only help text.")
-        self.browser.setMaximumHeight(160)
+        self.browser.setMaximumHeight(100)
         self.pane.setToolTip("Read, select and copy these instructions and literal diagnostics; text cannot be edited.")
         self.insert_content(self.search_row)
         self.insert_content(self.browser, 1)
@@ -143,9 +143,9 @@ class HelpWindow(ReadOnlyTextWindow):
             self.check_button.setVisible(identifier == 'geometry.orientation')
             self.run_button.setVisible(bool(topic.run_key))
             capability = getattr(self.parentWidget(), 'open_orientation_check', None)
-            self.run_button.setEnabled(bool(topic.run_key and callable(capability)))
             self.run_button.set_purpose_tooltip('Open the read-only orientation check in the originating calibration window; '
                 'open Calibrate first when this action is unavailable. Opening does not start a job.')
+            self.run_button.setEnabled(bool(topic.run_key and callable(capability)))
             self._draw_figure()
         elif self.figure_view is not None:
             for widget in self._figure_widgets:
@@ -159,7 +159,7 @@ class HelpWindow(ReadOnlyTextWindow):
         from xdart.gui.tabs.scattering.scientific_view import ScientificView
         from xdart.gui.tabs.scattering.results_table import ResultsTable
         self.figure_view = ScientificView(self)
-        self.figure_view.setMinimumHeight(260)
+        self.figure_view.setMinimumHeight(380)
         self.figure_view.setToolTip('Computed synthetic figures in declared coordinates; native right-click Export is available.')
         self.figure_row = FormRow(label='Figure', path=('help', 'figure'), kind='combo', value='')
         self.figure_row.set_purpose_tooltip('Choose a computed example for this topic. No experimental file is read.')
@@ -177,7 +177,7 @@ class HelpWindow(ReadOnlyTextWindow):
         self.score_table = ResultsTable(('Mounting', 'del', 'nu', 'AUC', 'SE'), self,
             header_tooltips={i: tip for i, tip in enumerate(('Camera hypothesis; never applied.',
                 'Candidate del sense.', 'Candidate nu sense.', 'Ring/background AUC, not probability.',
-                'Conditional segment standard error; geometry uncertainty is excluded.'))}, max_height=150)
+                'Conditional segment standard error; geometry uncertainty is excluded.'))}, max_height=105)
         self.score_table.setToolTip('Computed synthetic scores, with fixed inputs and explicit ties; no file is read.')
         self.previous_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Previous step', SectionId.EXPERIMENT), self)
         self.next_button = ActionButton(ControlActionSpec(ControlAction.HELP, 'Next step', SectionId.EXPERIMENT), self)
@@ -190,8 +190,11 @@ class HelpWindow(ReadOnlyTextWindow):
             button.set_purpose_tooltip(tip)
         self._figure_widgets = (self.figure_row, self.step_row, self.candidate_row, self.feature_row, self.score_table,
             self.check_button, self.previous_button, self.next_button, self.run_button, self.figure_view)
-        for index, widget in enumerate(self._figure_widgets, 2):
-            self.insert_content(widget, index)
+        self.insert_content_row((self.figure_row, self.candidate_row), 2)
+        self.insert_content_row((self.step_row, self.feature_row), 3)
+        self.insert_content_row((self.check_button, self.previous_button, self.next_button, self.run_button), 4)
+        self.insert_content(self.score_table, 5)
+        self.insert_content(self.figure_view, 6)
         self.figure_row.editor.currentIndexChanged.connect(self._draw_figure)
         self.candidate_row.editor.currentIndexChanged.connect(self._draw_figure)
         self.step_row.editor.currentIndexChanged.connect(self._draw_step)
@@ -221,12 +224,14 @@ class HelpWindow(ReadOnlyTextWindow):
              'Moved rings constrain motor sense only together with camera mounting. Mirror-line flips can remain tied.',
              'Declare an asymmetric feature’s lab direction before checking χ. Powder rings alone cannot certify azimuth.',
              'A centred or mirror/diagonal frame may not identify the mounting. Check the physical detector and obtain separating evidence.')[self.step_row.editor.currentIndex()])
-        self._draw_figure_key(key)
         self.feature_row.setVisible(step == 2)
         from xrd_tools.geometry_figures import synthetic_orientation_finding
         if step not in self._synthetic_findings:
             self._synthetic_findings[step] = synthetic_orientation_finding(step)
         finding = self._synthetic_findings[step]
+        with QtCore.QSignalBlocker(self.figure_row.editor):
+            self.figure_row.editor.setCurrentIndex(topic.figures.index(key))
+        self._draw_figure_key(key, finding.reason)
         rows = tuple((c.camera.rows+'/'+c.camera.columns, *c.senses,
                       f'{c.score:.4g}', f'{c.standard_error:.4g}') for c in finding.candidates)
         self.score_table.show_rows(('Mounting', 'del', 'nu', 'AUC', 'SE'), rows,
@@ -258,11 +263,14 @@ class HelpWindow(ReadOnlyTextWindow):
             index = max(0, self.figure_row.editor.currentIndex())
             self._draw_figure_key(topic.figures[index])
 
-    def _draw_figure_key(self, key):
+    def _draw_figure_key(self, key, finding_reason=''):
         from xrd_tools.geometry_figures import help_figures
         from xrd_tools.session.display_logic import PanelKey, PanelRole
         from xdart.gui.tabs.scattering.shell_values import KeyedFigureProjection, KeyedPanelsProjection
         figures = help_figures(key, max(0, self.candidate_row.editor.currentIndex()))
+        if finding_reason:
+            from dataclasses import replace
+            figures = tuple(replace(f, caption=f.caption+' Synthetic result: '+finding_reason) for f in figures)
         keys = tuple(PanelKey(PanelRole.FIGURE, f'help-{i}') for i in range(len(figures)))
         layout = tuple(tuple(keys[i:i+2]) for i in range(0, len(keys), 2))
         self.figure_view.reconcile_keyed(KeyedPanelsProjection(layout,
@@ -289,6 +297,7 @@ class ContextHelpOwner(QtCore.QObject):
         self._resume_timer.setSingleShot(True)
         self._resume_timer.timeout.connect(self._resume_queued)
         root.installEventFilter(self)
+        QtWidgets.QApplication.instance().installEventFilter(self)
         QtWidgets.QApplication.instance().focusChanged.connect(self._focus_changed)
         self._bind_shortcut()
 
@@ -301,9 +310,21 @@ class ContextHelpOwner(QtCore.QObject):
         if os.environ.get('XDART_DEBUG_HELP_FOCUS'):
             logging.getLogger(__name__).warning('help_owner %s', dict(event=event,
                 generation=self._focus_generation, held=self._held_row,
-                focus=QtWidgets.QApplication.focusWidget(), root_focus=self.root.focusWidget(), **details))
+                focus=QtWidgets.QApplication.focusWidget(), root_focus=self.root.focusWidget(),
+                active_window=QtWidgets.QApplication.activeWindow(),
+                active_popup=QtWidgets.QApplication.activePopupWidget(), **details))
 
     def eventFilter(self, watched, event):
+        if (self._held_row is not None and event.type() == QtCore.QEvent.Type.MouseButtonPress
+                and isinstance(watched, QtWidgets.QWidget) and watched.window() is self.root
+                and not _help_action(watched) and watched is not self._held_row.editor):
+            # A deliberate control click wins over help's deferred restoration.
+            # Activate before the actual control handles its native focus/popup.
+            self.release_draft()
+            self.root.activateWindow()
+            if watched.focusPolicy() != QtCore.Qt.FocusPolicy.NoFocus:
+                watched.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+            self._trace_focus('deliberate_control', target=watched)
         if watched is self.root:
             if event.type() == QtCore.QEvent.Type.Hide:
                 self.shutdown()

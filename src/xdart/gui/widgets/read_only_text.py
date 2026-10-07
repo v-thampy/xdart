@@ -45,5 +45,12 @@ class ReadOnlyTextWindow(QtWidgets.QDialog):
         """Mount another shared owner before the text, without changing the plain window contract."""
         self.layout().insertWidget(index, widget)
 
+    def insert_content_row(self, widgets, index: int = 0) -> None:
+        """Mount shared controls beside each other without adding another editor/display."""
+        row = QtWidgets.QHBoxLayout()
+        for widget in widgets:
+            row.addWidget(widget)
+        self.layout().insertLayout(index, row)
+
 
 __all__ = ["ReadOnlyTextPane", "ReadOnlyTextWindow"]

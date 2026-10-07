@@ -153,6 +153,25 @@ def _frame_energy_known(frame, seed):
 
 def _dispatch_job(request, cancelled, publish):
     kind, arguments = request
+    if kind == 'orientation':
+        from xrd_tools.geometry_figures import consistent_motion_candidates, diagnose_calibration_frames
+        key, mode, options = arguments
+        options = dict(options)
+        if cancelled.is_set():
+            raise OperationCancelled('orientation check cancelled')
+        if mode == 'motion':
+            finding = consistent_motion_candidates(**options)
+            result = finding, None, None
+        else:
+            seed = options.pop('seed')
+            # Use only an existing fixed arm. Checking never invokes session_prediction or a fit.
+            record = seed.get('record') or seed.get('prediction') or seed.get('rough') or seed.get('file')
+            if record is None:
+                raise ValueError('Enter or load a fixed rough geometry before checking these frames.')
+            result = diagnose_calibration_frames(record=record, cancelled=cancelled.is_set, **options)
+        if cancelled.is_set():
+            raise OperationCancelled('orientation check cancelled')
+        return key, result
     if kind == 'source_details':
         from xrd_tools.integrate.stitch_calibration import calibration_source_energy_eV
         from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
@@ -472,6 +491,12 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._job = None
         self._row_identity = None
         self._close_pending = False
+        self.orientation_panel = None
+        self.instrument_schematic = None
+        self._orientation_generation = 0
+        self._orientation_pending_key = None
+        self._orientation_geometry = None
+        self._schematic_readings = None  # None is an explicitly labelled zero-pose example, not metadata.
         self._beam_detection = None
         self._beam_generation = 0
         self._beam_problem = 'Select a direct-beam source and scan'
@@ -538,6 +563,13 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._help_owner = owner_for(self)
         outer.addWidget(self.status)
         footer = QtWidgets.QHBoxLayout()
+        from .orientation_views import action
+        self.orientation_button = action('Orientation check', 'Open the read-only staged-frame or direct-beam orientation check; no values are applied.', self)
+        self.schematic_button = action('Instrument schematic', 'Show configured circle axes in three views; select a frame for its recorded motor readings.', self)
+        self.orientation_button.clicked.connect(self.open_orientation_check)
+        self.schematic_button.clicked.connect(self.show_instrument_schematic)
+        footer.addWidget(self.orientation_button)
+        footer.addWidget(self.schematic_button)
         self.cancel_button = QtWidgets.QPushButton('Cancel operation')
         self.cancel_button.clicked.connect(self._cancel)
         self.cancel_button.setEnabled(False)
@@ -586,7 +618,159 @@ class CalibrationDialog(QtWidgets.QDialog):
                        self.beam_source_kind.currentIndexChanged, self.rough_mode.currentIndexChanged):
             signal.connect(self._render_direct_beam_advice)
         self.tabs.currentChanged.connect(self._tab_readiness)
+        for field in dict.fromkeys(self._fields.values()):
+            signal = (getattr(field, 'currentIndexChanged', None) if isinstance(field, QtWidgets.QComboBox)
+                      else getattr(field, 'textChanged', None))
+            if signal is not None:
+                signal.connect(self._invalidate_orientation)
+        for signal in (self.geometry_editor.changed, self.camera.changed, self.point_images.changed,
+                       self.beam_source_kind.currentIndexChanged, self.rough_mode.currentIndexChanged,
+                       self.refine_calibrant.currentIndexChanged):
+            signal.connect(self._invalidate_orientation)
+        self.geometry_editor.changed.connect(self._redraw_schematic)
+        self.frame_table.itemSelectionChanged.connect(self._schematic_frame_selected)
         self._update_beam_readiness()
+
+    def open_orientation_check(self):
+        if self.orientation_panel is None:
+            from .orientation_views import OrientationPanel
+            self.orientation_panel = OrientationPanel(self, run=self._start_orientation, cancel=self._cancel,
+                camera_focus=self._orientation_camera_focus, sign_focus=self._orientation_sign_focus,
+                feature=self._orientation_feature)
+            self._tab_pages['orientation'] = self.orientation_panel
+            self.tabs.addTab(self.orientation_panel, 'Orientation check')
+            self.tabs.setTabToolTip(self.tabs.indexOf(self.orientation_panel),
+                                   'Read-only ring and motion evidence; edit geometry only in the existing controls.')
+            self.orientation_panel.frame_row.editor.currentIndexChanged.connect(self._invalidate_orientation)
+            self.orientation_panel.candidate_row.editor.currentIndexChanged.connect(self._orientation_candidate_changed)
+        self.orientation_panel.set_frames(self.frames)
+        self.orientation_panel.busy(self._owner.busy)
+        self.tabs.setCurrentWidget(self.orientation_panel)
+        self.show(); self.raise_(); self.activateWindow()
+
+    def _orientation_key(self):
+        return (self._orientation_generation, tuple((f.identity, f.image_sha256, f.poni_sha256) for f in self.frames),
+                self.camera.value(), self.geometry_editor.value(), id(self._distance_result), self._distance_key)
+
+    def _invalidate_orientation(self, *_args):
+        self._orientation_generation += 1
+        self._orientation_geometry = None
+        if self.orientation_panel is not None:
+            self.orientation_panel.invalidate()
+
+    def _start_orientation(self, *_args):
+        def go():
+            if self._owner.busy:
+                return
+            panel = self.orientation_panel
+            preview_camera, preview_senses = self.camera.value(), (1, 1)
+            if panel.finding is not None:
+                index = panel.candidate_row.editor.currentData()
+                if index is not None and 0 <= index < len(panel.finding.candidates):
+                    candidate = panel.finding.candidates[index]
+                    preview_camera, preview_senses = candidate.camera, candidate.senses
+            if self.frames:
+                if self._staged_camera_message():
+                    raise ValueError(self._staged_camera_message())
+                if self.geometry_editor.value().stitch_arm() != self._frame_motors or self._staged_source_mismatch():
+                    raise ValueError('Restore the staged frames’ source and motor mapping before checking them.')
+                selected = panel.frame_row.editor.currentData()
+                frames = tuple(sorted(self.frames, key=lambda f: f.identity != selected))
+                seed = self._seed_options()
+                mode, options = 'rings', dict(frames=frames, seed=seed,
+                    del_motor=self._frame_motors[0], nu_motor=self._frame_motors[1],
+                    mask=self._loaded_mask(), conditioning=self._conditioning(), saturation=self._saturation_value(),
+                    calibrant=seed['calibrant'], preview_camera=preview_camera, preview_senses=preview_senses)
+                if self._text('mask') and options['mask'] is None:
+                    raise ValueError('The configured static mask cannot be read.')
+            else:
+                if not self._distance_fresh():
+                    raise ValueError(self._STALE_DISTANCE)
+                from xrd_tools.core.geometry import ImageOrientation
+                from xrd_tools.core.geometry.camera import stitch_camera
+                fitted_options = json.loads(self._distance_key)[5]
+                measured = stitch_camera(ImageOrientation(rotation=fitted_options['rotation'],
+                    flip_horizontal=fitted_options.get('flip', False)))
+                role = self._beam_role()
+                motor_names = self.geometry_editor.value().stitch_arm()
+                held = {circle: self._distance_held[name] for circle, name in zip(('del', 'nu'), motor_names)
+                        if name in self._distance_held}
+                mode, options = 'motion', dict(result=self._distance_result, measured_camera=measured,
+                    detector=self._text('beam_detector'), motor=role, held=held,
+                    trusted_senses=self.geometry_editor.value().arm_senses(),
+                    first_pixel=int(self._text('beam_orientation')))
+            self._orientation_pending_key = self._orientation_key()
+            panel.invalidate()
+            self._start('orientation', (self._orientation_pending_key, mode, options))
+        self._guard(go)
+        if not self._owner.busy and self.orientation_panel is not None:
+            self.orientation_panel.finding_pane.set_text(self.status.text())
+
+    def _orientation_candidate_changed(self, *_args):
+        if self.orientation_panel is not None and self.orientation_panel.finding is not None and self.frames:
+            self._start_orientation()
+
+    def _orientation_camera_focus(self):
+        self._help_owner.release_draft()
+        self._show_tab('instrument')
+        self.activateWindow()
+        self.camera.rotation.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def _orientation_sign_focus(self):
+        self._help_owner.release_draft()
+        self._show_tab('instrument')
+        self.activateWindow()
+        geometry = self.geometry_editor.value()
+        role = self._beam_role() or 'del'
+        arm = geometry.stitch_arm()
+        motor = arm[0 if role == 'del' else 1]
+        circle = next((c for c, name in geometry.motors if name == motor and c in geometry.circles), None)
+        if circle is None:
+            self.status.setText('Select a measured detector circle to show its motor direction.')
+            return
+        self.geometry_editor.axis_box(circle).setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def _orientation_feature(self, _key, column, row):
+        panel = self.orientation_panel
+        if panel is None or panel.step_row.editor.currentIndex() != 2:
+            return
+        if self._orientation_geometry is None or panel.finding is None:
+            panel.finding_pane.set_text('Run on a staged calibrant frame before selecting a known feature.')
+            return
+        from xrd_tools.geometry_figures import feature_azimuth
+        index = panel.candidate_row.editor.currentData()
+        camera = panel.finding.candidates[index].camera if index is not None else self.camera.value()
+        direction = panel.feature_row.editor.currentText()
+        result = feature_azimuth(self._orientation_geometry, camera, (column, row),
+                                  expected_lab=None if direction == 'Undeclared' else direction)
+        panel.finding_pane.set_text(result.reason)
+
+    def show_instrument_schematic(self):
+        if self.instrument_schematic is None:
+            from .orientation_views import InstrumentSchematicWindow
+            self.instrument_schematic = InstrumentSchematicWindow(self)
+        self._redraw_schematic()
+        self.instrument_schematic.show(); self.instrument_schematic.raise_()
+
+    def set_schematic_readbacks(self, readings):
+        self._schematic_readings = dict(readings)
+        self._redraw_schematic()
+
+    def _schematic_frame_selected(self):
+        row = self.frame_table.currentRow()
+        if 0 <= row < len(self.frames):
+            self.set_schematic_readbacks(self.frames[row].motors)
+
+    def _redraw_schematic(self, *_args):
+        if self.instrument_schematic is None:
+            return
+        geometry = self.geometry_editor.value()
+        readings = self._schematic_readings
+        if readings is None:
+            readings = {motor: 0. for _, motor in geometry.motors}
+        self.instrument_schematic.show_geometry(geometry, readings)
+        if self._schematic_readings is None:
+            self.instrument_schematic.legend.appendPlainText('\nExplicit zero-readback example; no frame readbacks selected.')
 
     def _form(self, title, key):
         widget = QtWidgets.QWidget()
@@ -2033,6 +2217,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._calibration_fit_window.preview_busy(True)
         self._identity = self._owner.begin((kind, arguments))
         self._set_tabs_enabled(kind == 'beam_detect')
+        if self.orientation_panel is not None:
+            self.orientation_panel.busy(True)
         self.cancel_button.setEnabled(True)
         self.status.setText('Stitching calibrant preview…' if kind == 'stitch_preview' else
                             'Checking direct-beam scan…' if kind == 'beam_detect'
@@ -2739,7 +2925,7 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def hideEvent(self, event):
         """The fit windows go with this window (closed, hidden, or shut down by the host)."""
-        for window in (self._direct_beam_fit_window, self._calibration_fit_window):
+        for window in (self._direct_beam_fit_window, self._calibration_fit_window, self.instrument_schematic):
             if window is not None:
                 window.close()
         super().hideEvent(event)
@@ -2791,6 +2977,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.frame_table.selectRow(next((row for row in rows if row > after), rows[0]))
 
     def _render_frames(self):
+        self._invalidate_orientation()
+        if self.orientation_panel is not None:
+            self.orientation_panel.set_frames(self.frames)
         self._update_fit_source_label()
         rows, tips = [], {}
         for row, frame in enumerate(self.frames):
@@ -2878,6 +3067,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         terminal, kind = update.terminal, self._job
         self._identity = None
         self._set_tabs_enabled(True)
+        if self.orientation_panel is not None:
+            self.orientation_panel.busy(False)
         self.cancel_button.setEnabled(False)
         self._timer.stop()
         if self._calibration_fit_window is not None:
@@ -2902,7 +3093,12 @@ class CalibrationDialog(QtWidgets.QDialog):
                 return
             self.point_images.finish_run()
             try:
-                if kind == 'beam_detect':
+                if kind == 'orientation':
+                    key, (finding, figure, geometry) = result
+                    if not self._close_pending and key == self._orientation_key():
+                        self._orientation_geometry = geometry
+                        self.orientation_panel.show_finding(finding, figure)
+                elif kind == 'beam_detect':
                     if self._beam_probe_generation == self._beam_generation:
                         self._beam_detection = (self._beam_generation, *result)
                         self._beam_problem = ''
@@ -3040,6 +3236,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         else:
             self._close_after_save = False
             self.status.setText(terminal.failure_message)
+        if kind == 'orientation' and self.orientation_panel is not None:
+            if terminal.status is not OperationTerminalStatus.RETURNED:
+                self.orientation_panel.finding_pane.set_text(self.status.text())
+            elif self._orientation_pending_key != self._orientation_key() and not self._close_pending:
+                self.orientation_panel.finding_pane.set_text('Inputs changed during the check; run again. No stale finding was adopted.')
         if kind == 'stitch_preview' and self._calibration_fit_window is not None:
             self._calibration_fit_window.preview_busy(False, self.status.text())
         if kind == 'beam_detect':
@@ -3063,8 +3264,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _set_tabs_enabled(self, enabled):
         # Preserve the science/editor lock while the corner help action stays available.
         self.tabs.tabBar().setEnabled(enabled)
-        for page in self._tab_pages.values():
-            page.setEnabled(enabled)
+        for key, page in self._tab_pages.items():
+            page.setEnabled(enabled or key == 'orientation')
 
     def closeEvent(self, event):
         if (not self._owner.busy and self._saved_setup is not None

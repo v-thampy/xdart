@@ -607,8 +607,16 @@ class _ControlsComboBox(QtWidgets.QComboBox):
     only authoritative boundary -- immediately before the popup is shown.
     """
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup_resume = QtCore.QTimer(self)
+        self._popup_resume.setSingleShot(True)
+        self._popup_resume.timeout.connect(self._return_popup_focus)
+
     def showPopup(self) -> None:
         view = self.view()
+        self._popup_resume.stop()
+        view.window().installEventFilter(self)
         view.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
         view.doItemsLayout()
         popup_width = (
@@ -629,6 +637,34 @@ class _ControlsComboBox(QtWidgets.QComboBox):
         view.setMinimumHeight(max(1, viewport_floor))
         view.updateGeometry()
         super().showPopup()
+
+    def hidePopup(self) -> None:
+        popup = self.view().window()
+        was_visible = popup.isVisible()
+        super().hidePopup()
+        if os.environ.get('XDART_DEBUG_HELP_FOCUS'):
+            logging.getLogger(__name__).warning('controls_popup %s', dict(was_visible=was_visible,
+                popup=popup, visible=popup.isVisible(), active=QtWidgets.QApplication.activeWindow(),
+                focus=QtWidgets.QApplication.focusWidget(), root=self.window()))
+        if was_visible:
+            self._popup_resume.start(0)
+
+    def eventFilter(self, watched, event):
+        if (watched is self.view().window() and event.type() == QtCore.QEvent.Type.WindowActivate
+                and not watched.isVisible()):
+            self._popup_resume.start(0)
+        return super().eventFilter(watched, event)
+
+    def _return_popup_focus(self):
+        # Qt may activate the popup *after* hidePopup returns. Only recover
+        # an empty focus owned by this exact hidden popup; a later user choice
+        # in another control/window wins without any deferred focus override.
+        popup, root = self.view().window(), self.window()
+        if (not popup.isVisible() and QtWidgets.QApplication.activeWindow() is popup
+                and QtWidgets.QApplication.focusWidget() is None and root.focusWidget() is self
+                and root.isVisible() and self.isEnabled()):
+            root.activateWindow()
+            self.setFocus(QtCore.Qt.FocusReason.PopupFocusReason)
 
 
 class ControlsComboBox(_ControlsComboBox):

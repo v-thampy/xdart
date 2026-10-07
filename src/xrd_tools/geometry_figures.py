@@ -410,6 +410,24 @@ def help_figures(key, candidate_index=0):
     if key == 'arm-motion':
         return tuple(predict_ring_curves(replace(GeometryInputs(), readings=(('del', a), ('nu', 0.))), camera)
                      for a in (0., 15., 30.))
+    if key == 'mirror-tie':
+        panels = []
+        truth, flipped = DetectorCamera('x-', 'z+'), DetectorCamera('x+', 'z+')
+        for offset, angle, title in (((-190., 0.), 15., 'U/D flip or reversed δ: mirror-line tie'),
+                                     ((-190., 229.), 0., 'Off the mirror line: zero-angle evidence separates')):
+            value = replace(GeometryInputs(), beam_offset_px=offset, readings=(('del', angle), ('nu', 0.)))
+            flip_prediction = predict_ring_curves(value, flipped)
+            reverse_prediction = predict_ring_curves(value, truth, (-1, 1))
+            observed = synthetic_orientation_example(replace(value, readings=(('del', -angle), ('nu', 0.))), truth)
+            reverse_curves = tuple(replace(c, name='Reversed δ '+c.name, role='tie',
+                tooltip='Dotted: upright camera, reversed δ sense; fixed beam and geometry.')
+                for c in reverse_prediction.curves)
+            panels.append(replace(flip_prediction, title=title, image=observed.image,
+                curves=flip_prediction.curves+reverse_curves,
+                caption='Synthetic LaB6: dashed U/D-flipped camera at the recorded δ, dotted upright camera '
+                        'with reversed δ. The first case agrees on the row mirror line; the second uses a '
+                        'zero-angle frame off that line. Fixed beam/geometry; ν remains unmeasured.'))
+        return tuple(panels)
     value = GeometryInputs()
     if key == 'centred':
         value = replace(value, beam_offset_px=(0., 0.))
@@ -685,14 +703,14 @@ def diagnose_orientation(frames, *, cancelled=None):
     geometric_count = value_count = 0
     for frame in frames:
         if cancelled and cancelled():
-            raise RuntimeError('Orientation check cancelled.')
+            raise InterruptedError('Orientation check cancelled.')
         geometric, invalid = _frame_masks(frame)
         geometric_count += int(geometric.sum()); value_count += int((invalid & ~geometric).sum())
         reuse = {}
         for c in camera_candidates():
             for senses in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
                 if cancelled and cancelled():
-                    raise RuntimeError('Orientation check cancelled.')
+                    raise InterruptedError('Orientation check cancelled.')
                 effective = (c.camera, tuple(s*dict(frame.geometry.readings)[m]
                                             for s, m in zip(senses, ('del', 'nu'))))
                 if effective not in reuse:
@@ -789,11 +807,11 @@ def synthetic_orientation_finding(step):
     if step == 3:
         value = replace(value, beam_offset_px=(0., 0.))
     if step == 1:
-        value = replace(value, beam_offset_px=(0., 229.))
+        value = replace(value, beam_offset_px=(-190., 0.))
         def frames():
             for angle in (0., 15.):
                 pose = replace(value, readings=(('del', angle), ('nu', 0.)))
-                example = synthetic_orientation_example(pose, truth)
+                example = synthetic_orientation_example(replace(pose, readings=(('del', -angle), ('nu', 0.))), truth)
                 yield OrientationFrame(example.image, pose)
         return diagnose_orientation(frames())
     example = synthetic_orientation_example(value, truth)
@@ -874,7 +892,7 @@ def calibration_orientation_inputs(record, frame, *, del_motor='del', nu_motor='
 
 def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu', mask=None,
                                 conditioning=None, saturation=None, cancelled=None, preview_camera=None,
-                                calibrant='LaB6'):
+                                calibrant='LaB6', preview_senses=(1, 1)):
     """Read only verified staged frames through the existing format-aware reader.
 
     Frames stream through the numerical owner. The returned display contains one
@@ -886,7 +904,7 @@ def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu
     from os import PathLike
     frames = tuple(frames)
     if not frames:
-        return _finding((), Exclusions(), 32), None
+        return _finding((), Exclusions(), 32), None, None
     static_mask = np.asarray(read_image(mask), bool) if isinstance(mask, (str, bytes, PathLike)) else mask
     def load(frame):
         if cancelled and cancelled():
@@ -917,8 +935,8 @@ def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu
         raise InterruptedError('Orientation check cancelled.')
     observed = load(frames[0])
     camera = preview_camera or camera_candidates()[0].camera
-    prediction = predict_ring_curves(observed.geometry, camera)
+    prediction = predict_ring_curves(observed.geometry, camera, preview_senses)
     figure = replace(prediction, image=observed.image,
         caption=f'Observed staged frame {frames[0].index}; dashed rings are the displayed fixed mounting hypothesis. '
                 'No camera, motor sense, beam or PONI is applied or refitted. '+finding.reason)
-    return finding, figure
+    return finding, figure, observed.geometry

@@ -108,6 +108,8 @@ class OrientationPanel(SectionCard):
         self.finding = finding
         self.finding_pane.set_text(finding.reason)
         rows, tips = [], {}
+        previous = self.candidate_row.editor.currentData()
+        blocked = QtCore.QSignalBlocker(self.candidate_row.editor)
         self.candidate_row.editor.clear()
         for i, c in enumerate(finding.candidates):
             support = sum(r.support for r in c.ring_scores)/len(c.ring_scores) if c.ring_scores else float('nan')
@@ -119,6 +121,9 @@ class OrientationPanel(SectionCard):
                 tips[i, column] = ('Hypothesis only. Explicit geometric exclusions '
                     f'{finding.exclusions.geometric}; value exclusions {finding.exclusions.value}. '
                     'Detector gaps are excluded from ring support. Fixed inputs are not refitted.')
+        index = self.candidate_row.editor.findData(previous)
+        self.candidate_row.editor.setCurrentIndex(max(0, index))
+        del blocked
         self.table.show_rows(('Mounting', 'del', 'nu', 'AUC', 'SE', 'Support'), rows, cell_tooltips=tips)
         if figure is not None:
             show_figures(self.figure_view, (figure,)); self.figure_view.show()
