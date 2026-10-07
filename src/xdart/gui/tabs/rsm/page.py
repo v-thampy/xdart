@@ -1041,6 +1041,8 @@ class RSMPage(QtWidgets.QWidget):
     def _committed(self, key):
         """A committed edit: a typed source path is the selection, a kind shows its own rows; the output
         follows the Source until a name is chosen."""
+        if self._closing:
+            return
         if key == "spec_path":
             text = str(self._value("spec_path") or "").strip()
             if text != self._source_shown:  # the row's own display of the selection is not a path (Stitch's)
