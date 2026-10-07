@@ -994,7 +994,7 @@ class CoordinateRangeControl(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
-        self.row = RangeRow(label=label,
+        self.row = RangeRow(label=label, display_decimals=3,
             low={"path": ("display_range", "low"), "value": ""},
             high={"path": ("display_range", "high"), "value": ""})
         self.label, self.editors = self.row.label, self.row.editors
@@ -1021,8 +1021,10 @@ class CoordinateRangeControl(QtWidgets.QWidget):
             widget.setToolTip(tip)
 
     def _sync_editors(self):
-        for editor, value in zip(self.editors, self._bounds, strict=True):
-            editor.setText(format(value, '.9g'))
+        for editor, path, value in zip(self.editors, (self.row._low_path, self.row._high_path), self._bounds, strict=True):
+            self.row._model_text_by_path[path] = str(value)
+            editor.setText(format(value, '.3f'))
+            editor.setModified(False)
 
     def _edited(self, path, value):
         try:

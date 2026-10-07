@@ -43,6 +43,7 @@ def test_actual_rsm_page_defaults_to_mean_and_shared_ranges_change_all_six(qapp)
         assert len(page.view.coordinate_ranges) == 3
         row = page.view.coordinate_ranges[2]
         axis = values.axes[2][1]
+        assert [e.text() for e in row.editors] == ['2.000', '3.000']
         editor = row.editors[0]
         editor.setFocus(); editor.selectAll(); QTest.keyClicks(editor, format(float(axis[4]), '.9g'))
         QTest.keyClick(editor, QtCore.Qt.Key.Key_Return); qapp.processEvents()

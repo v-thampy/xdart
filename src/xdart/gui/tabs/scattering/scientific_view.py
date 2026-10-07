@@ -3486,6 +3486,8 @@ class ScientificView(QtWidgets.QFrame):
         # Share Axis and the intensity controls on the 2D Viewer's intensity row, below the panels; an Int mode
         # gives them back (``_leave_keyed_layout``, ``_apply_mode_layout``)
         self._share_axis_home = self.plot_bar.indexOf(self.share_axis)
+        options_layout = self.options.parentWidget().layout()
+        self._options_home = options_layout, options_layout.indexOf(self.options)
         self.viewer_intensity_row_layout.addWidget(self.share_axis)
         self.viewer_intensity_row_layout.addWidget(self.options)
         self.viewer_intensity_row_layout.addWidget(self.viewer_intensity)
@@ -3508,7 +3510,8 @@ class ScientificView(QtWidgets.QFrame):
         self._keyed_hidden = ()
         if self._share_axis_home >= 0:  # back where Int's plot bar keeps it; the controls go where the mode does
             self.plot_bar.insertWidget(self._share_axis_home, self.share_axis)
-        self.plot_bar.insertWidget(self.plot_bar.indexOf(self.share_axis), self.options)
+        options_layout, options_index = self._options_home
+        options_layout.insertWidget(options_index, self.options)
         self.viewer_intensity_row.setVisible(False)
 
     def _emit_panel_index(self, key: PanelKey, index: int) -> None:
