@@ -58,7 +58,44 @@ def _page_with_dialog(tmp_path, spec=None, seed_path=None):
         page.set_field("geometry_path", str(seed_path))
     page._calibrate()
     _wait(page._calibration_dialog)  # source metadata must finish before a user operation
+    if spec is not None:
+        from xrd_tools.core.geometry.camera import STITCH_CAMERA
+        page._calibration_dialog.camera.set_value(STITCH_CAMERA)  # ring_scan's native pyFAI pixels
     return page, page._calibration_dialog
+
+
+def _stage_native_pairs(dialog, pairs, root):
+    """Bind unchanged native control pairs to an actual SPEC scan and captured detector frames."""
+    import shutil
+    from xrd_tools.integrate.stitch_calibration import capture_calibration_frames, adopt_calibration_pair
+    root.mkdir()
+    images = root / 'images'
+    images.mkdir()
+    motors = tuple(pairs[0].motors)
+    rows = [' '.join(str(pair.motors[motor]) for motor in motors) for pair in pairs]
+    spec_path = root / 'native'
+    spec_path.write_text('#F native\n#O0 ' + ' '.join(motors) + '\n'
+                        f'#S 1 ascan {motors[0]} 0 1 {len(pairs) - 1} 1\n#P0 {rows[0]}\n'
+                        f'#N {len(motors)}\n#L ' + '  '.join(motors) + '\n' + '\n'.join(rows) + '\n')
+    for index, pair in enumerate(pairs):
+        shutil.copyfile(pair.image_path, images / f'native_scan1_{index:04d}.tif')
+    spec = SourceSpec(spec_path, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
+                      'image_stem': 'native_scan1_'})
+    dialog.set_source_context(spec, image_rotation=0)
+    _wait(dialog)
+    arm = dialog.geometry_editor.value().stitch_arm()
+    captured = capture_calibration_frames(dialog._spec(), range(len(pairs)), dialog.session_dir,
+                                         rotation=0, arm=arm)
+    frames = tuple(adopt_calibration_pair(frame, pair.poni_path, pair.npt_path)
+                   for frame, pair in zip(captured, pairs))
+    assert len(frames) == len(pairs)
+    assert tuple(frame.motors for frame in frames) == tuple(pair.motors for pair in pairs)
+    assert all(frame.rotation == 0 and frame.energy_eV == pair.energy_eV
+               for frame, pair in zip(frames, pairs))
+    dialog.frames, dialog._frame_motors = frames, arm
+    dialog._render_frames()
+    _wait(dialog)
+    return frames
 
 
 def _guided_frames(tmp_path, energy_ratio=1.0):
@@ -136,9 +173,7 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
     try:
         assert 'without the extension' in dialog.arm_note.text()
         assert 'the extension needs frames on at least 3 nu positions' in dialog.arm_note.text()
-        dialog.frames = frames
-        dialog._frame_motors = ('del', 'nu')
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         assert "the detector's tilt and roll on the arm, the sample's offset from the rotation centre), which the " \
                'frames on 5 nu positions can determine' in dialog.arm_note.text()
         # TRUTH's sample sits 0.5-2.2 mm off the centre: held at the default ±0.05 mm, the energy (refined by
@@ -204,8 +239,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
         dialog.geometry_editor.zero_edit('tth').setText(f'{-np.rad2deg(.05):.12g}')  # native arm's del zero
-        dialog.frames, dialog._frame_motors = frames, ('tth', None)
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         assert 'without the extension' in dialog.arm_note.text()
         assert 'a single 2θ arm holds one circle at zero' in dialog.arm_note.text()
         dialog.fit_button.click()
@@ -709,9 +743,7 @@ def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_o
     frames = _guided_frames(tmp_path, energy_ratio=(recorded + 100.) / recorded)
     page, dialog = _page_with_dialog(tmp_path)
     try:
-        dialog.frames = frames
-        dialog._frame_motors = ('del', 'nu')
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         _truth_bounds(dialog)  # or the energy absorbs the zero and offsets the default bounds hold back
         # on by default, ±100 eV (maintainer, 2026-09-29, D1: "+-100 and on by default")
         assert dialog.refine_energy.isChecked() and dialog._fields['energy_bound'].isEnabled()

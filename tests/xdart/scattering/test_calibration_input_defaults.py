@@ -257,8 +257,8 @@ def test_typed_beam_pixel_follows_the_camera_but_not_pyfais_origin(qapp, tmp_pat
         dialog._set_field_text('beam_orientation', '1')
         assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (x, y)
         dialog.camera.default_button.click()
-        assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (280, 97)
-        assert dialog._orientation() == ImageOrientation()
+        assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (206, 97)
+        assert dialog._orientation() == ImageOrientation(rotation=180)
         assert dialog._text('beam_orientation') == '1'
     finally:
         dialog.close()
@@ -390,6 +390,7 @@ def test_the_real_eiger_del_scan_fits_with_auto_motion_and_no_energy(qapp, tmp_p
         pytest.skip('direct-beam Eiger scan unavailable')
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
+        dialog.camera.set_value(stitch_camera(ImageOrientation()))  # frozen scan's native reference frame
         dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec_container'))
         dialog._set_field_text('beam_detector', 'Eiger2_500k')
         dialog._set_field_text('beam_source', root / 'direct_beam_dist_p33m')

@@ -437,12 +437,13 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
         session = dialog.session_dir / 'calibration-session.json'
         assert json.loads(session.read_text())['arm'] == {'del': None, 'nu': 'tth'}
         assert 'holds one circle at zero' in dialog.arm_note.text()
-        # the direct-beam default "del" means the arm's one circle: the rough geometry holds del
+        # The instrument's one horizontal circle owns the rough geometry; no motor editor is duplicated.
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '500'), ('beam_pixel', '3, 2'), ('beam_detector', 'Pilatus300kw')):
             dialog._set_field_text(key, value)
         rough = dialog._rough_record()
-        assert dialog._text('beam_motor') == 'del' and is_single_arm(rough) and rough['pos_names'] == ['nu_angle']
+        assert dialog.geometry_editor.value().stitch_arm() == (None, 'tth')
+        assert is_single_arm(rough) and rough['pos_names'] == ['nu_angle']
         # the same motor name, resumed in a window set to the vertical plane: the session keeps its plane
         monkeypatch.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
         other.set_instrument(InstrumentGeometry('twoc'))
@@ -504,32 +505,41 @@ def test_staged_frames_survive_pyfai_ring_extraction(tmp_path):
 
 
 def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path):
-    from tests.core.test_direct_beam import beam_images, config
+    from tests.core.test_direct_beam import beam_images
+    from xrd_tools.core.geometry.camera import DetectorCamera
+    from xrd_tools.session.instrument import InstrumentGeometry
     from xdart.gui.tabs.calibration.dialog import _run_job
     from xrd_tools.integrate.direct_beam import calibrate_direct_beam
     angles = np.array([5.5,6.,6.5,7.,7.5,8.,8.5])
-    images, _, beam = beam_images(angles)
+    images, _, beam = beam_images(angles, shape=(195, 487), pitches=(172e-6, 172e-6))
     spec = tmp_path/'direct'
     spec.write_text('#F direct\n#E 1\n#D today\n#C test\n#O0 del\n'
         '#S 1 ascan del 5.5 8.5 6 1\n#D today\n#P0 0\n#N 1\n#L del\n' + '\n'.join(map(str, angles)) + '\n')
     for index, array in enumerate(images):
         tifffile.imwrite(tmp_path/f'direct_scan1_{index:04d}.tif', array)
-    source = SourceSpec(spec, SourceKind.SPEC, options={'scan':'1','image_dir':str(tmp_path)})
-    options = dict(detector='Detector', detector_config=config(), beam_pixel=beam,
-                   angle_zero_deg=7., rotation=0)
-    result, energy, held = _run_job(('distance', (source, 'del', options, ())), Event(), lambda *_: None)
-    assert energy is None and held == {}  # the scan records no energy; no other circle is held
-    expected = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(),
-                                     beam_pixel=beam, angle_zero_deg=7.)
-    assert result.distance_m == pytest.approx(expected.distance_m)
-    assert result.point_ids == tuple(('1.1', index) for index in range(7))
-    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Pilatus100k',
+                                                 camera=DetectorCamera('x+', 'z-')))
+    dialog.set_instrument(InstrumentGeometry('twoc', motors=(('tth', 'del'),), plane='horizontal',
+                                             zeros=(('tth', 7.),)))
     for key, value in (('beam_source', spec), ('beam_scan', '1'), ('beam_images', tmp_path)):
         dialog._set_field_text(key, str(value))
     from tests.xdart.scattering.test_direct_beam_readiness import detect
+    dialog._set_field_text('beam_pixel', ', '.join(map(str, beam)))
+    dialog._set_field_text('beam_orientation', '3')
     detect(dialog)  # qualify the actual source before accepting its completed distance fit
-    # as the window's own job records it: the result and the inputs it was fitted from (Codex F5)
-    dialog._distance_result, dialog._distance_key = result, dialog._direct_beam_key()
+    assert dialog._beam_detection is not None, (dialog._beam_problem, dialog.beam_readiness.status.text())
+    assert dialog._beam_detection[0] == dialog._beam_generation and dialog.beam_button.isEnabled()
+    request = dialog._direct_beam_request()  # expose a qualification exception before key construction
+    key = dialog._direct_beam_key()
+    assert key is not None
+    result, energy, held = _run_job(('distance', request), Event(), lambda *_: None)
+    assert energy is None and held == {}  # the scan records no energy; no other circle is held
+    expected = calibrate_direct_beam(angles, images, detector='Pilatus100k',
+                                     beam_pixel=beam, angle_zero_deg=7.)
+    assert result.distance_m == pytest.approx(expected.distance_m)
+    assert result.point_ids == tuple(('1.1', index) for index in range(7))
+    # The actual completed job and its matching, qualified window inputs (Codex F5).
+    dialog._distance_result, dialog._distance_key = result, key
     assert dialog._advanced_card.body.isHidden()
     dialog._apply_distance()  # no confirmation: the result applies
     assert float(dialog._text('distance_seed')) == pytest.approx(80., rel=2e-5)
