@@ -2749,6 +2749,7 @@ def test_p37b_batch_live_texture_export_writer_and_private_average_are_absent(
     from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.help_topics import diagnostic_text
 
     assert HELD_REASONS == {
         "peak_live": "P3_7_LIVE_FITTING_UNAVAILABLE",
@@ -2767,15 +2768,15 @@ def test_p37b_batch_live_texture_export_writer_and_private_average_are_absent(
     try:
         scan, peak, phase = dialogs
         assert not scan.save_btn.isEnabled()
-        assert scan.save_btn.toolTip() == HELD_REASONS["export"]
+        assert scan.save_btn.toolTip() == diagnostic_text(HELD_REASONS["export"])
         assert not peak.live_check.isEnabled() and not peak.live_check.isChecked()
-        assert peak.live_check.toolTip() == HELD_REASONS["peak_live"]
+        assert peak.live_check.toolTip() == diagnostic_text(HELD_REASONS["peak_live"])
         assert not peak.batch_btn.isEnabled()
-        assert peak.batch_btn.toolTip() == HELD_REASONS["peak_batch"]
+        assert peak.batch_btn.toolTip() == diagnostic_text(HELD_REASONS["peak_batch"])
         assert not phase.texture_combo.isEnabled()
-        assert phase.texture_combo.toolTip() == HELD_REASONS["phase_texture"]
+        assert phase.texture_combo.toolTip() == diagnostic_text(HELD_REASONS["phase_texture"])
         assert not phase.batch_btn.isEnabled()
-        assert phase.batch_btn.toolTip() == HELD_REASONS["phase_batch"]
+        assert phase.batch_btn.toolTip() == diagnostic_text(HELD_REASONS["phase_batch"])
     finally:
         for dialog in dialogs: dialog.close()
         qapp.processEvents()
