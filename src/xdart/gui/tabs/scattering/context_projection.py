@@ -450,6 +450,9 @@ class ContextProjection:
             source_count=None if viewer_requested else source_count,
             source_count_is_files=source_count_is_files,
             source_count_includes_immediate=source_count_includes_immediate,
+            calibration_ready=(controls_readiness.experiment.ready
+                               if controls_readiness.experiment.detail else None),
+            calibration_reason=controls_readiness.experiment.detail,
         )
         if viewer_requested:
             run = replace(run, mode=("1D Viewer" if tool is Tool.XYE_VIEWER else "2D Viewer"))

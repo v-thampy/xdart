@@ -37,7 +37,8 @@ def _detector_projection(
         try:
             stat = path.stat()
             return _cached_poni_projection(
-                str(path.resolve()), stat.st_mtime_ns, stat.st_size
+                str(path.resolve()), stat.st_mtime_ns, stat.st_size,
+                stat.st_ctime_ns, stat.st_dev, stat.st_ino, stat.st_mode,
             )
         except Exception:
             # The production readiness contract fails closed for every parser
@@ -56,6 +57,10 @@ def _cached_poni_projection(
     path: str,
     _mtime_ns: int,
     _size: int,
+    _ctime_ns: int,
+    _device: int,
+    _inode: int,
+    _mode: int,
 ) -> tuple[str, bool, str]:
     poni = PONI.from_poni_file(path)
     detector = str(poni.detector or "").strip()

@@ -326,7 +326,10 @@ def _standard_page(
         _write_tiff(member, offset=label)
     selected = members[0]
     poni = tmp_path / "tiny.poni"
-    poni.write_text("accepted through immutable test assets")
+    # The real Run gate parses this file before the immutable test assets are
+    # admitted. Keep that readiness input valid without faking its owner.
+    from tests.xdart.scattering._e2sd_support import write_poni
+    write_poni(poni)
     output = tmp_path / "tiny.nexus"
     monkeypatch.setattr(
         executor_module,

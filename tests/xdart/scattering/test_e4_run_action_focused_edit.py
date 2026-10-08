@@ -117,6 +117,9 @@ class _CountingStore(RunIntentStore):
 def _page(
     tmp_path: Path,
 ) -> tuple[ScatteringWorkspace, _CountingStore, _Sources]:
+    # Run now shares the real readable-PONI fact with Experiment before capture.
+    from tests.xdart.scattering._e2sd_support import write_poni
+    write_poni(tmp_path / "calibration.poni")
     store = _CountingStore(
         RunIntent(
             source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
@@ -151,6 +154,7 @@ def _focus(
     qapp: QtWidgets.QApplication,
 ) -> None:
     page.show()
+    page.activateWindow()
     qapp.processEvents()
     editor.setFocus()
     qapp.processEvents()

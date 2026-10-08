@@ -97,6 +97,7 @@ def project_controls(
     advanced_editor_available: bool = False,
     source_mode_override: str | None = None,
     detector_summary_override: str | None = None,
+    detector_name_override: str | None = None,
     calibrate_available: bool = False,
     calibrate_dependency_available: bool = False,
     operation_busy: bool = False,
@@ -235,7 +236,8 @@ def project_controls(
         2,
     )
     fields.insert(insertion, output)
-    fields = _threshold_fields(fields, intent, observation, unlocked=unlocked)
+    fields = _threshold_fields(fields, intent, observation, unlocked=unlocked,
+                               detector=detector_name_override)
     fields = [truthful_field(candidate) for candidate in fields]
     if viewer:
         fields = [candidate if candidate.path == PROJECT_ROOT else
@@ -370,6 +372,7 @@ def _threshold_fields(
     observation: SourceObservation | None,
     *,
     unlocked: bool,
+    detector: str | None = None,
 ) -> list:
     """One enable owns the automatic native band or an explicit edited band."""
     manual_on = bool(intent.threshold.apply_threshold)
@@ -386,7 +389,7 @@ def _threshold_fields(
             placeholder = None
             if candidate.path == THRESHOLD_MAX:
                 # the automatic ceiling is a grey hint, never the field's value (decision 39)
-                ceiling = observed_saturation(intent, observation)
+                ceiling = observed_saturation(intent, observation, detector=detector)
                 placeholder = "Auto" if ceiling is None else (
                     f"Auto · {ceiling.value} "
                     + ("(data type maximum)" if ceiling.source == "dtype" else "(saturation)"))

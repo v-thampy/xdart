@@ -642,7 +642,8 @@ def _reduce_background_edit(
     return candidate
 
 
-def observed_saturation(intent: RunIntent, observation: SourceObservation | None):
+def observed_saturation(intent: RunIntent, observation: SourceObservation | None,
+                        *, detector: str | None = None):
     """The selected input's automatic ceiling (decision 39), as its run's admission resolves it.
 
     The value its header records, else the calibration detector's documented counter limit, else its
@@ -655,7 +656,8 @@ def observed_saturation(intent: RunIntent, observation: SourceObservation | None
 
     if observation is None or observation.source != intent.source_spec:
         return None
-    detector = poni_detector(intent.poni_file)
+    if detector is None:
+        detector = poni_detector(intent.poni_file)
     if type(intent.source_spec) is DirectorySourceSpec:
         return resolve_detector_saturation(detector=detector, dtype=None)
     return resolve_detector_saturation(recorded=observation.recorded_saturation,

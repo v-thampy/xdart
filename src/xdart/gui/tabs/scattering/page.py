@@ -130,7 +130,7 @@ from .controls_readiness import (
     SectionHeaderProjection,
 )
 from .coordinator import ScatteringCoordinator
-from .detector_projection import detector_summary
+from .detector_projection import detector_calibration_ready, detector_summary, poni_detector
 from .display_values import (
     DisplayFrameKey,
     StandardDisplayPayload,
@@ -702,8 +702,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._detector_demand_frame = None
         self._last_scientific_projection = None
         self._rendered_image_axis = self._preferences.image_axis
-        self._detector_summary_key: tuple[str, str] | None = None
         self._detector_summary_text = "not configured"
+        self._poni_detector_name = ""
+        self._poni_ready = False
         self._authoring_dependency_availability: tuple[bool, bool] | None = None
         self._project_readiness_key: tuple[str, str] | None = None
         self._project_readiness = SectionHeaderProjection("")
@@ -713,6 +714,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._artifact_progress: dict[str, ArtifactProgress] = {}
         self._progress = ProgressProjection()
         self._notice_text = ""
+        self._launch_notice_identity: RunIdentity | None = None
+        self._launch_auto_motor: str | None = None
+        self._launch_energy_announced = False
 
         self._context_projection = ContextProjection()
         self._browse_loader = BrowseLoader()
@@ -802,6 +806,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._poll_browser_catalog,
         )
 
+        self._refresh_poni_fact(initial)
         self._refresh_shell()
         self._request_observation(initial)
         self._request_browser_catalog()
@@ -2747,6 +2752,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or tool_from_mode_text(intent.processing_mode)
                 not in {Tool.INT_1D, Tool.INT_2D}):
             self._notice("Average requires one finite image source, Overwrite NeXus output, non-Live execution, an integration mode, and an idle workspace."); self._refresh_shell(); return
+        self._refresh_poni_fact(snapshot)
+        if not self._poni_ready:
+            self._refresh_shell()
+            return
         try:
             from pathlib import Path
             from .output_preflight import _resolved_generated_target
@@ -3882,6 +3891,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice("Standard cleanup remains pending.")
                 self._refresh_shell()
                 return
+        self._refresh_poni_fact()
         if not self._start_permitted()[0]:
             self._refresh_shell()
             return
@@ -4083,9 +4093,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         pipeline = self._pipeline
         if pipeline is None:
             return False
+        # Start validates this final intent revision and owns normalization of
+        # the captured source; normalization is not a new user source choice.
+        auto_motor = self._source_selection.automatic_motor_for(self._intents.snapshot())
         outcome = pipeline.start(receipt)
         if isinstance(outcome, StartLaunched):
             self._admission = None
+            self._launch_notice_identity = outcome.run_identity
+            self._launch_auto_motor = (
+                auto_motor if outcome.configuration.gi.enabled
+                and auto_motor == outcome.configuration.gi.incidence_motor
+                else None
+            )
+            self._launch_energy_announced = False
             self._bind_native_plot_axis_to_run(
                 outcome.run_identity,
                 outcome.configuration,
@@ -4326,6 +4346,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             FULL_REFUSED,
             "Batch terminal Full Raw request was refused; prior display retained.",
         )
+
+    def _show_launch_notice(self, event: StandardRunEvent) -> None:
+        """Render only fresh launch clauses, without retaining scientific status."""
+        if (event.run_identity is not self._launch_notice_identity
+                or self._progress.terminal
+                or self._lifecycle.phase is not RunPhase.RUNNING):
+            return
+        clauses = []
+        if event.detail and not self._launch_energy_announced:
+            clauses.append(event.detail)
+            self._launch_energy_announced = True
+        if self._launch_auto_motor is not None:
+            clauses.append(f"GI Auto selected incidence motor {self._launch_auto_motor}.")
+            self._launch_auto_motor = None
+        if clauses:
+            text = " ".join(clauses)
+            self._progress = replace(self._progress, detail=text, directory_files=None)
+            self._refresh_shell(preserve_scientific=True)
+            self.noticeChanged.emit(text)
 
     def _advance_batch_terminal(self, event: StandardRunEvent) -> BatchTerminalDecision:
         controller = self._batch_terminal
@@ -4751,7 +4790,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 changed = True
                 if not successor_settled:
                     detail = getattr(outcome, "detail", "")
-                    self._notice(detail)
+                    if detail or not self._progress.terminal or not self._notice_text:
+                        self._notice(detail)
                 current = self._context_controller.navigation.current
                 if current is not None:
                     self._follow_processed_artifact(current)
@@ -4844,6 +4884,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._context_controller.adopt_acquisition(
                         event.run_identity
                     )
+                    self._show_launch_notice(event)
                     changed = True
                     force_scientific = True
                 except Exception as error:
@@ -6844,17 +6885,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and not self._context_controller.viewer_2d_cleanup_pending
         )
 
+    def _refresh_poni_fact(self, snapshot: RunIntentSnapshot | None = None) -> None:
+        """Refresh only at explicit edits, idle activation and actual Run entry."""
+        intent = (snapshot or self._intents.snapshot()).thaw()
+        self._detector_summary_text = detector_summary(intent.poni_file, intent.mask_file)
+        self._poni_ready = detector_calibration_ready(intent.poni_file)
+        self._poni_detector_name = poni_detector(intent.poni_file)
+        self._experiment_readiness_key = None
+
     def _project_controls(
         self, snapshot: RunIntentSnapshot
     ):
         intent = snapshot.thaw()
-        detector_key = (
-            str(intent.poni_file or ""),
-            str(intent.mask_file or ""),
-        )
-        if detector_key != self._detector_summary_key:
-            self._detector_summary_text = detector_summary(*detector_key)
-            self._detector_summary_key = detector_key
         observation = self._source_selection.project_observation(snapshot)
         operation_identity = self._workspace_operations.current_identity
         operation_active = (operation_identity is not None and not self._closing and not self._closed)
@@ -6904,6 +6946,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ),
             source_mode_override=self._source_selection.mode,
             detector_summary_override=self._detector_summary_text,
+            detector_name_override=self._poni_detector_name,
             calibrate_available=calibrate_available,
             calibrate_dependency_available=calibrate_dependency_available,
             operation_busy=operation_busy,
@@ -6971,7 +7014,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if experiment_key != self._experiment_readiness_key:
             self._experiment_readiness = experiment_header_projection(
-                controls
+                controls, calibration_ready=self._poni_ready,
             )
             self._experiment_readiness_key = experiment_key
         self._controls_readiness = ControlsReadinessProjection(
@@ -7026,6 +7069,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return False, "Loading finalized Browse context…"
         phase = self._lifecycle.phase
+        intent = self._intents.snapshot().thaw()
+        if (phase in {RunPhase.IDLE, RunPhase.FAILED}
+                and tool_from_mode_text(intent.processing_mode) in {Tool.INT_1D, Tool.INT_2D}
+                and not self._poni_ready):
+            return False, ("Needs PONI" if not intent.poni_file else
+                           "Needs PONI · Choose a readable, parseable PONI calibration.")
         if phase is RunPhase.IDLE:
             return True, ""
         if phase is RunPhase.FAILED and self._lifecycle.reset_permitted:
@@ -7524,6 +7573,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
 
     def event(self, event: QtCore.QEvent) -> bool:
+        if (event.type() == QtCore.QEvent.WindowActivate
+                and hasattr(self, "_poni_ready")
+                and not self._closing and not self._closed
+                and self._lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED}):
+            self._refresh_poni_fact()
+            self._refresh_shell()
         if event.type() == QtCore.QEvent.DeferredDelete:
             if self._deferred_delete_pending:
                 self._schedule_deferred_delete_retry()
@@ -8053,6 +8108,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refuse_preparing(token)
         prior_intent = prior.thaw()
         current_intent = current.thaw()
+        if (self._lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED}
+                and (prior_intent.poni_file != current_intent.poni_file
+                     or prior_intent.source_spec != current_intent.source_spec
+                     or prior_intent.processing_mode != current_intent.processing_mode)):
+            self._refresh_poni_fact(current)
         if (
             _native_plot_axis_for_run(prior_intent)
             != _native_plot_axis_for_run(current_intent)

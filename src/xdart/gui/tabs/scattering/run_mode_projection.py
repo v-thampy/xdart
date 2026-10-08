@@ -37,6 +37,8 @@ def build_run_strip_projection(
     source_count: int | None = None,
     source_count_is_files: bool = False,
     source_count_includes_immediate: bool = False,
+    calibration_ready: bool | None = None,
+    calibration_reason: str = "",
 ) -> RunStripProjection:
     mode = str(intent.processing_mode or "")
     tool = tool_from_mode_text(mode)
@@ -71,6 +73,8 @@ def build_run_strip_projection(
         missing.append("source")
     if not intent.poni_file and not standalone:
         missing.append("PONI")
+    elif calibration_ready is False and not standalone:
+        missing.append(f"PONI · {calibration_reason}")
     if not intent.save_path and not standalone:
         missing.append("output")
     mode_blocker = dict(UNOWNED_RUN_MODE_REASONS).get(mode)

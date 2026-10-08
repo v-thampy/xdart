@@ -699,6 +699,8 @@ def project_header_projection(
 
 def experiment_header_projection(
     state: ControlsProjection,
+    *,
+    calibration_ready: bool | None = None,
 ) -> SectionHeaderProjection:
     """Qualify EXPERIMENT from the production parsed-PONI fact."""
 
@@ -706,7 +708,8 @@ def experiment_header_projection(
     text = "grazing" if values.get(("GI", "Grazing")) is True else "standard"
     raw_poni = values.get(("Signal", "poni_file"))
     poni_file = raw_poni if type(raw_poni) is str else ""
-    ready = detector_calibration_ready(poni_file)
+    ready = (detector_calibration_ready(poni_file)
+             if calibration_ready is None else calibration_ready)
     return SectionHeaderProjection(
         text,
         ready,

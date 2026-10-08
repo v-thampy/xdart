@@ -98,9 +98,17 @@ def test_eiger_gi_run_falls_back_to_manual_and_keeps_angle(tmp_path):
         _close(page, app)
 
 
-def test_admission_error_is_visible_and_logged(tmp_path, caplog):
+def test_admission_error_is_visible_and_logged(tmp_path, caplog, monkeypatch):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    page, artifact = _page(tmp_path, broken_calibration=True)
+    page, artifact = _page(tmp_path)
+    admission = page._begin_admission
+
+    def damage_before_real_admission(capture):
+        # Run has checked the real valid asset; admission must detect this race.
+        (tmp_path / "cal.poni").write_text("not a calibration\n")
+        return admission(capture)
+
+    monkeypatch.setattr(page, "_begin_admission", damage_before_real_admission)
     try:
         _wait(app, lambda: page._source_selection.observation is not None)
         with caplog.at_level(logging.WARNING):

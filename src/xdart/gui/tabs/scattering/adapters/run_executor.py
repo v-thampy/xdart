@@ -43,6 +43,7 @@ from xrd_tools.sources.cursor import open_container_cursor
 from xrd_tools.sources.nexus import NexusStackSource
 from xrd_tools.sources.point_images import PointImageSource
 from xrd_tools.sources.probe import ProbeState
+from xrd_tools.sources.selection import DirectorySourceSpec
 from ..contracts import (
     AdmittedOutput, AdmissionFailure, AdmissionReceipt, AdmissionReleased,
     AdmissionToken,
@@ -462,6 +463,7 @@ class _StandardRun:
     pending_partition_count: int = 1
     terminal_commit_identity: StreamTerminal | None = None
     background_capsule: _PreparedSingleFrameBackground | _PreparedSeriesFrameBackground | None = None
+    energy_notice_sent: bool = False
 
     def __post_init__(self) -> None:
         self.perf_quartiles_enabled = (
@@ -1662,10 +1664,22 @@ class StandardRunExecutor:
             else runtime.context.hydration_owner
         )
         context = runtime.adopt(run, owner, source_path)
-        if created or context.hydration_owner != previous:
+        # The native binder already resolved these values for this output.
+        # Announce only after its acquisition context has actually been adopted.
+        selection = getattr(run.scan, "extra", {}).get("energy_selection", {})
+        detail = ""
+        if selection.get("disagreement") and not run.energy_notice_sent:
+            detail = (f"Using the scan energy, {selection['source_energy_eV'] / 1000:.3f} keV; "
+                      f"the PONI says {selection['calibration_energy_eV'] / 1000:.3f} keV.")
+            if isinstance(run.capture.source, DirectorySourceSpec):
+                detail = f"{run.artifact.name}: {detail}"
+        if created or context.hydration_owner != previous or detail:
             self._events.put(StandardRunEvent(
-                run.identity, StandardEventKind.CONTEXT_READY
+                run.identity, StandardEventKind.CONTEXT_READY,
+                artifact=str(run.artifact), detail=detail,
             ))
+            if detail:
+                run.energy_notice_sent = True
         return context
 
     def _run(self, run: _StandardRun) -> None:
