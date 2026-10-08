@@ -57,6 +57,7 @@ def _page_with_dialog(tmp_path, spec=None, seed_path=None):
         page.set_field("geometry_kind", "Goniometer JSON")
         page.set_field("geometry_path", str(seed_path))
     page._calibrate()
+    _wait(page._calibration_dialog)  # source metadata must finish before a user operation
     return page, page._calibration_dialog
 
 
@@ -497,6 +498,7 @@ def test_cancelled_refinement_ends_cancelled_and_a_refusal_saves_nothing(qapp, t
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.set_source_context(spec, geometry_path=seed_path)
+        _wait(dialog)
         dialog._fields['refine_frames'].setText('2')
         dialog.refine_button.click()
         _wait(dialog)

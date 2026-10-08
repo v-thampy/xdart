@@ -427,6 +427,7 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
     try:
         dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
         dialog.set_source_context(source)
+        _finish(dialog)  # metadata admission precedes enumeration
         dialog._enumerate()
         _finish(dialog)
         assert dialog._enumerated_motors == (None, 'tth'), dialog.status.text()
@@ -525,6 +526,8 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     for key, value in (('beam_source', spec), ('beam_scan', '1'), ('beam_images', tmp_path)):
         dialog._set_field_text(key, str(value))
+    from tests.xdart.scattering.test_direct_beam_readiness import detect
+    detect(dialog)  # qualify the actual source before accepting its completed distance fit
     # as the window's own job records it: the result and the inputs it was fitted from (Codex F5)
     dialog._distance_result, dialog._distance_key = result, dialog._direct_beam_key()
     assert dialog._advanced_card.body.isHidden()
