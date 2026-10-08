@@ -1155,6 +1155,12 @@ def _display_replace(figure, **changes):
     return result
 
 
+def redraw_orientation_display(figure, geometry, camera, senses=(1, 1)):
+    """Redraw one hypothesis over the completed immutable preview, without reading or scoring."""
+    prediction, _detector = _display_prediction(geometry, camera, senses, figure.display_binning)
+    return _display_replace(prediction, image=figure.image, caption=figure.caption)
+
+
 class TeachingCache:
     """One bounded, source-free cache for the finite catalogue during this session."""
     MAX_FINDINGS = 4

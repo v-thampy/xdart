@@ -482,6 +482,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.session_dir = self.project_root / 'calibration' / f'session-{uuid.uuid4().hex[:12]}'
         self.frames = ()
         self.fit = None
+        self._saved_ring_fit = None
+        self._checklist_fit_outdated = False
         #: The arm fitted to the calibrated frames: (their identities, record); see _seed_options.
         self._prediction = None
         #: Predicted rings per (frame, calibrant, calibration): see _expected_rings.
@@ -497,6 +499,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._orientation_generation = 0
         self._orientation_pending_key = None
         self._orientation_geometry = None
+        self._orientation_figure = None
         self._schematic_readings = None  # None is an explicitly labelled zero-pose example, not metadata.
         self._beam_detection = None
         self._beam_generation = 0
@@ -630,7 +633,99 @@ class CalibrationDialog(QtWidgets.QDialog):
             signal.connect(self._invalidate_orientation)
         self.geometry_editor.changed.connect(self._redraw_schematic)
         self.frame_table.itemSelectionChanged.connect(self._schematic_frame_selected)
+        self._build_checklist()
+        outer.insertWidget(0, self.checklist_card)
         self._update_beam_readiness()
+
+    def _build_checklist(self):
+        self.checklist_card = SectionCard('Calibration checklist')
+        tip = 'Read-only progress from the current calibration owners. Activate a row to visit its controls; no science or save is started.'
+        self.checklist_card.setToolTip(tip)
+        self.checklist_card.title.setToolTip(tip)
+        self.checklist_card.status.setToolTip('Counts completed workflow steps; does not certify fit quality or physical orientation.')
+        self.checklist_card.set_help_topic('calibration.multi-step')
+        self.checklist_table = ResultsTable(('Step', 'State', 'What to do'), row_selection=True,
+            minimum_rows=8, max_height=270, header_tooltips={
+                0: 'Opening phrase of the teaching step; its tooltip carries the full step. Activate to navigate.',
+                1: 'Readiness or provenance reported by the current owners; Done is not a fit-quality verdict.',
+                2: 'Current owner diagnostic or the next workflow action.'})
+        self.checklist_table.setToolTip(tip)
+        self.checklist_table.setColumnWidth(0, 250)
+        self.checklist_table.setColumnWidth(1, 100)
+        self.checklist_table.cellActivated.connect(self._checklist_navigate)
+        self.checklist_card.set_embedded_widget(self.checklist_table)
+        self.checklist_card.set_collapsed(True)
+        self._refresh_checklist()
+
+    def _refresh_checklist(self):
+        if not hasattr(self, 'checklist_table'):
+            return
+        from xrd_tools.integrate.calibration_checklist import ChecklistFacts, calibration_checklist
+        instrument_ready, instrument_message = False, 'Describe the instrument, detector and camera.'
+        try:
+            geometry = self.geometry_editor.value()
+            geometry.stitch_arm()
+            self._zeros()
+            if detector_shape(self._text('beam_detector')) is None:
+                raise ValueError('Select a known detector.')
+            if int(self._text('beam_orientation')) not in dict(DETECTOR_ORIENTATIONS):
+                raise ValueError('Select a supported first-pixel orientation.')
+            self.camera.value()
+            instrument_ready = True
+            instrument_message = f'{geometry.geometry} · {self._text("beam_detector")} · configured camera; orientation check is optional.'
+        except (ValueError, TypeError, KeyError, RuntimeError) as error:
+            instrument_message = str(error)
+        mode = self.rough_mode.currentData()
+        stale = mode == 'scan' and self._distance_result is not None and not self._distance_fresh()
+        rough_ready = False
+        rough_message = self._ROUGH_NOTES[mode]
+        try:
+            rough_ready = self._rough_arm() is not None
+            if stale:
+                rough_message = self._STALE_DISTANCE
+            elif mode == 'scan':
+                rough_message = self.beam_summary.toPlainText() if rough_ready else self._beam_problem
+        except (ValueError, TypeError, KeyError, RuntimeError) as error:
+            rough_message = str(error)
+        complete = sum(frame.complete for frame in self.frames)
+        facts = ChecklistFacts(instrument_ready=instrument_ready, instrument_message=instrument_message,
+            rough_mode=mode, rough_ready=rough_ready, rough_stale=stale, rough_message=rough_message,
+            source_ready=self._calibrant_source_ready(), source_message=self.active_source_row.editor.text(),
+            frame_count=len(self.frames), complete_count=complete,
+            frame_message=f'{complete} of {len(self.frames)} Complete' if self.frames else 'Select frames and calibrate their rings.',
+            fit_present=self.fit is not None, fit_outdated=self._checklist_fit_outdated,
+            fit_message=self.fit_summary.toPlainText() if self.fit is not None else 'Fit the calibrated frames or refine the scan.',
+            saved_current_fit=self.fit is not None and self._saved_ring_fit is self.fit)
+        self._checklist_rows = calibration_checklist(facts)
+        tips = {(i, c): row.text if c == 0 else
+                f'{row.state}: current owner readiness or provenance; no scientific quality verdict.' if c == 1
+                else row.message or 'Activate this row to visit the existing controls.'
+                for i, row in enumerate(self._checklist_rows) for c in range(3)}
+        self.checklist_table.show_rows(('Step', 'State', 'What to do'),
+            tuple((row.step, row.state, row.message) for row in self._checklist_rows), cell_tooltips=tips)
+        current = next((i for i, row in enumerate(self._checklist_rows[:7])
+                        if row.state in ('Needs input', 'Out of date')), 6)
+        step = self._checklist_rows[current]
+        self.checklist_card.set_readiness(step.state not in ('Needs input', 'Out of date'),
+            f'Step {current + 1} of 7: {step.message}')
+
+    def _checklist_navigate(self, row, _column):
+        if self._owner.busy or not 0 <= row < len(self._checklist_rows):
+            return
+        self._help_owner.release_draft()
+        target = self._checklist_rows[row].target
+        if target == 'orientation':
+            self.open_orientation_check()
+        elif target == 'inspect' and self.fit is not None:
+            self._show_calibration_fit()
+        else:
+            self._show_tab('calibrate' if target in ('fit', 'inspect', 'save') else target)
+            if target in ('fit', 'inspect', 'save'):
+                (self.save_button if target == 'save' else self.fit_button).setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+            else:
+                {'instrument': self.geometry_editor.geometry, 'rough': self.rough_mode,
+                 'select': self._fields['source'], 'calibrate': self.frame_table}[target].setFocus(
+                     QtCore.Qt.FocusReason.OtherFocusReason)
 
     def open_orientation_check(self):
         if self.orientation_panel is None:
@@ -660,8 +755,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                          self._orientation_generation, field, self._job, self._owner.busy)
         self._orientation_generation += 1
         self._orientation_geometry = None
+        self._orientation_figure = None
         if self.orientation_panel is not None:
             self.orientation_panel.invalidate()
+        self._refresh_checklist()
 
     def _start_orientation(self, *_args):
         def go():
@@ -711,8 +808,19 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.orientation_panel.finding_pane.set_text(self.status.text())
 
     def _orientation_candidate_changed(self, *_args):
-        if self.orientation_panel is not None and self.orientation_panel.finding is not None and self.frames:
-            self._start_orientation()
+        panel = self.orientation_panel
+        if (panel is None or panel.finding is None or self._orientation_geometry is None
+                or self._orientation_figure is None or self._owner.busy):
+            return
+        index = panel.candidate_row.editor.currentData()
+        if index is None or not 0 <= index < len(panel.finding.candidates):
+            return
+        from xrd_tools.geometry_figures import redraw_orientation_display
+        from .orientation_views import show_figures
+        candidate = panel.finding.candidates[index]
+        self._orientation_figure = redraw_orientation_display(self._orientation_figure,
+            self._orientation_geometry, candidate.camera, candidate.senses)
+        show_figures(panel.figure_view, (self._orientation_figure,))
 
     def _orientation_camera_focus(self):
         self._help_owner.release_draft()
@@ -1026,6 +1134,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             text += f' · {self._calibrant_source_problem}'
         self.active_source_row.editor.setText(text)
         self.active_source_row.editor.setToolTip(text)
+        self._refresh_checklist()
 
     def _set_field_text(self, key, value):
         field, value = self._fields[key], str(value)
@@ -2362,6 +2471,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._guard(go)
 
     def _invalidate_fit(self):
+        self._checklist_fit_outdated = self.fit is not None or self._checklist_fit_outdated
+        self._saved_ring_fit = None
         self._cancel_preview()
         self._fit_source = None
         self.fit = None
@@ -2373,6 +2484,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._calibration_fit_window is not None:  # it showed the fit that is gone
             self._calibration_fit_window.clear_preview()
             self._calibration_fit_window.close()
+        self._refresh_checklist()
 
     def _geometry_edited(self):
         """A fit belongs to the instrument it recorded: any other value leaves it unsaveable."""
@@ -2765,6 +2877,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.beam_readiness.set_readiness(ready, text)
         if hasattr(self, 'status') and self.tabs.currentWidget() is self._tab_pages['rough']:
             self.status.setText(text)
+        self._refresh_checklist()
 
     def _tab_readiness(self, *_args):
         if self.tabs.currentWidget() is self._tab_pages['rough']:
@@ -2873,9 +2986,12 @@ class CalibrationDialog(QtWidgets.QDialog):
         if mismatch.quarter_turn:
             return f'{mismatch} The camera is probably a quarter turn off from {mounting_description(camera)}.'
         turned = DetectorCamera(*(axis[0] + ('-' if axis[1] == '+' else '+') for axis in camera.to_xu()))
+        unmeasured = 'nu' if self._beam_role() == 'del' else 'del'
         return (f'{mismatch} The detector is probably mounted the other way round: try '
                 f"{mounting_description(turned)} rather than {mounting_description(camera)}, or check {motor}'s "
-                'sense in the Diffractometer section.')
+                'sense in the Diffractometer section. A single-axis reflection as well as a 180° turn can '
+                f'reverse this motion, with a corresponding sense hypothesis; {unmeasured} is unmeasured. '
+                'This one-axis scan cannot identify the mounting or both motor senses.')
 
     def _render_direct_beam_advice(self, *_args):
         """The motion advice for the controls as they are now, on its three surfaces together: the distance rows,
@@ -3112,6 +3228,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                     key, (finding, figure, geometry) = result
                     if not self._close_pending and key == self._orientation_key():
                         self._orientation_geometry = geometry
+                        self._orientation_figure = figure
                         self.orientation_panel.show_finding(finding, figure,
                             configured_senses=self.geometry_editor.value().arm_senses())
                 elif kind == 'beam_detect':
@@ -3173,6 +3290,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                         result.asset['provenance']['calibration_conditioning'] = self._job_policy['conditioning']
                     summary = fit_summary_text(result)  # before adopting: a failure leaves no fit
                     self.fit = result  # Start from keeps the person's choice (maintainer, 2026-09-29)
+                    self._checklist_fit_outdated = False
                     self._fit_source = self._pending_fit_source
                     self._fit_kind = kind
                     self._fit_instrument = result.asset['provenance'].get('instrument_geometry')
@@ -3194,6 +3312,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                     from xrd_tools.integrate.calibration_seed import calibration_file_identity
                     self._loaded_calibration_identity = calibration_file_identity(result.pyfai_path)
                     provenance = self._saving.asset['provenance']
+                    if self._saving is self.fit and provenance.get('calibration_kind') != 'direct_beam_not_ring_fitted':
+                        self._saved_ring_fit = self.fit
                     self.saved_source_motors = provenance['source_motors']
                     self.saved_instrument_geometry = provenance.get('instrument_geometry')
                     self.saved_image_rotation = provenance['image_rotation']
@@ -3275,11 +3395,14 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._pending_source_details is not None and not self._close_pending:
             prefix, self._pending_source_details = self._pending_source_details, None
             self._source_details(prefix)
+        self._refresh_checklist()
         if self._close_pending:
             self._close_pending = False
             self.close()
 
     def _set_tabs_enabled(self, enabled):
+        if hasattr(self, 'checklist_table'):
+            self.checklist_table.setEnabled(enabled)
         # Preserve the science/editor lock while the corner help action stays available.
         self.tabs.tabBar().setEnabled(enabled)
         for key, page in self._tab_pages.items():

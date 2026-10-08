@@ -15,6 +15,8 @@ extra) is imported lazily so xdart still launches without it.
 
 import logging
 
+from xrd_tools.help_topics import diagnostic_text
+
 import numpy as np
 from dataclasses import replace
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
@@ -96,10 +98,10 @@ class PeakFitDialog(QtWidgets.QDialog):
         self._build_ui()
         if self._vnext:
             self.live_check.setChecked(False); self.live_check.setEnabled(False)
-            self.live_check.setToolTip("P3_7_LIVE_FITTING_UNAVAILABLE")
+            self.live_check.setToolTip(diagnostic_text("P3_7_LIVE_FITTING_UNAVAILABLE"))
             self.batch_btn.setEnabled(bool(allow_batch))
             if not allow_batch:
-                self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+                self.batch_btn.setToolTip(diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE"))
         from .fit_export import FitExportActions
         self.export_actions = FitExportActions(self, tool='peak', snapshot=self.export_snapshot,
                                                settings=self.vnext_fit_values)

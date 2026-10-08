@@ -32,6 +32,95 @@ def geometry_state(dialog):
             dialog._text('rough_distance'), dialog._text('rough_mount'))
 
 
+def test_ring_candidate_selection_keeps_completed_finding_and_table_idle(qapp, tmp_path, monkeypatch):
+    from dataclasses import replace
+    import json
+    from xdart.gui.tabs.calibration.dialog import CalibrationDialog, CalibrationContext
+    from xrd_tools import geometry_figures as gf
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.core.geometry import ImageOrientation
+    from xrd_tools.core.geometry.camera import stitch_camera
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.integrate.calibration_seed import rough_arm_record
+    from tests.core.test_geometry_figures import reference
+    value = gf.GeometryInputs(); camera = stitch_camera(ImageOrientation())
+    images = tmp_path/'images'; images.mkdir()
+    for index, angle in enumerate((0., 15.)):
+        _, image = reference(replace(value, readings=(('del', angle), ('nu', 0.))), camera)
+        (images/f'rings_scan1_{index:04d}.raw').write_bytes(image.astype('<f4').tobytes())
+    spec = tmp_path/'rings'
+    spec.write_text('#F rings\n#O0 del nu energy\n#S 1 ascan del 0 15 1 1\n'
+        f'#P0 0 0 {wavelength_m_to_energy_eV(value.wavelength_m)}\n'
+        '#N 2\n#L del  nu\n0 0\n15 0\n')
+    record = rough_arm_record(detector=value.detector, distance_m=value.distance_m,
+        wavelength_m=value.wavelength_m, beam_px=((value.shape[1]-1)/2+value.beam_offset_px[0],
+            (value.shape[0]-1)/2+value.beam_offset_px[1]), camera=ImageOrientation(), orientation=value.first_pixel)
+    saved = tmp_path/'fixed-arm.json'; saved.write_text(json.dumps(record))
+    source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
+        'image_stem': 'rings', 'read_image_kwargs': {'detector_shape': value.shape, 'raw_dtype': '<f4'}})
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path)); dialog.show()
+    try:
+        dialog.set_source_context(source, image_rotation=0); wait(dialog)
+        dialog._enumerate(); wait(dialog); dialog._prepare(); wait(dialog)
+        dialog.load_calibration(saved); dialog._source_details(); wait(dialog)
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        dialog.open_orientation_check(); panel = dialog.orientation_panel
+        panel.run_button.click(); wait(dialog)
+        finding = panel.finding
+        chosen = (panel.candidate_row.editor.currentIndex()+1) % len(finding.candidates)
+        panel.candidate_row.editor.setCurrentIndex(chosen)
+        assert panel.table.rowCount() == len(finding.candidates)
+        assert len(finding.candidates) >= 2 and panel.finding is finding and not dialog.active()
+        image = dialog._orientation_figure.image
+        calls = []
+        real_diagnose = gf.diagnose_calibration_frames
+        def counted(*a, **k):
+            calls.append(True)
+            return real_diagnose(*a, **k)
+        monkeypatch.setattr(gf, 'diagnose_calibration_frames', counted)
+        import xrd_tools.io.image as images_owner
+        real_read = images_owner.read_image
+        def counted_read(*a, **k):
+            calls.append(True)
+            return real_read(*a, **k)
+        monkeypatch.setattr(images_owner, 'read_image', counted_read)
+        next_index = (chosen+1) % len(finding.candidates)
+        panel.candidate_row.editor.setCurrentIndex(next_index); qapp.processEvents()
+        assert not calls and not dialog.active() and panel.finding is finding
+        assert dialog._orientation_figure.image is image
+        candidate = finding.candidates[next_index]
+        expected, _ = gf._display_prediction(dialog._orientation_geometry, candidate.camera,
+            candidate.senses, dialog._orientation_figure.display_binning)
+        for actual, oracle in zip(dialog._orientation_figure.curves, expected.curves):
+            np.testing.assert_array_equal(actual.xy, oracle.xy)
+        assert len(dialog._orientation_figure.curves) == len(expected.curves)
+        dialog._fields['rms'].setText('0.021')
+        assert panel.finding is None and panel.table.rowCount() == 0
+    finally:
+        dialog.close(); wait(dialog); dialog.deleteLater(); qapp.processEvents()
+
+
+def test_one_axis_advice_keeps_reflection_turn_and_unmeasured_circle(qapp, tmp_path):
+    from tests.xdart.scattering.test_direct_beam_readiness import _fit_container, _surfaces
+    from xdart.gui.tabs.calibration.dialog import CalibrationDialog, CalibrationContext
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        result = _fit_container(dialog, tmp_path, 90)
+        shown = _surfaces(dialog)
+        assert all('single-axis reflection' in text for text in shown)
+        assert all('180°' in text and 'nu is unmeasured' in text and 'sense' in text for text in shown)
+        prior = geometry_state(dialog)
+        dialog.open_orientation_check(); dialog.orientation_panel.run_button.click(); wait(dialog)
+        finding = dialog.orientation_panel.finding
+        assert finding.best is None and not finding.identifiable and finding.unmeasured_motor == 'nu'
+        assert len({candidate.camera for candidate in finding.candidates}) > 1
+        assert {candidate.senses[0] for candidate in finding.candidates} == {-1, 1}
+        assert geometry_state(dialog) == prior and dialog._distance_result is result
+        dialog.close()
+    finally:
+        dialog.close(); wait(dialog); dialog.deleteLater(); qapp.processEvents()
+
+
 def test_diagnosis_uses_calibration_worker_cancels_joins_and_changes_no_geometry(qapp, tmp_path):
     from xdart.gui.pages.values import PageCleanup
     dialog = dialog_at_fit(tmp_path); dialog.show()

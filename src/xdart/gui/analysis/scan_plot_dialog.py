@@ -217,7 +217,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 lambda value: self._vnext_submit("metadata", value))
             self.trend.pointRowsClicked.connect(self._roi_point_clicked)
             self.save_btn.setEnabled(False)
-            self.save_btn.setToolTip("P3_7_EXPORT_UNAVAILABLE")
+            self.save_btn.setToolTip(diagnostic_text("P3_7_EXPORT_UNAVAILABLE"))
         else:
             self.source_widget.sigSourceChanged.connect(self._on_source_selected)
         self.roi_btn.clicked.connect(self._open_roi_dialog)

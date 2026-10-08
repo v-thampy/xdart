@@ -16,6 +16,8 @@ so xdart still launches without them — the dialog shows a friendly install hin
 """
 
 import logging
+
+from xrd_tools.help_topics import diagnostic_text
 import os
 
 from dataclasses import replace
@@ -105,10 +107,10 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._build_ui()
         if self._vnext:
             self.texture_combo.setCurrentIndex(0); self.texture_combo.setEnabled(False)
-            self.texture_combo.setToolTip("P3_7_PHASE_TEXTURE_UNAVAILABLE")
+            self.texture_combo.setToolTip(diagnostic_text("P3_7_PHASE_TEXTURE_UNAVAILABLE"))
             self.batch_btn.setEnabled(bool(allow_batch))
             if not allow_batch:
-                self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+                self.batch_btn.setToolTip(diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE"))
         from .fit_export import FitExportActions
         self.export_actions = FitExportActions(self, tool='phase', snapshot=self.export_snapshot,
                                                settings=self.vnext_fit_values)

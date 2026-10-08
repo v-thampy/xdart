@@ -2383,7 +2383,11 @@ class StitchPage(QtWidgets.QWidget):
                     self._run_next_job()
             else:
                 self._queued_jobs.clear()
-                self._status(f"{result.terminal.disposition.value}: {result.terminal.diagnostic or result.terminal.code}", ready=False)
+                terminal = result.terminal
+                notice = terminal.diagnostic or terminal.code
+                if terminal.disposition is ModuleDisposition.REFUSED:
+                    notice = terminal.code + (f": {terminal.diagnostic}" if terminal.diagnostic else "")
+                self._status(f"{terminal.disposition.value}: {notice}", ready=False)
         else:
             self._queued_jobs.clear()
             self._status(outcome.finalization_message or "Output retained · finalization retry required", ready=False)

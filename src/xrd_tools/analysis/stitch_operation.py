@@ -38,6 +38,7 @@ from xrd_tools.analysis.module_transaction import (
     ModuleSourceGroupReceipt,
     ModuleTerminalResult,
     admit_module_artifact,
+    refusal_diagnostic,
     module_artifact_request,
     module_plan_fingerprint,
     module_provenance_digest,
@@ -3451,14 +3452,14 @@ class StitchOperationExecution:
         except AnalysisSourceLeaseRefused as error:
             if error.code == "CANCELLED":
                 return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         except (
             XuRuntimeUnsupported,
             XuStitchCalibrationRefused,
             XuStitchScienceRefused,
             StitchOperationRefused,
         ) as error:
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -3556,9 +3557,9 @@ class StitchOperationExecution:
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
-        except FileExistsError:
-            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
+        except FileExistsError as error:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS", str(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -3594,7 +3595,7 @@ class StitchOperationExecution:
                 XuStitchScienceRefused,
                 StitchOperationRefused,
             ) as error:
-                raise ModuleArtifactRefused(error.code) from error
+                raise ModuleArtifactRefused(error.code, refusal_diagnostic(error)) from error
 
         def writer(entry) -> None:
             revalidate_xu_stitch_calibration(plan.calibration)
@@ -3714,9 +3715,9 @@ class StitchOperationExecution:
         except AnalysisSourceLeaseRefused as error:
             if error.code == "CANCELLED":
                 return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         except StitchOperationRefused as error:
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -3793,9 +3794,9 @@ class StitchOperationExecution:
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
-        except FileExistsError:
-            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
+        except FileExistsError as error:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS", str(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -3814,7 +3815,7 @@ class StitchOperationExecution:
                 _revalidate_geometry(self.request.plan.geometry)
                 revalidate_mask(self.request.plan._mask_receipt)
             except StitchOperationRefused as error:
-                raise ModuleArtifactRefused(error.code) from error
+                raise ModuleArtifactRefused(error.code, refusal_diagnostic(error)) from error
 
         try:
             terminal = self._output.publish(

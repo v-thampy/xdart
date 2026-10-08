@@ -105,12 +105,18 @@ class ModuleDisposition(str, Enum):
     FAILED = "failed"
 
 
+def refusal_diagnostic(error: BaseException) -> str:
+    """Retain an owner's literal reason, without repeating a code-only exception."""
+    message = str(error)
+    return "" if message == getattr(error, "code", None) else message
+
+
 class ModuleArtifactRefused(RuntimeError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, message: str = ""):
         if type(code) is not str or not code:
             raise TypeError("module artifact refusal code must be a nonempty string")
         self.code = code
-        super().__init__(code)
+        super().__init__(message or code)
 
 
 class _ModuleCommitCancelled(RuntimeError):
@@ -118,9 +124,9 @@ class _ModuleCommitCancelled(RuntimeError):
 
 
 class _ModuleCommitRefused(RuntimeError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, message: str = ""):
         self.code = code
-        super().__init__(code)
+        super().__init__(message or code)
 
 
 class _ModuleWriterFailed(RuntimeError):
@@ -1454,7 +1460,7 @@ class ModuleArtifactOutput:
                     cancel_token=cancel_token,
                 )
             except ModuleArtifactRefused as error:
-                raise _ModuleCommitRefused(error.code) from error
+                raise _ModuleCommitRefused(error.code, refusal_diagnostic(error)) from error
             if result.disposition is AnalysisDisposition.CANCELLED:
                 raise _ModuleCommitCancelled("CANCELLED")
             if result.disposition is not AnalysisDisposition.COMPLETED:
@@ -1467,11 +1473,12 @@ class ModuleArtifactOutput:
                         raise _ModulePrepublishFailed(error) from error
                     try:
                         code = error.code
+                        diagnostic = refusal_diagnostic(error)
                     except BaseException as code_error:
                         raise _ModulePrepublishFailed(code_error) from code_error
                     if type(code) is not str or not code:
                         raise _ModulePrepublishFailed(error) from error
-                    raise _ModuleCommitRefused(code) from error
+                    raise _ModuleCommitRefused(code, diagnostic) from error
                 except BaseException as error:
                     raise _ModulePrepublishFailed(error) from error
 
@@ -1505,7 +1512,7 @@ class ModuleArtifactOutput:
         if isinstance(primary, _ModuleCommitCancelled):
             self._pending = (ModuleDisposition.CANCELLED, "CANCELLED", "")
         elif isinstance(primary, _ModuleCommitRefused):
-            self._pending = (ModuleDisposition.REFUSED, primary.code, "")
+            self._pending = (ModuleDisposition.REFUSED, primary.code, refusal_diagnostic(primary))
         elif isinstance(primary, OutputCollisionError):
             self._pending = (ModuleDisposition.REFUSED, "OUTPUT_INPUT_ALIAS", str(primary))
         else:
@@ -1577,9 +1584,9 @@ def admit_module_artifact(
             artifact_request, coordinator=coordinator, protected_inputs=tuple(inputs),
         )
     except OutputCollisionError as error:
-        raise ModuleArtifactRefused("OUTPUT_INPUT_ALIAS") from error
+        raise ModuleArtifactRefused("OUTPUT_INPUT_ALIAS", str(error)) from error
     except AnalysisArtifactInvalid as error:
-        raise ModuleArtifactRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS") from error
+        raise ModuleArtifactRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS", str(error)) from error
     return ModuleArtifactOutput(
         request,
         output,

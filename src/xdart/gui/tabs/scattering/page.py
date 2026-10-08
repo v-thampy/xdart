@@ -1640,7 +1640,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if payload is None:
             if target == "scan_roi" and self._scan_roi_dialog is not None:
                 self._scan_roi_dialog.status.setText(diagnostic)
-                self._scan_roi_dialog.set_help_diagnostic(diagnostic)
+                terminal_payload = None if update.terminal is None else update.terminal.payload
+                details = tuple(getattr(terminal_payload, "diagnostics", ())) if current and not update.stale else ()
+                self._scan_roi_dialog.set_help_diagnostic(diagnostic, details)
             if kind == "roi_preview" and current and self._scan_roi_dialog is not None:
                 dialog = self._scan_roi_dialog
                 dialog._roi_preview_waiting = False

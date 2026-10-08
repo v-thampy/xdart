@@ -41,6 +41,7 @@ from xrd_tools.analysis.module_transaction import (
     ModuleSourceReceipt,
     ModuleTerminalResult,
     admit_module_artifact,
+    refusal_diagnostic,
     module_artifact_request,
     module_plan_fingerprint,
     module_provenance_digest,
@@ -5786,7 +5787,7 @@ class RSMOperationExecution:
                 self.request.output_authority,
             )
         except RSMOperationRefused as error:
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         try:
             with requalified_analysis_source(
                 self.request.module.source.analysis,
@@ -5835,14 +5836,14 @@ class RSMOperationExecution:
         except AnalysisSourceLeaseRefused as error:
             if error.code == "CANCELLED":
                 return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         except RSMOperationRefused as error:
             disposition = (
                 ModuleDisposition.CANCELLED
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -5877,7 +5878,7 @@ class RSMOperationExecution:
                 self.request.output_authority,
             )
         except RSMOperationRefused as error:
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         provenance = self.request.provenance
         bound = module_artifact_request(self.request.module, provenance)
         try:
@@ -5893,9 +5894,9 @@ class RSMOperationExecution:
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
-        except FileExistsError:
-            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
+        except FileExistsError as error:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS", str(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -5919,7 +5920,7 @@ class RSMOperationExecution:
                     self.request.output_authority,
                 )
             except RSMOperationRefused as error:
-                raise ModuleArtifactRefused(error.code) from error
+                raise ModuleArtifactRefused(error.code, refusal_diagnostic(error)) from error
 
         try:
             terminal = self._output.publish(
@@ -6386,7 +6387,7 @@ class RSMOperationExecutionV2:
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
         self._emit("revalidate", 1)
 
         from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
@@ -6534,18 +6535,20 @@ class RSMOperationExecutionV2:
         except AnalysisSourceLeaseRefused as error:
             if error.code == "CANCELLED":
                 return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
-        except RSMGridChunkReleaseError:
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
+        except RSMGridChunkReleaseError as error:
             return self._terminal(
                 ModuleDisposition.REFUSED,
                 "RSM_CHUNK_RELEASE_FAILED",
+                refusal_diagnostic(error),
             )
         except XuRuntimeUnsupported as error:
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
-        except AllocatorPressureUnavailable:
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
+        except AllocatorPressureUnavailable as error:
             return self._terminal(
                 ModuleDisposition.REFUSED,
                 "RSM_ALLOCATOR_PRESSURE_UNAVAILABLE",
+                refusal_diagnostic(error),
             )
         except AllocatorPressureCallFailed:
             return self._terminal(
@@ -6558,7 +6561,7 @@ class RSMOperationExecutionV2:
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -6597,10 +6600,11 @@ class RSMOperationExecutionV2:
             # with HDF5 validation and strict detached reload.
             if allocator_pressure is not None:
                 allocator_pressure.relieve()
-        except AllocatorPressureUnavailable:
+        except AllocatorPressureUnavailable as error:
             return self._terminal(
                 ModuleDisposition.REFUSED,
                 "RSM_ALLOCATOR_PRESSURE_UNAVAILABLE",
+                refusal_diagnostic(error),
             )
         except AllocatorPressureCallFailed:
             return self._terminal(
@@ -6653,9 +6657,9 @@ class RSMOperationExecutionV2:
                 if code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, code)
-        except FileExistsError:
-            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+            return self._terminal(disposition, code, refusal_diagnostic(error))
+        except FileExistsError as error:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS", str(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -6684,7 +6688,7 @@ class RSMOperationExecutionV2:
                     cancel_token=cancel_token,
                 )
             except RSMOperationRefused as error:
-                raise ModuleArtifactRefused(error.code) from error
+                raise ModuleArtifactRefused(error.code, refusal_diagnostic(error)) from error
 
         try:
             terminal = self._output.publish(
