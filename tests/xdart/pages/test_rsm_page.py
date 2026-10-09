@@ -742,9 +742,8 @@ def test_the_advanced_settings_are_ints_advanced_dialog_of_shared_rows(qapp, tmp
         _with_source(page, tmp_path)
         assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
         cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
-        assert {"Source and geometry", "Normalization column occurrences", "Corrections",
-                "Chunk and memory"} <= set(cards)
-        assert {"Image conditioning", "Images per point"} <= set(cards)
+        assert set(cards) == {"Source and geometry", "Normalization column occurrences", "Corrections",
+                              "Chunk and memory", "Image conditioning", "Images per point"}
         page.set_field("adv_foil_occurrence", "-1")  # a normalization occurrence is Processing's
         assert "Advanced Foil column occurrence" in page._headers["processing"].detail
         page.set_field("adv_foil_occurrence", "0")

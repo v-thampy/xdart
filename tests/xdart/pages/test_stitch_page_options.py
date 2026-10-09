@@ -344,6 +344,7 @@ def test_the_calibration_must_drive_the_geometrys_arm(qapp, tmp_path):
     finally:
         if page._calibration_dialog is not None:
             from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
+            from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _wait as wait_calibration
             wait_calibration(page._calibration_dialog)
             _close_with(page._calibration_dialog, qapp, 'Discard')
         _close(page, qapp)
@@ -684,8 +685,7 @@ def test_stitchs_advanced_is_ints_advanced_dialog_with_its_three_groups(qapp):
         assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
         assert page.advanced.buttons.standardButtons() == QtWidgets.QDialogButtonBox.StandardButton.Close
         cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
-        assert {"Source and geometry", "Frames and sample", "Corrections"} <= set(cards)
-        assert "Images per point" in cards
+        assert set(cards) == {"Source and geometry", "Frames and sample", "Corrections", "Images per point"}
         assert cards["Corrections"] is page.corrections_card
         for title, keys in (("Source and geometry", ("geometry_kind", "detector_rows", "raw_dtype", "camera",
                                                      "frame_step", "max_frame_mib", "output_family")),
