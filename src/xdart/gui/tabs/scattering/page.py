@@ -6885,13 +6885,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and not self._context_controller.viewer_2d_cleanup_pending
         )
 
-    def _refresh_poni_fact(self, snapshot: RunIntentSnapshot | None = None) -> None:
+    def _refresh_poni_fact(self, snapshot: RunIntentSnapshot | None = None) -> bool:
         """Refresh only at explicit edits, idle activation and actual Run entry."""
+        prior = (self._detector_summary_text, self._poni_ready, self._poni_detector_name)
         intent = (snapshot or self._intents.snapshot()).thaw()
         self._detector_summary_text = detector_summary(intent.poni_file, intent.mask_file)
         self._poni_ready = detector_calibration_ready(intent.poni_file)
         self._poni_detector_name = poni_detector(intent.poni_file)
-        self._experiment_readiness_key = None
+        changed = prior != (self._detector_summary_text, self._poni_ready, self._poni_detector_name)
+        if changed:
+            self._experiment_readiness_key = None
+        return changed
 
     def _project_controls(
         self, snapshot: RunIntentSnapshot
@@ -7577,8 +7581,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and hasattr(self, "_poni_ready")
                 and not self._closing and not self._closed
                 and self._lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED}):
-            self._refresh_poni_fact()
-            self._refresh_shell()
+            # Replacing focused controls can activate the window again during
+            # reconciliation. Unchanged PONI facts need no nested shell paint.
+            if self._refresh_poni_fact():
+                self._refresh_shell()
         if event.type() == QtCore.QEvent.DeferredDelete:
             if self._deferred_delete_pending:
                 self._schedule_deferred_delete_retry()

@@ -67,6 +67,54 @@ def _activate(page):
     QtWidgets.QApplication.sendEvent(page, QtCore.QEvent(QtCore.QEvent.WindowActivate))
 
 
+def test_unchanged_idle_activation_leaves_the_mounted_shell_alone(tmp_path, monkeypatch):
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page, _, _ = _page(tmp_path, mode="Int 2D")
+    try:
+        _wait(app, lambda: page._source_selection.observation is not None)
+        applied = []
+        owner = page._shell.apply_state
+
+        def observed(*args, **kwargs):
+            applied.append(args[0])
+            return owner(*args, **kwargs)
+
+        monkeypatch.setattr(page._shell, "apply_state", observed)
+        _activate(page)
+        assert not applied, "unchanged native activation refreshed the full shell"
+    finally:
+        _close(page, app)
+
+
+def test_activation_during_grazing_schema_change_does_not_reenter_controls(tmp_path, monkeypatch):
+    from xdart.gui.widgets.controls_panel import SegmentedControl
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page, _, _ = _page(tmp_path, mode="Int 2D")
+    try:
+        _wait(app, lambda: page._source_selection.observation is not None)
+        controls = page._shell.controls
+        rendered = []
+        owner = controls._render_experiment_bound_section
+
+        def observed(*args, **kwargs):
+            rendered.append(args[0])
+            if len(rendered) == 1:
+                # Native activation can arrive while Qt replaces the focused
+                # controls. Deliver the real event once at that owner boundary.
+                _activate(page)
+            return owner(*args, **kwargs)
+
+        monkeypatch.setattr(controls, "_render_experiment_bound_section", observed)
+        segment = next(row for row in controls.findChildren(SegmentedControl)
+                       if row.path == ("GI", "Grazing"))
+        next(button for value, button in segment._segments if value is True).click()
+        assert len(rendered) == 1, "native activation recursively rebuilt controls"
+        assert page._intents.snapshot().thaw().gi.enabled
+    finally:
+        _close(page, app)
+
+
 def _record_notices(page):
     notices = []
     def record(text):
