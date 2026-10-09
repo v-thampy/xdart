@@ -119,8 +119,8 @@ def _pyfai_arguments(frame, seed, cancelled=None):
     predicted geometry when a calibration is at hand, so "extract rings" numbers the rings.
 
     A frame whose scan records no energy takes the window's wavelength (typed, else the calibrant
-    scan's, else the direct-beam scan's: ``seed['wavelength_A']``), else a seed calibration's; never
-    pyFAI's default (the window refuses first: ``_frame_energy_known``)."""
+    scan's, else the calibrated frames' PONI files', else the direct-beam scan's: ``seed['wavelength_A']``),
+    else a seed calibration's; never pyFAI's default (the window refuses first: ``_frame_energy_known``)."""
     if not frame.energy_eV and seed.get('wavelength_A'):
         from xrd_tools.core.energy import wavelength_m_to_energy_eV
         frame = replace(frame, energy_eV=float(wavelength_m_to_energy_eV(seed['wavelength_A'] * 1e-10)))
@@ -519,6 +519,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._preview_key = None
         self._distance_key = self._distance_pending_key = None  # what the result was fitted from
         self._source_energy_eV = None
+        self._poni_wavelength = (None, None)  # (the calibrated frames' PONI files, the wavelength they agree on)
         self._pending_source_details = None
         self._calibrant_ready_key = None
         self._calibrant_frame_count = None
@@ -1053,7 +1054,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._calibrant_ready_key = None
             self._calibrant_frame_count = None
             self._calibrant_source_problem = ''
-            self._fields['rough_energy'].setPlaceholderText('Auto · scan energy unavailable')
+            self._refresh_energy_hint()
             self._source_details_key = self._energy_source_key()
         path = self._text(prefix + 'source')
         if not path:
@@ -1087,7 +1088,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._calibrant_frame_count = None
         self._calibrant_source_problem = ''
         self._choices = []
-        self._fields['rough_energy'].setPlaceholderText('Auto · scan energy unavailable')
+        self._refresh_energy_hint()
         self._update_fit_source_label()
 
     def _calibrant_source_changed(self, *_args):
@@ -1102,10 +1103,42 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _show_source_energy(self, energy):
         self._source_energy_eV = energy
+        self._refresh_energy_hint()
+
+    def _refresh_energy_hint(self):
+        """The Energy field's grey Auto hint: the energy a blank field takes and where it is from (the scan's
+        recorded one, else the calibrated frames' PONI files'; the direct-beam scan's is said by its fit)."""
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        energy, origin = self._source_energy_eV, ('SPEC' if self.source_kind.currentData() != 'nexus_stack'
+                                                  else 'NeXus')
+        if energy is None and not any(value is not None for _index, _motors, value in self._choices):
+            wavelength = self._frames_poni_wavelength_m()
+            if wavelength is not None:
+                energy, origin = float(wavelength_m_to_energy_eV(wavelength)), "the calibrated frames' PONI files"
         self._fields['rough_energy'].setPlaceholderText(
-            f'Auto · {energy / 1000:.4f} keV from '
-            + ('SPEC' if self.source_kind.currentData() != 'nexus_stack' else 'NeXus')
-            if energy is not None else 'Auto · scan energy unavailable')
+            f'Auto · {energy / 1000:.4f} keV from {origin}' if energy is not None else 'Auto · scan energy unavailable')
+
+    def _frames_poni_wavelength_m(self):
+        """The wavelength (m) the calibrated frames' PONI files agree on, None when there are none, they disagree
+        or the frames were staged from another source (maintainer, 2026-10-09: "if there is no typed in energy but
+        there is a poni file, it should use the energy from the poni file"). Read as Fit reads them; cached by file."""
+        files = tuple((frame.poni_path, frame.poni_sha256) for frame in self.frames if frame.complete)
+        if not files or self._staged_source_mismatch():
+            return None
+        if self._poni_wavelength[0] != files:
+            from xrd_tools.integrate.calibration import load_detector_calibration
+            values = []
+            for path, _sha in files:
+                try:
+                    value = float(load_detector_calibration(path).poni.wavelength)
+                except Exception:  # a file Fit would refuse says nothing here; drawing the table never fails on it
+                    continue
+                if math.isfinite(value) and value > 0:
+                    values.append(value)
+            agreed = values[0] if values and all(math.isclose(value, values[0], rel_tol=1e-6)
+                                                 for value in values) else None
+            self._poni_wavelength = (files, agreed)
+        return self._poni_wavelength[1]
 
     def _calibrant_source_ready(self):
         return self._calibrant_ready_key is not None and self._calibrant_ready_key == self._energy_source_key()
@@ -1195,10 +1228,12 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._rows['calibrant'] = (form, self._row_of[self.refine_calibrant])
         self._attach('rough_energy', 'calibrant', 'Energy (keV)', '', width=300,
                      placeholder='Auto · scan energy unavailable',
-                     tip='Blank uses the calibrant scan\'s recorded energy or wavelength; the grey Auto hint '
-                         'shows its energy in keV. Type a value to override it; clear it to restore Auto. '
-                         'Wavelength is computed from this value; the direct-beam distance fit needs no energy. '
-                         'Saving a rough calibration needs this or the direct-beam scan\'s recorded energy'
+                     tip='Blank uses the calibrant scan\'s recorded energy or wavelength; when it records none (or '
+                         'an impossible one), the wavelength of the calibrated frames\' PONI files, when they agree. '
+                         'The grey Auto hint shows that energy in keV and where it is from. Type a value to '
+                         'override it; clear it to restore Auto. Wavelength is computed from this value; the '
+                         'direct-beam distance fit needs no energy. Saving a rough calibration needs an energy: '
+                         'this, else the one a blank field uses, else the direct-beam scan\'s recorded energy'
                          + _PAGE_USE.get(self.context.page, {}).get('energy_field', '') + '.')
         self._fields['rough_energy'].setMinimumWidth(300)
         self._fields['rough_energy'].editingFinished.connect(self._render_frames)
@@ -2033,8 +2068,10 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _rough_wavelength_A(self):
         """Wavelength from the Energy field, else the calibrant scan's when every frame records the same
-        energy, else the direct-beam scan's (maintainer, 2026-09-29: "why doesn't it get it from the
-        spec file?") while its fit is current, else None."""
+        energy, else, when it records none (or an impossible one), the calibrated frames' PONI files' when they
+        agree (maintainer, 2026-10-09: "if there is no typed in energy but there is a poni file, it should use
+        the energy from the poni file"), else the direct-beam scan's (maintainer, 2026-09-29: "why doesn't it
+        get it from the spec file?") while its fit is current, else None."""
         from xrd_tools.core.energy import energy_eV_to_wavelength_m
         if self._text('rough_energy'):
             energy = float(self._text('rough_energy')) * 1000
@@ -2046,6 +2083,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         energies = {energy for _index, _values, energy in self._choices if energy is not None}
         if len(energies) == 1:
             return float(energy_eV_to_wavelength_m(energies.pop())) * 1e10
+        wavelength = None if energies else self._frames_poni_wavelength_m()
+        if wavelength is not None:
+            return wavelength * 1e10
         if (not energies and self.rough_mode.currentData() == 'scan' and self._distance_fresh()
                 and self._distance_energy_eV is not None):
             return float(energy_eV_to_wavelength_m(self._distance_energy_eV)) * 1e10
@@ -3269,6 +3309,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self.orientation_panel is not None:
             self.orientation_panel.set_frames(self.frames)
         self._update_fit_source_label()
+        self._refresh_energy_hint()  # a calibrated frame's PONI file can supply the energy
         rows, tips = [], {}
         for row, frame in enumerate(self.frames):
             # the frame's own detector image (and its frame number inside a multi-frame file)
