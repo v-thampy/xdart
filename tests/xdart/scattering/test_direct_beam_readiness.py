@@ -36,6 +36,58 @@ def settle(dialog, timeout=15):
     assert not dialog.active(), dialog.status.text()
 
 
+@pytest.mark.parametrize('outcome', ['complete', 'refused', 'cancelled'])
+def test_job_buttons_wait_for_the_background_probe_and_keep_the_fit(qapp, tmp_path, monkeypatch, outcome):
+    """CAL-BUSY-ACTION-DISCARDS-FIT (maintainer, 2026-10-09: "disable buttons if possible during probe"): the background
+    direct-beam probe keeps the tabs open for typing, so the buttons that start a job wait while it runs, and Refine or
+    Fit asked for anyway keeps the current fit and says to wait. Before, either discarded the fit and started nothing
+    (_start drops a job while one runs). The buttons return however the probe ends: complete, refused or cancelled."""
+    import xrd_tools.integrate.direct_beam as direct_beam
+    from tests.core.test_stitch_autocalibration import ROW_ANGLES, five_parameter_seed, ring_scan
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    fit = refine_arm_from_scan(ring_scan(tmp_path / 'scan', [(d, 0.) for d in (6., 20., 34.)]),
+                               five_parameter_seed(ROW_ANGLES), max_frames=3)
+    entered, release = Event(), Event()
+    original = direct_beam.infer_direct_beam_motion
+
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(30)
+        if outcome == 'refused':
+            raise ValueError('the direct-beam scan does not move the beam')
+        return original(*args, **kwargs)
+    monkeypatch.setattr(direct_beam, 'infer_direct_beam_motion', held)
+    nexus, _, _ = _beam_container(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    buttons = (dialog.list_button, dialog.prepare_button, dialog.calibrate_button, dialog.fit_button,
+               dialog.refine_button)
+    try:
+        dialog.fit = fit
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog._set_field_text('beam_source', nexus)
+        dialog._beam_probe_timer.stop()
+        dialog._detect_beam()
+        assert entered.wait(10) and dialog._job == 'beam_detect' and dialog._owner.busy
+        QtWidgets.QApplication.processEvents()
+        assert all(dialog.tabs.isTabEnabled(index) for index in range(dialog.tabs.count()))  # typing goes on
+        assert [button.text() for button in buttons if button.isEnabled()] == []
+        dialog.refine_button.click()  # a disabled button takes no press
+        assert dialog.fit is fit and dialog._job == 'beam_detect'
+        for asked in (dialog._refine, dialog._fit):  # asked for anyway: the fit stays and the status says to wait
+            asked()
+            assert dialog.fit is fit and 'wait' in dialog.status.text().lower(), dialog.status.text()
+        if outcome == 'cancelled':
+            dialog.cancel_button.click()
+        release.set()
+        settle(dialog)
+        assert [button.text() for button in buttons if not button.isEnabled()] == []
+        assert dialog.fit is fit
+    finally:
+        release.set()
+        dialog.close()
+
+
 def test_blank_source_and_rough_tab_use_the_shared_readiness_header(qapp, tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
