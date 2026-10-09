@@ -2785,6 +2785,8 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _save(self):
         def go():
+            if self._owner.busy:  # before the file dialog: _start would drop the save once a name is chosen
+                raise ValueError(self._BUSY_WAIT)
             if self.fit is None:
                 raise ValueError('fit the current controls before saving')
             selected = self._save_path(beam=False)
@@ -2853,6 +2855,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _save_rough(self):
         """Save step 1's geometry as the calibration pair, without a ring fit."""
         def go():
+            if self._owner.busy:  # before the file dialog: _start would drop the save once a name is chosen
+                raise ValueError(self._BUSY_WAIT)
             self._render_direct_beam_advice()  # what is saved is the arm the advice is about
             fit = self._rough_fit()
             selected = self._save_path(beam=self.rough_mode.currentData() == 'scan')
@@ -3336,7 +3340,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     #: The buttons that start a job wait while one runs (maintainer, 2026-10-09): the background direct-beam probe
     #: keeps the tabs open for typing, and a press then was taken by Qt and dropped by _start, Fit and Refine
     #: discarding the current fit first (CAL-BUSY-ACTION-DISCARDS-FIT).
-    _JOB_BUTTONS = ('list_button', 'prepare_button', 'calibrate_button', 'fit_button', 'refine_button')
+    _JOB_BUTTONS = ('list_button', 'prepare_button', 'calibrate_button', 'fit_button', 'refine_button',
+                    'save_rough_button')
     _BUSY_WAIT = 'Wait for the running operation to end (Cancel operation stops it); the current fit is kept.'
 
     def _sync_job_buttons(self):
@@ -3344,6 +3349,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             button = getattr(self, name, None)
             if button is not None:
                 button.setEnabled(not self._owner.busy)
+        if hasattr(self, 'save_button'):  # it saves the adopted fit: enabled with one, as adoption sets it
+            self.save_button.setEnabled(self.fit is not None and not self._owner.busy)
 
     def _sync_quick_button(self):
         """Every start and end of a job comes here: the Quick button and the job buttons follow it."""
