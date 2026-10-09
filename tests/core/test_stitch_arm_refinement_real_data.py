@@ -445,7 +445,9 @@ def test_fatigue_eiger_invalid_pixels_stay_out_of_refine_whatever_the_threshold(
     """CAL-REFINE-INVALID-PIXEL (maintainer, 2026-10-08): each frame of the 17-2 Fatigue pair's Eiger scan holds 28
     pixels of 4294967295, the detector's invalid-pixel value. Refine from the saved scan7_2 calibration, as the
     window asks, fits the same with the threshold off as with Auto; off refused before (fit RMS 0.0357), the bad
-    points already extracted. Loose bounds: pyFAI 2026.9 keeps 3160 of the save's 3176 points (0.018 mm)."""
+    points already extracted. One nu row leaves the distance and del zero degenerate with the beam position (the save
+    correlates poni1 and del zero at -0.999996): from the save's own geometry Refine settles 0.15 mm and 0.3° away at
+    a lower RMS, so only runaways (Oct 3's 349.94 mm, del zero on its -5° bound) are bounded here."""
     from xrd_tools.integrate.refine import ArmFitBounds
     from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
     from xrd_tools.integrate.stitch_conditioning import StitchConditioning
@@ -471,5 +473,6 @@ def test_fatigue_eiger_invalid_pixels_stay_out_of_refine_whatever_the_threshold(
     print(f"Fatigue refine: rms {auto.rms_q:.6f} points {auto.n_points} distance {table['distance_mm']['fitted']:.4f} mm "
           f"del zero {table['del_zero_deg']['fitted']:.4f}° (saved {saved['rms_q_A^-1']:.6f}, {saved['n_points']})")
     assert auto.rms_q < .003 and auto.n_points >= 3000
-    assert abs(table['distance_mm']['fitted'] - saved['fit_bounds']['parameters']['distance_mm']['fitted']) < .1
-    assert abs(table['del_zero_deg']['fitted'] - saved['fit_bounds']['parameters']['del_zero_deg']['fitted']) < .2
+    for name, bound in (('distance_mm', 1.), ('del_zero_deg', 1.), ('nu_zero_deg', 1.)):
+        assert abs(table[name]['fitted'] - saved['fit_bounds']['parameters'][name]['fitted']) < bound, (name, table[name])
+        assert not table[name]['at_bound'], (name, table[name])

@@ -449,7 +449,8 @@ def test_quick_calibrates_the_real_17_2_pair_with_the_windows_defaults(qapp, tmp
     """Q9 (maintainer, 2026-10-08): the 17-2 Fatigue pair, an Eiger2 500k on the upright mount and LaB6 at 11.27 keV.
     Quick with the window's own defaults (the threshold on) ends at Refine's summary, near the Oct 3 save (scan7_2).
     The threshold used to start off, and the detector's 28 invalid pixels a frame (4294967295) then reached the
-    ring search: Refine refused (fit RMS 0.03906). Loose bounds: pyFAI 2026.9 keeps 3160 of the save's 3176 points."""
+    ring search: Refine refused (fit RMS 0.03906). One nu row leaves the distance and del zero degenerate with the
+    beam position, so only runaways (349.94 mm, del zero on its -5° bound) are bounded against the save."""
     configured = os.environ.get('XDART_TEST_DATA')
     data = Path(configured or '') / 'stitching' / 'GIXRD_Fatigue_Radha'
     if not configured or not data.is_dir():
@@ -478,8 +479,9 @@ def test_quick_calibrates_the_real_17_2_pair_with_the_windows_defaults(qapp, tmp
         print(f"Q9: rms {dialog.fit.rms_q:.6f} points {dialog.fit.n_points} distance "
               f"{fitted['distance_mm']['fitted']:.4f} mm del zero {fitted['del_zero_deg']['fitted']:.4f}°")
         assert dialog.fit.rms_q < .003 and dialog.fit.n_points >= 3000
-        for name, bound in (('distance_mm', .1), ('del_zero_deg', .2)):
-            assert abs(fitted[name]['fitted'] - saved['parameters'][name]['fitted']) < bound, (name, fitted[name])
+        for name in ('distance_mm', 'del_zero_deg', 'nu_zero_deg'):
+            assert abs(fitted[name]['fitted'] - saved['parameters'][name]['fitted']) < 1., (name, fitted[name])
+            assert not fitted[name]['at_bound'], (name, fitted[name])
         assert _calibration_files(tmp_path / 'project') == []
     finally:
         _close(qapp, page, dialog)
