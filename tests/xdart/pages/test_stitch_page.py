@@ -846,10 +846,8 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         assert page.build_form().conditioning == StitchConditioning("auto")
         page.run_bar.startButton.click()
         _wait(page, qapp, timeout=60)
-        if backend == "multigeometry":
-            assert len(set(page.browser.listed_results()) & set(page._listed)) == 2, page.run_bar.readinessLabel.full_text()
-        else:  # XU-QUEUE remains held; its original assertion is unchanged.
-            assert page.results.count() == 2, page.run_bar.readinessLabel.full_text()
+        # the two outputs, whichever backend (XU-QUEUE: the results list also holds the browser's ".." row)
+        assert len(set(page.browser.listed_results()) & set(page._listed)) == 2, page.run_bar.readinessLabel.full_text()
         status = page.run_bar.readinessLabel.full_text()  # skips and warnings stay on the status line
         assert "· 1 scan skipped" in status and status.endswith("(Preview lists them)")
         assert not page._queued_jobs
