@@ -1575,9 +1575,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._sync_quick_button()
 
     def _quick_mirror(self, key):
-        """The card's row shows the tab's value, a draft typed there included; never over a draft typed on the card."""
+        """The card's row shows the tab's value, a draft typed there included. It never overwrites a draft typed on the
+        card, nor a focused file row (a file row takes no set while it holds the focus); a focused scan box that holds
+        no draft does follow (Tab from a new file to its scan: the reset scan, not the old file's)."""
         row = self._quick_rows.get(key)
-        if row is None or row.editor.hasFocus():
+        if row is None or (row.editor.hasFocus() and (row.editor.isModified() or key.endswith('source'))):
             return
         value = self._text(key)
         if row.current_value() != value:
@@ -1586,7 +1588,9 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _quick_commit(self, key, value):
         """A scan edited on the card is the tab's value, set there and committed as that row commits, so the tab's
         own handlers run (a new calibrant file resets its scan, images, stem and energy; source details refresh).
-        An unchanged value writes nothing: re-setting a file would reset them too (review A1)."""
+        An unchanged value writes nothing: re-setting a file would reset them too (review A1). Committed, the card's
+        row holds no draft, so its modified flag (Quick's and the mirror's draft test) is cleared."""
+        self._quick_rows[key].editor.setModified(False)
         value = '' if value is None else str(value).strip()
         if value == self._text(key):
             return
@@ -3326,6 +3330,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._quick_stage is None or self._close_pending or self._owner.busy:
             return
         if self._quick_stage == 1:
+            if self.rough_mode.currentData() != 'scan':  # switched while its direct-beam check ran (tabs enabled)
+                self._quick_stop(1, self._QUICK_NEEDS_SCAN)
+                return
             if self._beam_detection is None or self._beam_detection[0] != self._beam_generation:
                 if self._quick_detected_generation == self._beam_generation:  # its check ran on these inputs
                     self._quick_stop(1, self._beam_problem)
@@ -3333,8 +3340,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                 self._beam_probe_timer.stop()
                 self._detect_beam()  # a queued source refresh may start first
                 if self._owner.busy:
-                    if self._job == 'beam_detect':
-                        self._quick_detected_generation = self._beam_generation
+                    if self._job == 'beam_detect':  # the inputs that check runs on
+                        self._quick_detected_generation = self._beam_probe_generation
                     return
                 if self._beam_detection is None or self._beam_detection[0] != self._beam_generation:
                     self._quick_stop(1, self._beam_problem)
