@@ -159,7 +159,8 @@ def calibration_source_energy_eV(spec: SourceSpec) -> float | None:
 
 
 def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
-    """Metadata-only enumeration; requested SPEC selectors never fall back."""
+    """Metadata-only enumeration; requested SPEC selectors never fall back. Each row is (index, motors, energy):
+    the frame's recorded energy in eV, or None when it records none or an impossible one."""
     from xrd_tools.sources import open_source
     from xrd_tools.io.spec import list_spec_scans
     if len(set(motor_names)) != len(motor_names) or any(not name for name in motor_names):
@@ -196,8 +197,10 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
                 energy = metadata.get('energy')
                 if energy is not None:
                     energy = float(energy)
+                    # An impossible recorded energy (a glitched readback: the 17-2 del-only file records -2165.0213
+                    # for one scan) is no energy, as calibration_source_energy_eV holds; the typed one applies.
                     if not math.isfinite(energy) or energy <= 0:
-                        raise ValueError(f'frame {index}: invalid energy in eV')
+                        energy = None
                 rows.append((int(index), motors, energy))
         return rows
     finally:
