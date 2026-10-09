@@ -88,7 +88,7 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "Int's Threshold rule; on by default. Auto leaves out pixels at or above the detector's "
         "saturation; typed bounds tighten the band. Off keeps saturated pixels (strong grains). "
         "The automatic refinement leaves out the detector's invalid-pixel value (4294967295) "
-        "either way. Raw images and Stitch processing thresholds stay unchanged."),
+        "either way. Raw images and the page's own processing threshold stay unchanged."),
     ("Calibration", "min"): (
         "Calibration threshold lower bound: pixels below it are left out of ring finding. "
         "Default 0."),
