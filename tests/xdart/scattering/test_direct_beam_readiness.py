@@ -172,6 +172,40 @@ def test_import_waits_for_the_background_probe(qapp, tmp_path, monkeypatch):
         dialog.close()
 
 
+def test_the_source_read_keeps_the_tabs_open_and_the_job_buttons_waiting(qapp, tmp_path, monkeypatch):
+    """Maintainer, 2026-10-09 ("Yes", to Claude's item 5): the window's metadata read of its calibrant scan (which
+    starts as it opens with a page's scan) keeps the tabs open for typing, as the direct-beam probe does; the buttons
+    that start a job still wait for it."""
+    import xrd_tools.integrate.stitch_calibration as stitch_calibration
+    entered, release = Event(), Event()
+    original = stitch_calibration.calibration_source_energy_eV
+
+    def held(spec):
+        entered.set()
+        assert release.wait(30)
+        return original(spec)
+    monkeypatch.setattr(stitch_calibration, 'calibration_source_energy_eV', held)
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#O0 energy\n#S 1 ascan del 1 -1 1 1\n#P0 11270\n#N 1\n#L del\n1\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    buttons = (dialog.list_button, dialog.prepare_button, dialog.calibrate_button, dialog.import_button,
+               dialog.fit_button, dialog.refine_button, dialog.save_rough_button)
+    try:
+        dialog._set_field_text('source', spec)
+        dialog._source_details()
+        assert entered.wait(10) and dialog._job == 'source_details' and dialog._owner.busy
+        QtWidgets.QApplication.processEvents()
+        assert dialog.tabs.tabBar().isEnabled() and all(page.isEnabled() for page in dialog._tab_pages.values())
+        assert [button.text() for button in buttons if button.isEnabled()] == []
+        release.set()
+        settle(dialog)
+        assert dialog._source_energy_eV == 11270
+        assert dialog.list_button.isEnabled()
+    finally:
+        release.set()
+        dialog.close()
+
+
 def test_blank_source_and_rough_tab_use_the_shared_readiness_header(qapp, tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
