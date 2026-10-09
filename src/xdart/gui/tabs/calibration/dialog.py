@@ -2601,6 +2601,8 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _import(self):
         def go():
+            if self._owner.busy:  # before the file dialogs: _start would drop the import once both are chosen
+                raise ValueError(self._BUSY_WAIT)
             frame = self._selected_frame()
             from xdart.gui.widgets.file_dialogs import browse
             picks = browse(self, 'PONI for this exact frame', file_filter='PONI (*.poni)',
@@ -3340,8 +3342,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     #: The buttons that start a job wait while one runs (maintainer, 2026-10-09): the background direct-beam probe
     #: keeps the tabs open for typing, and a press then was taken by Qt and dropped by _start, Fit and Refine
     #: discarding the current fit first (CAL-BUSY-ACTION-DISCARDS-FIT).
-    _JOB_BUTTONS = ('list_button', 'prepare_button', 'calibrate_button', 'fit_button', 'refine_button',
-                    'save_rough_button')
+    _JOB_BUTTONS = ('list_button', 'prepare_button', 'calibrate_button', 'import_button', 'fit_button',
+                    'refine_button', 'save_rough_button')
     _BUSY_WAIT = 'Wait for the running operation to end (Cancel operation stops it); the current fit is kept.'
 
     def _sync_job_buttons(self):
