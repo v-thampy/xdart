@@ -488,7 +488,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._prediction = None
         #: Predicted rings per (frame, calibrant, calibration): see _expected_rings.
         self._ring_cache = {}
-        self._threshold_state = ThresholdState(mask_saturation=False)
+        #: Calibration's threshold, Int's rule and Int's default: on, Auto leaving saturated pixels out (maintainer,
+        #: 2026-10-08); shown by every row in _threshold_rows (Advanced's, the Quick card's).
+        self._threshold_state = ThresholdState()
+        self._threshold_rows = []
         self._choices = []
         self._identity = None
         self._job = None
@@ -1238,8 +1241,25 @@ class CalibrationDialog(QtWidgets.QDialog):
         return (StitchConditioning('manual', state.threshold_min, state.threshold_max) if state.apply_threshold
                 else StitchConditioning('auto' if state.mask_saturation else 'off'))
 
+    def _threshold_row(self):
+        """Int's shared threshold row on this window's one threshold state: every row shows that state
+        (_show_threshold) and edits it through the shared transitions (_threshold_edited); its tooltips are the
+        shared registry's for these paths."""
+        from xdart.gui.widgets.controls_panel import RangeRow
+        row = RangeRow(label='Threshold',
+                       low={'path': ('Calibration', 'min'), 'value': 0},
+                       high={'path': ('Calibration', 'max'), 'value': None, 'placeholder': 'Auto'},
+                       toggle={'path': ('Calibration', 'enabled'), 'value': True},
+                       display_decimals=0)
+        row.label.setToolTip('Which counts calibrant ring finding and the automatic refinement use, by Int\'s '
+                             'Threshold rule: on by default, Auto leaving saturated pixels out. The switch and the '
+                             'bounds say more.')
+        row.valueChanged.connect(self._threshold_edited)
+        self._threshold_rows.append(row)
+        return row
+
     def _show_threshold(self):
-        if not hasattr(self, 'threshold_range'):
+        if not self._threshold_rows:
             return
         from xrd_tools.session.readiness import ControlFormField, SectionId
         try:
@@ -1255,9 +1275,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         values = {'min': 0 if automatic or state.threshold_min is None else state.threshold_min,
                   'max': None if automatic else state.threshold_max,
                   'enabled': state.apply_threshold or state.mask_saturation}
-        self.threshold_range.apply_fields({('Calibration', key): ControlFormField(
+        fields = {('Calibration', key): ControlFormField(
             SectionId.PROCESSING, 'Threshold', ('Calibration', key), value=value,
-            placeholder=hint if key == 'max' else None) for key, value in values.items()})
+            placeholder=hint if key == 'max' else None) for key, value in values.items()}
+        for row in self._threshold_rows:
+            row.apply_fields(fields)
 
     def _threshold_edited(self, path, value):
         result = threshold_transition(self._threshold_state, path[-1], value, self._threshold_default_max)
@@ -1344,15 +1366,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.point_images = PointImagesSettings()
         options.addRow(self.point_images)
         self.point_images.changed.connect(lambda: self._source_details())
-        from xdart.gui.widgets.controls_panel import RangeRow
-        self.threshold_range = RangeRow(label='Threshold',
-            low={'path': ('Calibration', 'min'), 'value': 0},
-            high={'path': ('Calibration', 'max'), 'value': None, 'placeholder': 'Auto'},
-            toggle={'path': ('Calibration', 'enabled'), 'value': False,
-                    'tooltip': 'Filter pixels for calibrant ring finding and automatic refinement; '
-                               'raw images and Stitch processing thresholds stay unchanged.'},
-            display_decimals=0)
-        self.threshold_range.valueChanged.connect(self._threshold_edited)
+        self.threshold_range = self._threshold_row()
         options.addRow(self.threshold_range.label, self.threshold_range)
         self._fields['saturation'].editingFinished.connect(self._show_threshold)
         self._show_threshold()
@@ -2173,7 +2187,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if isinstance(values.get('refine_energy'), bool):
             self.refine_energy.setChecked(values['refine_energy'])
         self._apply_camera(values)
-        self._threshold_state = ThresholdState(mask_saturation=False)
+        self._threshold_state = ThresholdState()  # no saved choice: on; a saved one, on or off, stays
         if isinstance(values.get('calibration_threshold'), dict):
             try:
                 state = ThresholdState(**values['calibration_threshold'])

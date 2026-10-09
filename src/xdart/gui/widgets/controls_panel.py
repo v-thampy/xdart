@@ -82,6 +82,20 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "detector's saturation (the value the input records, else the "
         "calibration detector's counter limit, else the data type's maximum), "
         "never the frame maximum. Clear this bound to restore the automatic band."),
+    # The calibration window's own threshold (and its Quick card's view of it), Int's rule
+    ("Calibration", "enabled"): (
+        "Calibration's threshold for calibrant ring finding and the automatic refinement, by "
+        "Int's Threshold rule; on by default. Auto leaves out pixels at or above the detector's "
+        "saturation; typed bounds tighten the band. Off keeps saturated pixels (strong grains). "
+        "The automatic refinement leaves out the detector's invalid-pixel value (4294967295) "
+        "either way. Raw images and Stitch processing thresholds stay unchanged."),
+    ("Calibration", "min"): (
+        "Calibration threshold lower bound: pixels below it are left out of ring finding. "
+        "Default 0."),
+    ("Calibration", "max"): (
+        "Calibration threshold upper bound: pixels above it are left out of ring finding. "
+        "Blank: Auto, the detector's saturation (the Saturation field, else its documented "
+        "counter limit, else the image type's maximum)."),
     # Source
     ("Signal", "inp_type"): (
         "Source kind: a numbered image series, a directory of images, or a "
