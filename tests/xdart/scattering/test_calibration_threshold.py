@@ -100,6 +100,47 @@ def test_the_threshold_starts_on_and_says_what_it_always_leaves_out(qapp, tmp_pa
         dialog.close()
 
 
+def test_the_detectors_invalid_value_stays_out_of_the_staged_frames_mask_whatever_the_threshold(qapp, tmp_path):
+    """Maintainer, 2026-10-08 ("extend it"): the detector's invalid-pixel value (4294967295, an Eiger's dead pixels)
+    stays out of the staged frames' calibration mask, pyFAI-calib2's and the shared owner's (predicted rings,
+    orientation checks), whatever the threshold, as it stays out of the automatic ring search. A clean frame with the
+    threshold off keeps the Detector panel's mask as it is: none stays none. The staged pixels are never rewritten."""
+    from xrd_tools.core.geometry.camera import STITCH_CAMERA
+    from xrd_tools.core.invalid import UINT32_CEILING
+    from xrd_tools.integrate.stitch_calibration import calibration_frame_mask
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'beam').write_text('#F beam\n#O0 del nu\n#S 1 ascan del 0 0 0 1\n#P0 0 0\n#N 2\n#L del  nu\n0 0\n')
+    image = np.resize(np.array([2, 5, 10, 11], dtype='<u4'), (195, 487))
+    dead = np.zeros(image.shape, bool)
+    dead[3, 7] = dead[100, 400] = True
+    image[dead] = int(UINT32_CEILING)
+    image.tofile(root / 'beam_scan1_0000.raw')
+    spec = SourceSpec(root / 'beam', SourceKind.SPEC, options={'scan': '1', 'image_dir': str(root),
+        'read_image_kwargs': {'detector_shape': image.shape, 'raw_dtype': 'uint32'}})
+    staged = capture_calibration_frames(spec, [0], root / 'staged')[0]
+    clean, _ = frame(tmp_path / 'clean')
+    before = hashlib.sha256(open(staged.image_path, 'rb').read()).hexdigest()
+    static = np.zeros(image.shape, bool)
+    static[0, 1] = True
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Pilatus100k'))
+    dialog.camera.set_value(STITCH_CAMERA)  # staged pixels unturned
+    try:
+        dialog.frames = (staged,)
+        dialog.session_dir = root / 'staged'
+        edit(dialog.threshold_range, 'enabled', False)
+        assert dialog._conditioning().mode == 'off'
+        np.testing.assert_array_equal(fabio.open(dialog._pyfai_mask(staged)).data.astype(bool), dead)
+        np.testing.assert_array_equal(calibration_frame_mask(staged), dead)
+        np.testing.assert_array_equal(calibration_frame_mask(staged, static), dead | static)
+        band = calibration_frame_mask(staged, conditioning=StitchConditioning('manual', 1.))  # a band without a max
+        assert (band & dead).sum() == dead.sum()
+        assert calibration_frame_mask(clean) is None and dialog._pyfai_mask(clean) is None
+        assert hashlib.sha256(open(staged.image_path, 'rb').read()).hexdigest() == before
+    finally:
+        dialog.close()
+
+
 def test_detector_selection_supplies_whole_auto_counts_to_frame_prediction(qapp, tmp_path):
     from xrd_tools.integrate.calibration_seed import rough_arm_record
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Eiger2_500k'))
