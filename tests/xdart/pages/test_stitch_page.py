@@ -804,6 +804,22 @@ def test_an_xu_preview_registers_no_edit_of_its_own(qapp, tmp_path):
         assert page._owner.prepared is not None, page.run_bar.readinessLabel.full_text()
         assert page._revision == page._action_revision  # the Preview's own outcome is no edit
         assert page._prepared_revision == page._revision  # so it stays prepared for Run
+        # a Preview whose calibration changes a row (its file re-saved meanwhile) is an edit
+        from pyFAI.detectors import detector_factory
+        from xrd_tools.analysis.xu_stitch_calibration import (
+            XuStitchCalibrationInput, authored_surface_calibration, capture_xu_stitch_calibration)
+        from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+        asset = authored_surface_calibration(detector=detector_factory("Pilatus300kw"), cch1=220., cch2=235.,
+            distance_m=.395, del_offset_deg=3., nu_offset_deg=1., energy_eV=17000.018,
+            xu_wavelength_A=12398.41984 / 17000.018, source_motors={"del": "gamma", "nu": "delta"}, rotation=180,
+            control_domain={"del": [5., 40.], "nu": [-10., 10.]}, domain={"del": [0., 50.], "nu": [-15., 30.]},
+            rms_q=.001, condition=100., n_frames=4, n_points=200)
+        resaved = tmp_path / "resaved.json"
+        resaved.write_text(json.dumps(asset, sort_keys=True, separators=(",", ":")))
+        revision = page._revision
+        page._refresh_xu_geometry(calibration=capture_xu_stitch_calibration(
+            XuStitchCalibrationInput(xu_calibration_path(str(resaved), tmp_path)), project_root=tmp_path))
+        assert page._value("source_motors") == "del=gamma, nu=delta" and page._revision == revision + 1
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
