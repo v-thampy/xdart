@@ -646,6 +646,9 @@ def test_scan43_from_a_rough_calibration_authored_in_the_window_runs_and_reopens
         page.set_field("image_dir", "images")
         page._calibrate()
         dialog = page._calibration_dialog
+        # The window reads the page's scan metadata as it opens (since ebf112a4), its tabs waiting meanwhile: wait
+        # as a person does before typing (RSM-ROUGH: a click during that read did nothing).
+        _wait(page, qapp, lambda: not dialog.active(), seconds=60)
         dialog.camera.set_value(DetectorCamera("z-", "x-"))
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData("manual"))
         for key, value in (("beam_detector", "Pilatus100k"), ("rough_distance", "1014.7173"),
