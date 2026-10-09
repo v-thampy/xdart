@@ -132,6 +132,46 @@ def test_save_buttons_wait_for_the_background_probe(qapp, tmp_path, monkeypatch)
         dialog.close()
 
 
+def test_import_waits_for_the_background_probe(qapp, tmp_path, monkeypatch):
+    """Claude's second self-review of CAL-SMALL-FIXES-20261009 (same request): Import matched PONI + NPT pressed during
+    the probe opened both file dialogs, then _start dropped the import. It waits too; asked for anyway, it says to
+    wait before any file dialog opens, and once the probe ends the dialogs open again."""
+    import xrd_tools.integrate.direct_beam as direct_beam
+    from xdart.gui.widgets import file_dialogs
+    entered, release = Event(), Event()
+    original = direct_beam.infer_direct_beam_motion
+
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(30)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(direct_beam, 'infer_direct_beam_motion', held)
+    picks = []
+    monkeypatch.setattr(file_dialogs, 'browse', lambda *args, **kwargs: picks.append(kwargs.get('file_filter')) or [])
+    nexus, _, _ = _beam_container(tmp_path)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    monkeypatch.setattr(dialog, '_selected_frame', lambda: 'a selected frame')  # the dialogs are for a selected frame
+    try:
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog._set_field_text('beam_source', nexus)
+        dialog._beam_probe_timer.stop()
+        dialog._detect_beam()
+        assert entered.wait(10) and dialog._job == 'beam_detect'
+        QtWidgets.QApplication.processEvents()
+        assert not dialog.import_button.isEnabled()
+        dialog._import()
+        assert picks == [] and 'wait' in dialog.status.text().lower(), dialog.status.text()
+        release.set()
+        settle(dialog)
+        assert dialog.import_button.isEnabled()
+        dialog._import()
+        assert picks == ['PONI (*.poni)']
+    finally:
+        release.set()
+        dialog.close()
+
+
 def test_blank_source_and_rough_tab_use_the_shared_readiness_header(qapp, tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
