@@ -367,6 +367,13 @@ def test_a_blank_energy_takes_the_calibrated_frames_poni_wavelength(qapp, tmp_pa
         dialog._render_frames()
         assert dialog._rough_wavelength_A() == pytest.approx(.7749012402075016, rel=1e-12, abs=0)
         assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
+        spec = tmp_path / 'other.spec'
+        spec.write_text('#F other\n#S 1 ascan del 1 -1 1 1\n#N 1\n#L del\n1\n-1\n')
+        dialog._set_field_text('source', spec)  # frames staged from another scan say nothing about this one
+        assert dialog._rough_wavelength_A() is None
+        assert dialog._fields['rough_energy'].placeholderText() == 'Auto · scan energy unavailable'
+        dialog._set_field_text('source', '')
+        assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
         dialog._set_field_text('rough_energy', '12')  # typed comes first
         assert dialog._rough_wavelength_A() == pytest.approx(float(energy_eV_to_wavelength_m(12000)) * 1e10,
                                                              rel=1e-12, abs=0)
