@@ -434,6 +434,23 @@ def _fit_scan7(root, *, nu):
                              fit_scales=False, model='stacked_del_on_nu')
 
 
+def test_the_real_del_only_scan_7s_impossible_energy_is_no_energy():
+    """Maintainer, 2026-10-09 ("why is it unusable? It wasn't before"): this file's mono/energy positioners read
+    -2165.0213 for scan 7 (a glitched readback; 15999.985 for scan 1), and calibration refused the scan as "frame 0:
+    invalid energy in eV". Scan 7's 41 frames now list with no energy, so the typed one applies; scan 1 keeps its own."""
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.integrate.stitch_calibration import source_frame_choices
+    root = _del_only_root()
+    rows = {}
+    for scan in ('1', '7'):
+        spec = SourceSpec(root / 'calibration/LaB6_16keV', SourceKind.SPEC, options={
+            'scan': scan, 'image_dir': str(root / 'images'), 'image_stem': f'b_thampy_LaB6_16keV_scan{scan}_',
+            'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': 'int32'}})
+        rows[scan] = source_frame_choices(spec, ('del',))
+    assert len(rows['7']) == 41 and {energy for _index, _motors, energy in rows['7']} == {None}
+    assert rows['1'] and {energy for _index, _motors, energy in rows['1']} == {15999.985}
+
+
 def test_the_real_del_only_scan_fits_the_same_as_a_2theta_arm_and_as_psic():
     root = _del_only_root()
     single, psic = _fit_scan7(root, nu=False), _fit_scan7(root, nu=True)

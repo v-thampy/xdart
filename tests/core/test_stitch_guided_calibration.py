@@ -294,6 +294,26 @@ def test_calibration_refuses_same_count_missing_interior_raw_frame(tmp_path):
         source_frame_choices(spec, ('th', 'chi'))
 
 
+@pytest.mark.parametrize('recorded,expected', [('-2165.0213', None), ('0', None), ('nan', None),
+                                               ('15999.985', 15999.985)])
+def test_an_impossible_recorded_energy_is_no_energy(tmp_path, recorded, expected):
+    """Maintainer, 2026-10-09: the 17-2 del-only SPEC file records mono/energy -2165.0213 for scan 7 and 0 for scan 6
+    (15999.985 elsewhere), a glitched readback; calibration read it as the beam energy and refused the scan (since
+    ca7738f1). An impossible recorded energy is no energy, as calibration_source_energy_eV already treats it, so the
+    typed Energy or the calibration's wavelength applies; a real recorded energy is kept."""
+    from xrd_tools.integrate.stitch_calibration import calibration_source_energy_eV, source_frame_choices
+    path = tmp_path / 'cal'
+    path.write_text('#F cal\n#E 1\n#D today\n#O0 del  energy\n\n#S 7 ascan del 5 6 1 1\n#D today\n'
+                    f'#P0 5 {recorded}\n#N 2\n#L del  i0\n5 1\n6 1\n')
+    for index in (0, 1):
+        np.ones((2, 3), dtype=np.uint16).tofile(tmp_path / f'cal_scan7_{index}.raw')
+    spec = SourceSpec(path, SourceKind.SPEC, options={'scan': '7', 'image_dir': str(tmp_path),
+        'read_image_kwargs': {'detector_shape': (2, 3), 'raw_dtype': 'uint16'}})
+    rows = source_frame_choices(spec, ('del',))
+    assert [(index, motors['del'], energy) for index, motors, energy in rows] == [(0, 5., expected), (1, 6., expected)]
+    assert calibration_source_energy_eV(spec) == expected
+
+
 def test_a_saved_fit_writes_its_xrayutilities_partner_bound_by_hash(tmp_path):
     """Always both (maintainer, 2026-09-29): the pyFAI file, then its xrayutilities partner beside it,
     checked on the calibrant frames, the scan's frames and the typed range, and bound to the pyFAI bytes."""
