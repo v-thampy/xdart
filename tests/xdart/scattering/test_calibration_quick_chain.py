@@ -427,20 +427,21 @@ def test_quick_card_shares_the_windows_threshold_and_mask(qapp, tmp_path, monkey
         masks = [row for row in card.findChildren(FormRow) if row.label.text() == 'Mask file']
         assert len(masks) == 1 and masks[0].label.toolTip()
         mask = masks[0]
-        drawn, other = tmp_path / 'drawn.npy', tmp_path / 'other.npy'
-        for path in (drawn, other):
+        drawn, other, picked = tmp_path / 'drawn.npy', tmp_path / 'other.npy', tmp_path / 'picked.npy'
+        for path in (drawn, other, picked):
             np.save(path, np.zeros((4, 4), bool))
         _commit(mask.editor, str(drawn))  # card → Detector panel
         assert dialog._text('mask') == str(drawn) == mask.current_value()
         _commit(dialog._fields['mask'], str(other))  # Detector panel → card
         assert mask.current_value() == str(other)
+        dialog._fields['mask'].clearFocus()  # a file row takes no set while it holds the focus
         calls = []
-        monkeypatch.setattr(file_dialogs, 'browse', lambda *a, **k: calls.append(k.get('file_filter')) or [str(drawn)])
-        _click(mask.browse_button)
+        monkeypatch.setattr(file_dialogs, 'browse', lambda *a, **k: calls.append(k.get('file_filter')) or [str(picked)])
+        _click(mask.browse_button)  # the card's 📁 is the Detector panel's
         assert calls == ['Masks (*.edf *.tif *.tiff *.npy);;All files (*)']
-        assert dialog._text('mask') == str(drawn) == mask.current_value()
+        assert dialog._text('mask') == str(picked) == mask.current_value()
         saved = dialog.settings()
-        assert set(saved['fields']) == set(dialog._fields) and saved['fields']['mask'] == str(drawn)
+        assert set(saved['fields']) == set(dialog._fields) and saved['fields']['mask'] == str(picked)
     finally:
         _close(qapp, page, dialog)
 

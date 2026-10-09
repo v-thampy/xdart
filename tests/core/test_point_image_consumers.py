@@ -191,6 +191,35 @@ def test_automatic_calibration_masks_each_average_operand(tmp_path):
     assert all(control.col_positions.min() >= 699 for control in points.controls)
 
 
+def test_automatic_calibration_leaves_the_invalid_value_out_of_each_point(tmp_path):
+    """CAL-REFINE-INVALID-PIXEL (maintainer, 2026-10-08): a confirmed point whose exposures hold the detector's
+    invalid-pixel value (4294967295, the same dead pixels in each) leaves those pixels out whatever the threshold,
+    as a mask of them does."""
+    from tests.core.test_stitch_autocalibration import ring_scan, five_parameter_seed, ROW_ANGLES
+    from xrd_tools.core.invalid import UINT32_CEILING
+    from xrd_tools.integrate.stitch_autocalibration import extract_scan_ring_points
+    spec = ring_scan(tmp_path / 'scan', [(d, 0.) for d in (6., 20., 34.)], dtype='<u4')
+    dead = np.zeros((195, 1475), bool)
+    rows, cols = np.random.default_rng(0).integers((0, 0), (195, 1475), size=(28, 2)).T
+    dead[rows, cols] = True
+    files = sorted((tmp_path / 'scan/images').glob('*.raw'))
+    images = [np.fromfile(path, dtype='<u4').reshape(195, 1475) for path in files]
+    for path in files:
+        path.unlink()
+    for point, image in enumerate(images):
+        image[dead] = int(UINT32_CEILING)
+        for offset in range(2):
+            image.tofile(tmp_path / f'scan/images/ring_scan1_{2*point+offset:04}.raw')
+    spec = replace(spec, options={**spec.options, 'point_images': PointImagePolicy(2, 'average').to_dict()})
+    seed = five_parameter_seed(ROW_ANGLES)
+    left_in = extract_scan_ring_points(spec, seed, max_frames=3)  # no threshold
+    masked = extract_scan_ring_points(spec, seed, max_frames=3, mask=dead)
+    assert [frame['points'] for frame in left_in.frames] == [frame['points'] for frame in masked.frames]
+    for found, expected in zip(left_in.controls, masked.controls, strict=True):
+        np.testing.assert_array_equal(found.row_positions, expected.row_positions)
+        np.testing.assert_array_equal(found.col_positions, expected.col_positions)
+
+
 def test_xu_difference_cancels_shared_dark_and_its_invalid_mask(tmp_path):
     from tests.core.test_xu_stitch import _receipt
     from xrd_tools.sources.registry import open_source
