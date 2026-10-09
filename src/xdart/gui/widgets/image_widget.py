@@ -251,7 +251,8 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         self.displayed_image = np.zeros(0)
         self._level_cache = None
         self._level_scan_token = None
-        self.show()
+        # Never shown here: the owner's layout shows it with its parent. Shown before it had one, it opened as its
+        # own window for an instant, and on macOS that takes and returns the activation (live 2026-10-08).
 
     def make_pos_label(self, itemPos=(1, 0), parentPos=(1, 1), offset=(0, -20)):
         self.image_win.addItem(self.imageItem.pos_label)
