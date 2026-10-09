@@ -245,6 +245,7 @@ def test_a_frame_without_energy_takes_the_windows_wavelength_never_pyfais_defaul
 def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.threshold_range._toggle[1].setChecked(False)  # no staged image here: the threshold's mask reads one (test_calibration_threshold)
     dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20'),)
     dialog._render_frames()
     assert dialog.frame_table.item(0, 5).text() == '—'  # nothing to predict from yet
@@ -263,6 +264,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from pyFAI.io.ponifile import PoniFile
     from tests.core.test_calibration_seed import _frame, _record
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.threshold_range._toggle[1].setChecked(False)  # no staged image here: the threshold's mask reads one (test_calibration_threshold)
     assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
         '1 · Instrument', '2 · Rough geometry', '3 · Calibrant scan', '4 · Calibrate and fit']
     visible = dialog._row_visible
@@ -861,6 +863,7 @@ def test_the_detector_mask_reaches_pyfai_turned_as_the_frames_are(tmp_path):
     np.save(tmp_path / 'mask.npy', mask)
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
+        dialog.threshold_range._toggle[1].setChecked(False)  # the static mask alone, without a frame: the band's own rows are in test_calibration_threshold
         dialog._fields['mask'].setText(str(tmp_path / 'mask.npy'))
         from xrd_tools.core.geometry.camera import DetectorCamera
         dialog.camera.set_value(DetectorCamera('z-', 'x-'))  # turned 90° counterclockwise into the native frame

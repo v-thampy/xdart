@@ -458,6 +458,7 @@ def test_the_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
     frames = _guided_frames(tmp_path)
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
+        dialog.threshold_range._toggle[1].setChecked(False)  # the core fit takes no threshold, so neither does the window's here
         frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog.fit_button.click()
         _wait(dialog)
