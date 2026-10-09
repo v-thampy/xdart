@@ -262,8 +262,10 @@ class SectionCard(QtWidgets.QFrame):
         self.chip.setObjectName("controlsSectionChip")
         self.chip.setProperty("accent", accent)
         self.chip.setAlignment(QtCore.Qt.AlignCenter)
-        self.chip.setVisible(bool(number))
+        # Parented first: a parentless label made visible opens as its own window for an instant, and on macOS
+        # that steals and returns the activation (live 2026-10-08: the Int page re-rendered on it, endlessly).
         header_lay.addWidget(self.chip)
+        self.chip.setVisible(bool(number))
         self.title = QtWidgets.QLabel(title.upper())
         self.title.setObjectName("controlsSectionTitle")
         header_lay.addWidget(self.title, 1)
@@ -494,8 +496,8 @@ class SubsectionCard(QtWidgets.QFrame):
         # When a numbered/chip prefix already names the group (e.g. the "1-D"
         # chip), an identical title text duplicates it ("1-D 1-D").  Hide the
         # title label when empty so the chip alone names the group.
+        h_lay.addWidget(self.title)  # parented before it is shown (see SectionCard's chip)
         self.title.setVisible(bool(title))
-        h_lay.addWidget(self.title)
         # Explicit stretch (not the title's) so trailing header widgets (the
         # "Pts" cluster, the status) right-align even when the title is hidden —
         # a hidden title item would otherwise swallow its own stretch.
@@ -514,8 +516,8 @@ class SubsectionCard(QtWidgets.QFrame):
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
                                   QtWidgets.QSizePolicy.Policy.Preferred)
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        self.status.setVisible(bool(status))
         h_lay.addWidget(self.status, 1)
+        self.status.setVisible(bool(status))
         self.header.mousePressEvent = self._header_mouse_press
         outer.addWidget(self.header)
         self.body = QtWidgets.QFrame()

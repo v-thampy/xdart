@@ -1465,3 +1465,43 @@ def test_a_range_rows_editors_and_trailing_widget(qapp):
         assert row.layout().indexOf(button) == row.layout().count() - 1
     finally:
         row.deleteLater()
+
+
+@pytest.mark.parametrize("card_kind", ("section", "subsection"))
+def test_a_card_never_shows_its_header_labels_as_windows(qapp, card_kind):
+    """Live 2026-10-08: a header label made visible before it had a parent opened as its own window for an
+    instant. On macOS that window took the activation and handing it back reactivated the main window, inside
+    the Int page's render, which rendered again (an endless recursion). A card shows its chip, title and status
+    only once they are parented; which of them end up visible is unchanged."""
+    from xdart.gui.widgets.controls_panel import SectionCard, SubsectionCard
+    shown = []
+
+    class WindowsShown(QtCore.QObject):
+        def eventFilter(self, watched, event):
+            if (event.type() == QtCore.QEvent.Type.Show and isinstance(watched, QtWidgets.QWidget)
+                    and watched.isWindow()):
+                shown.append(type(watched).__name__)
+            return False
+
+    def build(full):
+        if card_kind == "section":
+            return SectionCard("Experiment", number="1" if full else "", accent="experiment")
+        return SubsectionCard("Sample & measurement" if full else "", status="Auto" if full else "",
+                              accent="experiment")
+
+    spy = WindowsShown()
+    qapp.installEventFilter(spy)
+    try:
+        full, empty = build(True), build(False)
+    finally:
+        qapp.removeEventFilter(spy)
+    try:
+        assert shown == []
+        if card_kind == "section":
+            assert not full.chip.isHidden() and empty.chip.isHidden()
+        else:
+            assert not full.title.isHidden() and not full.status.isHidden()
+            assert empty.title.isHidden() and empty.status.isHidden()
+    finally:
+        full.deleteLater()
+        empty.deleteLater()
