@@ -789,6 +789,27 @@ def test_run_checks_the_inputs_itself_and_stops_when_nothing_is_left_to_stitch(q
         qapp.processEvents()
 
 
+def test_an_xu_preview_registers_no_edit_of_its_own(qapp, tmp_path):
+    """XU-QUEUE (maintainer, 2026-10-09, item 4: trace it, then fix it as ST-TERMINAL asked). Traced
+    (xu-queue-trace-file): an xrayutilities Preview's own outcome refreshed the read-only XU rows and counted that as
+    an edit, so the Preview was no longer prepared for Run and a source check returning later replaced its summary
+    with the readiness line. Its own outcome is now no edit unless a row changes."""
+    form = _form(tmp_path, "xu_hist")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        _wait(page, qapp)
+        page.begin_preview()
+        _wait(page, qapp)
+        assert page._owner.prepared is not None, page.run_bar.readinessLabel.full_text()
+        assert page._revision == page._action_revision  # the Preview's own outcome is no edit
+        assert page._prepared_revision == page._revision  # so it stays prepared for Run
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qapp, tmp_path, backend):
     form = _form(tmp_path, backend)
