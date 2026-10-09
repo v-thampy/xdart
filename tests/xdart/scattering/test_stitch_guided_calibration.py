@@ -815,7 +815,9 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
         dialog.frames = (calibrated[0], *waiting)
         dialog._render_frames()
         expected = [ring_summary(predict_frame_seed(true_arm, frame).rings) for frame in waiting]
-        assert dialog.frame_table.item(1, 5).text() != expected[0]  # the rough guess misnumbers them
+        # the rough guess misnumbers them (it has the calibrated frame's PONI energy since 33b439bf, where it had a
+        # 1 Å placeholder, so the first now agrees by chance: '15–20')
+        assert [dialog.frame_table.item(row, 5).text() for row in (1, 2, 3)] != expected
         dialog._start('predict', (dialog._calibrated_key(), dialog._seed_options()))
         until = time.monotonic() + 60
         while dialog.active() and time.monotonic() < until:  # sleep, as the app's event loop idles:

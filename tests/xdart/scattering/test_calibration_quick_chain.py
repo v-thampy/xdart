@@ -382,6 +382,7 @@ def test_quick_card_follows_restore_and_session_resume(qapp, tmp_path, monkeypat
         path = save_calibration_session(tmp_path / 'session-a', frames, arm=('del', 'nu'),
                                         fit_policy=dialog._fit_policy())
         monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse', lambda *args, **kwargs: [str(path)])
+        _wait(dialog)  # the reads the commits queued end first: Open saved session waits for them (CAL-HELD-BATCH)
         dialog._resume()
         _wait(dialog)
         assert len(dialog.frames) == len(frames)
