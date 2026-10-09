@@ -592,12 +592,16 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.cancel_button.setEnabled(False)
         footer.addWidget(self.cancel_button)
         footer.addStretch()
-        new_session = QtWidgets.QPushButton('New session')
-        new_session.clicked.connect(self._new_session)
-        footer.addWidget(new_session)
-        resume = QtWidgets.QPushButton('Open saved session…')
-        resume.clicked.connect(self._resume)
-        footer.addWidget(resume)
+        self.new_session_button = QtWidgets.QPushButton('New session')
+        self.new_session_button.setToolTip('Starts a new session: the staged frames and the fit are cleared; saved '
+                                           'session files remain. Waits while an operation runs.')
+        self.new_session_button.clicked.connect(self._new_session)
+        footer.addWidget(self.new_session_button)
+        self.open_session_button = QtWidgets.QPushButton('Open saved session…')
+        self.open_session_button.setToolTip("Opens a saved session's frames and fit choices. Waits while an "
+                                            'operation runs.')
+        self.open_session_button.clicked.connect(self._resume)
+        footer.addWidget(self.open_session_button)
         close = QtWidgets.QPushButton('Close')
         close.clicked.connect(self.close)
         footer.addWidget(close)
@@ -3383,9 +3387,10 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     #: The buttons that start a job wait while one runs (maintainer, 2026-10-09): the background direct-beam probe
     #: keeps the tabs open for typing, and a press then was taken by Qt and dropped by _start, Fit and Refine
-    #: discarding the current fit first (CAL-BUSY-ACTION-DISCARDS-FIT).
+    #: discarding the current fit first (CAL-BUSY-ACTION-DISCARDS-FIT). The session buttons wait too: they replace the
+    #: frames a job works on, and return while one runs (the metadata read keeps the tabs open since CAL-HELD-BATCH).
     _JOB_BUTTONS = ('list_button', 'prepare_button', 'calibrate_button', 'import_button', 'fit_button',
-                    'refine_button', 'save_rough_button')
+                    'refine_button', 'save_rough_button', 'new_session_button', 'open_session_button')
     _BUSY_WAIT = 'Wait for the running operation to end (Cancel operation stops it); the current fit is kept.'
 
     def _sync_job_buttons(self):
