@@ -46,7 +46,7 @@ def test_calibration_threshold_uses_shared_transitions_and_restores_its_session(
     try:
         row = dialog.threshold_range
         assert type(row) is RangeRow
-        assert dialog._conditioning().mode == 'off'
+        assert dialog._conditioning().mode == 'auto'  # on by default (maintainer, 2026-10-08)
         edit(row, 'max', 10)
         edit(row, 'min', 5)
         assert dialog._conditioning().to_dict() == {'mode': 'manual', 'threshold_min': 5., 'threshold_max': 10.}
@@ -74,6 +74,30 @@ def test_calibration_threshold_uses_shared_transitions_and_restores_its_session(
     finally:
         dialog.close()
         again.close()
+
+
+def test_the_threshold_starts_on_and_says_what_it_always_leaves_out(qapp, tmp_path):
+    """Maintainer, 2026-10-08: calibration's threshold works as Int's does and starts on: Auto leaves saturated pixels
+    out, a typed band tightens it, off keeps strong grains. A window restored without a saved choice starts on too; a
+    saved off stays off. Its tooltips say so, and that the detector's invalid-pixel value never reaches the ring
+    search either way (CAL-REFINE-INVALID-PIXEL)."""
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        row = dialog.threshold_range
+        assert dialog._conditioning() == StitchConditioning('auto') and row._toggle[1].isChecked()
+        assert row.editors[1].text() == '' and 'Auto' in row.editors[1].placeholderText()
+        assert all(widget.toolTip() for widget in (row.label, row._toggle[1], *row.editors))
+        assert '4294967295' in row._toggle[1].toolTip()
+        settings = dialog.settings()
+        edit(row, 'enabled', False)
+        assert dialog._conditioning().mode == 'off' and not row._toggle[1].isChecked()
+        dialog.apply_settings({key: value for key, value in settings.items() if key != 'calibration_threshold'})
+        assert dialog._conditioning().mode == 'auto' and row._toggle[1].isChecked()
+        edit(row, 'enabled', False)
+        dialog.apply_settings(dialog.settings())
+        assert dialog._conditioning().mode == 'off' and not row._toggle[1].isChecked()
+    finally:
+        dialog.close()
 
 
 def test_detector_selection_supplies_whole_auto_counts_to_frame_prediction(qapp, tmp_path):

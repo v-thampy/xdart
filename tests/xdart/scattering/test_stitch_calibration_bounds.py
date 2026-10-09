@@ -387,7 +387,8 @@ def test_a_session_records_the_choices_its_fit_took_and_a_resume_restores_them(q
         assert dialog.fit is not None, dialog.status.text()
         path = dialog.session_dir / 'calibration-session.json'
         _frames, arm, policy = load_calibration_session(path, with_arm=True, with_policy=True)
-        assert json.loads(path.read_text())['version'] == 5 and arm == ('del', 'nu')
+        # version 6: the default threshold (on, maintainer 2026-10-08) is recorded with the session
+        assert json.loads(path.read_text())['version'] == 6 and arm == ('del', 'nu')
         assert (policy['refine_energy'], policy['energy_bound_eV'], policy['fit_motor_scales']) == (False, 200., False)
         assert policy['bounds']['sample_offset_mm'] == 5.
         assert policy['instrument_geometry'] == dialog.geometry_editor.value().to_record()

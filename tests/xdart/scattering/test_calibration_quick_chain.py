@@ -8,6 +8,8 @@ so on a window without the card each row fails there, on what the window shows. 
 existing beam and ring fixtures are different detectors and distances, so they are not a pair): a direct-beam del scan
 and a LaB6 ring scan rendered in the window's frame for the page's detector and camera, written raw beside their SPEC
 files under the default naming, so a file and a scan number identify each."""
+import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -392,6 +394,96 @@ def test_quick_card_follows_restore_and_session_resume(qapp, tmp_path, monkeypat
         if restored is not None:
             restored.close()
         _close(qapp, page, dialog)
+
+
+@pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
+def test_quick_card_shares_the_windows_threshold_and_mask(qapp, tmp_path, monkeypatch, page_name):
+    """Maintainer, 2026-10-08: the card carries the window's Threshold (Int's shared row and rules, on by default:
+    saturated pixels left out) and its Mask file (which becomes the page's Mask File), each the same value as
+    4 · Calibrate and fit's Advanced and the Detector panel's, edited in either place, with their tooltips; the
+    card's 📁 is the Detector panel's, and the window saves no key of its own for them."""
+    from xdart.gui.widgets import file_dialogs
+    from xdart.gui.widgets.controls_panel import RangeRow
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    page, dialog = _window(qapp, tmp_path / 'project', page_name)
+    try:
+        card = _quick_card(dialog)
+        rows = card.findChildren(RangeRow)
+        assert len(rows) == 1 and rows[0] is not dialog.threshold_range
+        threshold, window = rows[0], dialog.threshold_range
+        assert threshold.label.text() == 'Threshold' and not card.isAncestorOf(window)
+        assert threshold._toggle[1].isChecked() and dialog._conditioning() == StitchConditioning('auto')
+        assert threshold.editors[1].text() == '' and 'Auto' in threshold.editors[1].placeholderText()
+        assert threshold.label.toolTip() and all(box.toolTip() for box in threshold.editors)
+        assert threshold._toggle[1].toolTip() == window._toggle[1].toolTip()
+        assert '4294967295' in threshold._toggle[1].toolTip()
+        _commit(threshold.editors[1], '50000')  # card → window
+        band = dialog._conditioning()
+        assert (band.mode, band.threshold_max) == ('manual', 50000.) and window.editors[1].text() == '50000'
+        window._toggle[1].setChecked(False)  # window → card
+        assert dialog._conditioning().mode == 'off' and not threshold._toggle[1].isChecked()
+        threshold._toggle[1].setChecked(True)
+        assert dialog._conditioning().mode == 'manual' and window._toggle[1].isChecked()
+        masks = [row for row in card.findChildren(FormRow) if row.label.text() == 'Mask file']
+        assert len(masks) == 1 and masks[0].label.toolTip()
+        mask = masks[0]
+        drawn, other = tmp_path / 'drawn.npy', tmp_path / 'other.npy'
+        for path in (drawn, other):
+            np.save(path, np.zeros((4, 4), bool))
+        _commit(mask.editor, str(drawn))  # card → Detector panel
+        assert dialog._text('mask') == str(drawn) == mask.current_value()
+        _commit(dialog._fields['mask'], str(other))  # Detector panel → card
+        assert mask.current_value() == str(other)
+        calls = []
+        monkeypatch.setattr(file_dialogs, 'browse', lambda *a, **k: calls.append(k.get('file_filter')) or [str(drawn)])
+        _click(mask.browse_button)
+        assert calls == ['Masks (*.edf *.tif *.tiff *.npy);;All files (*)']
+        assert dialog._text('mask') == str(drawn) == mask.current_value()
+        saved = dialog.settings()
+        assert set(saved['fields']) == set(dialog._fields) and saved['fields']['mask'] == str(drawn)
+    finally:
+        _close(qapp, page, dialog)
+
+
+def test_quick_calibrates_the_real_17_2_pair_with_the_windows_defaults(qapp, tmp_path):
+    """Q9 (maintainer, 2026-10-08): the 17-2 Fatigue pair, an Eiger2 500k on the upright mount and LaB6 at 11.27 keV.
+    Quick with the window's own defaults (the threshold on) ends at Refine's summary, near the Oct 3 save (scan7_2).
+    The threshold used to start off, and the detector's 28 invalid pixels a frame (4294967295) then reached the
+    ring search: Refine refused (fit RMS 0.03906). Loose bounds: pyFAI 2026.9 keeps 3160 of the save's 3176 points."""
+    configured = os.environ.get('XDART_TEST_DATA')
+    data = Path(configured or '') / 'stitching' / 'GIXRD_Fatigue_Radha'
+    if not configured or not data.is_dir():
+        pytest.skip('needs XDART_TEST_DATA with stitching/GIXRD_Fatigue_Radha')
+    saved = json.loads((data / 'LaB6_11p27keV_dist_p33m_scan7_2.json.provenance.json').read_text())['fit_bounds']
+    before = {path.name: path.stat().st_mtime_ns for path in data.iterdir()}
+    page, dialog = _page_with_dialog(tmp_path / 'project')
+    try:
+        card = _quick_card(dialog)
+        dialog.camera.set_value(UPRIGHT_CAMERA)
+        dialog._set_field_text('beam_detector', 'Eiger2_500k')
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec_container'))
+        dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('spec_container'))
+        beam_file, beam_scan = _card_rows(card, 'Direct-beam')
+        ring_file, ring_scan = _card_rows(card, 'Calibrant')
+        _commit(beam_file.editor, str(data / 'direct_beam_dist_p33m'))
+        _commit(beam_scan.editor, '1')
+        _commit(ring_file.editor, str(data / 'LaB6_11p27keV_dist_p33m'))
+        _commit(ring_scan.editor, '7')
+        for key in ('beam_images', 'images'):
+            _commit(dialog._fields[key], str(data))
+        _wait(dialog)
+        status = _run(dialog, card, timeout=600)
+        assert card.status.text().startswith('Done'), (status, card.status.text())
+        fitted = dialog.fit.asset['provenance']['fit_bounds']['parameters']
+        print(f"Q9: rms {dialog.fit.rms_q:.6f} points {dialog.fit.n_points} distance "
+              f"{fitted['distance_mm']['fitted']:.4f} mm del zero {fitted['del_zero_deg']['fitted']:.4f}°")
+        assert dialog.fit.rms_q < .003 and dialog.fit.n_points >= 3000
+        for name, bound in (('distance_mm', .1), ('del_zero_deg', .2)):
+            assert abs(fitted[name]['fitted'] - saved['parameters'][name]['fitted']) < bound, (name, fitted[name])
+        assert _calibration_files(tmp_path / 'project') == []
+    finally:
+        _close(qapp, page, dialog)
+    assert {path.name: path.stat().st_mtime_ns for path in data.iterdir()} == before
 
 
 def test_quick_chain_ends_at_refine_summary_without_saving(qapp, tmp_path, monkeypatch):

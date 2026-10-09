@@ -251,6 +251,7 @@ def test_pyfai_calib2_is_given_the_turned_model_s_gaps_and_never_a_bare_generic_
     dialog = CalibrationDialog(CalibrationContext("RSM", tmp_path))
     try:
         dialog._set_field_text("beam_detector", "Pilatus300k")
+        dialog.threshold_range._toggle[1].setChecked(False)  # the gaps alone: the band's own row is in test_calibration_threshold
         assert dialog._pyfai_mask() is None  # the default camera keeps the axes, no mask drawn: none
         dialog.camera.set_value(stitch_camera(_TURNED))
         gaps = _TURNED.apply(_gaps("Pilatus300k"))

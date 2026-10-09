@@ -438,3 +438,38 @@ def test_scan14_known_zeros_reproduce_the_bounded_optimum(guided):
                    ('distance_mm', 'del_zero_deg', 'nu_zero_deg', 'mount_tilt_deg', 'mount_roll_deg', 'energy_eV'))
     assert all(table[f'sample_offset{k}_mm']['at_bound'] for k in (1, 2, 3))
     assert 'at a fit bound: sample_offset1_mm, sample_offset2_mm, sample_offset3_mm' in fit.message
+
+
+@pytest.mark.slow
+def test_fatigue_eiger_invalid_pixels_stay_out_of_refine_whatever_the_threshold():
+    """CAL-REFINE-INVALID-PIXEL (maintainer, 2026-10-08): each frame of the 17-2 Fatigue pair's Eiger scan holds 28
+    pixels of 4294967295, the detector's invalid-pixel value. Refine from the saved scan7_2 calibration, as the
+    window asks, fits the same with the threshold off as with Auto; off refused before (fit RMS 0.0357), the bad
+    points already extracted. Loose bounds: pyFAI 2026.9 keeps 3160 of the save's 3176 points (0.018 mm)."""
+    from xrd_tools.integrate.refine import ArmFitBounds
+    from xrd_tools.integrate.stitch_autocalibration import refine_arm_from_scan
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    data = _root() / 'GIXRD_Fatigue_Radha'
+    if not data.is_dir():
+        pytest.skip('the 17-2 Fatigue calibration pair is unavailable')
+    saved = json.loads((data / 'LaB6_11p27keV_dist_p33m_scan7_2.json.provenance.json').read_text())
+    spec = SourceSpec(data / 'LaB6_11p27keV_dist_p33m', SourceKind.SPEC, entry='entry', options={
+        'scan': '7', 'image_dir': str(data),
+        'read_image_kwargs': {'detector_shape': (512, 1028), 'raw_dtype': 'int32', 'raw_header_skip': 0}})
+    fits = {}
+    for mode in ('off', 'auto'):
+        fits[mode] = refine_arm_from_scan(
+            spec, data / 'LaB6_11p27keV_dist_p33m_scan7_2.json', source_motors=(('del_angle', 'del'), ('nu_angle', 'nu')),
+            instrument_geometry=saved['instrument_geometry'], image_rotation=180, calibrant='LaB6', max_frames=48,
+            energy_bound_eV=200., conditioning=None if mode == 'off' else StitchConditioning('auto'),
+            bounds=ArmFitBounds(mount_deg=(0., 0.), zero_freedom_deg=5., mount_freedom_deg=2., sample_offset_mm=.05,
+                                distance_fraction=.05))
+    off, auto = fits['off'], fits['auto']
+    assert (off.n_points, off.rms_q) == (auto.n_points, auto.rms_q)
+    np.testing.assert_allclose(off.asset['calibration']['param'], auto.asset['calibration']['param'], rtol=0, atol=1e-12)
+    table = auto.asset['provenance']['fit_bounds']['parameters']
+    print(f"Fatigue refine: rms {auto.rms_q:.6f} points {auto.n_points} distance {table['distance_mm']['fitted']:.4f} mm "
+          f"del zero {table['del_zero_deg']['fitted']:.4f}° (saved {saved['rms_q_A^-1']:.6f}, {saved['n_points']})")
+    assert auto.rms_q < .003 and auto.n_points >= 3000
+    assert abs(table['distance_mm']['fitted'] - saved['fit_bounds']['parameters']['distance_mm']['fitted']) < .1
+    assert abs(table['del_zero_deg']['fitted'] - saved['fit_bounds']['parameters']['del_zero_deg']['fitted']) < .2

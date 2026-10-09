@@ -20,9 +20,9 @@ def five_parameter_seed(angles):
     return record
 
 
-def ring_scan(root, angles=ROW_ANGLES, scale=None, energy_ratio=1.0):
+def ring_scan(root, angles=ROW_ANGLES, scale=None, energy_ratio=1.0, dtype='<i4'):
     """A SPEC scan of LaB6 ring images; ``scale`` maps a frame index to a count factor;
-    ``energy_ratio``: the beam's true energy over the recorded one."""
+    ``energy_ratio``: the beam's true energy over the recorded one; ``dtype`` the stored counts' type."""
     from pyFAI.calibrant import get_calibrant
     calibrant = get_calibrant('LaB6')
     calibrant.wavelength = .7293e-10
@@ -34,13 +34,13 @@ def ring_scan(root, angles=ROW_ANGLES, scale=None, energy_ratio=1.0):
         q, _ = _ray(TRUTH, _calibration(), delta, nu, rows, cols)
         image = 10 + 5000 * np.exp(-((q[..., None] - q_rings) ** 2) / (2 * .008 ** 2)).sum(-1)
         image *= (scale or {}).get(index, 1.0)
-        image.astype('<i4').tofile(images / f'ring_scan1_{index:04d}.raw')
+        image.astype(dtype).tofile(images / f'ring_scan1_{index:04d}.raw')
     lines = '\n'.join(f'{d} {n}' for d, n in angles)
     (root / 'ring').write_text('#F ring\n#E 1\n#D today\n#O0 del nu\n#S 1 ascan del 6 34 11 1\n'
                                f'#D today\n#P0 0 0\n#N 2\n#L del  nu\n{lines}\n')
     return SourceSpec(root / 'ring', SourceKind.SPEC, options={
         'scan': '1', 'image_dir': str(images), 'image_stem': 'ring_scan1_',
-        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': 'int32'}})
+        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': np.dtype(dtype).name}})
 
 
 def test_a_partial_frame_is_screened_against_the_whole_scan_before_selection(tmp_path):
@@ -119,6 +119,33 @@ def test_the_calibrations_mask_keeps_ring_points_off_its_pixels(tmp_path):
     assert len(fit.asset['provenance']['automatic_refinement']['mask_sha256']) == 64
     with pytest.raises(ValueError, match=r'the mask is \(2, 2\), the oriented image \(195, 1475\)'):
         extract_scan_ring_points(spec, seed, max_frames=12, mask=np.zeros((2, 2), bool))
+
+
+def test_the_detectors_invalid_value_never_reaches_the_ring_search(tmp_path):
+    """Maintainer, 2026-10-08 (CAL-REFINE-INVALID-PIXEL): an Eiger writes 4294967295, uint32's maximum, into its dead
+    pixels: its own mask, not a count. The ring search leaves those pixels out whatever the threshold, exactly as a
+    mask of them would, and the refinement records that it does. One such pixel in a ring's band lifts pyFAI's cut
+    there (the band's mean + std) above every real pixel: the real 17-2 pair kept a quarter of its points."""
+    from xrd_tools.core.invalid import UINT32_CEILING
+    from xrd_tools.integrate.stitch_autocalibration import extract_scan_ring_points, refine_arm_from_scan
+    spec = ring_scan(tmp_path / 'scan', dtype='<u4')
+    dead = np.zeros((195, 1475), bool)
+    rows, cols = np.random.default_rng(0).integers((0, 0), (195, 1475), size=(28, 2)).T
+    dead[rows, cols] = True
+    for path in (tmp_path / 'scan' / 'images').glob('*.raw'):
+        image = np.fromfile(path, dtype='<u4').reshape(195, 1475)
+        image[dead] = int(UINT32_CEILING)
+        image.tofile(path)
+    seed = five_parameter_seed(ROW_ANGLES)
+    left_in = extract_scan_ring_points(spec, seed, max_frames=12)  # no threshold
+    masked = extract_scan_ring_points(spec, seed, max_frames=12, mask=dead)
+    assert [frame['points'] for frame in left_in.frames] == [frame['points'] for frame in masked.frames]
+    for found, expected in zip(left_in.controls, masked.controls, strict=True):
+        np.testing.assert_array_equal(found.row_positions, expected.row_positions)
+        np.testing.assert_array_equal(found.col_positions, expected.col_positions)
+        np.testing.assert_array_equal(found.rings, expected.rings)
+    fit = refine_arm_from_scan(spec, seed, max_frames=12)
+    assert '4294967295' in fit.asset['provenance']['automatic_refinement']['invalid_pixels']
 
 
 def test_the_automatic_refinement_refines_the_energy_within_its_bound(tmp_path):
