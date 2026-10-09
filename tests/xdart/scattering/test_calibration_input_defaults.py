@@ -342,6 +342,85 @@ def test_committed_nexus_wavelength_updates_energy(qapp, tmp_path):
         dialog.close()
 
 
+_PONI_HINT = "Auto · 16.0000 keV from the calibrated frames' PONI files"
+
+
+def test_a_blank_energy_takes_the_calibrated_frames_poni_wavelength(qapp, tmp_path):
+    """Maintainer, 2026-10-09: "if there is no typed in energy but there is a poni file, it should use the energy
+    from the poni file". With nothing typed and no recorded energy, the calibrated frames' PONI wavelength is the
+    window's (the one Fit reads), and the Auto hint names it; a typed or recorded energy still comes first, and
+    PONI files that disagree give none."""
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.integrate.refine import ControlFrame
+    from tests.core.test_stitch_guided_calibration import _frames
+    control = ControlFrame([1, 2], [3, 4], [0, 0], {'del': 10., 'nu': 2.})
+    poni = PONI(dist=.39, poni1=.01, poni2=.02, wavelength=7.749012402075016e-11, detector='Pilatus300kw')
+    (tmp_path / 'agree').mkdir()
+    (tmp_path / 'other').mkdir()
+    frames = _frames(tmp_path / 'agree', (control, control), poni)
+    other, = _frames(tmp_path / 'other', (control,), PONI(dist=.39, poni1=.01, poni2=.02, wavelength=1e-10,
+                                                          detector='Pilatus300kw'))
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        assert dialog._rough_wavelength_A() is None
+        dialog.frames = frames
+        dialog._render_frames()
+        assert dialog._rough_wavelength_A() == pytest.approx(.7749012402075016, rel=1e-12, abs=0)
+        assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
+        dialog._set_field_text('rough_energy', '12')  # typed comes first
+        assert dialog._rough_wavelength_A() == pytest.approx(float(energy_eV_to_wavelength_m(12000)) * 1e10,
+                                                             rel=1e-12, abs=0)
+        dialog._set_field_text('rough_energy', '')
+        dialog._show_source_energy(11270.)  # then the scan's recorded energy
+        assert dialog._rough_wavelength_A() == pytest.approx(float(energy_eV_to_wavelength_m(11270)) * 1e10,
+                                                             rel=1e-12, abs=0)
+        assert dialog._fields['rough_energy'].placeholderText() == 'Auto · 11.2700 keV from SPEC'
+        dialog._show_source_energy(None)
+        assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
+        dialog.frames = (*frames, other)
+        dialog._render_frames()
+        assert dialog._rough_wavelength_A() is None
+        assert dialog._fields['rough_energy'].placeholderText() == 'Auto · scan energy unavailable'
+    finally:
+        dialog.close()
+
+
+def test_the_real_del_only_scan_7_takes_its_saved_poni_files_energy(qapp, tmp_path):
+    """The maintainer's case (2026-10-09): 17-2's del-only scan 7 records an impossible energy (-2165.0213 eV), and
+    five of its frames were calibrated in June, their PONI files at 16 keV. Opened on scan 7 as a page opens it,
+    staged and the June pairs imported, with nothing typed: the window takes their 16 keV, so pyFAI opens frames
+    at it and Save as calibration needs no typed energy."""
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.integrate.stitch_calibration import adopt_calibration_pair, capture_calibration_frames
+    from tests.core.test_single_detector_arm import _del_only_root
+    root = _del_only_root().resolve()
+    spec = SourceSpec(root / 'calibration/LaB6_16keV', SourceKind.SPEC, options={
+        'scan': '7', 'image_dir': str(root / 'images'), 'image_stem': 'b_thampy_LaB6_16keV_scan7_',
+        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': 'int32'}})
+    indices, june = (2, 5, 15, 30, 38), root / 'processed_data'
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.set_source_context(spec, image_rotation=0)
+        settle(dialog, timeout=30)
+        assert dialog._source_energy_eV is None  # the impossible readback is no energy
+        staged = capture_calibration_frames(dialog._spec(), indices, tmp_path / 'session')  # as Prepare stages
+        dialog.frames = tuple(adopt_calibration_pair(frame, june / f'b_thampy_LaB6_16keV_scan7_{index:04d}.poni',
+                                                     june / f'b_thampy_LaB6_16keV_scan7_{index:04d}.npt')
+                              for frame, index in zip(staged, indices))
+        dialog._render_frames()
+        assert not dialog._staged_source_mismatch()
+        assert dialog._rough_wavelength_A() == pytest.approx(.7749012402075016, rel=1e-12, abs=0)
+        assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
+        assert dialog._seed_options()['wavelength_A'] == dialog._rough_wavelength_A()  # pyFAI's frames open at it
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        for key, value in (('beam_detector', 'Pilatus300kw'), ('rough_distance', '1000'), ('beam_pixel', '100, 97')):
+            dialog._set_field_text(key, value)
+        fit = dialog._rough_fit()  # Save as calibration's geometry
+        assert fit.asset['calibration']['wavelength'] == pytest.approx(7.749012402075016e-11, rel=1e-12, abs=0)
+    finally:
+        dialog.close()
+
+
 def test_spec_container_uses_auto_folder_and_padded_stem(qapp, tmp_path):
     from tests.xdart.scattering.test_stitch_guided_calibration import _beam_container
     nexus, _, _ = _beam_container(tmp_path)
