@@ -206,6 +206,39 @@ def test_the_source_read_keeps_the_tabs_open_and_the_job_buttons_waiting(qapp, t
         dialog.close()
 
 
+def test_the_session_buttons_wait_for_a_running_job(qapp, tmp_path, monkeypatch):
+    """Claude's batch-end battery (CAL-HELD-BATCH-20261009): with the tabs open during the metadata read (623cefc2),
+    reads queue as fields are committed, and New session or Open saved session pressed meanwhile did nothing (both
+    return while a job runs). They wait with the job buttons."""
+    import xrd_tools.integrate.stitch_calibration as stitch_calibration
+    entered, release = Event(), Event()
+    original = stitch_calibration.calibration_source_energy_eV
+
+    def held(spec):
+        entered.set()
+        assert release.wait(30)
+        return original(spec)
+    monkeypatch.setattr(stitch_calibration, 'calibration_source_energy_eV', held)
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#O0 energy\n#S 1 ascan del 1 -1 1 1\n#P0 11270\n#N 1\n#L del\n1\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    sessions = [button for button in dialog.findChildren(QtWidgets.QPushButton)
+                if button.text() in ('New session', 'Open saved session…')]
+    try:
+        assert len(sessions) == 2 and all(button.isEnabled() for button in sessions)
+        dialog._set_field_text('source', spec)
+        dialog._source_details()
+        assert entered.wait(10) and dialog._owner.busy
+        QtWidgets.QApplication.processEvents()
+        assert [button.text() for button in sessions if button.isEnabled()] == []
+        release.set()
+        settle(dialog)
+        assert all(button.isEnabled() for button in sessions)
+    finally:
+        release.set()
+        dialog.close()
+
+
 def test_blank_source_and_rough_tab_use_the_shared_readiness_header(qapp, tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
