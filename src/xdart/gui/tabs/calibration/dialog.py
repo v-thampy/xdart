@@ -2511,7 +2511,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._calibration_fit_window is not None:
             self._calibration_fit_window.preview_busy(True)
         self._identity = self._owner.begin((kind, arguments))
-        self._set_tabs_enabled(kind == 'beam_detect')
+        # the two background reads keep typing open; the job buttons wait for them (maintainer, 2026-10-09)
+        self._set_tabs_enabled(kind in ('beam_detect', 'source_details'))
         if self.orientation_panel is not None:
             self.orientation_panel.busy(True)
         self.cancel_button.setEnabled(True)
