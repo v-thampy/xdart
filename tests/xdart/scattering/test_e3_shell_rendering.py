@@ -734,13 +734,13 @@ def test_e3_ui2_restores_control_inventory_and_ranges(
             "Auto Last",
             "Peak Fitting",
             "Phase Fitting",
-            "Plot Metadata",
+            "ROI Statistics",  # Metadata plotting moved into the Metadata popup at 2fa82580.
             "Run",
         } <= {
             text.removeprefix("▶ ")
             .removeprefix("∧ ")
             .removeprefix("≈ ")
-            .removeprefix("▤ ")
+            .removeprefix("▣ ")
             for text in buttons
         }
         options = shell.scientific.plot_options_dialog
