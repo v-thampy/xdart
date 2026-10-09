@@ -2694,6 +2694,8 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _fit(self):
         def go():
+            if self._owner.busy:
+                raise ValueError(self._BUSY_WAIT)
             if not self.frames or not all(frame.source_uri for frame in self.frames):
                 raise ValueError('Select a calibrant source and prepare its frames first (3 · Calibrant scan).')
             if self._staged_source_mismatch():
@@ -2733,6 +2735,8 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _refine(self):
         def go():
+            if self._owner.busy:
+                raise ValueError(self._BUSY_WAIT)
             if not self._calibrant_source_ready():
                 raise ValueError('Select a valid calibrant source and read its metadata first (3 · Calibrant scan).')
             geometry = self.geometry_editor.value()
@@ -3329,7 +3333,21 @@ class CalibrationDialog(QtWidgets.QDialog):
                                         'the window\'s are used.')
         self._guard(go)
 
+    #: The buttons that start a job wait while one runs (maintainer, 2026-10-09): the background direct-beam probe
+    #: keeps the tabs open for typing, and a press then was taken by Qt and dropped by _start, Fit and Refine
+    #: discarding the current fit first (CAL-BUSY-ACTION-DISCARDS-FIT).
+    _JOB_BUTTONS = ('list_button', 'prepare_button', 'calibrate_button', 'fit_button', 'refine_button')
+    _BUSY_WAIT = 'Wait for the running operation to end (Cancel operation stops it); the current fit is kept.'
+
+    def _sync_job_buttons(self):
+        for name in self._JOB_BUTTONS:
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(not self._owner.busy)
+
     def _sync_quick_button(self):
+        """Every start and end of a job comes here: the Quick button and the job buttons follow it."""
+        self._sync_job_buttons()
         if not hasattr(self, 'quick_button'):
             return
         active = self._quick_stage is not None
