@@ -536,6 +536,15 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.saved_image_flip = False  # with the rotation: the camera's transform into Stitch's frame
         self.saved_mask = ''
         self._owner = SingleWorkerOwner(_run_job)
+        #: Quick calibration: the step it is on (1-3; None when idle), the job it waits for, whether Cancel was
+        #: pressed, and the inputs its direct-beam check last ran on (_quick_advance)
+        self._quick_stage = self._quick_kind = None
+        self._quick_cancelled = False
+        self._quick_detected_generation = None
+        #: canonical key -> the card's row showing it (beam_source, beam_scan, source, scan)
+        self._quick_rows = {}
+        #: key -> its file row's chooser, so another row can browse as it does (the Quick card's)
+        self._choosers = {}
         self._fields = {}
         #: key -> its Int ``FormRow``: the field is the row's editor, its value read through the row
         self._formrows = {}
@@ -635,6 +644,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.frame_table.itemSelectionChanged.connect(self._schematic_frame_selected)
         self._build_checklist()
         outer.insertWidget(0, self.checklist_card)
+        self._build_quick()
         self._update_beam_readiness()
 
     def _build_checklist(self):
@@ -953,6 +963,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         edit.setPlaceholderText(placeholder)
         if chooser is not None:
             row.browseRequested.connect(lambda _path: self._browse(key, chooser))
+            self._choosers[key] = chooser
         form.addRow(row.label, row)
         self._fields[key] = edit
         self._formrows[key] = row
@@ -1220,6 +1231,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         for key, shown in (('scan', spec), ('images', spec), ('entry', kind != 'spec')):
             self._show(key, shown)
         self._label('source').setText('SPEC file' if spec else 'NeXus file')
+        self._sync_quick_rows()
 
     def _conditioning(self):
         state = self._threshold_state
@@ -1496,6 +1508,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         """The instrument every step reads: the diffractometer's circles and their motors, then the
         detector, one above the other (maintainer, 2026-09-30)."""
         layout, _ = self._form('1 · Instrument', 'instrument')
+        self._instrument_layout = layout
         from xdart.gui.widgets.geometry_editor import GeometryEditor
         self._diffractometer_box = QtWidgets.QGroupBox('Diffractometer')
         box = QtWidgets.QVBoxLayout(self._diffractometer_box)
@@ -1518,6 +1531,82 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.geometry_editor.zero_edit(circle).editingFinished.connect(self._render_frames)
             self.geometry_editor.zero_edit(circle).textChanged.connect(self._bounds_edited)
             self.geometry_editor.axis_box(circle).currentIndexChanged.connect(self._render_frames)
+
+    def _build_quick(self):
+        """Quick calibration (M6, maintainer 2026-10-08): a card at the top of 1 · Instrument with the two scans that
+        identify a calibration, their file and scan number (the values 2 · Rough geometry and 3 · Calibrant scan use,
+        edited in either place; no second copy, nothing saved of its own), and one action that runs the window's
+        own direct-beam fit, metadata read and Refine from the rough geometry (_quick_advance)."""
+        self.quick_card = SectionCard('Quick calibration')
+        tip = ('Fit direct-beam distance (2 · Rough geometry), Read metadata (3 · Calibrant scan), then Refine '
+               'automatically from the rough geometry (4 · Calibrate and fit), one after another. It stops at the '
+               'first problem and shows that step; inspect the fit and save it by hand.')
+        self.quick_card.setToolTip(tip)
+        self.quick_card.title.setToolTip(tip)
+        self.quick_card.status.setToolTip('The step Quick calibration is on, where it stopped, or that it finished.')
+        body = QtWidgets.QWidget()
+        form = self._quick_form = QtWidgets.QFormLayout(body)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        for scan, prefix, tab in (('Direct-beam', 'beam_', '2 · Rough geometry'), ('Calibrant', '', '3 · Calibrant scan')):
+            file_row = FormRow(label=f'{scan} SPEC file', path=('Calibration', 'Quick', prefix + 'source'), value='',
+                               browse=True)
+            scan_row = FormRow(label='Scan', path=('Calibration', 'Quick', prefix + 'scan'), value='')
+            scan_row.label.setMinimumWidth(0)
+            scan_row.editor.setMaximumWidth(90)
+            file_row.add_trailing_widget(scan_row, 0)
+            form.addRow(file_row.label, file_row)
+            for key, row, what in ((prefix + 'source', file_row, 'file'), (prefix + 'scan', scan_row, 'scan number')):
+                row.set_purpose_tooltip(f"The {scan.lower()} scan's {what}: the same value as {tab}'s, edited here "
+                                        'or there.')
+                self._quick_rows[key] = row
+                row.valueChanged.connect(lambda _path, value, key=key: self._quick_commit(key, value))
+                self._fields[key].textChanged.connect(lambda _text, key=key: self._quick_mirror(key))
+                self._formrows[key].valueChanged.connect(lambda _path, _value, key=key: self._quick_mirror(key))
+                self._quick_mirror(key)
+            file_row.browseRequested.connect(
+                lambda _path, key=prefix + 'source': self._browse(key, self._choosers[key]))
+        self.quick_button = QtWidgets.QPushButton('Run quick calibration')
+        self.quick_button.clicked.connect(self._quick_start)
+        form.addRow(self.quick_button)
+        self.quick_card.add_row(body)
+        self._instrument_layout.insertWidget(0, self.quick_card)
+        self._sync_quick_rows()
+        self._sync_quick_button()
+
+    def _quick_mirror(self, key):
+        """The card's row shows the tab's value, a draft typed there included; never over a draft typed on the card."""
+        row = self._quick_rows.get(key)
+        if row is None or row.editor.hasFocus():
+            return
+        value = self._text(key)
+        if row.current_value() != value:
+            row.editor.setText(value)
+
+    def _quick_commit(self, key, value):
+        """A scan edited on the card is the tab's value, set there and committed as that row commits, so the tab's
+        own handlers run (a new calibrant file resets its scan, images, stem and energy; source details refresh).
+        An unchanged value writes nothing: re-setting a file would reset them too (review A1)."""
+        value = '' if value is None else str(value).strip()
+        if value == self._text(key):
+            return
+        field = self._fields[key]
+        field.setText(value)
+        field.editingFinished.emit()
+
+    def _sync_quick_rows(self, *_args):
+        """The card's rows follow the tabs' rows: no direct-beam scan unless Rough geometry measures one, no scan
+        number for a NeXus file, and the tab's word for the kind of file."""
+        if not self._quick_rows:
+            return
+        beam_nexus = self.beam_source_kind.currentData() == 'nexus'
+        calibrant_nexus = self.source_kind.currentData() == 'nexus_stack'
+        beam = self._quick_rows['beam_source']
+        self._quick_form.setRowVisible(beam, self.rough_mode.currentData() == 'scan')
+        beam.label.setText('Direct-beam NeXus file' if beam_nexus else 'Direct-beam SPEC file')
+        self._quick_rows['beam_scan'].setVisible(not beam_nexus)
+        self._quick_rows['source'].label.setText('Calibrant NeXus file' if calibrant_nexus else 'Calibrant SPEC file')
+        self._quick_rows['scan'].setVisible(not calibrant_nexus)
 
     def _build_distance(self):
         layout, form = self._form('2 · Rough geometry', 'rough')
@@ -1862,6 +1951,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._beam_pixel_hint()
         if hasattr(self, 'frame_table'):
             self._render_frames()
+        self._sync_quick_rows()
 
     def _rough_record(self):
         """Step 1 as a nominal arm, or None (skipped, not yet measured, or incomplete)."""
@@ -1971,6 +2061,18 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     _STALE_DISTANCE = ('The direct-beam fit was made with other inputs (a motor zero, its motor, the source, the '
                        'detector or the search settings changed since): fit the direct-beam distance again.')
+    _NO_ENERGY = 'type Energy (keV) in 3 · Calibrant scan: the rings are predicted with it'
+
+    #: Quick calibration's steps: their names and the tabs that hold each step's controls
+    _QUICK_STEPS = {1: ('1 · Direct-beam fit', 'rough'), 2: ('2 · Calibrant metadata', 'select'),
+                    3: ('3 · Refine', 'calibrate')}
+    _QUICK_NEEDS_SCAN = 'Quick calibration fits a direct-beam scan: choose "Direct-beam scan" in 2 · Rough geometry.'
+    _QUICK_METADATA_STALE = "Reading the calibrant scan's metadata changed the instrument. "
+    _QUICK_CANCELLED = 'Cancelled; the steps completed before it are kept.'
+    _QUICK_NO_FRAMES = 'the calibrant scan lists no frames (3 · Calibrant scan).'
+    _QUICK_TIP = ('Fits the direct-beam scan, reads the calibrant scan\'s metadata, then refines automatically from the '
+                  'rough geometry, with these scans and every other setting as the tabs have them. It stops at the '
+                  'first problem, never saves, and changes no camera, motor sense or zero.')
 
     #: The freedom every fit keeps about its estimates (maintainer, 2026-09-29), with defaults.
     _BOUND_DEFAULTS = {'zero_freedom': '2', 'mount_freedom': '2', 'displacement_limit': '0.05',
@@ -2344,6 +2446,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                             'Checking direct-beam scan…' if kind == 'beam_detect'
                             else f'{kind.capitalize()} in progress…')
         self._timer.start()
+        self._sync_quick_button()
 
     def _job_status(self, detail):
         """A calibrant preview reports in its panel; the message box keeps the fit result."""
@@ -2611,7 +2714,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                 if seed is None:
                     raise ValueError('measure or type the distance and the beam pixel first (2 · Rough geometry)')
                 if self._rough_wavelength_A() is None:
-                    raise ValueError('type Energy (keV) in 3 · Calibrant scan: the rings are predicted with it')
+                    raise ValueError(self._NO_ENERGY)
             else:
                 if not self._text('refine_seed_path'):
                     raise ValueError('choose the geometry file to start from')
@@ -3191,7 +3294,151 @@ class CalibrationDialog(QtWidgets.QDialog):
                                         'the window\'s are used.')
         self._guard(go)
 
+    def _sync_quick_button(self):
+        if not hasattr(self, 'quick_button'):
+            return
+        active = self._quick_stage is not None
+        ready = not active and not self._owner.busy
+        self.quick_button.setEnabled(ready)
+        self.quick_button.setToolTip(self._QUICK_TIP if ready else self._QUICK_TIP + (
+            '\nRunning now: Cancel operation stops it.' if active else '\nAvailable when the current operation ends.'))
+
+    def _quick_start(self):
+        """Quick calibration: the window's own Fit direct-beam distance, Read metadata and Refine automatically from
+        the rough geometry, one after another, stopping at the first problem (_quick_advance)."""
+        if self._quick_stage is not None or self._owner.busy:
+            return
+        for key, row in self._quick_rows.items():  # a scan typed on the card and not yet committed is the one used
+            if row.editor.isModified() and row.current_value() != self._text(key):
+                row.editor.editingFinished.emit()
+        if self.rough_mode.currentData() != 'scan':
+            self._quick_stop(1, self._QUICK_NEEDS_SCAN)
+            return
+        self._quick_cancelled, self._quick_detected_generation = False, None
+        self._quick_stage, self._quick_kind = 1, None
+        self._quick_progress()
+        self._quick_advance()
+
+    def _quick_advance(self):
+        """Start the current step's job once the worker is free. A refresh or check the window queued (restoring
+        its settings, a source edit) runs first, and its end brings Quick back here (review A3); a job that is
+        refused at once stops Quick with its reason."""
+        if self._quick_stage is None or self._close_pending or self._owner.busy:
+            return
+        if self._quick_stage == 1:
+            if self._beam_detection is None or self._beam_detection[0] != self._beam_generation:
+                if self._quick_detected_generation == self._beam_generation:  # its check ran on these inputs
+                    self._quick_stop(1, self._beam_problem)
+                    return
+                self._beam_probe_timer.stop()
+                self._detect_beam()  # a queued source refresh may start first
+                if self._owner.busy:
+                    if self._job == 'beam_detect':
+                        self._quick_detected_generation = self._beam_generation
+                    return
+                if self._beam_detection is None or self._beam_detection[0] != self._beam_generation:
+                    self._quick_stop(1, self._beam_problem)
+                    return
+            self._quick_start_job('distance', self._distance)
+        elif self._quick_stage == 2:
+            self._quick_start_job('enumerate', self._enumerate)
+        else:
+            self.refine_seed.setCurrentIndex(self.refine_seed.findData('rough'))
+            self._quick_start_job('refine', self._refine)
+
+    def _quick_start_job(self, kind, action):
+        self._quick_kind = kind
+        action()
+        if not (self._owner.busy and self._job == kind):  # refused at once: the reason is on the status line
+            self._quick_kind = None
+            self._quick_stop(self._quick_stage, self.status.text())
+
+    def _quick_after_terminal(self, kind, status):
+        """A job ended while Quick calibration runs: its next step, or a stop at the first problem. A job it did not
+        start (a refresh, the direct-beam check) only lets it go on."""
+        if self._quick_stage is None:
+            return
+        if self._close_pending:  # the window is closing: no later step
+            self._quick_clear()
+            return
+        step = self._quick_stage
+        if self._quick_cancelled:
+            self._quick_stop(step, self._QUICK_CANCELLED)
+            return
+        if kind != self._quick_kind:
+            self._quick_advance()
+            return
+        self._quick_kind = None
+        if status is not OperationTerminalStatus.RETURNED:  # the job's own reason is on the status line
+            self._quick_stop(step, self.status.text())
+            return
+        if kind == 'distance':
+            if self._distance_warning:  # the camera or a motor's sense, as the fit's advice says
+                self._quick_stop(1, self._distance_warning)
+                return
+            if not self._distance_fresh():
+                self._quick_stop(1, self._STALE_DISTANCE)
+                return
+        elif kind == 'enumerate':
+            if not self._calibrant_source_ready() or not self._calibrant_frame_count:
+                self._quick_stop(2, self._QUICK_NO_FRAMES)
+                return
+            try:
+                wavelength = self._rough_wavelength_A()
+            except ValueError as error:
+                self._quick_stop(2, str(error))
+                return
+            if wavelength is None:
+                self._quick_stop(2, self._NO_ENERGY)
+                return
+            # the metadata picks the scan's own motors for the arm, which can make step 1's fit stale (review A4)
+            if not self._distance_fresh():
+                self._quick_stop(1, self._QUICK_METADATA_STALE + self._STALE_DISTANCE)
+                return
+            advice = self._direct_beam_motion_warning()
+            if advice:
+                self._quick_stop(1, advice)
+                return
+        elif self.fit is None:
+            self._quick_stop(3, self.status.text())
+            return
+        else:  # Refine's summary and window are shown; its stitched preview reports in its own panel
+            self._quick_done()
+            return
+        self._quick_stage = step + 1
+        self._quick_progress()
+        self._quick_advance()
+
+    def _quick_stop(self, step, message):
+        """Stop at ``step``: its tab shown first (switching tabs rewrites the status line, review A5), then the step
+        and its reason on the status line and the card. Completed steps stay; every action stays available."""
+        name, tab = self._QUICK_STEPS[step]
+        self._quick_clear()
+        self._show_tab(tab)
+        reason = str(message or '').strip() or "see this step's controls."
+        self.status.setText(f'Quick calibration stopped at {name}: {reason}')
+        self.quick_card.set_readiness(False, f'Stopped at {name}: {reason}')
+
+    def _quick_done(self):
+        self._quick_clear()
+        self._show_tab('calibrate')
+        self.status.setText(calibration_fit_text(self.fit, 'refine'))
+        self.quick_card.set_readiness(True, 'Done: refined from the rough geometry; inspect the fit, then save it')
+
+    def _quick_progress(self):
+        name, _ = self._QUICK_STEPS[self._quick_stage]
+        self.quick_card.set_valid_marker(False)
+        self.quick_card.set_status_text(f'Step {self._quick_stage} of 3: {name}…')
+        self._sync_quick_button()
+
+    def _quick_clear(self):
+        self._quick_stage = self._quick_kind = None
+        self._quick_cancelled = False
+        self._sync_quick_button()
+
     def _cancel(self):
+        if self._quick_stage is not None:  # Cancel operation stops Quick calibration at its step
+            self._quick_cancelled = True
         self.point_images.finish_run()
         if self._identity is not None:
             self._owner.cancel(self._identity)
@@ -3220,6 +3467,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             result = terminal.payload
             if type(result) is PointImageDetection:
                 if self._close_pending:
+                    self._quick_clear()
                     self.point_images.finish_run()
                     self.close()
                     return
@@ -3233,6 +3481,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self._start(kind, arguments)
                 else:
                     self.status.setText('Grouping not confirmed; scan unprocessed')
+                    self._quick_after_terminal(kind, None)
+                    self._sync_quick_button()
                 return
             self.point_images.finish_run()
             try:
@@ -3406,6 +3656,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             prefix, self._pending_source_details = self._pending_source_details, None
             self._source_details(prefix)
         self._refresh_checklist()
+        # after the queued refresh and the direct-beam check have their turn, so Refine never starts with one queued
+        self._quick_after_terminal(kind, terminal.status)
+        self._sync_quick_button()
         if self._close_pending:
             self._close_pending = False
             self.close()
@@ -3493,6 +3746,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     def shutdown(self):
         """Host Exit: cancel and return the existing retryable close receipt."""
         from xdart.gui.pages.values import PageCleanup
+        self._quick_stage = self._quick_kind = None
         self._beam_probe_timer.stop()
         self._timer.stop()
         receipt = self._owner.close()
