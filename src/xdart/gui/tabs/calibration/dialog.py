@@ -3507,6 +3507,11 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.point_images.finish_run()
                     self.close()
                     return
+                if self._quick_cancelled:  # a returned preflight must not open a new prompt after Quick's Cancel
+                    self.point_images.finish_run()
+                    self._quick_after_terminal(kind, terminal.status)
+                    self._sync_quick_button()
+                    return
                 if self.point_images.confirm((result,), self):
                     _, arguments = self._point_request
                     arguments = tuple(self.point_images.options(value) if type(value) is SourceSpec else value
