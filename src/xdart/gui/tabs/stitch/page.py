@@ -1894,6 +1894,7 @@ class StitchPage(QtWidgets.QWidget):
         """Present asset-owned settings through the existing strict admission owner."""
         if self._value("backend") != "xrayutilities histogram":
             return
+        calibration_given = calibration  # a Preview's outcome passes the calibration it used
         from xrd_tools.analysis.xu_stitch_calibration import (
             XuStitchCalibrationInput, capture_xu_stitch_calibration,
         )
@@ -1917,14 +1918,20 @@ class StitchPage(QtWidgets.QWidget):
                     frame=DetectorCamera(*calibration.projection.value["xrayutilities"]["camera"])))
             tip = "Defined by the selected XU calibration; change it in Calibrate."
         values.update(geometry_kind="Goniometer JSON", poni_references="")
+        changed = False
         for key, value in values.items():
             field = replace(self._fields[key], value=value)
             if key == "camera":
                 field = _camera_field(field, value)
+            changed = changed or field.value != self._fields[key].value
             self._fields[key] = field
             self._rows[key].apply_field(field)
             self._rows[key].setToolTip(tip)
-        self._edited()  # readiness rechecks the arm the calibration's own mapping names
+        # readiness rechecks the arm the calibration's own mapping names. A Preview's own outcome (its calibration
+        # given) is no edit unless a row changed: one unprepared it and let a late source check replace its summary
+        # (XU-QUEUE, maintainer 2026-10-09)
+        if changed or calibration_given is None:
+            self._edited()
 
     def _browse(self, key):
         """Browse as Int does: the last folder picked, the same file types for the same inputs."""
