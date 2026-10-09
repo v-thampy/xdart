@@ -179,6 +179,8 @@ class CalibrationFitWindow(FitWindow):
             self.pattern_view.reconcile_keyed(replace(state, **{field: command.value}))
 
     def preview_busy(self, busy, detail=''):
+        """Show the preview lifecycle in its panel, independently of the fit's summary
+        and the calibration dialog's message box (including failure or cancellation)."""
         self._preview_busy = bool(busy)
         self.pattern_view.page_tool('preview').setEnabled(not busy)
         self.pattern_view.page_tool('preview').setText('Stitching…' if busy else 'Stitch calibrant')

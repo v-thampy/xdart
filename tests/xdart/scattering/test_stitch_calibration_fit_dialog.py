@@ -34,12 +34,18 @@ def qapp():
 
 def _wait(dialog, timeout=60):
     until = time.monotonic() + timeout
-    while dialog.active() and time.monotonic() < until:
+    while time.monotonic() < until:
+        while dialog.active() and time.monotonic() < until:
+            QtWidgets.QApplication.processEvents()
+            time.sleep(.005)
+        for _ in range(5):  # the 50 ms poll delivers the terminal and may start its preview
+            if time.monotonic() >= until:
+                break
+            QtWidgets.QApplication.processEvents()
+            time.sleep(.06)
         QtWidgets.QApplication.processEvents()
-        time.sleep(.005)
-    for _ in range(5):  # the 50 ms poll delivers the terminal
-        QtWidgets.QApplication.processEvents()
-        time.sleep(.06)
+        if not dialog.active():
+            break
     QtWidgets.QApplication.processEvents()
     assert not dialog.active(), dialog.status.text()
 
@@ -64,34 +70,44 @@ def _page_with_dialog(tmp_path, spec=None, seed_path=None):
     return page, page._calibration_dialog
 
 
-def _stage_native_pairs(dialog, pairs, root):
+def _stage_native_pairs(dialog, pairs, root, scan_motors=None):
     """Bind unchanged native control pairs to an actual SPEC scan and captured detector frames."""
-    import shutil
+    import tifffile
+    import fabio
+    from xrd_tools.core.geometry import ImageOrientation
     from xrd_tools.integrate.stitch_calibration import capture_calibration_frames, adopt_calibration_pair
     root.mkdir()
     images = root / 'images'
     images.mkdir()
     motors = tuple(pairs[0].motors)
-    rows = [' '.join(str(pair.motors[motor]) for motor in motors) for pair in pairs]
+    readings = tuple(scan_motors) if scan_motors is not None else tuple(pair.motors for pair in pairs)
+    indices = tuple(readings.index(pair.motors) for pair in pairs)
+    orientation = ImageOrientation(pairs[0].rotation, pairs[0].flip)
+    rows = [' '.join(str(row[motor]) for motor in motors) for row in readings]
     spec_path = root / 'native'
     spec_path.write_text('#F native\n#O0 ' + ' '.join(motors) + '\n'
-                        f'#S 1 ascan {motors[0]} 0 1 {len(pairs) - 1} 1\n#P0 {rows[0]}\n'
+                        f'#S 1 ascan {motors[0]} 0 1 {len(readings) - 1} 1\n#P0 {rows[0]}\n'
                         f'#N {len(motors)}\n#L ' + '  '.join(motors) + '\n' + '\n'.join(rows) + '\n')
-    for index, pair in enumerate(pairs):
-        shutil.copyfile(pair.image_path, images / f'native_scan1_{index:04d}.tif')
+    for index in range(len(readings)):
+        pair = pairs[indices.index(index)] if index in indices else pairs[0]
+        tifffile.imwrite(images / f'native_scan1_{index:04d}.tif',
+                         orientation.unapply(tifffile.imread(pair.image_path)))
     spec = SourceSpec(spec_path, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(images),
                       'image_stem': 'native_scan1_'})
-    dialog.set_source_context(spec, image_rotation=0)
+    dialog.set_source_context(spec, image_rotation=orientation.rotation,
+                              image_flip=orientation.flip_horizontal)
     _wait(dialog)
     arm = dialog.geometry_editor.value().stitch_arm()
-    captured = capture_calibration_frames(dialog._spec(), range(len(pairs)), dialog.session_dir,
-                                         rotation=0, arm=arm)
+    captured = capture_calibration_frames(dialog._spec(), indices, dialog.session_dir,
+                                         rotation=orientation.rotation, flip=orientation.flip_horizontal, arm=arm)
     frames = tuple(adopt_calibration_pair(frame, pair.poni_path, pair.npt_path)
                    for frame, pair in zip(captured, pairs))
     assert len(frames) == len(pairs)
     assert tuple(frame.motors for frame in frames) == tuple(pair.motors for pair in pairs)
-    assert all(frame.rotation == 0 and frame.energy_eV == pair.energy_eV
+    assert all(frame.rotation == pair.rotation and frame.flip == pair.flip and frame.energy_eV == pair.energy_eV
                for frame, pair in zip(frames, pairs))
+    for frame, pair in zip(frames, pairs):
+        np.testing.assert_array_equal(fabio.open(frame.image_path).data, tifffile.imread(pair.image_path))
     dialog.frames, dialog._frame_motors = frames, arm
     dialog._render_frames()
     _wait(dialog)
@@ -183,9 +199,15 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
         assert dialog.fit.asset['provenance']['arm_model'] == 'stacked_extended'
+        from xrd_tools.core.geometry import Diffractometer
+        arm = Diffractometer.from_pyfai_goniometer(
+            dialog.fit.asset['calibration'],
+            source_motors={'del_angle': 'del', 'nu_angle': 'nu'}).stacked_arm
+        assert abs(arm.mount_tilt - TRUTH['mount_tilt']) < 2e-3
         summary = dialog.fit_summary.toPlainText()
         assert 'Fitted arm parameters (± 1σ):' in summary and '  detector tilt on the arm: ' in summary
         assert '  sample offset, along the beam: ' in summary
+        assert dialog._calibration_fit_window.pattern_view.status.text() == 'Calibrant preview complete.'
         _assert_fit_shown(dialog, 'fit', len(frames))
         window = dialog._calibration_fit_window
         dialog.scales.setChecked(True)  # a changed option invalidates the fit and says what it changes
@@ -283,8 +305,7 @@ def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
-        dialog.frames, dialog._frame_motors = frames, (None, 'tth')
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
@@ -318,8 +339,7 @@ def test_a_twoc_arms_xrayutilities_file_covers_the_frames_with_nu_at_zero(qapp, 
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
-        dialog.frames, dialog._frame_motors = frames, ('tth', None)
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog.fit_button.click()
         _wait(dialog)
         page.set_field("backend", "xrayutilities histogram")
@@ -350,8 +370,7 @@ def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_frames_with_del_at
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc', plane='horizontal'))
-        dialog.frames, dialog._frame_motors = frames, (None, 'tth')
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog.fit_button.click()
         _wait(dialog)
         page.set_field("backend", "xrayutilities histogram")
@@ -379,8 +398,7 @@ def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_p
     frames = _guided_frames(tmp_path)
     page, dialog = _page_with_dialog(tmp_path)
     try:
-        dialog.frames, dialog._frame_motors = frames, ('del', 'nu')
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog.set_instrument(InstrumentGeometry('psic', (('del', 'delta'), ('nu', 'gamma'))))
         dialog.fit_button.click()
         assert dialog.fit is None and not dialog.active()
@@ -437,9 +455,7 @@ def test_the_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
     frames = _guided_frames(tmp_path)
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
-        dialog.frames = frames
-        dialog._frame_motors = ('del', 'nu')
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is not None, dialog.status.text()
@@ -594,10 +610,8 @@ def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the
     frames = _guided_frames(tmp_path)
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
-        dialog.frames = frames
-        dialog._frame_motors = ('del', 'nu')
-        dialog._choices = [(index, {'del': d, 'nu': n}, None) for index, (d, n) in enumerate(ANGLES)]
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source',
+            scan_motors=tuple({'del': d, 'nu': n} for d, n in ANGLES))
         dialog.fit_button.click()
         _wait(dialog)
         target = (tmp_path / 'calibration' / 'arm.json').resolve()
@@ -792,9 +806,7 @@ def test_fitted_motor_scales_hold_the_default_energy(qapp, tmp_path):
     frames = _guided_frames(tmp_path)
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
-        dialog.frames = frames
-        dialog._frame_motors = ('del', 'nu')
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         assert dialog.refine_energy.isChecked()
         dialog.scales.setChecked(True)
         assert 'the energy stays at the recorded one' in dialog.arm_note.text()
@@ -818,8 +830,7 @@ def test_a_twoc_arm_refines_the_energy_and_saves_its_xrayutilities_partner(qapp,
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(InstrumentGeometry('twoc'))
-        dialog.frames, dialog._frame_motors = frames, ('tth', None)
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog.refine_energy.setChecked(True)
         dialog.fit_button.click()
         _wait(dialog)

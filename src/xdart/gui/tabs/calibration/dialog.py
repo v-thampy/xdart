@@ -2340,10 +2340,18 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self.orientation_panel is not None:
             self.orientation_panel.busy(True)
         self.cancel_button.setEnabled(True)
-        self.status.setText('Stitching calibrant preview…' if kind == 'stitch_preview' else
+        self._job_status('Stitching calibrant preview…' if kind == 'stitch_preview' else
                             'Checking direct-beam scan…' if kind == 'beam_detect'
                             else f'{kind.capitalize()} in progress…')
         self._timer.start()
+
+    def _job_status(self, detail):
+        """A calibrant preview reports in its panel; the message box keeps the fit result."""
+        if self._job == 'stitch_preview':
+            if self._calibration_fit_window is not None:
+                self._calibration_fit_window.preview_busy(self._owner.busy, detail)
+        else:
+            self.status.setText(detail)
 
     def _guard(self, operation):
         try:
@@ -3043,7 +3051,11 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._start('stitch_preview', (self.fit, self._fit_source,
                 dict(mask=self._oriented_mask() if self._text('mask') else None,
                      conditioning=self._conditioning(), saturation=self._saturation_value())))
-        self._guard(go)
+        try:
+            go()
+        except Exception as error:
+            if self._calibration_fit_window is not None:
+                self._calibration_fit_window.preview_busy(False, str(error))
 
     def _cancel_preview(self):
         self._preview_key = None
@@ -3183,14 +3195,14 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.point_images.finish_run()
         if self._identity is not None:
             self._owner.cancel(self._identity)
-            self.status.setText('Cancelling; completed rows and saved files are retained.')
+            self._job_status('Cancelling; completed rows and saved files are retained.')
 
     def _poll(self):
         update = self._owner.poll(self._identity)
         if update is None:
             return
         if update.terminal is None:
-            self.status.setText(f'{self._job.capitalize()}: {update.progress.stage}…')
+            self._job_status(f'{self._job.capitalize()}: {update.progress.stage}…')
             return
         terminal, kind = update.terminal, self._job
         if os.environ.get('XDART_DEBUG_ORIENTATION'):
@@ -3362,25 +3374,23 @@ class CalibrationDialog(QtWidgets.QDialog):
                 elif kind in ('fit', 'refine'):  # what it found, as the direct-beam fit says its distance
                     self.status.setText(calibration_fit_text(result, kind))
                 elif kind == 'stitch_preview':
-                    self.status.setText('Calibrant preview complete.')
+                    self._job_status('Calibrant preview complete.')
                 else:
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:
                 self._close_after_save = False
-                self.status.setText(str(error))
+                self._job_status(str(error))
         elif terminal.status is OperationTerminalStatus.CANCELLED:
             self._close_after_save = False
-            self.status.setText('Cancelled. Previously completed frames and saved files are retained.')
+            self._job_status('Cancelled. Previously completed frames and saved files are retained.')
         else:
             self._close_after_save = False
-            self.status.setText(terminal.failure_message)
+            self._job_status(terminal.failure_message)
         if kind == 'orientation' and self.orientation_panel is not None:
             if terminal.status is not OperationTerminalStatus.RETURNED:
                 self.orientation_panel.finding_pane.set_text(self.status.text())
             elif self._orientation_pending_key != self._orientation_key() and not self._close_pending:
                 self.orientation_panel.finding_pane.set_text('Inputs changed during the check; run again. No stale finding was adopted.')
-        if kind == 'stitch_preview' and self._calibration_fit_window is not None:
-            self._calibration_fit_window.preview_busy(False, self.status.text())
         if kind == 'beam_detect':
             if (terminal.status is not OperationTerminalStatus.RETURNED
                     and self._beam_probe_generation == self._beam_generation):

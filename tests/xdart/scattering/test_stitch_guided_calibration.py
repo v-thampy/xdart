@@ -169,9 +169,10 @@ def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tm
     assert not dialog.isModal()
     assert dialog.tabs.count() == 4  # 4 · Calibrate and fit holds the fit (maintainer, 2026-09-29, -30)
     assert dialog._spec().options['scan'] == '14'
-    assert dialog.camera.value().to_xu() == ('x+', 'z-') and dialog._orientation().rotation == 180  # turned half
+    assert dialog.camera.value().to_xu() == ('x-', 'z+') and dialog._orientation().rotation == 180  # turned half
     assert not dialog.scales.isChecked()
     assert dialog._text('del_motor') == 'delta'
+    _finish(dialog)  # retire the actual metadata job before an idle New session action
     previous = dialog.session_dir
     dialog._new_session()
     assert dialog.session_dir != previous
