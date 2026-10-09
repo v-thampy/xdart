@@ -731,6 +731,8 @@ def test_native_xu_displays_admitted_mapping_and_rotation_read_only(qapp, tmp_pa
         assert page._value("camera") == ""
         page._calibrate()
         assert page._calibration_dialog.isVisible()
+        from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _wait as wait_calibration
+        wait_calibration(page._calibration_dialog)  # it reads the page's scan as it opens (since ebf112a4)
         page._calibration_dialog.close()
         page.set_field("backend", "pyFAI MultiGeometry")
         assert page._rows["source_motors"].isEnabled()
