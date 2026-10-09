@@ -1549,8 +1549,9 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _build_quick(self):
         """Quick calibration (M6, maintainer 2026-10-08): a card at the top of 1 · Instrument with the two scans that
         identify a calibration, their file and scan number (the values 2 · Rough geometry and 3 · Calibrant scan use,
-        edited in either place; no second copy, nothing saved of its own), and one action that runs the window's
-        own direct-beam fit, metadata read and Refine from the rough geometry (_quick_advance)."""
+        edited in either place; no second copy, nothing saved of its own), the window's Mask file and Threshold (the
+        Detector panel's file and Advanced's threshold, likewise; maintainer, 2026-10-08) and one action that runs the
+        window's own direct-beam fit, metadata read and Refine from the rough geometry (_quick_advance)."""
         self.quick_card = SectionCard('Quick calibration')
         tip = ('Fit direct-beam distance (2 · Rough geometry), Read metadata (3 · Calibrant scan), then Refine '
                'automatically from the rough geometry (4 · Calibrate and fit), one after another. It stops at the '
@@ -1571,15 +1572,19 @@ class CalibrationDialog(QtWidgets.QDialog):
             file_row.add_trailing_widget(scan_row, 0)
             form.addRow(file_row.label, file_row)
             for key, row, what in ((prefix + 'source', file_row, 'file'), (prefix + 'scan', scan_row, 'scan number')):
-                row.set_purpose_tooltip(f"The {scan.lower()} scan's {what}: the same value as {tab}'s, edited here "
-                                        'or there.')
-                self._quick_rows[key] = row
-                row.valueChanged.connect(lambda _path, value, key=key: self._quick_commit(key, value))
-                self._fields[key].textChanged.connect(lambda _text, key=key: self._quick_mirror(key))
-                self._formrows[key].valueChanged.connect(lambda _path, _value, key=key: self._quick_mirror(key))
-                self._quick_mirror(key)
+                self._quick_project(key, row, f"The {scan.lower()} scan's {what}: the same value as {tab}'s, edited "
+                                              'here or there.')
             file_row.browseRequested.connect(
                 lambda _path, key=prefix + 'source': self._browse(key, self._choosers[key]))
+        mask_row = FormRow(label='Mask file', path=('Calibration', 'Quick', 'mask'), value='', browse=True)
+        form.addRow(mask_row.label, mask_row)
+        self._quick_project('mask', mask_row, "The Detector panel's Mask file, edited here or there: pixels left out "
+                                              'everywhere in this calibration; saving the calibration makes it the '
+                                              "page's Mask File.")
+        mask_row.browseRequested.connect(lambda _path: self._browse('mask', self._choosers['mask']))
+        self.quick_threshold = self._threshold_row()  # Advanced's threshold: one state, shown on both rows
+        form.addRow(self.quick_threshold.label, self.quick_threshold)
+        self._show_threshold()
         self.quick_button = QtWidgets.QPushButton('Run quick calibration')
         self.quick_button.clicked.connect(self._quick_start)
         form.addRow(self.quick_button)
@@ -1588,12 +1593,22 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._sync_quick_rows()
         self._sync_quick_button()
 
+    def _quick_project(self, key, row, tip):
+        """The card's ``row`` for the window's field ``key``: one value, edited on the card or in its tab."""
+        row.set_purpose_tooltip(tip)
+        self._quick_rows[key] = row
+        row.valueChanged.connect(lambda _path, value: self._quick_commit(key, value))
+        self._fields[key].textChanged.connect(lambda _text: self._quick_mirror(key))
+        self._formrows[key].valueChanged.connect(lambda _path, _value: self._quick_mirror(key))
+        self._quick_mirror(key)
+
     def _quick_mirror(self, key):
         """The card's row shows the tab's value, a draft typed there included. It never overwrites a draft typed on the
         card, nor a focused file row (a file row takes no set while it holds the focus); a focused scan box that holds
         no draft does follow (Tab from a new file to its scan: the reset scan, not the old file's)."""
         row = self._quick_rows.get(key)
-        if row is None or (row.editor.hasFocus() and (row.editor.isModified() or key.endswith('source'))):
+        if row is None or (row.editor.hasFocus() and (row.editor.isModified() or key.endswith('source')
+                                                      or key == 'mask')):
             return
         value = self._text(key)
         if row.current_value() != value:
