@@ -861,6 +861,8 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
     """Maintainer, 2026-09-29: "the default json/poni file names … should be named like the nexus files …
     (spec_name_scan_no.json/poni)": the calibrant scan's SPEC file and scan (the direct-beam scan's for a
     direct-beam geometry), the first free name, since a saved calibration is never overwritten."""
+    # Its own session: the shared Browse rule puts the last picked folder first, and earlier rows pick some.
+    monkeypatch.setenv('XDART_SESSION_FILE', str(tmp_path / 'session.json'))
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         folder = tmp_path / 'scans'

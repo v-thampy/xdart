@@ -49,7 +49,11 @@ def test_preview_is_the_full_scan_stitched_at_the_fitted_geometry(refined_scan):
     result = stitch_calibrant_preview(fit, spec, mask=mask, conditioning=band,
         radial_range=(.1, 6.), npt_rad=80, npt_azim=36, npt_1d=120)
     np.testing.assert_array_equal(result.profile[0].radial, expected.radial)
-    np.testing.assert_allclose(result.profile[0].intensity, expected.intensity, rtol=1e-12, atol=1e-12)
+    # pyFAI writes 0 in a bin no pixel reaches; native Stitch profiles mark it NaN (5cc058db), as the preview does
+    empty = np.asarray(expected.count) == 0
+    assert empty.any()  # the band and mask leave such bins, so the rule is exercised
+    np.testing.assert_allclose(result.profile[0].intensity, np.where(empty, np.nan, expected.intensity),
+                               rtol=1e-12, atol=1e-12)
     assert result.payload.intensity.shape == (80, 36)
     assert result.provenance['calibrant_preview']['frame_count'] == 3
     assert all(path.read_bytes() == data for path, data in original.items())

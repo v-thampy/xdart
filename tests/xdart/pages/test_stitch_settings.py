@@ -2,6 +2,7 @@
 page input, the source files, the threshold policy and the calibration dialog, but
 never its per-use confirmations."""
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +19,15 @@ from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _wait
 
 
 def _close(page, qapp):
-    assert page.shutdown().status is PageCleanup.CLEAN
+    """Shut down as the app does: a page whose analysis window is still closing reports PENDING until that window
+    retires on later events, then CLEAN."""
+    until = time.monotonic() + 10
+    receipt = page.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+        qapp.processEvents()
+        time.sleep(.005)
+        receipt = page.shutdown()
+    assert receipt.status is PageCleanup.CLEAN
     page.deleteLater()
     qapp.processEvents()
 
