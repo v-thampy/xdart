@@ -326,6 +326,10 @@ def test_run_right_after_typing_in_a_field_checks_and_runs(qapp, tmp_path):
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
         page.run_bar.writeModeButton.click()  # Replace: the same inputs stitch again (Append skips them)
+        # Run waits while the page checks the scan's detector images (since 71bb665a), as a person sees
+        # "Checking detector images…" first (ST-TERMINAL: a click during that check did nothing)
+        _wait(page, qapp)
+        assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
         page.activateWindow()
         page.run_bar.startButton.click()
         _wait(page, qapp)
