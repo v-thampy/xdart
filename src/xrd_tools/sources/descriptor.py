@@ -486,7 +486,11 @@ def describe_container_from_open(
     scan_name = _scan_name(path)
 
     motor_names = None
-    if entry_grp is not None:
+    if entry_grp is not None and _is_eiger_master(path):
+        # An Eiger master records no scan metadata: its frames' provider is empty, and its motors come from a proper
+        # NeXus, SPEC or txt source (maintainer, 2026-10-09). Positioners written into one named motors no frame resolves.
+        motor_names = ()
+    elif entry_grp is not None:
         try:
             from xrd_tools.io.bluesky_nexus import bluesky_all_motor_names
             motor_names = tuple(bluesky_all_motor_names(entry_grp))

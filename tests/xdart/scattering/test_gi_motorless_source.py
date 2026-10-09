@@ -61,7 +61,8 @@ def _close(page, app):
 
 @pytest.mark.parametrize("motors", ((), ("eta",)))
 def test_container_observation_exposes_known_motor_catalog(tmp_path, motors):
-    raw = tmp_path / "scan_master.h5"
+    # an Eiger master names no motors (maintainer, 2026-10-09); a NeXus container names its positioners
+    raw = tmp_path / ("scan.nxs" if motors else "scan_master.h5")
     if motors:
         write_motor_container(raw, motors[0])
     else:

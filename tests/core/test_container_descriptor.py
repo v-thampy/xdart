@@ -319,12 +319,13 @@ def test_bluesky_finalized_is_ready(tmp_path):
     assert d.state is ProbeState.READY
 
 
-def test_a_plain_master_names_no_motors_even_with_positioners(tmp_path):
+def test_an_eiger_master_names_no_motors_even_with_positioners(tmp_path):
     """NEXUS-GI-AUTO-METADATA (maintainer, 2026-10-09: "the Eiger master file doesn't store the relevant metadata like
-    eta values … The metadata comes from proper Nexus files, spec, or in some cases from txt files"). A plain master's
+    eta values … The metadata comes from proper Nexus files, spec, or in some cases from txt files"). An Eiger master's
     frames carry no metadata (EmptyMetadataProvider), so discovery names no motors there even when positioners are
     written into it: a synthetic fixture did, GI Auto offered its eta, and frame 0 then could not resolve it. None of
-    the 40 plain masters in test_data records one. A Bluesky file keeps naming its motors."""
+    the 38 Eiger masters in test_data records one. A proper NeXus file keeps naming its motors: Bluesky's, and a
+    self-contained container's positioners (Int's directory motor sources)."""
     master = _eiger_master(tmp_path / "scan_master.h5", [tmp_path / "scan_data_000001.h5"])
     with h5py.File(master, "a") as m:
         m.create_dataset("entry/instrument/positioners/eta/value", data=np.full(5, .2))
@@ -333,6 +334,10 @@ def test_a_plain_master_names_no_motors_even_with_positioners(tmp_path):
     with h5py.File(bluesky, "a") as h5:
         h5.create_dataset("entry/instrument/positioners/eta/value", data=np.full(4, .2))
     assert describe_container(bluesky).motor_names == ("eta",)
+    container = _chunked_stack(tmp_path / "container.nxs")
+    with h5py.File(container, "a") as h5:
+        h5.create_dataset("entry/instrument/positioners/halpha/value", data=.2)
+    assert describe_container(container).motor_names == ("halpha",)
 
 
 def test_bluesky_unfinalized_is_in_progress(tmp_path):
