@@ -685,3 +685,58 @@ def test_quick_refuses_non_scan_rough_modes(qapp, tmp_path, monkeypatch, mode):
         assert started == ['enumerate'] and dialog._calibrant_source_ready()
     finally:
         _close(qapp, page, dialog)
+
+
+@pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
+def test_tabbing_from_the_card_file_to_its_scan_shows_the_reset_scan(qapp, tmp_path, page_name):
+    """Q1, added after Claude's self-review of 6d00dc8b: a new calibrant file typed on the card and left with Tab
+    resets the scan to 1 (as tab 3 does), and the card's scan box, which now has the focus, shows that 1 rather than
+    the scan the old file had (otherwise Quick would run on scan 1 under a card showing another)."""
+    page, dialog = _window(qapp, tmp_path / 'project', page_name)
+    try:
+        card = _quick_card(dialog)
+        ring_file, ring_scan = _card_rows(card, 'Calibrant')
+        (tmp_path / 'data').mkdir()
+        first, second = tmp_path / 'data' / 'LaB6', tmp_path / 'data' / 'CeO2'
+        for path in (first, second):
+            path.write_text('#F scan\n')
+        _commit(ring_file.editor, str(first))
+        _commit(ring_scan.editor, '7')
+        _wait(dialog)
+        assert dialog._text('scan') == '7' == ring_scan.current_value()
+        dialog.activateWindow()
+        ring_file.editor.setFocus()
+        qapp.processEvents()
+        assert ring_file.editor.hasFocus()
+        ring_file.editor.selectAll()
+        QTest.keyClicks(ring_file.editor, str(second))
+        ring_scan.editor.setFocus()  # Tab: the file commits as its box loses the focus (the source refresh it
+        qapp.processEvents()         # starts then disables the tabs, so the scan box does not keep the focus)
+        assert dialog._text('source') == str(second)
+        assert dialog._text('scan') == '1' == ring_scan.current_value() == ring_scan.editor.text()
+        _wait(dialog)
+    finally:
+        _close(qapp, page, dialog)
+
+
+def test_quick_stops_with_its_reason_when_rough_geometry_leaves_the_scan_mid_chain(qapp, tmp_path, monkeypatch):
+    """Q8, added after Claude's self-review of 6d00dc8b: Rough geometry switched to Enter the distance while Quick's
+    direct-beam check runs (the tabs stay enabled during that check) stops it at step 1 with D1's reason, not the
+    check's interrupted status."""
+    pair = _stitch_pair(tmp_path / 'data')
+    page, dialog = _page_with_dialog(tmp_path / 'project')
+    try:
+        card = _quick_card(dialog)
+        _configure(dialog, card, pair, camera=UPRIGHT_CAMERA)
+        dialog.camera.set_value(STITCH_CAMERA)  # an edit and back: the direct-beam check must run again
+        dialog.camera.set_value(UPRIGHT_CAMERA)
+
+        def leave_scan(kind):
+            if kind == 'beam_detect':
+                dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        started = _starts(dialog, monkeypatch, leave_scan)
+        status = _run(dialog, card)
+        _assert_stopped(dialog, card, status, 1, 'choose "Direct-beam scan" in 2 · Rough geometry')
+        assert started.count('beam_detect') == 1 and 'distance' not in started
+    finally:
+        _close(qapp, page, dialog)
