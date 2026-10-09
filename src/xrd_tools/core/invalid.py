@@ -3,10 +3,11 @@
 Mask Saturated excludes every native integer ceiling pixel, including isolated
 ones, alongside negative detector values and the uint32 invalid sentinel.
 The caller's toggle controls all finite value exclusions; static masks remain
-independent. Calibration's automatic ring search is the one exception
-(maintainer, 2026-10-08): it leaves the uint32 invalid sentinel out whatever
-its threshold, as it always left negative values out
-(``stitch_autocalibration._calibration_pixels``). Active manual intensity thresholds take precedence at the run-policy
+independent. Calibration is the one exception (maintainer, 2026-10-08): its
+automatic ring search and its staged frames' mask (pyFAI-calib2's, predicted
+rings, orientation checks) leave the uint32 invalid sentinel out whatever its
+threshold (``stitch_autocalibration._calibration_pixels``,
+``stitch_calibration.calibration_frame_mask``). Active manual intensity thresholds take precedence at the run-policy
 boundary, so they do not require an additional saturation pass.
 
 Deliberately dtype-derived and **never hardcodes 65535**: a float frame whose

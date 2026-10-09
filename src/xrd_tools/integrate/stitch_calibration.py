@@ -474,17 +474,29 @@ def _session_row(frame):
 def calibration_frame_mask(frame, mask=None, *, conditioning=None, saturation=None):
     """Combine the calibration's static mask with its Int threshold band, in staged pixel coordinates.
 
-    The staged image stays unchanged. None/off preserves the existing static mask without reading pixels.
+    The detector's invalid-pixel value (``UINT32_CEILING``: an Eiger's dead pixels) is left out whatever the threshold
+    (maintainer, 2026-10-08), as the automatic ring search leaves it out. None/off keeps the static mask as given for
+    a frame whose staged pixels hold none of it, or that has no staged image to read. The staged image stays unchanged.
     """
-    if frame.point_images is None and (conditioning is None or conditioning.mode == 'off'):
+    from xrd_tools.core.invalid import UINT32_CEILING
+    off = conditioning is None or conditioning.mode == 'off'
+    if frame.point_images is None and off and not Path(frame.image_path).is_file():
         return mask
     from xrd_tools.io.image import read_image
-    from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
     image = read_image(frame.image_path)
     if tuple(image.shape) != tuple(frame.shape):
         raise ValueError('the staged calibration image changed shape')
-    bad = (~np.isfinite(image) if frame.point_images is not None
-           else np.isnan(condition_stitch_frame(image, conditioning, saturation)))
+    invalid = np.asarray(image) >= UINT32_CEILING
+    if frame.point_images is not None:
+        bad = ~np.isfinite(image)
+    elif off:
+        if not invalid.any():
+            return mask
+        bad = np.zeros(image.shape, dtype=bool)
+    else:
+        from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+        bad = np.isnan(condition_stitch_frame(image, conditioning, saturation))
+    bad |= invalid
     if mask is not None:
         if np.shape(mask) != bad.shape:
             raise ValueError('the calibration mask does not match the staged image')

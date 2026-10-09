@@ -2929,11 +2929,13 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _pyfai_mask(self, frame=None):
         """The turned mask as a file pyFAI-calib2 reads (non-zero: masked), in the session folder; under a quarter
-        turn with the model's own gaps turned too, which pyFAI's generic detector there does not hold (item 8)."""
+        turn with the model's own gaps turned too, which pyFAI's generic detector there does not hold (item 8).
+        ``frame``'s staged pixels add the detector's invalid-pixel value whatever the threshold and, with it on, the
+        band (calibration_frame_mask); without a frame, the threshold off, the Detector panel's mask alone."""
         mask = self._loaded_mask()
         if mask is None and self._text('mask'):
             raise ValueError(f"the Detector panel's mask cannot be read: {self._text('mask')}")
-        if self._conditioning().mode != 'off':
+        if frame is not None or self._conditioning().mode != 'off':
             from xrd_tools.integrate.stitch_calibration import calibration_frame_mask
             mask = calibration_frame_mask(frame or self._selected_frame(), mask,
                                           conditioning=self._conditioning(), saturation=self._saturation_value())
