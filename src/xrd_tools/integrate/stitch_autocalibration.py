@@ -167,23 +167,29 @@ def _masked(valid, mask):
 
 
 def _calibration_pixels(source, index, orientation, conditioning, max_counts):
-    """Value-mask original exposures before a confirmed point operation."""
+    """Value-mask original exposures before a confirmed point operation.
+
+    The detector's invalid-pixel value (``UINT32_CEILING``: an Eiger's dead pixels, its own mask) is left out whatever
+    the threshold (maintainer, 2026-10-08), as negative markers are below: it is no count, and one such pixel in a
+    ring's band lifts pyFAI's cut there (the band's mean + std) above every real pixel.
+    """
+    from xrd_tools.core.invalid import UINT32_CEILING
     from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+    saturation = None if max_counts is None else max_counts + 1
     grouped = getattr(source, 'point_image_policy', None) is not None
     if grouped:
         def condition(native):
-            image = condition_stitch_frame(native, conditioning,
-                None if max_counts is None else max_counts + 1)
+            image = condition_stitch_frame(native, conditioning, saturation)
+            image[np.asarray(native) >= UINT32_CEILING] = np.nan
             if max_counts is not None:
                 image[np.asarray(native) > max_counts] = np.nan
             return image
         image = source.load_point_frame(index, native_transform=condition)
     else:
         loader = getattr(source, 'load_native_frame', source.load_frame)
-        image = loader(index)
-        if conditioning is not None and conditioning.mode != 'off':
-            image = condition_stitch_frame(image, conditioning,
-                None if max_counts is None else max_counts + 1)
+        native = np.asarray(loader(index))
+        image = condition_stitch_frame(native, conditioning, saturation)  # off or absent: the counts, as floats
+        image[native >= UINT32_CEILING] = np.nan
     return np.asarray(orientation.apply(image), dtype=np.float64), grouped
 
 
@@ -505,6 +511,8 @@ def refine_arm_from_scan(spec, geometry, *, source_motors=_SOURCE_MOTORS, image_
                   'automatic_refinement': {
                       'method': 'pyFAI SingleGeometry.extract_cp seeded by a stacked calibration',
                       'extraction_seed': 'numpy global generator seeded by frame index, restored after',
+                      'invalid_pixels': 'the detector invalid-pixel value 4294967295 (uint32 maximum) is left out '
+                                        'whatever the threshold',
                       'seed_sha256': digest, 'source': source, 'calibrant': str(calibrant),
                       'points_per_degree': float(points_per_degree), 'max_counts': max_counts,
                       'mask_sha256': None if mask is None else hashlib.sha256(repr(np.shape(mask)).encode()
