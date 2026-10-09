@@ -286,12 +286,16 @@ def test_the_calibration_must_drive_the_geometrys_arm(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(form)
+        _wait(page, qapp)
         assert page._readiness[1], page._readiness
         page._calibrate()  # through the window, as a user chooses the geometry
+        from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _wait as wait_calibration
+        wait_calibration(page._calibration_dialog)
         editor = page._calibration_dialog.geometry_editor
         editor.geometry.setCurrentIndex(editor.geometry.findData("fourc"))
         editor.motor_edit("tth").setText("del")
         page._calibration_dialog.hide()
+        _wait(page, qapp)
         assert not page._readiness[1] and "fourc has one detector circle" in page._readiness[0]
         assert not page.run_bar.startButton.isEnabled()
         with pytest.raises(ValueError, match="one detector circle"):
@@ -306,10 +310,12 @@ def test_the_calibration_must_drive_the_geometrys_arm(qapp, tmp_path):
                                      .to_pyfai_goniometer(calibration)))
         page.set_field("geometry_path", str(single))
         assert page._value("source_motors") == "del_angle=del"
+        _wait(page, qapp)
         assert page._readiness[1], page._readiness
         request = prepare_stitch_tool(page.build_form()).request
         assert {name for item in request.manifest.contributions for name, _o, _v in item.values} == {"del"}
         page._set_instrument(InstrumentGeometry("psic"))  # psic's nu moves
+        _wait(page, qapp)
         assert not page._readiness[1] and "nu held at zero" in page._readiness[0]
         # PONI + offsets: a fresh mapping takes the Geometry's arm, one reference per circle
         page.set_field("geometry_kind", "PONI + offsets")
@@ -319,9 +325,11 @@ def test_the_calibration_must_drive_the_geometrys_arm(qapp, tmp_path):
         page._set_instrument(InstrumentGeometry("twoc", (("tth", "del"),)))
         assert (page._value("source_motors"), page._value("poni_references")) == ("del=del, nu=nu",
                                                                                   "del=12.5, nu=0")
+        _wait(page, qapp)
         assert not page._readiness[1] and "twoc has one detector circle" in page._readiness[0]
         _edit_mapping(page, "del=del")  # the user maps twoc's arm alone
         assert (page._value("source_motors"), page._value("poni_references")) == ("del=del", "del=12.5")
+        _wait(page, qapp)
         assert page._readiness[1], page._readiness
         # an xrayutilities calibration names its own arm: psic's canonical one cannot drive twoc's
         from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_bytes
@@ -331,8 +339,13 @@ def test_the_calibration_must_drive_the_geometrys_arm(qapp, tmp_path):
         page.set_field("backend", "xrayutilities histogram")
         page.set_field("geometry_path", str(xu))
         assert page._value("source_motors") == "del=del, nu=nu"
+        _wait(page, qapp)
         assert not page._readiness[1] and "twoc has one detector circle" in page._readiness[0]
     finally:
+        if page._calibration_dialog is not None:
+            from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
+            wait_calibration(page._calibration_dialog)
+            _close_with(page._calibration_dialog, qapp, 'Discard')
         _close(page, qapp)
 
 
@@ -365,6 +378,7 @@ def test_a_custom_position_calibration_is_checked_by_the_circles_it_moves(qapp, 
         page._set_instrument(InstrumentGeometry("fourc", (("tth", "del"),)))  # chosen before the form
         page.load_form(form)
         assert page._value("source_motors") == "dval=del, nval=nu"  # kept (round 11 F2)
+        _wait(page, qapp)
         assert not page._readiness[1] and "fourc has one detector circle" in page._readiness[0]
         assert not page.run_bar.startButton.isEnabled()
         with pytest.raises(ValueError, match="one detector circle"):
@@ -372,6 +386,7 @@ def test_a_custom_position_calibration_is_checked_by_the_circles_it_moves(qapp, 
         page.begin_run()  # refused before anything is written
         assert not list((tmp_path / "output").glob("*.nexus"))
         page._set_instrument(InstrumentGeometry("psic"))
+        _wait(page, qapp)
         assert page._readiness[1], page._readiness
         assert _read_columns(page.build_form()) == {"del", "nu"}
     finally:
@@ -396,6 +411,7 @@ def test_a_poni_form_keeps_its_mapping_and_references_under_any_geometry(qapp, t
         page.load_form(two)
         assert (page._value("source_motors"), page._value("poni_references")) == ("del=del, nu=nu",
                                                                                   "del=0.0, nu=3.0")
+        _wait(page, qapp)
         assert not page._readiness[1] and "fourc has one detector circle" in page._readiness[0]
         with pytest.raises(ValueError, match="one detector circle"):
             page.build_form()
@@ -405,10 +421,12 @@ def test_a_poni_form_keeps_its_mapping_and_references_under_any_geometry(qapp, t
             assert restored._instrument().geometry == "fourc"
             assert (restored._value("source_motors"), restored._value("poni_references")) == (
                 "del=del, nu=nu", "del=0.0, nu=3.0")
+            _wait(restored, qapp)
             assert not restored._readiness[1] and "fourc has one detector circle" in restored._readiness[0]
         finally:
             _close(restored, qapp)
         page._set_instrument(InstrumentGeometry("psic"))
+        _wait(page, qapp)
         assert page._readiness[1], page._readiness
         built = page.build_form()
         assert (built.source_motors, built.poni_references) == ((("del", "del"), ("nu", "nu")),
@@ -417,8 +435,10 @@ def test_a_poni_form_keeps_its_mapping_and_references_under_any_geometry(qapp, t
         # the reverse: a form mapping del alone, loaded under psic, stays del alone and is refused
         page.load_form(replace(two, source_motors=(("del", "del"),), poni_references=(("del", 0.),)))
         assert (page._value("source_motors"), page._value("poni_references")) == ("del=del", "del=0.0")
+        _wait(page, qapp)
         assert not page._readiness[1] and "nu held at zero" in page._readiness[0]
         page._set_instrument(InstrumentGeometry("twoc", (("tth", "del"),)))
+        _wait(page, qapp)
         assert page._readiness[1], page._readiness
         assert _read_columns(page.build_form()) == {"del"}
     finally:
@@ -445,9 +465,11 @@ def test_a_horizontal_2theta_arm_maps_nu_and_refuses_a_vertical_calibration(qapp
         page._set_instrument(InstrumentGeometry("twoc", (("tth", "nu"),), "horizontal"))  # the scan's nu is 2θ
         page.set_field("geometry_path", str(files["horizontal"]))
         assert page._value("source_motors") == "nu_angle=nu"
+        _wait(page, qapp)
         assert page._readiness[1], page._readiness
         assert _read_columns(page.build_form()) == {"nu"}
         page.set_field("geometry_path", str(files["vertical"]))
+        _wait(page, qapp)
         assert not page._readiness[1] and "Choose the vertical scattering plane" in page._readiness[0]
         page.set_field("geometry_kind", "PONI + offsets")  # a fresh PONI mapping: the horizontal arm, nu
         assert (page._value("source_motors"), page._value("poni_references")) == ("nu=nu", "nu=0")
@@ -662,7 +684,8 @@ def test_stitchs_advanced_is_ints_advanced_dialog_with_its_three_groups(qapp):
         assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
         assert page.advanced.buttons.standardButtons() == QtWidgets.QDialogButtonBox.StandardButton.Close
         cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
-        assert set(cards) == {"Source and geometry", "Frames and sample", "Corrections"}
+        assert {"Source and geometry", "Frames and sample", "Corrections"} <= set(cards)
+        assert "Images per point" in cards
         assert cards["Corrections"] is page.corrections_card
         for title, keys in (("Source and geometry", ("geometry_kind", "detector_rows", "raw_dtype", "camera",
                                                      "frame_step", "max_frame_mib", "output_family")),

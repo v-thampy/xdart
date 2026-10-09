@@ -398,6 +398,10 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
         assert "Ordered members: 2 · total frames 4" in shown and "Member 2:" in shown
         page.begin_run()
         _wait(page, qapp, lambda: page.shown is not None)
+        assert page._map_choice.currentText() == "Mean over range"
+        page.view._show_plot_options()
+        page._map_choice.setCurrentText("Single plane")
+        page.view.plot_options_dialog.accept_button.click()
         snapshot = page.shown[1]
         for pane, product in zip(_slices(page.view), snapshot.products[:3], strict=True):
             np.testing.assert_array_equal(pane.canvas.raw_image, np.asarray(product.values).T)
@@ -410,7 +414,8 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
         moved = page.shown[1]
         assert (moved.state.h_index, moved.state.k_index, moved.state.l_index) == (0, 3, 4)
         np.testing.assert_array_equal(_slices(page.view)[2].canvas.raw_image, np.asarray(moved.products[2].values).T)
-        assert page.results.count() == 1 and page.results.item(0).text() == output.name
+        assert len(set(page.browser.listed_results()) & set(page._listed)) == 1
+        assert Path(page.browser.current_result()).name == output.name
         assert page.run_bar.readinessLabel.full_text() == f"Saved {output.name}"
         output.parent.mkdir()
         output.write_bytes(b"")  # the run's file, as a real commit leaves it
@@ -494,10 +499,10 @@ def test_open_reads_saved_results_off_the_gui_thread_and_keeps_the_newest_five(q
             assert page.reopen(str(tmp_path / f"{name}_rsm.nexus"))
             _wait(page, qapp, lambda: not page.active())
             assert page.shown[0] is shown[name]
-        assert [page.results.item(row).text() for row in range(6)] == [f"{name}_rsm.nexus" for name in shown]
-        page.results.setCurrentRow(1)  # kept: shown at once
+        assert [Path(path).name for path in page.browser.listed_results() if path in page._listed] == [f"{name}_rsm.nexus" for name in shown]
+        page.browser.set_current_result(str(tmp_path / 'two_rsm.nexus'), keep_selection=False)  # kept: shown at once
         assert page.shown[0] is shown["two"] and len(reads) == 6
-        page.results.setCurrentRow(0)  # the oldest: read again
+        page.browser.set_current_result(str(tmp_path / 'one_rsm.nexus'), keep_selection=False)  # the oldest: read again
         _wait(page, qapp, lambda: not page.active())
         assert page.shown[0] is shown["one"] and reads == [f"{name}_rsm.nexus" for name in (*names, "one")]
     finally:
@@ -737,8 +742,9 @@ def test_the_advanced_settings_are_ints_advanced_dialog_of_shared_rows(qapp, tmp
         _with_source(page, tmp_path)
         assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
         cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
-        assert set(cards) == {"Source and geometry", "Normalization column occurrences", "Corrections",
-                              "Chunk and memory"}
+        assert {"Source and geometry", "Normalization column occurrences", "Corrections",
+                "Chunk and memory"} <= set(cards)
+        assert {"Image conditioning", "Images per point"} <= set(cards)
         page.set_field("adv_foil_occurrence", "-1")  # a normalization occurrence is Processing's
         assert "Advanced Foil column occurrence" in page._headers["processing"].detail
         page.set_field("adv_foil_occurrence", "0")
@@ -1106,7 +1112,7 @@ def test_a_replace_repaints_the_new_result_under_the_same_name(qapp, tmp_path, m
         monkeypatch.setattr(page_module, "make_rsm_viewer_values", {"payload": second}.__getitem__)
         page.begin_run()
         _wait(page, qapp, lambda: page.shown[0] is second and not page.active())
-        assert page.results.count() == 1
+        assert len(set(page.browser.listed_results()) & set(page._listed)) == 1
         np.testing.assert_array_equal(_slices(page.view)[0].canvas.raw_image,
                                       np.asarray(page.shown[1].products[0].values).T)
     finally:
@@ -1132,13 +1138,13 @@ def test_a_refused_or_stopped_replace_keeps_the_prior_result_shown(qapp, tmp_pat
         page.begin_run()
         _wait(page, qapp, lambda: "refused" in label.full_text() and not page.active())
         assert label.full_text() == "RSM refused: OUTPUT_NOT_PREVIOUS_ANALYSIS"
-        assert page.shown is prior and page.results.count() == 1
+        assert page.shown is prior and len(set(page.browser.listed_results()) & set(page._listed)) == 1
         _terminal_instead_of_gridding(monkeypatch, ModuleDisposition.CANCELLED, "CANCELLED", until_stopped=True)
         page.begin_run()
         _wait(page, qapp, lambda: page._owner.busy and page.run_bar.stopButton.isEnabled())
         page.stop()
         _wait(page, qapp, lambda: "stopped" in label.full_text() and not page.active())
-        assert page.shown is prior and page.results.count() == 1
+        assert page.shown is prior and len(set(page.browser.listed_results()) & set(page._listed)) == 1
     finally:
         _close(page, qapp)
 
@@ -1328,6 +1334,8 @@ def test_calibrate_and_make_mask_open_the_shared_windows_with_rsms_context(qapp,
         page._control_action(ControlAction.CALIBRATE)
         dialog = page._calibration_dialog
         assert dialog is not None and dialog.windowTitle() == "RSM calibration"
+        from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _wait as wait_calibration
+        wait_calibration(dialog)
         assert dialog.save_button.text() == "Save geometry and use in RSM"
         dialog.saved_mask = str(tmp_path / "cal_mask.npy")
         dialog.calibrationSaved.emit(str(tmp_path / "calibration" / "new.json"), "multigeometry")
@@ -1530,7 +1538,7 @@ def test_a_comma_selection_previews_every_rsm_and_grids_each_in_turn(qapp, tmp_p
         assert f"RSM 2 of 2 · {names[1]}" in shown and grids == []
         page.begin_run()
         _wait(page, qapp, lambda: "Saved 2 of 2 RSMs" in label.full_text())
-        assert grids == names and page.results.count() == 2 and not page.active()
+        assert grids == names and len(set(page.browser.listed_results()) & set(page._listed)) == 2 and not page.active()
     finally:
         _close(page, qapp)
 
@@ -1687,7 +1695,7 @@ def test_a_file_appearing_at_a_queued_output_after_the_check_is_refused_at_its_t
         _wait(page, qapp, lambda: not page.active() and "refused" in label.full_text())
         assert label.full_text().startswith("Preview refused (RSM 2 of 2): ")
         assert f"{second.name} is not an RSM result" in label.full_text()
-        assert grids == [first.name] and page.results.count() == 1
+        assert grids == [first.name] and len(set(page.browser.listed_results()) & set(page._listed)) == 1
         assert second.read_bytes() == b"an operator's own file"
     finally:
         _close(page, qapp)

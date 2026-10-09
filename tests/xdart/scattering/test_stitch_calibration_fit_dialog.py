@@ -326,7 +326,8 @@ def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero
         page._set_instrument(InstrumentGeometry('twoc'))  # the vertical plane cannot take it
         assert 'Choose the horizontal scattering plane' in page._arm_problem()
     finally:
-        dialog.close()
+        from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
+        _close_with(dialog, qapp, 'Discard')  # answer the real saved-setup close prompt
         page.shutdown()
 
 
@@ -359,7 +360,8 @@ def test_a_twoc_arms_xrayutilities_file_covers_the_frames_with_nu_at_zero(qapp, 
         page._set_instrument(InstrumentGeometry('psic'))  # psic's nu moves
         assert 'nu held at zero' in page._arm_problem()
     finally:
-        dialog.close()
+        from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
+        _close_with(dialog, qapp, 'Discard')
         page.shutdown()
 
 
@@ -387,7 +389,8 @@ def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_frames_with_del_at
         page._set_instrument(InstrumentGeometry('twoc'))  # the vertical plane cannot take it
         assert 'Choose the horizontal scattering plane' in page._arm_problem()
     finally:
-        dialog.close()
+        from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
+        _close_with(dialog, qapp, 'Discard')
         page.shutdown()
 
 
@@ -612,6 +615,8 @@ def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the
     try:
         frames = _stage_native_pairs(dialog, frames, tmp_path / 'source',
             scan_motors=tuple({'del': d, 'nu': n} for d, n in ANGLES))
+        dialog._enumerate()  # Read metadata for the full scan, beyond the fitted subset.
+        _wait(dialog)
         dialog.fit_button.click()
         _wait(dialog)
         target = (tmp_path / 'calibration' / 'arm.json').resolve()

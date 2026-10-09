@@ -24,6 +24,7 @@ from tests.core.test_rsm_calibration_geometry import _canonical_partner
 from tests.xdart.pages.test_rsm_page import (  # noqa: F401
     _Owner, _Status, _close, _page, _scan43_dialog_form, _sto_align, _synthetic_source, _with_source, qapp,
 )
+from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _wait as wait_calibration
 
 #: The scan-43 settings file (design §2 item 5: the "Scan 43" preset button went with the classic dialog)
 _SCAN43 = Path(__file__).parent / "fixtures" / "rsm_scan43_settings.json"
@@ -316,11 +317,13 @@ def test_calibrate_opens_on_the_saved_window_settings_and_keeps_its_own_calibrat
             _with_source(each, tmp_path)
         page._calibrate()  # a new window takes the first selected scan
         dialog = page._calibration_dialog
+        wait_calibration(dialog)
         processing = dialog._text("source")
         assert processing == str(tmp_path / "source" / "RSM_synth")
         calibrant = str(tmp_path / "powder.spec")
         dialog._set_field_text("source", calibrant)
         dialog._set_field_text("rms", ".02")
+        wait_calibration(dialog)
         saved = page.settings()["calibration"]
         assert saved == dialog.settings() and saved["fields"]["source"] == calibrant
         assert saved["fields"]["rms"] == ".02"
@@ -329,12 +332,14 @@ def test_calibrate_opens_on_the_saved_window_settings_and_keeps_its_own_calibrat
         restored.apply_settings(page.settings())
         restored._calibrate()
         again = restored._calibration_dialog
+        wait_calibration(again)
         assert (again._text("source"), again._text("rms")) == (calibrant, ".02")
         again.hide()
         unnamed = page.settings()
         unnamed["calibration"]["fields"]["source"] = ""  # saved without a calibration source
         sourceless.apply_settings(unnamed)
         sourceless._calibrate()
+        wait_calibration(sourceless._calibration_dialog)
         assert (sourceless._calibration_dialog._text("source"), sourceless._calibration_dialog._text("rms")) == (
             processing, ".02")
         sourceless._calibration_dialog.hide()
@@ -343,6 +348,7 @@ def test_calibrate_opens_on_the_saved_window_settings_and_keeps_its_own_calibrat
         elsewhere.mkdir()
         page.set_field("project_root", str(elsewhere))
         page._calibrate()  # the window a Project change closes leaves its inputs to the next one
+        wait_calibration(page._calibration_dialog)
         assert page._calibration_dialog is not dialog
         assert (page._calibration_dialog._text("source"), page._calibration_dialog._text("rms")) == (calibrant, ".02")
         page._calibration_dialog.hide()
@@ -366,6 +372,7 @@ def test_a_document_saved_without_a_calibration_window_closes_the_one_opened_sin
         assert original["calibration"] is None
         page._calibrate()
         dialog = page._calibration_dialog
+        wait_calibration(dialog)
         default_rms = dialog._text("rms")
         dialog._set_field_text("rms", ".02")
         dialog.hide()
@@ -376,6 +383,7 @@ def test_a_document_saved_without_a_calibration_window_closes_the_one_opened_sin
         assert dialog not in page._authoring_dialogs  # idle: shut down and let go at once, its memory with it
         page._calibrate()
         again = page._calibration_dialog
+        wait_calibration(again)
         assert again is not dialog and again._text("rms") == default_rms
         again._set_field_text("rms", ".02")
         again.hide()

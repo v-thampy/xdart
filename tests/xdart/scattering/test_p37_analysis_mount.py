@@ -1613,6 +1613,7 @@ def test_p37b_scan_plot_submits_headless_defaults_normalization_and_roi_kind(
         dialog.set_vnext_metadata(table)
         dialog._vnext_rendering = True
         try:
+            _check_item(dialog.y_list, "frame_index", checked=False)
             _check_item(dialog.y_list, "signal")
             _check_item(dialog.r_list, "motor")
             dialog.norm_combo.setCurrentText("signal")

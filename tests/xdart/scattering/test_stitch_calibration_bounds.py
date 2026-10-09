@@ -12,7 +12,8 @@ from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from xrd_tools.core.geometry import Diffractometer
 from tests.core.test_stacked_arm_extension import TRUTH
 from tests.xdart.scattering.test_stitch_calibration_fit_dialog import (  # noqa: F401  (qapp)
-    _ROW_ANGLES, _five_parameter_seed, _guided_frames, _page_with_dialog, _ring_scan, _wait, qapp,
+    _ROW_ANGLES, _five_parameter_seed, _guided_frames, _page_with_dialog, _ring_scan,
+    _single_arm_frames, _stage_native_pairs, _wait, qapp,
 )
 
 SOURCES = {'del_angle': 'del', 'nu_angle': 'nu'}
@@ -85,8 +86,7 @@ def test_the_advanced_bounds_reach_the_fit_and_its_summary_reports_contact(qapp,
     try:
         assert {key: dialog._text(key) for key in dialog._BOUND_DEFAULTS} == {
             'zero_freedom': '2', 'mount_freedom': '2', 'displacement_limit': '0.05', 'distance_freedom': '5'}
-        dialog.frames, dialog._frame_motors = frames, ('del', 'nu')
-        dialog._render_frames()
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         _type_zeros(dialog, TRUTH_ZEROS)
         assert 'Fits start from: del zero 2.86' in dialog.bounds_note.text()
         dialog._fields['displacement_limit'].setText('0.02')
@@ -123,7 +123,7 @@ def test_editing_a_zero_or_a_bound_leaves_the_fit_and_the_prediction_stale(qapp,
     frames = _guided_frames(tmp_path)
     page, dialog = _page_with_dialog(tmp_path)
     try:
-        dialog.frames, dialog._frame_motors = frames, ('del', 'nu')
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         _type_zeros(dialog, TRUTH_ZEROS)
         dialog._fields['displacement_limit'].setText('5')
         for edit in (lambda: dialog.geometry_editor.zero_edit('del').setText('2.9'),
@@ -200,6 +200,10 @@ def test_the_first_opening_keeps_an_older_windows_normal_incidence_zero(qapp, tm
     dialog = page._calibration_dialog
     try:
         assert dialog.geometry_editor.value().arm_zeros() == zeros
+        _wait(dialog)
+        (tmp_path / 'frames').mkdir()
+        pairs = _guided_frames(tmp_path) if record['geometry'] == 'psic' else _single_arm_frames(tmp_path)
+        _stage_native_pairs(dialog, pairs, tmp_path / 'source')
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '390'), ('beam_pixel', '240, 97'), ('rough_energy', str(wavelength_m_to_energy_eV(.7293e-10) / 1000))):
             dialog._fields[key].setText(value)
@@ -222,11 +226,21 @@ def test_a_malformed_zero_is_refused_by_every_operation_and_a_typed_zero_is_supp
     and Save as calibration refuse it by name and start nothing; an explicit 0 is typed."""
     page, dialog = _page_with_dialog(tmp_path)
     try:
+        (tmp_path / 'frames').mkdir()
+        _stage_native_pairs(dialog, _guided_frames(tmp_path), tmp_path / 'source')
+        from tests.xdart.scattering.test_stitch_guided_calibration import _beam_container
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        beam_root = tmp_path / 'beam'
+        beam_root.mkdir()
+        nexus, _, _ = _beam_container(beam_root)
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('nexus'))
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog._set_field_text('beam_source', nexus)
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         for key, value in (('rough_distance', '390'), ('beam_pixel', '240, 97'), ('rough_energy', str(wavelength_m_to_energy_eV(.7293e-10) / 1000))):
             dialog._fields[key].setText(value)
         dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData('rough'))
-        dialog._fields['source'].setText(str(tmp_path / 'calibrant'))
+        detect(dialog)
         started = _captured(dialog)
         for text in ('-', '.'):
             dialog.geometry_editor.zero_edit('del').setText(text)
@@ -302,7 +316,7 @@ def test_a_resumed_session_fits_and_predicts_with_its_own_zeros_and_bounds(qapp,
     frames = _guided_frames(tmp_path)
     page, dialog = _page_with_dialog(tmp_path)
     try:
-        dialog.frames, dialog._frame_motors = frames, ('del', 'nu')
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         _type_zeros(dialog, {'del': 2.3})
         dialog._fields['displacement_limit'].setText('0.02')
         dialog._fields['distance_bounds'].setText('385, 395')
@@ -335,7 +349,6 @@ def test_a_resumed_session_fits_and_predicts_with_its_own_zeros_and_bounds(qapp,
         seed_file = tmp_path / 'seed.json'
         seed_file.write_text(json.dumps(_five_parameter_seed(_ROW_ANGLES)))
         dialog._fields['refine_seed_path'].setText(str(seed_file))
-        dialog._fields['source'].setText(str(tmp_path / 'calibrant'))
         dialog.refine_button.click()
         (kind, (_spec, _seed, options)), = started
         assert kind == 'refine' and options['distance_bounds_m'] == (.385, .395)
@@ -361,7 +374,7 @@ def test_a_session_records_the_choices_its_fit_took_and_a_resume_restores_them(q
     frames = _guided_frames(tmp_path)
     page, dialog = _page_with_dialog(tmp_path)
     try:
-        dialog.frames, dialog._frame_motors = frames, ('del', 'nu')
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog.session_dir = tmp_path / 'session-a'
         dialog.session_dir.mkdir()
         dialog._render_frames()
@@ -413,6 +426,7 @@ def test_a_horizontal_arm_session_reopens_with_its_nu_zero(qapp, tmp_path, monke
     page, dialog = _page_with_dialog(tmp_path)
     try:
         dialog.set_instrument(horizontal)
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         policy = dialog._fit_policy()
         assert policy['instrument_geometry'] == horizontal.to_record()
         assert policy['bounds']['zeros_deg'] == {'nu': 2.3}
@@ -422,6 +436,7 @@ def test_a_horizontal_arm_session_reopens_with_its_nu_zero(qapp, tmp_path, monke
             (tmp_path / f'v{version}').mkdir()
             sessions[version] = save_calibration_session(tmp_path / f'v{version}', frames, arm=(None, 'tth'),
                                                          fit_policy=record)
+        dialog.frames = ()  # Neither saved session has been reopened in this window yet.
         dialog.set_instrument(InstrumentGeometry('twoc'))  # the window now shows a vertical 2θ arm
         started = _captured(dialog)
         monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse',

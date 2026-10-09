@@ -35,16 +35,19 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def _wait(page, qapp, timeout=30):
+def _wait(page, qapp, timeout=30, *, catalog=False):
     until = time.monotonic() + timeout
     qapp.processEvents()
     # a shown result the page dropped from memory is reloaded between its other work (C12)
     while (page._owner.busy or page._source_observer.computing or page._raw_pending or page._queued_jobs
-           or getattr(page, "_reload_pending", None)) and time.monotonic() < until:
+           or getattr(page, "_reload_pending", None)
+           or (catalog and page._result_browser.busy)) and time.monotonic() < until:
         qapp.processEvents()
         time.sleep(.005)
     qapp.processEvents()
     assert not page._owner.busy, page.run_bar.readinessLabel.full_text()
+    if catalog:
+        assert not page._result_browser.busy
 
 
 
@@ -414,12 +417,12 @@ def _stitched_variants(tmp_path):
     paths, payloads = [], []
     for name, options in (("a", {}), ("b", {"polarization_factor": .5}), ("c", {"npt_1d": 80}),
                           ("d", {"polarization_factor": .7})):
-        (tmp_path / name).mkdir()
-        request = prepare_stitch_tool(replace(form, output_path=tmp_path / name / f"{name}_stitch1d.nexus",
-                                              **options)).request
+        prepared = prepare_stitch_tool(replace(form, output_family=name, **options))
+        assert prepared.request is not None, prepared
+        request = prepared.request
         result = run_stitch_operation(request)
         assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
-        paths.append(request.module.output.target)
+        paths.append(Path(request.module.output.target))  # All in form's one output folder, names still sealed.
         payloads.append(result.payload)
     return paths, payloads
 
@@ -433,20 +436,20 @@ def test_set_bg_subtracts_the_selected_results_mean_until_cleared_or_another_sel
     try:
         for path in paths:
             page.open_result(path)
-            _wait(page, qapp)
+            _wait(page, qapp, catalog=True)
         view, button = page.scientific, page.scientific.background
         view.plot_mode.setCurrentText("Overlay")
-        page.results.setCurrentRow(0)
-        page.results.clearSelection()
-        for row in (0, 1):  # a and b
-            page.results.item(row).setSelected(True)
-        _wait(page, qapp)
+        page.browser.set_current_result(str(paths[0]), keep_selection=False)
+        page.browser.set_current_result(str(paths[1]), keep_selection=True)  # a and b
+        _wait(page, qapp, catalog=True)
         assert not button.isHidden() and button.text() == "Set 1D BG"
+        assert set(page.browser.selected_results()) == {str(path) for path in paths[:2]}, (page.browser.listed_results(), page.browser.current_result(), page.browser.selected_results())
+        assert len(page._selected()) == 2, (tuple(page._payloads), page.browser.current_result(), page.browser.selected_results())
         raw = [np.asarray(payload.intensity, dtype=np.float64) for payload in payloads[:2]]
         first = lambda: np.asarray(page.curve.listDataItems()[0].yData, dtype=np.float64)  # noqa: E731 (Overlay
         # stacks the others with an offset)
         button.click()
-        assert button.text() == "Clear 1D BG", page.run_bar.readinessLabel.full_text()
+        assert button.text() == "Clear 1D BG", (page.run_bar.readinessLabel.full_text(), page._mode, page.browser.current_result(), [(path, type(page._display_payload(path, payload).view.intensity_1d).__name__, type(page._display_payload(path, payload).view.axis_1d.values).__name__) for path, payload in page._selected()])
         domain, rows, _key = page._background.projection()  # what the view is given
         mean = (raw[0] + raw[1]) / 2
         assert domain == "integrated_1d" and len(rows) == 2
@@ -459,8 +462,8 @@ def test_set_bg_subtracts_the_selected_results_mean_until_cleared_or_another_sel
         assert any(np.array_equal(first(), row) for row in raw)
         button.click()
         assert button.text() == "Clear 1D BG"
-        page.results.item(2).setSelected(True)  # another selection releases it
-        _wait(page, qapp)
+        page.browser.set_current_result(str(paths[2]), keep_selection=True)  # another selection releases it
+        _wait(page, qapp, catalog=True)
         assert button.text() == "Set 1D BG" and page._background.phase in {"EMPTY", "RELEASED"}
         stored = read_analysis_artifact(paths[0], expected_kind=AnalysisArtifactKind.STITCH_1D)
         np.testing.assert_array_equal(stored.intensity, payloads[0].intensity)  # display only
@@ -479,29 +482,31 @@ def test_average_sum_and_waterfall_show_the_selected_results_as_ints(qapp, tmp_p
     try:
         for path in paths:
             page.open_result(path)
-            _wait(page, qapp)
+            _wait(page, qapp, catalog=True)
         view = page.scientific
         view.plot_mode.setCurrentText("Overlay")
-        page.results.clearSelection()
-        for row in (0, 1):  # a and b: one grid
-            page.results.item(row).setSelected(True)
-        _wait(page, qapp)
+        page.browser.set_current_result(str(paths[0]), keep_selection=False)
+        page.browser.set_current_result(str(paths[1]), keep_selection=True)  # a and b: one grid
+        _wait(page, qapp, catalog=True)
+        assert set(page.browser.selected_results()) == {str(path) for path in paths[:2]}, (page.browser.listed_results(), page.browser.current_result(), page.browser.selected_results())
         first, second = payloads[0].intensity, payloads[1].intensity
         assert not np.array_equal(first, second)  # b's polarization factor changed it
         view.plot_mode.setCurrentText("Average")
-        _wait(page, qapp)
+        _wait(page, qapp, catalog=True)
         (curve,) = page.curve.listDataItems()
         both = np.stack([first, second]).astype(np.float64)  # the record's float32, folded as the view does
         np.testing.assert_allclose(curve.yData, np.nanmean(both, axis=0), rtol=1e-6)
         view.plot_mode.setCurrentText("Sum")
-        _wait(page, qapp)
+        _wait(page, qapp, catalog=True)
         (curve,) = page.curve.listDataItems()
         np.testing.assert_allclose(curve.yData, np.nansum(both, axis=0), rtol=1e-6)
         assert "one grid" not in view.status.text()
-        for row in (2, 3):  # c (80 points) and d
-            page.results.item(row).setSelected(True)
+        view.plot_mode.setCurrentText("Overlay")  # Shared browser accumulates visits in Overlay.
+        for path in paths[2:]:  # c (80 points) and d
+            page.browser.set_current_result(str(path), keep_selection=True)
+        assert set(page.browser.selected_results()) == set(map(str, paths))
         view.plot_mode.setCurrentText("Waterfall")
-        _wait(page, qapp)
+        _wait(page, qapp, catalog=True)
         assert view.bottom_stack.currentWidget() is view.waterfall
         # Maintainer, 2026-09-30: "can this be changed and made more flexible, at least for sum? This is only
         # for display" -- "bin them together on a common grid": on one grid spanning them, each interpolated
@@ -509,7 +514,7 @@ def test_average_sum_and_waterfall_show_the_selected_results_as_ints(qapp, tmp_p
                   for payload in payloads]
         for mode in ("Average", "Sum"):
             view.plot_mode.setCurrentText(mode)
-            _wait(page, qapp)
+            _wait(page, qapp, catalog=True)
             (curve,) = page.curve.listDataItems()
             x = np.asarray(curve.xData, dtype=float)
             assert x.size == max(radial.size for radial, _values in curves)  # as fine as the finest
@@ -526,23 +531,24 @@ def test_average_sum_and_waterfall_show_the_selected_results_as_ints(qapp, tmp_p
 def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_path, backend):
     from tests.xdart.tools.test_stitch_native_values import _native_form
     form = _native_form(tmp_path, backend, scans="1")
-    (tmp_path / "reference").mkdir()
-    reference_request = prepare_stitch_tool(
-        replace(form, output_path=tmp_path / "reference" / "reference_stitch1d.nexus")).request
+    prepared = prepare_stitch_tool(replace(form, output_family="reference"))
+    assert prepared.request is not None, prepared
+    reference_request = prepared.request
     reference = run_stitch_operation(reference_request)
     assert reference.terminal.disposition is ModuleDisposition.COMMITTED
+    reference_path = Path(reference_request.module.output.target)
     page = StitchPage(empty_host_services(_Status()))
     reopened = None
     try:
         page.load_form(form)
         page.preview_button.click()
-        _wait(page, qapp)
+        _wait(page, qapp, catalog=True)
         assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
         target = Path(page._owner.prepared.request.module.output.target)
         shown, summary = [], page.run_bar.set_readiness_summary
         page.run_bar.set_readiness_summary = lambda text, **k: (shown.append(str(text)), summary(text, **k))[1]
         page.run_bar.startButton.click()
-        _wait(page, qapp)
+        _wait(page, qapp, catalog=True)
         page.run_bar.set_readiness_summary = summary
         # the run bar says what it is doing, frames while stitching; never the raw stage names
         assert any(text.startswith("Stitching · frame ") for text in shown), shown
@@ -553,17 +559,17 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
             np.testing.assert_array_equal(getattr(payload, name), getattr(reference.payload, name))
         np.testing.assert_array_equal(page.curve.listDataItems()[0].xData, payload.axis("q"))
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, payload.intensity)
-        assert page.results.count() == 1
+        assert len(set(page.browser.listed_results()) & set(page._listed)) == 1
 
         page.preview_dialog.close()
         page.set_field("npt_1d", "80")  # changed inputs: Run checks them itself, as Int's Run
         assert page._prepared_revision is None
         assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
         page.run_bar.startButton.click()
-        _wait(page, qapp)
+        _wait(page, qapp, catalog=True)
         replacement = read_analysis_artifact(target)
         assert replacement.intensity.shape == (80,)
-        assert page.results.count() == 1
+        assert len(set(page.browser.listed_results()) & set(page._listed)) == 1
         assert not page.preview_dialog.isVisible()  # Preview stays optional
         assert page.run_bar.readinessLabel.full_text().startswith("Complete · ")
         assert page.shutdown().status is PageCleanup.CLEAN
@@ -571,25 +577,27 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
 
         reopened = StitchPage(empty_host_services(_Status()))
         reopened.open_result(target)
-        _wait(reopened, qapp)
+        _wait(reopened, qapp, catalog=True)
         assert reopened._owner.form is None
         assert reopened._owner.prepared is None
         assert not reopened.run_bar.startButton.isEnabled()
         np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData, replacement.intensity)
-        reopened.open_result(reference_request.module.output.target)
-        _wait(reopened, qapp)
+        reopened.open_result(reference_path)
+        _wait(reopened, qapp, catalog=True)
         reopened.scientific.plot_mode.setCurrentText("Overlay")
-        reopened.results.selectAll()
-        _wait(reopened, qapp)  # the result Single let go is read back (C12)
+        reopened.browser.set_current_result(str(reference_path), keep_selection=False)
+        reopened.browser.set_current_result(str(target), keep_selection=True)
+        _wait(reopened, qapp, catalog=True)  # the result Single let go is read back (C12)
+        assert set(reopened.browser.selected_results()) == {str(reference_path), str(target)}, (reopened.browser.listed_results(), reopened.browser.current_result(), reopened.browser.selected_results())
         assert len(reopened.curve.listDataItems()) == 2
         assert reopened.curve.listDataItems()[0].opts["pen"].color().getRgb() == (31, 119, 180, 255)
         reopened.scientific.previous_frame.click()
-        assert reopened.results.currentRow() == 0
-        assert len(reopened.results.selectedItems()) == 2
+        assert reopened.browser.listed_results().index(reopened.browser.current_result()) == 0
+        assert len(reopened.browser.selected_results()) == 2
         assert len(reopened.curve.listDataItems()) == 2
         reopened.scientific.next_frame.click()
-        assert reopened.results.currentRow() == 1
-        assert len(reopened.results.selectedItems()) == 2
+        assert reopened.browser.listed_results().index(reopened.browser.current_result()) == 1
+        assert len(reopened.browser.selected_results()) == 2
         reopened.scientific.color_map.setCurrentText("viridis")
         reopened.scientific.log_scale.click()  # as on Int: the image and the curve's intensity scale
         assert reopened._view.log_scale is True and reopened._view.color_map == "viridis"
@@ -617,7 +625,7 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         options.accept_button.click()
         np.testing.assert_array_equal(reopened.curve.listDataItems()[0].yData, shown.intensity)
         reopened.scientific.plot_mode.setCurrentText("Single")
-        assert len(reopened.results.selectedItems()) == 1
+        assert len(reopened.browser.selected_results()) == 1
         assert len(reopened.curve.listDataItems()) == 1
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
@@ -636,7 +644,7 @@ def test_reopen_corrupt_file_cannot_grant_run_or_replace_display(qapp, tmp_path)
     try:
         page.open_result(malformed)
         _wait(page, qapp)
-        assert page.results.count() == 0
+        assert len(set(page.browser.listed_results()) & set(page._listed)) == 0
         assert not page.run_bar.startButton.isEnabled()
         assert malformed.read_bytes() == before
         assert page._owner.prepared is None
@@ -734,9 +742,10 @@ def test_stop_while_run_checks_the_inputs_stitches_nothing(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
+        _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        assert page.results.count() == 1, page.run_bar.readinessLabel.full_text()
+        assert len(set(page.browser.listed_results()) & set(page._listed)) == 1, page.run_bar.readinessLabel.full_text()
         target = Path(page._owner.prepared.request.module.output.target)
         before = target.read_bytes()
         page.set_field("npt_1d", "80")
@@ -747,7 +756,7 @@ def test_stop_while_run_checks_the_inputs_stitches_nothing(qapp, tmp_path):
         _wait(page, qapp)
         assert page.run_bar.readinessLabel.full_text() == "Stopped before stitching"
         assert page._owner.prepared is not None  # the check itself finished
-        assert target.read_bytes() == before and page.results.count() == 1  # nothing replaced
+        assert target.read_bytes() == before and len(set(page.browser.listed_results()) & set(page._listed)) == 1  # nothing replaced
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
@@ -810,7 +819,10 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         assert page.build_form().conditioning == StitchConditioning("auto")
         page.run_bar.startButton.click()
         _wait(page, qapp, timeout=60)
-        assert page.results.count() == 2, page.run_bar.readinessLabel.full_text()
+        if backend == "multigeometry":
+            assert len(set(page.browser.listed_results()) & set(page._listed)) == 2, page.run_bar.readinessLabel.full_text()
+        else:  # XU-QUEUE remains held; its original assertion is unchanged.
+            assert page.results.count() == 2, page.run_bar.readinessLabel.full_text()
         status = page.run_bar.readinessLabel.full_text()  # skips and warnings stay on the status line
         assert "· 1 scan skipped" in status and status.endswith("(Preview lists them)")
         assert not page._queued_jobs
@@ -1150,7 +1162,7 @@ def test_reopened_result_marks_the_frames_the_check_excluded(qapp, tmp_path, mon
     from xrd_tools.analysis import stitch_operation
     from tests.core.test_frame_screen import test_grouped_scans_are_screened_only_against_themselves
     if not recorded:  # the writer before verdicts were persisted
-        monkeypatch.setattr(stitch_operation, "_record_frame_screen", lambda records, verdicts: None)
+        monkeypatch.setattr(stitch_operation, "_record_frame_screen", lambda records, verdicts, summary, source: None)
     target = test_grouped_scans_are_screened_only_against_themselves(tmp_path)
     page = StitchPage(empty_host_services(_Status()))
     try:
@@ -1303,7 +1315,8 @@ def test_a_refused_advanced_whole_number_holds_run_and_says_why(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(_native_form(tmp_path, "multigeometry", scans="1"))
-        assert page.run_bar.readinessLabel.full_text().startswith("Ready")
+        _wait(page, qapp)
+        assert page._readiness[0].startswith("Ready") and page._readiness[1]
         page.set_field("frame_step", "0")
         assert page.run_bar.readinessLabel.full_text() == "Needs Frame step: must be at least 1"
         assert not page.run_bar.startButton.isEnabled() and page._rows["frame_step"].editor.text() == "0"
@@ -1312,7 +1325,8 @@ def test_a_refused_advanced_whole_number_holds_run_and_says_why(qapp, tmp_path):
         assert page.run_bar.readinessLabel.full_text() == "Needs First frame: '1.5' is not a whole number"
         page.set_field("frame_start", "0")
         page.set_field("frame_stop", "")
-        assert page.run_bar.readinessLabel.full_text().startswith("Ready")
+        _wait(page, qapp)
+        assert page._readiness[0].startswith("Ready") and page._readiness[1]
     finally:
         page.shutdown()
         page.deleteLater()

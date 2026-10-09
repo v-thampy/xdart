@@ -598,20 +598,25 @@ def test_real_executor_pauses_at_durable_store_boundary(
     source_facts = []
     plan_configurations = []
     native_plan = executor_module.native_int_reduction_plan
-    real_integrator = executor_module.poni_to_integrator
+    from xrd_tools.session import readiness as readiness_module
+    native_binding = readiness_module.bind_native_int_source_energy
+
+    def bind_tiny_integrator(scan, calibration, **options):
+        effective = native_binding(scan, calibration, **options)
+        if not gi_enabled:
+            scan.integrator = _TinyIntegrator(scan.integrator)
+        return effective
+
     monkeypatch.setattr(
-        executor_module,
-        "poni_to_integrator",
-        lambda calibration: (real_integrator(calibration) if gi_enabled
-                             else _TinyIntegrator(real_integrator(calibration))),
+        readiness_module, "bind_native_int_source_energy", bind_tiny_integrator,
     )
 
-    def tiny_plan(configuration, **options):
+    def tiny_plan(configuration, *, energy_selection=None, **options):
         assert type(configuration) is FrozenRunConfiguration
         plan_configurations.append(configuration)
         # An ordinary Run asks the translation to declare its companion maps.
         assert options == {"companion_modes_2d": True}
-        plan = native_plan(configuration, **options)
+        plan = native_plan(configuration, energy_selection=energy_selection, **options)
         assert plan.integration_1d is not None
         assert plan.integration_1d.npt == 2
         assert plan.integration_2d is None
@@ -698,7 +703,12 @@ def test_real_executor_pauses_at_durable_store_boundary(
         projection=ContextProjection(),
     )
     controller.adopt_acquisition(launched.run_identity)
-    first_key = context.record_store.catalog_snapshot().entries[-1]
+    entries = context.record_store.catalog_snapshot().entries
+    assert entries, tuple(
+        (event.kind, event.detail, event.primary, event.cleanup_failures)
+        for event in observed + executor.drain_events()
+    )
+    first_key = entries[-1]
     first_payload = controller.project(first_key)
     assert first_payload is not None
     assert first_payload.measurement_mode == (

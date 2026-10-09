@@ -14,6 +14,7 @@ from xdart.gui.tabs.stitch.page import StitchPage, build_stitch_page
 from xdart.gui.tabs.stitch.settings import SESSION_KEY, dump_settings, load_settings
 from tests.xdart.pages.test_stitch_page import _Status, qapp  # noqa: F401
 from tests.xdart.tools.test_stitch_native_values import _native_form
+from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _wait
 
 
 def _close(page, qapp):
@@ -159,12 +160,14 @@ def test_a_load_waits_while_the_calibration_window_works(qapp, tmp_path):
         page._calibrate()
         dialog = page._calibration_dialog
         assert dialog is not None and not page._owner.busy
+        _wait(dialog)
         page._settings_path_chooser = lambda action, start: asked.append(action)  # then cancelled
         dialog.active = lambda: True  # a fit running
         assert page.load() == ActionRefused(
             "Stitch's calibration window is working; load settings when it is done")
         assert asked == []
         del dialog.active  # the fit done
+        _wait(dialog)
         assert page.load() == ActionCompleted("stitch-settings-load-cancelled") and asked == ["load"]
     finally:
         _close(page, qapp)
@@ -280,22 +283,26 @@ def test_calibrate_keeps_a_calibration_source_other_than_the_processing_scan(qap
     try:
         page._calibrate()  # a new dialog starts from the processing scan
         dialog = page._calibration_dialog
-        assert _calibration_source(dialog)[1:] == ("1", ("x-", "z+"))  # Stitch's frame, the default
+        _wait(dialog)
+        assert _calibration_source(dialog)[1:] == ("1", ("x+", "z-"))  # Processing scan uses native pixels.
         dialog._set_field_text("source", calibrant[0])
         dialog._set_field_text("scan", calibrant[1])
         from xrd_tools.core.geometry.camera import DetectorCamera
         dialog.camera.set_value(DetectorCamera(*calibrant[2]))
+        _wait(dialog)
         page._calibrate()  # opening it again keeps the calibrant scan
         assert _calibration_source(dialog) == calibrant
 
         restored.apply_settings(page.settings())
         restored._calibrate()  # so do the saved settings
+        _wait(restored._calibration_dialog)
         assert _calibration_source(restored._calibration_dialog) == calibrant
         unnamed = page.settings()
         unnamed["calibration"]["fields"]["source"] = ""  # saved without a calibration source
         sourceless.apply_settings(unnamed)
         sourceless._calibrate()
-        assert _calibration_source(sourceless._calibration_dialog)[1:] == ("1", ("x-", "z+"))
+        _wait(sourceless._calibration_dialog)
+        assert _calibration_source(sourceless._calibration_dialog)[1:] == ("1", ("x+", "z-"))
     finally:
         _close(page, qapp)
         _close(restored, qapp)

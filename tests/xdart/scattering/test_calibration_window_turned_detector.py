@@ -17,7 +17,7 @@ from xdart.gui.pages.services import empty_host_services
 from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
 from xrd_tools.core.geometry import ImageOrientation
 from xrd_tools.core.geometry.camera import stitch_camera
-from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _page_with_dialog, _save_to, _wait
+from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _page_with_dialog, _save_to, _stage_native_pairs, _wait
 
 QUARTER = {"270": ImageOrientation(rotation=270), "90": ImageOrientation(rotation=90),
            "270m": ImageOrientation(rotation=270, flip_horizontal=True),
@@ -215,10 +215,9 @@ def test_the_guided_fit_saved_for_a_quarter_turned_camera_carries_the_turned_mod
     dialog, close = _window(page_name, tmp_path)
     try:
         dialog.camera.set_value(stitch_camera(_TURNED))
+        dialog._set_field_text("beam_detector", model)
+        frames = _stage_native_pairs(dialog, frames, tmp_path / 'source')
         dialog._set_field_text("beam_detector", "Pilatus100k")  # not the frames' detector
-        dialog.frames, dialog._frame_motors = frames, ("del", "nu")
-        dialog._choices = [(index, dict(frame.motors), None) for index, frame in enumerate(frames)]
-        dialog._render_frames()
         dialog.fit_button.click()
         _wait(dialog)
         assert dialog.fit is None and "is not the Pilatus100k turned" in dialog.status.text(), dialog.status.text()
@@ -271,11 +270,11 @@ def test_pyfai_calib2_is_given_the_turned_model_s_gaps_and_never_a_bare_generic_
 
 def test_stitchs_calibration_window_keeps_its_own_starting_detector_and_camera(qapp, tmp_path):
     """Item 10 changes RSM's start only: Stitch's page names no starting detector or camera, so its window starts
-    on the Pilatus 300K-W in the native frame (camera x+, z−), RAW 195 × 1475."""
+    on the Pilatus 300K-W with its upright reset camera (x−, z+), RAW 195 × 1475."""
     page, dialog = _page_with_dialog(tmp_path)
     try:
         assert (dialog._text("beam_detector"), tuple(dialog.camera.value().to_xu()), dialog._text("shape")) == (
-            "Pilatus300kw", ("x+", "z-"), "195, 1475")
+            "Pilatus300kw", ("x-", "z+"), "195, 1475")
         assert dialog._image_size.text() == "1475 × 195 px (W × H)"
     finally:
         dialog.close()

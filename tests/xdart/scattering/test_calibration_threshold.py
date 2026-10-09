@@ -112,7 +112,9 @@ def test_detector_selection_supplies_whole_auto_counts_to_frame_prediction(qapp,
 
 def test_the_calibration_band_masks_pyfai_and_prediction_without_rewriting_pixels(qapp, tmp_path):
     from xrd_tools.integrate.calibration_seed import rough_arm_record
+    from xrd_tools.core.geometry.camera import STITCH_CAMERA
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Pilatus100k'))
+    dialog.camera.set_value(STITCH_CAMERA)  # frame() stages unchanged native pyFAI pixels.
     staged, image = frame(tmp_path / 'source')
     before = hashlib.sha256(open(staged.image_path, 'rb').read()).hexdigest()
     static = np.zeros(image.shape, bool)
