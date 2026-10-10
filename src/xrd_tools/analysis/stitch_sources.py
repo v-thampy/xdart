@@ -227,20 +227,10 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             if members:
                 groups.append(tuple(members))
 
-    def nexus_members(path, *, directory=False):
-        descriptor = describe_container(path)
-        kind = descriptor.kind
+    def nexus_members(path):
+        kind = describe_container(path).kind
         if kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
             raise ValueError(f"{path.name} is not a raw NeXus detector source")
-        if kind is SourceKind.EIGER_MASTER and descriptor.motor_names == ():
-            # Maintainer, 2026-10-09: "an eiger master file by itself is a valid source only for Int ... in
-            # stitch/rsm, the eiger file should be accompanied by the metadata source - nexus/spec".
-            reason = ("a detector-only Eiger master: Stitch and RSM read its scan's motors from its metadata "
-                      "source (SPEC or NeXus)")
-            if directory:
-                skipped.append((str(path), "entry", reason))
-                return ()
-            raise ValueError(f"{path.name} is {reason}")
         entries = tuple(list_entries(path))
         if not entries:
             raise ValueError(f"{path.name} has no NeXus entries")
@@ -271,7 +261,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                 resolved = path.resolve()
                 if resolved not in seen_nexus:
                     seen_nexus.add(resolved)
-                    groups.append(nexus_members(path, directory=True))
+                    groups.append(nexus_members(path))
     if len(groups) > 4096:
         raise ValueError("Selection exceeds 4096 result groups")
     if pending:
