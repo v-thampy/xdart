@@ -362,14 +362,19 @@ def test_a_generic_provider_read_after_close_before_materialize_fails_clearly(tm
 
 @pytest.mark.parametrize("field,units,value,expected", [
     ("energy", "eV", 16000.0, 16000.0),
-    ("energy", None, 16.0, 16000.0),  # no units: the legacy keV
+    ("energy", None, 16.0, 16000.0),  # below 1000: keV
+    ("energy", None, 16000.0, 16000.0),  # 1000 or more: eV
+    ("energy", "keV", 16000.0, 16000.0),  # a mislabel cannot mislead: the size decides
+    ("energy", "eV", 16.0, 16000.0),
     ("wavelength", None, 0.7749, 1.239841984e-6 / 0.7749e-10),  # no units: the legacy angstrom
     ("wavelength", "m", 0.7749e-10, 1.239841984e-6 / 0.7749e-10),
     ("energy", "J", 1.0, None),  # unsupported units: not served
 ])
 def test_a_generic_entrys_energy_is_served_in_ev_through_the_energy_owner(tmp_path, field, units, value, expected):
     """CAL-HELD-BATCH-20261009 (added after implementation): the monochromator energy, or its wavelength when no
-    energy is recorded, is served as eV through core.energy; undeclared units keep the legacy keV and angstrom."""
+    energy is recorded, is served as eV through core.energy. An X-ray energy's scale is decided by its size (maintainer:
+    "It should be easy enough to figure out if the energy is in eV or keV for X-rays"); an undeclared wavelength keeps
+    the legacy angstrom."""
     path = tmp_path / "mono.nxs"
     with h5py.File(path, "w") as h5:
         entry = h5.create_group("entry")

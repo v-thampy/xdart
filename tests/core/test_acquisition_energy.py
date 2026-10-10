@@ -264,3 +264,22 @@ def test_xu_energy_changes_q_without_changing_pose_corrections_or_default_identi
         np.testing.assert_allclose(q1, q0 * (16000. / 17000.018), rtol=2e-15)
         np.testing.assert_allclose(chi1, chi0, atol=1e-12)
         np.testing.assert_allclose(pol1, pol0, atol=2e-15)
+
+
+@pytest.mark.parametrize('recorded,units', [(16000., None), (16000., 'eV'), (16., 'keV'), (16., None)])
+def test_int_replay_reads_a_nexus_monochromator_energy_in_ev_or_kev(tmp_path, recorded, units):
+    """CAL-HELD-BATCH-20261009 (maintainer: "It should be easy enough to figure out if the energy is in eV or keV for
+    X-rays"): an Int run of a non-Bluesky container recording its monochromator energy as 16000 (eV) or 16 (keV),
+    labelled or not, selects a 16 keV metadata energy instead of refusing or misreading it."""
+    from xrd_tools.core.provenance import read_provenance
+    intent = _fixture(tmp_path / 'project')
+    with h5py.File(intent.source_spec.uri, 'r+') as handle:
+        del handle.attrs['creator']  # a non-Bluesky acquisition container
+        energy = handle.create_dataset('entry/instrument/monochromator/energy', data=recorded)
+        if units is not None:
+            energy.attrs['units'] = units
+    path = _replay(intent, 'run')
+    selection = read_provenance(path)['config']['energy_selection']
+    assert (selection['source'], selection['energy_eV']) == ('metadata', pytest.approx(16000., rel=1e-12, abs=0))
+    assert open_scan(path).metadata['wavelength_A'] == pytest.approx(energy_eV_to_wavelength_m(16000.) * 1e10)
+

@@ -562,3 +562,23 @@ def test_bluesky_motor_catalog_survives_a_master_filename(tmp_path):
     descriptor = describe_container(path)
     assert descriptor.motor_names == ("eta",)
     assert descriptor.is_bluesky
+
+
+@pytest.mark.parametrize("recorded,units", [(16000.0, None), (16000.0, "eV"), (16.0, "keV"), (16.0, None)])
+def test_a_containers_energy_is_read_in_ev_or_kev_by_its_size(tmp_path, recorded, units):
+    """CAL-HELD-BATCH-20261009 (maintainer: "It should be easy enough to figure out if the energy is in eV or keV for
+    X-rays"): a non-Bluesky container's monochromator energy below 1000 is keV and otherwise eV, labelled or not, so the
+    descriptor's wavelength and read_nexus's energy agree with the provider's eV for a 16 keV beam."""
+    from xrd_tools.io.nexus import read_nexus
+    from xrd_tools.transforms import energy_to_wavelength
+    path = tmp_path / "mono.nxs"
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/data", data=np.ones((2, 4, 4), np.uint16))
+        energy = entry.create_dataset("instrument/monochromator/energy", data=recorded)
+        if units is not None:
+            energy.attrs["units"] = units
+    assert describe_container(path).wavelength == pytest.approx(float(energy_to_wavelength(16.0)), rel=1e-12, abs=0)
+    assert read_nexus(path).energy == pytest.approx(16.0, rel=1e-12, abs=0)
+
