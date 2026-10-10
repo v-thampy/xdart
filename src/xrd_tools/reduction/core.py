@@ -5289,13 +5289,13 @@ class _ReductionIntegratorProvider:
         self.initial_incident_angle = initial_incident_angle
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
-        # An energy scan reduces each frame at its own wavelength on a private integrator.
+        # An energy scan reduces each frame at its own wavelength on a private integrator;
+        # a frame its energies do not list takes the representative (base) wavelength.
         self._frame_wavelengths = _energy_scan_wavelengths(plan)
-        self._base_wavelength = (
-            float(ai.wavelength) if ai is not None and ai.wavelength
-            else float(scan.poni.wavelength) if scan.poni is not None and scan.poni.wavelength
-            else None
-        )
+        self._base_wavelength = None
+        if self._frame_wavelengths is not None:
+            base = getattr(ai, "wavelength", None) or getattr(scan.poni, "wavelength", None)
+            self._base_wavelength = None if base is None else float(base)
 
     def _new_standard(self) -> Any:
         """Build one private standard integrator from the accepted calibration."""
