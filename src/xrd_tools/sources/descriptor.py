@@ -437,6 +437,7 @@ def describe_container_from_open(
         _read_saturation,
         _read_wavelength,
         acquisition_motor_names,
+        acquisition_wavelength,
     )
     from xrd_tools.io.processed_scan_id import (
         ProcessedXdartInputError,
@@ -588,7 +589,8 @@ def describe_container_from_open(
     wavelength: float | None = None
     if entry_grp is not None:
         try:
-            wl = _read_wavelength(entry_grp, _read_energy(entry_grp))
+            wl = (_read_wavelength(entry_grp, _read_energy(entry_grp)) if is_bluesky
+                  else acquisition_wavelength(entry_grp, facts["frame_count"]))
             wavelength = float(wl) if _finite(wl) else None
         except Exception:
             wavelength = None
@@ -635,7 +637,7 @@ def _describe_container_from_open_with_binding(
 
     from xrd_tools.io.nexus import (
         _bind_nexus_stack_from_entry, _read_energy, _read_saturation,
-        _read_wavelength,
+        _read_wavelength, acquisition_wavelength,
     )
     from xrd_tools.io.image import eiger_vendor_master
 
@@ -675,9 +677,8 @@ def _describe_container_from_open_with_binding(
         finalized = (not is_bluesky) or "end_time" in resolved_entry_group
         wavelength = None
         try:
-            raw = _read_wavelength(
-                resolved_entry_group, _read_energy(resolved_entry_group),
-            )
+            raw = (_read_wavelength(resolved_entry_group, _read_energy(resolved_entry_group))
+                   if is_bluesky else acquisition_wavelength(resolved_entry_group, frame_count))
             wavelength = float(raw) if _finite(raw) else None
         except Exception:
             pass

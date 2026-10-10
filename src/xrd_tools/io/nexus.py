@@ -427,38 +427,37 @@ def find_nexus_image_dataset(
         return find_nexus_image_dataset_in_open_file(f, entry)
 
 
-def _find_eiger_external_link_paths(
-    h5f: h5py.File, entry: str
-) -> list[str]:
-    """Return sorted ``/{entry}/data/data_NNNNNN`` external-link paths.
+def _external_detector_segment_names(data: h5py.Group) -> list[str]:
+    """Sorted linked detector segments, using declarations or dataset headers.
 
-    Eiger master files store the full image stack as a sequence of
-    sibling external links named ``data_000001``, ``data_000002``, ….
-    Each link resolves to a 3D ``(n_in_file, H, W)`` dataset; the full
-    scan is the concatenation along axis 0.
-
-    Returns an empty list if there are no external links under
-    ``/{entry}/data``.
+    Canonical ``data``/``data_NNN`` links remain selected when dangling or
+    malformed so binding refuses the whole stack rather than a landed prefix.
+    Other names must resolve to 2-D/3-D pixels; a dangling NXdata signal remains
+    provisional. Resolved scalar/1-D counters never become image segments.
     """
-    if entry not in h5f:
-        return []
-    grp = h5f[entry]
-    if "data" not in grp or not isinstance(grp["data"], h5py.Group):
-        return []
-    data_grp = grp["data"]
-    ext_keys: list[str] = []
-    for k in data_grp:
-        try:
-            link = data_grp.get(k, getlink=True)
-        except KeyError:
+    signal = data.attrs.get("signal", "")
+    if isinstance(signal, (bytes, np.bytes_)):
+        signal = signal.decode("utf-8", errors="replace")
+    names: list[str] = []
+    for name in sorted(data.keys()):
+        if not isinstance(data.get(name, getlink=True), h5py.ExternalLink):
             continue
-        if link.__class__.__name__ == "ExternalLink":
-            ext_keys.append(k)
-    if not ext_keys:
+        if name == "data" or (name.startswith("data_") and name[5:].isdigit()):
+            names.append(name)
+            continue
+        value = data.get(name)
+        if (isinstance(value, h5py.Dataset) and value.ndim in (2, 3)
+                or value is None and name == signal):
+            names.append(name)
+    return names
+
+
+def _find_eiger_external_link_paths(h5f: h5py.File, entry: str) -> list[str]:
+    """Linked detector selectors, excluding external scalar/1-D counters."""
+    group = h5f.get(f"{entry}/data")
+    if not isinstance(group, h5py.Group):
         return []
-    # Eiger names are zero-padded, so lexical sort = numeric order.
-    ext_keys.sort()
-    return [f"/{entry}/data/{k}" for k in ext_keys]
+    return [f"/{entry}/data/{name}" for name in _external_detector_segment_names(group)]
 
 
 class _NexusDatasetOwnerSlot:
@@ -747,12 +746,8 @@ def _bind_nexus_stack_from_entry(
 
     try:
         data_group = direct("data")
-        external_names: list[str] = []
-        if isinstance(data_group, h5py.Group):
-            for name in sorted(data_group.keys()):
-                link = data_group.get(name, getlink=True)
-                if isinstance(link, h5py.ExternalLink) and name.startswith("data_"):
-                    external_names.append(name)
+        external_names = (_external_detector_segment_names(data_group)
+                          if isinstance(data_group, h5py.Group) else [])
         if external_names:
             for name in external_names:
                 acquire(
@@ -4927,28 +4922,22 @@ def acquisition_motor_names(entry: h5py.Group, frame_count: int) -> tuple[str, .
     return tuple(item.name for item in acquisition_items(entry, frame_count)[0] if item.role == "motor")
 
 
-def read_acquisition_metadata(
-    entry: h5py.Group,
-    frame_count: int,
+def _acquisition_values(
+    entry: h5py.Group, items: tuple[AcquisitionItem, ...],
     *,
     motor_names: tuple[str, ...] | None = None,
     admit: Callable[[str, bool], Any] | None = None,
-) -> AcquisitionMetadata:
-    """Read a non-Bluesky *entry*'s supported acquisition metadata from its open handle.
-
-    *motor_names* restricts the motors (a prevalidated catalog); *admit(path, per_frame)*, when given, must return
-    each dataset before it is read (a bounded reader's own admission)."""
+    frame_index: int | None = None,
+):
+    """One conversion/admission seam for full tables, indexed rows and scalar energy."""
     from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m, wavelength_m_to_energy_eV
 
-    items, excluded = acquisition_items(entry, frame_count)
-    names: list[str] = []
-    per_frame: dict[str, np.ndarray] = {}
-    constants: dict[str, float] = {}
     for item in items:
         if item.role == "motor" and motor_names is not None and item.name not in motor_names:
             continue
         dataset = entry[item.path] if admit is None else admit(item.path, item.per_frame)
-        values = np.asarray(dataset[()], dtype=float)
+        selection = frame_index if item.per_frame and frame_index is not None else ()
+        values = np.asarray(dataset[selection], dtype=float)
         if item.unit == "rad":
             values = np.degrees(values)
         elif item.unit == "energy:kev":
@@ -4960,6 +4949,49 @@ def read_acquisition_metadata(
                 else wavelength_m_to_energy_eV(metres)
                 for value in np.atleast_1d(values)
             ]).reshape(values.shape)
+        yield item, values
+
+
+def acquisition_wavelength(entry: h5py.Group, frame_count: int) -> float | None:
+    """Generic scalar acquisition wavelength in Å, respecting admitted units.
+
+    Per-frame energy belongs to the provider rows, never a first-value descriptor.
+    """
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+
+    items = tuple(item for item in acquisition_items(entry, frame_count)[0]
+                  if item.role == "energy" and not item.per_frame)
+    for _, values in _acquisition_values(entry, items):
+        energy = float(values)
+        if np.isfinite(energy) and energy > 0:
+            return energy_eV_to_wavelength_m(energy) * 1e10
+    return None
+
+
+def read_acquisition_metadata_row(
+    entry: h5py.Group, frame_count: int, frame_index: int, *,
+    motor_names: tuple[str, ...] | None = None,
+    admit: Callable[[str, bool], Any] | None = None,
+) -> dict[str, float]:
+    """Read only one supported row from the held entry, without whole-scan arrays."""
+    if not 0 <= frame_index < frame_count:
+        return {}
+    items, _ = acquisition_items(entry, frame_count)
+    return {item.name: float(value) for item, value in _acquisition_values(
+        entry, items, motor_names=motor_names, admit=admit, frame_index=frame_index)}
+
+
+def read_acquisition_metadata(
+    entry: h5py.Group, frame_count: int, *,
+    motor_names: tuple[str, ...] | None = None,
+    admit: Callable[[str, bool], Any] | None = None,
+) -> AcquisitionMetadata:
+    """Read a supported table once, sharing indexed-row conversion and admission."""
+    items, excluded = acquisition_items(entry, frame_count)
+    names: list[str] = []
+    per_frame: dict[str, np.ndarray] = {}
+    constants: dict[str, float] = {}
+    for item, values in _acquisition_values(entry, items, motor_names=motor_names, admit=admit):
         if item.per_frame:
             per_frame[item.name] = values
         else:

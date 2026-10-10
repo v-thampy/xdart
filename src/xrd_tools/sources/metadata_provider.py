@@ -307,12 +307,12 @@ class BlueskyMetadataProvider(MetadataProvider):
 class NexusMetadataProvider(MetadataProvider):
     """Lazy supported acquisition metadata of a non-Bluesky NeXus entry.
 
-    Nothing is read until the first metadata access; then every supported item
-    is read once from the held entry and served from memory with the Bluesky
+    Complete rows read only indexed values from the held entry. Table access
+    materializes the supported items once and serves them with the Bluesky
     provider's surfaces: ``motors`` holds the per-frame motors in degrees,
     ``metadata_for`` the counters, the energy in eV and the constants (one-value
-    motors and energy), and ``complete_metadata_for`` composes both.  A read
-    after the owning cursor closed before that first access fails clearly.  On
+    motors and energy). A read after the owning cursor closed before table
+    materialization fails clearly, even if rows were streamed earlier. On
     the Average route the prevalidated motor names restrict the motors, and each
     dataset passes Average's bounded admission before it is read.
     """
@@ -335,16 +335,15 @@ class NexusMetadataProvider(MetadataProvider):
         if self._metadata is None:
             self._entry = _SOURCE_CLOSED
 
-    def _read(self) -> Any:
-        if self._metadata is not None:
-            return self._metadata
+    def _live_entry(self) -> Any:
         entry = self._entry
         if entry is _SOURCE_CLOSED:
             raise MetadataSourceClosedError(
                 "metadata provider read after its cursor closed before the "
                 "per-frame table was materialized; open a fresh cursor")
-        from xrd_tools.io.nexus import read_acquisition_metadata
-        admit = None
+        return entry
+
+    def _admission(self, entry: Any) -> Any:
         if self._all_motor_names is not None:
             from xrd_tools.io.bluesky_nexus import (
                 _average_fixed_numeric_dataset,
@@ -354,8 +353,30 @@ class NexusMetadataProvider(MetadataProvider):
             def admit(path: str, per_frame: bool) -> Any:
                 return _average_fixed_numeric_dataset(
                     _average_hard_path(entry, path), scalar_only=not per_frame)
+            return admit
+        return None
+
+    def complete_metadata_for(self, frame_index: int) -> Mapping[str, Any]:
+        pos = int(frame_index)
+        if not 0 <= pos < self._frame_count:
+            return {}
+        if self._metadata is not None:
+            return super().complete_metadata_for(pos)
+        from xrd_tools.io.nexus import read_acquisition_metadata_row
+
+        entry = self._live_entry()
+        return read_acquisition_metadata_row(
+            entry, self._frame_count, pos, motor_names=self._all_motor_names,
+            admit=self._admission(entry))
+
+    def _read(self) -> Any:
+        if self._metadata is not None:
+            return self._metadata
+        from xrd_tools.io.nexus import read_acquisition_metadata
+
+        entry = self._live_entry()
         self._metadata = read_acquisition_metadata(
-            entry, self._frame_count, motor_names=self._all_motor_names, admit=admit)
+            entry, self._frame_count, motor_names=self._all_motor_names, admit=self._admission(entry))
         self._entry = None
         return self._metadata
 
