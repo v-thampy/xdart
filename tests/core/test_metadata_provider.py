@@ -362,8 +362,8 @@ def test_a_generic_provider_read_after_close_before_materialize_fails_clearly(tm
 
 @pytest.mark.parametrize("field,units,value,expected", [
     ("energy", "eV", 16000.0, 16000.0),
-    ("energy", None, 16.0, 16000.0),  # below 1000: keV
-    ("energy", None, 16000.0, 16000.0),  # 1000 or more: eV
+    ("energy", None, 16.0, 16000.0),  # up to 150: keV
+    ("energy", None, 16000.0, 16000.0),  # above 150: eV
     ("energy", "keV", 16000.0, 16000.0),  # a mislabel cannot mislead: the size decides
     ("energy", "eV", 16.0, 16000.0),
     ("wavelength", None, 0.7749, 1.239841984e-6 / 0.7749e-10),  # no units: the legacy angstrom

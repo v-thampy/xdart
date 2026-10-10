@@ -567,7 +567,7 @@ def test_bluesky_motor_catalog_survives_a_master_filename(tmp_path):
 @pytest.mark.parametrize("recorded,units", [(16000.0, None), (16000.0, "eV"), (16.0, "keV"), (16.0, None)])
 def test_a_containers_energy_is_read_in_ev_or_kev_by_its_size(tmp_path, recorded, units):
     """CAL-HELD-BATCH-20261009 (maintainer: "It should be easy enough to figure out if the energy is in eV or keV for
-    X-rays"): a non-Bluesky container's monochromator energy below 1000 is keV and otherwise eV, labelled or not, so the
+    X-rays"): a non-Bluesky container's monochromator energy up to 150 is keV and otherwise eV, labelled or not, so the
     descriptor's wavelength and read_nexus's energy agree with the provider's eV for a 16 keV beam."""
     from xrd_tools.core.energy import energy_eV_to_wavelength_m
     from xrd_tools.io.nexus import read_nexus

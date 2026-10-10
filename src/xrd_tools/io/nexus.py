@@ -4549,7 +4549,7 @@ def _scalar_or_first(ds: h5py.Dataset) -> float:
 def _read_energy(grp: h5py.Group) -> float:
     """Extract beam energy (keV) from the monochromator group.
 
-    A recorded eV value (1000 or more) is converted: an X-ray energy's scale is
+    A recorded eV value (above 150) is converted: an X-ray energy's scale is
     decided by its size (:func:`xrd_tools.core.energy.xray_energy_keV`)."""
     from xrd_tools.core.energy import xray_energy_keV
     from xrd_tools.io.bluesky_nexus import bluesky_energy_kev, is_bluesky_nxwriter
