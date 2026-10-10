@@ -18,9 +18,12 @@ after that the live h5py entry reference is dropped, so repeated reads touch
 only memory and never reopen the source master.  Providers return ordinary
 Python/numpy values, never live ``h5py`` dataset objects.
 
-Plain NeXus / Eiger raw stacks (no Bluesky marker) get an
-:class:`EmptyMetadataProvider`: their per-frame metadata is sidecar-sourced and
-stays owned by the existing sidecar path, unchanged by R2.
+Any other NeXus entry with supported acquisition metadata (CAL-HELD-BATCH-20261009:
+positioners, NXdata axes, counters, the monochromator energy, read by
+:func:`xrd_tools.io.nexus.read_acquisition_metadata`) gets a lazy
+:class:`NexusMetadataProvider` with the same surfaces.  The rest, including a
+detector-only Eiger master, get an :class:`EmptyMetadataProvider`: their per-frame
+metadata comes from a SPEC/NeXus/txt companion, unchanged by R2.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ __all__ = [
     "BlueskyMetadataProvider",
     "EmptyMetadataProvider",
     "MetadataSourceClosedError",
+    "NexusMetadataProvider",
     "metadata_provider_for_open_entry",
 ]
 
@@ -300,6 +304,92 @@ class BlueskyMetadataProvider(MetadataProvider):
         return out
 
 
+class NexusMetadataProvider(MetadataProvider):
+    """Lazy supported acquisition metadata of a non-Bluesky NeXus entry.
+
+    Nothing is read until the first metadata access; then every supported item
+    is read once from the held entry and served from memory with the Bluesky
+    provider's surfaces: ``motors`` holds the per-frame motors in degrees,
+    ``metadata_for`` the counters, the energy in eV and the constants (one-value
+    motors and energy), and ``complete_metadata_for`` composes both.  A read
+    after the owning cursor closed before that first access fails clearly.  On
+    the Average route the prevalidated motor names restrict the motors, and each
+    dataset passes Average's bounded admission before it is read.
+    """
+
+    def __init__(self, entry_grp: Any, *, frame_count: int,
+                 wavelength: float | None = None,
+                 wavelength_unit: WavelengthUnit | None = None,
+                 all_motor_names: tuple[str, ...] | None = None) -> None:
+        self._entry = entry_grp          # live h5py group; dropped after the read
+        self._frame_count = int(frame_count)
+        self._wavelength = wavelength
+        self._wavelength_unit = wavelength_unit
+        self._all_motor_names = all_motor_names
+        self._metadata: Any = None
+
+    def frame_count(self) -> int | None:
+        return self._frame_count
+
+    def mark_source_closed(self) -> None:
+        if self._metadata is None:
+            self._entry = _SOURCE_CLOSED
+
+    def _read(self) -> Any:
+        if self._metadata is not None:
+            return self._metadata
+        entry = self._entry
+        if entry is _SOURCE_CLOSED:
+            raise MetadataSourceClosedError(
+                "metadata provider read after its cursor closed before the "
+                "per-frame table was materialized; open a fresh cursor")
+        from xrd_tools.io.nexus import read_acquisition_metadata
+        admit = None
+        if self._all_motor_names is not None:
+            from xrd_tools.io.bluesky_nexus import (
+                _average_fixed_numeric_dataset,
+                _average_hard_path,
+            )
+
+            def admit(path: str, per_frame: bool) -> Any:
+                return _average_fixed_numeric_dataset(
+                    _average_hard_path(entry, path), scalar_only=not per_frame)
+        self._metadata = read_acquisition_metadata(
+            entry, self._frame_count, motor_names=self._all_motor_names, admit=admit)
+        self._entry = None
+        return self._metadata
+
+    def motors(self) -> dict[str, np.ndarray]:
+        metadata = self._read()
+        return {name: metadata.per_frame[name] for name in metadata.motor_names
+                if name in metadata.per_frame}
+
+    def scan_table(self) -> dict[str, np.ndarray]:
+        return dict(self._read().per_frame)
+
+    def constants(self) -> dict[str, float]:
+        return dict(self._read().constants)
+
+    def wavelength(self) -> float | None:
+        return self._wavelength
+
+    def wavelength_unit(self) -> WavelengthUnit | None:
+        return self._wavelength_unit
+
+    def metadata_for(self, frame_index: int) -> Mapping[str, Any]:
+        metadata = self._read()
+        pos = int(frame_index)
+        if not 0 <= pos < self._frame_count:
+            return {}
+        out: dict[str, Any] = {
+            name: float(values[pos]) for name, values in metadata.per_frame.items()
+            if name not in metadata.motor_names
+        }
+        for name, value in metadata.constants.items():
+            out.setdefault(name, float(value))
+        return out
+
+
 def _validate_prequalified_motor_pair(scanned, all_names) -> None:
     pair = (scanned, all_names)
     if any(value is not None for value in pair) and any(
@@ -321,10 +411,12 @@ def metadata_provider_for_open_entry(
 ) -> MetadataProvider:
     """Build the right provider for an OPEN entry group.
 
-    A Bluesky/NXWriter entry gets a lazy :class:`BlueskyMetadataProvider`; every
-    other raw stack gets an :class:`EmptyMetadataProvider` (sidecar behavior
-    preserved).  ``is_bluesky`` may be supplied (e.g. from the descriptor) to
-    avoid re-detecting; otherwise it is probed once from the open group.
+    A Bluesky/NXWriter entry gets a lazy :class:`BlueskyMetadataProvider`; any
+    other entry with supported acquisition metadata a lazy
+    :class:`NexusMetadataProvider`; every other raw stack an
+    :class:`EmptyMetadataProvider` (sidecar behavior preserved).  ``is_bluesky``
+    may be supplied (e.g. from the descriptor) to avoid re-detecting; otherwise
+    it is probed once from the open group.
     ``wavelength_unit`` is the caller's explicit unit declaration for
     ``wavelength`` (R3-P1) — retained as value-only provider state.
     """
@@ -344,5 +436,10 @@ def metadata_provider_for_open_entry(
             wavelength_unit=wavelength_unit,
             scanned_motor_names=scanned_motor_names,
             all_motor_names=all_motor_names)
+    from xrd_tools.io.nexus import acquisition_items
+    if acquisition_items(entry_grp, frame_count)[0]:
+        return NexusMetadataProvider(
+            entry_grp, frame_count=frame_count, wavelength=wavelength,
+            wavelength_unit=wavelength_unit, all_motor_names=all_motor_names)
     return EmptyMetadataProvider(
         wavelength=wavelength, wavelength_unit=wavelength_unit)

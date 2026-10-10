@@ -13,7 +13,9 @@ import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import fabio
 import h5py
@@ -81,9 +83,50 @@ COMMON_RAW_DETECTOR_SHAPES: tuple[tuple[str, tuple[int, int]], ...] = (
 )
 
 
-def _is_eiger_master(path: Path) -> bool:
-    """Return True if *path* looks like an Eiger HDF5 master file."""
-    return path.stem.endswith("_master")
+# Eiger content (CAL-HELD-BATCH-20261009).  Two independent facts of an open
+# NeXus entry decide Eiger handling; the file name and extension never do.
+
+def eiger_vendor_master(entry: Any) -> bool:
+    """Whether an open NeXus *entry* is a DECTRIS Eiger master: its detector holds the
+    vendor configuration (``detectorSpecific/eiger_fw_version``).  This alone makes the
+    EIGER_MASTER kind (direct decode, the Average and discovery lanes)."""
+    try:
+        return (isinstance(entry, h5py.Group)
+                and "instrument/detector/detectorSpecific/eiger_fw_version" in entry)
+    except Exception:
+        return False
+
+
+def eiger_split_layout(entry: Any) -> bool:
+    """Whether an open NeXus *entry* links its images from other files: external links
+    under ``entry/data`` (an Eiger master's ``data_000001``, ...).  This alone routes
+    image reads through :func:`~xrd_tools.io.nexus.open_nexus_image_stack`, which
+    concatenates exactly those segments, whatever the vendor or file name."""
+    try:
+        data = entry.get("data") if isinstance(entry, h5py.Group) else None
+        return isinstance(data, h5py.Group) and any(  # a link is never resolved here
+            isinstance(data.get(name, getlink=True), h5py.ExternalLink) for name in data)
+    except Exception:
+        return False
+
+
+def eiger_content(path: Path | str) -> tuple[bool, bool]:
+    """``(eiger_vendor_master, eiger_split_layout)`` of the HDF5 file at *path*, cached
+    by (path, mtime_ns, size).  A file that cannot be read is neither, and is not cached."""
+    try:
+        state = Path(path).stat()
+        return _eiger_content_at(str(path), state.st_mtime_ns, state.st_size)
+    except Exception:
+        return False, False
+
+
+@lru_cache(maxsize=256)
+def _eiger_content_at(path: str, mtime_ns: int, size: int) -> tuple[bool, bool]:
+    from xrd_tools.io.bluesky_nexus import resolve_nxentry
+
+    with h5py.File(path, "r") as handle:
+        entry = resolve_nxentry(handle, "entry")
+        return eiger_vendor_master(entry), eiger_split_layout(entry)
 
 
 def resolve_detector_shape(
@@ -175,7 +218,7 @@ def read_detector_image_layout(
     suffix = selected.suffix.lower()
     saturation = None
     if suffix in _HDF5_READ_EXTS:
-        if suffix in {".h5", ".hdf5"} and _is_eiger_master(selected):
+        if suffix in {".h5", ".hdf5"} and eiger_content(selected)[1]:
             from xrd_tools.io.nexus import open_nexus_image_stack
             with open_nexus_image_stack(selected) as stack:
                 shape = tuple(int(value) for value in stack.shape[1:])
@@ -392,7 +435,7 @@ def read_image(
         if not exact_frame:
             _reject_if_processed_xdart(path)
         arr = _read_hdf5_frame(path, frame, dataset_path, exact=exact_frame)
-    elif ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+    elif ext in {".h5", ".hdf5"} and eiger_content(path)[1]:
         from xrd_tools.io.nexus import open_nexus_image_stack
         with open_nexus_image_stack(path) as stack:
             arr = np.asarray(stack[frame])
@@ -455,7 +498,7 @@ def read_image_stack(
         )
 
     if ext in _HDF5_READ_EXTS:
-        if ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+        if ext in {".h5", ".hdf5"} and eiger_content(path)[1]:
             from xrd_tools.io.nexus import open_nexus_image_stack
             with open_nexus_image_stack(path) as stack:
                 arr = np.asarray(stack[:])
@@ -671,7 +714,7 @@ def count_frames(path: Path | str) -> int:
     path = Path(path)
     ext = path.suffix.lower()
     try:
-        if ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+        if ext in {".h5", ".hdf5"} and eiger_content(path)[1]:
             from xrd_tools.io.nexus import open_nexus_image_stack
             with open_nexus_image_stack(path) as stack:
                 return int(stack.shape[0])

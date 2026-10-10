@@ -62,6 +62,8 @@ def _eiger_master(root: Path, extents=(2, 3)) -> tuple[Path, tuple[Path, ...]]:
     master = root / "scan_master.h5"
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version",
+                             data=np.bytes_("release-2022.1.2"))  # the DECTRIS vendor block
         data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
         for ordinal, path in enumerate(members, 1):
             data[f"data_{ordinal:06d}"] = h5py.ExternalLink(path.name, "/entry/data/data")
@@ -2836,3 +2838,34 @@ def test_average_reads_a_generic_nexus_containers_motors(tmp_path) -> None:
     )
     with graph.open_source_execution_graph(value) as window:
         assert window.complete_metadata_for(1)["eta"] == pytest.approx(0.25, rel=0, abs=1e-12)
+
+
+def test_average_reads_generic_metadata_only_through_its_own_bounds(tmp_path) -> None:
+    """CAL-HELD-BATCH-20261009 (added after implementation): on the prevalidated Average route the generic provider
+    reads each metadata dataset through Average's unchanged bounded admission, so a soft-linked sample positioner
+    value (Int resolves it) refuses there with Average's reason before it is read."""
+    from tests.core.test_metadata_provider import _acquisition
+    path = tmp_path / "acquisition.nxs"
+    _acquisition(path)
+    with h5py.File(path, "a") as handle:
+        del handle["entry/instrument/positioners/chi"]
+        del handle["entry/instrument/monochromator/energy"]
+        del handle["entry/sample/positioners/eta/value"]
+        handle["entry/sample/positioners/eta/value"] = h5py.SoftLink("/entry/instrument/positioners/omega/value")
+    value = graph.qualify_source_execution_graph(
+        SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta", reader_binding="average_closed_v1",
+    )
+    with graph.open_source_execution_graph(value) as window:
+        with pytest.raises(ValueError, match="AVERAGE_METADATA_INDIRECTION_UNSUPPORTED"):
+            window.complete_metadata_for(0)
+
+
+def test_a_selected_motor_recorded_unsupported_is_refused_with_its_reason(tmp_path) -> None:
+    """CAL-HELD-BATCH-20261009 (added after implementation): a motor the container records but its supported metadata
+    excludes is refused with the named exclusion, not only the supported locations."""
+    from tests.core.test_metadata_provider import _acquisition
+    path = tmp_path / "acquisition.nxs"
+    _acquisition(path)
+    with pytest.raises(ValueError, match=r"'x' is not in acquisition\.nxs's supported scan metadata "
+                                         r"\(x: units 'mm' are not an angle\); choose Manual"):
+        graph.qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="x")

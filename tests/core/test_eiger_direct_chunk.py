@@ -95,6 +95,7 @@ def test_external_link_direct_chunks_decode_tail_and_stay_detached_in_cursor_ord
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         data = entry.create_group("data")
         for position, path in enumerate(paths, 1):
             data[f"data_{position:06d}"] = h5py.ExternalLink(path.name, "/data")
@@ -167,6 +168,7 @@ def test_average_window_uses_exact_direct_grant_and_matches_conventional_frames(
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         data = entry.create_group("data")
         data["data_000001"] = h5py.ExternalLink(data_path.name, "/data")
 
@@ -232,6 +234,7 @@ def test_average_direct_iterator_cancellation_is_terminal_cancelled(
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         entry.create_group("data").create_dataset(
             "data_000001", data=np.ones((1, 17, 17), dtype="u2"),
             chunks=(1, 17, 17), **hdf5plugin.Bitshuffle(cname="lz4"),
@@ -278,6 +281,7 @@ def test_average_direct_shutdown_failure_is_terminal_not_retryable(
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         entry.create_group("data").create_dataset(
             "data_000001", data=np.ones((1, 17, 17), dtype="u2"),
             chunks=(1, 17, 17), **hdf5plugin.Bitshuffle(cname="lz4"),
@@ -375,6 +379,7 @@ def test_average_window_direct_layout_refusal_falls_back_once(
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         entry.create_group("data").create_dataset(
             "data_000001", data=expected, chunks=(1, 2, 2),
             **hdf5plugin.Bitshuffle(cname="lz4"),
@@ -435,6 +440,7 @@ def test_average_provenance_records_terminal_direct_and_fallback_counts(
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         entry.create_group("data")["data_000001"] = h5py.ExternalLink(
             data_path.name, "/data",
         )
@@ -504,6 +510,7 @@ def test_average_plan_qualifies_layout_before_direct_grant(
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         entry.create_group("data").create_dataset(
             "data_000001", data=expected, chunks=(1, 2, 2),
         )
@@ -554,6 +561,7 @@ def test_missing_imagecodecs_refuses_direct_decode_and_uses_conventional_blocks(
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         data = entry.create_group("data")
         data["data_000001"] = h5py.ExternalLink(data_path.name, "/data")
 

@@ -777,7 +777,7 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
         handle = _HDF5_FILE_OPEN(path, "r", **({"rdcc_nbytes": 1 << 20} if reader_binding else {}))
         slot = _NexusDatasetOwnerSlot(); error = None; descriptor = None
         external_members: list[ExternalSourceState] = []; dependencies: list[SourceFileState] = []
-        external_index = dependency_index = 0; pair: tuple[Any, Any] = (None, None)
+        external_index = dependency_index = 0; pair: tuple[Any, Any] = (None, None); excluded = ()
         def emit_external(value: ExternalSourceState) -> None:
             nonlocal external_index
             if expected is not None and external_index >= len(expected.stamp.external_members):
@@ -806,6 +806,11 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
                     raise ValueError(f"selected container has no compatible owner: {path}")
                 descriptor = describe_container_from_open(handle, path=path, entry=entry_name,
                     size=before.size, mtime_ns=before.mtime_ns, adapter_id=owner.id)
+                if selected_motor is not None and selected_motor not in (descriptor.motor_names or ()) \
+                        and not descriptor.is_bluesky and descriptor.frame_count > 0:
+                    from xrd_tools.io.nexus import acquisition_items
+                    excluded = tuple(reason for reason in acquisition_items(entry_group, descriptor.frame_count)[1]
+                                     if reason.startswith(f"{selected_motor}: "))
                 # Keep the selected entry already resolved from this open
                 # graph. Raw Run permits external/soft entry links; Average's
                 # bounded reader above deliberately requires a hard link.
@@ -851,7 +856,12 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
             all_motors = tuple(pair[1] or ()) if reader_binding else descriptor.motor_names
             scanned = tuple(pair[0] or ()) if reader_binding else None
             if selected_motor is not None and selected_motor not in (all_motors or ()):
-                raise ValueError("selected motor is absent from the container")
+                where = "; ".join(excluded) or (
+                    "Average reads instrument positioners and Bluesky baseline motors" if reader_binding
+                    else "Bluesky positioners and baseline motors" if descriptor.is_bluesky
+                    else "NXpositioner values under entry/sample or entry/instrument, or NXdata axes")
+                raise ValueError(f"selected motor {selected_motor!r} is not in {path.name}'s supported scan "
+                                 f"metadata ({where}); choose Manual or a SPEC/NeXus metadata source")
             group = descriptor.scan_name or path.stem.removesuffix("_master")
             execution = SourceSpec(path, descriptor.kind, metadata_uri=source.metadata_uri,
                 entry=descriptor.resolved_entry or entry_name, options=dict(source.options))

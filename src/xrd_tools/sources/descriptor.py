@@ -430,12 +430,13 @@ def describe_container_from_open(
         return descriptor
 
     from xrd_tools.io.bluesky_nexus import is_bluesky_nxwriter, resolve_nxentry
-    from xrd_tools.io.image import _is_eiger_master
+    from xrd_tools.io.image import eiger_vendor_master
     from xrd_tools.io.nexus import (
         UnsupportedDetectorRankError,
         _read_energy,
         _read_saturation,
         _read_wavelength,
+        acquisition_motor_names,
     )
     from xrd_tools.io.processed_scan_id import (
         ProcessedXdartInputError,
@@ -486,16 +487,19 @@ def describe_container_from_open(
     scan_name = _scan_name(path)
 
     motor_names = None
-    if entry_grp is not None and _is_eiger_master(path) and not is_bluesky:
-        # An Eiger master records no scan metadata: its frames' provider is empty, and its motors come from a proper
-        # NeXus, SPEC or txt source (maintainer, 2026-10-09). Positioners written into one named motors no frame resolves.
-        motor_names = ()
-    elif entry_grp is not None:
+    if entry_grp is not None and is_bluesky:
         try:
             from xrd_tools.io.bluesky_nexus import bluesky_all_motor_names
             motor_names = tuple(bluesky_all_motor_names(entry_grp))
         except Exception:
             pass
+    elif entry_grp is not None:
+        # Any other entry names the motors its supported acquisition metadata
+        # resolves (io.nexus.acquisition_items, as its frames' provider reads
+        # them), which needs the frame count: set once READY below.  A
+        # detector-only Eiger master names none; its motors come from a SPEC,
+        # NeXus or txt companion (maintainer, 2026-10-09).
+        motor_names = ()
     common: dict[str, Any] = dict(
         path=path, size=size, mtime_ns=mtime_ns, adapter_id=adapter_id,
         scan_name=scan_name, requested_entry=entry, resolved_entry=resolved_entry,
@@ -523,7 +527,7 @@ def describe_container_from_open(
             reason="integrated result groups are not raw detector frames",
             **common)
 
-    kind = SourceKind.EIGER_MASTER if _is_eiger_master(path) else SourceKind.NEXUS_STACK
+    kind = SourceKind.EIGER_MASTER if eiger_vendor_master(entry_grp) else SourceKind.NEXUS_STACK
 
     try:
         if _apstools_flat_nxdata_contract(h5f, entry_grp):
@@ -597,6 +601,11 @@ def describe_container_from_open(
         state, reason = ProbeState.IMAGELESS, "zero-frame detector dataset"
     else:
         state, reason = ProbeState.READY, "detector dataset present"
+    if entry_grp is not None and not is_bluesky and facts["frame_count"] > 0:
+        try:
+            common["motor_names"] = acquisition_motor_names(entry_grp, facts["frame_count"])
+        except Exception:
+            pass
 
     return ContainerDescriptor(
         state=state, kind=kind, reason=reason,
@@ -628,7 +637,7 @@ def _describe_container_from_open_with_binding(
         _bind_nexus_stack_from_entry, _read_energy, _read_saturation,
         _read_wavelength,
     )
-    from xrd_tools.io.image import _is_eiger_master
+    from xrd_tools.io.image import eiger_vendor_master
 
     selected = Path(path)
     if candidate is not None:
@@ -673,7 +682,7 @@ def _describe_container_from_open_with_binding(
         except Exception:
             pass
         resolved = resolved_entry_group.name.strip("/").split("/")[-1] or entry
-        kind = (SourceKind.EIGER_MASTER if _is_eiger_master(selected)
+        kind = (SourceKind.EIGER_MASTER if eiger_vendor_master(resolved_entry_group)
                 else SourceKind.NEXUS_STACK)
         descriptor = ContainerDescriptor(
             path=selected, size=size, mtime_ns=mtime_ns, adapter_id=adapter_id,

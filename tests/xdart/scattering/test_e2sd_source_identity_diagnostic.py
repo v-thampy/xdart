@@ -642,6 +642,8 @@ def test_selected_eiger_master_keeps_container_owner_and_frame_count(
             sidecar.name,
             "/entry/data/data",
         )
+        handle.create_dataset("entry/instrument/detector/detectorSpecific/eiger_fw_version",
+                              data="release-2022.1.2")  # the DECTRIS vendor block
     poni = tmp_path / "cal.poni"
     write_poni(poni)
     source = image_series_spec(master)

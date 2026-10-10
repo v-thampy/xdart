@@ -226,13 +226,20 @@ def test_discover_scans_uses_natural_file_order(tmp_path):
 
 
 def test_discover_scans_eiger_filters_master(tmp_path):
-    """Eiger discovery returns only the _master file, not the sibling data files."""
-    (tmp_path / "scan_master.h5").write_bytes(b"")
+    """Eiger discovery returns the DECTRIS masters, known by their vendor detector configuration whatever their
+    name (CAL-HELD-BATCH-20261009), never the sibling data files, which are skipped unopened by their exact names."""
+    import h5py
+    for name, vendor in (("scan_master.h5", True), ("renamed.h5", True), ("plain_master.h5", False)):
+        with h5py.File(tmp_path / name, "w") as handle:
+            handle.create_group("entry").attrs["NX_class"] = "NXentry"
+            if vendor:
+                handle.create_dataset("entry/instrument/detector/detectorSpecific/eiger_fw_version",
+                                      data="release-2022.1.2")
     (tmp_path / "scan_data_000001.h5").write_bytes(b"")
     (tmp_path / "scan_data_000002.h5").write_bytes(b"")
     specs = discover_scans(tmp_path, "eiger_master")
-    assert [s.uri.name for s in specs] == ["scan_master.h5"]
-    assert specs[0].kind is SourceKind.EIGER_MASTER
+    assert sorted(s.uri.name for s in specs) == ["renamed.h5", "scan_master.h5"]
+    assert {s.kind for s in specs} == {SourceKind.EIGER_MASTER}
 
 
 def test_discover_scans_nexus_reuses_exact_eiger_sidecar_policy(tmp_path):

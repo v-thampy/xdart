@@ -4739,31 +4739,234 @@ def _read_data_group(
             _harvest(sub)
 
     # NXpositioner ``value`` arrays under sample/positioners — the actual scanned
-    # motor(s).  Each positioner is a GROUP (NXpositioner) with a ``value`` field;
-    # non-group children (e.g. a stray ``frame_index`` dataset) are NOT motors and
-    # are skipped.  These are authoritative motors -> force into angles.
+    # motor(s).  These are authoritative motors -> force into angles.
     sample = grp.get("sample")
-    if isinstance(sample, h5py.Group):
-        positioners = sample.get("positioners")
-        if isinstance(positioners, h5py.Group):
-            for name, obj in positioners.items():
-                if not isinstance(obj, h5py.Group):
-                    continue
-                value = obj.get("value")
-                if not isinstance(value, h5py.Dataset):
-                    continue
-                if getattr(value.dtype, "kind", "O") not in "fiub":
-                    continue
-                try:
-                    arr = np.asarray(value, dtype=float)
-                except (TypeError, ValueError, OSError):
-                    continue
-                if arr.ndim != 1:
-                    continue
-                angles[name] = arr          # authoritative scanned motor
-                counters.pop(name, None)
+    positioners = sample.get("positioners") if isinstance(sample, h5py.Group) else None
+    for name, value in _nxpositioner_values(positioners):
+        if getattr(value.dtype, "kind", "O") not in "fiub":
+            continue
+        try:
+            arr = np.asarray(value, dtype=float)
+        except (TypeError, ValueError, OSError):
+            continue
+        if arr.ndim != 1:
+            continue
+        angles[name] = arr          # authoritative scanned motor
+        counters.pop(name, None)
 
     return angles, counters
+
+
+def _nxpositioner_values(group: Any, *, local_only: bool = False):
+    """``(name, value)`` for each NXpositioner child of *group*: a group whose ``value`` field is a dataset.
+
+    Nothing is read.  A non-group child (e.g. a stray ``frame_index`` dataset) is not a positioner.  With
+    *local_only*, a positioner reached through an external link comes back with ``value=None`` instead of opening
+    the other file."""
+    if not isinstance(group, h5py.Group):
+        return
+    for name in group:
+        if local_only and isinstance(group.get(name, getlink=True), h5py.ExternalLink):
+            yield name, None
+            continue
+        obj = group.get(name)
+        if not isinstance(obj, h5py.Group):
+            continue
+        if local_only and isinstance(obj.get("value", getlink=True), h5py.ExternalLink):
+            yield name, None
+            continue
+        value = obj.get("value")
+        if isinstance(value, h5py.Dataset):
+            yield name, value
+
+
+# ---------------------------------------------------------------------------
+# Supported acquisition metadata of a non-Bluesky NeXus entry (v1)
+# ---------------------------------------------------------------------------
+# CAL-HELD-BATCH-20261009.  A Bluesky/NXWriter entry keeps its own readers.  Any
+# other entry serves only these items, each one value per detector frame or one
+# constant: NXpositioner values under entry/sample (winning a name clash) and
+# entry/instrument, then the NXdata @axes of entry/data, as motors in degrees;
+# counter-named entry/data and scan_data columns, never motors; and the
+# monochromator energy in eV (from its wavelength only when no energy is
+# recorded).  A supported item of another shape or units, or not numeric, is
+# excluded with its reason; nothing is trimmed, padded, interpolated or reduced
+# to its first value.  Units without a declaration keep the legacy readers'
+# assumptions: degrees, keV and angstrom.
+
+#: Declared units (casefolded) -> the unit each supported item is read in.
+_ANGLE_UNITS = {"": "deg", "deg": "deg", "degree": "deg", "degrees": "deg",
+                "rad": "rad", "radian": "rad", "radians": "rad"}
+_ENERGY_UNITS = {"": "energy:kev", "kev": "energy:kev", "ev": "energy:ev"}
+_WAVELENGTH_UNITS = {unit: f"wavelength:{value}" for unit, value in (
+    ("", "angstrom"), ("a", "angstrom"), ("å", "angstrom"), ("angstrom", "angstrom"), ("angstroms", "angstrom"),
+    ("m", "m"), ("metre", "m"), ("metres", "m"), ("meter", "m"), ("meters", "m"))}
+
+
+class AcquisitionItem(NamedTuple):
+    """One supported item: served *name*, *path* in the entry, *role* (motor, counter or energy), the *unit* it
+    is read in, and whether it holds one value per frame (else one constant)."""
+    name: str
+    path: str
+    role: str
+    unit: str
+    per_frame: bool
+
+
+class AcquisitionMetadata(NamedTuple):
+    """A non-Bluesky entry's supported acquisition metadata, read once.
+
+    ``motor_names`` is the catalog order; ``per_frame`` holds the per-frame motors (degrees), counters and energy
+    (eV), each one value per frame; ``constants`` the one-value motors and energy; ``excluded`` the reasons."""
+    motor_names: tuple[str, ...]
+    per_frame: dict[str, np.ndarray]
+    constants: dict[str, float]
+    excluded: tuple[str, ...]
+
+
+def _units_text(dataset: h5py.Dataset) -> str:
+    raw = dataset.attrs.get("units", "")
+    if isinstance(raw, np.ndarray):
+        raw = raw.ravel()[0] if raw.size == 1 else ""
+    if isinstance(raw, (bytes, np.bytes_)):
+        raw = raw.decode("utf-8", errors="replace")
+    return str(raw).strip().casefold()
+
+
+def _acquisition_alignment(name: str, dataset: h5py.Dataset, frame_count: int,
+                           constant: bool) -> tuple[bool, str | None]:
+    """``(per_frame, reason)``: one value per frame, one constant (when *constant* is allowed), or excluded."""
+    if getattr(dataset.dtype, "kind", "O") not in "fiub" or dataset.shape is None:
+        return False, f"{name}: not numeric"
+    if dataset.is_virtual or dataset.external:
+        return False, f"{name}: stored in another file"
+    shape = tuple(int(extent) for extent in dataset.shape)
+    if shape == (int(frame_count),):
+        return True, None
+    if shape == ():
+        return False, None if constant else f"{name}: one value, not one per frame"
+    if len(shape) == 1:
+        return False, f"{name}: {shape[0]} values for {int(frame_count)} frames"
+    return False, f"{name}: shape {shape} is not one value per frame"
+
+
+def _nxdata_axes(data: h5py.Group) -> tuple[str, ...]:
+    raw = data.attrs.get("axes")
+    if raw is None:
+        return ()
+    names: list[str] = []
+    for value in np.atleast_1d(np.asarray(raw, dtype=object)).ravel():
+        text = value.decode("utf-8", errors="replace") if isinstance(value, (bytes, np.bytes_)) else str(value)
+        names.extend(part.strip() for part in text.replace(",", ":").split(":"))
+    return tuple(dict.fromkeys(name for name in names if name and name != "."))
+
+
+def acquisition_items(entry: h5py.Group, frame_count: int) -> tuple[tuple[AcquisitionItem, ...], tuple[str, ...]]:
+    """The supported items of a non-Bluesky *entry* and the reasons others were excluded, reading no values."""
+    items: list[AcquisitionItem] = []
+    excluded: list[str] = []
+    taken: set[str] = set()
+
+    def resolve(group: h5py.Group, name: str) -> Any:
+        """The local dataset *group*/*name*, or why it is not one; another file is never opened."""
+        if isinstance(group.get(name, getlink=True), h5py.ExternalLink):
+            return "stored in another file"
+        value = group.get(name)
+        return value if isinstance(value, h5py.Dataset) else f"no dataset at {group.name}/{name}"
+
+    def admit(name: str, path: str, dataset: Any, role: str, units: Mapping[str, str] | None, what: str,
+              constant: bool = True) -> None:
+        """Plan *dataset* (or the reason it is unresolved) as *name*; *units* maps its declared units to the
+        unit it is read in, and ``None`` reads it raw."""
+        if isinstance(dataset, str):
+            reason = f"{name}: {dataset}"
+        else:
+            per_frame, reason = _acquisition_alignment(name, dataset, frame_count, constant)
+            text = _units_text(dataset)
+            if reason is None and units is not None and text not in units:
+                reason = f"{name}: units {text!r} are not {what}"
+        if reason is not None:
+            excluded.append(reason)
+            return
+        items.append(AcquisitionItem(name, path, role, "raw" if units is None else units[text], per_frame))
+        taken.add(name)
+
+    for where in ("sample", "instrument"):
+        parent = entry.get(where)
+        positioners = parent.get("positioners") if isinstance(parent, h5py.Group) else None
+        for name, value in _nxpositioner_values(positioners, local_only=True):
+            if name not in taken and name not in _NON_MOTOR_COLUMNS:
+                admit(name, f"{where}/positioners/{name}/value",
+                      "stored in another file" if value is None else value, "motor", _ANGLE_UNITS, "an angle")
+    data = entry.get("data")
+    if isinstance(data, h5py.Group) and _nx_class(data) == "NXdata":
+        for name in _nxdata_axes(data):
+            if (name not in taken and name not in _NON_MOTOR_COLUMNS
+                    and name.casefold() not in _DEFAULT_COUNTER_NAMES):
+                admit(name, f"data/{name}", resolve(data, name), "motor", _ANGLE_UNITS, "an angle", constant=False)
+    for group_name in ("data", "scan_data"):
+        group = entry.get(group_name)
+        if not isinstance(group, h5py.Group):
+            continue
+        for name in group:  # names only: a linked image stack is never resolved here
+            if name.casefold() in _DEFAULT_COUNTER_NAMES and name not in taken:
+                admit(name, f"{group_name}/{name}", resolve(group, name), "counter", None, "",
+                      constant=False)
+    monochromator = entry.get("instrument/monochromator")
+    if isinstance(monochromator, h5py.Group):
+        field = "energy" if "energy" in monochromator else "wavelength" if "wavelength" in monochromator else None
+        if field is not None:
+            admit("energy", f"instrument/monochromator/{field}", resolve(monochromator, field), "energy",
+                  _ENERGY_UNITS if field == "energy" else _WAVELENGTH_UNITS,
+                  "eV or keV" if field == "energy" else "a wavelength unit")
+    return tuple(items), tuple(excluded)
+
+
+def acquisition_motor_names(entry: h5py.Group, frame_count: int) -> tuple[str, ...]:
+    """The motors a non-Bluesky *entry*'s supported metadata resolves, in catalog order, reading no values."""
+    return tuple(item.name for item in acquisition_items(entry, frame_count)[0] if item.role == "motor")
+
+
+def read_acquisition_metadata(
+    entry: h5py.Group,
+    frame_count: int,
+    *,
+    motor_names: tuple[str, ...] | None = None,
+    admit: Callable[[str, bool], Any] | None = None,
+) -> AcquisitionMetadata:
+    """Read a non-Bluesky *entry*'s supported acquisition metadata from its open handle.
+
+    *motor_names* restricts the motors (a prevalidated catalog); *admit(path, per_frame)*, when given, must return
+    each dataset before it is read (a bounded reader's own admission)."""
+    from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m, wavelength_m_to_energy_eV
+
+    items, excluded = acquisition_items(entry, frame_count)
+    names: list[str] = []
+    per_frame: dict[str, np.ndarray] = {}
+    constants: dict[str, float] = {}
+    for item in items:
+        if item.role == "motor" and motor_names is not None and item.name not in motor_names:
+            continue
+        dataset = entry[item.path] if admit is None else admit(item.path, item.per_frame)
+        values = np.asarray(dataset[()], dtype=float)
+        if item.unit == "rad":
+            values = np.degrees(values)
+        elif item.unit == "energy:kev":
+            values = values * 1000.0
+        elif item.unit.startswith("wavelength:"):
+            unit = WavelengthUnit(item.unit.partition(":")[2])
+            values = np.asarray([
+                np.nan if (metres := canonical_wavelength_m(value, unit)) is None
+                else wavelength_m_to_energy_eV(metres)
+                for value in np.atleast_1d(values)
+            ]).reshape(values.shape)
+        if item.per_frame:
+            per_frame[item.name] = values
+        else:
+            constants[item.name] = float(values)
+        if item.role == "motor":
+            names.append(item.name)
+    return AcquisitionMetadata(tuple(names), per_frame, constants, excluded)
 
 
 # ===========================================================================

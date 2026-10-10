@@ -80,7 +80,7 @@ def discover_scans(directory, kind, *, recursive: bool = False,
 
     if kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER,
                 SourceKind.PROCESSED_NEXUS):
-        from xrd_tools.io.image import _is_eiger_master
+        from xrd_tools.io.image import eiger_content
         from xrd_tools.sources.registry import (_nexus_is_candidate,
                                                 guess_source_kind)
         out = []
@@ -88,7 +88,10 @@ def discover_scans(directory, kind, *, recursive: bool = False,
             if f.suffix.lower() not in _NEXUS_EXTS:
                 continue
             if kind is SourceKind.EIGER_MASTER:
-                if not _is_eiger_master(f):       # skip the sibling _data_ files
+                # Masters link their data files by those exact names, so the
+                # files are skipped unopened; any other is a master only by its
+                # DECTRIS content, whatever it is called.
+                if not _nexus_is_candidate(f) or not eiger_content(f)[0]:
                     continue
                 out.append(SourceSpec(f, SourceKind.EIGER_MASTER,
                                       options=dict(options)))

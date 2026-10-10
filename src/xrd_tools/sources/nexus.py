@@ -205,9 +205,13 @@ class NexusStackSource(BaseFrameSource):
     _canonical_iter_cursor_chunks = _iter_cursor_chunks
 
     def frame_for(self, index: int) -> ScanFrame:
+        # A frame carries its complete row, its per-frame motors included: GI
+        # resolves the incident angle from these frames (CAL-HELD-BATCH-20261009).
+        provider = self._metadata_provider()
         return ScanFrame(
             index=int(index),
-            metadata=dict(self.metadata_for(index)),
+            metadata=({} if provider is None
+                      else dict(provider.complete_metadata_for(int(index)))),
             source_path=self.path,
             source_frame_index=int(index),
             loader=lambda frame: self.load_frame(frame.source_frame_index or 0),

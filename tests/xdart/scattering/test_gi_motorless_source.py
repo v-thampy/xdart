@@ -33,9 +33,17 @@ def _wait(app, predicate):
     pytest.fail("GI Run/observation did not settle")
 
 
+def _vendor_master(raw):
+    """Mark a _write_eiger master as DECTRIS writes it: the vendor detector configuration makes it an Eiger master."""
+    import h5py
+    with h5py.File(raw, "a") as handle:
+        handle.create_dataset("entry/instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")
+
+
 def _page(tmp_path, *, broken_calibration=False):
     raw = tmp_path / "scan_master.h5"
     _write_eiger(raw, tmp_path / "scan_data_000001.h5", 2)
+    _vendor_master(raw)
     poni = tmp_path / "cal.poni"
     write_poni(poni)
     if broken_calibration:
@@ -67,6 +75,7 @@ def test_container_observation_exposes_known_motor_catalog(tmp_path, motors):
         write_motor_container(raw, motors[0])
     else:
         _write_eiger(raw, tmp_path / "scan_data_000001.h5", 2)
+        _vendor_master(raw)
     observed = FilesystemSourceAdapter().observe(
         SourceObservationRequest(1, 0, image_series_spec(raw)))
     assert observed.gi_motor_choices == motors

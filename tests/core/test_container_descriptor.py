@@ -186,7 +186,7 @@ def test_processed_never_resolves_a_detector_dataset(tmp_path):
 # external-link Eiger master
 # --------------------------------------------------------------------------- #
 def test_single_link_eiger_master(tmp_path):
-    p = _eiger_master(
+    p = _vendor_eiger_master(
         tmp_path / "burst_master.h5", [tmp_path / "burst_data_000001.h5"])
     d = describe_container(p)
     assert d.state is ProbeState.READY
@@ -216,6 +216,8 @@ def _missing_link_master(path, target_name="late_data_000001.h5"):
     with h5py.File(path, "w") as h5:
         entry = h5.create_group("entry")
         entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version",
+                             data=np.bytes_("release-2022.1.2"))  # the DECTRIS vendor block
         data = entry.create_group("data")
         data.attrs["NX_class"] = "NXdata"
         data["data_000001"] = h5py.ExternalLink(target_name, "/entry/data/data")

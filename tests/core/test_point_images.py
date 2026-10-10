@@ -140,6 +140,7 @@ def _eiger(tmp_path):
         specific = entry.create_group("instrument/detector/detectorSpecific")
         specific.create_dataset("nimages", data=2)
         specific.create_dataset("ntrigger", data=2)
+        specific.create_dataset("eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
     return SourceSpec(master, SourceKind.NEXUS_STACK), images
 
 

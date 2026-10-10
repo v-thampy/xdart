@@ -1415,6 +1415,7 @@ def test_average_lineage_iterators_cover_container_tiff_and_eiger(tmp_path, monk
     master = roots["eiger"] / "scan_master.h5"
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
         for ordinal, path in enumerate(member_paths, 1):
             data[f"data_{ordinal:06d}"] = h5py.ExternalLink(path.name, "/entry/data/data")

@@ -389,6 +389,7 @@ def test_average_grouped_direct_eiger_select_keeps_native_cursor_census(tmp_path
         stream.create_dataset("data", data=images, chunks=(1, 17, 17), **hdf5plugin.Bitshuffle(cname="lz4"))
     with h5py.File(master, "w") as stream:
         entry = stream.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
         data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
         data["data_000001"] = h5py.ExternalLink(shard.name, "/data")
     policy = PointImagePolicy(2, "select", image_index=1)

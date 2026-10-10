@@ -358,3 +358,26 @@ def test_a_generic_provider_read_after_close_before_materialize_fails_clearly(tm
         provider = cur.metadata_provider()
         provider.scan_table()  # materialize while the handle is open
     assert provider.complete_metadata_for(1)["eta"] == pytest.approx(0.25, rel=0, abs=1e-12)
+
+
+@pytest.mark.parametrize("field,units,value,expected", [
+    ("energy", "eV", 16000.0, 16000.0),
+    ("energy", None, 16.0, 16000.0),  # no units: the legacy keV
+    ("wavelength", None, 0.7749, 1.239841984e-6 / 0.7749e-10),  # no units: the legacy angstrom
+    ("wavelength", "m", 0.7749e-10, 1.239841984e-6 / 0.7749e-10),
+    ("energy", "J", 1.0, None),  # unsupported units: not served
+])
+def test_a_generic_entrys_energy_is_served_in_ev_through_the_energy_owner(tmp_path, field, units, value, expected):
+    """CAL-HELD-BATCH-20261009 (added after implementation): the monochromator energy, or its wavelength when no
+    energy is recorded, is served as eV through core.energy; undeclared units keep the legacy keV and angstrom."""
+    path = tmp_path / "mono.nxs"
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/data", data=np.ones((2, 4, 4), np.uint16))
+        dataset = entry.create_dataset(f"instrument/monochromator/{field}", data=value)
+        if units is not None:
+            dataset.attrs["units"] = units
+    with ContainerCursor(path) as cur:
+        row = dict(cur.metadata_provider().metadata_for(1))
+    assert row == ({} if expected is None else {"energy": pytest.approx(expected, rel=1e-12, abs=0)})
