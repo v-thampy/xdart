@@ -28,7 +28,7 @@ def _generic(root, recorded=0.1, *, wavelength=False):
             dataset = mono.create_dataset('energy', data=recorded)
             dataset.attrs['units'] = 'keV'
         for name, values in (('del', [0., 1.]), ('nu', [0., 0.])):
-            group = handle.create_group(f'entry/instrument/{name}')
+            group = handle.create_group(f'entry/instrument/positioners/{name}')
             group.attrs['NX_class'] = 'NXpositioner'
             group.create_dataset('value', data=values).attrs['units'] = 'deg'
     return intent
