@@ -80,8 +80,10 @@ def test_average_without_metadata_retains_exact_admitted_wavelength(tmp_path, wa
 
 
 @pytest.mark.parametrize('source_kind', ['nexus', 'tiff'])
-@pytest.mark.parametrize('second', [17000., -1.])
-def test_average_refuses_invalid_or_mixed_energy_before_replacing_output(tmp_path, second, source_kind):
+@pytest.mark.parametrize('second', [17000.])
+def test_average_refuses_mixed_energy_before_replacing_output(tmp_path, second, source_kind):
+    # PROCESSING-ENERGY-BATCH-20261010: an impossible energy (the former -1 rows) now counts as none; Average still
+    # adds frames into one pattern, so a mixed series keeps refusing.
     intent = _fixture(tmp_path / 'project')
     if source_kind == 'nexus':
         _record_nexus_energy(intent, [16000., 16000.])

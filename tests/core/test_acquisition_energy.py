@@ -100,15 +100,6 @@ def test_int_replay_missing_energy_uses_poni_and_stored_axes_stay_fixed(tmp_path
     assert read_provenance(actual_path)['config']['energy_selection']['source'] == 'calibration'
 
 
-@pytest.mark.parametrize('values', [[16000., 17000.], [16000., -1.]])
-def test_int_replay_invalid_or_varying_metadata_energy_refuses(tmp_path, values):
-    intent = _fixture(tmp_path / 'project')
-    _record_nexus_energy(intent, values)
-    with pytest.raises(ValueError, match='metadata energy'):
-        _replay(intent, 'refused')
-    assert not (Path(intent.project_root) / 'refused').exists()
-
-
 def _native_energy_request(root, unit, metadata_energy, fitted=False, poni=False):
     from tests.core.test_stitch_operation import _prepared, _goniometer_record, _poni_record
     from xrd_tools.analysis.stitch_operation import (capture_stitch_geometry, StitchGeometryInput,
