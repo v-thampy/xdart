@@ -102,7 +102,9 @@ def test_eiger_gi_run_falls_back_to_manual_and_keeps_angle(tmp_path):
 def test_a_generic_nexus_containers_eta_reaches_each_frames_incident_angle(tmp_path):
     """CAL-HELD-BATCH-20261009 (maintainer: "I want these things to be addressed in this batch"): a non-Bluesky
     acquisition container, split images and a misleading scan_master name, records eta per frame under
-    instrument/positioners; GI Auto chooses it, and the real Int run saves each frame's own incident angle."""
+    instrument/positioners; GI Auto chooses it, and the real Int run reduces each frame at its own eta. (An Int GI
+    motor run records each frame's motor value and the motor, not a per-frame incident_angle: that field is written
+    only for frames carrying a FrameGeometry.)"""
     import h5py
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     raw = tmp_path / "scan_master.h5"
@@ -127,9 +129,14 @@ def test_a_generic_nexus_containers_eta_reaches_each_frames_incident_angle(tmp_p
         _wait(app, lambda: page._capture_current_loaded_browse() is not None
               or page._admission is None and page._notice_text.startswith("Output admission failed:"))
         assert page._capture_current_loaded_browse() is not None, page._notice_text
+        saved = read_provenance(artifact)["config"]["run_configuration"]["gi"]
+        assert (saved["incidence_motor"], saved["resolved_motor"]) == ("eta", "eta")
         with FrameViewReader(artifact) as reader:
-            assert [reader.read(label).incident_angle for label in (0, 1)] == pytest.approx([0.11, 0.37],
-                                                                                           rel=0, abs=1e-12)
+            views = [reader.read(label) for label in (0, 1)]
+        # each frame records its own eta (the output keeps scan metadata in single precision)
+        assert [view.metadata_raw["eta"] for view in views] == pytest.approx([0.11, 0.37], rel=0, abs=1e-6)
+        # the two detector images are identical, so different Qip-Qoop maps mean each frame used its own angle
+        assert not np.array_equal(views[0].intensity_2d, views[1].intensity_2d, equal_nan=True)
     finally:
         _close(page, app)
 
