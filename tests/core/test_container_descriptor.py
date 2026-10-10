@@ -497,3 +497,12 @@ def test_apstools_flat_detector_does_not_hide_canonical_rank_error(tmp_path):
 
     assert descriptor.state is ProbeState.INVALID
     assert "rank 4" in descriptor.reason
+
+
+def test_bluesky_motor_catalog_survives_a_master_filename(tmp_path):
+    path = _bluesky(tmp_path / "scan_master.nxs")
+    with h5py.File(path, "a") as h5:
+        h5.create_dataset("entry/instrument/positioners/eta/value", data=np.full(4, .2))
+    descriptor = describe_container(path)
+    assert descriptor.motor_names == ("eta",)
+    assert descriptor.is_bluesky

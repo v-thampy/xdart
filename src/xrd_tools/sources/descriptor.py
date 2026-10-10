@@ -486,7 +486,7 @@ def describe_container_from_open(
     scan_name = _scan_name(path)
 
     motor_names = None
-    if entry_grp is not None and _is_eiger_master(path):
+    if entry_grp is not None and _is_eiger_master(path) and not is_bluesky:
         # An Eiger master records no scan metadata: its frames' provider is empty, and its motors come from a proper
         # NeXus, SPEC or txt source (maintainer, 2026-10-09). Positioners written into one named motors no frame resolves.
         motor_names = ()
