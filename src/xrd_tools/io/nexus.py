@@ -4547,7 +4547,11 @@ def _scalar_or_first(ds: h5py.Dataset) -> float:
 
 
 def _read_energy(grp: h5py.Group) -> float:
-    """Extract beam energy (keV) from the monochromator group."""
+    """Extract beam energy (keV) from the monochromator group.
+
+    A recorded eV value (1000 or more) is converted: an X-ray energy's scale is
+    decided by its size (:func:`xrd_tools.core.energy.xray_energy_keV`)."""
+    from xrd_tools.core.energy import xray_energy_keV
     from xrd_tools.io.bluesky_nexus import bluesky_energy_kev, is_bluesky_nxwriter
     if is_bluesky_nxwriter(grp):
         # Bluesky/NXWriter: energy lives in the eiger detector config (in eV).
@@ -4557,7 +4561,7 @@ def _read_energy(grp: h5py.Group) -> float:
     path = "instrument/monochromator/energy"
     if path in grp:
         try:
-            return _scalar_or_first(grp[path])
+            return xray_energy_keV(_scalar_or_first(grp[path]))
         except Exception:
             logger.warning("Could not read energy from %s", path, exc_info=True)
     logger.debug(
@@ -4786,13 +4790,13 @@ def _nxpositioner_values(group: Any, *, local_only: bool = False):
 # monochromator energy in eV (from its wavelength only when no energy is
 # recorded).  A supported item of another shape or units, or not numeric, is
 # excluded with its reason; nothing is trimmed, padded, interpolated or reduced
-# to its first value.  Units without a declaration keep the legacy readers'
-# assumptions: degrees, keV and angstrom.
+# to its first value.  An energy is eV or keV by its size (core.energy); angles
+# and wavelengths without a declared unit keep the legacy degrees and angstrom.
 
 #: Declared units (casefolded) -> the unit each supported item is read in.
 _ANGLE_UNITS = {"": "deg", "deg": "deg", "degree": "deg", "degrees": "deg",
                 "rad": "rad", "radian": "rad", "radians": "rad"}
-_ENERGY_UNITS = {"": "energy:kev", "kev": "energy:kev", "ev": "energy:ev"}
+_ENERGY_UNITS = {"": "energy", "kev": "energy", "ev": "energy"}  # the size decides eV or keV
 _WAVELENGTH_UNITS = {unit: f"wavelength:{value}" for unit, value in (
     ("", "angstrom"), ("a", "angstrom"), ("å", "angstrom"), ("angstrom", "angstrom"), ("angstroms", "angstrom"),
     ("m", "m"), ("metre", "m"), ("metres", "m"), ("meter", "m"), ("meters", "m"))}
@@ -4930,7 +4934,9 @@ def _acquisition_values(
     frame_index: int | None = None,
 ):
     """One conversion/admission seam for full tables, indexed rows and scalar energy."""
-    from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m, wavelength_m_to_energy_eV
+    from xrd_tools.core.energy import (
+        WavelengthUnit, canonical_wavelength_m, wavelength_m_to_energy_eV, xray_energy_eV,
+    )
 
     for item in items:
         if item.role == "motor" and motor_names is not None and item.name not in motor_names:
@@ -4940,8 +4946,8 @@ def _acquisition_values(
         values = np.asarray(dataset[selection], dtype=float)
         if item.unit == "rad":
             values = np.degrees(values)
-        elif item.unit == "energy:kev":
-            values = values * 1000.0
+        elif item.unit == "energy":
+            values = np.asarray(xray_energy_eV(values), dtype=float)
         elif item.unit.startswith("wavelength:"):
             unit = WavelengthUnit(item.unit.partition(":")[2])
             values = np.asarray([

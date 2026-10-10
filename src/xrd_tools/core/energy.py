@@ -29,6 +29,8 @@ _HC_EV_M = 1.239841984e-6
 __all__ = [
     "energy_eV_to_wavelength_m",
     "wavelength_m_to_energy_eV",
+    "xray_energy_eV",
+    "xray_energy_keV",
     "calibration_recorded_energy_eV",
     "check_energy_consistency",
     "resolve_acquisition_energy",
@@ -147,6 +149,37 @@ def energy_eV_to_wavelength_m(energy_eV: float) -> float:
 def wavelength_m_to_energy_eV(wavelength_m: float) -> float:
     """X-ray wavelength (m) → energy (eV)."""
     return _HC_EV_M / float(wavelength_m)
+
+
+#: X-ray diffraction energies span about 1-200 keV, that is 1000-200000 eV, so the two
+#: scales never overlap: a recorded energy below this is in keV, any other in eV
+#: (maintainer, 2026-10-09: "It should be easy enough to figure out if the energy is in
+#: eV or keV for X-rays").  No unit is needed, and a mislabel cannot mislead it.
+_XRAY_KEV_EV_BOUNDARY = 1000.0
+
+
+def _xray_energy_scaled(value, *, to_eV: bool):
+    energy = np.asarray(value, dtype=float)
+    positive = np.isfinite(energy) & (energy > 0)
+    if to_eV:
+        result = np.where(positive & (energy < _XRAY_KEV_EV_BOUNDARY), energy * 1000.0, energy)
+    else:
+        result = np.where(positive & (energy >= _XRAY_KEV_EV_BOUNDARY), energy / 1000.0, energy)
+    return float(result) if result.ndim == 0 else result
+
+
+def xray_energy_eV(value):
+    """A recorded X-ray energy (a number or an array) in eV, its scale decided by its size.
+
+    Below 1000 it is keV; a value already in eV is returned exactly.  A value that is
+    not finite and positive is returned unchanged: its consumer decides what is impossible.
+    """
+    return _xray_energy_scaled(value, to_eV=True)
+
+
+def xray_energy_keV(value):
+    """As :func:`xray_energy_eV`, in keV: a recorded value of 1000 or more is eV."""
+    return _xray_energy_scaled(value, to_eV=False)
 
 
 def metadata_energy_values(row, *, wavelength=None, wavelength_unit=None) -> tuple:
