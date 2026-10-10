@@ -5358,6 +5358,11 @@ class _ReductionIntegratorProvider:
         still provide the scientific isolation; this small process-wide lock
         covers only their one-time geometry construction.
         """
+        for unit in self._standard_units():
+            ai.array_from_unit(shape, "center", unit, scale=False)
+
+    def _standard_units(self) -> tuple[str, ...]:
+        """The radial and azimuthal units the plan's standard integrations use."""
         units: list[str] = []
         one_d = getattr(self.plan, "integration_1d", None)
         if one_d is not None:
@@ -5370,8 +5375,7 @@ class _ReductionIntegratorProvider:
         two_d = getattr(self.plan, "integration_2d", None)
         if two_d is not None:
             units.extend((two_d.unit, "chi_deg"))
-        for unit in dict.fromkeys(units):
-            ai.array_from_unit(shape, "center", unit, scale=False)
+        return tuple(dict.fromkeys(units))
 
     def standard_with_run_mask(
         self,
@@ -5457,8 +5461,9 @@ class _ReductionIntegratorProvider:
 
         A frame the scan's energies do not list (one appended later) takes the
         representative energy. pyFAI's wavelength setter resets the geometry, so a
-        standard integrator's centres are rebuilt under the numexpr lock, as at its
-        first binding.
+        standard integrator's arrays that pyFAI builds with numexpr (centres, pixel
+        extents and polarization) are rebuilt under the lock, as at its first binding,
+        rather than inside every worker's integration.
         """
         wavelengths = self._frame_wavelengths
         if wavelengths is None or integrator is None:
@@ -5469,7 +5474,14 @@ class _ReductionIntegratorProvider:
         with _PYFAI_COLD_GEOMETRY_LOCK:
             integrator.wavelength = wavelength
             if warm:
-                self._warm_standard_centers(integrator, (int(shape[0]), int(shape[1])))
+                frame_shape = (int(shape[0]), int(shape[1]))
+                self._warm_standard_centers(integrator, frame_shape)
+                for unit in self._standard_units():
+                    integrator.array_from_unit(frame_shape, "delta", unit, scale=False)
+                for factor in {item.polarization_factor for item in (self.plan.integration_1d,
+                                                                     self.plan.integration_2d)
+                               if item is not None and item.polarization_factor is not None}:
+                    integrator.polarization(frame_shape, factor, with_checksum=True)
 
     def fiber(self) -> Any:
         if self.scan.poni is None:
