@@ -323,6 +323,7 @@ def test_stop_during_admitted_revalidation_returns_stopped(
 
 def test_executor_constructs_and_releases_each_standard_owner_once(monkeypatch, tmp_path: Path) -> None:
     from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.integrate import calibration as calibration_module
     from xrd_tools.reduction import NexusSink
     from xrd_tools.session import ScanSession
     from xrd_tools.sources.image import TiffSeriesSource
@@ -332,7 +333,8 @@ def test_executor_constructs_and_releases_each_standard_owner_once(monkeypatch, 
     calls, sessions, sinks = {}, [], []
     originals = (
         (executor_module, "open_source"),
-        (executor_module, "poni_to_integrator"),
+        # Since 15250a49 the Int source-energy binder builds the run's integrator.
+        (calibration_module, "detector_calibration_to_integrator"),
         (executor_module, "native_int_reduction_plan"),
         (TiffSeriesSource, "to_scan"),
         (NexusSink, "begin"),

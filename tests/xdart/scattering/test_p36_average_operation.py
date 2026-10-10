@@ -1200,6 +1200,10 @@ def test_average_page_dispatches_one_revision_checked_canonical_freeze(
     from xrd_tools.sources import selection
 
     source = _source(tmp_path / "source")
+    # Average needs a ready PONI before it freezes, as Run does since a53c324e.
+    poni = tmp_path / "average.poni"
+    poni.write_text("poni_version: 2\nDetector: Pilatus100k\nDetector_config: {}\nDistance: 0.1234\n"
+                    "Poni1: 0.01\nPoni2: 0.03\nRot1: 0\nRot2: 0\nRot3: 0\nWavelength: 1e-10\n")
     intent = RunIntent(
         source_spec=source,
         processing_mode="Int 2D",
@@ -1207,6 +1211,7 @@ def test_average_page_dispatches_one_revision_checked_canonical_freeze(
         max_cores=3,
         project_root=str(tmp_path),
         save_path=str(tmp_path / "processed"),
+        poni_file=str(poni),
         run_options={"series_average": True},
     )
     store = RunIntentStore(intent)

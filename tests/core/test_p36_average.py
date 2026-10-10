@@ -274,10 +274,9 @@ def test_streaming_average_matches_reference_counts_metadata_and_order(tmp_path,
     np.testing.assert_array_equal(mask, finite.values == 0)
     assert normalization == pytest.approx(2.0)
     assert read_order == [0, 0, 1, 2]
-    assert metadata_calls == [(1, {"max_input_bytes": 65536}),
-                              (1, {"max_input_bytes": 65536}),
-                              (2, {"max_input_bytes": 65536}),
-                              (3, {"max_input_bytes": 65536})]
+    # Average reads bounded SPEC point snapshots since 0d46a239.
+    snapshot = {"max_input_bytes": 65536, "spec_point_snapshot": True}
+    assert metadata_calls == [(1, snapshot), (1, snapshot), (2, snapshot), (3, snapshot)]
     assert background_order == []
     assert detector_masks == []  # Manual thresholds skip the redundant saturation pass.
     assert recipe.batch_mode is False and result.finite_counts == finite.evidence

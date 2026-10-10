@@ -179,10 +179,10 @@ def test_batch_selection_is_cheap_and_trend_reads_contributing_rows(qapp, tmp_pa
     from xrd_tools.io import analysis_artifact
     form = _native_form(tmp_path, "xu_hist", scans="1")
     first, _ = _published(replace(form, mode="2d", npt_rad_2d=48, npt_azim_2d=32))
-    second_dir = tmp_path / "second"
-    second_dir.mkdir()
-    second, _ = _published(replace(form, mode="2d", output_path=second_dir / "second_stitch2d.nexus",
-                                  npt_rad_2d=48, npt_azim_2d=32))
+    # The batch is what the results browser lists, and since 063fc88f/8791ec8b the browser follows the opened
+    # result's folder; Stitch names a result by its family, so the second one is its own family in the same folder.
+    second, _ = _published(replace(form, mode="2d", output_family="second", npt_rad_2d=48, npt_azim_2d=32))
+    assert Path(second).parent == Path(first).parent and Path(second).name != Path(first).name
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(replace(form, mode="2d"))
@@ -213,11 +213,20 @@ def test_batch_selection_is_cheap_and_trend_reads_contributing_rows(qapp, tmp_pa
             unavailable[0].load()
         _command(page, ShellCommandKind.SET_SLICE_ENABLED, False)
         page._fit_batch("peak")[0].load()  # the native profile is available until BG is applied
+        # Since 20e60fd2 Set BG takes the explicitly selected results; select the current one, as a user does.
+        from pyqtgraph.Qt import QtCore
+        current = page.browser.current_result()
+        row = next(row for row in range(page.results.count())
+                   if page.results.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == current)
+        page.results.item(row).setSelected(True)
+        _wait(page, qapp)
         page.scientific.background.click()
         assert page._background.phase == "ACTIVE"
         assert all(target.reference is None for target in page._fit_batch("peak"))
+        # A result that is not displayed cannot capture the presentation background.
+        other = next(str(path) for path in (first, second) if str(path) != str(current))
         with pytest.raises(ValueError, match="FIT_BATCH_SELECTION_UNAVAILABLE"):
-            page._fit_batch("peak")[0].load()
+            page._fit_target(other, "peak").load()
     finally:
         _dispose(page, qapp)
 
