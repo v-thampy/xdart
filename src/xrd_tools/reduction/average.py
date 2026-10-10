@@ -1538,11 +1538,12 @@ class AverageScanRunner:
             if self.recipe.calibration.values is not None:
                 from xrd_tools.core.energy import metadata_energy_values, resolve_acquisition_energy
                 wavelength, unit = window.metadata_wavelength()
+                energy_is_eV = window.metadata_energy_is_eV()
                 def energies():
                     for index in range(window.extent):
                         row = (self._preparation_first_row if index == 0
                                else window.complete_metadata_for(index))
-                        yield from metadata_energy_values(row, wavelength=wavelength,
+                        yield from metadata_energy_values(row, energy_is_eV=energy_is_eV, wavelength=wavelength,
                                                           wavelength_unit=unit)
                 selection = resolve_acquisition_energy(
                     self.recipe.calibration.values.wavelength_m, energies())

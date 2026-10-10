@@ -575,17 +575,19 @@ def source_energy_checks(source, wavelength_A, recorded_eV=None, *, tables=None,
         table = _fresh_table(member) if tables is None else tables[index]
         names = [column.name for column in table.columns]
         energies = []
+        desc = (describe_container(member.analysis.resolved_root, entry=member.analysis.resolved_entry or "entry")
+                if member.analysis.resolved_kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER} else None)
         if names.count("energy") > 1:
             _refuse("AMBIGUOUS_METADATA_SELECTOR", "energy must occur at most once per member")
         if "energy" in names:
             positions, columns = _manifest_numeric_lookup(table, (MetadataColumnSelector("energy"),))
-            # eV or keV by its size ("0-150 read are keV, above 150 in eV")
-            energies.extend(xray_energy_eV(float(columns[0][1][positions[label]]))
-                            for label in member.selected_labels)
-        if member.analysis.resolved_kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+            # Generic NeXus tables are already in eV; SPEC/Bluesky readings are raw.
+            canonical_eV = desc is not None and not desc.is_bluesky
+            values = (float(columns[0][1][positions[label]]) for label in member.selected_labels)
+            energies.extend(values if canonical_eV else (xray_energy_eV(value) for value in values))
+        if desc is not None:
             import h5py
             from xrd_tools.io.nexus import _read_energy
-            desc = describe_container(member.analysis.resolved_root, entry=member.analysis.resolved_entry or "entry")
             if desc.wavelength is not None:
                 # ContainerDescriptor uses the shared NeXus reader's angstroms.
                 energies.append(wavelength_m_to_energy_eV(desc.wavelength * 1e-10))

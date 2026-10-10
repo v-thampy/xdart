@@ -58,6 +58,8 @@ class MetadataSourceClosedError(RuntimeError):
 class MetadataProvider:
     """Small provider surface consumed by sources / benchmark / wrangler."""
 
+    metadata_energy_is_eV = False
+
     def metadata_for(self, frame_index: int) -> Mapping[str, Any]:
         return {}
 
@@ -316,6 +318,8 @@ class NexusMetadataProvider(MetadataProvider):
     the Average route the prevalidated motor names restrict the motors, and each
     dataset passes Average's bounded admission before it is read.
     """
+
+    metadata_energy_is_eV = True
 
     def __init__(self, entry_grp: Any, *, frame_count: int,
                  wavelength: float | None = None,

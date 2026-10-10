@@ -169,6 +169,8 @@ class ScanFrame:
     point_statistics_loader: Callable[..., Any] | None = None
     point_variance: np.ndarray | None = None
     point_exposure_multiplier: float = 1.0
+    # Transient source contract; generic NeXus rows already express energy in eV.
+    metadata_energy_is_eV: bool = False
 
     def __post_init__(self) -> None:
         self.metadata = dict(self.metadata or {})

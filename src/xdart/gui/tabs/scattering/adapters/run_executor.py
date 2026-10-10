@@ -1425,7 +1425,7 @@ class StandardRunExecutor:
             calibration = bind_native_int_source_energy(run.scan, calibration,
                 metadata_wavelength_A=(None if item is None or item.descriptor is None
                                        else item.descriptor.wavelength),
-                metadata_energy_eV=getattr(run.source, 'motors', {}).get('energy', ()))
+                metadata_energy_eV=run.source.metadata_energy_eV)
             integrator = run.scan.integrator
             poni = run.scan.poni
             if calibration.parallax is not None:

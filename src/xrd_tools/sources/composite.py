@@ -103,8 +103,13 @@ class CompositeFrameSource(BaseFrameSource):
                          source_path=frame.source_path,
                          source_frame_index=frame.source_frame_index,
                          source_identity=frame.source_identity,
+                         metadata_energy_is_eV=frame.metadata_energy_is_eV,
                          loader=lambda value: self.load_frame(value.index),
                          point_statistics_loader=(self.load_point_statistics if frame.point_statistics_loader is not None else None))
+
+    @property
+    def metadata_energy_eV(self) -> tuple:
+        return tuple(value for member in self._members for value in member.metadata_energy_eV)
 
     @property
     def motors(self) -> dict[str, np.ndarray]:

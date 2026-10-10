@@ -197,8 +197,8 @@ def _recorded_energy_eV(value):
     return xray_energy_eV(number)
 
 
-def metadata_energy_values(row, *, wavelength=None, wavelength_unit=None) -> tuple:
-    """Read a metadata row's energy (eV or keV by its size) or explicitly unit-declared wavelength, in eV.
+def metadata_energy_values(row, *, energy_is_eV=False, wavelength=None, wavelength_unit=None) -> tuple:
+    """Read raw energy by size, canonical eV unchanged, or a declared wavelength, in eV.
 
     Missing evidence returns no values. An impossible energy (zero, negative or not a
     number) counts as none, so a recorded wavelength applies instead; invalid wavelength
@@ -206,7 +206,8 @@ def metadata_energy_values(row, *, wavelength=None, wavelength_unit=None) -> tup
     """
     names = {str(key).casefold(): value for key, value in row.items()}
     if 'energy' in names:
-        energy = _possible_energy(_recorded_energy_eV(names['energy']))
+        value = names['energy'] if energy_is_eV else _recorded_energy_eV(names['energy'])
+        energy = _possible_energy(value)
         if energy is not None:
             return (energy,)
     values = [(names[name], unit) for name, unit in

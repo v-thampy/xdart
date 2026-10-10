@@ -2172,6 +2172,10 @@ class _AverageSourceReadWindow:
         return dict(getattr(self._tiff, "metadata_for")(
             index + 1, max_input_bytes=1 << 16, spec_point_snapshot=True,
         ))
+    def metadata_energy_is_eV(self):
+        """Unit contract of the complete rows served by this read window."""
+        return self._cursor is not None and self._cursor.metadata_provider().metadata_energy_is_eV
+
     def metadata_wavelength(self):
         """Declared wavelength from this already-qualified container owner."""
         _cancelled(self._cancelled)

@@ -216,6 +216,7 @@ class NexusStackSource(BaseFrameSource):
             source_frame_index=int(index),
             loader=lambda frame: self.load_frame(frame.source_frame_index or 0),
             source_identity=str(self.path),
+            metadata_energy_is_eV=provider.metadata_energy_is_eV if provider is not None else False,
         )
 
     # -- Bluesky / apstools NXWriter per-frame metadata --------------------
@@ -228,6 +229,11 @@ class NexusStackSource(BaseFrameSource):
     # with identical column semantics.  Built once through a short-lived cursor
     # and MATERIALIZED before the cursor closes, so repeated metadata reads touch
     # only memory and reopen no master.
+    @property
+    def metadata_energy_is_eV(self) -> bool:
+        provider = self._metadata_provider()
+        return provider.metadata_energy_is_eV if provider is not None else False
+
     def _metadata_provider(self) -> MetadataProvider | None:
         cache = self.__dict__.get("_provider_cache", _UNSET)
         if cache is not _UNSET:

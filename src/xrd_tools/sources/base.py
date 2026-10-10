@@ -55,6 +55,19 @@ class BaseFrameSource(ABC):
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         return {}
 
+    @property
+    def metadata_energy_is_eV(self) -> bool:
+        """Whether this source's metadata energy has already been converted."""
+        return False
+
+    @property
+    def metadata_energy_eV(self) -> tuple:
+        """Source-level energy, converted at its raw-reading boundary only once."""
+        from xrd_tools.core.energy import metadata_energy_values
+        return tuple(energy for value in np.atleast_1d(getattr(self, 'motors', {}).get('energy', ()))
+                     for energy in metadata_energy_values({'energy': value},
+                                                         energy_is_eV=self.metadata_energy_is_eV))
+
     def scan_manifest(self) -> list[tuple[int, Mapping[str, Any]]] | None:
         """Cheap METADATA-ONLY pass: ``(frame_index, metadata)`` for every frame
         (ADR-0006).  MUST NOT load detector images.  Returns ``None`` when the
@@ -73,6 +86,7 @@ class BaseFrameSource(ABC):
             metadata=dict(self.metadata_for(index)),
             loader=lambda frame: self.load_frame(frame.index),
             source_identity=self.name,
+            metadata_energy_is_eV=self.metadata_energy_is_eV,
         )
 
     def iter_frames(self) -> Iterator[ScanFrame]:

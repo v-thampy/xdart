@@ -99,9 +99,10 @@ def _metadata_reader(source):
     opener = getattr(source, 'open_cursor', None)
     if opener is not None:
         with opener() as cursor:
-            yield cursor.metadata_provider().complete_metadata_for
+            provider = cursor.metadata_provider()
+            yield provider.complete_metadata_for, provider.metadata_energy_is_eV
     else:
-        yield source.metadata_for
+        yield source.metadata_for, source.metadata_energy_is_eV
 
 
 def _exact_source(spec):
@@ -187,7 +188,7 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
             if len(indices) != expected:
                 raise ValueError('SPEC image count differs from metadata; exact frame association is required')
         rows = []
-        with _metadata_reader(source) as read_metadata:
+        with _metadata_reader(source) as (read_metadata, energy_is_eV):
             for index in indices:
                 metadata = read_metadata(index)
                 try:
@@ -199,7 +200,9 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
                 energy = metadata.get('energy')
                 if energy is not None:
                     from xrd_tools.core.energy import xray_energy_eV
-                    energy = xray_energy_eV(float(energy))  # eV or keV by its size
+                    energy = float(energy)
+                    if not energy_is_eV:
+                        energy = xray_energy_eV(energy)  # raw eV or keV by its size
                     # An impossible recorded energy (a glitched readback: the 17-2 del-only file records -2165.0213
                     # for one scan) is no energy, as calibration_source_energy_eV holds; the typed one applies.
                     if not math.isfinite(energy) or energy <= 0:
@@ -231,7 +234,7 @@ def direct_beam_pose(spec: SourceSpec, motor: str, held=()) -> tuple[float | Non
         if held:
             source = open_source(_exact_source(spec))
             try:
-                with _metadata_reader(source) as read_metadata:
+                with _metadata_reader(source) as (read_metadata, _energy_is_eV):
                     for index in source.frame_indices:
                         metadata = read_metadata(index)
                         for name in held:
@@ -401,7 +404,7 @@ def capture_calibration_frames(spec: SourceSpec, indices, directory, *,
             if index not in choices:
                 raise ValueError(f'frame {index} is not in the selected scan')
             _, motors, energy = choices[index]
-            with _metadata_reader(source) as read_metadata:
+            with _metadata_reader(source) as (read_metadata, _energy_is_eV):
                 metadata = read_metadata(index)
             if any(float(metadata[name]) != value for name, value in motors.items()):
                 raise ValueError('source angle metadata changed during preparation')

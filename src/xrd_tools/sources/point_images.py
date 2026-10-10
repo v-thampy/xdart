@@ -418,11 +418,16 @@ class PointImageSource(BaseFrameSource):
                 raise ValueError("NeXus motor metadata does not match image or point count")
         return out
 
+    @property
+    def metadata_energy_is_eV(self):
+        return self.source.metadata_energy_is_eV
+
     def frame_for(self, index):
         path, raw = self.raw_locator_for(index)
         return ScanFrame(index=index, metadata=self.metadata_for(index), source_path=path,
                          source_frame_index=raw, loader=lambda frame: self.load_frame(frame.index),
                          source_identity=self.name,
+                         metadata_energy_is_eV=self.metadata_energy_is_eV,
                          point_statistics_loader=self.load_point_statistics)
 
     def close(self):

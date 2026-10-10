@@ -1087,7 +1087,7 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
     labels, recorded = [], []
     for frame in scan.frames:
-        values = metadata_energy_values(frame.metadata)
+        values = metadata_energy_values(frame.metadata, energy_is_eV=frame.metadata_energy_is_eV)
         if len(values) > 1:
             resolve_acquisition_energy(None, values)  # a row's energy and wavelengths must agree
         labels.append(int(frame.index))
@@ -1096,8 +1096,7 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
     if per_frame:
         energies = recorded
     else:
-        energies = [value for energy in metadata_energy_eV
-                    for value in metadata_energy_values({'energy': energy})]
+        energies = list(metadata_energy_eV)
         if metadata_wavelength_A is not None:
             energies.extend(metadata_energy_values({}, wavelength=metadata_wavelength_A,
                                                   wavelength_unit=WavelengthUnit.ANGSTROM))
