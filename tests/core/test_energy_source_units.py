@@ -119,10 +119,11 @@ def test_generic_stitch_table_does_not_infer_canonical_energy_again(tmp_path):
 def test_composite_frames_keep_each_members_energy_unit(tmp_path):
     from xrd_tools.sources.composite import CompositeFrameSource
     intent = _generic(tmp_path / 'generic')
-    source = CompositeFrameSource([intent.source_spec])
+    member = open_source(intent.source_spec)
+    source = CompositeFrameSource([member])
     try:
         scan = source.to_scan()
         bind_native_int_source_energy(scan, load_detector_calibration(intent.poni_file))
         assert scan.extra['energy_selection']['energy_eV'] == pytest.approx(100.)
     finally:
-        source.close()
+        member.close()
