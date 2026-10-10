@@ -2788,17 +2788,25 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
 
 @pytest.mark.parametrize("external", [False, True])
 def test_int_reads_a_generic_nexus_containers_motors_on_every_frame(tmp_path, external) -> None:
-    """CAL-HELD-BATCH-20261009 (maintainer: "I want these things to be addressed in this batch"): the Int run path, an
-    execution-graph window's complete_metadata_for, reads a non-Bluesky acquisition container's supported motors on
-    frame 0 and later frames, its images self-contained or split, even when it is called scan_master."""
+    """CAL-HELD-BATCH-20261009 (maintainer: "I want these things to be addressed in this batch"): Int's run path
+    (run_executor: the qualified cursor's NexusStackSource, then to_scan, whose frame metadata GI reads) carries a
+    non-Bluesky acquisition container's supported motors on frame 0 and later frames, its images self-contained or
+    split, even when it is called scan_master."""
     from tests.core.test_metadata_provider import _acquisition
+    from xrd_tools.sources.cursor import open_container_cursor
+    from xrd_tools.sources.nexus import NexusStackSource
     path = tmp_path / "scan_master.h5"
     _acquisition(path, external=external)
     value = graph.qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta")
-    with graph.open_source_execution_graph(value) as window:
-        assert window.complete_metadata_for(0)["eta"] == pytest.approx(0.11, rel=0, abs=1e-12)
-        row = window.complete_metadata_for(2)
+    entry = value.execution_source.entry or "entry"
+    source = NexusStackSource(path, entry=entry, cursor=open_container_cursor(path, entry=entry))
+    try:
+        frames = source.to_scan().frames
+        assert frames[0].metadata["eta"] == pytest.approx(0.11, rel=0, abs=1e-12)
+        row = frames[2].metadata
         assert (row["eta"], row["phi"], row["chi"]) == pytest.approx((0.37, 30.0, 12.5), rel=0, abs=1e-9)
+    finally:
+        source.close()
 
 
 def test_a_container_without_the_selected_motor_refuses_naming_its_supported_metadata(tmp_path) -> None:
