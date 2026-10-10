@@ -68,6 +68,17 @@ def test_a_rows_energy_is_ev_or_kev_by_its_size(row, eV):
 # ---------------------------------------------------------------- impossible energies and glitched frames
 
 
+def test_an_impossible_row_energy_yields_to_the_recorded_wavelength():
+    """Added after implementation (self-review): an impossible energy counts as none, so a wavelength the row or its
+    container records applies, as it does when no energy is recorded."""
+    from xrd_tools.core.energy import WavelengthUnit
+    angstrom = energy_eV_to_wavelength_m(16000.) * 1e10
+    assert metadata_energy_values({"energy": -1., "wavelength_A": angstrom}) == pytest.approx((16000.,), rel=1e-12, abs=0)
+    assert metadata_energy_values({"energy": float("nan")}, wavelength=angstrom,
+                                  wavelength_unit=WavelengthUnit.ANGSTROM) == pytest.approx((16000.,), rel=1e-12, abs=0)
+    assert metadata_energy_values({"energy": 0.}) == ()
+
+
 @pytest.mark.parametrize("recorded", [0., -1., -2165.0213, float("nan"), float("inf"), None, "n/a", True])
 def test_an_impossible_recorded_energy_counts_as_none(recorded):
     for values in ((recorded,), (recorded, recorded)):

@@ -200,13 +200,15 @@ def _recorded_energy_eV(value):
 def metadata_energy_values(row, *, wavelength=None, wavelength_unit=None) -> tuple:
     """Read a metadata row's energy (eV or keV by its size) or explicitly unit-declared wavelength, in eV.
 
-    Missing evidence returns no values. An impossible energy is passed on, for the
-    resolver to count as none; invalid wavelength evidence refuses, and a wavelength's
-    unit is never inferred from its size.
+    Missing evidence returns no values. An impossible energy (zero, negative or not a
+    number) counts as none, so a recorded wavelength applies instead; invalid wavelength
+    evidence refuses, and a wavelength's unit is never inferred from its size.
     """
     names = {str(key).casefold(): value for key, value in row.items()}
     if 'energy' in names:
-        return (_recorded_energy_eV(names['energy']),)
+        energy = _possible_energy(_recorded_energy_eV(names['energy']))
+        if energy is not None:
+            return (energy,)
     values = [(names[name], unit) for name, unit in
               (('wavelength_m', WavelengthUnit.METRE),
                ('wavelength_a', WavelengthUnit.ANGSTROM)) if name in names]
