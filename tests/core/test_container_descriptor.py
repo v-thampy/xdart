@@ -569,8 +569,8 @@ def test_a_containers_energy_is_read_in_ev_or_kev_by_its_size(tmp_path, recorded
     """CAL-HELD-BATCH-20261009 (maintainer: "It should be easy enough to figure out if the energy is in eV or keV for
     X-rays"): a non-Bluesky container's monochromator energy below 1000 is keV and otherwise eV, labelled or not, so the
     descriptor's wavelength and read_nexus's energy agree with the provider's eV for a 16 keV beam."""
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
     from xrd_tools.io.nexus import read_nexus
-    from xrd_tools.transforms import energy_to_wavelength
     path = tmp_path / "mono.nxs"
     with h5py.File(path, "w") as h5:
         entry = h5.create_group("entry")
@@ -579,6 +579,7 @@ def test_a_containers_energy_is_read_in_ev_or_kev_by_its_size(tmp_path, recorded
         energy = entry.create_dataset("instrument/monochromator/energy", data=recorded)
         if units is not None:
             energy.attrs["units"] = units
-    assert describe_container(path).wavelength == pytest.approx(float(energy_to_wavelength(16.0)), rel=1e-12, abs=0)
+    # the generic descriptor's wavelength comes from core.energy (B3, 062a348a), as the provider's energy does
+    assert describe_container(path).wavelength == pytest.approx(energy_eV_to_wavelength_m(16000.0) * 1e10, rel=1e-12, abs=0)
     assert read_nexus(path).energy == pytest.approx(16.0, rel=1e-12, abs=0)
 
