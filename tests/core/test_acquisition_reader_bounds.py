@@ -70,7 +70,7 @@ def test_split_detector_images_do_not_depend_on_the_nexus_suffix(tmp_path, suffi
     np.testing.assert_array_equal(read_image_stack(path), pixels)
     np.testing.assert_array_equal(read_image(path, frame=3), pixels[3])
     assert read_detector_image_layout(path).frame_count == 4
-    assert classify_image_source(path).frame_count == 4
+    assert classify_image_source(path).n_frames == 4
 
 
 def test_streamed_generic_metadata_seals_on_close_but_materialized_table_survives(tmp_path):
