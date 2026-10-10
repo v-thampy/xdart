@@ -1075,17 +1075,39 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
 
     Explicitly called by new Run/replay only; persisted and Reintegrate scans retain
     their existing interpretation. The returned calibration is an effective copy.
+
+    Each frame's own recorded energy decides (eV or keV by its size; an impossible one
+    counts as none). Only when no frame records one does the source's energy or wavelength
+    apply. A varying series is an energy scan, which Int reduces frame by frame at each
+    frame's own energy (``frame_labels`` and ``frame_energies_eV``); the sensor parallax
+    correction, computed at one energy, cannot follow it.
     """
     from dataclasses import replace
     from xrd_tools.core.energy import resolve_acquisition_energy, metadata_energy_values, WavelengthUnit
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
-    energies = list(metadata_energy_eV)
+    labels, recorded = [], []
     for frame in scan.frames:
-        energies.extend(metadata_energy_values(frame.metadata))
-    if metadata_wavelength_A is not None:
-        energies.extend(metadata_energy_values({}, wavelength=metadata_wavelength_A,
-                                              wavelength_unit=WavelengthUnit.ANGSTROM))
-    selection = resolve_acquisition_energy(calibration.poni.wavelength, energies)
+        values = metadata_energy_values(frame.metadata)
+        if len(values) > 1:
+            resolve_acquisition_energy(None, values)  # a row's energy and wavelengths must agree
+        labels.append(int(frame.index))
+        recorded.append(values[0] if values else None)
+    per_frame = any(value is not None for value in recorded)
+    if per_frame:
+        energies = recorded
+    else:
+        energies = [value for energy in metadata_energy_eV
+                    for value in metadata_energy_values({'energy': energy})]
+        if metadata_wavelength_A is not None:
+            energies.extend(metadata_energy_values({}, wavelength=metadata_wavelength_A,
+                                                  wavelength_unit=WavelengthUnit.ANGSTROM))
+    selection = resolve_acquisition_energy(calibration.poni.wavelength, energies, allow_energy_scan=per_frame)
+    if 'frame_energies_eV' in selection:
+        if calibration.parallax is not None:
+            raise ValueError('an energy scan cannot use the sensor parallax correction, which is computed at one '
+                             'energy; turn parallax off to reduce each frame at its own energy')
+        selection = {**selection, 'frame_labels': labels,
+                     'frame_energies_eV': [float(value) for value in selection['frame_energies_eV']]}
     if selection['disagreement']:
         logger.warning('X-ray energy mismatch: metadata=%.1f eV, PONI=%.1f eV; using metadata',
                        selection['source_energy_eV'], selection['calibration_energy_eV'])

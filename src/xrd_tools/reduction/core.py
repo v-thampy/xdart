@@ -3522,6 +3522,9 @@ class ReductionSession:
             ai = self.scan.integrator
             if ai is None and self.scan.poni is None:
                 raise ValueError("Reduction requires scan.integrator or scan.poni.")
+            self.plan = _freeze_energy_scan_q_grid(
+                self.plan, ai if ai is not None else poni_to_integrator(self.scan.poni),
+            )
 
         self._integrators = _ReductionIntegratorProvider(
             scan=self.scan,
@@ -5104,10 +5107,17 @@ def _gi_freeze_scout_indices(
                 raise ValueError(f"GI freeze scout frame {idx} is not in scan {scan.name!r}")
             if idx not in out:
                 out.append(idx)
-        return out
-    if freeze_policy == "first_frame" or len(scan.frames) == 1:
-        return [int(scan.frames[0].index)]
-    return [int(scan.frames[0].index), int(scan.frames[-1].index)]
+    elif freeze_policy == "first_frame" or len(scan.frames) == 1:
+        out = [int(scan.frames[0].index)]
+    else:
+        out = [int(scan.frames[0].index), int(scan.frames[-1].index)]
+    # An energy scan's lowest- and highest-energy frames bound its q extents too.
+    wavelengths = _energy_scan_wavelengths(plan)
+    listed = [int(label) for label in scan.frame_indices if int(label) in (wavelengths or {})]
+    for idx in ((min(listed, key=wavelengths.get), max(listed, key=wavelengths.get)) if listed else ()):
+        if idx not in out:
+            out.append(idx)
+    return out
 
 
 def _gi_1d_freeze_key(plan: ReductionPlan) -> str | None:
@@ -5180,6 +5190,85 @@ def _replace_integration_2d_ranges(
 # Shared with Stitch's frame workers: one lock for all pyFAI numexpr work in the process.
 _PYFAI_COLD_GEOMETRY_LOCK = PYFAI_NUMEXPR_LOCK
 
+#: Radial units that do not depend on the X-ray energy (maintainer, 2026-10-10: "2θ never needs one energy").
+_ENERGY_FREE_UNITS = frozenset({"2th_deg", "2th_rad", "r_mm", "r_m"})
+_Q_UNITS = frozenset({"q_nm^-1", "q_a^-1"})
+#: plan.extra key: an energy scan's common q range per dimension, applied as each frame is
+#: integrated (as COMPANION_RANGES_2D is), so the recorded integration settings stay the
+#: user's and Reintegrate derives the same grid from the persisted energies.
+ENERGY_SCAN_Q_RANGES = "energy_scan_q_ranges"
+
+
+def _energy_scan_wavelengths(plan: ReductionPlan) -> dict[int, float] | None:
+    """An energy scan's own wavelength (m) for each frame label its energy selection lists, or None.
+
+    None also when nothing the plan integrates depends on the energy: a standard plan in 2θ keeps one
+    integrator for every frame.
+    """
+    selection = (getattr(plan, "extra", None) or {}).get("energy_selection")
+    if not isinstance(selection, Mapping) or "frame_energies_eV" not in selection:
+        return None
+    if plan.gi is None and all(
+        str(item.unit or "").lower() in _ENERGY_FREE_UNITS
+        for item in (plan.integration_1d, plan.integration_2d) if item is not None
+    ):
+        return None
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    return {
+        int(label): energy_eV_to_wavelength_m(float(energy))
+        for label, energy in zip(selection["frame_labels"], selection["frame_energies_eV"], strict=True)
+    }
+
+
+def _freeze_energy_scan_q_grid(plan: ReductionPlan, integrator: Any) -> ReductionPlan:
+    """Give a standard energy scan in q one radial range, so that every frame, reduced at its own energy, shares
+    one grid: from the lowest energy's lowest q to the highest energy's highest q over every pixel's extent
+    (centre ± delta). A range the plan sets is kept, 2θ needs none, and the writer's common-axis check is
+    unchanged (maintainer, 2026-10-10: "q needs each frame reduced at its own energy on a common grid").
+    The ranges go to ``plan.extra[ENERGY_SCAN_Q_RANGES]``."""
+    wavelengths = _energy_scan_wavelengths(plan)
+    if wavelengths is None or plan.gi is not None:
+        return plan
+    targets = {}
+    for key, item in (("1d", plan.integration_1d), ("2d", plan.integration_2d)):
+        if item is None or key == "1d" and standard_chi_profile(plan):
+            continue  # a chi profile's axis is the azimuth; its q band is the user's
+        unit = str(item.unit or "").lower()
+        if unit in _ENERGY_FREE_UNITS:
+            continue
+        if unit not in _Q_UNITS:
+            raise ValueError(f"an energy scan is reduced in q or 2θ, not {item.unit}")
+        if item.radial_range is None:
+            targets[key] = str(item.unit)  # pyFAI's unit names are case-sensitive
+    if not targets:
+        return plan
+    shape = getattr(getattr(integrator, "detector", None), "shape", None)
+    if shape is None:
+        raise ValueError("an energy scan needs its detector's shape to share one q grid")
+    from xrd_tools.integrate.calibration import _clone_integrator_preserving_calibration
+    clone = _clone_integrator_preserving_calibration(integrator)
+    ranges = {}
+    with _PYFAI_COLD_GEOMETRY_LOCK:
+        for unit in sorted(set(targets.values())):
+            lows, highs = [], []
+            for wavelength in (max(wavelengths.values()), min(wavelengths.values())):
+                clone.wavelength = wavelength
+                centre = clone.array_from_unit(shape, "center", unit, scale=True)
+                delta = clone.array_from_unit(shape, "delta", unit, scale=True)
+                lows.append(float(np.min(centre - delta)))
+                highs.append(float(np.max(centre + delta)))
+            ranges[unit] = (max(0.0, min(lows)), max(highs))
+    return replace(plan, extra={
+        **plan.extra, ENERGY_SCAN_Q_RANGES: {key: ranges[unit] for key, unit in targets.items()},
+    })
+
+
+def _on_energy_scan_grid(item: Any, grid: Mapping[str, Any] | None, key: str) -> Any:
+    """One integration on its energy scan's common q range (``_freeze_energy_scan_q_grid``)."""
+    if not grid or item is None or key not in grid:
+        return item
+    return replace(item, radial_range=tuple(map(float, grid[key])))
+
 
 class _ReductionIntegratorProvider:
     """Per-thread integrator cache for executor-backed reductions."""
@@ -5200,6 +5289,13 @@ class _ReductionIntegratorProvider:
         self.initial_incident_angle = initial_incident_angle
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
+        # An energy scan reduces each frame at its own wavelength on a private integrator.
+        self._frame_wavelengths = _energy_scan_wavelengths(plan)
+        self._base_wavelength = (
+            float(ai.wavelength) if ai is not None and ai.wavelength
+            else float(scan.poni.wavelength) if scan.poni is not None and scan.poni.wavelength
+            else None
+        )
 
     def _new_standard(self) -> Any:
         """Build one private standard integrator from the accepted calibration."""
@@ -5214,11 +5310,14 @@ class _ReductionIntegratorProvider:
         local_ai = getattr(self._local, "ai", None)
         if local_ai is not None:
             return local_ai
-        if self.scan.poni is None:
-            return self.ai
-        if threading.get_ident() == self._owner_thread and self.ai is not None:
-            return self.ai
-        # Per-worker AI (pyFAI AIs aren't safe to share across threads).
+        if self._frame_wavelengths is None:
+            if self.scan.poni is None:
+                return self.ai
+            if threading.get_ident() == self._owner_thread and self.ai is not None:
+                return self.ai
+        # Per-worker AI (pyFAI AIs aren't safe to share across threads).  An energy
+        # scan's frames each set their own wavelength, so even the owner thread
+        # never shares the accepted base integrator then.
         # Deep-copy the base integrator instead of rebuilding from scan.poni:
         # a PONI cannot recover an unnamed detector's pixel size.
         ai = self._new_standard()
@@ -5350,10 +5449,32 @@ class _ReductionIntegratorProvider:
         self._local.run_mask_binding = (run_mask, shape, True)
         return ai, True
 
+    def at_frame_energy(
+        self, integrator: Any, frame: Frame, shape: tuple[int, ...], *, warm: bool,
+    ) -> None:
+        """Set an energy scan frame's own wavelength on this thread's private integrator.
+
+        A frame the scan's energies do not list (one appended later) takes the
+        representative energy. pyFAI's wavelength setter resets the geometry, so a
+        standard integrator's centres are rebuilt under the numexpr lock, as at its
+        first binding.
+        """
+        wavelengths = self._frame_wavelengths
+        if wavelengths is None or integrator is None:
+            return
+        wavelength = wavelengths.get(int(frame.index), self._base_wavelength)
+        if wavelength is None or float(integrator.wavelength) == wavelength:
+            return
+        with _PYFAI_COLD_GEOMETRY_LOCK:
+            integrator.wavelength = wavelength
+            if warm:
+                self._warm_standard_centers(integrator, (int(shape[0]), int(shape[1])))
+
     def fiber(self) -> Any:
         if self.scan.poni is None:
             return self.fi
-        if threading.get_ident() == self._owner_thread and self.fi is not None:
+        if (threading.get_ident() == self._owner_thread and self.fi is not None
+                and self._frame_wavelengths is None):
             return self.fi
         fi = getattr(self._local, "fi", None)
         if fi is None:
@@ -5803,8 +5924,9 @@ def _reduce_frame(
         variance = _poisson_variance(image, frame, plan, plan_derived)
         image = _subtract_background(image, background)
     # Poisson plans with a dark or background integrate with an explicit variance.
-    p1_frame = _with_variance(plan.integration_1d, variance)
-    p2_frame = _with_variance(plan.integration_2d, variance)
+    grid = (plan.extra or {}).get(ENERGY_SCAN_Q_RANGES)
+    p1_frame = _with_variance(_on_energy_scan_grid(plan.integration_1d, grid, "1d"), variance)
+    p2_frame = _with_variance(_on_energy_scan_grid(plan.integration_2d, grid, "2d"), variance)
     plan_mask = _cached_mask_for_shape(
         plan.mask,
         image.shape,
@@ -5823,6 +5945,9 @@ def _reduce_frame(
             else plan_mask | frame_mask
         )
         fi = integrators.fiber()
+        at_energy = getattr(integrators, "at_frame_energy", None)
+        if at_energy is not None:
+            at_energy(fi, frame, image.shape, warm=False)
         incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
         r1d = (
             _run_gi_1d(
@@ -5911,6 +6036,9 @@ def _reduce_frame(
             integration_mask = mask
         if ai is None:
             ai = integrators.standard()
+        at_energy = getattr(integrators, "at_frame_energy", None)
+        if at_energy is not None:
+            at_energy(ai, frame, image.shape, warm=True)
         if chi_mode:
             # Non-GI azimuthal profile (Mode A): the output axis is chi, while
             # radial_range is the q band to integrate over.  Mirror

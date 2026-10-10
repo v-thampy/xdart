@@ -2545,6 +2545,9 @@ def _core_plan(selected: Mapping[str, Any], shared: Mapping[str, Any], mask=None
     return plan
 def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, target_revision, *, cancel_token=None):
     _event(cancel_token); gi = shared["gi"]
+    # A GI energy scan's common grid comes from its Run's scouts; Reintegrate does not repeat them yet.
+    _reject(gi["enabled"] and "frame_energies_eV" in (shared.get("energy_selection") or {}),
+            "Reintegrate does not yet repeat a GI energy scan; run it again instead")
     if not gi["enabled"] or gi["resolved_motor"] == "Manual": return selected, None
     try: bootstrap = float(observed.gi_values[observed.labels[0]])
     except (KeyError, TypeError, ValueError) as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
