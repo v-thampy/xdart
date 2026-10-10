@@ -109,7 +109,11 @@ class CompositeFrameSource(BaseFrameSource):
 
     @property
     def metadata_energy_eV(self) -> tuple:
-        return tuple(value for member in self._members for value in member.metadata_energy_eV)
+        values = []
+        for member in self._members:
+            canonical = getattr(member, 'metadata_energy_eV', None)
+            values.extend(BaseFrameSource.metadata_energy_eV.fget(member) if canonical is None else canonical)
+        return tuple(values)
 
     @property
     def motors(self) -> dict[str, np.ndarray]:

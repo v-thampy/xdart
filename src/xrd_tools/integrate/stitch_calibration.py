@@ -102,7 +102,7 @@ def _metadata_reader(source):
             provider = cursor.metadata_provider()
             yield provider.complete_metadata_for, provider.metadata_energy_is_eV
     else:
-        yield source.metadata_for, source.metadata_energy_is_eV
+        yield source.metadata_for, getattr(source, 'metadata_energy_is_eV', False)
 
 
 def _exact_source(spec):

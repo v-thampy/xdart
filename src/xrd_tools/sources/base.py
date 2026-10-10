@@ -66,7 +66,7 @@ class BaseFrameSource(ABC):
         from xrd_tools.core.energy import metadata_energy_values
         return tuple(energy for value in np.atleast_1d(getattr(self, 'motors', {}).get('energy', ()))
                      for energy in metadata_energy_values({'energy': value},
-                                                         energy_is_eV=self.metadata_energy_is_eV))
+                                                         energy_is_eV=getattr(self, 'metadata_energy_is_eV', False)))
 
     def scan_manifest(self) -> list[tuple[int, Mapping[str, Any]]] | None:
         """Cheap METADATA-ONLY pass: ``(frame_index, metadata)`` for every frame

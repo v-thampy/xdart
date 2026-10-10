@@ -420,7 +420,7 @@ class PointImageSource(BaseFrameSource):
 
     @property
     def metadata_energy_is_eV(self):
-        return self.source.metadata_energy_is_eV
+        return getattr(self.source, 'metadata_energy_is_eV', False)
 
     def frame_for(self, index):
         path, raw = self.raw_locator_for(index)
