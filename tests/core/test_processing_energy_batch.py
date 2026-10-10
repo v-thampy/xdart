@@ -134,12 +134,18 @@ def _edges(axis):
     return float(axis[0] - half), float(axis[-1] + half)
 
 
-def _q_coverage(intent, energy_eV):
+def _q_grid(poni_file, low_eV, high_eV):
+    """The declared common grid, computed directly with pyFAI: from the lowest energy's lowest q to the highest
+    energy's highest q over every pixel's extent (centre ± delta), never below 0."""
     from xrd_tools.integrate.calibration import load_detector_calibration, detector_calibration_to_integrator
-    integrator = detector_calibration_to_integrator(load_detector_calibration(intent.poni_file))
-    integrator.wavelength = energy_eV_to_wavelength_m(energy_eV)
-    q = integrator.array_from_unit(_SHAPE, "center", "q_A^-1", scale=True)
-    return float(np.min(q)), float(np.max(q))
+    extents = []
+    for energy in (low_eV, high_eV):
+        integrator = detector_calibration_to_integrator(load_detector_calibration(poni_file))
+        integrator.wavelength = energy_eV_to_wavelength_m(energy)
+        centre = integrator.array_from_unit(_SHAPE, "center", "q_A^-1", scale=True)
+        delta = integrator.array_from_unit(_SHAPE, "delta", "q_A^-1", scale=True)
+        extents.append((float(np.min(centre - delta)), float(np.max(centre + delta))))
+    return max(0.0, extents[0][0]), extents[1][1]
 
 
 @pytest.mark.parametrize("recorded", [[16000., 17000.], [16., 17.]])
@@ -153,15 +159,13 @@ def test_int_reduces_an_energy_scan_in_q_at_each_frames_energy_on_one_grid(tmp_p
     scan = open_scan(path)
     q0, q1 = scan.get_1d(0).q, scan.get_1d(1).q
     np.testing.assert_array_equal(q0, q1)
-    low, high = _edges(q0)
-    # One grid covering every frame: the lowest energy's lowest q to the highest energy's highest q.
-    assert low <= _q_coverage(intent, 16000.)[0] and high >= _q_coverage(intent, 17000.)[1]
     assert not np.allclose(scan.get_1d(0).intensity, scan.get_1d(1).intensity)
+    grid = _q_grid(intent.poni_file, 16000., 17000.)
     for label, energy in ((0, 16000.), (1, 17000.)):
-        # Each frame equals an ordinary one-energy run at its own energy on the same grid.
+        # Each frame equals an ordinary one-energy run at its own energy on the declared common grid.
         reference = open_scan(_replay(_int(tmp_path / f"reference-{label}", [energy, energy], "q_A^-1",
-                                           radial_range=(low, high)), "reference"))
-        np.testing.assert_allclose(reference.get_1d(0).q, q0, rtol=1e-12, atol=0)
+                                           radial_range=grid), "reference"))
+        np.testing.assert_array_equal(reference.get_1d(0).q, q0)
         np.testing.assert_allclose(scan.get_1d(label).intensity, reference.get_1d(0).intensity, rtol=1e-12, atol=0)
 
 
@@ -172,11 +176,9 @@ def test_int_reduces_a_2d_energy_scan_in_q_on_one_grid(tmp_path):
     first, second = scan.get_2d(0), scan.get_2d(1)
     np.testing.assert_array_equal(first.q, second.q)
     np.testing.assert_array_equal(first.chi, second.chi)
-    low, high = _edges(first.q)
-    assert low <= _q_coverage(intent, 16000.)[0] and high >= _q_coverage(intent, 17000.)[1]
     reference = open_scan(_replay(_int(tmp_path / "reference", [17000., 17000.], "q_A^-1", mode="Int 2D",
-                                       radial_range=(low, high)), "reference"))
-    np.testing.assert_allclose(reference.get_2d(0).q, first.q, rtol=1e-12, atol=0)
+                                       radial_range=_q_grid(intent.poni_file, 16000., 17000.)), "reference"))
+    np.testing.assert_array_equal(reference.get_2d(0).q, first.q)
     np.testing.assert_allclose(second.intensity, reference.get_2d(0).intensity, rtol=1e-12, atol=0, equal_nan=True)
 
 
@@ -192,11 +194,15 @@ def test_a_gi_energy_scan_in_q_shares_one_grid(tmp_path):
     from xrd_tools.session.run_configuration import GIIntent
     gi = GIIntent(enabled=True, incidence_motor="Manual", th_val=0.3)
     scan = open_scan(_replay(_int(tmp_path / "scan", [16000., 17000.], "q_A^-1", gi=gi), "scan"))
-    reference = open_scan(_replay(_int(tmp_path / "reference", [16000., 16000.], "q_A^-1", gi=gi), "reference"))
     np.testing.assert_array_equal(scan.get_1d(0).q, scan.get_1d(1).q)
     assert not np.allclose(scan.get_1d(0).intensity, scan.get_1d(1).intensity, equal_nan=True)
-    # The lower-energy frame keeps its coverage on the common grid.
-    assert np.nanmin(scan.get_1d(0).q) <= np.nanmin(reference.get_1d(0).q)
+    # The common grid spans each frame's own one-energy grid.
+    low, high = _edges(scan.get_1d(0).q)
+    for energy in (16000., 17000.):
+        reference = open_scan(_replay(_int(tmp_path / f"reference-{energy:g}", [energy, energy], "q_A^-1", gi=gi),
+                                      "reference"))
+        own_low, own_high = _edges(reference.get_1d(0).q)
+        assert low <= own_low + 1e-6 and high >= own_high - 1e-6
 
 
 def test_int_replay_glitched_frame_takes_the_series_energy(tmp_path):

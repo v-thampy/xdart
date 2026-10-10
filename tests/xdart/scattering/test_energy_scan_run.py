@@ -46,10 +46,19 @@ def _run(root: Path, energies_keV, unit: str, radial_range=None):
     return intent, written(root / "escan.nexus", "Int 1D")
 
 
-def _edges(axis):
-    axis = np.asarray(axis, dtype=float)
-    half = (axis[-1] - axis[0]) / (len(axis) - 1) / 2
-    return float(axis[0] - half), float(axis[-1] + half)
+def _q_grid(poni_file, low_eV, high_eV):
+    """The declared common grid, computed directly with pyFAI: from the lowest energy's lowest q to the highest
+    energy's highest q over every pixel's extent (centre ± delta), never below 0."""
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.integrate.calibration import load_detector_calibration, detector_calibration_to_integrator
+    extents = []
+    for energy in (low_eV, high_eV):
+        integrator = detector_calibration_to_integrator(load_detector_calibration(poni_file))
+        integrator.wavelength = energy_eV_to_wavelength_m(energy)
+        centre = integrator.array_from_unit((195, 487), "center", "q_A^-1", scale=True)
+        delta = integrator.array_from_unit((195, 487), "delta", "q_A^-1", scale=True)
+        extents.append((float(np.min(centre - delta)), float(np.max(centre + delta))))
+    return max(0.0, extents[0][0]), extents[1][1]
 
 
 def test_a_real_energy_scan_run_reduces_each_frame_at_its_energy_and_reintegrates_the_same(tmp_path):
@@ -67,12 +76,12 @@ def test_a_real_energy_scan_run_reduces_each_frame_at_its_energy_and_reintegrate
     first, second = (scan.get_1d(label) for label in labels)
     np.testing.assert_array_equal(first.q, second.q)
     assert not np.allclose(first.intensity, second.intensity)
-    low, high = _edges(first.q)
+    grid = _q_grid(intent.poni_file, 16000., 17000.)
     for label, energy in zip(labels, (16, 17)):
         _intent_unused, reference = _run(tmp_path / f"reference-{energy}", (energy, energy), "q_A^-1",
-                                         radial_range=(low, high))
+                                         radial_range=grid)
         expected = open_scan(reference).get_1d(int(open_scan(reference).frame_indices[0]))
-        np.testing.assert_allclose(expected.q, first.q, rtol=1e-12, atol=0)
+        np.testing.assert_array_equal(expected.q, first.q)
         np.testing.assert_allclose(scan.get_1d(label).intensity, expected.intensity, rtol=1e-12, atol=0)
     # Reintegrate repeats each frame at its persisted energy; no current source-energy inference.
     plan = ReintegrateSuccessorPlan.from_artifact(
