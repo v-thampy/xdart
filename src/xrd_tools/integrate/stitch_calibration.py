@@ -122,7 +122,7 @@ def calibration_source_energy_eV(spec: SourceSpec) -> float | None:
     their units. NeXus uses the existing metadata reader's keV/angstrom projection. A missing,
     invalid or varying energy is not a default energy, and an absent SPEC selector never falls back.
     """
-    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV, xray_energy_eV
     if spec.kind is SourceKind.SPEC:
         from xrd_tools.io.spec import list_spec_scans, read_spec_scan_columns
         key = str(spec.options.get('scan', ''))
@@ -134,6 +134,8 @@ def calibration_source_energy_eV(spec: SourceSpec) -> float | None:
         columns, fixed, _ = read_spec_scan_columns(spec.uri, key)
         metadata = {name.casefold(): np.asarray(value, dtype=float) for name, value in (*fixed, *columns)}
         values = metadata.get('energy')
+        if values is not None:
+            values = xray_energy_eV(values)  # eV or keV by its size
         if values is None:
             for name, factor in (('wavelength_m', 1.), ('wavelength_a', 1e-10)):
                 if name in metadata:
@@ -147,7 +149,7 @@ def calibration_source_energy_eV(spec: SourceSpec) -> float | None:
         return float(values[0]) if np.all(values == values[0]) else None
     from xrd_tools.io.nexus import read_nexus
     metadata = read_nexus(spec.uri, spec.entry or 'entry', motor_names=['energy'], counter_names=[])
-    values = np.asarray(metadata.angles.get('energy', ()), dtype=float)
+    values = np.asarray(xray_energy_eV(np.asarray(metadata.angles.get('energy', ()), dtype=float)), dtype=float)
     if values.size:
         return (float(values.flat[0]) if np.all(np.isfinite(values) & (values > 0))
                 and np.all(values == values.flat[0]) else None)
@@ -196,7 +198,8 @@ def source_frame_choices(spec: SourceSpec, motor_names=('del', 'nu')):
                     raise ValueError(f'frame {index}: diffraction angles must be finite')
                 energy = metadata.get('energy')
                 if energy is not None:
-                    energy = float(energy)
+                    from xrd_tools.core.energy import xray_energy_eV
+                    energy = xray_energy_eV(float(energy))  # eV or keV by its size
                     # An impossible recorded energy (a glitched readback: the 17-2 del-only file records -2165.0213
                     # for one scan) is no energy, as calibration_source_energy_eV holds; the typed one applies.
                     if not math.isfinite(energy) or energy <= 0:
@@ -246,7 +249,8 @@ def direct_beam_pose(spec: SourceSpec, motor: str, held=()) -> tuple[float | Non
             raise ValueError(f'NeXus has no {motor!r} angle column')
         count = len(metadata.angles[motor])
         seen = {name: list(metadata.angles[name]) for name in held if name in metadata.angles}
-        energies = list(metadata.angles.get('energy', ()))
+        from xrd_tools.core.energy import xray_energy_eV
+        energies = [xray_energy_eV(float(value)) for value in metadata.angles.get('energy', ())]
         if not energies and metadata.energy and math.isfinite(metadata.energy) and metadata.energy > 0:
             energies = [float(metadata.energy) * 1000.0]  # its instrument energy, in keV
     readings: dict[str, float] = {}

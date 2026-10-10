@@ -565,7 +565,7 @@ def source_energy_checks(source, wavelength_A, recorded_eV=None, *, tables=None,
     absent, each is read."""
     from xrd_tools.analysis.module_transaction import MetadataColumnSelector
     from xrd_tools.analysis.stitch_operation import _fresh_table, _source_members, _manifest_numeric_lookup
-    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV, xray_energy_eV
     from xrd_tools.core.scan import SourceKind
     from xrd_tools.sources.descriptor import describe_container
     expected = wavelength_m_to_energy_eV(wavelength_A * 1e-10) if recorded_eV is None else float(recorded_eV)
@@ -579,7 +579,9 @@ def source_energy_checks(source, wavelength_A, recorded_eV=None, *, tables=None,
             _refuse("AMBIGUOUS_METADATA_SELECTOR", "energy must occur at most once per member")
         if "energy" in names:
             positions, columns = _manifest_numeric_lookup(table, (MetadataColumnSelector("energy"),))
-            energies.extend(float(columns[0][1][positions[label]]) for label in member.selected_labels)
+            # eV or keV by its size ("0-150 read are keV, above 150 in eV")
+            energies.extend(xray_energy_eV(float(columns[0][1][positions[label]]))
+                            for label in member.selected_labels)
         if member.analysis.resolved_kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
             import h5py
             from xrd_tools.io.nexus import _read_energy
@@ -591,11 +593,10 @@ def source_energy_checks(source, wavelength_A, recorded_eV=None, *, tables=None,
                 energy_kev = _read_energy(handle[member.analysis.resolved_entry or "entry"])
                 if math.isfinite(energy_kev):
                     energies.append(energy_kev * 1000)
-        if any(not math.isfinite(energy) or energy <= 0 or
-               (not allow_calibration_override and abs(energy - expected) > 0.001 * expected)
-               for energy in energies):
-            _refuse("STITCH_SOURCE_ENERGY_CONFLICT", ("selected member metadata energy must be finite and positive"
-                if allow_calibration_override else "selected member energy differs from calibration"))
+        # An impossible recorded energy (zero, negative or not a number) counts as none.
+        energies = [energy for energy in energies if math.isfinite(energy) and energy > 0]
+        if not allow_calibration_override and any(abs(energy - expected) > 0.001 * expected for energy in energies):
+            _refuse("STITCH_SOURCE_ENERGY_CONFLICT", "selected member energy differs from calibration")
         checks.append({"source_id": member.fingerprint, "sample_count": len(energies),
                        "range_eV": [min(energies), max(energies)] if energies else None})
     return checks

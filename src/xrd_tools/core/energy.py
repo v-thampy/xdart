@@ -52,7 +52,8 @@ class WavelengthUnit(str, Enum):
     A wavelength value is evidence only when its unit is DECLARED by its
     source — the NeXus container descriptor reports angstroms, PONI/run values
     are metres, and an unqualified number has no enforceable unit.  Consumers
-    must never infer a unit from value magnitude.
+    must never infer a wavelength's unit from its magnitude (an X-ray energy's
+    scale, by contrast, is decided by its size: :func:`xray_energy_eV`).
     """
 
     METRE = "m"
@@ -151,46 +152,61 @@ def wavelength_m_to_energy_eV(wavelength_m: float) -> float:
     return _HC_EV_M / float(wavelength_m)
 
 
-#: X-ray diffraction energies span about 1-200 keV, that is 1000-200000 eV, so the two
-#: scales never overlap: a recorded energy below this is in keV, any other in eV
-#: (maintainer, 2026-10-09: "It should be easy enough to figure out if the energy is in
-#: eV or keV for X-rays").  No unit is needed, and a mislabel cannot mislead it.
-_XRAY_KEV_EV_BOUNDARY = 1000.0
+#: A recorded X-ray energy up to this is in keV, any larger one in eV (maintainer,
+#: 2026-10-10: "For energies, the rule should be 0-150 read are keV, above 150 in eV.
+#: This accounts for soft xrays as well").  No unit is needed, and a mislabel cannot
+#: mislead it.
+_XRAY_KEV_MAX = 150.0
 
 
 def _xray_energy_scaled(value, *, to_eV: bool):
     energy = np.asarray(value, dtype=float)
     positive = np.isfinite(energy) & (energy > 0)
+    in_keV = positive & (energy <= _XRAY_KEV_MAX)
     if to_eV:
-        result = np.where(positive & (energy < _XRAY_KEV_EV_BOUNDARY), energy * 1000.0, energy)
+        result = np.where(in_keV, energy * 1000.0, energy)
     else:
-        result = np.where(positive & (energy >= _XRAY_KEV_EV_BOUNDARY), energy / 1000.0, energy)
+        result = np.where(positive & ~in_keV, energy / 1000.0, energy)
     return float(result) if result.ndim == 0 else result
 
 
 def xray_energy_eV(value):
     """A recorded X-ray energy (a number or an array) in eV, its scale decided by its size.
 
-    Below 1000 it is keV; a value already in eV is returned exactly.  A value that is
-    not finite and positive is returned unchanged: its consumer decides what is impossible.
+    Up to 150 it is keV; a larger value is already eV and is returned exactly.  A value
+    that is not finite and positive is returned unchanged: its consumer decides what is
+    impossible.
     """
     return _xray_energy_scaled(value, to_eV=True)
 
 
 def xray_energy_keV(value):
-    """As :func:`xray_energy_eV`, in keV: a recorded value of 1000 or more is eV."""
+    """As :func:`xray_energy_eV`, in keV: a recorded value above 150 is eV."""
     return _xray_energy_scaled(value, to_eV=False)
 
 
-def metadata_energy_values(row, *, wavelength=None, wavelength_unit=None) -> tuple:
-    """Read a metadata row's eV energy or explicitly unit-declared wavelength.
+def _recorded_energy_eV(value):
+    """A recorded energy in eV by its size; anything that is not a number is passed on unchanged,
+    for :func:`resolve_acquisition_energy` to count as no energy."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    return xray_energy_eV(number)
 
-    Missing evidence returns no values. Present invalid evidence refuses rather
-    than selecting the calibration fallback; units are never inferred by size.
+
+def metadata_energy_values(row, *, wavelength=None, wavelength_unit=None) -> tuple:
+    """Read a metadata row's energy (eV or keV by its size) or explicitly unit-declared wavelength, in eV.
+
+    Missing evidence returns no values. An impossible energy is passed on, for the
+    resolver to count as none; invalid wavelength evidence refuses, and a wavelength's
+    unit is never inferred from its size.
     """
     names = {str(key).casefold(): value for key, value in row.items()}
     if 'energy' in names:
-        return (names['energy'],)
+        return (_recorded_energy_eV(names['energy']),)
     values = [(names[name], unit) for name, unit in
               (('wavelength_m', WavelengthUnit.METRE),
                ('wavelength_a', WavelengthUnit.ANGSTROM)) if name in names]
@@ -205,28 +221,36 @@ def metadata_energy_values(row, *, wavelength=None, wavelength_unit=None) -> tup
     return tuple(energies)
 
 
-def resolve_acquisition_energy(calibration_wavelength_m, metadata_energy_eV=(), *,
-                               fitted_source_energy_eV=None) -> dict:
-    """Freeze one acquisition energy and its explicit fitted correction, without I/O.
+def _possible_energy(value) -> float | None:
+    """A recorded energy that is a finite positive number, else None: zero, negative or not a number is none."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) and number > 0 else None
 
-    Metadata values must be positive, finite and common within the existing 0.1 %
-    source-energy tolerance. An empty sequence selects the calibration fallback.
-    The calibration itself remains immutable.
+
+def resolve_acquisition_energy(calibration_wavelength_m, metadata_energy_eV=(), *,
+                               fitted_source_energy_eV=None, allow_energy_scan=False) -> dict:
+    """Freeze the acquisition energy and its explicit fitted correction, without I/O.
+
+    A recorded energy that is zero, negative or not a number counts as none (maintainer,
+    2026-10-09): with no valid value the calibration fallback applies, and a glitched frame
+    in a valid series takes the series' energy. Valid values must be common within the
+    existing 0.1 % source-energy tolerance, unless the caller reduces each frame at its own
+    energy (``allow_energy_scan``): a varying series is then an energy scan, and
+    ``frame_energies_eV`` holds each value's effective energy in order, a glitched one
+    taking the nearest earlier valid frame's (the first valid one's when it leads). The first
+    valid value is the representative energy. The calibration itself remains immutable.
     """
-    first = None
-    for value in metadata_energy_eV:
-        if isinstance(value, (bool, np.bool_)):
-            raise ValueError("metadata energy must be finite and positive")
-        try:
-            number = float(value)
-        except (TypeError, ValueError) as error:
-            raise ValueError("metadata energy must be finite and positive") from error
-        if not np.isfinite(number) or number <= 0:
-            raise ValueError("metadata energy must be finite and positive")
-        if first is None:
-            first = number
-        elif abs(number - first) > .001 * first:
-            raise ValueError("metadata energy must be common across selected frames")
+    recorded = [_possible_energy(value) for value in metadata_energy_eV]
+    valid = [value for value in recorded if value is not None]
+    first = valid[0] if valid else None
+    scan = any(abs(value - first) > .001 * first for value in valid)
+    if scan and not allow_energy_scan:
+        raise ValueError("metadata energy must be common across selected frames")
     wavelength = canonical_wavelength_m(calibration_wavelength_m, WavelengthUnit.METRE)
     calibration = None if wavelength is None else wavelength_m_to_energy_eV(wavelength)
     if fitted_source_energy_eV is not None and calibration is None:
@@ -245,11 +269,21 @@ def resolve_acquisition_energy(calibration_wavelength_m, metadata_energy_eV=(), 
         effective, selected_wavelength = calibration, wavelength
     else:
         selected_wavelength = None if effective is None else energy_eV_to_wavelength_m(effective)
-    return {"source": "metadata" if first is not None else "calibration", "source_energy_eV": base,
-            "calibration_energy_eV": calibration, "fitted_energy_offset_eV": offset,
-            "energy_eV": effective,
-            "wavelength_m": selected_wavelength,
-            "disagreement": disagreement}
+    selection = {"source": "metadata" if first is not None else "calibration", "source_energy_eV": base,
+                 "calibration_energy_eV": calibration, "fitted_energy_offset_eV": offset,
+                 "energy_eV": effective,
+                 "wavelength_m": selected_wavelength,
+                 "disagreement": disagreement}
+    if scan:
+        frames, previous = [], first
+        for value in recorded:
+            previous = previous if value is None else value
+            energy = previous + offset
+            if not np.isfinite(energy) or energy <= 0:
+                raise ValueError("effective acquisition energy must be finite and positive")
+            frames.append(energy)
+        selection["frame_energies_eV"] = tuple(frames)
+    return selection
 
 
 def calibration_recorded_energy_eV(record) -> float | None:
