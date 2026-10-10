@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind
-from xrd_tools.sources.base import BaseFrameSource
+from xrd_tools.sources.base import BaseFrameSource, source_metadata_energy_eV
 
 
 class CompositeFrameSource(BaseFrameSource):
@@ -109,11 +109,7 @@ class CompositeFrameSource(BaseFrameSource):
 
     @property
     def metadata_energy_eV(self) -> tuple:
-        values = []
-        for member in self._members:
-            canonical = getattr(member, 'metadata_energy_eV', None)
-            values.extend(BaseFrameSource.metadata_energy_eV.fget(member) if canonical is None else canonical)
-        return tuple(values)
+        return tuple(value for member in self._members for value in source_metadata_energy_eV(member))
 
     @property
     def motors(self) -> dict[str, np.ndarray]:

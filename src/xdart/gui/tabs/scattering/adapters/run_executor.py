@@ -38,6 +38,7 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources import open_source
+from xrd_tools.sources.base import source_metadata_energy_eV
 from xrd_tools.sources.point_images import PointImagesRequired
 from xrd_tools.sources.cursor import open_container_cursor
 from xrd_tools.sources.nexus import NexusStackSource
@@ -1425,7 +1426,7 @@ class StandardRunExecutor:
             calibration = bind_native_int_source_energy(run.scan, calibration,
                 metadata_wavelength_A=(None if item is None or item.descriptor is None
                                        else item.descriptor.wavelength),
-                metadata_energy_eV=run.source.metadata_energy_eV)
+                metadata_energy_eV=source_metadata_energy_eV(run.source))
             integrator = run.scan.integrator
             poni = run.scan.poni
             if calibration.parallax is not None:

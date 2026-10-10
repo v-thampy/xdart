@@ -113,4 +113,10 @@ def ensure_frame_source(source: FrameSource | Scan | BaseFrameSource) -> FrameSo
     raise TypeError(f"object does not implement FrameSource: {type(source)!r}")
 
 
-__all__ = ["BaseFrameSource", "ensure_frame_source"]
+def source_metadata_energy_eV(source) -> tuple:
+    """*source*'s source-level energy in eV; a custom source without the optional fact reads as raw."""
+    canonical = getattr(source, 'metadata_energy_eV', None)
+    return tuple(BaseFrameSource.metadata_energy_eV.fget(source) if canonical is None else canonical)
+
+
+__all__ = ["BaseFrameSource", "ensure_frame_source", "source_metadata_energy_eV"]

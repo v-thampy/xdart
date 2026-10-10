@@ -97,6 +97,7 @@ def run_int_replay(configuration, *, data_root, output_root, on_progress=None, s
     from xrd_tools.session.readiness import native_int_reduction_plan, bind_native_int_source_energy
     from xrd_tools.session.scientific_assets import load_scientific_assets
     from xrd_tools.sources import open_source
+    from xrd_tools.sources.base import source_metadata_energy_eV
     from xrd_tools.sources.execution_graph import (qualify_source_execution_graph, graph_saturation,
         source_execution_projection, source_snapshots_projection)
     intent = load_run_intent_profile(json.dumps(configuration, allow_nan=False))
@@ -151,7 +152,7 @@ def run_int_replay(configuration, *, data_root, output_root, on_progress=None, s
             scan = source.to_scan()
             calibration = bind_native_int_source_energy(scan, calibration,
                 metadata_wavelength_A=None if graph.descriptor is None else graph.descriptor.wavelength,
-                metadata_energy_eV=source.metadata_energy_eV)
+                metadata_energy_eV=source_metadata_energy_eV(source))
             integrator = scan.integrator
             scan.gi_config = frozen.gi.scan_config().copy()
             scan.extra = dict(scan.extra or {})
