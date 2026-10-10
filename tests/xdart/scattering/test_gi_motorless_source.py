@@ -99,6 +99,41 @@ def test_eiger_gi_run_falls_back_to_manual_and_keeps_angle(tmp_path):
         _close(page, app)
 
 
+def test_a_generic_nexus_containers_eta_reaches_each_frames_incident_angle(tmp_path):
+    """CAL-HELD-BATCH-20261009 (maintainer: "I want these things to be addressed in this batch"): a non-Bluesky
+    acquisition container, split images and a misleading scan_master name, records eta per frame under
+    instrument/positioners; GI Auto chooses it, and the real Int run saves each frame's own incident angle."""
+    import h5py
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    raw = tmp_path / "scan_master.h5"
+    _write_eiger(raw, tmp_path / "scan_data_000001.h5", 2)
+    with h5py.File(raw, "a") as handle:
+        handle.create_dataset("entry/instrument/positioners/eta/value", data=[0.11, 0.37])
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    target = tmp_path / "result.nexus"
+    intent = _intent(raw, target, poni, processing_mode="Int 2D")
+    intent.gi.enabled = True
+    intent.gi.incidence_motor = "Manual"
+    intent.gi.th_val = 0.5
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(), executor=StandardRunExecutor(join_timeout=2.0),
+    )
+    artifact = _written(target, "Int 2D")
+    try:
+        _wait(app, lambda: page._intents.snapshot().thaw().gi.incidence_motor == "eta")
+        page._shell.run_controls.startButton.click()
+        _wait(app, lambda: page._capture_current_loaded_browse() is not None
+              or page._admission is None and page._notice_text.startswith("Output admission failed:"))
+        assert page._capture_current_loaded_browse() is not None, page._notice_text
+        with FrameViewReader(artifact) as reader:
+            assert [reader.read(label).incident_angle for label in (0, 1)] == pytest.approx([0.11, 0.37],
+                                                                                           rel=0, abs=1e-12)
+    finally:
+        _close(page, app)
+
+
 def test_admission_error_is_visible_and_logged(tmp_path, caplog, monkeypatch):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page, artifact = _page(tmp_path)

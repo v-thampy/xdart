@@ -68,6 +68,52 @@ def _plain(path):
     return path
 
 
+ACQUISITION_FRAMES = 3
+
+
+def _acquisition(path, *, external=False):
+    """A non-Bluesky acquisition NeXus container (no NXWriter marker): images in entry/instrument/detector/data or
+    linked from a split data file, with the CAL-HELD-BATCH-20261009 v1 supported metadata beside items that contract
+    excludes or ignores. Returns what it resolves: motors in degrees, the energy in eV."""
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        if external:
+            member = path.with_name(path.stem + "_data_000001.h5")
+            with h5py.File(member, "w") as data_file:
+                data_file.create_dataset("entry/data/data", data=np.ones((ACQUISITION_FRAMES, 8, 8), np.uint16),
+                                         chunks=(1, 8, 8))
+            entry.create_group("data")["data_000001"] = h5py.ExternalLink(member.name, "/entry/data/data")
+        else:
+            entry.create_dataset("instrument/detector/data", data=np.ones((ACQUISITION_FRAMES, 8, 8), np.uint16))
+        data = entry.require_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data.attrs["axes"] = "tth"
+        data.create_dataset("tth", data=[5.0, 6.0, 7.0])  # an NXdata axis: a motor
+
+        def positioner(where, name, value, units=None):
+            group = entry.require_group(f"{where}/positioners/{name}")
+            group.attrs["NX_class"] = "NXpositioner"
+            dataset = group.create_dataset("value", data=value)
+            if units is not None:
+                dataset.attrs["units"] = units
+
+        positioner("sample", "eta", [0.11, 0.25, 0.37], "deg")  # wins the name clash below
+        positioner("instrument", "eta", [9.0, 9.0, 9.0], "deg")
+        positioner("instrument", "phi", np.radians([10.0, 20.0, 30.0]), "rad")  # converted to degrees
+        positioner("instrument", "chi", 12.5, "degrees")  # 0-d: a constant
+        positioner("instrument", "omega", [1.0, 1.5, 2.0])  # no units: degrees, the legacy assumption
+        positioner("instrument", "bad", [1.0, 2.0, 3.0, 4.0, 5.0], "deg")  # 5 values for 3 frames: excluded
+        positioner("instrument", "x", [0.1, 0.2, 0.3], "mm")  # not an angle: excluded
+        scan = entry.create_group("scan_data")
+        scan.create_dataset("i0", data=[100.0, 101.0, 102.0])  # a counter, never a motor
+        scan.create_dataset("foo", data=[7.0, 8.0, 9.0])  # not a supported item: ignored
+        energy = entry.require_group("instrument/monochromator").create_dataset("energy", data=[16.0, 16.0, 16.001])
+        energy.attrs["units"] = "keV"
+    return {"eta": [0.11, 0.25, 0.37], "phi": [10.0, 20.0, 30.0], "omega": [1.0, 1.5, 2.0], "tth": [5.0, 6.0, 7.0],
+            "chi": 12.5, "i0": [100.0, 101.0, 102.0], "energy": [16000.0, 16000.0, 16001.0]}
+
+
 def _count_h5_opens(monkeypatch) -> list:
     opens: list = []
     orig = h5py.File.__init__
@@ -260,3 +306,55 @@ def test_nexus_stack_source_metadata_via_provider(tmp_path):
     psrc = NexusStackSource(plain)
     assert psrc.motors == {}
     assert psrc.metadata_for(0) == {}
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_a_non_bluesky_acquisition_entry_serves_its_supported_metadata(tmp_path, external):
+    """CAL-HELD-BATCH-20261009 (maintainer: "I want these things to be addressed in this batch"): a NeXus acquisition
+    container without the NXWriter marker, here misleadingly called scan_master, serves its supported metadata
+    through the existing provider seam, frame-aligned: per-frame motors in degrees from sample positioners (winning
+    a clash), instrument positioners and NXdata axes; a 0-d positioner as a constant; counters and the energy (eV)
+    per frame. Misaligned, non-angle and unsupported items are not served."""
+    path = tmp_path / "scan_master.h5"
+    expected = _acquisition(path, external=external)
+    with ContainerCursor(path) as cur:
+        provider = cur.metadata_provider()
+        motors = provider.motors()
+        assert sorted(motors) == ["eta", "omega", "phi", "tth"]
+        for name, values in motors.items():
+            np.testing.assert_allclose(values, expected[name], rtol=0, atol=1e-9)
+        assert dict(provider.metadata_for(1)) == pytest.approx({"chi": 12.5, "i0": 101.0, "energy": 16000.0},
+                                                               rel=0, abs=1e-9)
+        assert dict(provider.complete_metadata_for(2)) == pytest.approx(
+            {"eta": 0.37, "omega": 2.0, "phi": 30.0, "tth": 7.0, "chi": 12.5, "i0": 102.0, "energy": 16001.0},
+            rel=0, abs=1e-9)
+
+
+def test_a_vendor_eiger_master_has_no_scan_metadata_whatever_its_name(tmp_path):
+    """CAL-HELD-BATCH-20261009: a detector-only DECTRIS master records images and detector configuration, no scan
+    metadata (its sample goniometer and transformations are not supported locations), renamed or not."""
+    from tests.core.test_container_descriptor import _vendor_eiger_master
+    for name in ("scan_master.h5", "renamed.h5"):
+        directory = tmp_path / name.replace(".", "_")
+        directory.mkdir()
+        master = _vendor_eiger_master(directory / name, [directory / "scan_data_000001.h5"])
+        with ContainerCursor(master) as cur:
+            provider = cur.metadata_provider()
+            assert (provider.motors(), dict(provider.metadata_for(0))) == ({}, {})
+
+
+def test_a_generic_provider_read_after_close_before_materialize_fails_clearly(tmp_path):
+    """As the Bluesky provider (handoff §4.2.5): a non-Bluesky acquisition provider obtained but not materialized
+    before its cursor closes fails clearly, and one materialized first keeps serving from memory."""
+    from xrd_tools.sources.metadata_provider import MetadataSourceClosedError
+    path = tmp_path / "acquisition.nxs"
+    _acquisition(path)
+    cur = ContainerCursor(path).open()
+    provider = cur.metadata_provider()
+    cur.close()
+    with pytest.raises(MetadataSourceClosedError):
+        provider.metadata_for(0)
+    with ContainerCursor(path) as cur:
+        provider = cur.metadata_provider()
+        provider.scan_table()  # materialize while the handle is open
+    assert provider.complete_metadata_for(1)["eta"] == pytest.approx(0.25, rel=0, abs=1e-12)

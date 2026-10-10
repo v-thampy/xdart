@@ -2784,3 +2784,47 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
         )
     assert events == ["open", "body", "close"]
     assert len(scratch) == 1 and not scratch.pop().exists()
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_int_reads_a_generic_nexus_containers_motors_on_every_frame(tmp_path, external) -> None:
+    """CAL-HELD-BATCH-20261009 (maintainer: "I want these things to be addressed in this batch"): the Int run path, an
+    execution-graph window's complete_metadata_for, reads a non-Bluesky acquisition container's supported motors on
+    frame 0 and later frames, its images self-contained or split, even when it is called scan_master."""
+    from tests.core.test_metadata_provider import _acquisition
+    path = tmp_path / "scan_master.h5"
+    _acquisition(path, external=external)
+    value = graph.qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta")
+    with graph.open_source_execution_graph(value) as window:
+        assert window.complete_metadata_for(0)["eta"] == pytest.approx(0.11, rel=0, abs=1e-12)
+        row = window.complete_metadata_for(2)
+        assert (row["eta"], row["phi"], row["chi"]) == pytest.approx((0.37, 30.0, 12.5), rel=0, abs=1e-9)
+
+
+def test_a_container_without_the_selected_motor_refuses_naming_its_supported_metadata(tmp_path) -> None:
+    """CAL-HELD-BATCH-20261009: a GI motor a container's supported metadata does not record is refused with the
+    reason and the way on (Manual, or a SPEC/NeXus metadata source), not a bare absence."""
+    path = tmp_path / "plain.nxs"
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/data", data=np.ones((2, 2, 3), dtype=np.uint16))
+    with pytest.raises(ValueError, match=r"'eta' is not in plain\.nxs's supported scan metadata.*Manual"):
+        graph.qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta")
+
+
+def test_average_reads_a_generic_nexus_containers_motors(tmp_path) -> None:
+    """CAL-HELD-BATCH-20261009: the prevalidated Average route reads the same container's motor per frame. Average's
+    own bounded catalog (unchanged) admits only 1-D instrument positioner values and a scalar monochromator energy,
+    so the 0-d constant and the per-frame energy are left out here."""
+    from tests.core.test_metadata_provider import _acquisition
+    path = tmp_path / "acquisition.nxs"
+    _acquisition(path)
+    with h5py.File(path, "a") as handle:
+        del handle["entry/instrument/positioners/chi"]
+        del handle["entry/instrument/monochromator/energy"]
+    value = graph.qualify_source_execution_graph(
+        SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta", reader_binding="average_closed_v1",
+    )
+    with graph.open_source_execution_graph(value) as window:
+        assert window.complete_metadata_for(1)["eta"] == pytest.approx(0.25, rel=0, abs=1e-12)

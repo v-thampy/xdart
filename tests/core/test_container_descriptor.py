@@ -100,6 +100,18 @@ def _eiger_master(master_path, data_paths, *, per_seg=(5, 8, 8), dtype=np.uint16
     return master_path
 
 
+def _vendor_eiger_master(master_path, data_paths, **kwargs):
+    """An Eiger master as the DECTRIS detector writes it: the split image layout above plus the vendor detector
+    configuration (a description and detectorSpecific/eiger_fw_version, as all 38 test_data masters carry)."""
+    master = _eiger_master(master_path, data_paths, **kwargs)
+    with h5py.File(master, "a") as m:
+        detector = m.require_group("entry/instrument/detector")
+        detector.create_dataset("description", data=np.bytes_("Dectris EIGER2 Si 500K"))
+        detector.require_group("detectorSpecific").create_dataset("eiger_fw_version",
+                                                                  data=np.bytes_("release-2022.1.2"))
+    return master
+
+
 def _bluesky(path, *, finalized=True, shape=(4, 8, 8), dtype=np.uint16):
     with h5py.File(path, "w") as h5:
         entry = h5.create_group("entry")
@@ -319,17 +331,35 @@ def test_bluesky_finalized_is_ready(tmp_path):
     assert d.state is ProbeState.READY
 
 
-def test_an_eiger_master_names_no_motors_even_with_positioners(tmp_path):
-    """NEXUS-GI-AUTO-METADATA (maintainer, 2026-10-09: "the Eiger master file doesn't store the relevant metadata like
-    eta values … The metadata comes from proper Nexus files, spec, or in some cases from txt files"). An Eiger master's
-    frames carry no metadata (EmptyMetadataProvider), so discovery names no motors there even when positioners are
-    written into it: a synthetic fixture did, GI Auto offered its eta, and frame 0 then could not resolve it. None of
-    the 38 Eiger masters in test_data records one. A proper NeXus file keeps naming its motors: Bluesky's, and a
-    self-contained container's positioners (Int's directory motor sources)."""
-    master = _eiger_master(tmp_path / "scan_master.h5", [tmp_path / "scan_data_000001.h5"])
-    with h5py.File(master, "a") as m:
-        m.create_dataset("entry/instrument/positioners/eta/value", data=np.full(5, .2))
-    assert describe_container(master).motor_names == ()
+def test_eiger_identity_is_the_vendor_block_not_the_name(tmp_path):
+    """CAL-HELD-BATCH-20261009 (maintainer: "I want these things to be addressed in this batch"): the DECTRIS detector
+    configuration (detectorSpecific/eiger_fw_version) makes a vendor Eiger master whatever the file is called, .h5 or
+    .hdf5, and it names no scan motors; a split container without it is a NeXus stack even when called scan_master.
+    Both read their split frames. Supersedes the name-rule row of 458c58de/a238f4f0."""
+    for name in ("renamed.h5", "renamed.hdf5", "scan_master.h5"):
+        directory = tmp_path / name.replace(".", "_")
+        directory.mkdir()
+        master = _vendor_eiger_master(directory / name, [directory / "scan_data_000001.h5",
+                                                         directory / "scan_data_000002.h5"])
+        d = describe_container(master)
+        assert (d.kind, d.frame_count, d.motor_names) == (SourceKind.EIGER_MASTER, 10, ()), name
+    (tmp_path / "plain").mkdir()
+    plain = _eiger_master(tmp_path / "plain" / "scan_master.h5", [tmp_path / "plain" / "scan_data_000001.h5"])
+    d = describe_container(plain)
+    assert (d.kind, d.frame_count) == (SourceKind.NEXUS_STACK, 5)
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_a_non_bluesky_acquisition_container_names_its_supported_motors(tmp_path, external):
+    """CAL-HELD-BATCH-20261009: the descriptor's motor catalog is what the metadata provider resolves. A non-Bluesky
+    acquisition container called scan_master names its sample positioners, instrument positioners and NXdata axes, in
+    that order; counters, misaligned, non-angle and unsupported items are not motors. Bluesky files and a
+    self-contained container's 0-d positioner (Int's directory motor sources) keep theirs."""
+    from tests.core.test_metadata_provider import _acquisition
+    path = tmp_path / "scan_master.h5"
+    _acquisition(path, external=external)
+    d = describe_container(path)
+    assert (d.kind, d.motor_names) == (SourceKind.NEXUS_STACK, ("eta", "chi", "omega", "phi", "tth"))
     bluesky = _bluesky(tmp_path / "bluesky.nxs")
     with h5py.File(bluesky, "a") as h5:
         h5.create_dataset("entry/instrument/positioners/eta/value", data=np.full(4, .2))
@@ -338,6 +368,30 @@ def test_an_eiger_master_names_no_motors_even_with_positioners(tmp_path):
     with h5py.File(container, "a") as h5:
         h5.create_dataset("entry/instrument/positioners/halpha/value", data=.2)
     assert describe_container(container).motor_names == ("halpha",)
+
+
+def test_real_eiger_masters_are_known_by_content_and_keep_their_linked_pixels(tmp_path):
+    """CAL-HELD-BATCH-20261009 on real data: a 17-2 EIGER2 master and a renamed copy (its data file linked beside it)
+    are vendor Eiger masters with no scan motors, and read the same linked pixels."""
+    import os
+    import shutil
+    from pathlib import Path
+    from xrd_tools.io.image import read_image
+    root = Path(os.environ.get("XDART_TEST_DATA", "/nonexistent")) / "stitching/GIXRD_Fatigue_Radha"
+    master = root / "LaB6_11p27keV_dist_p33m_scan007_master.h5"
+    if not master.is_file():
+        pytest.skip("needs XDART_TEST_DATA with stitching/GIXRD_Fatigue_Radha")
+    renamed = tmp_path / "lab6_scan7.h5"
+    shutil.copy2(master, renamed)
+    with h5py.File(master, "r") as h5:
+        for name in h5["entry/data"]:
+            link = h5["entry/data"].get(name, getlink=True)
+            os.symlink(root / link.filename, tmp_path / link.filename)
+    for path in (master, renamed):
+        d = describe_container(path)
+        assert (d.kind, d.motor_names) == (SourceKind.EIGER_MASTER, ()), path.name
+    assert describe_container(renamed).frame_count == describe_container(master).frame_count
+    np.testing.assert_array_equal(read_image(renamed, frame=1), read_image(master, frame=1))
 
 
 def test_bluesky_unfinalized_is_in_progress(tmp_path):
