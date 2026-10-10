@@ -290,15 +290,14 @@ def test_int_energy_notice_is_brief_and_keeps_native_selection(tmp_path, monkeyp
         finally:
             _close(page, app)
 
+    # PROCESSING-ENERGY-BATCH-20261010 (maintainer, October 9): an impossible recorded energy counts as none, so
+    # the run uses the PONI's wavelength where it used to fail; there is still no energy notice.
     page, _, target = _page(tmp_path / "invalid", energy=-16000, unit=unit)
     notices = _record_notices(page)
     try:
-        _wait(app, lambda: page._source_selection.observation is not None)
-        page._shell.run_controls.startButton.click()
-        _wait(app, lambda: page._notice_text.startswith("Output admission failed:")
-              or page._lifecycle.phase.name == "FAILED")
-        assert not target.exists()
+        _run(page, app)
         assert not [row for row in notices if "Using the scan energy" in row[0]]
+        assert read_provenance(target)["config"]["energy_selection"]["source"] == "calibration"
     finally:
         _close(page, app)
 

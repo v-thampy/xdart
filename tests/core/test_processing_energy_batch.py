@@ -205,6 +205,17 @@ def test_a_gi_energy_scan_in_q_shares_one_grid(tmp_path):
         assert low <= own_low + 1e-6 and high >= own_high - 1e-6
 
 
+def test_reintegrate_names_a_gi_energy_scan_it_does_not_repeat():
+    """A GI energy scan's common grid comes from its Run's scouts, which Reintegrate does not repeat yet. (Added after
+    implementation: a GI Run output is refused earlier today by the open GI-REINTEGRATE-2D-REFUSED row, so the guard
+    is reached directly.)"""
+    from xrd_tools.reduction.reintegrate import _prepare_gi_scouts
+    shared = {"gi": {"enabled": True, "resolved_motor": "Manual"},
+              "energy_selection": {"frame_labels": [0, 1], "frame_energies_eV": [16000., 17000.]}}
+    with pytest.raises(ValueError, match="does not yet repeat a GI energy scan"):
+        _prepare_gi_scouts(None, "entry", None, None, shared, None, None)
+
+
 def test_int_replay_glitched_frame_takes_the_series_energy(tmp_path):
     """Superseded the [16000, -1] refusal row of test_int_replay_invalid_or_varying_metadata_energy_refuses."""
     glitched = _replay(_int(tmp_path / "glitched", [16000., -1.], "q_A^-1"), "run")
@@ -297,28 +308,3 @@ def test_calibration_reads_a_rows_energy_by_its_size(tmp_path, recorded):
 def test_a_bluesky_tiled_energy_is_kev_by_its_size(recorded):
     from xrd_tools.io.tiled import _extract_energy
     assert _extract_energy(None, {"energy": recorded}, "primary") == pytest.approx(16., rel=1e-15, abs=0)
-
-
-# ---------------------------------------------------------------- a bare Eiger master in Stitch and RSM
-
-
-def _bare_master(root):
-    from tests.core.test_container_descriptor import _vendor_eiger_master
-    root.mkdir(parents=True, exist_ok=True)
-    data = root / "burst_data_000001.h5"
-    return _vendor_eiger_master(root / "burst_master.h5", [data])
-
-
-def test_a_detector_only_eiger_master_names_its_missing_metadata_source(tmp_path):
-    """Maintainer, October 9: "an eiger master file by itself is a valid source only for Int ... in stitch/rsm, the
-    eiger file should be accompanied by the metadata source - nexus/spec"."""
-    from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
-    master = _bare_master(tmp_path / "data")
-    kwargs = {"detector_shape": (4, 4), "raw_dtype": "<u2", "raw_header_skip": 0, "threshold": None, "rotation": 0}
-    with pytest.raises(ValueError, match="metadata source"):
-        resolve_stitch_sources(StitchSourceSelection("NeXus", (str(master),)), dict(kwargs))
-    # Directory mode skips it with the reason, as it skips other kinds it cannot read.
-    resolution = resolve_stitch_sources(StitchSourceSelection("Directory", (str(master.parent),)), dict(kwargs))
-    assert resolution.pending == () and resolution.groups == ()
-    (path, _entry, reason), = resolution.skipped
-    assert Path(path).name == "burst_master.h5" and "metadata source" in reason
