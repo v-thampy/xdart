@@ -30,7 +30,7 @@ def _generic(root, recorded=0.1, *, wavelength=False):
         for name, values in (('del', [0., 1.]), ('nu', [0., 0.])):
             group = handle.create_group(f'entry/instrument/{name}')
             group.attrs['NX_class'] = 'NXpositioner'
-            group.create_dataset('value', data=values)
+            group.create_dataset('value', data=values).attrs['units'] = 'deg'
     return intent
 
 
