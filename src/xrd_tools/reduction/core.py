@@ -3522,9 +3522,7 @@ class ReductionSession:
             ai = self.scan.integrator
             if ai is None and self.scan.poni is None:
                 raise ValueError("Reduction requires scan.integrator or scan.poni.")
-            self.plan = _freeze_energy_scan_q_grid(
-                self.plan, ai if ai is not None else poni_to_integrator(self.scan.poni),
-            )
+            self.plan = _freeze_energy_scan_q_grid(self.plan, ai, self.scan.poni)
 
         self._integrators = _ReductionIntegratorProvider(
             scan=self.scan,
@@ -5220,12 +5218,13 @@ def _energy_scan_wavelengths(plan: ReductionPlan) -> dict[int, float] | None:
     }
 
 
-def _freeze_energy_scan_q_grid(plan: ReductionPlan, integrator: Any) -> ReductionPlan:
+def _freeze_energy_scan_q_grid(plan: ReductionPlan, integrator: Any, poni: Any = None) -> ReductionPlan:
     """Give a standard energy scan in q one radial range, so that every frame, reduced at its own energy, shares
     one grid: from the lowest energy's lowest q to the highest energy's highest q over every pixel's extent
     (centre ± delta). A range the plan sets is kept, 2θ needs none, and the writer's common-axis check is
     unchanged (maintainer, 2026-10-10: "q needs each frame reduced at its own energy on a common grid").
-    The ranges go to ``plan.extra[ENERGY_SCAN_Q_RANGES]``."""
+    The ranges go to ``plan.extra[ENERGY_SCAN_Q_RANGES]``. Without an accepted integrator, one is built from
+    *poni* only when there is a grid to compute."""
     wavelengths = _energy_scan_wavelengths(plan)
     if wavelengths is None or plan.gi is not None:
         return plan
@@ -5242,6 +5241,8 @@ def _freeze_energy_scan_q_grid(plan: ReductionPlan, integrator: Any) -> Reductio
             targets[key] = str(item.unit)  # pyFAI's unit names are case-sensitive
     if not targets:
         return plan
+    if integrator is None:
+        integrator = poni_to_integrator(poni)
     shape = getattr(getattr(integrator, "detector", None), "shape", None)
     if shape is None:
         raise ValueError("an energy scan needs its detector's shape to share one q grid")
