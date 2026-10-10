@@ -216,6 +216,30 @@ def test_a_gi_energy_scan_in_q_shares_one_grid(tmp_path):
         assert low <= own_low + 1e-6 and high >= own_high - 1e-6
 
 
+def test_a_gi_energy_scan_grid_spans_an_extreme_energy_in_the_middle(tmp_path):
+    """Added after implementation (mutation check): GI's scouts take the scan's lowest- and highest-energy frames, not
+    only its first and last, so a scan whose highest energy is in the middle keeps that frame's coverage."""
+    from xrd_tools.session.run_configuration import GIIntent
+    gi = GIIntent(enabled=True, incidence_motor="Manual", th_val=0.3)
+    intent = _fixture(tmp_path / "scan")
+    intent.processing_mode = "Int 1D"
+    intent.gi = gi
+    rows, columns = np.mgrid[:_SHAPE[0], :_SHAPE[1]]
+    image = (100 + (rows + 2 * columns) % 97).astype(np.uint16)
+    with h5py.File(intent.source_spec.uri, "r+") as handle:  # three identical frames
+        del handle["entry/data/image"], handle["entry/instrument/detector/data"], handle["entry/data/i0"]
+        images = handle.create_dataset("entry/instrument/detector/data", data=np.stack([image] * 3))
+        images.attrs["signal_type"] = "detector"
+        handle["entry/data/image"] = images
+        handle["entry/data"].create_dataset("i0", data=[2., 4., 6.])
+    _record_nexus_energy(intent, [16000., 17000., 16000.])
+    scan = open_scan(_replay(intent, "scan"))
+    low, high = _edges(scan.get_1d(0).q)
+    reference = open_scan(_replay(_int(tmp_path / "reference", [17000., 17000.], "q_A^-1", gi=gi), "reference"))
+    own_low, own_high = _edges(reference.get_1d(0).q)
+    assert low <= own_low + 1e-6 and high >= own_high - 1e-6
+
+
 def test_reintegrate_names_a_gi_energy_scan_it_does_not_repeat():
     """A GI energy scan's common grid comes from its Run's scouts, which Reintegrate does not repeat yet. (Added after
     implementation: a GI Run output is refused earlier today by the open GI-REINTEGRATE-2D-REFUSED row, so the guard
