@@ -120,7 +120,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
         from xrd_tools.integrate.calibration import CALIBRANT_NAMES
         self.calibrant = self.add_choice('Calibrant', ('Off', *CALIBRANT_NAMES), 'Off', tooltip=RING_TOOLTIP)
-        self.set_ring_available(False)
+        self.set_ring_available(False, visible=False)  # shown only when Int's raw display reconciles
 
         self.reconcile(self._projection)
 

@@ -1337,15 +1337,23 @@ class ScientificView(QtWidgets.QFrame):
                 )
 
     def _clear_ring_overlay(self):
-        self._ring_cache = self._ring_prediction = self._ring_frame = None
+        self._ring_cache = self._ring_prediction = None
+        self._remove_ring_items()
+
+    def _remove_ring_items(self):
+        self._ring_frame = None
         self.raw.render_ring_curves(())
         if self.raw_popup_image is not None:
             self.raw_popup_image.render_ring_curves(())
 
     def _reconcile_ring_overlay(self, state, navigation):
         from xrd_tools import geometry_figures as gf
-        heavy = state.heavy
-        is_int = state.processing_mode in ('Int 1D', 'Int 2D')
+        heavy, mode = state.heavy, state.processing_mode
+        # Rings belong on Int's own raw displays; a host that hides them (Stitch, RSM) never offers the choice.
+        shown = (mode in ('Average', 'Reintegrate')
+                 or mode == 'Int 1D' and 'raw' not in self._hidden_tools
+                 or mode == 'Int 2D' and 'raw_pane' not in self._hidden_tools)
+        is_int = shown and mode in ('Int 1D', 'Int 2D')
         if (heavy is None and state.retain_display and is_int
                 and self._ring_frame is navigation.current):
             return  # Keep only the previously accepted image+geometry pair.
@@ -1357,10 +1365,11 @@ class ScientificView(QtWidgets.QFrame):
             logging.getLogger(__name__).warning('ring_state frame=%r heavy=%s matches=%s shape=%r snapshot=%s choice=%s reason=%r',
                 navigation.current, heavy is not None, matches, shape, snapshot is not None,
                 state.plot_options.calibrant, reason)
-        self.plot_options_dialog.set_ring_available(not reason, reason,
-            visible=is_int or state.processing_mode in ('Average', 'Reintegrate'))
+        self.plot_options_dialog.set_ring_available(not reason, reason, visible=shown)
         if reason or state.plot_options.calibrant == 'Off':
-            self._clear_ring_overlay()
+            # Retire the curves but keep the one cached prediction: the next frame with the same
+            # snapshot (hydrating or newly arrived) redraws it without predicting again.
+            self._remove_ring_items()
             return
         key = (tuple(snapshot.items()), shape, state.plot_options.calibrant)
         if self._ring_cache != key:
