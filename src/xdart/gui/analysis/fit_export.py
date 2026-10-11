@@ -9,7 +9,12 @@ from xdart.gui.widgets import file_dialogs
 
 def plain_settings(values):
     """Detach current controls into the snapshot's plain, comparable settings."""
+    from xrd_tools.analysis.phase_references import PhaseEntry
     def plain(value):
+        if isinstance(value, PhaseEntry):
+            # The library ID pins CIF bytes; manual cells remain part of the
+            # request identity. This is a key projection, not a recipe format.
+            return ('phase', value.id, value.name, value.source_kind, plain(value.lattice))
         if isinstance(value, Path):
             return str(value)
         if isinstance(value, (list, tuple)):
@@ -65,6 +70,7 @@ class FitExportActions(QtCore.QObject):
         self.tool, self.snapshot, self.settings = tool, snapshot, settings
         self.export = export
         self.source_root = None
+        self._unavailable_reason = ''
         row = QtWidgets.QHBoxLayout()
         self.buttons = {}
         for format, label in (('jupyter', 'Export Jupyter…'), ('marimo', 'Export marimo…')):
@@ -75,9 +81,19 @@ class FitExportActions(QtCore.QObject):
             self.buttons[format] = button
         parent.layout().addLayout(row)
 
+    def set_available(self, available, reason=''):
+        """Explain an unsupported workflow through the shared export buttons."""
+        self._unavailable_reason = '' if available else str(reason)
+        for format, button in self.buttons.items():
+            button.setEnabled(bool(available))
+            button.setToolTip(self._unavailable_reason or
+                             f"Export the current fitting workflow as a {format} notebook.")
+
     def choose(self, format):
         extension = '.ipynb' if format == 'jupyter' else '.py'
         try:
+            if self._unavailable_reason:
+                raise ValueError(self._unavailable_reason)
             snapshot = self.snapshot()
             if snapshot is None:
                 raise ValueError('FIT_INPUT_REQUIRED: load a scientific input first')

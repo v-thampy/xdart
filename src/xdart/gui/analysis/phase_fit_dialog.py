@@ -114,7 +114,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
                 self.batch_btn.setToolTip(diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE"))
         from .fit_export import FitExportActions
         self.export_actions = FitExportActions(self, tool='phase', snapshot=self.export_snapshot,
-                                               settings=self.vnext_fit_values)
+                                               settings=self.export_fit_values)
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
@@ -241,6 +241,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._phase_entries.extend(BrowserResult(str(first_deferred+index), name, path)
                                    for index, (path, name) in enumerate(self._deferred_cifs))
         manual = any(entry.source_kind == 'lattice' for entry in entries)
+        if hasattr(self, 'export_actions'):
+            self.export_actions.set_available(not manual, self._lattice_export_reason())
         self.texture_combo.setEnabled(not self._vnext and not manual)
         self.texture_row.set_purpose_tooltip(
             'Lattice phases use free per-peak heights; CIF phases use no texture correction.' if manual else
@@ -453,6 +455,23 @@ class PhaseFitDialog(QtWidgets.QDialog):
                           phase_names=tuple(entry.name for entry in entries))
         if self.use_uncertainties.isChecked():
             values['use_uncertainties'] = True
+        return values
+
+    @staticmethod
+    def _lattice_export_reason():
+        return ('PHASE_LATTICE_NOTEBOOK_UNAVAILABLE: manual lattice phases cannot be exported '
+                'in the existing CIF notebook format.')
+
+    def export_fit_values(self):
+        """Keep structural-library exports on the existing portable CIF recipe."""
+        values = dict(self.vnext_fit_values())
+        entries = values.pop('phase_entries', ())
+        if any(entry.source_kind == 'lattice' for entry in entries):
+            raise ValueError(self._lattice_export_reason())
+        if entries:
+            values.update(cif_paths=tuple(str(entry.cif_path) for entry in entries),
+                          phase_names=tuple(entry.name for entry in entries),
+                          expected_hashes=tuple(entry.id for entry in entries))
         return values
 
     def _do_fit(self):

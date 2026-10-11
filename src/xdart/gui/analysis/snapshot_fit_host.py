@@ -43,7 +43,7 @@ def _snapshot(target, settings):
     snapshot = target.load() if isinstance(target, FitTarget) else target
     if not isinstance(snapshot, FitInputSnapshot):
         raise ValueError('FIT_INPUT_REQUIRED: load a scientific input first')
-    return replace(snapshot, key=replace(snapshot.key, settings=settings))
+    return replace(snapshot, key=replace(snapshot.key, settings=plain_settings(dict(settings))))
 
 
 def _job(request, cancel, progress):
@@ -130,7 +130,7 @@ class SnapshotFitHost(QtCore.QObject):
         combo.setCurrentText(current)
 
     def _request(self, action, inputs, destination=None):
-        settings = plain_settings(self.dialog.vnext_fit_values())
+        settings = self._request_settings(action)
         self.owner.forget()
         self.dialog.status.setText('Loading…' if action == 'reload' else 'Exporting…' if action == 'export' else 'Fitting…')
         if action == 'batch':
@@ -140,6 +140,13 @@ class SnapshotFitHost(QtCore.QObject):
         self.owner.ask(_Request(action, self.kind, self.scope(), settings, tuple(inputs),
                                 self.trend_column, destination,
                                 self.source_root() if callable(self.source_root) else self.source_root))
+
+    def _request_settings(self, action):
+        # Frozen phase entries feed the analyzer unchanged; only FitInputKey
+        # uses their detached plain identity. Notebook requests use CIF paths.
+        values = (self.dialog.export_actions.settings() if action == 'export'
+                  else self.dialog.vnext_fit_values())
+        return tuple(sorted(values.items()))
 
     def reload(self):
         try:
@@ -177,7 +184,7 @@ class SnapshotFitHost(QtCore.QObject):
         self.dialog.set_batch_running(False)
         try:
             unchanged = (request.scope == self.scope()
-                         and request.settings == plain_settings(self.dialog.vnext_fit_values()))
+                         and request.settings == self._request_settings(request.action))
         except (ValueError, KeyError, OSError):
             unchanged = False
         if not unchanged:
@@ -196,7 +203,7 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.set_vnext_trace(self.snapshot.trace_input())
             return True
         self.outcomes, self.snapshot, self._keys, xs = terminal.payload
-        self._last_settings = request.settings
+        self._last_settings = plain_settings(dict(request.settings))
         self.dialog.trend.clear()
         for position, outcome in enumerate(self.outcomes):
             self.dialog.trend.set_row(outcome.label, xs.get(outcome.label) if request.column else float(position), outcome.params)
@@ -240,7 +247,7 @@ class SnapshotFitHost(QtCore.QObject):
 
     def export_to(self, path):
         """Direct publication interface, also used by scripts/tests; GUI uses the worker path."""
-        settings = self.dialog.vnext_fit_values()
+        settings = self.dialog.export_actions.settings()
         frozen = plain_settings(settings)
         inputs = () if self.batch is None else tuple(self.batch())
         batch = (item.reference if isinstance(item, FitTarget) and item.reference is not None
