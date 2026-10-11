@@ -336,9 +336,11 @@ def _standard_page(
         "build_admission_receipt",
         _accepted_admission(labels, mask=mask),
     )
+    # Since 15250a49 the Int source-energy binder builds the run's integrator.
+    from xrd_tools.integrate import calibration as calibration_module
     monkeypatch.setattr(
-        executor_module,
-        "poni_to_integrator",
+        calibration_module,
+        "detector_calibration_to_integrator",
         _Integrator,
     )
     lifecycle = ScatteringCoordinator()

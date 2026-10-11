@@ -3628,6 +3628,10 @@ def test_post_g2_unsafe_unfunded_staging_accepts_exact_eiger(
     target = tmp_path / "unsafe.nexus"
     poni = tmp_path / "unsafe.poni"
     _write_eiger(master, member, 1)
+    # Since 5d2eb8ec a DECTRIS master is known by its vendor block, not its name.
+    with h5py.File(master, "a") as handle:
+        handle.require_group("entry/instrument/detector/detectorSpecific").create_dataset(
+            "eiger_fw_version", data="release-2022.1.2")
     write_poni(poni)
     intent = _intent(
         master, target, poni,

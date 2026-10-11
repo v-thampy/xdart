@@ -396,6 +396,9 @@ def test_accepted_advanced_values_commit_by_revision_and_freeze_for_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Since a53c324e Run refuses a missing PONI before admission, so the row gives Run a real one.
+    from tests.xdart.scattering._e2sd_support import write_poni
+    write_poni(tmp_path / "calibration.poni")
     store = RunIntentStore(_intent(tmp_path))
 
     def editor(snapshot):
