@@ -1081,6 +1081,7 @@ def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_aga
         page.apply_settings(document)
         assert page.run_bar.write_mode() == "Append"
         assert page.run_bar.writeModeButton.toolTip().startswith("Append:")
+        _wait(page, qapp)  # applying the settings re-checks the SPEC source on the page's worker
     finally:
         page.run_bar.set_readiness_summary = summary
         assert page.shutdown().status is PageCleanup.CLEAN
