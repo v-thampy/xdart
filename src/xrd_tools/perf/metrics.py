@@ -96,9 +96,9 @@ OBSERVATION_SOURCES: dict[str, str] = {
     "retained_owner_bytes_peak": "R2: peak bytes retained by a SINGLE owner block "
                                  "(<= ReadPlan.max_owner_bytes; charged once per "
                                  "block, never per frame view)",
-    "metadata_reads": "R2/v4: number of FrameSource metadata_for() calls while "
-                      "run_reduction materializes its canonical frame records; "
-                      "the source provider is cached after materialization",
+    "metadata_reads": "R2/v4: number of FrameSource metadata_for() and frame_for() "
+                      "calls while run_reduction materializes its canonical frame "
+                      "records; the source provider is cached after materialization",
 }
 
 #: Categories of :attr:`ContainerMetrics.open_counts` / run aggregate.
