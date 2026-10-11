@@ -2064,7 +2064,7 @@ def test_processing_takes_ints_threshold_and_the_shared_normalization_group(qapp
             RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION, MetadataColumnSelector("foil status", 0), None,
             MetadataColumnSelector("Seconds", 1))
     finally:
-        page.close_page()
+        _close(page, qapp)
 
 
 def test_advanced_corrections_reach_the_runs_frame_corrections(qapp, tmp_path):
@@ -2097,7 +2097,7 @@ def test_advanced_corrections_reach_the_runs_frame_corrections(qapp, tmp_path):
         page.set_field("dark_path", "missing.npy")
         assert "the Dark (missing.npy not found)" in page._headers["processing"].detail
     finally:
-        page.close_page()
+        _close(page, qapp)
 
 
 def test_stitch_and_rsm_lay_out_one_corrections_group(qapp):
@@ -2129,7 +2129,7 @@ def test_stitch_and_rsm_lay_out_one_corrections_group(qapp):
     finally:
         stitch.shutdown()
         stitch.deleteLater()
-        page.close_page()
+        _close(page, qapp)
 
 
 def test_preview_lists_the_shared_dark_and_flat_checks_warnings(qapp, tmp_path, monkeypatch):

@@ -24,7 +24,7 @@ from xrd_tools.integrate.stitch_conditioning import StitchConditioning
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent, ThresholdIntent
 from xrd_tools.sources.selection import image_series_spec
-from tests.xdart.pages.test_stitch_page import _Status, _wait, qapp
+from tests.xdart.pages.test_stitch_page import _Status, _dispose, _wait, qapp
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
@@ -53,7 +53,7 @@ def test_restoring_an_automatic_threshold_clears_a_prior_manual_band(qapp, tmp_p
         page.load_form(replace(form, conditioning=StitchConditioning("auto")))
         assert page.build_form().conditioning.mode == "auto"
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
 
 
 @pytest.mark.parametrize("dtype", ("int32", "uint32", "uint16", "float32"))
@@ -151,6 +151,6 @@ def test_threshold_edit_sequences_match_int(qapp, tmp_path, dtype, initial):
                 threshold.threshold_min if mode == "manual" else None,
                 threshold.threshold_max if mode == "manual" else None)
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
         panel.close()
         panel.deleteLater()

@@ -12,7 +12,7 @@ from xdart.gui.tools.stitch_values import prepare_stitch_tool
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.stitch_operation import run_stitch_operation
 from xrd_tools.io.analysis_artifact import read_analysis_artifact
-from tests.xdart.pages.test_stitch_page import _Status, qapp  # noqa: F401
+from tests.xdart.pages.test_stitch_page import _Status, _dispose, qapp  # noqa: F401
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
@@ -46,4 +46,4 @@ def test_the_page_builds_auto_and_keeps_an_explicit_range(qapp, tmp_path):  # no
             page.load_form(replace(form, chi_range=explicit))
             assert page._value("chi_auto") is False and page.build_form().chi_range == explicit
     finally:
-        page.shutdown()
+        _dispose(page, qapp)

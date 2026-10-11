@@ -43,6 +43,7 @@ def _draw():
         return {item.name(): item.opts for item in dialog.plot.listDataItems() if item.name()}
     finally:
         dialog.close()
+        dialog.deleteLater()
 
 
 def test_data_is_markers_only():

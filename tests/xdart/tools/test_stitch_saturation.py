@@ -23,7 +23,7 @@ from xrd_tools.core import invalid
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning, condition_stitch_frame
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
 from xrd_tools.io.output_path import resolve_finite_output_target
-from tests.xdart.pages.test_stitch_page import _Status, _wait, qapp  # noqa: F401
+from tests.xdart.pages.test_stitch_page import _Status, _dispose, _wait, qapp  # noqa: F401
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
@@ -154,4 +154,4 @@ def test_the_page_shows_the_ceiling_as_a_hint_and_a_typed_number_is_manual(qapp,
         assert editor.placeholderText() == "Auto · 65535 (data type maximum)"
         assert page._auto_threshold_max == 65534.0
     finally:
-        page.shutdown()
+        _dispose(page, qapp)

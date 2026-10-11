@@ -4,6 +4,7 @@ from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.widgets import file_dialogs
 from xdart.gui.widgets.file_dialogs import ANY_FILTER, NEXUS_FILTER, browse_spec
+from tests.xdart.pages.test_stitch_page import _dispose
 
 
 @pytest.fixture(scope="module")
@@ -101,7 +102,7 @@ def test_stitch_spec_sources_use_the_spec_picker_and_keep_every_pick(qapp, tmp_p
         kind, options = calls[-1]
         assert kind == "any" and options["file_filter"] == NEXUS_FILTER
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
 
 
 def test_calibration_source_fields_pick_spec_or_nexus_by_their_source_type(qapp, tmp_path, monkeypatch):
@@ -203,7 +204,7 @@ def test_every_stitch_and_rsm_chooser_goes_through_the_shared_rule(qapp, tmp_pat
         for widget in (mask, calibration):
             widget.close()
             widget.deleteLater()
-        page.shutdown()
+        _dispose(page, qapp)
         rsm.close_page()
         rsm.deleteLater()
 

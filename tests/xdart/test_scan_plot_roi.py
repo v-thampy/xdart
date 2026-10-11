@@ -122,6 +122,7 @@ def test_scan_plot_loads_spec_metadata_roi_disabled(qapp, tmp_path):
         assert "chi" in dlg._columns and "det" not in dlg._columns
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 def test_roi_button_reflects_reachability(qapp, monkeypatch):
     from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
@@ -141,6 +142,7 @@ def test_roi_button_reflects_reachability(qapp, monkeypatch):
         assert dlg.roi_btn.isEnabled() is False
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 # ── ROI picker: RectROI <-> fields two-way sync ───────────────────────────
@@ -183,6 +185,7 @@ def test_roi_select_field_round_trip(qapp):
         assert float(dlg.f_wrow.text()) == pytest.approx(20, abs=0.5)
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_roi_select_picker_defaults_and_gating(qapp):
@@ -210,6 +213,7 @@ def test_roi_select_picker_defaults_and_gating(qapp):
         assert dlg.roi_signals()[0].background is None
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_roi_select_reducer_and_background(qapp):
@@ -234,6 +238,7 @@ def test_roi_select_reducer_and_background(qapp):
         assert len(dlg.roi_signals()) == 1
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_roi_picker_mounts_shared_owners_and_preserves_all_signal_and_background_marks(qapp):
@@ -266,6 +271,7 @@ def test_roi_picker_mounts_shared_owners_and_preserves_all_signal_and_background
         assert dlg.roi_signals()[0].name == second.name
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 # ── end-to-end: compute fills table columns == direct run_roi_signals ─────
@@ -309,6 +315,7 @@ def test_scan_plot_roi_fills_columns_end_to_end(qapp, monkeypatch):
         assert np.all(np.diff(dlg._table["roiA"]) > 0)
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp, monkeypatch):
@@ -341,6 +348,7 @@ def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp, monkeypatch):
         assert np.all(np.diff(dlg._table["roiA"]) > 0)
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def _nxs_stack(path, frames):
@@ -382,6 +390,7 @@ def test_scan_plot_same_scan_param_change_keeps_columns(qapp, tmp_path):
         assert "roiX" not in dlg._columns
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_metadata_less_source_roi_vs_frame(qapp, tmp_path):
@@ -408,6 +417,7 @@ def test_scan_plot_metadata_less_source_roi_vs_frame(qapp, tmp_path):
         assert "roiB" in dlg._table and np.all(np.diff(dlg._table["roiB"]) > 0)
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_roi_applies_provider_mask(qapp, monkeypatch):
@@ -439,6 +449,7 @@ def test_scan_plot_roi_applies_provider_mask(qapp, monkeypatch):
         assert not np.allclose(dlg._table["roiM"], unmasked)
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_roi_column_normalizes_and_csv_roundtrips(qapp, tmp_path):
@@ -474,6 +485,7 @@ def test_scan_plot_roi_column_normalizes_and_csv_roundtrips(qapp, tmp_path):
         assert [float(v) for v in col["sig"]] == [10.0, 20.0, 40.0]
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_table_policy_delegates_to_headless_owner(qapp, tmp_path, monkeypatch):
@@ -506,6 +518,7 @@ def test_scan_plot_table_policy_delegates_to_headless_owner(qapp, tmp_path, monk
         assert observed == ["scan_frame_rows", "scan_table_columns", "write_scan_table_csv"]
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_roi_abort_on_source_swap(qapp, monkeypatch):
@@ -532,6 +545,8 @@ def test_scan_plot_roi_abort_on_source_swap(qapp, monkeypatch):
     assert not dlg._roi_worker.isRunning()
     assert dlg._roi_run_columns == [] and dlg._roi_row_of == {}
     assert dlg._roi_dialog is None
+    dlg.close()
+    dlg.deleteLater()
 
 
 # ── cross-family right-hand axis ──────────────────────────────────────────
@@ -571,6 +586,7 @@ def test_scan_plot_right_axis_splits_series(qapp):
         assert list(dlg.right_vb.mouseEnabled()) == [False, False]
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_right_axis_plots_column_not_checked_in_y(qapp):
@@ -593,6 +609,7 @@ def test_scan_plot_right_axis_plots_column_not_checked_in_y(qapp):
         assert dlg.right_vb.addedItems[0].name() == "b"
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp, monkeypatch):
@@ -622,6 +639,7 @@ def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp, monkeypatch):
         "partial ROI column survived the close"
     assert "roiZ" not in dlg._columns
     assert dlg._roi_run_columns == []
+    dlg.deleteLater()
 
 
 def test_roi_source_is_opened_and_closed_on_worker_thread(qapp, monkeypatch):
@@ -667,6 +685,7 @@ def test_roi_source_is_opened_and_closed_on_worker_thread(qapp, monkeypatch):
         assert tracked.closed_on == opened_on[0]
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_selection_metadata_open_is_short_lived(qapp, monkeypatch):
@@ -704,6 +723,7 @@ def test_selection_metadata_open_is_short_lived(qapp, monkeypatch):
         assert not hasattr(dlg, "_source")
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_roi_frame_updates_are_redraw_coalesced(qapp):
@@ -733,6 +753,7 @@ def test_roi_frame_updates_are_redraw_coalesced(qapp):
         np.testing.assert_allclose(dlg._table["roiZ"], [0.0, 1.0, 2.0, 3.0])
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_roi_done_flushes_final_coalesced_redraw(qapp):
@@ -763,6 +784,7 @@ def test_roi_done_flushes_final_coalesced_redraw(qapp):
         assert calls["n"] == 1
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_skips_all_nan_series_without_pyqtgraph_warning(qapp):
@@ -784,6 +806,7 @@ def test_scan_plot_skips_all_nan_series_without_pyqtgraph_warning(qapp):
         assert len(dlg.plot.getPlotItem().listDataItems()) == 0
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 # ---- §10 refinements: axis defaults, log, styling, viewer parity, Esc -------
@@ -809,6 +832,7 @@ def test_scan_plot_default_y_priority_counter(qapp):
         assert dlg.x_combo.currentText() == "samz"
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_shared_default_projection_matches_runner(qapp, tmp_path):
@@ -843,6 +867,7 @@ def test_scan_plot_shared_default_projection_matches_runner(qapp, tmp_path):
     finally:
         _close_page(page, qapp)
         standalone.close()
+        standalone.deleteLater()
 
 
 def test_scan_plot_default_y_never_roi(qapp):
@@ -863,6 +888,7 @@ def test_scan_plot_default_y_never_roi(qapp):
         assert dlg._checked_y() == ["frame_index"]   # not ROI1/ROI2
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_default_x_positioner_else_frame_index(qapp):
@@ -883,6 +909,7 @@ def test_scan_plot_default_x_positioner_else_frame_index(qapp):
         assert dlg.x_combo.currentText() == "samz"
     finally:
         dlg.close()
+        dlg.deleteLater()
     dlg2 = ScanPlotDialog()
     try:
         dlg2._positioner_names = []          # e.g. an older file with no positioners
@@ -890,6 +917,7 @@ def test_scan_plot_default_x_positioner_else_frame_index(qapp):
         assert dlg2.x_combo.currentText() == "frame_index"
     finally:
         dlg2.close()
+        dlg2.deleteLater()
 
 
 def test_scan_plot_spec_default_x_is_declared_motor_not_largest_counter(
@@ -922,6 +950,7 @@ def test_scan_plot_spec_default_x_is_declared_motor_not_largest_counter(
         assert dlg._checked_y() == ["Photod"]
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_scan_plot_log_button_drives_left_axis(qapp):
@@ -955,6 +984,7 @@ def test_scan_plot_log_button_drives_left_axis(qapp):
         assert not dlg.plot.getAxis("left").logMode
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_roi_select_has_viewer_controls(qapp):
@@ -975,6 +1005,7 @@ def test_roi_select_has_viewer_controls(qapp):
         qapp.processEvents()
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_dialogs_swallow_escape(qapp):
@@ -997,6 +1028,7 @@ def test_dialogs_swallow_escape(qapp):
         assert sp.isVisible()                # still open after Esc
     finally:
         sp.close()
+        sp.deleteLater()
 
     roi = RoiSelectDialog(np.zeros((20, 20), dtype=float))
     roi.show()
@@ -1006,6 +1038,7 @@ def test_dialogs_swallow_escape(qapp):
         assert roi.isVisible()
     finally:
         roi.close()
+        roi.deleteLater()
 
 
 # ── close() shuts down the source-probe executor ──────────────────────────
@@ -1039,6 +1072,7 @@ def test_dialog_close_shuts_down_probe_executor(qapp, tmp_path):
     qapp.processEvents()
     assert sw._probe_executor is None, \
         "closeEvent did not shut down the probe executor"
+    dlg.deleteLater()
 
 
 # ── X1-6: processed-.nxs reads take the writer-coordinating lock ──────────
@@ -1115,3 +1149,4 @@ def test_scan_plot_processed_reads_take_writer_lock_x16(qapp, tmp_path):
             f"(acquisitions: {rec.enter_count})")
     finally:
         dlg.close()
+        dlg.deleteLater()
