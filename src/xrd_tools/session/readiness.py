@@ -1088,7 +1088,8 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
     counts as none). Only when no frame records one does the source's energy or wavelength
     apply. A varying series is an energy scan, which Int reduces frame by frame at each
     frame's own energy (``frame_labels`` and ``frame_energies_eV``); the sensor parallax
-    correction, computed at one energy, cannot follow it.
+    correction, computed at one energy, cannot follow it. Such a scan, and one whose per-frame
+    energies would not fit the run's saved settings, raise :class:`EnergyScanRefused`.
     """
     from dataclasses import replace
     from xrd_tools.core.energy import resolve_acquisition_energy, metadata_energy_values, WavelengthUnit

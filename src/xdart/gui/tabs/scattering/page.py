@@ -1927,7 +1927,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._notice(f"Making {os.path.basename(request.final_path)}…")
 
     def _open_warning(self, title: str, detail: str) -> None:
-        """The page's warning notification: a window-modal box titled *title* showing *detail*."""
+        """The page's warning notification: a window-modal box with *title* as its text, *detail* below it."""
         if self._closing or self._closed:
             return
         dialog = QtWidgets.QMessageBox(
