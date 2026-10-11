@@ -101,6 +101,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._phases = []
         #: what the phases' list shows for each (its row's text and tooltip: a fit's CIF receipt once fitted)
         self._phase_entries = []
+        self._deferred_cifs = []
         self.setObjectName("phaseFitDialog")
         self.setWindowTitle("Phase Fitting")
         self.resize(600, 900)
@@ -121,27 +122,23 @@ class PhaseFitDialog(QtWidgets.QDialog):
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
 
-        # Phases: the CIFs, on the shared browser's keyed list, with Add and Remove.
-        phases = SectionCard("Phases", collapsible=False)
-        self.cif_browser = BrowserView(self, profile=keyed_list_profile("CIF files"))
-        self.cif_browser.setObjectName("phaseCifBrowser")
-        self.cif_browser.setMinimumWidth(0)
-        self.cif_browser.setMaximumHeight(150)
-        self.cif_list = self.cif_browser.scans
-        self.cif_list.setToolTip("CIF files defining the phases to fit")
-        buttons = QtWidgets.QHBoxLayout()
-        self.add_cif_btn = QtWidgets.QPushButton("Add CIF…")
-        self.add_cif_btn.setToolTip("Browse for a CIF and add it as a phase (+)")
-        self.remove_cif_btn = QtWidgets.QPushButton("Remove")
-        self.remove_cif_btn.setToolTip("Remove the selected phase")
-        buttons.addWidget(self.add_cif_btn)
-        buttons.addWidget(self.remove_cif_btn)
-        buttons.addStretch(1)
-        phases.add_row(self.cif_browser)
-        row = QtWidgets.QWidget()
-        row.setLayout(buttons)
-        phases.add_row(row)
+        # One source owner is mounted by this tool and Plot Options. Valid
+        # source bytes/cells live only in its headless library.
+        from .phase_source import PhaseSourceWidget
+        phases = SectionCard("Phases", self, collapsible=False)
+        phases.setToolTip("Choose structural CIF phases or manual lattice positions to fit.")
+        self.phase_source = PhaseSourceWidget(self, checkable=False, show_library=False, key_by_index=True)
+        phases.add_row(self.phase_source)
         lay.addWidget(phases)
+        # Existing tool integrations retain these aliases to the shared owner.
+        self.cif_browser = self.phase_source.browser
+        self.cif_browser.setObjectName("phaseCifBrowser")
+        self.cif_list = self.cif_browser.scans
+        self.add_cif_btn = self.phase_source.add_cif_btn
+        self.remove_cif_btn = self.phase_source.remove_btn
+        self.add_lattice_btn = self.phase_source.add_lattice_btn
+        self.remove_cif_btn.clicked.disconnect(self.phase_source.remove_current)
+        self.phase_source.changed.connect(self._phase_source_changed)
 
         # Options (the notebook knobs), on the shared rows.
         options = SectionCard("Phase fit", collapsible=False)
@@ -179,6 +176,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("peakFitStatus")
         self.status.setWordWrap(True)
+        self.status.setToolTip("Phase fitting status, source refusals and result diagnostics.")
         lay.addWidget(self.status)
 
         # Data + fit (top) and residual (below), on the shared fit display (Codex's Stitch/Int reuse
@@ -198,7 +196,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.table = ResultsTable(PHASE_OUTCOME_HEADERS, self, name="phaseFitTable", max_height=120)
         lay.addWidget(self.table)
 
-        self.add_cif_btn.clicked.connect(self._add_cif)
+        self.phase_source.messageChanged.connect(self.status.setText)
         self.remove_cif_btn.clicked.connect(self._remove_cif)
         self.refresh_btn.clicked.connect(self.refresh_pattern)
         self.fit_btn.clicked.connect(self._do_fit)
@@ -231,9 +229,27 @@ class PhaseFitDialog(QtWidgets.QDialog):
         return f"{self._maxfev_row.label.text()}: {refusal}" if refusal else ""
 
     # ---- phases (CIF) ---------------------------------------------------
+    def _phase_source_changed(self, _selection):
+        """Project the one shared source selection into this tool's legacy values."""
+        entries = self.phase_source.selected_entries()
+        self._phases = [(entry.cif_path or entry.id, entry.name if self._vnext else entry)
+                        for entry in entries]
+        self._phases.extend(self._deferred_cifs)
+        self._phase_entries = [BrowserResult(str(index), entry.name,
+            f"{entry.source_kind} phase: {entry.name}") for index, entry in enumerate(entries)]
+        first_deferred = len(self._phase_entries)
+        self._phase_entries.extend(BrowserResult(str(first_deferred+index), name, path)
+                                   for index, (path, name) in enumerate(self._deferred_cifs))
+        self._sync_phase_list()
+
     def _sync_phase_list(self):
-        """The phases' list shows the phases, in order; the one chosen stays chosen."""
-        self.cif_browser.reconcile_results(tuple(self._phase_entries), self.cif_browser.current_result())
+        """Keep the source owner's keyed list and fit receipts reconciled."""
+        selected = self.phase_source.selected_entries()
+        if selected and not self._deferred_cifs:
+            self.phase_source.set_details({entry.id: row.detail
+                for entry, row in zip(selected, self._phase_entries)})
+        else:
+            self.cif_browser.reconcile_results(tuple(self._phase_entries), self.cif_browser.current_result())
 
     def _add_cif(self):
         if self._vnext:
@@ -243,6 +259,9 @@ class PhaseFitDialog(QtWidgets.QDialog):
             if not picks:
                 return
             path = picks[0]
+            if os.path.isfile(path):
+                self.phase_source.add_cif_paths((path,))
+                return
             if any(path == existing for existing, _name in self._phases):
                 self.status.setText("Duplicate CIF path ignored."); return
             base = os.path.splitext(os.path.basename(path))[0] or "phase"
@@ -254,32 +273,11 @@ class PhaseFitDialog(QtWidgets.QDialog):
             if len(name.encode("utf-8")) > 256:
                 self.status.setText("PHASE_NAME_LIMIT_EXCEEDED"); return
             self._phases.append((path, name))
+            self._deferred_cifs.append((path, name))
             self._phase_entries.append(BrowserResult(str(len(self._phase_entries)), name))
             self._renumber_entries()
             return
-        try:
-            from xrd_tools.analysis.phase import PhaseModel  # noqa: F401
-            import pymatgen  # noqa: F401  CIF parsing backend
-        except Exception:
-            self.status.setText(
-                "Phase fitting needs pymatgen — install it with "
-                "`pip install \"xrd-tools[fitting]\"`, then reopen.")
-            return
-        from xrd_tools.analysis.phase import PhaseModel
-        paths = browse(self, "Add CIF phase(s)", many=True, file_filter=CIF_FILTER)
-        for path in paths:
-            try:
-                phase = PhaseModel.from_cif(path)
-            except Exception as exc:
-                logger.exception("CIF load failed: %s", path)
-                self.status.setText(f"Could not load {os.path.basename(path)}: {exc}")
-                continue
-            self._phases.append((path, phase))
-            self._phase_entries.append(BrowserResult("", f"{phase.name}  ({os.path.basename(path)})", path))
-        self._renumber_entries()
-        if self._phases:
-            self.status.setText(
-                f"{len(self._phases)} phase(s) loaded. Set options and click Fit.")
+        self.phase_source._browse_cifs()
 
     def _renumber_entries(self):
         """Each row keyed by its place (two phases may come from one file), then the list reconciled."""
@@ -291,6 +289,13 @@ class PhaseFitDialog(QtWidgets.QDialog):
         row = self.cif_browser.current_result_row()
         if not 0 <= row < len(self._phases):
             return
+        entries = self.phase_source.selected_entries()
+        if row < len(entries):
+            identifier = entries[row].id
+            self.phase_source.set_selection(tuple(pair for pair in self.phase_source.selection if pair[0] != identifier))
+            return
+        if self._deferred_cifs:
+            self._deferred_cifs.pop(row-len(entries))
         self._phases.pop(row)
         self._phase_entries.pop(row)
         self._renumber_entries()
@@ -403,7 +408,16 @@ class PhaseFitDialog(QtWidgets.QDialog):
         if self.max_nfev.value():
             fit_kw["max_nfev"] = int(self.max_nfev.value())
 
-        phases = [pm for _, pm in self._phases]
+        # Standalone legacy callers may still supply PhaseModels directly.
+        # Library entries defer reflection preparation until this fit request.
+        from xrd_tools.analysis.phase_references import PhaseEntry, phase_model
+        range_name = 'two_theta_range' if any(word in self._x_label.lower() for word in ('2th', '2θ')) else 'q_range'
+        phase_range = {range_name: (float(x.min()), float(x.max()))}
+        phases = [phase_model(pm, wavelength_angstrom=self._export_wavelength or 1.5406, **phase_range)
+                  if isinstance(pm, PhaseEntry) else pm for _, pm in self._phases]
+        manual = any(isinstance(pm, PhaseEntry) and pm.source_kind == 'lattice' for _, pm in self._phases)
+        if manual:
+            fit_kw['texture'] = 'free'
         config = FitConfig(init_kw=init_kw, fit_kw=fit_kw,
                            phase_names=[p.name for p in phases],
                            min_intensity=min_int)
@@ -426,6 +440,10 @@ class PhaseFitDialog(QtWidgets.QDialog):
             "lattice_pct": lattice, "min_intensity": minimum,
             "max_nfev": int(nfev) if nfev else None,
         }
+        entries = self.phase_source.selected_entries()
+        if entries and not self._deferred_cifs:
+            values.update(cif_paths=(), expected_hashes=(), phase_entries=entries,
+                          phase_names=tuple(entry.name for entry in entries))
         if self.use_uncertainties.isChecked():
             values['use_uncertainties'] = True
         return values
@@ -488,8 +506,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
     def set_vnext_result(self, result):
         fit_x = self._x[np.isfinite(self._x) & np.isfinite(self._y)]
         upper, markers, lower = fit_result_series(fit_x, result,
-            tuple((receipt.phase_name, values) for receipt, values in zip(
-                result.cif_receipts, result.phase_components, strict=True)))
+            tuple(zip(getattr(result, 'phase_names', ()) or tuple(receipt.phase_name for receipt in result.cif_receipts),
+                      result.phase_components, strict=True)))
         self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper, markers=markers),
                                               FitPanel(lower, zero_line=True)))
         for index, receipt in enumerate(result.cif_receipts):
@@ -501,7 +519,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
                         receipt.receipt_fingerprint))))
         self._sync_phase_list()
         self.table.show_rows(*phase_result_rows(result))
-        detail = "; ".join(result.diagnostics)
+        detail = "; ".join((*result.diagnostics,
+                            *((result.phase_fractions_reason,) if getattr(result, 'phase_fractions_reason', '') else ())))
         self.status.setText((result.message or result.code) +
             (f"; wavelength={result.wavelength_angstrom}" if result.wavelength_angstrom else "") +
             (f"; {detail}" if detail else ""))
@@ -546,7 +565,10 @@ class PhaseFitDialog(QtWidgets.QDialog):
         msg = "Phase fit converged." if ok else "Phase fit did NOT converge (best effort)."
         if rchi is not None and np.isfinite(rchi):
             msg += f"  reduced χ² = {rchi:.4g}."
-        self.status.setText(msg)
+        fractions_reason = (entry or {}).get('phase_fractions_reason', '')
+        if not fractions_reason and any(getattr(phase, 'source_kind', '') == 'lattice' for _, phase in self._phases):
+            fractions_reason = 'Phase fractions are withheld: lattice-only entries have no structural intensities.'
+        self.status.setText(msg + (' ' + fractions_reason if fractions_reason else ''))
 
     # ---- batch hooks (driven by the workspace) --------------------------
     def batch_x_range(self):
