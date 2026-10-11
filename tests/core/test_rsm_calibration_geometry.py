@@ -106,7 +106,7 @@ def _row_e(tmp_path, rotation, cch, refinement=True):
             turned = np.stack([orientation.apply(component[0]) for component in raw])
             assert turned.shape == reference.shape
             worst = max(worst, float(np.max(np.abs(turned - reference))))
-            if rotation in (0, 90) and float(cch[0]).is_integer() and float(cch[1]).is_integer():
+            if rotation == 0 and float(cch[0]).is_integer() and float(cch[1]).is_integer():
                 assert np.array_equal(turned, reference), (rotation, delta, nu)
     return worst
 
@@ -116,9 +116,10 @@ def _row_e(tmp_path, rotation, cch, refinement=True):
 @pytest.mark.parametrize("cch", [(4.0, 6.0), (3.25, 7.5)])
 def test_row_e_rsm_q_equals_stitch_q_at_the_same_physical_pixel(tmp_path, rotation, cch, refinement):
     """Row E (design §3.3): RSM's raw-frame q equals Stitch's xrayutilities backend's at the same physical pixel,
-    within 1e-12 Å⁻¹. Measured: bit for bit at whole-number beam pixels for the 0° and 90° turns; at 180° and 270°
-    xrayutilities' arithmetic along a reversed camera direction differs in the last place (the design expected
-    bit-for-bit there too). With the refinement (on by default) the map applies the calibration's del/nu offsets
+    within 1e-12 Å⁻¹. Measured: bit for bit at whole-number beam pixels for the 0° turn, and for the 90° turn on
+    macOS but not on x86 Linux; at 180° and 270° xrayutilities' arithmetic along a reversed camera direction
+    differs in the last place (the design expected bit-for-bit there too). Only the 0° turn is pinned bit for bit
+    (maintainer, 2026-10-11). With the refinement (on by default) the map applies the calibration's del/nu offsets
     itself; with it off the motors' angles carry them explicitly, which is the plain geometry."""
     worst = _row_e(tmp_path, rotation, cch, refinement)
     print("row E", rotation, cch, refinement, "max |dq|", worst)
