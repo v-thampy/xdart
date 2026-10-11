@@ -173,7 +173,7 @@ def test_unchanged_activation_rebuilds_no_ring_overlay(qapp, tmp_path, monkeypat
         QtWidgets.QApplication.sendEvent(page, QtCore.QEvent(QtCore.QEvent.WindowActivate))
         qapp.processEvents(); page._refresh_shell()
         select(qapp, page, page._context_controller.frame_keys[0])
-        view.raw.canvas.viewBox.setRange(xRange=(10, 20), yRange=(20, 40))
+        view.raw.canvas.imageViewBox.setRange(xRange=(10, 20), yRange=(20, 40))
         qapp.processEvents()
         assert not calls and tuple(view.raw.ring_items) == items
     with run_page(qapp, tmp_path/'scan') as (page, view):
@@ -200,7 +200,7 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
         view.show_raw_image(raw, status='source', color_map='Default', log_scale=False)
         np.testing.assert_array_equal(view.raw_popup_image.image.image, raw.T[:,::-1])
         assert not getattr(view.raw_popup_image, 'ring_items', ())
-        view._raw_popup.close(); qapp.processEvents()
+        view.raw_popup_dialog.close(); qapp.processEvents()
         view.raw.clear(); assert not getattr(view.raw, 'ring_items', ())
     finally:
         shell.close(); shell.deleteLater(); qapp.processEvents()
