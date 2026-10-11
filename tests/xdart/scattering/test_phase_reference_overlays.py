@@ -289,7 +289,8 @@ def test_phase_rings_on_ints_detector_image_follow_p3a(qapp, tmp_path, monkeypat
                 view.raw_popup_button.click(); qapp.processEvents()
                 # Opening Int's popup requests full raw asynchronously. Compare
                 # family identity only after that real image transition settles.
-                _settle(qapp, view, lambda: view.raw_popup_image.canvas.raw_image.shape == (195, 487))
+                _settle(qapp, view, lambda: view.raw_popup_image.image.image is not None
+                        and view.raw_popup_image.image.image.shape == (487, 195))
             pane = view.raw_popup_image if mode == 'Int 1D' else view.raw
             assert isinstance(view.phase_worker, SingleWorkerOwner)
             items = _phase_items(pane, entry)
