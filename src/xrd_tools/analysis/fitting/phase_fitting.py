@@ -1799,10 +1799,15 @@ class PhaseFitter:
 
         for key in ("a", "b", "c"):
             v0 = lat0[key]
+            # Bounds exactly equidistant from v0 (both differences are exact for
+            # lattice_pct <= 1/3) start lmfit's bounded transform at exactly 0.
+            # v0(1±pct) can leave a ~1e-15 residue, where leastsq's forward step
+            # vanishes and the axis never moves.
+            upper = v0 * (1 + lattice_pct)
             params[f"{pre}{key}"].set(
                 value=v0,
-                min=v0 * (1 - lattice_pct),
-                max=v0 * (1 + lattice_pct),
+                min=v0 - (upper - v0),
+                max=upper,
                 vary=True,
             )
         for key in ("alpha", "beta", "gamma"):
