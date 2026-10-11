@@ -8,6 +8,7 @@ import gc
 import os
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -60,13 +61,30 @@ def _xdart_qt_harness():
 
 
 @pytest.fixture(autouse=True)
-def _qt_test_boundary(_xdart_qt_harness):
+def _qt_test_boundary(_xdart_qt_harness, request):
     """Retire one test's Qt roots, then collect its cycles on the GUI thread."""
 
     baseline = _xdart_qt_harness.top_level_snapshot()
+    started = time.perf_counter()
     yield
     _xdart_qt_harness.retire_new_top_levels(baseline)
     _xdart_qt_harness.collect()
+    census = os.environ.get("XDART_QT_CENSUS")
+    if census:
+        # QT-TEST-LIFECYCLE diagnosis, off by default: what one process still
+        # holds after each test's own cleanup, one JSON line per test.
+        import json
+        import psutil
+        from PySide6 import QtWidgets
+        row = {
+            "test": request.node.nodeid,
+            "wall_s": round(time.perf_counter() - started, 3),
+            "widgets": len(QtWidgets.QApplication.allWidgets()),
+            "top_levels": len(QtWidgets.QApplication.topLevelWidgets()),
+            "rss_bytes": psutil.Process().memory_info().rss,
+        }
+        with open(census, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
 
 
 @pytest.fixture(scope="session", autouse=True)
