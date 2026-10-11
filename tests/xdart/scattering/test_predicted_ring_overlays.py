@@ -25,7 +25,7 @@ def qapp():
 
 
 @contextmanager
-def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, source_spec=None):
+def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, source_spec=None, heavy_window=None):
     root.mkdir(parents=True, exist_ok=True)
     raw = _series(root, energies)
     poni = root/'cal.poni'; write_poni(poni)
@@ -37,6 +37,8 @@ def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, sourc
     poni.write_text(text)
     intent = _intent(raw, root/'run.nexus', poni, processing_mode=mode)
     intent.source_spec = source_spec or image_series_spec(raw, metadata_format='txt')
+    if heavy_window is not None:
+        intent.run_options['heavy_window'] = heavy_window
     executor = StandardRunExecutor(join_timeout=2.)
     page = ScatteringWorkspace(intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
                                sources=FilesystemSourceAdapter(), executor=executor)
@@ -241,7 +243,7 @@ def test_logical_point_frames_keep_their_own_ring_geometry(qapp, tmp_path):
 
 
 def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path):
-    with run_page(qapp, tmp_path, energies=(16,17,18)) as (page, view):
+    with run_page(qapp, tmp_path, energies=(16,17,18), heavy_window=1) as (page, view):
         choice(view); choose(qapp, view)
         controller = page._context_controller
         keys = controller.frame_keys
