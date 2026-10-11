@@ -94,7 +94,7 @@ class FrameSelectionIntent(str, Enum):
 @dataclass(frozen=True, slots=True)
 class ShellCommand:
     kind: ShellCommandKind
-    value: Scalar = None
+    value: Scalar | tuple[tuple[str, bool], ...] = None
     path: tuple[str, ...] = ()
     frame: DisplayFrameKey | None = None
     frames: tuple[DisplayFrameKey, ...] = ()
@@ -104,7 +104,12 @@ class ShellCommand:
     def __post_init__(self) -> None:
         if type(self.kind) is not ShellCommandKind:
             raise TypeError("shell command kind must be exact")
-        if not _scalar_is_valid(self.value):
+        phase_selection = (self.kind is ShellCommandKind.SET_PLOT_OPTION
+            and self.path == ("other", "phase_references") and type(self.value) is tuple
+            and len(self.value) <= 8 and all(type(item) is tuple and len(item) == 2
+                and type(item[0]) is str and bool(item[0]) and type(item[1]) is bool for item in self.value)
+            and len({item[0] for item in self.value}) == len(self.value))
+        if not _scalar_is_valid(self.value) and not phase_selection:
             raise TypeError("shell command values must be detached scalars")
         if (
             type(self.path) is not tuple

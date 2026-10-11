@@ -50,7 +50,10 @@ from .scientific_plot_options import (
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
-from .scientific_curves import add_curve_item, add_text_item
+from .scientific_curves import add_curve_item, add_text_item, draw_marker
+from xdart.gui.widgets.latest_request import LatestRequestOwner
+from xdart.gui.pages.operation_owner import OperationTerminalStatus
+from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest, positions_for_axis
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
@@ -1095,6 +1098,7 @@ class ScientificView(QtWidgets.QFrame):
             self.raw_popup_image.clear_image_buffers()
         if self._processing_mode == 'Int 1D':
             self._clear_ring_overlay()
+            self._clear_grid_overlay()
         if hasattr(self, "raw_popup_status"): self.raw_popup_status.setText("")
         self.raw_popup_intensity.sync(None, None, reset=True)
         if self._raw_popup_host:
@@ -1223,6 +1227,16 @@ class ScientificView(QtWidgets.QFrame):
         self._ring_prediction = None
         self._ring_frame = None
         self._grid_cache = self._grid_prediction = self._grid_frame = None
+        self._phase_job = PhaseOverlayJob()
+        self._phase_requests = LatestRequestOwner(self._phase_job, self._phase_done,
+                                                  same=lambda a, b: a == b, parent=self)
+        self.phase_worker = self._phase_requests._owner
+        self.phase_families = {}
+        self._phase_markers, self._phase_legends, self._phase_colors = {}, {}, {}
+        self._phase_drawings = {}
+        self._phase_line_context = None
+        self._phase_wavelengths = ()
+        self._phase_display_contract = None
         self.clear = QtWidgets.QPushButton("Clear")
         self.share_axis = QtWidgets.QPushButton("Share Axis")
         self.share_axis.setCheckable(True)
@@ -1334,6 +1348,153 @@ class ScientificView(QtWidgets.QFrame):
                     new_value,
                     path,
                 )
+
+    def _remove_phase_family(self, identifier):
+        family = 'phase:' + identifier
+        self._phase_drawings.pop(identifier, None)
+        for pane in (self.raw, self.cake, self.raw_popup_image):
+            if pane is not None:
+                pane.render_overlay_family(family, ())
+        for marker in self._phase_markers.pop(identifier, ()):
+            self.curve.removeItem(marker)
+        legend = self._phase_legends.pop(identifier, None)
+        if legend is not None:
+            self.legend.removeItem(legend)
+        self.phase_families.pop(identifier, None)
+
+    def _clear_phase_overlays(self):
+        self._phase_requests.release()
+        self._phase_job.clear_cache()
+        for identifier in tuple(self.phase_families):
+            self._remove_phase_family(identifier)
+        self._phase_colors.clear()
+        self._phase_line_context = None
+        self._phase_wavelengths = ()
+        self._phase_display_contract = None
+
+    def shutdown_phase_overlays(self):
+        self._clear_phase_overlays()
+        return self._phase_requests.shutdown()
+
+    @staticmethod
+    def _phase_axis(axis):
+        if axis is None:
+            return None
+        key = ScientificView._axis_key(axis)
+        values = np.asarray(axis.values)
+        values = values[np.isfinite(values)]
+        return (key, (float(values.min()), float(values.max()))) if values.size else None
+
+    def _reconcile_phase_overlay(self, state, navigation):
+        from xrd_tools.analysis import phase
+        from xrd_tools import geometry_figures as gf
+        options, source = state.plot_options, self.plot_options_dialog.phase_source
+        visible = state.processing_mode != '2D Viewer'
+        self.plot_options_dialog.set_phase_available(bool(phase.HAS_PYMATGEN),
+            '' if phase.HAS_PYMATGEN else 'Reference phases require pymatgen; install xdart[fitting].', visible=visible)
+        entries = source.selected_entries() if visible and phase.HAS_PYMATGEN else ()
+        wanted = {entry.id for entry in entries}
+        for identifier in tuple(self.phase_families):
+            if identifier not in wanted:
+                self._remove_phase_family(identifier)
+        if not entries:
+            self._phase_requests.release()
+            self._phase_job.clear_cache()
+            return
+        self._phase_colors = dict(zip((entry.id for entry in entries), trace_colors('Default', len(entries))))
+        wavelengths = self._phase_wavelengths
+        wavelength = wavelengths[0]*1e10 if len(wavelengths) == 1 and wavelengths[0] is not None else None
+        context = self._phase_line_context
+        cake = self._phase_axis(self._rendered_cake_x_axis)
+        if context is None or context[0] not in _CONVERTIBLE_RADIAL_AXIS_KEYS:
+            context = cake
+        key, bounds = context if context is not None else ('', (0., 1.))
+        unit = {'q_A^-1': 'q', '2th_deg': '2theta'}.get(key, '')
+        reason = ''
+        if state.measurement_mode == 'Grazing':
+            reason = 'Reference lines and maps require Standard q or 2θ coordinates; GI detector rings remain detector-frame references.'
+        elif not unit:
+            reason = 'Reference phases require a q or 2θ axis.'
+        elif unit == '2theta' and wavelength is None:
+            reason = '2θ reference lines require one displayed energy; mixed or missing energies cannot share reference lines.'
+        heavy = state.heavy
+        is_int = (state.processing_mode == 'Int 1D' and 'raw' not in self._hidden_tools
+                  or state.processing_mode == 'Int 2D' and 'raw_pane' not in self._hidden_tools)
+        snapshot, shape = (), None
+        if is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None:
+            if not gf.detector_ring_unavailable(heavy.ring_geometry, heavy.detector_shape):
+                snapshot, shape = tuple(heavy.ring_geometry.items()), heavy.detector_shape
+        self._phase_display_contract = (state.measurement_mode, self._phase_line_context, cake,
+            self._phase_axis(self._rendered_cake_y_axis), wavelength, shape, bool(snapshot), state.processing_mode)
+        request = PhaseOverlayRequest(entries, options.phase_min_intensity, unit, bounds, wavelength,
+                                      snapshot, shape, line_reason=reason)
+        if request != self._phase_requests.shown:
+            for identifier in tuple(self.phase_families):
+                self._remove_phase_family(identifier)
+        self._phase_requests.ask(request)
+        self._draw_phase_overlays()
+
+    def _phase_done(self, request, terminal):
+        if terminal.status is OperationTerminalStatus.RETURNED:
+            self.phase_families = {family.id: family for family in terminal.payload}
+        else:
+            from xrd_tools.analysis.phase_overlays import PhaseOverlayFamily
+            self.phase_families = {entry.id: PhaseOverlayFamily(entry.id, entry.name, entry.source_kind,
+                reason=str(terminal.failure_message or 'Reference phase computation failed.')) for entry in request.entries}
+        self._draw_phase_overlays()
+        return True
+
+    def _draw_phase_overlays(self):
+        from xrd_tools.geometry_figures import Curve
+        if self._phase_display_contract is None:
+            return
+        measurement, line, cake, cake_y, wavelength, shape, raw_allowed, mode = self._phase_display_contract
+        line_key = line[0] if line else ''
+        for identifier, family in self.phase_families.items():
+            name = 'phase:' + identifier
+            color = self._phase_colors.get(identifier, (240, 200, 90))
+            tip = f'{family.name}: {family.omitted_count} reflections omitted below the floor. Display reference only.'
+            if family.reason:
+                tip += ' ' + family.reason
+            positions = positions_for_axis(family.q_lines,
+                {'q_A^-1': 'q', '2th_deg': '2theta'}.get(line_key, ''), wavelength)
+            values = positions.values if measurement != 'Grazing' else ()
+            markers = self._phase_markers.get(identifier, ())
+            plot_items = self.curve.getPlotItem().items
+            if (tuple(marker.value() for marker in markers) != values
+                    or any(marker not in plot_items for marker in markers)
+                    or any(marker.pen.color().getRgb()[:3] != color[:3] for marker in markers)):
+                for marker in markers:
+                    self.curve.removeItem(marker)
+                self._phase_markers[identifier] = tuple(draw_marker(self.curve, value, color=color,
+                    family=name, tooltip=tip) for value in values)
+            legend = self._phase_legends.get(identifier)
+            if legend is None:
+                legend = pg.PlotDataItem(pen=pg.mkPen(color, width=2))
+                legend.setToolTip(tip)
+                self._phase_legends[identifier] = legend
+            if not any(item.item is legend for item, _label in self.legend.items):
+                self.legend.addItem(legend, family.name)
+            legend.setPen(pg.mkPen(color, width=2))
+            drawing_key = (id(family), measurement, cake, cake_y, wavelength, color)
+            drawing = self._phase_drawings.get(identifier)
+            if drawing is None or drawing[0] != drawing_key:
+                drawing = (drawing_key, tuple(replace(curve, tooltip=tip) for curve in family.rings))
+                self._phase_drawings[identifier] = drawing
+            curves = ()
+            if measurement != 'Grazing' and cake is not None and cake_y is not None:
+                cake_values = positions_for_axis(family.q_lines,
+                    {'q_A^-1': 'q', '2th_deg': '2theta'}.get(cake[0], ''), wavelength).values
+                curves = tuple(Curve(family.name, np.asarray(((value, cake_y[1][0]),
+                    (value, cake_y[1][1]))), 'predicted', tip) for value in cake_values)
+            self.cake.render_overlay_family(name, curves, color=color, joined=True)
+            raw_curves = drawing[1] if raw_allowed else ()
+            self.raw.render_overlay_family(name, raw_curves if mode == 'Int 2D' else (),
+                                           native_shape=shape, color=color, joined=True)
+            if self.raw_popup_image is not None:
+                own_popup = mode == 'Int 1D' and not self._raw_popup_host and self.raw_popup_dialog.isVisible()
+                self.raw_popup_image.render_overlay_family(name, raw_curves if own_popup else (),
+                                                           native_shape=shape, color=color, joined=True)
 
     def _clear_ring_overlay(self):
         self._ring_cache = self._ring_prediction = None
@@ -1694,6 +1855,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._reconcile_raw_popup(state)
             self._reconcile_ring_overlay(state, navigation)
             self._reconcile_grid_overlay(state, navigation)
+            self._reconcile_phase_overlay(state, navigation)
         finally:
             self._share_axis_syncing = prior_syncing
         if replace_presentation:
@@ -1832,6 +1994,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def _clear_viewer_payloads(self, *, keep_chrome=False, failure=False):
         """Release scientific buffers; navigation need not dismantle the layout."""
+        self._clear_phase_overlays()
         cleared, canonical = True, self._viewer_2d_payload
         def scrub(target, name, value=None, *, read=False):
             nonlocal cleared
@@ -2591,6 +2754,8 @@ class ScientificView(QtWidgets.QFrame):
                 return
             if browse_snapshot is None:
                 rows = self._bounded_waterfall_rows(rows)
+        self._phase_wavelengths = tuple(sorted({getattr(trace, "wavelength_m", None)
+            for _, trace in rows}, key=lambda value: -1. if value is None else value))
         if state.plot_mode in {"Average", "Sum"}:
             traces = self._aggregate_trace_rows(
                 rows,
@@ -2618,6 +2783,11 @@ class ScientificView(QtWidgets.QFrame):
             self._axis_key(trace.axis)
             for trace in traces
         }
+        self._phase_line_context = None
+        if len(axis_keys) == 1 and traces:
+            finite = np.concatenate([np.asarray(t.axis.values)[np.isfinite(t.axis.values)] for t in traces])
+            if finite.size:
+                self._phase_line_context = (next(iter(axis_keys)), (float(finite.min()), float(finite.max())))
         prior_trace_axis_key = self._rendered_trace_axis_key
         self._rendered_trace_axis_key = (
             next(iter(axis_keys))
@@ -2991,6 +3161,7 @@ class ScientificView(QtWidgets.QFrame):
                             )
                             and retained.title == trace.title
                             and retained.epoch == trace.epoch
+                            and getattr(retained, "wavelength_m", None) == getattr(trace, "wavelength_m", None)
                         )
                     )
                 ):
@@ -3390,6 +3561,8 @@ class ScientificView(QtWidgets.QFrame):
         drawn again (or cleared) and the error raised."""
         if type(state) is not KeyedPanelsProjection:
             raise TypeError("a keyed layout is drawn from a KeyedPanelsProjection")
+        self._clear_phase_overlays()
+        self.plot_options_dialog.set_phase_available(False, "Reference phases are unavailable in keyed views.", visible=False)
         prior = self._keyed_shown
         try:
             self._paint_keyed(state)

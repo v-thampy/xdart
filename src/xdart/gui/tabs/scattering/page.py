@@ -2976,7 +2976,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         except Exception:
             analysis_clean = False
 
-        if (not self._release_browse_1d_debt()
+        from xdart.gui.pages.values import PageCleanup
+        phase_close = self._shell.scientific.shutdown_phase_overlays()
+        if (phase_close.status is not PageCleanup.CLEAN
+                or not self._release_browse_1d_debt()
                 or not self._clear_viewer_1d_renderer(close=True)
                 or not self._clear_viewer_2d_renderer(close=True)
                 or not self._shell.scientific.clear_workspace()):

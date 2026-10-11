@@ -3409,6 +3409,7 @@ class StitchPage(QtWidgets.QWidget):
         receipt = self._owner.close()
         child_receipts = [dialog.shutdown() for dialog in self._authoring_dialogs]
         child_receipts.append(self._source_observer.shutdown())
+        child_receipts.append(self.scientific.shutdown_phase_overlays())
         child_receipts.extend(host.shutdown() for host in self._fit_hosts.values())
         if not self._result_browser.close():
             from xdart.gui.pages.values import CloseReceipt
