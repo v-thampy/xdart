@@ -378,7 +378,10 @@ def test_phase_fits_a_real_cif_and_shows_its_receipt_lattice_component_markers_a
         dialog = _show(page, monkeypatch, "phase", trace, anchor)
         monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(_TIN), "CIF"))
         dialog._add_cif()
-        assert dialog._phases == [(str(_TIN), "TiN")]
+        assert len(dialog._phases) == 1
+        managed_path, phase_name = dialog._phases[0]
+        assert phase_name == "TiN" and Path(managed_path).read_bytes() == _TIN.read_bytes()
+        assert Path(managed_path).is_relative_to(Path(os.environ["XDART_PHASE_LIBRARY"]))
         dialog.fit_btn.click()
         assert page._consume_analysis_update(_settle(page))
         result = page._phase_result
