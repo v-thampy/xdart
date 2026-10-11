@@ -655,7 +655,9 @@ def _measure_candidate(frame, camera, senses, geometric, invalid):
     from pyFAI.calibrant import get_calibrant
     from scipy.ndimage import map_coordinates
     value, image = frame.geometry, frame.image
-    _, seed, shape = _geometry(value, camera, senses, include_rings=False)
+    # A temporary integrator per hypothesis: pyFAI's forced process-wide collection on its wavelength set
+    # would cost a full gc.collect() each time, on the scoring worker thread.
+    _, seed, shape = _geometry(value, camera, senses, include_rings=False, collect_garbage=False)
     ai = seed.integrator
     if not ai.detector.IS_FLAT or not ai.detector.uniform_pixel or ai.detector.spline is not None:
         raise ValueError('Orientation scoring requires a uniform, flat, undistorted detector.')
