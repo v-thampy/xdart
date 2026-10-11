@@ -254,8 +254,6 @@ def _fit_plan_value(plan: DisplayedPeakFitPlan) -> tuple[Any, ...]:
         plan.amplitude_bounds, plan.center_bounds_delta, plan.fraction_init,
         plan.max_nfev,
     )
-    if plan.phase_entries:
-        value += (("phase_entries", tuple((entry.id, entry.name, entry.source_kind, entry.lattice) for entry in plan.phase_entries)),)
     return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
 
 def _fit_sigma(plan, mask: np.ndarray) -> np.ndarray | None:
@@ -515,6 +513,8 @@ def _phase_plan_value(
         plan.prefit_background, plan.phase_profile,
         plan.lattice_pct, plan.min_intensity, plan.max_nfev,
     )
+    if plan.phase_entries:
+        value += (("phase_entries", tuple((entry.id, entry.name, entry.source_kind, entry.lattice) for entry in plan.phase_entries)),)
     return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
 def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
     if not isinstance(plan, DisplayedPhaseFitPlan):
