@@ -25,7 +25,7 @@ def qapp():
 
 
 @contextmanager
-def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, source_spec=None, heavy_window=None):
+def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, source_spec=None, heavy_window=None, parallax_override=None):
     root.mkdir(parents=True, exist_ok=True)
     raw = _series(root, energies)
     poni = root/'cal.poni'; write_poni(poni)
@@ -37,6 +37,8 @@ def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, sourc
     poni.write_text(text)
     intent = _intent(raw, root/'run.nexus', poni, processing_mode=mode)
     intent.source_spec = source_spec or image_series_spec(raw, metadata_format='txt')
+    if parallax_override is not None:
+        intent.poni_v3_override = parallax_override
     if heavy_window is not None:
         intent.run_options['heavy_window'] = heavy_window
     executor = StandardRunExecutor(join_timeout=2.)
@@ -159,11 +161,14 @@ def test_raw_ring_points_share_image_and_hover_mapping(qapp, tmp_path, thumbnail
             assert np.isfinite(np.column_stack(target.ring_items[0].getData())).all()
 
 
+@pytest.mark.parametrize('kind', ('v3', 'override'))
 @pytest.mark.parametrize('enabled', (False, True))
-def test_parallax_controls_ring_availability(qapp, tmp_path, enabled):
+def test_parallax_controls_ring_availability(qapp, tmp_path, enabled, kind):
     from tests.xdart.scattering.test_poni_v3_start import _V3_PONI
-    text = _V3_PONI.replace('Parallax: False', f'Parallax: {enabled}')
-    with run_page(qapp, tmp_path, energies=(16,16), poni_text=text) as (page, view):
+    from xrd_tools.session.run_configuration import PoniV3OverrideIntent
+    text = _V3_PONI.replace('Parallax: False', f'Parallax: {enabled}') if kind == 'v3' else None
+    override = PoniV3OverrideIntent('Si', 450e-6, enabled) if kind == 'override' else None
+    with run_page(qapp, tmp_path, energies=(16,16), poni_text=text, parallax_override=override) as (page, view):
         editor = choice(view)
         assert editor.isEnabled() is (not enabled)
         if enabled:
