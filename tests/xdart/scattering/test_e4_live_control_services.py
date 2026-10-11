@@ -34,6 +34,7 @@ from xrd_tools.sources.selection import (
     normalize_image_source_metadata,
     single_image_spec,
 )
+from tests.xdart.scattering._e2sd_support import write_poni
 
 
 @pytest.fixture
@@ -90,6 +91,8 @@ def test_page_keeps_and_restores_explicit_single_image_mode(
     selected = tmp_path / "scan_0002.tif"
     selected.write_bytes(b"frame")
     single = single_image_spec(selected)
+    # Since a53c324e an Int page with an absent PONI reads "Needs PONI", not its source's readiness.
+    write_poni(tmp_path / "cal.poni")
     store = RunIntentStore(RunIntent(
         poni_file=str(tmp_path / "cal.poni"),
         save_path=str(tmp_path / "processed.nxs"),

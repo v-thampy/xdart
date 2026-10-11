@@ -33,6 +33,7 @@ from xdart.gui.tabs.scattering.start_outcomes import executor_closed_is_valid
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from tests.xdart.scattering._admission import ImmediateAdmission
+from tests.xdart.scattering._e2sd_support import write_poni
 
 
 class _UnprintableError(RuntimeError):
@@ -273,6 +274,8 @@ def test_cleaned_failure_can_launch_a_real_next_attempt(
 ) -> None:
     executor = _Executor()
     source = image_series_spec(tmp_path / "frame_0001.tif")
+    # Since a53c324e Run refuses an absent PONI before admission, so the next attempt has a real one.
+    write_poni(tmp_path / "calibration.poni")
     intents = RunIntentStore(
         RunIntent(
             source_spec=source,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import functools
 import os
 from pathlib import Path
+import tempfile
 from threading import Event
 import time
 from types import SimpleNamespace
@@ -60,6 +62,19 @@ from tests.xdart.scattering._admission import (
     ImmediateAdmission,
     admission_for,
 )
+from tests.xdart.scattering._e2sd_support import write_poni
+
+
+def _poni(directory: Path) -> str:
+    """A real PONI there: since a53c324e Run refuses an absent or unparseable one before admission."""
+    path = directory / "calibration.poni"
+    write_poni(path)
+    return str(path)
+
+
+@functools.cache
+def _shared_poni() -> str:
+    return _poni(Path(tempfile.mkdtemp(prefix="xdart_e1b2_poni_")))
 
 
 @pytest.fixture
@@ -160,7 +175,7 @@ def _active_page(
         intents=RunIntentStore(
             RunIntent(
                 source_spec=image_series_spec(Path("frame_0001.tif")),
-                poni_file="calibration.poni",
+                poni_file=_shared_poni(),
                 save_path="output.nxs",
                 output_mode=output_mode,
                 processing_mode=processing_mode,
@@ -873,7 +888,7 @@ def test_executor_drain_timer_tracks_only_launched_run_lifetime(qapp: QtWidgets.
     source = image_series_spec(tmp_path / "frame_0001.tif")
     lifecycle = ScatteringCoordinator()
     page = ScatteringWorkspace(
-        intents=RunIntentStore(RunIntent(source_spec=source, poni_file=str(tmp_path / "calibration.poni"),
+        intents=RunIntentStore(RunIntent(source_spec=source, poni_file=_poni(tmp_path),
                                           save_path=str(tmp_path / "output.nxs"),
                                           output_mode="Overwrite")),
         lifecycle=lifecycle, sources=_Sources(), executor=executor,
@@ -1262,7 +1277,7 @@ def test_fresh_run_projects_output_checking_not_cleanup(
         intents=RunIntentStore(
             RunIntent(
                 source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
-                poni_file=str(tmp_path / "calibration.poni"),
+                poni_file=_poni(tmp_path),
                 save_path=str(tmp_path / "output.nxs"),
                 output_mode="Overwrite",
             )
@@ -1299,7 +1314,7 @@ def test_run_click_preserves_outgoing_paint_until_a_frame_arrives(
         intents=RunIntentStore(
             RunIntent(
                 source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
-                poni_file=str(tmp_path / "calibration.poni"),
+                poni_file=_poni(tmp_path),
                 save_path=str(tmp_path / "output.nxs"),
                 output_mode="Overwrite",
             )
@@ -1500,7 +1515,7 @@ def test_post_retirement_start_refusal_preserves_detached_outgoing_paint(
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent(
             source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
-            poni_file=str(tmp_path / "calibration.poni"),
+            poni_file=_poni(tmp_path),
             save_path=str(tmp_path / "output.nxs"),
             output_mode="Overwrite",
         )),
@@ -1942,7 +1957,7 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent(
             source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
-            poni_file=str(tmp_path / "calibration.poni"),
+            poni_file=_poni(tmp_path),
             save_path=str(tmp_path / "output.nxs"),
             output_mode="Overwrite",
             processing_mode="Int 2D",
@@ -3121,7 +3136,7 @@ def test_run_retries_transient_prior_display_cleanup_without_second_click(
         intents=RunIntentStore(
             RunIntent(
                 source_spec=source,
-                poni_file=str(tmp_path / "calibration.poni"),
+                poni_file=_poni(tmp_path),
                 save_path=str(tmp_path / "output.nxs"),
                 output_mode="Overwrite",
             )
@@ -3173,7 +3188,7 @@ def test_clean_output_release_projects_pending_display_retirement(
         intents=RunIntentStore(
             RunIntent(
                 source_spec=image_series_spec(tmp_path / "frame_0001.tif"),
-                poni_file=str(tmp_path / "calibration.poni"),
+                poni_file=_poni(tmp_path),
                 save_path=str(tmp_path / "output.nxs"),
                 output_mode="Overwrite",
             )
