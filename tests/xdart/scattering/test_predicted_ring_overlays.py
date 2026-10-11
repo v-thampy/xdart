@@ -265,3 +265,21 @@ def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path):
         assert payload.view.geometry.poni == original
         assert payload.view.geometry.poni != last
         assert view.raw.ring_items
+
+
+def test_same_energy_step_to_an_evicted_frame_reuses_the_prediction(qapp, tmp_path, monkeypatch):
+    # O5 beyond the heavy window (P3a terminal review): the frame's own snapshot equals the cached one,
+    # so its PREVIEW hydration redraws the cached rings without predicting them again.
+    import xrd_tools.geometry_figures as gf
+    with run_page(qapp, tmp_path, energies=(16,)*17, heavy_window=16) as (page, view):
+        choice(view); choose(qapp, view)
+        controller = page._context_controller
+        keys = controller.frame_keys
+        store = controller.acquisition_context.publication_store.artifacts[keys[0].artifact].publications
+        assert store.get(keys[0].local_frame_label).view.intensity_2d is None
+        calls = []; actual = gf.predict_detector_rings
+        def count(*a, **k):
+            calls.append(1); return actual(*a, **k)
+        monkeypatch.setattr(gf, 'predict_detector_rings', count)
+        select(qapp, page, keys[0])
+        assert view.raw.ring_items and not calls

@@ -3123,3 +3123,18 @@ def test_a_presentation_failure_in_poll_is_contained_with_its_stable_code(qapp, 
         assert not page._timer.isActive()
     finally:
         _close(page, qapp)
+
+
+def test_plot_options_offer_no_predicted_ring_choice(qapp):
+    """Int's Calibrant overlay needs Int's raw display. RSM hides it, so its plot options never show the row
+    (P3a terminal review)."""
+    page = _page(qapp)
+    try:
+        page.view._show_plot_options()
+        qapp.processEvents()
+        dialog = page.view.plot_options_dialog
+        assert not [label for label in dialog.findChildren(QtWidgets.QLabel)
+                    if label.text() == "Calibrant" and label.isVisible()]
+        dialog.reject()
+    finally:
+        _close(page, qapp)

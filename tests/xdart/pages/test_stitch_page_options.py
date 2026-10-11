@@ -1178,3 +1178,21 @@ def test_saved_normalization_restores_and_older_settings_take_their_monitor(qapp
     finally:
         _close(page, qapp)
         _close(other, qapp)
+
+
+def test_plot_options_offer_no_predicted_ring_choice(qapp):
+    """Stitch drives Int's view as Int 1D/2D with Int's raw displays hidden, so Int's Calibrant overlay row
+    stays hidden in both modes (P3a terminal review)."""
+    from pyqtgraph.Qt import QtWidgets
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        for mode in ("Stitch 1D", "Stitch 2D"):
+            assert page.select_mode(mode)
+            page.scientific._show_plot_options()
+            qapp.processEvents()
+            dialog = page.scientific.plot_options_dialog
+            assert not [label for label in dialog.findChildren(QtWidgets.QLabel)
+                        if label.text() == "Calibrant" and label.isVisible()], mode
+            dialog.reject()
+    finally:
+        _close(page, qapp)
