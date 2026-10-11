@@ -93,3 +93,15 @@ def test_predicted_parameter_cap_counts_every_lattice_height(tmp_path):
     result = run_displayed_phase_fit(plan)
     assert result.code == "FIT_PARAMETER_LIMIT_EXCEEDED", result.diagnostics
     assert result.fit is None and result.parameter_names == ()
+
+
+def test_displayed_lattice_plan_fingerprint_binds_its_cell(tmp_path):
+    from xrd_tools.analysis.phase_references import PhaseLibrary
+    from xrd_tools.analysis.display_fit_operations import run_displayed_phase_fit
+    library = PhaseLibrary(tmp_path / "library")
+    first = library.add_lattice("positions", a=4.1, space_group="Pm-3m")
+    second = library.add_lattice("positions", a=4.2, space_group="Pm-3m")
+    one = run_displayed_phase_fit(_plan(tmp_path, (first,)))
+    two = run_displayed_phase_fit(_plan(tmp_path, (second,)))
+    assert one.code == two.code == "OK"
+    assert one.plan_fingerprint != two.plan_fingerprint, "the plan identity must bind its lattice cell"
