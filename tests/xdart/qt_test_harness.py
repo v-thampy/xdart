@@ -8,9 +8,9 @@ wrong thread and leave Qt's timer dispatcher holding a stale recipient.
 The test process therefore disables *automatic* cyclic collection and calls
 ``collect`` only through this main-thread-owned harness.  Reference counting
 is unaffected.  The harness also closes top-level widgets created by one test
-before collecting its unreachable Python cycles.  It deliberately never
-flushes Qt's ``DeferredDelete`` queue; that operation has a separate known
-suite-scale teardown hazard documented in ``tests/xdart/conftest.py``.
+before collecting its unreachable Python cycles.  DeferredDelete delivery is
+opt-in at the per-test boundary; the session-end backlog drain remains banned
+because of the hazard documented in ``tests/xdart/conftest.py``.
 """
 
 from __future__ import annotations
@@ -94,8 +94,9 @@ class QtTestHarness:
         Qt delivers a deletion posted outside any event loop only when a later
         nested loop runs, so without this one process keeps every such object
         until some test destroys the whole backlog at once (QT-TEST-LIFECYCLE).
-        Called at each test boundary under the ``XDART_QT_DELIVER_DELETES``
-        trial switch, the backlog never exceeds one test's objects.
+        The ``XDART_QT_DELIVER_DELETES`` trial delivers pending deletions on the
+        GUI thread after each test's retirement.  It does not delete windows
+        merely because they were closed, or bound the number of live widgets.
         """
 
         self.assert_main_thread()

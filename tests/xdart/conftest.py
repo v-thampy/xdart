@@ -155,7 +155,7 @@ def _qt_session_teardown(_xdart_qt_harness):
 # is banned (it segfaulted linux CI mid-run -- see _qt_session_teardown), and a
 # blind ``shiboken6.delete`` of the parentless popup graph double-frees
 # (verified: SIGSEGV).  Delivering each test's own deletions at its boundary,
-# which keeps N to one test's objects, is on trial behind
+# which reduces the pending-deletion backlog, is on trial behind
 # XDART_QT_DELIVER_DELETES=1 (QT-TEST-LIFECYCLE, maintainer 2026-10-10) until a
 # Linux nightly has run with it.  Either way we do what scripts/ci_pytest.py already does on linux
 # CI (and what pyqtgraph's ``pg.exit()`` does): once pytest has finished — the
