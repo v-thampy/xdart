@@ -28,6 +28,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         from xrd_tools.analysis.phase_references import PhaseLibrary
         self.library = PhaseLibrary() if library is None else library
         self._selection = ()
+        #: the current selection's entries as last resolved; reconciles read no library files
+        self._resolved = {}
         self._show_library = bool(show_library)
         self._checkable = bool(checkable)
         self._key_by_index = bool(key_by_index)
@@ -116,6 +118,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         return self._reason
 
     def _message(self, message):
+        if str(message) == self._reason:
+            return
         self._reason = str(message)
         self.status.setText(self._reason)
         self._sync_tooltips()
@@ -131,18 +135,9 @@ class PhaseSourceWidget(QtWidgets.QWidget):
                 control.setToolTip(purpose + suffix)
 
     def selected_entries(self):
-        entries = []
-        missing = []
-        for identifier, visible in self._selection:
-            if not visible:
-                continue
-            lookup = self.library.resolve(identifier)
-            if lookup.entry is None:
-                missing.append(lookup.reason or f'Missing phase library entry: {identifier}')
-            else:
-                entries.append(lookup.entry)
-        self._message('; '.join(missing))
-        return tuple(entries)
+        """The visible selected entries as last resolved by refresh_library."""
+        return tuple(self._resolved[identifier] for identifier, visible in self._selection
+                     if visible and identifier in self._resolved)
 
     def set_selection(self, selection):
         selection = tuple(selection)
@@ -151,19 +146,26 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             raise ValueError('Choose at most eight identified phases with boolean visibility.')
         if len({identifier for identifier, _visible in selection}) != len(selection):
             raise ValueError('A phase can be selected only once.')
-        changed = selection != self._selection
+        if selection == self._selection:
+            return
         self._selection = selection
         self.refresh_library()
-        if changed:
-            self.changed.emit(self._selection)
+        self.changed.emit(self._selection)
 
     def refresh_library(self):
+        """Read the library once for the list and the selection (user actions, never reconciles)."""
+        from xrd_tools.analysis.phase_references import PhaseLibraryLookup, pymatgen_available
         selected = dict(self._selection)
         if self._show_library:
             entries = tuple(self.library.entries())
+            known = {entry.id: entry for entry in entries}
+            lookups = {identifier: PhaseLibraryLookup(known[identifier]) if identifier in known
+                       else self.library.resolve(identifier) for identifier in selected}
         else:
-            entries = tuple(lookup.entry for identifier, _visible in self._selection
-                            if (lookup := self.library.resolve(identifier)).entry is not None)
+            lookups = {identifier: self.library.resolve(identifier) for identifier in selected}
+            entries = tuple(lookup.entry for lookup in lookups.values() if lookup.entry is not None)
+        self._resolved = {identifier: lookup.entry for identifier, lookup in lookups.items()
+                          if lookup.entry is not None}
         self._shown_ids = tuple(entry.id for entry in entries)
         rows = tuple(BrowserResult(str(index) if self._key_by_index else entry.id, entry.name,
                                    self._details.get(entry.id, f'{entry.source_kind} phase: {entry.name}'))
@@ -174,12 +176,10 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         else:
             self.browser.reconcile_results(rows, self.browser.current_result())
         missing = [lookup.reason or f'Missing phase library entry: {identifier}'
-                   for identifier, _visible in self._selection
-                   if (lookup := self.library.resolve(identifier)).entry is None]
+                   for identifier, lookup in lookups.items() if lookup.entry is None]
         self._message('; '.join(missing))
-        from xrd_tools.analysis import phase
-        self.set_available(bool(phase.HAS_PYMATGEN),
-                           '' if phase.HAS_PYMATGEN else 'Phase sources need pymatgen; install xdart[fitting].')
+        if not pymatgen_available():  # never re-enable over a host's own unavailable reason
+            self.set_available(False, 'Phase sources need pymatgen; install xdart[fitting].')
 
     def set_available(self, available, reason=''):
         self.setEnabled(bool(available))
@@ -204,13 +204,16 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.set_selection(selected)
 
     def _add_entry(self, entry):
-        if entry.id not in dict(self._selection):
-            if len(self._selection) >= 8:
+        before = self._selection
+        if entry.id not in dict(before):
+            if len(before) >= 8:
                 raise ValueError('Choose at most eight phases.')
-            self.set_selection((*self._selection, (entry.id, True)))
+            self.set_selection((*before, (entry.id, True)))
         else:
             self.set_selection(tuple((identifier, visible or identifier == entry.id)
-                                     for identifier, visible in self._selection))
+                                     for identifier, visible in before))
+        if self._selection == before:
+            self.refresh_library()  # the library entry itself may have been rewritten
         return entry
 
     def add_cif_paths(self, paths):

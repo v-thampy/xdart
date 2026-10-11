@@ -132,7 +132,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
         from xdart.gui.analysis.phase_source import PhaseSourceWidget
         from xdart.gui.widgets.controls_panel import FormRow
-        phase = self._section(layout, 'Reference phases')
+        phase = self._section(layout, 'Reference phases', index=layout.count() - 1)  # above Okay/Cancel
         self._phase_group = phase.parentWidget()
         self._phase_group.setToolTip('Choose reference phases for q/2θ lines and current-Run detector rings. Display only.')
         self.phase_source = PhaseSourceWidget(self._phase_group)
@@ -149,10 +149,15 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     def _section(
         outer: QtWidgets.QVBoxLayout,
         title: str,
+        *,
+        index: int | None = None,
     ) -> QtWidgets.QGridLayout:
         group = QtWidgets.QGroupBox(title)
         grid = QtWidgets.QGridLayout(group)
-        outer.addWidget(group)
+        if index is None:
+            outer.addWidget(group)
+        else:
+            outer.insertWidget(index, group)
         return grid
 
     @staticmethod
@@ -222,6 +227,11 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         row.setVisible(visible)
         for widget in (row, self.coordinate_grid, row.findChild(QtWidgets.QLabel)):
             widget.setToolTip(tip)
+
+    def showEvent(self, event) -> None:
+        # Opening Plot Options lists entries other tools added; reconciles never read the library.
+        self.phase_source.refresh_library()
+        super().showEvent(event)
 
     def set_phase_available(self, available, reason='', *, visible=True):
         self._phase_available = bool(available)

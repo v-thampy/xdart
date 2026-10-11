@@ -55,6 +55,16 @@ class PhaseReferences:
     reason: str = ""
 
 
+def pymatgen_available() -> bool:
+    """Whether the optional phase backend can run, without importing it on a GUI path."""
+    import importlib.util
+    import sys
+    loaded = sys.modules.get("xrd_tools.analysis.phase")
+    if loaded is not None:
+        return bool(loaded.HAS_PYMATGEN)
+    return importlib.util.find_spec("pymatgen") is not None
+
+
 def _atomic_write(path: Path, raw: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")

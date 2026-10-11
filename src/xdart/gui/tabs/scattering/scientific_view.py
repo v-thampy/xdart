@@ -1389,13 +1389,14 @@ class ScientificView(QtWidgets.QFrame):
         return (key, (float(values.min()), float(values.max()))) if values.size else None
 
     def _reconcile_phase_overlay(self, state, navigation):
-        from xrd_tools.analysis import phase
+        from xrd_tools.analysis.phase_references import pymatgen_available
         from xrd_tools import geometry_figures as gf
         options, source = state.plot_options, self.plot_options_dialog.phase_source
         visible = state.processing_mode != '2D Viewer'
-        self.plot_options_dialog.set_phase_available(bool(phase.HAS_PYMATGEN),
-            '' if phase.HAS_PYMATGEN else 'Reference phases require pymatgen; install xdart[fitting].', visible=visible)
-        entries = source.selected_entries() if visible and phase.HAS_PYMATGEN else ()
+        available = pymatgen_available()
+        self.plot_options_dialog.set_phase_available(available,
+            '' if available else 'Reference phases require pymatgen; install xdart[fitting].', visible=visible)
+        entries = source.selected_entries() if visible and available else ()
         wanted = {entry.id for entry in entries}
         for identifier in tuple(self.phase_families):
             if identifier not in wanted:
@@ -1479,6 +1480,11 @@ class ScientificView(QtWidgets.QFrame):
             if not any(item.item is legend for item, _label in self.legend.items):
                 self.legend.addItem(legend, family.name)
             legend.setPen(pg.mkPen(color, width=2))
+            legend.setToolTip(tip)
+            for sample, label in self.legend.items:
+                if sample.item is legend:  # the entry the legend shows, not only its proxy
+                    sample.setToolTip(tip)
+                    label.setToolTip(tip)
             drawing_key = (id(family), measurement, cake, cake_y, wavelength, color)
             drawing = self._phase_drawings.get(identifier)
             if drawing is None or drawing[0] != drawing_key:
