@@ -33,7 +33,7 @@ from .controls_readiness import (
 from .detector_projection import detector_calibration_ready
 from .display_values import DisplayFrameKey
 from .shell_values import AxisProjection, TraceProjection
-from .scientific_curves import add_curve_item
+from .scientific_curves import add_curve_item, add_text_item
 
 
 def _axis_text(text: str) -> str:
@@ -137,11 +137,12 @@ class ScientificImagePane(QtWidgets.QWidget):
         self._geometry_contract: tuple[object, ...] | None = None
         self._axis_presentation_contract: tuple[object, ...] | None = None
         self.ring_items = []
-        self._ring_contract = None
+        self.overlay_families = {}
+        self._overlay_contracts = {}
         layout.addWidget(self.canvas, 1)
 
     def clear(self) -> None:
-        self.render_ring_curves(())
+        self.clear_overlay_families()
         self._render_contract = None
         self._geometry_contract = None
         self._axis_presentation_contract = None
@@ -153,36 +154,56 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.render_coverage(None)
 
     def render_ring_curves(self, curves, *, native_shape=None) -> None:
-        """Draw native pixel-centre curves on the actual raw ImageItem grid.
+        self.render_overlay_family('calibrant', curves, native_shape=native_shape)
+        self.ring_items = list(self.overlay_families.get('calibrant', ()))
 
-        Raw and corner-aligned thumbnails share endpoint centres. The image
-        itself owns the native extent, transform and single Y mirror.
-        """
+    def clear_overlay_families(self):
+        for family in tuple(self.overlay_families):
+            self.render_overlay_family(family, ())
+        self.ring_items = []
+
+    def _map_overlay_points(self, points, native_shape):
+        if native_shape is None:
+            return np.asarray(points)
+        c, r = self.image.image.shape[:2]
+        rows, columns = native_shape
+        native = np.asarray(points)
+        x = native[:, 0]*(c-1)/(columns-1)+.5 if columns > 1 else np.full(len(native), .5)
+        y = r-.5-native[:, 1]*(r-1)/(rows-1) if rows > 1 else np.full(len(native), .5)
+        transform, pos = self.image.transform(), self.image.pos()
+        return np.column_stack((
+            transform.m11()*x+transform.m21()*y+transform.dx()+pos.x(),
+            transform.m12()*x+transform.m22()*y+transform.dy()+pos.y()))
+
+    def render_overlay_family(self, family, curves, *, texts=(), native_shape=None,
+                              color=None, joined=False):
+        """Independent passive family using one native-pixel display mapper."""
         contract = None
-        if curves and self.image.image is not None and native_shape is not None:
-            c, r = self.image.image.shape[:2]
-            rows, columns = native_shape
+        if curves and (native_shape is None or self.image.image is not None):
             transform, pos = self.image.transform(), self.image.pos()
-            contract = (tuple(id(curve) for curve in curves), native_shape, c, r,
+            contract = (tuple(id(curve) for curve in curves), tuple(id(text) for text in texts),
+                        native_shape, None if self.image.image is None else self.image.image.shape,
                         transform.m11(), transform.m12(), transform.m21(), transform.m22(),
-                        transform.dx(), transform.dy(), pos.x(), pos.y())
-        if contract == self._ring_contract:
+                        transform.dx(), transform.dy(), pos.x(), pos.y(), color, joined)
+        if contract == self._overlay_contracts.get(family):
             return
-        for item in self.ring_items:
+        for item in self.overlay_families.pop(family, ()):
             self.plot.removeItem(item)
-        self.ring_items.clear(); self._ring_contract = contract
+        self._overlay_contracts.pop(family, None)
         if contract is None:
             return
-        for curve in curves:
-            native = curve.xy
-            x = native[:, 0]*(c-1)/(columns-1)+.5 if columns > 1 else np.full(len(native), .5)
-            y = r-.5-native[:, 1]*(r-1)/(rows-1) if rows > 1 else np.full(len(native), .5)
-            mapped = np.column_stack((
-                transform.m11()*x+transform.m21()*y+transform.dx()+pos.x(),
-                transform.m12()*x+transform.m22()*y+transform.dy()+pos.y()))
-            item = add_curve_item(self.plot, curve, '#e7b44c', xy=mapped)
+        self._overlay_contracts[family] = contract
+        color = color or ('#e7b44c' if family == 'calibrant' else '#8dd3ec')
+        mapped = [self._map_overlay_points(curve.xy, native_shape) for curve in curves]
+        pairs = [(curves[0], np.vstack([np.vstack((points, (np.nan, np.nan))) for points in mapped]))]
+        if not joined:
+            pairs = zip(curves, mapped)
+        items = [add_curve_item(self.plot, curve, color, xy=points) for curve, points in pairs]
+        items.extend(add_text_item(self.plot, text, color,
+                     xy=self._map_overlay_points([text.xy], native_shape)[0]) for text in texts)
+        for item in items:
             item.setZValue(2)
-            self.ring_items.append(item)
+        self.overlay_families[family] = tuple(items)
 
     def render_coverage(self, coverage: np.ndarray | None) -> None:
         """Shade zero-support bins separately from the scientific image and its color scale."""
@@ -373,7 +394,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         try:
             return self._render_image(*args, **kwargs)
         except Exception:
-            self.render_ring_curves(())
+            self.clear_overlay_families()
             raise
 
     def _render_image(

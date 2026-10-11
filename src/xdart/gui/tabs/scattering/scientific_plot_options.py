@@ -22,6 +22,8 @@ COVERAGE_TOOLTIP = (
 )
 RING_TOOLTIP = ("Overlay predicted powder rings using this frame's effective run geometry and wavelength. "
                 'Radial agreement alone does not identify detector mounting.')
+GRID_TOOLTIP = ('Show detector-frame q contours and χ half-rays with the effective Run plan’s χ offset. '
+                'Display only; available on Standard Int Run frames with a uniform flat detector.')
 
 #: Every 1-D plot option: its command path and its ``ScientificPlotOptions`` field, the one table the
 #: view emits and every page applies (Codex general audit AUD-8).
@@ -35,6 +37,7 @@ PLOT_OPTION_BINDINGS = (
     (("other", "intensity_scale"), "intensity_scale"),
     (("other", "coverage_holes"), "show_coverage_holes"),
     (("other", "calibrant"), "calibrant"),
+    (("other", "coordinate_grid"), "coordinate_grid"),
 )
 
 
@@ -121,6 +124,9 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         from xrd_tools.integrate.calibration import CALIBRANT_NAMES
         self.calibrant = self.add_choice('Calibrant', ('Off', *CALIBRANT_NAMES), 'Off', tooltip=RING_TOOLTIP)
         self.set_ring_available(False, visible=False)  # shown only when Int's raw display reconciles
+        self.coordinate_grid = self.add_choice('Coordinate grid', ('Off', 'q', 'χ', 'q + χ'),
+                                               'Off', tooltip=GRID_TOOLTIP)
+        self.set_grid_available(False, visible=False)
 
         self.reconcile(self._projection)
 
@@ -193,6 +199,15 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         row = self.calibrant.parentWidget(); row.setVisible(visible); row.setToolTip(tip)
         row.findChild(QtWidgets.QLabel).setToolTip(tip)
 
+    def set_grid_available(self, available: bool, reason: str = '', *, visible: bool = True) -> None:
+        from xrd_tools.geometry_figures import RUN_RING_REASON
+        tip = GRID_TOOLTIP if available else GRID_TOOLTIP+' '+(reason or RUN_RING_REASON)
+        self.coordinate_grid.setEnabled(available)
+        row = self.coordinate_grid.parentWidget()
+        row.setVisible(visible)
+        for widget in (row, self.coordinate_grid, row.findChild(QtWidgets.QLabel)):
+            widget.setToolTip(tip)
+
     def reconcile(self, options: ScientificPlotOptions) -> None:
         if type(options) is not ScientificPlotOptions:
             raise TypeError("plot options must be an exact frozen value")
@@ -206,6 +221,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             self.intensity_scale,
             self.show_coverage_holes,
             self.calibrant,
+            self.coordinate_grid,
         )
         blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
         self.waterfall_y_axis.clear()
@@ -221,6 +237,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.intensity_scale.setCurrentText(options.intensity_scale)
         self.show_coverage_holes.setChecked(options.show_coverage_holes)
         self.calibrant.setCurrentText(options.calibrant)
+        self.coordinate_grid.setCurrentText(options.coordinate_grid)
         self._projection = options
         del blockers
 
@@ -235,6 +252,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             intensity_scale=self.intensity_scale.currentText(),
             show_coverage_holes=self.show_coverage_holes.isChecked(),
             calibrant=self.calibrant.currentText(),
+            coordinate_grid=self.coordinate_grid.currentText(),
         )
 
     def reject(self) -> None:

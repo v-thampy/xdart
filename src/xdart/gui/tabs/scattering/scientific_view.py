@@ -50,7 +50,7 @@ from .scientific_plot_options import (
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
-from .scientific_curves import add_curve_item
+from .scientific_curves import add_curve_item, add_text_item
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
@@ -564,9 +564,7 @@ class _KeyedFigurePanel:
                 pen=pg.mkPen(color), brush=pg.mkBrush(color))
             self._overlay(item, arrow.tooltip)
         for text in figure.texts:
-            item = pg.TextItem(text.text, color=color)
-            item.setPos(*text.xy)
-            self._overlay(item, text.tooltip)
+            self.overlay_items.append(add_text_item(self.plot, text, color))
         self.viewbox.autoRange()
 
     def _overlay(self, item, tooltip):
@@ -1224,6 +1222,7 @@ class ScientificView(QtWidgets.QFrame):
         self._ring_cache = None
         self._ring_prediction = None
         self._ring_frame = None
+        self._grid_cache = self._grid_prediction = self._grid_frame = None
         self.clear = QtWidgets.QPushButton("Clear")
         self.share_axis = QtWidgets.QPushButton("Share Axis")
         self.share_axis.setCheckable(True)
@@ -1346,6 +1345,50 @@ class ScientificView(QtWidgets.QFrame):
         if self.raw_popup_image is not None:
             self.raw_popup_image.render_ring_curves(())
 
+    def _clear_grid_overlay(self, *, retain_cache=False):
+        self._grid_frame = None
+        if not retain_cache:
+            self._grid_cache = self._grid_prediction = None
+        self.raw.render_overlay_family('grid', ())
+        if self.raw_popup_image is not None:
+            self.raw_popup_image.render_overlay_family('grid', ())
+
+    def _reconcile_grid_overlay(self, state, navigation):
+        from xrd_tools import geometry_figures as gf
+        heavy, mode = state.heavy, state.processing_mode
+        shown = (mode in ('Average', 'Reintegrate')
+                 or mode == 'Int 1D' and 'raw' not in self._hidden_tools
+                 or mode == 'Int 2D' and 'raw_pane' not in self._hidden_tools)
+        is_int = shown and mode in ('Int 1D', 'Int 2D')
+        if (heavy is None and state.retain_display and is_int
+                and self._grid_frame is navigation.current):
+            return
+        matches = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
+        snapshot, shape = ((heavy.ring_geometry, heavy.detector_shape) if matches else (None, None))
+        reason = gf.detector_grid_unavailable(snapshot, shape)
+        self.plot_options_dialog.set_grid_available(not reason, reason, visible=shown)
+        choice = state.plot_options.coordinate_grid
+        if reason or choice == 'Off':
+            self._clear_grid_overlay(retain_cache=True)
+            return
+        dimension = '1d' if mode == 'Int 1D' else '2d'
+        key = (tuple(snapshot.items()), shape, choice, dimension)
+        if self._grid_cache != key:
+            self._clear_grid_overlay()
+            try:
+                self._grid_prediction = gf.predict_detector_grid(snapshot, shape=shape, choice=choice,
+                                                                  mode=dimension)
+            except ValueError as error:
+                self.plot_options_dialog.set_grid_available(False, str(error))
+                return
+            self._grid_cache = key
+        self._grid_frame = navigation.current
+        target = self.raw if mode == 'Int 2D' else self.raw_popup_image
+        if target is not None and (mode == 'Int 2D' or
+                                  self.raw_popup_dialog.isVisible() and not self._raw_popup_host):
+            target.render_overlay_family('grid', self._grid_prediction.curves,
+                                         texts=self._grid_prediction.texts, native_shape=shape)
+
     def _reconcile_ring_overlay(self, state, navigation):
         from xrd_tools import geometry_figures as gf
         heavy, mode = state.heavy, state.processing_mode
@@ -1399,7 +1442,9 @@ class ScientificView(QtWidgets.QFrame):
         self.reconcile_action_availability(state)
         if state.processing_mode == '2D Viewer':
             self._clear_ring_overlay()
+            self._clear_grid_overlay()
             self.plot_options_dialog.set_ring_available(False, visible=False)
+            self.plot_options_dialog.set_grid_available(False, visible=False)
         coverage = (
             state.heavy.cake_coverage
             if state.heavy is not None
@@ -1648,6 +1693,7 @@ class ScientificView(QtWidgets.QFrame):
             if state.processing_mode == "Int 1D":
                 self._reconcile_raw_popup(state)
             self._reconcile_ring_overlay(state, navigation)
+            self._reconcile_grid_overlay(state, navigation)
         finally:
             self._share_axis_syncing = prior_syncing
         if replace_presentation:
@@ -1925,6 +1971,7 @@ class ScientificView(QtWidgets.QFrame):
     def clear_workspace(self) -> bool:
         """Drop every mounted scientific payload before owner retirement."""
         self._clear_ring_overlay()
+        self._clear_grid_overlay()
         self.drop_viewer_loading_snapshot()
         cleared = ScientificView.clear_viewer_1d(
             self, None, failure=True

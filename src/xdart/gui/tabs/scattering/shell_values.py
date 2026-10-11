@@ -668,6 +668,7 @@ class ScientificPlotOptions:
     intensity_scale: str = "Linear"
     show_coverage_holes: bool = False
     calibrant: str = 'Off'
+    coordinate_grid: str = 'Off'
 
     def __post_init__(self) -> None:
         if type(self.waterfall_y_axis) is not str or not self.waterfall_y_axis:
@@ -692,6 +693,8 @@ class ScientificPlotOptions:
         from xrd_tools.integrate.calibration import CALIBRANT_NAMES
         if self.calibrant not in ('Off', *CALIBRANT_NAMES):
             raise ValueError('unsupported predicted-ring calibrant')
+        if self.coordinate_grid not in ('Off', 'q', 'χ', 'q + χ'):
+            raise ValueError('unsupported coordinate grid')
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,3 +14,14 @@ def add_curve_item(plot, curve, color, *, xy=None):
     item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
     item.setAcceptHoverEvents(False)
     return item
+
+
+def add_text_item(plot, text, color, *, xy=None):
+    """Shared passive Figure label, in the caller's displayed coordinates."""
+    item = pg.TextItem(text.text, color=color)
+    item.setPos(*(text.xy if xy is None else xy))
+    item.setToolTip(text.tooltip)
+    item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+    item.setAcceptHoverEvents(False)
+    plot.addItem(item)
+    return item

@@ -1137,7 +1137,7 @@ def _nice_q_levels(lo, hi):
             start, stop = max(1,math.ceil(lo/step)), math.floor(hi/step)
             count = max(0,stop-start+1)
             choices.append((abs(count-10), step, start, stop))
-    _, step, start, stop = min(choices)
+    _, step, start, stop = min(choices, key=lambda value: (value[0], -value[1]))
     return tuple(i*step for i in range(start,stop+1))
 
 
