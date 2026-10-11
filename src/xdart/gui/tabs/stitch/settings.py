@@ -19,7 +19,8 @@ from xdart.gui.tools.page_settings import (
 )
 
 #: The document's kind and version, its key in the session file, and its own object section.
-STITCH_SETTINGS = SettingsKind("xdart-stitch-settings", 1, "stitch_settings", "Stitch", sections=("gi", "point_images"))
+STITCH_SETTINGS = SettingsKind("xdart-stitch-settings", 1, "stitch_settings", "Stitch",
+                               sections=("gi", "point_images", "phase_references"))
 SETTINGS_KIND = STITCH_SETTINGS.kind
 SETTINGS_VERSION = STITCH_SETTINGS.version
 #: Where the last session's settings live in the session file.
@@ -34,11 +35,14 @@ _THRESHOLD = frozenset({"threshold_min", "threshold", "threshold_enabled"})
 
 def page_settings(page) -> dict[str, Any]:
     """The page's current settings document."""
+    options = (page._member_preferences or page._view).plot_options
     return STITCH_SETTINGS.document(
         page, (key for key in page._fields if key not in _DERIVED),
         # grazing incidence as Int sets it (its axis and ranges are fields above)
         gi=dict(page._gi),
         point_images=page.point_images.document(),
+        phase_references={"references": [list(row) for row in options.phase_references],
+                          "min_intensity": options.phase_min_intensity},
         # Append skips an output already stitched with these settings; "Overwrite" is Replace
         write_mode=page.run_bar.write_mode(),
         # Stitch 1D or Stitch 2D
@@ -57,6 +61,13 @@ load_settings = STITCH_SETTINGS.load
 def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
     document = validate_settings(document)
+    phase_options = None
+    if "phase_references" in document:
+        saved_phases = document["phase_references"]
+        current = (page._member_preferences or page._view).plot_options
+        phase_options = replace(current,
+            phase_references=tuple(tuple(row) for row in saved_phases.get("references", current.phase_references)),
+            phase_min_intensity=saved_phases.get("min_intensity", current.phase_min_intensity))
     if "point_images" in document:
         page.point_images.restore(document["point_images"])
     fields = saved_fields(page, document, _DERIVED)
@@ -115,6 +126,9 @@ def apply_page_settings(page, document: Any) -> None:
     for key in ("q_min", "q_max", "map_min", "map_max"):  # an axis's range, after the axis that resets it
         if key in fields:
             page.set_field(key, fields[key])
+    if phase_options is not None:
+        page._set_view(plot_options=phase_options)
+        page._draw()
 
 
 __all__ = [

@@ -14,7 +14,7 @@ launcher.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _SESSION_PROFILE_KEY = "scattering_run_profile"
+_SESSION_PHASE_KEY = "scattering_phase_references"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +116,12 @@ class _WorkspaceCloser:
 
                 try:
                     profile = dump_run_intent_profile(self.widget._intents.snapshot().thaw())
-                    save_session({_SESSION_PROFILE_KEY: profile})
+                    options = self.widget._preferences.plot_options
+                    save_session({_SESSION_PROFILE_KEY: profile,
+                                  _SESSION_PHASE_KEY: {
+                                      "references": [list(row) for row in options.phase_references],
+                                      "min_intensity": options.phase_min_intensity,
+                                  }})
                 except Exception:
                     logger.warning("Could not save the last run configuration", exc_info=True)
                 self._session_saved = True
@@ -515,6 +521,7 @@ def build_scattering_workspace(
     key = SCATTERING_PAGE_KEY
     intents = services.run_intents.store_for(key)
     persist_session = intents is None
+    phase_preferences = None
     if intents is None:
         from xdart.gui.tabs.scattering.controls_editing import (
             DEFAULT_POLARIZATION_FACTOR,
@@ -540,7 +547,9 @@ def build_scattering_workspace(
             bai_2d_args=dict(polarization),
         )
         try:
-            profile = load_session().get(_SESSION_PROFILE_KEY)
+            saved_session = load_session()
+            profile = saved_session.get(_SESSION_PROFILE_KEY)
+            phase_preferences = saved_session.get(_SESSION_PHASE_KEY)
             if profile is not None:
                 intent = load_run_intent_profile(profile)
         except Exception:
@@ -566,6 +575,16 @@ def build_scattering_workspace(
         source_selection_chooser=_source_selection_chooser(parent),
         parent=parent,
     )
+    if phase_preferences is not None:
+        try:
+            options = widget._preferences.plot_options
+            options = replace(options,
+                phase_references=tuple(tuple(row) for row in phase_preferences.get("references", ())),
+                phase_min_intensity=phase_preferences.get("min_intensity", 5.))
+            widget._preferences = replace(widget._preferences, plot_options=options)
+            widget._refresh_shell()
+        except (AttributeError, TypeError, ValueError):
+            logger.warning("Could not restore the last reference phases", exc_info=True)
 
     # Operation/analysis refusal paths emit a notice and return without a
     # projection refresh; bridge them to the host status presenter so the

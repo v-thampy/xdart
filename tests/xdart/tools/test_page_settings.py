@@ -250,7 +250,7 @@ def test_stitch_keeps_its_settings_on_the_shared_owner(qapp):
 
     # The confirmed point-image section joined the document in adb2f15a.
     assert stitch.STITCH_SETTINGS == SettingsKind("xdart-stitch-settings", 1, "stitch_settings", "Stitch",
-                                                  ("gi", "point_images"))
+                                                  ("gi", "point_images", "phase_references"))
     for function in (stitch.validate_settings, stitch.dump_settings, stitch.load_settings):
         assert function.__self__ is stitch.STITCH_SETTINGS
     page = StitchPage(empty_host_services(_Status()))
