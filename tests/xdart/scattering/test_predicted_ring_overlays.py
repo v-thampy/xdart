@@ -252,9 +252,10 @@ def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path):
         art = controller.acquisition_context
         store = art.publication_store.artifacts[keys[0].artifact].publications
         original = store.get(keys[0].local_frame_label).view.geometry.poni
+        last = store.get(keys[-1].local_frame_label).view.geometry.poni
         assert store._max_heavy_items == 16
         assert store.get(keys[0].local_frame_label).view.intensity_2d is None
         payload = select(qapp, page, keys[0])
         assert payload.view.geometry.poni == original
-        assert payload.view.geometry.poni != controller.project(keys[-1]).view.geometry.poni
+        assert payload.view.geometry.poni != last
         assert view.raw.ring_items
