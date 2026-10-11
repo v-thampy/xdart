@@ -6,6 +6,7 @@ the shared provider's 8/2048/4096 reflection and 16 MiB source limits. No source
 frame, image, integrator or structure is retained. A floor-zero listing normally
 serves every floor edit. If that listing exceeds a cap, the requested filtered
 listing is cached instead and serves equal or higher floors without relisting.
+A phase still over its own cap is refused alone; the other phases keep their lines.
 """
 from __future__ import annotations
 
@@ -93,17 +94,29 @@ class PhaseOverlayJob:
     def _listed(self, request, wavelength, bounds, cancel):
         # Import late: the shared provider remains the observable production seam.
         from . import phase_references as provider
-        self._check(cancel)
-        result = provider.build_phase_references(*request.entries,
-            wavelength_angstrom=wavelength, min_intensity=0., **bounds)
-        floor = 0.
-        if result.reason and 'reflection limit' in result.reason and request.floor > 0:
+        def listing(entries, floor):
             self._check(cancel)
-            floor = request.floor
-            result = provider.build_phase_references(*request.entries,
+            return provider.build_phase_references(*entries,
                 wavelength_angstrom=wavelength, min_intensity=floor, **bounds)
+        result, floor, refused = listing(request.entries, 0.), 0., {}
+        if result.reason and 'reflection limit' in result.reason and request.floor > 0:
+            floor = request.floor
+            result = listing(request.entries, floor)
+        if result.reason and 'reflection limit' in result.reason and len(request.entries) > 1:
+            # One phase over its cap must not blank the others: keep each phase
+            # that lists alone within the shared total; refuse only the rest.
+            phases, total = [], 0
+            for entry in request.entries:
+                alone = listing((entry,), floor)
+                count = sum(len(phase.reflections) for phase in alone.phases)
+                if alone.reason or total+count > provider.MAX_REFLECTIONS_TOTAL:
+                    refused[entry.id] = alone.reason or 'cumulative reflection limit exceeded'
+                else:
+                    phases.extend(alone.phases)
+                    total += count
+            result = provider.PhaseReferences(tuple(phases))
         self._check(cancel)
-        return result, floor
+        return result, floor, refused
 
     def _ring_context(self, request, cancel):
         from xrd_tools import geometry_figures as geometry
@@ -120,7 +133,7 @@ class PhaseOverlayJob:
         if not ai.detector.IS_FLAT or not ai.detector.uniform_pixel or ai.detector.spline is not None:
             return None, 'Predicted rings require a uniform, flat, undistorted detector.'
         bounds = tuple(map(math.degrees, geometry._detector_angle_extrema(ai, request.ring_shape)))
-        listed, floor = self._listed(request, ai.wavelength*1e10, {'two_theta_range': bounds}, cancel)
+        listed, floor, refused = self._listed(request, ai.wavelength*1e10, {'two_theta_range': bounds}, cancel)
         points, rings = geometry.cone_plane(ai), {}
         for phase in listed.phases:
             curves = []
@@ -132,7 +145,7 @@ class PhaseOverlayJob:
                     curves.append((reflection, geometry.Curve(phase.name, arc, 'predicted',
                         f'{phase.name} reference: q {reflection.q:.5g} Å⁻¹. Display only.', math.degrees(theta))))
             rings[phase.id] = tuple(curves)
-        return (listed, floor, rings), listed.reason
+        return (listed, floor, rings, refused), listed.reason
 
     def __call__(self, request, cancel, progress):
         self._check(cancel)
@@ -167,9 +180,9 @@ class PhaseOverlayJob:
             if previous is not None and previous[1] <= request.floor:
                 contexts['line'] = previous
             else:
-                listed, floor = self._listed(request, wavelength,
+                listed, floor, refused = self._listed(request, wavelength,
                     {'q_range' if request.line_unit == 'q' else 'two_theta_range': bounds}, cancel)
-                contexts['line'] = (listed, floor, {})
+                contexts['line'] = (listed, floor, {}, refused)
         else:
             reasons.append(line_reason)
         if request.ring_snapshot:
@@ -186,9 +199,11 @@ class PhaseOverlayJob:
         results = []
         for entry in request.entries:
             qs, rings, omitted, errors = (), (), 0, list(reasons)
-            for kind, (listed, floor, arcs) in contexts.items():
+            for kind, (listed, floor, arcs, refused) in contexts.items():
                 if listed.reason:
                     errors.append(listed.reason)
+                if entry.id in refused:
+                    errors.append(refused[entry.id])
                 phase = next((p for p in listed.phases if p.id == entry.id), None)
                 if phase is None:
                     continue
