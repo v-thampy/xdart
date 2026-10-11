@@ -16,6 +16,12 @@ from typing import Any
 import numpy as np
 
 from xrd_tools.analysis.axis_units import require_inverse_angstrom
+from xrd_tools.analysis.phase_references import (
+    MAX_PHASES as _MAX_PHASES, MAX_CIF_BYTES as _MAX_CIF_BYTES,
+    MAX_TOTAL_CIF_BYTES as _MAX_TOTAL_CIF_BYTES,
+    MAX_REFLECTIONS_PER_PHASE as _MAX_REFLECTIONS_PER_PHASE,
+    MAX_REFLECTIONS_TOTAL as _MAX_REFLECTIONS_TOTAL,
+)
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
     InvalidCanonicalValue,
@@ -32,9 +38,6 @@ __all__ = [
 ]
 _MAX_TRACE_POINTS = 1_000_000
 _MAX_TRACE_BYTES, _MAX_FIT_BYTES = 16 * 1024 * 1024, 64 * 1024 * 1024
-_MAX_PHASES = 8
-_MAX_CIF_BYTES, _MAX_TOTAL_CIF_BYTES = 4 * 1024 * 1024, 16 * 1024 * 1024
-_MAX_REFLECTIONS_PER_PHASE, _MAX_REFLECTIONS_TOTAL = 2048, 4096
 _MAX_FIT_PARAMETERS, _MAX_PARAMETER_NAME_BYTES = 512, 256
 _MAX_PARAMETER_NAMES_BYTES = 64 * 1024
 _MAX_DIAGNOSTIC_BYTES = 1024
@@ -185,10 +188,12 @@ class DisplayedPhaseFitPlan:
     min_intensity: float = 0.0
     max_nfev: int | None = None
     use_uncertainties: bool = False
+    phase_entries: tuple[Any, ...] = ()
     def __post_init__(self) -> None:
         object.__setattr__(self, "cif_paths", tuple(Path(p) for p in _tuple_once(self.cif_paths)))
         object.__setattr__(self, "expected_hashes", _tuple_once(self.expected_hashes))
         object.__setattr__(self, "phase_names", _tuple_once(self.phase_names))
+        object.__setattr__(self, "phase_entries", _tuple_once(self.phase_entries))
 @dataclass(frozen=True, slots=True)
 class DisplayedPhaseFitResult:
     disposition: AnalysisDisposition
@@ -216,6 +221,8 @@ class DisplayedPhaseFitResult:
     marker_positions: np.ndarray | None = None
     storage_bytes: int = 0
     result_fingerprint: str = ""
+    phase_names: tuple[str, ...] = ()
+    phase_fractions_reason: str = ""
 class _Refusal(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -247,6 +254,8 @@ def _fit_plan_value(plan: DisplayedPeakFitPlan) -> tuple[Any, ...]:
         plan.amplitude_bounds, plan.center_bounds_delta, plan.fraction_init,
         plan.max_nfev,
     )
+    if plan.phase_entries:
+        value += (("phase_entries", tuple((entry.id, entry.name, entry.source_kind, entry.lattice) for entry in plan.phase_entries)),)
     return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
 
 def _fit_sigma(plan, mask: np.ndarray) -> np.ndarray | None:
@@ -511,8 +520,14 @@ def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
     if not isinstance(plan, DisplayedPhaseFitPlan):
         raise _Refusal("INVALID_PHASE_PLAN", "plan has the wrong type")
     _fit_trace(plan.trace)
-    count = len(plan.cif_paths)
-    if not 1 <= count <= _MAX_PHASES or len(plan.expected_hashes) != count or len(plan.phase_names) != count:
+    count = len(plan.phase_entries) if plan.phase_entries else len(plan.cif_paths)
+    if plan.phase_entries:
+        from .phase_references import PhaseEntry
+        if plan.cif_paths or plan.expected_hashes or any(not isinstance(entry, PhaseEntry) for entry in plan.phase_entries):
+            raise _Refusal("INVALID_PHASE_PLAN", "invalid phase entry mode")
+        if tuple(entry.name for entry in plan.phase_entries) != plan.phase_names:
+            raise _Refusal("INVALID_PHASE_PLAN", "phase entry names do not match")
+    if not 1 <= count <= _MAX_PHASES or (not plan.phase_entries and len(plan.expected_hashes) != count) or len(plan.phase_names) != count:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid CIF tuple lengths")
     if any(type(name) is not str or not name or len(name.encode("utf-8")) > 256 for name in plan.phase_names) or len(set(plan.phase_names)) != count:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid phase names")
@@ -582,39 +597,43 @@ def run_displayed_phase_fit(
         finite = np.isfinite(plan.trace.axis) & np.isfinite(plan.trace.intensity)
         x, y = plan.trace.axis[finite], plan.trace.intensity[finite]
         q_range = (float(np.min(x)), float(np.max(x)))
-        receipts, phases, markers, total_bytes, total_reflections = [], [], [], 0, 0
-        for index, (path, name, expected) in enumerate(zip(plan.cif_paths, plan.phase_names, plan.expected_hashes)):
+        from .phase_references import PhaseEntry, prepare_phase_models
+        receipts, entries, markers, total_bytes = [], [], [], 0
+        sources = tuple(plan.phase_entries) if plan.phase_entries else tuple(
+            zip(plan.cif_paths, plan.phase_names, plan.expected_hashes))
+        for index, source in enumerate(sources):
             if cancel_token is not None and cancel_token.is_set():
                 return _cancelled_phase(plan)
+            if isinstance(source, PhaseEntry) and source.source_kind == "lattice":
+                entries.append(source)
+                continue
+            if isinstance(source, PhaseEntry):
+                if source.cif_path is None:
+                    raise _Refusal("CIF_UNAVAILABLE", "library CIF path is unavailable")
+                path, name, expected = source.cif_path, source.name, source.id
+            else:
+                path, name, expected = source
             raw, receipt = _capture_cif(path, name, expected)
             total_bytes += len(raw)
             if total_bytes > _MAX_TOTAL_CIF_BYTES:
                 raise _Refusal("CIF_BYTE_LIMIT_EXCEEDED", "cumulative CIF byte limit exceeded")
-            try:
-                text = raw.decode("utf-8-sig", errors="strict")
-                structure = Structure.from_str(text, fmt="cif")
-                phase = PhaseModel(name)
-                phase.structure = structure
-                phase.calculate_peaks(wavelength=wavelength_angstrom)
-            except (UnicodeError, ValueError) as exc:
-                raise _Refusal("CIF_PARSE_FAILED", "CIF could not be parsed") from exc
-            admitted = tuple(
-                peak for peak in phase.peaks
-                if q_range[0] <= float(peak.q) <= q_range[1]
-                and float(peak.intensity) >= plan.min_intensity
-            )
-            if len(admitted) > _MAX_REFLECTIONS_PER_PHASE:
-                raise _Refusal("PHASE_REFLECTION_LIMIT_EXCEEDED", "per-phase reflection limit exceeded")
-            total_reflections += len(admitted)
-            if total_reflections > _MAX_REFLECTIONS_TOTAL:
-                raise _Refusal("PHASE_REFLECTION_LIMIT_EXCEEDED", "cumulative reflection limit exceeded")
-            markers.extend(float(peak.q) for peak in admitted)
-            receipts.append(receipt); phases.append(phase)
-            _progress(progress_callback, index + 1, len(plan.cif_paths) + 1)
+            entries.append(PhaseEntry(receipt.sha256, name, "cif", raw, cif_path=path))
+            receipts.append(receipt)
+            _progress(progress_callback, index + 1, len(sources) + 1)
             if cancel_token is not None and cancel_token.is_set():
                 return _cancelled_phase(plan)
+        try:
+            phases, references = prepare_phase_models(
+                *entries, wavelength_angstrom=wavelength_angstrom, q_range=q_range,
+                min_intensity=plan.min_intensity, model_class=PhaseModel, structure_class=Structure,
+            )
+        except ValueError as exc:
+            code = "PHASE_REFLECTION_LIMIT_EXCEEDED" if "reflection limit" in str(exc) else "CIF_PARSE_FAILED"
+            raise _Refusal(code, str(exc)) from exc
+        markers.extend(peak.q for reference in references for peak in reference.reflections)
         profile_extra = 1 if plan.phase_profile in {"pseudovoigt", "voigt"} else 0
-        if 1 + len(phases) * (8 + 3 + profile_extra + 2) > _MAX_FIT_PARAMETERS:
+        heights = sum(len(phase.peaks) for phase in phases if getattr(phase, "source_kind", "") == "lattice")
+        if 1 + len(phases) * (8 + 3 + profile_extra + 2) + heights > _MAX_FIT_PARAMETERS:
             raise _Refusal("FIT_PARAMETER_LIMIT_EXCEEDED", "predicted fit parameter limit exceeded")
         sigma = _fit_sigma(plan, finite)
         fitter = PhaseFitter(x, y, prefit_background=plan.prefit_background) if sigma is None else PhaseFitter(
@@ -653,15 +672,16 @@ def run_displayed_phase_fit(
         size = _result_base(scalar_floor)
         message = _fit_message(backend.lmfit_result.message)
         size = _result_grow(size, len(message.encode("utf-8")))
+        fractions_reason = getattr(backend, "phase_fractions_reason", "")
         fractions_map = backend.phase_fractions()
         if not isinstance(fractions_map, Mapping) or (
-            len(fractions_map) != len(plan.phase_names)
+            len(fractions_map) != (0 if fractions_reason else len(plan.phase_names))
             or any(type(key) is not str for key in fractions_map)
-            or set(fractions_map) != set(plan.phase_names)
+            or set(fractions_map) != (set() if fractions_reason else set(plan.phase_names))
         ):
             raise _Refusal("FIT_RESULT_LIMIT_EXCEEDED", "invalid phase fractions")
         fraction_values = []
-        for name in plan.phase_names:
+        for name in (() if fractions_reason else plan.phase_names):
             try:
                 value = float(fractions_map[name])
             except (TypeError, ValueError, OverflowError) as exc:
@@ -701,6 +721,8 @@ def run_displayed_phase_fit(
             plan.trace.label, plan.trace.axis_unit, names, values, errors,
             fractions, lattice,
         )
+        if fractions_reason:
+            scalar += (("phase_fractions_reason", fractions_reason),)
         size = _result_base(scalar)
         fit = _result_array(fitter.eval_model(backend.params), x.size)
         size = _result_add(size, fit)
@@ -720,7 +742,7 @@ def run_displayed_phase_fit(
         components = tuple(component_values)
         arrays = (fit, background, residual, marker_array, *components)
         fingerprint = _digest((scalar, arrays))
-        _progress(progress_callback, len(plan.cif_paths) + 1, len(plan.cif_paths) + 1)
+        _progress(progress_callback, len(sources) + 1, len(sources) + 1)
         if cancel_token is not None and cancel_token.is_set():
             return _cancelled_phase(plan)
         return DisplayedPhaseFitResult(
@@ -733,6 +755,7 @@ def run_displayed_phase_fit(
             label=plan.trace.label, axis_unit=plan.trace.axis_unit,
             parameter_names=names, parameter_values=values,
             parameter_stderr=errors, phase_fractions=fractions,
+            phase_names=plan.phase_names, phase_fractions_reason=fractions_reason,
             lattice_parameters=lattice, phase_components=components,
             fit=fit, background=background, residual=residual,
             marker_positions=marker_array, storage_bytes=size,

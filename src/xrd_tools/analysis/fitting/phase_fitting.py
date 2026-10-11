@@ -966,12 +966,20 @@ class MultiPhaseResult:
 
     def phase_fractions(self) -> dict[str, float]:
         """Phase fractions defined as scale_i / Σ scales."""
+        if self.phase_fractions_reason:
+            return {}
         scales = {
             ph.name: float(self.params[f"p{i}_scale"].value)
             for i, ph in enumerate(self.fitter.phases)
         }
         total = sum(scales.values()) or 1.0
         return {k: v / total for k, v in scales.items()}
+
+    @property
+    def phase_fractions_reason(self) -> str:
+        if any(getattr(phase, "source_kind", "") == "lattice" for phase in self.fitter.phases):
+            return "Phase fractions withheld: lattice-only phases have no structural intensities."
+        return ""
 
     def lattice_params(self, idx: int) -> dict[str, float]:
         pre = f"p{idx}_"
@@ -1012,10 +1020,13 @@ class MultiPhaseResult:
         lines.append("")
 
         fracs = self.phase_fractions()
+        if self.phase_fractions_reason:
+            lines.append(self.phase_fractions_reason)
         for i, ph in enumerate(self.fitter.phases):
             lines.append(f"--- {ph.name} ---")
             lines.append(f"  scale      = {self.phase_scale(i):.4g}")
-            lines.append(f"  fraction   = {fracs[ph.name]:.4f}")
+            if ph.name in fracs:
+                lines.append(f"  fraction   = {fracs[ph.name]:.4f}")
             lp = self.lattice_params(i)
             if lp:
                 lines.append(
@@ -1353,11 +1364,18 @@ class PhaseFitter:
             margin = 0.1 * (self.x.max() - self.x.min())
             q_range = (self.x.min() - margin, self.x.max() + margin)
 
+        # Library and legacy CIF callers share the same bounded normalization.
+        # Explicit peak-only phases retain their historical fixed-q behaviour.
+        if getattr(phase, "source_kind", "peaks") in {"cif", "lattice"}:
+            bounded = (max(0., float(q_range[0])), float(q_range[1]))
+            if getattr(phase, "listing_q_range", None) != bounded:
+                phase.calculate_peaks(wavelength=getattr(phase, "wavelength", 1.5406), q_range=bounded)
+
         hkls, amps, qs = [], [], []
         for pk in phase.peaks:
             if pk.q < q_range[0] or pk.q > q_range[1]:
                 continue
-            if pk.intensity < min_intensity:
+            if getattr(phase, "source_kind", "") != "lattice" and pk.intensity < min_intensity:
                 continue
             hkls.append(pk.hkl)
             amps.append(pk.intensity)
@@ -1378,8 +1396,10 @@ class PhaseFitter:
         self._template_amps.append(amp_arr)
         self._peak_q_arrays.append(q_arr)
 
-        if phase.structure:
+        lat = getattr(phase, "lattice", None)
+        if lat is None and phase.structure:
             lat = phase.structure.lattice
+        if lat is not None:
             self._init_lattice.append(dict(
                 a=lat.a, b=lat.b, c=lat.c,
                 alpha=lat.alpha, beta=lat.beta, gamma=lat.gamma,
@@ -1444,13 +1464,15 @@ class PhaseFitter:
         for i, (ph, hkl, amps, qs) in enumerate(zip(
             self.phases, self._hkl_arrays, self._template_amps, self._peak_q_arrays,
         )):
-            fixed_q = None if ph.structure else qs
+            fixed_q = None if ph.structure or getattr(ph, "lattice", None) is not None else qs
+            mode = "free" if getattr(ph, "source_kind", "") == "lattice" else (
+                texture.get(ph.name, "none") if isinstance(texture, dict) else texture)
             self._phase_models.append(
                 PhasePeakModel(
                     phase=ph, hkl=hkl, template_amp=amps, prefix=f"p{i}_",
                     width_model=wm, fixed_q=fixed_q,
                     profile=self._phase_profile,
-                    texture=texture, march_axis=march_axis,
+                    texture=mode, march_axis=march_axis,
                 )
             )
 
@@ -1623,7 +1645,11 @@ class PhaseFitter:
             params[f"{pre}scale"].set(value=scale_guess, min=0.0, vary=True)
             self._init_width_params(params, pre, wm, sigma_guess, sigma_cap, sigma_floor)
             self._init_profile_params(params, pre, profile_key, sigma_cap)
-            self._init_texture_params(params, pre, texture, pmodel, pk_scale_range)
+            self._init_texture_params(params, pre, pmodel.texture, pmodel, pk_scale_range)
+            # Free manual heights own the amplitude; an additional free scale
+            # would introduce an exact scale/height degeneracy.
+            if getattr(pmodel.phase, "source_kind", "") == "lattice":
+                params[f"{pre}scale"].set(value=scale_guess, vary=False)
             self._init_lattice_params(params, pre, lat0, lattice_pct, lock_lattice_order)
 
         # ---- Inter-phase lattice ordering (optional) ----
