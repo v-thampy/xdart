@@ -50,7 +50,9 @@ def test_the_foil_transmission_is_the_notebooks_for_every_status_code(lengths) -
     np.testing.assert_array_equal(ours, foil_to_factor(codes, lengths))
     assert ours[0] == 1.0  # no foil
     assert ours[1234] == np.exp(-(1 * lengths[0] + 2 * lengths[1] + 3 * lengths[2] + 4 * lengths[3]))
-    assert ours[9999] == np.exp(-9 * sum(lengths))
+    # each foil alone at nine, thousands first: exact on every platform, unlike a sum of all four, whose rounding
+    # follows the platform's dot product; 9999 itself is the notebook's above, bit for bit (maintainer, 2026-10-11)
+    assert [ours[9000], ours[900], ours[90], ours[9]] == [np.exp(-9 * length) for length in lengths]
 
 
 @pytest.mark.parametrize("code, notebook_refuses", [
