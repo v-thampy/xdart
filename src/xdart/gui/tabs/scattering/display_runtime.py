@@ -1343,6 +1343,8 @@ class RunDisplayState:
             native_shape = retained.view.extra.get('detector_shape')
             if native_shape is not None:
                 view = replace(view, extra={**view.extra, 'detector_shape': native_shape})
+        # get() composes borrowed light-1D arrays: release them before replacement.
+        del retained
         if preview.raw is not None:
             view = replace(
                 view,
