@@ -1421,13 +1421,14 @@ class StandardRunExecutor:
                     thickness_m=override.thickness_m,
                     parallax=override.parallax,
                 )
-            from xrd_tools.session.readiness import bind_native_int_source_energy
+            from xrd_tools.session.readiness import bind_native_int_source_energy, effective_ring_geometry
             run.scan = run.source.to_scan(output_path=artifact)
             calibration = bind_native_int_source_energy(run.scan, calibration,
                 metadata_wavelength_A=(None if item is None or item.descriptor is None
                                        else item.descriptor.wavelength),
                 metadata_energy_eV=source_metadata_energy_eV(run.source))
             integrator = run.scan.integrator
+            ring_geometry = effective_ring_geometry(calibration, integrator=integrator)
             poni = run.scan.poni
             if calibration.parallax is not None:
                 extra = dict(getattr(run.scan, "extra", None) or {})
@@ -1582,6 +1583,7 @@ class StandardRunExecutor:
             raise RuntimeError("admission cancelled")
         run.session, created = output.activate(
             preparation,
+            ring_geometry=ring_geometry,
             record_store=run.records,
             run_provenance=run_provenance,
             cancelled=cancelled,

@@ -1222,8 +1222,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._rows['source_kind'] = (form, self._row_of[self.source_kind])
         self._attach('entry', 'source_kind', 'NeXus entry', 'entry', width=120,
                      tip='The NeXus entry (group) holding the frames and angles.')
-        self.refine_calibrant = self._combo(form, 'Calibrant', [(name, None) for name in (
-            'LaB6', 'CeO2', 'Si', 'Al2O3', 'Cr2O3', 'AgBh')],
+        from xrd_tools.integrate.calibration import CALIBRANT_NAMES
+        self.refine_calibrant = self._combo(form, 'Calibrant', [(name, None) for name in CALIBRANT_NAMES],
             tip='The powder standard in this scan: pyFAI opens each frame with it, the table predicts its '
                 'rings, and the refinement fits them. Another pyFAI calibrant name may be typed.')
         self.refine_calibrant.setEditable(True)

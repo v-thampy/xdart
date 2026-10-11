@@ -1037,6 +1037,7 @@ class DynamicOutputAdapter:
         preparation: _PreparedAdmission,
         *,
         record_store,
+        ring_geometry=None,
         run_provenance,
         cancelled,
         publication_store=None,
@@ -1410,6 +1411,7 @@ class DynamicOutputAdapter:
             session = open_headless_scan_session(
                 session_scan,
                 plan,
+                ring_geometry=ring_geometry,
                 sink=sink,
                 executor=(self.configuration.max_cores if policy is None
                           else policy.allocation.workers),

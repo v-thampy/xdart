@@ -618,6 +618,7 @@ class HeavyProjection:
     detector_shape: tuple[int, int] | None = None
     detector_source: str = "none"
     cake_coverage: np.ndarray | None = None
+    ring_geometry: Mapping | None = None
 
     def __post_init__(self) -> None:
         if type(self.frame) is not DisplayFrameKey:
@@ -666,6 +667,7 @@ class ScientificPlotOptions:
     show_legend: bool = True
     intensity_scale: str = "Linear"
     show_coverage_holes: bool = False
+    calibrant: str = 'Off'
 
     def __post_init__(self) -> None:
         if type(self.waterfall_y_axis) is not str or not self.waterfall_y_axis:
@@ -687,6 +689,9 @@ class ScientificPlotOptions:
             raise ValueError("unsupported 1-D intensity scale")
         if type(self.show_coverage_holes) is not bool:
             raise TypeError("coverage shading must be boolean")
+        from xrd_tools.integrate.calibration import CALIBRANT_NAMES
+        if self.calibrant not in ('Off', *CALIBRANT_NAMES):
+            raise ValueError('unsupported predicted-ring calibrant')
 
 
 @dataclass(frozen=True, slots=True)

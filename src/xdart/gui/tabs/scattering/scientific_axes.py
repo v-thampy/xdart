@@ -650,6 +650,7 @@ def heavy_projection(
             frame, raw, cake, x_axis, y_axis,
             detector_shape=detector_shape,
             detector_source=detector_source,
+            ring_geometry=None if view.geometry is None else view.geometry.poni,
         )
     except Exception:
         return None

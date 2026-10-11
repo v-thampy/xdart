@@ -33,6 +33,7 @@ from .controls_readiness import (
 from .detector_projection import detector_calibration_ready
 from .display_values import DisplayFrameKey
 from .shell_values import AxisProjection, TraceProjection
+from .scientific_curves import add_curve_item
 
 
 def _axis_text(text: str) -> str:
@@ -135,9 +136,12 @@ class ScientificImagePane(QtWidgets.QWidget):
         self._render_contract: tuple[object, ...] | None = None
         self._geometry_contract: tuple[object, ...] | None = None
         self._axis_presentation_contract: tuple[object, ...] | None = None
+        self.ring_items = []
+        self._ring_contract = None
         layout.addWidget(self.canvas, 1)
 
     def clear(self) -> None:
+        self.render_ring_curves(())
         self._render_contract = None
         self._geometry_contract = None
         self._axis_presentation_contract = None
@@ -147,6 +151,38 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.canvas._level_scan_token = None
         self.image.clear()
         self.render_coverage(None)
+
+    def render_ring_curves(self, curves, *, native_shape=None) -> None:
+        """Draw native pixel-centre curves on the actual raw ImageItem grid.
+
+        Raw and corner-aligned thumbnails share endpoint centres. The image
+        itself owns the native extent, transform and single Y mirror.
+        """
+        contract = None
+        if curves and self.image.image is not None and native_shape is not None:
+            c, r = self.image.image.shape[:2]
+            rows, columns = native_shape
+            transform, pos = self.image.transform(), self.image.pos()
+            contract = (tuple(id(curve) for curve in curves), native_shape, c, r,
+                        transform.m11(), transform.m12(), transform.m21(), transform.m22(),
+                        transform.dx(), transform.dy(), pos.x(), pos.y())
+        if contract == self._ring_contract:
+            return
+        for item in self.ring_items:
+            self.plot.removeItem(item)
+        self.ring_items.clear(); self._ring_contract = contract
+        if contract is None:
+            return
+        for curve in curves:
+            native = curve.xy
+            x = native[:, 0]*(c-1)/(columns-1)+.5 if columns > 1 else np.full(len(native), .5)
+            y = r-.5-native[:, 1]*(r-1)/(rows-1) if rows > 1 else np.full(len(native), .5)
+            mapped = np.column_stack((
+                transform.m11()*x+transform.m21()*y+transform.dx()+pos.x(),
+                transform.m12()*x+transform.m22()*y+transform.dy()+pos.y()))
+            item = add_curve_item(self.plot, curve, '#e7b44c', xy=mapped)
+            item.setZValue(2)
+            self.ring_items.append(item)
 
     def render_coverage(self, coverage: np.ndarray | None) -> None:
         """Shade zero-support bins separately from the scientific image and its color scale."""
@@ -333,7 +369,14 @@ class ScientificImagePane(QtWidgets.QWidget):
             autorange_finite_y=autorange_finite_y,
         )
 
-    def render(
+    def render(self, *args, **kwargs) -> bool:
+        try:
+            return self._render_image(*args, **kwargs)
+        except Exception:
+            self.render_ring_curves(())
+            raise
+
+    def _render_image(
         self,
         data: np.ndarray,
         *,

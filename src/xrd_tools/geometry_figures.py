@@ -597,7 +597,7 @@ def _raw_affine(camera, shape):
     return origin, matrix
 
 
-def _cone_plane(ai):
+def cone_plane(ai):
     """Flat-detector cone intersections from pyFAI's physical pixel positions.
 
     The detector owns first-pixel reindexing and the integrator owns rotations.
@@ -622,6 +622,9 @@ def _cone_plane(ai):
         xy[:, scale <= 0] = np.nan
         return xy.T
     return points
+
+
+_cone_plane = cone_plane
 
 
 def _eligible_arcs(points, theta, shape):
@@ -1044,7 +1047,7 @@ def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu
 
 
 
-def _display_arcs(points, theta, shape, factor):
+def display_arcs(points, theta, shape, factor):
     """Contiguous cone intersections, clipped at native pixel-centre bounds."""
     chi = np.linspace(-math.pi, math.pi, 16385)
     xy = points(theta, chi)
@@ -1076,6 +1079,72 @@ def _display_arcs(points, theta, shape, factor):
         count = max(2, int(math.ceil(length[-1]/(.4*factor)))+1)
         sampled = np.interp(np.linspace(0., length[-1], count), length, arc_chi)
         yield points(theta, sampled)
+
+
+_display_arcs = display_arcs
+
+
+RUN_RING_REASON = 'Predicted rings are drawn only for frames reduced by Run in this session.'
+PARALLAX_RING_REASON = ('Predicted rings are unavailable for runs reduced with detector sensor parallax '
+    "correction: this display-only overlay's flat-detector ring model does not include parallax.")
+
+
+def detector_ring_unavailable(snapshot, shape):
+    """Explain availability from exported values only; never inspect a source file."""
+    if snapshot is None:
+        return RUN_RING_REASON
+    if snapshot.get('parallax') is True:
+        return PARALLAX_RING_REASON
+    if (not snapshot.get('is_flat', True) or not snapshot.get('uniform_pixel', True)
+            or snapshot.get('has_spline', False)):
+        return 'Predicted rings require a uniform, flat, undistorted detector.'
+    if shape is None or len(shape) != 2 or any(n < 1 for n in shape):
+        return 'Predicted rings require the displayed frame’s native detector shape.'
+    if not snapshot.get('wavelength', 0) or not math.isfinite(snapshot['wavelength']):
+        return 'Predicted rings require this frame’s effective wavelength.'
+    return ''
+
+
+def predict_detector_rings(snapshot, calibrant, *, shape, step_px=2.):
+    """Source-free analytic rings in native detector pixel-centre coordinates.
+
+    The snapshot comes from Run's effective binding. First-pixel orientation and
+    rotations are applied by the calibration owner once. No detector angle map,
+    camera transform, GI basis or view-scale sampling enters this display.
+    """
+    import json
+    from pyFAI.calibrant import get_calibrant
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry.diffractometer import DetectorCalibration
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    from xrd_tools.integrate.calibration_seed import ExpectedRing
+    reason = detector_ring_unavailable(snapshot, shape)
+    if reason:
+        raise ValueError(reason)
+    if not math.isfinite(step_px) or step_px <= 0:
+        raise ValueError('ring sampling step must be positive and finite')
+    cal = DetectorCalibration(PONI.from_dict(snapshot), json.loads(snapshot['detector_config_json']),
+                              parallax=snapshot.get('parallax'))
+    ai = detector_calibration_to_integrator(cal)
+    if not ai.detector.IS_FLAT or not ai.detector.uniform_pixel or ai.detector.spline is not None:
+        raise ValueError('Predicted rings require a uniform, flat, undistorted detector.')
+    points = cone_plane(ai)
+    reference = get_calibrant(calibrant); reference.wavelength = ai.wavelength
+    curves, rings = [], []
+    for number, (theta, d) in enumerate(zip(reference.get_2th(), reference.dspacing), 1):
+        if theta is None:
+            continue
+        arcs = tuple(display_arcs(points, theta, shape, step_px/.4))
+        if not arcs:
+            continue
+        ring = ExpectedRing(number, math.degrees(theta), float(d)); rings.append(ring)
+        for index, arc in enumerate(arcs, 1):
+            curves.append(Curve(f'Ring {number}, arc {index}', arc, 'predicted',
+                f'Predicted {calibrant} ring {number}: 2θ {ring.two_theta_deg:.4g}°. '
+                'Display only; radial agreement alone does not identify detector mounting.', ring.two_theta_deg))
+    return RingPrediction(f'{calibrant} predicted rings', 'Stored column', 'Stored row', 'px',
+                          'Detector-frame powder rings from this frame’s effective Run geometry and wavelength.',
+                          curves=tuple(curves), rings=tuple(rings))
 
 
 def _display_prediction(value, camera, senses, mapping):

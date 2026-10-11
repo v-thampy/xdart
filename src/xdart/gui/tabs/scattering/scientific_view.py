@@ -13,6 +13,7 @@ from xdart.gui.widgets.scientific_plot import (
 
 from dataclasses import dataclass, replace
 import functools
+import logging
 import math
 import os
 import time
@@ -49,6 +50,7 @@ from .scientific_plot_options import (
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
+from .scientific_curves import add_curve_item
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
@@ -548,12 +550,7 @@ class _KeyedFigurePanel:
             item.setToolTip('Image in stored pixel coordinates. '+figure.caption)
             self.plot.addItem(item)
         for curve in figure.curves:
-            style = (QtCore.Qt.PenStyle.DashLine if curve.role == 'predicted'
-                     else QtCore.Qt.PenStyle.DotLine if curve.role == 'tie'
-                     else QtCore.Qt.PenStyle.SolidLine)
-            item = self.plot.plot(curve.xy[:, 0], curve.xy[:, 1],
-                                 pen=pg.mkPen(color, width=2, style=style), name=curve.name)
-            item.setToolTip(f'{curve.role}: {curve.tooltip}')
+            item = add_curve_item(self.plot, curve, color)
             self.curves[curve.name] = item
             self.overlay_items.append(item)
         for marker in figure.markers:
@@ -1098,6 +1095,8 @@ class ScientificView(QtWidgets.QFrame):
     def _release_raw_popup(self, *_args) -> None:
         if self.raw_popup_image is not None:
             self.raw_popup_image.clear_image_buffers()
+        if self._processing_mode == 'Int 1D':
+            self._clear_ring_overlay()
         if hasattr(self, "raw_popup_status"): self.raw_popup_status.setText("")
         self.raw_popup_intensity.sync(None, None, reset=True)
         if self._raw_popup_host:
@@ -1137,6 +1136,7 @@ class ScientificView(QtWidgets.QFrame):
         """A host page's image in its open raw pop-up, with the line below it."""
         if not self.raw_popup_shown():
             return
+        self.raw_popup_image.render_ring_curves(())
         self.raw_popup_image.render(image, detector_shape=detector_shape, color_map=color_map,
                                     log_scale=log_scale)
         self.raw_popup_intensity.set_percentile_defaults((0.1, 99.9) if log_scale else (2, 98))
@@ -1221,6 +1221,9 @@ class ScientificView(QtWidgets.QFrame):
         self.options = _CompactMenuButton("Options")
         self.options.setToolTip("Edit plot options and display limits. Display limit changes apply immediately.")
         self.plot_options_dialog = PlotOptionsDialog(self)
+        self._ring_cache = None
+        self._ring_prediction = None
+        self._ring_frame = None
         self.clear = QtWidgets.QPushButton("Clear")
         self.share_axis = QtWidgets.QPushButton("Share Axis")
         self.share_axis.setCheckable(True)
@@ -1333,6 +1336,48 @@ class ScientificView(QtWidgets.QFrame):
                     path,
                 )
 
+    def _clear_ring_overlay(self):
+        self._ring_cache = self._ring_prediction = self._ring_frame = None
+        self.raw.render_ring_curves(())
+        if self.raw_popup_image is not None:
+            self.raw_popup_image.render_ring_curves(())
+
+    def _reconcile_ring_overlay(self, state, navigation):
+        from xrd_tools import geometry_figures as gf
+        heavy = state.heavy
+        is_int = state.processing_mode in ('Int 1D', 'Int 2D')
+        if (heavy is None and state.retain_display and is_int
+                and self._ring_frame is navigation.current):
+            return  # Keep only the previously accepted image+geometry pair.
+        matches = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
+        snapshot = heavy.ring_geometry if matches else None
+        shape = heavy.detector_shape if matches else None
+        reason = gf.detector_ring_unavailable(snapshot, shape)
+        if os.environ.get('XDART_DEBUG_PREDICTED_RINGS') == '1':
+            logging.getLogger(__name__).warning('ring_state frame=%r heavy=%s matches=%s shape=%r snapshot=%s choice=%s reason=%r',
+                navigation.current, heavy is not None, matches, shape, snapshot is not None,
+                state.plot_options.calibrant, reason)
+        self.plot_options_dialog.set_ring_available(not reason, reason,
+            visible=is_int or state.processing_mode in ('Average', 'Reintegrate'))
+        if reason or state.plot_options.calibrant == 'Off':
+            self._clear_ring_overlay()
+            return
+        key = (tuple(snapshot.items()), shape, state.plot_options.calibrant)
+        if self._ring_cache != key:
+            self._clear_ring_overlay()
+            try:
+                prediction = gf.predict_detector_rings(snapshot, state.plot_options.calibrant, shape=shape)
+            except ValueError as error:
+                self.plot_options_dialog.set_ring_available(False, str(error))
+                return
+            self._ring_cache, self._ring_prediction = key, prediction
+        self._ring_frame = navigation.current
+        if state.processing_mode == 'Int 2D':
+            self.raw.render_ring_curves(self._ring_prediction.curves, native_shape=shape)
+        elif (self.raw_popup_dialog is not None and self.raw_popup_dialog.isVisible()
+              and not self._raw_popup_host):
+            self.raw_popup_image.render_ring_curves(self._ring_prediction.curves, native_shape=shape)
+
     def reconcile(
         self,
         state: ScientificProjection,
@@ -1343,6 +1388,9 @@ class ScientificView(QtWidgets.QFrame):
         detail: str,
     ) -> None:
         self.reconcile_action_availability(state)
+        if state.processing_mode == '2D Viewer':
+            self._clear_ring_overlay()
+            self.plot_options_dialog.set_ring_available(False, visible=False)
         coverage = (
             state.heavy.cake_coverage
             if state.heavy is not None
@@ -1590,6 +1638,7 @@ class ScientificView(QtWidgets.QFrame):
                 )
             if state.processing_mode == "Int 1D":
                 self._reconcile_raw_popup(state)
+            self._reconcile_ring_overlay(state, navigation)
         finally:
             self._share_axis_syncing = prior_syncing
         if replace_presentation:
@@ -1866,6 +1915,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def clear_workspace(self) -> bool:
         """Drop every mounted scientific payload before owner retirement."""
+        self._clear_ring_overlay()
         self.drop_viewer_loading_snapshot()
         cleared = ScientificView.clear_viewer_1d(
             self, None, failure=True

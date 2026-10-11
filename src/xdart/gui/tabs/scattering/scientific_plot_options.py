@@ -20,6 +20,8 @@ COVERAGE_TOOLTIP = (
     "Shade Q–χ bins that received no contributing pixels. Coverage includes pixel splitting "
     "and does not measure angular completeness."
 )
+RING_TOOLTIP = ("Overlay predicted powder rings using this frame's effective run geometry and wavelength. "
+                'Radial agreement alone does not identify detector mounting.')
 
 #: Every 1-D plot option: its command path and its ``ScientificPlotOptions`` field, the one table the
 #: view emits and every page applies (Codex general audit AUD-8).
@@ -32,6 +34,7 @@ PLOT_OPTION_BINDINGS = (
     (("other", "legend"), "show_legend"),
     (("other", "intensity_scale"), "intensity_scale"),
     (("other", "coverage_holes"), "show_coverage_holes"),
+    (("other", "calibrant"), "calibrant"),
 )
 
 
@@ -115,6 +118,10 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.accept_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
 
+        from xrd_tools.integrate.calibration import CALIBRANT_NAMES
+        self.calibrant = self.add_choice('Calibrant', ('Off', *CALIBRANT_NAMES), 'Off', tooltip=RING_TOOLTIP)
+        self.set_ring_available(False)
+
         self.reconcile(self._projection)
 
     @staticmethod
@@ -157,7 +164,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             " Available on a Stitch Q–χ intensity map with stored coverage."
         )
 
-    def add_choice(self, label: str, choices: tuple[str, ...], value: str) -> QtWidgets.QComboBox:
+    def add_choice(self, label: str, choices: tuple[str, ...], value: str, *, tooltip: str = '') -> QtWidgets.QComboBox:
         """A host's own choice among ``choices``, built here above the buttons (Codex's Stitch/Int reuse
         audit R3: Stitch's Diagnostic was a combo box the page built). Returns the editor; the host
         applies its value on ``ScientificView.plotOptionsAccepted`` and resets it on ``rejected``."""
@@ -170,11 +177,21 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         row = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QtWidgets.QLabel(label))
+        caption = QtWidgets.QLabel(label)
+        caption.setToolTip(tooltip); editor.setToolTip(tooltip); row.setToolTip(tooltip)
+        layout.addWidget(caption)
         layout.addWidget(editor)
         outer = self.layout()
         outer.insertWidget(outer.count() - 1, row)
         return editor
+
+    def set_ring_available(self, available: bool, reason: str = '', *, visible: bool = True) -> None:
+        from xrd_tools.geometry_figures import RUN_RING_REASON
+        tip = RING_TOOLTIP if available else RING_TOOLTIP+' '+(reason or RUN_RING_REASON)
+        self.calibrant.setEnabled(available)
+        self.calibrant.setToolTip(tip)
+        row = self.calibrant.parentWidget(); row.setVisible(visible); row.setToolTip(tip)
+        row.findChild(QtWidgets.QLabel).setToolTip(tip)
 
     def reconcile(self, options: ScientificPlotOptions) -> None:
         if type(options) is not ScientificPlotOptions:
@@ -188,6 +205,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             self.show_legend,
             self.intensity_scale,
             self.show_coverage_holes,
+            self.calibrant,
         )
         blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
         self.waterfall_y_axis.clear()
@@ -202,6 +220,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.show_legend.setChecked(options.show_legend)
         self.intensity_scale.setCurrentText(options.intensity_scale)
         self.show_coverage_holes.setChecked(options.show_coverage_holes)
+        self.calibrant.setCurrentText(options.calibrant)
         self._projection = options
         del blockers
 
@@ -215,6 +234,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             show_legend=self.show_legend.isChecked(),
             intensity_scale=self.intensity_scale.currentText(),
             show_coverage_holes=self.show_coverage_holes.isChecked(),
+            calibrant=self.calibrant.currentText(),
         )
 
     def reject(self) -> None:

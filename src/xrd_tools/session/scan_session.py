@@ -410,6 +410,7 @@ class ScanSession:
         cancel_token: Any | None = None,
         clear_frame_images: bool = False,
         record_store: FrameRecordStore | None = None,
+        ring_geometry: Mapping | None = None,
         record_store_persisted_on_write: bool = False,
         strict: StrictPolicy | None = None,
         obligations: Iterable[str] = (),
@@ -468,6 +469,11 @@ class ScanSession:
         self._dynamic_batch_settlement_authority_cb = (
             _dynamic_batch_settlement_authority_cb
         )
+        self._ring_geometry = ring_geometry
+        selection = source.extra.get('energy_selection', {}) if ring_geometry is not None else {}
+        from xrd_tools.core.energy import energy_eV_to_wavelength_m
+        self._ring_wavelengths = dict(zip(selection.get('frame_labels', ()),
+            map(energy_eV_to_wavelength_m, selection.get('frame_energies_eV', ()))))
         if dynamic_accounting is not None and record_store_persisted_on_write:
             raise RuntimeError(
                 "dynamic durable truth is owned only by the writer boundary"
@@ -2392,6 +2398,17 @@ class ScanSession:
                     if self._accounting.current_revision(label, mode) >= 1]
         if receipts:
             self._accounting.record_durable(receipts)
+    def _published_ring_geometry(self, frame, label):
+        if self._ring_geometry is None:
+            return None
+        from xrd_tools.core.scan import FrameGeometry
+        snapshot = self._ring_geometry
+        wavelength = self._ring_wavelengths.get(int(label), snapshot['wavelength'])
+        if wavelength != snapshot['wavelength']:
+            snapshot = MappingProxyType({**snapshot, 'wavelength': wavelength})
+        return FrameGeometry(rot1=snapshot['rot1'], rot2=snapshot['rot2'], rot3=snapshot['rot3'],
+            incident_angle=getattr(getattr(frame, 'geometry', None), 'incident_angle', None), poni=snapshot)
+
     def _upsert_record_store(self, frame: Frame, reduction: Any,
                              event: FrameEvent) -> None:
         if self._record_store is None:
@@ -2400,6 +2417,7 @@ class ScanSession:
         try:
             facts = dict(
                 label=event.frame_index,
+                geometry=self._published_ring_geometry(frame, event.frame_index),
                 metadata_raw=event.metadata,
                 metadata_numeric=getattr(frame, "metadata_numeric", None),
                 incident_angle=getattr(getattr(frame, "geometry", None), "incident_angle", None),

@@ -373,6 +373,9 @@ def detector_calibration_from_projection(
     )
 
 
+CALIBRANT_NAMES = ('LaB6', 'CeO2', 'Si', 'Al2O3', 'Cr2O3', 'AgBh')
+
+
 def detector_calibration_record(
     calibration: DetectorCalibration,
     *,

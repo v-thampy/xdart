@@ -1077,6 +1077,27 @@ class EnergyScanRefused(ValueError):
     """
 
 
+def effective_ring_geometry(calibration, *, integrator):
+    """One immutable, transient snapshot of geometry already bound for Run.
+
+    Construct once, before publication. JSON owns the nested detector config;
+    no integrator, array, source or RSM-only image transform is retained.
+    """
+    import json
+    detector = integrator.detector
+    return MappingProxyType({
+        **{name: float(getattr(integrator, name)) for name in
+           ('dist', 'poni1', 'poni2', 'rot1', 'rot2', 'rot3')},
+        'wavelength': integrator.wavelength,
+        'detector': detector.name,
+        'detector_config_json': json.dumps(dict(calibration.detector_config), sort_keys=True),
+        'parallax': calibration.parallax,
+        'is_flat': bool(detector.IS_FLAT),
+        'uniform_pixel': bool(detector.uniform_pixel),
+        'has_spline': detector.spline is not None,
+    })
+
+
 def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=None,
                                   metadata_energy_eV=()):
     """Bind already-read source metadata to a new Int scan, without loading pixels.

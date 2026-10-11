@@ -1330,6 +1330,19 @@ class RunDisplayState:
             )
         presentation_generation = prepared.token.presentation_generation
         view = preview.view
+        # The disk owns pixels/results, never a current-session ring snapshot.
+        # commit_preview already fenced artifact, canonical key and both stores.
+        retained = art.publications.get(key.local_frame_label)
+        if (retained is not None and retained.view.label == key.local_frame_label
+                and retained.generation == art.publications.generation
+                and retained.view.geometry is not None
+                and retained.view.geometry.poni is not None):
+            from xrd_tools.core.scan import FrameGeometry
+            geometry = view.geometry or FrameGeometry()
+            view = replace(view, geometry=replace(geometry, poni=retained.view.geometry.poni))
+            native_shape = retained.view.extra.get('detector_shape')
+            if native_shape is not None:
+                view = replace(view, extra={**view.extra, 'detector_shape': native_shape})
         if preview.raw is not None:
             view = replace(
                 view,
