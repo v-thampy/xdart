@@ -154,7 +154,17 @@ def test_default_levels_and_labels_are_finite_physical_and_bounded():
     snap = views[0].geometry.poni
     grid = predict_detector_grid(snap, shape=(195, 487))
     qnames = {c.name.split(',')[0] for c in grid.curves if c.name.startswith('q ')}
-    assert 8 <= len(qnames) <= 12
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    ai = detector_calibration_to_integrator(calibration(wavelength=snap['wavelength']))
+    yy, xx = np.indices((195, 487))
+    physical_q = 4*np.pi*np.sin(ai.tth(yy, xx)/2)/(snap['wavelength']*1e10)
+    lo, hi = float(physical_q.min()), float(physical_q.max())
+    permitted = (multiple*10.**exponent for exponent in range(-12, 13)
+                 for multiple in (1, 2, 2.5, 5))
+    counts = [(max(0, math.floor(hi/step)-max(1, math.ceil(lo/step))+1), step)
+              for step in permitted]
+    expected_count, _ = min(counts, key=lambda item: (abs(item[0]-10), -item[1]))
+    assert len(qnames) == expected_count
     assert len(grid.curves) <= 60 and len(grid.texts) <= len(grid.curves)
     assert grid.image is None
     assert len({text.name for text in grid.texts}) == len(grid.texts)

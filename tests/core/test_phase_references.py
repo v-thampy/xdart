@@ -116,7 +116,7 @@ def test_reflection_listing_is_bounded_by_the_reachable_range(tmp_path, monkeypa
     cif.write_text(_CIF, encoding="utf-8")
     q = np.linspace(1.0, 6.0, 251)
     phase = PhaseModel.from_cif(cif)
-    phase.calculate_peaks(wavelength=0.25)
+    phase.calculate_peaks(wavelength=0.251)
     y = np.ones_like(q)
     for peak in phase.peaks:
         if q[0] <= peak.q <= q[-1]:
@@ -130,7 +130,7 @@ def test_reflection_listing_is_bounded_by_the_reachable_range(tmp_path, monkeypa
     )
     plan = DisplayedPhaseFitPlan(
         trace=trace, cif_paths=(cif,), expected_hashes=(None,),
-        phase_names=("primitive",), wavelength_angstrom=0.25,
+        phase_names=("primitive",), wavelength_angstrom=0.251,
         phase_profile="gaussian", max_nfev=1,
     )
     real_pattern = XRDCalculator.get_pattern
@@ -142,7 +142,7 @@ def test_reflection_listing_is_bounded_by_the_reachable_range(tmp_path, monkeypa
 
     monkeypatch.setattr(XRDCalculator, "get_pattern", observed)
     bounded_fit = run_displayed_phase_fit(plan)
-    expected = np.degrees(2 * np.arcsin(q[[0, -1]] * 0.25 / (4 * np.pi)))
+    expected = np.degrees(2 * np.arcsin(q[[0, -1]] * 0.251 / (4 * np.pi)))
     assert calls and all(
         np.allclose(bounds, expected, rtol=1e-12, atol=1e-12) for bounds in calls
     ), f"fit must request the reachable 2theta range {expected}; got {calls}"
@@ -167,6 +167,16 @@ def test_reflection_listing_is_bounded_by_the_reachable_range(tmp_path, monkeypa
         return real_pattern(self, structure, *args, **kwargs)
 
     monkeypatch.setattr(XRDCalculator, "get_pattern", force_full)
+    forced_pattern = force_full(XRDCalculator(wavelength=0.251), full.structure)
+    reachable_pattern = real_pattern(
+        XRDCalculator(wavelength=0.251), full.structure, scaled=True,
+        two_theta_range=tuple(expected),
+    )
+    full_q = 4*np.pi*np.sin(np.radians(forced_pattern.x/2))/0.251
+    reachable_q = 4*np.pi*np.sin(np.radians(reachable_pattern.x/2))/0.251
+    assert len(reachable_q) and all(
+        np.isclose(full_q, value, rtol=1e-12, atol=1e-12).any() for value in reachable_q
+    ), "forced 0–180° listing must contain every reachable line before fits are compared"
     full_fit = run_displayed_phase_fit(plan)
     assert full_fit.code == bounded_fit.code
     np.testing.assert_allclose(full_fit.fit, bounded_fit.fit, rtol=1e-12, atol=1e-12)
@@ -177,10 +187,10 @@ def test_reflection_listing_is_bounded_by_the_reachable_range(tmp_path, monkeypa
     entry = library.add_cif(cif, name="primitive")
     calls.clear()
     monkeypatch.setattr(XRDCalculator, "get_pattern", observed)
-    reference = build(entry, wavelength_angstrom=0.25, two_theta_range=(0.0, 30.0))
+    reference = build(entry, wavelength_angstrom=0.251, two_theta_range=(0.0, 30.0))
     assert not reference.reason
     assert calls and all(bounds == (0.0, 30.0) for bounds in calls)
-    assert all(4 * np.pi * np.sin(np.radians(15)) / 0.25 >= p.q for p in reference.phases[0].reflections)
+    assert all(4 * np.pi * np.sin(np.radians(15)) / 0.251 >= p.q for p in reference.phases[0].reflections)
 
 
 def test_phase_library_round_trips_cif_and_lattice_entries(tmp_path, monkeypatch):
