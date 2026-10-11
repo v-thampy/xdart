@@ -83,9 +83,11 @@ def _phase_items(pane, entry):
 
 
 def _markers(view, entry):
+    """Positions drawn by the phase's one joined 1D item (maintainer, October 11: one object per phase)."""
     family = 'phase:' + entry.id
-    return tuple(item for item in view.curve.getPlotItem().items
-                 if isinstance(item, pg.InfiniteLine) and item.data(0) == family)
+    items = [item for item in view.curve.getPlotItem().items if item.data(0) == family]
+    assert len(items) <= 1, 'a phase draws one joined 1D reference item, not one item per reflection'
+    return tuple(items[0].reference_positions) if items else ()
 
 
 def _navigation(page):
@@ -232,7 +234,7 @@ def test_phase_lines_on_q_and_2theta_axes_in_int_and_stitch(qapp, tmp_path):
             _phase_section(view)
             entry, = _entries(tmp_path)
             _edit(qapp, view, (entry,))
-            q_positions = tuple(sorted(item.value() for item in _markers(view, entry)))
+            q_positions = tuple(sorted(_markers(view, entry)))
             assert q_positions
             original = page._last_scientific_projection
             # Projection-owned consumers: browse and operation results retain
@@ -247,7 +249,7 @@ def test_phase_lines_on_q_and_2theta_axes_in_int_and_stitch(qapp, tmp_path):
             payload = page._context_controller.project(page._context_controller.navigation.current)
             wavelength = payload.view.geometry.poni['wavelength'] * 1e10
             expected = 2. * np.rad2deg(np.arcsin(np.asarray(q_positions)*wavelength/(4.*np.pi)))
-            np.testing.assert_allclose(sorted(item.value() for item in _markers(view, entry)), expected, atol=1e-10)
+            np.testing.assert_allclose(sorted(_markers(view, entry)), expected, atol=1e-10)
             if mode == 'Int 2D':
                 assert _phase_items(view.cake, entry)
             state = replace(page._last_scientific_projection, measurement_mode='Grazing')
