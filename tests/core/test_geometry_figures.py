@@ -183,6 +183,10 @@ def test_orientation_scores_identifiable_ties_masks_and_refusals():
             assert 'diagonal' in finding.reason.lower()
 
 
+# About five minutes locally (313 s): slow, so pr.yml's core job skips it, and its own budget instead of the
+# job-wide --timeout, as the notebook smoke has (maintainer, 2026-10-11).
+@pytest.mark.slow
+@pytest.mark.timeout(1800)
 def test_frozen_photon_ensemble_never_tunes_and_preserves_diagonal_ties():
     gf = api()
     for offset, tilt, pose in POSITIVE_CASES:
