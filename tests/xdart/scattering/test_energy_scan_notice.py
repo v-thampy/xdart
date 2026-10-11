@@ -71,8 +71,9 @@ def _failed_run(qapp, monkeypatch, root: Path, energies_keV, *, parallax: bool, 
         assert failed, (page._notice_text, tuple((event.kind, event.detail) for event in observed))
         for _ in range(5):
             qapp.processEvents()
+        # The box's text, not its window title: Qt leaves message-box titles empty on macOS.
         boxes = [box for box in page.findChildren(QtWidgets.QMessageBox)
-                 if box.windowTitle() == _TITLE and box.isVisible()]
+                 if box.text() == _TITLE and box.isVisible()]
         return failed[0], [(box.text(), box.informativeText()) for box in boxes]
     finally:
         for box in page.findChildren(QtWidgets.QMessageBox):
