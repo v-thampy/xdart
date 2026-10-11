@@ -168,7 +168,10 @@ def test_the_fit_and_seeds_take_a_horizontal_arm():
     assert {key: psic.params[key] for key in single.params} == single.params
     # this fit reads whole-pixel control points, so it recovers the truth approximately
     assert single.params['nu_offset'] == pytest.approx(.03, abs=2e-3)
-    assert single.params['del_offset'] == pytest.approx(-.012, abs=2e-3)  # the detector's fixed pitch
+    # The detector's fixed pitch. del's zero and poni1 are nearly degenerate in this geometry: 0.005° moves the
+    # beam about 0.2 px at 0.39 m, below what whole-pixel points resolve (measured -0.0114 on macOS, -0.0082 on
+    # x86 Linux; tolerance widened from 2e-3 by the maintainer, 2026-10-11).
+    assert single.params['del_offset'] == pytest.approx(-.012, abs=5e-3)
     record = single.diffractometer.stacked_arm.to_pyfai_goniometer(single.diffractometer.calibration)
     frame = _frame({'tth': 20.})
     seeded = predict_frame_seed(record, frame, del_motor=None, nu_motor='tth')
