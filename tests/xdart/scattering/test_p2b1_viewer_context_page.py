@@ -602,6 +602,7 @@ def test_viewer_1d_modes_preserve_sigma_and_axes_and_refuse_invalid_combination(
 
 def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_path, caplog) -> None:
     import xrd_tools.session.viewer_1d as viewer
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
     from tests.xdart.scattering.test_e3_context_contract import _cold_controller, _select_browse
     one_d = _write_xye(tmp_path / "one.xye", [0, 1], [1, 2])
     two_d = tmp_path / "two.npy"
@@ -652,6 +653,8 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
         catalog_reader=lambda _directory, **_kwargs: (),
     )
     assert processed_browser.begin_close()
+    # Keep the injected renderer receipts, but close the real shared phase owner.
+    phase_view = ScientificView()
     workspace = SimpleNamespace(_context_controller=controller,
         _shell=SimpleNamespace(browser=SimpleNamespace(
             reconcile_detector_mode=lambda _projection: None,
@@ -661,6 +664,7 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
             bottom_waterfall_active=False,
             drop_viewer_loading_snapshot=lambda: None,
             clear_workspace=lambda: True,
+            shutdown_phase_overlays=phase_view.shutdown_phase_overlays,
         )),
         _last_scientific_projection=object(), _preferences=ScientificPreferences(),
         _batch_terminal=BatchTerminalPresentationController(),
