@@ -1084,7 +1084,8 @@ def display_arcs(points, theta, shape, factor):
 _display_arcs = display_arcs
 
 
-RUN_RING_REASON = 'Predicted rings are drawn only for frames reduced by Run in this session.'
+RUN_RING_REASON = ("Predicted rings are drawn only on a Run's frames while that Run is shown. "
+                   "Frames opened from a file, and Average or Reintegrate results, carry no ring geometry.")
 PARALLAX_RING_REASON = ('Predicted rings are unavailable for runs reduced with detector sensor parallax '
     "correction: this display-only overlay's flat-detector ring model does not include parallax.")
 

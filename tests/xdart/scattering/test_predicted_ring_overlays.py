@@ -212,7 +212,8 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
         if mode.startswith('Int') or mode in ('Average', 'Reintegrate'):
             editor = choice(view)
             assert not editor.isEnabled()
-            assert 'Predicted rings are drawn only for frames reduced by Run in this session.' in editor.toolTip()
+            assert ("Predicted rings are drawn only on a Run's frames while that Run is shown. "
+                    "Frames opened from a file, and Average or Reintegrate results, carry no ring geometry.") in editor.toolTip()
         view.show_raw_popup('Contributing raw')
         raw = np.arange(35.).reshape(5,7)
         view.show_raw_image(raw, status='source', color_map='Default', log_scale=False)
