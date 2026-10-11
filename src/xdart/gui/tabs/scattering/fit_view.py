@@ -109,9 +109,8 @@ def draw_series(plot, series: FitSeries, *, group_count: int = 1):
 
 def draw_marker(plot, position: float):
     """A vertical marker line (a peak position) on ``plot``."""
-    line = pg.InfiniteLine(float(position), angle=90, pen=pg.mkPen(_MARKER, width=1))
-    plot.addItem(line)
-    return line
+    from .scientific_curves import draw_marker as shared_marker
+    return shared_marker(plot, position, color=_MARKER)
 
 
 def draw_zero_line(plot):

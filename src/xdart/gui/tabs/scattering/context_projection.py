@@ -342,7 +342,7 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice,
             axis = AxisProjection(values, view.axis_1d.label, view.axis_1d.unit)
             traces.append(_Viewer1DTraceProjection(
                 frame, axis, intensity, os.path.basename(view.source_path or ""),
-                sigma=sigma))
+                sigma=sigma, wavelength_m=payload.wavelength_m))
     current = payload_by_id.get(id(navigation.current))
     if ready and current is not None:
         status += f" · {os.path.basename(current.view.source_path or '')}"

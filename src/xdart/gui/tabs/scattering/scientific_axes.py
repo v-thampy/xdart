@@ -348,6 +348,7 @@ def trace_projection(
             intensity,
             title,
             _finite_metadata_value(view.metadata_numeric, "epoch"),
+            wavelength_m=payload.wavelength_m,
         )
     except Exception:
         return None

@@ -25,3 +25,15 @@ def add_text_item(plot, text, color, *, xy=None):
     item.setAcceptHoverEvents(False)
     plot.addItem(item)
     return item
+
+
+def draw_marker(plot, position, *, color=(240, 200, 90), family=None, tooltip=''):
+    """One passive vertical reference marker, shared by fits and overlays."""
+    line = pg.InfiniteLine(float(position), angle=90, pen=pg.mkPen(color, width=1))
+    line.setToolTip(tooltip)
+    line.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+    line.setAcceptHoverEvents(False)
+    if family is not None:
+        line.setData(0, family)
+    plot.addItem(line, ignoreBounds=True)
+    return line

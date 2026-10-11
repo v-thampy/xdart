@@ -489,6 +489,7 @@ class TraceProjection:
     intensity: np.ndarray
     title: str = ""
     epoch: float | None = None
+    wavelength_m: float | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -502,6 +503,9 @@ class TraceProjection:
             type(self.epoch) is not float or not np.isfinite(self.epoch)
         ):
             raise TypeError("trace epoch must be a finite float or None")
+        if self.wavelength_m is not None and (type(self.wavelength_m) is not float
+                or not math.isfinite(self.wavelength_m) or self.wavelength_m <= 0):
+            raise TypeError("trace wavelength must be a positive finite float or None")
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -669,6 +673,8 @@ class ScientificPlotOptions:
     show_coverage_holes: bool = False
     calibrant: str = 'Off'
     coordinate_grid: str = 'Off'
+    phase_references: tuple[tuple[str, bool], ...] = ()
+    phase_min_intensity: float = 5.
 
     def __post_init__(self) -> None:
         if type(self.waterfall_y_axis) is not str or not self.waterfall_y_axis:
@@ -695,6 +701,14 @@ class ScientificPlotOptions:
             raise ValueError('unsupported predicted-ring calibrant')
         if self.coordinate_grid not in ('Off', 'q', 'χ', 'q + χ'):
             raise ValueError('unsupported coordinate grid')
+        if (type(self.phase_references) is not tuple or len(self.phase_references) > 8
+                or any(type(row) is not tuple or len(row) != 2 or type(row[0]) is not str
+                       or not row[0] or type(row[1]) is not bool for row in self.phase_references)
+                or len({row[0] for row in self.phase_references}) != len(self.phase_references)):
+            raise ValueError('select at most eight unique phase IDs with visibility flags')
+        if (type(self.phase_min_intensity) not in (int, float)
+                or not math.isfinite(self.phase_min_intensity) or not 0 <= self.phase_min_intensity <= 100):
+            raise ValueError('phase floor must be between 0 and 100 percent')
 
 
 @dataclass(frozen=True, slots=True)
