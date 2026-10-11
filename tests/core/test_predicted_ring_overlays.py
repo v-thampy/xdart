@@ -151,7 +151,12 @@ def test_analytic_rings_match_pyfai_without_detector_maps(case, monkeypatch):
         if not contours[number]:
             assert not arcs
             continue
-        cloud = np.concatenate(contours[number])
+        # contourpy supplies polyline vertices, not a uniformly dense point cloud.
+        # Densify its independent straight segments before nearest-point distance;
+        # measuring distance to sparse vertices falsely rejects diagonal segments.
+        cloud = np.concatenate([np.concatenate([
+            np.linspace(a, b, max(2, int(np.ceil(np.linalg.norm(b-a)/.1))+1))
+            for a, b in zip(line[:-1], line[1:])]) for line in contours[number]])
         assert arcs
         predicted = np.concatenate(arcs)
         assert cKDTree(cloud).query(predicted)[0].max() <= .5

@@ -200,7 +200,7 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
         view.show_raw_image(raw, status='source', color_map='Default', log_scale=False)
         np.testing.assert_array_equal(view.raw_popup_image.image.image, raw.T[:,::-1])
         assert not getattr(view.raw_popup_image, 'ring_items', ())
-        view.raw_popup.close(); qapp.processEvents()
+        view._raw_popup.close(); qapp.processEvents()
         view.raw.clear(); assert not getattr(view.raw, 'ring_items', ())
     finally:
         shell.close(); shell.deleteLater(); qapp.processEvents()
