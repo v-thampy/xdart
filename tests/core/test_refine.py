@@ -21,6 +21,11 @@ _FIXTURES = Path(__file__).parent / "fixtures"
 _GONIO_DELNU = _FIXTURES / "gonio_del_nu_object.json"
 
 
+#: The archived del/nu fixture records the former camera frame with positive arm scales. Since 1e0f662c a
+#: new fit seeds pyFAI's native frame, where those scales are circles turning opposite to psic's.
+_ARCHIVED_SENSES = {"nu": -1, "del": -1}
+
+
 def _truth():
     return Diffractometer.from_pyfai_goniometer(
         _GONIO_DELNU, source_motors={"del_value": "del", "nu_value": "nu"},
@@ -125,7 +130,7 @@ class TestRefineGoniometer:
                     detector="Pilatus300kw")
         res = refine_goniometer(
             seed, frames, rot1_motor="nu", rot2_motor="del", calibrant="LaB6",
-            detector_config={"orientation": 3}, base=Diffractometer.psic())
+            detector_config={"orientation": 3}, base=Diffractometer.psic(), senses=_ARCHIVED_SENSES)
 
         assert res.success
         assert res.rms_q < 0.006              # clean synthetic points
@@ -169,7 +174,7 @@ class TestRefineGoniometer:
         frames = _synth_control_frames(truth, [(15.0, 0.0), (15.0, 4.0), (15.0, 9.0)])
         res = refine_goniometer(
             truth.calibration.poni, frames, rot1_motor="nu", rot2_motor="del",
-            detector_config={"orientation": 3}, base=Diffractometer.psic())
+            detector_config={"orientation": 3}, base=Diffractometer.psic(), senses=_ARCHIVED_SENSES)
         assert "del" in res.frozen_scales           # del scale frozen (un-spanned)
         # the frozen scale is the sane deg2rad, NOT a collapsed garbage value
         assert res.diffractometer.rot2.sign == pytest.approx(1.0, abs=1e-6)
@@ -185,7 +190,7 @@ class TestRefineGoniometer:
         frames = _synth_control_frames(truth, _FRAMES)
         res = refine_goniometer(
             truth.calibration.poni, frames, rot1_motor="nu", rot2_motor="del",
-            detector_config={"orientation": 3}, base=Diffractometer.psic())
+            detector_config={"orientation": 3}, base=Diffractometer.psic(), senses=_ARCHIVED_SENSES)
         # truth offsets: nu (rot1) +1.445°, del (rot2) -8.380°
         assert res.diffractometer.rot1.offset == pytest.approx(1.445, abs=0.1)
         assert res.diffractometer.rot2.offset == pytest.approx(-8.380, abs=0.2)

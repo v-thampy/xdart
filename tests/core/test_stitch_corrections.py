@@ -55,8 +55,10 @@ def test_one_frame_matches_pyfai_with_dark_flat_polarization_and_poisson():
     # pyFAI's Poisson model treats the dark as noiseless; a measured dark adds its counts.
     expected = ai.integrate1d_ng(raw, npt, variance=np.maximum(raw, 1.) + np.where(invalid, 0., dark),
                                  **common)
-    np.testing.assert_allclose(payload.intensity, expected.intensity, rtol=1e-12, atol=0)
-    np.testing.assert_allclose(payload.sigma, expected.sigma, rtol=1e-12, atol=0)
+    # Stitch keeps a bin no pixel reached as NaN (5cc058db); pyFAI 2026.9 fills it with 0.
+    empty = expected.count == 0
+    np.testing.assert_allclose(payload.intensity, np.where(empty, np.nan, expected.intensity), rtol=1e-12, atol=0)
+    np.testing.assert_allclose(payload.sigma, np.where(empty, np.nan, expected.sigma), rtol=1e-12, atol=0)
     noiseless = ai.integrate1d_ng(raw, npt, error_model='poisson', **common)
     finite = np.isfinite(payload.sigma) & (payload.sigma > 0)
     assert np.all(payload.sigma[finite] > noiseless.sigma[finite])

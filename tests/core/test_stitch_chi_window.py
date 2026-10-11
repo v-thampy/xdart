@@ -36,7 +36,8 @@ def test_a_pyfai_window_is_multigeometrys(poni_fixture):
                   correct_solid_angle=False)
     streamed, diagnostics, _cuts = stitch_1d_streaming(images, 3, integrators, azimuth_range=window, **common)
     np.testing.assert_array_equal(streamed.radial, eager.radial)
-    np.testing.assert_array_equal(streamed.intensity, eager.intensity)
+    # Stitch keeps a bin no pixel reached as NaN (5cc058db); pyFAI 2026.9 fills it with 0.
+    np.testing.assert_array_equal(streamed.intensity, np.where(eager.count == 0, np.nan, eager.intensity))
     np.testing.assert_array_equal(diagnostics.coverage, eager.count)
     np.testing.assert_array_equal(diagnostics.normalization, eager.sum_normalization)
     _every, every, _cuts = stitch_1d_streaming(images, 3, integrators, **common)
