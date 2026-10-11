@@ -135,3 +135,25 @@ def test_lattice_fraction_reason_survives_the_store_and_shared_result_tables(tmp
     assert len(phase_rows) == 1 and phase_rows[0][0:2] == ("positions", "—")
     assert "a=" in phase_rows[0][2]
     assert any(displayed.phase_fractions_reason in str(cell) for row in rows for cell in row)
+
+
+def test_lattice_heights_have_no_ceiling_and_fit_broad_peaks():
+    """A lattice phase's scale is fixed, so each free height is its reflection's whole amplitude."""
+    a_true = 4.1569
+    truth = PhaseModel.from_lattice("truth", a=a_true, space_group="Pm-3m")
+    q = np.linspace(1., 6., 5001)
+    centres = [peak.q for peak in truth.peaks if 1.05 <= peak.q <= 5.95]
+    heights = 1000. * np.random.default_rng(7).uniform(.05, 1., len(centres))
+    y = 20. + sum(h * np.exp(-(q - c) ** 2 / (2 * .1 ** 2)) for h, c in zip(heights, centres))
+    fitter = PhaseFitter(q, y)
+    # 4.151 Å has an exactly-zero bounded internal start, so leastsq can move the cell.
+    fitter.add_phase(PhaseModel.from_lattice("start", a=4.151, space_group="Pm-3m"),
+                     q_range=(1., 6.), min_intensity=5.)
+    result = fitter.fit(phase_profile="gaussian", texture="none")
+    free = [p for name, p in result.params.items() if name.startswith("p0_pk")]
+    assert free and all(p.max == np.inf for p in free), (
+        "lattice heights must not inherit the texture multipliers' ceiling"
+    )
+    residual = np.sqrt(np.sum((y - fitter.eval_model(result.params)) ** 2) / np.sum(y ** 2))
+    assert residual < .05, residual
+    assert abs(result.params["p0_a"].value - a_true) < 4e-3

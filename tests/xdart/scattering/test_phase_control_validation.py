@@ -83,3 +83,64 @@ def test_plot_options_accept_both_phase_floor_boundaries(qapp, floor):
         dialog.close()
         dialog.deleteLater()
         qapp.processEvents()
+
+
+def test_reconciling_plot_options_reads_no_phase_library_files(qapp, tmp_path, monkeypatch):
+    """A selection resolves once; every later projection reconcile reuses it."""
+    from dataclasses import replace
+    from pymatgen.core import Lattice, Structure
+    from pymatgen.io.cif import CifWriter
+    library = PhaseLibrary(tmp_path / "library")
+    monkeypatch.setenv("XDART_PHASE_LIBRARY", str(library.path))
+    path = tmp_path / "CsCl.cif"
+    path.write_text(str(CifWriter(Structure(Lattice.cubic(4.1), ["Cs", "Cl"], [[0, 0, 0], [.5, .5, .5]]))))
+    cif = library.add_cif(path, name="CsCl")
+    lattice = library.add_lattice("cell", a=4.2, space_group="Pm-3m")
+    dialog = PlotOptionsDialog()
+    try:
+        options = replace(dialog.projection, phase_references=((cif.id, True), (lattice.id, True)))
+        dialog.reconcile(options)
+        assert tuple(entry.id for entry in dialog.phase_source.selected_entries()) == (cif.id, lattice.id)
+        reads = []
+        for name in ("resolve", "entries"):
+            actual = getattr(PhaseLibrary, name)
+            monkeypatch.setattr(PhaseLibrary, name, lambda self, *args, _actual=actual, _name=name, **kwargs:
+                                (reads.append(_name), _actual(self, *args, **kwargs))[1])
+        for _ in range(3):
+            dialog.reconcile(options)
+            dialog.set_phase_available(True)
+            assert tuple(entry.id for entry in dialog.phase_source.selected_entries()) == (cif.id, lattice.id)
+        assert reads == [], "a projection reconcile must not read the phase library on the GUI thread"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qapp.processEvents()
+
+
+def test_the_int_workspace_starts_without_importing_pymatgen(tmp_path):
+    """Phase availability is probed without loading the optional backend on the GUI thread."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[3]
+    code = textwrap.dedent("""
+        import os, sys
+        from pyqtgraph.Qt import QtWidgets
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        from xdart.gui.pages.scattering_workspace import build_scattering_workspace
+        from xdart.gui.pages.services import empty_host_services
+        from tests.xdart.pages.test_stitch_page import _Status
+        handle = build_scattering_workspace(empty_host_services(_Status()), None)
+        app.processEvents()
+        print("pymatgen" if "pymatgen" in sys.modules else "clean", flush=True)
+        handle.close()
+        os._exit(0)
+    """)
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDART_PHASE_LIBRARY=str(tmp_path / "library"),
+               XDART_SESSION_FILE=str(tmp_path / "session.json"))
+    env["PYTHONPATH"] = os.pathsep.join((str(root / "src"), str(root), env.get("PYTHONPATH", "")))
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+                          cwd=root, timeout=300)
+    assert proc.stdout.strip().splitlines()[-1:] == ["clean"], (proc.stdout, proc.stderr[-2000:])
