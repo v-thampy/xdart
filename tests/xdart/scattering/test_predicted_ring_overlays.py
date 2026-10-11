@@ -242,19 +242,18 @@ def test_logical_point_frames_keep_their_own_ring_geometry(qapp, tmp_path):
         assert view.raw.ring_items
 
 
-def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path, monkeypatch):
-    from xrd_tools.core import staging
-    # Fix only the RAM request, not publication, eviction or hydration. The real
-    # resource policy admits one frame and binds that allocation to both stores.
-    monkeypatch.setattr(staging, 'heavy_window', lambda *args, **kwargs: 1)
-    with run_page(qapp, tmp_path, energies=(16,17,18)) as (page, view):
+def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path):
+    # The supported Run option funds its existing sixteen-frame checkpoint.
+    # Seventeen frames still force frame 0 through real eviction and hydration.
+    with run_page(qapp, tmp_path, energies=tuple(range(16,33)), heavy_window=16) as (page, view):
         choice(view); choose(qapp, view)
         controller = page._context_controller
         keys = controller.frame_keys
         art = controller.acquisition_context
         store = art.publication_store.artifacts[keys[0].artifact].publications
         original = store.get(keys[0].local_frame_label).view.geometry.poni
-        store.set_max_heavy_items(1)
+        assert store._max_heavy_items == 16
+        assert store.get(keys[0].local_frame_label).view.intensity_2d is None
         payload = select(qapp, page, keys[0])
         assert payload.view.geometry.poni == original
         assert payload.view.geometry.poni != controller.project(keys[-1]).view.geometry.poni
