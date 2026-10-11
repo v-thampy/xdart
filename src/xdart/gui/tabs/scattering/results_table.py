@@ -90,8 +90,13 @@ def phase_result_rows(result) -> tuple[tuple[str, ...], tuple[tuple[object, ...]
     """A displayed phase fit's rows (``DisplayedPhaseFitResult``): each phase's fraction and lattice, then each
     fitted parameter with its error."""
     lattice = dict(result.lattice_parameters)
-    rows = [(name, value, ", ".join(f"{key}={number}" for key, number in lattice.get(name, ())), "phase", "")
-            for name, value in result.phase_fractions]
+    fractions = dict(result.phase_fractions)
+    names = getattr(result, "phase_names", ()) or tuple(fractions) or tuple(lattice)
+    rows = [(name, fractions.get(name, "—"), ", ".join(f"{key}={number}" for key, number in lattice.get(name, ())), "phase", "")
+            for name in names]
+    reason = getattr(result, "phase_fractions_reason", "")
+    if reason:
+        rows.append(("Phase fractions", reason, "", "notice", ""))
     rows += [(name, value, "", "parameter", error) for name, value, error
              in zip(result.parameter_names, result.parameter_values, result.parameter_stderr, strict=True)]
     return PHASE_RESULT_HEADERS, tuple(rows)
@@ -129,8 +134,12 @@ def phase_outcome_rows(entry, names: Sequence[str]) -> tuple[tuple[str, ...], tu
     rows = []
     for name in list(fractions) or list(names):
         cell = lattice.get(name, {})
-        rows.append((name, f"{fractions.get(name, float('nan')):.3f}",
+        fraction = f"{fractions[name]:.3f}" if name in fractions else "—"
+        rows.append((name, fraction,
                      *(f"{cell[key]:.4f}" if cell.get(key) is not None else "—" for key in ("a", "b", "c"))))
+    reason = (entry or {}).get("phase_fractions_reason", "")
+    if reason:
+        rows.append((reason, "—", "—", "—", "—"))
     return PHASE_OUTCOME_HEADERS, tuple(rows)
 
 
