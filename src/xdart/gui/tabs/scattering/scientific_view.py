@@ -50,7 +50,7 @@ from .scientific_plot_options import (
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
-from .scientific_curves import add_curve_item, add_text_item, draw_marker
+from .scientific_curves import add_curve_item, add_text_item, draw_reference_lines
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
 from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest, positions_for_axis
@@ -1358,7 +1358,8 @@ class ScientificView(QtWidgets.QFrame):
         for pane in (self.raw, self.cake, self.raw_popup_image):
             if pane is not None:
                 pane.render_overlay_family(family, ())
-        for marker in self._phase_markers.pop(identifier, ()):
+        marker = self._phase_markers.pop(identifier, None)
+        if marker is not None:
             self.curve.removeItem(marker)
         legend = self._phase_legends.pop(identifier, None)
         if legend is not None:
@@ -1463,15 +1464,21 @@ class ScientificView(QtWidgets.QFrame):
             positions = positions_for_axis(family.q_lines,
                 {'q_A^-1': 'q', '2th_deg': '2theta'}.get(line_key, ''), wavelength)
             values = positions.values if measurement != 'Grazing' else ()
-            markers = self._phase_markers.get(identifier, ())
-            plot_items = self.curve.getPlotItem().items
-            if (tuple(marker.value() for marker in markers) != values
-                    or any(marker not in plot_items for marker in markers)
-                    or any(marker.pen.color().getRgb()[:3] != color[:3] for marker in markers)):
-                for marker in markers:
+            # One joined 1D item per phase (maintainer, October 11), not one item per reflection.
+            marker = self._phase_markers.get(identifier)
+            if (marker is None or marker.reference_positions != tuple(values)
+                    or marker not in self.curve.getPlotItem().items
+                    or marker.lines.opts['pen'].color().getRgb()[:3] != color[:3]):
+                if marker is not None:
                     self.curve.removeItem(marker)
-                self._phase_markers[identifier] = tuple(draw_marker(self.curve, value, color=color,
-                    family=name, tooltip=tip) for value in values)
+                marker = draw_reference_lines(self.curve, values, color=color, family=name,
+                                              tooltip=tip) if values else None
+                if marker is None:
+                    self._phase_markers.pop(identifier, None)
+                else:
+                    self._phase_markers[identifier] = marker
+            if marker is not None:
+                marker.set_tooltip(tip)
             legend = self._phase_legends.get(identifier)
             if legend is None:
                 legend = pg.PlotDataItem(pen=pg.mkPen(color, width=2))

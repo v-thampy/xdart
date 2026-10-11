@@ -178,3 +178,28 @@ def test_each_phase_legend_entry_explains_its_family(qapp, tmp_path, monkeypatch
         for sample, label in shown:
             for item in (sample, label):
                 assert entry.name in item.toolTip() and "omitted" in item.toolTip().lower(), item.toolTip()
+
+
+def test_reference_lines_are_one_passive_item_that_follows_the_view(qapp):
+    """The shared joined item is never trace data, and its lines span every pan, zoom and log scale."""
+    import numpy as np
+    import pyqtgraph as pg
+    from xdart.gui.tabs.scattering.scientific_curves import draw_reference_lines
+    widget = pg.PlotWidget()
+    try:
+        widget.show()
+        trace = widget.plot([1., 2., 3.], [10., 100., 1000.])
+        item = draw_reference_lines(widget, (1.5, 2.5), color=(10, 20, 30), family="phase:x", tooltip="tip")
+        assert widget.getPlotItem().listDataItems() == [trace], "reference lines must not join the traces"
+        assert item.data(0) == "phase:x" and item.reference_positions == (1.5, 2.5)
+        assert item.toolTip() == item.lines.toolTip() == "tip"
+        for log, span in ((False, (-50., 2000.)), (True, (1., 3.))):
+            widget.getPlotItem().setLogMode(False, log)
+            widget.setYRange(*span, padding=0)
+            qapp.processEvents()
+            low, high = widget.getViewBox().viewRange()[1]
+            x, y = item.lines.getData()
+            np.testing.assert_allclose(x[~np.isnan(x)], (1.5, 1.5, 2.5, 2.5))
+            np.testing.assert_allclose(y[~np.isnan(y)], (low, high, low, high))
+    finally:
+        widget.deleteLater()  # the Qt test boundary retires (closes) this top level once
