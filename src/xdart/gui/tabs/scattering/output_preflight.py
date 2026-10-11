@@ -137,8 +137,9 @@ class OutputCandidate:
         if type(source) not in {SourceSpec, DirectorySourceSpec}:
             raise ValueError("output admission requires a supported source")
         accepted = assets or _load_scientific_assets(intent)
-        if accepted.poni_parallax is not None:
-            intent.poni_values = accepted.poni_projection
+        signed = accepted.signed_poni_values
+        if signed is not None:
+            intent.poni_values = signed
         frozen = intent.freeze(gi_motor_choices=gi_motor_choices, saturation=saturation)
         processing = frozen.as_provenance()
         processing["accepted_scientific_assets"] = {

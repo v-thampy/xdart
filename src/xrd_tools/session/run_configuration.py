@@ -1293,6 +1293,7 @@ class RunIntent:
         generation: int | None = None,
         gi_motor_choices: "list[str] | tuple[str, ...] | None" = None,
         saturation: int | None = None,
+        poni_values: Mapping[Any, Any] | None = None,
     ) -> FrozenRunConfiguration:
         """Freeze the current values and advance the monotonic run generation.
 
@@ -1300,7 +1301,10 @@ class RunIntent:
         caller (the GUI) so the effective GI motor is resolved ONCE here (R4B-8)
         rather than independently by each run consumer. ``saturation`` is the
         admitted source's resolved automatic ceiling (decision 39), likewise
-        resolved once at admission.
+        resolved once at admission. ``poni_values``, when given, is the PONI
+        projection admission signed for a v3 calibration
+        (``AcceptedScientificAssets.signed_poni_values``) and replaces the
+        intent's own, as admission's candidate does.
         """
 
         heavy_residency_choice(self.run_options)
@@ -1320,6 +1324,7 @@ class RunIntent:
             if source_spec is None
             else FrozenSourceSpec.from_source(source_spec)
         )
+        signed_poni = self.poni_values if poni_values is None else poni_values
         frozen = FrozenRunConfiguration(
             generation=next_generation,
             source=source,
@@ -1345,7 +1350,7 @@ class RunIntent:
             _bai_1d_args=_mapping_value(self.bai_1d_args),
             _bai_2d_args=_mapping_value(self.bai_2d_args),
             _poni_values=_freeze_value(
-                None if self.poni_values is None else dict(self.poni_values)
+                None if signed_poni is None else dict(signed_poni)
             ),
             _run_options=_mapping_value(self.run_options),
         )

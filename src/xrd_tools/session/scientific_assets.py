@@ -150,6 +150,15 @@ class AcceptedScientificAssets:
         return detector_calibration_projection(self.detector_calibration)
 
     @property
+    def signed_poni_values(self) -> dict[str, object] | None:
+        """The projection a v3 (sensor and parallax) calibration signs into its run, else None.
+
+        Admission's candidate and the start's freeze both take it, so the run they admit and the
+        run that starts carry one calibration identity.
+        """
+        return self.poni_projection if self.poni_parallax is not None else None
+
+    @property
     def mask(self) -> np.ndarray | None:
         return None if self.mask_bytes is None else np.frombuffer(
             self.mask_bytes, dtype=np.dtype(self.mask_dtype)).reshape(
