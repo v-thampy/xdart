@@ -173,9 +173,22 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
     groups, skipped, names, pending = [], [], {}, []
     choices = {(uri, scan): policy for uri, scan, policy in selection.point_image_choices}
 
-    def confirmed(spec):
+    def confirmed(spec, *, directory=False):
         policy = choices.get((str(spec.uri), str(spec.options.get("scan") or spec.entry or "entry")))
         detection = (inspect_point_images(spec) if policy is not None or spec.kind is not SourceKind.SPEC else None)
+        if (detection is not None and spec.kind is SourceKind.EIGER_MASTER
+                and describe_container(Path(spec.uri), entry=spec.entry or "entry").motor_names == ()):
+            # Maintainer, 2026-10-10: "A bare Eiger master will never be the only source in RSM and
+            # stitching. Though it can be in int of course with a poni file." A burst master's images
+            # are not one scan point's, so it is refused (skipped in Directory mode) before any grouping
+            # question or confirmed grouping. A master without a burst keeps Stitch's preflight refusal.
+            reason = (f"a detector-only Eiger master ({detection.image_count} images for {detection.point_count} "
+                      "trigger(s)): Stitch and RSM read its scan from its metadata source (SPEC or NeXus); "
+                      "select that source instead")
+            if directory:
+                skipped.append((str(spec.uri), str(spec.entry or "entry"), reason))
+                return None
+            raise ValueError(f"{Path(spec.uri).name} is {reason}")
         if detection is not None and (policy is None or policy.images_per_point != detection.images_per_point):
             pending.append(detection)
             return None
@@ -227,7 +240,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             if members:
                 groups.append(tuple(members))
 
-    def nexus_members(path):
+    def nexus_members(path, *, directory=False):
         kind = describe_container(path).kind
         if kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
             raise ValueError(f"{path.name} is not a raw NeXus detector source")
@@ -236,7 +249,8 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             raise ValueError(f"{path.name} has no NeXus entries")
         # Each file remains one output/group; its exact entries contribute.
         members = tuple(value for entry in entries
-                        if (value := confirmed(SourceSpec(path, kind, entry=entry))) is not None)
+                        if (value := confirmed(SourceSpec(path, kind, entry=entry), directory=directory))
+                        is not None)
         names.update(dict.fromkeys(map(id, members), int_scan_name(path)))
         return members
 
@@ -261,7 +275,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                 resolved = path.resolve()
                 if resolved not in seen_nexus:
                     seen_nexus.add(resolved)
-                    groups.append(nexus_members(path))
+                    groups.append(nexus_members(path, directory=True))
     if len(groups) > 4096:
         raise ValueError("Selection exceeds 4096 result groups")
     if pending:
