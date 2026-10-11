@@ -34,6 +34,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._shown_ids = ()
         self._details = {}
         self._reason = ''
+        self._availability_reason = ''
         self.setObjectName('phaseSourceWidget')
         self.setToolTip(_SOURCE_TIP)
         layout = QtWidgets.QVBoxLayout(self)
@@ -92,6 +93,12 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         self.status.setToolTip('Phase-source validation and missing-library-entry notices.')
         layout.addWidget(self.status)
+        controls = (self.browser, self.browser.scans, self.browser.scans_label,
+                    self.browser.show_all, self.browser.metadata, self.browser.auto_last,
+                    self.browser.date_sort, self.browser.refresh, self.add_cif_btn,
+                    self.add_lattice_btn, self.remove_btn, self.lattice_form,
+                    self.add_lattice_commit, self.status, *self.lattice_rows.values())
+        self._purpose_tooltips = {control: control.toolTip() for control in controls}
         self.add_cif_btn.clicked.connect(self._browse_cifs)
         self.add_lattice_btn.clicked.connect(lambda: self.lattice_form.setVisible(not self.lattice_form.isVisible()))
         self.add_lattice_commit.clicked.connect(self._commit_lattice)
@@ -111,8 +118,17 @@ class PhaseSourceWidget(QtWidgets.QWidget):
     def _message(self, message):
         self._reason = str(message)
         self.status.setText(self._reason)
-        self.setToolTip(_SOURCE_TIP + (' ' + self._reason if self._reason else ''))
+        self._sync_tooltips()
         self.messageChanged.emit(self._reason)
+
+    def _sync_tooltips(self):
+        suffix = ' ' + self._availability_reason if self._availability_reason else ''
+        self.setToolTip(_SOURCE_TIP + suffix + (' ' + self._reason if self._reason else ''))
+        for control, purpose in self._purpose_tooltips.items():
+            if isinstance(control, FormRow):
+                control.set_purpose_tooltip(purpose + suffix)
+            else:
+                control.setToolTip(purpose + suffix)
 
     def selected_entries(self):
         entries = []
@@ -167,12 +183,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
 
     def set_available(self, available, reason=''):
         self.setEnabled(bool(available))
-        tip = _SOURCE_TIP + (' ' + str(reason) if reason else '')
-        self.setToolTip(tip + (' ' + self._reason if self._reason else ''))
-        for button, purpose in ((self.add_cif_btn, 'Add a structural CIF to the library.'),
-                                (self.add_lattice_btn, 'Enter a lattice and space group.'),
-                                (self.remove_btn, 'Remove this tool’s selected phase.')):
-            button.setToolTip(purpose + (' ' + str(reason) if reason else ''))
+        self._availability_reason = str(reason) if not available else ''
+        self._sync_tooltips()
 
     def set_details(self, details):
         self._details = dict(details)

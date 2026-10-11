@@ -293,6 +293,18 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             phase_min_intensity=float(self.phase_floor.editor.text()),
         )
 
+    def accept(self) -> None:
+        try:
+            self.edited_options()
+        except (TypeError, ValueError):
+            self.phase_floor.set_purpose_tooltip(
+                'Minimum intensity must be a finite number between 0 and 100 percent.'
+            )
+            self.phase_floor.editor.setFocus()
+            return
+        self._sync_phase_floor()
+        super().accept()
+
     def reject(self) -> None:
         self.reconcile(self._projection)
         super().reject()
