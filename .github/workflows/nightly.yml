@@ -8,8 +8,8 @@ on:
         description: "Teardown-crash diagnosis: also run tests/xdart WITHOUT the hard-exit wrapper, under gdb, and upload the native backtrace"
         type: boolean
         default: false
-      qt_deliver_deletes:
-        description: "QT-TEST-LIFECYCLE trial: deliver each test's own deleteLater() objects at its boundary (XDART_QT_DELIVER_DELETES=1)"
+      qt_keep_deletes:
+        description: "QT-TEST-LIFECYCLE opt-out: keep each test's deleteLater() objects instead of delivering them at its boundary (XDART_QT_DELIVER_DELETES=0)"
         type: boolean
         default: false
 
@@ -28,9 +28,9 @@ jobs:
     name: xdart-offscreen (${{ matrix.group }})
     strategy:
       fail-fast: false
-      # Same five bounded groups as pr.yml: the harness retains Qt objects to
-      # avoid unsafe DeferredDelete teardown, and one process over the whole
-      # tests/xdart tree grows that graph until theme repolishes time out.
+      # Same five bounded groups as pr.yml: windows that tests close without
+      # deleting stay alive, and one process over the whole tests/xdart tree
+      # grows that graph until theme repolishes time out.
       matrix:
         include:
           - group: execution-context
@@ -55,8 +55,8 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.group }}-session.json
           XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.group }}-settings.ini
-          # Empty (off) for scheduled runs; "1" only when dispatched with the trial input.
-          XDART_QT_DELIVER_DELETES: ${{ inputs.qt_deliver_deletes && '1' || '' }}
+          # Empty (the harness default: deliver) for scheduled runs; "0" only when dispatched with the opt-out.
+          XDART_QT_DELIVER_DELETES: ${{ inputs.qt_keep_deletes && '0' || '' }}
         # scripts/ci_pytest.py hard-exits with pytest's own verdict, skipping
         # the interpreter teardown where the deterministic offscreen segfault
         # (exit 139, post-summary) lives — see pr.yml for the full rationale.
