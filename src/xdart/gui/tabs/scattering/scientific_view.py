@@ -1179,7 +1179,10 @@ class ScientificView(QtWidgets.QFrame):
         if heavy is None or heavy.raw is None:
             self.raw_popup_image.clear_image_buffers()
             return
-        if heavy.detector_source != "full":
+        if heavy.detector_source != "full" and not self.raw_popup_image.render_matches(
+            heavy.raw, detector_shape=heavy.detector_shape,
+            color_map=state.color_map, log_scale=state.log_scale,
+        ):
             self.raw_popup_image.clear_image_buffers()
         self.raw_popup_image.render(
             heavy.raw, detector_shape=heavy.detector_shape,
