@@ -134,8 +134,9 @@ def test_a_vanishing_transmission_or_divisor_is_refused_with_its_factors_named()
 
 
 def test_rsm_delegates_its_foil_exposure_divisors_byte_for_byte_with_its_own_refusals() -> None:
-    """RSM's ``rsm_normalization_divisors`` is the shared function's: the same bytes as its former expression
-    (``exp(-(digits @ lengths)) * exposure``), its refusals as ``RSMOperationRefused`` with the same codes and
+    """RSM's ``rsm_normalization_divisors`` is the shared function's: the same bytes as the notebook's
+    transmission times the exposure (its former expression, ``exp(-(digits @ lengths)) * exposure``, adds the
+    terms in another order on x86 Linux), its refusals as ``RSMOperationRefused`` with the same codes and
     messages, and its policy-specific missing-metadata refusal kept."""
     from xrd_tools.analysis.module_transaction import MetadataColumnSelector
     from xrd_tools.analysis.rsm_operation import (
@@ -147,11 +148,9 @@ def test_rsm_delegates_its_foil_exposure_divisors_byte_for_byte_with_its_own_ref
                                     lengths)
     foil = np.array([0.0, 1101.0, 9999.0, 37.0])
     exposure = np.array([1.0, 2.0, 0.25, 3.0])
-    codes = foil.astype(np.int64)
-    digits = np.column_stack((codes // 1000, (codes // 100) % 10, (codes // 10) % 10, codes % 10))
-    former = np.exp(-(digits @ np.asarray(lengths, dtype=np.float64))) * exposure
+    notebook = foil_to_factor(foil, lengths) * exposure
     result = rsm_normalization_divisors(policy, 4, foil_status=foil, exposure_seconds=exposure)
-    assert result.tobytes() == former.tobytes() and not result.flags.writeable
+    assert result.tobytes() == notebook.tobytes() and not result.flags.writeable
     with pytest.raises(RSMOperationRefused) as refused:
         rsm_normalization_divisors(policy, 4, foil_status=np.array([0.0, 0.0, 0.0, 10000.0]),
                                    exposure_seconds=exposure)
