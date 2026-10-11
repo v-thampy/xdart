@@ -29,7 +29,7 @@ from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.corrections.frame_preparation import correction_image
 from xrd_tools.integrate import pyfai_numexpr
 from xrd_tools.integrate.frame_workers import parallel_frames
-from xrd_tools.integrate.detector_mask import mask_with_detector
+from xrd_tools.integrate.detector_mask import mask_with_detector, writable_for_pyfai
 from xrd_tools.integrate.calibration import poni_to_integrator
 from xrd_tools.integrate.gid import _nan_empty_1d
 from xrd_tools.integrate.stitch_gi import GI_CUTS, GI_UNITS
@@ -259,6 +259,7 @@ def _streaming_multigeometry(
     # noise, so with a dark the variance max(1, raw) + dark is passed explicitly.
     # admitted by Int's owners (corrections.frame_preparation, shared with the xrayutilities path and RSM)
     dark, dark_invalid = correction_image(dark, "dark")
+    dark = writable_for_pyfai(dark)  # it becomes detector.darkcurrent, which pyFAI checksums
     flat, flat_invalid = correction_image(flat, "flat", min_fraction=flat_min_fraction)
     invalid = (dark_invalid if flat_invalid is None else flat_invalid if dark_invalid is None
                else dark_invalid | flat_invalid)

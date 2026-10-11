@@ -27,6 +27,30 @@ def _ai():
                                wavelength=.729e-10)
 
 
+def test_a_read_only_dark_reaches_pyfai_as_a_writable_copy(monkeypatch):
+    """pyFAI checksums ``detector.darkcurrent`` with x86 SSE code that needs a writable buffer although it only
+    reads it (macOS arm64 accepts a read-only one), so a hash-bound read-only dark failed Stitch on Linux CI with
+    "buffer source array is read-only". This checksum refuses a read-only buffer as x86's does; the dark the
+    caller holds stays read-only and unchanged, and the result is the writable dark's."""
+    import pyFAI.detectors._common as detectors
+    real_crc32 = detectors.crc32
+
+    def x86_crc32(array):
+        if isinstance(array, np.ndarray) and not array.flags.writeable:
+            raise ValueError("buffer source array is read-only")
+        return real_crc32(array)
+
+    monkeypatch.setattr(detectors, "crc32", x86_crc32)
+    raw = np.random.default_rng(5).poisson(60, SHAPE).astype(float) + 20.
+    dark = np.full(SHAPE, 20.)
+    dark.setflags(write=False)
+    kwargs = dict(npt=24, radial_range=(0., 2.), method='full', normalization=[3.])
+    held, _, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), dark=dark, **kwargs)
+    copied, _, _ = stitch_1d_streaming([raw], 1, lambda: iter([_ai()]), dark=dark.copy(), **kwargs)
+    np.testing.assert_array_equal(held.intensity, copied.intensity)
+    assert not dark.flags.writeable and np.all(dark == 20.)
+
+
 def test_one_frame_matches_pyfai_with_dark_flat_polarization_and_poisson():
     from xrd_tools.integrate.detector_mask import mask_with_detector
     rng = np.random.default_rng(3)
