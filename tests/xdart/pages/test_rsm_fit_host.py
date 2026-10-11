@@ -1,4 +1,5 @@
 """The native page supplies admitted artifacts to the shared fit windows."""
+from pathlib import Path
 import time
 
 import numpy as np
@@ -19,6 +20,16 @@ def settle(page, qapp):
         time.sleep(.01)
     qapp.processEvents()
     assert not page.active()
+
+
+def catalog(page, qapp):
+    """Wait for the results folder's catalog, which the browser lists since 063fc88f."""
+    end = time.monotonic() + 30
+    while page._result_browser.busy and time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(.01)
+    qapp.processEvents()
+    assert not page._result_browser.busy
 
 
 def dispose(page, qapp):
@@ -73,11 +84,11 @@ def test_lineout_batch_is_lazy_project_scoped_and_keeps_scalar_rows(qapp, tmp_pa
     page = RSMPage(empty_host_services(_Status()))
     try:
         page._rows['project_root'].editor.setText(str(tmp_path))
-        (tmp_path/'one').mkdir()
-        (tmp_path/'two').mkdir()
-        first, second = payload(tmp_path/'one'), payload(tmp_path/'two')
+        # The results list shows one folder since 063fc88f, so both results share it.
+        first, second = payload(tmp_path, name='one.nexus'), payload(tmp_path, name='two.nexus')
         page._add_result(first.inspection.path, first, show=False)
         page._add_result(second.inspection.path, second)
+        catalog(page, qapp)
         page.tools.page_tool('lineout').click()
         settle(page, qapp)
         window = page._tool_windows['lineout']
@@ -96,7 +107,11 @@ def test_lineout_batch_is_lazy_project_scoped_and_keeps_scalar_rows(qapp, tmp_pa
         assert window.host.outcomes[0].overlay is None
         assert window.host.outcomes[-1].overlay is not None
         before = window.scope()
+        # A result leaving the listed folder changes the batch scope.
         page._listed.pop(0)
+        Path(first.inspection.path).unlink()
+        page._result_browser.refresh()
+        catalog(page, qapp)
         assert window.scope() != before
     finally:
         dispose(page, qapp)

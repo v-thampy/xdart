@@ -20,6 +20,21 @@ from tests.xdart.pages.test_stitch_page import _Status, _wait, qapp  # noqa: F40
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
+_ROLE = QtCore.Qt.ItemDataRole.UserRole
+
+
+def _listed(page, qapp):
+    """The listed results, once the folder's catalog is read (the list also holds its `..` row, 063fc88f)."""
+    _wait(page, qapp, catalog=True)
+    return list(page.browser.listed_results())
+
+
+def _show(page, path, flag=None):
+    """Select a listed result by identity, as a user would."""
+    row = next(row for row in range(page.results.count()) if page.results.item(row).data(_ROLE) == path)
+    page.results.setCurrentRow(row) if flag is None else page.results.setCurrentRow(row, flag)
+
+
 @pytest.fixture
 def no_recent(monkeypatch):
     from xdart.gui.tabs.stitch import page as module
@@ -29,31 +44,30 @@ def no_recent(monkeypatch):
 def test_only_the_shown_results_stay_in_memory_and_the_others_reload(qapp, tmp_path, no_recent):
     page = StitchPage(empty_host_services(_Status()))
     select = QtCore.QItemSelectionModel.SelectionFlag
-    role = QtCore.Qt.ItemDataRole.UserRole
     try:
         page.load_form(_native_form(tmp_path, "multigeometry"))  # three outputs
         _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        paths = [page.results.item(row).data(role) for row in range(page.results.count())]
+        paths = _listed(page, qapp)
         assert len(paths) == 3 and all(Path(path).is_file() for path in paths)
         # Single: the current result only (the last one stitched)
         assert set(page._payloads) == {paths[-1]}
-        page.results.setCurrentRow(0)
+        _show(page, paths[0])
         _wait(page, qapp)
         assert set(page._payloads) == {paths[0]} and page.frames.count() == 3
         # Overlay: the selected results
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
-        page.results.setCurrentRow(2, select.ClearAndSelect)
-        page.results.setCurrentRow(0, select.Select)
+        _show(page, paths[2], select.ClearAndSelect)
+        _show(page, paths[0], select.Select)
         _wait(page, qapp)
         assert set(page._payloads) == {paths[0], paths[2]}
         assert len(page.curve.listDataItems()) == 2
         # a result whose file is gone stays listed, with the reason, and holds nothing
         Path(paths[1]).unlink()
-        page.results.setCurrentRow(1, select.ClearAndSelect)
+        _show(page, paths[1], select.ClearAndSelect)
         _wait(page, qapp)
-        assert page.results.count() == 3 and paths[1] not in page._payloads
+        assert page.browser.listed_results() == tuple(paths) and paths[1] not in page._payloads
         status = page.run_bar.readinessLabel.full_text()
         assert Path(paths[1]).name in status and "No such file" in status, status
         assert not page.run_bar.readinessDot.property("ready")
@@ -73,7 +87,8 @@ def test_a_pin_survives_selecting_another_result(qapp, tmp_path):
         _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        assert page.results.count() == 3
+        paths = _listed(page, qapp)
+        assert len(paths) == 3
         command(ShellCommandKind.SET_PLOT_MODE, "Overlay")
         command(ShellCommandKind.SET_SLICE_ENABLED, True)
         # inside the map: χ Auto spans the frames' own χ (here about -157 to -80°), as Int 2D's
@@ -81,7 +96,7 @@ def test_a_pin_survives_selecting_another_result(qapp, tmp_path):
         command(ShellCommandKind.PIN_SLICE)
         (pinned,) = page._last_map_state.pinned_traces
         pinned_path = page.results.currentItem().data(QtCore.Qt.ItemDataRole.UserRole)
-        page.results.setCurrentRow(0, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        _show(page, paths[0], QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
         _wait(page, qapp)
         assert pinned_path in page._payloads and len(page._view.slice_pins) == 1
         (kept,) = page._last_map_state.pinned_traces
@@ -105,11 +120,13 @@ def test_the_chosen_gi_axis_survives_reading_a_result_back(qapp, tmp_path, no_re
             ("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE))
         page.load_form(replace(form, mode="2d", npt_rad_2d=48, npt_azim_2d=32,
                                source_selection=replace(form.source_selection, scans="1,2")))
+        _wait(page, qapp)  # Start waits for the SPEC source's readiness (71bb665a)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        assert page.results.count() == 2 and len(page._payloads) == 1
+        paths = _listed(page, qapp)
+        assert len(paths) == 2 and len(page._payloads) == 1
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "q_oop"))
-        page.results.setCurrentRow(0)
+        _show(page, paths[0])
         assert page._view.plot_axis == "q_oop"  # while it is read back
         _wait(page, qapp)
         assert page._view.plot_axis == "q_oop" and page._last_map_state.plot_axis == "q_oop"
@@ -130,24 +147,27 @@ def test_a_map_without_the_chosen_cut_shows_i_of_q_and_keeps_the_choice(qapp, tm
             ("q_ip", "q_oop"), incidence_motor="eta", tilt_motor="chi", sample_motors=_SAMPLE)),
             mode="2d", npt_rad_2d=48, npt_azim_2d=32)
         page.load_form(form)
+        _wait(page, qapp)  # Start waits for the SPEC source's readiness (71bb665a)
         page.run_bar.startButton.click()  # the GI Stitch 2D
         _wait(page, qapp)
         page.load_form(replace(form, gi=None, output_family="plain"))
+        _wait(page, qapp)
         page.run_bar.startButton.click()  # a plain Stitch 2D beside it
         _wait(page, qapp)
-        assert page.results.count() == 2
-        page.results.setCurrentRow(0)
+        paths = _listed(page, qapp)
+        assert len(paths) == 2
+        _show(page, paths[0])
         _wait(page, qapp)
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "q_oop"))
         gi_payload = page._current_payload()
         assert gi_payload.gi_map is not None and page._last_map_state.plot_axis == "q_oop"
-        page.results.setCurrentRow(1)
+        _show(page, paths[1])
         _wait(page, qapp)
         plain = page._current_payload()
         assert plain.gi_map is None and page._view.plot_axis == "q_oop"
         (trace,) = page._last_map_state.traces
         np.testing.assert_array_equal(trace.intensity, plain.profile.intensity)
-        page.results.setCurrentRow(0)
+        _show(page, paths[0])
         _wait(page, qapp)
         (trace,) = page._last_map_state.traces
         np.testing.assert_array_equal(trace.intensity, dict(page._current_payload().gi)["q_oop"].intensity)
@@ -160,20 +180,20 @@ def test_a_map_without_the_chosen_cut_shows_i_of_q_and_keeps_the_choice(qapp, tm
 def test_recently_shown_results_stay_within_the_budget_least_recent_first(qapp, tmp_path, monkeypatch):
     from xdart.gui.tabs.stitch import page as module
     page = StitchPage(empty_host_services(_Status()))
-    role = QtCore.Qt.ItemDataRole.UserRole
     try:
         page.load_form(_native_form(tmp_path, "multigeometry"))  # three outputs, each shown as it lands
+        _wait(page, qapp)  # Start waits for the SPEC source's readiness (71bb665a)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        paths = [page.results.item(row).data(role) for row in range(page.results.count())]
+        paths = _listed(page, qapp)
         assert set(page._payloads) == set(paths)  # all within the default budget: nothing to read back
-        page.results.setCurrentRow(0)
+        _show(page, paths[0])
         _wait(page, qapp)
         assert set(page._payloads) == set(paths) and page._reloading is None
         # a budget of one result keeps the shown one and the most recently shown other
         sizes = {path: page._payload_bytes[path] for path in paths}
         monkeypatch.setattr(module, "_RECENT_BYTES", max(sizes.values()))
-        page.results.setCurrentRow(1)
+        _show(page, paths[1])
         _wait(page, qapp)
         assert set(page._payloads) == {paths[1], paths[0]}  # paths[2] was shown least recently
         assert all(page._payload_bytes[path] == sizes[path] > 0 for path in page._payloads)

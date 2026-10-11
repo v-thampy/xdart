@@ -9,11 +9,12 @@ from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions, ShellC
 from xdart.gui.tabs.stitch.page import StitchPage
 from tests.xdart.pages.test_stitch_page import _Status, qapp  # noqa: F401
 
-#: A value each option takes, and one it refuses.
+#: A value each option takes, and one it refuses (coverage shading since 0df40f45).
 _TAKEN = {"waterfall_y_axis": "Time (s)", "waterfall_start": 3, "waterfall_stop": 9, "waterfall_step": 2,
-          "overlay_offset": 1.5, "show_legend": False, "intensity_scale": "Log"}
+          "overlay_offset": 1.5, "show_legend": False, "intensity_scale": "Log", "show_coverage_holes": True}
 _REFUSED = {"waterfall_y_axis": "", "waterfall_start": 0, "waterfall_stop": -1, "waterfall_step": 0,
-            "overlay_offset": float("nan"), "show_legend": 1, "intensity_scale": "Cube"}
+            "overlay_offset": float("nan"), "show_legend": 1, "intensity_scale": "Cube",
+            "show_coverage_holes": 1}
 
 
 def test_one_table_binds_every_plot_option_to_its_command():

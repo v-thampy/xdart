@@ -49,8 +49,9 @@ def test_int_tools_keep_their_existing_buttons_and_command_kind(qapp):
     commands = []
     shell.commandRequested.connect(commands.append)
     try:
+        # Plot Metadata left Int's tools column for the shared metadata popup (2fa82580).
         assert tuple(shell.tools._tool_buttons) == (
-            "peak_fitting", "phase_fitting", "plot_metadata", "roi_statistics",
+            "peak_fitting", "phase_fitting", "roi_statistics",
             "nexpy_selected", "silx_h5viewer")
         shell.tools._tool_buttons["peak_fitting"].click()
         assert commands == [ShellCommand(ShellCommandKind.LAUNCH_TOOL, "peak_fitting")]

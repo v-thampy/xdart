@@ -34,6 +34,7 @@ from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.shell_values import AxisProjection, ScientificProjection, TraceProjection
 from xrd_tools.analysis.display_fit_operations import DisplayedPeakFitResult, DisplayedPhaseFitResult
 from xrd_tools.analysis.scan_operations import AnalysisDisposition
+from xrd_tools.help_topics import diagnostic_text
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 
@@ -306,7 +307,8 @@ def test_held_controls_stay_held_through_a_fit(monkeypatch, qapp):
                                  (phase, (("texture_combo", "phase_texture"), ("batch_btn", "phase_batch")))):
             for name, reason in controls:
                 control = getattr(dialog, name)
-                assert not control.isEnabled() and control.toolTip() == mount.HELD_REASONS[reason]
+                # a held control explains its code through the shared guidance text (c47d4a9f)
+                assert not control.isEnabled() and control.toolTip() == diagnostic_text(mount.HELD_REASONS[reason])
         assert not peak.live_check.isChecked()
     finally:
         _close_page(page, qapp)

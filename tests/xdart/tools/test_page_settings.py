@@ -248,7 +248,9 @@ def test_stitch_keeps_its_settings_on_the_shared_owner(qapp):
     from xdart.gui.tabs.stitch.page import StitchPage
     from tests.xdart.pages.test_stitch_page import _Status
 
-    assert stitch.STITCH_SETTINGS == SettingsKind("xdart-stitch-settings", 1, "stitch_settings", "Stitch", ("gi",))
+    # The confirmed point-image section joined the document in adb2f15a.
+    assert stitch.STITCH_SETTINGS == SettingsKind("xdart-stitch-settings", 1, "stitch_settings", "Stitch",
+                                                  ("gi", "point_images"))
     for function in (stitch.validate_settings, stitch.dump_settings, stitch.load_settings):
         assert function.__self__ is stitch.STITCH_SETTINGS
     page = StitchPage(empty_host_services(_Status()))

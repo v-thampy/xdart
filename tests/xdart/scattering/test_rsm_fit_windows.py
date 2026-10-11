@@ -24,7 +24,7 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def payload(tmp_path, shape=(13, 15, 17)):
+def payload(tmp_path, shape=(13, 15, 17), name='region.nexus'):
     axes = tuple((name, np.linspace(-2, 2, count)) for name, count in zip(('h', 'k', 'l'), shape))
     xyz = np.meshgrid(*(axis for _, axis in axes), indexing='ij')
     data = 3 + .1*xyz[0] - .2*xyz[1] + .05*xyz[2]
@@ -35,7 +35,7 @@ def payload(tmp_path, shape=(13, 15, 17)):
         sigma=None, coverage=None, normalization=None)
     request_id = _digest('fit-window-request')
     attestation = _rsm_execution_attestation(request_id, projection.result_fingerprint)
-    request = AnalysisArtifactRequest(tmp_path/'region.nexus', AnalysisArtifactKind.RSM,
+    request = AnalysisArtifactRequest(tmp_path/name, AnalysisArtifactKind.RSM,
         AnalysisArtifactOverwrite.CREATE_NEW, request_id, _digest('source'), _digest('plan'),
         _digest('provenance'), {'schema_version': 'rsm-operation-v2-intent'},
         schema_version=ANALYSIS_SCHEMA_VERSION_V2, execution_attestation=attestation,

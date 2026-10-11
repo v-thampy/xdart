@@ -478,7 +478,9 @@ def test_live_thumbnail_carrier_is_exact_complete_and_snapshot_ordered(
     owner = run.display.add_artifact(target, "live", mask=None, mask_saturation=False, measurement_mode="Standard")
     policy, layout, rows, ceiling, _ = dynamic_output._light_policy_layout(
         RunIntent(max_cores=1).freeze(), plan,
-        SimpleNamespace(descriptor=None, source_stamp=SimpleNamespace(frame_count=1)),
+        # the source's options are read for point images since 40ff9574
+        SimpleNamespace(descriptor=None, source_stamp=SimpleNamespace(frame_count=1),
+                        source_spec=SimpleNamespace(options={})),
         scan, (1,),
     )
     lease = dynamic_output.acquire_light_1d_retention(dynamic_output.SessionResourceAuthority.from_allocation(policy.allocation), owner="scattering-light-1d:perf-c5", generation=1, layout=layout, requested_rows=rows, compatibility_byte_ceiling=ceiling, gui_thread_id=run.gui_thread_id, funding_mode=dynamic_output.Light1DFundingMode.REPLACE_PUBLICATION_A1, current_lineage_rows=1)
