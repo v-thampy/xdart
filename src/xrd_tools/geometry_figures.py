@@ -1051,8 +1051,13 @@ def diagnose_calibration_frames(frames, record, *, del_motor='del', nu_motor='nu
 
 def display_arcs(points, theta, shape, factor):
     """Contiguous cone intersections, clipped at native pixel-centre bounds."""
-    chi = np.linspace(-math.pi, math.pi, 16385)
-    xy = points(theta, chi)
+    yield from _display_path(lambda chi: points(theta, chi),
+                            np.linspace(-math.pi, math.pi, 16385), shape, factor)
+
+
+def _display_path(sample, parameter, shape, factor):
+    """Clip and resample a ray parameter without joining disconnected branches."""
+    xy = sample(parameter)
     upper = np.asarray(shape)[::-1]-1
     def inside(values):
         return np.isfinite(values).all(axis=1) & (values >= 0).all(axis=1) & (values <= upper).all(axis=1)
@@ -1061,13 +1066,13 @@ def display_arcs(points, theta, shape, factor):
     for start, end in zip(np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)):
         if end-start < 2:
             continue
-        lo, hi = chi[start], chi[end-1]
+        lo, hi = parameter[start], parameter[end-1]
         # Refine each observed boundary; no pole/off-detector segment is bridged.
-        for valid, invalid, side in ((lo, chi[max(start-1, 0)], 0),
-                                     (hi, chi[min(end, len(chi)-1)], 1)):
+        for valid, invalid, side in ((lo, parameter[max(start-1, 0)], 0),
+                                     (hi, parameter[min(end, len(parameter)-1)], 1)):
             for _ in range(24):
                 mid = (valid+invalid)/2
-                if inside(points(theta, np.array([mid])))[0]:
+                if inside(sample(np.array([mid])))[0]:
                     valid = mid
                 else:
                     invalid = mid
@@ -1075,15 +1080,130 @@ def display_arcs(points, theta, shape, factor):
                 lo = valid
             else:
                 hi = valid
-        arc_chi = np.r_[lo, chi[start:end], hi]
-        arc = points(theta, arc_chi)
+        arc_parameter = np.r_[lo, parameter[start:end], hi]
+        arc = sample(arc_parameter)
         length = np.r_[0., np.cumsum(np.linalg.norm(np.diff(arc, axis=0), axis=1))]
         count = max(2, int(math.ceil(length[-1]/(.4*factor)))+1)
-        sampled = np.interp(np.linspace(0., length[-1], count), length, arc_chi)
-        yield points(theta, sampled)
+        sampled = np.interp(np.linspace(0., length[-1], count), length, arc_parameter)
+        yield sample(sampled)
 
 
 _display_arcs = display_arcs
+
+
+def detector_grid_unavailable(snapshot, shape):
+    """Coordinate-grid capability from the current Run's exported facts only."""
+    reason = detector_ring_unavailable(snapshot, shape)
+    if reason:
+        return reason
+    if snapshot.get('domain') != 'Standard':
+        return 'GI cake χ uses the sample basis; detector-frame χ cannot label that cake.'
+    if snapshot.get('chiDiscAtPi') is not True:
+        return 'Coordinate grids require the Run integrator’s χ discontinuity at π.'
+    return ''
+
+
+def _detector_angle_extrema(ai, shape):
+    """Bounded extrema of cos(2θ) on a physical flat detector rectangle."""
+    rows, cols = shape
+    corners = np.array(((0.,0.),(cols-1.,0.),(cols-1.,rows-1.),(0.,rows-1.)))
+    physical = np.array(ai.calc_pos_zyx(d1=corners[:,1], d2=corners[:,0])).T
+    candidates = list(corners)
+    for i in range(4):
+        a = physical[i]; b = physical[(i+1)%4]-a
+        alpha, beta = a[0], b[0]
+        gamma, delta, epsilon = a@a, a@b, b@b
+        denominator = alpha*epsilon-beta*delta
+        if denominator != 0:
+            t = (beta*gamma-alpha*delta)/denominator
+            if 0 < t < 1:
+                candidates.append(corners[i]+t*(corners[(i+1)%4]-corners[i]))
+    beam = cone_plane(ai)(0., 0.)[0]
+    if np.isfinite(beam).all() and (beam >= 0).all() and (beam <= np.array((cols-1,rows-1))).all():
+        candidates.append(beam)
+    candidates = np.asarray(candidates)
+    angles = ai.tth(candidates[:,1], candidates[:,0])
+    return float(np.min(angles)), float(np.max(angles))
+
+
+def _nice_q_levels(lo, hi):
+    if not math.isfinite(lo+hi) or hi <= lo:
+        return ()
+    power = math.floor(math.log10((hi-lo)/10))
+    choices = []
+    for exponent in (power-1,power,power+1):
+        for multiple in (1.,2.,2.5,5.):
+            step = multiple*10**exponent
+            start, stop = max(1,math.ceil(lo/step)), math.floor(hi/step)
+            count = max(0,stop-start+1)
+            choices.append((abs(count-10), step, start, stop))
+    _, step, start, stop = min(choices)
+    return tuple(i*step for i in range(start,stop+1))
+
+
+def predict_detector_grid(snapshot, *, shape, choice='q + χ', mode='2d', step_px=2., q_levels=None):
+    """Analytic Standard-detector q contours and positive χ half-rays.
+
+    Returned curves/text are read-only plain data. No source, image, integrator
+    or detector-sized map is retained. Labels use the selected plan's offset.
+    """
+    import json
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.core.geometry.diffractometer import DetectorCalibration
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    reason = detector_grid_unavailable(snapshot, shape)
+    if reason:
+        raise ValueError(reason)
+    if choice not in ('Off','q','χ','q + χ') or mode not in ('1d','2d'):
+        raise ValueError('unsupported coordinate grid choice or plan dimension')
+    if not math.isfinite(step_px) or step_px <= 0:
+        raise ValueError('grid sampling step must be positive and finite')
+    cal = DetectorCalibration(PONI.from_dict(snapshot), json.loads(snapshot['detector_config_json']),
+                              parallax=snapshot.get('parallax'))
+    ai = detector_calibration_to_integrator(cal)
+    points = cone_plane(ai)
+    wavelength = ai.wavelength*1e10
+    minimum, maximum = _detector_angle_extrema(ai, shape)
+    qmin, qmax = 4*math.pi*np.sin(np.array((minimum,maximum))/2)/wavelength
+    levels = _nice_q_levels(qmin,qmax) if q_levels is None else tuple(q_levels)
+    if any(not math.isfinite(q) or not 0 < q <= 4*math.pi/wavelength for q in levels):
+        raise ValueError('q levels must be positive and physically reachable at this wavelength')
+    curves, texts, anchors = [], [], []
+    upper = np.asarray(shape)[::-1]-1
+    def append(name, arcs, tip, theta=None):
+        family = []
+        for i, arc in enumerate(arcs,1):
+            label = f'{name}, arc {i}' if name.startswith('q ') else f'{name} arc {i}'
+            curve = Curve(label, arc, 'predicted', tip, theta)
+            curves.append(curve); family.append(curve)
+        for curve in family:
+            for anchor in (curve.xy[0],curve.xy[-1]):
+                if np.min(np.r_[np.abs(anchor),np.abs(anchor-upper)]) > 1e-6:
+                    continue
+                if any(np.linalg.norm(anchor-old) < 28 for old in anchors):
+                    continue
+                texts.append(Text(name,tuple(anchor),name,tip)); anchors.append(anchor)
+                return
+    if choice in ('q','q + χ'):
+        for q in levels:
+            theta = 2*math.asin(q*wavelength/(4*math.pi))
+            append(f'q {q:g}', display_arcs(points,theta,shape,step_px/.4),
+                   f'q {q:g} Å⁻¹; detector-frame coordinate at this frame’s Run wavelength. Display only.',
+                   math.degrees(theta))
+    if choice in ('χ','q + χ'):
+        offset = float(snapshot.get('azimuth_offset_'+mode,0.))
+        # At the beam/antipode χ is undefined. Stay outside the floating-point
+        # cancellation neighbourhood as well as the exact singular point.
+        beam_epsilon = float(np.cbrt(np.finfo(float).eps))
+        for level in np.arange(math.ceil((-180+offset)/30)*30,180+offset,30.):
+            native = math.radians(level-offset)
+            arcs = _display_path(lambda theta: points(theta,native),
+                                 np.linspace(beam_epsilon,math.pi-beam_epsilon,16385),shape,step_px/.4)
+            append(f'χ {level:g}',arcs,
+                   f'χ {level:g}° in the Run’s {mode} plan; native χ {level-offset:g}°. Display only.')
+    return Figure('Detector coordinate grid','Stored column','Stored row','px',
+                  'Standard detector-frame coordinates; labels include the effective plan offset.',
+                  curves=tuple(curves),texts=tuple(texts))
 
 
 RUN_RING_REASON = ("Predicted rings are drawn only on a Run's frames while that Run is shown. "

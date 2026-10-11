@@ -1428,7 +1428,6 @@ class StandardRunExecutor:
                                        else item.descriptor.wavelength),
                 metadata_energy_eV=source_metadata_energy_eV(run.source))
             integrator = run.scan.integrator
-            ring_geometry = effective_ring_geometry(calibration, integrator=integrator)
             poni = run.scan.poni
             if calibration.parallax is not None:
                 extra = dict(getattr(run.scan, "extra", None) or {})
@@ -1487,6 +1486,7 @@ class StandardRunExecutor:
             flat=None if assets is None else assets.flat,
             dark=None if assets is None else assets.dark,
         )
+        ring_geometry = effective_ring_geometry(calibration, integrator=integrator, plan=plan)
         run.point_plan = plan if isinstance(run.source, PointImageSource) else None
         try:
             npt = int(configuration.bai_1d_args.get("npt", 0))

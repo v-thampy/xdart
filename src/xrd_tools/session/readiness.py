@@ -1077,7 +1077,7 @@ class EnergyScanRefused(ValueError):
     """
 
 
-def effective_ring_geometry(calibration, *, integrator):
+def effective_ring_geometry(calibration, *, integrator, plan=None):
     """One immutable, transient snapshot of geometry already bound for Run.
 
     Construct once, before publication. JSON owns the nested detector config;
@@ -1095,6 +1095,10 @@ def effective_ring_geometry(calibration, *, integrator):
         'is_flat': bool(detector.IS_FLAT),
         'uniform_pixel': bool(detector.uniform_pixel),
         'has_spline': detector.spline is not None,
+        'domain': 'Grazing' if plan is not None and plan.gi is not None else 'Standard',
+        'chiDiscAtPi': bool(integrator.chiDiscAtPi),
+        'azimuth_offset_1d': float(getattr(getattr(plan, 'integration_1d', None), 'azimuth_offset', 0.)),
+        'azimuth_offset_2d': float(getattr(getattr(plan, 'integration_2d', None), 'azimuth_offset', 0.)),
     })
 
 
