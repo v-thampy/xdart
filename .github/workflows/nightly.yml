@@ -8,6 +8,10 @@ on:
         description: "Teardown-crash diagnosis: also run tests/xdart WITHOUT the hard-exit wrapper, under gdb, and upload the native backtrace"
         type: boolean
         default: false
+      qt_deliver_deletes:
+        description: "QT-TEST-LIFECYCLE trial: deliver each test's own deleteLater() objects at its boundary (XDART_QT_DELIVER_DELETES=1)"
+        type: boolean
+        default: false
 
 jobs:
   core:
@@ -51,6 +55,8 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.group }}-session.json
           XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.group }}-settings.ini
+          # Empty (off) for scheduled runs; "1" only when dispatched with the trial input.
+          XDART_QT_DELIVER_DELETES: ${{ inputs.qt_deliver_deletes && '1' || '' }}
         # scripts/ci_pytest.py hard-exits with pytest's own verdict, skipping
         # the interpreter teardown where the deterministic offscreen segfault
         # (exit 139, post-summary) lives — see pr.yml for the full rationale.

@@ -88,6 +88,21 @@ class QtTestHarness:
             QtCore.QEventLoop.ProcessEventsFlag.AllEvents,
         )
 
+    def deliver_deferred_deletes(self) -> None:
+        """Delete the objects this test scheduled with ``deleteLater()``.
+
+        Qt delivers a deletion posted outside any event loop only when a later
+        nested loop runs, so without this one process keeps every such object
+        until some test destroys the whole backlog at once (QT-TEST-LIFECYCLE).
+        Called at each test boundary under the ``XDART_QT_DELIVER_DELETES``
+        trial switch, the backlog never exceeds one test's objects.
+        """
+
+        self.assert_main_thread()
+        QtCore.QCoreApplication.sendPostedEvents(
+            None, QtCore.QEvent.Type.DeferredDelete,
+        )
+
     def collect(self) -> int:
         """Collect Python cycles on the QApplication's owning thread."""
 

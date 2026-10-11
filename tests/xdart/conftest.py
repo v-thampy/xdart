@@ -68,6 +68,11 @@ def _qt_test_boundary(_xdart_qt_harness, request):
     started = time.perf_counter()
     yield
     _xdart_qt_harness.retire_new_top_levels(baseline)
+    if os.environ.get("XDART_QT_DELIVER_DELETES") == "1":
+        # QT-TEST-LIFECYCLE remedy trial (maintainer, 2026-10-10): delete what
+        # this test scheduled with deleteLater() now, so no later test inherits
+        # a backlog.  Off by default until a Linux nightly has run with it.
+        _xdart_qt_harness.deliver_deferred_deletes()
     _xdart_qt_harness.collect()
     census = os.environ.get("XDART_QT_CENSUS")
     if census:
@@ -146,10 +151,13 @@ def _qt_session_teardown(_xdart_qt_harness):
 # object graph fall through normal interpreter finalization has historically
 # caused a long O(N^2) shutdown or a native crash.
 #
-# We CANNOT reduce N by reaping per test: a ``sendPostedEvents(DeferredDelete)``
-# drain is banned (it segfaulted linux CI mid-run -- see _qt_session_teardown),
-# and a blind ``shiboken6.delete`` of the parentless popup graph double-frees
-# (verified: SIGSEGV).  So we do what scripts/ci_pytest.py already does on linux
+# A session-end ``sendPostedEvents(DeferredDelete)`` drain of the whole backlog
+# is banned (it segfaulted linux CI mid-run -- see _qt_session_teardown), and a
+# blind ``shiboken6.delete`` of the parentless popup graph double-frees
+# (verified: SIGSEGV).  Delivering each test's own deletions at its boundary,
+# which keeps N to one test's objects, is on trial behind
+# XDART_QT_DELIVER_DELETES=1 (QT-TEST-LIFECYCLE, maintainer 2026-10-10) until a
+# Linux nightly has run with it.  Either way we do what scripts/ci_pytest.py already does on linux
 # CI (and what pyqtgraph's ``pg.exit()`` does): once pytest has finished — the
 # terminal summary printed and any JUnit XML written in pytest_sessionfinish —
 # hard-exit with pytest's own verdict, skipping the Py_Finalize object-graph
