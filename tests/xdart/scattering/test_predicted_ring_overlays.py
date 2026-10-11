@@ -92,6 +92,7 @@ def select(qapp, page, key):
         qapp.processEvents(); page._refresh_shell()
         payload = controller.project(key)
         if payload is not None and payload.view.thumbnail is not None:
+            page._refresh_shell(); qapp.processEvents()
             return payload
         time.sleep(.01)
     raise AssertionError('selected frame did not settle')
