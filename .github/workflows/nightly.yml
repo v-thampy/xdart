@@ -28,9 +28,12 @@ jobs:
     name: xdart-offscreen (${{ matrix.group }})
     strategy:
       fail-fast: false
-      # Same five bounded groups as pr.yml: windows that tests close without
+      # Same six bounded groups as pr.yml: windows that tests close without
       # deleting stay alive, and one process over the whole tests/xdart tree
-      # grows that graph until theme repolishes time out.
+      # grows that graph until theme repolishes time out. The files that
+      # change the application's theme or font restyle every live widget, so
+      # they run in their own process (inside the application group they took
+      # 9,572 s of its 10,360 s locally; alone, about 4 s).
       matrix:
         include:
           - group: execution-context
@@ -42,7 +45,18 @@ jobs:
           - group: scattering-other
             tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py
           - group: application
-            tests: tests/xdart --ignore=tests/xdart/scattering
+            tests: >-
+              tests/xdart --ignore=tests/xdart/scattering
+              --ignore=tests/xdart/test_app_appearance_options.py
+              --ignore=tests/xdart/test_app_font_scaling.py
+              --ignore=tests/xdart/test_text_selection_contrast.py
+              --ignore=tests/xdart/pages/test_synthetic_page_host.py
+          - group: appearance
+            tests: >-
+              tests/xdart/test_app_appearance_options.py
+              tests/xdart/test_app_font_scaling.py
+              tests/xdart/test_text_selection_contrast.py
+              tests/xdart/pages/test_synthetic_page_host.py
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

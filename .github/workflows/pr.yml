@@ -110,7 +110,9 @@ jobs:
       fail-fast: false
       # Windows that tests close without deleting stay alive. Bound that graph
       # per process: application-wide theme changes otherwise repolish
-      # thousands of widgets left by unrelated tests.
+      # thousands of widgets left by unrelated tests. The files that change
+      # the application's theme or font run in their own group (nightly.yml
+      # has the measurement).
       matrix:
         include:
           - group: execution-context
@@ -122,7 +124,18 @@ jobs:
           - group: scattering-other
             tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py
           - group: application
-            tests: tests/xdart --ignore=tests/xdart/scattering
+            tests: >-
+              tests/xdart --ignore=tests/xdart/scattering
+              --ignore=tests/xdart/test_app_appearance_options.py
+              --ignore=tests/xdart/test_app_font_scaling.py
+              --ignore=tests/xdart/test_text_selection_contrast.py
+              --ignore=tests/xdart/pages/test_synthetic_page_host.py
+          - group: appearance
+            tests: >-
+              tests/xdart/test_app_appearance_options.py
+              tests/xdart/test_app_font_scaling.py
+              tests/xdart/test_text_selection_contrast.py
+              tests/xdart/pages/test_synthetic_page_host.py
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
