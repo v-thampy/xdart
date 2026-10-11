@@ -266,8 +266,12 @@ def test_phase_lines_on_q_and_2theta_axes_in_int_and_stitch(qapp, tmp_path):
     with run_page(qapp, tmp_path/'scan', energies=(16, 17)) as (page, view):
         _phase_section(view); _edit(qapp, view, (entry,))
         _command(page, ShellCommandKind.SET_PLOT_MODE, 'Overlay')
-        for key in page._context_controller.frame_keys:
+        controller = page._context_controller
+        keys = tuple(controller.frame_keys)
+        for key in keys:
             select(qapp, page, key)
+        assert controller.select_navigation(keys[-1], keys)
+        page._refresh_shell(); qapp.processEvents()
         _command(page, ShellCommandKind.SET_PLOT_AXIS, '2theta'); _settle(qapp, view)
         assert not _markers(view, entry)
         assert 'ener' in view.phase_families[entry.id].reason.lower()
@@ -301,7 +305,12 @@ def test_phase_rings_on_ints_detector_image_follow_p3a(qapp, tmp_path, monkeypat
                 PONI.from_dict(snapshot), json.loads(snapshot['detector_config_json']),
                 parallax=snapshot.get('parallax')))
             structure = Structure.from_str(entry.cif_bytes.decode('utf-8'), fmt='cif')
-            pattern = XRDCalculator(wavelength=ai.wavelength*1e10).get_pattern(structure)
+            # Independent upstream angle map bounds the reachable listing.
+            # Normalize only within this range, as the maintainer requires.
+            angles = np.rad2deg(ai.center_array(ai.detector.shape, unit='2th_rad', scale=False))
+            bounds = (float(angles.min()), float(angles.max()))
+            pattern = XRDCalculator(wavelength=ai.wavelength*1e10).get_pattern(
+                structure, two_theta_range=bounds)
             expected_arcs = []
             for theta, intensity in zip(pattern.x, pattern.y):
                 if intensity >= 5.:
