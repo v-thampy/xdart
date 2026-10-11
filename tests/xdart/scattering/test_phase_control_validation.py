@@ -144,3 +144,37 @@ def test_the_int_workspace_starts_without_importing_pymatgen(tmp_path):
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
                           cwd=root, timeout=300)
     assert proc.stdout.strip().splitlines()[-1:] == ["clean"], (proc.stdout, proc.stderr[-2000:])
+
+
+def test_okay_and_cancel_stay_the_last_plot_options_row(qapp):
+    """Reference phases and every host row are built above the dialog's buttons."""
+    dialog = PlotOptionsDialog()
+    try:
+        dialog.add_choice("Host choice", ("a", "b"), "a", tooltip="A host's own choice.")
+        dialog.mount_display_scale(QtWidgets.QWidget())
+        layout = dialog.layout()
+        last = layout.itemAt(layout.count() - 1).layout()
+        assert last is not None and last.indexOf(dialog.accept_button) >= 0, "Okay/Cancel must stay last"
+        phases = next(group for group in dialog.findChildren(QtWidgets.QGroupBox)
+                      if group.title() == "Reference phases")
+        assert layout.indexOf(phases) < layout.count() - 1
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qapp.processEvents()
+
+
+def test_each_phase_legend_entry_explains_its_family(qapp, tmp_path, monkeypatch):
+    """The visible legend sample and label carry the family's tooltip, not only a hidden proxy."""
+    from tests.xdart.scattering.test_predicted_ring_overlays import run_page
+    from tests.xdart.scattering.test_phase_reference_overlays import _edit, _entries
+    monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
+    with run_page(qapp, tmp_path / "legend", energies=(16, 16)) as (_page, view):
+        entry, = _entries(tmp_path)
+        _edit(qapp, view, (entry,))
+        shown = [(sample, label) for sample, label in view.curve.getPlotItem().legend.items
+                 if label.text == entry.name]
+        assert shown, "the phase must have a legend entry"
+        for sample, label in shown:
+            for item in (sample, label):
+                assert entry.name in item.toolTip() and "omitted" in item.toolTip().lower(), item.toolTip()
