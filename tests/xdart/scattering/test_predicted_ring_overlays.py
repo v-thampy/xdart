@@ -58,6 +58,7 @@ def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, sourc
         while time.monotonic()<until and controller.browse_pending:
             qapp.processEvents(); time.sleep(.01)
         controller.adopt_acquisition(terminal[-1].run_identity)
+        controller.select_acquisition()
         page._refresh_shell(); qapp.processEvents()
         yield page, shell.scientific
     finally:
