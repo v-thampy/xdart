@@ -1,5 +1,4 @@
 """Real shared-source fitting retains plain identities and existing CIF recipes."""
-from pathlib import Path
 import time
 
 import numpy as np
@@ -46,7 +45,7 @@ def test_library_cif_input_key_and_notebook_keep_the_existing_path_recipe(qapp, 
         assert FitInputKey('same', '', '', 1, settings=plain_settings(values)).settings
         settings = dialog.export_actions.settings()
         entry = dialog.phase_source.selected_entries()[0]
-        assert settings['cif_paths'] == (entry.cif_path,)
+        assert settings['cif_paths'] == (str(entry.cif_path),)
         assert settings['phase_names'] == (entry.name,)
         assert settings['expected_hashes'] == (entry.id,)
         assert 'phase_entries' not in settings
@@ -109,6 +108,7 @@ def test_shared_host_fits_actual_lattice_entries_with_plain_input_keys(qapp, tmp
             time.sleep(.005)
         assert host.outcomes, host.dialog.status.text()
         result = host.outcomes[0].result
+        assert result is not None, host.outcomes[0].message
         assert result.code == 'OK', result.diagnostics
         assert result.phase_fractions_reason
         assert not any(name.startswith('frac_') for name in host.outcomes[0].params)
