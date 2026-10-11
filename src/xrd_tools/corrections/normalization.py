@@ -208,7 +208,12 @@ def _transmission(codes: np.ndarray, absorption_lengths) -> np.ndarray:
     # the code's four decimal digits, thousands first, each its foil's multiplicity
     digits = np.column_stack(
         (codes // 1000, (codes // 100) % 10, (codes // 10) % 10, codes % 10))
-    return np.exp(-(digits @ np.asarray(absorption_lengths, dtype=np.float64)))
+    # one code at a time, as the notebook's foil_to_factor: a matrix product adds the four
+    # terms in another order on x86 Linux, one bit off in the exponent
+    lengths = np.asarray(absorption_lengths, dtype=np.float64)
+    unique, frame_row = np.unique(digits, axis=0, return_inverse=True)
+    per_code = np.array([np.exp(-np.dot(lengths, row)) for row in unique], dtype=np.float64)
+    return per_code[frame_row.reshape(-1)]
 
 
 def _absorption_lengths(value) -> np.ndarray:

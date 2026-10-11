@@ -27,6 +27,7 @@ from xrd_tools.analysis.stitch_operation import (
 )
 from xrd_tools.core.scan import ScanFrame
 from xrd_tools.sources import MemoryFrameSource
+from tests.core.test_beam_normalization import foil_to_factor
 
 LENGTHS = (1.06, 3.04, 4.65, 9.5)
 CHOICES = ("none", "monitor", "foil-transmission-exposure", "monitor-foil-transmission")
@@ -34,9 +35,7 @@ CHOICES = ("none", "monitor", "foil-transmission-exposure", "monitor-foil-transm
 
 def _transmission(codes) -> np.ndarray:
     """The notebook's ``foil_to_factor`` (bit for bit, ``test_beam_normalization``)."""
-    codes = np.asarray(codes, dtype=np.int64)
-    digits = np.column_stack((codes // 1000, (codes // 100) % 10, (codes // 10) % 10, codes % 10))
-    return np.exp(-(digits @ np.asarray(LENGTHS, dtype=np.float64)))
+    return foil_to_factor(np.asarray(codes, dtype=np.float64), LENGTHS)
 
 
 def _divisors(choice, monitor, foil, seconds) -> np.ndarray:
