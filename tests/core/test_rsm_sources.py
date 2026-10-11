@@ -99,9 +99,10 @@ def test_a_psic_role_mapped_to_a_column_the_scan_lacks_is_named(tmp_path):
 def test_an_explicit_nexus_selection_is_a_nexus_member_since_c5c():
     """C5c: a raw NeXus stack is an RSM member (its path, kind and entry), where C5b refused it. A detector-only Eiger
     master is not one (maintainer, October 9: "an eiger master file by itself is a valid source only for Int ... in
-    stitch/rsm, the eiger file should be accompanied by the metadata source - nexus/spec"). Since 870ed9e8 a real
-    burst master (one trigger, 1000 images) first asks to group its images; the metadata check that follows refuses
-    it (MISSING_REQUIRED_METADATA in Stitch). That detour is ledgered (PROCESSING-ENERGY-BATCH-20261010)."""
+    stitch/rsm, the eiger file should be accompanied by the metadata source - nexus/spec"). A real burst master (one
+    trigger, 1000 images) is refused, naming its metadata source, instead of first asking to group its images
+    (PRE-P3-BATCH-20261010; maintainer, October 10: "A bare Eiger master will never be the only source in RSM and
+    stitching")."""
     from xrd_tools.analysis.rsm_values import RSMNexusMemberForm
     from xrd_tools.sources.point_images import PointImagesRequired
     root = Path(os.environ.get("XDART_TEST_DATA", "")) / "nexus"
@@ -109,8 +110,9 @@ def test_an_explicit_nexus_selection_is_a_nexus_member_since_c5c():
     container = root / "bluesky_17_2_00090.nxs"
     if not masters or not container.is_file():
         pytest.skip("no NeXus master file or Bluesky container in XDART_TEST_DATA")
-    with pytest.raises(PointImagesRequired):
+    with pytest.raises(ValueError, match="metadata source") as error:
         _groups(StitchSourceSelection("NeXus", (str(masters[0]),)))
+    assert not isinstance(error.value, PointImagesRequired)
     groups, _skipped = _groups(StitchSourceSelection("NeXus", (str(container),)))
     members = [member for group in groups for member in group]
     assert members and all(type(member) is RSMNexusMemberForm for member in members)

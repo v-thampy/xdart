@@ -220,6 +220,10 @@ def test_page_does_not_acknowledge_failed_executor_close(
         def drain_events(self):
             return ()
 
+    # Since a53c324e Run refuses a missing PONI before it starts, so the row gives Run a real PONI and image.
+    from tests.xdart.scattering._e2sd_support import write_poni
+    tifffile.imwrite(tmp_path / "raw_0001.tif", np.zeros((195, 487), dtype=np.uint16), photometric="minisblack")
+    write_poni(tmp_path / "calibration.poni")
     source = image_series_spec(tmp_path / "raw_0001.tif")
     lifecycle = ScatteringCoordinator()
     executor = FailingCloseExecutor()

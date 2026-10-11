@@ -4719,6 +4719,9 @@ def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
         "xdart/gui/tabs/scattering/page.py",
         "xdart/gui/tabs/scattering/processed_browser.py",
         "xdart/gui/tabs/scattering/workspace_operations.py",
+        # Since 947d93fb a confirmed calibration replacement is saved through
+        # replace_into_place.
+        "xrd_tools/integrate/stitch_calibration.py",
         "xrd_tools/io/append.py",
         "xrd_tools/io/finite_artifact.py",
         "xrd_tools/io/record_writer.py",
@@ -4752,6 +4755,9 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
         "get_output_transaction_coordinator",
     )
     allowed = {
+        # Since 947d93fb a confirmed calibration replacement is saved through
+        # replace_into_place.
+        "xrd_tools/integrate/stitch_calibration.py",
         "xrd_tools/io/__init__.py",
         "xrd_tools/io/analysis_artifact.py",
         "xrd_tools/io/append.py",
