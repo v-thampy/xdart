@@ -47,7 +47,7 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog, _stable_revision
 from .results_notebook import results_notebook_text
-from xrd_tools.session.readiness import Tool, tool_from_mode_text
+from xrd_tools.session.readiness import EnergyScanRefused, Tool, tool_from_mode_text
 from xrd_tools.session.display_logic import xye_prefix_for_unit
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
@@ -1926,9 +1926,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._apply_authored_asset_transition(transition)
         self._notice(f"Making {os.path.basename(request.final_path)}…")
 
-    def _authoring_error(self, title: str, detail: str) -> None:
-        _LOG.warning("%s: %s", title, detail)
-        self._notice(f"{title}: {detail}")
+    def _open_warning(self, title: str, detail: str) -> None:
+        """The page's warning notification: a window-modal box titled *title* showing *detail*."""
         if self._closing or self._closed:
             return
         dialog = QtWidgets.QMessageBox(
@@ -1938,6 +1937,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         dialog.setInformativeText(detail)
         dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dialog.open()
+
+    def _authoring_error(self, title: str, detail: str) -> None:
+        _LOG.warning("%s: %s", title, detail)
+        self._notice(f"{title}: {detail}")
+        if self._closing or self._closed:
+            return
+        self._open_warning(title, detail)
         self._refresh_shell(preserve_display=True, preserve_scientific=True)
 
     def _apply_authored_asset_transition(
@@ -3985,14 +3991,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             elif result.append_refused:
                 self._confirm_append_overwrite(result)
             else:
-                dialog = QtWidgets.QMessageBox(
-                    QtWidgets.QMessageBox.Icon.Warning,
-                    "Run not started", "Run not started",
-                    QtWidgets.QMessageBox.StandardButton.Ok, self,
-                )
-                dialog.setInformativeText(result.reason)
-                dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
-                dialog.open()
+                self._open_warning("Run not started", result.reason)
             return True
         if type(result) is not AdmissionReceipt:
             self._release_admission(token)
@@ -5354,6 +5353,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     else "Standard cleanup remains pending."
                 )
             )
+            primary = event.primary
+            if failed and primary is not None and (
+                primary.type_module, primary.type_qualname
+            ) == (EnergyScanRefused.__module__, EnergyScanRefused.__qualname__):
+                # Maintainer, 2026-10-10: "there should be a notification for that with
+                # advice to turn it off to allow processing"; the refusal says what to change.
+                self._open_warning("Energy scan not processed", primary.message)
             return
         ended = self._lifecycle.execution_ended(
             ExecutionEnded(identity)

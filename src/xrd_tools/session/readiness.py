@@ -1069,6 +1069,14 @@ def execution_plan_values(
     }
 
 
+class EnergyScanRefused(ValueError):
+    """An Int energy scan that cannot be reduced as recorded.
+
+    Raised when the scan is bound, before any frame is reduced or anything is written; its
+    message says what to change, and the page shows it in a notification.
+    """
+
+
 def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=None,
                                   metadata_energy_eV=()):
     """Bind already-read source metadata to a new Int scan, without loading pixels.
@@ -1103,10 +1111,20 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
     selection = resolve_acquisition_energy(calibration.poni.wavelength, energies, allow_energy_scan=per_frame)
     if 'frame_energies_eV' in selection:
         if calibration.parallax is not None:
-            raise ValueError('an energy scan cannot use the sensor parallax correction, which is computed at one '
-                             'energy; turn parallax off to reduce each frame at its own energy')
+            raise EnergyScanRefused(
+                'an energy scan cannot use the sensor parallax correction, which is computed at one energy. To '
+                'reduce each frame at its own energy, turn parallax off: in Advanced, "Detector sensor / parallax '
+                '(PONI v3)", check "Override selected PONI sensor settings" and clear "Enable parallax"')
         selection = {**selection, 'frame_labels': labels,
                      'frame_energies_eV': [float(value) for value in selection['frame_energies_eV']]}
+        from xrd_tools.core.provenance import config_entry_overflow
+        overflow = config_entry_overflow('energy_selection', selection)  # as the run saves it at its end
+        if overflow is not None:
+            size, ceiling = overflow
+            raise EnergyScanRefused(
+                f"an energy scan of {len(labels):,} frames cannot be saved: Int saves each frame's energy with the "
+                f"run's settings, which hold at most {ceiling:,} bytes, and these energies need {size:,}. Reduce at "
+                f"most about {len(labels) * ceiling // size:,} frames per run")
     if selection['disagreement']:
         logger.warning('X-ray energy mismatch: metadata=%.1f eV, PONI=%.1f eV; using metadata',
                        selection['source_energy_eV'], selection['calibration_energy_eV'])
