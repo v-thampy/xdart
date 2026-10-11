@@ -79,6 +79,7 @@ def test_fresh_stitch_page_window_and_camera_editor_share_upright_default(qapp, 
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         dialog.close()
+        dialog.deleteLater()
         editor.deleteLater()
         qapp.processEvents()
 

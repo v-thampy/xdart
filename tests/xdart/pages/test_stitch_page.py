@@ -50,6 +50,19 @@ def _wait(page, qapp, timeout=30, *, catalog=False):
         assert not page._result_browser.busy
 
 
+def _dispose(page, qapp, timeout=30):
+    """Shut the page down, wait for its workers, then delete it: a page left alive keeps its widgets in the
+    process, and every later theme or font change restyles them (QT-TEST-LIFECYCLE)."""
+    until = time.monotonic() + timeout
+    receipt = page.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+        qapp.processEvents()
+        time.sleep(.005)
+        receipt = page.shutdown()
+    assert receipt.status is PageCleanup.CLEAN, receipt
+    page.deleteLater()
+
+
 
 
 def _as_native(form, scans="1"):
@@ -138,9 +151,7 @@ def test_metadata_shows_experimental_columns_and_separate_provenance(qapp, tmp_p
         assert "changed" in page._metadata_dialog.status.text().lower()
         assert page._metadata_dialog.provenance_button.isEnabled()
     finally:
-        until = time.monotonic() + 5
-        while page.shutdown().status is PageCleanup.PENDING and time.monotonic() < until:
-            qapp.processEvents(); time.sleep(.01)
+        _dispose(page, qapp)
 
 
 def test_native_source_controls_ranges_and_threshold_semantics(qapp, tmp_path):
@@ -189,7 +200,7 @@ def test_native_source_controls_ranges_and_threshold_semantics(qapp, tmp_path):
         assert page.build_form().source_selection.kind == "Directory"
         assert page._rows["scan_mode"].isHidden()
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
 
 
 def test_grouped_metadata_plot_uses_only_displayed_contributors(qapp, tmp_path):
@@ -248,9 +259,7 @@ def test_grouped_metadata_plot_uses_only_displayed_contributors(qapp, tmp_path):
         page.shutdown(); qapp.processEvents()
         assert page._metadata_plot_dialog is None
     finally:
-        until = time.monotonic() + 5
-        while page.shutdown().status is PageCleanup.PENDING and time.monotonic() < until:
-            qapp.processEvents(); time.sleep(.01)
+        _dispose(page, qapp)
 
 
 def _commit_source_box(page, qapp, text, *, key="Tab"):
@@ -312,7 +321,7 @@ def test_clearing_the_source_box_clears_the_selection_and_refuses_run(qapp, tmp_
                 page.build_form()
             assert not page.run_bar.startButton.isEnabled()
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
 
 
 def test_run_right_after_typing_in_a_field_checks_and_runs(qapp, tmp_path):
@@ -345,7 +354,7 @@ def test_run_right_after_typing_in_a_field_checks_and_runs(qapp, tmp_path):
         assert page.run_bar.readinessLabel.full_text().startswith("Complete"), page.run_bar.readinessLabel.full_text()
         assert page.build_form().source_selection.scans == "1"
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
 
 
 @pytest.mark.parametrize("dtype", ("int32", "uint32"))
@@ -374,7 +383,7 @@ def test_native_minimum_only_threshold_edit_excludes_native_ceiling(qapp, tmp_pa
         np.testing.assert_array_equal(np.isfinite(actual), [[False, True, True, False, False, False]])
         np.testing.assert_array_equal(raw, original)
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
 
 
 def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp, tmp_path):
@@ -410,7 +419,7 @@ def test_native_saved_frame_popup_keeps_curve_and_shows_thumbnail_fallback(qapp,
         assert page._raw_frame_view is None
         assert page.scientific.raw_popup_image.canvas.raw_image.size == 0
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
 
 
 def _stitched_variants(tmp_path):
@@ -1221,7 +1230,7 @@ def test_reopened_result_marks_the_frames_the_check_excluded(qapp, tmp_path, mon
             assert all("Frame check: not recorded" in item.toolTip() for item in items)
             assert "frame check not recorded" in status
     finally:
-        page.shutdown()
+        _dispose(page, qapp)
 
 
 def test_a_gi_result_opens_on_its_cut_and_offers_its_cuts_beside_q_and_two_theta(qapp, tmp_path):

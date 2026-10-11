@@ -36,6 +36,7 @@ def test_detect_peaks_rejects_peakless_noise(qapp):
         assert dlg._detect_peaks(x, y) == []
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_detect_peaks_finds_real_peak_above_noise(qapp):
@@ -52,3 +53,4 @@ def test_detect_peaks_finds_real_peak_above_noise(qapp):
         assert any(abs(c - 2.5) < 0.1 for c in centers)
     finally:
         dlg.close()
+        dlg.deleteLater()
