@@ -180,8 +180,13 @@ class PhaseSourceWidget(QtWidgets.QWidget):
 
     def _checks_changed(self, checked):
         checked = set(checked)
-        selected = tuple((identifier, True) for index, identifier in enumerate(self._shown_ids)
-                         if (str(index) if self._key_by_index else identifier) in checked)
+        visible_ids = {identifier for index, identifier in enumerate(self._shown_ids)
+                       if (str(index) if self._key_by_index else identifier) in checked}
+        known_ids = {identifier for identifier, _visible in self._selection}
+        selected = tuple((identifier, identifier in visible_ids)
+                         for identifier, _visible in self._selection)
+        selected += tuple((identifier, True) for identifier in self._shown_ids
+                          if identifier in visible_ids and identifier not in known_ids)
         if len(selected) > 8:
             self._message('Choose at most eight phases.'); self.refresh_library(); return
         self.set_selection(selected)

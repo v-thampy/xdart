@@ -240,6 +240,12 @@ class PhaseFitDialog(QtWidgets.QDialog):
         first_deferred = len(self._phase_entries)
         self._phase_entries.extend(BrowserResult(str(first_deferred+index), name, path)
                                    for index, (path, name) in enumerate(self._deferred_cifs))
+        manual = any(entry.source_kind == 'lattice' for entry in entries)
+        self.texture_combo.setEnabled(not self._vnext and not manual)
+        self.texture_row.set_purpose_tooltip(
+            'Lattice phases use free per-peak heights; CIF phases use no texture correction.' if manual else
+            diagnostic_text('P3_7_PHASE_TEXTURE_UNAVAILABLE') if self._vnext else
+            'Choose how the fit models relative peak intensities within each structural phase.')
         self._sync_phase_list()
 
     def _sync_phase_list(self):
@@ -417,7 +423,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
                   if isinstance(pm, PhaseEntry) else pm for _, pm in self._phases]
         manual = any(isinstance(pm, PhaseEntry) and pm.source_kind == 'lattice' for _, pm in self._phases)
         if manual:
-            fit_kw['texture'] = 'free'
+            fit_kw['texture'] = {phase.name: 'free' if getattr(phase, 'source_kind', '') == 'lattice'
+                                else 'none' for phase in phases}
         config = FitConfig(init_kw=init_kw, fit_kw=fit_kw,
                            phase_names=[p.name for p in phases],
                            min_intensity=min_int)
