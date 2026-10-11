@@ -286,7 +286,11 @@ def test_phase_rings_on_ints_detector_image_follow_p3a(qapp, tmp_path, monkeypat
             entry, = _entries(tmp_path)
             _edit(qapp, view, (entry,))
             if mode == 'Int 1D':
-                view.raw_popup_button.click(); qapp.processEvents(); _settle(qapp, view)
+                view.raw_popup_button.click(); qapp.processEvents()
+                # Opening Int's popup requests full raw asynchronously. Compare
+                # family identity only after that real image transition settles.
+                _settle(qapp, view, lambda: page._last_scientific_projection.heavy is not None
+                        and page._last_scientific_projection.heavy.detector_source == 'full')
             pane = view.raw_popup_image if mode == 'Int 1D' else view.raw
             assert isinstance(view.phase_worker, SingleWorkerOwner)
             items = _phase_items(pane, entry)
