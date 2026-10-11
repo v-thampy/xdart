@@ -211,6 +211,9 @@ def _transmission(codes: np.ndarray, absorption_lengths) -> np.ndarray:
     # one code at a time, as the notebook's foil_to_factor: a matrix product adds the four
     # terms in another order on x86 Linux, one bit off in the exponent
     lengths = np.asarray(absorption_lengths, dtype=np.float64)
+    if digits.shape[0] == 0:
+        # Keep the former shape refusal even when no row reaches the per-code dot.
+        return np.exp(-(digits @ lengths))
     unique, frame_row = np.unique(digits, axis=0, return_inverse=True)
     per_code = np.array([np.exp(-np.dot(lengths, row)) for row in unique], dtype=np.float64)
     return per_code[frame_row.reshape(-1)]

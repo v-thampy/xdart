@@ -55,6 +55,27 @@ def test_the_foil_transmission_is_the_notebooks_for_every_status_code(lengths) -
     assert [ours[9000], ours[900], ours[90], ours[9]] == [np.exp(-9 * length) for length in lengths]
 
 
+@pytest.mark.parametrize("codes", [
+    np.array(1234), np.array([1234, 0, 1234, 12]),
+    np.array([[1234], [0], [1234], [12]]), np.array([]), np.empty((0, 1)),
+])
+def test_valid_foil_input_keeps_shape_dtype_order_and_notebook_values(codes):
+    before = codes.copy()
+    codes.setflags(write=False)
+    expected = foil_to_factor(codes.reshape(-1), _LENGTH_SETS[0])
+    result = foil_transmission(codes, _LENGTH_SETS[0])
+    assert result.shape == (codes.size,) and result.dtype == np.float64
+    np.testing.assert_array_equal(result, expected)
+    np.testing.assert_array_equal(codes, before)
+    assert not codes.flags.writeable
+
+
+@pytest.mark.parametrize("codes", [np.empty((0, 2)), np.array([[12, 34], [56, 78]])])
+def test_multicolumn_foil_input_keeps_its_shape_refusal_when_empty(codes):
+    with pytest.raises(ValueError):
+        foil_transmission(codes, _LENGTH_SETS[0])
+
+
 @pytest.mark.parametrize("code, notebook_refuses", [
     (10000.0, True),   # above four digits: both refuse
     (-1.0, True),      # negative: the notebook fails on the minus sign
