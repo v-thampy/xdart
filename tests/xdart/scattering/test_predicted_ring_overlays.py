@@ -52,6 +52,12 @@ def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, sourc
             qapp.processEvents(); time.sleep(.01)
         terminal = [e for e in observed if e.kind in (StandardEventKind.FINISHED, StandardEventKind.FAILED)]
         assert terminal and terminal[-1].kind is StandardEventKind.FINISHED, (page._notice_text, terminal)
+        controller = page._context_controller
+        # The terminal follows the output asynchronously into Browse. Complete
+        # that owner transition, then explicitly inspect this session's Run.
+        while time.monotonic()<until and controller.browse_pending:
+            qapp.processEvents(); time.sleep(.01)
+        controller.adopt_acquisition(terminal[-1].run_identity)
         page._refresh_shell(); qapp.processEvents()
         yield page, shell.scientific
     finally:
@@ -98,7 +104,8 @@ def test_int_rings_follow_current_frame_and_off_clears(qapp, tmp_path, mode):
         editor = choice(view)
         assert editor.currentText() == 'Off' and editor.toolTip()
         if mode == 'Int 1D':
-            view.show_raw_popup('Detector image'); qapp.processEvents()
+            view.raw_popup_button.click(); qapp.processEvents()
+            select(qapp, page, page._context_controller.navigation.current)
         before = pane(view, mode).image.image.copy()
         choose(qapp, view)
         target = pane(view, mode)
@@ -107,13 +114,15 @@ def test_int_rings_follow_current_frame_and_off_clears(qapp, tmp_path, mode):
         choose(qapp, view, 'CeO2', accept=False)
         assert choice(view).currentText() == 'LaB6'
         assert target.ring_items
+        np.testing.assert_array_equal(target.image.image, before)
         keys = page._context_controller.frame_keys
         select(qapp, page, keys[0])
         second = tuple(item.getData() for item in target.ring_items)
         assert len(first) != len(second) or any(not np.array_equal(a[0], b[0]) for a,b in zip(first, second))
-        np.testing.assert_array_equal(target.image.image, before)
+        current_pixels = target.image.image.copy()
         choose(qapp, view, 'Off')
         assert not target.ring_items
+        np.testing.assert_array_equal(target.image.image, current_pixels)
 
 
 @pytest.mark.parametrize('thumbnail', (False, True))
@@ -236,7 +245,7 @@ def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path):
         controller = page._context_controller
         keys = controller.frame_keys
         art = controller.acquisition_context
-        store = art.publication_store
+        store = art.publication_store.artifacts[keys[0].artifact].publications
         original = store.get(keys[0].local_frame_label).view.geometry.poni
         store.set_max_heavy_items(1)
         payload = select(qapp, page, keys[0])
