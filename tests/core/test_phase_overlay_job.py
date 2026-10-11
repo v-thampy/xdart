@@ -128,3 +128,17 @@ def test_axis_conversion_missing_wavelength_and_cancellation_are_explicit():
     cancelled = threading.Event(); cancelled.set()
     with pytest.raises(InterruptedError):
         PhaseOverlayJob()(request, cancelled, None)
+
+
+def test_one_phase_over_its_cap_does_not_blank_the_others(tmp_path):
+    """Only the oversized phase is refused, with its own reason; the other phases keep their lines."""
+    from xrd_tools.analysis.phase_references import PhaseLibrary
+    from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest
+    big = PhaseLibrary(tmp_path / "library").add_lattice("big cell", a=13., b=14., c=15., space_group=1)
+    alone, = PhaseOverlayJob()(PhaseOverlayRequest((entry(),), 5., 'q', (1., 7.), 1.), threading.Event(), None)
+    assert alone.q_lines and not alone.reason
+    families = {family.id: family for family in PhaseOverlayJob()(
+        PhaseOverlayRequest((entry(), big), 5., 'q', (1., 7.), 1.), threading.Event(), None)}
+    assert families[entry().id].q_lines == alone.q_lines and not families[entry().id].reason, (
+        "a CIF phase within its caps must keep its lines when another phase is refused")
+    assert not families[big.id].q_lines and "limit" in families[big.id].reason
