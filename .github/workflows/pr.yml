@@ -108,9 +108,9 @@ jobs:
     name: xdart-offscreen (${{ matrix.group }})
     strategy:
       fail-fast: false
-      # The harness retains Qt objects to avoid unsafe DeferredDelete teardown.
-      # Bound that graph per process: application-wide theme changes otherwise
-      # repolish thousands of widgets left by unrelated tests.
+      # Windows that tests close without deleting stay alive. Bound that graph
+      # per process: application-wide theme changes otherwise repolish
+      # thousands of widgets left by unrelated tests.
       matrix:
         include:
           - group: execution-context
