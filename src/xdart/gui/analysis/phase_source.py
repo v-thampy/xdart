@@ -45,6 +45,14 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.browser.scans.setToolTip('Phases in library order. Check a phase to show its reference overlay.'
                                       if checkable else 'The phases selected for this fit, in order.')
         self.browser.scans_label.setToolTip('Persistent CIF and lattice entries available to this tool.')
+        # The keyed profile hides Int's file actions, but they remain children of
+        # the mounted owner and retain useful help if a profile reveals them.
+        for control, tip in ((self.browser.show_all, 'Show every phase in this source list.'),
+                             (self.browser.metadata, 'Show the selected phase source details.'),
+                             (self.browser.auto_last, 'Follow the last phase added to the list.'),
+                             (self.browser.date_sort, 'Sort the source list by time.'),
+                             (self.browser.refresh, 'Refresh the available phase sources.')):
+            control.setToolTip(tip)
         layout.addWidget(self.browser)
         buttons = QtWidgets.QHBoxLayout()
         self.add_cif_btn = QtWidgets.QPushButton('Add CIF…', self)

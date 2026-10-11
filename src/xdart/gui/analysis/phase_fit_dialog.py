@@ -518,7 +518,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
                         receipt.expected_sha256, receipt.pre_state, receipt.post_state,
                         receipt.receipt_fingerprint))))
         self._sync_phase_list()
-        self.table.show_rows(*phase_result_rows(result))
+        self._show_phase_rows(phase_result_rows(result), getattr(result, 'phase_fractions_reason', ''))
         detail = "; ".join((*result.diagnostics,
                             *((result.phase_fractions_reason,) if getattr(result, 'phase_fractions_reason', '') else ())))
         self.status.setText((result.message or result.code) +
@@ -559,7 +559,6 @@ class PhaseFitDialog(QtWidgets.QDialog):
                 entry = store[0]
         except Exception:
             entry = None
-        self.table.show_rows(*phase_outcome_rows(entry, [getattr(phase, "name", phase) for _, phase in self._phases]))
         ok = bool(entry.get("success", False)) if entry else False
         rchi = entry.get("redchi") if entry else None
         msg = "Phase fit converged." if ok else "Phase fit did NOT converge (best effort)."
@@ -568,7 +567,15 @@ class PhaseFitDialog(QtWidgets.QDialog):
         fractions_reason = (entry or {}).get('phase_fractions_reason', '')
         if not fractions_reason and any(getattr(phase, 'source_kind', '') == 'lattice' for _, phase in self._phases):
             fractions_reason = 'Phase fractions are withheld: lattice-only entries have no structural intensities.'
+        self._show_phase_rows(phase_outcome_rows(entry,
+            [getattr(phase, "name", phase) for _, phase in self._phases]), fractions_reason)
         self.status.setText(msg + (' ' + fractions_reason if fractions_reason else ''))
+
+    def _show_phase_rows(self, projection, reason=''):
+        headers, rows = projection
+        tips = {(row_index, column): reason for row_index, row in enumerate(rows)
+                for column, value in enumerate(row) if reason and (value == '—' or value == reason)}
+        self.table.show_rows(headers, rows, cell_tooltips=tips)
 
     # ---- batch hooks (driven by the workspace) --------------------------
     def batch_x_range(self):
