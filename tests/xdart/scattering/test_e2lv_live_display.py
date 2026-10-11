@@ -194,7 +194,7 @@ class _Integrator:
         self.detector = calibrated.detector
         for name in (
             "dist", "poni1", "poni2", "rot1", "rot2", "rot3",
-            "wavelength", "parallax",
+            "wavelength", "parallax", "chiDiscAtPi",
         ):
             setattr(self, name, getattr(calibrated, name))
 
