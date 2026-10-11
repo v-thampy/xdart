@@ -269,10 +269,10 @@ def test_e3_ui6_compact_shell_continuity_at_review_viewports(
             QtWidgets.QLabel, "toolsHeader"
         )
         tool_buttons = shell.tools.findChildren(QtWidgets.QPushButton)
+        # Plot Metadata left Int's tools column for the shared metadata popup (2fa82580).
         assert [button.text() for button in tool_buttons] == [
             "∧ Peak Fitting",
             "≈ Phase Fitting",
-            "▤ Plot Metadata",
             "▣ ROI Statistics",
             "◇ Open Selected in NeXpy",
             "▦ silx HDF5 Viewer…",

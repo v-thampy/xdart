@@ -236,7 +236,7 @@ def test_e3_ui4_scientific_controls_have_exact_local_and_global_order(
         assert [
             group.title()
             for group in dialog.findChildren(QtWidgets.QGroupBox)
-        ] == ["Waterfall", "Overlay", "Other"]
+        ] == ["Waterfall", "Overlay", "Other", "2-D Support"]  # 2-D Support since 0df40f45
         assert dialog.waterfall_stop.specialValueText() == "End"
         assert dialog.show_legend.isCheckable()
     finally:

@@ -390,6 +390,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _poll_admission=lambda: False,
         _settle_browse_1d_before_drain=lambda: True,
         _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
+        _dispatch_roi_preview=lambda: None,  # the drain dispatches ROI previews since 495c1380
         _batch_ready_to_paint=lambda: None,
         _advance_authored_asset_confirmation=lambda: None,
         _run_executor=SimpleNamespace(drain_events=lambda: (StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)),

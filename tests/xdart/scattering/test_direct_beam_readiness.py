@@ -611,6 +611,7 @@ def test_background_detection_cannot_adopt_after_source_or_camera_changes(qapp, 
         dialog.close()
 
 
+@pytest.mark.skipif(not os.environ.get('XDART_TEST_DATA'), reason='needs XDART_TEST_DATA')
 def test_real_eiger_scan_fits_after_a_quarter_turn(qapp, tmp_path):
     root = Path(os.environ['XDART_TEST_DATA']) / 'stitching/GIXRD_Fatigue_Radha'
     assert (root / 'direct_beam_dist_p33m_scan001_master.h5').is_file()
