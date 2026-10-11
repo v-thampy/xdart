@@ -1650,6 +1650,11 @@ class PhaseFitter:
             # would introduce an exact scale/height degeneracy.
             if getattr(pmodel.phase, "source_kind", "") == "lattice":
                 params[f"{pre}scale"].set(value=scale_guess, vary=False)
+                # With the scale fixed, each height is its reflection's whole
+                # amplitude, so the texture multipliers' ceiling does not apply.
+                for j in range(int(pmodel.hkl.shape[0]) if pmodel.hkl.size else 0):
+                    if f"{pre}pk{j}" in params:
+                        params[f"{pre}pk{j}"].set(max=np.inf)
             self._init_lattice_params(params, pre, lat0, lattice_pct, lock_lattice_order)
 
         # ---- Inter-phase lattice ordering (optional) ----
