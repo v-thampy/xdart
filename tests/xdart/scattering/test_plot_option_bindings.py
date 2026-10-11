@@ -18,6 +18,10 @@ _REFUSED = {"waterfall_y_axis": "", "waterfall_start": 0, "waterfall_stop": -1, 
             "overlay_offset": float("nan"), "show_legend": 1, "intensity_scale": "Cube",
             "show_coverage_holes": 1, "calibrant": "Unobtainium"}
 
+# P3b's coordinate grid and reference phases (a scalar reaches the owner and is no phase selection).
+_TAKEN.update(coordinate_grid="q + χ", phase_references=(("a" * 64, True),), phase_min_intensity=12.5)
+_REFUSED.update(coordinate_grid="r", phase_references=True, phase_min_intensity=101.)
+
 
 def test_one_table_binds_every_plot_option_to_its_command():
     assert [field for _path, field in PLOT_OPTION_BINDINGS] == [item.name for item in fields(ScientificPlotOptions)]
