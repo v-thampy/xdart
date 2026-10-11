@@ -242,8 +242,12 @@ def test_logical_point_frames_keep_their_own_ring_geometry(qapp, tmp_path):
         assert view.raw.ring_items
 
 
-def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path):
-    with run_page(qapp, tmp_path, energies=(16,17,18), heavy_window=1) as (page, view):
+def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path, monkeypatch):
+    from xrd_tools.core import staging
+    # Fix only the RAM request, not publication, eviction or hydration. The real
+    # resource policy admits one frame and binds that allocation to both stores.
+    monkeypatch.setattr(staging, 'heavy_window', lambda *args, **kwargs: 1)
+    with run_page(qapp, tmp_path, energies=(16,17,18)) as (page, view):
         choice(view); choose(qapp, view)
         controller = page._context_controller
         keys = controller.frame_keys
