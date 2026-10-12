@@ -2,7 +2,8 @@
 
 Claude's pre-handback adversarial pass found three defects that no frozen row drove: the window built its own label
 for the rings notice (Rule 14), the window outlived its page's shutdown, and a CIF minimum edit rebuilt calibrant and
-lattice families that no minimum applies to. Each row fails on 0b8b6c01 and passes with the fix.
+lattice families that no minimum applies to. The original three rows fail on 0b8b6c01 and pass with the fix.
+The maintainer requested the additional SR2 Stitch shutdown preservation row before integration.
 """
 import os
 
