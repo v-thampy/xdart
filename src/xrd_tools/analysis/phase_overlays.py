@@ -6,8 +6,9 @@ context and one detector-ring context. A request is admitted whole first (phase 
 is then listed alone at floor zero, or at its own floor when floor zero is over its cap, so a floor edit is
 served without listing and one phase's change never lists another. Caps apply after filtering: a phase over its
 own cap, or past the shared total in list order, is refused alone and the others keep their lines. A phase whose
-entry, effective floor (``phase_floor``: none for a calibrant or lattice) and contexts are unchanged is returned as
-the identical family object. No source, frame, image, integrator or structure is retained beyond those listings.
+entry, effective floor (``phase_floor``: none for a calibrant or lattice), contexts and admitted reflections are
+unchanged is returned as the identical family object. No source, frame, image, integrator or structure is retained
+beyond those listings.
 """
 from __future__ import annotations
 
@@ -267,8 +268,9 @@ class PhaseOverlayJob:
             if positions.reason and qs:
                 errors.append(positions.reason)
             reason = ' '.join(dict.fromkeys(errors))
+            # Another phase's cutoff can change admission in only one context while the shared cap reason stays.
             scalars = (phase_floor(request, entry), request.line_unit, request.wavelength_angstrom, line_key,
-                       ring_key, reason)
+                       ring_key, reason, qs, tuple(r.q for r in accepted.get((identity, 'ring'), ())))
             line = slot.get('line') if line_key is not None else None
             previous = slot.get('family')
             if previous is not None and previous[0] == scalars and previous[1] is line and previous[2] is ring:
