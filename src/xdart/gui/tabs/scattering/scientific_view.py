@@ -1529,7 +1529,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._phase_ring_run = navigation.current.run_identity
             # A frame of that run whose image has not arrived yet waits for it (P3a residual 9); a frame opened from
             # a file, or an Average or Reintegrate result, never carried ring geometry and keeps the Run reason.
-            loading = (is_int and not current and navigation.current is not None
+            loading = (is_int and state.acquisition_selected and not current and navigation.current is not None
                        and (heavy is None or heavy.frame is not navigation.current)
                        and navigation.current.run_identity is self._phase_ring_run)
             ring_reason = (gf.LOADING_RING_REASON if loading else

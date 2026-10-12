@@ -521,6 +521,8 @@ class ContextProjection:
                 norm_aggregate=norm_aggregate))
         scientific = apply_presentation_background(
             scientific, presentation_background)
+        scientific = replace(scientific, acquisition_selected=(
+            selection is not None and selection.kind is ContextKind.ACQUISITION))
         return ShellProjection(
             revision,
             build_browser_projection(

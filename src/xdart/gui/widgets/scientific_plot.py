@@ -37,6 +37,8 @@ class HoverTooltip(QtCore.QObject):
         self._text = ""
 
     def eventFilter(self, watched, event):  # noqa: N802 - Qt override
+        if event.type() in (QtCore.QEvent.Type.Leave, QtCore.QEvent.Type.Hide):
+            self.hide()
         return bool(self._text) and event.type() == QtCore.QEvent.Type.ToolTip
 
 

@@ -816,8 +816,13 @@ class ScientificProjection:
     # Whole detached cut batches replace history, including empty/refused rows.
     # Acquisition's incremental trace publications keep their existing merge.
     replace_trace_history: bool = False
+    #: Whether the authoritative display selection is the acquisition, rather than Browse or a viewer.
+    #: Frame RunIdentity alone cannot distinguish Browse, which can retain the acquisition's identity.
+    acquisition_selected: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.acquisition_selected) is not bool:
+            raise TypeError("acquisition selection must be boolean")
         if self.detector_mode not in {"thumbnail", "full"}:
             raise ValueError("detector mode must be exact")
         if type(self.detector_available) is not bool or type(self.detector_pending) is not bool:
