@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
-from tests.xdart.scattering.test_phase_reference_overlays import _cif, _settle
+from tests.xdart.scattering.test_phase_reference_overlays import _cif, _settle, _stitch
 from tests.xdart.scattering.test_predicted_ring_overlays import run_page
 from tests.xdart.scattering.test_reference_phases_window import (LAB6, _ids, _marker, _options, _pane_items, _same,
                                                                  _type, _window)
@@ -58,6 +58,17 @@ def test_sr2_closing_the_page_closes_its_reference_phases_window(qapp, tmp_path)
         assert page.close_workspace().cleanup_status is CleanupStatus.CLEANED
         qapp.processEvents()
         assert not window.isVisible(), 'the window does not outlive its page'
+
+
+def test_sr2_stitch_shutdown_closes_its_reference_phases_window(qapp, tmp_path):
+    from xdart.gui.pages.values import PageCleanup
+    with _stitch(qapp, tmp_path / 'stitch') as (page, view, _payload):
+        window = _window(qapp, view)
+        window.phase_source.add_calibrant('LaB6')
+        _settle(qapp, view)
+        assert page.shutdown().status is PageCleanup.CLEAN
+        qapp.processEvents()
+        assert not window.isVisible(), 'the window does not outlive its Stitch page'
 
 
 def test_sr3_a_cif_minimum_edit_leaves_calibrant_and_lattice_families_identical(qapp, tmp_path):

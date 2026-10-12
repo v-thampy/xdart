@@ -269,6 +269,29 @@ def test_rs6c_the_filtered_total_refuses_only_the_overflowing_phases(monkeypatch
     assert not families[cscl.id].q_lines and "limit" in families[cscl.id].reason
 
 
+def test_rs6d_cached_admission_tracks_lines_and_rings_separately(monkeypatch):
+    """A phase can regain rings while its lines still exceed the shared total."""
+    from xrd_tools.analysis.phase_overlays import PhaseOverlayJob
+    cscl, nacl = _entry("CsCl"), _entry("NaCl")
+    ring = _ring_context()
+    monkeypatch.setattr(provider, "MAX_REFLECTIONS_TOTAL", 32)
+    job = PhaseOverlayJob()
+    first = _families(job, cscl, nacl, floors=((cscl.id, 0.),), ring=ring, line_range=(1., 8.))
+    assert not first[nacl.id].q_lines and not first[nacl.id].rings
+    second = _families(job, cscl, nacl, floors=((cscl.id, 2.),), ring=ring, line_range=(1., 8.))
+    fresh = _families(PhaseOverlayJob(), cscl, nacl, floors=((cscl.id, 2.),), ring=ring, line_range=(1., 8.))
+    assert not fresh[nacl.id].q_lines and fresh[nacl.id].rings
+    assert first[nacl.id].reason == fresh[nacl.id].reason == "cumulative reflection limit exceeded"
+    assert second[nacl.id].rings, "cached cap refusal must not hide newly admitted rings"
+    assert second[nacl.id].q_lines == fresh[nacl.id].q_lines
+    assert len(second[nacl.id].rings) == len(fresh[nacl.id].rings)
+    for actual, expected in zip(second[nacl.id].rings, fresh[nacl.id].rings):
+        np.testing.assert_array_equal(actual.xy, expected.xy)
+    third = _families(job, cscl, nacl, floors=((cscl.id, 0.),), ring=ring, line_range=(1., 8.))
+    assert not third[nacl.id].q_lines and not third[nacl.id].rings
+    assert third[nacl.id].reason == first[nacl.id].reason
+
+
 def test_rs7_calibrant_rings_match_the_p3a_kernel():
     import xrd_tools.geometry_figures as geometry
     from xrd_tools.analysis.phase_overlays import PhaseOverlayJob
