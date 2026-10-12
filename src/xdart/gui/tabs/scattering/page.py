@@ -739,8 +739,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._metadata_dialog = self._scan_roi_dialog = None
         self._metadata_plot_dialog = None
         self._peak_dialog = self._phase_dialog = None
-        #: closed Phase Fitters' Add CIF… workers, kept until each closes CLEAN (the dialog deletes on close)
-        self._retired_phase_adds = []
         self._scan_roi_generation = 0
         self._peak_generation = self._phase_generation = 0
         self._analysis_identity = None; self._analysis_kind = None
@@ -1251,10 +1249,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         elif target == "peak": self._peak_result = None
         elif target == "phase":
             self._phase_result = None
-            # Nothing a CIF still being read returns reaches this Fitter; its worker is kept until it stops.
-            from xdart.gui.pages.values import PageCleanup
-            if dialog.phase_source.shutdown().status is not PageCleanup.CLEAN:
-                self._retired_phase_adds.append(dialog.phase_source.add_worker)
+            # Nothing a CIF still being read returns reaches this Fitter (it deletes on close); the view keeps its
+            # Add CIF… worker until it stops, and the page's close waits for it through the view's.
+            dialog.phase_source.shutdown()
+            self._shell.scientific.retire_phase_worker(dialog.phase_source.add_worker)
 
     def _open_analysis_mount(self, target, *, focus_roi=False):
         field = f"_{target}_dialog"; dialog = getattr(self, field)
@@ -2985,9 +2983,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         from xdart.gui.pages.values import PageCleanup
         phase_close = self._shell.scientific.shutdown_phase_overlays()
-        self._retired_phase_adds = [worker for worker in self._retired_phase_adds
-                                    if worker.close().status is not PageCleanup.CLEAN]
-        if (phase_close.status is not PageCleanup.CLEAN or self._retired_phase_adds
+        if (phase_close.status is not PageCleanup.CLEAN
                 or not self._release_browse_1d_debt()
                 or not self._clear_viewer_1d_renderer(close=True)
                 or not self._clear_viewer_2d_renderer(close=True)

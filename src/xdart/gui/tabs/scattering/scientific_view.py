@@ -1266,6 +1266,8 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_ring_context = None
         #: the run whose frames carry ring geometry (the last one shown with it): its frames still loading wait
         self._phase_ring_run = None
+        #: closed tools' phase workers a host retired here (a deleted Phase Fitter's Add CIF…), until each is CLEAN
+        self._retired_phase_workers = []
         #: every listed phase with its include flag, as the window resolved it (legend entries and colours)
         self._phase_listed = ()
         #: each listed phase's colour slot, kept from when it joined the list until it leaves it
@@ -1427,12 +1429,21 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_listed = ()
         self._phase_color_slots = {}
 
+    def retire_phase_worker(self, worker):
+        """Keep a closed tool's phase worker (a deleted Phase Fitter's Add CIF…) until it closes CLEAN; this view's
+        shutdown waits for it."""
+        if worker.close().status is not PageCleanup.CLEAN:
+            self._retired_phase_workers.append(worker)
+
     def shutdown_phase_overlays(self):
-        """Close the phase worker and the window's Add CIF… worker: CLEAN, or PENDING while either runs (the host
-        asks again)."""
+        """Close the phase worker, the window's Add CIF… worker and any retired one: CLEAN, or PENDING while one runs
+        (the host asks again)."""
         self.reference_phases.close()  # the view's window does not outlive its overlays
         self._clear_phase_overlays()
-        receipts = (self._phase_requests.shutdown(), self.reference_phases.phase_source.shutdown())
+        retired = [(worker, worker.close()) for worker in self._retired_phase_workers]
+        self._retired_phase_workers = [worker for worker, receipt in retired if receipt.status is not PageCleanup.CLEAN]
+        receipts = (self._phase_requests.shutdown(), self.reference_phases.phase_source.shutdown(),
+                    *(receipt for _worker, receipt in retired))
         return next((receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN), receipts[0])
 
     @staticmethod
