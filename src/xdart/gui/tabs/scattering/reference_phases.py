@@ -1,10 +1,10 @@
 """The Tools panel's Reference Phases window, owned by ScientificView (REFERENCE-PHASES-20261011).
 
 It mounts Int's shared phase source in its working-list mode (calibrants, library entries, new CIFs and lattices,
-each with an include check and a minimum-intensity row) and applies every edit at once through the host's
-plot-option commands. It keeps no selection of its own: it reconciles from the accepted options, and orders its
-commands so each intermediate value is valid (a removed phase's minimum is pruned before the phase leaves the
-list; a new phase joins the list before its minimum).
+each with an include check and a minimum-intensity row), shows the view's rings notice on the source's note line,
+and applies every edit at once through the host's plot-option commands. It keeps no selection of its own: it
+reconciles from the accepted options, and orders its commands so each intermediate value is valid (a removed
+phase's minimum is pruned before the phase leaves the list; a new phase joins the list before its minimum).
 """
 from __future__ import annotations
 
@@ -38,11 +38,9 @@ class ReferencePhasesWindow(QtWidgets.QDialog):
         self.phase_source = PhaseSourceWidget(self, checkable=True, show_library=False, calibrants=True,
                                               cutoffs=True)
         layout.addWidget(self.phase_source)
-        self.rings_note = QtWidgets.QLabel('', self)
-        self.rings_note.setObjectName('referencePhasesRingsNote')
-        self.rings_note.setWordWrap(True)
-        self.rings_note.setToolTip(RINGS_TOOLTIP)
-        layout.addWidget(self.rings_note)
+        #: the rings notice is the shared source's note line: the window builds no display of its own (Rule 14)
+        self.rings_note = self.phase_source.note
+        self.phase_source.set_note('', RINGS_TOOLTIP)
         buttons = QtWidgets.QHBoxLayout()
         buttons.addStretch(1)
         self.close_button = QtWidgets.QPushButton('Close', self)
@@ -75,10 +73,7 @@ class ReferencePhasesWindow(QtWidgets.QDialog):
             self.hide()
 
     def set_rings_reason(self, reason: str) -> None:
-        reason = str(reason)
-        if self.rings_note.text() != reason:
-            self.rings_note.setText(reason)
-            self.rings_note.setToolTip(RINGS_TOOLTIP + (' ' + reason if reason else ''))
+        self.phase_source.set_note(reason, RINGS_TOOLTIP)
 
     def showEvent(self, event) -> None:
         # Opening the window lists entries other tools added; reconciles never read the library.

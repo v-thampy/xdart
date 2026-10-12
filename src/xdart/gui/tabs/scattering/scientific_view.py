@@ -53,7 +53,7 @@ from .scientific_plot_options import (
 from .scientific_curves import add_curve_item, add_text_item, draw_reference_lines
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
-from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest, positions_for_axis
+from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest, phase_floor, positions_for_axis
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
@@ -1405,6 +1405,7 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_color_slots = {}
 
     def shutdown_phase_overlays(self):
+        self.reference_phases.close()  # the view's window does not outlive its overlays
         self._clear_phase_overlays()
         return self._phase_requests.shutdown()
 
@@ -1495,10 +1496,9 @@ class ScientificView(QtWidgets.QFrame):
                 for identifier in tuple(self.phase_families):
                     self._remove_phase_drawings(identifier)
             else:
-                before = {entry.id: (entry, dict(shown.floors).get(entry.id, shown.floor)) for entry in shown.entries}
+                before = {entry.id: (entry, phase_floor(shown, entry)) for entry in shown.entries}
                 for entry in entries:
-                    floor = dict(request.floors).get(entry.id, request.floor)
-                    if before.get(entry.id) != (entry, floor):
+                    if before.get(entry.id) != (entry, phase_floor(request, entry)):
                         self._remove_phase_drawings(entry.id)  # only the phase that changed waits for its lines
         self._phase_requests.ask(request)
         self._draw_phase_overlays()

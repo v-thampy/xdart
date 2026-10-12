@@ -6,8 +6,8 @@ context and one detector-ring context. A request is admitted whole first (phase 
 is then listed alone at floor zero, or at its own floor when floor zero is over its cap, so a floor edit is
 served without listing and one phase's change never lists another. Caps apply after filtering: a phase over its
 own cap, or past the shared total in list order, is refused alone and the others keep their lines. A phase whose
-entry, floor and contexts are unchanged is returned as the identical family object. No source, frame, image,
-integrator or structure is retained beyond those listings.
+entry, effective floor (``phase_floor``: none for a calibrant or lattice) and contexts are unchanged is returned as
+the identical family object. No source, frame, image, integrator or structure is retained beyond those listings.
 """
 from __future__ import annotations
 
@@ -93,6 +93,12 @@ class _Detector:
 def _valid_floor(value):
     return (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
             and 0 <= value <= 100)
+
+
+def phase_floor(request, entry):
+    """The minimum intensity that can change ``entry``'s family: a CIF phase's own value, else the request's. A
+    calibrant or lattice lists positions without intensities, so no minimum applies to it (None)."""
+    return dict(request.floors).get(entry.id, request.floor) if entry.source_kind == 'cif' else None
 
 
 class PhaseOverlayJob:
@@ -261,7 +267,8 @@ class PhaseOverlayJob:
             if positions.reason and qs:
                 errors.append(positions.reason)
             reason = ' '.join(dict.fromkeys(errors))
-            scalars = (floor, request.line_unit, request.wavelength_angstrom, line_key, ring_key, reason)
+            scalars = (phase_floor(request, entry), request.line_unit, request.wavelength_angstrom, line_key,
+                       ring_key, reason)
             line = slot.get('line') if line_key is not None else None
             previous = slot.get('family')
             if previous is not None and previous[0] == scalars and previous[1] is line and previous[2] is ring:

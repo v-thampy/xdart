@@ -151,6 +151,13 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         self.status.setToolTip('Phase-source validation and missing-library-entry notices.')
         layout.addWidget(self.status)
+        #: a host's notice about its use of the list (``set_note``), hidden while empty
+        self.note = QtWidgets.QLabel('', self)
+        self.note.setObjectName('phaseSourceNote')
+        self.note.setWordWrap(True)
+        self.note.hide()
+        layout.addWidget(self.note)
+        self._note = ('', '')
         controls = (self.browser, self.browser.scans, self.browser.scans_label,
                     self.browser.show_all, self.browser.metadata, self.browser.auto_last,
                     self.browser.date_sort, self.browser.refresh, self.add_cif_btn,
@@ -181,6 +188,16 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.status.setText(self._reason)
         self._sync_tooltips()
         self.messageChanged.emit(self._reason)
+
+    def set_note(self, text, purpose):
+        """Show a host's notice under the list (hidden while empty); its tooltip is the purpose plus the notice."""
+        text, purpose = str(text), str(purpose)
+        if (text, purpose) == self._note:
+            return
+        self._note = (text, purpose)
+        self.note.setText(text)
+        self.note.setToolTip(purpose + (' ' + text if text else ''))
+        self.note.setVisible(bool(text))
 
     def _sync_tooltips(self):
         suffix = ' ' + self._availability_reason if self._availability_reason else ''
