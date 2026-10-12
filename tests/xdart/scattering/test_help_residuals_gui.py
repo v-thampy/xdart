@@ -989,24 +989,38 @@ def test_ge2_a_real_average_result_shows_the_run_reason_no_raw_rings_and_referen
 
 
 @contextmanager
-def _run_after(qapp, root, prepare, energies):
-    """``run_page``'s Int Run with ``prepare(page, view)`` called after the page shows and before Run."""
-    from tests.xdart.scattering.test_energy_scan_run import _series
+def _live_run(qapp, root, prepare):
+    """A live Int 2D Run on a watched directory holding one frame, with ``prepare(page, view)`` called after the page
+    shows and before Run. Yields the page, its shell, ``arrive(index)`` (one more frame at the calibration's energy,
+    its image renamed into place whole, as an acquisition writes) and the drained Run events. A Run still going at
+    exit is stopped before the page closes. The frames carry no metadata sidecar: a sidecar read that overlaps a new
+    arrival fails the Run (LIVE-METADATA-DISCOVERY-RACE, pre-existing at 305df401, ledgered)."""
+    import os
+    import fabio
     from tests.xdart.scattering.test_p1b_output_graph import _intent, write_poni
     from xrd_tools.session.intent_store import RunIntentStore
-    from xrd_tools.sources import image_series_spec
+    from xrd_tools.sources.selection import DirectorySourceSpec
     from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
     from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
     from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
     from xdart.gui.tabs.scattering.display_values import StandardEventKind
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
-    root.mkdir(parents=True, exist_ok=True)
-    raw = _series(root, energies)
+    raw = root / 'raw'
+    raw.mkdir(parents=True)
+    rows, columns = np.mgrid[:195, :487]
+    image = (100 + (rows + 2 * columns) % 97).astype(np.uint16)  # test_energy_scan_run._series' frame
+
+    def arrive(index):
+        target = raw / f'escan_{index:04d}.tif'
+        partial = raw / f'escan_{index:04d}.part'
+        fabio.tifimage.TifImage(data=image).write(str(partial))
+        os.replace(partial, target)
+    arrive(1)
     poni = root / 'cal.poni'
     write_poni(poni)
     poni.write_text(poni.read_text().replace('Distance: 0.1234', 'Distance: 0.03'))
-    intent = _intent(raw, root / 'run.nexus', poni, processing_mode='Int 2D')
-    intent.source_spec = image_series_spec(raw, metadata_format='txt')
+    intent = _intent(raw / 'escan_0001.tif', root / 'processed', poni, processing_mode='Int 2D', live_mode=True)
+    intent.source_spec = DirectorySourceSpec(raw, suffixes=('.tif',), metadata_format=None)
     executor = StandardRunExecutor(join_timeout=2.)
     page = ScatteringWorkspace(intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
                                sources=FilesystemSourceAdapter(), executor=executor)
@@ -1018,29 +1032,31 @@ def _run_after(qapp, root, prepare, energies):
         observed.extend(events)
         return events
     executor.drain_events = observe
-    terminal = (StandardEventKind.FINISHED, StandardEventKind.FAILED)
+    terminal = (StandardEventKind.STOPPED, StandardEventKind.FINISHED, StandardEventKind.FAILED)
     try:
         page.show()
         prepare(page, shell.scientific)
         shell.run_controls.startButton.click()
-        _until(qapp, lambda: any(event.kind in terminal for event in observed), seconds=60, what='the Run terminal')
-        last = [event for event in observed if event.kind in terminal][-1]
-        assert last.kind is StandardEventKind.FINISHED, (page._notice_text, last)
-        controller = page._context_controller
-        _until(qapp, lambda: not controller.browse_pending, seconds=60, what='the Browse hand-over')
-        controller.adopt_acquisition(last.run_identity)
-        controller.select_acquisition()
-        page._refresh_shell()
-        qapp.processEvents()
-        yield page, shell.scientific
+        yield page, shell, arrive, observed
     finally:
+        if shell.run_controls.stopButton.isEnabled():
+            shell.run_controls.stopButton.click()
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not any(event.kind in terminal for event in observed):
+            qapp.processEvents()
+            time.sleep(.005)
         page.close()
         page.deleteLater()
         qapp.processEvents()
 
 
 def test_ge3_frames_arriving_at_one_energy_list_the_calibrant_rings_once(qapp, tmp_path, monkeypatch):
+    """Each frame of a live Run arrives, and is drawn with its own image and LaB6's rings, while the Run is still
+    going; the rings are listed once. Oracle repair (October 12, the maintainer's word): this row first ran a
+    four-frame series, which reached the page in one 125 ms drain with its terminal, so no frame was drawn while it
+    ran and a ring context keyed on the frame survived (probes p08, p09)."""
     import xrd_tools.analysis.phase_references as provider
+    from xdart.gui.tabs.scattering.display_values import StandardEventKind
     calls, actual = [], provider.build_phase_references
 
     def count(*args, **kwargs):
@@ -1052,9 +1068,26 @@ def test_ge3_frames_arriving_at_one_energy_list_the_calibrant_rings_once(qapp, t
         choice(view)
         choose(qapp, view)
         monkeypatch.setattr(provider, 'build_phase_references', count)
-    with _run_after(qapp, tmp_path / 'run', prepare, energies=(16,) * 4) as (page, view):
-        settle(qapp, view, lambda: rings(view.raw))
-        assert len(page._context_controller.frame_keys) == 4 and rings(view.raw)
+    with _live_run(qapp, tmp_path, prepare) as (page, shell, arrive, observed):
+        view, controller = shell.scientific, page._context_controller
+        for index in range(1, 5):
+            if index > 1:
+                arrive(index)
+
+            def drawn():
+                state, current = page._last_scientific_projection, controller.navigation.current
+                return (current is not None and current.local_frame_label == index and state is not None
+                        and state.heavy is not None and state.heavy.frame is current
+                        and not view.phase_worker.busy and bool(rings(view.raw)))
+            _until(qapp, drawn, seconds=30, what=f'frame {index} drawn with its image and rings')
+            assert shell.run_controls.stopButton.isEnabled(), 'the frame is drawn while the Run is still going'
+            assert view.reference_phases.rings_note.text() == '', view.reference_phases.rings_note.text()
+        assert len(controller.frame_keys) == 4
+        assert calls == [(LAB6,)], calls
+        shell.run_controls.stopButton.click()
+        _until(qapp, lambda: any(event.kind is StandardEventKind.STOPPED for event in observed), seconds=60,
+               what='the stopped Run')
+        settle(qapp, view)
         assert calls == [(LAB6,)], calls
 
 
