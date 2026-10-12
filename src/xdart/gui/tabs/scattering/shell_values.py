@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from os.path import normcase
 from types import MappingProxyType
@@ -94,7 +94,7 @@ class FrameSelectionIntent(str, Enum):
 @dataclass(frozen=True, slots=True)
 class ShellCommand:
     kind: ShellCommandKind
-    value: Scalar | tuple[tuple[str, bool], ...] = None
+    value: Scalar | tuple[tuple[str, bool], ...] | tuple[tuple[str, float], ...] = None
     path: tuple[str, ...] = ()
     frame: DisplayFrameKey | None = None
     frames: tuple[DisplayFrameKey, ...] = ()
@@ -109,7 +109,14 @@ class ShellCommand:
             and len(self.value) <= 8 and all(type(item) is tuple and len(item) == 2
                 and type(item[0]) is str and bool(item[0]) and type(item[1]) is bool for item in self.value)
             and len({item[0] for item in self.value}) == len(self.value))
-        if not _scalar_is_valid(self.value) and not phase_selection:
+        # REFERENCE-PHASES-20261011: per-phase minimums, (phase id, percent) pairs
+        phase_floors = (self.kind is ShellCommandKind.SET_PLOT_OPTION
+            and self.path == ("other", "phase_floors") and type(self.value) is tuple
+            and len(self.value) <= 8 and all(type(item) is tuple and len(item) == 2
+                and type(item[0]) is str and bool(item[0]) and type(item[1]) in (int, float)
+                and math.isfinite(item[1]) for item in self.value)
+            and len({item[0] for item in self.value}) == len(self.value))
+        if not _scalar_is_valid(self.value) and not phase_selection and not phase_floors:
             raise TypeError("shell command values must be detached scalars")
         if (
             type(self.path) is not tuple
@@ -676,10 +683,14 @@ class ScientificPlotOptions:
     show_legend: bool = True
     intensity_scale: str = "Linear"
     show_coverage_holes: bool = False
-    calibrant: str = 'Off'
     coordinate_grid: str = 'Off'
     phase_references: tuple[tuple[str, bool], ...] = ()
     phase_min_intensity: float = 5.
+    #: "Same minimum for all phases" (REFERENCE-PHASES-20261011): on, ``phase_min_intensity`` applies to every CIF
+    #: phase; off, each uses its own ``phase_floors`` value. Stored values survive the switch.
+    phase_global_floor: bool = True
+    #: per-phase minimum intensities ((listed phase id, percent), ...), in list order
+    phase_floors: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.waterfall_y_axis) is not str or not self.waterfall_y_axis:
@@ -701,9 +712,6 @@ class ScientificPlotOptions:
             raise ValueError("unsupported 1-D intensity scale")
         if type(self.show_coverage_holes) is not bool:
             raise TypeError("coverage shading must be boolean")
-        from xrd_tools.integrate.calibration import CALIBRANT_NAMES
-        if self.calibrant not in ('Off', *CALIBRANT_NAMES):
-            raise ValueError('unsupported predicted-ring calibrant')
         if self.coordinate_grid not in ('Off', 'q', 'χ', 'q + χ'):
             raise ValueError('unsupported coordinate grid')
         if (type(self.phase_references) is not tuple or len(self.phase_references) > 8
@@ -714,6 +722,36 @@ class ScientificPlotOptions:
         if (type(self.phase_min_intensity) not in (int, float)
                 or not math.isfinite(self.phase_min_intensity) or not 0 <= self.phase_min_intensity <= 100):
             raise ValueError('phase floor must be between 0 and 100 percent')
+        if type(self.phase_global_floor) is not bool:
+            raise TypeError('the global phase floor switch must be boolean')
+        listed = {row[0] for row in self.phase_references}
+        if (type(self.phase_floors) is not tuple or len(self.phase_floors) > 8
+                or any(type(row) is not tuple or len(row) != 2 or row[0] not in listed
+                       or type(row[1]) not in (int, float) or not math.isfinite(row[1]) or not 0 <= row[1] <= 100
+                       for row in self.phase_floors)
+                or len({row[0] for row in self.phase_floors}) != len(self.phase_floors)):
+            raise ValueError('per-phase floors name listed phases once each, between 0 and 100 percent')
+
+
+def phase_reference_document(options: ScientificPlotOptions) -> dict:
+    """The saved reference-phase section of Int's session and Stitch's settings (its ``global_floor`` and
+    ``floors`` keys are additive since REFERENCE-PHASES-20261011)."""
+    return {"references": [list(row) for row in options.phase_references],
+            "min_intensity": options.phase_min_intensity,
+            "global_floor": options.phase_global_floor,
+            "floors": [list(row) for row in options.phase_floors]}
+
+
+def restore_phase_references(options: ScientificPlotOptions, document) -> ScientificPlotOptions:
+    """``options`` with a saved reference-phase section. An older document (no switch, no floors) restores the
+    global minimum; a saved minimum naming a phase that is no longer listed is dropped."""
+    references = tuple(tuple(row) for row in document.get("references", options.phase_references))
+    listed = {row[0] for row in references if row}
+    floors = tuple((row[0], row[1]) for row in (tuple(item) for item in document.get("floors", ()))
+                   if len(row) == 2 and row[0] in listed)
+    return replace(options, phase_references=references,
+                   phase_min_intensity=document.get("min_intensity", options.phase_min_intensity),
+                   phase_global_floor=document.get("global_floor", True), phase_floors=floors)
 
 
 @dataclass(frozen=True, slots=True)

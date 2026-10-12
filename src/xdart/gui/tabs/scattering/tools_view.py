@@ -13,13 +13,18 @@ from .external_tools import (
 )
 from .shell_values import ShellCommand, ShellCommandKind
 
+#: The Tools button that opens ScientificView's Reference Phases window (REFERENCE-PHASES-20261011).
+REFERENCE_PHASES_TOOLTIP = ("Show reference lines and detector rings for calibrants, CIF phases and lattices, each with its own colour, legend entry and minimum intensity. Display only.")
+
 
 class ToolsView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
 
+    #: Int's analysis launchers: (label, command value[, tooltip])
     _TOOLS = (
         ("∧ Peak Fitting", "peak_fitting"),
         ("≈ Phase Fitting", "phase_fitting"),
+        ("┆ Reference Phases", "reference_phases", REFERENCE_PHASES_TOOLTIP),
         ("▣ ROI Statistics", "roi_statistics"),
     )
     _EXTERNAL_VIEWERS = (
@@ -50,9 +55,11 @@ class ToolsView(QtWidgets.QFrame):
         tools_layout = QtWidgets.QVBoxLayout(self.tool_content)
         self._tools_layout = tools_layout
         self._tool_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for label, value in self._TOOLS if page_tools is None else ():
+        for label, value, *tooltip in self._TOOLS if page_tools is None else ():
             button = QtWidgets.QPushButton(label)
             button.setObjectName(f"e3Tool_{value}")
+            if tooltip:
+                button.setToolTip(tooltip[0])
             button.clicked.connect(
                 lambda _checked=False, target=value: self.commandRequested.emit(
                     ShellCommand(ShellCommandKind.LAUNCH_TOOL, target)

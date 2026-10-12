@@ -730,6 +730,8 @@ class ScientificView(QtWidgets.QFrame):
             ONE_D_PLOT_BOTTOM_MARGIN,
         )
         self.legend = self.curve.addLegend()
+        # A phase's legend sample includes or excludes that phase (REFERENCE-PHASES-20261011).
+        self.legend.sigSampleClicked.connect(self._legend_sample_clicked)
         self._cursor_readout = PlotCursorReadout(self.curve)
         self.cursor_position = self._cursor_readout.label
         self._mouse_proxy = self._cursor_readout.proxy
@@ -1097,7 +1099,7 @@ class ScientificView(QtWidgets.QFrame):
         if self.raw_popup_image is not None:
             self.raw_popup_image.clear_image_buffers()
         if self._processing_mode == 'Int 1D':
-            self._clear_ring_overlay()
+            self._clear_phase_popup()
             self._clear_grid_overlay()
         if hasattr(self, "raw_popup_status"): self.raw_popup_status.setText("")
         self.raw_popup_intensity.sync(None, None, reset=True)
@@ -1138,7 +1140,7 @@ class ScientificView(QtWidgets.QFrame):
         """A host page's image in its open raw pop-up, with the line below it."""
         if not self.raw_popup_shown():
             return
-        self.raw_popup_image.render_ring_curves(())
+        self._clear_phase_popup()  # a host's own image carries no ring geometry
         self.raw_popup_image.render(image, detector_shape=detector_shape, color_map=color_map,
                                     log_scale=log_scale)
         self.raw_popup_intensity.set_percentile_defaults((0.1, 99.9) if log_scale else (2, 98))
@@ -1226,9 +1228,10 @@ class ScientificView(QtWidgets.QFrame):
         self.options = _CompactMenuButton("Options")
         self.options.setToolTip("Edit plot options and display limits. Display limit changes apply immediately.")
         self.plot_options_dialog = PlotOptionsDialog(self)
-        self._ring_cache = None
-        self._ring_prediction = None
-        self._ring_frame = None
+        from .reference_phases import ReferencePhasesWindow
+        self.reference_phases = ReferencePhasesWindow(self)
+        self.reference_phases.optionEdited.connect(
+            lambda path, value: self._emit(ShellCommandKind.SET_PLOT_OPTION, value, path))
         self._grid_cache = self._grid_prediction = self._grid_frame = None
         self._phase_job = PhaseOverlayJob()
         self._phase_requests = LatestRequestOwner(self._phase_job, self._phase_done,
@@ -1240,6 +1243,12 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_line_context = None
         self._phase_wavelengths = ()
         self._phase_display_contract = None
+        #: the last accepted detector-ring context (frame, snapshot, shape), kept across a retained display
+        self._phase_ring_context = None
+        #: every listed phase with its include flag, as the window resolved it (legend entries and colours)
+        self._phase_listed = ()
+        #: each listed phase's colour slot, kept from when it joined the list until it leaves it
+        self._phase_color_slots = {}
         self.clear = QtWidgets.QPushButton("Clear")
         self.share_axis = QtWidgets.QPushButton("Share Axis")
         self.share_axis.setCheckable(True)
@@ -1332,6 +1341,12 @@ class ScientificView(QtWidgets.QFrame):
         self.next_frame.clicked.connect(lambda: self._navigate(1))
         return row
 
+    def show_reference_phases(self) -> None:
+        """The Tools panel's Reference Phases window (REFERENCE-PHASES-20261011)."""
+        self.reference_phases.show()
+        self.reference_phases.raise_()
+        self.reference_phases.activateWindow()
+
     def _show_plot_options(self) -> None:
         self._emit(ShellCommandKind.SHOW_WATERFALL_OPTIONS)
         self.plot_options_dialog.show()
@@ -1352,7 +1367,7 @@ class ScientificView(QtWidgets.QFrame):
                     path,
                 )
 
-    def _remove_phase_family(self, identifier):
+    def _remove_phase_drawings(self, identifier):
         family = 'phase:' + identifier
         self._phase_drawings.pop(identifier, None)
         for pane in (self.raw, self.cake, self.raw_popup_image):
@@ -1361,20 +1376,33 @@ class ScientificView(QtWidgets.QFrame):
         marker = self._phase_markers.pop(identifier, None)
         if marker is not None:
             self.curve.removeItem(marker)
+        self.phase_families.pop(identifier, None)
+
+    def _remove_phase_family(self, identifier):
+        self._remove_phase_drawings(identifier)
         legend = self._phase_legends.pop(identifier, None)
         if legend is not None:
             self.legend.removeItem(legend)
-        self.phase_families.pop(identifier, None)
+
+    def _clear_phase_popup(self):
+        if self.raw_popup_image is not None:
+            for family in tuple(self.raw_popup_image.overlay_families):
+                if family.startswith('phase:'):
+                    self.raw_popup_image.render_overlay_family(family, ())
 
     def _clear_phase_overlays(self):
         self._phase_requests.release()
         self._phase_job.clear_cache()
-        for identifier in tuple(self.phase_families):
+        for identifier in set(self.phase_families) | set(self._phase_legends) | set(self._phase_markers):
             self._remove_phase_family(identifier)
+        self._phase_drawings.clear()
         self._phase_colors.clear()
         self._phase_line_context = None
         self._phase_wavelengths = ()
         self._phase_display_contract = None
+        self._phase_ring_context = None
+        self._phase_listed = ()
+        self._phase_color_slots = {}
 
     def shutdown_phase_overlays(self):
         self._clear_phase_overlays()
@@ -1390,23 +1418,34 @@ class ScientificView(QtWidgets.QFrame):
         return (key, (float(values.min()), float(values.max()))) if values.size else None
 
     def _reconcile_phase_overlay(self, state, navigation):
-        from xrd_tools.analysis.phase_references import pymatgen_available
         from xrd_tools import geometry_figures as gf
-        options, source = state.plot_options, self.plot_options_dialog.phase_source
+        options, window = state.plot_options, self.reference_phases
         visible = state.processing_mode != '2D Viewer'
-        available = pymatgen_available()
-        self.plot_options_dialog.set_phase_available(available,
-            '' if available else 'Reference phases require pymatgen; install xdart[fitting].', visible=visible)
-        entries = source.selected_entries() if visible and available else ()
-        wanted = {entry.id for entry in entries}
-        for identifier in tuple(self.phase_families):
-            if identifier not in wanted:
+        window.set_available(visible, '' if visible else 'Reference phases are unavailable in the 2D Viewer.')
+        window.reconcile(options)
+        listed = window.phase_source.listed_entries() if visible else ()
+        listed_ids = {entry.id for entry, _shown in listed}
+        entries = tuple(entry for entry, shown in listed if shown)
+        shown_ids = {entry.id for entry in entries}
+        for identifier in set(self.phase_families) | set(self._phase_legends) | set(self._phase_markers):
+            if identifier not in listed_ids:
                 self._remove_phase_family(identifier)
+            elif identifier not in shown_ids:
+                self._remove_phase_drawings(identifier)  # a hidden phase keeps its greyed legend entry
+        # Each phase keeps the colour slot it joined with, so hiding or removing a phase recolours no other.
+        slots = {identifier: slot for identifier, slot in self._phase_color_slots.items() if identifier in listed_ids}
+        for entry, _shown in listed:
+            if entry.id not in slots:
+                slots[entry.id] = min(set(range(len(listed) + len(slots))) - set(slots.values()))
+        self._phase_color_slots = slots
+        palette = trace_colors('Default', max(slots.values(), default=-1) + 1)
+        self._phase_colors = {identifier: palette[slot] for identifier, slot in slots.items()}
+        self._phase_listed = listed
         if not entries:
             self._phase_requests.release()
-            self._phase_job.clear_cache()
+            window.set_rings_reason('')
+            self._draw_phase_legends()
             return
-        self._phase_colors = dict(zip((entry.id for entry in entries), trace_colors('Default', len(entries))))
         wavelengths = self._phase_wavelengths
         wavelength = wavelengths[0]*1e10 if len(wavelengths) == 1 and wavelengths[0] is not None else None
         context = self._phase_line_context
@@ -1425,17 +1464,42 @@ class ScientificView(QtWidgets.QFrame):
         heavy = state.heavy
         is_int = (state.processing_mode == 'Int 1D' and 'raw' not in self._hidden_tools
                   or state.processing_mode == 'Int 2D' and 'raw_pane' not in self._hidden_tools)
-        snapshot, shape = (), None
-        if is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None:
-            if not gf.detector_ring_unavailable(heavy.ring_geometry, heavy.detector_shape):
-                snapshot, shape = tuple(heavy.ring_geometry.items()), heavy.detector_shape
+        raw_shown = is_int or state.processing_mode in ('Average', 'Reintegrate')
+        snapshot, shape, retained = (), None, self._phase_ring_context
+        if (heavy is None and state.retain_display and is_int and retained is not None
+                and retained[0] is navigation.current):
+            snapshot, shape = retained[1], retained[2]  # the accepted image+geometry pair (R10)
+            ring_reason = ''
+        else:
+            current = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
+            geometry = heavy.ring_geometry if current else None
+            ring_reason = gf.detector_ring_unavailable(geometry, heavy.detector_shape if current else None)
+            if current and not ring_reason:
+                snapshot, shape = tuple(geometry.items()), heavy.detector_shape
+                self._phase_ring_context = (navigation.current, snapshot, shape)
+            else:
+                self._phase_ring_context = None
+        window.set_rings_reason(ring_reason if raw_shown else '')
         self._phase_display_contract = (state.measurement_mode, self._phase_line_context, cake,
             self._phase_axis(self._rendered_cake_y_axis), wavelength, shape, bool(snapshot), state.processing_mode)
+        floors = () if options.phase_global_floor else tuple(
+            pair for pair in options.phase_floors if pair[0] in shown_ids)
         request = PhaseOverlayRequest(entries, options.phase_min_intensity, unit, bounds, wavelength,
-                                      snapshot, shape, line_reason=reason)
-        if request != self._phase_requests.shown:
-            for identifier in tuple(self.phase_families):
-                self._remove_phase_family(identifier)
+                                      snapshot, shape, line_reason=reason, floors=floors)
+        shown = self._phase_requests.shown
+        if shown is not None and request != shown:
+            def context(value):
+                return (value.line_unit, value.line_range, value.wavelength_angstrom, value.ring_snapshot,
+                        value.ring_shape, value.step_px, value.line_reason)
+            if context(shown) != context(request):
+                for identifier in tuple(self.phase_families):
+                    self._remove_phase_drawings(identifier)
+            else:
+                before = {entry.id: (entry, dict(shown.floors).get(entry.id, shown.floor)) for entry in shown.entries}
+                for entry in entries:
+                    floor = dict(request.floors).get(entry.id, request.floor)
+                    if before.get(entry.id) != (entry, floor):
+                        self._remove_phase_drawings(entry.id)  # only the phase that changed waits for its lines
         self._phase_requests.ask(request)
         self._draw_phase_overlays()
 
@@ -1449,8 +1513,51 @@ class ScientificView(QtWidgets.QFrame):
         self._draw_phase_overlays()
         return True
 
+    @staticmethod
+    def _phase_tip(family):
+        from xrd_tools.analysis.phase_overlays import RING_CAVEAT
+        if family.source_kind == 'calibrant':
+            tip = f'{family.name} (built-in calibrant): reference positions from pyFAI d-spacings. {RING_CAVEAT}'
+        else:
+            tip = f'{family.name}: {family.omitted_count} reflections omitted below the floor. Display reference only.'
+        return tip + (' ' + family.reason if family.reason else '')
+
+    def _draw_phase_legends(self):
+        for entry, shown in self._phase_listed:
+            identifier = entry.id
+            color = self._phase_colors.get(identifier, (240, 200, 90))
+            family = self.phase_families.get(identifier)
+            tip = (self._phase_tip(family) if family is not None and shown else
+                   f'{entry.name}: hidden. Click to show it again. Display reference only.' if not shown else
+                   f'{entry.name}: computing reference positions. Display reference only.')
+            legend = self._phase_legends.get(identifier)
+            if legend is None:
+                legend = pg.PlotDataItem(pen=pg.mkPen(color, width=2))
+                self._phase_legends[identifier] = legend
+            if not any(item.item is legend for item, _label in self.legend.items):
+                self.legend.addItem(legend, entry.name)
+            legend.setPen(pg.mkPen(color, width=2))
+            legend.setVisible(bool(shown))  # pyqtgraph greys a hidden sample
+            legend.setToolTip(tip)
+            for sample, label in self.legend.items:
+                if sample.item is legend:  # the entry the legend shows, not only its proxy
+                    sample.setToolTip(tip)
+                    label.setToolTip(tip)
+                    sample.update()
+
+    def _legend_sample_clicked(self, item):
+        identifier = next((key for key, legend in self._phase_legends.items() if legend is item), None)
+        if identifier is None:
+            return  # a trace's own entry: pyqtgraph shows or hides the trace itself
+        shown = bool(item.isVisible())  # the sample toggled its proxy before this signal
+        options = self.reference_phases.projection
+        references = tuple((key, shown if key == identifier else flag) for key, flag in options.phase_references)
+        if references != options.phase_references:
+            self._emit(ShellCommandKind.SET_PLOT_OPTION, references, ('other', 'phase_references'))
+
     def _draw_phase_overlays(self):
         from xrd_tools.geometry_figures import Curve
+        self._draw_phase_legends()
         if self._phase_display_contract is None:
             return
         measurement, line, cake, cake_y, wavelength, shape, raw_allowed, mode = self._phase_display_contract
@@ -1458,9 +1565,7 @@ class ScientificView(QtWidgets.QFrame):
         for identifier, family in self.phase_families.items():
             name = 'phase:' + identifier
             color = self._phase_colors.get(identifier, (240, 200, 90))
-            tip = f'{family.name}: {family.omitted_count} reflections omitted below the floor. Display reference only.'
-            if family.reason:
-                tip += ' ' + family.reason
+            tip = self._phase_tip(family)
             positions = positions_for_axis(family.q_lines,
                 {'q_A^-1': 'q', '2th_deg': '2theta'}.get(line_key, ''), wavelength)
             values = positions.values if measurement != 'Grazing' else ()
@@ -1479,48 +1584,27 @@ class ScientificView(QtWidgets.QFrame):
                     self._phase_markers[identifier] = marker
             if marker is not None:
                 marker.set_tooltip(tip)
-            legend = self._phase_legends.get(identifier)
-            if legend is None:
-                legend = pg.PlotDataItem(pen=pg.mkPen(color, width=2))
-                legend.setToolTip(tip)
-                self._phase_legends[identifier] = legend
-            if not any(item.item is legend for item, _label in self.legend.items):
-                self.legend.addItem(legend, family.name)
-            legend.setPen(pg.mkPen(color, width=2))
-            legend.setToolTip(tip)
-            for sample, label in self.legend.items:
-                if sample.item is legend:  # the entry the legend shows, not only its proxy
-                    sample.setToolTip(tip)
-                    label.setToolTip(tip)
-            drawing_key = (id(family), measurement, cake, cake_y, wavelength, color)
+            # The family object, unchanged by another phase's edit, keeps its curves and so every pane's items.
+            scalars = (measurement, cake, cake_y, wavelength, color, tip)
             drawing = self._phase_drawings.get(identifier)
-            if drawing is None or drawing[0] != drawing_key:
-                drawing = (drawing_key, tuple(replace(curve, tooltip=tip) for curve in family.rings))
+            if drawing is None or drawing[0] is not family or drawing[1] != scalars:
+                rings = tuple(replace(curve, tooltip=tip) for curve in family.rings)
+                cuts = ()
+                if measurement != 'Grazing' and cake is not None and cake_y is not None:
+                    cake_values = positions_for_axis(family.q_lines,
+                        {'q_A^-1': 'q', '2th_deg': '2theta'}.get(cake[0], ''), wavelength).values
+                    cuts = tuple(Curve(family.name, np.asarray(((value, cake_y[1][0]), (value, cake_y[1][1]))),
+                                       'predicted', tip) for value in cake_values)
+                drawing = (family, scalars, rings, cuts)
                 self._phase_drawings[identifier] = drawing
-            curves = ()
-            if measurement != 'Grazing' and cake is not None and cake_y is not None:
-                cake_values = positions_for_axis(family.q_lines,
-                    {'q_A^-1': 'q', '2th_deg': '2theta'}.get(cake[0], ''), wavelength).values
-                curves = tuple(Curve(family.name, np.asarray(((value, cake_y[1][0]),
-                    (value, cake_y[1][1]))), 'predicted', tip) for value in cake_values)
-            self.cake.render_overlay_family(name, curves, color=color, joined=True)
-            raw_curves = drawing[1] if raw_allowed else ()
+            self.cake.render_overlay_family(name, drawing[3], color=color, joined=True)
+            raw_curves = drawing[2] if raw_allowed else ()
             self.raw.render_overlay_family(name, raw_curves if mode == 'Int 2D' else (),
                                            native_shape=shape, color=color, joined=True)
             if self.raw_popup_image is not None:
                 own_popup = mode == 'Int 1D' and not self._raw_popup_host and self.raw_popup_dialog.isVisible()
                 self.raw_popup_image.render_overlay_family(name, raw_curves if own_popup else (),
                                                            native_shape=shape, color=color, joined=True)
-
-    def _clear_ring_overlay(self):
-        self._ring_cache = self._ring_prediction = None
-        self._remove_ring_items()
-
-    def _remove_ring_items(self):
-        self._ring_frame = None
-        self.raw.render_ring_curves(())
-        if self.raw_popup_image is not None:
-            self.raw_popup_image.render_ring_curves(())
 
     def _clear_grid_overlay(self, *, retain_cache=False):
         self._grid_frame = None
@@ -1566,47 +1650,6 @@ class ScientificView(QtWidgets.QFrame):
             target.render_overlay_family('grid', self._grid_prediction.curves,
                                          texts=self._grid_prediction.texts, native_shape=shape)
 
-    def _reconcile_ring_overlay(self, state, navigation):
-        from xrd_tools import geometry_figures as gf
-        heavy, mode = state.heavy, state.processing_mode
-        # Rings belong on Int's own raw displays; a host that hides them (Stitch, RSM) never offers the choice.
-        shown = (mode in ('Average', 'Reintegrate')
-                 or mode == 'Int 1D' and 'raw' not in self._hidden_tools
-                 or mode == 'Int 2D' and 'raw_pane' not in self._hidden_tools)
-        is_int = shown and mode in ('Int 1D', 'Int 2D')
-        if (heavy is None and state.retain_display and is_int
-                and self._ring_frame is navigation.current):
-            return  # Keep only the previously accepted image+geometry pair.
-        matches = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
-        snapshot = heavy.ring_geometry if matches else None
-        shape = heavy.detector_shape if matches else None
-        reason = gf.detector_ring_unavailable(snapshot, shape)
-        if os.environ.get('XDART_DEBUG_PREDICTED_RINGS') == '1':
-            logging.getLogger(__name__).warning('ring_state frame=%r heavy=%s matches=%s shape=%r snapshot=%s choice=%s reason=%r',
-                navigation.current, heavy is not None, matches, shape, snapshot is not None,
-                state.plot_options.calibrant, reason)
-        self.plot_options_dialog.set_ring_available(not reason, reason, visible=shown)
-        if reason or state.plot_options.calibrant == 'Off':
-            # Retire the curves but keep the one cached prediction: the next frame with the same
-            # snapshot (hydrating or newly arrived) redraws it without predicting again.
-            self._remove_ring_items()
-            return
-        key = (tuple(snapshot.items()), shape, state.plot_options.calibrant)
-        if self._ring_cache != key:
-            self._clear_ring_overlay()
-            try:
-                prediction = gf.predict_detector_rings(snapshot, state.plot_options.calibrant, shape=shape)
-            except ValueError as error:
-                self.plot_options_dialog.set_ring_available(False, str(error))
-                return
-            self._ring_cache, self._ring_prediction = key, prediction
-        self._ring_frame = navigation.current
-        if state.processing_mode == 'Int 2D':
-            self.raw.render_ring_curves(self._ring_prediction.curves, native_shape=shape)
-        elif (self.raw_popup_dialog is not None and self.raw_popup_dialog.isVisible()
-              and not self._raw_popup_host):
-            self.raw_popup_image.render_ring_curves(self._ring_prediction.curves, native_shape=shape)
-
     def reconcile(
         self,
         state: ScientificProjection,
@@ -1618,10 +1661,10 @@ class ScientificView(QtWidgets.QFrame):
     ) -> None:
         self.reconcile_action_availability(state)
         if state.processing_mode == '2D Viewer':
-            self._clear_ring_overlay()
             self._clear_grid_overlay()
-            self.plot_options_dialog.set_ring_available(False, visible=False)
             self.plot_options_dialog.set_grid_available(False, visible=False)
+            self._clear_phase_overlays()
+            self.reference_phases.set_available(False, 'Reference phases are unavailable in the 2D Viewer.')
         coverage = (
             state.heavy.cake_coverage
             if state.heavy is not None
@@ -1869,7 +1912,6 @@ class ScientificView(QtWidgets.QFrame):
                 )
             if state.processing_mode == "Int 1D":
                 self._reconcile_raw_popup(state)
-            self._reconcile_ring_overlay(state, navigation)
             self._reconcile_grid_overlay(state, navigation)
             self._reconcile_phase_overlay(state, navigation)
         finally:
@@ -2149,7 +2191,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def clear_workspace(self) -> bool:
         """Drop every mounted scientific payload before owner retirement."""
-        self._clear_ring_overlay()
+        self._clear_phase_overlays()
         self._clear_grid_overlay()
         self.drop_viewer_loading_snapshot()
         cleared = ScientificView.clear_viewer_1d(
@@ -3578,7 +3620,7 @@ class ScientificView(QtWidgets.QFrame):
         if type(state) is not KeyedPanelsProjection:
             raise TypeError("a keyed layout is drawn from a KeyedPanelsProjection")
         self._clear_phase_overlays()
-        self.plot_options_dialog.set_phase_available(False, "Reference phases are unavailable in keyed views.", visible=False)
+        self.reference_phases.set_available(False, "Reference phases are unavailable in keyed views.", visible=False)
         prior = self._keyed_shown
         try:
             self._paint_keyed(state)

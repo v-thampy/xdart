@@ -3201,6 +3201,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             )
             return
+        if kind is ShellCommandKind.LAUNCH_TOOL and command.value == "reference_phases":
+            self._shell.scientific.show_reference_phases()  # a view-owned window, not an analysis mount
+            return
         if kind in {ShellCommandKind.SHOW_METADATA, ShellCommandKind.LAUNCH_TOOL,
                     ShellCommandKind.ANALYSIS_ACTION}:
             from .analysis_mount import mount_target

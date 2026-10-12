@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+from xdart.gui.tabs.scattering.shell_values import phase_reference_document, restore_phase_references
+
 from xdart.gui.tools.page_settings import (
     SettingsKind, restore_sources, restore_write_mode, saved_fields, saved_threshold,
 )
@@ -41,8 +43,7 @@ def page_settings(page) -> dict[str, Any]:
         # grazing incidence as Int sets it (its axis and ranges are fields above)
         gi=dict(page._gi),
         point_images=page.point_images.document(),
-        phase_references={"references": [list(row) for row in options.phase_references],
-                          "min_intensity": options.phase_min_intensity},
+        phase_references=phase_reference_document(options),
         # Append skips an output already stitched with these settings; "Overwrite" is Replace
         write_mode=page.run_bar.write_mode(),
         # Stitch 1D or Stitch 2D
@@ -63,11 +64,8 @@ def apply_page_settings(page, document: Any) -> None:
     document = validate_settings(document)
     phase_options = None
     if "phase_references" in document:
-        saved_phases = document["phase_references"]
         current = (page._member_preferences or page._view).plot_options
-        phase_options = replace(current,
-            phase_references=tuple(tuple(row) for row in saved_phases.get("references", current.phase_references)),
-            phase_min_intensity=saved_phases.get("min_intensity", current.phase_min_intensity))
+        phase_options = restore_phase_references(current, document["phase_references"])
     if "point_images" in document:
         page.point_images.restore(document["point_images"])
     fields = saved_fields(page, document, _DERIVED)

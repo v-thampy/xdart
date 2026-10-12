@@ -6,13 +6,32 @@ visibility flags. No reflection listing or detector prediction runs here.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
+from xdart.gui.tabs.scattering.browser_view import (BrowserResult, BrowserView, ResultValueSpec,
+                                                    keyed_list_profile)
 from xdart.gui.widgets.controls_panel import FormRow, SectionCard
 from xdart.gui.widgets.file_dialogs import browse
 
 CIF_FILTER = 'CIF files (*.cif);;All files (*)'
+_PYMATGEN_REASON = 'Phase sources need pymatgen; install xdart[fitting].'
+_ADD_CALIBRANT, _ADD_FROM_LIBRARY = 'Add calibrant…', 'Add from library…'
+_ROW_TIP = 'This phase\'s minimum intensity, in percent of its strongest reachable reflection.'
+_SAME_TIP = 'Same minimum for all phases is on; turn it off to give each CIF phase its own minimum.'
+_NO_INTENSITY_TIP = {'lattice': 'Lattice phases have no structural intensities; every allowed position is shown.',
+                     'calibrant': 'Calibrants carry positions only, with no intensities; every line is shown.'}
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseCutoffs:
+    """The minimum-intensity choice (REFERENCE-PHASES-20261011): one value for every CIF phase while
+    ``global_on``, else each listed CIF phase's own ``per_phase`` value (stored values survive the switch)."""
+
+    global_on: bool = True
+    global_value: float = 5.
+    per_phase: tuple[tuple[str, float], ...] = ()
 _SOURCE_TIP = ('Choose structural CIF phases or enter lattice parameters. CIF entries retain their bytes in the '
                'phase library; a lattice entry predicts positions only, without structural intensities.')
 
@@ -22,8 +41,11 @@ class PhaseSourceWidget(QtWidgets.QWidget):
 
     changed = QtCore.Signal(object)
     messageChanged = QtCore.Signal(str)
+    #: a user's minimum-intensity edit (row, global switch or global value), as the new ``PhaseCutoffs``
+    cutoffsChanged = QtCore.Signal(object)
 
-    def __init__(self, parent=None, *, library=None, checkable=True, show_library=True, key_by_index=False):
+    def __init__(self, parent=None, *, library=None, checkable=True, show_library=True, key_by_index=False,
+                 calibrants=False, cutoffs=False):
         super().__init__(parent)
         from xrd_tools.analysis.phase_references import PhaseLibrary
         self.library = PhaseLibrary() if library is None else library
@@ -37,11 +59,15 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._details = {}
         self._reason = ''
         self._availability_reason = ''
+        self._source_reason = ''
+        self._cutoffs_enabled = bool(cutoffs)
+        self._cutoffs = PhaseCutoffs()
         self.setObjectName('phaseSourceWidget')
         self.setToolTip(_SOURCE_TIP)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.browser = BrowserView(self, profile=keyed_list_profile('Phases', checkable=checkable))
+        values = ResultValueSpec(suffix=' %', minimum=0., maximum=100., decimals=1) if cutoffs else None
+        self.browser = BrowserView(self, profile=keyed_list_profile('Phases', checkable=checkable, values=values))
         self.browser.setObjectName('phaseSourceBrowser')
         self.browser.setMaximumHeight(150)
         self.browser.setToolTip(_SOURCE_TIP)
@@ -68,6 +94,36 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             buttons.addWidget(button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
+        self.calibrant_row = self.library_row = None
+        if calibrants:
+            from xrd_tools.integrate.calibration import CALIBRANT_NAMES
+            self.calibrant_row = FormRow(label='Calibrant', path=('phase_source', 'calibrant'), value=_ADD_CALIBRANT,
+                                         kind='combo', choices=(_ADD_CALIBRANT, *CALIBRANT_NAMES), parent=self)
+            self.calibrant_row.set_purpose_tooltip(
+                'Add a built-in calibrant: its pyFAI d-spacings as reference lines and current-Run detector rings. '
+                'Positions only; needs no pymatgen.')
+            self.calibrant_row.valueChanged.connect(lambda _path, value: self._choose_calibrant(value))
+            layout.addWidget(self.calibrant_row)
+        if calibrants and not show_library:
+            self.library_row = FormRow(label='Library', path=('phase_source', 'library'), value='', kind='combo',
+                                       choices=('',), choice_labels={'': _ADD_FROM_LIBRARY}, parent=self)
+            self.library_row.set_purpose_tooltip('Add a CIF or lattice entry already kept in the phase library.')
+            self.library_row.valueChanged.connect(lambda _path, value: self._choose_library_entry(value))
+            layout.addWidget(self.library_row)
+        self.global_switch = self.global_row = None
+        if cutoffs:
+            self.global_switch = FormRow(label='Same minimum for all phases', path=('phase_source', 'global_floor'),
+                                         value=True, kind='bool', parent=self)
+            self.global_switch.set_purpose_tooltip(
+                'On: one minimum intensity applies to every CIF phase and the row values are off. '
+                'Off: each CIF phase uses its own value, starting from this one.')
+            self.global_row = FormRow(label='Minimum intensity', path=('phase_source', 'min_intensity'), value=5.,
+                                      kind='float', minimum=0., maximum=100., decimals=1, suffix=' %', parent=self)
+            self.global_switch.valueChanged.connect(lambda _path, value: self._switch_edited(bool(value)))
+            self.global_row.valueChanged.connect(lambda _path, value: self._global_edited(float(value)))
+            self.browser.resultValueChanged.connect(self._row_edited)
+            layout.addWidget(self.global_switch)
+            layout.addWidget(self.global_row)
         self.lattice_form = SectionCard('Lattice parameters', self, collapsible=False)
         self.lattice_form.setToolTip('A unit cell and space group determine allowed reflection positions, not intensities.')
         self.lattice_rows = {}
@@ -99,7 +155,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
                     self.browser.show_all, self.browser.metadata, self.browser.auto_last,
                     self.browser.date_sort, self.browser.refresh, self.add_cif_btn,
                     self.add_lattice_btn, self.remove_btn, self.lattice_form,
-                    self.add_lattice_commit, self.status, *self.lattice_rows.values())
+                    self.add_lattice_commit, self.status, *self.lattice_rows.values(),
+                    *(row for row in (self.calibrant_row, self.library_row, self.global_switch) if row is not None))
         self._purpose_tooltips = {control: control.toolTip() for control in controls}
         self.add_cif_btn.clicked.connect(self._browse_cifs)
         self.add_lattice_btn.clicked.connect(lambda: self.lattice_form.setVisible(not self.lattice_form.isVisible()))
@@ -128,16 +185,123 @@ class PhaseSourceWidget(QtWidgets.QWidget):
     def _sync_tooltips(self):
         suffix = ' ' + self._availability_reason if self._availability_reason else ''
         self.setToolTip(_SOURCE_TIP + suffix + (' ' + self._reason if self._reason else ''))
+        needs_backend = (self.add_cif_btn, self.add_lattice_btn, self.lattice_form, self.add_lattice_commit,
+                         *self.lattice_rows.values())
         for control, purpose in self._purpose_tooltips.items():
+            extra = suffix or (' ' + self._source_reason if self._source_reason and control in needs_backend else '')
             if isinstance(control, FormRow):
-                control.set_purpose_tooltip(purpose + suffix)
+                control.set_purpose_tooltip(purpose + extra)
             else:
-                control.setToolTip(purpose + suffix)
+                control.setToolTip(purpose + extra)
+        self._sync_cutoff_rows()
 
     def selected_entries(self):
         """The visible selected entries as last resolved by refresh_library."""
         return tuple(self._resolved[identifier] for identifier, visible in self._selection
                      if visible and identifier in self._resolved)
+
+    def listed_entries(self):
+        """Every listed entry with its visibility, in list order, as last resolved."""
+        return tuple((self._resolved[identifier], visible) for identifier, visible in self._selection
+                     if identifier in self._resolved)
+
+    @property
+    def cutoffs(self) -> PhaseCutoffs:
+        return self._cutoffs
+
+    def set_cutoffs(self, cutoffs) -> None:
+        """Project the minimum-intensity choice silently (no ``cutoffsChanged``)."""
+        if type(cutoffs) is not PhaseCutoffs:
+            raise TypeError('cutoffs must be an exact PhaseCutoffs')
+        self._cutoffs = cutoffs
+        self._sync_cutoff_rows()
+
+    def cutoff_editor(self, identifier):
+        """The listed phase's row editor (None: not listed, or no cutoffs)."""
+        if identifier not in self._shown_ids:
+            return None
+        key = str(self._shown_ids.index(identifier)) if self._key_by_index else identifier
+        return self.browser.result_value_editor(key)
+
+    def refresh_cutoffs(self):
+        """Re-project the cutoff rows after a host reconciled this source's list itself."""
+        self._sync_cutoff_rows()
+
+    def _cif_ids(self):
+        return [entry.id for entry, _visible in self.listed_entries() if entry.source_kind == 'cif']
+
+    def _sync_cutoff_rows(self):
+        if not self._cutoffs_enabled:
+            return
+        cutoffs, available = self._cutoffs, self.isEnabled() and not self._availability_reason
+        own, rows = dict(cutoffs.per_phase), {}
+        for index, identifier in enumerate(self._shown_ids):
+            entry = self._resolved.get(identifier)
+            if entry is None:
+                continue
+            key = str(index) if self._key_by_index else identifier
+            if entry.source_kind != 'cif':
+                rows[key] = (cutoffs.global_value, False, _NO_INTENSITY_TIP.get(entry.source_kind, _ROW_TIP))
+            else:
+                value = cutoffs.global_value if cutoffs.global_on else own.get(identifier, cutoffs.global_value)
+                tip = _ROW_TIP + (' ' + _SAME_TIP if cutoffs.global_on else '')
+                rows[key] = (value, available and not cutoffs.global_on, tip)
+        self.browser.reconcile_result_values(rows)
+        blocked = self.global_switch.editor.blockSignals(True)
+        try:
+            self.global_switch.editor.setChecked(cutoffs.global_on)
+        finally:
+            self.global_switch.editor.blockSignals(blocked)
+        self.global_row.set_number(cutoffs.global_value)
+        cif = bool(self._cif_ids())
+        tip = 'Minimum intensity as a percent of the strongest reflection in the reachable range, from 0 to 100.'
+        if not cutoffs.global_on:
+            tip += ' Each CIF phase uses its own value now; new phases start from this one.'
+        elif not cif:
+            tip += (' Lattice and calibrant phases bypass the minimum.' if self._selection
+                    else ' Select a CIF phase to edit the minimum.')
+        self.global_row.editor.setEnabled(available and cutoffs.global_on and cif)
+        self.global_row.set_purpose_tooltip(tip + (' ' + self._availability_reason if self._availability_reason else ''))
+
+    def _adjust_cutoffs(self):
+        """Keep stored values for listed phases only; with the switch off a new CIF phase starts from the global."""
+        cutoffs = self._cutoffs
+        listed = [identifier for identifier, _visible in self._selection]
+        own = dict(cutoffs.per_phase)
+        values = [(identifier, own[identifier]) for identifier in listed if identifier in own]
+        if not cutoffs.global_on:
+            values += [(identifier, cutoffs.global_value) for identifier in self._cif_ids() if identifier not in own]
+            order = {identifier: index for index, identifier in enumerate(listed)}
+            values.sort(key=lambda pair: order[pair[0]])
+        self._cutoffs = replace(cutoffs, per_phase=tuple(values))
+
+    def _switch_edited(self, on):
+        cutoffs = self._cutoffs
+        if on == cutoffs.global_on:
+            return
+        self._cutoffs = replace(cutoffs, global_on=on)
+        if not on:
+            self._adjust_cutoffs()  # materialize the global value for each CIF phase without its own
+        self._sync_cutoff_rows()
+        self.cutoffsChanged.emit(self._cutoffs)
+
+    def _global_edited(self, value):
+        if value == self._cutoffs.global_value:
+            return
+        self._cutoffs = replace(self._cutoffs, global_value=value)
+        self._sync_cutoff_rows()
+        self.cutoffsChanged.emit(self._cutoffs)
+
+    def _row_edited(self, key, value):
+        identifier = self._shown_ids[int(key)] if self._key_by_index else key
+        own = dict(self._cutoffs.per_phase)
+        if own.get(identifier) == value:
+            return
+        own[identifier] = float(value)
+        order = [identifier for identifier, _visible in self._selection]
+        self._cutoffs = replace(self._cutoffs, per_phase=tuple(
+            (identifier, own[identifier]) for identifier in order if identifier in own))
+        self.cutoffsChanged.emit(self._cutoffs)
 
     def set_selection(self, selection):
         selection = tuple(selection)
@@ -150,6 +314,9 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             return
         self._selection = selection
         self.refresh_library()
+        if self._cutoffs_enabled:
+            self._adjust_cutoffs()
+            self._sync_cutoff_rows()
         self.changed.emit(self._selection)
 
     def refresh_library(self):
@@ -178,13 +345,32 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         missing = [lookup.reason or f'Missing phase library entry: {identifier}'
                    for identifier, lookup in lookups.items() if lookup.entry is None]
         self._message('; '.join(missing))
-        if not pymatgen_available():  # never re-enable over a host's own unavailable reason
-            self.set_available(False, 'Phase sources need pymatgen; install xdart[fitting].')
+        if self.library_row is not None:
+            editor = self.library_row.editor
+            blocked = editor.blockSignals(True)
+            try:
+                editor.clear()
+                editor.addItem(_ADD_FROM_LIBRARY, '')
+                for entry in self.library.entries():
+                    if entry.id not in selected:
+                        editor.addItem(entry.name, entry.id)
+            finally:
+                editor.blockSignals(blocked)
+        self._sync_backend()
+        self._sync_tooltips()
 
     def set_available(self, available, reason=''):
         self.setEnabled(bool(available))
         self._availability_reason = str(reason) if not available else ''
+        self._sync_backend()
         self._sync_tooltips()
+
+    def _sync_backend(self):
+        """Calibrants need no pymatgen (P3a's rings never did); CIF and lattice sources say why they are off."""
+        from xrd_tools.analysis.phase_references import pymatgen_available
+        self._source_reason = '' if pymatgen_available() else _PYMATGEN_REASON
+        for control in (self.add_cif_btn, self.add_lattice_btn, self.lattice_form):
+            control.setEnabled(not self._source_reason)
 
     def set_details(self, details):
         self._details = dict(details)
@@ -227,6 +413,48 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             except (OSError, ValueError, ImportError) as error:
                 self._message(str(error)); break
         return tuple(added)
+
+    def add_calibrant(self, name):
+        """Add a built-in calibrant entry (no library file) and show it."""
+        from xrd_tools.analysis.phase_references import calibrant_entry
+        try:
+            if len(self._selection) >= 8 and calibrant_entry(name).id not in dict(self._selection):
+                raise ValueError('Choose at most eight phases.')
+            return self._add_entry(calibrant_entry(name))
+        except ValueError as error:
+            self._message(str(error))
+            return None
+
+    def add_library_entry(self, identifier):
+        lookup = self.library.resolve(identifier)
+        if lookup.entry is None:
+            self._message(lookup.reason or f'Missing phase library entry: {identifier}')
+            return None
+        try:
+            if len(self._selection) >= 8 and identifier not in dict(self._selection):
+                raise ValueError('Choose at most eight phases.')
+            return self._add_entry(lookup.entry)
+        except ValueError as error:
+            self._message(str(error))
+            return None
+
+    def _choose_calibrant(self, value):
+        if value and value != _ADD_CALIBRANT:
+            self.add_calibrant(value)
+        self._reset_choice(self.calibrant_row, 0)
+
+    def _choose_library_entry(self, value):
+        if value:
+            self.add_library_entry(value)
+        self._reset_choice(self.library_row, 0)
+
+    @staticmethod
+    def _reset_choice(row, index):
+        blocked = row.editor.blockSignals(True)
+        try:
+            row.editor.setCurrentIndex(index)
+        finally:
+            row.editor.blockSignals(blocked)
 
     def add_lattice(self, name, **lattice):
         try:

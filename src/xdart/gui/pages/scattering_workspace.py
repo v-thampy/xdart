@@ -111,6 +111,7 @@ class _WorkspaceCloser:
             )
         if closed.cleanup_status is CleanupStatus.CLEANED:
             if self.persist_session and not self._session_saved:
+                from xdart.gui.tabs.scattering.shell_values import phase_reference_document
                 from xdart.utils.session import save_session
                 from xrd_tools.session.run_intent_profile import dump_run_intent_profile
 
@@ -118,10 +119,7 @@ class _WorkspaceCloser:
                     profile = dump_run_intent_profile(self.widget._intents.snapshot().thaw())
                     options = self.widget._preferences.plot_options
                     save_session({_SESSION_PROFILE_KEY: profile,
-                                  _SESSION_PHASE_KEY: {
-                                      "references": [list(row) for row in options.phase_references],
-                                      "min_intensity": options.phase_min_intensity,
-                                  }})
+                                  _SESSION_PHASE_KEY: phase_reference_document(options)})
                 except Exception:
                     logger.warning("Could not save the last run configuration", exc_info=True)
                 self._session_saved = True
@@ -577,10 +575,8 @@ def build_scattering_workspace(
     )
     if phase_preferences is not None:
         try:
-            options = widget._preferences.plot_options
-            options = replace(options,
-                phase_references=tuple(tuple(row) for row in phase_preferences.get("references", ())),
-                phase_min_intensity=phase_preferences.get("min_intensity", 5.))
+            from xdart.gui.tabs.scattering.shell_values import restore_phase_references
+            options = restore_phase_references(widget._preferences.plot_options, phase_preferences)
             widget._preferences = replace(widget._preferences, plot_options=options)
             widget._refresh_shell()
         except (AttributeError, TypeError, ValueError):

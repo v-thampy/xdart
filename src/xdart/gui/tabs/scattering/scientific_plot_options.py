@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 from .scientific_waterfall_policy import waterfall_should_be_active
 from .shell_values import ScientificPlotOptions
@@ -20,8 +20,6 @@ COVERAGE_TOOLTIP = (
     "Shade Q–χ bins that received no contributing pixels. Coverage includes pixel splitting "
     "and does not measure angular completeness."
 )
-RING_TOOLTIP = ("Overlay predicted powder rings using this frame's effective run geometry and wavelength. "
-                'Radial agreement alone does not identify detector mounting.')
 GRID_TOOLTIP = ('Show detector-frame q contours and χ half-rays with the effective Run plan’s χ offset. '
                 'Display only; available on Standard Int Run frames with a uniform flat detector.')
 
@@ -36,10 +34,11 @@ PLOT_OPTION_BINDINGS = (
     (("other", "legend"), "show_legend"),
     (("other", "intensity_scale"), "intensity_scale"),
     (("other", "coverage_holes"), "show_coverage_holes"),
-    (("other", "calibrant"), "calibrant"),
     (("other", "coordinate_grid"), "coordinate_grid"),
     (("other", "phase_references"), "phase_references"),
     (("other", "phase_min_intensity"), "phase_min_intensity"),
+    (("other", "phase_global_floor"), "phase_global_floor"),
+    (("other", "phase_floors"), "phase_floors"),
 )
 
 
@@ -123,26 +122,11 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.accept_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
 
-        from xrd_tools.integrate.calibration import CALIBRANT_NAMES
-        self.calibrant = self.add_choice('Calibrant', ('Off', *CALIBRANT_NAMES), 'Off', tooltip=RING_TOOLTIP)
-        self.set_ring_available(False, visible=False)  # shown only when Int's raw display reconciles
+        # Calibrants and reference phases live in the Tools panel's Reference Phases window
+        # (REFERENCE-PHASES-20261011); this dialog keeps the coordinate grid.
         self.coordinate_grid = self.add_choice('Coordinate grid', ('Off', 'q', 'χ', 'q + χ'),
                                                'Off', tooltip=GRID_TOOLTIP)
         self.set_grid_available(False, visible=False)
-
-        from xdart.gui.analysis.phase_source import PhaseSourceWidget
-        from xdart.gui.widgets.controls_panel import FormRow
-        phase = self._section(layout, 'Reference phases', index=layout.count() - 1)  # above Okay/Cancel
-        self._phase_group = phase.parentWidget()
-        self._phase_group.setToolTip('Choose reference phases for q/2θ lines and current-Run detector rings. Display only.')
-        self.phase_source = PhaseSourceWidget(self._phase_group)
-        phase.addWidget(self.phase_source, 0, 0)
-        self.phase_floor = FormRow(label='Minimum intensity (%)', path=('other', 'phase_min_intensity'),
-                                   value='5', parent=self._phase_group)
-        self.phase_floor.editor.setValidator(QtGui.QDoubleValidator(0., 100., 6, self.phase_floor))
-        phase.addWidget(self.phase_floor, 1, 0)
-        self._phase_available = True
-        self.phase_source.changed.connect(lambda _value: self._sync_phase_floor())
         self.reconcile(self._projection)
 
     @staticmethod
@@ -211,14 +195,6 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         outer.insertWidget(outer.count() - 1, row)
         return editor
 
-    def set_ring_available(self, available: bool, reason: str = '', *, visible: bool = True) -> None:
-        from xrd_tools.geometry_figures import RUN_RING_REASON
-        tip = RING_TOOLTIP if available else RING_TOOLTIP+' '+(reason or RUN_RING_REASON)
-        self.calibrant.setEnabled(available)
-        self.calibrant.setToolTip(tip)
-        row = self.calibrant.parentWidget(); row.setVisible(visible); row.setToolTip(tip)
-        row.findChild(QtWidgets.QLabel).setToolTip(tip)
-
     def set_grid_available(self, available: bool, reason: str = '', *, visible: bool = True) -> None:
         from xrd_tools.geometry_figures import RUN_RING_REASON
         tip = GRID_TOOLTIP if available else GRID_TOOLTIP+' '+(reason or RUN_RING_REASON)
@@ -227,28 +203,6 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         row.setVisible(visible)
         for widget in (row, self.coordinate_grid, row.findChild(QtWidgets.QLabel)):
             widget.setToolTip(tip)
-
-    def showEvent(self, event) -> None:
-        # Opening Plot Options lists entries other tools added; reconciles never read the library.
-        self.phase_source.refresh_library()
-        super().showEvent(event)
-
-    def set_phase_available(self, available, reason='', *, visible=True):
-        self._phase_available = bool(available)
-        self._phase_group.setVisible(visible)
-        self.phase_source.set_available(available, reason)
-        self._sync_phase_floor(reason)
-
-    def _sync_phase_floor(self, reason=''):
-        entries = self.phase_source.selected_entries()
-        cif = any(entry.source_kind == 'cif' for entry in entries)
-        available = self._phase_available and cif
-        tip = ('Minimum intensity as a percent of the strongest reflection in the reachable range. '
-               'Applies to CIF phases only; lattice phases have no structural intensities.')
-        if not available:
-            tip += ' ' + (reason or ('Lattice-only phases bypass the floor.' if entries else 'Select a CIF phase to edit the floor.'))
-        self.phase_floor.editor.setEnabled(available)
-        self.phase_floor.set_purpose_tooltip(tip)
 
     def reconcile(self, options: ScientificPlotOptions) -> None:
         if type(options) is not ScientificPlotOptions:
@@ -262,7 +216,6 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             self.show_legend,
             self.intensity_scale,
             self.show_coverage_holes,
-            self.calibrant,
             self.coordinate_grid,
         )
         blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
@@ -278,17 +231,14 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.show_legend.setChecked(options.show_legend)
         self.intensity_scale.setCurrentText(options.intensity_scale)
         self.show_coverage_holes.setChecked(options.show_coverage_holes)
-        self.calibrant.setCurrentText(options.calibrant)
         self.coordinate_grid.setCurrentText(options.coordinate_grid)
-        source_block = QtCore.QSignalBlocker(self.phase_source)
-        self.phase_source.set_selection(options.phase_references)
-        self.phase_floor.editor.setText(str(options.phase_min_intensity))
         self._projection = options
-        self._sync_phase_floor()
-        del source_block, blockers
+        del blockers
 
     def edited_options(self) -> ScientificPlotOptions:
-        return ScientificPlotOptions(
+        # The reference-phase fields are the window's; they pass through unchanged.
+        return replace(
+            self._projection,
             waterfall_y_axis=self.waterfall_y_axis.currentText(),
             waterfall_start=self.waterfall_start.value(),
             waterfall_stop=self.waterfall_stop.value(),
@@ -297,23 +247,8 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             show_legend=self.show_legend.isChecked(),
             intensity_scale=self.intensity_scale.currentText(),
             show_coverage_holes=self.show_coverage_holes.isChecked(),
-            calibrant=self.calibrant.currentText(),
             coordinate_grid=self.coordinate_grid.currentText(),
-            phase_references=self.phase_source.selection,
-            phase_min_intensity=float(self.phase_floor.editor.text()),
         )
-
-    def accept(self) -> None:
-        try:
-            self.edited_options()
-        except (TypeError, ValueError):
-            self.phase_floor.set_purpose_tooltip(
-                'Minimum intensity must be a finite number between 0 and 100 percent.'
-            )
-            self.phase_floor.editor.setFocus()
-            return
-        self._sync_phase_floor()
-        super().accept()
 
     def reject(self) -> None:
         self.reconcile(self._projection)

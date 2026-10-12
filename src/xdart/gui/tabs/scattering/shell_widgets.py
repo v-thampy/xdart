@@ -136,7 +136,6 @@ class ScientificImagePane(QtWidgets.QWidget):
         self._render_contract: tuple[object, ...] | None = None
         self._geometry_contract: tuple[object, ...] | None = None
         self._axis_presentation_contract: tuple[object, ...] | None = None
-        self.ring_items = []
         self.overlay_families = {}
         self._overlay_contracts = {}
         layout.addWidget(self.canvas, 1)
@@ -153,14 +152,9 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.image.clear()
         self.render_coverage(None)
 
-    def render_ring_curves(self, curves, *, native_shape=None) -> None:
-        self.render_overlay_family('calibrant', curves, native_shape=native_shape)
-        self.ring_items = list(self.overlay_families.get('calibrant', ()))
-
     def clear_overlay_families(self):
         for family in tuple(self.overlay_families):
             self.render_overlay_family(family, ())
-        self.ring_items = []
 
     def _map_overlay_points(self, points, native_shape):
         if native_shape is None:
@@ -193,7 +187,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         if contract is None:
             return
         self._overlay_contracts[family] = contract
-        color = color or ('#e7b44c' if family == 'calibrant' else '#8dd3ec')
+        color = color or '#8dd3ec'
         mapped = [self._map_overlay_points(curve.xy, native_shape) for curve in curves]
         pairs = [(curves[0], np.vstack([np.vstack((points, (np.nan, np.nan))) for points in mapped]))]
         if not joined:

@@ -523,7 +523,8 @@ class StitchPage(QtWidgets.QWidget):
         # Frames, and Open… · Metadata · Raw image. Stitch publishes its results and frames to it and acts on
         # its commands, as the lists' own signals did.
         from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserView, ResultDirectoryBrowser
-        from xdart.gui.tabs.scattering.tools_view import BrowserToolsColumn, ToolsView
+        from xdart.gui.tabs.scattering.tools_view import (REFERENCE_PHASES_TOOLTIP, BrowserToolsColumn,
+                                                            ToolsView)
         self.browser = BrowserView(profile=BrowserProfile(
             menus=(("File", ("Open Folder", "Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
             raw_resolution_menus=False, list_caption="Results", directory=True, frames=True,
@@ -540,6 +541,7 @@ class StitchPage(QtWidgets.QWidget):
              "listed results when none are selected. Overlay selects displayed slices for a slice batch."),
             ("phase_fit", "≈ Phase Fitting", "Fit radial Intensity in Q or 2θ with its recorded wavelength. "
              "Batch fits selected results, or all listed results when none are selected."),
+            ("reference_phases", "┆ Reference Phases", REFERENCE_PHASES_TOOLTIP),
         ), external_viewers=False)
         self.tools.commandRequested.connect(self._view_command)
         self.splitter.addWidget(BrowserToolsColumn(self.browser, self.tools))
@@ -3235,6 +3237,9 @@ class StitchPage(QtWidgets.QWidget):
             return
         if kind is ShellCommandKind.PAGE_TOOL and command.value == "export-run":
             self._workflow_export.choose()
+            return
+        if kind is ShellCommandKind.PAGE_TOOL and command.value == "reference_phases":
+            self.scientific.show_reference_phases()
             return
         if kind is ShellCommandKind.PAGE_TOOL and command.value in {"peak_fit", "phase_fit"}:
             self._open_fit("peak" if command.value == "peak_fit" else "phase")
