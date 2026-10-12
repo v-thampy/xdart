@@ -19,6 +19,10 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from tests.xdart.scattering.test_predicted_ring_overlays import run_page, select, choose
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 
+#: REFERENCE-PHASES-20261011 moved the phase controls from Plot Options to the Tools-panel window and made
+#: calibrants phase entries; these successor rows keep every scientific assertion (declared in its kickoff).
+LAB6 = 'calibrant:LaB6'
+
 
 @pytest.fixture
 def qapp():
@@ -31,12 +35,11 @@ def isolated_library(tmp_path, monkeypatch):
 
 
 def _phase_section(view):
-    # Behavioral parent assertion: no import or access to an API being added.
-    groups = [widget for widget in view.plot_options_dialog.findChildren(QtWidgets.QGroupBox)
-              if widget.title() == 'Reference phases']
-    assert len(groups) == 1, 'Plot Options must show its Reference phases section'
-    assert groups[0].toolTip()
-    return groups[0]
+    """The Reference Phases window (successor of Plot Options' Reference phases section)."""
+    view.show_reference_phases()
+    window = view.reference_phases
+    assert window.isVisible() and window.toolTip()
+    return window
 
 
 def _cif(root, name='CsCl', a=4.1):
@@ -67,13 +70,14 @@ def _settle(qapp, view, predicate=lambda: True):
     raise AssertionError('the shared phase worker did not settle')
 
 
-def _edit(qapp, view, entries, *, floor=5., accept=True):
-    view.options.click(); qapp.processEvents()
-    _phase_section(view)
-    dialog = view.plot_options_dialog
-    dialog.phase_source.set_selection(tuple((entry.id, True) for entry in entries))
-    dialog.phase_floor.editor.setText(str(floor))
-    (dialog.accept_button if accept else dialog.cancel_button).click()
+def _edit(qapp, view, entries, *, floor=5.):
+    """Select ``entries`` and the global minimum in the window; each edit applies at once (no Okay)."""
+    source = _phase_section(view).phase_source
+    qapp.processEvents()
+    source.set_selection(tuple((entry.id, True) for entry in entries))
+    qapp.processEvents()
+    if source.global_row.current_value() != float(floor):
+        source.global_row.editor.setValue(float(floor))
     qapp.processEvents()
     _settle(qapp, view)
 
@@ -182,12 +186,12 @@ def test_plot_options_phase_selection_is_shared_by_int_and_stitch(qapp, tmp_path
         from xdart.gui.tabs.scattering.scientific_plot_options import plot_option_update
         from xrd_tools.analysis.phase import XRDCalculator
         entries = _entries(tmp_path)
-        dialog = view.plot_options_dialog
+        dialog = view.reference_phases
         assert isinstance(dialog.phase_source, PhaseSourceWidget)
-        assert isinstance(dialog.phase_floor, FormRow)
-        assert float(dialog.phase_floor.editor.text()) == 5.
-        assert not dialog.phase_floor.editor.isEnabled()
-        assert dialog.phase_floor.editor.toolTip()
+        assert isinstance(dialog.phase_source.global_row, FormRow)
+        assert dialog.phase_source.global_row.current_value() == 5.
+        assert not dialog.phase_source.global_row.editor.isEnabled()
+        assert dialog.phase_source.global_row.editor.toolTip()
         calls = []; actual = XRDCalculator.get_pattern
         def counted(self, *args, **kwargs):
             calls.append(threading.get_ident()); return actual(self, *args, **kwargs)
@@ -196,14 +200,14 @@ def test_plot_options_phase_selection_is_shared_by_int_and_stitch(qapp, tmp_path
         assert calls and all(thread != threading.get_ident() for thread in calls)
         selection = tuple((entry.id, True) for entry in entries)
         assert page._preferences.plot_options.phase_references == selection
-        assert dialog.phase_floor.editor.isEnabled()
+        assert dialog.phase_source.global_row.editor.isEnabled()
         prior = len(calls)
         _edit(qapp, view, entries, floor=20.)
         assert len(calls) == prior, 'editing the floor must reuse listed reflections'
         assert page._preferences.plot_options.phase_min_intensity == 20.
-        _edit(qapp, view, (), floor=90., accept=False)
+        dialog.close_button.click(); qapp.processEvents()  # live apply: closing keeps what was applied
         assert dialog.phase_source.selection == selection
-        assert float(dialog.phase_floor.editor.text()) == 20.
+        assert dialog.phase_source.global_row.current_value() == 20.
         assert page._preferences.plot_options.phase_min_intensity == 20.
         options = page._preferences.plot_options
         assert plot_option_update(options, ('other', 'phase_min_intensity'), -1.) is None
@@ -211,21 +215,24 @@ def test_plot_options_phase_selection_is_shared_by_int_and_stitch(qapp, tmp_path
         from xrd_tools.analysis.phase_references import PhaseLibrary
         lattice = PhaseLibrary().add_lattice('positions', a=4.1, space_group=221)
         _edit(qapp, view, (lattice,))
-        assert not dialog.phase_floor.editor.isEnabled()
-        assert 'lattice' in dialog.phase_floor.editor.toolTip().lower()
+        assert not dialog.phase_source.global_row.editor.isEnabled()
+        assert 'lattice' in dialog.phase_source.global_row.editor.toolTip().lower()
     with _stitch(qapp, tmp_path/'stitch') as (page, view, _payload):
         _phase_section(view)
         _edit(qapp, view, entries, floor=20.)
-        assert view.plot_options_dialog.projection.phase_references == selection
-        assert view.plot_options_dialog.projection.phase_min_intensity == 20.
+        assert view.reference_phases.projection.phase_references == selection
+        assert view.reference_phases.projection.phase_min_intensity == 20.
         assert view.phase_families
     import xrd_tools.analysis.phase as phase_owner
     with run_page(qapp, tmp_path/'dependency', energies=(16, 16)) as (page, view):
         _phase_section(view)
         monkeypatch.setattr(phase_owner, 'HAS_PYMATGEN', False)
         page._refresh_shell(); qapp.processEvents()
-        assert not view.plot_options_dialog.phase_source.isEnabled()
-        assert 'pymatgen' in view.plot_options_dialog.phase_source.toolTip().lower()
+        source = view.reference_phases.phase_source
+        # Calibrants need no pymatgen (as P3a's rings never did); CIF and lattice sources say why they are off.
+        assert not source.add_cif_btn.isEnabled() and 'pymatgen' in source.add_cif_btn.toolTip().lower()
+        assert not source.add_lattice_btn.isEnabled() and 'pymatgen' in source.add_lattice_btn.toolTip().lower()
+        assert source.calibrant_row.editor.isEnabled()
 
 
 def test_phase_lines_on_q_and_2theta_axes_in_int_and_stitch(qapp, tmp_path):
@@ -328,9 +335,10 @@ def test_phase_rings_on_ints_detector_image_follow_p3a(qapp, tmp_path, monkeypat
             actual_xy = np.column_stack(items[0].getData())
             finite = actual_xy[np.isfinite(actual_xy).all(axis=1)]
             assert len(finite) == sum(len(curve.xy) for curve in curves)
-            # P3a's retained calibrant family remains per-arc and independent.
+            # The calibrant is its own independent phase family (P3a's rings, on the phase path).
             choose(qapp, view, 'LaB6'); _settle(qapp, view)
-            assert pane.ring_items and all(np.isfinite(np.column_stack(item.getData())).all() for item in pane.ring_items)
+            calibrant = pane.overlay_families.get('phase:' + LAB6, ())
+            assert calibrant and all(np.isfinite(np.column_stack(item.getData())).any() for item in calibrant)
             assert _phase_items(pane, entry) == items
             # Observe the real cone owner, never substitute a successful result.
             calls = []; actual = figures.display_arcs
@@ -359,13 +367,10 @@ def test_phase_rings_on_ints_detector_image_follow_p3a(qapp, tmp_path, monkeypat
             return build_phase_references(*args, **kwargs)
         monkeypatch.setattr(references, 'build_phase_references', blocked)
         try:
-            view.options.click(); qapp.processEvents()
-            view.plot_options_dialog.phase_source.set_selection(((entries[0].id, True),))
-            view.plot_options_dialog.accept_button.click(); qapp.processEvents()
+            source = view.reference_phases.phase_source
+            source.set_selection(((entries[0].id, True),)); qapp.processEvents()
             assert entered.wait(5)
-            view.options.click(); qapp.processEvents()
-            view.plot_options_dialog.phase_source.set_selection(((entries[1].id, True),))
-            view.plot_options_dialog.accept_button.click(); qapp.processEvents()
+            source.set_selection(((entries[1].id, True),)); qapp.processEvents()
             assert entries[0].id not in view.phase_families
             release.set(); _settle(qapp, view, lambda: entries[1].id in view.phase_families)
             assert tuple(view.phase_families) == (entries[1].id,)
@@ -381,7 +386,8 @@ def test_several_phases_have_colours_legend_and_independent_families(qapp, tmp_p
         entries = _entries(tmp_path, 3)
         _edit(qapp, view, entries)
         choose(qapp, view, 'LaB6'); _settle(qapp, view)
-        calibrant = tuple(view.raw.ring_items)
+        calibrant = tuple(view.raw.overlay_families.get('phase:' + LAB6, ()))
+        assert calibrant
         view.options.click(); qapp.processEvents()
         grid_label = next(label for label in view.plot_options_dialog.findChildren(QtWidgets.QLabel)
                           if label.text() == 'Coordinate grid')
@@ -398,13 +404,15 @@ def test_several_phases_have_colours_legend_and_independent_families(qapp, tmp_p
             assert _markers(view, entry)
         legend_names = tuple(label.text for _item, label in view.curve.getPlotItem().legend.items)
         assert all(entry.name in legend_names for entry in entries)
-        _edit(qapp, view, entries[1:])
+        source = view.reference_phases.phase_source
+        source.set_selection(tuple((entry.id, True) for entry in entries[1:]) + ((LAB6, True),))
+        _settle(qapp, view)
         assert not _phase_items(view.raw, entries[0])
         assert all(_phase_items(view.raw, entry) for entry in entries[1:])
-        assert tuple(view.raw.ring_items) == calibrant
+        assert tuple(view.raw.overlay_families.get('phase:' + LAB6, ())) == calibrant
         assert tuple(view.raw.overlay_families['grid']) == grid
         choose(qapp, view, 'Off'); _settle(qapp, view)
-        assert not view.raw.ring_items
+        assert not view.raw.overlay_families.get('phase:' + LAB6)
         assert all(_phase_items(view.raw, entry) for entry in entries[1:])
 
 
@@ -449,12 +457,12 @@ def test_phase_selection_and_library_persist_across_restart(qapp, tmp_path, monk
         assert settings['phase_references']['references'] == [[entries[0].id, True]]
         assert settings['phase_references']['min_intensity'] == 13.
         _edit(qapp, view, ()); page.apply_settings(settings); _settle(qapp, view)
-        assert view.plot_options_dialog.projection.phase_references == ((entries[0].id, True),)
-        assert view.plot_options_dialog.projection.phase_min_intensity == 13.
-        missing = replace(view.plot_options_dialog.projection, phase_references=(('f'*64, True),))
+        assert view.reference_phases.projection.phase_references == ((entries[0].id, True),)
+        assert view.reference_phases.projection.phase_min_intensity == 13.
+        missing = replace(view.reference_phases.projection, phase_references=(('f'*64, True),))
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, missing.phase_references,
                                        ('other', 'phase_references')))
         _settle(qapp, view)
         assert not view.phase_families
-        assert 'missing' in view.plot_options_dialog.phase_source.toolTip().lower()
+        assert 'missing' in view.reference_phases.phase_source.toolTip().lower()
     assert str(PhaseLibrary().path).startswith(str(tmp_path))

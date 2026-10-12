@@ -5,7 +5,7 @@ import pytest
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from tests.xdart.scattering.test_predicted_ring_overlays import qapp, run_page, select, pane, choose
+from tests.xdart.scattering.test_predicted_ring_overlays import qapp, run_page, select, pane, choose, rings, settle
 
 
 def control(view):
@@ -33,13 +33,14 @@ def test_coordinate_grid_control_and_labels_reuse_ints_owners(qapp, tmp_path):
         assert all(x.toolTip() for x in view.raw.overlay_families['grid'])
         assert all(x.acceptedMouseButtons() == QtCore.Qt.MouseButton.NoButton
                    for x in view.raw.overlay_families['grid'])
-        choose(qapp, view)
-        ring_items = tuple(view.raw.ring_items)
+        # REFERENCE-PHASES-20261011 successor: the calibrant is a phase family from the Reference Phases window.
+        choose(qapp, view); settle(qapp, view, lambda: rings(view.raw))
+        ring_items = rings(view.raw)
         choose_grid(qapp, view, 'Off', accept=False)
         assert control(view).currentText() == 'q + χ'
-        assert tuple(view.raw.ring_items) == ring_items
+        assert rings(view.raw) == ring_items
         choose_grid(qapp, view, 'Off')
-        assert not view.raw.overlay_families.get('grid') and view.raw.ring_items
+        assert not view.raw.overlay_families.get('grid') and rings(view.raw)
 
 
 @pytest.mark.parametrize('mode', ('Int 1D', 'Int 2D'))

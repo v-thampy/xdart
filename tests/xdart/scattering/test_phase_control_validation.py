@@ -1,7 +1,12 @@
-"""Direct shared-owner checks for disabled phase help and refused floor drafts."""
+"""Direct shared-owner checks for disabled phase help and refused floor drafts.
+
+REFERENCE-PHASES-20261011 successors (declared in its kickoff): the floor rows moved from Plot Options to the
+Reference Phases window, whose global minimum is a decimal spinbox that cannot commit an invalid value.
+"""
+import math
 
 import pytest
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.analysis.phase_source import PhaseSourceWidget
 from xdart.gui.tabs.scattering.scientific_plot_options import PlotOptionsDialog
@@ -41,47 +46,54 @@ def test_disabled_phase_reason_survives_resolution_on_every_shared_control(qapp,
         qapp.processEvents()
 
 
+def _cutoff_source(tmp_path):
+    source = PhaseSourceWidget(library=PhaseLibrary(tmp_path / "library"), checkable=True, show_library=False,
+                               cutoffs=True)
+    source.show()
+    return source
+
+
+def _type(qapp, editor, text):
+    editor.window().activateWindow()
+    editor.setFocus()
+    qapp.processEvents()
+    editor.selectAll()
+    QtTest.QTest.keyClicks(editor, text)
+    QtTest.QTest.keyClick(editor, QtCore.Qt.Key.Key_Return)
+    qapp.processEvents()
+
+
 @pytest.mark.parametrize("draft", ("", "nan", "inf", "-1", "101"))
-def test_plot_options_keep_invalid_phase_floor_open_with_reason_then_accept_valid_edit(qapp, draft):
-    dialog = PlotOptionsDialog()
-    accepted = []
-    dialog.accepted.connect(lambda: accepted.append(dialog.edited_options()))
-    original = dialog.projection
+def test_reference_minimum_cannot_commit_an_invalid_draft_then_commits_a_valid_edit(qapp, tmp_path, draft):
+    source = _cutoff_source(tmp_path)
+    changes = []
+    source.cutoffsChanged.connect(changes.append)
     try:
-        dialog.show()
-        dialog.phase_floor.editor.setText(draft)
-        dialog.accept_button.click()
-        assert dialog.isVisible() and accepted == []
-        assert dialog.projection is original
-        assert dialog.phase_floor.editor.text() == draft
-        reason = dialog.phase_floor.editor.toolTip().lower()
-        assert "finite" in reason and "0" in reason and "100" in reason
-        assert dialog.phase_floor.label.toolTip() == dialog.phase_floor.editor.toolTip()
-        dialog.phase_floor.editor.setText("12.5")
-        dialog.accept_button.click()
-        assert not dialog.isVisible() and len(accepted) == 1
-        assert accepted[0].phase_min_intensity == 12.5
-        assert "finite" not in dialog.phase_floor.editor.toolTip().lower()
+        editor = source.global_row.editor
+        tip = editor.toolTip().lower()
+        assert "0" in tip and "100" in tip, tip
+        _type(qapp, editor, draft)
+        values = [change.global_value for change in changes] + [source.cutoffs.global_value]
+        assert all(math.isfinite(value) and 0. <= value <= 100. for value in values), values
+        _type(qapp, editor, "12.5")
+        assert source.cutoffs.global_value == 12.5 and changes[-1].global_value == 12.5
     finally:
-        dialog.close()
-        dialog.deleteLater()
+        source.close()
+        source.deleteLater()
         qapp.processEvents()
 
 
 @pytest.mark.parametrize("floor", ("0", "100"))
-def test_plot_options_accept_both_phase_floor_boundaries(qapp, floor):
-    dialog = PlotOptionsDialog()
-    accepted = []
-    dialog.accepted.connect(lambda: accepted.append(dialog.edited_options()))
+def test_reference_minimum_accepts_both_boundaries(qapp, tmp_path, floor):
+    source = _cutoff_source(tmp_path)
+    changes = []
+    source.cutoffsChanged.connect(changes.append)
     try:
-        dialog.show()
-        dialog.phase_floor.editor.setText(floor)
-        dialog.accept_button.click()
-        assert not dialog.isVisible() and len(accepted) == 1
-        assert accepted[0].phase_min_intensity == float(floor)
+        _type(qapp, source.global_row.editor, floor)
+        assert source.cutoffs.global_value == float(floor) and changes[-1].global_value == float(floor)
     finally:
-        dialog.close()
-        dialog.deleteLater()
+        source.close()
+        source.deleteLater()
         qapp.processEvents()
 
 
@@ -96,9 +108,11 @@ def test_reconciling_plot_options_reads_no_phase_library_files(qapp, tmp_path, m
     path.write_text(str(CifWriter(Structure(Lattice.cubic(4.1), ["Cs", "Cl"], [[0, 0, 0], [.5, .5, .5]]))))
     cif = library.add_cif(path, name="CsCl")
     lattice = library.add_lattice("cell", a=4.2, space_group="Pm-3m")
-    dialog = PlotOptionsDialog()
+    from xdart.gui.tabs.scattering.reference_phases import ReferencePhasesWindow
+    from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions
+    dialog = ReferencePhasesWindow()
     try:
-        options = replace(dialog.projection, phase_references=((cif.id, True), (lattice.id, True)))
+        options = replace(ScientificPlotOptions(), phase_references=((cif.id, True), (lattice.id, True)))
         dialog.reconcile(options)
         assert tuple(entry.id for entry in dialog.phase_source.selected_entries()) == (cif.id, lattice.id)
         reads = []
@@ -108,7 +122,7 @@ def test_reconciling_plot_options_reads_no_phase_library_files(qapp, tmp_path, m
                                 (reads.append(_name), _actual(self, *args, **kwargs))[1])
         for _ in range(3):
             dialog.reconcile(options)
-            dialog.set_phase_available(True)
+            dialog.set_available(True)
             assert tuple(entry.id for entry in dialog.phase_source.selected_entries()) == (cif.id, lattice.id)
         assert reads == [], "a projection reconcile must not read the phase library on the GUI thread"
     finally:
@@ -147,7 +161,7 @@ def test_the_int_workspace_starts_without_importing_pymatgen(tmp_path):
 
 
 def test_okay_and_cancel_stay_the_last_plot_options_row(qapp):
-    """Reference phases and every host row are built above the dialog's buttons."""
+    """Every host row is built above the dialog's buttons; reference phases live in their own window now."""
     dialog = PlotOptionsDialog()
     try:
         dialog.add_choice("Host choice", ("a", "b"), "a", tooltip="A host's own choice.")
@@ -155,9 +169,8 @@ def test_okay_and_cancel_stay_the_last_plot_options_row(qapp):
         layout = dialog.layout()
         last = layout.itemAt(layout.count() - 1).layout()
         assert last is not None and last.indexOf(dialog.accept_button) >= 0, "Okay/Cancel must stay last"
-        phases = next(group for group in dialog.findChildren(QtWidgets.QGroupBox)
-                      if group.title() == "Reference phases")
-        assert layout.indexOf(phases) < layout.count() - 1
+        assert not [group for group in dialog.findChildren(QtWidgets.QGroupBox)
+                    if group.title() == "Reference phases"]
     finally:
         dialog.close()
         dialog.deleteLater()

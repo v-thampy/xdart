@@ -120,7 +120,10 @@ def test_the_phase_fit_mounts_the_shared_owners_and_its_phases_are_a_keyed_list(
         assert dialog.cif_browser.profile.results and not dialog.cif_browser.profile.heading
         assert isinstance(dialog.table, ResultsTable) and isinstance(dialog.trend, TrendView)
         assert isinstance(dialog.advanced, AdvancedDialog) and dialog.advanced.isAncestorOf(dialog.max_nfev)
-        assert dialog.advanced.isAncestorOf(dialog.min_intensity) and isinstance(dialog.max_nfev, IntegerLineEdit)
+        # REFERENCE-PHASES-20261011 successor: the cutoff left Advanced for the Phases card (global switch, value
+        # and per-row cutoffs on the shared phase source).
+        assert dialog.phase_source.isAncestorOf(dialog.min_intensity) and not dialog.advanced.isAncestorOf(
+            dialog.min_intensity) and isinstance(dialog.max_nfev, IntegerLineEdit)
         picks = iter(("/tmp/alpha.cif", "/tmp/beta.cif"))
         monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *args, **kwargs: (next(picks), "CIF"))
         dialog._add_cif(); dialog._add_cif()

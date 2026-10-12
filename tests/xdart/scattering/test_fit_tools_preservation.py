@@ -330,7 +330,8 @@ def test_phase_defaults_choices_and_values(monkeypatch, qapp):
         assert [dialog.texture_combo.itemText(i) for i in range(dialog.texture_combo.count())] == [
             "None", "March-Dollase", "Free (per-peak)"]
         dialog.profile_combo.setCurrentIndex(1); dialog.bkg_combo.setCurrentIndex(1)
-        dialog.lattice_pct.setText("2.5"); dialog.min_intensity.setText("1"); dialog.max_nfev.setValue(300)
+        # REFERENCE-PHASES-20261011 successor: the global minimum is a decimal spinbox (numeric setter).
+        dialog.lattice_pct.setText("2.5"); dialog.min_intensity.setValue(1.); dialog.max_nfev.setValue(300)
         values = dialog.vnext_fit_values()
         assert (values["phase_profile"], values["prefit_background"], values["lattice_pct"],
                 values["min_intensity"], values["max_nfev"]) == ("gaussian", "snip", 0.025, 1.0, 300)

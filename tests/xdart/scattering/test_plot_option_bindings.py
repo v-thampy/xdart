@@ -9,18 +9,20 @@ from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions, ShellC
 from xdart.gui.tabs.stitch.page import StitchPage
 from tests.xdart.pages.test_stitch_page import _Status, qapp  # noqa: F401
 
-#: A value each option takes, and one it refuses (coverage shading since 0df40f45, the predicted-ring calibrant
-#: since P3a).
+#: A value each option takes, and one it refuses (coverage shading since 0df40f45). REFERENCE-PHASES-20261011
+#: retired P3a's ``calibrant`` option (calibrants are phase entries now) and added the global-minimum switch and
+#: the per-phase minimums, whose ids must be listed phases (an orphan is refused; see below).
 _TAKEN = {"waterfall_y_axis": "Time (s)", "waterfall_start": 3, "waterfall_stop": 9, "waterfall_step": 2,
-          "overlay_offset": 1.5, "show_legend": False, "intensity_scale": "Log", "show_coverage_holes": True,
-          "calibrant": "LaB6"}
+          "overlay_offset": 1.5, "show_legend": False, "intensity_scale": "Log", "show_coverage_holes": True}
 _REFUSED = {"waterfall_y_axis": "", "waterfall_start": 0, "waterfall_stop": -1, "waterfall_step": 0,
             "overlay_offset": float("nan"), "show_legend": 1, "intensity_scale": "Cube",
-            "show_coverage_holes": 1, "calibrant": "Unobtainium"}
+            "show_coverage_holes": 1}
 
 # P3b's coordinate grid and reference phases (a scalar reaches the owner and is no phase selection).
-_TAKEN.update(coordinate_grid="q + χ", phase_references=(("a" * 64, True),), phase_min_intensity=12.5)
-_REFUSED.update(coordinate_grid="r", phase_references=True, phase_min_intensity=101.)
+_TAKEN.update(coordinate_grid="q + χ", phase_references=(("a" * 64, True),), phase_min_intensity=12.5,
+              phase_global_floor=False, phase_floors=())
+_REFUSED.update(coordinate_grid="r", phase_references=True, phase_min_intensity=101.,
+                phase_global_floor=1, phase_floors=(("a" * 64, 101.),))
 
 
 def test_one_table_binds_every_plot_option_to_its_command():
@@ -31,6 +33,11 @@ def test_one_table_binds_every_plot_option_to_its_command():
         assert plot_option_update(ScientificPlotOptions(), path, _REFUSED[field]) is None
     assert plot_option_update(ScientificPlotOptions(), ("overlay", "offset"), 2).overlay_offset == 2.0
     assert plot_option_update(ScientificPlotOptions(), ("other", "unknown"), True) is None
+    listed = ScientificPlotOptions(phase_references=(("a" * 64, True),))
+    floors = (("a" * 64, 12.5),)
+    assert plot_option_update(listed, ("other", "phase_floors"), floors).phase_floors == floors
+    assert plot_option_update(ScientificPlotOptions(), ("other", "phase_floors"), floors) is None, "orphan id"
+    assert plot_option_update(listed, ("other", "calibrant"), "LaB6") is None
 
 
 def test_the_stitch_page_applies_every_plot_option_as_int_does(qapp):

@@ -1,4 +1,9 @@
-"""Frozen P3a GUI oracle. Real Runs, shared view, and existing PREVIEW transport."""
+"""Frozen P3a GUI oracle. Real Runs, shared view, and existing PREVIEW transport.
+
+REFERENCE-PHASES-20261011 successor (declared in its kickoff): calibrant rings now come from calibrant entries in
+the Tools-panel Reference Phases window, through the shared phase worker, instead of Plot Options' Calibrant row.
+Every scientific assertion of the eight original rows is kept; helpers keep their names for D and DP.
+"""
 from contextlib import contextmanager
 from dataclasses import replace
 import time
@@ -70,19 +75,40 @@ def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, sourc
 
 
 def choice(view):
-    # Behavioral first assertion: parent has no visible Calibrant control.
-    labels = [label for label in view.plot_options_dialog.findChildren(QtWidgets.QLabel)
-              if label.text() == 'Calibrant']
-    assert len(labels) == 1, 'Plot Options must contain the Calibrant choice'
-    return labels[0].parentWidget().findChild(QtWidgets.QComboBox)
+    """The window whose calibrant chooser replaced Plot Options' Calibrant row."""
+    view.show_reference_phases()
+    window = view.reference_phases
+    assert window.isVisible() and window.phase_source.calibrant_row.editor.toolTip()
+    return window
 
 
 def choose(qapp, view, value='LaB6', accept=True):
-    view.options.click(); qapp.processEvents()
-    editor = choice(view); editor.setCurrentText(value)
-    (view.plot_options_dialog.accept_button if accept else view.plot_options_dialog.cancel_button).click()
+    """Add calibrant ``value`` through the window ('Off' removes every calibrant), then let the shared phase
+    worker settle. The window applies live, so a declined choice (``accept=False``) is simply never made."""
+    source = choice(view).phase_source
     qapp.processEvents()
-    return editor
+    if accept and value == 'Off':
+        source.set_selection(tuple(pair for pair in source.selection if not pair[0].startswith('calibrant:')))
+    elif accept:
+        source.add_calibrant(value)
+    settle(qapp, view)
+    return source
+
+
+def rings(target, name='LaB6'):
+    """The calibrant's ring items on one pane (one joined item per family)."""
+    return tuple(target.overlay_families.get('phase:calibrant:' + name, ()))
+
+
+def settle(qapp, view, predicate=lambda: True):
+    deadline = time.monotonic()+30
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if not view.phase_worker.busy and predicate():
+            qapp.processEvents()
+            return
+        time.sleep(.005)
+    raise AssertionError('the shared phase worker did not settle')
 
 
 def select(qapp, page, key):
@@ -107,27 +133,27 @@ def pane(view, mode='Int 2D'):
 @pytest.mark.parametrize('mode', ('Int 1D', 'Int 2D'))
 def test_int_rings_follow_current_frame_and_off_clears(qapp, tmp_path, mode):
     with run_page(qapp, tmp_path, mode=mode) as (page, view):
-        editor = choice(view)
-        assert editor.currentText() == 'Off' and editor.toolTip()
+        window = choice(view)
+        assert not window.phase_source.selection and window.phase_source.calibrant_row.editor.toolTip()
         if mode == 'Int 1D':
             view.raw_popup_button.click(); qapp.processEvents()
             select(qapp, page, page._context_controller.navigation.current)
         before = pane(view, mode).image.image.copy()
         choose(qapp, view)
         target = pane(view, mode)
-        assert target.ring_items
-        first = tuple(item.getData() for item in target.ring_items)
+        settle(qapp, view, lambda: rings(target))
+        first = tuple(item.getData() for item in rings(target))
         choose(qapp, view, 'CeO2', accept=False)
-        assert choice(view).currentText() == 'LaB6'
-        assert target.ring_items
+        assert not rings(target, 'CeO2') and rings(target)
         np.testing.assert_array_equal(target.image.image, before)
         keys = page._context_controller.frame_keys
-        select(qapp, page, keys[0])
-        second = tuple(item.getData() for item in target.ring_items)
-        assert len(first) != len(second) or any(not np.array_equal(a[0], b[0]) for a,b in zip(first, second))
+        select(qapp, page, keys[0]); settle(qapp, view, lambda: rings(target))
+        second = tuple(item.getData() for item in rings(target))
+        assert len(first) != len(second) or any(not np.array_equal(a[0], b[0], equal_nan=True)
+                                                for a, b in zip(first, second))
         current_pixels = target.image.image.copy()
         choose(qapp, view, 'Off')
-        assert not target.ring_items
+        assert not rings(target)
         np.testing.assert_array_equal(target.image.image, current_pixels)
 
 
@@ -145,8 +171,8 @@ def test_raw_ring_points_share_image_and_hover_mapping(qapp, tmp_path, thumbnail
         image = make_thumbnail_array(raw, max_size=256) if thumbnail else raw
         target.render(image, detector_shape=shape)
         xy = np.array(((0., 0.), (shape[1]-1., 0.), (shape[1]-1., shape[0]-1.)))
-        target.render_ring_curves((Curve('edges', xy, 'predicted', 'display only'),), native_shape=shape)
-        item = target.ring_items[0]
+        target.render_overlay_family('edges', (Curve('edges', xy, 'predicted', 'display only'),), native_shape=shape)
+        item = target.overlay_families['edges'][0]
         scene = np.column_stack(item.getData())
         for point, native in zip(scene, xy):
             local = target.image.mapFromParent(QtCore.QPointF(*point))
@@ -157,8 +183,9 @@ def test_raw_ring_points_share_image_and_hover_mapping(qapp, tmp_path, thumbnail
             assert target.image.image[int(np.floor(j)), int(np.floor(i))] == 1000
         for singleton in ((1, 9), (7, 1), (1, 1)):
             target.render(np.ones(singleton), detector_shape=singleton)
-            target.render_ring_curves((Curve('one', np.zeros((1,2)), 'predicted', 'display only'),), native_shape=singleton)
-            assert np.isfinite(np.column_stack(target.ring_items[0].getData())).all()
+            target.render_overlay_family('one', (Curve('one', np.zeros((1,2)), 'predicted', 'display only'),),
+                                         native_shape=singleton)
+            assert np.isfinite(np.column_stack(target.overlay_families['one'][0].getData())).all()
 
 
 @pytest.mark.parametrize('kind', ('v3', 'override'))
@@ -169,35 +196,36 @@ def test_parallax_controls_ring_availability(qapp, tmp_path, enabled, kind):
     text = _V3_PONI.replace('Parallax: False', f'Parallax: {enabled}') if kind == 'v3' else None
     override = PoniV3OverrideIntent('Si', 450e-6, enabled) if kind == 'override' else None
     with run_page(qapp, tmp_path, energies=(16,16), poni_text=text, parallax_override=override) as (page, view):
-        editor = choice(view)
-        assert editor.isEnabled() is (not enabled)
+        window = choice(view)
+        choose(qapp, view)
+        assert window.phase_source.calibrant_row.editor.isEnabled(), 'calibrant lines stay available'
         if enabled:
-            assert 'parallax' in editor.toolTip().lower()
+            assert 'parallax' in window.rings_note.text().lower() and not rings(view.raw)
         else:
-            choose(qapp, view)
-            assert view.raw.ring_items
+            settle(qapp, view, lambda: rings(view.raw))
+            assert rings(view.raw) and not window.rings_note.text()
 
 
 def test_unchanged_activation_rebuilds_no_ring_overlay(qapp, tmp_path, monkeypatch):
-    import xrd_tools.geometry_figures as gf
+    import xrd_tools.analysis.phase_references as provider
+    calls = []; actual = provider.build_phase_references
+    def count(*a, **k):
+        calls.append(tuple(entry.id for entry in a)); return actual(*a, **k)
     with run_page(qapp, tmp_path, energies=(16,16)) as (page, view):
-        choice(view); choose(qapp, view)
-        assert view.raw.ring_items
-        items = tuple(view.raw.ring_items)
-        calls = []; actual = gf.predict_detector_rings
-        def count(*a, **k):
-            calls.append(1); return actual(*a, **k)
-        monkeypatch.setattr(gf, 'predict_detector_rings', count)
+        choice(view); choose(qapp, view); settle(qapp, view, lambda: rings(view.raw))
+        items = rings(view.raw)
+        monkeypatch.setattr(provider, 'build_phase_references', count)
         QtWidgets.QApplication.sendEvent(page, QtCore.QEvent(QtCore.QEvent.WindowActivate))
         qapp.processEvents(); page._refresh_shell()
-        select(qapp, page, page._context_controller.frame_keys[0])
+        select(qapp, page, page._context_controller.frame_keys[0]); settle(qapp, view)
         view.raw.canvas.imageViewBox.setRange(xRange=(10, 20), yRange=(20, 40))
         qapp.processEvents()
-        assert not calls and tuple(view.raw.ring_items) == items
+        assert not calls and rings(view.raw) == items
     with run_page(qapp, tmp_path/'scan') as (page, view):
-        choice(view); choose(qapp, view); calls.clear()
-        select(qapp, page, page._context_controller.frame_keys[0])
-        assert len(calls) == 1
+        choice(view); choose(qapp, view); settle(qapp, view, lambda: rings(view.raw)); calls.clear()
+        select(qapp, page, page._context_controller.frame_keys[0]); settle(qapp, view, lambda: rings(view.raw))
+        assert calls and all(call == ('calibrant:LaB6',) for call in calls), 'a new energy lists the calibrant again'
+        assert rings(view.raw)
 
 
 @pytest.mark.parametrize('mode', ('Int 1D', 'Int 2D', '2D Viewer', 'Stitch 2D', 'Average', 'Reintegrate'))
@@ -208,19 +236,23 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
     try:
         shell.show(); shell.apply_state(state); qapp.processEvents()
         view = shell.scientific
-        assert not getattr(view.raw, 'ring_items', ())
+        assert not rings(view.raw)
         if mode.startswith('Int') or mode in ('Average', 'Reintegrate'):
-            editor = choice(view)
-            assert not editor.isEnabled()
+            window = choice(view)
+            options = replace(state.scientific.plot_options, phase_references=(('calibrant:LaB6', True),))
+            shell.apply_state(replace(state, scientific=replace(state.scientific, plot_options=options)))
+            settle(qapp, view)
+            assert not rings(view.raw)
             assert ("Predicted rings are drawn only on a Run's frames while that Run is shown. "
-                    "Frames opened from a file, and Average or Reintegrate results, carry no ring geometry.") in editor.toolTip()
+                    "Frames opened from a file, and Average or Reintegrate results, carry no ring geometry."
+                    ) in window.rings_note.text()
         view.show_raw_popup('Contributing raw')
         raw = np.arange(35.).reshape(5,7)
         view.show_raw_image(raw, status='source', color_map='Default', log_scale=False)
         np.testing.assert_array_equal(view.raw_popup_image.image.image, raw.T[:,::-1])
-        assert not getattr(view.raw_popup_image, 'ring_items', ())
+        assert not rings(view.raw_popup_image)
         view.raw_popup_dialog.close(); qapp.processEvents()
-        view.raw.clear(); assert not getattr(view.raw, 'ring_items', ())
+        view.raw.clear(); assert not rings(view.raw)
     finally:
         shell.close(); shell.deleteLater(); qapp.processEvents()
 
@@ -241,12 +273,12 @@ def test_logical_point_frames_keep_their_own_ring_geometry(qapp, tmp_path):
         controller = page._context_controller
         payload = controller.project(controller.frame_keys[-1])
         assert payload.view.geometry is not None and payload.view.geometry.poni is not None
-        choice(view); choose(qapp, view)
-        assert len(controller.frame_keys) == 2 and view.raw.ring_items
+        choice(view); choose(qapp, view); settle(qapp, view, lambda: rings(view.raw))
+        assert len(controller.frame_keys) == 2 and rings(view.raw)
         prior = payload.view.geometry.poni
-        other = select(qapp, page, controller.frame_keys[0])
+        other = select(qapp, page, controller.frame_keys[0]); settle(qapp, view, lambda: rings(view.raw))
         assert other.view.geometry.poni == prior
-        assert view.raw.ring_items
+        assert rings(view.raw)
 
 
 def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path):
@@ -262,25 +294,25 @@ def test_rehydrated_frame_keeps_its_ring_geometry(qapp, tmp_path):
         last = store.get(keys[-1].local_frame_label).view.geometry.poni
         assert store._max_heavy_items == 16
         assert store.get(keys[0].local_frame_label).view.intensity_2d is None
-        payload = select(qapp, page, keys[0])
+        payload = select(qapp, page, keys[0]); settle(qapp, view, lambda: rings(view.raw))
         assert payload.view.geometry.poni == original
         assert payload.view.geometry.poni != last
-        assert view.raw.ring_items
+        assert rings(view.raw)
 
 
 def test_same_energy_step_to_an_evicted_frame_reuses_the_prediction(qapp, tmp_path, monkeypatch):
     # O5 beyond the heavy window (P3a terminal review): the frame's own snapshot equals the cached one,
     # so its PREVIEW hydration redraws the cached rings without predicting them again.
-    import xrd_tools.geometry_figures as gf
+    import xrd_tools.analysis.phase_references as provider
     with run_page(qapp, tmp_path, energies=(16,)*17, heavy_window=16) as (page, view):
-        choice(view); choose(qapp, view)
+        choice(view); choose(qapp, view); settle(qapp, view, lambda: rings(view.raw))
         controller = page._context_controller
         keys = controller.frame_keys
         store = controller.acquisition_context.publication_store.artifacts[keys[0].artifact].publications
         assert store.get(keys[0].local_frame_label).view.intensity_2d is None
-        calls = []; actual = gf.predict_detector_rings
+        calls = []; actual = provider.build_phase_references
         def count(*a, **k):
             calls.append(1); return actual(*a, **k)
-        monkeypatch.setattr(gf, 'predict_detector_rings', count)
-        select(qapp, page, keys[0])
-        assert view.raw.ring_items and not calls
+        monkeypatch.setattr(provider, 'build_phase_references', count)
+        select(qapp, page, keys[0]); settle(qapp, view, lambda: rings(view.raw))
+        assert rings(view.raw) and not calls
