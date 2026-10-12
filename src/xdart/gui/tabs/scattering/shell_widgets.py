@@ -109,9 +109,11 @@ class _ScientificImageWidget(pgImageWidget):
 class _OverlayHitIndex:
     """One joined overlay family's drawn points (the item's own array, not a copy) bucketed in a uniform grid over
     their view-coordinate extent, so a hover finds the curves within ``HOVER_PX`` without scanning every point (C7,
-    CR7). Built once per drawing; a zoom changes only the query's reach. Memory: two int32 entries per point."""
+    CR7). Built once per drawing (a radix sort of 16-bit cell ids); a zoom changes only the query's reach. A segment
+    longer than one cell is kept in a short exact list instead of widening every query. Memory: about eight bytes per
+    drawn point."""
 
-    CELLS = 256
+    CELLS = 255  # (CELLS + 1)² cell ids fit 16 bits
 
     def __init__(self, points, values, color):
         self.points, self.values, self.color = points, values, color
@@ -126,39 +128,41 @@ class _OverlayHitIndex:
         self.origin = xy.min(axis=0)
         self.cell = np.maximum((xy.max(axis=0) - self.origin) / self.CELLS, 1e-12)
         joined = np.diff(index) == 1  # consecutive drawn points of one curve
-        half = np.abs(np.diff(xy, axis=0))[joined] / 2
-        #: half the longest segment, per axis: a segment can pass the cursor with both ends this far away
-        self.reach = half.max(axis=0) if half.size else np.zeros(2)
+        starts = index[:-1][joined]
+        long = (np.abs(points[starts + 1] - points[starts]) > self.cell).any(axis=1)
+        #: segments longer than one cell, checked exactly at every hover (few: arcs are sampled finely)
+        self.long = starts[long].astype(np.int32)
         cells = self._cells(xy)
         order = np.argsort(cells, kind='stable')
-        self.cells, self.order = cells[order].astype(np.int32), index[order].astype(np.int32)
+        self.cells, self.order = cells[order], index[order].astype(np.int32)
 
     def _cells(self, xy):
-        ij = np.clip(np.floor((xy - self.origin) / self.cell), 0, self.CELLS).astype(np.int64)
-        return ij[..., 1] * (self.CELLS + 1) + ij[..., 0]
+        ij = np.clip(np.floor((xy - self.origin) / self.cell), 0, self.CELLS).astype(np.uint16)
+        return (ij[..., 1].astype(np.uint32) * (self.CELLS + 1) + ij[..., 0]).astype(np.uint16)
 
     def hits(self, x, y, pixel):
         """The curves (indices into ``values``) passing within ``HOVER_PX`` screen pixels of view (x, y)."""
         if self.empty:
             return ()
         scale = np.abs(np.asarray(pixel, dtype=float))
-        reach = HOVER_PX * scale + self.reach
-        low, high = (np.array((x, y)) - reach - self.origin) / self.cell, (np.array((x, y)) + reach - self.origin) / self.cell
-        if (high < 0).any() or (low > self.CELLS).any():
-            return ()
-        (i0, j0), (i1, j1) = np.clip(np.floor(low), 0, self.CELLS).astype(int), np.clip(np.floor(high), 0, self.CELLS).astype(int)
-        rows = [self.order[np.searchsorted(self.cells, j * (self.CELLS + 1) + i0):
-                           np.searchsorted(self.cells, j * (self.CELLS + 1) + i1, side='right')]
-                for j in range(j0, j1 + 1)]
-        near = np.concatenate(rows) if rows else np.zeros(0, dtype=np.int32)
-        if near.size == 0:
-            return ()
+        cursor_view = np.array((x, y))
+        reach = HOVER_PX * scale + self.cell
+        low = (cursor_view - reach - self.origin) / self.cell
+        high = (cursor_view + reach - self.origin) / self.cell
+        near = np.zeros(0, dtype=np.int32)
+        if not ((high < 0).any() or (low > self.CELLS).any()):
+            (i0, j0) = np.clip(np.floor(low), 0, self.CELLS).astype(int)
+            (i1, j1) = np.clip(np.floor(high), 0, self.CELLS).astype(int)
+            width = self.CELLS + 1
+            rows = [self.order[np.searchsorted(self.cells, j * width + i0):
+                               np.searchsorted(self.cells, j * width + i1, side='right')]
+                    for j in range(j0, j1 + 1)]
+            near = np.concatenate(rows) if rows else near
         points, last = self.points, len(self.points) - 1
-        starts = np.unique(np.concatenate((near, near - 1)))
+        starts = np.unique(np.concatenate((near, near - 1, self.long)))
         starts = starts[(starts >= 0) & (starts < last)]
-        ends = starts + 1
-        segments = starts[np.isfinite(points[starts]).all(axis=1) & np.isfinite(points[ends]).all(axis=1)]
-        cursor = np.array((x, y)) / scale
+        segments = starts[np.isfinite(points[starts]).all(axis=1) & np.isfinite(points[starts + 1]).all(axis=1)]
+        cursor = cursor_view / scale
         a, b = points[segments] / scale, points[segments + 1] / scale
         d = b - a
         t = np.clip(((cursor - a) * d).sum(axis=1) / np.maximum((d * d).sum(axis=1), 1e-300), 0., 1.)
