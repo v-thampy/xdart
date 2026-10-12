@@ -2394,7 +2394,7 @@ class StitchPage(QtWidgets.QWidget):
                 self._queued_jobs.clear()
                 terminal = result.terminal
                 notice = terminal.diagnostic or terminal.code
-                if terminal.disposition is ModuleDisposition.REFUSED:
+                if terminal.disposition is not ModuleDisposition.CANCELLED:  # "CODE: reason", as RSM's (D5)
                     notice = terminal.code + (f": {terminal.diagnostic}" if terminal.diagnostic else "")
                 self._status(f"{terminal.disposition.value}: {notice}", ready=False)
         else:

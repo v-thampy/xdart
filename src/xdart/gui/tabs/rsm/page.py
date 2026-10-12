@@ -2154,11 +2154,11 @@ class RSMPage(QtWidgets.QWidget):
                 self._notice(f"Saved {Path(target).name}, but the inputs changed: listed, not shown")
             return
         self._clear_jobs()
-        detail = f" · {terminal.diagnostic}" if terminal.diagnostic else ""
         if terminal.disposition is ModuleDisposition.CANCELLED:
-            self._notice("RSM stopped" + detail)
-        else:
-            self._notice(f"RSM {terminal.disposition.value}: {terminal.code}{detail}")
+            self._notice("RSM stopped" + (f" · {terminal.diagnostic}" if terminal.diagnostic else ""))
+        else:  # "CODE: reason", as Stitch's and both pages' preflight messages (D5)
+            self._notice(f"RSM {terminal.disposition.value}: {terminal.code}"
+                         + (f": {terminal.diagnostic}" if terminal.diagnostic else ""))
 
     # ── results ──
     @property
