@@ -1,8 +1,7 @@
 """Read-only calibration progress from facts supplied by the existing owners."""
 from dataclasses import dataclass
-import re
 
-from xrd_tools.help_topics import get_topic
+from xrd_tools.help_topics import CALIBRATION_STEPS
 
 
 @dataclass(frozen=True)
@@ -21,6 +20,8 @@ class ChecklistFacts:
     fit_present: bool = False
     fit_outdated: bool = False
     fit_message: str = "Fit the calibrated frames or refine the scan."
+    #: the full fit summary, shown as the tooltip of the one-line fit and inspect cells (empty: the message)
+    fit_detail: str = ""
     saved_current_fit: bool = False
     orientation_message: str = "Optional: inspect orientation evidence; no camera or sense is applied."
 
@@ -32,11 +33,11 @@ class ChecklistRow:
     state: str
     message: str
     target: str
+    #: the row's full detail, its cell tooltip (empty: the message)
+    detail: str = ""
 
 
-# The teaching topic is the single text authority for the seven numbered steps.
-_STEPS = tuple(" ".join(text.split()) for text in re.findall(
-    r"^\d\. (.*?)(?=^\d\. |\n\nUnits)", get_topic("calibration.multi-step").text, re.M | re.S))
+_ORIENTATION_STEP = ("Orientation check", "Orientation check: inspect the consistent camera and motor-sense hypotheses.")
 
 
 def calibration_checklist(facts: ChecklistFacts) -> tuple[ChecklistRow, ...]:
@@ -51,12 +52,16 @@ def calibration_checklist(facts: ChecklistFacts) -> tuple[ChecklistRow, ...]:
         fit, "Optional" if facts.fit_present else "Needs input",
         "Done" if facts.fit_present and facts.saved_current_fit else "Needs input", "Optional",
     )
-    messages = (facts.instrument_message, facts.rough_message, facts.source_message, facts.frame_message,
+    frames = facts.frame_message
+    if 0 < facts.frame_count < 3:
+        frames += "; the fit needs at least three Complete frames"
+    messages = (facts.instrument_message, facts.rough_message, facts.source_message, frames,
                 facts.fit_message, facts.fit_message,
                 "Current ring fit saved; validate it on an informative frame." if states[6] == "Done"
                 else "Save the current ring fit, then validate it on an informative frame.",
                 facts.orientation_message)
-    texts = (*_STEPS, "Orientation check: inspect the consistent camera and motor-sense hypotheses.")
+    details = ("", "", "", "", facts.fit_detail, facts.fit_detail, "", "")
     targets = ("instrument", "rough", "select", "calibrate", "fit", "inspect", "save", "orientation")
-    return tuple(ChecklistRow(re.split(r"[:.]", text, maxsplit=1)[0], text, state, message, target)
-                 for text, state, message, target in zip(texts, states, messages, targets, strict=True))
+    return tuple(ChecklistRow(label, text, state, message, target, detail)
+                 for (label, text), state, message, target, detail
+                 in zip((*CALIBRATION_STEPS, _ORIENTATION_STEP), states, messages, targets, details, strict=True))

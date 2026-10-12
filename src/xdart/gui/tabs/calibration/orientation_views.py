@@ -37,6 +37,8 @@ class OrientationPanel(SectionCard):
         self.setToolTip('Read-only orientation checks with fixed geometry; edit or refit only in the existing controls.')
         self.status.setToolTip('Eligibility and lifecycle of this read-only orientation check.')
         self.finding = None
+        #: the selected hypothesis's (camera, senses), kept across a re-run so a reordered finding keeps it
+        self._selected = None
         self.frame_row = FormRow(label='Frame', path=('orientation', 'frame'), value=None, kind='combo')
         self.frame_row.set_purpose_tooltip('Choose a staged calibration frame by its identity and motor pose.')
         self.step_row = FormRow(label='Step', path=('orientation', 'step'), value='Beam and rings', kind='combo',
@@ -74,6 +76,7 @@ class OrientationPanel(SectionCard):
         self.show_sign_button.clicked.connect(sign_focus)
         self.figure_view.figureImageClicked.connect(feature)
         self.feature_row.editor.currentIndexChanged.connect(lambda: self.finding_pane.set_text('Declare the known feature’s lab direction, then click it in the displayed frame.'))
+        self.candidate_row.editor.currentIndexChanged.connect(self._remember_selection)
         self.cancel_button.setEnabled(False)
         self.figure_view.hide()
         self.invalidate()
@@ -104,11 +107,18 @@ class OrientationPanel(SectionCard):
         self.finding_pane.set_text('Run a new check after changing geometry, frames or extraction inputs.')
         self.figure_view.hide()
 
+    def _remember_selection(self, *_args):
+        index = self.candidate_row.editor.currentData()
+        if self.finding is not None and index is not None and 0 <= index < len(self.finding.candidates):
+            candidate = self.finding.candidates[index]
+            self._selected = (candidate.camera, candidate.senses)
+
     def show_finding(self, finding, figure=None, *, configured_senses=None):
+        """Show ``finding``, keeping the selected hypothesis by its camera and senses (a re-run may order the
+        candidates differently); the first candidate when it is not among them."""
         self.finding = finding
         self.finding_pane.set_text(finding.reason)
         rows, tips = [], {}
-        previous = self.candidate_row.editor.currentData()
         blocked = QtCore.QSignalBlocker(self.candidate_row.editor)
         self.candidate_row.editor.clear()
         for i, c in enumerate(finding.candidates):
@@ -131,9 +141,10 @@ class OrientationPanel(SectionCard):
                     f'{finding.exclusions.geometric}; value exclusions {finding.exclusions.value}. '
                     'Detector gaps are excluded from ring support. Fixed inputs are not refitted. '
                     'Configured matches are a reference, not verified senses; unmeasured senses are hypotheses.')
-        index = self.candidate_row.editor.findData(previous)
-        self.candidate_row.editor.setCurrentIndex(max(0, index))
+        index = next((i for i, c in enumerate(finding.candidates) if (c.camera, c.senses) == self._selected), 0)
+        self.candidate_row.editor.setCurrentIndex(index)
         del blocked
+        self._remember_selection()
         self.table.show_rows(('Mounting', 'del', 'nu', 'AUC', 'SE', 'Support'), rows, cell_tooltips=tips)
         if figure is not None:
             show_figures(self.figure_view, (figure,)); self.figure_view.show()

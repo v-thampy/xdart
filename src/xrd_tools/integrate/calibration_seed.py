@@ -118,8 +118,8 @@ def _source_motors(record, del_motor, nu_motor):
 def expected_rings(integrator, calibrant, shape, mask=None) -> tuple[ExpectedRing, ...]:
     """The calibrant rings whose 2θ falls on an unmasked pixel of this geometry: the detector's
     mask and ``mask`` (True: left out, in the frame's image), when it has the frame's shape."""
-    from pyFAI.calibrant import get_calibrant
-    reference = get_calibrant(calibrant) if isinstance(calibrant, str) else calibrant
+    from xrd_tools.integrate.calibration import pyfai_calibrant
+    reference = pyfai_calibrant(calibrant) if isinstance(calibrant, str) else calibrant
     reference.wavelength = float(integrator.wavelength)
     two_theta = np.asarray(integrator.center_array(tuple(shape), unit='2th_rad', scale=False), dtype=float)
     valid = np.isfinite(two_theta)
@@ -396,8 +396,9 @@ def direct_beam_motion_mismatch(record, result, *, motor, del_motor='del', nu_mo
 def write_seed_poni(seed: FrameSeed, path, *, calibrant='LaB6') -> Path:
     """The predicted geometry as a PONI pyFAI-calib2 opens with (``--poni``)."""
     from pyFAI.io.ponifile import PoniFile
+    from xrd_tools.integrate.calibration import pyfai_calibrant_name
     poni = PoniFile(seed.integrator)
-    poni.extra['Calibrant'] = str(calibrant)
+    poni.extra['Calibrant'] = pyfai_calibrant_name(str(calibrant))
     path = Path(path)
     with path.open('wt', encoding='utf-8') as stream:
         poni.write(stream)

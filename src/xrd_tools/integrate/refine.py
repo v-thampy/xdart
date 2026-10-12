@@ -278,8 +278,8 @@ def _resolve_calibrant_q(calibrant: Any, wavelength_m: float,
                          n_rings: int) -> np.ndarray:
     """Ring index → |q| (Å⁻¹) for the calibrant: q = 2π / d, d in Å."""
     if isinstance(calibrant, str):
-        from pyFAI.calibrant import get_calibrant  # noqa: PLC0415
-        cal = get_calibrant(calibrant)
+        from xrd_tools.integrate.calibration import pyfai_calibrant  # noqa: PLC0415
+        cal = pyfai_calibrant(calibrant)
     else:
         cal = calibrant
     cal.wavelength = float(wavelength_m)

@@ -124,7 +124,8 @@ def _pyfai_arguments(frame, seed, cancelled=None):
     if not frame.energy_eV and seed.get('wavelength_A'):
         from xrd_tools.core.energy import wavelength_m_to_energy_eV
         frame = replace(frame, energy_eV=float(wavelength_m_to_energy_eV(seed['wavelength_A'] * 1e-10)))
-    arguments = ['-c', seed['calibrant']]
+    from xrd_tools.integrate.calibration import pyfai_calibrant_name
+    arguments = ['-c', pyfai_calibrant_name(seed['calibrant'])]
     if seed.get('mask'):  # the Detector panel's mask, turned as the staged frame is
         arguments += ['-m', seed['mask']]
     record = _seed_record(seed, cancelled)
@@ -706,18 +707,21 @@ class CalibrationDialog(QtWidgets.QDialog):
         except (ValueError, TypeError, KeyError, RuntimeError) as error:
             rough_message = str(error)
         complete = sum(frame.complete for frame in self.frames)
+        summary = self.fit_summary.toPlainText()
         facts = ChecklistFacts(instrument_ready=instrument_ready, instrument_message=instrument_message,
             rough_mode=mode, rough_ready=rough_ready, rough_stale=stale, rough_message=rough_message,
             source_ready=self._calibrant_source_ready(), source_message=self.active_source_row.editor.text(),
             frame_count=len(self.frames), complete_count=complete,
             frame_message=f'{complete} of {len(self.frames)} Complete' if self.frames else 'Select frames and calibrate their rings.',
             fit_present=self.fit is not None, fit_outdated=self._checklist_fit_outdated,
-            fit_message=self.fit_summary.toPlainText() if self.fit is not None else 'Fit the calibrated frames or refine the scan.',
+            fit_message=(summary.splitlines() or [''])[0] if self.fit is not None
+            else 'Fit the calibrated frames or refine the scan.',
+            fit_detail=summary if self.fit is not None else '',
             saved_current_fit=self.fit is not None and self._saved_ring_fit is self.fit)
         self._checklist_rows = calibration_checklist(facts)
         tips = {(i, c): row.text if c == 0 else
                 f'{row.state}: current owner readiness or provenance; no scientific quality verdict.' if c == 1
-                else row.message or 'Activate this row to visit the existing controls.'
+                else row.detail or row.message or 'Activate this row to visit the existing controls.'
                 for i, row in enumerate(self._checklist_rows) for c in range(3)}
         self.checklist_table.show_rows(('Step', 'State', 'What to do'),
             tuple((row.step, row.state, row.message) for row in self._checklist_rows), cell_tooltips=tips)
@@ -3610,6 +3614,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                         self._orientation_figure = figure
                         self.orientation_panel.show_finding(finding, figure,
                             configured_senses=self.geometry_editor.value().arm_senses())
+                        # The job drew the hypothesis selected at its start; draw the one selected now.
+                        self._orientation_candidate_changed()
                 elif kind == 'beam_detect':
                     if self._beam_probe_generation == self._beam_generation:
                         self._beam_detection = (self._beam_generation, *result)

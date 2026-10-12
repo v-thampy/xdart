@@ -374,6 +374,24 @@ def detector_calibration_from_projection(
 
 
 CALIBRANT_NAMES = ('LaB6', 'CeO2', 'Si', 'Al2O3', 'Cr2O3', 'AgBh')
+#: pyFAI registers xdart's "Al2O3" as "alpha_Al2O3"; the other five names match pyFAI's.
+_PYFAI_CALIBRANT_NAMES = MappingProxyType({'Al2O3': 'alpha_Al2O3'})
+
+
+def pyfai_calibrant_name(name: str) -> str:
+    """pyFAI's registered name for a calibrant xdart offers (``CALIBRANT_NAMES``). Any other name, such as one typed
+    into Calibrate's editable list, passes through unchanged."""
+    return _PYFAI_CALIBRANT_NAMES.get(name, name)
+
+
+def pyfai_calibrant(name: str, wavelength_m: float | None = None):
+    """pyFAI's calibrant for ``name`` (through ``pyfai_calibrant_name``), at ``wavelength_m`` when given. Every
+    binding of a calibrant name to pyFAI goes through here."""
+    from pyFAI.calibrant import get_calibrant  # noqa: PLC0415
+    calibrant = get_calibrant(pyfai_calibrant_name(name))
+    if wavelength_m is not None:
+        calibrant.wavelength = float(wavelength_m)
+    return calibrant
 
 
 def detector_calibration_record(

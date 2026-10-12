@@ -125,8 +125,8 @@ def _seed(geometry, source_motors):
 
 
 def _calibrant(name, wavelength_m):
-    from pyFAI.calibrant import get_calibrant  # noqa: PLC0415
-    calibrant = get_calibrant(name) if isinstance(name, str) else name
+    from xrd_tools.integrate.calibration import pyfai_calibrant  # noqa: PLC0415
+    calibrant = pyfai_calibrant(name) if isinstance(name, str) else name
     calibrant.wavelength = float(wavelength_m)
     return calibrant
 

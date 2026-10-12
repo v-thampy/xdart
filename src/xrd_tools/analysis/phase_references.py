@@ -16,8 +16,6 @@ MAX_REFLECTIONS_PER_PHASE = 2048
 MAX_REFLECTIONS_TOTAL = 4096
 #: Built-in calibrant entries (REFERENCE-PHASES-20261011) carry this id prefix and need no library file.
 CALIBRANT_PREFIX = "calibrant:"
-#: pyFAI registers xdart's "Al2O3" as "alpha_Al2O3" (pre-existing name mismatch; the other five match).
-_PYFAI_CALIBRANT_NAMES = {"Al2O3": "alpha_Al2O3"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,14 +204,14 @@ def _valid_floor(value) -> bool:
 
 def _calibrant_reflections(entry, wavelength_angstrom, q_range, two_theta_range):
     """A calibrant's reachable lines from pyFAI's d-spacings (q = 2π/d); no intensities, no pymatgen."""
-    from pyFAI.calibrant import get_calibrant
+    from xrd_tools.integrate.calibration import pyfai_calibrant
     reach = 4. * math.pi / float(wavelength_angstrom)
     if q_range is not None:
         low, high = (float(value) for value in q_range)
     else:
         angles = (0., 180.) if two_theta_range is None else tuple(float(value) for value in two_theta_range)
         low, high = (4. * math.pi * math.sin(math.radians(angle) / 2.) / float(wavelength_angstrom) for angle in angles)
-    spacings = get_calibrant(_PYFAI_CALIBRANT_NAMES.get(entry.name, entry.name)).dspacing
+    spacings = pyfai_calibrant(entry.name).dspacing
     qs = sorted(2. * math.pi / d for d in spacings if d > 0)
     return tuple(PhaseReflection(q, 2. * math.pi / q, None, ()) for q in qs if low <= q <= high and q <= reach)
 

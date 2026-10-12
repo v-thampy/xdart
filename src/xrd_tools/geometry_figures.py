@@ -652,8 +652,8 @@ def _auc(ring, background):
 
 
 def _measure_candidate(frame, camera, senses, geometric, invalid):
-    from pyFAI.calibrant import get_calibrant
     from scipy.ndimage import map_coordinates
+    from xrd_tools.integrate.calibration import pyfai_calibrant
     value, image = frame.geometry, frame.image
     # A temporary integrator per hypothesis: pyFAI's forced process-wide collection on its wavelength set
     # would cost a full gc.collect() each time, on the scoring worker thread.
@@ -673,7 +673,7 @@ def _measure_candidate(frame, camera, senses, geometric, invalid):
     oriented = (raw-origin) @ matrix
     signature = tuple(ai.tth(oriented[:, 1], oriented[:, 0]))
     maximum = max(signature)
-    calibrant = get_calibrant('LaB6', value.wavelength_m)
+    calibrant = pyfai_calibrant(value.calibrant, value.wavelength_m)  # the rings the figure draws (D7)
     ring_scores = []
     for number, theta in enumerate(calibrant.get_2th(), 1):
         if theta is None or theta > maximum:
@@ -1236,10 +1236,9 @@ def predict_detector_rings(snapshot, calibrant, *, shape, step_px=2.):
     camera transform, GI basis or view-scale sampling enters this display.
     """
     import json
-    from pyFAI.calibrant import get_calibrant
     from xrd_tools.core.containers import PONI
     from xrd_tools.core.geometry.diffractometer import DetectorCalibration
-    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator, pyfai_calibrant
     from xrd_tools.integrate.calibration_seed import ExpectedRing
     reason = detector_ring_unavailable(snapshot, shape)
     if reason:
@@ -1252,7 +1251,7 @@ def predict_detector_rings(snapshot, calibrant, *, shape, step_px=2.):
     if not ai.detector.IS_FLAT or not ai.detector.uniform_pixel or ai.detector.spline is not None:
         raise ValueError('Predicted rings require a uniform, flat, undistorted detector.')
     points = cone_plane(ai)
-    reference = get_calibrant(calibrant); reference.wavelength = ai.wavelength
+    reference = pyfai_calibrant(calibrant, ai.wavelength)
     curves, rings = [], []
     for number, (theta, d) in enumerate(zip(reference.get_2th(), reference.dspacing), 1):
         if theta is None:
@@ -1271,7 +1270,7 @@ def predict_detector_rings(snapshot, calibrant, *, shape, step_px=2.):
 
 
 def _display_prediction(value, camera, senses, mapping):
-    from pyFAI.calibrant import get_calibrant
+    from xrd_tools.integrate.calibration import pyfai_calibrant
     from xrd_tools.integrate.calibration_seed import ExpectedRing, _direct_beam_hit
     record, seed, shape = _geometry(value, camera, senses, include_rings=False, collect_garbage=False)
     ai = seed.integrator
@@ -1279,7 +1278,7 @@ def _display_prediction(value, camera, senses, mapping):
         raise ValueError('Orientation display requires a uniform, flat, undistorted detector.')
     points = _cone_plane(ai)
     origin, matrix = _raw_affine(camera, value.shape)
-    reference = get_calibrant(value.calibrant); reference.wavelength = ai.wavelength
+    reference = pyfai_calibrant(value.calibrant, ai.wavelength)
     curves, rings = [], []
     for number, (theta, d) in enumerate(zip(reference.get_2th(), reference.dspacing), 1):
         if theta is None:
@@ -1321,10 +1320,10 @@ def orientation_display(frame, camera, senses=(1, 1), *, cap=ORIENTATION_PREVIEW
 
 
 def _teaching_example(value, camera=None, *, image=None):
-    from pyFAI.calibrant import get_calibrant
+    from xrd_tools.integrate.calibration import pyfai_calibrant
     truth = camera or DetectorCamera('x-', 'z+')
     _, seed, shape = _geometry(value, truth, include_rings=False, collect_garbage=False)
-    reference = get_calibrant(value.calibrant); reference.wavelength = value.wavelength_m
+    reference = pyfai_calibrant(value.calibrant, value.wavelength_m)
     pitch = seed.integrator.detector.pixel1
     if image is None:
         pixels = reference.fake_calibration_image(seed.integrator, shape=shape, Imax=200.,

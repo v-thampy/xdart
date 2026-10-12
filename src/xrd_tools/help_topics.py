@@ -15,6 +15,36 @@ class HelpTopic:
     run_key: str | None = None
 
 
+#: The multi-step calibration's seven steps, declared once as (label, text), each text starting with its label:
+#: Calibrate's checklist lists them and the "calibration.multi-step" topic numbers them under Steps.
+CALIBRATION_STEPS = tuple((label, label + rest) for label, rest in (
+    ("Describe the instrument first", ": geometry, motor names, signed axes and zeros, detector, camera mounting "
+     "and first-pixel corner."),
+    ("Start from a rough geometry", ": direct-beam scan, typed distance, or Skip. The guess predicts rings; it does "
+     "not replace ring calibration."),
+    ("Read calibrant-scan metadata, inspect the suggested frames and prepare the selected images",
+     ". Prefer varied arm angles and useful ring coverage."),
+    ("Calibrate each selected image in pyFAI, saving its PONI and control points",
+     ". Import existing files only when they match that exact frame and image."),
+    ("Fit at least three Complete frames together", ". Shared detector geometry is fitted across the arm positions; "
+     "enabled free parameters move within their bounds, while fixed parameters stay fixed. Read model-selection "
+     "reasons."),
+    ("Inspect the summary and Show the fit", ". Refine with further scan observations when appropriate; check "
+     "residuals and the held-out comparison rather than accepting more points merely because there are more of "
+     "them."),
+    ("Validate the informative frames, then Save geometry and use it in Stitch or RSM", ". Read the existing "
+     "overwrite confirmation before replacing a file."),
+))
+
+
+def _numbered(steps):
+    """A topic's numbered list, wrapped as the hand-written topics are."""
+    import textwrap
+    return "\n".join(textwrap.fill(text, 79, initial_indent=f"{number}. ", subsequent_indent="   ",
+                                    break_on_hyphens=False, break_long_words=False)
+                      for number, (_label, text) in enumerate(steps, 1))
+
+
 TOPICS = (
     HelpTopic("calibration.multi-step", "Multi-step detector calibration", """Purpose
 Build one detector geometry from powder-ring control points across a calibrant
@@ -27,22 +57,7 @@ angles; the matching calibrant; recorded energy/wavelength or an Energy override
 matching PONI and control-point files for each calibrated frame.
 
 Steps
-1. Describe the instrument first: geometry, motor names, signed axes and zeros,
-   detector, camera mounting and first-pixel corner.
-2. Start from a rough geometry: direct-beam scan, typed distance, or Skip. The
-   guess predicts rings; it does not replace ring calibration.
-3. Read calibrant-scan metadata, inspect the suggested frames and prepare the
-   selected images. Prefer varied arm angles and useful ring coverage.
-4. Calibrate each selected image in pyFAI, saving its PONI and control points.
-   Import existing files only when they match that exact frame and image.
-5. Fit at least three Complete frames together. Shared detector geometry is
-   fitted across the arm positions; enabled free parameters move within their
-   bounds, while fixed parameters stay fixed. Read model-selection reasons.
-6. Inspect the summary and Show the fit. Refine with further scan observations
-   when appropriate; check residuals and the held-out comparison rather than
-   accepting more points merely because there are more of them.
-7. Validate the informative frames, then Save geometry and use it in Stitch or
-   RSM. Read the existing overwrite confirmation before replacing a file.
+""" + _numbered(CALIBRATION_STEPS) + """
 
 Units and conventions
 Motor angles are degrees; displayed sample–detector distance is millimetres;
