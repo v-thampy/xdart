@@ -641,11 +641,26 @@ def _hide_tip(qapp):
     _until(qapp, lambda: not QtWidgets.QToolTip.isVisible(), seconds=3, what='the previous tooltip to hide')
 
 
+def _move(widget, local):
+    """A real mouse move to ``local`` of ``widget``, delivered to its own top-level window. Oracle repairs: offscreen,
+    a widget-level move lands on whichever overlapping window is on top, and an earlier test's page can stay visible
+    until its deferred delete (probe p06); pyqtgraph's scene ignores a move within 10 ms of the one before
+    (``mouseRateLimit``), so each move waits 20 ms (the GC7d diagnosis, scratch-state/flake8)."""
+    _spin(QtWidgets.QApplication.instance(), .02)
+    window = widget.window()
+    QtTest.QTest.mouseMove(window.windowHandle(), widget.mapTo(window, local))
+
+
 def _hover(qapp, canvas, box, point, *, want=None, seconds=1.5):
     """A real mouse move (QTest) to view coordinates ``point`` of ``box`` on the graphics view ``canvas``; the
-    tooltip shown by then ('' when none). ``want`` ends the wait as soon as the text satisfies it."""
+    tooltip shown by then ('' when none). ``want`` ends the wait as soon as the text satisfies it.
+
+    Oracle repair (probe p05): the move starts from the viewport's corner, because Qt drops a move to the position
+    it last recorded, and a QTest click does not record one."""
+    _move(canvas.viewport(), QtCore.QPoint(1, 1))
+    _spin(qapp, .05)
     local = canvas.mapFromScene(box.mapViewToScene(QtCore.QPointF(*map(float, point))))
-    QtTest.QTest.mouseMove(canvas.viewport(), local)
+    _move(canvas.viewport(), local)
     deadline = time.monotonic() + seconds
     text = ''
     while time.monotonic() < deadline:
@@ -757,6 +772,9 @@ def test_gc7b_a_ring_on_the_raw_pane_and_cake_and_the_raw_popup_lists_its_reflec
         popup = view.raw_popup_image
         _settle(qapp, view, lambda: popup.image.image is not None and popup.image.image.shape == (487, 195)
                 and _pane_items(popup, entry.id))
+        # Oracle repair (probe p05): offscreen, a move over the page's overlapping window never reaches the popup.
+        popup.window().move(page.window().geometry().right() + 40, page.window().geometry().top())
+        qapp.processEvents()
         canvas, box = _pane(popup)
         segment = _segments(_pane_items(popup, entry.id)[0])[0]
         _hide_tip(qapp)
@@ -827,7 +845,7 @@ def test_gc7d_a_phase_tooltip_clears_when_the_cursor_leaves_phases_switch_off_or
             text = _hover(qapp, canvas, box, segment[len(segment) // 2], want=lambda t: re.search(r'\(\d{3}\)', t))
             assert re.search(r'\(\d{3}\)', text), ('a ring names its reflection', text)
         show()
-        QtTest.QTest.mouseMove(canvas.viewport(), QtCore.QPoint(2, 2))
+        _move(canvas.viewport(), QtCore.QPoint(2, 2))
         _until(qapp, lambda: '■' not in _tip_text(), seconds=3, what='the tooltip to clear on leaving')
         show()
         QtTest.QTest.mouseClick(_phases_button(view), QtCore.Qt.MouseButton.LeftButton)
