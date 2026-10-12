@@ -748,9 +748,11 @@ class FormRow(QtWidgets.QWidget):
         browse: bool = False,
         enabled: bool = True,
         reason: str = "",
-        minimum: int | None = None,
-        maximum: int | None = None,
+        minimum: int | float | None = None,
+        maximum: int | float | None = None,
         allow_blank: bool = False,
+        decimals: int = 2,
+        suffix: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -796,6 +798,20 @@ class FormRow(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Expanding,
                 QtWidgets.QSizePolicy.Preferred,
             )
+            lay.addWidget(editor, 1)
+        elif kind == "float":
+            # A decimal number with arrows (REFERENCE-PHASES-20261011): it commits once per changed value, on
+            # Return, focus-out or a step, and ``set_number`` projects it silently.
+            lay.addWidget(self.label)
+            editor = QtWidgets.QDoubleSpinBox()
+            editor.setObjectName("controlsDoubleSpin")
+            editor.setKeyboardTracking(False)
+            editor.setDecimals(int(decimals))
+            editor.setRange(float(-1e12 if minimum is None else minimum), float(1e12 if maximum is None else maximum))
+            editor.setSuffix(str(suffix))
+            editor.setValue(float(value))
+            self._number = float(editor.value())
+            editor.valueChanged.connect(self._number_edited)
             lay.addWidget(editor, 1)
         elif kind == "combo":
             lay.addWidget(self.label)
@@ -914,7 +930,10 @@ class FormRow(QtWidgets.QWidget):
         tip = (f"{self.label.text()}: {refusal}" if refusal else
                self._reason or (self._model_value if self._browse and self._model_value else
                                 self._purpose_tooltip or _field_tooltip(self._path)))
-        for widget in (self, self.editor, self.label):
+        widgets = (self, self.editor, self.label)
+        if self._kind == "float":
+            widgets += (self.editor.lineEdit(),)
+        for widget in widgets:
             if widget.toolTip() != tip:
                 widget.setToolTip(tip)
 
@@ -952,7 +971,31 @@ class FormRow(QtWidgets.QWidget):
         (a second field on a file row, e.g. the calibration window's image stem)."""
         self.layout().addWidget(widget, stretch)
 
+    def set_number(self, value) -> None:
+        """A float row's projection: silent; a changed value is authoritative, an equal one keeps a draft being
+        typed (REFERENCE-PHASES-20261011)."""
+        if self._kind != "float":
+            raise TypeError("set_number needs a float row")
+        value = float(value)
+        if value == self._number:
+            return
+        self._number = value
+        blocked = self.editor.blockSignals(True)
+        try:
+            self.editor.setValue(value)
+        finally:
+            self.editor.blockSignals(blocked)
+
+    def _number_edited(self, value) -> None:
+        value = float(value)
+        if value == self._number:
+            return
+        self._number = value
+        self._emit_edit(value)
+
     def current_value(self):
+        if self._kind == "float":
+            return float(self.editor.value())
         if self._kind == "bool":
             return bool(self.editor.isChecked())
         if self._kind == "combo":

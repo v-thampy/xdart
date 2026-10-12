@@ -322,6 +322,21 @@ INT_BROWSER_MENUS = (
 
 
 @dataclass(frozen=True, slots=True)
+class ResultValueSpec:
+    """A results list's opt-in number per row (REFERENCE-PHASES-20261011): a decimal spinbox at each row's right
+    end, e.g. a phase's minimum intensity. The list keeps each row's value, enabled state and tooltip
+    (``BrowserView.reconcile_result_values``) and reports a user's committed edit as ``resultValueChanged``."""
+
+    suffix: str = ""
+    minimum: float = 0.
+    maximum: float = 100.
+    decimals: int = 1
+    step: float = 1.
+    #: the editor's width at the row's right end, in pixels
+    width: int = 88
+
+
+@dataclass(frozen=True, slots=True)
 class BrowserProfile:
     """What a page's Data Browser shows (AUD-9; the maintainer's reuse rule: another page mounts this view
     instead of copying its menus, heading and lists). The default is Int's. A results profile (``results``)
@@ -350,16 +365,19 @@ class BrowserProfile:
     heading: bool = True
     #: A keyed tool list's independent checks (metadata columns), reconciled through reconcile_checked_results.
     result_checks: bool = False
+    #: A results list's opt-in per-row number (``ResultValueSpec``), reconciled through reconcile_result_values.
+    result_values: ResultValueSpec | None = None
 
 
-def keyed_list_profile(caption: str, *, checkable: bool = False) -> BrowserProfile:
+def keyed_list_profile(caption: str, *, checkable: bool = False,
+                       values: ResultValueSpec | None = None) -> BrowserProfile:
     """A plain keyed list (FIT-TOOLS-2026-10, Codex's design review F7: the Phase Fit's CIF rows): a window's own
     entries under ``caption``, each keyed by its identity (``BrowserResult``), with no menus, heading, frames or
     actions and none of a scan's or a frame's meaning. The window keeps its collection and reconciles the list from
     it after each Add or Remove (``reconcile_results``); ``current_result`` is the entry chosen."""
     return BrowserProfile(menus=(), raw_resolution_menus=False, list_caption=caption, directory=False, frames=False,
                           actions=(), date_sort=False, refresh=False, results=True, heading=False,
-                          result_checks=bool(checkable))
+                          result_checks=bool(checkable), result_values=values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,6 +481,8 @@ class BrowserView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
     #: A user changed independent checks: the checked identities in list order; reconciliation emits nothing.
     checksChanged = QtCore.Signal(object)
+    #: A user committed a row's number (a ``result_values`` profile): its identity and value; projection is silent.
+    resultValueChanged = QtCore.Signal(str, float)
 
     def __init__(
         self,
@@ -480,6 +500,14 @@ class BrowserView(QtWidgets.QFrame):
             raise ValueError("result_frames needs a results profile")
         if self.profile.result_checks and not self.profile.results:
             raise ValueError("result_checks needs a results profile")
+        if self.profile.result_values is not None:
+            if type(self.profile.result_values) is not ResultValueSpec:
+                raise TypeError("result_values must be an exact ResultValueSpec")
+            if not self.profile.results:
+                raise ValueError("result_values needs a results profile")
+        #: per-row numbers (identity -> value, enabled, tooltip), kept here so a rebuilt list re-attaches them
+        self._row_values: dict[str, tuple[float, bool, str]] = {}
+        self._value_editors: dict[str, QtWidgets.QDoubleSpinBox] = {}
         self._results: tuple[BrowserResult, ...] = ()
         self.setObjectName("e3BrowserView")
         self.setMinimumWidth(255 if self.profile.heading else 0)
@@ -643,6 +671,8 @@ class BrowserView(QtWidgets.QFrame):
             self.scans.itemActivated.connect(self._activate_directory)
         if self.profile.result_checks:
             self.scans.itemChanged.connect(lambda _item: self.checksChanged.emit(self.checked_results()))
+        if self.profile.result_values is not None:
+            self.scans.setItemDelegate(_RowValueDelegate(self))
         self.frames.selectionModel().selectionChanged.connect(
             self._frames_selected
         )
@@ -836,7 +866,10 @@ class BrowserView(QtWidgets.QFrame):
         rebuilt = _listed_entries(self.scans) != entries
         if rebuilt:
             _fill(self.scans, entries)
+            self._value_editors = {}  # clear() closed every row's editor
         self._results = entries
+        if self.profile.result_values is not None:
+            self._attach_value_editors()
         target = next((self.scans.item(index) for index in range(self.scans.count())
                        if self.scans.item(index).data(_USER_ROLE) == current), None)
         if self.scans.currentItem() is not target:
@@ -866,6 +899,74 @@ class BrowserView(QtWidgets.QFrame):
             item.setCheckState(QtCore.Qt.CheckState.Checked if item.data(_USER_ROLE) in checked
                                else QtCore.Qt.CheckState.Unchecked)
         del blocker
+
+    def reconcile_result_values(self, values) -> None:
+        """A ``result_values`` list's numbers: identity -> (value, enabled, tooltip). Silent: a changed value is
+        authoritative, an equal one keeps a draft being typed; rows without a value show no editor."""
+        if self.profile.result_values is None:
+            raise RuntimeError("reconcile_result_values needs a result_values profile")
+        self._row_values = {str(identifier): (float(value), bool(enabled), str(tooltip))
+                            for identifier, (value, enabled, tooltip) in dict(values).items()}
+        self._attach_value_editors()
+
+    def result_value_editor(self, identifier: str) -> QtWidgets.QDoubleSpinBox | None:
+        """The listed row's number editor (None: no such row or no value)."""
+        return self._value_editors.get(identifier)
+
+    def _attach_value_editors(self) -> None:
+        listed = set()
+        for index in range(self.scans.count()):
+            item = self.scans.item(index)
+            identifier = item.data(_USER_ROLE)
+            listed.add(identifier)
+            editor = self._value_editors.get(identifier)
+            if identifier not in self._row_values:
+                if self.scans.isPersistentEditorOpen(item):
+                    self.scans.closePersistentEditor(item)
+                self._value_editors.pop(identifier, None)
+            elif editor is None or not self.scans.isPersistentEditorOpen(item):
+                self.scans.openPersistentEditor(item)  # the delegate builds it from the row's value
+            else:
+                self._project_value(editor, self._row_values[identifier])
+        for identifier in tuple(self._value_editors):
+            if identifier not in listed:
+                self._value_editors.pop(identifier)
+
+    def _create_value_editor(self, parent, index) -> QtWidgets.QDoubleSpinBox:
+        spec = self.profile.result_values
+        identifier = index.data(_USER_ROLE)
+        editor = QtWidgets.QDoubleSpinBox(parent)
+        editor.setObjectName("browserRowValue")
+        editor.setKeyboardTracking(False)  # a typed number commits on Return, focus-out or a step
+        editor.setDecimals(int(spec.decimals))
+        editor.setRange(float(spec.minimum), float(spec.maximum))
+        editor.setSingleStep(float(spec.step))
+        editor.setSuffix(spec.suffix)
+        editor.setValue(self._row_values.get(identifier, (spec.minimum, False, ""))[0])
+        self._project_value(editor, self._row_values.get(identifier, (editor.value(), False, "")))
+        editor.valueChanged.connect(lambda value, key=identifier: self._value_edited(key, value))
+        self._value_editors[identifier] = editor
+        return editor
+
+    @staticmethod
+    def _project_value(editor, row) -> None:
+        value, enabled, tooltip = row
+        blocked = editor.blockSignals(True)
+        try:
+            if editor.value() != value:
+                editor.setValue(value)
+            editor.setEnabled(enabled)
+            for widget in (editor, editor.lineEdit()):
+                widget.setToolTip(tooltip)
+        finally:
+            editor.blockSignals(blocked)
+
+    def _value_edited(self, identifier: str, value: float) -> None:
+        row = self._row_values.get(identifier)
+        if row is None or float(value) == row[0]:
+            return
+        self._row_values[identifier] = (float(value), row[1], row[2])
+        self.resultValueChanged.emit(identifier, float(value))
 
     def checked_results(self) -> tuple[str, ...]:
         """The independently checked entries, in stable list order."""
@@ -1532,6 +1633,38 @@ class BrowserView(QtWidgets.QFrame):
         self.commandRequested.emit(ShellCommand(kind, value, path=path))
 
 
+class _RowValueDelegate(QtWidgets.QStyledItemDelegate):
+    """Positions a ``result_values`` row's persistent number editor at the row's right end and keeps the label
+    clear of it; the values themselves live in the BrowserView, never in item roles."""
+
+    def __init__(self, view: BrowserView) -> None:
+        super().__init__(view.scans)
+        self._view = view
+        self._height = QtWidgets.QDoubleSpinBox().sizeHint().height()
+
+    def createEditor(self, parent, _option, index):
+        return self._view._create_value_editor(parent, index)
+
+    def setEditorData(self, _editor, _index) -> None:
+        pass
+
+    def setModelData(self, _editor, _model, _index) -> None:
+        pass
+
+    def updateEditorGeometry(self, editor, option, _index) -> None:
+        width = min(self._view.profile.result_values.width, option.rect.width())
+        editor.setGeometry(option.rect.right() - width + 1, option.rect.top(), width, option.rect.height())
+
+    def paint(self, painter, option, index) -> None:
+        clear = QtWidgets.QStyleOptionViewItem(option)
+        clear.rect = option.rect.adjusted(0, 0, -(self._view.profile.result_values.width + 4), 0)
+        super().paint(painter, clear, index)
+
+    def sizeHint(self, option, index):
+        hint = super().sizeHint(option, index)
+        return QtCore.QSize(hint.width() + self._view.profile.result_values.width + 4, max(hint.height(), self._height))
+
+
 def _listed_entries(widget: QtWidgets.QListWidget) -> tuple[BrowserResult, ...]:
     """What a results list shows, as entries (its identities, texts, tooltips and muted marks)."""
     return tuple(
@@ -1613,4 +1746,4 @@ def _command_belongs_to_catalog(
     )
 
 
-__all__ = ["BrowserProfile", "BrowserResult", "BrowserView", "keyed_list_profile"]
+__all__ = ["BrowserProfile", "BrowserResult", "BrowserView", "ResultValueSpec", "keyed_list_profile"]
