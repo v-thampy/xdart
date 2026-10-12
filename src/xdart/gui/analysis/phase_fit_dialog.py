@@ -569,6 +569,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
             result.policy_fingerprint, result.result_fingerprint)))
 
     def closeEvent(self, event):
+        self.phase_source.invalidate_add()  # a CIF still being read selects nothing in a closed Fitter
         if self._vnext:
             self._vnext_submit("close", None)
         super().closeEvent(event)

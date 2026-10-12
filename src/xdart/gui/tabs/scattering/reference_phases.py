@@ -80,6 +80,10 @@ class ReferencePhasesWindow(QtWidgets.QDialog):
         self.phase_source.refresh_library()
         super().showEvent(event)
 
+    def closeEvent(self, event) -> None:
+        self.phase_source.invalidate_add()  # a CIF still being read selects nothing after the window closes
+        super().closeEvent(event)
+
     def _emit(self, field, value) -> None:
         self.optionEdited.emit(('other', field), value)
 

@@ -180,6 +180,24 @@ class PhaseLibrary:
         return tuple(lookup.entry for path in sorted(self.path.glob("*.json"))
                      if (lookup := self.resolve(path.stem)).entry is not None)
 
+    def catalogue(self) -> tuple[tuple[str, str, str], ...]:
+        """``(id, name, source_kind)`` for a chooser, from the small JSON documents alone: a CIF entry is listed while
+        its bytes file exists (a stat; nothing is read or hashed). Rows are untrusted; only ``resolve`` and
+        admission yield verified entries (R1, D1)."""
+        rows = []
+        for path in sorted(self.path.glob("*.json")):
+            try:
+                document = json.loads(path.read_text())
+                identity, name, kind = document["id"], _name(document["name"]), document["source_kind"]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if identity != path.stem or kind not in ("cif", "lattice"):
+                continue
+            if kind == "cif" and not (self.path/(identity+".cif")).is_file():
+                continue
+            rows.append((identity, name, kind))
+        return tuple(rows)
+
 
 def calibrant_entry(name: str) -> PhaseEntry:
     """A built-in calibrant (pyFAI's, as Calibrate offers them): positions only, with no library file."""

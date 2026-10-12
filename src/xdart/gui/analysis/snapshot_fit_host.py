@@ -12,6 +12,7 @@ from xdart.gui.tabs.scattering.results_table import peak_parameter_rows, phase_r
 from xdart.gui.widgets.controls_panel import FormRow
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
+from xdart.gui.pages.values import PageCleanup
 from xrd_tools.analysis.fit_snapshot import FitInputSnapshot
 from xrd_tools.analysis.fit_sources import phase_fit_snapshot
 from xrd_tools.analysis.runner import DisplayedPeakFitAnalyzer, DisplayedPhaseFitAnalyzer, run_batch
@@ -278,5 +279,10 @@ class SnapshotFitHost(QtCore.QObject):
                 self.dialog.status.setText(str(error))
 
     def shutdown(self):
+        """Close the fit worker and the Fitter's Add CIF… worker: CLEAN, or PENDING while either runs."""
         self.invalidate()
-        return self.owner.shutdown()
+        receipts = [self.owner.shutdown()]
+        source = getattr(self.dialog, 'phase_source', None)
+        if source is not None:
+            receipts.append(source.shutdown())
+        return next((receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN), receipts[0])

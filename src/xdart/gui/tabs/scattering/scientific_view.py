@@ -54,6 +54,7 @@ from .scientific_plot_options import (
 from .scientific_curves import add_curve_item, add_text_item, draw_reference_lines
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
+from xdart.gui.pages.values import PageCleanup
 from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest, phase_floor, positions_for_axis
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .processed_browser import TerminalRebindAuthorization
@@ -1406,9 +1407,12 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_color_slots = {}
 
     def shutdown_phase_overlays(self):
+        """Close the phase worker and the window's Add CIF… worker: CLEAN, or PENDING while either runs (the host
+        asks again)."""
         self.reference_phases.close()  # the view's window does not outlive its overlays
         self._clear_phase_overlays()
-        return self._phase_requests.shutdown()
+        receipts = (self._phase_requests.shutdown(), self.reference_phases.phase_source.shutdown())
+        return next((receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN), receipts[0])
 
     @staticmethod
     def _phase_axis(axis):

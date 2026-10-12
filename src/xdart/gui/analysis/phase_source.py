@@ -10,10 +10,12 @@ from dataclasses import dataclass, replace
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
+from xdart.gui.pages.operation_owner import OperationTerminalStatus
 from xdart.gui.tabs.scattering.browser_view import (BrowserResult, BrowserView, ResultValueSpec,
                                                     keyed_list_profile)
 from xdart.gui.widgets.controls_panel import FormRow, SectionCard
 from xdart.gui.widgets.file_dialogs import browse
+from xdart.gui.widgets.latest_request import LatestRequestOwner
 
 CIF_FILTER = 'CIF files (*.cif);;All files (*)'
 _PYMATGEN_REASON = 'Phase sources need pymatgen; install xdart[fitting].'
@@ -22,6 +24,30 @@ _ROW_TIP = 'This phase\'s minimum intensity, in percent of its strongest reachab
 _SAME_TIP = 'Same minimum for all phases is on; turn it off to give each CIF phase its own minimum.'
 _NO_INTENSITY_TIP = {'lattice': 'Lattice phases have no structural intensities; every allowed position is shown.',
                      'calibrant': 'Calibrants carry positions only, with no intensities; every line is shown.'}
+#: Add CIF…'s busy reason while the chosen files are read (R1, D1)
+_ADD_BUSY_TIP = 'Reading the chosen CIF files on a worker; Add CIF is available again once they are added.'
+
+
+@dataclass(frozen=True, eq=False)
+class _CifAdd:
+    """One Add CIF… request: the chosen files, parsed and kept in the library on the worker."""
+    library: object
+    paths: tuple[str, ...]
+    epoch: int
+
+
+def _add_cifs(request, cancel, _progress):
+    """Add CIF…'s worker half: each chosen file parsed and kept in the library, in order, stopping at the first
+    error. Which entries join the list is decided on the GUI thread, against the list then current."""
+    entries = []
+    for path in request.paths:
+        if cancel.is_set():
+            break
+        try:
+            entries.append(request.library.add_cif(path))
+        except (OSError, ValueError, ImportError) as error:
+            return tuple(entries), str(error)
+    return tuple(entries), ''
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +88,9 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._source_reason = ''
         self._cutoffs_enabled = bool(cutoffs)
         self._cutoffs = PhaseCutoffs()
+        #: Add CIF… parses on this worker, one add at a time; a close invalidates it (``invalidate_add``)
+        self._adds = LatestRequestOwner(_add_cifs, self._cifs_added, same=lambda a, b: a is b, parent=self)
+        self._add_epoch, self._adding = 0, False
         self.setObjectName('phaseSourceWidget')
         self.setToolTip(_SOURCE_TIP)
         layout = QtWidgets.QVBoxLayout(self)
@@ -208,6 +237,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
                          *self.lattice_rows.values())
         for control, purpose in self._purpose_tooltips.items():
             extra = suffix or (' ' + self._source_reason if self._source_reason and control in needs_backend else '')
+            if control is self.add_cif_btn and self._adding and not extra:
+                extra = ' ' + _ADD_BUSY_TIP
             if isinstance(control, FormRow):
                 control.set_purpose_tooltip(purpose + extra)
             else:
@@ -340,24 +371,23 @@ class PhaseSourceWidget(QtWidgets.QWidget):
 
     def refresh_library(self):
         """Read the library once for the list and the selection (user actions, never reconciles)."""
-        from xrd_tools.analysis.phase_references import PhaseLibraryLookup, pymatgen_available
         selected = dict(self._selection)
+        # Only the selected entries are resolved (read and verified); the library is listed from its catalogue.
+        lookups = {identifier: self.library.resolve(identifier) for identifier in selected}
         if self._show_library:
-            entries = tuple(self.library.entries())
-            known = {entry.id: entry for entry in entries}
-            lookups = {identifier: PhaseLibraryLookup(known[identifier]) if identifier in known
-                       else self.library.resolve(identifier) for identifier in selected}
+            listed = self.library.catalogue()
         else:
-            lookups = {identifier: self.library.resolve(identifier) for identifier in selected}
-            entries = tuple(lookup.entry for lookup in lookups.values() if lookup.entry is not None)
+            listed = tuple((lookup.entry.id, lookup.entry.name, lookup.entry.source_kind)
+                           for lookup in lookups.values() if lookup.entry is not None)
         self._resolved = {identifier: lookup.entry for identifier, lookup in lookups.items()
                           if lookup.entry is not None}
-        self._shown_ids = tuple(entry.id for entry in entries)
-        rows = tuple(BrowserResult(str(index) if self._key_by_index else entry.id, entry.name,
-                                   self._details.get(entry.id, f'{entry.source_kind} phase: {entry.name}'))
-                     for index, entry in enumerate(entries))
+        self._shown_ids = tuple(identifier for identifier, _name, _kind in listed)
+        rows = tuple(BrowserResult(str(index) if self._key_by_index else identifier, name,
+                                   self._details.get(identifier, f'{kind} phase: {name}'))
+                     for index, (identifier, name, kind) in enumerate(listed))
         if self._checkable:
-            checked = tuple(row.identifier for row, entry in zip(rows, entries) if selected.get(entry.id, False))
+            checked = tuple(row.identifier for row, identifier in zip(rows, self._shown_ids)
+                            if selected.get(identifier, False))
             self.browser.reconcile_checked_results(rows, checked)
         else:
             self.browser.reconcile_results(rows, self.browser.current_result())
@@ -370,9 +400,9 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             try:
                 editor.clear()
                 editor.addItem(_ADD_FROM_LIBRARY, '')
-                for entry in self.library.entries():
-                    if entry.id not in selected:
-                        editor.addItem(entry.name, entry.id)
+                for identifier, name, _kind in self.library.catalogue():
+                    if identifier not in selected:
+                        editor.addItem(name, identifier)
             finally:
                 editor.blockSignals(blocked)
         self._sync_backend()
@@ -390,6 +420,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._source_reason = '' if pymatgen_available() else _PYMATGEN_REASON
         for control in (self.add_cif_btn, self.add_lattice_btn, self.lattice_form):
             control.setEnabled(not self._source_reason)
+        if self._adding:
+            self.add_cif_btn.setEnabled(False)
 
     def set_details(self, details):
         self._details = dict(details)
@@ -493,7 +525,54 @@ class PhaseSourceWidget(QtWidgets.QWidget):
     def _browse_cifs(self):
         paths = browse(self, 'Add CIF phase(s)', many=True, file_filter=CIF_FILTER)
         if paths:
-            self.add_cif_paths(paths)
+            self.read_cif_paths(paths)
+
+    def read_cif_paths(self, paths):
+        """Add CIF…'s path (R1, D1): the files are parsed and kept in the library on the worker, one add at a time;
+        on return the successful prefix joins the list current then, under its eight-phase cap, and the first error
+        shows. ``add_cif_paths`` stays the synchronous programmatic path. False when an add is already reading."""
+        paths = tuple(str(path) for path in paths)
+        if self._adding or not paths:
+            return False
+        self._adding = True
+        self._sync_backend()
+        self._sync_tooltips()
+        self._adds.ask(_CifAdd(self.library, paths, self._add_epoch))
+        return True
+
+    def _cifs_added(self, request, terminal):
+        self._adding = False
+        if request.epoch == self._add_epoch:  # a close in between invalidated it: nothing joins the list late
+            if terminal.status is OperationTerminalStatus.RETURNED:
+                entries, error = terminal.payload
+                for entry in entries:
+                    try:
+                        self._add_entry(entry)
+                    except ValueError as cap:
+                        error = str(cap)
+                        break
+            else:
+                error = str(terminal.failure_message or 'Adding the CIF files failed.')
+            if error:
+                self._message(error)
+        self._sync_backend()
+        self._sync_tooltips()
+        return True
+
+    def invalidate_add(self):
+        """An ordinary close: an add still reading selects nothing when it returns (its library entries stay)."""
+        self._add_epoch += 1
+
+    def shutdown(self):
+        """Close Add CIF…'s worker with the host: CLEAN, or PENDING while a CIF is still read (ask again). Nothing
+        is selected after it."""
+        self._add_epoch += 1
+        return self._adds.shutdown()
+
+    @property
+    def add_worker(self):
+        """Add CIF…'s ``SingleWorkerOwner``: a host that deletes this widget keeps it until it closes CLEAN."""
+        return self._adds.worker
 
     def _commit_lattice(self):
         text = {key: row.editor.text().strip() for key, row in self.lattice_rows.items()}
