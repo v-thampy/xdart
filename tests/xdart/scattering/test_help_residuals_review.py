@@ -14,8 +14,9 @@ def qapp():
 @pytest.mark.parametrize('canvas_type', (pg.PlotWidget, pg.GraphicsLayoutWidget))
 def test_reference_hover_clears_on_a_real_viewport_leave(qapp, canvas_type):
     from xdart.gui.widgets.scientific_plot import HoverTooltip
-    canvas = canvas_type()
-    canvas.show()
+    holder = QtWidgets.QWidget()
+    canvas = canvas_type(parent=holder)
+    holder.show()
     qapp.processEvents()
     hover = HoverTooltip(canvas)
     try:
@@ -24,8 +25,8 @@ def test_reference_hover_clears_on_a_real_viewport_leave(qapp, canvas_type):
         assert hover.text == '', 'leaving the viewport retires its reference tooltip'
     finally:
         hover.hide()
-        canvas.close()
-        canvas.deleteLater()
+        holder.close()
+        holder.deleteLater()
         qapp.processEvents()
 
 
