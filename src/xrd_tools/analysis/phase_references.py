@@ -14,6 +14,10 @@ MAX_CIF_BYTES = 4*1024*1024
 MAX_TOTAL_CIF_BYTES = 16*1024*1024
 MAX_REFLECTIONS_PER_PHASE = 2048
 MAX_REFLECTIONS_TOTAL = 4096
+#: Built-in calibrant entries (REFERENCE-PHASES-20261011) carry this id prefix and need no library file.
+CALIBRANT_PREFIX = "calibrant:"
+#: pyFAI registers xdart's "Al2O3" as "alpha_Al2O3" (pre-existing name mismatch; the other five match).
+_PYFAI_CALIBRANT_NAMES = {"Al2O3": "alpha_Al2O3"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,9 +91,10 @@ def _name(value) -> str:
 def _parse_cif(raw, structure_class=None):
     if len(raw) > MAX_CIF_BYTES:
         raise ValueError("CIF byte limit exceeded (4 MiB)")
-    from .phase import HAS_PYMATGEN, Structure
-    if not HAS_PYMATGEN:
+    from . import phase as backend  # pre-existing: importing Structure failed before this reason could be raised
+    if not backend.HAS_PYMATGEN:
         raise ValueError("pymatgen is required to parse CIF phases")
+    Structure = backend.Structure
     try:
         return (Structure if structure_class is None else structure_class).from_str(raw.decode("utf-8-sig"), fmt="cif")
     except (ValueError, UnicodeError, KeyError, IndexError) as exc:
@@ -145,6 +150,11 @@ class PhaseLibrary:
         return PhaseEntry(identity, name, "lattice", lattice=tuple(sorted(values.items())))
 
     def resolve(self, identity: str) -> PhaseLibraryLookup:
+        if isinstance(identity, str) and identity.startswith(CALIBRANT_PREFIX):
+            try:
+                return PhaseLibraryLookup(calibrant_entry(identity[len(CALIBRANT_PREFIX):]))
+            except ValueError as exc:
+                return PhaseLibraryLookup(reason=str(exc))
         if not isinstance(identity, str) or len(identity) != 64 or any(c not in "0123456789abcdef" for c in identity):
             return PhaseLibraryLookup(reason="Phase library entry is missing")
         try:
@@ -170,20 +180,73 @@ class PhaseLibrary:
                      if (lookup := self.resolve(path.stem)).entry is not None)
 
 
-def prepare_phase_models(*entries: PhaseEntry, wavelength_angstrom: float,
-                         q_range=None, two_theta_range=None, min_intensity=5,
-                         model_class=None, structure_class=None):
-    """The sole source/listing path shared by overlays and the phase fit."""
-    from .phase import PhaseModel
-    model_class = PhaseModel if model_class is None else model_class
+def calibrant_entry(name: str) -> PhaseEntry:
+    """A built-in calibrant (pyFAI's, as Calibrate offers them): positions only, with no library file."""
+    from xrd_tools.integrate.calibration import CALIBRANT_NAMES
+    if name not in CALIBRANT_NAMES:
+        raise ValueError(f"unknown built-in calibrant: {name}")
+    return PhaseEntry(CALIBRANT_PREFIX + name, name, "calibrant")
+
+
+def admit_phase_entries(entries) -> None:
+    """Whole-request admission before any listing: the phase count and the CIF byte limits (ValueError)."""
+    entries = tuple(entries)
     if not 1 <= len(entries) <= MAX_PHASES:
         raise ValueError("phase limit exceeded (at most 8)")
-    if not math.isfinite(float(min_intensity)) or not 0 <= min_intensity <= 100:
-        raise ValueError("minimum intensity must be between 0 and 100 percent")
-    if sum(len(e.cif_bytes) for e in entries) > MAX_TOTAL_CIF_BYTES:
+    if any(len(entry.cif_bytes) > MAX_CIF_BYTES for entry in entries):
+        raise ValueError("CIF byte limit exceeded (4 MiB)")
+    if sum(len(entry.cif_bytes) for entry in entries) > MAX_TOTAL_CIF_BYTES:
         raise ValueError("cumulative CIF byte limit exceeded")
+
+
+def _valid_floor(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+            and 0 <= value <= 100)
+
+
+def _calibrant_reflections(entry, wavelength_angstrom, q_range, two_theta_range):
+    """A calibrant's reachable lines from pyFAI's d-spacings (q = 2π/d); no intensities, no pymatgen."""
+    from pyFAI.calibrant import get_calibrant
+    reach = 4. * math.pi / float(wavelength_angstrom)
+    if q_range is not None:
+        low, high = (float(value) for value in q_range)
+    else:
+        angles = (0., 180.) if two_theta_range is None else tuple(float(value) for value in two_theta_range)
+        low, high = (4. * math.pi * math.sin(math.radians(angle) / 2.) / float(wavelength_angstrom) for angle in angles)
+    spacings = get_calibrant(_PYFAI_CALIBRANT_NAMES.get(entry.name, entry.name)).dspacing
+    qs = sorted(2. * math.pi / d for d in spacings if d > 0)
+    return tuple(PhaseReflection(q, 2. * math.pi / q, None, ()) for q in qs if low <= q <= high and q <= reach)
+
+
+def prepare_phase_models(*entries: PhaseEntry, wavelength_angstrom: float,
+                         q_range=None, two_theta_range=None, min_intensity=5, floors=None,
+                         model_class=None, structure_class=None):
+    """The sole source/listing path shared by overlays and the phase fit. ``floors`` (one per entry) overrides
+    ``min_intensity`` per phase; built-in calibrants list pyFAI positions without importing the pymatgen backend
+    (their model is None)."""
+    admit_phase_entries(entries)
+    if not _valid_floor(min_intensity):
+        raise ValueError("minimum intensity must be between 0 and 100 percent")
+    if floors is not None:
+        floors = tuple(floors)
+        if len(floors) != len(entries) or not all(_valid_floor(value) for value in floors):
+            raise ValueError("per-phase minimum intensities must align with the phases, each 0 to 100 percent")
     models, references, total = [], [], 0
-    for entry in entries:
+    for index, entry in enumerate(entries):
+        floor = min_intensity if floors is None else floors[index]
+        if entry.source_kind == "calibrant":
+            reflections = _calibrant_reflections(entry, wavelength_angstrom, q_range, two_theta_range)
+            if len(reflections) > MAX_REFLECTIONS_PER_PHASE:
+                raise ValueError("per-phase reflection limit exceeded")
+            total += len(reflections)
+            if total > MAX_REFLECTIONS_TOTAL:
+                raise ValueError("cumulative reflection limit exceeded")
+            references.append(PhaseReference(entry.id, entry.name, "calibrant", reflections))
+            models.append(None)
+            continue
+        if model_class is None:
+            from .phase import PhaseModel
+            model_class = PhaseModel
         if entry.source_kind == "cif":
             model = model_class(entry.name)
             model.structure = _parse_cif(entry.cif_bytes, structure_class)
@@ -203,7 +266,7 @@ def prepare_phase_models(*entries: PhaseEntry, wavelength_angstrom: float,
         model.calculate_peaks(wavelength=wavelength_angstrom,
                               two_theta_range=(0, 180) if two_theta_range is None else two_theta_range,
                               q_range=q_range, max_reflections=MAX_REFLECTIONS_PER_PHASE if entry.source_kind == "lattice" else None)
-        admitted = tuple(p for p in model.peaks if entry.source_kind == "lattice" or p.intensity >= min_intensity)
+        admitted = tuple(p for p in model.peaks if entry.source_kind == "lattice" or p.intensity >= floor)
         if len(admitted) > MAX_REFLECTIONS_PER_PHASE:
             raise ValueError("per-phase reflection limit exceeded")
         total += len(admitted)
@@ -218,11 +281,11 @@ def prepare_phase_models(*entries: PhaseEntry, wavelength_angstrom: float,
 
 
 def build_phase_references(*entries: PhaseEntry, wavelength_angstrom: float,
-                           q_range=None, two_theta_range=None, min_intensity=5) -> PhaseReferences:
+                           q_range=None, two_theta_range=None, min_intensity=5, floors=None) -> PhaseReferences:
     try:
         _, phases = prepare_phase_models(*entries, wavelength_angstrom=wavelength_angstrom,
                                          q_range=q_range, two_theta_range=two_theta_range,
-                                         min_intensity=min_intensity)
+                                         min_intensity=min_intensity, floors=floors)
         return PhaseReferences(phases)
     except (ValueError, TypeError, OSError, ImportError) as exc:
         return PhaseReferences(reason=str(exc))
