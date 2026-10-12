@@ -127,7 +127,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
         from .phase_source import PhaseSourceWidget
         phases = SectionCard("Phases", self, collapsible=False)
         phases.setToolTip("Choose structural CIF phases or manual lattice positions to fit.")
-        self.phase_source = PhaseSourceWidget(self, checkable=False, show_library=False, key_by_index=True)
+        self.phase_source = PhaseSourceWidget(self, checkable=False, show_library=False, key_by_index=True,
+                                              cutoffs=True)
         phases.add_row(self.phase_source)
         lay.addWidget(phases)
         # Existing tool integrations retain these aliases to the shared owner.
@@ -203,20 +204,18 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.advanced_btn.clicked.connect(self._show_advanced)
 
     def _build_advanced(self):
-        """Min intensity and solver iterations, on the shared Advanced dialog's rows."""
+        """Solver iterations and weighting, on the shared Advanced dialog's rows. The minimum intensity is the
+        Phases card's (REFERENCE-PHASES-20261011): one value or each phase's own."""
         self.advanced = AdvancedDialog(self, title="Advanced — Phase Fitting", object_name="phaseFitAdvancedDialog")
-        minimum = FormRow(label="Min peak intensity %", path=_path("min_intensity"), value="5")
         self._maxfev_row = FormRow(label="Max iterations", path=_path("max_nfev"), value="", kind="int", minimum=0,
                                    maximum=1_000_000, allow_blank=True)
-        self.advanced.add_group("Phases", (minimum, self._maxfev_row))
+        self.advanced.add_group("Solver", (self._maxfev_row,))
         uncertainty = FormRow(label="Use uncertainties", path=_path("use_uncertainties"), value=False, kind="bool")
         self.advanced.add_group("Weighting", (uncertainty,))
         self.use_uncertainties = uncertainty.editor
         self.use_uncertainties.setEnabled(False)
         self.use_uncertainties.setToolTip("Use admitted measured sigma; no uncertainties are inferred")
-        self.min_intensity, self.max_nfev = minimum.editor, self._maxfev_row.editor
-        self.min_intensity.setValidator(QtGui.QDoubleValidator(self))
-        self.min_intensity.setToolTip("Drop template peaks below this % of a phase's max intensity")
+        self.min_intensity, self.max_nfev = self.phase_source.global_row.editor, self._maxfev_row.editor
         self.max_nfev.setPlaceholderText("auto")
         self.max_nfev.setToolTip("Max solver iterations (max_nfev); blank or 0 = default")
 
@@ -258,6 +257,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
                 for entry, row in zip(selected, self._phase_entries)})
         else:
             self.cif_browser.reconcile_results(tuple(self._phase_entries), self.cif_browser.current_result())
+            self.phase_source.refresh_cutoffs()
 
     def _add_cif(self):
         if self._vnext:
@@ -403,10 +403,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
             lattice_pct = max(0.0, float(self.lattice_pct.text())) / 100.0
         except ValueError:
             lattice_pct = 0.05
-        try:
-            min_int = float(self.min_intensity.text())
-        except ValueError:
-            min_int = 5.0
+        min_int = self.phase_source.cutoffs.global_value
 
         init_kw = {}
         if background != "none":
@@ -437,8 +434,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
     def vnext_fit_values(self):
         try: lattice = float(self.lattice_pct.text()) / 100.0
         except ValueError: lattice = 0.05
-        try: minimum = float(self.min_intensity.text())
-        except ValueError: minimum = 5.0
+        cutoffs = self.phase_source.cutoffs
+        minimum = cutoffs.global_value
         nfev = self.max_nfev.value()
         values = {
             "cif_paths": tuple(path for path, _name in self._phases),
@@ -453,6 +450,12 @@ class PhaseFitDialog(QtWidgets.QDialog):
         if entries and not self._deferred_cifs:
             values.update(cif_paths=(), expected_hashes=(), phase_entries=entries,
                           phase_names=tuple(entry.name for entry in entries))
+        if not cutoffs.global_on:
+            # each listed phase's own minimum, in the fit's phase order (library entries, then deferred CIFs)
+            own = dict(cutoffs.per_phase)
+            values['phase_min_intensities'] = tuple(
+                float(own.get(entry.id, minimum)) for entry in self.phase_source.selected_entries()
+            ) + (float(minimum),) * len(self._deferred_cifs)
         if self.use_uncertainties.isChecked():
             values['use_uncertainties'] = True
         return values

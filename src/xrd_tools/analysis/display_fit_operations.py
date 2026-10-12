@@ -189,11 +189,15 @@ class DisplayedPhaseFitPlan:
     max_nfev: int | None = None
     use_uncertainties: bool = False
     phase_entries: tuple[Any, ...] = ()
+    #: each phase's own minimum intensity, aligned with ``phase_names`` (REFERENCE-PHASES-20261011); empty: every
+    #: phase uses ``min_intensity``. A lattice phase's value is ignored (it has no intensities).
+    phase_min_intensities: tuple[float, ...] = ()
     def __post_init__(self) -> None:
         object.__setattr__(self, "cif_paths", tuple(Path(p) for p in _tuple_once(self.cif_paths)))
         object.__setattr__(self, "expected_hashes", _tuple_once(self.expected_hashes))
         object.__setattr__(self, "phase_names", _tuple_once(self.phase_names))
         object.__setattr__(self, "phase_entries", _tuple_once(self.phase_entries))
+        object.__setattr__(self, "phase_min_intensities", _tuple_once(self.phase_min_intensities))
 @dataclass(frozen=True, slots=True)
 class DisplayedPhaseFitResult:
     disposition: AnalysisDisposition
@@ -515,6 +519,8 @@ def _phase_plan_value(
     )
     if plan.phase_entries:
         value += (("phase_entries", tuple((entry.id, entry.name, entry.source_kind, entry.lattice) for entry in plan.phase_entries)),)
+    if plan.phase_min_intensities:
+        value += (("phase_min_intensities", plan.phase_min_intensities),)
     return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
 def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
     if not isinstance(plan, DisplayedPhaseFitPlan):
@@ -539,6 +545,9 @@ def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid phase option")
     if not _valid_number(plan.lattice_pct, minimum=0, maximum=0.25) or not _valid_number(plan.min_intensity, minimum=0, maximum=100):
         raise _Refusal("INVALID_PHASE_PLAN", "invalid phase numeric option")
+    if plan.phase_min_intensities and (len(plan.phase_min_intensities) != count or not all(
+            _valid_number(value, minimum=0, maximum=100) for value in plan.phase_min_intensities)):
+        raise _Refusal("INVALID_PHASE_PLAN", "invalid per-phase minimum intensities")
     if plan.max_nfev is not None and (type(plan.max_nfev) is not int or not 1 <= plan.max_nfev <= 100_000):
         raise _Refusal("INVALID_PHASE_PLAN", "invalid max_nfev")
     finite = np.isfinite(plan.trace.axis) & np.isfinite(plan.trace.intensity)
@@ -625,7 +634,8 @@ def run_displayed_phase_fit(
         try:
             phases, references = prepare_phase_models(
                 *entries, wavelength_angstrom=wavelength_angstrom, q_range=q_range,
-                min_intensity=plan.min_intensity, model_class=PhaseModel, structure_class=Structure,
+                min_intensity=plan.min_intensity, floors=plan.phase_min_intensities or None,
+                model_class=PhaseModel, structure_class=Structure,
             )
         except ValueError as exc:
             code = "PHASE_REFLECTION_LIMIT_EXCEEDED" if "reflection limit" in str(exc) else "CIF_PARSE_FAILED"
@@ -638,8 +648,9 @@ def run_displayed_phase_fit(
         sigma = _fit_sigma(plan, finite)
         fitter = PhaseFitter(x, y, prefit_background=plan.prefit_background) if sigma is None else PhaseFitter(
             x, y, sigma, prefit_background=plan.prefit_background)
-        for phase in phases:
-            fitter.add_phase(phase, q_range=q_range, min_intensity=plan.min_intensity)
+        floors = plan.phase_min_intensities or (plan.min_intensity,) * len(phases)
+        for phase, floor in zip(phases, floors):  # the same per-phase value at both filter sites
+            fitter.add_phase(phase, q_range=q_range, min_intensity=floor)
         params = fitter.build_parameters(
             lattice_pct=plan.lattice_pct, phase_profile=plan.phase_profile,
             texture="none",

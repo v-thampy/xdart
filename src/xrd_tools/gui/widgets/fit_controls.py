@@ -183,8 +183,9 @@ class PhaseFitControls:
             names = list(settings.get("phase_names", ()))
             enabled = self.enabled_phases
             indices = [i for i, name in enumerate(names) if name in enabled]
-            for field in ("phase_names", "cif_paths", "expected_hashes"):
-                settings[field] = tuple(settings[field][i] for i in indices)
+            for field in ("phase_names", "cif_paths", "expected_hashes", "phase_min_intensities"):
+                if field in settings:  # per-phase minimums exist only when the fit chose them
+                    settings[field] = tuple(settings[field][i] for i in indices)
             return settings
         return dict(
             use_snip=self.use_snip.value,
