@@ -5,6 +5,7 @@ import configparser
 import logging
 import os
 import re
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ImageMetadataRead",
+    "MetadataDiscoveryChanged",
     "MetadataInputTooLarge",
     "MetadataScratchCleanupFailed",
     "read_txt_metadata",
@@ -37,6 +39,16 @@ class MetadataInputTooLarge(ValueError):
 
 class MetadataScratchCleanupFailed(RuntimeError):
     """A bounded SPEC snapshot could not be closed or removed."""
+
+
+class MetadataDiscoveryChanged(OSError):
+    """Only directories that discovery lists changed during a read.
+
+    A file was added, removed or renamed in one, as a live acquisition does at
+    any time.  No candidate file and no selected source changed, so the read
+    can simply be repeated; :func:`read_image_metadata_observed` does, a
+    bounded number of times.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +170,10 @@ def _metadata_discovery_revisions(
     return tuple(ordered)
 
 
+def _is_directory_revision(revision: MetadataSourceRevision | None) -> bool:
+    return revision is not None and stat.S_ISDIR(revision[0])
+
+
 def _with_discovery_revisions(
     result: ImageMetadataRead,
     discovery_revisions: tuple[
@@ -176,21 +192,31 @@ def _with_discovery_revisions(
     combined = (*discovery_revisions, *result.discovery_revisions)
     ordered: list[tuple[Path, MetadataSourceRevision | None]] = []
     seen: dict[Path, MetadataSourceRevision | None] = {}
+    changed: list[tuple[
+        Path, MetadataSourceRevision | None, MetadataSourceRevision | None,
+    ]] = []
     for path, revision in combined:
         if path in seen:
             if seen[path] != revision:
-                raise OSError(
-                    f"metadata discovery changed during read: {path}"
-                )
+                changed.append((path, seen[path], revision))
             continue
         seen[path] = revision
         ordered.append((path, revision))
     unique = tuple(ordered)
     for path, revision in unique:
-        if _metadata_path_revision(path) != revision:
-            raise OSError(
-                f"metadata discovery changed during read: {path}"
-            )
+        current = _metadata_path_revision(path)
+        if current != revision:
+            changed.append((path, revision, current))
+    if changed:
+        message = f"metadata discovery changed during read: {changed[0][0]}"
+        # A directory that stayed a directory only gained, lost or renamed an
+        # entry; any other change is refused at once.
+        if all(
+            _is_directory_revision(before) and _is_directory_revision(after)
+            for _path, before, after in changed
+        ):
+            raise MetadataDiscoveryChanged(message)
+        raise OSError(message)
     return ImageMetadataRead(
         result.values,
         result.source_path,
@@ -1014,6 +1040,12 @@ def read_image_metadata(
     )
 
 
+#: Pauses in seconds before reading again when only a listed directory
+#: changed during a read (MetadataDiscoveryChanged): a live acquisition
+#: writes beside the image at any time.  Five reads in all.
+_DISCOVERY_PAUSES_S = (0.005, 0.01, 0.02, 0.04)
+
+
 def read_image_metadata_observed(
     image_path: Path | str,
     meta_format: str | None = "txt",
@@ -1029,7 +1061,38 @@ def read_image_metadata_observed(
     provenance owners that must retain the file actually consumed.
     ``spec_point_snapshot`` selects Average's bounded single-point SPEC policy;
     it requires ``max_input_bytes`` and leaves other formats unchanged.
+
+    A read during which only listed directories changed is read again, at most
+    five reads in all, and the first read whose inputs held still is returned
+    with its own recorded revisions; the last refusal is raised. A changed
+    candidate or selected source is refused at once.
     """
+
+    for pause in _DISCOVERY_PAUSES_S:
+        try:
+            return _read_image_metadata_observed_once(
+                image_path, meta_format, meta_dir,
+                max_input_bytes=max_input_bytes,
+                spec_point_snapshot=spec_point_snapshot,
+            )
+        except MetadataDiscoveryChanged:
+            time.sleep(pause)
+    return _read_image_metadata_observed_once(
+        image_path, meta_format, meta_dir,
+        max_input_bytes=max_input_bytes,
+        spec_point_snapshot=spec_point_snapshot,
+    )
+
+
+def _read_image_metadata_observed_once(
+    image_path: Path | str,
+    meta_format: str | None,
+    meta_dir: Path | str | None,
+    *,
+    max_input_bytes: int | None,
+    spec_point_snapshot: bool,
+) -> ImageMetadataRead:
+    """One read for :func:`read_image_metadata_observed`."""
 
     image_path = _lexical_absolute(image_path)
 
