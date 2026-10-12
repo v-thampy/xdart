@@ -109,6 +109,8 @@ class Curve:
     role: str
     tooltip: str
     two_theta_deg: float | None = None
+    #: a detached value the curve stands for (a reference phase's reflection, for hover); never parsed from text
+    value: object = None
 
     def __post_init__(self):
         object.__setattr__(self, 'xy', _points(self.xy))
@@ -1217,6 +1219,8 @@ def predict_detector_grid(snapshot, *, shape, choice='q + χ', mode='2d', step_p
 
 RUN_RING_REASON = ("Predicted rings are drawn only on a Run's frames while that Run is shown. "
                    "Frames opened from a file, and Average or Reintegrate results, carry no ring geometry.")
+#: while the current Run frame's image is still loading (P3a residual 9); its own reason, or none, follows
+LOADING_RING_REASON = "Predicted rings wait for this Run frame's image, which is loading."
 #: the coordinate grid's own wording of RUN_RING_REASON (R4)
 GRID_RUN_REASON = ("Coordinate grids are drawn only on a Run's frames while that Run is shown. Frames opened from a "
                    "file, and Average or Reintegrate results, carry no detector geometry.")

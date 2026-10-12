@@ -38,11 +38,30 @@ class PeakData:
         Miller indices.
     d_spacing : float
         d-spacing (Å).
+    hkls : tuple of tuple of int
+        Every hkl family of this line, ``hkl`` first: pymatgen merges the families sharing one 2θ (decision D3), and a
+        lattice position keeps every family sharing it.
     """
     q: float
     intensity: float
     hkl: tuple[int, int, int]
     d_spacing: float
+    hkls: tuple[tuple[int, int, int], ...] = ()
+
+
+def _hkl_families(allowed, rotations):
+    """The symmetry-distinct families among one lattice position's allowed hkl, Friedel pairs and the group's
+    rotations being equivalent; each is named by its largest member, the largest family first."""
+    remaining, families = set(allowed), []
+    while remaining:
+        representative = max(remaining)
+        images = np.rint(np.einsum("nji,j->ni", rotations, np.asarray(representative))).astype(int)
+        orbit = {tuple(int(index) for index in image) for image in images}
+        orbit |= {tuple(-index for index in member) for member in orbit}
+        families.append(representative)
+        remaining -= orbit
+        remaining.discard(representative)
+    return tuple(families)
 
 
 class PhaseModel:
@@ -190,14 +209,18 @@ class PhaseModel:
             theta_rad = np.radians(two_theta / 2.0)
             q = (4 * np.pi * np.sin(theta_rad)) / wavelength
             
-            # Select first HKL representation for simplicity
-            hkl = hkls[0]["hkl"] if isinstance(hkls[0], dict) else hkls[0]
-            # Convert 4-index Miller-Bravais (h,k,i,l) to 3-index (h,k,l)
-            # for trigonal/hexagonal space groups where i = -(h+k)
-            if len(hkl) == 4:
-                hkl = (hkl[0], hkl[1], hkl[3])
+            # Every family pymatgen merged into this line, in its order; the first names the line.
+            families = []
+            for family in hkls:
+                hkl = family["hkl"] if isinstance(family, dict) else family
+                # Convert 4-index Miller-Bravais (h,k,i,l) to 3-index (h,k,l)
+                # for trigonal/hexagonal space groups where i = -(h+k)
+                if len(hkl) == 4:
+                    hkl = (hkl[0], hkl[1], hkl[3])
+                families.append(tuple(int(index) for index in hkl))
             if lower - 1e-12 <= q <= upper + 1e-12:
-                self.peaks.append(PeakData(q=q, intensity=float(intensity), hkl=tuple(hkl), d_spacing=d_hkl))
+                self.peaks.append(PeakData(q=q, intensity=float(intensity), hkl=families[0], d_spacing=d_hkl,
+                                           hkls=tuple(families)))
         maximum = max((p.intensity for p in self.peaks), default=0.)
         if maximum > 0:
             for peak in self.peaks:
@@ -212,7 +235,7 @@ class PhaseModel:
         points = self.lattice.reciprocal_lattice_crystallographic.get_points_in_sphere(
             [[0, 0, 0]], [0, 0, 0], upper/(2*np.pi),
         )
-        seen = set()
+        positions = {}  # each allowed position's q and its allowed hkl, in distance order
         for point in sorted(points, key=lambda item: item[1]):
             hkl = np.rint(point[0]).astype(int)
             q = float(2*np.pi*point[1])
@@ -226,12 +249,14 @@ class PhaseModel:
             if np.any(np.abs(phases-np.rint(phases)) > 1e-7):
                 continue
             key = round(q, 10)
-            if key in seen:
-                continue
-            seen.add(key)
-            self.peaks.append(PeakData(q, 100., tuple(map(int, hkl)), 2*np.pi/q))
-            if limit is not None and len(self.peaks) > limit:
-                raise ValueError("per-phase reflection limit exceeded")
+            if key not in positions:
+                positions[key] = (q, [])
+                if limit is not None and len(positions) > limit:
+                    raise ValueError("per-phase reflection limit exceeded")
+            positions[key][1].append(tuple(map(int, hkl)))
+        for q, allowed in positions.values():
+            families = _hkl_families(allowed, rotations)
+            self.peaks.append(PeakData(q, 100., families[0], 2*np.pi/q, families))
 
     def update_lattice(self, a: float=None, b: float=None, c: float=None,
                        alpha: float=None, beta: float=None, gamma: float=None) -> None:

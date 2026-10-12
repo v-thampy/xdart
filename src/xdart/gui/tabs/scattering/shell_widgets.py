@@ -33,7 +33,8 @@ from .controls_readiness import (
 from .detector_projection import detector_calibration_ready
 from .display_values import DisplayFrameKey
 from .shell_values import AxisProjection, TraceProjection
-from .scientific_curves import add_curve_item, add_text_item
+from .scientific_curves import add_curve_item, add_text_item, reference_entry
+from xdart.gui.widgets.scientific_plot import HOVER_PX, HoverTooltip
 
 
 def _axis_text(text: str) -> str:
@@ -105,6 +106,69 @@ class _ScientificImageWidget(pgImageWidget):
             self.raw_image = raw
 
 
+class _OverlayHitIndex:
+    """One joined overlay family's drawn points (the item's own array, not a copy) bucketed in a uniform grid over
+    their view-coordinate extent, so a hover finds the curves within ``HOVER_PX`` without scanning every point (C7,
+    CR7). Built once per drawing; a zoom changes only the query's reach. Memory: two int32 entries per point."""
+
+    CELLS = 256
+
+    def __init__(self, points, values, color):
+        self.points, self.values, self.color = points, values, color
+        finite = np.isfinite(points).all(axis=1)
+        #: the separator rows: curve k ends before ``breaks[k]`` (one separator follows each joined curve)
+        self.breaks = np.flatnonzero(~finite)
+        index = np.flatnonzero(finite)
+        self.empty = index.size == 0
+        if self.empty:
+            return
+        xy = points[index]
+        self.origin = xy.min(axis=0)
+        self.cell = np.maximum((xy.max(axis=0) - self.origin) / self.CELLS, 1e-12)
+        joined = np.diff(index) == 1  # consecutive drawn points of one curve
+        half = np.abs(np.diff(xy, axis=0))[joined] / 2
+        #: half the longest segment, per axis: a segment can pass the cursor with both ends this far away
+        self.reach = half.max(axis=0) if half.size else np.zeros(2)
+        cells = self._cells(xy)
+        order = np.argsort(cells, kind='stable')
+        self.cells, self.order = cells[order].astype(np.int32), index[order].astype(np.int32)
+
+    def _cells(self, xy):
+        ij = np.clip(np.floor((xy - self.origin) / self.cell), 0, self.CELLS).astype(np.int64)
+        return ij[..., 1] * (self.CELLS + 1) + ij[..., 0]
+
+    def hits(self, x, y, pixel):
+        """The curves (indices into ``values``) passing within ``HOVER_PX`` screen pixels of view (x, y)."""
+        if self.empty:
+            return ()
+        scale = np.abs(np.asarray(pixel, dtype=float))
+        reach = HOVER_PX * scale + self.reach
+        low, high = (np.array((x, y)) - reach - self.origin) / self.cell, (np.array((x, y)) + reach - self.origin) / self.cell
+        if (high < 0).any() or (low > self.CELLS).any():
+            return ()
+        (i0, j0), (i1, j1) = np.clip(np.floor(low), 0, self.CELLS).astype(int), np.clip(np.floor(high), 0, self.CELLS).astype(int)
+        rows = [self.order[np.searchsorted(self.cells, j * (self.CELLS + 1) + i0):
+                           np.searchsorted(self.cells, j * (self.CELLS + 1) + i1, side='right')]
+                for j in range(j0, j1 + 1)]
+        near = np.concatenate(rows) if rows else np.zeros(0, dtype=np.int32)
+        if near.size == 0:
+            return ()
+        points, last = self.points, len(self.points) - 1
+        starts = np.unique(np.concatenate((near, near - 1)))
+        starts = starts[(starts >= 0) & (starts < last)]
+        ends = starts + 1
+        segments = starts[np.isfinite(points[starts]).all(axis=1) & np.isfinite(points[ends]).all(axis=1)]
+        cursor = np.array((x, y)) / scale
+        a, b = points[segments] / scale, points[segments + 1] / scale
+        d = b - a
+        t = np.clip(((cursor - a) * d).sum(axis=1) / np.maximum((d * d).sum(axis=1), 1e-300), 0., 1.)
+        hit = np.hypot(*(a + t[:, None] * d - cursor).T) <= HOVER_PX
+        single = near[~np.isin(near, np.concatenate((segments, segments + 1)))]
+        alone = single[np.hypot(*((points[single] / scale) - cursor).T) <= HOVER_PX] if single.size else single
+        curves = np.searchsorted(self.breaks, np.concatenate((segments[hit], alone)))
+        return tuple(int(curve) for curve in np.unique(curves) if curve < len(self.values))
+
+
 class ScientificImagePane(QtWidgets.QWidget):
     def __init__(
         self,
@@ -138,6 +202,12 @@ class ScientificImagePane(QtWidgets.QWidget):
         self._axis_presentation_contract: tuple[object, ...] | None = None
         self.overlay_families = {}
         self._overlay_contracts = {}
+        #: hoverable families (curves carrying values: reference phases' rings and lines, C7): their drawn points,
+        #: the curves' values and colour; each index is built on the first hover after its drawing
+        self._hover_data, self._hover_indexes = {}, {}
+        self.hover = HoverTooltip(self.canvas.image_win)
+        self._hover_proxy = pg.SignalProxy(signal=self.canvas.image_win.scene().sigMouseMoved, rateLimit=60,
+                                           slot=self._hover_moved)
         layout.addWidget(self.canvas, 1)
 
     def clear(self) -> None:
@@ -184,12 +254,18 @@ class ScientificImagePane(QtWidgets.QWidget):
         for item in self.overlay_families.pop(family, ()):
             self.plot.removeItem(item)
         self._overlay_contracts.pop(family, None)
+        self._hover_data.pop(family, None)
+        self._hover_indexes.pop(family, None)
+        self.hover.hide()  # what it named may be gone or moved
         if contract is None:
             return
         self._overlay_contracts[family] = contract
         color = color or '#8dd3ec'
         mapped = [self._map_overlay_points(curve.xy, native_shape) for curve in curves]
         pairs = [(curves[0], np.vstack([np.vstack((points, (np.nan, np.nan))) for points in mapped]))]
+        values = tuple(getattr(curve, 'value', None) for curve in curves)
+        if joined and any(value is not None for value in values):
+            self._hover_data[family] = (pairs[0][1], values, pg.mkColor(color).getRgb()[:3])
         if not joined:
             pairs = zip(curves, mapped)
         items = [add_curve_item(self.plot, curve, color, xy=points) for curve, points in pairs]
@@ -198,6 +274,27 @@ class ScientificImagePane(QtWidgets.QWidget):
         for item in items:
             item.setZValue(2)
         self.overlay_families[family] = tuple(items)
+
+    def _hover_moved(self, positions):
+        """The overlay curves within ``HOVER_PX`` of the cursor name their reflections in one tooltip (C7)."""
+        position = positions[0] if type(positions) is tuple and positions else positions
+        box = self.canvas.imageViewBox
+        if (not isinstance(position, QtCore.QPointF) or not self._hover_data
+                or not box.sceneBoundingRect().contains(position)):
+            self.hover.hide()
+            return
+        point, pixel = box.mapSceneToView(position), box.viewPixelSize()
+        entries = []
+        for family, (points, values, color) in self._hover_data.items():
+            index = self._hover_indexes.get(family)
+            if index is None:
+                index = self._hover_indexes[family] = _OverlayHitIndex(points, values, color)
+            entries.extend(reference_entry(values[curve], color) for curve in index.hits(point.x(), point.y(), pixel)
+                           if values[curve] is not None)
+        if entries:
+            self.hover.show(position, "<br>".join(entries))
+        else:
+            self.hover.hide()
 
     def render_coverage(self, coverage: np.ndarray | None) -> None:
         """Shade zero-support bins separately from the scientific image and its color scale."""

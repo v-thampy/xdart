@@ -105,7 +105,8 @@ class FrameGeometry:
     poni: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.poni is not None and not isinstance(self.poni, MappingProxyType):
+        # Always a fresh copy: a proxy passed in may still view its producer's live dict (P3a residual 7).
+        if self.poni is not None:
             object.__setattr__(self, "poni", MappingProxyType(dict(self.poni)))
 
 

@@ -54,6 +54,21 @@ class PhaseAxisPositions:
 
 
 @dataclass(frozen=True, slots=True)
+class PhaseLineValue:
+    """One drawn reference line or ring's reflection, detached for display (C7): its q, d-spacing, relative
+    intensity (None for a lattice or calibrant) and hkl families (none for a calibrant)."""
+    q: float
+    d_spacing: float
+    intensity: float | None = None
+    hkls: tuple[tuple[int, int, int], ...] = ()
+
+    @classmethod
+    def of(cls, reflection):
+        intensity = None if reflection.intensity is None else float(reflection.intensity)
+        return cls(float(reflection.q), float(reflection.d_spacing), intensity, tuple(reflection.hkls))
+
+
+@dataclass(frozen=True, slots=True)
 class PhaseOverlayFamily:
     id: str
     name: str
@@ -63,6 +78,9 @@ class PhaseOverlayFamily:
     rings: tuple = ()
     omitted_count: int = 0
     reason: str = ''
+    #: one value per ``q_lines`` entry, in order; a 2θ axis draws only the reachable prefix, so ``line_values[i]``
+    #: names ``lines[i]``. Each ring curve carries its own reflection's value (``Curve.value``).
+    line_values: tuple[PhaseLineValue, ...] = ()
 
 
 def positions_for_axis(qs, unit, wavelength_angstrom):
@@ -171,7 +189,8 @@ class PhaseOverlayJob:
             for arc in geometry.display_arcs(detector.points, theta, request.ring_shape, request.step_px/.4):
                 tip = (f'Predicted {entry.name} ring: 2θ {math.degrees(theta):.4g}°. {RING_CAVEAT}' if calibrant
                        else f'{entry.name} reference: q {reflection.q:.5g} Å⁻¹. Display only.')
-                curves.append((reflection, geometry.Curve(entry.name, arc, 'predicted', tip, math.degrees(theta))))
+                curves.append((reflection, geometry.Curve(entry.name, arc, 'predicted', tip, math.degrees(theta),
+                                                          PhaseLineValue.of(reflection))))
         return tuple(curves)
 
     def __call__(self, request, cancel, progress):
@@ -277,7 +296,8 @@ class PhaseOverlayJob:
                 family = previous[3]
             else:
                 family = PhaseOverlayFamily(entry.id, entry.name, entry.source_kind, qs, positions.values, rings,
-                                            omitted, reason)
+                                            omitted, reason, tuple(PhaseLineValue.of(r)
+                                                                   for r in accepted.get((identity, 'line'), ())))
                 slot['family'] = (scalars, line, ring, family)
             results.append(family)
         with self._lock:

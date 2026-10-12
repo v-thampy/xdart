@@ -3,6 +3,27 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
 
+from xdart.gui.widgets.scientific_plot import HOVER_PX
+
+
+def hkl_label(hkl):
+    """``(110)`` for single-digit non-negative indices, else ``(1 -1 10)``."""
+    hkl = tuple(int(index) for index in hkl)
+    if all(0 <= index <= 9 for index in hkl):
+        return "(" + "".join(map(str, hkl)) + ")"
+    return "(" + " ".join(map(str, hkl)) + ")"
+
+
+def reference_entry(value, color):
+    """One hovered reference line's tooltip entry (C7): a swatch in its phase's legend colour, then its hkl families,
+    its d-spacing and, for a CIF phase, its relative intensity; a calibrant line, which has no hkl, shows its
+    d-spacing alone."""
+    swatch = '<span style="color:#%02x%02x%02x">■</span>' % tuple(int(channel) for channel in color[:3])
+    if not value.hkls:
+        return f"{swatch} d = {value.d_spacing:.3f} Å"
+    text = f"{swatch} {' '.join(hkl_label(hkl) for hkl in value.hkls)} · d {value.d_spacing:.3f} Å"
+    return text if value.intensity is None else f"{text} · {value.intensity:.0f} %"
+
 
 def add_curve_item(plot, curve, color, *, xy=None):
     points = curve.xy if xy is None else xy
@@ -41,17 +62,26 @@ def draw_marker(plot, position, *, color=(240, 200, 90), family=None, tooltip=''
 
 
 class ReferenceLines(pg.ItemGroup):
-    """One passive item per reference family: vertical lines at view x positions, each spanning the visible y range.
+    """One passive item per reference family: vertical lines at view x positions, rising from the view's bottom.
 
     A plain group, not a plot data item, so trace bookkeeping (``listDataItems``) never sees it; its single
-    curve child draws every line and is re-spanned whenever the view range changes.
+    curve child draws every line and is re-spanned whenever the view range changes. A line whose value carries a
+    relative intensity (a CIF phase's) stops at that fraction of the displayed height, in displayed coordinates and
+    so identically in linear and log views (C8); any other spans the view. ``hover_entries`` names the lines under
+    the cursor (C7), for the plot's ``PlotCursorReadout``.
     """
 
-    def __init__(self, positions, *, color, family=None, tooltip=''):
+    def __init__(self, positions, *, color, family=None, tooltip='', values=()):
         super().__init__()
         self.reference_positions = tuple(float(position) for position in positions)
+        #: each line's detached value (C7), aligned with ``reference_positions``; empty: no hover entries
+        self.line_values = tuple(values) if len(values) == len(self.reference_positions) else ()
+        self._fractions = np.array([1. if value.intensity is None else max(0., min(1., value.intensity / 100.))
+                                    for value in self.line_values] or [1.] * len(self.reference_positions))
+        self.color = color
         self.lines = pg.PlotCurveItem(pen=pg.mkPen(color, width=1.4, style=QtCore.Qt.PenStyle.DashLine),
                                       connect='finite')  # dashed, apart from measured traces (D4)
+        self._x = np.asarray(self.reference_positions, dtype=float)
         self.addItem(self.lines)
         for item in (self, self.lines):
             item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
@@ -73,14 +103,30 @@ class ReferenceLines(pg.ItemGroup):
         if box is None:
             return
         low, high = box.viewRange()[1]
-        x = np.repeat(np.asarray(self.reference_positions, dtype=float), 3)
+        x = np.repeat(self._x, 3)
         x[2::3] = np.nan
-        self.lines.setData(x, np.tile((low, high, np.nan), len(self.reference_positions)), connect='finite')
+        y = np.empty_like(x)
+        y[0::3], y[1::3], y[2::3] = low, low + self._fractions * (high - low), np.nan
+        self.lines.setData(x, y, connect='finite')
+
+    def hover_entries(self, point, pixel):
+        """Tooltip entries for the drawn lines within ``HOVER_PX`` of view ``point`` (``pixel``: the view's size of
+        one screen pixel), in line order; none above a line's drawn top."""
+        box = self.getViewBox()
+        if not self.line_values or box is None or not self.isVisible():
+            return ()
+        low, high = box.viewRange()[1]
+        reach_x, reach_y = HOVER_PX * abs(pixel[0]), HOVER_PX * abs(pixel[1])
+        tops = low + self._fractions * (high - low)
+        under = ((np.abs(self._x - point.x()) <= reach_x) & (point.y() >= low - reach_y)
+                 & (point.y() <= tops + reach_y))
+        return tuple(reference_entry(self.line_values[index], self.color) for index in np.flatnonzero(under))
 
 
-def draw_reference_lines(plot, positions, *, color=(240, 200, 90), family=None, tooltip=''):
-    """All of one family's reference positions as one passive item (one object per phase)."""
-    item = ReferenceLines(positions, color=color, family=family, tooltip=tooltip)
+def draw_reference_lines(plot, positions, *, color=(240, 200, 90), family=None, tooltip='', values=()):
+    """All of one family's reference positions as one passive item (one object per phase); ``values`` are the
+    lines' detached reflections (C7, C8)."""
+    item = ReferenceLines(positions, color=color, family=family, tooltip=tooltip, values=values)
     plot.addItem(item, ignoreBounds=True)
     item.span()
     return item

@@ -3,7 +3,41 @@
 import numpy as np
 from matplotlib import colormaps
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore
+from pyqtgraph.Qt import QtCore, QtWidgets
+
+#: how near (screen pixels) the cursor must come to a hoverable reference line or ring (C7)
+HOVER_PX = 4.
+
+
+class HoverTooltip(QtCore.QObject):
+    """One display owner's hover tooltip over a graphics view (C7): shown at a scene position, hidden when it no
+    longer applies (only while it is the tooltip shown), and kept over Qt's own item tooltip while shown."""
+
+    def __init__(self, view):
+        super().__init__(view)
+        self._view, self._text = view, ""
+        viewport = getattr(view, "viewport", None)
+        self._viewport = viewport() if callable(viewport) else view
+        self._viewport.installEventFilter(self)
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    def show(self, scene_position, text: str) -> None:
+        local = self._view.mapFromScene(scene_position)
+        self._text = text
+        QtWidgets.QToolTip.showText(self._viewport.mapToGlobal(local), text, self._viewport)
+
+    def hide(self) -> None:
+        # Ours whether or not Qt reports it visible yet: a show still settling is hidden too.
+        shown = QtWidgets.QToolTip.text() == self._text
+        if self._text and shown:
+            QtWidgets.QToolTip.hideText()
+        self._text = ""
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt override
+        return bool(self._text) and event.type() == QtCore.QEvent.Type.ToolTip
 
 
 def data_curve_style(color):
@@ -23,6 +57,8 @@ class PlotCursorReadout:
         self.proxy = pg.SignalProxy(
             signal=curve.scene().sigMouseMoved, rateLimit=60, slot=self.mouse_moved,
         )
+        #: the plot's hover tooltip: entries from items that offer them (ReferenceLines' reflections, C7)
+        self.hover = HoverTooltip(curve)
 
     def mouse_moved(self, positions):
         position = positions
@@ -36,10 +72,22 @@ class PlotCursorReadout:
         if not plot.sceneBoundingRect().contains(position):
             self.label.setText("")
             self.curve.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            self.hover.hide()
             return
         point = plot.vb.mapSceneToView(position)
         self.label.setText(f"x={point.x():.2f}, y={point.y():.2e}")
         self.curve.setCursor(QtCore.Qt.CursorShape.CrossCursor)
+        pixel = plot.vb.viewPixelSize()
+        entries = [entry for item in plot.items if hasattr(item, "hover_entries")
+                   for entry in item.hover_entries(point, pixel)]
+        if entries:
+            self.hover.show(position, "<br>".join(entries))
+        else:
+            self.hover.hide()
+
+    def clear_hover(self):
+        """The hovered drawing changed or left: its tooltip goes."""
+        self.hover.hide()
 
 
 def scaled_intensity(values: np.ndarray, scale: str) -> np.ndarray:

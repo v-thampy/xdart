@@ -1264,6 +1264,8 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_display_contract = None
         #: the last accepted detector-ring context (frame, snapshot, shape), kept across a retained display
         self._phase_ring_context = None
+        #: the run whose frames carry ring geometry (the last one shown with it): its frames still loading wait
+        self._phase_ring_run = None
         #: every listed phase with its include flag, as the window resolved it (legend entries and colours)
         self._phase_listed = ()
         #: each listed phase's colour slot, kept from when it joined the list until it leaves it
@@ -1395,6 +1397,7 @@ class ScientificView(QtWidgets.QFrame):
         marker = self._phase_markers.pop(identifier, None)
         if marker is not None:
             self.curve.removeItem(marker)
+            self._cursor_readout.clear_hover()
         self.phase_families.pop(identifier, None)
 
     def _remove_phase_family(self, identifier):
@@ -1420,6 +1423,7 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_wavelengths = ()
         self._phase_display_contract = None
         self._phase_ring_context = None
+        self._phase_ring_run = None
         self._phase_listed = ()
         self._phase_color_slots = {}
 
@@ -1510,7 +1514,15 @@ class ScientificView(QtWidgets.QFrame):
         else:
             current = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
             geometry = heavy.ring_geometry if current else None
-            ring_reason = gf.detector_ring_unavailable(geometry, heavy.detector_shape if current else None)
+            if geometry is not None:
+                self._phase_ring_run = navigation.current.run_identity
+            # A frame of that run whose image has not arrived yet waits for it (P3a residual 9); a frame opened from
+            # a file, or an Average or Reintegrate result, never carried ring geometry and keeps the Run reason.
+            loading = (is_int and not current and navigation.current is not None
+                       and (heavy is None or heavy.frame is not navigation.current)
+                       and navigation.current.run_identity is self._phase_ring_run)
+            ring_reason = (gf.LOADING_RING_REASON if loading else
+                           gf.detector_ring_unavailable(geometry, heavy.detector_shape if current else None))
             if current and not ring_reason:
                 snapshot, shape = tuple(geometry.items()), heavy.detector_shape
                 self._phase_ring_context = (navigation.current, snapshot, shape)
@@ -1556,6 +1568,9 @@ class ScientificView(QtWidgets.QFrame):
             tip = f'{family.name} (built-in calibrant): reference positions from pyFAI d-spacings. {RING_CAVEAT}'
         else:
             tip = f'{family.name}: {family.omitted_count} reflections omitted below the floor. Display reference only.'
+            if family.source_kind == 'cif':  # C8: what a stick's height means
+                tip += (" Stick heights are relative reference intensities within this phase's reachable range, "
+                        "not measured counts or phase fractions.")
         return tip + (' ' + family.reason if family.reason else '')
 
     def _draw_phase_legends(self):
@@ -1606,15 +1621,19 @@ class ScientificView(QtWidgets.QFrame):
             positions = positions_for_axis(family.q_lines,
                 {'q_A^-1': 'q', '2th_deg': '2theta'}.get(line_key, ''), wavelength)
             values = positions.values if measurement != 'Grazing' else ()
+            # Each drawn line's reflection (C7): a 2θ axis draws the reachable prefix of ``q_lines``.
+            line_values = family.line_values[:len(values)]
             # One joined 1D item per phase (maintainer, October 11), not one item per reflection.
             marker = self._phase_markers.get(identifier)
             if (marker is None or marker.reference_positions != tuple(values)
+                    or marker.line_values != line_values
                     or marker not in self.curve.getPlotItem().items
                     or marker.lines.opts['pen'].color().getRgb()[:3] != color[:3]):
                 if marker is not None:
                     self.curve.removeItem(marker)
+                    self._cursor_readout.clear_hover()
                 marker = draw_reference_lines(self.curve, values, color=color, family=name,
-                                              tooltip=tip) if values else None
+                                              tooltip=tip, values=line_values) if values else None
                 if marker is None:
                     self._phase_markers.pop(identifier, None)
                 else:
@@ -1631,7 +1650,8 @@ class ScientificView(QtWidgets.QFrame):
                     cake_values = positions_for_axis(family.q_lines,
                         {'q_A^-1': 'q', '2th_deg': '2theta'}.get(cake[0], ''), wavelength).values
                     cuts = tuple(Curve(family.name, np.asarray(((value, cake_y[1][0]), (value, cake_y[1][1]))),
-                                       'predicted', tip) for value in cake_values)
+                                       'predicted', tip, value=line_value)
+                                 for value, line_value in zip(cake_values, family.line_values))
                 drawing = (family, scalars, rings, cuts)
                 self._phase_drawings[identifier] = drawing
             self.cake.render_overlay_family(name, drawing[3], color=color, joined=True)

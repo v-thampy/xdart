@@ -40,6 +40,8 @@ class PhaseReflection:
     d_spacing: float
     intensity: float | None
     hkl: tuple[int, int, int]
+    #: every hkl family of the line, ``hkl`` first (coincident families stay merged: D3); none for a calibrant
+    hkls: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +294,8 @@ def prepare_phase_models(*entries: PhaseEntry, wavelength_angstrom: float,
         if total > MAX_REFLECTIONS_TOTAL:
             raise ValueError("cumulative reflection limit exceeded")
         references.append(PhaseReference(entry.id, entry.name, entry.source_kind, tuple(
-            PhaseReflection(p.q, p.d_spacing, None if entry.source_kind == "lattice" else p.intensity, p.hkl)
+            PhaseReflection(p.q, p.d_spacing, None if entry.source_kind == "lattice" else p.intensity, p.hkl,
+                            tuple(getattr(p, "hkls", ())) or (tuple(p.hkl),))
             for p in admitted), len(model.peaks)-len(admitted)))
         model.peaks = list(admitted)
         models.append(model)
