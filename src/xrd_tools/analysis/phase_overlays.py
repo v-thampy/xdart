@@ -78,8 +78,9 @@ class PhaseOverlayFamily:
     rings: tuple = ()
     omitted_count: int = 0
     reason: str = ''
-    #: one value per ``q_lines`` entry, in order; a 2θ axis draws only the reachable prefix, so ``line_values[i]``
-    #: names ``lines[i]``. Each ring curve carries its own reflection's value (``Curve.value``).
+    #: one value per ``q_lines`` entry (ascending q, sorted by the job); a 2θ axis drops only unreachable, largest q,
+    #: so it draws a prefix and ``line_values[i]`` names ``lines[i]``. Each ring curve carries its own reflection's
+    #: value (``Curve.value``).
     line_values: tuple[PhaseLineValue, ...] = ()
 
 
@@ -273,7 +274,9 @@ class PhaseOverlayJob:
             identity = (entry.id, entry.name, entry.source_kind, entry.lattice)
             slot, floor = slots[identity], overrides.get(entry.id, request.floor)
             errors = list(reasons) + [reason for reason in refusals.get(identity, ()) if reason]
-            qs = tuple(r.q for r in accepted.get((identity, 'line'), ()))
+            # Ascending q, so a 2θ axis, which drops only unreachable (largest) q, draws a prefix of these lines.
+            listed_lines = sorted(accepted.get((identity, 'line'), ()), key=lambda r: r.q)
+            qs = tuple(r.q for r in listed_lines)
             kept = set(map(id, accepted.get((identity, 'ring'), ())))
             ring = slot.get('ring') if ring_key is not None else None
             rings = tuple(curve for reflection, curve in ring[4] if id(reflection) in kept) if ring else ()
@@ -296,8 +299,7 @@ class PhaseOverlayJob:
                 family = previous[3]
             else:
                 family = PhaseOverlayFamily(entry.id, entry.name, entry.source_kind, qs, positions.values, rings,
-                                            omitted, reason, tuple(PhaseLineValue.of(r)
-                                                                   for r in accepted.get((identity, 'line'), ())))
+                                            omitted, reason, tuple(PhaseLineValue.of(r) for r in listed_lines))
                 slot['family'] = (scalars, line, ring, family)
             results.append(family)
         with self._lock:
