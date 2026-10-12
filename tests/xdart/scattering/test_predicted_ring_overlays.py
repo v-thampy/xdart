@@ -138,6 +138,9 @@ def test_int_rings_follow_current_frame_and_off_clears(qapp, tmp_path, mode):
         if mode == 'Int 1D':
             view.raw_popup_button.click(); qapp.processEvents()
             select(qapp, page, page._context_controller.navigation.current)
+            # Opening Int's popup loads full raw asynchronously (as DP waits); compare pixels after it settles.
+            settle(qapp, view, lambda: view.raw_popup_image.image.image is not None
+                   and view.raw_popup_image.image.image.shape == (487, 195))
         before = pane(view, mode).image.image.copy()
         choose(qapp, view)
         target = pane(view, mode)
@@ -147,7 +150,8 @@ def test_int_rings_follow_current_frame_and_off_clears(qapp, tmp_path, mode):
         assert not rings(target, 'CeO2') and rings(target)
         np.testing.assert_array_equal(target.image.image, before)
         keys = page._context_controller.frame_keys
-        select(qapp, page, keys[0]); settle(qapp, view, lambda: rings(target))
+        select(qapp, page, keys[0])
+        settle(qapp, view, lambda: rings(target) and (mode != 'Int 1D' or target.image.image.shape == (487, 195)))
         second = tuple(item.getData() for item in rings(target))
         assert len(first) != len(second) or any(not np.array_equal(a[0], b[0], equal_nan=True)
                                                 for a, b in zip(first, second))
@@ -312,7 +316,9 @@ def test_same_energy_step_to_an_evicted_frame_reuses_the_prediction(qapp, tmp_pa
         assert store.get(keys[0].local_frame_label).view.intensity_2d is None
         calls = []; actual = provider.build_phase_references
         def count(*a, **k):
-            calls.append(1); return actual(*a, **k)
+            if 'two_theta_range' in k:  # a detector-ring listing (1D lines list by q range)
+                calls.append(1)
+            return actual(*a, **k)
         monkeypatch.setattr(provider, 'build_phase_references', count)
         select(qapp, page, keys[0]); settle(qapp, view, lambda: rings(view.raw))
         assert rings(view.raw) and not calls

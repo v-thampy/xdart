@@ -230,7 +230,7 @@ def test_rw3_one_phase_edit_leaves_every_other_phase_item_identical(qapp, tmp_pa
         page._refresh_shell()
         qapp.processEvents()
         assert same(items(b_id), before) and same(items(a_id), a_items), 'an unchanged activation reuses items'
-        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, '2θ'))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, '2theta'))
         _settle(qapp, view)
         assert _marker(view, b_id) is not None and _marker(view, b_id) is not before[0], 'a real context change redraws'
 
@@ -490,6 +490,7 @@ def test_rw8_phase_fitter_rows_switch_real_fit_and_stitch_batch(qapp, tmp_path):
         page.tools.page_tool('phase_fit').click()
         qapp.processEvents()
         host = page._fit_hosts['phase']
+        _finish(host, qapp)  # the host's opening reload, as test_stitch_fit_host waits (Batch while busy cancels)
         source = host.dialog.phase_source
         source.add_cif_paths(tuple(str(path) for path in paths))
         nacl, _cscl = _ids(source)

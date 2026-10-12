@@ -47,8 +47,14 @@ def test_disabled_phase_reason_survives_resolution_on_every_shared_control(qapp,
 
 
 def _cutoff_source(tmp_path):
+    from pymatgen.core import Lattice, Structure
+    from pymatgen.io.cif import CifWriter
     source = PhaseSourceWidget(library=PhaseLibrary(tmp_path / "library"), checkable=True, show_library=False,
                                cutoffs=True)
+    # The global minimum is editable once a CIF phase is listed (P3b's rule, kept by DP's successor rows).
+    path = tmp_path / "CsCl.cif"
+    path.write_text(str(CifWriter(Structure(Lattice.cubic(4.1), ["Cs", "Cl"], [[0, 0, 0], [.5, .5, .5]]))))
+    source.add_cif_paths((str(path),))
     source.show()
     return source
 
