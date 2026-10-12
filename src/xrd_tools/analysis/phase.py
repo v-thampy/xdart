@@ -175,6 +175,10 @@ class PhaseModel:
 
         This is the shared listing owner for fitting and reference overlays.
         A forced wider backend listing is filtered before normalization.
+        Kept as pymatgen gives them (maintainer decisions D2 and D3, October 11):
+        its XRDCalculator omits reflections under 0.1 % of the strongest, so
+        that relative cut applies even at a floor of 0; and reflections sharing
+        one 2θ are one line, whose ``hkls`` list every merged family.
         """
         if not np.isfinite(wavelength) or wavelength <= 0:
             raise ValueError("wavelength must be positive and finite")
