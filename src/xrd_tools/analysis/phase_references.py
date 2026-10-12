@@ -168,6 +168,9 @@ class PhaseLibrary:
                     raise ValueError("CIF bytes changed")
                 return PhaseLibraryLookup(PhaseEntry(identity, name, kind, raw, cif_path=path))
             if kind == "lattice":
+                body = {"name": document["name"], "source_kind": kind, "lattice": document["lattice"]}
+                if hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest() != identity:
+                    raise ValueError("phase identity mismatch: the lattice document changed")
                 return PhaseLibraryLookup(PhaseEntry(identity, name, kind, lattice=tuple(sorted(document["lattice"].items()))))
             raise ValueError("unknown phase source")
         except (OSError, ValueError, KeyError, TypeError) as exc:

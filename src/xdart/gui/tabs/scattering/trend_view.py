@@ -150,10 +150,11 @@ class TrendView(QtWidgets.QWidget):
         self.family.clear()
         self.right_family.clear()
         self.right_family.addItem("None", None)
-        self.family.setToolTip("Which fitted parameter to plot across the results")
-        self.overlay.setToolTip("Plot every series in the selected parameter on one axis, not just the first")
-        self.right_family.setToolTip("Overlay a second parameter family against a right-hand axis (None = off) — "
-                                     "for families of very different magnitude")
+        self.family_row.set_purpose_tooltip("Which fitted parameter to plot across the results")
+        self.overlay_row.set_purpose_tooltip(
+            "Plot every series in the selected parameter on one axis, not just the first")
+        self.right_row.set_purpose_tooltip("Overlay a second parameter family against a right-hand axis "
+                                           "(None = off) — for families of very different magnitude")
         self.save = QtWidgets.QPushButton("Save CSV…")
         self.save.setToolTip("Export the parameters table")
         for row in (self.family_row, self.overlay_row, self.right_row):

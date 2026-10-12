@@ -50,7 +50,8 @@ class ReferenceLines(pg.ItemGroup):
     def __init__(self, positions, *, color, family=None, tooltip=''):
         super().__init__()
         self.reference_positions = tuple(float(position) for position in positions)
-        self.lines = pg.PlotCurveItem(pen=pg.mkPen(color, width=1), connect='finite')
+        self.lines = pg.PlotCurveItem(pen=pg.mkPen(color, width=1.4, style=QtCore.Qt.PenStyle.DashLine),
+                                      connect='finite')  # dashed, apart from measured traces (D4)
         self.addItem(self.lines)
         for item in (self, self.lines):
             item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)

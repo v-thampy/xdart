@@ -324,6 +324,11 @@ class SectionCard(QtWidgets.QFrame):
             self.status.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self._apply_spacing(current_spacing_tokens())
 
+    def set_purpose_tooltip(self, text: str) -> None:
+        """Explain the section on the card and on its title."""
+        self.setToolTip(text)
+        self.title.setToolTip(text)
+
     def set_help_topic(self, topic_id: str) -> None:
         """Keep contextual help in the header, outside editor/body locks."""
         _card_help(self, topic_id)

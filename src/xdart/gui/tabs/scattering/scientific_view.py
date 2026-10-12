@@ -7,6 +7,7 @@ from xdart.gui.widgets.scientific_plot import (
     scaled_intensity as _scaled_intensity,
     scaled_intensity_label as _scaled_intensity_label,
     overlay_step,
+    reference_colors,
     trace_colors,
     data_curve_style,
 )
@@ -1236,7 +1237,7 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_job = PhaseOverlayJob()
         self._phase_requests = LatestRequestOwner(self._phase_job, self._phase_done,
                                                   same=lambda a, b: a == b, parent=self)
-        self.phase_worker = self._phase_requests._owner
+        self.phase_worker = self._phase_requests.worker
         self.phase_families = {}
         self._phase_markers, self._phase_legends, self._phase_colors = {}, {}, {}
         self._phase_drawings = {}
@@ -1439,7 +1440,7 @@ class ScientificView(QtWidgets.QFrame):
             if entry.id not in slots:
                 slots[entry.id] = min(set(range(len(listed) + len(slots))) - set(slots.values()))
         self._phase_color_slots = slots
-        palette = trace_colors('Default', max(slots.values(), default=-1) + 1)
+        palette = reference_colors(max(slots.values(), default=-1) + 1)
         self._phase_colors = {identifier: palette[slot] for identifier, slot in slots.items()}
         self._phase_listed = listed
         if not entries:
@@ -1531,12 +1532,13 @@ class ScientificView(QtWidgets.QFrame):
                    f'{entry.name}: hidden. Click to show it again. Display reference only.' if not shown else
                    f'{entry.name}: computing reference positions. Display reference only.')
             legend = self._phase_legends.get(identifier)
+            pen = pg.mkPen(color, width=2, style=QtCore.Qt.PenStyle.DashLine)  # the lines' dash (D4)
             if legend is None:
-                legend = pg.PlotDataItem(pen=pg.mkPen(color, width=2))
+                legend = pg.PlotDataItem(pen=pen)
                 self._phase_legends[identifier] = legend
             if not any(item.item is legend for item, _label in self.legend.items):
                 self.legend.addItem(legend, entry.name)
-            legend.setPen(pg.mkPen(color, width=2))
+            legend.setPen(pen)
             legend.setVisible(bool(shown))  # pyqtgraph greys a hidden sample
             legend.setToolTip(tip)
             for sample, label in self.legend.items:

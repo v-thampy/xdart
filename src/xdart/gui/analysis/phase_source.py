@@ -45,7 +45,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
     cutoffsChanged = QtCore.Signal(object)
 
     def __init__(self, parent=None, *, library=None, checkable=True, show_library=True, key_by_index=False,
-                 calibrants=False, cutoffs=False):
+                 calibrants=False, cutoffs=False, status_visible=True):
         super().__init__(parent)
         from xrd_tools.analysis.phase_references import PhaseLibrary
         self.library = PhaseLibrary() if library is None else library
@@ -151,6 +151,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         self.status.setToolTip('Phase-source validation and missing-library-entry notices.')
         layout.addWidget(self.status)
+        #: False: a host shows the messages (``messageChanged``) on its own status line, so each shows once
+        self.status.setVisible(bool(status_visible))
         #: a host's notice about its use of the list (``set_note``), hidden while empty
         self.note = QtWidgets.QLabel('', self)
         self.note.setObjectName('phaseSourceNote')

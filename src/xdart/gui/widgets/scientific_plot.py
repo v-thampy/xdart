@@ -87,6 +87,19 @@ _TRACE_COLORS = (
 )
 
 
+#: Reference-phase colours (D4): Okabe–Ito's seven and a grey that reads on both themes. None is a Default trace
+#: colour (``_TRACE_COLORS``); a user-chosen trace colormap carries no such promise.
+REFERENCE_COLORS = (
+    (230, 159, 0), (86, 180, 233), (0, 158, 115), (240, 228, 66), (0, 114, 178),
+    (213, 94, 0), (204, 121, 167), (96, 96, 96),
+)
+
+
+def reference_colors(count: int) -> tuple:
+    """The first ``count`` reference-phase colours, repeating past eight."""
+    return tuple(REFERENCE_COLORS[index % len(REFERENCE_COLORS)] for index in range(count))
+
+
 def trace_colors(name: str, count: int) -> tuple:
     if name != "Default" and name in colormaps:
         positions = [.65] if count == 1 else np.linspace(.15, .85, count)

@@ -55,6 +55,12 @@ class LatestRequestOwner(QtCore.QObject):
         self._timer.timeout.connect(self._poll)
 
     @property
+    def worker(self) -> SingleWorkerOwner:
+        """The ``SingleWorkerOwner`` this owner drives (its ``busy`` and ``close``), for hosts that report or retire
+        it; requests still go through this owner."""
+        return self._owner
+
+    @property
     def computing(self) -> bool:
         """Whether a request asked for is not yet handed over (what is shown is the one before it)."""
         return self._wanted is not None

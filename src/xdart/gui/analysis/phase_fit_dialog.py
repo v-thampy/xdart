@@ -61,6 +61,10 @@ _TEXTURES = [
 ]
 
 
+#: a "—" lattice cell's reason (R4)
+_UNREFINED_LATTICE = "Not refined for this phase: the fit reports no value for this lattice parameter."
+
+
 def _path(name):
     return ("phase_fit", name)
 
@@ -126,9 +130,9 @@ class PhaseFitDialog(QtWidgets.QDialog):
         # source bytes/cells live only in its headless library.
         from .phase_source import PhaseSourceWidget
         phases = SectionCard("Phases", self, collapsible=False)
-        phases.setToolTip("Choose structural CIF phases or manual lattice positions to fit.")
+        phases.set_purpose_tooltip("Choose structural CIF phases or manual lattice positions to fit.")
         self.phase_source = PhaseSourceWidget(self, checkable=False, show_library=False, key_by_index=True,
-                                              cutoffs=True)
+                                              cutoffs=True, status_visible=False)
         phases.add_row(self.phase_source)
         lay.addWidget(phases)
         # Existing tool integrations retain these aliases to the shared owner.
@@ -143,14 +147,19 @@ class PhaseFitDialog(QtWidgets.QDialog):
 
         # Options (the notebook knobs), on the shared rows.
         options = SectionCard("Phase fit", collapsible=False)
+        options.set_purpose_tooltip("The fit's peak profile, background, texture model and lattice tolerance.")
         self.profile_row = _combo("Profile", "profile", _PROFILES)
+        self.profile_row.set_purpose_tooltip("The peak shape fitted to every reflection of every phase.")
         self.bkg_row = _combo("Background", "background", _BACKGROUNDS)
+        self.bkg_row.set_purpose_tooltip("How the background under the pattern is modelled before the phases.")
         self.texture_row = _combo("Texture", "texture", _TEXTURES)
+        self.texture_row.set_purpose_tooltip(
+            'Choose how the fit models relative peak intensities within each structural phase.')
         self.lattice_row = FormRow(label="Lattice ±%", path=_path("lattice_pct"), value="5")
         self.profile_combo, self.bkg_combo = self.profile_row.editor, self.bkg_row.editor
         self.texture_combo, self.lattice_pct = self.texture_row.editor, self.lattice_row.editor
         self.lattice_pct.setValidator(QtGui.QDoubleValidator(self))
-        self.lattice_pct.setToolTip("Lattice tolerance ±% (a/b/c float within this band)")
+        self.lattice_row.set_purpose_tooltip("Lattice tolerance ±% (a/b/c float within this band)")
         for item in (self.profile_row, self.bkg_row, self.texture_row, self.lattice_row):
             options.add_row(item)
         lay.addWidget(options)
@@ -158,10 +167,12 @@ class PhaseFitDialog(QtWidgets.QDialog):
         # Run controls.
         run_row = QtWidgets.QHBoxLayout()
         self.advanced_btn = QtWidgets.QPushButton("Advanced…")
+        self.advanced_btn.setToolTip("Solver iterations and weighting for this fit.")
         self.refresh_btn = QtWidgets.QPushButton("Reload")
         self.refresh_btn.setToolTip("Re-grab the currently selected frame's pattern")
         self.fit_btn = QtWidgets.QPushButton("Fit")
         self.fit_btn.setObjectName("peakFitGo")
+        self.fit_btn.setToolTip("Fit the listed phases to the displayed pattern.")
         self.batch_btn = QtWidgets.QPushButton("Batch")
         self.batch_btn.setToolTip(
             "Phase-fit every frame, then plot fractions / lattice vs frame.")
@@ -195,6 +206,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
 
         # Results table: phase / fraction / a / b / c, on the shared table.
         self.table = ResultsTable(PHASE_OUTCOME_HEADERS, self, name="phaseFitTable", max_height=120)
+        self.table.setToolTip("Each fitted phase's fraction and lattice; a '—' cell's tooltip says why it is empty.")
         lay.addWidget(self.table)
 
         self.phase_source.messageChanged.connect(self.status.setText)
@@ -601,9 +613,16 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.status.setText(msg + (' ' + fractions_reason if fractions_reason else ''))
 
     def _show_phase_rows(self, projection, reason=''):
+        """The table's rows; a "—" cell carries its own column's reason: a fraction cell the fraction reason, a
+        lattice cell that the fit refined no such parameter for that phase (R4)."""
         headers, rows = projection
-        tips = {(row_index, column): reason for row_index, row in enumerate(rows)
-                for column, value in enumerate(row) if reason and (value == '—' or value == reason)}
+        own = {"Fraction": reason, "Value": reason, **dict.fromkeys(("a", "b", "c"), _UNREFINED_LATTICE)}
+        tips = {}
+        for row_index, row in enumerate(rows):
+            for column, value in enumerate(row):
+                tip = own.get(headers[column], '') if value == '—' else reason if reason and value == reason else ''
+                if tip:
+                    tips[row_index, column] = tip
         self.table.show_rows(headers, rows, cell_tooltips=tips)
 
     # ---- batch hooks (driven by the workspace) --------------------------

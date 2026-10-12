@@ -196,8 +196,8 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         return editor
 
     def set_grid_available(self, available: bool, reason: str = '', *, visible: bool = True) -> None:
-        from xrd_tools.geometry_figures import RUN_RING_REASON
-        tip = GRID_TOOLTIP if available else GRID_TOOLTIP+' '+(reason or RUN_RING_REASON)
+        from xrd_tools.geometry_figures import GRID_RUN_REASON
+        tip = GRID_TOOLTIP if available else GRID_TOOLTIP+' '+(reason or GRID_RUN_REASON)
         self.coordinate_grid.setEnabled(available)
         row = self.coordinate_grid.parentWidget()
         row.setVisible(visible)

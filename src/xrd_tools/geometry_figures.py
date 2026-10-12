@@ -1092,10 +1092,19 @@ _display_arcs = display_arcs
 
 
 def detector_grid_unavailable(snapshot, shape):
-    """Coordinate-grid capability from the current Run's exported facts only."""
-    reason = detector_ring_unavailable(snapshot, shape)
-    if reason:
-        return reason
+    """Coordinate-grid capability from the current Run's exported facts only, worded for the grid."""
+    if snapshot is None:
+        return GRID_RUN_REASON
+    if snapshot.get('parallax') is True:
+        return ('The coordinate grid is unavailable for runs reduced with detector sensor parallax correction: '
+                'its flat-detector model does not include parallax.')
+    if (not snapshot.get('is_flat', True) or not snapshot.get('uniform_pixel', True)
+            or snapshot.get('has_spline', False)):
+        return 'The coordinate grid requires a uniform, flat, undistorted detector.'
+    if shape is None or len(shape) != 2 or any(n < 1 for n in shape):
+        return 'The coordinate grid requires the displayed frame’s native detector shape.'
+    if not snapshot.get('wavelength', 0) or not math.isfinite(snapshot['wavelength']):
+        return 'The coordinate grid requires this frame’s effective wavelength.'
     if snapshot.get('domain') != 'Standard':
         return 'GI cake χ uses the sample basis; detector-frame χ cannot label that cake.'
     if snapshot.get('chiDiscAtPi') is not True:
@@ -1208,6 +1217,9 @@ def predict_detector_grid(snapshot, *, shape, choice='q + χ', mode='2d', step_p
 
 RUN_RING_REASON = ("Predicted rings are drawn only on a Run's frames while that Run is shown. "
                    "Frames opened from a file, and Average or Reintegrate results, carry no ring geometry.")
+#: the coordinate grid's own wording of RUN_RING_REASON (R4)
+GRID_RUN_REASON = ("Coordinate grids are drawn only on a Run's frames while that Run is shown. Frames opened from a "
+                   "file, and Average or Reintegrate results, carry no detector geometry.")
 PARALLAX_RING_REASON = ('Predicted rings are unavailable for runs reduced with detector sensor parallax '
     "correction: this display-only overlay's flat-detector ring model does not include parallax.")
 

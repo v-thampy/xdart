@@ -382,7 +382,7 @@ def test_phase_rings_on_ints_detector_image_follow_p3a(qapp, tmp_path, monkeypat
 def test_several_phases_have_colours_legend_and_independent_families(qapp, tmp_path):
     with run_page(qapp, tmp_path/'int', energies=(16, 16)) as (page, view):
         _phase_section(view)
-        from xdart.gui.widgets.scientific_plot import trace_colors
+        from xdart.gui.widgets.scientific_plot import reference_colors
         entries = _entries(tmp_path, 3)
         _edit(qapp, view, entries)
         choose(qapp, view, 'LaB6'); _settle(qapp, view)
@@ -395,7 +395,8 @@ def test_several_phases_have_colours_legend_and_independent_families(qapp, tmp_p
         view.plot_options_dialog.accept_button.click(); qapp.processEvents(); _settle(qapp, view)
         grid = tuple(view.raw.overlay_families['grid'])
         assert grid
-        colors = trace_colors('Default', len(entries))
+        # HELP-RESIDUALS-20261011 successor edit (decision D4): phases take the reference palette, not trace colours.
+        colors = reference_colors(len(entries))
         for entry, color in zip(entries, colors):
             items = _phase_items(view.raw, entry)
             assert len(items) == 1
