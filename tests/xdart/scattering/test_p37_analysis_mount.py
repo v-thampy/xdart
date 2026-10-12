@@ -249,10 +249,13 @@ def test_metadata_row_headers_remain_default_unless_explicitly_selected(qapp):
 
 def test_p37b_literal_commands_open_four_singletons_and_share_scan_roi_mount() -> None:
     # Plot Metadata is in the shared popup; ROI remains a tool. Literal routes
-    # remain accepted for existing command consumers.
+    # remain accepted for existing command consumers. REFERENCE-PHASES-20261011 added
+    # the Reference Phases launcher, which opens a view-owned window (no analysis mount).
+    from xdart.gui.tabs.scattering.tools_view import REFERENCE_PHASES_TOOLTIP
     assert ToolsView._TOOLS == (
         ("\u2227 Peak Fitting", "peak_fitting"),
         ("\u2248 Phase Fitting", "phase_fitting"),
+        ("\u2506 Reference Phases", "reference_phases", REFERENCE_PHASES_TOOLTIP),
         ("\u25a3 ROI Statistics", "roi_statistics"),
     )
     from xdart.gui.tabs.scattering.analysis_mount import MOUNT_TARGETS
