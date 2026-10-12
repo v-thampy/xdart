@@ -1922,9 +1922,16 @@ def validate_planned_source(
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
     is_cancelled = _not_cancelled if cancelled is None else cancelled
-    validate_source_execution_graph(
-        item.graph, cancelled=is_cancelled,
-    )
+    try:
+        validate_source_execution_graph(
+            item.graph, cancelled=is_cancelled,
+        )
+    except InterruptedError as error:
+        # The same cancellation token as admission (_qualify_for_admission),
+        # so a Stop during a live re-check stops the Run instead of failing it.
+        if error.args != ("source qualification cancelled",):
+            raise
+        raise RuntimeError("admission cancelled") from error
 def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
     return source_snapshots_projection(
         item.graph, writer=False
