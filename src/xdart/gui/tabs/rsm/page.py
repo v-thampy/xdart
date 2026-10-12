@@ -442,7 +442,7 @@ class RSMPage(QtWidgets.QWidget):
         # Int's top bar (colour map, Log); the tools RSM has no operation for are left out
         self.view = ScientificView()
         self.view.setObjectName("rsmPageView")
-        self.view.set_hidden_tools("norm", "raw", "raw_pane", "slice")
+        self.view.set_hidden_tools("norm", "raw", "raw_pane", "slice", "phases")
         self._mean_maps = True
         self._map_choice = self.view.plot_options_dialog.add_choice(
             "RSM maps", ("Mean over range", "Single plane"), "Mean over range")

@@ -39,6 +39,7 @@ PLOT_OPTION_BINDINGS = (
     (("other", "phase_min_intensity"), "phase_min_intensity"),
     (("other", "phase_global_floor"), "phase_global_floor"),
     (("other", "phase_floors"), "phase_floors"),
+    (("other", "phase_references_shown"), "phase_references_shown"),
 )
 
 

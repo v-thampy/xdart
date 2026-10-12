@@ -23,6 +23,9 @@ _TAKEN.update(coordinate_grid="q + χ", phase_references=(("a" * 64, True),), ph
               phase_global_floor=False, phase_floors=())
 _REFUSED.update(coordinate_grid="r", phase_references=True, phase_min_intensity=101.,
                 phase_global_floor=1, phase_floors=(("a" * 64, 101.),))
+# HELP-RESIDUALS-20261011 successor edit (C6): the top bar's Phases toggle is one more plot option.
+_TAKEN.update(phase_references_shown=False)
+_REFUSED.update(phase_references_shown=1)
 
 
 def test_one_table_binds_every_plot_option_to_its_command():

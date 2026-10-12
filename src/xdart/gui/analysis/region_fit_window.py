@@ -159,7 +159,7 @@ class RegionFitWindow(QtWidgets.QDialog):
         layout = QtWidgets.QHBoxLayout()
         outer.addLayout(layout)
         self.view = ScientificView()
-        self.view.set_hidden_tools('norm', 'background', 'raw', 'raw_pane', 'slice')
+        self.view.set_hidden_tools('norm', 'background', 'raw', 'raw_pane', 'slice', 'phases')
         self.view.commandRequested.connect(self._view_command)
         self.view.keyedRegionChanged.connect(self._region_changed)
         layout.addWidget(self.view, 1)

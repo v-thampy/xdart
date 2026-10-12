@@ -146,7 +146,7 @@ class CalibrationFitWindow(FitWindow):
         self.layout().removeWidget(self.view)
         self.layout().addWidget(self.panels)
         self.pattern_view = ScientificView(self)
-        self.pattern_view.set_hidden_tools('norm', 'background', 'raw', 'slice')
+        self.pattern_view.set_hidden_tools('norm', 'background', 'raw', 'slice', 'phases')
         self.pattern_view.set_page_tools(('preview', 'Stitch calibrant',
             'Stitch the complete calibrant scan with the fitted geometry (no files are written).'))
         self.pattern_view.commandRequested.connect(self._pattern_command)

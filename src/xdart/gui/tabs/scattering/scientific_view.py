@@ -100,6 +100,12 @@ ONE_D_PLOT_BOTTOM_MARGIN = 6
 MAX_WATERFALL_DISPLAY_ROWS = 256
 MAX_VIEWER_LOADING_SNAPSHOT_PIXELS = 2_000_000
 _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
+#: the top bar's Phases toggle (C6)
+PHASES_TOOLTIP = ("Switch every reference phase listed in the Reference Phases window off or on at once; the list, "
+                  "each phase's include check and every minimum intensity are kept.")
+PHASES_NONE_LISTED = "No reference phase is listed: add one in the Tools panel's Reference Phases window."
+PHASES_OFF_NOTE = ("Reference phases are switched off with the top bar's Phases button; the list, include checks and "
+                   "minimums are kept.")
 _STANDARD_PLOT_AXIS_CHOICES = (
     ("Q (Å⁻¹)", "Q"),
     ("2θ (°)", "2theta"),
@@ -1016,6 +1022,14 @@ class ScientificView(QtWidgets.QFrame):
         self.norm = ContentFitComboBox()
         self.norm.setObjectName("e3NormChannel")
         self.background = QtWidgets.QPushButton("Set BG")
+        #: switches every listed reference phase off or on at once (C6); it never takes input focus
+        self.phases = QtWidgets.QPushButton("Phases")
+        self.phases.setObjectName("e3PhasesToggle")
+        self.phases.setCheckable(True)
+        self.phases.setChecked(True)
+        self.phases.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.phases.setEnabled(False)
+        self.phases.setToolTip(PHASES_TOOLTIP + ' ' + PHASES_NONE_LISTED)
         self.title = QtWidgets.QLabel("Current")
         self.title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.color_map = color_map_combo()  # Int's list, shared with the 3D Viewer (shell_widgets)
@@ -1024,6 +1038,7 @@ class ScientificView(QtWidgets.QFrame):
         self.raw_popup_button = QtWidgets.QPushButton("Raw")
         row.addWidget(self.norm)
         row.addWidget(self.background)
+        row.addWidget(self.phases)
         row.addWidget(self.raw_popup_button)
         self._top_bar_row = row
         self._page_tool_buttons: dict[str, QtWidgets.QPushButton] = {}
@@ -1038,6 +1053,8 @@ class ScientificView(QtWidgets.QFrame):
         self.background.clicked.connect(
             lambda: self._emit(ShellCommandKind.SET_BACKGROUND)
         )
+        self.phases.clicked.connect(lambda on: self._emit(
+            ShellCommandKind.SET_PLOT_OPTION, bool(on), ("other", "phase_references_shown")))
         self.color_map.currentTextChanged.connect(
             lambda value: self._emit(ShellCommandKind.SET_COLOR_MAP, value)
         )
@@ -1423,18 +1440,32 @@ class ScientificView(QtWidgets.QFrame):
         values = values[np.isfinite(values)]
         return (key, (float(values.min()), float(values.max()))) if values.size else None
 
+    def _sync_phases_button(self, options, available):
+        """The Phases toggle (C6): its state follows the option; it switches something only while a phase is
+        listed, and says so."""
+        listed = available and bool(options.phase_references)
+        blocker = QtCore.QSignalBlocker(self.phases)
+        self.phases.setChecked(options.phase_references_shown)
+        del blocker
+        self.phases.setEnabled(listed)
+        self.phases.setToolTip(PHASES_TOOLTIP + (' Now on.' if options.phase_references_shown else ' Now off.')
+                               + ('' if listed else ' ' + PHASES_NONE_LISTED))
+
     def _reconcile_phase_overlay(self, state, navigation):
         from xrd_tools import geometry_figures as gf
         options, window = state.plot_options, self.reference_phases
         visible = state.processing_mode != '2D Viewer'
         window.set_available(visible, '' if visible else 'Reference phases are unavailable in the 2D Viewer.')
         window.reconcile(options)
+        self._sync_phases_button(options, visible)
         listed = window.phase_source.listed_entries() if visible else ()
         listed_ids = {entry.id for entry, _shown in listed}
-        entries = tuple(entry for entry, shown in listed if shown)
+        # Switched off (C6): nothing draws, while the list, each include flag, every minimum and the colour slots stay.
+        switched_off = not options.phase_references_shown
+        entries = () if switched_off else tuple(entry for entry, shown in listed if shown)
         shown_ids = {entry.id for entry in entries}
         for identifier in set(self.phase_families) | set(self._phase_legends) | set(self._phase_markers):
-            if identifier not in listed_ids:
+            if identifier not in listed_ids or switched_off:
                 self._remove_phase_family(identifier)
             elif identifier not in shown_ids:
                 self._remove_phase_drawings(identifier)  # a hidden phase keeps its greyed legend entry
@@ -1446,10 +1477,10 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_color_slots = slots
         palette = reference_colors(max(slots.values(), default=-1) + 1)
         self._phase_colors = {identifier: palette[slot] for identifier, slot in slots.items()}
-        self._phase_listed = listed
+        self._phase_listed = () if switched_off else listed
         if not entries:
             self._phase_requests.release()
-            window.set_rings_reason('')
+            window.set_rings_reason(PHASES_OFF_NOTE if switched_off and listed else '')
             self._draw_phase_legends()
             return
         wavelengths = self._phase_wavelengths
@@ -3925,7 +3956,7 @@ class ScientificView(QtWidgets.QFrame):
             self.raw_popup_dialog.close()
         hidden = tuple(widget for widget in (
             self.vertical_splitter, self.previous_frame, self.frame_selector,
-            self.next_frame, self.progress, self.raw_popup_button,
+            self.next_frame, self.progress, self.raw_popup_button, self.phases,
         ) if not widget.isHidden())
         for widget in hidden:
             widget.setVisible(False)
@@ -3998,7 +4029,8 @@ class ScientificView(QtWidgets.QFrame):
 
     #: Top-bar tools a host page may leave out, by name (some name several widgets).
     _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button",
-                   "raw_pane": "raw", "slice": ("slice", "slice_center", "slice_width", "pin")}
+                   "raw_pane": "raw", "slice": ("slice", "slice_center", "slice_width", "pin"),
+                   "phases": "phases"}
     _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
 
     def set_plot_modes(self, *names: str) -> None:
@@ -4070,6 +4102,8 @@ class ScientificView(QtWidgets.QFrame):
             self._viewer_intensity_domain = self._viewer_auto_levels = None
             self.curve.getViewBox().enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self.raw_popup_button.setVisible(normalized == "Int 1D")
+        # Reference phases are unavailable in the 2D Viewer, so is their switch (keyed layouts hide it too).
+        self.phases.setVisible(normalized != "2D Viewer" and "phases" not in self._hidden_tools)
         if (normalized != "Int 1D" and self.raw_popup_dialog is not None
                 and not self._raw_popup_host):
             self.raw_popup_dialog.close()

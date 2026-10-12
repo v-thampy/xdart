@@ -172,7 +172,7 @@ class RSMCustomSliceWindow(QtWidgets.QDialog):
         layout.addWidget(splitter)
         self.view = ScientificView()
         self.view.setObjectName("rsmCustomSliceView")
-        self.view.set_hidden_tools("norm", "background", "raw", "raw_pane", "slice")
+        self.view.set_hidden_tools("norm", "background", "raw", "raw_pane", "slice", "phases")
         self.view.commandRequested.connect(self._view_command)
         splitter.addWidget(self.view)
         self.card = SectionCard("Custom Slice", collapsible=False)

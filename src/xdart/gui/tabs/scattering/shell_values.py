@@ -691,6 +691,8 @@ class ScientificPlotOptions:
     phase_global_floor: bool = True
     #: per-phase minimum intensities ((listed phase id, percent), ...), in list order
     phase_floors: tuple[tuple[str, float], ...] = ()
+    #: the top bar's Phases toggle (C6): off draws no reference phase, keeping the list, flags and minimums
+    phase_references_shown: bool = True
 
     def __post_init__(self) -> None:
         if type(self.waterfall_y_axis) is not str or not self.waterfall_y_axis:
@@ -731,27 +733,31 @@ class ScientificPlotOptions:
                        for row in self.phase_floors)
                 or len({row[0] for row in self.phase_floors}) != len(self.phase_floors)):
             raise ValueError('per-phase floors name listed phases once each, between 0 and 100 percent')
+        if type(self.phase_references_shown) is not bool:
+            raise TypeError('the reference phases switch must be boolean')
 
 
 def phase_reference_document(options: ScientificPlotOptions) -> dict:
     """The saved reference-phase section of Int's session and Stitch's settings (its ``global_floor`` and
-    ``floors`` keys are additive since REFERENCE-PHASES-20261011)."""
+    ``floors`` keys are additive since REFERENCE-PHASES-20261011, ``shown`` since HELP-RESIDUALS-20261011)."""
     return {"references": [list(row) for row in options.phase_references],
             "min_intensity": options.phase_min_intensity,
             "global_floor": options.phase_global_floor,
-            "floors": [list(row) for row in options.phase_floors]}
+            "floors": [list(row) for row in options.phase_floors],
+            "shown": options.phase_references_shown}
 
 
 def restore_phase_references(options: ScientificPlotOptions, document) -> ScientificPlotOptions:
     """``options`` with a saved reference-phase section. An older document (no switch, no floors) restores the
-    global minimum; a saved minimum naming a phase that is no longer listed is dropped."""
+    global minimum; a saved minimum naming a phase that is no longer listed is dropped; no ``shown`` means on."""
     references = tuple(tuple(row) for row in document.get("references", options.phase_references))
     listed = {row[0] for row in references if row}
     floors = tuple((row[0], row[1]) for row in (tuple(item) for item in document.get("floors", ()))
                    if len(row) == 2 and row[0] in listed)
     return replace(options, phase_references=references,
                    phase_min_intensity=document.get("min_intensity", options.phase_min_intensity),
-                   phase_global_floor=document.get("global_floor", True), phase_floors=floors)
+                   phase_global_floor=document.get("global_floor", True), phase_floors=floors,
+                   phase_references_shown=document.get("shown", True))
 
 
 @dataclass(frozen=True, slots=True)
