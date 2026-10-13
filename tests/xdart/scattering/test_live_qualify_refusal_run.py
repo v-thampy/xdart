@@ -544,6 +544,31 @@ def test_p1_a_change_inside_the_construct_recheck_is_still_rescued(tmp_path, mon
     assert (labels, i0) == ((1, 2), (1.0, 2.0))
 
 
+@pytest.mark.parametrize('fmt', ('txt', 'auto'))
+def test_p3_a_fast_sidecar_first_acquisition_keeps_publishing_while_frames_arrive(tmp_path, fmt):
+    """Added after the first implementation (self-review): frames arriving faster than the 0.1 s poll must not hold
+    the whole scan back until the acquisition pauses; a frame waits only for its own metadata."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    _frame(raw, 'scan', 1, 'txt', 1.0)
+    executor, identity = _run(tmp_path, raw, fmt, 3250 + ('txt', 'auto').index(fmt))
+    events, frames = [], 21
+    try:
+        _wait(executor, events, lambda values: 1 in _labels(values) or _terminal(values))
+        for index in range(2, frames + 1):  # one frame every 0.05 s, its sidecar first
+            _frame(raw, 'scan', index, 'txt', float(index))
+            _settle(executor, events, .05)
+        published_while_arriving = sorted(set(_labels(events)) - {1})
+        _wait(executor, events, lambda values: set(range(1, frames + 1)) <= set(_labels(values)) or _terminal(values))
+        _settle(executor, events)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert published_while_arriving, 'no new frame was published until the acquisition paused'
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    labels, i0, _epoch = _output(tmp_path)
+    assert (labels, i0) == (tuple(range(1, frames + 1)), tuple(float(index) for index in range(1, frames + 1)))
+
+
 def test_p2_a_sidecar_first_acquisition_runs_to_stop_with_every_frame_and_its_metadata(tmp_path):
     raw = tmp_path / 'raw'
     raw.mkdir()
