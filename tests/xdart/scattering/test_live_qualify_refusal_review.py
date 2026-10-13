@@ -1,6 +1,8 @@
 """Terminal-review discriminators for published metadata removal and mixed raw drift."""
 import threading
 
+import pytest
+
 from tests.xdart.scattering.test_live_qualify_refusal_run import (
     SIDECARS, _frame, _labels, _output, _published, _run, _said, _settle,
     _stop, _terminal, _wait, _worker,
@@ -33,7 +35,8 @@ def test_a_removed_published_explicit_sidecar_blocks_its_target_and_reports_it(t
     assert (labels, i0) == ((1,), (7.0,))
 
 
-def test_raw_member_rewrite_with_metadata_drift_keeps_the_raw_validator_terminal(tmp_path, monkeypatch):
+@pytest.mark.parametrize('next_ready', (True, False))
+def test_raw_member_rewrite_with_metadata_drift_keeps_the_raw_validator_terminal(tmp_path, monkeypatch, next_ready):
     raw = tmp_path / 'raw'
     raw.mkdir()
     _frame(raw, 'scan', 1, 'txt', 1.0)
@@ -55,9 +58,12 @@ def test_raw_member_rewrite_with_metadata_drift_keeps_the_raw_validator_terminal
         armed.set()
         assert inside.wait(30.), 'the live loop is held before its next observation'
         _frame(raw, 'scan', 1, 'txt', 9.0)
-        _frame(raw, 'scan', 2, 'txt', 2.0)
+        _frame(raw, 'scan', 2, 'txt', 2.0, sidecar=next_ready)
         released.set()
-        _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values))
+        if next_ready:
+            _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values))
+        else:
+            _settle(executor, events, 1.)
     finally:
         released.set()
         terminal = _stop(executor, identity, events)
