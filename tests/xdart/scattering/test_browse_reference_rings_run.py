@@ -174,12 +174,20 @@ def _target(view, mode):
 
 
 def _show(qapp, page, view, mode, key):
-    """Select ``key`` and wait for its image (Int 1D: in the raw popup, full raw)."""
-    if mode == 'Int 1D' and (view.raw_popup_dialog is None or not view.raw_popup_dialog.isVisible()):
-        view.raw_popup_button.click()
-        qapp.processEvents()
+    """Select ``key`` and wait for its image (Int 1D: in the raw popup, full raw).
+
+    The popup button is enabled only once the selected frame's image is available, so the frame is selected
+    first, the popup opened, and the frame selected again for the popup's full raw read (as P3a's rows do).
+    """
     select(qapp, page, key)
     if mode == 'Int 1D':
+        if view.raw_popup_dialog is None or not view.raw_popup_dialog.isVisible():
+            page._refresh_shell()
+            qapp.processEvents()
+            assert view.raw_popup_button.isEnabled(), view.raw_popup_button.toolTip()
+            view.raw_popup_button.click()
+            qapp.processEvents()
+            select(qapp, page, key)
         settle(qapp, view, lambda: view.raw_popup_image.image.image is not None
                and view.raw_popup_image.image.image.shape == SHAPE[::-1])
     settle(qapp, view)
