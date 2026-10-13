@@ -1107,8 +1107,9 @@ def published_metadata_drift(published: PreparedSourceExecutionGraph,
     old, new = published.stamp, current.stamp
     if old.adapter_id != "tiff_series" or new.adapter_id != "tiff_series" or len(old.members) > len(new.members):
         return ()
-    if any(_path_key(_absolute(str(before.path))) != _path_key(_absolute(str(after.path)))
-           for before, after in zip(old.members, new.members)):
+    # Metadata-only policy cannot hide a rewritten raw member. Leave every
+    # raw file-state change to the existing source/Append validators.
+    if old.members != new.members[:len(old.members)]:
         return ()
     changed = []
     for before, after in zip(old.metadata_sources, new.metadata_sources):

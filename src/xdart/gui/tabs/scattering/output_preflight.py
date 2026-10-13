@@ -1097,18 +1097,23 @@ def _live_metadata_ready(
     configuration: FrozenRunConfiguration,
     group: LiveDirectoryGroup,
     observations: dict[str, tuple[tuple[str, object], ...]],
+    *,
+    published_members: int = 0,
 ) -> tuple[int, str]:
     """How many leading members of a Live group have their metadata ready.
 
     A member is ready when its selected sidecar (an explicit format) or its
     Auto candidates look the same on two observations a poll apart, and an
-    explicit sidecar exists, so a frame waits for a sidecar still being
+    explicit sidecar exists, so a new frame waits for a sidecar still being
     written or about to land.  Under Auto, no sidecar on both observations
     still means no metadata.  Under SPEC a member is ready once its own SPEC
     row is complete: a row is final once written, so one look suffices, and
     no other point's row is ever borrowed.  Metadata-off Runs do not wait.
     ``observations`` is the Run's own record, one entry per image, replaced at
-    every look.  Also returns why the first member that is not ready waits.
+    every look. Published members may have lost their sidecar: after the
+    observation settles they must reach the published-metadata drift fence,
+    rather than wait forever as if they were new frames.
+    Also returns why the first member that is not ready waits.
     """
 
     candidates = group.plan.candidates
@@ -1137,7 +1142,7 @@ def _live_metadata_ready(
         if ready == len(candidates) and (
             previous != seen
             or any(revision is None for _path, revision in seen)
-            or (meta_format != "auto" and not seen)
+            or (meta_format != "auto" and not seen and index >= published_members)
         ):
             ready, reason = index, f"waiting for the metadata of {image.name}"
     return ready, reason
@@ -1152,6 +1157,7 @@ def materialize_live_directory_group(
     cancelled: Callable[[], bool],
     reprobe: bool = False,
     sidecar_observations: dict[str, tuple[tuple[str, object], ...]] | None = None,
+    published_members: int = 0,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
@@ -1192,6 +1198,7 @@ def materialize_live_directory_group(
     if sidecar_observations is not None:
         count, waiting = _live_metadata_ready(
             configuration, group, sidecar_observations,
+            published_members=published_members,
         )
         if count == 0:
             return LiveDirectoryAttempt(
@@ -1231,6 +1238,11 @@ def materialize_live_directory_group(
         if error.args == ("admission cancelled",):
             raise
         raise
+    except InterruptedError as error:
+        # JIT source revalidation has the same Stop token as qualification.
+        if error.args != ("source qualification cancelled",):
+            raise
+        raise RuntimeError("admission cancelled") from error
     except SourceRevisionChanged as error:
         return LiveDirectoryAttempt(
             group,

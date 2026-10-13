@@ -2014,6 +2014,14 @@ class StandardRunExecutor:
                         reprobe = (
                             retry_revisions.pop(target_key, None) == revision
                         )
+                        with run.live_revision_lock:
+                            retained = run.processed_live_revisions.get(
+                                target_key
+                            )
+                        published = (
+                            0 if retained is None or retained.decision is None
+                            else len(retained.decision.item.source_stamp.members)
+                        )
                         self._release_predecessor_before_target(
                             run, group.target,
                         )
@@ -2025,6 +2033,7 @@ class StandardRunExecutor:
                             cancelled=lambda: run.stop_requested,
                             reprobe=reprobe,
                             sidecar_observations=sidecar_observations,
+                            published_members=published,
                         )
                         if attempt.state is ProbeState.IN_PROGRESS:
                             if attempt.revision_changed:
@@ -2045,10 +2054,6 @@ class StandardRunExecutor:
                             raise RuntimeError(
                                 "Live output target changed after JIT"
                             )
-                        with run.live_revision_lock:
-                            retained = run.processed_live_revisions.get(
-                                target_key
-                            )
                         drift = (
                             () if retained is None or retained.decision is None
                             else published_metadata_drift(
@@ -2066,14 +2071,17 @@ class StandardRunExecutor:
                             )
                             publish(force=True)
                             continue
-                        published = (
-                            0 if retained is None or retained.decision is None
-                            else len(retained.decision.item.source_stamp.members)
-                        )
                         if attempt.partial and len(
                             decision.item.source_stamp.members
-                        ) <= published:
+                        ) <= published and (
+                            retained is not None and retained.decision is not None
+                            and decision.item.source_stamp.members
+                            == retained.decision.item.source_stamp.members[
+                                :len(decision.item.source_stamp.members)
+                            ]
+                        ):
                             # Nothing beyond the published frames is ready yet.
+                            # A raw rewrite must still reach the Append guard.
                             continue
                         item = decision.item
                         run.current_file_total = len(group.physical_paths)
