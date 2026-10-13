@@ -10,6 +10,7 @@ from tests.xdart.scattering.test_live_qualify_refusal_run import (
 )
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xdart.gui.tabs.scattering.adapters import run_executor
+from xdart.gui.tabs.scattering import output_preflight
 
 
 def test_a_removed_published_explicit_sidecar_blocks_its_target_and_reports_it(tmp_path):
@@ -80,7 +81,8 @@ def test_stop_inside_a_live_admission_metadata_read_ends_stopped(tmp_path, monke
     armed, inside, released = threading.Event(), threading.Event(), threading.Event()
     state = threading.local()
     real_materialize = run_executor.materialize_live_directory_group
-    real_lookup = metadata._find_sidecar
+    real_read = metadata.read_txt_metadata
+    real_validate = output_preflight.validate_source_execution_graph
 
     def materialize(*args, **kwargs):
         state.selected = armed.is_set() and len(args[3].physical_paths) == 2
@@ -89,14 +91,22 @@ def test_stop_inside_a_live_admission_metadata_read_ends_stopped(tmp_path, monke
         finally:
             state.selected = False
 
-    def lookup(path, ext):
-        if getattr(state, 'selected', False) and not inside.is_set() and _worker():
+    def validate(*args, **kwargs):
+        state.validating = getattr(state, 'selected', False)
+        try:
+            return real_validate(*args, **kwargs)
+        finally:
+            state.validating = False
+
+    def read(path, *args, **kwargs):
+        if getattr(state, 'validating', False) and not inside.is_set() and _worker():
             inside.set()
             released.wait(30.)
-        return real_lookup(path, ext)
+        return real_read(path, *args, **kwargs)
 
     monkeypatch.setattr(run_executor, 'materialize_live_directory_group', materialize)
-    monkeypatch.setattr(metadata, '_find_sidecar', lookup)
+    monkeypatch.setattr(output_preflight, 'validate_source_execution_graph', validate)
+    monkeypatch.setattr(metadata, 'read_txt_metadata', read)
     executor, identity = _run(tmp_path, raw, 'txt', 3303)
     events = []
     try:
