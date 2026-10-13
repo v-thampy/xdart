@@ -4,7 +4,6 @@ from __future__ import annotations
 import configparser
 import hashlib
 import logging
-import mmap
 import os
 import re
 import stat
@@ -1456,8 +1455,19 @@ def _read_spec_metadata(
 # SPEC rows of an image series: one read per scan, and Live row readiness
 # ---------------------------------------------------------------------------
 
-_SPEC_SCAN_LINE = re.compile(rb"^#S[ \t]+(\d+)(?=\s|$)", re.MULTILINE)
-_SPEC_FILE_HEADER_LINE = re.compile(rb"^#F(?=\s|$)", re.MULTILINE)
+_SPEC_SCAN_LINE = re.compile(rb"#S[ \t]+(\d+)(?=\s|$)")
+
+
+class SpecRowPending(Exception):
+    """A live image's own SPEC row is not there yet: its SPEC file, scan or row is missing."""
+
+
+class SpecRowInvalid(ValueError):
+    """A complete SPEC line at or before a live image's row is not a row the scan's parser reads as such."""
+
+
+class _SpecParseDisagreement(ValueError):
+    """silx read a scan's rows differently from the scan's own lines."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1535,7 +1545,53 @@ class _SpecScan:
     header: tuple[bytes, ...]
     lines: tuple[bytes, ...]  # the scan's own lines in order, MCA data left out
     rows: tuple[int, ...]  # the position in ``lines`` of each complete row
+    columns: int | None  # the declared column count: ``#N``, else the ``#L`` labels
     extent: SpecScanExtent  # through every complete row
+
+    def valid_rows(self, limit: int) -> int:
+        """How many leading rows, of the first ``limit``, hold ``columns`` numbers each."""
+        for index, position in enumerate(self.rows[:limit]):
+            tokens = self.lines[position].split()
+            if not tokens or self.columns is not None and len(tokens) != self.columns:
+                return index
+            try:
+                for token in tokens:
+                    float(token)
+            except ValueError:
+                return index
+        return min(limit, len(self.rows))
+
+
+def _line_start(data: bytes, position: int) -> bool:
+    return position == 0 or data[position - 1:position] == b"\n"
+
+
+def _find_spec_scan(data: bytes, scan_number: int) -> int | None:
+    """The offset of the first ``#S scan_number`` line; ``None`` when there is none."""
+    position = data.find(b"#S")
+    while position >= 0:
+        match = _SPEC_SCAN_LINE.match(data, position) if _line_start(data, position) else None
+        if match is not None and int(match[1]) == scan_number:
+            return position
+        position = data.find(b"#S", position + 2)
+    return None
+
+
+def _last_spec_file_header(data: bytes, end: int) -> int:
+    """The offset of the last ``#F`` line before ``end``; 0 when there is none."""
+    position = data.rfind(b"#F", 0, end)
+    while position >= 0:
+        if _line_start(data, position) and data[position + 2:position + 3] in (b"", b" ", b"\t", b"\r", b"\n"):
+            return position
+        position = data.rfind(b"#F", 0, position)
+    return 0
+
+
+def _spec_count(text: bytes) -> int | None:
+    try:
+        return int(text)
+    except ValueError:
+        return None
 
 
 def _read_spec_scan(path: Path, scan_number: int) -> _SpecScan | None:
@@ -1545,70 +1601,73 @@ def _read_spec_scan(path: Path, scan_number: int) -> _SpecScan | None:
     ``#F``/``#E``/``#O`` lines of the last ``#F`` block before the scan, the
     scan ends at the next ``#S`` or ``#F`` line, and MCA (``@``) data is left
     out.  A line without its newline is still being written and ends the read.
-    ``None`` when the file holds no such scan.
+    The file is copied once, up to the size it had when opened: bytes rewritten
+    or truncated meanwhile cannot fault the read, as they could under a mapped
+    view.  ``None`` when the file holds no such scan.
     """
     with path.open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
-        if size <= 0:
-            return None
-        with mmap.mmap(stream.fileno(), size, access=mmap.ACCESS_READ) as data:
-            start = next((match.start() for match in _SPEC_SCAN_LINE.finditer(data)
-                          if int(match[1]) == scan_number), None)
-            if start is None:
-                return None
-            position = 0
-            for match in _SPEC_FILE_HEADER_LINE.finditer(data, 0, start):
-                position = match.start()
-            headers: dict[bytes, tuple[int, int]] = {}
-            while position < start:
-                end = data.find(b"\n", position, start)
-                end = start if end < 0 else end + 1
-                line = data[position:end].strip()
-                marker = line.split(None, 1)[0] if line else b""
-                if marker == b"#S":
-                    break
-                if marker == b"#F":
-                    headers = {marker: (position, end - position)}
-                elif marker == b"#E" or re.fullmatch(rb"#[Oo]\d+", marker):
-                    headers[marker] = (position, end - position)
-                position = end
-            header = tuple(headers.values())
-            header_bytes = tuple(data[offset:offset + length] for offset, length in header)
-            digest = hashlib.sha256()
-            lines: list[bytes] = []
-            rows: list[int] = []
-            marks: list[tuple[int, str]] = []
-            position, mca = start, False
-            while position < size:
-                end = data.find(b"\n", position)
-                if end < 0:
-                    break
-                end += 1
-                raw = data[position:end]
-                line = raw.strip()
-                marker = line.split(None, 1)[0] if line else b""
-                if position != start and marker in (b"#S", b"#F"):
-                    break
-                if mca or line.startswith(b"@"):
-                    mca = line.endswith(b"\\")
-                elif line.startswith(b"#"):
-                    lines.append(raw)
-                elif line:
-                    if not marks:
-                        marks.append((position, digest.hexdigest()))
-                    lines.append(raw)
-                    rows.append(len(lines) - 1)
-                    digest.update(raw)
-                    marks.append((end, digest.hexdigest()))
-                    position = end
-                    continue
-                digest.update(raw)
-                position = end
+        data = stream.read(size) if size > 0 else b""
+    start = _find_spec_scan(data, scan_number)
+    if start is None:
+        return None
+    position = _last_spec_file_header(data, start)
+    headers: dict[bytes, tuple[int, int]] = {}
+    while position < start:
+        end = data.find(b"\n", position, start)
+        end = start if end < 0 else end + 1
+        line = data[position:end].strip()
+        marker = line.split(None, 1)[0] if line else b""
+        if marker == b"#S":
+            break
+        if marker == b"#F":
+            headers = {marker: (position, end - position)}
+        elif marker == b"#E" or re.fullmatch(rb"#[Oo]\d+", marker):
+            headers[marker] = (position, end - position)
+        position = end
+    header = tuple(headers.values())
+    header_bytes = tuple(data[offset:offset + length] for offset, length in header)
+    digest = hashlib.sha256()
+    lines: list[bytes] = []
+    rows: list[int] = []
+    marks: list[tuple[int, str]] = []
+    declared = labels = None
+    position, mca = start, False
+    while position < len(data):
+        end = data.find(b"\n", position)
+        if end < 0:
+            break
+        end += 1
+        raw = data[position:end]
+        line = raw.strip()
+        marker = line.split(None, 1)[0] if line else b""
+        if position != start and marker in (b"#S", b"#F"):
+            break
+        if mca or line.startswith(b"@"):
+            mca = line.endswith(b"\\")
+        elif line.startswith(b"#"):
+            lines.append(raw)
+            if marker == b"#N" and declared is None:
+                declared = _spec_count(line[2:])
+            elif marker == b"#L" and labels is None:
+                labels = len(re.split(rb"\s{2,}", line[2:].strip()))
+        elif line:
             if not marks:
                 marks.append((position, digest.hexdigest()))
+            lines.append(raw)
+            rows.append(len(lines) - 1)
+            digest.update(raw)
+            marks.append((end, digest.hexdigest()))
+            position = end
+            continue
+        digest.update(raw)
+        position = end
+    if not marks:
+        marks.append((position, digest.hexdigest()))
     header_digest = hashlib.sha256(b"".join(header_bytes)).hexdigest()
     extent = SpecScanExtent(str(_lexical_absolute(path)), header, header_digest, start, tuple(marks))
-    return _SpecScan(header_bytes, tuple(lines), tuple(rows), extent)
+    return _SpecScan(header_bytes, tuple(lines), tuple(rows),
+                     declared if declared is not None else labels, extent)
 
 
 def _resolve_spec_image(image_path: Path, meta_dir: Path | str | None) -> tuple[Path, int, int] | None:
@@ -1623,13 +1682,22 @@ def _resolve_spec_image(image_path: Path, meta_dir: Path | str | None) -> tuple[
     return None
 
 
-def _spec_rows_values(payload: bytes, scan_number: int,
-                      rows: Sequence[int]) -> list[dict[str, float]]:
+def _same_number(left: float, right: float) -> bool:
+    return left == right or left != left and right != right
+
+
+def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
+                      own_rows: Sequence[tuple[float, ...]] | None = None,
+                      row_count: int | None = None) -> list[dict[str, float]]:
     """Each requested row's counters, with the scan's motor positions, parsed by silx.
 
     silx reads files only, so ``payload`` (one scan) goes through a scratch
-    file.  A parse failure is raised; a failure to close or remove the scratch
-    file raises MetadataScratchCleanupFailed, chained to any parse failure.
+    file.  With ``own_rows`` (each requested row's numbers as its own line
+    holds them) and ``row_count`` (the payload's rows), silx must read the
+    same table: that many rows, and each requested row equal to its line,
+    else _SpecParseDisagreement.  A parse failure is raised; a failure to
+    close or remove the scratch file raises MetadataScratchCleanupFailed,
+    chained to any parse failure.
     """
     from silx.io.specfile import SpecFile  # noqa: PLC0415
 
@@ -1644,6 +1712,12 @@ def _spec_rows_values(payload: bytes, scan_number: int,
         scratch_handle.close()
         parser = SpecFile(str(scratch))
         scan = parser[f"{scan_number}.1"]
+        if own_rows is not None:
+            table = scan.data
+            if table.ndim != 2 or table.shape[1] != row_count or any(
+                    table.shape[0] != len(own) or not all(map(_same_number, map(float, table[:, row]), own))
+                    for row, own in zip(rows, own_rows)):
+                raise _SpecParseDisagreement(f"silx read scan {scan_number} differently from its lines")
         motors = {name: float(scan.motor_position_by_name(name)) for name in scan.motor_names}
         for row in rows:
             counters = {label: float(scan.data_column_by_name(label)[row]) for label in scan.labels}
@@ -1675,52 +1749,98 @@ def _spec_rows_values(payload: bytes, scan_number: int,
 
 @dataclass(frozen=True, slots=True)
 class SpecPoints:
-    """The SPEC rows of an image series, read once: one result per image, and their extent."""
+    """The SPEC rows of an image series, read once: one result per image, and their extent.
 
-    path: Path
-    extent: SpecScanExtent
+    ``extent`` is ``None`` when a live read found the row of an image the Run
+    already published gone or not valid: every image then has no metadata.
+    """
+
+    path: Path | None
+    extent: SpecScanExtent | None
     reads: tuple[ImageMetadataRead, ...]
 
 
-def read_spec_points(image_paths: Sequence[Path | str],
-                     meta_dir: Path | str | None = None) -> SpecPoints | None:
+def _not_a_row(spec_path: Path, scan_number: int, scan: _SpecScan, index: int) -> str:
+    line = scan.lines[scan.rows[index]].strip().decode("utf-8", "replace")
+    shape = "numbers" if scan.columns is None else f"{scan.columns} numbers"
+    return f"{spec_path.name} scan {scan_number} row {index + 1} is not a row of {shape}: {line!r}"
+
+
+def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None, *,
+                     published: int | None = None) -> SpecPoints | None:
     """Every image's own SPEC row, from one read of their scan.
 
     Each image's name gives its SPEC file (the reader's own folder search),
-    scan and row, as for :func:`read_image_metadata`.  The values are the ones
-    that reader returns for an image whose row is complete; the extent covers
-    the file-header lines and the scan through the last of these rows.
-    ``None`` unless every image names the same scan of the same SPEC file and
-    that scan already holds a complete row for each; callers then read each
-    image as before.  A scan silx cannot parse gives ``None`` too.
+    scan and row, as for :func:`read_image_metadata`.  A row is valid when its
+    line is complete, holds the scan's declared column count (``#N``, else the
+    ``#L`` labels) of numbers, and silx reads it as that same row.  The values
+    are the ones that reader returns for an image whose row is valid; the
+    extent covers the file-header lines and the scan through the last of these
+    rows.
+
+    Finite (``published`` is ``None``): ``None`` unless every image names the
+    same scan of the same SPEC file and that scan holds a valid row for each;
+    callers then read each image as before.
+
+    Live (``published`` is how many leading images the Run already published):
+    never another image's row.  If a published image's row is gone or not
+    valid, every image comes back without metadata and ``extent`` is ``None``,
+    for the caller's published-metadata fence; otherwise an image whose row is
+    not there yet raises SpecRowPending, and one at or after a complete line
+    that is not a valid row raises SpecRowInvalid naming that line.
     """
     paths = tuple(_lexical_absolute(path) for path in image_paths)
+    live = published is not None
     if not paths:
+        if live:
+            raise ValueError("SPEC points need at least one image")
         return None
     resolved = [_resolve_spec_image(path, meta_dir) for path in paths]
-    if any(value is None for value in resolved) or len({value[:2] for value in resolved}) != 1:
+    scans = {value[:2] for value in resolved if value is not None}
+    if len(scans) > 1:
+        if live:
+            raise SpecRowInvalid(f"{paths[0].name} and the images after it name different SPEC scans")
         return None
-    spec_path, scan_number, _row = resolved[0]
-    numbers = [value[2] for value in resolved]
+    spec_path = scan_number = scan = None
+    if scans:
+        ((spec_path, scan_number),) = scans
+        try:
+            scan = _read_spec_scan(spec_path, scan_number)
+        except OSError:  # the file went away under the read
+            scan = None
+    numbers = tuple(None if value is None else value[2] for value in resolved)
+    needed = max((number for number in numbers if number is not None), default=-1) + 1
+    rows = 0 if scan is None else len(scan.rows)
+    valid = 0 if scan is None else scan.valid_rows(needed)
+    if not live:
+        if scan is None or None in numbers or needed > valid:
+            return None
+    else:
+        published = min(published, len(paths))
+        if any(number is None or number >= valid for number in numbers[:published]):
+            return SpecPoints(spec_path, None, tuple(ImageMetadataRead({}, None) for _path in paths))
+        for path, number in zip(paths[published:], numbers[published:]):
+            if number is not None and number >= valid and valid < rows:
+                raise SpecRowInvalid(_not_a_row(spec_path, scan_number, scan, valid))
+            if number is None or number >= valid:
+                raise SpecRowPending(f"waiting for the SPEC row of {path.name}")
+    own = [tuple(float(token) for token in scan.lines[scan.rows[number]].split()) for number in numbers]
     try:
-        scan = _read_spec_scan(spec_path, scan_number)
-    except (OSError, ValueError):  # the file went away or shrank under the read
-        return None
-    if scan is None or max(numbers) >= len(scan.rows):
-        return None
-    last = scan.rows[max(numbers)]
-    try:
-        values = _spec_rows_values(b"".join(scan.header) + b"".join(scan.lines[:last + 1]),
-                                   scan_number, numbers)
+        values = _spec_rows_values(
+            b"".join(scan.header) + b"".join(scan.lines[:scan.rows[needed - 1] + 1]),
+            scan_number, numbers, own_rows=own, row_count=needed)
     except MetadataScratchCleanupFailed:
         raise
     except Exception as error:
         if isinstance(error.__cause__, MetadataScratchCleanupFailed):
             raise
+        if live:
+            raise SpecRowInvalid(f"{spec_path.name} scan {scan_number} rows 1 to {needed} cannot be read "
+                                 f"as their lines hold them: {error}") from error
         logger.warning("read_spec_points: failed to parse scan %s of %s",
                        scan_number, spec_path, exc_info=True)
         return None
-    return SpecPoints(spec_path, scan.extent.through(max(numbers) + 1),
+    return SpecPoints(spec_path, scan.extent.through(needed),
                       tuple(ImageMetadataRead(value, spec_path) for value in values))
 
 

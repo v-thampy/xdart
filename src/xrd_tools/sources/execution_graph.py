@@ -4,7 +4,8 @@ from dataclasses import dataclass, field, replace
 import hashlib, json, math, os, posixpath
 from pathlib import Path
 import threading, time
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 import h5py
 import numpy as np
 _HDF5_FILE_OPEN = h5py.File
@@ -13,7 +14,7 @@ from xrd_tools.io.append import (
     AppendExternalMember, AppendImageMember, AppendSource, science_fingerprint,
 )
 from xrd_tools.io.image import read_detector_image_layout
-from xrd_tools.io.metadata import SpecScanExtent, spec_extent_holds
+from xrd_tools.io.metadata import SpecRowPending, SpecScanExtent, spec_extent_holds
 from xrd_tools.sources.descriptor import ContainerDescriptor, describe_container_from_open
 class SourceRevisionChanged(ValueError): pass
 
@@ -272,12 +273,17 @@ class AdmittedMetadataSource:
     # In memory only, never in as_dict() or a digest: the SPEC rows this
     # member's metadata was read from.  Later rows and scans may extend them.
     spec_extent: SpecScanExtent | None = field(default=None, compare=False)
+    # In memory only, likewise: the values that row gave at admission.  A live
+    # Run's reduction read must consume exactly these.
+    spec_values: Mapping[str, Any] | None = field(default=None, compare=False)
     def __post_init__(self) -> None:
         if (type(self.source_path) is not str or not os.path.isabs(self.source_path)
                 or self.metadata_file is not None
                 and type(self.metadata_file) is not SourceFileState
                 or self.spec_extent is not None
-                and (type(self.spec_extent) is not SpecScanExtent or self.metadata_file is None)):
+                and (type(self.spec_extent) is not SpecScanExtent or self.metadata_file is None)
+                or self.spec_values is not None
+                and (type(self.spec_values) is not MappingProxyType or self.spec_extent is None)):
             raise TypeError("admitted metadata source is invalid")
     def as_dict(self) -> dict[str, Any]:
         return {"source_path": self.source_path, "metadata_file": (
@@ -675,7 +681,8 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                    cancelled: Callable[[], bool] | None,
                    expected: PreparedSourceExecutionGraph | None = None,
                    force_compact: bool = False,
-                   infer_point_images: bool = True) -> PreparedSourceExecutionGraph | None:
+                   infer_point_images: bool = True,
+                   published_members: int = 0) -> PreparedSourceExecutionGraph | None:
     options = dict(source.options); marker = options.pop("average_compact_series_v1", None)
     if marker is not None and marker is not True: raise ValueError("compact Average TIFF marker is invalid")
     if marker is True and ({"files", "admitted_motor_values"} & set(options)):
@@ -720,9 +727,17 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     spec_points = spec_state = None
     if metadata_format == "spec" and grouped_source is None and not compact and not reader_binding:
         # Every member's own SPEC row from one read of their scan; the SPEC file
-        # is captured once, after it, so its members share one state.
-        spec_points = read_spec_points(files, meta_dir=qualified.get("meta_dir"))
-        if spec_points is not None:
+        # is captured once, after it, so its members share one state.  A live
+        # graph (no point inference) holds each member to its own valid row and
+        # never reads it the finite way; a re-check treats every member as
+        # published, so any change shows as a difference.
+        published = (None if infer_point_images else
+                     len(files) if expected is not None else published_members)
+        try:
+            spec_points = read_spec_points(files, meta_dir=qualified.get("meta_dir"), published=published)
+        except SpecRowPending as error:
+            raise SourceRevisionChanged(str(error)) from error
+        if spec_points is not None and spec_points.extent is not None:
             _cancelled(cancelled)
             spec_state = SourceFileState.capture(spec_points.path)
             if not spec_extent_holds(spec_points.extent):
@@ -769,8 +784,10 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                 or first.source_path is not None and _path_key(_absolute(str(first.source_path)))
                 != _path_key(_absolute(str(second.source_path))) or first_state != second_state):
             raise SourceRevisionChanged(f"TIFF metadata source changed during admission: {path}")
+        spec_read = spec_points is not None and spec_points.extent is not None
         metadata = AdmittedMetadataSource(before.path, second_state,
-            spec_extent=None if spec_points is None else spec_points.extent)
+            spec_extent=spec_points.extent if spec_read else None,
+            spec_values=MappingProxyType(dict(second.values)) if spec_read else None)
         motors = _finite_motors(dict(second.values))
         common = list(motors) if common is None else [name for name in common if name in motors]
         motor = None
@@ -1029,9 +1046,18 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
         reader_binding: str | None = None,
         selected_container: SelectedContainerInput | None = None,
         cancelled: Callable[[], bool] | None = None,
-        infer_point_images: bool = True) -> PreparedSourceExecutionGraph:
-    """Qualify one source; ``infer_point_images=False`` (a live Run) never infers images per point."""
+        infer_point_images: bool = True, published_members: int = 0) -> PreparedSourceExecutionGraph:
+    """Qualify one source; ``infer_point_images=False`` (a live Run) never infers images per point.
+
+    A live TIFF series under SPEC metadata also holds each member to its own
+    valid row: ``published_members`` leading members, already published by the
+    Run, come back without metadata when their rows are gone, for the
+    published-metadata fence; a later member whose row is not there yet is a
+    SourceRevisionChanged, and one whose row is not a valid row a ValueError.
+    """
     if type(source) is not SourceSpec: raise TypeError("source must be an exact SourceSpec")
+    if type(published_members) is not int or published_members < 0:
+        raise ValueError("published member count is invalid")
     if reader_binding not in (None, "average_closed_v1"): raise ValueError("source reader binding is unsupported")
     if selected_container is not None and (
         type(selected_container) is not SelectedContainerInput
@@ -1046,7 +1072,7 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
     if source.kind is SourceKind.TIFF_SERIES:
         return _qualify_tiff(source, selected_motor=selected_motor,
             reader_binding=reader_binding, cancelled=cancelled,
-            infer_point_images=infer_point_images)
+            infer_point_images=infer_point_images, published_members=published_members)
     if source.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
         return _qualify_container(source, selected_motor=selected_motor,
                                   reader_binding=reader_binding, cancelled=cancelled,
@@ -1117,6 +1143,38 @@ def published_metadata_drift(published: PreparedSourceExecutionGraph,
             state = after.metadata_file or before.metadata_file
             changed.append(before.source_path if state is None else state.path)
     return tuple(changed)
+def _same_value(actual: Any, admitted: Any) -> bool:
+    if isinstance(actual, (float, int, np.floating, np.integer)) and isinstance(admitted, (float, int)):
+        return float(actual) == float(admitted) or math.isnan(float(actual)) and math.isnan(float(admitted))
+    return actual == admitted
+def validate_consumed_metadata(value: PreparedSourceExecutionGraph,
+                               consumed: Mapping[int, Mapping[str, Any]]) -> None:
+    """Require a live Run's reduction read to consume exactly the SPEC values its admission read.
+
+    ``consumed`` maps frame labels to the metadata the reduction read for
+    them.  A live TIFF graph keeps each member's admitted row values in
+    memory; a row rewritten or gone since admission reads differently (or as
+    another row), which is a SourceRevisionChanged before anything is
+    published.  The selected motor is compared as the reader overrides it
+    with its admitted value.  Finite graphs are not checked.
+    """
+    stamp = value.stamp
+    if value.infers_point_images or stamp.adapter_id != "tiff_series":
+        return
+    motors = stamp.admitted_motor_values
+    for index, source in enumerate(stamp.metadata_sources):
+        actual = consumed.get(stamp.first_label + index)
+        if source.spec_values is None or actual is None:
+            continue
+        expected = dict(source.spec_values)
+        if motors:
+            selected = motors[index]
+            for key in tuple(expected):
+                if type(key) is str and key.casefold() == selected.motor.casefold():
+                    del expected[key]
+            expected[selected.motor] = selected.value
+        if set(actual) != set(expected) or not all(_same_value(actual[key], expected[key]) for key in expected):
+            raise SourceRevisionChanged(f"TIFF metadata changed after admission: {source.source_path}")
 def source_execution_projection(value: PreparedSourceExecutionGraph) -> dict:
     return value.stamp.as_dict()
 def source_execution_identity_v1_projection(value: PreparedSourceExecutionGraph) -> dict:

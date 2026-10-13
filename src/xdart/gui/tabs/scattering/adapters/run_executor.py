@@ -16,6 +16,7 @@ from xdart.modules.frame_publication import (
 )
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.append import AppendRefused
+from xrd_tools.io.metadata import MetadataSourceChanged
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.background import (
     _PreparedSeriesFrameBackground,
@@ -41,7 +42,7 @@ from xrd_tools.sources import open_source
 from xrd_tools.sources.base import source_metadata_energy_eV
 from xrd_tools.sources.point_images import PointImagesRequired
 from xrd_tools.sources.cursor import open_container_cursor
-from xrd_tools.sources.execution_graph import published_metadata_drift
+from xrd_tools.sources.execution_graph import published_metadata_drift, validate_consumed_metadata
 from xrd_tools.sources.nexus import NexusStackSource
 from xrd_tools.sources.point_images import PointImageSource
 from xrd_tools.sources.probe import ProbeState
@@ -1447,6 +1448,12 @@ class StandardRunExecutor:
                 )
             from xrd_tools.session.readiness import bind_native_int_source_energy, effective_ring_geometry
             run.scan = run.source.to_scan(output_path=artifact)
+            if item is not None:
+                # A live Run reduces only the SPEC values its admission read.
+                validate_consumed_metadata(
+                    item.graph,
+                    {int(frame.index): frame.metadata for frame in run.scan.frames},
+                )
             calibration = bind_native_int_source_energy(run.scan, calibration,
                 metadata_wavelength_A=(None if item is None or item.descriptor is None
                                        else item.descriptor.wavelength),
@@ -1483,6 +1490,15 @@ class StandardRunExecutor:
             ):
                 discard_source()
                 raise
+            if (
+                isinstance(error, MetadataSourceChanged)
+                and item is not None
+                and not item.graph.infers_point_images
+            ):
+                # A live Run's reduction read met a metadata file changing under
+                # it (a SPEC file still being appended): read again next poll.
+                discard_source()
+                raise SourceRevisionChanged(str(error)) from error
             if item is not None:
                 try:
                     validate_planned_source(item, cancelled=cancelled)
@@ -2034,6 +2050,10 @@ class StandardRunExecutor:
                             reprobe=reprobe,
                             sidecar_observations=sidecar_observations,
                             published_members=published,
+                            published_graph=(
+                                None if retained is None or retained.decision is None
+                                else retained.decision.item.graph
+                            ),
                         )
                         if attempt.state is ProbeState.IN_PROGRESS:
                             if attempt.revision_changed:

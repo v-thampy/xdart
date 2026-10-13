@@ -1106,9 +1106,10 @@ def _live_metadata_ready(
     Auto candidates look the same on two observations a poll apart, and an
     explicit sidecar exists, so a new frame waits for a sidecar still being
     written or about to land.  Under Auto, no sidecar on both observations
-    still means no metadata.  Under SPEC a member is ready once its own SPEC
-    row is complete: a row is final once written, so one look suffices, and
-    no other point's row is ever borrowed.  Metadata-off Runs do not wait.
+    still means no metadata.  Under SPEC a new member is ready once its own
+    SPEC row is complete: a row is final once written, so one look suffices
+    (qualification then proves it), and no other point's row is ever borrowed;
+    published members are not re-gated.  Metadata-off Runs do not wait.
     ``observations`` is the Run's own record, one entry per image, replaced at
     every look. Published members may have lost their sidecar: after the
     observation settles they must reach the published-metadata drift fence,
@@ -1126,7 +1127,8 @@ def _live_metadata_ready(
     if meta_format == "spec":
         from xrd_tools.io.metadata import spec_rows_ready
 
-        ready = spec_rows_ready(tuple(Path(value.path) for value in candidates))
+        exempt = min(published_members, len(candidates))
+        ready = exempt + spec_rows_ready(tuple(Path(value.path) for value in candidates[exempt:]))
         if ready == len(candidates):
             return ready, ""
         return ready, f"waiting for the SPEC row of {Path(candidates[ready].path).name}"
@@ -1148,6 +1150,34 @@ def _live_metadata_ready(
     return ready, reason
 
 
+def _published_prefix_current(
+    graph: PreparedSourceExecutionGraph, cancelled: Callable[[], bool],
+) -> bool:
+    """Whether the published frames' admitted graph still validates exactly.
+
+    :func:`validate_source_execution_graph` proves its aliases and candidate
+    owners, every raw member's exact state, every metadata dependency read
+    again (SPEC rows strictly, their extent extended), the admitted motor
+    values, read policy and cardinality.  A Stop inside it is admission's
+    cancellation; any other failure means "not current" and is left to
+    admission, so its existing policy (the published-metadata fence, the
+    Append guard) decides.
+    """
+    try:
+        validate_source_execution_graph(graph, cancelled=cancelled)
+    except RuntimeError as error:
+        if error.args == ("admission cancelled",):
+            raise
+        return False
+    except InterruptedError as error:
+        if error.args == ("source qualification cancelled",):
+            raise RuntimeError("admission cancelled") from error
+        return False
+    except Exception:
+        return False
+    return True
+
+
 def materialize_live_directory_group(
     receipt: AdmissionReceipt,
     configuration: FrozenRunConfiguration,
@@ -1158,6 +1188,7 @@ def materialize_live_directory_group(
     reprobe: bool = False,
     sidecar_observations: dict[str, tuple[tuple[str, object], ...]] | None = None,
     published_members: int = 0,
+    published_graph: PreparedSourceExecutionGraph | None = None,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
@@ -1166,7 +1197,10 @@ def materialize_live_directory_group(
     With ``sidecar_observations`` (the live Run's record), only the group's
     leading members whose metadata is ready are admitted
     (:func:`_live_metadata_ready`); a later ready member waits behind an
-    earlier pending one, and such an attempt is ``partial``.
+    earlier pending one, and such an attempt is ``partial``.  When nothing
+    beyond the published frames is ready, the attempt waits without admission
+    while ``published_graph`` (their admitted graph) still validates exactly;
+    any other outcome is admitted as before.
     """
 
     observations = []
@@ -1204,6 +1238,18 @@ def materialize_live_directory_group(
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting,
             )
+        if (
+            published_graph is not None
+            and count < len(group.plan.candidates)
+            and count <= len(published_graph.stamp.members)
+            and _published_prefix_current(published_graph, cancelled)
+        ):
+            # A frame waits and the published frames are exactly as admitted:
+            # re-admitting them would only repeat their admission (and, in
+            # Append mode, its same-extent preview against a grown SPEC file).
+            return LiveDirectoryAttempt(
+                group, ProbeState.IN_PROGRESS, reason=waiting,
+            )
         observations = observations[:count]
         physical_paths = physical_paths[:count]
 
@@ -1233,6 +1279,7 @@ def materialize_live_directory_group(
             session,
             deferred.entries[0],
             cancelled=cancelled,
+            published_members=published_members,
         )
     except RuntimeError as error:
         if error.args == ("admission cancelled",):
@@ -1274,6 +1321,7 @@ def materialize_deferred_output(
     entry: DeferredDirectoryEntry,
     *,
     cancelled: Callable[[], bool],
+    published_members: int = 0,
 ) -> tuple[AdmittedOutput | None, int, int]:
     deferred = receipt.deferred_directory
     if (
@@ -1322,6 +1370,7 @@ def materialize_deferred_output(
             receipt.candidate,
             subset,
             cancelled=cancelled,
+            published_members=published_members,
         )
     except (ValueError, OSError):
         # A semantic/schema failure remains terminal when every admitted
@@ -1806,12 +1855,14 @@ def _qualify_for_admission(
     selected_container: SelectedContainerInput | None = None,
     cancelled: Callable[[], bool],
     infer_point_images: bool = True,
+    published_members: int = 0,
 ) -> PreparedSourceExecutionGraph:
     try:
         return qualify_source_execution_graph(
             source, selected_motor=selected_motor,
             selected_container=selected_container, cancelled=cancelled,
             infer_point_images=infer_point_images,
+            published_members=published_members,
         )
     except InterruptedError as error:
         if error.args != ("source qualification cancelled",):
@@ -1865,6 +1916,7 @@ def _directory_items(
     plan: RunCandidatePlan,
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
+    published_members: int = 0,
 ) -> tuple[PlannedOutput, ...]:
     output_root, items, consumed = Path(configuration.save_path), [], set()
     resolved_output_root = None
@@ -1924,6 +1976,7 @@ def _directory_items(
                 cancelled=cancelled,
                 # Live never infers images per point: an image waits for its row.
                 infer_point_images=not _is_live(configuration),
+                published_members=published_members,
             )
         else:
             consumed.add(candidate.path)
