@@ -573,9 +573,20 @@ def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration
                 '# Counters\nI0 = 1\n# Motors\nenergy = 18\nUser: energy, time: Mon Jan 15 10:30:00 2024  # Temp\n')
         executor, identity, events = _run_to_terminal(_series(tmp_path, (18, 18)), request_value=9651)
         executor.close(identity)
-        page._context_controller.select_navigation(keys[1], (keys[1],))  # its hydration is still in flight
+        controller = page._context_controller
+        controller.select_navigation(keys[1], (keys[1],))  # its hydration is still in flight
         page._refresh_shell()
-        new = _reopen(qapp, page, written(tmp_path / 'run.nexus', 'Int 2D'))
+        target = written(tmp_path / 'run.nexus', 'Int 2D')
+
+        def reopened():
+            # Browse refuses a new load while the old context's cleanup is pending (its hydration in flight) and
+            # admits it once that cleanup ends, as a user's retry is admitted.
+            if controller.browse_context is old and not controller.browse_pending:
+                page._select_scan(str(target), reopen=True)
+            return controller.browse_context not in (None, old)
+
+        assert _pump(qapp, reopened), page._notice_text
+        new = _browsing(qapp, page)
         assert new is not old and old.released and old.ring_basis is None
         _show(qapp, page, view, page._context_controller.frame_keys[0])
         assert rings(view.raw) and not _same(before, _curves(view.raw))
