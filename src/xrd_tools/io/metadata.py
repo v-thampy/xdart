@@ -4,7 +4,6 @@ from __future__ import annotations
 import configparser
 import hashlib
 import logging
-import math
 import os
 import re
 import stat
@@ -1551,13 +1550,15 @@ class _SpecScan:
 
     def valid_rows(self, limit: int) -> int:
         """How many leading rows, of the first ``limit``, hold ``columns`` numbers each."""
+        from xrd_tools.io.spec import _SPEC_NUMBER
+
         for index, position in enumerate(self.rows[:limit]):
             tokens = self.lines[position].split()
             if not tokens or self.columns is not None and len(tokens) != self.columns:
                 return index
             try:
                 for token in tokens:
-                    if not math.isfinite(float(token)):
+                    if not _SPEC_NUMBER.fullmatch(token.decode("ascii")):
                         return index
             except ValueError:
                 return index
