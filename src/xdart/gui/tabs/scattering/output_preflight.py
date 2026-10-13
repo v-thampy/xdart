@@ -362,6 +362,9 @@ class LiveDirectoryAttempt:
     decision: AdmittedOutput | None = None
     reason: str = ""
     revision_changed: bool = False
+    # READY for only the group's leading members: a later one is still waiting
+    # for its metadata, so the group must not settle on this attempt.
+    partial: bool = False
 
     def __post_init__(self) -> None:
         if not (
@@ -379,6 +382,8 @@ class LiveDirectoryAttempt:
                 not self.revision_changed
                 or self.state is ProbeState.IN_PROGRESS
             )
+            and type(self.partial) is bool
+            and (not self.partial or self.state is ProbeState.READY)
         ):
             raise TypeError("live directory attempt is invalid")
 
@@ -1087,43 +1092,45 @@ def live_directory_groups(
     return tuple(groups)
 
 
-def _live_metadata_wait(
+def _live_metadata_ready(
     configuration: FrozenRunConfiguration,
     group: LiveDirectoryGroup,
     observations: dict[str, tuple[tuple[str, object], ...]],
-) -> str | None:
-    """Why a Live group's metadata is not ready yet, or ``None`` once it is.
+) -> tuple[int, str]:
+    """How many leading members of a Live group have their metadata ready.
 
-    Every member's selected sidecar (an explicit format) or Auto candidates
-    must look the same on two observations a poll apart, and an explicit
-    sidecar must exist, so a frame waits for a sidecar still being written or
-    about to land.  Under Auto, no sidecar on both observations still means no
-    metadata.  SPEC and metadata-off Runs do not wait here.  ``observations``
-    is the Run's own record, one entry per image, replaced at every look.
+    A member is ready when its selected sidecar (an explicit format) or its
+    Auto candidates look the same on two observations a poll apart, and an
+    explicit sidecar exists, so a frame waits for a sidecar still being
+    written or about to land.  Under Auto, no sidecar on both observations
+    still means no metadata.  SPEC and metadata-off Runs do not wait here.
+    ``observations`` is the Run's own record, one entry per image, replaced at
+    every look.  Also returns why the first member that is not ready waits.
     """
 
+    candidates = group.plan.candidates
     source = configuration.thaw_source_spec()
     meta_format = (
         source.metadata_format if type(source) is DirectorySourceSpec else None
     )
     if meta_format is None or meta_format == "spec":
-        return None
+        return len(candidates), ""
     from xrd_tools.io.metadata import live_sidecar_observation
 
-    waiting = None
-    for candidate in group.plan.candidates:
+    ready, reason = len(candidates), ""
+    for index, candidate in enumerate(candidates):
         image = Path(candidate.path)
         seen = live_sidecar_observation(image, meta_format)
         key = os.path.normcase(os.path.abspath(image))
         previous = observations.get(key)
         observations[key] = seen
-        if waiting is None and (
+        if ready == len(candidates) and (
             previous != seen
             or any(revision is None for _path, revision in seen)
             or (meta_format != "auto" and not seen)
         ):
-            waiting = f"waiting for the metadata of {image.name}"
-    return waiting
+            ready, reason = index, f"waiting for the metadata of {image.name}"
+    return ready, reason
 
 
 def materialize_live_directory_group(
@@ -1140,8 +1147,10 @@ def materialize_live_directory_group(
 
     Provisional or concurrently changing bytes produce a typed retry-later
     result.  Output collision/configuration failures remain hard failures.
-    With ``sidecar_observations`` (the live Run's record), a group also waits
-    until every member's metadata is ready (:func:`_live_metadata_wait`).
+    With ``sidecar_observations`` (the live Run's record), only the group's
+    leading members whose metadata is ready are admitted
+    (:func:`_live_metadata_ready`); a later ready member waits behind an
+    earlier pending one, and such an attempt is ``partial``.
     """
 
     observations = []
@@ -1169,14 +1178,17 @@ def materialize_live_directory_group(
                 observed.result.state,
                 reason=observed.result.reason,
             )
+    physical_paths = group.physical_paths
     if sidecar_observations is not None:
-        waiting = _live_metadata_wait(
+        count, waiting = _live_metadata_ready(
             configuration, group, sidecar_observations,
         )
-        if waiting is not None:
+        if count == 0:
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting,
             )
+        observations = observations[:count]
+        physical_paths = physical_paths[:count]
 
     ready = RunCandidatePlan(
         group.plan.generation,
@@ -1190,14 +1202,14 @@ def materialize_live_directory_group(
         deferred = _deferred_directory_plan(
             receipt.candidate,
             ready,
-            group.physical_paths,
+            physical_paths,
             cancelled=cancelled,
         )
         transient = replace(
             receipt,
             deferred_directory=deferred,
-            directory_discovered_file_count=len(group.physical_paths),
-            directory_discovered_paths=group.physical_paths,
+            directory_discovered_file_count=len(physical_paths),
+            directory_discovered_paths=physical_paths,
         )
         decision, _ready_files, _skipped_files = materialize_deferred_output(
             transient,
@@ -1230,6 +1242,7 @@ def materialize_live_directory_group(
         group,
         ProbeState.READY,
         decision=decision,
+        partial=len(physical_paths) < len(group.physical_paths),
     )
 
 

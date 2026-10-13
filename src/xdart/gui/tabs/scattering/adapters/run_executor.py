@@ -2066,6 +2066,15 @@ class StandardRunExecutor:
                             )
                             publish(force=True)
                             continue
+                        published = (
+                            0 if retained is None or retained.decision is None
+                            else len(retained.decision.item.source_stamp.members)
+                        )
+                        if attempt.partial and len(
+                            decision.item.source_stamp.members
+                        ) <= published:
+                            # Nothing beyond the published frames is ready yet.
+                            continue
                         item = decision.item
                         run.current_file_total = len(group.physical_paths)
                         run.current_files_incremental = (
@@ -2124,10 +2133,13 @@ class StandardRunExecutor:
                     ):
                         with run.live_revision_lock:
                             run.processed_live_revisions[target_key] = attempt
-                        settled_revisions[target_key] = (
-                            revision,
-                            decision.item.source_stamp.execution_identity_v1,
-                        )
+                        if not attempt.partial:
+                            # A partial attempt leaves members still waiting
+                            # for their metadata: retry them next poll.
+                            settled_revisions[target_key] = (
+                                revision,
+                                decision.item.source_stamp.execution_identity_v1,
+                            )
                     run.current_file_total = 0
                     run.current_files_incremental = False
                     publish(force=True)
