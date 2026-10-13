@@ -54,6 +54,7 @@ from xrd_tools.sources.execution_graph import (
     PreparedSourceExecutionGraph,
     SelectedContainerInput,
     SourceRevisionChanged,
+    admitted_metadata_current,
     qualify_source_execution_graph,
     source_snapshots_projection,
     validate_source_execution_graph,
@@ -1103,7 +1104,9 @@ def _live_metadata_ready(
     Auto candidates look the same on two observations a poll apart, and an
     explicit sidecar exists, so a frame waits for a sidecar still being
     written or about to land.  Under Auto, no sidecar on both observations
-    still means no metadata.  SPEC and metadata-off Runs do not wait here.
+    still means no metadata.  Under SPEC a member is ready once its own SPEC
+    row is complete: a row is final once written, so one look suffices, and
+    no other point's row is ever borrowed.  Metadata-off Runs do not wait.
     ``observations`` is the Run's own record, one entry per image, replaced at
     every look.  Also returns why the first member that is not ready waits.
     """
@@ -1113,8 +1116,15 @@ def _live_metadata_ready(
     meta_format = (
         source.metadata_format if type(source) is DirectorySourceSpec else None
     )
-    if meta_format is None or meta_format == "spec":
+    if meta_format is None:
         return len(candidates), ""
+    if meta_format == "spec":
+        from xrd_tools.io.metadata import spec_rows_ready
+
+        ready = spec_rows_ready(tuple(Path(value.path) for value in candidates))
+        if ready == len(candidates):
+            return ready, ""
+        return ready, f"waiting for the SPEC row of {Path(candidates[ready].path).name}"
     from xrd_tools.io.metadata import live_sidecar_observation
 
     ready, reason = len(candidates), ""
@@ -1396,6 +1406,8 @@ def _validate_deferred_entry_states(
                 "image_metadata",
             } and state.matches_disk():
                 continue
+            if role == "image_metadata" and admitted_metadata_current(stamp, state):
+                continue  # a SPEC file that only grew past its members' rows
             raise SourceRevisionChanged(
                 "source dependency escaped admitted revision: "
                 f"{state.path}"
@@ -1781,11 +1793,13 @@ def _qualify_for_admission(
     selected_motor: str | None = None,
     selected_container: SelectedContainerInput | None = None,
     cancelled: Callable[[], bool],
+    infer_point_images: bool = True,
 ) -> PreparedSourceExecutionGraph:
     try:
         return qualify_source_execution_graph(
             source, selected_motor=selected_motor,
             selected_container=selected_container, cancelled=cancelled,
+            infer_point_images=infer_point_images,
         )
     except InterruptedError as error:
         if error.args != ("source qualification cancelled",):
@@ -1815,6 +1829,12 @@ def _gi_enabled(
         return bool(configuration.gi.enabled)
     gi = configuration.processing_mapping().get("gi", {})
     return bool(type(gi) is dict and gi.get("enabled"))
+
+
+def _is_live(configuration: FrozenRunConfiguration | OutputCandidate) -> bool:
+    if type(configuration) is FrozenRunConfiguration:
+        return bool(configuration.live_mode)
+    return bool(configuration.processing_mapping().get("live_mode"))
 
 
 def _uses_eager_directory_descriptors(
@@ -1890,6 +1910,8 @@ def _directory_items(
                 spec,
                 selected_motor=_selected_tiff_gi_motor(configuration),
                 cancelled=cancelled,
+                # Live never infers images per point: an image waits for its row.
+                infer_point_images=not _is_live(configuration),
             )
         else:
             consumed.add(candidate.path)
