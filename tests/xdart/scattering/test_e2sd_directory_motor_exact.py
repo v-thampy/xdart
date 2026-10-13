@@ -1627,9 +1627,9 @@ def test_dependency_graph_state_cannot_rebaseline_after_jit_freeze(
     original_items = output_preflight._directory_items
     mutated = False
 
-    def racing_items(configuration, plan, *, cancelled):
+    def racing_items(configuration, plan, *, cancelled, **kwargs):
         nonlocal mutated
-        result = original_items(configuration, plan, cancelled=cancelled)
+        result = original_items(configuration, plan, cancelled=cancelled, **kwargs)
         graph = result[0].graph
         assert str(sidecar.resolve()) in {
             target.resolved_path for target in graph.stamp.canonical_targets
