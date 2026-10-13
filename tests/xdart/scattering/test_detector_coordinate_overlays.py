@@ -147,6 +147,8 @@ def test_terminal_browse_average_and_reintegrate_have_no_grid_geometry(qapp, tmp
         from tests.xdart.scattering.e3_shell_support import make_shell_projection
         for mode in ('Average','Reintegrate'):
             state = make_shell_projection()
-            page._shell.apply_state(replace(state,scientific=replace(state.scientific,processing_mode=mode)))
+            # The page's own revision: the shell ignores an older one (BROWSE-REFERENCE-RINGS-20261013 correction).
+            page._shell.apply_state(replace(state,revision=page._shell_revision,
+                                            scientific=replace(state.scientific,processing_mode=mode)))
             assert not control(view).isEnabled()
             assert not view.raw.overlay_families.get('grid')
