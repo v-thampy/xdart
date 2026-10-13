@@ -4,6 +4,7 @@ from __future__ import annotations
 import configparser
 import hashlib
 import logging
+import math
 import os
 import re
 import stat
@@ -1556,7 +1557,8 @@ class _SpecScan:
                 return index
             try:
                 for token in tokens:
-                    float(token)
+                    if not math.isfinite(float(token)):
+                        return index
             except ValueError:
                 return index
         return min(limit, len(self.rows))
