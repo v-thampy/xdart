@@ -41,6 +41,7 @@ from xrd_tools.sources import open_source
 from xrd_tools.sources.base import source_metadata_energy_eV
 from xrd_tools.sources.point_images import PointImagesRequired
 from xrd_tools.sources.cursor import open_container_cursor
+from xrd_tools.sources.execution_graph import published_metadata_drift
 from xrd_tools.sources.nexus import NexusStackSource
 from xrd_tools.sources.point_images import PointImageSource
 from xrd_tools.sources.probe import ProbeState
@@ -437,6 +438,9 @@ class _StandardRun:
         default_factory=dict
     )
     live_revision_lock: Lock = field(default_factory=Lock)
+    # Live outputs that stopped growing because a published frame's metadata
+    # changed: physical target key -> the reason every later status carries.
+    live_blocked: dict[str, str] = field(default_factory=dict)
     current_file_total: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
@@ -554,7 +558,7 @@ def _directory_status(
         f"{state} · {processed} processed · {skipped} skipped · "
         f"{pending} pending · {discovered} discovered"
     )
-    return status
+    return " · ".join((status, *run.live_blocked.values()))
 
 
 def _directory_counts(
@@ -1348,6 +1352,26 @@ class StandardRunExecutor:
             return
         self._settle_predecessor(run, output, predecessor)
 
+    def _block_live_target(
+        self, run: _StandardRun, target: Path, target_key: str,
+        drift: tuple[str, ...],
+    ) -> None:
+        """Stop extending one Live output whose published frames' metadata changed.
+
+        Its published frames, their metadata and lineage stay as written; its
+        open writer is finished through the output owner, and a failure there
+        still fails the Run.  The reason stays in every later status.
+        """
+
+        self._release_predecessor_before_target(run, target)
+        names = ", ".join(sorted({Path(path).name for path in drift}))
+        reason = (
+            f"{Path(target).name} stopped growing: {names} changed after "
+            "its frame was reduced; published frames kept"
+        )
+        run.live_blocked[target_key] = reason
+        logger.warning("[LIVE] %s", reason)
+
     def _settle_predecessor(self, run, output, predecessor) -> None:
         result = output.finish_predecessor(predecessor)
         self._finish_display_projection(run)
@@ -1896,10 +1920,12 @@ class StandardRunExecutor:
             tuple[tuple[object, ...], SourceExecutionIdentityV1 | None],
         ] = {}
         retry_revisions: dict[str, tuple[object, ...]] = {}
+        # Each image's sidecar as last seen; admission waits until it holds still.
+        sidecar_observations: dict[str, tuple[tuple[str, object], ...]] = {}
         discovered_paths: set[Path] = set(deferred.discovered_paths)
         processed_paths: set[Path] = set()
         skipped_paths: set[Path] = set()
-        last_projection: tuple[int, int, int, int, int] | None = None
+        last_projection: tuple[object, ...] | None = None
 
         def publish(*, force: bool = False) -> None:
             nonlocal last_projection
@@ -1916,6 +1942,8 @@ class StandardRunExecutor:
                     - run.files_skipped,
                 ),
                 run.files_discovered,
+                # A newly stopped output is news even when no count moved.
+                tuple(run.live_blocked.values()),
             )
             if not force and projection == last_projection:
                 return
@@ -1947,6 +1975,14 @@ class StandardRunExecutor:
                     return True
                 revision = tuple(group.revision)
                 target_key = _physical_file_key(group.target)
+                if target_key in run.live_blocked:
+                    # This output stopped growing; later frames are skipped.
+                    skipped_paths.update(
+                        path for path in group.physical_paths
+                        if path not in processed_paths
+                    )
+                    publish()
+                    continue
                 settled = settled_revisions.get(target_key)
                 if settled is not None and settled[0] == revision:
                     settled_identity = settled[1]
@@ -1988,6 +2024,7 @@ class StandardRunExecutor:
                             group,
                             cancelled=lambda: run.stop_requested,
                             reprobe=reprobe,
+                            sidecar_observations=sidecar_observations,
                         )
                         if attempt.state is ProbeState.IN_PROGRESS:
                             if attempt.revision_changed:
@@ -2008,6 +2045,27 @@ class StandardRunExecutor:
                             raise RuntimeError(
                                 "Live output target changed after JIT"
                             )
+                        with run.live_revision_lock:
+                            retained = run.processed_live_revisions.get(
+                                target_key
+                            )
+                        drift = (
+                            () if retained is None or retained.decision is None
+                            else published_metadata_drift(
+                                retained.decision.item.graph,
+                                decision.item.graph,
+                            )
+                        )
+                        if drift:
+                            self._block_live_target(
+                                run, group.target, target_key, drift,
+                            )
+                            skipped_paths.update(
+                                path for path in group.physical_paths
+                                if path not in processed_paths
+                            )
+                            publish(force=True)
+                            continue
                         item = decision.item
                         run.current_file_total = len(group.physical_paths)
                         run.current_files_incremental = (

@@ -17,6 +17,21 @@ from xrd_tools.sources.descriptor import ContainerDescriptor, describe_container
 class SourceRevisionChanged(ValueError): pass
 
 
+class MetadataRevisionChanged(SourceRevisionChanged):
+    """A metadata file changed while qualification was reading it.
+
+    The reader's typed refusal (``MetadataSourceChanged``), raised as a source
+    revision change so a live Run reads again at its next poll.  ``image_path``
+    is the member being qualified; ``metadata_path`` is what changed.
+    """
+
+    def __init__(self, message: str, *, image_path: str | Path | None = None,
+                 metadata_path: str | Path | None = None) -> None:
+        super().__init__(message)
+        self.image_path = None if image_path is None else str(image_path)
+        self.metadata_path = None if metadata_path is None else str(metadata_path)
+
+
 class SourceCleanupPending(RuntimeError):
     """One exact source owner needs another creating-thread close command."""
 
@@ -593,6 +608,18 @@ def _source_policy(source: SourceSpec, options: dict[str, Any]) -> tuple:
     excluded = {"files", "admitted_motor_values", "average_compact_series_v1"}
     return (str(source.uri), source.kind, None if source.metadata_uri is None else str(source.metadata_uri),
             source.entry, _frozen_options({key: value for key, value in options.items() if key not in excluded}))
+def _read_member_metadata(path: str | Path, metadata_format: str, **kwargs: Any):
+    """One member's metadata read; a metadata file that changed during it is a MetadataRevisionChanged.
+
+    Only the reader's typed change is translated: any other OSError, a parse
+    failure or an oversized bounded input stays what it was.
+    """
+    from xrd_tools.io.metadata import MetadataSourceChanged, read_image_metadata_observed
+    try:
+        return read_image_metadata_observed(path, metadata_format, **kwargs)
+    except MetadataSourceChanged as error:
+        raise MetadataRevisionChanged(str(error), image_path=path,
+                                      metadata_path=error.metadata_path) from error
 def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_binding: str | None,
                    cancelled: Callable[[], bool] | None,
                    expected: PreparedSourceExecutionGraph | None = None,
@@ -626,8 +653,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     if "point_images" in qualified:
         from xrd_tools.sources import open_source
         if reader_binding:
-            from xrd_tools.io.metadata import read_image_metadata_observed
-            read_image_metadata_observed(files[0], "spec",
+            _read_member_metadata(files[0], "spec",
                 meta_dir=qualified.get("meta_dir"), max_input_bytes=1 << 16,
                 spec_point_snapshot=True)
         grouped_source = open_source(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
@@ -638,7 +664,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     common: list[str] | None = None; layout = None
     metadata_format = (grouped_source.metadata_format if grouped_source is not None
                        else qualified.get("metadata_format", "auto"))
-    from xrd_tools.io.metadata import ImageMetadataRead, read_image_metadata_observed
+    from xrd_tools.io.metadata import ImageMetadataRead
     for index, value in enumerate(files):
         _cancelled(cancelled); path = Path(value); before = SourceFileState.capture(path)
         current = None
@@ -653,14 +679,14 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
             layout = current
         _cancelled(cancelled)
         first = (ImageMetadataRead({}, None) if metadata_format is None else
-                 read_image_metadata_observed(path, metadata_format, meta_dir=qualified.get("meta_dir"),
+                 _read_member_metadata(path, metadata_format, meta_dir=qualified.get("meta_dir"),
                     max_input_bytes=(1 << 16) if reader_binding else None,
                     spec_point_snapshot=bool(reader_binding)))
         _cancelled(cancelled)
         first_state = None if first.source_path is None else SourceFileState.capture(first.source_path)
         _cancelled(cancelled)
         second = (ImageMetadataRead({}, None) if metadata_format is None else
-                  read_image_metadata_observed(path, metadata_format, meta_dir=qualified.get("meta_dir"),
+                  _read_member_metadata(path, metadata_format, meta_dir=qualified.get("meta_dir"),
                     max_input_bytes=(1 << 16) if reader_binding else None,
                     spec_point_snapshot=bool(reader_binding)))
         if grouped_source is not None:
@@ -989,6 +1015,29 @@ def validate_source_execution_graph(value: PreparedSourceExecutionGraph, *,
         _qualify_container(source, selected_motor=None, reader_binding=value.reader_binding,
             cancelled=cancelled, expected=value)
     else: raise SourceRevisionChanged("source graph kind is unsupported")
+def published_metadata_drift(published: PreparedSourceExecutionGraph,
+                             current: PreparedSourceExecutionGraph) -> tuple[str, ...]:
+    """Metadata files of ``published``'s members that ``current`` no longer admits as they were.
+
+    A live owner asks this before it extends a published output, at the same
+    extent or a larger one: the published members must be, in order, the first
+    members of ``current``, and each one's admitted metadata file (or its
+    absence) must be unchanged.  The paths that changed, appeared or went away
+    are returned.  Any other difference (other members, another adapter) is raw
+    source drift that the existing validators own, so none is returned for it.
+    """
+    old, new = published.stamp, current.stamp
+    if old.adapter_id != "tiff_series" or new.adapter_id != "tiff_series" or len(old.members) > len(new.members):
+        return ()
+    if any(_path_key(_absolute(str(before.path))) != _path_key(_absolute(str(after.path)))
+           for before, after in zip(old.members, new.members)):
+        return ()
+    changed = []
+    for before, after in zip(old.metadata_sources, new.metadata_sources):
+        if before != after:
+            state = after.metadata_file or before.metadata_file
+            changed.append(before.source_path if state is None else state.path)
+    return tuple(changed)
 def source_execution_projection(value: PreparedSourceExecutionGraph) -> dict:
     return value.stamp.as_dict()
 def source_execution_identity_v1_projection(value: PreparedSourceExecutionGraph) -> dict:

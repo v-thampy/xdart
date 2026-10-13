@@ -41,7 +41,22 @@ class MetadataScratchCleanupFailed(RuntimeError):
     """A bounded SPEC snapshot could not be closed or removed."""
 
 
-class MetadataDiscoveryChanged(OSError):
+class MetadataSourceChanged(OSError):
+    """A metadata file changed while it was being read.
+
+    A recorded candidate or the selected source changed between the reader's
+    record of it and its check, or its bytes moved under a bounded read.  The
+    message is the reader's own refusal text, and ``metadata_path`` names the
+    file or directory that changed.  Source qualification raises it as a typed
+    source-revision change, so a live Run can read again at its next poll.
+    """
+
+    def __init__(self, message: str, *, path: Path | str | None = None) -> None:
+        super().__init__(message)
+        self.metadata_path = None if path is None else Path(path)
+
+
+class MetadataDiscoveryChanged(MetadataSourceChanged):
     """Only directories that discovery lists changed during a read.
 
     A file was added, removed or renamed in one, as a live acquisition does at
@@ -186,8 +201,9 @@ def _with_discovery_revisions(
             or _metadata_path_revision(result.source_path)
             != result.source_revision
         ):
-            raise OSError(
-                f"metadata source changed during read: {result.source_path}"
+            raise MetadataSourceChanged(
+                f"metadata source changed during read: {result.source_path}",
+                path=result.source_path,
             )
     combined = (*discovery_revisions, *result.discovery_revisions)
     ordered: list[tuple[Path, MetadataSourceRevision | None]] = []
@@ -215,8 +231,8 @@ def _with_discovery_revisions(
             _is_directory_revision(before) and _is_directory_revision(after)
             for _path, before, after in changed
         ):
-            raise MetadataDiscoveryChanged(message)
-        raise OSError(message)
+            raise MetadataDiscoveryChanged(message, path=changed[0][0])
+        raise MetadataSourceChanged(message, path=changed[0][0])
     return ImageMetadataRead(
         result.values,
         result.source_path,
@@ -538,7 +554,9 @@ def _bounded_metadata_snapshot(
         int(value.st_size), int(value.st_mtime_ns), int(value.st_ctime_ns),
     )
     if fence_revision(before) != fence_revision(after):
-        raise OSError(f"metadata input changed during bounded read: {path}")
+        raise MetadataSourceChanged(
+            f"metadata input changed during bounded read: {path}", path=path,
+        )
     if len(payload) > limit:
         if os.environ.get("XDART_METADATA_DEBUG") == "1":
             logger.warning("metadata_snapshot_refused path=%s limit_bytes=%d",
@@ -626,7 +644,9 @@ def _bounded_spec_point_snapshot(path: Path, scan_number: int, image_number: int
         value.st_mtime_ns, value.st_ctime_ns,
     )
     if descriptor_fence(before) != descriptor_fence(after):
-        raise OSError(f"metadata input changed during bounded read: {path}")
+        raise MetadataSourceChanged(
+            f"metadata input changed during bounded read: {path}", path=path,
+        )
     revision = (int(after.st_mode), int(after.st_dev), int(after.st_ino),
                 int(after.st_size), int(after.st_mtime_ns), identity_ctime_ns(after.st_ctime_ns))
     return b"".join(headers.values()) + bytes(selected) + point, revision
@@ -1038,6 +1058,30 @@ def read_image_metadata(
             max_input_bytes=max_input_bytes,
         ).values
     )
+
+
+def live_sidecar_observation(
+    image_path: Path | str, meta_format: str,
+) -> tuple[tuple[str, MetadataSourceRevision | None], ...]:
+    """The sidecar files a live Run waits on for one image, with their revisions.
+
+    An explicit sidecar format names the one file :func:`_find_sidecar`
+    selects; Auto names every allow-listed candidate that exists now.  ``()``
+    means none exists.  Nothing is opened or parsed: the live owner compares two
+    observations a poll apart before it admits the frame.
+    """
+
+    image = _lexical_absolute(image_path)
+    meta_format_norm = str(meta_format).strip().lower()
+    if meta_format_norm == "auto":
+        found = tuple(
+            candidate for candidate, _convention, _suffix
+            in _iter_auto_sidecar_candidates(image)
+        )
+    else:
+        sidecar = _find_sidecar(image, meta_format_norm)
+        found = () if sidecar is None else (sidecar,)
+    return tuple((str(path), _metadata_path_revision(path)) for path in found)
 
 
 #: Pauses in seconds before reading again when only a listed directory

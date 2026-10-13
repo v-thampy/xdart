@@ -1087,6 +1087,45 @@ def live_directory_groups(
     return tuple(groups)
 
 
+def _live_metadata_wait(
+    configuration: FrozenRunConfiguration,
+    group: LiveDirectoryGroup,
+    observations: dict[str, tuple[tuple[str, object], ...]],
+) -> str | None:
+    """Why a Live group's metadata is not ready yet, or ``None`` once it is.
+
+    Every member's selected sidecar (an explicit format) or Auto candidates
+    must look the same on two observations a poll apart, and an explicit
+    sidecar must exist, so a frame waits for a sidecar still being written or
+    about to land.  Under Auto, no sidecar on both observations still means no
+    metadata.  SPEC and metadata-off Runs do not wait here.  ``observations``
+    is the Run's own record, one entry per image, replaced at every look.
+    """
+
+    source = configuration.thaw_source_spec()
+    meta_format = (
+        source.metadata_format if type(source) is DirectorySourceSpec else None
+    )
+    if meta_format is None or meta_format == "spec":
+        return None
+    from xrd_tools.io.metadata import live_sidecar_observation
+
+    waiting = None
+    for candidate in group.plan.candidates:
+        image = Path(candidate.path)
+        seen = live_sidecar_observation(image, meta_format)
+        key = os.path.normcase(os.path.abspath(image))
+        previous = observations.get(key)
+        observations[key] = seen
+        if waiting is None and (
+            previous != seen
+            or any(revision is None for _path, revision in seen)
+            or (meta_format != "auto" and not seen)
+        ):
+            waiting = f"waiting for the metadata of {image.name}"
+    return waiting
+
+
 def materialize_live_directory_group(
     receipt: AdmissionReceipt,
     configuration: FrozenRunConfiguration,
@@ -1095,11 +1134,14 @@ def materialize_live_directory_group(
     *,
     cancelled: Callable[[], bool],
     reprobe: bool = False,
+    sidecar_observations: dict[str, tuple[tuple[str, object], ...]] | None = None,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
     Provisional or concurrently changing bytes produce a typed retry-later
     result.  Output collision/configuration failures remain hard failures.
+    With ``sidecar_observations`` (the live Run's record), a group also waits
+    until every member's metadata is ready (:func:`_live_metadata_wait`).
     """
 
     observations = []
@@ -1126,6 +1168,14 @@ def materialize_live_directory_group(
                 group,
                 observed.result.state,
                 reason=observed.result.reason,
+            )
+    if sidecar_observations is not None:
+        waiting = _live_metadata_wait(
+            configuration, group, sidecar_observations,
+        )
+        if waiting is not None:
+            return LiveDirectoryAttempt(
+                group, ProbeState.IN_PROGRESS, reason=waiting,
             )
 
     ready = RunCandidatePlan(

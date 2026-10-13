@@ -480,12 +480,24 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
         run.processed_live_revisions = RejectMap()
         execution_gate.set()
         deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not attempts and not forbidden:
+        while (
+            time.monotonic() < deadline
+            and not any(value.revision_changed for value in attempts)
+            and not forbidden
+        ):
             time.sleep(0.01)
 
         assert retargeted is True
-        assert len(attempts) == 1
-        attempt = attempts[0]
+        # LIVE-QUALIFY-REFUSAL-20261012: under Auto a Live frame first waits one
+        # poll for its metadata to hold still; only then is the group qualified.
+        *waits, attempt = attempts
+        assert waits and all(
+            value.state is ProbeState.IN_PROGRESS
+            and not value.revision_changed
+            and value.decision is None
+            and value.reason.startswith("waiting for the metadata of")
+            for value in waits
+        ), waits
         assert attempt.state is ProbeState.IN_PROGRESS
         assert attempt.revision_changed is True
         assert attempt.decision is None
