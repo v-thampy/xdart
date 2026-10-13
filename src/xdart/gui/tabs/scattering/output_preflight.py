@@ -1228,6 +1228,11 @@ def materialize_live_directory_group(
         if error.args == ("admission cancelled",):
             raise
         raise
+    except InterruptedError as error:
+        # JIT source revalidation has the same Stop token as qualification.
+        if error.args != ("source qualification cancelled",):
+            raise
+        raise RuntimeError("admission cancelled") from error
     except SourceRevisionChanged as error:
         return LiveDirectoryAttempt(
             group,
