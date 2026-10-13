@@ -138,8 +138,12 @@ def test_terminal_browse_average_and_reintegrate_have_no_grid_geometry(qapp, tmp
         control(view); choose_grid(qapp, view)
         page._context_controller.select_browse()
         page._refresh_shell(); qapp.processEvents()
-        assert not control(view).isEnabled()
-        assert 'Run' in control(view).toolTip() and not view.raw.overlay_families.get('grid')
+        # BROWSE-REFERENCE-RINGS-20261013 (superseded terminal-Browse clause, D4(c)): terminal Browse draws the
+        # saved frame's q contours and withholds its χ half-rays; the choice is unchanged and the row says why.
+        select(qapp, page, page._context_controller.frame_keys[0])
+        assert control(view).isEnabled() and control(view).currentText() == 'q + χ', control(view).toolTip()
+        from xrd_tools.geometry_figures import GRID_CHI_WITHHELD_NOTE
+        assert GRID_CHI_WITHHELD_NOTE in control(view).toolTip() and view.raw.overlay_families.get('grid')
         from tests.xdart.scattering.e3_shell_support import make_shell_projection
         for mode in ('Average','Reintegrate'):
             state = make_shell_projection()

@@ -350,7 +350,11 @@ def test_phase_rings_on_ints_detector_image_follow_p3a(qapp, tmp_path, monkeypat
             assert not calls or all(thread != threading.get_ident() for thread in calls)
             controller = page._context_controller
             controller.select_browse(); page._refresh_shell(); _settle(qapp, view)
-            assert not _phase_items(pane, entry)
+            # BROWSE-REFERENCE-RINGS-20261013 (superseded clause): terminal Browse keeps the phase's rings,
+            # computed from the saved output's own record.
+            select(qapp, page, controller.frame_keys[0])
+            _settle(qapp, view, lambda: _phase_items(pane, entry))
+            assert _phase_items(pane, entry)
     # Latest-only request test: block a real listing, supersede it, then allow
     # it to finish. It must never paint the stale entry into the new selection.
     with run_page(qapp, tmp_path/'stale', energies=(16, 16)) as (page, view):

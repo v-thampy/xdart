@@ -247,9 +247,10 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
             shell.apply_state(replace(state, scientific=replace(state.scientific, plot_options=options)))
             settle(qapp, view)
             assert not rings(view.raw)
-            assert ("Predicted rings are drawn only on a Run's frames while that Run is shown. "
-                    "Frames opened from a file, and Average or Reintegrate results, carry no ring geometry."
-                    ) in window.rings_note.text()
+            # BROWSE-REFERENCE-RINGS-20261013 (superseded text): saved Int outputs now carry ring geometry, so the
+            # generic reason no longer says that frames opened from a file cannot.
+            from xrd_tools.geometry_figures import RUN_RING_REASON
+            assert window.rings_note.text() == RUN_RING_REASON and 'opened from a file' not in RUN_RING_REASON
         view.show_raw_popup('Contributing raw')
         raw = np.arange(35.).reshape(5,7)
         view.show_raw_image(raw, status='source', color_map='Default', log_scale=False)
