@@ -2073,8 +2073,15 @@ class StandardRunExecutor:
                             continue
                         if attempt.partial and len(
                             decision.item.source_stamp.members
-                        ) <= published:
+                        ) <= published and (
+                            retained is not None and retained.decision is not None
+                            and decision.item.source_stamp.members
+                            == retained.decision.item.source_stamp.members[
+                                :len(decision.item.source_stamp.members)
+                            ]
+                        ):
                             # Nothing beyond the published frames is ready yet.
+                            # A raw rewrite must still reach the Append guard.
                             continue
                         item = decision.item
                         run.current_file_total = len(group.physical_paths)
