@@ -1194,7 +1194,7 @@ def _valid_energy_selection(selection: Any) -> bool:
     and equal-length lists of unique nonnegative integer labels and finite positive energies, or neither list."""
     def positive(value):
         return type(value) in (int, float) and math.isfinite(value) and value > 0
-    if not isinstance(selection, Mapping):
+    if not isinstance(selection, Mapping) or 'wavelength_m' not in selection:
         return False
     wavelength = selection.get('wavelength_m')
     if wavelength is not None and not positive(wavelength):
@@ -1239,6 +1239,10 @@ def ring_basis_from_saved(run_configuration, energy_selection, *, labels, monoch
     if 'energy_selection' in unreadable or (energy_selection is not None
                                             and not _valid_energy_selection(energy_selection)):
         return RingRefusal(gf.SAVED_ENERGY_MALFORMED_REASON)
+    if energy_selection is None and 'monochromator' in unreadable:
+        return RingRefusal(gf.SAVED_ENERGY_MALFORMED_REASON)
+    if energy_selection is not None and energy_selection['wavelength_m'] is None:
+        return RingRefusal(gf.SAVED_NO_ENERGY_REASON)
     if energy_selection is None and monochromator_wavelength_m is None:
         return RingRefusal(gf.SAVED_NO_ENERGY_REASON)
     per_frame = energy_selection is not None and 'frame_energies_eV' in energy_selection

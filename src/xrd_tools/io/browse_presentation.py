@@ -134,7 +134,9 @@ def _json_value(
         return text
 
 
-def _positive_scalar(dataset: h5py.Dataset | None, *, role: str) -> float | None:
+def _positive_scalar(dataset: h5py.Dataset | None, *, role: str, scalar_only: bool = False) -> float | None:
+    if scalar_only and dataset is not None and dataset.shape != ():
+        raise ValueError(f"{role} is not a scalar")
     if dataset is None or dataset.dtype.kind not in "iuf" or dataset.size < 1:
         return None
     if dataset.ndim == 0:
@@ -215,7 +217,7 @@ def read_browse_presentation(
     return presentation, mask
 
 
-def _monochromator_wavelength_m(entry_group: h5py.Group, entry: str) -> float | None:
+def _monochromator_wavelength_m(entry_group: h5py.Group, entry: str, *, scalar_only: bool = False) -> float | None:
     """The output's recorded wavelength (m): the monochromator's wavelength, else its energy."""
 
     instrument = _optional_group(
@@ -239,6 +241,7 @@ def _monochromator_wavelength_m(entry_group: h5py.Group, entry: str) -> float | 
             role="Browse wavelength",
         ),
         role="Browse wavelength",
+        scalar_only=scalar_only,
     )
     if wavelength_a is None:
         energy_kev = _positive_scalar(
@@ -246,6 +249,7 @@ def _monochromator_wavelength_m(entry_group: h5py.Group, entry: str) -> float | 
                 monochromator, "energy", role="Browse energy",
             ),
             role="Browse energy",
+            scalar_only=scalar_only,
         )
         if energy_kev is not None:
             wavelength_a = float(energy_to_wavelength(energy_kev))
@@ -294,11 +298,13 @@ def read_ring_record(path: str | Path, *, entry: str = "entry") -> SavedRingReco
         def node(name: str) -> Any:
             try:
                 dataset = _optional_dataset(config, name, role=f"Ring config {name}")
-                value = None if dataset is None else _json_value(
+                if dataset is None:
+                    return None
+                value = _json_value(
                     dataset, role=f"Ring config {name}", max_bytes=_MAX_RING_RECORD_UTF8_BYTES)
             except ValueError:
                 value = ""
-            if value is not None and type(value) is not dict:
+            if type(value) is not dict:
                 unreadable.append(name)
                 return None
             return value
@@ -318,7 +324,11 @@ def read_ring_record(path: str | Path, *, entry: str = "entry") -> SavedRingReco
                     epochs = tuple(tuple(epoch["labels"]) for epoch in lineage["epochs"])
                 except (KeyError, TypeError, ValueError):
                     unreadable.append("append_lineage")
-        wavelength_m = _monochromator_wavelength_m(entry_group, entry)
+        try:
+            wavelength_m = _monochromator_wavelength_m(entry_group, entry, scalar_only=True)
+        except ValueError:
+            wavelength_m = None
+            unreadable.append("monochromator")
     return SavedRingRecord(kind, run_configuration, energy_selection, wavelength_m, epochs, tuple(unreadable))
 
 
