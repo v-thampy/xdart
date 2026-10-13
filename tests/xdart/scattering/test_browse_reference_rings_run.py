@@ -175,7 +175,7 @@ def _target(view, mode):
 
 def _show(qapp, page, view, mode, key):
     """Select ``key`` and wait for its image (Int 1D: in the raw popup, full raw)."""
-    if mode == 'Int 1D' and not view.raw_popup_dialog.isVisible():
+    if mode == 'Int 1D' and (view.raw_popup_dialog is None or not view.raw_popup_dialog.isVisible()):
         view.raw_popup_button.click()
         qapp.processEvents()
     select(qapp, page, key)
