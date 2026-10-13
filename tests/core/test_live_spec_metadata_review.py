@@ -8,7 +8,7 @@ from xrd_tools.io.metadata import SpecRowInvalid
 from xrd_tools.sources.execution_graph import published_metadata_drift, qualify_source_execution_graph
 
 
-@pytest.mark.parametrize('token', ['nan', 'inf'])
+@pytest.mark.parametrize('token', ['nan', 'inf', '1_00'])
 def test_a_nonfinite_new_row_is_refused_naming_its_row(tmp_path, token):
     raw, spec, paths = _acquisition(tmp_path, images=2, rows=2)
     spec.write_text(spec.read_text().replace('0.1 101\n', f'0.1 {token}\n'))
@@ -16,7 +16,7 @@ def test_a_nonfinite_new_row_is_refused_naming_its_row(tmp_path, token):
         qualify_source_execution_graph(_series(raw, paths), infer_point_images=False)
 
 
-@pytest.mark.parametrize('token', ['nan', 'inf'])
+@pytest.mark.parametrize('token', ['nan', 'inf', '1_00'])
 def test_a_nonfinite_published_row_reaches_the_metadata_fence(tmp_path, token):
     raw, spec, paths = _acquisition(tmp_path, images=2, rows=2)
     source = _series(raw, paths)
