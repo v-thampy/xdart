@@ -90,13 +90,14 @@ def _series(root, energies, *, mode='Int 2D', unit=None, one=None, two=None, gi=
     return intent
 
 
-def _directory(root, *, live, output_mode='Overwrite', unit='2th_deg'):
+def _directory(root, *, live, output_mode='Overwrite', unit='2th_deg', mode='Int 1D'):
     poni = root / 'cal.poni' if (root / 'cal.poni').exists() else _poni(root)
     (root / 'raw').mkdir(parents=True, exist_ok=True)
     return RunIntent(source_spec=DirectorySourceSpec(root / 'raw', suffixes=('.tif',), metadata_format='txt'),
                      poni_file=str(poni), project_root=str(root / 'raw'), save_path=str(root / 'processed'),
-                     output_mode=output_mode, processing_mode='Int 1D', live_mode=live, max_cores=1,
-                     bai_1d_args={'npt': 8, 'method': 'numpy', 'unit': unit})
+                     output_mode=output_mode, processing_mode=mode, live_mode=live, max_cores=1,
+                     bai_1d_args={'npt': 8, 'method': 'numpy', 'unit': unit},
+                     bai_2d_args={'npt_rad': 8, 'npt_azim': 4, 'method': 'numpy', 'unit': unit})
 
 
 @contextmanager
@@ -169,27 +170,9 @@ def _labels(path):
         return tuple(int(value) for value in node[()])
 
 
-def _target(view, mode):
-    return view.raw if mode == 'Int 2D' else view.raw_popup_image
-
-
-def _show(qapp, page, view, mode, key):
-    """Select ``key`` and wait for its image (Int 1D: in the raw popup, full raw).
-
-    The popup button is enabled only once the selected frame's image is available, so the frame is selected
-    first, the popup opened, and the frame selected again for the popup's full raw read (as P3a's rows do).
-    """
+def _show(qapp, page, view, key):
+    """Select ``key`` and wait for Int 2D's raw pane (Browse has no Int 1D raw display; see G1)."""
     select(qapp, page, key)
-    if mode == 'Int 1D':
-        if view.raw_popup_dialog is None or not view.raw_popup_dialog.isVisible():
-            page._refresh_shell()
-            qapp.processEvents()
-            assert view.raw_popup_button.isEnabled(), view.raw_popup_button.toolTip()
-            view.raw_popup_button.click()
-            qapp.processEvents()
-            select(qapp, page, key)
-        settle(qapp, view, lambda: view.raw_popup_image.image.image is not None
-               and view.raw_popup_image.image.image.shape == SHAPE[::-1])
     settle(qapp, view)
 
 
@@ -463,22 +446,24 @@ def test_h8_an_older_record_uses_its_recorded_monochromator_wavelength(qapp, tmp
 
 # ---------------------------------------------------------------------------------------------------- G rows
 
-@pytest.mark.parametrize('mode', ('Int 1D', 'Int 2D'))
+# Int 1D is not parameterized: Browse has no Int 1D raw display (its raw popup reports "Full Raw is available only
+# for an exact acquisition frame"), so terminal Browse rings draw on Int 2D's raw pane (freeze record, F11).
+@pytest.mark.parametrize('mode', ('Int 2D',))
 def test_g1_terminal_browse_draws_each_frames_own_rings(qapp, tmp_path, mode):
     with _page(qapp, _series(tmp_path, (16, 17), mode=mode)) as (page, view, observed):
         terminal = _run(qapp, page, observed)
         _browsing(qapp, page)
         window = choice(view)
         choose(qapp, view)
-        target, browse = _target(view, mode), {}
+        browse = {}
         for key in page._context_controller.frame_keys:
-            _show(qapp, page, view, mode, key)
-            assert rings(target), ('terminal Browse draws the frame\'s rings', window.rings_note.text())
-            browse[key.local_frame_label] = _curves(target)
+            _show(qapp, page, view, key)
+            assert rings(view.raw), ('terminal Browse draws the frame\'s rings', window.rings_note.text())
+            browse[key.local_frame_label] = _curves(view.raw)
         _published(qapp, page, terminal)
         for key in page._context_controller.frame_keys:
-            _show(qapp, page, view, mode, key)
-            assert _same(browse[key.local_frame_label], _curves(_target(view, mode))), key.local_frame_label
+            _show(qapp, page, view, key)
+            assert _same(browse[key.local_frame_label], _curves(view.raw)), key.local_frame_label
         assert not _same(browse[1], browse[2])
 
 
@@ -493,13 +478,13 @@ def test_g2_moving_between_frames_and_outputs_keeps_each_frames_snapshot(qapp, t
         choose(qapp, view)
         seen = {}
         for key in page._context_controller.frame_keys:
-            _show(qapp, page, view, 'Int 2D', key)
+            _show(qapp, page, view, key)
             assert rings(view.raw), view.reference_phases.rings_note.text()
             seen['first', key.local_frame_label] = _curves(view.raw)
         second = _reopen(qapp, page, written(other / 'run.nexus', 'Int 2D'))
         assert second is not first and first.released and first.ring_basis is None
         for key in page._context_controller.frame_keys:
-            _show(qapp, page, view, 'Int 2D', key)
+            _show(qapp, page, view, key)
             assert rings(view.raw), view.reference_phases.rings_note.text()
             seen['second', key.local_frame_label] = _curves(view.raw)
         assert not _same(seen['first', 1], seen['second', 1]) and not _same(seen['second', 1], seen['second', 2])
@@ -507,7 +492,6 @@ def test_g2_moving_between_frames_and_outputs_keeps_each_frames_snapshot(qapp, t
 
 def test_g3_reopen_draws_rings_with_the_source_present_and_thumbnail_only(qapp, tmp_path):
     from xrd_tools import geometry_figures as gf
-    from xrd_tools.session.readiness import ring_basis_for_record
     output, published = _fresh_output(qapp, tmp_path, (16, 17))
     expected = gf.predict_detector_rings(published[1], 'LaB6', shape=SHAPE).curves
     for state in ('source present', 'thumbnail only'):
@@ -519,9 +503,10 @@ def test_g3_reopen_draws_rings_with_the_source_present_and_thumbnail_only(qapp, 
             choice(view)
             choose(qapp, view)
             key = page._context_controller.frame_keys[0]
-            _show(qapp, page, view, 'Int 2D', key)
+            _show(qapp, page, view, key)
             assert rings(view.raw), (state, view.reference_phases.rings_note.text())
             assert _near(_native_points(view.raw, SHAPE), expected) < 2.5, state
+    from xrd_tools.session.readiness import ring_basis_for_record
     assert ring_basis_for_record(output, labels=_labels(output)).shape == SHAPE
 
 
@@ -537,13 +522,13 @@ def test_g3b_a_real_binned_output_places_rings_on_its_thumbnail(qapp, tmp_path):
         _reopen(qapp, page, output)
         choice(view)
         choose(qapp, view)
-        _show(qapp, page, view, 'Int 2D', page._context_controller.frame_keys[0])
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
         assert rings(view.raw), view.reference_phases.rings_note.text()
         assert _near(_native_points(view.raw, basis.shape), expected, tolerance=12.) < 12.
 
 
 def test_g4_a_stopped_live_run_browses_with_the_energies_live_published(qapp, tmp_path):
-    intent = _directory(tmp_path, live=True)
+    intent = _directory(tmp_path, live=True, mode='Int 2D')
     _frame(tmp_path / 'raw', 'scan', 1, 16)
     with _page(qapp, intent) as (page, view, observed):
         page.findChild(ScatteringWorkspaceShell).run_controls.startButton.click()
@@ -559,13 +544,13 @@ def test_g4_a_stopped_live_run_browses_with_the_energies_live_published(qapp, tm
         choose(qapp, view)
         browse = {}
         for key in page._context_controller.frame_keys:
-            _show(qapp, page, view, 'Int 1D', key)
-            assert rings(view.raw_popup_image), view.reference_phases.rings_note.text()
-            browse[key.local_frame_label] = _curves(view.raw_popup_image)
+            _show(qapp, page, view, key)
+            assert rings(view.raw), view.reference_phases.rings_note.text()
+            browse[key.local_frame_label] = _curves(view.raw)
         _published(qapp, page, terminal)
         for key in page._context_controller.frame_keys:
-            _show(qapp, page, view, 'Int 1D', key)
-            assert _same(browse[key.local_frame_label], _curves(view.raw_popup_image))
+            _show(qapp, page, view, key)
+            assert _same(browse[key.local_frame_label], _curves(view.raw))
 
 
 def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration(qapp, tmp_path):
@@ -575,7 +560,7 @@ def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration
         choice(view)
         choose(qapp, view)
         keys = page._context_controller.frame_keys
-        _show(qapp, page, view, 'Int 2D', keys[0])
+        _show(qapp, page, view, keys[0])
         assert rings(view.raw), view.reference_phases.rings_note.text()
         before = _curves(view.raw)
         for index in (1, 2):
@@ -587,7 +572,7 @@ def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration
         page._refresh_shell()
         new = _reopen(qapp, page, written(tmp_path / 'run.nexus', 'Int 2D'))
         assert new is not old and old.released and old.ring_basis is None
-        _show(qapp, page, view, 'Int 2D', page._context_controller.frame_keys[0])
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
         assert rings(view.raw) and not _same(before, _curves(view.raw))
 
 
@@ -601,7 +586,7 @@ def test_g6_eviction_and_hydration_in_browse_keep_each_frames_snapshot(qapp, tmp
         keys = page._context_controller.frame_keys
         seen = {}
         for key in (*keys, keys[0]):
-            _show(qapp, page, view, 'Int 2D', key)
+            _show(qapp, page, view, key)
             assert rings(view.raw), view.reference_phases.rings_note.text()
             seen.setdefault(key.local_frame_label, []).append(_curves(view.raw))
         first, again = seen[keys[0].local_frame_label]
@@ -612,20 +597,20 @@ def test_g7_refusals_keep_the_output_usable_and_show_their_reasons(qapp, tmp_pat
     from tests.xdart.scattering.test_poni_v3_start import _V3_PONI
     from xrd_tools import geometry_figures as gf
     root = tmp_path / 'scan'
-    output, published = _fresh_output(qapp, root, (16, 17), mode='Int 1D', unit='2th_deg')
+    output, published = _fresh_output(qapp, root, (16, 17), unit='2th_deg')
     _frame(root, 'escan', 3, 16.5)
-    executor, identity, events = _run_to_terminal(_series(root, (16, 17, 16.5), mode='Int 1D', unit='2th_deg',
+    executor, identity, events = _run_to_terminal(_series(root, (16, 17, 16.5), unit='2th_deg',
                                                           output_mode='Append'), request_value=9671)
     executor.close(identity)
-    with _page(qapp, _series(tmp_path / 'empty', (16,), mode='Int 1D')) as (page, view, observed):
+    with _page(qapp, _series(tmp_path / 'empty', (16,))) as (page, view, observed):
         _reopen(qapp, page, output)
         window = choice(view)
         choose(qapp, view)
         by_label = {key.local_frame_label: key for key in page._context_controller.frame_keys}
-        _show(qapp, page, view, 'Int 1D', by_label[3])
-        assert rings(view.raw_popup_image), window.rings_note.text()
-        _show(qapp, page, view, 'Int 1D', by_label[1])
-        assert not rings(view.raw_popup_image) and page._last_scientific_projection.heavy is not None
+        _show(qapp, page, view, by_label[3])
+        assert rings(view.raw), window.rings_note.text()
+        _show(qapp, page, view, by_label[1])
+        assert not rings(view.raw) and page._last_scientific_projection.heavy is not None
         assert window.rings_note.text() == gf.SAVED_HISTORY_REASON
 
         def unconfigured(entry):
@@ -635,8 +620,8 @@ def test_g7_refusals_keep_the_output_usable_and_show_their_reasons(qapp, tmp_pat
             _replace_json(config, 'run_configuration', run)
 
         _reopen(qapp, page, _copy(output, tmp_path / 'unconfigured.nexus', unconfigured))
-        _show(qapp, page, view, 'Int 1D', page._context_controller.frame_keys[0])
-        assert page._last_scientific_projection.heavy is not None and not rings(view.raw_popup_image)
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
+        assert page._last_scientific_projection.heavy is not None and not rings(view.raw)
         assert window.rings_note.text() == gf.SAVED_NO_DETECTOR_CONFIG_REASON
     text = _V3_PONI.replace('Parallax: False', 'Parallax: True')
     with _page(qapp, _series(tmp_path / 'parallax', (16, 16), poni_text=text)) as (page, view, observed):
@@ -644,7 +629,7 @@ def test_g7_refusals_keep_the_output_usable_and_show_their_reasons(qapp, tmp_pat
         _browsing(qapp, page)
         window = choice(view)
         choose(qapp, view)
-        _show(qapp, page, view, 'Int 2D', page._context_controller.frame_keys[0])
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
         assert page._last_scientific_projection.heavy is not None and not rings(view.raw)
         assert window.rings_note.text() == gf.PARALLAX_RING_REASON
 
@@ -654,7 +639,7 @@ def test_g8_the_grid_in_browse_draws_q_and_withholds_chi_without_changing_the_ch
     with _page(qapp, _series(tmp_path, (16, 17))) as (page, view, observed):
         terminal = _run(qapp, page, observed)
         _browsing(qapp, page)
-        _show(qapp, page, view, 'Int 2D', page._context_controller.frame_keys[0])
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
         choose_grid(qapp, view, 'q + χ')
         editor = control(view)
         assert editor.isEnabled(), editor.toolTip()
@@ -667,7 +652,7 @@ def test_g8_the_grid_in_browse_draws_q_and_withholds_chi_without_changing_the_ch
         assert not view.raw.overlay_families.get('grid') and gf.GRID_CHI_WITHHELD_NOTE in editor.toolTip()
         choose_grid(qapp, view, 'q + χ')
         _published(qapp, page, terminal)
-        _show(qapp, page, view, 'Int 2D', page._context_controller.frame_keys[0])
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
         assert control(view).currentText() == 'q + χ'
         assert len(view.raw.overlay_families.get('grid', ())) > browse_items
 
@@ -682,7 +667,7 @@ def test_g9_a_cif_phases_rings_appear_in_browse_with_hkl_hover(qapp, tmp_path):
         page.resize(1600, 1000)
         _run(qapp, page, observed)
         _browsing(qapp, page)
-        _show(qapp, page, view, 'Int 2D', page._context_controller.frame_keys[0])
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
         _window(qapp, view).phase_source.set_selection(((entry.id, True),))
         view.reference_phases.close()
         _settle(qapp, view, lambda: bool(_pane_items(view.raw, entry.id)))
@@ -701,15 +686,18 @@ def test_g10_a_gi_output_browses_with_detector_frame_rings_and_no_grid(qapp, tmp
         _browsing(qapp, page)
         choice(view)
         choose(qapp, view)
-        _show(qapp, page, view, 'Int 2D', page._context_controller.frame_keys[0])
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
         assert rings(view.raw), view.reference_phases.rings_note.text()
         editor = control(view)
         assert not editor.isEnabled() and 'GI' in editor.toolTip()
 
 
 def test_g11_a_full_raw_of_another_shape_refuses(qapp, tmp_path):
-    from xrd_tools import geometry_figures as gf
-    output, published = _fresh_output(qapp, tmp_path / 'run', (16, 16), mode='Int 1D')
+    """Browse shows no full raw today ("Full Raw is available only for an exact acquisition frame"), so the guard is
+    driven at the projection that attaches saved rings: a real Browse projection whose heavy is replaced by a full
+    raw image of the Run's shape, against the real saved basis of a copy whose detector is wider."""
+    from dataclasses import replace
+    output, published = _fresh_output(qapp, tmp_path / 'run', (16, 16))
 
     def wider(entry):
         config = entry['reduction/config']
@@ -718,10 +706,20 @@ def test_g11_a_full_raw_of_another_shape_refuses(qapp, tmp_path):
         _replace_json(config, 'run_configuration', run)
 
     copy = _copy(output, tmp_path / 'run' / 'wider.nexus', wider)
-    with _page(qapp, _series(tmp_path / 'empty', (16,), mode='Int 1D')) as (page, view, observed):
+    with _page(qapp, _series(tmp_path / 'empty', (16,))) as (page, view, observed):
         _reopen(qapp, page, copy)
-        window = choice(view)
-        choose(qapp, view)
-        _show(qapp, page, view, 'Int 1D', page._context_controller.frame_keys[0])
-        assert not rings(view.raw_popup_image)
-        assert window.rings_note.text() == gf.RING_SHAPE_MISMATCH_REASON
+        _show(qapp, page, view, page._context_controller.frame_keys[0])
+        state = page._last_scientific_projection
+        assert state.heavy is not None
+        from xrd_tools import geometry_figures as gf
+        from xrd_tools.session.readiness import ring_basis_for_record
+        from xdart.gui.tabs.scattering.context_projection import attach_saved_rings
+        basis = ring_basis_for_record(copy, labels=_labels(copy))
+        assert basis.shape != SHAPE
+        full = replace(state.heavy, raw=np.zeros(SHAPE, dtype=np.float32), detector_source='full',
+                       detector_shape=SHAPE, ring_geometry=None)
+        refused = attach_saved_rings(replace(state, heavy=full), basis, full.frame)
+        assert refused.heavy.ring_geometry is None and refused.saved_ring_reason == gf.RING_SHAPE_MISMATCH_REASON
+        thumbnail = replace(full, detector_source='thumbnail', detector_shape=None)
+        attached = attach_saved_rings(replace(state, heavy=thumbnail), basis, thumbnail.frame)
+        assert attached.heavy.ring_geometry is not None and attached.heavy.detector_shape == basis.shape
