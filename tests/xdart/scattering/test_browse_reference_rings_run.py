@@ -91,8 +91,8 @@ def _series(root, energies, *, mode='Int 2D', unit=None, one=None, two=None, gi=
 
 
 def _directory(root, *, live, output_mode='Overwrite', unit='2th_deg', mode='Int 1D'):
-    poni = root / 'cal.poni' if (root / 'cal.poni').exists() else _poni(root)
     (root / 'raw').mkdir(parents=True, exist_ok=True)
+    poni = root / 'cal.poni' if (root / 'cal.poni').exists() else _poni(root)
     return RunIntent(source_spec=DirectorySourceSpec(root / 'raw', suffixes=('.tif',), metadata_format='txt'),
                      poni_file=str(poni), project_root=str(root / 'raw'), save_path=str(root / 'processed'),
                      output_mode=output_mode, processing_mode=mode, live_mode=live, max_cores=1,
@@ -429,6 +429,8 @@ def test_h8_an_older_record_uses_its_recorded_monochromator_wavelength(qapp, tmp
         del monochromator['wavelength']
         if wavelength_A is not None:
             monochromator['wavelength'] = wavelength_A
+        else:
+            del monochromator['energy']  # no recorded energy at all: the monochromator's energy also records one
         if not configuration:
             config = entry['reduction/config']
             run = _json(config['run_configuration'])
