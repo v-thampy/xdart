@@ -1051,6 +1051,7 @@ class BrowseLoader:
         presentation, _ = read_browse_presentation(
             canonical_path,
         )
+        ring_basis = _saved_ring_basis(canonical_path, target_entry, labels)
         stage_finish("presentation_read_s", started)
         if cancelled.is_set():
             return None
@@ -1126,6 +1127,7 @@ class BrowseLoader:
                 loaded_labels=labels,
                 target_snapshot=after,
                 prepared_reintegrate_offer=prepared_offer,
+                ring_basis=ring_basis,
             )
             context.adopt_load_request(request)
             context.stamp_provenance(
@@ -1151,5 +1153,25 @@ class BrowseLoader:
             raise
         stage_finish("context_build_s", started)
         return context
+
+
+def _saved_ring_basis(path: str, entry: str, labels: tuple[int, ...]):
+    """The output's own ring basis, read once inside the load's seals (BROWSE-REFERENCE-RINGS-20261013).
+
+    Rings are display-only: a record that cannot supply them refuses them with a reason, and never fails or
+    degrades the Browse load itself.
+    """
+    from xrd_tools.session.readiness import RingRefusal, ring_basis_for_record
+
+    try:
+        return ring_basis_for_record(path, entry=entry, labels=labels)
+    except Exception:
+        import logging
+
+        from xrd_tools.geometry_figures import SAVED_RECORD_MALFORMED_REASON
+
+        logging.getLogger(__name__).warning("Browse ring record unreadable: %s", path, exc_info=True)
+        return RingRefusal(SAVED_RECORD_MALFORMED_REASON)
+
 
 __all__ = ["BrowseLoader"]

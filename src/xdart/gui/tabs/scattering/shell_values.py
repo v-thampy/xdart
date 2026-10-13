@@ -635,10 +635,15 @@ class HeavyProjection:
     detector_source: str = "none"
     cake_coverage: np.ndarray | None = None
     ring_geometry: Mapping | None = None
+    #: ``"saved"`` when ``ring_geometry`` was rebuilt from a Browse output's own record
+    #: (BROWSE-REFERENCE-RINGS-20261013) rather than published by the Run being shown.
+    ring_origin: str = ""
 
     def __post_init__(self) -> None:
         if type(self.frame) is not DisplayFrameKey:
             raise TypeError("heavy projection frame must be exact")
+        if self.ring_origin not in {"", "saved"}:
+            raise ValueError("ring origin must be exact")
         if self.raw is not None and (
             type(self.raw) is not np.ndarray or self.raw.ndim != 2
         ):
@@ -819,10 +824,16 @@ class ScientificProjection:
     #: Whether the authoritative display selection is the acquisition, rather than Browse or a viewer.
     #: Frame RunIdentity alone cannot distinguish Browse, which can retain the acquisition's identity.
     acquisition_selected: bool = False
+    #: A Browse Int frame's saved rings (BROWSE-REFERENCE-RINGS-20261013): the specific reason its output's
+    #: record refuses them, or, when it supplies them, whether they wait for the frame's image.
+    saved_ring_reason: str = ""
+    saved_ring_expected: bool = False
 
     def __post_init__(self) -> None:
         if type(self.acquisition_selected) is not bool:
             raise TypeError("acquisition selection must be boolean")
+        if type(self.saved_ring_reason) is not str or type(self.saved_ring_expected) is not bool:
+            raise TypeError("saved ring availability must be exact")
         if self.detector_mode not in {"thumbnail", "full"}:
             raise ValueError("detector mode must be exact")
         if type(self.detector_available) is not bool or type(self.detector_pending) is not bool:

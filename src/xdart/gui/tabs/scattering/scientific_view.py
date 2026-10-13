@@ -1525,14 +1525,17 @@ class ScientificView(QtWidgets.QFrame):
         else:
             current = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
             geometry = heavy.ring_geometry if current else None
-            if geometry is not None:
+            if geometry is not None and heavy.ring_origin != 'saved':
                 self._phase_ring_run = navigation.current.run_identity
-            # A frame of that run whose image has not arrived yet waits for it (P3a residual 9); a frame opened from
-            # a file, or an Average or Reintegrate result, never carried ring geometry and keeps the Run reason.
+            # A frame of that run whose image has not arrived yet waits for it (P3a residual 9). A Browse frame's
+            # rings come from its saved output (BROWSE-REFERENCE-RINGS-20261013): they wait for its image, or its
+            # record's own reason says why there are none; an Average or Reintegrate result keeps the Run reason.
             loading = (is_int and state.acquisition_selected and not current and navigation.current is not None
                        and (heavy is None or heavy.frame is not navigation.current)
                        and navigation.current.run_identity is self._phase_ring_run)
             ring_reason = (gf.LOADING_RING_REASON if loading else
+                           gf.BROWSE_LOADING_RING_REASON if is_int and not current and state.saved_ring_expected else
+                           state.saved_ring_reason if is_int and geometry is None and state.saved_ring_reason else
                            gf.detector_ring_unavailable(geometry, heavy.detector_shape if current else None))
             if current and not ring_reason:
                 snapshot, shape = tuple(geometry.items()), heavy.detector_shape
@@ -1559,6 +1562,9 @@ class ScientificView(QtWidgets.QFrame):
                 for entry in entries:
                     if before.get(entry.id) != (entry, phase_floor(request, entry)):
                         self._remove_phase_drawings(entry.id)  # only the phase that changed waits for its lines
+            # What is drawn is no longer the shown request's result, so asking for it again (a Browse frame
+            # re-selected through a transient state) must compute it again rather than count as unchanged.
+            self._phase_requests.forget()
         self._phase_requests.ask(request)
         self._draw_phase_overlays()
 
@@ -1694,19 +1700,22 @@ class ScientificView(QtWidgets.QFrame):
             return
         matches = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
         snapshot, shape = ((heavy.ring_geometry, heavy.detector_shape) if matches else (None, None))
+        # A saved output's frame draws q contours and withholds χ, and its note says so (D4(c)).
+        saved = matches and heavy.ring_origin == 'saved'
         reason = gf.detector_grid_unavailable(snapshot, shape)
-        self.plot_options_dialog.set_grid_available(not reason, reason, visible=shown)
         choice = state.plot_options.coordinate_grid
+        self.plot_options_dialog.set_grid_available(
+            not reason, reason, note='' if reason else gf.detector_grid_note(choice, saved=saved), visible=shown)
         if reason or choice == 'Off':
             self._clear_grid_overlay(retain_cache=True)
             return
         dimension = '1d' if mode == 'Int 1D' else '2d'
-        key = (tuple(snapshot.items()), shape, choice, dimension)
+        key = (tuple(snapshot.items()), shape, choice, dimension, saved)
         if self._grid_cache != key:
             self._clear_grid_overlay()
             try:
                 self._grid_prediction = gf.predict_detector_grid(snapshot, shape=shape, choice=choice,
-                                                                  mode=dimension)
+                                                                  mode=dimension, saved=saved)
             except ValueError as error:
                 self.plot_options_dialog.set_grid_available(False, str(error))
                 return

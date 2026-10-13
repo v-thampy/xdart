@@ -523,6 +523,11 @@ class ContextProjection:
             scientific, presentation_background)
         scientific = replace(scientific, acquisition_selected=(
             selection is not None and selection.kind is ContextKind.ACQUISITION))
+        if not viewer_selected and selection is not None and selection.kind is ContextKind.BROWSE:
+            browse = next((context for context in contexts
+                           if type(context) is BrowseContext and selection.names(context)), None)
+            if browse is not None and not browse.released:
+                scientific = attach_saved_rings(scientific, browse.ring_basis, navigation.current)
         return ShellProjection(
             revision,
             build_browser_projection(
@@ -720,6 +725,37 @@ class ContextProjection:
         return HydrationEligibleMiss(request)
 
 
+def attach_saved_rings(scientific: ScientificProjection, basis, current) -> ScientificProjection:
+    """A Browse Int frame's own saved ring snapshot on its heavy projection (BROWSE-REFERENCE-RINGS-20261013).
+
+    The snapshot and native shape come only from the output's basis. A thumbnail takes the saved detector's shape;
+    a full raw image or recorded native shape that differs refuses. A frame whose image has not arrived keeps
+    ``saved_ring_expected``, so the view says its rings wait for it; a refused frame carries its reason. An Average
+    result or a Reintegrate version is not an Int Run's record and keeps the view's generic reason.
+    """
+    from xrd_tools.geometry_figures import RING_SHAPE_MISMATCH_REASON
+
+    if (basis is None or basis.kind != "run" or current is None
+            or scientific.processing_mode not in {"Int 1D", "Int 2D"}):
+        return scientific
+    label = current.local_frame_label
+    snapshot = basis.frame_snapshot(label)
+    if snapshot is None:
+        return replace(scientific, saved_ring_reason=basis.frame_reason(label))
+    heavy = scientific.heavy
+    if heavy is None or heavy.frame is not current:
+        return replace(scientific, saved_ring_expected=True)
+    if heavy.raw is None:
+        return scientific
+    shape = basis.shape
+    if (heavy.detector_source == "full" and tuple(heavy.raw.shape) != shape
+            or heavy.detector_shape is not None and heavy.detector_shape != shape):
+        return replace(scientific, heavy=replace(heavy, ring_geometry=None, ring_origin=""),
+                       saved_ring_reason=RING_SHAPE_MISMATCH_REASON)
+    return replace(scientific, saved_ring_expected=True, heavy=replace(
+        heavy, ring_geometry=snapshot, detector_shape=shape, ring_origin="saved"))
+
+
 def _browse_payload(
     context: BrowseContext,
     publication,
@@ -829,4 +865,4 @@ def _browse_wavelength(context: BrowseContext) -> float | None:
     return canonical_wavelength_m(value, WavelengthUnit.METRE)
 
 
-__all__ = ["ContextProjection", "ProjectionRequest", "apply_presentation_background"]
+__all__ = ["ContextProjection", "ProjectionRequest", "apply_presentation_background", "attach_saved_rings"]

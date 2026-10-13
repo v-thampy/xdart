@@ -21,7 +21,8 @@ COVERAGE_TOOLTIP = (
     "and does not measure angular completeness."
 )
 GRID_TOOLTIP = ('Show detector-frame q contours and χ half-rays with the effective Run plan’s χ offset. '
-                'Display only; available on Standard Int Run frames with a uniform flat detector.')
+                'Display only; available on Standard Int frames with a uniform flat detector (q contours only on '
+                'a saved output’s frames).')
 
 #: Every 1-D plot option: its command path and its ``ScientificPlotOptions`` field, the one table the
 #: view emits and every page applies (Codex general audit AUD-8).
@@ -196,9 +197,13 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         outer.insertWidget(outer.count() - 1, row)
         return editor
 
-    def set_grid_available(self, available: bool, reason: str = '', *, visible: bool = True) -> None:
+    def set_grid_available(self, available: bool, reason: str = '', *, note: str = '',
+                           visible: bool = True) -> None:
+        """Enable the grid row, or disable it with its reason; ``note`` informs while it is enabled (a saved
+        output's frame withholds χ half-rays)."""
         from xrd_tools.geometry_figures import GRID_RUN_REASON
-        tip = GRID_TOOLTIP if available else GRID_TOOLTIP+' '+(reason or GRID_RUN_REASON)
+        tip = (GRID_TOOLTIP + (' ' + note if note else '') if available
+               else GRID_TOOLTIP + ' ' + (reason or GRID_RUN_REASON))
         self.coordinate_grid.setEnabled(available)
         row = self.coordinate_grid.parentWidget()
         row.setVisible(visible)

@@ -1342,6 +1342,9 @@ class BrowseContext(_WriteOnceIdentity):
     #: bracket.  The concrete reduction type is admitted by BrowseLoader;
     #: this import-pure lifecycle owner transports only the exact reference.
     prepared_reintegrate_offer: object = None
+    #: The output's own detached ring basis or refusal (BROWSE-REFERENCE-RINGS-20261013), read once inside the
+    #: load's seals; the concrete headless type is admitted by BrowseLoader. Invalidation and release clear it.
+    ring_basis: object = None
 
     _IDENTITY_FIELDS = frozenset({
         "context_token", "load_generation", "operation", "requested_path",
@@ -1350,7 +1353,7 @@ class BrowseContext(_WriteOnceIdentity):
         # E6-NORM-N1: the aggregate travels with the context, write-once.
         "norm_aggregate",
         "target_entry", "loaded_labels", "target_snapshot",
-        "prepared_reintegrate_offer",
+        "prepared_reintegrate_offer", "ring_basis",
         # §10.2: one gate, created with the context and mutated only through
         # its own methods — never replaceable by assignment.
         "commit_gate",
@@ -1360,7 +1363,7 @@ class BrowseContext(_WriteOnceIdentity):
         if (
             name in {
                 "scalar_catalog", "browse_1d_cache", "loaded",
-                "prepared_reintegrate_offer",
+                "prepared_reintegrate_offer", "ring_basis",
             }
             and getattr(self, name, _UNSET) is not _UNSET
         ):
@@ -1528,6 +1531,7 @@ class BrowseContext(_WriteOnceIdentity):
         self.invalidated = True
         object.__setattr__(self, "loaded", False)
         object.__setattr__(self, "prepared_reintegrate_offer", None)
+        object.__setattr__(self, "ring_basis", None)
         # §9.2.7 — commit authority goes FIRST.  A read already in flight may
         # finish reading; it may insert into nothing.
         self.commit_gate.cancel()
@@ -1568,4 +1572,5 @@ class BrowseContext(_WriteOnceIdentity):
         object.__setattr__(self, "loaded_labels", empty_labels)
         object.__setattr__(self, "scalar_catalog", None)
         object.__setattr__(self, "prepared_reintegrate_offer", None)
+        object.__setattr__(self, "ring_basis", None)
         self.released = True

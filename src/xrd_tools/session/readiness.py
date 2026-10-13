@@ -1038,11 +1038,18 @@ def build_native_int_reduction_plan_from_scan(
     )
 
 
-def execution_plan_values(
-    configuration: FrozenRunConfiguration,
+def execution_plan_shape(
+    bai_1d_args: Mapping[str, Any],
+    bai_2d_args: Mapping[str, Any],
+    gi: Any,
+    processing_mode: str,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    threshold, gi = configuration.threshold, configuration.gi
-    one, two = configuration.bai_1d_args, configuration.bai_2d_args
+    """The plan arguments a Run's controls imply: its argument copies, GI and dimensions.
+
+    One rule for the Run's frozen configuration and for a saved output's ``run_configuration``
+    (BROWSE-REFERENCE-RINGS-20261013), whose rings must rebuild the plan facts the Run published.
+    """
+    one, two = dict(bai_1d_args), dict(bai_2d_args)
     if gi.enabled:
         one["gi_mode_1d"], two["gi_mode_2d"] = gi.mode_1d, gi.mode_2d
     manual = gi.enabled and gi.effective_motor == "Manual"
@@ -1053,10 +1060,23 @@ def execution_plan_values(
         "tilt_angle": gi.tilt_angle, "sample_orientation": gi.sample_orientation,
         "integrate_1d": True,
         "integrate_2d": not (
-            "Viewer" not in configuration.processing_mode
-            and "1D" in configuration.processing_mode
-            and "2D" not in configuration.processing_mode
+            "Viewer" not in processing_mode
+            and "1D" in processing_mode
+            and "2D" not in processing_mode
         ),
+    }
+
+
+def execution_plan_values(
+    configuration: FrozenRunConfiguration,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    threshold = configuration.threshold
+    one, two, shape = execution_plan_shape(
+        configuration.bai_1d_args, configuration.bai_2d_args,
+        configuration.gi, configuration.processing_mode,
+    )
+    return one, two, {
+        **shape,
         "threshold_min": (
             threshold.threshold_min if threshold.apply_threshold else None
         ),
@@ -1100,6 +1120,161 @@ def effective_ring_geometry(calibration, *, integrator, plan=None):
         'azimuth_offset_1d': float(getattr(getattr(plan, 'integration_1d', None), 'azimuth_offset', 0.)),
         'azimuth_offset_2d': float(getattr(getattr(plan, 'integration_2d', None), 'azimuth_offset', 0.)),
     })
+
+
+def frame_ring_wavelengths(selection: Mapping[str, Any] | None) -> dict[int, float]:
+    """Each listed frame's effective wavelength (m) from an energy selection's per-frame energies.
+
+    The one per-label rule the Run's ring publication and a saved output's rings share: a label in
+    ``frame_labels`` takes its own ``frame_energies_eV`` entry; any other keeps the snapshot's wavelength.
+    """
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    selection = selection or {}
+    return dict(zip(selection.get('frame_labels', ()),
+                    map(energy_eV_to_wavelength_m, selection.get('frame_energies_eV', ()))))
+
+
+@dataclass(frozen=True, slots=True)
+class RingRefusal:
+    """A saved output whose frames get no predicted rings, with the reason for each of them.
+
+    ``kind`` is the record's: an Average result or a Reintegrate version is not an Int Run's record, so a
+    display keeps its own generic reason for it rather than this one.
+    """
+
+    reason: str
+    kind: str = 'run'
+
+    @property
+    def shape(self) -> None:
+        return None
+
+    def frame_snapshot(self, label: int) -> None:
+        return None
+
+    def frame_reason(self, label: int) -> str:
+        return self.reason
+
+
+@dataclass(frozen=True, slots=True)
+class RingBasis:
+    """Detached per-frame ring snapshots rebuilt from one saved Int output (BROWSE-REFERENCE-RINGS-20261013).
+
+    ``base`` is the output's 17-field snapshot; an eligible label's own wavelength replaces its ``wavelength``,
+    as the Run published it. ``shape`` is the saved detector's native shape. Labels outside the output, and an
+    energy scan's earlier Append epochs (D5), refuse with their own reasons. No handle, integrator or array is held.
+    """
+
+    base: Mapping[str, Any]
+    wavelengths: Mapping[int, float]
+    labels: frozenset[int]
+    eligible: frozenset[int]
+    shape: tuple[int, int]
+
+    @property
+    def kind(self) -> str:
+        return 'run'
+
+    def frame_snapshot(self, label: int) -> Mapping[str, Any] | None:
+        if self.frame_reason(label):
+            return None
+        wavelength = self.wavelengths.get(label, self.base['wavelength'])
+        return (self.base if wavelength == self.base['wavelength']
+                else MappingProxyType({**self.base, 'wavelength': wavelength}))
+
+    def frame_reason(self, label: int) -> str:
+        from xrd_tools import geometry_figures as gf
+        if label not in self.labels:
+            return gf.SAVED_LABEL_ABSENT_REASON
+        return '' if label in self.eligible else gf.SAVED_HISTORY_REASON
+
+
+def _valid_energy_selection(selection: Any) -> bool:
+    """A saved energy selection the Run's rule can trust: a finite positive or absent representative wavelength,
+    and equal-length lists of unique nonnegative integer labels and finite positive energies, or neither list."""
+    def positive(value):
+        return type(value) in (int, float) and math.isfinite(value) and value > 0
+    if not isinstance(selection, Mapping):
+        return False
+    wavelength = selection.get('wavelength_m')
+    if wavelength is not None and not positive(wavelength):
+        return False
+    labels, energies = selection.get('frame_labels'), selection.get('frame_energies_eV')
+    if labels is None and energies is None:
+        return True
+    return (type(labels) is list and type(energies) is list and len(labels) == len(energies)
+            and all(type(label) is int and label >= 0 for label in labels) and len(set(labels)) == len(labels)
+            and all(positive(energy) for energy in energies))
+
+
+def ring_basis_from_saved(run_configuration, energy_selection, *, labels, monochromator_wavelength_m=None,
+                          epochs=None, kind='run', unreadable=()):
+    """One saved Int output's ring basis, or a typed refusal; malformed content refuses rather than raises.
+
+    Geometry comes only from the output's own record: its accepted PONI values and detector configuration, its
+    saved plan arguments through the Run's own plan route (:func:`execution_plan_shape`), and its effective
+    energy — the energy selection, or for an older output without one its recorded monochromator wavelength (D2).
+    When the selection lists per-frame energies, only the last Append epoch's labels are eligible (D5).
+    ``unreadable`` names the record nodes that exist but could not be read.
+    """
+    import json
+    from dataclasses import replace
+    from xrd_tools import geometry_figures as gf
+    from xrd_tools.integrate.calibration import (
+        detector_calibration_from_projection, detector_calibration_to_integrator)
+    from xrd_tools.session.run_configuration import FrozenGIConfiguration
+    if kind == 'average':
+        return RingRefusal(gf.SAVED_AVERAGE_REASON, kind)
+    if kind == 'reintegrate':
+        return RingRefusal(gf.SAVED_REINTEGRATE_REASON, kind)
+    if 'run_configuration' in unreadable or (run_configuration is not None
+                                             and not isinstance(run_configuration, Mapping)):
+        return RingRefusal(gf.SAVED_RECORD_MALFORMED_REASON)
+    signature = (run_configuration or {}).get('scientific_signature')
+    assets = signature.get('accepted_scientific_assets') if isinstance(signature, Mapping) else None
+    if not isinstance(assets, Mapping) or not isinstance(assets.get('poni_values'), Mapping):
+        return RingRefusal(gf.SAVED_NO_CALIBRATION_REASON)
+    if assets.get('poni_detector_config_json') is None:
+        return RingRefusal(gf.SAVED_NO_DETECTOR_CONFIG_REASON)
+    if 'energy_selection' in unreadable or (energy_selection is not None
+                                            and not _valid_energy_selection(energy_selection)):
+        return RingRefusal(gf.SAVED_ENERGY_MALFORMED_REASON)
+    if energy_selection is None and monochromator_wavelength_m is None:
+        return RingRefusal(gf.SAVED_NO_ENERGY_REASON)
+    per_frame = energy_selection is not None and 'frame_energies_eV' in energy_selection
+    if per_frame and (epochs is None or 'append_lineage' in unreadable):
+        return RingRefusal(gf.SAVED_HISTORY_UNREADABLE_REASON)
+    wavelength = monochromator_wavelength_m if energy_selection is None else energy_selection.get('wavelength_m')
+    try:
+        calibration = detector_calibration_from_projection(
+            dict(assets['poni_values']), detector_config=json.loads(assets['poni_detector_config_json']))
+        if wavelength is not None:
+            calibration = replace(calibration, poni=replace(calibration.poni, wavelength=wavelength))
+        integrator = detector_calibration_to_integrator(calibration)
+        one, two, values = execution_plan_shape(
+            run_configuration['bai_1d_args'], run_configuration['bai_2d_args'],
+            FrozenGIConfiguration.from_dict(run_configuration['gi']), run_configuration['processing_mode'])
+        base = effective_ring_geometry(calibration, integrator=integrator,
+                                       plan=build_native_int_reduction_plan_from_args(one, two, **values))
+        shape = tuple(int(size) for size in integrator.detector.shape)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return RingRefusal(gf.SAVED_RECORD_MALFORMED_REASON)
+    reason = gf.detector_ring_unavailable(base, shape)
+    if reason:
+        return RingRefusal(reason)
+    held = frozenset(labels)
+    return RingBasis(base, MappingProxyType(frame_ring_wavelengths(energy_selection)), held,
+                     held & frozenset(epochs[-1] if epochs else ()) if per_frame else held, shape)
+
+
+def ring_basis_for_record(path, *, entry='entry', labels):
+    """Read one processed output's ring facts (bounded, local, once) and return its basis or refusal."""
+    from xrd_tools.io.browse_presentation import read_ring_record
+    record = read_ring_record(path, entry=entry)
+    return ring_basis_from_saved(
+        record.run_configuration, record.energy_selection, labels=labels,
+        monochromator_wavelength_m=record.monochromator_wavelength_m, epochs=record.epochs, kind=record.kind,
+        unreadable=record.unreadable)
 
 
 def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=None,

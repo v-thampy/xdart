@@ -1152,11 +1152,18 @@ def _nice_q_levels(lo, hi):
     return tuple(i*step for i in range(start,stop+1))
 
 
-def predict_detector_grid(snapshot, *, shape, choice='q + χ', mode='2d', step_px=2., q_levels=None):
+def detector_grid_note(choice, *, saved):
+    """The grid's informational note while it is enabled: a saved output's frame withholds χ (D4(c))."""
+    return GRID_CHI_WITHHELD_NOTE if saved and choice in ('χ', 'q + χ') else ''
+
+
+def predict_detector_grid(snapshot, *, shape, choice='q + χ', mode='2d', step_px=2., q_levels=None, saved=False):
     """Analytic Standard-detector q contours and positive χ half-rays.
 
     Returned curves/text are read-only plain data. No source, image, integrator
     or detector-sized map is retained. Labels use the selected plan's offset.
+    A ``saved`` snapshot (a Browse frame's, rebuilt from its output's record)
+    draws the same q contours and no χ half-rays (BROWSE-REFERENCE-RINGS D4(c)).
     """
     import json
     from xrd_tools.core.containers import PONI
@@ -1195,13 +1202,14 @@ def predict_detector_grid(snapshot, *, shape, choice='q + χ', mode='2d', step_p
                     continue
                 texts.append(Text(name,tuple(anchor),name,tip)); anchors.append(anchor)
                 return
+    source = 'recorded' if saved else 'Run'
     if choice in ('q','q + χ'):
         for q in levels:
             theta = 2*math.asin(q*wavelength/(4*math.pi))
             append(f'q {q:g}', display_arcs(points,theta,shape,step_px/.4),
-                   f'q {q:g} Å⁻¹; detector-frame coordinate at this frame’s Run wavelength. Display only.',
+                   f'q {q:g} Å⁻¹; detector-frame coordinate at this frame’s {source} wavelength. Display only.',
                    math.degrees(theta))
-    if choice in ('χ','q + χ'):
+    if choice in ('χ','q + χ') and not saved:
         offset = float(snapshot.get('azimuth_offset_'+mode,0.))
         # At the beam/antipode χ is undefined. Stay outside the floating-point
         # cancellation neighbourhood as well as the exact singular point.
@@ -1217,13 +1225,37 @@ def predict_detector_grid(snapshot, *, shape, choice='q + χ', mode='2d', step_p
                   curves=tuple(curves),texts=tuple(texts))
 
 
-RUN_RING_REASON = ("Predicted rings are drawn only on a Run's frames while that Run is shown. "
-                   "Frames opened from a file, and Average or Reintegrate results, carry no ring geometry.")
+RUN_RING_REASON = ("Predicted rings need the frame's own geometry: a Run's frames carry it while the Run is shown, "
+                   "and a saved Int output's frames when the output records its calibration, detector configuration "
+                   "and energy. Average and Reintegrate results carry none.")
 #: while the current Run frame's image is still loading (P3a residual 9); its own reason, or none, follows
 LOADING_RING_REASON = "Predicted rings wait for this Run frame's image, which is loading."
+#: the same for a Browse frame whose saved output supplies its rings (BROWSE-REFERENCE-RINGS-20261013)
+BROWSE_LOADING_RING_REASON = "Predicted rings wait for this saved frame's image, which is loading."
 #: the coordinate grid's own wording of RUN_RING_REASON (R4)
-GRID_RUN_REASON = ("Coordinate grids are drawn only on a Run's frames while that Run is shown. Frames opened from a "
-                   "file, and Average or Reintegrate results, carry no detector geometry.")
+GRID_RUN_REASON = ("The coordinate grid needs the frame's own detector geometry: a Run's frames carry it while the "
+                   "Run is shown, and a saved Int output's frames when the output records its calibration, detector "
+                   "configuration and energy. Average and Reintegrate results carry none.")
+#: shown with the grid's tooltip while a saved output's frame withholds χ half-rays (D4(c))
+GRID_CHI_WITHHELD_NOTE = ("χ half-rays are drawn only on a Run's frames; a saved output's frame shows q contours "
+                          "only.")
+#: why a saved Int output's frame draws no predicted rings (BROWSE-REFERENCE-RINGS-20261013)
+SAVED_NO_CALIBRATION_REASON = "Predicted rings need the calibration this output saved, and it saved none."
+SAVED_NO_DETECTOR_CONFIG_REASON = ("Predicted rings need the detector configuration this output saved; older outputs "
+                                   "did not save it.")
+SAVED_NO_ENERGY_REASON = "Predicted rings need the energy this output recorded, and it recorded none."
+SAVED_ENERGY_MALFORMED_REASON = "Predicted rings are unavailable: this output's recorded energies are unreadable."
+SAVED_HISTORY_REASON = ("Predicted rings are drawn only for an energy scan's last Append batch: the saved record "
+                        "cannot prove an earlier batch's frame energies.")
+SAVED_HISTORY_UNREADABLE_REASON = ("Predicted rings are unavailable: this energy scan's Append history is missing or "
+                                   "unreadable, so its frame energies cannot be proven.")
+SAVED_AVERAGE_REASON = "Predicted rings are unavailable for an Average result, which carries no ring geometry."
+SAVED_REINTEGRATE_REASON = ("Predicted rings are unavailable for a Reintegrate version; open the output it was made "
+                            "from.")
+SAVED_RECORD_MALFORMED_REASON = "Predicted rings are unavailable: this output's saved run configuration is unreadable."
+SAVED_LABEL_ABSENT_REASON = "Predicted rings are unavailable: this frame is not in the saved output."
+RING_SHAPE_MISMATCH_REASON = ("Predicted rings are unavailable: this image's shape differs from the detector the output "
+                              "saved.")
 PARALLAX_RING_REASON = ('Predicted rings are unavailable for runs reduced with detector sensor parallax '
     "correction: this display-only overlay's flat-detector ring model does not include parallax.")
 

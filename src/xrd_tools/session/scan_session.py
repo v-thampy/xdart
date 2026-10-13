@@ -92,6 +92,7 @@ from .dynamic_accounting import (
     DynamicRunState,
 )
 from .frame_record_store import FrameRecordStore
+from .readiness import frame_ring_wavelengths
 from .policy import (SessionPolicy, _int, requirements_from,
                      resolve_session_policy)
 from .stage_accounting import (
@@ -470,10 +471,9 @@ class ScanSession:
             _dynamic_batch_settlement_authority_cb
         )
         self._ring_geometry = ring_geometry
-        selection = source.extra.get('energy_selection', {}) if ring_geometry is not None else {}
-        from xrd_tools.core.energy import energy_eV_to_wavelength_m
-        self._ring_wavelengths = dict(zip(selection.get('frame_labels', ()),
-            map(energy_eV_to_wavelength_m, selection.get('frame_energies_eV', ()))))
+        # The one per-label rule a saved output's rings also use (BROWSE-REFERENCE-RINGS-20261013).
+        self._ring_wavelengths = frame_ring_wavelengths(
+            source.extra.get('energy_selection', {}) if ring_geometry is not None else {})
         if dynamic_accounting is not None and record_store_persisted_on_write:
             raise RuntimeError(
                 "dynamic durable truth is owned only by the writer boundary"
