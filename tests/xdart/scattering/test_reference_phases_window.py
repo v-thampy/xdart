@@ -327,8 +327,11 @@ def test_rw5_calibrants_draw_on_the_phase_path_with_p3a_semantics(qapp, tmp_path
                 assert not view.phase_families and not window.phase_source.isEnabled()
                 assert window.phase_source.toolTip()
             else:
-                assert ("Predicted rings are drawn only on a Run's frames while that Run is shown."
-                        in window.rings_note.text()), window.rings_note.text()
+                # BROWSE-REFERENCE-RINGS-20261013 (superseded text): saved Int outputs now draw rings too, so the
+                # generic reason states the rule rather than "only on a Run's frames".
+                from xrd_tools.geometry_figures import RUN_RING_REASON
+                assert window.rings_note.text() == RUN_RING_REASON, window.rings_note.text()
+                assert 'opened from a file' not in RUN_RING_REASON and "only on a Run's frames" not in RUN_RING_REASON
         finally:
             shell.close()
             shell.deleteLater()
