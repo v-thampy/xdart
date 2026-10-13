@@ -61,13 +61,13 @@ def _acquisition(tmp_path, points=1):
     return raw, spec
 
 
-def _run(tmp_path, raw, request_value, fmt='spec'):
+def _run(tmp_path, raw, request_value, fmt='spec', mode='Overwrite'):
     poni = tmp_path / 'cal.poni'
     write_poni(poni)
     executor = StandardRunExecutor(join_timeout=2.)
     identity = _start(executor, RunIntent(
         source_spec=DirectorySourceSpec(raw, suffixes=('.tif',), metadata_format=fmt), poni_file=str(poni),
-        project_root=str(raw), save_path=str(tmp_path / 'processed'), output_mode='Overwrite',
+        project_root=str(raw), save_path=str(tmp_path / 'processed'), output_mode=mode,
         processing_mode='Int 1D', live_mode=True, max_cores=1, bai_1d_args={'npt': 8, 'method': 'numpy'}),
         request_value=request_value)
     return executor, identity
@@ -260,3 +260,28 @@ def test_l8_an_image_without_its_spec_file_waits_for_it(tmp_path):
     assert waiting and '1 pending' in waiting[-1], waiting
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert _output(tmp_path) == ((1,), (100.0,))
+
+
+def test_p1_an_aborted_point_then_a_later_scan_does_not_fail_an_append_run(tmp_path):
+    """Self-review, after the first implementation: a point whose image landed but whose row never will (an
+    aborted scan), then the next scan's lines growing the SPEC file, in Append mode."""
+    raw, spec = _acquisition(tmp_path, points=2)
+    executor, identity = _run(tmp_path, raw, 5109, mode='Append')
+    events = []
+    try:
+        _wait(executor, events, _reduced(2), 20.)
+        _image(raw, 1, 2)  # point 3's image; its row never comes
+        _settle(executor, events)
+        with spec.open('a') as stream:
+            stream.write('\n')
+        _scan(spec, 2)
+        _row(spec, 2, 0)
+        _image(raw, 2, 0)
+        _wait(executor, events, _reduced(1, scan=2), 20.)
+        _settle(executor, events)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert '1 pending' in terminal[0][1], terminal
+    assert _output(tmp_path, 1) == ((1, 2), (100.0, 101.0))
+    assert _output(tmp_path, 2) == ((1,), (200.0,))
