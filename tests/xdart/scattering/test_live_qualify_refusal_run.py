@@ -1,4 +1,5 @@
-"""LIVE-QUALIFY-REFUSAL-20261012 frozen live-Run oracle (Claude, October 12): Q1-Q5, Q7, Q9, P1-P2.
+"""LIVE-QUALIFY-REFUSAL-20261012 frozen live-Run oracle (Claude, October 12): Q1-Q5, Q7, Q9, P1-P2; Q3e, Q3f
+and Q4c added before any production edit, after the maintainer chose that Auto waits one poll.
 
 Real live Runs: a StandardRunExecutor watches a directory whose images carry metadata sidecars. Every row keeps
 every drained event (no helper that discards events on a timeout), waits for its own predicate, ends with an
@@ -107,11 +108,12 @@ def _stop(executor, identity, events):
     return _terminals(events)
 
 
-def _published(executor, identity, timeout=30.):
-    """The published attempt's source digest and member count, as Append records them, once it has settled
-    (FRAME_READY arrives before the attempt settles)."""
+def _published(executor, identity, timeout=30., members=1):
+    """The published attempt's source digest and member count, as Append records them, once an attempt with
+    ``members`` frames has settled (FRAME_READY arrives before the attempt settles)."""
     deadline = time.monotonic() + timeout
-    while not (attempts := executor.processed_live_revisions(identity)):
+    while not ((attempts := executor.processed_live_revisions(identity))
+               and len(attempts[0].decision.item.source_stamp.members) == members):
         assert time.monotonic() < deadline, 'the published attempt never settled'
         time.sleep(.01)
     assert len(attempts) == 1, attempts
@@ -292,6 +294,59 @@ def test_q3d_a_pending_frame_holds_up_neither_another_scan_nor_unrelated_directo
     assert '1 pending' in terminal[0][1], terminal
 
 
+def test_q3e_under_auto_a_sidecar_landing_just_after_its_image_is_picked_up(tmp_path, monkeypatch):
+    """Maintainer, October 12: under Auto a frame waits one poll, so a near-simultaneous sidecar is read."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    _frame(raw, 'scan', 1, 'txt', 1.0)
+    armed, wrote, real = threading.Event(), [], run_executor.materialize_live_directory_group
+
+    def materialize(*args, **kwargs):
+        attempt = real(*args, **kwargs)
+        if armed.is_set() and not wrote and any(Path(path).name == 'scan_0002.tif' for path in args[3].physical_paths):
+            # The sidecar lands 30 ms after the first admission attempt saw the image alone: after an immediate
+            # construction has checked the frame, well before the next poll.
+            wrote.append(threading.Timer(.03, (raw / 'scan_0002.txt').write_text, (SIDECARS['txt'](2.0),)))
+            wrote[0].start()
+        return attempt
+    monkeypatch.setattr(run_executor, 'materialize_live_directory_group', materialize)
+    executor, identity = _run(tmp_path, raw, 'auto', 3220)
+    events = []
+    try:
+        _wait(executor, events, lambda values: 1 in _labels(values) or _terminal(values))
+        armed.set()
+        _frame(raw, 'scan', 2, 'txt', 2.0, sidecar=False)
+        _wait(executor, events, lambda values: 2 in _labels(values) or _terminal(values))
+        _settle(executor, events)
+    finally:
+        for timer in wrote:
+            timer.join()
+        terminal = _stop(executor, identity, events)
+    assert len(wrote) == 1
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert not _said(events, 'scan_0002.txt'), 'no output was stopped'
+    labels, i0, _epoch = _output(tmp_path)
+    assert (labels, i0) == ((1, 2), (1.0, 2.0))
+
+
+def test_q3f_under_auto_a_frame_without_any_sidecar_is_still_reduced_without_metadata(tmp_path):
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    _frame(raw, 'scan', 1, 'txt', 1.0)
+    executor, identity = _run(tmp_path, raw, 'auto', 3230)
+    events = []
+    try:
+        _wait(executor, events, lambda values: 1 in _labels(values) or _terminal(values))
+        _frame(raw, 'scan', 2, 'txt', 2.0, sidecar=False)  # no sidecar, ever
+        _wait(executor, events, lambda values: 2 in _labels(values) or _terminal(values))
+        _settle(executor, events)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    labels, i0, _epoch = _output(tmp_path)
+    assert labels == (1, 2) and i0[0] == 1.0 and np.isnan(i0[1]), (labels, i0)
+
+
 def test_q4a_a_published_sidecar_changed_at_the_same_extent_stops_its_output_growing(tmp_path):
     raw = tmp_path / 'raw'
     raw.mkdir()
@@ -351,6 +406,29 @@ def test_q4b_a_published_sidecar_change_arriving_with_the_next_image_is_still_fe
     assert (epoch['digest'], epoch['extent']) == (digest, published)
     labels, i0, _epoch = _output(tmp_path, 'other')
     assert (labels, i0) == ((1,), (7.0,))
+
+
+def test_q4c_under_auto_a_sidecar_appearing_after_its_frame_was_published_stops_that_output(tmp_path):
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    _frame(raw, 'scan', 1, 'txt', 1.0)
+    executor, identity = _run(tmp_path, raw, 'auto', 3240)
+    events = []
+    try:
+        _wait(executor, events, lambda values: 1 in _labels(values) or _terminal(values))
+        _frame(raw, 'scan', 2, 'txt', 2.0, sidecar=False)
+        _wait(executor, events, lambda values: 2 in _labels(values) or _terminal(values))
+        digest, published = _published(executor, identity, members=2)
+        (raw / 'scan_0002.txt').write_text(SIDECARS['txt'](2.0))  # appears after frame 2 was published
+        _wait(executor, events, lambda values: _said(values, 'scan_0002.txt') or _terminal(values))
+        _settle(executor, events)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert 'scan_0002.txt' in terminal[0][1], terminal
+    labels, i0, epoch = _output(tmp_path)
+    assert labels == (1, 2) and i0[0] == 1.0 and np.isnan(i0[1]), (labels, i0)
+    assert (epoch['digest'], epoch['extent']) == (digest, published)
 
 
 def test_q5_an_explicit_sidecar_that_never_arrives_keeps_its_frame_pending_until_stop(tmp_path):
