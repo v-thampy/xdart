@@ -277,12 +277,15 @@ def test_h2_the_maintainers_outputs_refuse_with_their_own_reasons_beside_an_elig
     labels = _labels(eligible)
     basis = ring_basis_for_record(eligible, labels=labels)
     assert basis.frame_snapshot(labels[0]) is not None and basis.shape == (2167, 2070)
-    for name, reason in (('eiger_S069Ta_redo_eta2p0_1_scan001_master_average.nexus', gf.SAVED_AVERAGE_REASON),
-                         ('eiger_S069Ta_redo_eta2p0_1_scan001_reintegrate1d.nexus', gf.SAVED_REINTEGRATE_REASON),
-                         ('eiger_S069Ta_redo_eta2p0_1_scan001.nexus', gf.SAVED_NO_DETECTOR_CONFIG_REASON)):
-        refused = ring_basis_for_record(SAVED / name, labels=_labels(SAVED / name))
-        first = _labels(SAVED / name)[0]
-        assert refused.frame_snapshot(first) is None and refused.frame_reason(first) == reason, (name, reason)
+    # The older, slot-less output (schema 2, no detector configuration) is saved under test_data/eiger/.
+    for path, reason in ((SAVED / 'eiger_S069Ta_redo_eta2p0_1_scan001_master_average.nexus', gf.SAVED_AVERAGE_REASON),
+                         (SAVED / 'eiger_S069Ta_redo_eta2p0_1_scan001_reintegrate1d.nexus',
+                          gf.SAVED_REINTEGRATE_REASON),
+                         (Path(DATA) / 'eiger' / 'xdart_processed_data' / 'eiger_S069Ta_redo_eta2p0_1_scan001.nexus',
+                          gf.SAVED_NO_DETECTOR_CONFIG_REASON)):
+        refused = ring_basis_for_record(path, labels=_labels(path))
+        first = _labels(path)[0]
+        assert refused.frame_snapshot(first) is None and refused.frame_reason(first) == reason, (path.name, reason)
 
 
 def test_h2b_synthetic_refusals_beside_their_eligible_original(qapp, tmp_path):
