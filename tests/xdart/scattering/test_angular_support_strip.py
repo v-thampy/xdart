@@ -233,6 +233,7 @@ def test_d3b_saved_average_and_reintegrate_outputs_name_their_reasons(qapp, tmp_
                               SupportReason.LEGACY_REINTEGRATE)):
             copy = tmp_path / name
             shutil.copy2(SAVED / name, copy)
+            _wait(qapp, lambda: not page._context_controller.browse_preview_polling_needed)
             _reopen(qapp, page, copy)
             _wait(qapp, lambda: REASON_TEXT[reason] in view.angular_support_message())
             assert not _curves(view)

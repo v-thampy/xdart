@@ -1175,19 +1175,23 @@ def drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
             data = data[keep_mask]
         datasets.append((
             key, data, dict(obj.attrs.items()),
-            _recreate_filter_kwargs(obj), row_aligned, obj.chunks,
+            _recreate_filter_kwargs(obj), row_aligned, obj.chunks, obj.maxshape,
         ))
 
     del parent[name]
     new_group = parent.create_group(name)
     for key, value in group_attrs.items():
         new_group.attrs[key] = value
-    for (key, data, attrs, filter_kwargs, row_aligned, chunks) in datasets:
+    for (key, data, attrs, filter_kwargs, row_aligned, chunks, maxshape) in datasets:
         kwargs = {}
         if row_aligned:
             kwargs["maxshape"] = (None,) + tuple(np.asarray(data).shape[1:])
             if chunks is not None:
                 kwargs["chunks"] = chunks
+        elif chunks is not None:
+            # Optional label-keyed tables are not frame-aligned, but must remain
+            # appendable after row surgery just as they were before it.
+            kwargs.update(chunks=chunks, maxshape=maxshape)
         kwargs.update(filter_kwargs)
         # A filter requires chunking; restore the source chunks if the recreate
         # path above didn't already set them (non-row-aligned filtered datasets).

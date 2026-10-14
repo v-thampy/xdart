@@ -133,8 +133,9 @@ def _datasets(group: Any) -> tuple | None:
     if deg.dtype != np.dtype("<f4") or deg.ndim != 2:
         raise AngularSupportFormatError("angular_support_deg must be a float32 (K, n) table")
     encoding = h5py.check_string_dtype(meta.dtype)
-    if encoding is None or meta.ndim != 1 or meta.shape[0] != deg.shape[0]:
-        raise AngularSupportFormatError("angular_support_meta must hold one string per table row")
+    if (encoding is None or encoding.encoding != "utf-8" or encoding.length != MAX_META_BYTES
+            or meta.ndim != 1 or meta.shape[0] != deg.shape[0]):
+        raise AngularSupportFormatError("angular_support_meta must hold one fixed 4096-byte UTF-8 string per row")
     if rows.dtype != np.dtype("<i8") or rows.ndim != 2 or rows.shape[1] != 2:
         raise AngularSupportFormatError("angular_support_rows must be int64 (M, 2)")
     if digest.dtype != np.dtype("u1") or digest.ndim != 2 or digest.shape != (rows.shape[0], 16):
@@ -244,6 +245,7 @@ class SupportTableReader:
             raise AngularSupportFormatError("a frame label has two angular support entries")
         self._deg, self._meta, self._points = deg, meta, int(deg.shape[1])
         self._stale_axis = _attr_text(deg, AXIS_SHA256_ATTR) != axis_sha256(axis[()])
+        self._axis_unit = _attr_text(axis, "units")
         self._entries = {int(label): (int(row), digests[number].tobytes())
                          for number, (label, row) in enumerate(entries)}
 
@@ -261,7 +263,8 @@ class SupportTableReader:
             return AngularSupportProfile.unavailable(SupportReason.NO_SAVED_SUPPORT, origin=SupportOrigin.SAVED)
         row, saved_digest = entry
         saved = self.table_profile(row)
-        if self._stale_axis or intensity_row is None or intensity_digest(intensity_row) != saved_digest:
+        if (self._stale_axis or (saved.available and saved.radial_unit != self._axis_unit)
+                or intensity_row is None or intensity_digest(intensity_row) != saved_digest):
             return AngularSupportProfile.unavailable(SupportReason.STALE_SAVED_SUPPORT, origin=SupportOrigin.SAVED)
         return saved
 
