@@ -68,10 +68,18 @@ def _settings(name):
 
 
 def _choose(qapp, row, token):
+    """A user's choice in a combo row: real arrow keys on the closed menu, Qt's activation, which FormRow commits
+    on the next event-loop turn (it ignores a programmatic index change). The shown item needs no key."""
     editor = row.editor
     index = editor.findData(token)
     assert index >= 0, (token, [editor.itemData(i) for i in range(editor.count())])
-    editor.setCurrentIndex(index)
+    key = QtCore.Qt.Key.Key_Down if index > editor.currentIndex() else QtCore.Qt.Key.Key_Up
+    for _ in range(editor.count()):
+        if editor.currentIndex() == index:
+            break
+        QtTest.QTest.keyClick(editor, key)
+    assert editor.currentIndex() == index
+    qapp.processEvents()
     qapp.processEvents()
 
 
