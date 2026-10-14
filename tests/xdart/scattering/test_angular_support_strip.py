@@ -441,9 +441,11 @@ def test_d8_stitch_run_browse_and_exclusions(qapp, tmp_path):
         page.shutdown()
         page.deleteLater()
         qapp.processEvents()
-    # the saved result reopens with its saved support, through Stitch and through Int Browse, original inputs hidden
-    copy = tmp_path / 'copy.nexus'
-    shutil.copy2(target, copy)
+    # the saved result reopens with its saved support, through Stitch and through Int Browse, original inputs hidden.
+    # Test-only oracle repair: a stitched record reads only at the path it records ("private candidate path",
+    # analysis_artifact.py:2192 at cf49f3cb), so the result reopens where it was written, its source moved away.
+    copy = target
+    shutil.move(str(tmp_path / 'source'), str(tmp_path / 'hidden'))
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.open_result(copy)
