@@ -479,6 +479,11 @@ def _light_policy_layout(
         ),
         margin=8,
     ))
+    # COVERAGE-SUPPORT-20261013 decision 6: the Run's frozen “Record angular coverage” choice rides its policy
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy, DEFAULT_RECORD_ANGULAR_SUPPORT
+    record = configuration.run_options.get("record_angular_support", DEFAULT_RECORD_ANGULAR_SUPPORT)
+    policy = replace(policy, angular_support=AngularSupportPolicy(
+        enabled=record if type(record) is bool else DEFAULT_RECORD_ANGULAR_SUPPORT))
     one_d = getattr(plan, "integration_1d", None)
     modes = tuple(mode.key for mode in required_result_modes(plan)
                   if mode.kind == "1d")

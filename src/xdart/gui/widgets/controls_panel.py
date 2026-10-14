@@ -71,6 +71,11 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
     # Processing / conditioning
     ("Signal", "series_average"): (
         "Average all frames in the series into one frame before integration."),
+    ("Int1D", "record_angular_support"): (
+        "Record angular coverage: with each new 1-D profile, compute and save how many degrees of its χ window "
+        "the detector's unmasked pixels reach in every radial bin (shown by Plot Options' “Angular coverage” "
+        "strip). This is angular reach, not a pixel count, and it never changes intensity. Turn off to skip the "
+        "work: the result then records that it was off, and Browse does not reconstruct it."),
     ("Mask", "Threshold"): (
         "Exclude values outside the inclusive [min, max] band per frame. "
         "Automatic: values at or above the detector's saturation are left out. "

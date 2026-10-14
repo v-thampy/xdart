@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
+from xrd_tools.analysis.angular_support import DEFAULT_RECORD_ANGULAR_SUPPORT
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.core.filters import compile_filter
 from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
@@ -63,6 +64,7 @@ from .controls_inventory import (
     OUTPUT_MODE,
     PONI_FILE,
     PROJECT_ROOT,
+    RECORD_ANGULAR_SUPPORT,
     SAVE_PATH,
     SOURCE_DIRECTORY,
     SOURCE_EDIT_PATHS,
@@ -515,6 +517,18 @@ def reduce_control_edit(
         if type(current) is bool and current is value:
             return EditNoChange()
         intent.run_options["series_average"] = value
+        return intent
+    if path == RECORD_ANGULAR_SUPPORT:
+        if type(value) is not bool:
+            return EditRefusal("Record angular coverage requires true or false.")
+        intent = snapshot.thaw()
+        current = intent.run_options.get("record_angular_support", DEFAULT_RECORD_ANGULAR_SUPPORT)
+        if type(current) is bool and current is value:
+            return EditNoChange()
+        if value is DEFAULT_RECORD_ANGULAR_SUPPORT:  # the default needs no option (unchanged fingerprints)
+            intent.run_options.pop("record_angular_support", None)
+        else:
+            intent.run_options["record_angular_support"] = value
         return intent
     if path in BACKGROUND_EDIT_PATHS:
         return _reduce_background_edit(snapshot, path, value)

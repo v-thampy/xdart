@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 from xdart.gui.pages.operation_owner import (
     OperationIdentity,
@@ -237,6 +238,8 @@ class _WorkerCommand:
     #: a Run's frame workers (the run bar's Cores): the result is the same for any count
     workers: int = 1
     export_paths: tuple[str, ...] = ()
+    #: a Run's frozen “Record angular coverage” policy (an AngularSupportPolicy; None: the default)
+    angular_support: Any = None
 
     def __post_init__(self) -> None:
         if (
@@ -285,8 +288,13 @@ class _WorkerCommand:
         if (not valid or (self.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.FRAME_READ, StitchOwnerAction.METADATA} and self.artifact_path)
             or (self.action is not StitchOwnerAction.FRAME_READ and self.frame_request is not None)
             or (self.action is not StitchOwnerAction.METADATA and (self.metadata_payload is not None or self.source_root is not None))
-            or (self.action is not StitchOwnerAction.RUN and self.workers != 1)):
+            or (self.action is not StitchOwnerAction.RUN and self.workers != 1)
+            or (self.action is not StitchOwnerAction.RUN and self.angular_support is not None)):
             raise TypeError("Stitch worker command fields disagree")
+        if self.angular_support is not None:
+            from xrd_tools.analysis.angular_support import AngularSupportPolicy
+            if type(self.angular_support) is not AngularSupportPolicy:
+                raise TypeError("a Run's angular support policy must be an AngularSupportPolicy")
         if self.export_paths and self.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.RUN,
                 StitchOwnerAction.RETRY_CLEANUP, StitchOwnerAction.RETRY_VERIFICATION}:
             raise TypeError("only Run or explicit Append may publish XYE companions")
@@ -486,8 +494,10 @@ class StitchToolOwner:
                 source_root=None if source_root is None else str(source_root),
             ))
 
-    def begin_run(self, job_index: int = 0, workers: int = 1, *, export_paths: tuple[str, ...] = ()) -> OperationIdentity | None:
-        """Run the prepared output ``job_index`` with ``workers`` frame workers (the run bar's Cores)."""
+    def begin_run(self, job_index: int = 0, workers: int = 1, *, export_paths: tuple[str, ...] = (),
+                  angular_support: Any = None) -> OperationIdentity | None:
+        """Run the prepared output ``job_index`` with ``workers`` frame workers (the run bar's Cores) and the
+        page's frozen “Record angular coverage” policy (``angular_support``; None: the default)."""
         if type(workers) is not int or workers < 1:
             raise TypeError("Stitch workers must be a positive int")
         with self._lock:
@@ -519,6 +529,7 @@ class StitchToolOwner:
                 execution=execution,
                 workers=workers,
                 export_paths=export_paths,
+                angular_support=angular_support,
             )
             identity = self._begin_locked(command)
             if identity is not None:
@@ -639,12 +650,15 @@ class StitchToolOwner:
                 if request.preflight.form.source_selection is not None:
                     from .stitch_native_values import create_native_output_directory
                     create_native_output_directory(execution.request)
+                # the page's frozen “Record angular coverage” policy, when it gave one (None: the run's default)
+                support = {} if request.angular_support is None else {"angular_support": request.angular_support}
                 result = execution.run(
                     cancel_token=cancel,
                     progress_callback=lambda progress: publish(
                         progress.stage, progress.completed, progress.total
                     ),
                     workers=request.workers,
+                    **support,
                 )
             elif request.action is StitchOwnerAction.RETRY_CLEANUP:
                 publish("cleanup", 0, 1)

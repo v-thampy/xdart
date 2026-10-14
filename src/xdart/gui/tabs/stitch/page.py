@@ -36,7 +36,7 @@ from xdart.gui.tools.correction_values import correction_rows
 from xdart.gui.tools.page_settings import PageSettings
 from xdart.gui.tools.stitch_values import StitchFrameSelector, StitchToolForm
 from xdart.gui.widgets.controls_panel import (
-    PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, RangeRow, SubsectionCard,
+    PROCESSING_ROW_GAP, PROCESSING_ROW_LABEL_WIDTH, ControlsPanel, FormRow, PillRow, RangeRow, SubsectionCard,
 )
 from xdart.gui.widgets.camera_editor import CAMERA_LABELS
 from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
@@ -49,6 +49,7 @@ from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_widgets import foldable
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xdart.gui.tabs.stitch.settings import STITCH_SETTINGS, apply_page_settings, page_settings
+from xrd_tools.analysis.angular_support import AngularSupportPolicy, DEFAULT_RECORD_ANGULAR_SUPPORT
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.stitch_native import native_ceilings
 from xrd_tools.analysis.stitch_operation import StitchFoilNormalization, StitchGeometryKind
@@ -63,7 +64,7 @@ from xrd_tools.session.readiness import (
 from xdart.gui.tabs.scattering.controls_inventory import (
     GI_1D_AXES, GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, INT_1D_AXIS, INT_1D_AZIM_AUTO, INT_1D_AZIM_HIGH,
     INT_1D_AZIM_LOW, INT_1D_POINTS, INT_1D_RADIAL_AUTO,
-    MASK_FILE, PONI_FILE,
+    MASK_FILE, PONI_FILE, RECORD_ANGULAR_SUPPORT,
     INT_1D_RADIAL_HIGH, INT_1D_RADIAL_LOW, INT_2D_AXIS, INT_2D_AZIM_AUTO, INT_2D_AZIM_HIGH, INT_2D_AZIM_LOW,
     INT_2D_AZIM_POINTS, INT_2D_RADIAL_AUTO, INT_2D_RADIAL_HIGH, INT_2D_RADIAL_LOW, INT_2D_RADIAL_POINTS,
     SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, SOURCE_TYPE, STANDARD_1D_AXES, STANDARD_2D_AXES,
@@ -113,6 +114,8 @@ _PROCESSING = (
     ("1-D", "gi_oop_auto", ("Stitch", "gi_oop_auto"), True),
     ("1-D", "gi_oop_min", ("Stitch", "gi_oop_low"), 0.0),
     ("1-D", "gi_oop_max", ("Stitch", "gi_oop_high"), 1.0),
+    # Int's “Record angular coverage” toggle, its pill and tooltip (COVERAGE-SUPPORT-20261013 decision 6)
+    ("1-D", "record_angular_support", RECORD_ANGULAR_SUPPORT, DEFAULT_RECORD_ANGULAR_SUPPORT),
     ("2-D", "map_axis", INT_2D_AXIS, "Q-χ"),
     ("2-D", "npt_rad_2d", INT_2D_RADIAL_POINTS, "1000"),
     ("2-D", "npt_azim_2d", INT_2D_AZIM_POINTS, "360"),
@@ -427,6 +430,10 @@ class StitchPage(QtWidgets.QWidget):
         self._paths_by_kind = {}
         self._range_rows = []
         self._range_keys = set()
+        #: The toggles Int's composer lays out as pills (a PillRow), read and set by key as any row.
+        self._pill_keys = set()
+        #: The “Record angular coverage” policy frozen when Run is clicked, for each of its jobs.
+        self._run_angular_support = None
         #: Each field's key by its path (Int's for the rows Int's composer builds).
         self._keys_by_path = {}
         self._threshold_state = ThresholdState()
@@ -685,6 +692,14 @@ class StitchPage(QtWidgets.QWidget):
         self._keys_by_path[field.path] = key
         return row
 
+    def _bind_pill(self, key, field, row):
+        """A toggle Int's composer lays out as a pill (``PillRow``, with Int's tooltip): read and set by ``key``."""
+        row.valueChanged.connect(self._edited)
+        self._fields[key], self._rows[key] = field, row
+        self._keys_by_path[field.path] = key
+        self._pill_keys.add(key)
+        return row
+
     def _tip(self, key, text):
         self._rows[key].set_purpose_tooltip(text)
 
@@ -806,6 +821,8 @@ class StitchPage(QtWidgets.QWidget):
                         row.valueChanged.connect(self._range_edited)
                         row.draftChanged.connect(self._edited)
                         self._range_rows.append(row)
+                elif isinstance(row, PillRow):  # a toggle among Int's pills
+                    self._bind_pill(key, fields[key], row)
                 else:  # its projected field (a combo's kind and choices), which set_field applies
                     self._bind(key, fields[key], row)
         self._map_card = self._processing_cards["2-D"]
@@ -1346,7 +1363,13 @@ class StitchPage(QtWidgets.QWidget):
             switch = (normalization.MONITOR if value != "None" and choice == normalization.NONE
                       else normalization.NONE if value == "None" and choice == normalization.MONITOR else None)
         self._fields[key] = field
-        self._rows[key].apply_field(field)
+        if key in self._pill_keys:  # Int's pill row applies all of its toggles at once
+            row = self._rows[key]
+            row.apply_fields({self._fields[name].path: field if name == key
+                              else replace(self._fields[name], value=self._value(name))
+                              for name in self._pill_keys if self._rows[name] is row})
+        else:
+            self._rows[key].apply_field(field)
         if switch is not None:
             self.set_field("normalization", switch)
             return
@@ -1377,6 +1400,8 @@ class StitchPage(QtWidgets.QWidget):
     def _value(self, key):
         if key in self._range_keys:
             return self._fields[key].value
+        if key in self._pill_keys:
+            return dict(self._rows[key].current_edits())[self._fields[key].path]
         return self._rows[key].current_value()
 
     def _edited(self, *_args):
@@ -2182,6 +2207,8 @@ class StitchPage(QtWidgets.QWidget):
         # Typing still in a field is part of this Run's inputs: committed first, it makes the check
         # below run again instead of Append reusing Preview's (Codex testing-fixes review F1).
         self._commit_typing()
+        # “Record angular coverage” is frozen here, at Run start, for every job of this Run (decision 6)
+        self._run_angular_support = AngularSupportPolicy(enabled=bool(self._value("record_angular_support")))
         if self._prepared_revision != self._revision or self._owner.prepared is None:
             # As Int's Run: the inputs are checked on the way (Preview's preflight), then run.
             self._prepare("Checking the inputs…", then="run")
@@ -2222,7 +2249,8 @@ class StitchPage(QtWidgets.QWidget):
         position = self._job_total - len(self._queued_jobs)
         if not self._start(f"Running · {self._mode} · {position}/{self._job_total}{self._skip_note}{self._prepared_notes}",
                            lambda: self._owner.begin_run(job_index=index, workers=self.run_bar.get_cores(),
-                               export_paths=self._kept_export_paths if position == 1 else ())):
+                               export_paths=self._kept_export_paths if position == 1 else (),
+                               angular_support=self._run_angular_support)):
             self._queued_jobs.clear()
             self._prepared_revision = None  # the next Run prepares again
 

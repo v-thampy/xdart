@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
+from xrd_tools.analysis.angular_support import DEFAULT_RECORD_ANGULAR_SUPPORT
 from xrd_tools.core.scan import SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.session.control_labels import (
     range_axis_labels_1d,
@@ -19,6 +20,7 @@ from xrd_tools.session.readiness import (
     SectionId,
     Tool,
     gi_companion_modes_2d,
+    tool_from_mode_text,
 )
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import (
@@ -52,6 +54,9 @@ SOURCE_FILTER = ("Signal", "Filter")
 SOURCE_META = ("Signal", "meta_ext")
 SOURCE_ENERGY = ("Source", "energy_preference")
 AVERAGE_SCAN = ("Signal", "series_average")
+#: Whether a Run records each 1-D profile's angular coverage (COVERAGE-SUPPORT-20261013 decision 6); kept in
+#: ``RunIntent.run_options["record_angular_support"]`` and shared by Stitch's Processing row.
+RECORD_ANGULAR_SUPPORT = ("Int1D", "record_angular_support")
 BACKGROUND_TYPE = ("BG", "bg_type")
 BACKGROUND_FILE = ("BG", "File")
 BACKGROUND_DIRECTORY = ("BG", "Directory")
@@ -395,6 +400,7 @@ def project_control_fields(
             kind=spec.kind,
         )
 
+    add(SectionId.PROCESSING, "Record angular coverage", RECORD_ANGULAR_SUPPORT, kind=ControlFieldKind.BOOL)
     if source_type != "Single Image" and AVERAGE_SCAN in values:
         add(
             SectionId.PROCESSING,
@@ -557,6 +563,9 @@ def bound_values(
     ):
         values[AVERAGE_SCAN] = average
     values.update(integration_values(intent))
+    record = intent.run_options.get("record_angular_support", DEFAULT_RECORD_ANGULAR_SUPPORT)
+    if type(record) is bool and tool_from_mode_text(intent.processing_mode) in {Tool.INT_1D, Tool.INT_2D}:
+        values[RECORD_ANGULAR_SUPPORT] = record
     choices: dict[tuple[str, ...], tuple[str, ...]] = {
         SOURCE_TYPE: (
             "Image Series",
