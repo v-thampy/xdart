@@ -1317,12 +1317,49 @@ def xu_corner_grid(geometry: Any, acquisition: Mapping[str, Any], *, nu: float, 
     return two_theta, chi
 
 
+def _great_circle_subedges(t0: np.ndarray, p0: np.ndarray, t1: np.ndarray, p1: np.ndarray):
+    """Sub-edges no wider than 0.25° in φ along the exact images of straight pixel edges of a flat detector.
+
+    Seen from the sample, a straight edge is an arc of a great circle, so renormalised linear interpolation of its two
+    corner directions traces it exactly (only the parametrisation differs). An edge through the beam is refused.
+    """
+    step = (p1 - p0 + _PI) % _TWO_PI - _PI
+    pieces = np.maximum(1, np.ceil(np.abs(step) / _SUB_EDGE_PHI)).astype(np.int64)
+    simple = pieces == 1
+    out = [(t0[simple], p0[simple], t1[simple], p0[simple] + step[simple])]
+    split = np.flatnonzero(~simple)
+    if split.size:
+        counts = pieces[split]
+        owner = np.repeat(np.arange(split.size), counts + 1)
+        offset = np.arange(owner.size) - np.repeat(np.cumsum(counts + 1) - (counts + 1), counts + 1)
+        fraction = (offset / counts[owner])[:, None]
+
+        def direction(t, p):
+            return np.stack((np.cos(t), np.sin(t) * np.cos(p), np.sin(t) * np.sin(p)), axis=-1)
+        vector = ((1 - fraction) * direction(t0[split], p0[split])[owner]
+                  + fraction * direction(t1[split], p1[split])[owner])
+        vector /= np.linalg.norm(vector, axis=1, keepdims=True)
+        t = np.arccos(np.clip(vector[:, 0], -1.0, 1.0))
+        p = np.arctan2(vector[:, 2], vector[:, 1])
+        steps = (np.diff(p) + _PI) % _TWO_PI - _PI
+        boundaries = np.cumsum(counts + 1)
+        steps = np.delete(steps, boundaries[:-1] - 1)
+        if steps.size and np.max(np.abs(steps)) > _SINGULAR_STEP:
+            raise ValueError("an unmasked pixel edge passes through the beam")
+        keep = np.ones(t.size, bool)
+        keep[boundaries - 1] = False
+        tails = np.ones(t.size, bool)
+        tails[np.concatenate(([0], boundaries[:-1]))] = False
+        out.append((t[keep], p[keep], t[tails], p[keep] + steps))
+    return tuple(np.concatenate([part[i] for part in out]) for i in range(4))
+
+
 def footprint_from_corners(key: str, two_theta: np.ndarray, chi: np.ndarray,
                            mask: np.ndarray | None) -> SupportFootprint:
     """A detector-χ footprint from a full (N+1)×(M+1) corner grid of (2θ, χ) (XU's corners).
 
-    Pixel edges map corner to corner; an edge wider than 0.25° in χ (near the beam) cannot be resolved from the
-    grid alone, so the pose is refused rather than approximated.
+    Pixel edges map corner to corner; an edge wider than 0.25° in χ is subdivided along its exact great-circle image
+    (:func:`_great_circle_subedges`, no further XU evaluation), and an edge through the beam refuses the pose.
     """
     shape = (two_theta.shape[0] - 1, two_theta.shape[1] - 1)
     if chi.shape != two_theta.shape or min(shape) < 1 or (mask is not None and mask.shape != shape):
@@ -1344,11 +1381,10 @@ def footprint_from_corners(key: str, two_theta: np.ndarray, chi: np.ndarray,
         return SupportFootprint(key, "detector_chi", empty, empty, empty, empty, empty, empty, empty, False)
     t0, p0 = mapped(start[:, 0], start[:, 1])
     t1, p1 = mapped(end[:, 0], end[:, 1])
-    step = (p1 - p0 + _PI) % _TWO_PI - _PI
-    if step.size and np.max(np.abs(step)) > _SUB_EDGE_PHI:
-        return SupportFootprint(key, "detector_chi", reason=SupportReason.XU_GEOMETRY_UNQUALIFIED,
-                                detail="a pixel edge spans more than 0.25° of χ (too near the beam)")
-    p1 = p0 + step
+    try:
+        t0, p0, t1, p1 = _great_circle_subedges(t0, p0, t1, p1)
+    except ValueError as error:
+        return SupportFootprint(key, "detector_chi", reason=SupportReason.XU_GEOMETRY_UNQUALIFIED, detail=str(error))
     sign = np.full(t0.size, float(sigma))
     seam_t, seam_sign = _seam_crossings(t0, p0, t1, p1, sign)
     # the beam lands in a valid pixel when that pixel's corners wind once around it
