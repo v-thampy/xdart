@@ -258,21 +258,31 @@ def test_k1_full_partial_zero_unknown():
 
 
 def test_k1b_units_weight_the_native_bin():
-    """A q bin is a q average: equal 2θ edges carried into q give a different, independently matched mean."""
+    """Each unit's bins are a reducer's uniform grid in that unit; a q bin is a q average, not a relabelled 2θ one."""
     from xrd_tools.analysis.angular_support import admitted_window, angular_support
     ai = _planar()
     rect = _rect(ai, 0, 400, 0, 500)
     window = admitted_window(None, reducer="int_standard")
     two_theta = np.linspace(9.0, 21.0, 7)
+
+    def q_of(tth, scale):
+        return 4 * np.pi * np.sin(np.radians(tth) / 2) / (ai.wavelength * scale)
+
     for unit, edges in (("2th_deg", two_theta), ("2th_rad", np.radians(two_theta)),
-                        ("q_A^-1", 4 * np.pi * np.sin(np.radians(two_theta) / 2) / (ai.wavelength * 1e10)),
-                        ("q_nm^-1", 4 * np.pi * np.sin(np.radians(two_theta) / 2) / (ai.wavelength * 1e9))):
+                        ("q_A^-1", np.linspace(q_of(9.0, 1e10), q_of(21.0, 1e10), 7)),
+                        ("q_nm^-1", np.linspace(q_of(9.0, 1e9), q_of(21.0, 1e9), 7))):
         got = angular_support(_request(ai, None, unit, edges, window)).supported_deg
         assert np.all(np.abs(got - _expected(edges, unit, ai, rect)) <= TOL * 360), unit
-    q = angular_support(_request(ai, None, "q_A^-1", 4 * np.pi * np.sin(np.radians(two_theta) / 2) / 1.0,
-                                 window)).supported_deg
-    tth = angular_support(_request(ai, None, "2th_deg", two_theta, window)).supported_deg
-    assert np.max(np.abs(q - tth)) > 0.0, "a q mean is not relabelled as a 2θ mean"
+    # one physical bin, two measures: the q mean weights by d(sin θ), the 2θ mean by d(2θ)
+    wide_tth = np.array([9.0, 21.0])
+    wide_q = q_of(wide_tth, 1e10)
+    expected_q = _expected(wide_q, "q_A^-1", ai, rect, samples=4000)[0]
+    expected_tth = _expected(wide_tth, "2th_deg", ai, rect, samples=4000)[0]
+    assert abs(expected_q - expected_tth) > 0.05, "fixture: the two measures differ"
+    got_q = angular_support(_request(ai, None, "q_A^-1", wide_q, window)).supported_deg[0]
+    got_tth = angular_support(_request(ai, None, "2th_deg", wide_tth, window)).supported_deg[0]
+    assert np.sign(got_q - got_tth) == np.sign(expected_q - expected_tth)
+    assert abs((got_q - got_tth) - (expected_q - expected_tth)) <= .5 * abs(expected_q - expected_tth)
 
 
 # --------------------------------------------------------------------------------------------------------- K2
@@ -483,7 +493,7 @@ def test_k4_gi_rotation_wedge_and_energy(orientation):
     other = _planar(shape=(300, 400), poni=(0.005013, 0.020007), wavelength=0.7e-10)
     same_tth = angular_support(_request(other, mask, "2th_deg", edges, window, convention="gi_chi", gi=gi))
     np.testing.assert_allclose(same_tth.supported_deg, got.supported_deg, atol=1e-9)
-    q_edges = 4 * np.pi * np.sin(np.radians(edges) / 2) / (ai.wavelength * 1e10)
+    q_edges = np.linspace(*(4 * np.pi * np.sin(np.radians(edges[[0, -1]]) / 2) / (ai.wavelength * 1e10)), edges.size)
     at_q = angular_support(_request(ai, mask, "q_A^-1", q_edges, window, convention="gi_chi", gi=gi))
     other_q = angular_support(_request(other, mask, "q_A^-1", q_edges, window, convention="gi_chi", gi=gi))
     assert np.max(np.abs(at_q.supported_deg - other_q.supported_deg)) > TOL * 360
