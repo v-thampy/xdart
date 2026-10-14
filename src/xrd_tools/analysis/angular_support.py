@@ -1369,31 +1369,43 @@ def support_basis_from_saved(run_configuration: Any, energy_selection: Any, *, l
 
 @dataclass(frozen=True, slots=True, eq=False)
 class SavedSupportRequest:
-    """One older Int output frame's support reconstruction (D5): detached facts only, no handle, frame or integrator.
+    """An older Int output's shown frames to rebuild (D5): detached facts only, no handle, frame or integrator.
 
     ``path``/``entry`` name the output Browse loaded and ``snapshot`` its load's ``TargetSnapshot``, revalidated around
-    every read; ``labels`` are its frames and ``label`` the one to rebuild.
+    every read; ``labels`` are its frames and ``selected`` the ones to rebuild, in one job sharing one basis.
     """
 
     path: str
     entry: str
     snapshot: Any
     labels: tuple[int, ...]
-    label: int
+    selected: tuple[int, ...]
 
     @property
     def key(self) -> tuple:
-        """The computation's identity: the same output revision and frame give the same profile."""
-        return (self.path, self.entry, self.snapshot, self.labels, self.label)
+        """The computation's identity: the same output revision and frames give the same profiles."""
+        return (self.path, self.entry, self.snapshot, self.labels, tuple(sorted(self.selected)))
 
 
 def reconstruct_saved_support(request: SavedSupportRequest, *, cancel: Callable[[], bool] | None = None
-                              ) -> AngularSupportProfile:
-    """``request``'s frame support rebuilt from its output's own record (origin ``reconstructed``), or the reason.
+                              ) -> dict[int, AngularSupportProfile]:
+    """``request``'s selected frames' support rebuilt from its output's own record (origin ``reconstructed``), each
+    with its profile or reason; one basis serves every frame.
 
     Reads only the ring record and the bounded saved facts (user mask, saved axis), each between revalidations of the
     load's snapshot; Average and Reintegrate results, insufficient records and a changed file refuse by name.
     """
+    selected = tuple(sorted({int(label) for label in request.selected}))
+    basis = _saved_support_basis(request)
+    if isinstance(basis, AngularSupportProfile):  # refused: every selected frame names the reason
+        return {label: basis for label in selected}
+    basis, axis_values = basis
+    return {label: basis.profile(label, axis_values=axis_values, axis_unit=basis.axis_unit, cancel=cancel)
+            for label in selected}
+
+
+def _saved_support_basis(request: SavedSupportRequest) -> "tuple[SavedSupportBasis, Any] | AngularSupportProfile":
+    """The shared basis and saved axis of ``request``'s output, or the refusal every frame carries."""
     from xrd_tools.io.browse_presentation import read_ring_record, read_saved_support_facts
     from xrd_tools.io.output_transaction import TargetChanged, revalidate_target_snapshot
     from xrd_tools.session.readiness import RingBasis, ring_basis_from_saved
@@ -1426,7 +1438,7 @@ def reconstruct_saved_support(request: SavedSupportRequest, *, cancel: Callable[
         kind=record.kind, monochromator_wavelength_m=record.monochromator_wavelength_m, unreadable=record.unreadable)
     if isinstance(basis, SupportRefusal):
         return refused(basis.reason, basis.detail)
-    return basis.profile(request.label, axis_values=facts.axis_values, axis_unit=basis.axis_unit, cancel=cancel)
+    return basis, facts.axis_values
 
 
 # --------------------------------------------------------------------------------------------- Stitch union

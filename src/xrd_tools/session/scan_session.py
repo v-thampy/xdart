@@ -217,6 +217,16 @@ class _EventSink:
         if self._inner is not None:
             self._inner.begin(scan, plan)
 
+    @property
+    def recorded_angular_support(self):
+        """The wrapped output's recorded coverage choice (COVERAGE-SUPPORT-20261013 contract B)."""
+        return getattr(self._inner, "recorded_angular_support", None)
+
+    def bind_angular_support(self, enabled: bool) -> None:
+        bind = getattr(self._inner, "bind_angular_support", None)
+        if callable(bind):
+            bind(enabled)
+
     def write(self, frame, reduction) -> None:
         if self._inner is not None:
             self._inner.write(frame, reduction)
@@ -2381,6 +2391,12 @@ class ScanSession:
         self._perf_values[key] = self._perf_values.get(key, 0.0) + max(
             0.0, time.perf_counter() - started,
         )
+
+    @property
+    def recorded_angular_support(self) -> str | None:
+        """The output's recorded “Record angular coverage” choice as this Run opened it ("off", "on"; None when the
+        Run creates its 1-D rows): an appending Run keeps it whatever it asked (COVERAGE-SUPPORT-20261013)."""
+        return getattr(getattr(self, "_session", None), "recorded_angular_support", None)
 
     def perf_snapshot(self) -> dict[str, float]:
         """Return writer-side timings without exposing mutable state."""

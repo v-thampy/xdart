@@ -2538,6 +2538,15 @@ class FrameViewReader:
                 return tuple(addresses)
 
             addresses = bundle._callback(dataset_addresses)
+            # the primary mode's saved support rows are read beside intensity: one root per distinct table row
+            support_table, support_address = None, None
+            if mode == self._primary_mode_1d:
+                support_table = bundle._callback(self._support_table, group)
+                if isinstance(support_table, Exception) or support_table.table is None:
+                    support_table = None
+                else:
+                    support_address = bundle._callback(
+                        lambda: int(h5py.h5o.get_info(support_table.table.id).addr))
             mode_rows: list[tuple[int, int]] = []
             mode_map = self._map_1d_modes[mode]
             for label in labels:
@@ -2556,8 +2565,11 @@ class FrameViewReader:
                         projected_bytes=axis_bytes + row_bytes_total,
                     )
                 mode_rows.append((label, row))
-                for address in addresses:
-                    key = (address, row)
+                support_row = None if support_table is None else support_table.table_row(label)
+                roots = tuple((address, row) for address in addresses)
+                if support_row is not None:
+                    roots += ((support_address, support_row),)
+                for key in roots:
                     prior_bytes = row_roots.get(key)
                     row_bytes = points * int(np.dtype(np.float64).itemsize)
                     if prior_bytes is None:
@@ -2652,10 +2664,12 @@ class FrameViewReader:
                 sigmas: list[np.ndarray] | None = (
                     [] if plan.has_sigma else None
                 )
-                # the primary mode's saved angular support, decoded as read() decodes it (one strict reader)
+                # the primary mode's saved angular support, decoded as read() decodes it (one strict reader),
+                # its values reserved in this bundle and a table row's profile shared only within this read
                 supports: list[object] | None = (
                     [] if mode == self._primary_mode_1d else None
                 )
+                support_memo: dict = {}
                 for label, row in plan.rows:
                     checkpoint()
                     intensity = _read_1d_row(
@@ -2683,7 +2697,8 @@ class FrameViewReader:
                             raise AssertionError("qualified sigma row is unavailable")
                         sigmas.append(sigma)
                     if supports is not None:
-                        supports.append(self._saved_support(group, label, intensity))
+                        supports.append(self._saved_support(group, label, intensity, bundle=bundle,
+                                                            memo=support_memo))
                         checkpoint()
                 mode_results.append(bundle._callback(
                     Frame1DModeRows,
@@ -3042,24 +3057,48 @@ class FrameViewReader:
             bundle.finish()
             return view
 
-    def _saved_support(self, group, label: int, intensity_row):
-        """``label``'s saved angular support in its primary 1-D group (format v1), or the reason it has none.
-
-        A malformed table is reported per frame as ``malformed_saved_support``: intensity stays readable.
-        """
-        from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin, SupportReason
-        from xrd_tools.io.angular_support import AngularSupportFormatError, SupportTableReader
+    def _support_table(self, group):
+        """The primary group's validated support index (an index, never values), cached per group, or its error."""
+        from xrd_tools.io.angular_support import AngularSupportFormatError, SupportTableReader, recorded_off
         table = self._support_tables.get(group.name)
         if table is None:
             try:
-                table = SupportTableReader(group, frame_count=len(self._map_1d_modes.get(self._primary_mode_1d, {})))
+                table = SupportTableReader(group, frame_count=len(self._map_1d_modes.get(self._primary_mode_1d, {})),
+                                           recording_off=recorded_off(self._entry))
             except AngularSupportFormatError as error:
                 table = error
             self._support_tables[group.name] = table
+        return table
+
+    @staticmethod
+    def _read_support_row(table, row: int, bundle: "_ReaderArrayBundle") -> np.ndarray:
+        """One table row's float64 values, reserved and read in ``bundle`` like the intensity row beside it: a
+        transient caller payload, shared within the bundle by the row's physical identity."""
+        deg = table.table
+
+        def qualify(value):
+            if not isinstance(value, h5py.Dataset) or value.ndim != 2 or value.dtype != np.dtype("<f4"):
+                raise ValueError(f"{deg.name} is not a bounded support table")
+            return value
+
+        return bundle.read_hdf(deg, role=deg.name, validator=qualify, selection=int(row),
+                               final_dtype=np.dtype(np.float64), transform="numeric-float64", retain=False)
+
+    def _saved_support(self, group, label: int, intensity_row, *, bundle: "_ReaderArrayBundle | None" = None,
+                       memo: dict | None = None):
+        """``label``'s saved angular support in its primary 1-D group (format v1), or the reason it has none.
+
+        Values are read in the caller's ``bundle``; ``memo`` shares a table row's profile within that one read.
+        A malformed table is reported per frame as ``malformed_saved_support``: intensity stays readable.
+        """
+        from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin, SupportReason
+        from xrd_tools.io.angular_support import AngularSupportFormatError
+        table = self._support_table(group)
         try:
             if isinstance(table, AngularSupportFormatError):
                 raise table
-            profile = table.profile(label, intensity_row)
+            read_values = None if bundle is None else (lambda row: self._read_support_row(table, row, bundle))
+            profile = table.profile(label, intensity_row, read_values=read_values, memo=memo)
         except AngularSupportFormatError as error:
             return AngularSupportProfile.unavailable(SupportReason.MALFORMED_SAVED_SUPPORT,
                                                      origin=SupportOrigin.SAVED, detail=str(error))
@@ -3102,7 +3141,7 @@ class FrameViewReader:
             return FrameView(
                 label=frame, axis_1d=self._axis_1d_modes.get(mode),
                 intensity_1d=intensity, sigma_1d=sig,
-                angular_support=(self._saved_support(g, frame, intensity)
+                angular_support=(self._saved_support(g, frame, intensity, bundle=bundle)
                                  if mode == self._primary_mode_1d else None),
                 **(
                     common

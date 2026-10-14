@@ -3278,8 +3278,9 @@ class ScientificView(QtWidgets.QFrame):
         elif not traces:
             reasons.append(_NO_TRACE_SUPPORT)
         else:
+            rebuilt = self._rebuilt_profiles(source, traces) if on else {}
             for trace, color in zip(traces, trace_colors(color_map, len(traces)), strict=True):
-                profile = self._strip_profile(source, trace) if on else trace.angular_support
+                profile = self._strip_profile(source, trace, rebuilt) if on else trace.angular_support
                 if profile is not None and profile.available:
                     drawn.append((trace, profile, color))
                     continue
@@ -3313,15 +3314,30 @@ class ScientificView(QtWidgets.QFrame):
         self.angular_support_plot.show()
         self._sync_support_geometry()
 
-    def _strip_profile(self, source, trace):
-        """``trace``'s profile; for a frame of the shown older Int output (``source``) that saved none, its
-        reconstruction from the output's own record, asked of the owner (the latest wins) and pending meanwhile (D5).
-        Nothing else is rebuilt: a result recorded with "Record angular coverage" off names that instead."""
+    @staticmethod
+    def _rebuildable(source, trace) -> bool:
+        """Whether ``trace`` is a frame of the shown older Int output (``source``) that saved no coverage (D5)."""
         profile = trace.angular_support
-        if (profile is None or profile.reason is not SupportReason.NO_SAVED_SUPPORT or source is None
-                or trace.frame.artifact != source.artifact):
+        return (profile is not None and profile.reason is SupportReason.NO_SAVED_SUPPORT and source is not None
+                and trace.frame.artifact == source.artifact)
+
+    def _rebuilt_profiles(self, source, traces) -> dict:
+        """The shown older output's rebuilt profiles: one ask of the owner for all its shown frames, which keeps
+        exactly those and rebuilds only the missing; with none shown, the owner lets go of what it kept."""
+        labels = [int(trace.frame.local_frame_label) for trace in traces if self._rebuildable(source, trace)]
+        if not labels:
+            self.angular_support_owner.clear()
+            return {}
+        return self.angular_support_owner.profiles(source, labels)
+
+    def _strip_profile(self, source, trace, rebuilt):
+        """``trace``'s profile; for a frame of the shown older Int output that saved none, its reconstruction from
+        the output's own record (``rebuilt``), pending meanwhile (D5). Nothing else is rebuilt: a result recorded with
+        "Record angular coverage" off names that instead."""
+        profile = trace.angular_support
+        if not self._rebuildable(source, trace):
             return profile
-        rebuilt = self.angular_support_owner.profile(source.request(trace.frame.local_frame_label))
+        rebuilt = rebuilt.get(int(trace.frame.local_frame_label))
         if rebuilt is None:
             return AngularSupportProfile.unavailable(SupportReason.PENDING, origin=SupportOrigin.RECONSTRUCTED)
         if rebuilt.available and rebuilt.supported_deg.shape != trace.intensity.shape:

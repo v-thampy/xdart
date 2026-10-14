@@ -790,10 +790,11 @@ class SavedSupportSource:
     snapshot: object
     labels: tuple[int, ...]
 
-    def request(self, label: int):
-        """The reconstruction request for one of the output's frames."""
+    def request(self, labels):
+        """The one reconstruction request for the output's shown frames ``labels``."""
         from xrd_tools.analysis.angular_support import SavedSupportRequest
-        return SavedSupportRequest(self.path, self.entry, self.snapshot, self.labels, int(label))
+        return SavedSupportRequest(self.path, self.entry, self.snapshot, self.labels,
+                                   tuple(sorted(int(label) for label in labels)))
 
 
 @dataclass(frozen=True, slots=True)

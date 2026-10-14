@@ -17,8 +17,14 @@ profile's integrated_1d mode group (Int top level; Stitch label 1):
 
 An entry is bound to its label and to the content of its intensity row, never to a position: rows moved by surgery
 keep their support, a row rewritten by a path that does not maintain support reads stale, and a removed label's entry
-is ignored. A group without the datasets has no saved support; a group with any of them malformed raises
+is retired with its row. A group without the datasets has no saved support; a group with any of them malformed raises
 :class:`AngularSupportFormatError`.
+
+An Int output created with “Record angular coverage” off carries one entry attribute instead,
+``ssrl_angular_support_recording`` = "off", and no per-frame support: the choice belongs to the output (Append and
+Reintegrate keep it; a new output or Overwrite chooses again), and its frames read ``recording_disabled``. An
+unmarked output without an entry for a frame is older and reads ``no_saved_support``. Stitch's single profile keeps
+its one entry either way.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -37,7 +43,7 @@ from xrd_tools.core.angular_support import (
     SupportOrigin,
     SupportReason,
 )
-from xrd_tools.io.schema import ANGULAR_SUPPORT_DATASETS, ANGULAR_SUPPORT_VERSION_ATTR
+from xrd_tools.io.schema import ANGULAR_SUPPORT_DATASETS, ANGULAR_SUPPORT_RECORDING_ATTR, ANGULAR_SUPPORT_VERSION_ATTR
 
 __all__ = [
     "AngularSupportFormatError",
@@ -45,10 +51,14 @@ __all__ = [
     "METRIC_ATTR",
     "AXIS_SHA256_ATTR",
     "MAX_META_BYTES",
+    "RECORDING_OFF",
     "axis_sha256",
     "has_angular_support",
     "intensity_digest",
+    "mark_recording_off",
     "read_angular_support",
+    "recorded_choice",
+    "recorded_off",
     "remove_angular_support",
     "SupportTableReader",
     "SupportTableWriter",
@@ -56,6 +66,8 @@ __all__ = [
 ]
 
 FORMAT_VERSION = 1
+#: The value of an Int output's ``ssrl_angular_support_recording`` entry attribute (the only one written).
+RECORDING_OFF = "off"
 METRIC_ATTR = "ssrl_angular_support_metric"
 AXIS_SHA256_ATTR = "ssrl_angular_support_axis_sha256"
 #: Largest UTF-8 JSON a table row's facts may take.
@@ -84,6 +96,30 @@ def axis_sha256(axis: Any) -> str:
 def has_angular_support(group: Any) -> bool:
     """Whether any of the four support names exists in ``group`` (present means it must be well formed)."""
     return any(name in group for name in ANGULAR_SUPPORT_DATASETS)
+
+
+def recorded_off(entry: Any) -> bool:
+    """Whether an output's entry carries the “recording off” marker (strict: a malformed marker raises)."""
+    if entry is None or ANGULAR_SUPPORT_RECORDING_ATTR not in entry.attrs:
+        return False
+    if _attr_text(entry, ANGULAR_SUPPORT_RECORDING_ATTR) != RECORDING_OFF:
+        raise AngularSupportFormatError("the output's angular coverage marker is malformed")
+    return True
+
+
+def recorded_choice(entry: Any) -> str | None:
+    """An Int output's recorded choice: "off" (its marker), "on" (unmarked with saved 1-D rows, whether it recorded
+    support or is older), or None (no 1-D rows yet: the Run that creates them chooses)."""
+    if recorded_off(entry):
+        return "off"
+    group = None if entry is None else entry.get("integrated_1d")
+    index = None if group is None else group.get("frame_index")
+    return "on" if index is not None and int(getattr(index, "shape", (0,))[0]) > 0 else None
+
+
+def mark_recording_off(entry: Any) -> None:
+    """Record, once, that an output was created with “Record angular coverage” off (no per-frame support follows)."""
+    entry.attrs[ANGULAR_SUPPORT_RECORDING_ATTR] = RECORDING_OFF
 
 
 def _meta_text(profile: AngularSupportProfile) -> str:
@@ -206,8 +242,11 @@ def _profile(facts: Mapping[str, Any], values: np.ndarray, points: int) -> Angul
         if facts.get("reason") is not None or common["convention"] not in SUPPORT_CONVENTIONS \
                 or values.shape != (points,) or not np.all(np.isfinite(values)):
             raise AngularSupportFormatError("an available angular support row is incomplete")
-        return AngularSupportProfile(supported_deg=values.astype(np.float64), window_deg=float(facts["window_deg"]),
-                                     **common)
+        # the caller's float64 row as read (its accounted allocation), else converted once; frozen, the profile
+        # adopts it instead of copying
+        values = np.array(values, dtype=np.float64, copy=None)
+        values.setflags(write=False)
+        return AngularSupportProfile(supported_deg=values, window_deg=float(facts["window_deg"]), **common)
     except AngularSupportFormatError:
         raise
     except (KeyError, TypeError, ValueError) as error:
@@ -215,17 +254,20 @@ def _profile(facts: Mapping[str, Any], values: np.ndarray, points: int) -> Angul
 
 
 class SupportTableReader:
-    """One group's validated support table, decoded lazily per label (FrameViewReader, Browse, Stitch readers).
+    """One group's validated support index, label → table row and digest (FrameViewReader, Browse, Stitch readers).
 
     Construction validates the four datasets' links, kinds, dtypes, ranks, version and size bounds before any data
     is read, and raises :class:`AngularSupportFormatError` when present but malformed. ``present`` is False when
-    the group has no table (every label then has ``no_saved_support``).
+    the group has no table. No decoded profile or vector is kept: a caller reads a row's values through its own
+    bounded, accounted read and shares a table row's profile only within that read (:meth:`profile`).
+    ``recording_off`` is the output's marker (:func:`recorded_off`): a label without an entry then reads
+    ``recording_disabled``, otherwise ``no_saved_support``.
     """
 
-    def __init__(self, group: Any, *, frame_count: int | None = None) -> None:
+    def __init__(self, group: Any, *, frame_count: int | None = None, recording_off: bool = False) -> None:
         datasets = _datasets(group)
         self.present = datasets is not None
-        self._cache: dict[int, AngularSupportProfile] = {}
+        self._off = bool(recording_off)
         if datasets is None:
             return
         deg, meta, rows_node, digest_node = datasets
@@ -249,20 +291,35 @@ class SupportTableReader:
         self._entries = {int(label): (int(row), digests[number].tobytes())
                          for number, (label, row) in enumerate(entries)}
 
-    def table_profile(self, row: int) -> AngularSupportProfile:
-        """The saved profile of one table row (strict)."""
-        if row not in self._cache:
-            self._cache[row] = _profile(_decode_meta(self._meta[row]), np.asarray(self._deg[row], np.float32),
-                                        self._points)
-        return self._cache[row]
+    @property
+    def table(self) -> Any:
+        """The validated ``angular_support_deg`` dataset rows are read from, or None without a table."""
+        return self._deg if self.present else None
 
-    def profile(self, label: int, intensity_row: Any) -> AngularSupportProfile:
-        """``label``'s saved support given its stored intensity row, or the reason it has none."""
+    def table_row(self, label: int) -> int | None:
+        """``label``'s table row, or None (a reader sizes its read from this before reading any value)."""
+        entry = self._entries.get(int(label)) if self.present else None
+        return None if entry is None else entry[0]
+
+    def profile(self, label: int, intensity_row: Any, *, read_values: Callable[[int], np.ndarray] | None = None,
+                memo: dict | None = None) -> AngularSupportProfile:
+        """``label``'s saved support given its stored intensity row, or the reason it has none (strict).
+
+        ``read_values(row)`` returns one table row's float64 values from the caller's accounted read (default: a
+        plain read of the row); ``memo``, a dict the caller drops with that read, shares one table row's profile
+        between the read's labels.
+        """
         entry = self._entries.get(int(label)) if self.present else None
         if entry is None:
-            return AngularSupportProfile.unavailable(SupportReason.NO_SAVED_SUPPORT, origin=SupportOrigin.SAVED)
+            reason = SupportReason.RECORDING_DISABLED if self._off else SupportReason.NO_SAVED_SUPPORT
+            return AngularSupportProfile.unavailable(reason, origin=SupportOrigin.SAVED)
         row, saved_digest = entry
-        saved = self.table_profile(row)
+        saved = None if memo is None else memo.get(row)
+        if saved is None:
+            values = np.asarray(self._deg[row], np.float32) if read_values is None else read_values(row)
+            saved = _profile(_decode_meta(self._meta[row]), values, self._points)
+            if memo is not None:
+                memo[row] = saved
         if (self._stale_axis or (saved.available and saved.radial_unit != self._axis_unit)
                 or intensity_row is None or intensity_digest(intensity_row) != saved_digest):
             return AngularSupportProfile.unavailable(SupportReason.STALE_SAVED_SUPPORT, origin=SupportOrigin.SAVED)

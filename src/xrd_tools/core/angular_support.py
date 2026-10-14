@@ -169,7 +169,10 @@ class AngularSupportProfile:
         object.__setattr__(self, "provenance", _frozen(dict(self.provenance)))
         if self.supported_deg is None:
             return
-        values = np.array(self.supported_deg, dtype=np.float64, copy=True)
+        values = self.supported_deg
+        if not (isinstance(values, np.ndarray) and values.dtype == np.float64 and values.base is None
+                and values.flags.c_contiguous and not values.flags.writeable):
+            values = np.array(values, dtype=np.float64, copy=True)  # a frozen float64 array of its own is adopted
         if values.ndim != 1 or not values.size:
             raise ValueError("angular support must be a nonempty 1-D array")
         window = float(self.window_deg)

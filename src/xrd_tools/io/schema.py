@@ -60,6 +60,7 @@ __all__ = [
     "integrated_axis_names",
     "INTEGRATED_ROW_ALIGNED",
     "ANGULAR_SUPPORT_DATASETS",
+    "ANGULAR_SUPPORT_RECORDING_ATTR",
     "ANGULAR_SUPPORT_VERSION_ATTR",
     "GroupSchema",
     "ProcessedScanSchema",
@@ -338,6 +339,10 @@ ANGULAR_SUPPORT_DATASETS = ("angular_support_deg", "angular_support_meta", "angu
                             "angular_support_row_digest")
 #: Integer attribute of ``angular_support_deg`` naming the format version (1).
 ANGULAR_SUPPORT_VERSION_ATTR = "ssrl_angular_support_version"
+#: Text attribute of an Int output's entry: "off" when the output was created with “Record angular coverage” off.
+#: The choice belongs to the output (Append and Reintegrate keep it), so an off output writes no per-frame support;
+#: an unmarked output recorded support or is older. Outside the pinned capability attributes, like the datasets.
+ANGULAR_SUPPORT_RECORDING_ATTR = "ssrl_angular_support_recording"
 
 # ── multi-result GI mode keys (the per-mode nested-subgroup layout) ──────────
 #: Canonical on-disk GI mode_keys == ``GI1DMode.value`` / ``GI2DMode.value``

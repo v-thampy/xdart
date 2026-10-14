@@ -993,6 +993,21 @@ class CompositeSink:
             if callable(bind):
                 bind(facade)
 
+    @property
+    def recorded_angular_support(self) -> str | None:
+        """The children's one recorded coverage choice (an output sink's), or None; two different ones refuse."""
+        recorded = {value for value in (getattr(sink, "recorded_angular_support", None) for sink in self.sinks)
+                    if value is not None}
+        if len(recorded) > 1:
+            raise ValueError("the Run's output sinks recorded different angular coverage choices")
+        return next(iter(recorded), None)
+
+    def bind_angular_support(self, enabled: bool) -> None:
+        for sink in self.sinks:
+            bind = getattr(sink, "bind_angular_support", None)
+            if callable(bind):
+                bind(enabled)
+
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         for sink in self.sinks:
             sink.write(frame, reduction)
@@ -1671,6 +1686,8 @@ class NexusSink:
     _primary_mode_2d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
     _extension_owner: Any | None = field(default=None, init=False, repr=False)
     _pending_append_decision: Any | None = field(default=None, init=False, repr=False)
+    #: the Run's bound “Record angular coverage” choice, applied to every writer this sink opens
+    _angular_support_enabled: bool | None = field(default=None, init=False, repr=False)
     _epoch_decision: Any | None = field(default=None, init=False, repr=False)
     _source_snapshots: dict[str, dict[str, Any]] = field(
         default_factory=dict, init=False, repr=False,
@@ -2397,6 +2414,18 @@ class NexusSink:
             raise
 
     @property
+    def recorded_angular_support(self) -> str | None:
+        """The output's recorded “Record angular coverage” choice as this sink's writer opened it ("off", "on" or
+        None when it has no 1-D rows yet; COVERAGE-SUPPORT-20261013 contract B)."""
+        return None if self._writer is None else self._writer.recorded_angular_support
+
+    def bind_angular_support(self, enabled: bool) -> None:
+        """The Run's resolved choice, bound to the open writer and to every writer this sink opens later."""
+        self._angular_support_enabled = enabled
+        if self._writer is not None:
+            self._writer.bind_angular_support(enabled)
+
+    @property
     def extension_owner(self):
         if self._extension_owner is None:
             raise RuntimeError("sink has no active same-run extension owner")
@@ -2478,6 +2507,8 @@ class NexusSink:
                 primary_mode_1d=self._primary_mode_1d,
                 primary_mode_2d=self._primary_mode_2d,
             )
+            if self._angular_support_enabled is not None:  # a successor epoch keeps the Run's bound choice
+                writer.bind_angular_support(self._angular_support_enabled)
         except BaseException as primary:
             try:
                 self._abort_composed()
@@ -3329,6 +3360,10 @@ class ReductionSession:
     # COVERAGE-SUPPORT-20261013: angular support capture (an AngularSupportPolicy; None = the default
     # policy; False = a path that never captures support, such as Average). Support never changes intensity.
     angular_support: Any = None
+    # Contract B: the output's recorded choice as the sink opened it ("off", "on", None for a new output) and the
+    # policy the Run adopted from it (the request when the Run creates the output), set when the session begins.
+    recorded_angular_support: Any = field(default=None, init=False, repr=False)
+    effective_angular_support: Any = field(default=None, init=False, repr=False)
     # H10-C1: ONE narrow synchronous acceptance-admission hook, invoked on the
     # CALLER thread inside submit() in publication order (§18.2) — Future bound,
     # the same undecided ticket queued, inventory staged, THEN this authority runs
@@ -3564,6 +3599,7 @@ class ReductionSession:
         try:
             self._worker, self._owns_worker = _coerce_executor(self.executor)
             self._sink.begin(self.scan, self.plan)
+            self._bind_angular_support()
             self._started = True
             _emit(self.progress_cb, self.scan.name, "start", None, 0, len(self.scan))
             if self.execution == "streaming":
@@ -3574,6 +3610,24 @@ class ReductionSession:
             except BaseException as cleanup:
                 raise primary from cleanup
             raise
+
+    def _bind_angular_support(self) -> None:
+        """Contract B (COVERAGE-SUPPORT-20261013): an output keeps the “Record angular coverage” choice it was
+        created with. The sink reports the choice its output recorded; the Run adopts it, else its own request,
+        before any frame is reduced, and binds the result to the sink (off: one marker, nothing per frame)."""
+        if self.angular_support is False:  # Average never captures support
+            return
+        from dataclasses import replace as _replace
+        from xrd_tools.analysis.angular_support import AngularSupportPolicy
+        requested = AngularSupportPolicy() if self.angular_support is None else self.angular_support
+        recorded = getattr(self._sink, "recorded_angular_support", None)
+        effective = requested if recorded is None else _replace(requested, enabled=recorded == "on")
+        if effective.enabled is not requested.enabled:
+            self._integrators.support = _support_capture(effective)
+        self.recorded_angular_support, self.effective_angular_support = recorded, effective
+        bind = getattr(self._sink, "bind_angular_support", None)
+        if callable(bind):
+            bind(effective.enabled)
 
     def __enter__(self) -> ReductionSession:
         return self

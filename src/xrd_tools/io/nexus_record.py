@@ -1200,3 +1200,8 @@ def drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
         ds = new_group.create_dataset(key, data=data, **kwargs)
         for attr_key, value in attrs.items():
             ds.attrs[attr_key] = value
+    # dropped labels' saved angular support goes with their rows (the one codec retires the entries)
+    from xrd_tools.io.angular_support import has_angular_support, write_angular_support
+    if has_angular_support(new_group):
+        dropped = {int(label) for label in labels[~keep_mask]}
+        write_angular_support(new_group, {label: None for label in sorted(dropped)}, intensity_rows={})

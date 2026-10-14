@@ -2047,6 +2047,10 @@ class NexusRecordWriter:
         self.compression = compression
         #: one incremental support-table writer for this writer's whole life (COVERAGE-SUPPORT-20261013)
         self._angular_support_table = None
+        #: the target's recorded “Record angular coverage” choice at open ("off", "on" or None for no 1-D rows yet)
+        #: and the Run's bound choice (None: unbound callers keep per-record support, as Stitch's one profile does)
+        self._recorded_angular_support: str | None = None
+        self._angular_support_enabled: bool | None = None
         self.overwrite = bool(overwrite)
         self.atomic = atomic
         self.flush_every = flush_every
@@ -4623,6 +4627,9 @@ class NexusRecordWriter:
                         "per_frame_geometry",
                     ):
                         self._row_cursors[name] = self._load_cursor(name)
+                # the output's recorded coverage choice, read before a Reintegrate successor resets its rows
+                from xrd_tools.io.angular_support import recorded_choice
+                self._recorded_angular_support = recorded_choice(self._entry_group())
                 if self._replacement_configuration is not None:
                     config = _replacement_hard_group(self._h5, f"{self.entry}/reduction/config"); node = _replacement_hard_group(config, "source_execution", h5py.Dataset)
                     try: execution = json.loads(_replacement_utf8_scalar(node, "source_execution", max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES))
@@ -5261,12 +5268,39 @@ class NexusRecordWriter:
     def write(self, record: RecordWrite) -> None:
         self.write_batch((record,))
 
+    @property
+    def recorded_angular_support(self) -> str | None:
+        """The target's recorded “Record angular coverage” choice when this writer opened it: "off" (its marker),
+        "on" (unmarked with 1-D rows) or None (no 1-D rows yet: the Run that creates them chooses)."""
+        return self._recorded_angular_support
+
+    def bind_angular_support(self, enabled: bool) -> None:
+        """Bind the Run's resolved choice (COVERAGE-SUPPORT-20261013, contract B: an output keeps the choice it was
+        created with). Off marks an output once and then writes no per-frame support; a choice contradicting the
+        output's recorded one is refused here, before any frame."""
+        self._require_active()
+        if type(enabled) is not bool:
+            raise TypeError("the Run's angular coverage choice must be an exact bool")
+        recorded = self._recorded_angular_support
+        if recorded is not None and (recorded == "on") is not enabled:
+            raise WriterStateError(f"the Run's angular coverage choice contradicts the output's recorded {recorded!r}")
+        self._angular_support_enabled = enabled
+        if not enabled and recorded is None:
+            from xrd_tools.io.angular_support import mark_recording_off
+            with self._boundary():
+                self._authorize_transaction_mutation()
+                mark_recording_off(self._entry_group())
+            self._recorded_angular_support = "off"
+
     def _write_angular_support(self, records: list[RecordWrite]) -> None:
         """Merge the primary 1-D rows' saved support into their group's table, inside this batch's transaction.
 
         A row written without support forgets any earlier entry for its label; a batch without support never
         creates the table. Digests bind each entry to its row exactly as the stack writer stores it (float32).
+        An output recorded off keeps no per-frame support: its one marker names every frame's reason.
         """
+        if self._angular_support_enabled is False:
+            return
         from xrd_tools.io.angular_support import SupportTableWriter, has_angular_support
         from xrd_tools.io.nexus import _comp_kwargs
         group = self._entry_group().get("integrated_1d")
@@ -5904,6 +5938,13 @@ class NexusRecordWriter:
             )
             cursor.clear()
             cursor.update({value: row for row, value in enumerate(labels)})
+            # the label's saved support goes with its row, in this transaction, through the one table writer
+            from xrd_tools.io.angular_support import SupportTableWriter, has_angular_support
+            if has_angular_support(group):
+                if self._angular_support_table is None:
+                    from xrd_tools.io.nexus import _comp_kwargs
+                    self._angular_support_table = SupportTableWriter(_comp_kwargs(self.compression))
+                self._angular_support_table.write(group, {label: None}, intensity_rows={})
 
             for key, expected in tuple(self._dirty_modes.items()):
                 if expected.group_name != group_name:

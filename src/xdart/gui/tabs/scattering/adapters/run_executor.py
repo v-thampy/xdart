@@ -402,6 +402,24 @@ def _session_terminal_commit_identity(
         return None
     return commit_identity
 
+
+def _coverage_notice(run) -> str:
+    """The Run-start notice when the output this Run appends to keeps a “Record angular coverage” choice that the
+    pill did not ask for (COVERAGE-SUPPORT-20261013 contract B: an output keeps the choice it was created with)."""
+    recorded = getattr(run.session, "recorded_angular_support", None)
+    if recorded is None or run.configuration is None:
+        return ""
+    from xrd_tools.analysis.angular_support import DEFAULT_RECORD_ANGULAR_SUPPORT
+    requested = run.configuration.run_options.get("record_angular_support", DEFAULT_RECORD_ANGULAR_SUPPORT)
+    if type(requested) is not bool or (recorded == "on") is requested:
+        return ""
+    if recorded == "off":
+        return (f"{run.artifact.name} was created with angular coverage off, and Append keeps that: this Run "
+                "records none. Overwrite or a new output records it.")
+    return (f"{run.artifact.name} was created recording angular coverage, and Append keeps that: this Run "
+            "records it. Overwrite or a new output can turn it off.")
+
+
 @dataclass(slots=True)
 class _StandardRun:
     configuration: FrozenRunConfiguration | None
@@ -470,6 +488,7 @@ class _StandardRun:
     terminal_commit_identity: StreamTerminal | None = None
     background_capsule: _PreparedSingleFrameBackground | _PreparedSeriesFrameBackground | None = None
     energy_notice_sent: bool = False
+    coverage_notice_sent: bool = False
 
     def __post_init__(self) -> None:
         self.perf_quartiles_enabled = (
@@ -1710,19 +1729,21 @@ class StandardRunExecutor:
         # The native binder already resolved these values for this output.
         # Announce only after its acquisition context has actually been adopted.
         selection = getattr(run.scan, "extra", {}).get("energy_selection", {})
-        detail = ""
+        energy = ""
         if selection.get("disagreement") and not run.energy_notice_sent:
-            detail = (f"Using the scan energy, {selection['source_energy_eV'] / 1000:.3f} keV; "
+            energy = (f"Using the scan energy, {selection['source_energy_eV'] / 1000:.3f} keV; "
                       f"the PONI says {selection['calibration_energy_eV'] / 1000:.3f} keV.")
             if isinstance(run.capture.source, DirectorySourceSpec):
-                detail = f"{run.artifact.name}: {detail}"
+                energy = f"{run.artifact.name}: {energy}"
+        coverage = "" if run.coverage_notice_sent else _coverage_notice(run)
+        detail = " ".join(part for part in (energy, coverage) if part)
         if created or context.hydration_owner != previous or detail:
             self._events.put(StandardRunEvent(
                 run.identity, StandardEventKind.CONTEXT_READY,
                 artifact=str(run.artifact), detail=detail,
             ))
-            if detail:
-                run.energy_notice_sent = True
+            run.energy_notice_sent |= bool(energy)
+            run.coverage_notice_sent |= bool(coverage)
         return context
 
     def _run(self, run: _StandardRun) -> None:
