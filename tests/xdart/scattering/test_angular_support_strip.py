@@ -187,8 +187,12 @@ def test_d3_availability_follows_selected_trace(qapp, tmp_path):
         _browsing(qapp, page)
         _enable(qapp, view)
         _wait(qapp, lambda: bool(_curves(view)))
+        # a display unit conversion keeps each bin's own result on the converted axis. Test-only oracle repair: an
+        # Int 2D Browse opens on Q whatever the run's unit (the plot-axis preference), so the row first shows the
+        # run's own 2θ axis, then converts.
+        _command(qapp, page, ShellCommandKind.SET_PLOT_AXIS, '2theta')
+        _wait(qapp, lambda: page._last_scientific_projection.plot_axis == '2theta' and bool(_curves(view)))
         (native, profile), = _curves(view).values()
-        # a display unit conversion keeps each bin's own result on the converted axis
         _command(qapp, page, ShellCommandKind.SET_PLOT_AXIS, 'Q')
         _wait(qapp, lambda: bool(_curves(view)) and not np.allclose(
             next(iter(_curves(view).values()))[0][:, 0], native[:, 0]))
@@ -208,6 +212,9 @@ def test_d3_availability_follows_selected_trace(qapp, tmp_path):
             assert view.plot_options_dialog.show_angular_support.isChecked()
         _command(qapp, page, ShellCommandKind.SET_PLOT_MODE, 'Single')
         assert page._context_controller.select_navigation(keys[0], (keys[0],))
+        # Test-only oracle repair: this Run's cake has four χ bins (±45°, ±135°), so the cut is centred on one (a cut
+        # at the default χ = 0 ± 10° holds no bin and makes no trace)
+        _command(qapp, page, ShellCommandKind.SET_SLICE_CENTER, 45.0)
         _command(qapp, page, ShellCommandKind.SET_SLICE_ENABLED, True)
         _wait(qapp, lambda: REASON_TEXT[SupportReason.NOT_RADIAL_PROFILE] in view.angular_support_message())
         assert view.plot_options_dialog.show_angular_support.isChecked()
@@ -273,13 +280,17 @@ def test_d4_saved_browse_and_successor(qapp, tmp_path):
         assert len(labels) >= 3
         assert all(reader.read(label).angular_support.available for label in labels)
 
-    # a Reintegrate successor recomputes support for its own mask, never copying its predecessor's
+    # a Reintegrate successor recomputes support for its own science, never copying its predecessor's. Test-only
+    # oracle repair: Reintegrate re-integrates the output's persisted mask (its preparation carries only the current
+    # integration settings, ScatteringWorkspace._reintegrate_preparation; the successor loads the record's mask,
+    # reintegrate_successor.py _load_persisted_mask, as at cf49f3cb), so its own 48 bins, not the predecessor's 32,
+    # tell a recomputation from a copy.
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
     from xrd_tools.io import open_scan
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.reduction import ReintegrateSuccessorPlan, run_reintegrate_successor
     artifact = written(tmp_path / 'first' / 'run.nexus', 'Int 1D')
-    intent = _masked_series(tmp_path / 'first', band=(400, 480))
+    intent = _masked_series(tmp_path / 'first', band=(100, 200), one={'npt': 48})
     plan = ReintegrateSuccessorPlan.from_artifact(
         artifact, entry='entry', dimension='1d', source_root=str(tmp_path / 'first'),
         expected_target_snapshot=capture_target_snapshot(artifact),
@@ -289,8 +300,8 @@ def test_d4_saved_browse_and_successor(qapp, tmp_path):
     assert result.disposition == 'COMMITTED', result
     with FrameViewReader(Path(result.output_artifact)) as reader:
         successor = reader.read(reader.labels()[0]).angular_support
-    assert successor.available
-    np.testing.assert_allclose(successor.supported_deg, _analytic(successor, (400, 480)),
+    assert successor.available and len(successor.supported_deg) == 48
+    np.testing.assert_allclose(successor.supported_deg, _analytic(successor, (100, 200)),
                                atol=TOL * 360)
 
 
