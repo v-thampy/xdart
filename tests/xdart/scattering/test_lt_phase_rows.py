@@ -281,21 +281,24 @@ def test_p2_phase_fitter_remove_acts_only_on_the_selected_phase(qapp, tmp_path):
         qapp.processEvents()
         scans = source.browser.scans
         ids = _ids(source)
-        paths = {entry.id: entry.cif_path or entry.id for entry in source.selected_entries()}
         assert source.global_switch.editor.isChecked() and not source.cutoff_editor(ids[2]).isEnabled()
 
+        def fitted():
+            """The phases the fit would use: library entries ride as phase_entries (no deferred CIFs here)."""
+            return [entry.id for entry in dialog.vnext_fit_values()['phase_entries']]
+
+        assert fitted() == ids
         # A label click on the last phase, then Remove: that phase leaves the fit and the others stay.
         _click(qapp, scans.viewport(), _label_point(scans, scans.item(2)))
         assert _selected(source) == [scans.item(2).text()]
         _click(qapp, source.remove_btn)
-        assert _ids(source) == ids[:2]
-        assert dialog.vnext_fit_values()['cif_paths'] == (paths[ids[0]], paths[ids[1]])
+        assert _ids(source) == ids[:2] and fitted() == ids[:2]
 
         # A click on the first phase's disabled box selects it; Remove takes exactly that one.
         _click(qapp, scans.viewport(), source.cutoff_editor(ids[0]).geometry().center())
         assert _selected(source) == [scans.item(0).text()]
         _click(qapp, source.remove_btn)
-        assert _ids(source) == [ids[1]] and dialog.vnext_fit_values()['cif_paths'] == (paths[ids[1]],)
+        assert _ids(source) == [ids[1]] and fitted() == [ids[1]]
         _remove_follows_selection(source)
     finally:
         dialog.close()
