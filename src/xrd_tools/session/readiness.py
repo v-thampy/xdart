@@ -639,6 +639,8 @@ class ControlFormField:
     minimum: int | None = None
     maximum: int | None = None
     allow_blank: bool = False
+    #: COMBO fields only: (stored choice, shown label) pairs; the stored choices stay the field's value
+    choice_labels: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

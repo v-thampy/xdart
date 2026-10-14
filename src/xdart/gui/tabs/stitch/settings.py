@@ -17,7 +17,7 @@ from typing import Any
 from xdart.gui.tabs.scattering.shell_values import phase_reference_document, restore_phase_references
 
 from xdart.gui.tools.page_settings import (
-    SettingsKind, restore_sources, restore_write_mode, saved_fields, saved_threshold,
+    SettingsKind, document_data_format, restore_sources, restore_write_mode, saved_fields, saved_threshold,
 )
 
 #: The document's kind and version, its key in the session file, and its own object section.
@@ -27,8 +27,9 @@ SETTINGS_KIND = STITCH_SETTINGS.kind
 SETTINGS_VERSION = STITCH_SETTINGS.version
 #: Where the last session's settings live in the session file.
 SESSION_KEY = STITCH_SETTINGS.session_key
-#: Applied first, in this order: each resets other fields to its own defaults.
-_FIRST = ("backend", "source_kind", "unit", "map_axis")
+#: Applied first, in this order: each resets other fields to its own defaults (the Data format and Files/Folder
+#: make the source kind, whose files the sources then select).
+_FIRST = ("backend", "data_format", "input_mode", "unit", "map_axis")
 #: Shown from the source selection, not an input of its own.
 _DERIVED = frozenset({"spec_path"})
 #: Restored as one threshold policy, not field by field.
@@ -68,7 +69,9 @@ def apply_page_settings(page, document: Any) -> None:
         phase_options = restore_phase_references(current, document["phase_references"])
     if "point_images" in document:
         page.point_images.restore(document["point_images"])
+    formats, conflict = document_data_format(document)  # an older document's Source kind, migrated first
     fields = saved_fields(page, document, _DERIVED)
+    fields.update(formats)
     for key in _FIRST:
         if key in fields:
             page.set_field(key, fields[key])
@@ -127,6 +130,7 @@ def apply_page_settings(page, document: Any) -> None:
     if phase_options is not None:
         page._set_view(plot_options=phase_options)
         page._draw()
+    page._set_format_choice(conflict)
 
 
 __all__ = [

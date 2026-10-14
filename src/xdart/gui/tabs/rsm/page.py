@@ -51,7 +51,7 @@ from xdart.gui.tabs.scattering.operation_values import OperationContextStamp
 from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.controls_inventory import (
-    MASK_FILE, PONI_FILE, SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, SOURCE_TYPE,
+    MASK_FILE, PONI_FILE, SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE,
     THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN,
 )
 from xdart.gui.tabs.scattering.controls_readiness import SectionHeaderProjection
@@ -84,6 +84,10 @@ from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.session.readiness import (
     ControlAction, ControlActionSpec, ControlFieldKind, ControlFormField, SectionId,
+)
+from xrd_tools.sources.selection import (
+    DATA_FORMAT_LABELS, DATA_FORMAT_PURPOSE, DATA_FORMATS, DEFAULT_DATA_FORMAT, INPUT_MODE_LABELS,
+    INPUT_MODE_PURPOSE, INPUT_MODES, page_source_kind,
 )
 from xrd_tools.session.rsm_viewer_model import RSMViewerModel, make_rsm_viewer_values
 from xrd_tools.session.threshold_editing import (
@@ -356,6 +360,10 @@ class RSMPage(QtWidgets.QWidget):
         self._source_shown = ""  # the SPEC files row's text for them ("3 files selected")
         self._paths_by_kind = {}
         self._readiness = ("", False)
+        #: Older saved settings whose sources disagree on the Data format: why the user must choose it ("" none)
+        self._format_choice = ""
+        #: The source kind the Source rows and files last showed (a format edit swaps files only when it changes)
+        self._source_kind_shown = None
         self._output_suggested = True  # the output follows the Source until the user names one
         self._run_requested = False
         # Several RSMs per run (Stitch's Selection: 42,43 two RSMs), queued through the one owner one form at a
@@ -505,7 +513,7 @@ class RSMPage(QtWidgets.QWidget):
             "Replace: grid again; the output is replaced once its new result is written")
 
     @staticmethod
-    def _new_field(section, key, label, value, choices=(), browse=False, path=None):
+    def _new_field(section, key, label, value, choices=(), browse=False, path=None, choice_labels=None):
         """One of the page's fields; ``path`` Int's for a row Int's composer lays out."""
         kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.BOOL if isinstance(value, bool)
                 else ControlFieldKind.INT if key in _INTEGER_FIELDS else ControlFieldKind.LINE)
@@ -513,7 +521,8 @@ class RSMPage(QtWidgets.QWidget):
             path = ("Project", "project_folder") if key == "project_root" else ("RSM", key)
         minimum, maximum, allow_blank = _INTEGER_FIELDS.get(key, (None, None, False))
         return ControlFormField(section, label, path, value, kind, tuple(choices), browse,
-                                minimum=minimum, maximum=maximum, allow_blank=allow_blank)
+                                minimum=minimum, maximum=maximum, allow_blank=allow_blank,
+                                choice_labels=tuple((choice_labels or {}).items()))
 
     def _bind(self, key, field, row):
         """A row the page reads and edits by ``key``, built here or by Int's composer."""
@@ -523,11 +532,11 @@ class RSMPage(QtWidgets.QWidget):
         self._fields[key], self._rows[key] = field, row
         return row
 
-    def _row(self, section, key, label, value, choices, browse):
-        field = self._new_field(section, key, label, value, choices, browse)
+    def _row(self, section, key, label, value, choices, browse, *, path=None, choice_labels=None):
+        field = self._new_field(section, key, label, value, choices, browse, path=path, choice_labels=choice_labels)
         return self._bind(key, field, FormRow(
             label=label, path=field.path, value=value, kind=field.kind.value, choices=choices, browse=browse,
-            minimum=field.minimum, maximum=field.maximum, allow_blank=field.allow_blank))
+            minimum=field.minimum, maximum=field.maximum, allow_blank=field.allow_blank, choice_labels=choice_labels))
 
     def _build_controls(self):
         cards = {SectionId.PROJECT: self.controls.project_card, SectionId.EXPERIMENT: self.controls.experiment_card,
@@ -536,6 +545,13 @@ class RSMPage(QtWidgets.QWidget):
         self._build_source()  # and its Source rows
         for section, key, label, value, choices, browse in _FIELDS:
             cards[section].add_row(self._row(section, key, label, value, choices, browse))
+        # One Data format for this page (LT-004; maintainer, October 14: RSM and Stitch each remember their own),
+        # under the Save Path: the Source rows and files and the calibration window's two sources follow it
+        cards[SectionId.PROJECT].add_row(self._row(
+            SectionId.PROJECT, "data_format", "Data format", DEFAULT_DATA_FORMAT, DATA_FORMATS, False,
+            path=("Project", "data_format"), choice_labels=DATA_FORMAT_LABELS))
+        self._rows["data_format"].editor.activated.connect(self._data_format_chosen)
+        self._sync_format_tip()
         fields = tuple(self._new_field(SectionId.PROCESSING, key, axis, "40")
                        for key, axis in zip(_GRID_FIELDS, "HKL", strict=True))
         rows = self.controls.render_count_row(self.controls.processing_card, "Grid", fields)
@@ -782,25 +798,30 @@ class RSMPage(QtWidgets.QWidget):
         SPEC or NeXus files or the folder, Directory's Filter, the Images folder, the Image stem, and the Scans
         with their Selection. The Selection's syntax is Stitch's: ``[42-44]`` makes one RSM of three scans.
         Every row is built once; a kind shows its own (``_source_changed``)."""
+        # grouped as Stitch's (LT-006, maintainer's layout, October 14): the Files/Folder menu with the files or
+        # folder and Subdirs on one row, and the Scans menu with its selection beside it; the Project's Data
+        # format and the menu make the source kind
         fields = {
-            "source_kind": self._new_field(SectionId.SOURCE, "source_kind", "Source", "Spec", _SOURCE_KINDS,
-                                           path=SOURCE_TYPE),
-            "spec_path": self._new_field(SectionId.SOURCE, "spec_path", "SPEC files", "", browse=True,
+            "input_mode": self._new_field(SectionId.SOURCE, "input_mode", "SPEC File", "files", INPUT_MODES,
+                                          path=("Source", "input_mode"), choice_labels=INPUT_MODE_LABELS),
+            "spec_path": self._new_field(SectionId.SOURCE, "spec_path", "SPEC File", "", browse=True,
                                          path=SOURCE_DIRECTORY),
             "subdirs": self._new_field(SectionId.SOURCE, "subdirs", "Subdirs", False, path=SOURCE_RECURSIVE),
             "name_filter": self._new_field(SectionId.SOURCE, "name_filter", "Filter", "", path=SOURCE_FILTER),
-            "image_dir": self._new_field(SectionId.SOURCE, "image_dir", "Images", "", browse=True),
+            "image_dir": self._new_field(SectionId.SOURCE, "image_dir", "Image Path", "", browse=True),
             # on the card, not in Advanced: a stem left from another dataset matches the wrong images
-            "image_stem": self._new_field(SectionId.SOURCE, "image_stem", "Image stem", ""),
+            "image_stem": self._new_field(SectionId.SOURCE, "image_stem", "Image Stem", ""),
             "scan_mode": self._new_field(SectionId.SOURCE, "scan_mode", "Scans", "Select Scans",
-                                         ("All Scans", "Select Scans")),
+                                         ("All Scans", "Select Scans"),
+                                         choice_labels={"All Scans": "All", "Select Scans": "Select"}),
             "scan": self._new_field(SectionId.SOURCE, "scan", "Selection", "1"),
         }
-        rows = self.controls.render_source_rows(self.controls.source_card, tuple(fields.values()))
+        rows = self.controls.render_source_rows(self.controls.source_card, tuple(fields.values()), groups=(
+            (fields["input_mode"].path, SOURCE_DIRECTORY, SOURCE_RECURSIVE),
+            (fields["scan_mode"].path, fields["scan"].path)))
         for key, field in fields.items():
             self._bind(key, field, rows[field.path])
-        self._tip("source_kind", "Source kind: SPEC files and their scans' images, raw NeXus files, or a folder "
-                                 "of both.")
+        self._tip("input_mode", INPUT_MODE_PURPOSE)
         self._tip("subdirs", "Also the SPEC and NeXus files in the folder's subfolders.")
         self._tip("name_filter", "Only the files whose names match: a space is and, | is or, -term is not.")
         self._tip("image_dir", "The folder of the scans' detector images. Blank: the SPEC file's folder.")
@@ -808,7 +829,7 @@ class RSMPage(QtWidgets.QWidget):
                   "The part of the image file names that identifies the scan; any prefix before it is "
                   "fine (b_thampy_R1C2_scan3_0000.raw has R1C2_scan3_). Blank: <SPEC name>_scan<N>_ for "
                   "each scan. {spec} and {scan} fill in the SPEC name and scan number.")
-        self._tip("scan_mode", "All Scans: each scan of the files is its own RSM. Select Scans: the Selection.")
+        self._tip("scan_mode", "All: each scan of the files is its own RSM. Select: only the scans typed beside it.")
         self._tip("scan", "Scan numbers, as Stitch's Selection: brackets combine scans into one RSM ([42-44] "
                           "is one RSM of three scans); 42,43 would be two RSMs, and the page grids one RSM per "
                           "run for now.")
@@ -1016,9 +1037,16 @@ class RSMPage(QtWidgets.QWidget):
         if key == "grid":  # old scripted callers and saved presets
             bins = tuple(int(self._rows[name].current_value()) for name in _GRID_FIELDS)
             return next((name for name, value in _GRIDS.items() if bins == value), "Custom")
+        if key == "source_kind":  # Spec, NeXus or Directory, the selection's unchanged tokens
+            data_format = (self._rows["data_format"].current_value() if "data_format" in self._rows
+                           else DEFAULT_DATA_FORMAT)  # the Source rows are built before the Project's
+            return page_source_kind(data_format, self._rows["input_mode"].current_value())
         return self._rows[key].current_value()
 
     def set_field(self, key, value):
+        if key == "source_kind":  # no row of its own: the Data format and Files/Folder make it
+            self._set_source_kind(value)
+            return
         if key in {"ub_row1", "ub_row2", "ub_row3"} and self._value("ub_from") != _UB_TYPED:
             rows = list(self._ub_typed_rows)
             rows[int(key[-1])-1] = value
@@ -1049,19 +1077,21 @@ class RSMPage(QtWidgets.QWidget):
                 self._adopt_sources((text,) if text else ())
                 self._source_shown = text
                 self._show_source_tip()
-        elif key in {"source_kind", "scan_mode"}:
+        elif key in {"data_format", "input_mode", "scan_mode"}:
             self._source_changed(key)
+        if key == "data_format":
+            self._project_data_format()
         if key == "output_path":
             self._output_suggested = not str(self._value("output_path")).strip()
         if key == "geometry_path":
             self._sync_calibration_window()
         if key in {"geometry_path", "project_root", "refinement", "spec_path", "scan_mode", "scan",
-                   "source_kind", "image_dir", "image_stem"}:
+                   "data_format", "input_mode", "image_dir", "image_stem"}:
             self._show_early_ceiling()
         if key in {"project_root", "spec_path", "scan_mode", "scan", "normalization"} and "normalization" in self._rows:
             self._refresh_normalization()  # a kind's own files come through set_sources
         if key in {"coordinates", "ub_from", "ub_spec_path", "ub_scan", "project_root", "spec_path",
-                   "scan", "scan_mode", "source_kind"}:
+                   "scan", "scan_mode", "data_format", "input_mode"}:
             self._render_ub()
         if key == "coordinates" or key in _GRID_FIELDS:
             self._render_grid_labels()
@@ -1106,10 +1136,46 @@ class RSMPage(QtWidgets.QWidget):
         self._rows["scan"].setVisible(kind == "Spec" and self._value("scan_mode") == "Select Scans")
         for name in ("subdirs", "name_filter"):
             self._rows[name].setVisible(kind == "Directory")
-        self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files",
-                                               "Directory": "Folder"}[kind])
-        if key == "source_kind":
+        label = {"Spec": "SPEC File", "NeXus": "NeXus File", "Directory": "Folder"}[kind]
+        self._rows["input_mode"].label.setText(label)  # the row's label; the path box keeps it as its name
+        self._rows["spec_path"].label.setText(label)
+        self._rows["spec_path"].editor.setAccessibleName(label)
+        shown, self._source_kind_shown = self._source_kind_shown, kind
+        if key is not None and shown is not None and kind != shown:  # each kind keeps its own files
             self.set_sources(self._paths_by_kind.get(kind, ()))
+
+    def _set_source_kind(self, kind):
+        """An older document's or caller's source kind, as the Data format and Files/Folder it means (Stitch's)."""
+        if kind not in _SOURCE_KINDS:
+            raise ValueError(f"Source: {kind!r} is not one of its choices")
+        if kind == "NeXus":
+            self.set_field("data_format", "nexus")
+        elif kind == "Spec" and self._value("data_format") == "nexus":
+            self.set_field("data_format", DEFAULT_DATA_FORMAT)
+        self.set_field("input_mode", "directory" if kind == "Directory" else "files")
+
+    def _data_format_chosen(self, *_args):
+        """A choice made in the Data format menu, even of the format shown, settles older settings' conflict."""
+        if self._format_choice:
+            self._set_format_choice("")
+
+    def _set_format_choice(self, reason):
+        """Older settings' conflict for the user to settle, as a readiness need and in the Data format's tooltip
+        ("" when there is none)."""
+        self._format_choice = str(reason or "")
+        self._sync_format_tip()
+        self._edited()
+
+    def _project_data_format(self):
+        if self._calibration_dialog is not None:
+            self._calibration_dialog.set_data_format(self._value("data_format"))
+
+    def _sync_format_tip(self, idle=True, authoring=False):
+        """The Data format's purpose, an older document's conflict to settle, and why it waits while locked."""
+        wait = ("" if idle else " It waits for the calibration window's job to finish." if authoring
+                else " It waits for this page's work to finish.")
+        self._tip("data_format", DATA_FORMAT_PURPOSE + (" " + self._format_choice if self._format_choice else "")
+                  + wait)
 
     def _source_files(self, root):
         """The chosen files or folder, a relative one inside the Project (the selection would take it from
@@ -1416,6 +1482,8 @@ class RSMPage(QtWidgets.QWidget):
             sections[section].append(text)
         project = str(self._value("project_root")).strip()
         root = Path(project).expanduser() if project else None
+        if self._format_choice:  # older settings disagree: one Data format now serves every source (its tooltip)
+            need("project", "a Data format choice")
         if not project:
             need("project", "a Project folder")
         elif not root.is_dir():
@@ -1640,6 +1708,7 @@ class RSMPage(QtWidgets.QWidget):
         idle = (not busy and not reading and not metadata_reading and not authoring and not resolving and self._job_form is None
                 and final is RSMOwnerFinalization.NONE and not self._closing)
         self.controls.set_editors_enabled(idle)  # the action row stays usable: Retry (Codex F2)
+        self._sync_format_tip(idle, authoring)
         self.calibrate_button.setEnabled(idle)
         self.mask_button.setEnabled(idle)
         for dialog in self._authoring_dialogs:
@@ -1736,10 +1805,13 @@ class RSMPage(QtWidgets.QWidget):
                 unconfigured = not (saved.get("fields") or {}).get("source")
                 self._calibration_project = project
                 self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
+                # its jobs lock this page's inputs at once (the Data format among them), not at the next poll
+                self._calibration_dialog.busyChanged.connect(lambda _busy: self._sync_actions())
                 self._authoring_dialogs.append(self._calibration_dialog)
             source = self._source_spec_for_tools() if unconfigured else None
             if source is not None:  # RSM turns no images of its own: the window's camera stays (item 10)
                 self._calibration_dialog.set_source_context(source, image_rotation=None)
+            self._project_data_format()
             self._sync_calibration_window()
             self._calibration_dialog.show()
             self._calibration_dialog.raise_()
@@ -2669,6 +2741,7 @@ class RSMPage(QtWidgets.QWidget):
             self._release_calibration_dialog()
         elif self._calibration_dialog is not None and self._calibration_settings:
             self._calibration_dialog.apply_settings(self._calibration_settings)
+            self._project_data_format()
 
     def _choose_settings_path(self, action, start):
         return self._saved_settings.choose_path(action, start)

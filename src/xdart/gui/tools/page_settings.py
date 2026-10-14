@@ -110,6 +110,31 @@ class SettingsKind:
         return self.validate(document)
 
 
+def document_data_format(document: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """The page's Data format and Files/Folder input a document names, applied before its other fields, and the
+    conflict an older document leaves to the user ("" for none). A current document names them itself; an older
+    one (LT-SMALL-FIXES-20261014, D2) through its Source kind and its calibration window's saved calibrant and
+    direct-beam sources (``legacy_data_format``); a document naming neither keeps the page's."""
+    from xrd_tools.sources.selection import legacy_data_format
+
+    fields = document.get("fields", {})
+    current = {key: fields[key] for key in ("data_format", "input_mode") if key in fields}
+    if current or "source_kind" not in fields:
+        return current, ""
+    calibration = document.get("calibration") if isinstance(document.get("calibration"), dict) else {}
+    inputs, choices = calibration.get("fields") or {}, calibration.get("choices") or {}
+
+    def chosen(name):
+        choice = choices.get(name)
+        return choice.get("data") if isinstance(choice, dict) else None
+    beam_used = chosen("rough_mode") in (None, "scan")  # a distance typed or skipped measures no beam scan
+    roles = (("the calibrant scan", chosen("source_kind"), bool(str(inputs.get("source") or "").strip())),
+             ("the direct-beam scan", chosen("beam_source_kind"),
+              beam_used and bool(str(inputs.get("beam_source") or "").strip())))
+    data_format, mode, conflict = legacy_data_format(str(fields["source_kind"]), roles)
+    return {"data_format": data_format, "input_mode": mode}, conflict
+
+
 def saved_fields(page, document: dict[str, Any], skip=frozenset()) -> dict[str, Any]:
     """The document's fields the page has, but those in ``skip`` (one shown from the others, or restored as a
     policy)."""

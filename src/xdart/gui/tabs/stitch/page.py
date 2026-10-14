@@ -62,13 +62,17 @@ from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifac
 from xrd_tools.session.readiness import (
     ControlAction, ControlActionSpec, ControlFieldKind, ControlFormField, SectionId,
 )
+from xrd_tools.sources.selection import (
+    DATA_FORMAT_LABELS, DATA_FORMAT_PURPOSE, DATA_FORMATS, DEFAULT_DATA_FORMAT, INPUT_MODE_LABELS,
+    INPUT_MODE_PURPOSE as _INPUT_MODE_TIP, INPUT_MODES, page_source_kind,
+)
 from xdart.gui.tabs.scattering.controls_inventory import (
     GI_1D_AXES, GI_ENABLED, GI_MOTOR, GI_ORIENTATION, GI_THETA, INT_1D_AXIS, INT_1D_AZIM_AUTO, INT_1D_AZIM_HIGH,
     INT_1D_AZIM_LOW, INT_1D_POINTS, INT_1D_RADIAL_AUTO,
     MASK_FILE, PONI_FILE, RECORD_ANGULAR_SUPPORT,
     INT_1D_RADIAL_HIGH, INT_1D_RADIAL_LOW, INT_2D_AXIS, INT_2D_AZIM_AUTO, INT_2D_AZIM_HIGH, INT_2D_AZIM_LOW,
     INT_2D_AZIM_POINTS, INT_2D_RADIAL_AUTO, INT_2D_RADIAL_HIGH, INT_2D_RADIAL_LOW, INT_2D_RADIAL_POINTS,
-    SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, SOURCE_TYPE, STANDARD_1D_AXES, STANDARD_2D_AXES,
+    SOURCE_DIRECTORY, SOURCE_FILTER, SOURCE_RECURSIVE, STANDARD_1D_AXES, STANDARD_2D_AXES,
     THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN,
 )
 from xrd_tools.session.threshold_editing import (
@@ -477,6 +481,10 @@ class StitchPage(QtWidgets.QWidget):
         #: Int's readiness line: (summary, ready) from the section checks.
         self._readiness = ("", False)
         self._run_ready = False
+        #: Older saved settings whose sources disagree on the Data format: why the user must choose it ("" none)
+        self._format_choice = ""
+        #: The source kind the Source rows and files last showed (a format edit swaps files only when it changes)
+        self._source_kind_shown = None
         #: The committed SPEC selection and the frames its scans record (None: unknown), as Int's "N frames".
         self._frames = None
         self._action_revision = None
@@ -661,8 +669,9 @@ class StitchPage(QtWidgets.QWidget):
             self._draw()  # the mode's layout, as Int's follows its run-bar mode
         return True
 
-    def _field(self, card, section, key, label, value="", *, choices=(), browse=False, choice_labels=None):
-        field = self._new_field(section, key, label, value, choices=choices, browse=browse)
+    def _field(self, card, section, key, label, value="", *, choices=(), browse=False, choice_labels=None,
+               path=None):
+        field = self._new_field(section, key, label, value, choices=choices, browse=browse, path=path)
         row = FormRow(label=label, path=field.path, value=value, kind=field.kind.value,
                       choices=choices, browse=browse, minimum=field.minimum, maximum=field.maximum,
                       allow_blank=field.allow_blank, choice_labels=choice_labels)
@@ -671,7 +680,7 @@ class StitchPage(QtWidgets.QWidget):
         return self._bind(key, field, row)
 
     @staticmethod
-    def _new_field(section, key, label, value="", *, choices=(), browse=False, path=None):
+    def _new_field(section, key, label, value="", *, choices=(), browse=False, path=None, choice_labels=None):
         """One of this page's fields; ``path`` Int's for a row Int's composer lays out."""
         kind = (ControlFieldKind.COMBO if choices else ControlFieldKind.BOOL if isinstance(value, bool)
                 else ControlFieldKind.INT if key in _INTEGER_FIELDS else ControlFieldKind.LINE)
@@ -679,7 +688,8 @@ class StitchPage(QtWidgets.QWidget):
             path = ("Project", "project_folder") if key == "project_root" else ("Stitch", key)
         minimum, maximum, allow_blank = _INTEGER_FIELDS.get(key, (None, None, False))
         return ControlFormField(section, label, path, value, kind, tuple(choices), browse,
-                                minimum=minimum, maximum=maximum, allow_blank=allow_blank)
+                                minimum=minimum, maximum=maximum, allow_blank=allow_blank,
+                                choice_labels=tuple((choice_labels or {}).items()))
 
     def _bind(self, key, field, row):
         """A row this page reads and edits by ``key``, built here or by Int's composer."""
@@ -718,6 +728,13 @@ class StitchPage(QtWidgets.QWidget):
         self._field(project, SectionId.PROJECT, "project_root", "Folder", browse=True)
         self._rows["project_root"].valueChanged.connect(self._refresh_xu_geometry)
         self._field(project, SectionId.PROJECT, "output_path", "Save Path", browse=True)
+        # One Data format for this page (LT-004; maintainer, October 14: Stitch and RSM each remember their own): the
+        # Source rows and files, and the calibration window's calibrant and direct-beam sources, follow it
+        self._field(project, SectionId.PROJECT, "data_format", "Data format", DEFAULT_DATA_FORMAT,
+                    choices=DATA_FORMATS, choice_labels=DATA_FORMAT_LABELS, path=("Project", "data_format"))
+        self._sync_format_tip()
+        self._rows["data_format"].valueChanged.connect(self._data_format_changed)
+        self._rows["data_format"].editor.activated.connect(self._data_format_chosen)
         # Int's EXPERIMENT rows, from its composer: Calibrate · Make Mask on top, the Detector subsection (the
         # calibration and mask), then Configuration (Grazing, below); every action button is Int's
         detector = {"geometry_path": self._new_field(SectionId.EXPERIMENT, "geometry_path", "Calibration",
@@ -749,36 +766,41 @@ class StitchPage(QtWidgets.QWidget):
         QtWidgets.QVBoxLayout(self._gi_host).setContentsMargins(0, 0, 0, 0)
         experiment.add_row(self._gi_host)
         self.controls.fieldValueChanged.connect(self._gi_edited)
-        # Int's Source rows, from its composer: the kind and (Directory only) Subdirs on one row, then the
-        # files or folder and, as Int's Image Directory, the Filter (maintainer, 2026-09-30: "Directory mode
-        # should have subfolders option as well as filters like in Int 2d"; "the subdirs toggle button should
-        # be in the same row a the source like in int 1d/2d"). Every row is built once; a kind shows its own.
+        # Int's Source rows, from its composer, grouped (LT-006, maintainer's layout, October 14): the Files/Folder
+        # menu, the files or folder and (a folder only) Subdirs on one row, then the Filter as Int's Image Directory
+        # (maintainer, 2026-09-30: "Directory mode should have subfolders option as well as filters like in Int
+        # 2d"), Image Path, Image Stem, and Scans with its selection beside the menu. The Data format above makes
+        # the source kind; every row is built once and a kind shows its own.
         fields = {
-            "source_kind": self._new_field(SectionId.SOURCE, "source_kind", "Source", "Spec",
-                                           choices=("Spec", "NeXus", "Directory"), path=SOURCE_TYPE),
-            "spec_path": self._new_field(SectionId.SOURCE, "spec_path", "SPEC files", browse=True,
+            "input_mode": self._new_field(SectionId.SOURCE, "input_mode", "SPEC File", "files", choices=INPUT_MODES,
+                                          path=("Source", "input_mode"), choice_labels=INPUT_MODE_LABELS),
+            "spec_path": self._new_field(SectionId.SOURCE, "spec_path", "SPEC File", browse=True,
                                          path=SOURCE_DIRECTORY),
             "subdirs": self._new_field(SectionId.SOURCE, "subdirs", "Subdirs", False, path=SOURCE_RECURSIVE),
             "name_filter": self._new_field(SectionId.SOURCE, "name_filter", "Filter", path=SOURCE_FILTER),
-            "image_dir": self._new_field(SectionId.SOURCE, "image_dir", "Images", browse=True),
+            "image_dir": self._new_field(SectionId.SOURCE, "image_dir", "Image Path", browse=True),
             # on the card, not in Advanced: a stem left from another dataset matches the wrong images
-            "image_stem": self._new_field(SectionId.SOURCE, "image_stem", "Image stem"),
+            "image_stem": self._new_field(SectionId.SOURCE, "image_stem", "Image Stem"),
             "scan_mode": self._new_field(SectionId.SOURCE, "scan_mode", "Scans", "Select Scans",
-                                         choices=("Stitch All", "Select Scans")),
+                                         choices=("Stitch All", "Select Scans"),
+                                         choice_labels={"Stitch All": "All", "Select Scans": "Select"}),
             "scan": self._new_field(SectionId.SOURCE, "scan", "Selection", "1"),
         }
-        rows = self.controls.render_source_rows(source, tuple(fields.values()))
+        rows = self.controls.render_source_rows(source, tuple(fields.values()), groups=(
+            (fields["input_mode"].path, SOURCE_DIRECTORY, SOURCE_RECURSIVE),
+            (fields["scan_mode"].path, fields["scan"].path)))
         for key, field in fields.items():
             self._bind(key, field, rows[field.path])
-        self._tip("source_kind", "Source kind: SPEC files and their scans' images, NeXus files, or a folder "
-                                 "of both.")
+        self._tip("input_mode", _INPUT_MODE_TIP)
+        self._tip("scan_mode", "All: every scan of the SPEC files, each its own output. Select: only the scans "
+                               "typed beside it.")
         self._tip("subdirs", "Also the SPEC and NeXus files in the folder's subfolders.")
         self._tip("image_stem",
                   "The part of the image file names that identifies the scan; any prefix before it is "
                   "fine (b_thampy_R1C2_scan3_0000.raw has R1C2_scan3_). Blank: <SPEC name>_scan<N>_ for "
                   "each scan. {spec} and {scan} fill in the SPEC name and scan number.")
         self._tip("scan", "1,2,[2-5,8] produces three outputs. Brackets combine scans into one result.")
-        self._rows["source_kind"].valueChanged.connect(self._source_changed)
+        self._rows["input_mode"].valueChanged.connect(self._source_changed)
         self._rows["scan_mode"].valueChanged.connect(self._source_changed)
         self._rows["spec_path"].valueChanged.connect(self._source_path_edited)
         self._rows["scan"].valueChanged.connect(self._source_committed)  # committed, not drafts
@@ -1326,10 +1348,53 @@ class StitchPage(QtWidgets.QWidget):
         for key in ("subdirs", "name_filter"):
             self._rows[key].setVisible(kind == "Directory")
         self._rows["scan"].setVisible(kind == "Spec" and self._value("scan_mode") == "Select Scans")
-        self._rows["spec_path"].label.setText({"Spec": "SPEC files", "NeXus": "NeXus files", "Directory": "Folder"}[kind])
-        if _args and tuple(_args[0]) == self._fields["source_kind"].path:
+        label = {"Spec": "SPEC File", "NeXus": "NeXus File", "Directory": "Folder"}[kind]
+        self._rows["input_mode"].label.setText(label)  # the row's label; the path box keeps it as its name
+        self._rows["spec_path"].label.setText(label)
+        self._rows["spec_path"].editor.setAccessibleName(label)
+        shown, self._source_kind_shown = self._source_kind_shown, kind
+        if _args and shown is not None and kind != shown:  # each kind keeps its own files
             self.set_sources(self._paths_by_kind.get(kind, ()))
         self._source_committed()
+
+    def _set_source_kind(self, kind):
+        """An older document's or caller's source kind, as the Data format and Files/Folder it means: NeXus files are
+        the NeXus format, Spec leaves NeXus for the default SPEC format, a Directory changes only the input."""
+        if kind not in ("Spec", "NeXus", "Directory"):
+            raise ValueError(f"Source: {kind!r} is not one of its choices")
+        if kind == "NeXus":
+            self.set_field("data_format", "nexus")
+        elif kind == "Spec" and self._value("data_format") == "nexus":
+            self.set_field("data_format", DEFAULT_DATA_FORMAT)
+        self.set_field("input_mode", "directory" if kind == "Directory" else "files")
+
+    def _data_format_changed(self, *_args):
+        """The page's one Data format: its Source rows and files, then its calibration window's sources."""
+        self._source_changed(self._fields["data_format"].path)
+        self._project_data_format()
+
+    def _data_format_chosen(self, *_args):
+        """A choice made in the Data format menu, even of the format shown, settles older settings' conflict."""
+        if self._format_choice:
+            self._set_format_choice("")
+
+    def _set_format_choice(self, reason):
+        """Older settings' conflict for the user to settle, as a readiness need and in the Data format's tooltip
+        ("" when there is none)."""
+        self._format_choice = str(reason or "")
+        self._sync_format_tip()
+        self._edited()
+
+    def _project_data_format(self):
+        if self._calibration_dialog is not None:
+            self._calibration_dialog.set_data_format(self._value("data_format"))
+
+    def _sync_format_tip(self, idle=True, authoring=False):
+        """The Data format's purpose, an older document's conflict to settle, and why it waits while locked."""
+        wait = ("" if idle else " It waits for the calibration window's job to finish." if authoring
+                else " It waits for this page's work to finish.")
+        self._tip("data_format", DATA_FORMAT_PURPOSE + (" " + self._format_choice if self._format_choice else "")
+                  + wait)
 
     def _processing_axis_changed(self, *_args):
         """An Axis choice: a change of unit resets its range to the unit's defaults (every 1-D axis but 2θ
@@ -1348,6 +1413,9 @@ class StitchPage(QtWidgets.QWidget):
     def set_field(self, key, value):
         if key in self._range_keys:
             self._range_edited(self._fields[key].path, value)
+            return
+        if key == "source_kind":  # no row of its own: the Data format and Files/Folder make it
+            self._set_source_kind(value)
             return
         if key == "unit":
             value = _LEGACY_AXES.get(value, value)
@@ -1381,7 +1449,9 @@ class StitchPage(QtWidgets.QWidget):
             self._backend_changed()
         elif key == "spec_path":
             self._source_path_edited(field.path, value)
-        elif key in {"source_kind", "scan_mode"}:
+        elif key == "data_format":
+            self._data_format_changed(field.path, value)
+        elif key in {"input_mode", "scan_mode"}:
             self._source_changed(field.path, value)
         elif key in {"scan", "image_dir", "image_stem", "detector_rows", "detector_cols",
                      "raw_dtype", "raw_header_skip"}:
@@ -1403,6 +1473,8 @@ class StitchPage(QtWidgets.QWidget):
             return self._fields[key].value
         if key in self._pill_keys:
             return dict(self._rows[key].current_edits())[self._fields[key].path]
+        if key == "source_kind":  # Spec, NeXus or Directory, the selection's unchanged tokens
+            return page_source_kind(self._rows["data_format"].current_value(), self._rows["input_mode"].current_value())
         return self._rows[key].current_value()
 
     def _edited(self, *_args):
@@ -1677,6 +1749,8 @@ class StitchPage(QtWidgets.QWidget):
         needs = {}
         if not project_ready:
             needs["project"] = "an existing Project folder" if str(value("project_root")).strip() else "a Project folder"
+        if self._format_choice:  # older settings disagree: one Data format now serves every source (its tooltip)
+            needs["project"] = ", ".join(filter(None, (needs.get("project"), "a Data format choice")))
         if not experiment_ready and not arm_problem:
             needs["experiment"] = ("a calibration" if not calibration else
                                    f"the calibration {Path(calibration).name} (not found)"
@@ -2667,6 +2741,8 @@ class StitchPage(QtWidgets.QWidget):
                     self._calibration_dialog.apply_settings(saved)
                 self._calibration_dialog.set_instrument(geometry)
                 self._calibration_dialog.geometryChanged.connect(self._instrument_changed)
+                # its jobs lock this page's inputs at once (the Data format among them), not at the next poll
+                self._calibration_dialog.busyChanged.connect(lambda _busy: self._sync_actions())
                 unconfigured = not (saved.get("fields") or {}).get("source")
                 self._calibration_project = project
                 self._calibration_dialog.calibrationSaved.connect(self._adopt_calibration)
@@ -2678,6 +2754,7 @@ class StitchPage(QtWidgets.QWidget):
                     image_flip=orientation.flip_horizontal,
                     geometry_path=(self._value("geometry_path") or None
                                    if self._value("geometry_kind") == "Goniometer JSON" else None))
+            self._project_data_format()
             self._sync_calibration_window()
             self._calibration_dialog.show()
             self._calibration_dialog.raise_()
@@ -3391,6 +3468,7 @@ class StitchPage(QtWidgets.QWidget):
         self._sync_fit_tools()
         for row in self._rows.values():
             row.setEnabled(idle)
+        self._sync_format_tip(idle, authoring)
         if self._value("backend") == "xrayutilities histogram":
             locked = ("geometry_kind", "source_motors", "poni_references", "camera")
             for key in locked:
@@ -3490,6 +3568,7 @@ class StitchPage(QtWidgets.QWidget):
             self._release_calibration_dialog()
         elif self._calibration_dialog is not None and self._calibration_settings:
             self._calibration_dialog.apply_settings(self._calibration_settings)
+            self._project_data_format()
 
     def _choose_settings_path(self, action, start):
         return self._saved_settings.choose_path(action, start)

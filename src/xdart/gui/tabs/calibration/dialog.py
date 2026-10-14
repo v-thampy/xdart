@@ -412,6 +412,9 @@ def _plain_choice(value):
     return value if value is None or isinstance(value, (bool, int, float, str)) else None
 
 
+#: The two scans' source kinds are the page's one Data format's (LT-SMALL-FIXES-20261014, LT-004/LT-005).
+_FROM_DATA_FORMAT = ("Set by the page's Data format (its Project card); the calibrant and direct-beam scans both "
+                     "follow it.")
 #: What the page a window serves does with what it saves, in the window's tips (G6 choice 4): the window is
 #: shared, so each tip names its own page's use, and claims none for a page it does not know.
 _PAGE_USE = {
@@ -469,6 +472,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     calibrationSaved = QtCore.Signal(str, str)
     #: The diffractometer or a circle's motor changed (the page keeps the same geometry).
     geometryChanged = QtCore.Signal()
+    #: A job started (True) or ended (False): the page locks its inputs, its Data format among them, meanwhile.
+    busyChanged = QtCore.Signal(bool)
 
     def __init__(self, context: CalibrationContext, *, parent=None):
         super().__init__(parent)
@@ -540,6 +545,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.saved_image_rotation = 0
         self.saved_image_flip = False  # with the rotation: the camera's transform into Stitch's frame
         self.saved_mask = ''
+        #: The page's Data format once it has set this window's sources (None: a window no page has set)
+        self._data_format = None
         self._owner = SingleWorkerOwner(_run_job)
         #: Quick calibration: the step it is on (1-3; None when idle), the job it waits for, whether Cancel was
         #: pressed, and the inputs its direct-beam check last ran on (_quick_advance)
@@ -1215,7 +1222,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                                                              ('SPEC + Eiger / NeXus', 'spec_container'),
                                                              ('NeXus images + metadata', 'nexus_stack')],
             tip='SPEC supplies each frame\'s angles; an image series or an Eiger/NeXus container supplies '
-                'the frames. Standalone NeXus holds both images and metadata.')
+                'the frames. Standalone NeXus holds both images and metadata. ' + _FROM_DATA_FORMAT)
+        self.source_kind.setEnabled(False)  # the page's Data format sets it (LT-005)
         self._edit(form, 'source', 'SPEC file',
                    chooser=lambda: NEXUS_FILTER if self.source_kind.currentData() == 'nexus_stack' else 'spec',
                    tip='The calibrant scan: its SPEC file, or its NeXus file.')
@@ -1613,12 +1621,27 @@ class CalibrationDialog(QtWidgets.QDialog):
             scan_row.label.setMinimumWidth(0)
             scan_row.editor.setMaximumWidth(90)
             file_row.add_trailing_widget(scan_row, 0)
+            # the page's Data format shows each role's own fields here, as its tab does (LT-005): a NeXus or container
+            # scan's entry, and a SPEC scan's images folder and stem
+            entry_row = FormRow(label='Entry', path=('Calibration', 'Quick', prefix + 'entry'), value='')
+            entry_row.label.setMinimumWidth(0)
+            entry_row.editor.setMaximumWidth(120)
+            file_row.add_trailing_widget(entry_row, 0)
             form.addRow(file_row.label, file_row)
-            for key, row, what in ((prefix + 'source', file_row, 'file'), (prefix + 'scan', scan_row, 'scan number')):
+            images_row = FormRow(label=f'{scan} Image Path', path=('Calibration', 'Quick', prefix + 'images'),
+                                 value='', browse=True)
+            stem_row = FormRow(label='Image Stem', path=('Calibration', 'Quick', prefix + 'stem'), value='')
+            stem_row.label.setMinimumWidth(0)
+            images_row.add_trailing_widget(stem_row, 1)
+            form.addRow(images_row.label, images_row)
+            for key, row, what in ((prefix + 'source', file_row, 'file'), (prefix + 'scan', scan_row, 'scan number'),
+                                   (prefix + 'entry', entry_row, 'NeXus entry'),
+                                   (prefix + 'images', images_row, "images folder (blank: the SPEC file's folder)"),
+                                   (prefix + 'stem', stem_row, 'image name stem (blank: <SPEC name>_scan<N>_)')):
                 self._quick_project(key, row, f"The {scan.lower()} scan's {what}: the same value as {tab}'s, edited "
                                               'here or there.')
-            file_row.browseRequested.connect(
-                lambda _path, key=prefix + 'source': self._browse(key, self._choosers[key]))
+            for key, row in ((prefix + 'source', file_row), (prefix + 'images', images_row)):
+                row.browseRequested.connect(lambda _path, key=key: self._browse(key, self._choosers[key]))
         mask_row = FormRow(label='Mask file', path=('Calibration', 'Quick', 'mask'), value='', browse=True)
         form.addRow(mask_row.label, mask_row)
         self._quick_project('mask', mask_row, "The Detector panel's Mask file, edited here or there: pixels left out "
@@ -1650,7 +1673,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         card, nor a focused file row (a file row takes no set while it holds the focus); a focused scan box that holds
         no draft does follow (Tab from a new file to its scan: the reset scan, not the old file's)."""
         row = self._quick_rows.get(key)
-        if row is None or (row.editor.hasFocus() and (row.editor.isModified() or key.endswith('source')
+        if row is None or (row.editor.hasFocus() and (row.editor.isModified() or key.endswith(('source', 'images'))
                                                       or key == 'mask')):
             return
         value = self._text(key)
@@ -1675,14 +1698,17 @@ class CalibrationDialog(QtWidgets.QDialog):
         number for a NeXus file, and the tab's word for the kind of file."""
         if not self._quick_rows:
             return
-        beam_nexus = self.beam_source_kind.currentData() == 'nexus'
-        calibrant_nexus = self.source_kind.currentData() == 'nexus_stack'
-        beam = self._quick_rows['beam_source']
-        self._quick_form.setRowVisible(beam, self.rough_mode.currentData() == 'scan')
-        beam.label.setText('Direct-beam NeXus file' if beam_nexus else 'Direct-beam SPEC file')
-        self._quick_rows['beam_scan'].setVisible(not beam_nexus)
-        self._quick_rows['source'].label.setText('Calibrant NeXus file' if calibrant_nexus else 'Calibrant SPEC file')
-        self._quick_rows['scan'].setVisible(not calibrant_nexus)
+        measured = self.rough_mode.currentData() == 'scan'
+        for prefix, role, kind, nexus_kind, shown in (
+                ('beam_', 'Direct-beam', self.beam_source_kind.currentData(), 'nexus', measured),
+                ('', 'Calibrant', self.source_kind.currentData(), 'nexus_stack', True)):
+            nexus, series = kind == nexus_kind, kind in ('spec', 'spec_series')
+            rows = self._quick_rows
+            self._quick_form.setRowVisible(rows[prefix + 'source'], shown)
+            self._quick_form.setRowVisible(rows[prefix + 'images'], shown and not nexus)
+            rows[prefix + 'source'].label.setText(f"{role} {'NeXus' if nexus else 'SPEC'} file")
+            rows[prefix + 'scan'].setVisible(not nexus)
+            rows[prefix + 'entry'].setVisible(not series)
 
     def _build_distance(self):
         layout, form = self._form('2 · Rough geometry', 'rough')
@@ -1699,7 +1725,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.beam_source_kind = self._combo(form, 'Source', [('SPEC + image series', 'spec_series'),
                                                              ('SPEC + Eiger / NeXus', 'spec_container'),
                                                              ('NeXus images + metadata', 'nexus')],
-            tip='Where the direct-beam scan\'s angles and images come from.')
+            tip='Where the direct-beam scan\'s angles and images come from. ' + _FROM_DATA_FORMAT)
+        self.beam_source_kind.setEnabled(False)  # the page's Data format sets it (LT-005)
         self._formrows['beam_source_kind'] = self._row_of[self.beam_source_kind]
         self._rows['beam_source_kind'] = (form, self._row_of[self.beam_source_kind])
         self._attach('beam_entry', 'beam_source_kind', 'NeXus entry', 'entry',
@@ -2103,6 +2130,20 @@ class CalibrationDialog(QtWidgets.QDialog):
         motor = self._beam_detection[1] if self._beam_detection is not None else ''
         return self.geometry_editor.value().arm_role(motor)
 
+    def set_data_format(self, data_format):
+        """The page's one Data format (LT-SMALL-FIXES-20261014): the calibrant and direct-beam source kinds follow
+        it, each through its own rows, file chooser and Quick rows; their inputs stay their own. False, changing
+        nothing, while a job runs (the page's inputs are locked then as well)."""
+        if self._owner.busy:
+            return False
+        from xrd_tools.sources.selection import calibration_source_kinds
+        self._data_format = data_format
+        for combo, kind in zip((self.source_kind, self.beam_source_kind), calibration_source_kinds(data_format)):
+            index = combo.findData(kind)
+            if index >= 0 and index != combo.currentIndex():
+                combo.setCurrentIndex(index)  # its own handlers: rows, energy and detection invalidation
+        return True
+
     def set_source_context(self, source: SourceSpec, *, image_rotation=0, del_motor=None, nu_motor=None,
                            geometry_path=None, image_flip=False):
         if self._owner.busy:
@@ -2111,8 +2152,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._fields['refine_seed_path'].setText(str(geometry_path))
             if self.fit is None and self._seed_file_problem(geometry_path) is None:  # an arm it can start from
                 self.refine_seed.setCurrentIndex(self.refine_seed.findData('file'))
-        self.source_kind.setCurrentIndex(self.source_kind.findData(
-            'spec' if source.kind is SourceKind.SPEC else 'nexus_stack'))
+        if self._data_format is None:  # a page's Data format, once set, decides the kind (set_data_format)
+            self.source_kind.setCurrentIndex(self.source_kind.findData(
+                'spec' if source.kind is SourceKind.SPEC else 'nexus_stack'))
         opts = source.options
         for key, value in [('source', source.uri), ('scan', opts.get('scan', '1')),
                            ('images', opts.get('image_dir', '')), ('stem', opts.get('image_stem', '')),
@@ -2175,9 +2217,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     )
 
     #: Choices saved with the page's settings (Stitch's, RSM's). The calibrant-scan and same-detector
-    #: confirmations are per use and never saved.
-    _SAVED_CHOICES = ('source_kind', 'refine_calibrant', 'refine_seed', 'beam_source_kind',
-                      'rough_mode', 'raw_layout')
+    #: confirmations are per use and never saved; the two scans' source kinds are the page's Data format's.
+    _SAVED_CHOICES = ('refine_calibrant', 'refine_seed', 'rough_mode', 'raw_layout')
 
     def settings(self):
         """This dialog's inputs as plain values, for the page's saved settings."""
@@ -2529,6 +2570,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                             else f'{kind.capitalize()} in progress…')
         self._timer.start()
         self._sync_quick_button()
+        self.busyChanged.emit(True)
 
     def _job_status(self, detail):
         """A calibrant preview reports in its panel; the message box keeps the fit result."""
@@ -3579,6 +3621,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._timer.stop()
         if self._calibration_fit_window is not None:
             self._calibration_fit_window.preview_busy(False)
+        self.busyChanged.emit(False)
         if terminal.status is OperationTerminalStatus.RETURNED:
             result = terminal.payload
             if type(result) is PointImageDetection:

@@ -20,7 +20,8 @@ from __future__ import annotations
 from typing import Any
 
 from xdart.gui.tools.page_settings import (
-    SettingsKind, check_fields, restore_sources, restore_write_mode, saved_fields, saved_threshold,
+    SettingsKind, check_fields, document_data_format, restore_sources, restore_write_mode, saved_fields,
+    saved_threshold,
 )
 
 #: The document's kind and version, and its key in the session file.
@@ -54,7 +55,9 @@ def apply_page_settings(page, document: Any) -> None:
     document = RSM_SETTINGS.validate(document)
     if "point_images" in document:
         page.point_images.restore(document["point_images"])
+    formats, conflict = document_data_format(document)  # an older document's Source kind, migrated first
     fields = saved_fields(page, document, _NOT_FIELDS)
+    fields.update(formats)
     legacy = document.get("fields", {}).get("grid")
     if legacy is not None:
         from xdart.gui.tabs.rsm.page import _GRID_FIELDS, _GRIDS
@@ -63,12 +66,14 @@ def apply_page_settings(page, document: Any) -> None:
         for key, value in zip(_GRID_FIELDS, _GRIDS[legacy], strict=True):
             fields.setdefault(key, str(value))
     check_fields(page, fields, _OPEN_CHOICES)
-    if "source_kind" in fields:  # first: a kind shows its own rows
-        page.set_field("source_kind", fields["source_kind"])
+    first = ("data_format", "input_mode")  # first: the format and input make the kind that shows its own rows
+    for key in first:
+        if key in fields:
+            page.set_field(key, fields[key])
     if "sources" in document:  # a document without them keeps the page's
         restore_sources(page, document)
     for key in page._fields:  # the page's own order: a document's (sorted in its file) is no order of the page's
-        if key in fields and key not in ("source_kind", "normalization"):
+        if key in fields and key not in (*first, "normalization"):
             page.set_field(key, fields[key])
     if "normalization" in fields:  # last, as Stitch's: once the Source names the columns it reads
         page.set_field("normalization", fields["normalization"])
@@ -79,7 +84,7 @@ def apply_page_settings(page, document: Any) -> None:
     if "calibration" in document:  # a document without it keeps the window's
         page._set_calibration_settings(document["calibration"])
     restore_write_mode(page, document)
-    page._edited()
+    page._set_format_choice(conflict)  # and page._edited(), as before
 
 
 __all__ = ["RSM_SETTINGS", "SESSION_KEY", "apply_page_settings", "page_settings"]

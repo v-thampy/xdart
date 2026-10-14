@@ -2105,14 +2105,25 @@ class ControlsPanel(QtWidgets.QWidget):
         self,
         card: SectionCard,
         fields: Iterable[ControlFormField],
+        *,
+        groups: Iterable[tuple[tuple[str, ...], ...]] = (),
     ) -> dict[tuple[str, ...], FormRow]:
         """SOURCE layout with a few coalesced rows (Vivek): the mode combo + the
         directory-only Subdirs toggle share a row, and File Type + Meta Type share
         a row.  Everything else renders one field per row, in field order.
 
         Public for another page's own source values (Stitch): returns each field's
-        row by path. Edits emit ``fieldValueChanged`` with the fields' paths."""
+        row by path. Edits emit ``fieldValueChanged`` with the fields' paths.
+
+        ``groups`` (opt-in; Stitch's and RSM's Source, LT-SMALL-FIXES-20261014) lays each group of paths out on
+        one row, under its first field's label: a menu sized to its text, a text box taking the remaining width, a
+        toggle with its own short label; another text box's label is hidden and kept as its editor's accessible
+        name. Every other field then has a row of its own, in field order. Without groups, Int's layout above is
+        unchanged."""
         fields = tuple(fields)
+        groups = tuple(tuple(group) for group in groups)
+        if groups:
+            return self._render_grouped_rows(card, fields, groups)
         by_path = {field.path: field for field in fields}
         rendered: set[tuple[str, ...]] = set()
         built: dict[tuple[str, ...], FormRow] = {}
@@ -2188,6 +2199,39 @@ class ControlsPanel(QtWidgets.QWidget):
             if field.path not in rendered:
                 built[field.path] = row = self._make_bound_row(field)
                 card.add_row(row)
+        return built
+
+    def _render_grouped_rows(self, card, fields, groups):
+        """``render_source_rows`` with ``groups``: see there."""
+        by_path = {field.path: field for field in fields}
+        group_of = {path: group for group in groups for path in group}
+        built: dict[tuple[str, ...], FormRow] = {}
+        for field in fields:
+            if field.path in built:
+                continue
+            group = group_of.get(field.path)
+            if group is None:
+                built[field.path] = row = self._make_bound_row(field)
+                card.add_row(row)
+                continue
+            container = QtWidgets.QWidget()
+            lay = QtWidgets.QHBoxLayout(container)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(8)
+            for index, path in enumerate(path for path in group if path in by_path):
+                member = by_path[path]
+                built[path] = sub = self._make_bound_row(member)
+                kind = getattr(member.kind, "value", member.kind)
+                if kind == "bool" and index:  # a toggle keeps its short label beside it
+                    sub.label.setMinimumWidth(0)
+                    sub.label.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
+                elif index:
+                    sub.label.hide()
+                    sub.editor.setAccessibleName(member.label)
+                if kind == "combo":
+                    sub.editor.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+                lay.addWidget(sub, 1 if kind == "line" else 0)
+            card.add_row(container)
         return built
 
     def _make_source_energy_button(
@@ -2782,6 +2826,7 @@ class ControlsPanel(QtWidgets.QWidget):
             minimum=field.minimum,
             maximum=field.maximum,
             allow_blank=field.allow_blank,
+            choice_labels=dict(field.choice_labels) or None,
         )
         row.valueChanged.connect(self.fieldValueChanged)
         row.draftChanged.connect(self.fieldDraftChanged)

@@ -233,11 +233,94 @@ def image_series_spec(
     )
 
 
+#: A Stitch or RSM page's one Data format (LT-SMALL-FIXES-20261014; maintainer, October 14: each page remembers its
+#: own). It drives that page's Source rows and its calibration window's calibrant and direct-beam sources; Int keeps
+#: its automatic file-type handling and has none. SPEC + Eiger keeps the calibration window's "SPEC + Eiger / NeXus"
+#: meaning: SPEC metadata with HDF5 image containers (Eiger masters or NeXus image stacks).
+DATA_FORMATS = ("spec_series", "spec_container", "nexus")
+DATA_FORMAT_LABELS = {"spec_series": "SPEC + Image Series", "spec_container": "SPEC + Eiger", "nexus": "NeXus"}
+DEFAULT_DATA_FORMAT = "spec_series"
+#: How a page picks its Source: files one by one, or a folder whose files are found (its Subdirs and Filter).
+INPUT_MODES = ("files", "directory")
+INPUT_MODE_LABELS = {"files": "Files", "directory": "Folder"}
+#: The two choices' purposes, as both pages show them.
+DATA_FORMAT_PURPOSE = ("This page's data: SPEC metadata with an image series, SPEC with Eiger or other HDF5 image "
+                       "files, or NeXus files holding both. It sets the Source rows and file choosers, and the "
+                       "calibration window's calibrant and direct-beam sources. The other page keeps its own.")
+INPUT_MODE_PURPOSE = ("Files: choose the SPEC or NeXus files themselves. Folder: choose one folder; every SPEC file "
+                      "and NeXus or Eiger file found in it (and with Subdirs, its subfolders) is used, each scan or "
+                      "file its own output, whatever the Data format.")
+#: Each format's calibration-window source kinds: (calibrant, direct beam).
+_ROLE_KINDS = {"spec_series": ("spec", "spec_series"), "spec_container": ("spec_container", "spec_container"),
+               "nexus": ("nexus_stack", "nexus")}
+#: A saved calibration-window kind's format family; the defaults ("spec", "spec_series") name SPEC, not its images.
+_SAVED_ROLE_KIND = {"spec": "spec", "spec_series": "spec", "spec_container": "spec_container",
+                    "nexus_stack": "nexus", "nexus": "nexus"}
+
+
+def page_source_kind(data_format: str, input_mode: str) -> str:
+    """The page's source-selection kind, in the unchanged tokens its saved identity keeps: a folder is Directory
+    whatever the format (its discovery stays format-agnostic); files are NeXus or Spec."""
+    if data_format not in DATA_FORMATS or input_mode not in INPUT_MODES:
+        raise ValueError(f"unknown Data format or input: {data_format!r}, {input_mode!r}")
+    if input_mode == "directory":
+        return "Directory"
+    return "NeXus" if data_format == "nexus" else "Spec"
+
+
+def calibration_source_kinds(data_format: str) -> tuple[str, str]:
+    """The calibration window's (calibrant, direct-beam) source kinds for a page's Data format."""
+    return _ROLE_KINDS[data_format]
+
+
+def legacy_data_format(page_kind: str, roles=()) -> tuple[str, str, str]:
+    """An older page document's (Data format, input mode, conflict) from its Source kind and its calibration
+    window's saved source kinds (D2, maintainer, October 14: a deterministic default).
+
+    ``roles`` are (role, saved kind, whether that role names an input) triples, e.g. ("the calibrant scan",
+    "nexus_stack", True); a role naming no input says nothing. A NeXus Source or role is NeXus; a SPEC + Eiger role is
+    SPEC + Eiger; a Spec Source or a role at the SPEC default only says SPEC, and nothing at all is SPEC + Image
+    Series. A conflict (NeXus beside SPEC) keeps the Source's own format and names the roles, for the user to choose:
+    one format now serves them all."""
+    mode = "directory" if page_kind == "Directory" else "files"
+    families = []  # (who, family) the document names
+    if page_kind == "NeXus":
+        families.append(("the Source", "nexus"))
+    elif page_kind == "Spec":
+        families.append(("the Source", "spec"))
+    for role, kind, named in roles:
+        family = _SAVED_ROLE_KIND.get(kind) if named else None
+        if family is not None:
+            families.append((role, family))
+    nexus = [who for who, family in families if family == "nexus"]
+    spec = [who for who, family in families if family != "nexus"]
+    container = any(family == "spec_container" for _who, family in families)
+    if nexus and spec:
+        own = "nexus" if page_kind == "NeXus" else "spec_container" if container else DEFAULT_DATA_FORMAT
+        def read(who):
+            return ", ".join(who) + (" reads" if len(who) == 1 else " read")
+        return own, mode, (f"Saved settings disagree: {read(nexus)} NeXus, {read(spec)} SPEC. Choose this page's "
+                           "Data format; it now serves all of them.")
+    if nexus:
+        return "nexus", mode, ""
+    return ("spec_container" if container else DEFAULT_DATA_FORMAT), mode, ""
+
+
 __all__ = [
+    "DATA_FORMATS",
+    "DATA_FORMAT_LABELS",
+    "DATA_FORMAT_PURPOSE",
+    "INPUT_MODE_PURPOSE",
+    "DEFAULT_DATA_FORMAT",
     "DirectorySourceSpec",
+    "INPUT_MODES",
+    "INPUT_MODE_LABELS",
+    "calibration_source_kinds",
     "image_series_spec",
     "is_single_image_spec",
+    "legacy_data_format",
     "normalize_image_source_metadata",
     "normalize_metadata_format",
+    "page_source_kind",
     "single_image_spec",
 ]
