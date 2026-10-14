@@ -11,6 +11,7 @@ absent bins <= 1e-6.
 import json
 import math
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -732,8 +733,14 @@ def test_k6_saved_support_contract(tmp_path):
             group = handle["entry/integrated_1d"]
             with pytest.raises(AngularSupportFormatError):
                 read_angular_support(group, labels=(1, 2, 3), intensity_rows=group["intensity"][()])
-    # absence is a fact for the strict reader: no saved support (Browse alone may reconstruct a sufficient Run)
-    legacy, _ = _saved_int(tmp_path / "legacy", enabled=False)
+    # absence is a fact for the strict reader: no saved support (Browse alone may reconstruct a sufficient Run).
+    # Decision 6 (October 13): a Run with recording off now records that it was off, so the older-output form is a
+    # written output with its support removed (D5's form).
+    legacy = tmp_path / "legacy.nexus"
+    legacy.write_bytes(target.read_bytes())
+    with h5py.File(legacy, "r+") as handle:
+        for name in ANGULAR_SUPPORT_DATASETS:
+            del handle["entry/integrated_1d"][name]
     with h5py.File(legacy, "r") as handle:
         assert not any(name in handle["entry/integrated_1d"] for name in ANGULAR_SUPPORT_DATASETS)
     with FrameViewReader(legacy) as reader:
@@ -938,7 +945,8 @@ def test_k8_stitch_contributor_union(tmp_path):
     _off_request, off = _stitch(tmp_path / "off", poses[:4], [hot, hot, ones, ones],
                                 conditioning=StitchConditioning("manual", threshold_max=1000.0),
                                 policy=AngularSupportPolicy(enabled=False))
-    assert off.angular_support is None
+    from xrd_tools.core.angular_support import SupportReason
+    assert off.angular_support.reason is SupportReason.RECORDING_DISABLED, "decision 6: off records why"
     np.testing.assert_array_equal(thresholded_result.payload.intensity, off.payload.intensity)
     # the profile's own window: explicit (normalised by pyFAI) versus scouted (denominator stays 360°)
     _w_request, windowed = _stitch(tmp_path / "window", poses[:4], [ones] * 4, azimuth=(-30.0, 30.0))
@@ -1013,8 +1021,14 @@ def test_k9_stitch_saved_support_and_legacy(tmp_path):
     np.testing.assert_array_equal(payload.intensity, plain.intensity)
     np.testing.assert_array_equal(payload.coverage, plain.coverage)
     assert payload.result_fingerprint == plain.result_fingerprint, "support stays outside the fingerprint"
-    # an older Stitch result (no support datasets) is refused, never reconstructed (D6)
-    assert plain.angular_support.reason is SupportReason.LEGACY_STITCH
+    # an older Stitch result (no support datasets) is refused, never reconstructed (D6). Decision 6: recording off
+    # now records that it was off, so the older form is a written result with its support removed.
+    older = tmp_path / "older.nexus"
+    older.write_bytes(Path(target).read_bytes())
+    with h5py.File(older, "r+") as handle:
+        for name in ANGULAR_SUPPORT_DATASETS:
+            del handle["entry/integrated_1d"][name]
+    assert read_analysis_artifact(older).angular_support.reason is SupportReason.LEGACY_STITCH
     assert REASON_TEXT[SupportReason.LEGACY_STITCH] == \
         "Older Stitch result: reprocess it to record angular coverage."
     # membership replacement: a new run's provenance names its own membership
