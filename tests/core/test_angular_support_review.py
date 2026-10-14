@@ -54,14 +54,24 @@ def test_public_row_drop_keeps_support_appendable(tmp_path):
         SupportTableWriter().write(group, {1: changed}, intensity_rows={1: group["intensity"][0]})
 
 
-def test_saved_support_is_accounted_by_the_readers_memory_authority(tmp_path):
-    from xrd_tools.core.physical_memory import physical_root_fact
-    from xrd_tools.io.frame_view import FrameViewReader
+def test_saved_support_is_accounted_by_the_readers_memory_authority(tmp_path, monkeypatch):
+    """Round-2 oracle repair (Claude, October 14), disclosed in the handoff. Saved support is admitted like the
+    intensity beside it: reserved within the read's budget before any row is read, then owned by the caller. The
+    original form asserted residence among the reader's retained roots, which intensity does not have and which the
+    reader's 64 MiB cache, having no eviction, would turn into a read-failure cliff on long energy scans; the release
+    half is test_angular_support_round2.py's B5 row."""
+    from xrd_tools.io import frame_view as module
     target, _captured = _saved_int(tmp_path, frames=1)
-    with FrameViewReader(target) as reader:
-        profile = reader.read(1).angular_support
-        assert profile.available
-        root = physical_root_fact(profile.supported_deg).root
-        assert any(root is retained for retained in reader._memory_authority.retained_roots), \
-            "saved coverage must participate in the reader's existing memory budget"
+    with module.FrameViewReader(target) as reader:
+        baseline = reader.retained_bytes
+    with h5py.File(target, "r") as handle:
+        group = handle["entry/integrated_1d"]
+        row = int(group["axis_1"].shape[0]) * np.dtype(np.float64).itemsize
+        rows = 2 if "sigma" in group else 1
+    # room for the intensity (and sigma) row, one byte short of the support row beside it
+    monkeypatch.setattr(module, "_MAX_READER_RETAINED_BYTES", baseline + rows * row + row - 1)
+    with module.FrameViewReader(target) as reader:
+        with pytest.raises(ValueError, match="bytes exceed limit"):
+            reader.read_1d_rows((1,))
+        assert reader.retained_bytes == baseline, "saved coverage must participate in the reader's memory budget"
 

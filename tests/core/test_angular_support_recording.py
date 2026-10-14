@@ -38,10 +38,14 @@ def test_r2_int_off_skips_computation_and_records_its_reason(tmp_path):
                for profile in off.values())
     on_target, on = _saved_int(tmp_path / "on")
     assert all(profile.available for profile in on.values())
+    # round-2 successor edit (maintainer's contract B, October 14): the reason is the output's one marker, with no
+    # per-frame coverage; it superseded the one all-NaN table row frozen here on October 13
     with h5py.File(off_target, "r") as handle, h5py.File(on_target, "r") as other:
         group = handle["entry/integrated_1d"]
-        assert all(name in group for name in ANGULAR_SUPPORT_DATASETS), "the reason is recorded"
-        assert group["angular_support_deg"].shape[0] == 1 and not np.isfinite(group["angular_support_deg"][()]).any()
+        assert not any(name in group for name in ANGULAR_SUPPORT_DATASETS), "off writes nothing per frame"
+        from xrd_tools.io.schema import ANGULAR_SUPPORT_RECORDING_ATTR
+        assert handle["entry"].attrs[ANGULAR_SUPPORT_RECORDING_ATTR] == "off", "the reason is recorded once"
+        assert ANGULAR_SUPPORT_RECORDING_ATTR not in other["entry"].attrs
         np.testing.assert_array_equal(group["intensity"][()], other["entry/integrated_1d/intensity"][()])
     with FrameViewReader(off_target) as reader:
         for label in reader.labels():
