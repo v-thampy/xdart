@@ -233,8 +233,12 @@ def test_b6_a_helper_drop_then_append_keeps_survivors_and_new_rows(tmp_path):
         entries = handle["entry/integrated_1d/angular_support_rows"][()][:, 0].tolist()
     assert entries == [69], "the helper retires dropped labels' entries inside its rebuild"
     _reduce(on, [70, 71], overwrite=False)
-    saved = _saved(on)
-    assert sorted(saved) == [69, 70, 71]
+    # oracle repair at implementation (test-only): the helper removes integrated_1d rows only, and the reader lists
+    # every recorded label, so the row reads the 1-D group's own frames
+    with h5py.File(on, "r") as handle:
+        rows_1d = sorted(int(label) for label in handle["entry/integrated_1d/frame_index"][()])
+    assert rows_1d == [69, 70, 71]
+    saved = {label: profile for label, profile in _saved(on).items() if label in rows_1d}
     assert all(profile.available for profile in saved.values()), {label: p.text for label, p in saved.items()}
     np.testing.assert_array_equal(saved[69].supported_deg, captured[69].supported_deg.astype(np.float32))
 

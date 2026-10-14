@@ -352,6 +352,11 @@ def test_real_gi_stopped_append_reuses_the_original_freeze_extent(
                 if isinstance(value, h5py.Dataset)
             }
         for key, values in reference_1d.items():
+            if values.dtype.kind in "SUO":
+                # COVERAGE-SUPPORT-20261013 test repair: the group's saved angular support carries fixed-width
+                # text facts, compared exactly (assert_allclose cannot compare text)
+                np.testing.assert_array_equal(resumed_1d[key], values, err_msg=key)
+                continue
             np.testing.assert_allclose(
                 resumed_1d[key], values, rtol=0.0, atol=0.0, equal_nan=True,
             )
