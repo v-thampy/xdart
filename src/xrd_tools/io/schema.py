@@ -59,6 +59,8 @@ __all__ = [
     "axis_display_metadata",
     "integrated_axis_names",
     "INTEGRATED_ROW_ALIGNED",
+    "ANGULAR_SUPPORT_DATASETS",
+    "ANGULAR_SUPPORT_VERSION_ATTR",
     "GroupSchema",
     "ProcessedScanSchema",
     "SCHEMA",
@@ -326,6 +328,16 @@ def axis_display_metadata(unit: str) -> dict[str, str]:
 #: (``drop_integrated_rows``) and grown by the appenders.  Axis datasets
 #: (``axis_1``/``axis_2``) are shared across rows and are NOT in this set.
 INTEGRATED_ROW_ALIGNED = frozenset({"frame_index", "intensity", "sigma"})
+
+# ── saved angular support (COVERAGE-SUPPORT-20261013, format v1) ─────────────
+#: The optional, label-keyed support table of a native 1-D profile, direct children of its integrated_1d mode group
+#: (Int top level; Stitch label 1). NOT row-aligned and outside the pinned group spec: admission ignores them and
+#: row surgery leaves them alone, because each entry names its frame label and binds the digest of that label's
+#: stored float32 intensity row (``xrd_tools.io.angular_support`` is the one codec).
+ANGULAR_SUPPORT_DATASETS = ("angular_support_deg", "angular_support_meta", "angular_support_rows",
+                            "angular_support_row_digest")
+#: Integer attribute of ``angular_support_deg`` naming the format version (1).
+ANGULAR_SUPPORT_VERSION_ATTR = "ssrl_angular_support_version"
 
 # ── multi-result GI mode keys (the per-mode nested-subgroup layout) ──────────
 #: Canonical on-disk GI mode_keys == ``GI1DMode.value`` / ``GI2DMode.value``

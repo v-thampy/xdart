@@ -2853,6 +2853,9 @@ class NexusSink:
             replace_existing=replace_existing,
             background_dependency_bytes=dependency[0],
             background_dependency_fingerprint=dependency[1],
+            # the Run's support describes the primary 1-D result only; companions and dropped rows carry none
+            angular_support=(getattr(reduction, "angular_support_1d", None)
+                             if result_1d is not None and result_1d is reduction.result_1d else None),
         )
 
     def replace(self, frame: Frame, reduction: FrameReduction):
@@ -3324,7 +3327,7 @@ class ReductionSession:
     # data; the xdart GUI passes StrictPolicy.graceful() (never abort a save).
     strict: StrictPolicy = field(default_factory=StrictPolicy.loud)
     # COVERAGE-SUPPORT-20261013: angular support capture (an AngularSupportPolicy; None = the default
-    # policy). Support never changes intensity; disabled, frames carry no profile.
+    # policy; False = a path that never captures support, such as Average). Support never changes intensity.
     angular_support: Any = None
     # H10-C1: ONE narrow synchronous acceptance-admission hook, invoked on the
     # CALLER thread inside submit() in publication order (§18.2) — Future bound,
@@ -6215,8 +6218,13 @@ def _reduce_frame(
 
 
 def _support_capture(policy: Any):
-    """The Run's capture owner for ``policy`` (None: the default policy), or None when capture is disabled."""
+    """The Run's capture owner for ``policy`` (None: the default policy), or None when nothing is captured.
+
+    ``False`` names a path that never captures support (Average): no profile and nothing saved.
+    """
     from xrd_tools.analysis.angular_support import AngularSupportPolicy, RunSupportCapture
+    if policy is False:
+        return None
     policy = AngularSupportPolicy() if policy is None else policy
     if type(policy) is not AngularSupportPolicy:
         raise TypeError("angular_support must be an AngularSupportPolicy or None")
@@ -6250,8 +6258,8 @@ def _standard_frame_support(capture: Any, ai: Any, explicit: np.ndarray | None, 
     from xrd_tools.analysis.angular_support import admitted_window
     from xrd_tools.core.angular_support import SupportReason
     unit = str(getattr(r1d, "unit", "") or getattr(p1, "unit", "") or "")
-    if grouped:
-        return _support_unavailable(SupportReason.AVERAGE_RESULT, unit)
+    if grouped:  # Average never captures support; its outputs name it from their kind
+        return None
     if chi_mode:
         return _support_unavailable(SupportReason.NOT_RADIAL_PROFILE, unit)
 
@@ -6275,8 +6283,8 @@ def _gi_frame_support(capture: Any, fi: Any, explicit: np.ndarray | None, plan: 
     from xrd_tools.core.angular_support import SupportReason
     gi = plan.gi
     unit = "q_A^-1" if "A^-1" in str(getattr(p1, "unit", "") or "") else "q_nm^-1"
-    if grouped:
-        return _support_unavailable(SupportReason.AVERAGE_RESULT, unit)
+    if grouped:  # Average never captures support; its outputs name it from their kind
+        return None
     if gi.mode_1d is not GI1DMode.Q_TOTAL:
         return _support_unavailable(SupportReason.NOT_RADIAL_PROFILE, str(getattr(r1d, "unit", "") or unit))
 

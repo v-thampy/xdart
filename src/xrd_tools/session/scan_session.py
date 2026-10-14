@@ -2430,6 +2430,9 @@ class ScanSession:
             )
             view = FrameView.from_results(
                 result_1d=event.result_1d, result_2d=event.result_2d, **facts,
+                angular_support=(getattr(reduction, "angular_support_1d", None)
+                                 if event.result_1d is not None
+                                 and event.result_1d is getattr(reduction, "result_1d", None) else None),
             )
             record = FrameRecord.from_view(view, mode_1d=mode_1d, mode_2d=mode_2d)
             for key, extra in (event.extra_results_2d or {}).items():

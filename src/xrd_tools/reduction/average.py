@@ -1238,7 +1238,8 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
             variance += np.clip(dark, 0.0, None)
         reduction = replace(reduction, integration_1d=_with_variance(reduction.integration_1d, variance),
                             integration_2d=_with_variance(reduction.integration_2d, variance))
-    reduced = run_reduction(reduction, scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True))
+    # An Average never captures angular support: no single detector footprint (COVERAGE-SUPPORT-20261013)
+    reduced = run_reduction(reduction, scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True), angular_support=False)
     progress('reduce', 1, 1)
     if reduced.failed and type(reduced.error) is str and reduced.error.startswith('monitor ') and reduced.error.endswith('Pass StrictPolicy.graceful() to allow it.'): raise MissingNormalizationError(reduced.error)
     _reject(reduced.failed or 1 not in reduced.frames, reduced.error or 'AVERAGE_REDUCTION_FAILED')

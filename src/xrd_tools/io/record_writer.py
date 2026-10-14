@@ -168,11 +168,17 @@ class RecordWrite:
     background_dependency_fingerprint: str | None = None
     source_constituents: tuple[Mapping[str, Any], ...] = ()
     point_images: Mapping[str, Any] | None = None
+    #: The primary 1-D profile's angular support (COVERAGE-SUPPORT-20261013): an ``AngularSupportProfile`` saved
+    #: with the row (available or with its reason), or None to save none (Average, older callers).
+    angular_support: Any | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "mode_1d", canonical_gi_mode_key(self.mode_1d, "1d"),
         )
+        if self.angular_support is not None and (
+                type(self.angular_support).__name__ != "AngularSupportProfile" or self.result_1d is None):
+            raise TypeError("RecordWrite.angular_support must be an AngularSupportProfile beside a 1-D result")
         object.__setattr__(
             self, "mode_2d", canonical_gi_mode_key(self.mode_2d, "2d"),
         )
@@ -2039,6 +2045,8 @@ class NexusRecordWriter:
         self.target = require_current_output_path(target)
         self.entry = str(entry)
         self.compression = compression
+        #: one incremental support-table writer for this writer's whole life (COVERAGE-SUPPORT-20261013)
+        self._angular_support_table = None
         self.overwrite = bool(overwrite)
         self.atomic = atomic
         self.flush_every = flush_every
@@ -5253,6 +5261,23 @@ class NexusRecordWriter:
     def write(self, record: RecordWrite) -> None:
         self.write_batch((record,))
 
+    def _write_angular_support(self, records: list[RecordWrite]) -> None:
+        """Merge the primary 1-D rows' saved support into their group's table, inside this batch's transaction.
+
+        A row written without support forgets any earlier entry for its label; a batch without support never
+        creates the table. Digests bind each entry to its row exactly as the stack writer stores it (float32).
+        """
+        from xrd_tools.io.angular_support import SupportTableWriter, has_angular_support
+        from xrd_tools.io.nexus import _comp_kwargs
+        group = self._entry_group().get("integrated_1d")
+        entries = {int(record.label): record.angular_support for record in records}
+        if group is None or (all(value is None for value in entries.values()) and not has_angular_support(group)):
+            return
+        if self._angular_support_table is None:
+            self._angular_support_table = SupportTableWriter(_comp_kwargs(self.compression))
+        self._angular_support_table.write(group, entries, intensity_rows={
+            int(record.label): np.asarray(record.result_1d.intensity, dtype=np.float32) for record in records})
+
     def _write_batch_preserving_average_counts(self, records: Iterable[RecordWrite]) -> None:
         self._require_active(); batch = tuple(records)
         if any(int(record.label) == 1 and record.write_frame_record for record in batch): raise WriterStateError("AVERAGE_FINITE_COUNTS_REPLACEMENT_REQUIRES_AVERAGE_FINALIZATION")
@@ -5373,6 +5398,8 @@ class NexusRecordWriter:
                         },
                         bulk_new_rows=self._fast_regenerable,
                     )
+                if primary_1d:
+                    self._write_angular_support(primary_1d)
                 if prepared_stack is None and (one_d or two_d):
                     self._capture_prepared_stack_authority(batch)
                 if primary_1d:

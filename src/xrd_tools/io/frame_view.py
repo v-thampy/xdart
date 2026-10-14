@@ -2108,6 +2108,7 @@ class FrameViewReader:
         self._map_geom, self._map_scan_data = map_geom, map_scan_data
         self._scan_data_items = scan_data_items
         self._g1_modes, self._g2_modes = g1_modes, g2_modes
+        self._support_tables = {}  # group name → SupportTableReader or its format error
         self._map_1d_modes, self._map_2d_modes = (
             map_1d_modes, map_2d_modes,
         )
@@ -2982,6 +2983,10 @@ class FrameViewReader:
                         bundle=bundle,
                     )
 
+            support = (
+                self._saved_support(g1, frame, intensity_1d)
+                if intensity_1d is not None and m1 == self._primary_mode_1d else None
+            )
             view = FrameView(
                 label=frame,
                 axis_1d=(
@@ -3002,9 +3007,32 @@ class FrameViewReader:
                 sigma_2d=sigma_2d,
                 two_d_kind=self._two_d_kind_modes.get(m2, TwoDKind.Q_CHI),
                 **self._common_fields(frame, bundle=bundle),
+                angular_support=support,
             )
             bundle.finish()
             return view
+
+    def _saved_support(self, group, label: int, intensity_row):
+        """``label``'s saved angular support in its primary 1-D group (format v1), or the reason it has none.
+
+        A malformed table is reported per frame as ``malformed_saved_support``: intensity stays readable.
+        """
+        from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin, SupportReason
+        from xrd_tools.io.angular_support import AngularSupportFormatError, SupportTableReader
+        table = self._support_tables.get(group.name)
+        if table is None:
+            try:
+                table = SupportTableReader(group, frame_count=len(self._map_1d_modes.get(self._primary_mode_1d, {})))
+            except AngularSupportFormatError as error:
+                table = error
+            self._support_tables[group.name] = table
+        try:
+            if isinstance(table, AngularSupportFormatError):
+                raise table
+            return table.profile(label, intensity_row)
+        except AngularSupportFormatError as error:
+            return AngularSupportProfile.unavailable(SupportReason.MALFORMED_SAVED_SUPPORT,
+                                                     origin=SupportOrigin.SAVED, detail=str(error))
 
     def _view_for(
         self,
@@ -3035,11 +3063,12 @@ class FrameViewReader:
                 )
                 if sigma_node is not None else None
             )
+            intensity = _read_1d_row(g, "intensity", row, points=points, bundle=bundle)
             return FrameView(
                 label=frame, axis_1d=self._axis_1d_modes.get(mode),
-                intensity_1d=_read_1d_row(
-                    g, "intensity", row, points=points, bundle=bundle,
-                ), sigma_1d=sig,
+                intensity_1d=intensity, sigma_1d=sig,
+                angular_support=(self._saved_support(g, frame, intensity)
+                                 if mode == self._primary_mode_1d else None),
                 **(
                     common
                     if common is not None
@@ -3401,6 +3430,7 @@ class FrameViewReader:
         self._axis_1d = self._axis_2d_x = self._axis_2d_y = None
         self._two_d_kind = TwoDKind.Q_CHI
         self._g1_modes = self._g2_modes = {}
+        self._support_tables = {}
         self._map_1d_modes = self._map_2d_modes = {}
         self._axis_1d_modes = self._axis_2d_x_modes = self._axis_2d_y_modes = {}
         self._two_d_kind_modes = {}
