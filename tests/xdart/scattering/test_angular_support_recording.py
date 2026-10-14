@@ -112,6 +112,9 @@ def test_g3_browse_names_disabled_results_and_keeps_saved_coverage(qapp, tmp_pat
         _wait(qapp, lambda: bool(_curves(view)))
         (_data, profile), = _curves(view).values()
         assert profile.origin is SupportOrigin.SAVED and profile.available, 'previously saved coverage displays'
+        # Test-only oracle repair: a reopen replaces the shown Browse only once the page's poll has consumed its last
+        # repaint (else "previous Browse cleanup is pending", by design and with the strip off too, as at cf49f3cb)
+        assert _pump(qapp, lambda: not page._context_controller.browse_preview_polling_needed, 30.)
         _reopen(qapp, page, disabled)
         _wait(qapp, lambda: REASON_TEXT[SupportReason.RECORDING_DISABLED] in view.angular_support_message())
         owner = view.angular_support_owner
