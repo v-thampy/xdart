@@ -58,21 +58,32 @@ def test_r3_session_policy_carries_the_int_policy():
     from xrd_tools.session.headless_scan import open_headless_scan_session
     from xrd_tools.session.policy import SessionPolicy
 
-    def published(policy):
+    def published(angular_support):
+        """A real headless session under an exact, validated policy (``requirements_from`` + ``resolve_session_policy``,
+        as open_headless_scan_session re-derives it) carrying ``angular_support``."""
+        from dataclasses import replace
+        from types import SimpleNamespace
+        from xrd_tools.session.policy import requirements_from, resolve_session_policy
         ai = _planar(shape=(120, 160), poni=(0.006013, 0.008007))
         frames = [Frame(label, image=np.full((120, 160), 10.0 + label, np.float32)) for label in (1, 2)]
+        plan = ReductionPlan(integration_1d=Integration1DPlan(npt=40, unit="2th_deg", method="csr"))
+        image = frames[0].image
+        policy = resolve_session_policy(
+            requirements_from(SimpleNamespace(frame_shape=image.shape, dtype=image.dtype), plan),
+            envelope_bytes=8 * 1024 ** 3, env={})
+        assert type(policy) is SessionPolicy and policy.angular_support is None
+        if angular_support is not None:
+            policy = replace(policy, angular_support=angular_support)
         store = FrameRecordStore()
-        session = open_headless_scan_session(
-            Scan("r3", frames, integrator=ai),
-            ReductionPlan(integration_1d=Integration1DPlan(npt=40, unit="2th_deg", method="csr")),
-            sink=MemorySink(), record_store=store, executor=1, policy=policy)
+        session = open_headless_scan_session(Scan("r3", frames, integrator=ai), plan, sink=MemorySink(),
+                                             record_store=store, executor=1, policy=policy)
         for frame in frames:
             session.submit(frame)
         session.finish()
         return [next(iter(store.get(frame.index).results_1d.values())).angular_support for frame in frames]
 
-    assert all(item.available for item in published(SessionPolicy()))
-    off = published(SessionPolicy(angular_support=AngularSupportPolicy(enabled=False)))
+    assert all(item.available for item in published(None))
+    off = published(AngularSupportPolicy(enabled=False))
     assert all(item.reason is SupportReason.RECORDING_DISABLED for item in off)
 
 
