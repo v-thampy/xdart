@@ -263,7 +263,8 @@ def test_settings_that_cannot_apply_are_refused_and_leave_the_inputs(qapp, tmp_p
     try:
         page._settings_path_chooser = lambda action, start: str(broken)
         refused = page.load()
-        assert type(refused) is ActionRefused and "cannot be applied" in refused.reason
+        # LT-SMALL-FIXES-20261014: an older document's Source kind is checked before anything applies, as RSM's
+        assert type(refused) is ActionRefused and refused.reason == "Source: 'TIFF stack' is not one of its choices"
         assert page.settings() == before
     finally:
         _close(page, qapp)

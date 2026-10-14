@@ -67,6 +67,9 @@ def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path)
         again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
         try:
             again.apply_settings(dialog.settings())
+            # LT-SMALL-FIXES-20261014 (LT-004/LT-005): the source kind is the page's Data format's, not a saved choice
+            assert 'source_kind' not in dialog.settings()['choices']
+            again.set_data_format('spec_container')
             assert again.source_kind.currentData() == 'spec_container'
             assert again._spec() == dialog._spec()
         finally:

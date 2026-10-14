@@ -47,7 +47,9 @@ def _every_input(root):
     and every Advanced row (decoder, Angle mapping, frames, occurrences, Corrections, chunk and memory)."""
     return {
         "geometry_path": "calibration/rsm_canonical.json", "mask_path": "mask.npy", "refinement": False,
-        "source_kind": "NeXus", "subdirs": True, "name_filter": "scan -bad", "image_dir": "source/images",
+        # LT-SMALL-FIXES-20261014: the page's Data format and Files/Folder are its inputs; they make the source kind
+        "data_format": "nexus", "input_mode": "directory",
+        "subdirs": True, "name_filter": "scan -bad", "image_dir": "source/images",
         "image_stem": "{spec}_scan{scan}_", "scan_mode": "All Scans", "scan": "[1-2]",
         "ub_from": "Typed", "ub_row1": "1 0 0", "ub_row2": "0 1 0", "ub_row3": "0 0 1",
         "ub_spec_path": "ub.spec", "ub_scan": "7",
@@ -96,7 +98,8 @@ def test_settings_round_trip_every_rsm_input(qapp, tmp_path):
         assert {key: restored._value(key) for key in values} == values
         assert restored.settings() == page.settings()
         assert restored._threshold_state == page._threshold_state
-        assert restored._source_paths == ("x.nxs",) and restored._value("spec_path") == "x.nxs"
+        # the restored kind is the table's (a NeXus-format folder: Directory) and shows that kind's own files
+        assert restored._source_paths == ("folder",) and restored._value("spec_path") == "folder"
         assert restored.run_bar.write_mode() == "Overwrite" and not restored._output_suggested
         assert restored._calibration_settings_now() == calibration
         restored.set_field("source_kind", "Spec")  # each kind keeps its own files
