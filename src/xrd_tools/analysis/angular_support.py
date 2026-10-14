@@ -989,6 +989,28 @@ def angular_support(request: AngularSupportRequest, *, oversample: int = 8, canc
 
 # --------------------------------------------------------------------------------------------- run capture
 
+#: What :func:`_referent` returns for an input whose weakly held object no longer exists.
+_GONE = object()
+
+
+def _weakly(value: Any) -> Any:
+    """A weak reference to ``value`` (None stays None; an object refusing weak references is held strongly)."""
+    import weakref
+    if value is None:
+        return None
+    try:
+        return weakref.ref(value)
+    except TypeError:
+        return lambda: value
+
+
+def _referent(held: Any) -> Any:
+    if held is None:
+        return None
+    value = held()
+    return _GONE if value is None else value
+
+
 def edges_from_centres(centres: Any, radial_range: tuple[float, float] | None = None) -> np.ndarray | None:
     """A reducer's uniform bin edges recovered from its float64 bin centres (never from rounded float32 ones)."""
     values = np.asarray(centres, dtype=np.float64)
@@ -1024,7 +1046,8 @@ class RunSupportCapture:
         self._lock = threading.Lock()
         self._footprints: dict[tuple[str, str], SupportFootprint] = {}
         self._keys: set[tuple[str, str]] = set()
-        self._masks: dict[tuple[int, int], tuple[Any, Any, np.ndarray | None, str]] = {}
+        self._masks: dict[tuple[int, int, bool], tuple[Any, Any, np.ndarray | None, str]] = {}
+        self._applied: dict[str, np.ndarray] = {}
         self._tables: dict[tuple, SupportLineTable] = {}
         self._profiles: dict[tuple, AngularSupportProfile] = {}
         self._geometry = SupportGeometryCache()
@@ -1042,18 +1065,20 @@ class RunSupportCapture:
 
         ``bound``: the run mask is bound into the integrator's detector (its mask is what pyFAI used). Otherwise
         pyFAI received :func:`~xrd_tools.integrate.detector_mask.mask_with_detector`'s union, exactly as the reducer
-        built it (a detector mask of another shape is not applied, so it is not geometry either).
+        built it (a detector mask of another shape is not applied, so it is not geometry either). The workers'
+        deep-copied integrators hold equal masks, so one read-only copy is kept per mask content; the inputs are
+        held weakly, so the cache never keeps a caller's per-frame mask alive.
         """
         detector = getattr(integrator, "detector", None)
         try:
             detector_mask = None if detector is None else detector.mask
         except Exception:
             detector_mask = None
-        key = (id(explicit), id(detector_mask)) if not bound else (id(detector_mask), -1)
+        source = detector_mask if bound else explicit
+        key = (id(source), id(detector_mask), bool(bound))
         with self._lock:
             cached = self._masks.get(key)
-            if cached is not None and cached[0] is (explicit if not bound else detector_mask) \
-                    and cached[1] is detector_mask:
+            if cached is not None and _referent(cached[0]) is source and _referent(cached[1]) is detector_mask:
                 return cached[2], cached[3]
         if bound:
             applied = None if detector_mask is None else np.asarray(detector_mask, dtype=bool)
@@ -1066,9 +1091,18 @@ class RunSupportCapture:
             applied.setflags(write=False)
         digest = _mask_digest(applied)
         with self._lock:
-            if len(self._masks) > 64:
-                self._masks.clear()
-            self._masks[key] = (explicit if not bound else detector_mask, detector_mask, applied, digest)
+            if applied is not None:
+                applied = self._applied.pop(digest, applied)
+                self._applied[digest] = applied
+                while len(self._applied) > 4:
+                    self._applied.pop(next(iter(self._applied)))
+            for stale in [item for item, entry in self._masks.items()
+                          if _referent(entry[0]) is _GONE or _referent(entry[1]) is _GONE]:
+                del self._masks[stale]
+            self._masks.pop(key, None)
+            self._masks[key] = (_weakly(source), _weakly(detector_mask), applied, digest)
+            while len(self._masks) > 16:
+                self._masks.pop(next(iter(self._masks)))
         return applied, digest
 
     def _once(self, key: tuple, lookup: Callable[[], Any], compute: Callable[[], Any], cancel) -> Any:

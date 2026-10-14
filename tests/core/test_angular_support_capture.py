@@ -143,3 +143,26 @@ def test_workers_starting_an_incidence_scan_compute_its_shared_cut_once():
     assert not errors and all(result is not None and result.available for result in results)
     assert capture.geometry_keys == 4
     assert cuts.call_count == 1 and loads.call_count == 1, "four incidence angles share one cut and geometry"
+
+
+def test_workers_equal_masks_share_one_copy_and_a_frame_mask_is_not_kept_alive():
+    import copy
+    import gc
+    import weakref
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy, RunSupportCapture
+    ai = _planar()
+    ai.detector.mask = _band_mask((400, 500)).astype(np.int8)
+    workers = [copy.deepcopy(ai) for _ in range(4)]  # as each reduction worker deep-copies its integrator
+    assert len({id(worker.detector.mask) for worker in workers}) == 4
+    capture = RunSupportCapture(AngularSupportPolicy())
+    applied = [capture.applied_mask(worker, None, bound=True) for worker in workers]
+    assert len({id(mask) for mask, _digest in applied}) == 1, "equal worker masks share one read-only copy"
+    assert len({digest for _mask, digest in applied}) == 1 and not applied[0][0].flags.writeable
+    frame_mask = np.zeros((400, 500), bool)
+    frame_mask[10:20, :] = True
+    union, _digest = capture.applied_mask(workers[0], frame_mask, bound=False)
+    assert union[15, 7] and union[5, 141] and not union[5, 7]
+    held = weakref.ref(frame_mask)
+    del frame_mask
+    gc.collect()
+    assert held() is None, "the capture must not keep a caller's per-frame mask alive"
