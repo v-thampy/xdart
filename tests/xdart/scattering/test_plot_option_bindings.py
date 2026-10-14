@@ -26,6 +26,9 @@ _REFUSED.update(coordinate_grid="r", phase_references=True, phase_min_intensity=
 # HELP-RESIDUALS-20261011 successor edit (C6): the top bar's Phases toggle is one more plot option.
 _TAKEN.update(phase_references_shown=False)
 _REFUSED.update(phase_references_shown=1)
+# COVERAGE-SUPPORT-20261013 successor edit: the opt-in angular coverage strip is one more plot option.
+_TAKEN.update(show_angular_support=True)
+_REFUSED.update(show_angular_support=1)
 
 
 def test_one_table_binds_every_plot_option_to_its_command():
