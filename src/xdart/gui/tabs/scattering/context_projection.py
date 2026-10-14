@@ -533,6 +533,7 @@ class ContextProjection:
                            if type(context) is BrowseContext and selection.names(context)), None)
             if browse is not None and not browse.released:
                 scientific = attach_saved_rings(scientific, browse.ring_basis, navigation.current)
+                scientific = attach_saved_support_source(scientific, browse)
         return ShellProjection(
             revision,
             build_browser_projection(
@@ -759,6 +760,20 @@ def attach_saved_rings(scientific: ScientificProjection, basis, current) -> Scie
                        saved_ring_reason=RING_SHAPE_MISMATCH_REASON)
     return replace(scientific, saved_ring_expected=True, heavy=replace(
         heavy, ring_geometry=snapshot, detector_shape=shape, ring_origin="saved"))
+
+
+def attach_saved_support_source(scientific: ScientificProjection, browse: BrowseContext) -> ScientificProjection:
+    """A Browse Int output's own facts, from which the strip may rebuild a frame's angular coverage when the output
+    saved none (COVERAGE-SUPPORT-20261013, D5): its frames' name, file, entry, load snapshot and labels."""
+    from .shell_values import SavedSupportSource
+
+    catalog = browse.scalar_catalog
+    if (scientific.processing_mode not in {"Int 1D", "Int 2D"} or browse.target_snapshot is None
+            or catalog is None or not catalog.labels):
+        return scientific
+    return replace(scientific, saved_support_source=SavedSupportSource(
+        browse.requested_path, catalog.artifact_path, browse.target_entry or catalog.entry, browse.target_snapshot,
+        tuple(catalog.labels)))
 
 
 def _browse_payload(

@@ -778,6 +778,24 @@ def restore_phase_references(options: ScientificPlotOptions, document) -> Scient
                    phase_references_shown=document.get("shown", True))
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class SavedSupportSource:
+    """A Browse Int output's facts a frame's angular coverage may be rebuilt from (COVERAGE-SUPPORT-20261013, D5):
+    the name its frames carry (``artifact``), the file read, its entry, the load's snapshot and its frames. Scalars
+    only: no handle, frame or array crosses into the reconstruction."""
+
+    artifact: str
+    path: str
+    entry: str
+    snapshot: object
+    labels: tuple[int, ...]
+
+    def request(self, label: int):
+        """The reconstruction request for one of the output's frames."""
+        from xrd_tools.analysis.angular_support import SavedSupportRequest
+        return SavedSupportRequest(self.path, self.entry, self.snapshot, self.labels, int(label))
+
+
 @dataclass(frozen=True, slots=True)
 class ScientificProjection:
     heavy_available: frozenset[DisplayFrameKey] = frozenset()
@@ -841,12 +859,16 @@ class ScientificProjection:
     #: record refuses them, or, when it supplies them, whether they wait for the frame's image.
     saved_ring_reason: str = ""
     saved_ring_expected: bool = False
+    #: A Browse Int output the strip may rebuild older frames' angular coverage from (COVERAGE-SUPPORT-20261013, D5)
+    saved_support_source: SavedSupportSource | None = None
 
     def __post_init__(self) -> None:
         if type(self.acquisition_selected) is not bool:
             raise TypeError("acquisition selection must be boolean")
         if type(self.saved_ring_reason) is not str or type(self.saved_ring_expected) is not bool:
             raise TypeError("saved ring availability must be exact")
+        if self.saved_support_source is not None and type(self.saved_support_source) is not SavedSupportSource:
+            raise TypeError("the saved support source must be exact")
         if self.detector_mode not in {"thumbnail", "full"}:
             raise ValueError("detector mode must be exact")
         if type(self.detector_available) is not bool or type(self.detector_pending) is not bool:

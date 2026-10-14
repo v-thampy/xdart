@@ -39,6 +39,8 @@ __all__ = [
     "SavedSupportMask",
     "SupportRefusal",
     "support_basis_from_saved",
+    "SavedSupportRequest",
+    "reconstruct_saved_support",
     "DEFAULT_RECORD_ANGULAR_SUPPORT",
     "AngularSupportPolicy",
     "AngularSupportRequest",
@@ -1253,6 +1255,11 @@ class SavedSupportBasis:
         self._digest = _mask_digest(applied_mask)
         self._integrators: dict[float, Any] = {}
 
+    @property
+    def axis_unit(self) -> str:
+        """The record's plan unit: the saved 1-D axis's own."""
+        return str(self._plan.unit)
+
     def integrator_for(self, label: int) -> Any:
         """``label``'s pyFAI integrator at its own recorded wavelength, or None for a label the basis refuses."""
         snapshot = self._ring.frame_snapshot(int(label))
@@ -1358,6 +1365,68 @@ def support_basis_from_saved(run_configuration: Any, energy_selection: Any, *, l
         applied = np.array(applied, dtype=bool, order="C", copy=True)
         applied.setflags(write=False)
     return SavedSupportBasis(ring, applied, plan_1d)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SavedSupportRequest:
+    """One older Int output frame's support reconstruction (D5): detached facts only, no handle, frame or integrator.
+
+    ``path``/``entry`` name the output Browse loaded and ``snapshot`` its load's ``TargetSnapshot``, revalidated around
+    every read; ``labels`` are its frames and ``label`` the one to rebuild.
+    """
+
+    path: str
+    entry: str
+    snapshot: Any
+    labels: tuple[int, ...]
+    label: int
+
+    @property
+    def key(self) -> tuple:
+        """The computation's identity: the same output revision and frame give the same profile."""
+        return (self.path, self.entry, self.snapshot, self.labels, self.label)
+
+
+def reconstruct_saved_support(request: SavedSupportRequest, *, cancel: Callable[[], bool] | None = None
+                              ) -> AngularSupportProfile:
+    """``request``'s frame support rebuilt from its output's own record (origin ``reconstructed``), or the reason.
+
+    Reads only the ring record and the bounded saved facts (user mask, saved axis), each between revalidations of the
+    load's snapshot; Average and Reintegrate results, insufficient records and a changed file refuse by name.
+    """
+    from xrd_tools.io.browse_presentation import read_ring_record, read_saved_support_facts
+    from xrd_tools.io.output_transaction import TargetChanged, revalidate_target_snapshot
+    from xrd_tools.session.readiness import RingBasis, ring_basis_from_saved
+
+    def refused(reason: SupportReason, detail: str = "") -> AngularSupportProfile:
+        return AngularSupportProfile.unavailable(reason, origin=SupportOrigin.RECONSTRUCTED, detail=detail)
+
+    try:
+        revalidate_target_snapshot(request.path, request.snapshot)
+        record = read_ring_record(request.path, entry=request.entry)
+        if record.kind != "run":
+            basis = support_basis_from_saved(None, None, labels=request.labels, mask=SavedSupportMask(False),
+                                             shape=(), kind=record.kind)
+            return refused(basis.reason, basis.detail)
+        ring = ring_basis_from_saved(record.run_configuration, record.energy_selection, labels=request.labels,
+                                     monochromator_wavelength_m=record.monochromator_wavelength_m,
+                                     epochs=record.epochs, unreadable=record.unreadable)
+        if not isinstance(ring, RingBasis):
+            return refused(SupportReason.LEGACY_INSUFFICIENT, str(getattr(ring, "reason", "") or ""))
+        facts = read_saved_support_facts(request.path, entry=request.entry, run_configuration=record.run_configuration,
+                                         pixels=int(ring.shape[0]) * int(ring.shape[1]))
+        revalidate_target_snapshot(request.path, request.snapshot)
+    except (TargetChanged, OSError, TypeError, ValueError, KeyError) as error:
+        return refused(SupportReason.LEGACY_INSUFFICIENT, f"the output could not be read: {error}"[:200])
+    if facts.axis_values is None:
+        return refused(SupportReason.LEGACY_INSUFFICIENT, "the output's saved 1-D axis is unreadable")
+    basis = support_basis_from_saved(
+        record.run_configuration, record.energy_selection, labels=request.labels, shape=ring.shape,
+        mask=SavedSupportMask(facts.mask_signed, facts.mask_sha256, facts.mask_indices), epochs=record.epochs,
+        kind=record.kind, monochromator_wavelength_m=record.monochromator_wavelength_m, unreadable=record.unreadable)
+    if isinstance(basis, SupportRefusal):
+        return refused(basis.reason, basis.detail)
+    return basis.profile(request.label, axis_values=facts.axis_values, axis_unit=basis.axis_unit, cancel=cancel)
 
 
 # --------------------------------------------------------------------------------------------- Stitch union

@@ -56,7 +56,7 @@ from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
 from xdart.gui.pages.values import PageCleanup
 from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest, phase_floor, positions_for_axis
-from xrd_tools.core.angular_support import REASON_TEXT, SupportReason
+from xrd_tools.core.angular_support import REASON_TEXT, AngularSupportProfile, SupportOrigin, SupportReason
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
@@ -787,6 +787,11 @@ class ScientificView(QtWidgets.QFrame):
         self._support_readout = PlotCursorReadout(self.angular_support_plot)
         self._support_contract = None
         self._support_message = ""
+        self._support_inputs = None
+        #: the one owner of older Int frames' reconstructions (D5); nothing else is computed for the strip
+        from .angular_support_owner import AngularSupportOwner
+        self.angular_support_owner = AngularSupportOwner(self)
+        self.angular_support_owner.reconstructed.connect(self._refresh_angular_support)
         curve_box = self.curve.getPlotItem().getViewBox()
         curve_box.sigXRangeChanged.connect(self._mirror_support_x)
         curve_box.sigResized.connect(self._sync_support_geometry)
@@ -1478,13 +1483,14 @@ class ScientificView(QtWidgets.QFrame):
             self._retired_phase_workers.append(worker)
 
     def shutdown_phase_overlays(self):
-        """Close the phase worker, the window's Add CIF… worker and any retired one: CLEAN, or PENDING while one runs
-        (the host asks again)."""
+        """Close the phase worker, the window's Add CIF… worker, any retired one and the angular coverage strip's
+        reconstruction owner: CLEAN, or PENDING while one runs (the host asks again)."""
         self.reference_phases.close()  # the view's window does not outlive its overlays
         self._clear_phase_overlays()
         retired = [(worker, worker.close()) for worker in self._retired_phase_workers]
         self._retired_phase_workers = [worker for worker, receipt in retired if receipt.status is not PageCleanup.CLEAN]
         receipts = (self._phase_requests.shutdown(), self.reference_phases.phase_source.shutdown(),
+                    self.angular_support_owner.shutdown(),  # the strip's reconstructions retire with the view
                     *(receipt for _worker, receipt in retired))
         return next((receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN), receipts[0])
 
@@ -3258,6 +3264,9 @@ class ScientificView(QtWidgets.QFrame):
         """Each shown native profile in its trace's colour on the strip, or the reasons there is none. An unavailable
         trace never unchecks the option: while it is on the strip stays shown, with its note."""
         on = state.plot_options.show_angular_support
+        self._support_inputs = (state, traces, aggregate)
+        if not on:
+            self.angular_support_owner.clear()  # the strip off: nothing kept, nothing computing
         drawn, reasons = [], []
         if aggregate or state.plot_mode in {"Average", "Sum", "Waterfall"}:  # a waterfall drawn as image or offsets
             reasons.append(REASON_TEXT[SupportReason.AGGREGATE_TRACE])
@@ -3265,7 +3274,7 @@ class ScientificView(QtWidgets.QFrame):
             reasons.append(_NO_TRACE_SUPPORT)
         else:
             for trace, color in zip(traces, trace_colors(state.color_map, len(traces)), strict=True):
-                profile = trace.angular_support
+                profile = self._strip_profile(state, trace) if on else trace.angular_support
                 if profile is not None and profile.available:
                     drawn.append((trace, profile, color))
                     continue
@@ -3298,8 +3307,33 @@ class ScientificView(QtWidgets.QFrame):
         self.angular_support_plot.show()
         self._sync_support_geometry()
 
+    def _strip_profile(self, state, trace):
+        """``trace``'s profile; for a frame of an older Int output that saved none, its reconstruction from the
+        output's own record, asked of the owner (the latest wins) and pending meanwhile (D5). Nothing else is
+        rebuilt: a result recorded with "Record angular coverage" off names that instead."""
+        profile = trace.angular_support
+        source = state.saved_support_source
+        if (profile is None or profile.reason is not SupportReason.NO_SAVED_SUPPORT or source is None
+                or trace.frame.artifact != source.artifact):
+            return profile
+        rebuilt = self.angular_support_owner.profile(source.request(trace.frame.local_frame_label))
+        if rebuilt is None:
+            return AngularSupportProfile.unavailable(SupportReason.PENDING, origin=SupportOrigin.RECONSTRUCTED)
+        if rebuilt.available and rebuilt.supported_deg.shape != trace.intensity.shape:
+            return AngularSupportProfile.unavailable(SupportReason.LEGACY_INSUFFICIENT, origin=SupportOrigin.RECONSTRUCTED,
+                                                     detail="the rebuilt bins are not the shown profile's")
+        return rebuilt
+
+    def _refresh_angular_support(self) -> None:
+        """A reconstruction completed: the strip draws what it now has for the traces it shows."""
+        if self._support_inputs is not None:
+            state, traces, aggregate = self._support_inputs
+            self._reconcile_angular_support(state, traces, aggregate=aggregate)
+
     def _clear_angular_support(self) -> None:
         """The strip lets go of its drawn profiles with the 1-D payloads they describe."""
+        self.angular_support_owner.clear()
+        self._support_inputs = None
         plot = self.angular_support_plot.getPlotItem()
         for item in plot.listDataItems():
             plot.removeItem(item)
