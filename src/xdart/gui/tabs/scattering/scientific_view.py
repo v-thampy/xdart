@@ -1790,7 +1790,8 @@ class ScientificView(QtWidgets.QFrame):
             self.plot_options_dialog.set_grid_available(False, visible=False)
             self._clear_phase_overlays()
             self.reference_phases.set_available(False, 'Reference phases are unavailable in the 2D Viewer.')
-            self._clear_angular_support()  # no 1-D profile in the 2D Viewer
+            self._clear_angular_support()  # no 1-D profile in the 2D Viewer: no strip and no option
+            self.plot_options_dialog.set_angular_support_mounted(False)
         coverage = (
             state.heavy.cake_coverage
             if state.heavy is not None
@@ -3263,6 +3264,7 @@ class ScientificView(QtWidgets.QFrame):
     def _reconcile_angular_support(self, state, traces, *, aggregate=False) -> None:
         """Each shown native profile in its trace's colour on the strip, or the reasons there is none. An unavailable
         trace never unchecks the option: while it is on the strip stays shown, with its note."""
+        self.plot_options_dialog.set_angular_support_mounted(True)
         on = state.plot_options.show_angular_support
         self._support_inputs = (state, traces, aggregate)
         if not on:
@@ -3860,6 +3862,8 @@ class ScientificView(QtWidgets.QFrame):
             raise TypeError("a keyed layout is drawn from a KeyedPanelsProjection")
         self._clear_phase_overlays()
         self.reference_phases.set_available(False, "Reference phases are unavailable in keyed views.", visible=False)
+        self._clear_angular_support()  # RSM's keyed panels: no strip and no option
+        self.plot_options_dialog.set_angular_support_mounted(False)
         prior = self._keyed_shown
         try:
             self._paint_keyed(state)

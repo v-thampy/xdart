@@ -187,6 +187,11 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             " Available on a Stitch Q–χ intensity map with stored coverage."
         )
 
+    def set_angular_support_mounted(self, mounted: bool) -> None:
+        """Offer the option only where the strip can show a 1-D profile (Int, Stitch, the 1D Viewer): not in RSM's
+        keyed panels or the 2D Viewer. Hiding it never changes what the user chose."""
+        self.show_angular_support.setVisible(bool(mounted))
+
     def set_angular_support_available(self, available: bool, reason: str = "") -> None:
         """Say whether the shown traces have angular coverage, and why not: the option stays as the user set it
         (an unavailable trace never unchecks it), so it remains editable either way."""
