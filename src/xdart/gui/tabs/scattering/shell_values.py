@@ -12,6 +12,7 @@ from typing import Mapping
 
 import numpy as np
 
+from xrd_tools.core.angular_support import AngularSupportProfile
 from xrd_tools.session.display_logic import PanelKey, PanelRole
 from xrd_tools.session.readiness import ControlsProjection
 
@@ -502,6 +503,9 @@ class TraceProjection:
     title: str = ""
     epoch: float | None = None
     wavelength_m: float | None = None
+    #: This native profile's angular coverage, or the reason it has none (COVERAGE-SUPPORT-20261013); None when its
+    #: producer carries none. A display conversion of the axis keeps the profile, each bin's own result.
+    angular_support: AngularSupportProfile | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -511,6 +515,11 @@ class TraceProjection:
             or self.intensity.shape != self.axis.values.shape
         ):
             raise TypeError("trace projection is invalid")
+        if self.angular_support is not None and (
+            type(self.angular_support) is not AngularSupportProfile
+            or self.angular_support.available and self.angular_support.supported_deg.shape != self.intensity.shape
+        ):
+            raise TypeError("trace angular support must be its own profile's AngularSupportProfile or None")
         if self.epoch is not None and (
             type(self.epoch) is not float or not np.isfinite(self.epoch)
         ):
@@ -698,6 +707,8 @@ class ScientificPlotOptions:
     phase_floors: tuple[tuple[str, float], ...] = ()
     #: the top bar's Phases toggle (C6): off draws no reference phase, keeping the list, flags and minimums
     phase_references_shown: bool = True
+    #: the opt-in angular coverage strip below the 1-D plot (COVERAGE-SUPPORT-20261013); display only
+    show_angular_support: bool = False
 
     def __post_init__(self) -> None:
         if type(self.waterfall_y_axis) is not str or not self.waterfall_y_axis:
@@ -740,6 +751,8 @@ class ScientificPlotOptions:
             raise ValueError('per-phase floors name listed phases once each, between 0 and 100 percent')
         if type(self.phase_references_shown) is not bool:
             raise TypeError('the reference phases switch must be boolean')
+        if type(self.show_angular_support) is not bool:
+            raise TypeError('the angular coverage strip switch must be boolean')
 
 
 def phase_reference_document(options: ScientificPlotOptions) -> dict:

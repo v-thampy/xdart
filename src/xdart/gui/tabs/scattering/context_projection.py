@@ -14,6 +14,7 @@ from xdart.modules.display_context import (
 )
 from xdart.modules.frame_publication import PublicationStore
 from xrd_tools.core import Axis, FrameView
+from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin, SupportReason
 from xrd_tools.io.viewer_2d import (
     Viewer2DArtifactCatalog, Viewer2DFrame, Viewer2DSourceKind,
 )
@@ -226,6 +227,10 @@ def _terminal_timing_tooltip(progress: ProgressProjection) -> str:
             "Submit/backpressure is orchestration wait, not pure integration."
         )
     return "\n".join(lines)
+#: A 1D Viewer source is a text or array export with no processing record (COVERAGE-SUPPORT-20261013, D7).
+_VIEWER_1D_SUPPORT = AngularSupportProfile.unavailable(SupportReason.NO_RECORD, origin=SupportOrigin.SAVED)
+
+
 @dataclass(frozen=True, slots=True)
 class _Viewer1DTraceProjection(TraceProjection):
     sigma: np.ndarray | None = None
@@ -342,7 +347,7 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice,
             axis = AxisProjection(values, view.axis_1d.label, view.axis_1d.unit)
             traces.append(_Viewer1DTraceProjection(
                 frame, axis, intensity, os.path.basename(view.source_path or ""),
-                sigma=sigma, wavelength_m=payload.wavelength_m))
+                sigma=sigma, wavelength_m=payload.wavelength_m, angular_support=_VIEWER_1D_SUPPORT))
     current = payload_by_id.get(id(navigation.current))
     if ready and current is not None:
         status += f" · {os.path.basename(current.view.source_path or '')}"

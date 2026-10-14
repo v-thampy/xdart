@@ -123,6 +123,37 @@ class ReferenceLines(pg.ItemGroup):
         return tuple(reference_entry(self.line_values[index], self.color) for index in np.flatnonzero(under))
 
 
+class AngularSupportCurve(pg.PlotDataItem):
+    """One shown trace's angular coverage on the 1-D strip (COVERAGE-SUPPORT-20261013): the share of its χ window
+    that unmasked pixels reach in each radial bin, in percent over the trace's own displayed axis and colour.
+    ``angular_support`` is the profile drawn, never copied or resampled; hover names the bin's degrees."""
+
+    def __init__(self, x, profile, *, name, color):
+        self.angular_support = profile
+        self._x = np.array(x, dtype=float)
+        fill = pg.mkColor(color)
+        fill.setAlpha(40)
+        super().__init__(self._x, 100.0 * profile.fraction, name=name, pen=pg.mkPen(color=color, width=1.2),
+                         fillLevel=0.0, brush=fill, connect='finite')
+        self.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+
+    def hover_entries(self, point, _context=None):
+        """The entry for the bin under view ``point``'s x (D1: the bin mean; D2: degrees of the window), none
+        beyond the drawn bins."""
+        finite = np.isfinite(self._x)
+        if not self.isVisible() or not finite.any():
+            return ()
+        distance = np.where(finite, np.abs(self._x - point.x()), np.inf)
+        index = int(np.argmin(distance))
+        neighbours = self._x[max(index - 1, 0):index + 2]
+        half_bin = 0.5 * float(np.nanmax(np.abs(np.diff(neighbours)))) if neighbours.size > 1 else 0.0
+        degrees = float(self.angular_support.supported_deg[index])
+        if distance[index] > half_bin or not np.isfinite(degrees):
+            return ()
+        window = self.angular_support.window_deg
+        return (f"{self.name()}: {100.0 * degrees / window:.1f} % of {window:g}° ({degrees:.2f}° over this bin)",)
+
+
 def draw_reference_lines(plot, positions, *, color=(240, 200, 90), family=None, tooltip='', values=()):
     """All of one family's reference positions as one passive item (one object per phase); ``values`` are the
     lines' detached reflections (C7, C8)."""

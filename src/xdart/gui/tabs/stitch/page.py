@@ -50,6 +50,7 @@ from xdart.gui.tabs.scattering.shell_widgets import foldable
 from xdart.gui.tabs.scattering.workspace_shell import _HugWidthScrollArea
 from xdart.gui.tabs.stitch.settings import STITCH_SETTINGS, apply_page_settings, page_settings
 from xrd_tools.analysis.angular_support import AngularSupportPolicy, DEFAULT_RECORD_ANGULAR_SUPPORT
+from xrd_tools.core.angular_support import AngularSupportProfile, SupportReason
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.stitch_native import native_ceilings
 from xrd_tools.analysis.stitch_operation import StitchFoilNormalization, StitchGeometryKind
@@ -2949,9 +2950,13 @@ class StitchPage(QtWidgets.QWidget):
         else:
             (_q, radial), = pattern.axes
             (_q, unit), = pattern.axis_units
+        # the I(q)'s saved angular coverage; the Diagnostic's pixel counts or normalization and a GI cut have none
+        support = (AngularSupportProfile.unavailable(SupportReason.DIAGNOSTIC_TRACE) if shown != "intensity"
+                   else AngularSupportProfile.unavailable(SupportReason.NOT_RADIAL_PROFILE) if pattern is cut
+                   else payload.angular_support)
         view = FrameView.from_results(label=key.local_frame_label,
                                       result_1d=IntegrationResult1D(radial, getattr(pattern, shown), None, unit),
-                                      result_2d=map_result)
+                                      result_2d=map_result, angular_support=support)
         gi = {}
         if payload.gi_map is not None or payload.gi:
             gi = dict(measurement_mode="GI", gi_resolved_motor=_gi_motor(payload),

@@ -15,6 +15,7 @@ from xrd_tools.core import (
     axis_from_unit,
     convert_radial_axis,
 )
+from xrd_tools.core.angular_support import AngularSupportProfile, SupportReason
 from xrd_tools.core.metadata import monitor_candidates, resolve_monitor_norm
 from xrd_tools.io import is_readable_output_path
 from xrd_tools.session.display_logic import (
@@ -349,9 +350,29 @@ def trace_projection(
             title,
             _finite_metadata_value(view.metadata_numeric, "epoch"),
             wavelength_m=payload.wavelength_m,
+            angular_support=_trace_angular_support(view, intensity, from_cake=selected_from_cake),
         )
     except Exception:
         return None
+
+
+def _trace_angular_support(view, intensity: np.ndarray, *, from_cake: bool) -> AngularSupportProfile | None:
+    """The trace's angular coverage (COVERAGE-SUPPORT-20261013): its frame's own profile, the very object, when the
+    trace is that native radial row (a display conversion between Q and 2θ keeps each bin's result); a cake-derived
+    slice, a χ or GI-cut row, or a profile of other bins is not that profile."""
+    profile = view.angular_support
+    if profile is None:
+        return None
+    native = view.axis_1d
+    key = None if native is None else canonical_axis_key(f"{native.label} ({native.unit})")
+    if from_cake or key not in _CONVERTIBLE_RADIAL_AXIS_KEYS:
+        return AngularSupportProfile.unavailable(SupportReason.NOT_RADIAL_PROFILE, origin=profile.origin)
+    if not profile.available:
+        return profile
+    if (profile.supported_deg.shape != intensity.shape
+            or profile.radial_unit.startswith("q") != key.startswith("q")):
+        return AngularSupportProfile.unavailable(SupportReason.NOT_RADIAL_PROFILE, origin=profile.origin)
+    return profile
 
 
 def _native_trace_values(

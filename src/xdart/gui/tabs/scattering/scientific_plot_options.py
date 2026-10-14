@@ -20,6 +20,12 @@ COVERAGE_TOOLTIP = (
     "Shade Q–χ bins that received no contributing pixels. Coverage includes pixel splitting "
     "and does not measure angular completeness."
 )
+#: The 1-D strip's option (COVERAGE-SUPPORT-20261013): angular reach, not Int's 2-D pixel coverage above.
+ANGULAR_SUPPORT_TOOLTIP = (
+    "Show angular coverage below the 1-D plot: for each radial bin, the share of the profile's χ window "
+    "(360° without one) that unmasked detector pixels reach, saved with the result when it was processed. "
+    "This is angular reach, not a pixel count, and it never changes intensity. Hover for the degrees over a bin."
+)
 GRID_TOOLTIP = ('Show detector-frame q contours and χ half-rays with the effective Run plan’s χ offset. '
                 'Display only; available on Standard Int frames with a uniform flat detector (q contours only on '
                 'a saved output’s frames).')
@@ -41,6 +47,7 @@ PLOT_OPTION_BINDINGS = (
     (("other", "phase_global_floor"), "phase_global_floor"),
     (("other", "phase_floors"), "phase_floors"),
     (("other", "phase_references_shown"), "phase_references_shown"),
+    (("other", "angular_support"), "show_angular_support"),
 )
 
 
@@ -107,6 +114,10 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.intensity_scale.addItems(INTENSITY_SCALE_CHOICES)
         other.addWidget(self.show_legend, 0, 0)
         other.addWidget(self.intensity_scale, 0, 1)
+        # the 1-D plot's angular coverage strip, kept apart from 2-D Support's pixel-coverage shading below
+        self.show_angular_support = QtWidgets.QCheckBox("Angular coverage")
+        other.addWidget(self.show_angular_support, 1, 0, 1, 2)
+        self.set_angular_support_available(True)
 
         support = self._section(layout, "2-D Support")
         support.parentWidget().setToolTip(COVERAGE_TOOLTIP)
@@ -176,6 +187,12 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             " Available on a Stitch Q–χ intensity map with stored coverage."
         )
 
+    def set_angular_support_available(self, available: bool, reason: str = "") -> None:
+        """Say whether the shown traces have angular coverage, and why not: the option stays as the user set it
+        (an unavailable trace never unchecks it), so it remains editable either way."""
+        self.show_angular_support.setToolTip(
+            ANGULAR_SUPPORT_TOOLTIP if available or not reason else f"{ANGULAR_SUPPORT_TOOLTIP} {reason}")
+
     def add_choice(self, label: str, choices: tuple[str, ...], value: str, *, tooltip: str = '') -> QtWidgets.QComboBox:
         """A host's own choice among ``choices``, built here above the buttons (Codex's Stitch/Int reuse
         audit R3: Stitch's Diagnostic was a combo box the page built). Returns the editor; the host
@@ -223,6 +240,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             self.intensity_scale,
             self.show_coverage_holes,
             self.coordinate_grid,
+            self.show_angular_support,
         )
         blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
         self.waterfall_y_axis.clear()
@@ -238,6 +256,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.intensity_scale.setCurrentText(options.intensity_scale)
         self.show_coverage_holes.setChecked(options.show_coverage_holes)
         self.coordinate_grid.setCurrentText(options.coordinate_grid)
+        self.show_angular_support.setChecked(options.show_angular_support)
         self._projection = options
         del blockers
 
@@ -254,6 +273,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             intensity_scale=self.intensity_scale.currentText(),
             show_coverage_holes=self.show_coverage_holes.isChecked(),
             coordinate_grid=self.coordinate_grid.currentText(),
+            show_angular_support=self.show_angular_support.isChecked(),
         )
 
     def reject(self) -> None:
@@ -262,6 +282,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
 
 __all__ = [
+    "ANGULAR_SUPPORT_TOOLTIP",
     "INTENSITY_SCALE_CHOICES",
     "PLOT_OPTION_BINDINGS",
     "PlotOptionsDialog",

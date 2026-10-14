@@ -51,11 +51,12 @@ from .scientific_plot_options import (
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
-from .scientific_curves import add_curve_item, add_text_item, draw_reference_lines
+from .scientific_curves import AngularSupportCurve, add_curve_item, add_text_item, draw_reference_lines
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
 from xdart.gui.pages.values import PageCleanup
 from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest, phase_floor, positions_for_axis
+from xrd_tools.core.angular_support import REASON_TEXT, SupportReason
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
@@ -97,6 +98,16 @@ PLOT_TOOLBAR_MENU_INDICATOR = "▾"
 SCIENTIFIC_TOOLBAR_EDGE_INSET = 4
 SCIENTIFIC_FOOTER_STATUS_LEFT_INSET = 8
 ONE_D_PLOT_BOTTOM_MARGIN = 6
+#: The angular coverage strip below the 1-D plot (COVERAGE-SUPPORT-20261013): its height and what it measures.
+ANGULAR_SUPPORT_STRIP_HEIGHT = 110
+ANGULAR_SUPPORT_STRIP_TOOLTIP = (
+    "Angular coverage of each shown 1-D profile: for every radial bin, the percentage of the profile's χ window "
+    "(360° without one) that unmasked detector pixels reach, averaged over the bin. Value masks such as the "
+    "threshold are not geometry and never reduce it; it is angular reach, not a pixel count, and a full-turn "
+    "window can give small values. Hover a curve for the degrees over a bin.")
+#: The strip's note for a trace whose producer carries no coverage, and for an empty plot.
+_NO_ANGULAR_SUPPORT = "This trace carries no angular coverage."
+_NO_TRACE_SUPPORT = "No 1-D profile is shown."
 MAX_WATERFALL_DISPLAY_ROWS = 256
 MAX_VIEWER_LOADING_SNAPSHOT_PIXELS = 2_000_000
 _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
@@ -751,6 +762,36 @@ class ScientificView(QtWidgets.QFrame):
         self.bottom_stack.addWidget(self.waterfall)
         self.bottom_stack.setCurrentWidget(self.curve)
         one_d_layout.addWidget(self.bottom_stack, 1)
+        # COVERAGE-SUPPORT-20261013: the opt-in angular coverage strip, a passive readout of the shown traces'
+        # profiles. Its plot area takes the 1-D plot's exact horizontal geometry and x range, mirrored one way so
+        # the curve's own autorange is never touched; its percentage axis is fixed at 0–100.
+        self.angular_support_plot = pg.PlotWidget()
+        self.angular_support_plot.setObjectName("angularSupportStrip")
+        strip = self.angular_support_plot.getPlotItem()
+        apply_seaborn_plot_style(strip, grid=True)
+        strip.layout.setContentsMargins(0, 0, 0, 0)
+        strip.hideAxis("bottom")
+        strip.hideButtons()
+        strip.setMenuEnabled(False)
+        strip.setLabel("left", "Angular (%)")
+        strip_box = strip.getViewBox()
+        strip_box.setMouseEnabled(x=False, y=False)
+        strip_box.enableAutoRange(x=False, y=False)
+        strip_box.setYRange(0.0, 100.0, padding=0.0)
+        self.angular_support_plot.setFixedHeight(ANGULAR_SUPPORT_STRIP_HEIGHT)
+        self.angular_support_plot.setToolTip(ANGULAR_SUPPORT_STRIP_TOOLTIP)
+        self.angular_support_plot.hide()
+        self._support_note = pg.LabelItem("", justify="center")
+        self._support_note.setParentItem(strip)
+        self._support_note.anchor(itemPos=(0.5, 0.5), parentPos=(0.5, 0.5))
+        self._support_readout = PlotCursorReadout(self.angular_support_plot)
+        self._support_contract = None
+        self._support_message = ""
+        curve_box = self.curve.getPlotItem().getViewBox()
+        curve_box.sigXRangeChanged.connect(self._mirror_support_x)
+        curve_box.sigResized.connect(self._sync_support_geometry)
+        strip_box.sigResized.connect(self._sync_support_geometry)
+        one_d_layout.addWidget(self.angular_support_plot)
         self.plot_bar = self._make_plot_bar()
         self.plot_toolbar = scrollable_toolbar(
             self.plot_bar,
@@ -1006,6 +1047,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._keyed_shown = None
             else:
                 self.curve.clear(); self.waterfall.clear(); self._trace_history_by_identity.clear(); self._pinned_trace_by_id.clear()
+                self._clear_angular_support()
                 self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
                 self._curve_mounted_keys = ()
                 self._curve_items_by_key.clear(); self._curve_item_contracts.clear()
@@ -1742,6 +1784,7 @@ class ScientificView(QtWidgets.QFrame):
             self.plot_options_dialog.set_grid_available(False, visible=False)
             self._clear_phase_overlays()
             self.reference_phases.set_available(False, 'Reference phases are unavailable in the 2D Viewer.')
+            self._clear_angular_support()  # no 1-D profile in the 2D Viewer
         coverage = (
             state.heavy.cake_coverage
             if state.heavy is not None
@@ -2176,6 +2219,7 @@ class ScientificView(QtWidgets.QFrame):
                 verify_released(target, name)
         for root in (self.curve, self.waterfall):
             scrub(root, "clear")
+        scrub(self, "_clear_angular_support")
         try:
             blocker = QtCore.QSignalBlocker(self.frame_selector)
         except Exception:
@@ -2971,6 +3015,7 @@ class ScientificView(QtWidgets.QFrame):
         ):
             self.bottom_stack.setCurrentWidget(self.waterfall)
             self.legend.setVisible(False)
+            self._reconcile_angular_support(state, (), aggregate=True)
             self._rendered_trace_keys = keys
             self._rendered_plot_mode = state.plot_mode
             self._rendered_plot_options = state.plot_options
@@ -3034,6 +3079,7 @@ class ScientificView(QtWidgets.QFrame):
         # curve during the synchronous rebuild.
         self.bottom_stack.setCurrentWidget(self.curve)
         self.legend.setVisible(state.plot_options.show_legend)
+        self._reconcile_angular_support(state, traces)
         self._rendered_trace_keys = keys
         self._rendered_plot_mode = state.plot_mode
         self._rendered_plot_options = state.plot_options
@@ -3202,6 +3248,88 @@ class ScientificView(QtWidgets.QFrame):
                 continue
             self._curve_items_by_key.pop(key, None)
             self._curve_item_contracts.pop(key, None)
+
+    def angular_support_message(self) -> str:
+        """The strip's note (COVERAGE-SUPPORT-20261013): why the shown traces, or some of them, have no angular
+        coverage; empty while every shown profile is drawn or the strip is off."""
+        return self._support_message
+
+    def _reconcile_angular_support(self, state, traces, *, aggregate=False) -> None:
+        """Each shown native profile in its trace's colour on the strip, or the reasons there is none. An unavailable
+        trace never unchecks the option: while it is on the strip stays shown, with its note."""
+        on = state.plot_options.show_angular_support
+        drawn, reasons = [], []
+        if aggregate or state.plot_mode in {"Average", "Sum"}:
+            reasons.append(REASON_TEXT[SupportReason.AGGREGATE_TRACE])
+        elif not traces:
+            reasons.append(_NO_TRACE_SUPPORT)
+        else:
+            for trace, color in zip(traces, trace_colors(state.color_map, len(traces)), strict=True):
+                profile = trace.angular_support
+                if profile is not None and profile.available:
+                    drawn.append((trace, profile, color))
+                    continue
+                text = _NO_ANGULAR_SUPPORT if profile is None else profile.text
+                if text not in reasons:
+                    reasons.append(text)
+        message = " ".join(reasons)
+        if drawn and reasons:
+            message = f"{len(traces) - len(drawn)} of {len(traces)} profiles: {message}"
+        self.plot_options_dialog.set_angular_support_available(bool(drawn), message)
+        contract = (on, message, tuple((trace.title, id(trace.axis.values), id(profile), color)
+                                       for trace, profile, color in drawn))
+        if contract == self._support_contract:
+            return
+        self._support_contract = contract
+        self._support_message = message if on else ""
+        plot = self.angular_support_plot.getPlotItem()
+        for item in plot.listDataItems():
+            plot.removeItem(item)
+        self._support_readout.clear_hover()
+        if not on:
+            self._support_note.setText("")
+            self.angular_support_plot.hide()
+            return
+        for trace, profile, color in drawn:
+            plot.addItem(AngularSupportCurve(trace.axis.values, profile, color=color,
+                                             name=trace.title or str(trace.frame.local_frame_label)))
+        self._support_note.setText("" if drawn else message)
+        self.angular_support_plot.setToolTip(ANGULAR_SUPPORT_STRIP_TOOLTIP + (f" {message}" if message else ""))
+        self.angular_support_plot.show()
+        self._sync_support_geometry()
+
+    def _clear_angular_support(self) -> None:
+        """The strip lets go of its drawn profiles with the 1-D payloads they describe."""
+        plot = self.angular_support_plot.getPlotItem()
+        for item in plot.listDataItems():
+            plot.removeItem(item)
+        self._support_readout.clear_hover()
+        self._support_note.setText("")
+        self._support_contract = None
+        self._support_message = ""
+        self.angular_support_plot.hide()
+
+    def _sync_support_geometry(self, *_args) -> None:
+        """The strip's plot area takes the 1-D plot's: its left axis as wide as the curve's (an AxisItem sizes itself
+        lazily, so this follows both view boxes' resizes), then the curve's x range."""
+        if not self.angular_support_plot.isVisible():
+            return
+        width = float(self.curve.getPlotItem().getAxis("left").width())
+        strip = self.angular_support_plot.getPlotItem()
+        axis = strip.getAxis("left")
+        if width > 0 and axis.fixedWidth != width:
+            axis.setWidth(width)
+            strip.layout.activate()
+        self._mirror_support_x()
+
+    def _mirror_support_x(self, *_args) -> None:
+        """The strip shows exactly the curve's x range (pan, zoom, drawable extent), whatever Share Axis does."""
+        if not self.angular_support_plot.isVisible():
+            return
+        low, high = self.curve.getPlotItem().getViewBox().viewRange()[0]
+        box = self.angular_support_plot.getPlotItem().getViewBox()
+        if box.viewRange()[0] != [low, high]:
+            box.setXRange(low, high, padding=0.0)
 
     def _update_curve_axis_labels(
         self,
