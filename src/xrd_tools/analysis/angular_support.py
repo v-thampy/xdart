@@ -438,13 +438,14 @@ def _signed_area(mapper, row: int, col: int, side=None) -> float:
     return float(.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
 
 
-def _orientation_pixels(valid: np.ndarray, side=None, corner_sign=None, wanted: int = 9):
-    """Up to ``wanted`` unmasked pixels spread over the detector (wholly on χ_GI half ``side`` if given),
-    found on a sparse grid first so a large detector never indexes all its pixels."""
-    height, width = valid.shape
+def _orientation_pixels(masked: np.ndarray | None, shape: tuple[int, int], side=None, corner_sign=None,
+                        wanted: int = 9):
+    """Up to ``wanted`` unmasked pixels spread over the detector (wholly on χ_GI half ``side`` if given), found on a
+    sparse grid first so a large detector never indexes, or inverts the mask of, all its pixels."""
+    height, width = shape
 
     def admissible(rows, cols):
-        keep = valid[rows, cols]
+        keep = np.ones(rows.size, bool) if masked is None else ~masked[rows, cols]
         if corner_sign is not None:
             keep &= ((corner_sign[rows, cols] == side) & (corner_sign[rows + 1, cols] == side)
                      & (corner_sign[rows, cols + 1] == side) & (corner_sign[rows + 1, cols + 1] == side))
@@ -454,7 +455,7 @@ def _orientation_pixels(valid: np.ndarray, side=None, corner_sign=None, wanted: 
                                        np.linspace(0, width - 1, 33).astype(int), indexing="ij")
     rows, cols = admissible(grid_rows.ravel(), grid_cols.ravel())
     if not rows.size:
-        rows, cols = np.nonzero(valid)
+        rows, cols = np.nonzero(np.ones(shape, bool) if masked is None else ~masked)
         rows, cols = admissible(rows, cols)
     if not rows.size:
         return rows, cols
@@ -462,9 +463,9 @@ def _orientation_pixels(valid: np.ndarray, side=None, corner_sign=None, wanted: 
     return rows[picks], cols[picks]
 
 
-def _orientation(mapper, valid: np.ndarray, side=None, corner_sign=None) -> int:
+def _orientation(mapper, masked: np.ndarray | None, shape: tuple[int, int], side=None, corner_sign=None) -> int:
     """+1 when the pose keeps the left side on the left in the polar plane, else −1 (measured on spread pixels)."""
-    rows, cols = _orientation_pixels(valid, side, corner_sign)
+    rows, cols = _orientation_pixels(masked, shape, side, corner_sign)
     if not rows.size:
         return 0
     areas = [_signed_area(mapper, int(row), int(col), side) for row, col in zip(rows, cols)]
@@ -564,7 +565,7 @@ def _gi_pieces(ai, valid: np.ndarray, horizontal, cancel, pole=None):
     corner_sign = np.empty((height + 1, width + 1), np.int8)
     rows = np.arange(height + 1, dtype=float)
     cols = np.arange(width + 1, dtype=float)
-    for chunk in np.array_split(np.arange(height + 1), max(1, (height + 1) // 256)):
+    for chunk in np.array_split(np.arange(height + 1), max(1, (height + 1) // 64)):
         _check(cancel)
         rr, cc = np.meshgrid(rows[chunk], cols, indexing="ij")
         value = horizontal(rr.ravel(), cc.ravel()).reshape(rr.shape)
@@ -637,13 +638,39 @@ def _gi_pieces(ai, valid: np.ndarray, horizontal, cancel, pole=None):
     return out, corner_sign
 
 
+def _single_flight(lock, flights: dict, key, lookup: Callable[[], Any], compute: Callable[[], Any], cancel) -> Any:
+    """``lookup()`` (called under ``lock``), else ``compute()`` by one caller while concurrent callers of the same
+    ``key`` wait, cancellably, and then look again."""
+    import threading
+    while True:
+        with lock:
+            found = lookup()
+            if found is not None:
+                return found
+            flight = flights.setdefault(key, threading.Lock())
+        if flight.acquire(timeout=0.05):
+            break
+        _check(cancel)
+    try:
+        with lock:
+            found = lookup()
+        return found if found is not None else compute()
+    finally:
+        with lock:
+            if flights.get(key) is flight:
+                del flights[key]
+        flight.release()
+
+
 class SupportGeometryCache:
-    """A small thread-safe cache one Run keeps across its poses (see :func:`support_footprint`)."""
+    """A small thread-safe cache one Run keeps across its poses (see :func:`support_footprint`); a missing entry is
+    built by one caller while concurrent callers wait for it."""
 
     def __init__(self, limit: int = 4) -> None:
         import threading
         self._lock = threading.Lock()
         self._items: dict = {}
+        self._flights: dict = {}
         self._limit = int(limit)
 
     def get(self, key):
@@ -656,6 +683,13 @@ class SupportGeometryCache:
                 self._items.pop(next(iter(self._items)))
             self._items[key] = value
 
+    def once(self, key, build: Callable[[], Any], cancel=None) -> Any:
+        def compute():
+            value = build()
+            self.put(key, value)
+            return value
+        return _single_flight(self._lock, self._flights, key, lambda: self._items.get(key), compute, cancel)
+
 
 def support_footprint(pose: SupportPose, convention: str, *, cancel=None,
                       cache: SupportGeometryCache | None = None) -> SupportFootprint:
@@ -666,15 +700,14 @@ def support_footprint(pose: SupportPose, convention: str, *, cancel=None,
     not depend on it; only the mapping to (2θ, χ_GI) is recomputed.
     """
     geometry = json.dumps(pose.geometry, sort_keys=True)
-    ai = None if cache is None else cache.get(("geometry", geometry))
-    if ai is None:
-        try:
-            ai = _integrator(pose.geometry)
-        except Exception as error:  # a geometry pyFAI cannot load is not qualified
-            return SupportFootprint(pose.key, convention, reason=SupportReason.UNQUALIFIED_GEOMETRY,
-                                    detail=f"geometry not loadable: {type(error).__name__}")
-        if cache is not None:
-            cache.put(("geometry", geometry), ai)
+    try:
+        ai = (_integrator(pose.geometry) if cache is None
+              else cache.once(("geometry", geometry), lambda: _integrator(pose.geometry), cancel))
+    except SupportCancelled:
+        raise
+    except Exception as error:  # a geometry pyFAI cannot load is not qualified
+        return SupportFootprint(pose.key, convention, reason=SupportReason.UNQUALIFIED_GEOMETRY,
+                                detail=f"geometry not loadable: {type(error).__name__}")
     unqualified = _qualification(ai)
     if unqualified:
         return SupportFootprint(pose.key, convention, reason=SupportReason.UNQUALIFIED_GEOMETRY, detail=unqualified)
@@ -682,13 +715,13 @@ def support_footprint(pose: SupportPose, convention: str, *, cancel=None,
     if pose.mask is not None and pose.mask.shape != shape:
         return SupportFootprint(pose.key, convention, reason=SupportReason.UNQUALIFIED_GEOMETRY,
                                 detail=f"mask shape {pose.mask.shape} differs from the detector's {shape}")
-    valid = np.ones(shape, bool) if pose.mask is None else ~pose.mask
     try:
         if convention == "detector_chi":
+            valid = np.ones(shape, bool) if pose.mask is None else ~pose.mask
             # (row, col) corner coordinates; boundary edges are directed (col right, row up), region on the left
             start_ab, end_ab = _boundary_edges(valid)
             mapper = _mapper(ai, convention, None)
-            sigma = _orientation(mapper, valid)
+            sigma = _orientation(mapper, pose.mask, shape)
             if sigma == 0:
                 return SupportFootprint(pose.key, convention, np.empty(0), np.empty(0), np.empty(0), np.empty(0),
                                         np.empty(0), np.empty(0), np.empty(0), False)
@@ -701,24 +734,23 @@ def support_footprint(pose: SupportPose, convention: str, *, cancel=None,
             order = np.argsort(seam_t, kind="stable")
             return SupportFootprint(pose.key, convention, t0, p0, t1, p1, sign, seam_t[order], seam_sign[order],
                                     inside)
-        reusable = cache is not None and pose.gi[1] == 0.0
-        cut_key = ("gi_cut", geometry, pose.mask_digest, pose.gi[2]) if reusable else None
-        cached = cache.get(cut_key) if reusable else None
-        if cached is None:
+        def cut():
+            valid = np.ones(shape, bool) if pose.mask is None else ~pose.mask
             horizontal = _horizontal_q(ai, pose.gi)
             pole = _pole(ai)
             inside = pole is not None and 0 <= pole[0] < shape[0] and 0 <= pole[1] < shape[1]
-            cached = _gi_pieces(ai, valid, horizontal, cancel, pole if inside else None)
-            if reusable:
-                cache.put(cut_key, cached)
-        pieces, corner_sign = cached
+            return _gi_pieces(ai, valid, horizontal, cancel, pole if inside else None)
+        if cache is not None and pose.gi[1] == 0.0:
+            pieces, corner_sign = cache.once(("gi_cut", geometry, pose.mask_digest, pose.gi[2]), cut, cancel)
+        else:
+            pieces, corner_sign = cut()
         mapper = _mapper(ai, convention, pose.gi)
         parts = []
         for side in (1, -1):
             starts, ends = pieces[side]
             if not starts.size:
                 continue
-            sigma = _orientation(mapper, valid, side, corner_sign)
+            sigma = _orientation(mapper, pose.mask, shape, side, corner_sign)
             if sigma == 0:
                 continue
             t0, p0, t1, p1 = _subdivide(mapper, starts, ends, float(side), cancel)
@@ -1041,25 +1073,7 @@ class RunSupportCapture:
 
     def _once(self, key: tuple, lookup: Callable[[], Any], compute: Callable[[], Any], cancel) -> Any:
         """``lookup()`` (under the lock), else ``compute()`` by one worker while the others wait for its result."""
-        import threading
-        while True:
-            with self._lock:
-                found = lookup()
-                if found is not None:
-                    return found
-                flight = self._flights.setdefault(key, threading.Lock())
-            if flight.acquire(timeout=0.05):
-                break
-            _check(cancel)
-        try:
-            with self._lock:
-                found = lookup()
-            return found if found is not None else compute()
-        finally:
-            with self._lock:
-                if self._flights.get(key) is flight:
-                    del self._flights[key]
-            flight.release()
+        return _single_flight(self._lock, self._flights, key, lookup, compute, cancel)
 
     def _footprint(self, pose: SupportPose, convention: str, cancel) -> SupportFootprint | None:
         key = (pose.key, convention)
@@ -1290,7 +1304,7 @@ def footprint_from_corners(key: str, two_theta: np.ndarray, chi: np.ndarray,
         r, c = np.asarray(rows).astype(int), np.asarray(cols).astype(int)
         return two_theta[r, c], chi[r, c]
 
-    sigma = _orientation(mapped, valid)
+    sigma = _orientation(mapped, mask, shape)
     if sigma == 0:
         empty = np.empty(0)
         return SupportFootprint(key, "detector_chi", empty, empty, empty, empty, empty, empty, empty, False)

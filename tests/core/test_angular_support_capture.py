@@ -109,3 +109,37 @@ def test_workers_sharing_a_run_compute_a_new_geometry_and_its_table_once():
     for result in results[1:]:
         assert np.array_equal(result.supported_deg, results[0].supported_deg)
     assert math.isclose(results[0].window_deg, 360.0)
+
+
+def test_workers_starting_an_incidence_scan_compute_its_shared_cut_once():
+    from xrd_tools.analysis import angular_support as kernel
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy, RunSupportCapture, SupportPose, admitted_window
+    ai = _planar(shape=(300, 400), poni=(0.005013, 0.020007))
+    mask = np.zeros((300, 400), bool)
+    mask[:, 300:305] = True
+    digest = SupportPose.from_integrator(ai, mask).mask_digest
+    centres = np.linspace(0.5, 3.5, 200)
+    capture = RunSupportCapture(AngularSupportPolicy())
+    start = threading.Barrier(4)
+    results, errors = [None] * 4, []
+
+    def worker(index):
+        try:
+            start.wait()
+            results[index] = capture.profile(
+                integrator=ai, mask=mask, mask_digest=digest, convention="gi_chi", radial_unit="q_A^-1",
+                centres=centres, wavelength_m=ai.wavelength, gi=(0.5 + 0.5 * index, 0.0, 1),
+                window=admitted_window(None, reducer="int_gi_total_q"))
+        except Exception as error:  # pragma: no cover - reported below
+            errors.append(error)
+
+    with mock.patch.object(kernel, "_gi_pieces", wraps=kernel._gi_pieces) as cuts, \
+            mock.patch.object(kernel, "_integrator", wraps=kernel._integrator) as loads:
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+    assert not errors and all(result is not None and result.available for result in results)
+    assert capture.geometry_keys == 4
+    assert cuts.call_count == 1 and loads.call_count == 1, "four incidence angles share one cut and geometry"
