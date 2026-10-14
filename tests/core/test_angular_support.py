@@ -604,11 +604,37 @@ def test_k5_capture_and_availability(tmp_path):
         assert over.frames[index].result_1d.intensity.tobytes() == plain_run.frames[index].result_1d.intensity.tobytes()
 
 
+def _energy_scan_views(energies, unit):
+    """BRR's bound_session (test_predicted_ring_overlays.py), with the plan carrying the scan's own energy selection
+    as the production plan does (readiness.native_int_reduction_plan): only then does Int reduce frame by frame.
+    Test-only oracle repair: bound_session's plan omits it, so its reduction ran at one wavelength."""
+    import xrd_tools.session.readiness as readiness
+    from tests.core.test_predicted_ring_overlays import calibration
+    from xrd_tools.reduction import Frame, Integration1DPlan, Integration2DPlan, MemorySink, ReductionPlan, Scan
+    from xrd_tools.session import FrameRecordStore
+    from xrd_tools.session.headless_scan import open_headless_scan_session
+    from xrd_tools.session.readiness import bind_native_int_source_energy
+    frames = [Frame(label, image=np.full((195, 487), 100., dtype=np.float32), metadata={"energy": energy})
+              for label, energy in zip((7, 11, 15, 19), energies)]
+    scan = Scan("rings", frames)
+    accepted = bind_native_int_source_energy(scan, calibration(wavelength=12.398419843320026 / 15 * 1e-10))
+    plan = ReductionPlan(integration_1d=Integration1DPlan(npt=64, unit=unit),
+                         integration_2d=Integration2DPlan(npt_rad=64, npt_azim=36, unit=unit),
+                         extra={"energy_selection": scan.extra["energy_selection"]})
+    store = FrameRecordStore()
+    session = open_headless_scan_session(
+        scan, plan, sink=MemorySink(), record_store=store, executor=1,
+        ring_geometry=readiness.effective_ring_geometry(accepted, integrator=scan.integrator))
+    for frame in frames:
+        session.submit(frame)
+    session.finish()
+    return [next(iter(store.get(frame.index).results_1d.values())) for frame in frames]
+
+
 def test_k5b_publication_carries_the_runs_support():
     """The published FrameView carries the Run's own immutable support object; mutation of inputs cannot reach it."""
-    from tests.core.test_predicted_ring_overlays import bound_session
     from xrd_tools.core.angular_support import SupportOrigin
-    accepted, scan, views, store = bound_session(energies=(16., 17.), unit="q_A^-1")
+    views = _energy_scan_views((16., 17.), "q_A^-1")
     published = [view.angular_support for view in views]
     assert all(item is not None and item.origin is SupportOrigin.RUN and item.available for item in published)
     assert published[0].provenance["wavelength_m"] != published[1].provenance["wavelength_m"]
@@ -723,7 +749,7 @@ def test_k6b_current_admission_reads_the_extension_unchanged(tmp_path):
     without, _ = _saved_int(tmp_path / "b", enabled=False)
     for path in (with_support, without):
         with h5py.File(path, "r") as handle:
-            read_current_mode_layout(handle["entry"], "integrated_1d")
+            read_current_mode_layout(handle["entry/integrated_1d"], "1d")
     a, b = ProcessedScan(with_support), ProcessedScan(without)
     try:
         np.testing.assert_array_equal(a.get_1d(1)[1], b.get_1d(1)[1])
