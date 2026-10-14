@@ -5993,7 +5993,7 @@ def _reduce_frame(
         )
         if support_capture is not None and r1d is not None:
             angular_support_1d = _gi_frame_support(
-                support_capture, fi, mask, plan, p1_frame, incident_angle, r1d, grouped)
+                support_capture, fi, mask, plan, p1_frame, incident_angle, r1d, grouped, cancel_token)
         r2d = (
             _run_gi_2d(
                 image,
@@ -6125,7 +6125,8 @@ def _reduce_frame(
             )
         if support_capture is not None and r1d is not None and p1 is not None:
             angular_support_1d = _standard_frame_support(
-                support_capture, ai, integration_mask, detector_mask_is_bound, p1, r1d, chi_mode, grouped)
+                support_capture, ai, integration_mask, detector_mask_is_bound, p1, r1d, chi_mode, grouped,
+                cancel_token)
         # S-4: re-add chi_offset to the 1D chi OUTPUT axis (mirror the 2D
         # r2d.azimuthal += azimuth_offset below), so the written Mode-A (chi_deg)
         # chi axis matches the 2D cake chi instead of staying in the raw pyFAI
@@ -6228,12 +6229,14 @@ def _support_unavailable(reason: Any, unit: str, detail: str = "") -> Any:
 
 
 def _guarded_support(build: Callable[[], Any], unit: str) -> Any:
-    """Support never fails a frame: an unexpected kernel error is logged and named, intensity unaffected."""
+    """Support never fails a frame: an unexpected kernel error is logged and named, intensity unaffected.
+    The Run's own cancellation, observed inside the kernel, stops the frame as any cancellation does."""
+    from xrd_tools.analysis.angular_support import SupportCancelled
     from xrd_tools.core.angular_support import SupportReason
     try:
         return build()
-    except _ReductionCancelled:
-        raise
+    except (_ReductionCancelled, SupportCancelled):
+        raise _ReductionCancelled from None
     except Exception as error:  # noqa: BLE001 - support is derived, never a reason to lose a frame
         logger.exception("angular support capture failed")
         return _support_unavailable(SupportReason.UNQUALIFIED_GEOMETRY, unit,
@@ -6241,7 +6244,8 @@ def _guarded_support(build: Callable[[], Any], unit: str) -> Any:
 
 
 def _standard_frame_support(capture: Any, ai: Any, explicit: np.ndarray | None, bound: bool,
-                            p1: Integration1DPlan, r1d: IntegrationResult1D, chi_mode: bool, grouped: bool) -> Any:
+                            p1: Integration1DPlan, r1d: IntegrationResult1D, chi_mode: bool, grouped: bool,
+                            cancel_token: CancelToken | None = None) -> Any:
     """Support of an Int Standard native radial profile, from the mask and window the reducer applied."""
     from xrd_tools.analysis.angular_support import admitted_window
     from xrd_tools.core.angular_support import SupportReason
@@ -6258,12 +6262,14 @@ def _standard_frame_support(capture: Any, ai: Any, explicit: np.ndarray | None, 
                                  chi_disc_at_pi=bool(getattr(ai, "chiDiscAtPi", True)))
         return capture.profile(integrator=ai, mask=mask, mask_digest=digest, convention="detector_chi",
                                radial_unit=unit, centres=r1d.radial, wavelength_m=getattr(ai, "wavelength", None),
-                               window=window, radial_range=p1.radial_range)
+                               window=window, radial_range=p1.radial_range,
+                               cancel=lambda: _cancel_requested(cancel_token))
     return _guarded_support(build, unit)
 
 
 def _gi_frame_support(capture: Any, fi: Any, explicit: np.ndarray | None, plan: ReductionPlan,
-                      p1: Integration1DPlan, incident_angle: float, r1d: IntegrationResult1D, grouped: bool) -> Any:
+                      p1: Integration1DPlan, incident_angle: float, r1d: IntegrationResult1D, grouped: bool,
+                      cancel_token: CancelToken | None = None) -> Any:
     """Support of Int's GI total-q profile in χ_GI (its fast path admits the full turn, its polar path a window)."""
     from xrd_tools.analysis.angular_support import admitted_window
     from xrd_tools.core.angular_support import SupportReason
@@ -6280,7 +6286,8 @@ def _gi_frame_support(capture: Any, fi: Any, explicit: np.ndarray | None, plan: 
         angles = (float(incident_angle), float(gi.tilt_angle), int(gi.sample_orientation))
         return capture.profile(integrator=fi, mask=mask, mask_digest=digest, convention="gi_chi",
                                radial_unit=unit, centres=r1d.radial, wavelength_m=getattr(fi, "wavelength", None),
-                               window=window, gi=angles, radial_range=p1.radial_range)
+                               window=window, gi=angles, radial_range=p1.radial_range,
+                               cancel=lambda: _cancel_requested(cancel_token))
     return _guarded_support(build, unit)
 
 

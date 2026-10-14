@@ -39,6 +39,7 @@ __all__ = [
     "AngularSupportRequest",
     "RunSupportCapture",
     "StitchSupportAccumulator",
+    "SupportCancelled",
     "SupportFootprint",
     "SupportLineTable",
     "XuSupportAccumulator",
@@ -65,8 +66,11 @@ _PI = math.pi
 _TWO_PI = 2 * math.pi
 
 
-class _Cancelled(Exception):
-    pass
+class SupportCancelled(Exception):
+    """The caller's cancellation, raised from inside a support computation."""
+
+
+_Cancelled = SupportCancelled
 
 
 def _check(cancel: Callable[[], bool] | None) -> None:
