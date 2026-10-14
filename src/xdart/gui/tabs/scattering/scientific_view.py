@@ -3264,19 +3264,22 @@ class ScientificView(QtWidgets.QFrame):
     def _reconcile_angular_support(self, state, traces, *, aggregate=False) -> None:
         """Each shown native profile in its trace's colour on the strip, or the reasons there is none. An unavailable
         trace never unchecks the option: while it is on the strip stays shown, with its note."""
+        # only what the strip reads, kept for a reconstruction's redraw: never the projection's images
+        self._draw_angular_support((tuple(traces), state.plot_mode, state.plot_options.show_angular_support,
+                                    state.color_map, state.saved_support_source, bool(aggregate)))
+
+    def _draw_angular_support(self, inputs) -> None:
+        traces, plot_mode, on, color_map, source, aggregate = inputs
+        self._support_inputs = inputs
         self.plot_options_dialog.set_angular_support_mounted(True)
-        on = state.plot_options.show_angular_support
-        self._support_inputs = (state, traces, aggregate)
-        if not on:
-            self.angular_support_owner.clear()  # the strip off: nothing kept, nothing computing
         drawn, reasons = [], []
-        if aggregate or state.plot_mode in {"Average", "Sum", "Waterfall"}:  # a waterfall drawn as image or offsets
+        if aggregate or plot_mode in {"Average", "Sum", "Waterfall"}:  # a waterfall drawn as image or offsets
             reasons.append(REASON_TEXT[SupportReason.AGGREGATE_TRACE])
         elif not traces:
             reasons.append(_NO_TRACE_SUPPORT)
         else:
-            for trace, color in zip(traces, trace_colors(state.color_map, len(traces)), strict=True):
-                profile = self._strip_profile(state, trace) if on else trace.angular_support
+            for trace, color in zip(traces, trace_colors(color_map, len(traces)), strict=True):
+                profile = self._strip_profile(source, trace) if on else trace.angular_support
                 if profile is not None and profile.available:
                     drawn.append((trace, profile, color))
                     continue
@@ -3286,18 +3289,19 @@ class ScientificView(QtWidgets.QFrame):
         message = " ".join(reasons)
         if drawn and reasons:
             message = f"{len(traces) - len(drawn)} of {len(traces)} profiles: {message}"
-        self.plot_options_dialog.set_angular_support_available(bool(drawn), message)
         contract = (on, message, tuple((trace.title, id(trace.axis.values), id(profile), color)
                                        for trace, profile, color in drawn))
         if contract == self._support_contract:
             return
         self._support_contract = contract
         self._support_message = message if on else ""
+        self.plot_options_dialog.set_angular_support_available(bool(drawn), message)
         plot = self.angular_support_plot.getPlotItem()
         for item in plot.listDataItems():
             plot.removeItem(item)
         self._support_readout.clear_hover()
         if not on:
+            self.angular_support_owner.clear()  # the strip off: nothing kept, nothing computing
             self._support_note.setText("")
             self.angular_support_plot.hide()
             return
@@ -3309,12 +3313,11 @@ class ScientificView(QtWidgets.QFrame):
         self.angular_support_plot.show()
         self._sync_support_geometry()
 
-    def _strip_profile(self, state, trace):
-        """``trace``'s profile; for a frame of an older Int output that saved none, its reconstruction from the
-        output's own record, asked of the owner (the latest wins) and pending meanwhile (D5). Nothing else is
-        rebuilt: a result recorded with "Record angular coverage" off names that instead."""
+    def _strip_profile(self, source, trace):
+        """``trace``'s profile; for a frame of the shown older Int output (``source``) that saved none, its
+        reconstruction from the output's own record, asked of the owner (the latest wins) and pending meanwhile (D5).
+        Nothing else is rebuilt: a result recorded with "Record angular coverage" off names that instead."""
         profile = trace.angular_support
-        source = state.saved_support_source
         if (profile is None or profile.reason is not SupportReason.NO_SAVED_SUPPORT or source is None
                 or trace.frame.artifact != source.artifact):
             return profile
@@ -3329,8 +3332,7 @@ class ScientificView(QtWidgets.QFrame):
     def _refresh_angular_support(self) -> None:
         """A reconstruction completed: the strip draws what it now has for the traces it shows."""
         if self._support_inputs is not None:
-            state, traces, aggregate = self._support_inputs
-            self._reconcile_angular_support(state, traces, aggregate=aggregate)
+            self._draw_angular_support(self._support_inputs)
 
     def _clear_angular_support(self) -> None:
         """The strip lets go of its drawn profiles with the 1-D payloads they describe."""

@@ -3059,10 +3059,15 @@ class FrameViewReader:
         try:
             if isinstance(table, AngularSupportFormatError):
                 raise table
-            return table.profile(label, intensity_row)
+            profile = table.profile(label, intensity_row)
         except AngularSupportFormatError as error:
             return AngularSupportProfile.unavailable(SupportReason.MALFORMED_SAVED_SUPPORT,
                                                      origin=SupportOrigin.SAVED, detail=str(error))
+        if profile.reason is SupportReason.NO_SAVED_SUPPORT and self._entry is not None:
+            from xrd_tools.io.stitch_record import STITCH_GROUP
+            if STITCH_GROUP in self._entry:  # an older Stitch result opened in Int Browse: never rebuilt (D6)
+                return AngularSupportProfile.unavailable(SupportReason.LEGACY_STITCH, origin=SupportOrigin.SAVED)
+        return profile
 
     def _view_for(
         self,
