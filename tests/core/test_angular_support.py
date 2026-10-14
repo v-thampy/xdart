@@ -367,7 +367,8 @@ def test_k2b_value_conditioning_never_reduces_support_and_intensity_is_unchanged
         for field in ("radial", "intensity"):
             assert getattr(enabled.frames[0].result_1d, field).tobytes() == \
                 getattr(disabled.frames[0].result_1d, field).tobytes()
-        assert disabled.frames[0].angular_support_1d is None
+        from xrd_tools.core.angular_support import SupportReason
+        assert disabled.frames[0].angular_support_1d.reason is SupportReason.RECORDING_DISABLED  # decision 6
 
 
 def test_k2c_the_applied_mask_includes_bound_and_degraded_cases():
