@@ -1022,13 +1022,12 @@ def test_k9_stitch_saved_support_and_legacy(tmp_path):
     np.testing.assert_array_equal(payload.intensity, plain.intensity)
     np.testing.assert_array_equal(payload.coverage, plain.coverage)
     # an older Stitch result (no support datasets) is refused, never reconstructed (D6). Decision 6: recording off
-    # now records that it was off, so the older form is a written result with its support removed.
-    older = tmp_path / "older.nexus"
-    older.write_bytes(Path(target).read_bytes())
-    with h5py.File(older, "r+") as handle:
+    # now records that it was off, so the older form is a written result with its support removed — at its own path,
+    # since a stitched record reads only where it was written (its file_name; test-only oracle repair).
+    with h5py.File(target, "r+") as handle:
         for name in ANGULAR_SUPPORT_DATASETS:
             del handle["entry/integrated_1d"][name]
-    older_payload = read_analysis_artifact(older)
+    older_payload = read_analysis_artifact(target)
     assert older_payload.angular_support.reason is SupportReason.LEGACY_STITCH
     # the same result with and without its support: only support differs, so the fingerprint must not (two Stitches
     # in different directories always differ by their own provenance — test-only oracle repair)
