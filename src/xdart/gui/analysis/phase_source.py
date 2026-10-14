@@ -26,6 +26,7 @@ _NO_INTENSITY_TIP = {'lattice': 'Lattice phases have no structural intensities; 
                      'calibrant': 'Calibrants carry positions only, with no intensities; every line is shown.'}
 #: Add CIF…'s busy reason while the chosen files are read (R1, D1)
 _ADD_BUSY_TIP = 'Reading the chosen CIF files on a worker; Add CIF is available again once they are added.'
+_REMOVE_NONE_TIP = 'Select a phase in the list first: Remove acts only on the selected phase.'
 
 
 @dataclass(frozen=True, eq=False)
@@ -200,6 +201,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.add_lattice_btn.clicked.connect(lambda: self.lattice_form.setVisible(not self.lattice_form.isVisible()))
         self.add_lattice_commit.clicked.connect(self._commit_lattice)
         self.remove_btn.clicked.connect(self.remove_current)
+        # a user's selection change (reconciles run signal-blocked and resync through _sync_tooltips)
+        self.browser.scans.itemSelectionChanged.connect(self._sync_remove)
         if checkable:
             self.browser.checksChanged.connect(self._checks_changed)
         self.refresh_library()
@@ -243,7 +246,17 @@ class PhaseSourceWidget(QtWidgets.QWidget):
                 control.set_purpose_tooltip(purpose + extra)
             else:
                 control.setToolTip(purpose + extra)
+        self._sync_remove()
         self._sync_cutoff_rows()
+
+    def _sync_remove(self):
+        """Remove acts only on the selected phase, never on the row Qt leaves current without selecting it
+        (PHASE-ROW-CLICK-SELECT-REMOVE): disabled, saying why, while none is selected."""
+        chosen = bool(self.browser.selected_result_rows())
+        self.remove_btn.setEnabled(chosen)
+        suffix = ('' if chosen else ' ' + _REMOVE_NONE_TIP) + (
+            ' ' + self._availability_reason if self._availability_reason else '')
+        self.remove_btn.setToolTip(self._purpose_tooltips[self.remove_btn] + suffix)
 
     def selected_entries(self):
         """The visible selected entries as last resolved by refresh_library."""
@@ -274,7 +287,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         return self.browser.result_value_editor(key)
 
     def refresh_cutoffs(self):
-        """Re-project the cutoff rows after a host reconciled this source's list itself."""
+        """Re-project the cutoff rows and Remove's readiness after a host reconciled this source's list itself."""
+        self._sync_remove()
         self._sync_cutoff_rows()
 
     def _cif_ids(self):
@@ -517,9 +531,10 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             return None
 
     def remove_current(self):
-        row = self.browser.current_result_row()
-        if 0 <= row < len(self._shown_ids):
-            identifier = self._shown_ids[row]
+        """Remove the selected phase (its library entry stays); with none selected, nothing."""
+        rows = self.browser.selected_result_rows()
+        if len(rows) == 1 and 0 <= rows[0] < len(self._shown_ids):
+            identifier = self._shown_ids[rows[0]]
             self.set_selection(tuple(pair for pair in self._selection if pair[0] != identifier))
 
     def _browse_cifs(self):

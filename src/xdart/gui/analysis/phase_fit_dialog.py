@@ -306,7 +306,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._sync_phase_list()
 
     def _remove_cif(self):
-        row = self.cif_browser.current_result_row()
+        rows = self.cif_browser.selected_result_rows()  # the selected phase only (PHASE-ROW-CLICK-SELECT-REMOVE)
+        row = rows[0] if len(rows) == 1 else -1
         if not 0 <= row < len(self._phases):
             return
         entries = self.phase_source.selected_entries()

@@ -555,7 +555,7 @@ class BrowserView(QtWidgets.QFrame):
             self.directory_label.hide()
         scan_labels_layout.addWidget(self.scans_label)
         scan_labels_layout.addWidget(self.directory_label, 1)
-        self.scans = QtWidgets.QListWidget()
+        self.scans = _ValueRowList() if self.profile.result_values is not None else QtWidgets.QListWidget()
         self.scans.setObjectName("e3ScanList")
         self._artifact_navigation_filter = _ArtifactNavigationFilter(
             self.scans, self._activate_directory, self._visit_artifact,
@@ -931,6 +931,7 @@ class BrowserView(QtWidgets.QFrame):
         for identifier in tuple(self._value_editors):
             if identifier not in listed:
                 self._value_editors.pop(identifier)
+        self.scans.updateGeometry()  # the list's width hint follows its rows
 
     def _create_value_editor(self, parent, index) -> QtWidgets.QDoubleSpinBox:
         spec = self.profile.result_values
@@ -991,6 +992,11 @@ class BrowserView(QtWidgets.QFrame):
         """A results list's selected entries' identities, in the order Qt reports them (an overlay's order)."""
         return tuple(item.data(_USER_ROLE) for item in self.scans.selectedItems()
                      if not item.data(_DIRECTORY_ROLE))
+
+    def selected_result_rows(self) -> tuple[int, ...]:
+        """A results list's selected rows, in list order. A row Qt makes current on focus is not selected."""
+        return tuple(sorted(self.scans.row(item) for item in self.scans.selectedItems()
+                            if not item.data(_DIRECTORY_ROLE)))
 
     def listed_results(self) -> tuple[str, ...]:
         """The visible artifact identities; directory rows are navigation only."""
@@ -1660,9 +1666,74 @@ class _RowValueDelegate(QtWidgets.QStyledItemDelegate):
         clear.rect = option.rect.adjusted(0, 0, -(self._view.profile.result_values.width + 4), 0)
         super().paint(painter, clear, index)
 
+    def natural_width(self, option, index) -> int:
+        """The row's whole width: check box, full name and number box."""
+        return super().sizeHint(option, index).width() + self._view.profile.result_values.width + 4
+
     def sizeHint(self, option, index):
+        # never wider than the visible list (LT-002): the box stays whole at its right end and the name elides,
+        # so no sideways scroll range exists to hide a box
         hint = super().sizeHint(option, index)
-        return QtCore.QSize(hint.width() + self._view.profile.result_values.width + 4, max(hint.height(), self._height))
+        width = hint.width() + self._view.profile.result_values.width + 4
+        visible = self._view.scans.viewport().width()
+        return QtCore.QSize(min(width, visible) if visible > 0 else width, max(hint.height(), self._height))
+
+
+class _ValueRowList(QtWidgets.QListWidget):
+    """The list of a ``result_values`` profile, whose rows carry persistent number editors (LT-SMALL-FIXES-20261014).
+
+    Qt hands every event on an index with an open persistent editor to that editor, before the row delegate's own
+    check handling and before a press makes the row current: check boxes ignored clicks and Space (LT-001), and a
+    click on a row's name selected nothing, so Remove acted on another row (PHASE-ROW-CLICK-SELECT-REMOVE). Here the
+    delegate sees mouse presses, releases and double-clicks and Space/Select first, exactly as on any checkable
+    list; a press it does not take (a name, a disabled box) selects the row as usual. A row made current (a click,
+    an arrow key, a reconcile) keeps the focus on the list rather than Qt moving it into the row's box. Every other
+    trigger is Qt's own: typing, F2 and clicks inside an enabled box are unchanged. The width hint follows the rows'
+    whole width, bounded, and rows never exceed the visible width (LT-002)."""
+
+    _MOUSE = (QtCore.QEvent.Type.MouseButtonPress, QtCore.QEvent.Type.MouseButtonRelease,
+              QtCore.QEvent.Type.MouseButtonDblClick)
+    _KEYS = (QtCore.Qt.Key.Key_Space, QtCore.Qt.Key.Key_Select)
+    #: the opening width's bound, in the font's average characters, before the screen's own bound
+    MAX_CHARACTERS = 72
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)  # rows follow the visible width as it changes
+
+    def edit(self, index, trigger=None, event=None):
+        if trigger is None:
+            return super().edit(index)
+        item = self.itemFromIndex(index) if index.isValid() else None
+        if item is None or not self.isPersistentEditorOpen(item):
+            return super().edit(index, trigger, event)
+        if trigger == QtWidgets.QAbstractItemView.EditTrigger.CurrentChanged:
+            return False
+        if event is None or not (event.type() in self._MOUSE
+                                 or (event.type() == QtCore.QEvent.Type.KeyPress and event.key() in self._KEYS)):
+            return super().edit(index, trigger, event)
+        option = QtWidgets.QStyleOptionViewItem()
+        self.initViewItemOption(option)
+        option.rect = self.visualRect(index)
+        if self.itemDelegateForIndex(index).editorEvent(event, self.model(), option, index):
+            self.update(index)
+            return True
+        return False
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        delegate = self.itemDelegate()
+        if not isinstance(delegate, _RowValueDelegate) or not self.count():
+            return hint
+        option = QtWidgets.QStyleOptionViewItem()
+        self.initViewItemOption(option)
+        rows = max(delegate.natural_width(option, self.indexFromItem(self.item(row))) for row in range(self.count()))
+        bound = self.MAX_CHARACTERS * self.fontMetrics().averageCharWidth()
+        screen = self.screen()
+        if screen is not None:
+            margin = self.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_LayoutLeftMargin)
+            bound = min(bound, screen.availableGeometry().width() - 2 * margin)
+        return QtCore.QSize(min(max(rows + 2 * self.frameWidth(), hint.width()), bound), hint.height())
 
 
 def _listed_entries(widget: QtWidgets.QListWidget) -> tuple[BrowserResult, ...]:
