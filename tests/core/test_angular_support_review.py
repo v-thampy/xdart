@@ -53,3 +53,15 @@ def test_public_row_drop_keeps_support_appendable(tmp_path):
         changed = replace(captured[1], detail="a replacement profile")
         SupportTableWriter().write(group, {1: changed}, intensity_rows={1: group["intensity"][0]})
 
+
+def test_saved_support_is_accounted_by_the_readers_memory_authority(tmp_path):
+    from xrd_tools.core.physical_memory import physical_root_fact
+    from xrd_tools.io.frame_view import FrameViewReader
+    target, _captured = _saved_int(tmp_path, frames=1)
+    with FrameViewReader(target) as reader:
+        profile = reader.read(1).angular_support
+        assert profile.available
+        root = physical_root_fact(profile.supported_deg).root
+        assert any(root is retained for retained in reader._memory_authority.retained_roots), \
+            "saved coverage must participate in the reader's existing memory budget"
+
