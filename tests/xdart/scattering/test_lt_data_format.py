@@ -174,8 +174,8 @@ def test_f1_the_page_format_sets_its_calibration_roles_and_quick_rows(qapp, tmp_
                     assert _shown(quick[prefix + key], dialog) is spec_rows, (token, prefix, key)
                 assert quick[prefix + 'source'].label.text() == f"{role} {'SPEC' if spec_rows else 'NeXus'} file"
                 assert dialog._choosers[prefix + 'source']() == ('spec' if spec_rows else NEXUS_FILTER)
-            # no role borrows another's inputs
-            assert page._source_paths == (str(spec),)
+            # no role borrows another's inputs (the page's SPEC files stay its own; NeXus shows NeXus files)
+            assert page._paths_by_kind.get('Spec') == (str(spec),)
             assert dialog._text('source') == str(tmp_path / 'calibrant.spec')
             assert dialog._text('beam_source') == str(tmp_path / 'beam.spec')
     finally:
