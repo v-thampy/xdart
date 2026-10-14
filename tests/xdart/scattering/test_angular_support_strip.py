@@ -106,12 +106,12 @@ def _fresh(qapp, root, **series):
 
 @pytest.mark.parametrize('mode,unit', (('Int 1D', '2th_deg'), ('Int 1D', 'q_A^-1'), ('Int 2D', '2th_deg')))
 def test_d1_option_and_real_int_run(qapp, tmp_path, mode, unit):
-    from xrd_tools.core.angular_support import SupportOrigin
     with _page(qapp, _masked_series(tmp_path, mode=mode, unit=unit)) as (page, view, observed):
         dialog = view.plot_options_dialog
         assert not dialog.show_angular_support.isChecked(), 'the strip is opt-in'
         assert dialog.show_angular_support.toolTip(), 'the option explains itself'
         assert not view.angular_support_plot.isVisible()
+        from xrd_tools.core.angular_support import SupportOrigin
         _run(qapp, page, observed)
         _browsing(qapp, page)
         _enable(qapp, view)
@@ -415,7 +415,6 @@ def test_d8_stitch_run_browse_and_exclusions(qapp, tmp_path):
     from xdart.gui.tabs.stitch.page import StitchPage
     from tests.core.test_stitch_operation import _native_form
     from tests.xdart.pages.test_stitch_page import _Status, _wait as _stitch_wait
-    from xrd_tools.core.angular_support import REASON_TEXT, SupportOrigin, SupportReason
     page = StitchPage(empty_host_services(_Status()))
     try:
         page.load_form(replace(_native_form(tmp_path, 'multigeometry', scans='1'), mode='1d'))
@@ -425,6 +424,7 @@ def test_d8_stitch_run_browse_and_exclusions(qapp, tmp_path):
         target = page._owner.prepared.request.module.output.target
         view = page.scientific
         _enable(qapp, view)
+        from xrd_tools.core.angular_support import REASON_TEXT, SupportOrigin, SupportReason
         _wait(qapp, lambda: bool(_curves(view)))
         (_data, profile), = _curves(view).values()
         assert profile.available and profile.provenance['backend'] == 'multigeometry'
