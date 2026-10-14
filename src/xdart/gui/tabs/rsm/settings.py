@@ -53,9 +53,9 @@ def page_settings(page) -> dict[str, Any]:
 def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
     document = RSM_SETTINGS.validate(document)
+    formats, conflict = document_data_format(document)  # first: an older document's Source kind, migrated (or refused)
     if "point_images" in document:
         page.point_images.restore(document["point_images"])
-    formats, conflict = document_data_format(document)  # an older document's Source kind, migrated first
     fields = saved_fields(page, document, _NOT_FIELDS)
     fields.update(formats)
     legacy = document.get("fields", {}).get("grid")

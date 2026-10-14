@@ -1628,8 +1628,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             entry_row.editor.setMaximumWidth(120)
             file_row.add_trailing_widget(entry_row, 0)
             form.addRow(file_row.label, file_row)
-            images_row = FormRow(label=f'{scan} Image Path', path=('Calibration', 'Quick', prefix + 'images'),
-                                 value='', browse=True)
+            images_row = FormRow(label='Image Path', path=('Calibration', 'Quick', prefix + 'images'),
+                                 value='', browse=True)  # under its scan's file row, which names the role
             stem_row = FormRow(label='Image Stem', path=('Calibration', 'Quick', prefix + 'stem'), value='')
             stem_row.label.setMinimumWidth(0)
             images_row.add_trailing_widget(stem_row, 1)

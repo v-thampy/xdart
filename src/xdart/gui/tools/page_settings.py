@@ -118,6 +118,9 @@ def document_data_format(document: dict[str, Any]) -> tuple[dict[str, Any], str]
     from xrd_tools.sources.selection import legacy_data_format
 
     fields = document.get("fields", {})
+    if "source_kind" in fields and fields["source_kind"] not in ("Spec", "NeXus", "Directory"):
+        # a kind this version lacks refuses the whole document, never half read (as every choice a row cannot hold)
+        raise ValueError(f"Source: {fields['source_kind']!r} is not one of its choices")
     current = {key: fields[key] for key in ("data_format", "input_mode") if key in fields}
     if current or "source_kind" not in fields:
         return current, ""

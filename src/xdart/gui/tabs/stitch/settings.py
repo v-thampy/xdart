@@ -63,13 +63,13 @@ load_settings = STITCH_SETTINGS.load
 def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
     document = validate_settings(document)
+    formats, conflict = document_data_format(document)  # first: an older document's Source kind, migrated (or refused)
     phase_options = None
     if "phase_references" in document:
         current = (page._member_preferences or page._view).plot_options
         phase_options = restore_phase_references(current, document["phase_references"])
     if "point_images" in document:
         page.point_images.restore(document["point_images"])
-    formats, conflict = document_data_format(document)  # an older document's Source kind, migrated first
     fields = saved_fields(page, document, _DERIVED)
     fields.update(formats)
     for key in _FIRST:
