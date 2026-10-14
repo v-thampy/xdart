@@ -35,6 +35,10 @@ from xrd_tools.core.angular_support import (
 
 __all__ = [
     "AdmittedWindow",
+    "SavedSupportBasis",
+    "SavedSupportMask",
+    "SupportRefusal",
+    "support_basis_from_saved",
     "DEFAULT_RECORD_ANGULAR_SUPPORT",
     "AngularSupportPolicy",
     "AngularSupportRequest",
@@ -1210,6 +1214,150 @@ class RunSupportCapture:
             while len(self._profiles) > 256:
                 self._profiles.pop(next(iter(self._profiles)))
         return profile
+
+
+# --------------------------------------------------------------------------------------------- saved basis (legacy Int)
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SavedSupportMask:
+    """An older Int output's user-mask facts, tri-state (K7).
+
+    ``signed``: the record states whether a user mask applied at all. ``sha256`` None: none applied; a digest: that
+    mask applied, whose pixels are ``indices`` (flat, C order) when the record embedded them. An unsigned record, a
+    digest without its pixels, or pixels outside the detector cannot say which pixels the reducer masked.
+    """
+
+    signed: bool
+    sha256: str | None = None
+    indices: np.ndarray | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SupportRefusal:
+    """Why an older output's own record cannot rebuild angular support: ``reason``, with ``detail``."""
+
+    reason: SupportReason
+    detail: str = ""
+
+
+class SavedSupportBasis:
+    """An older ordinary Int Run's support geometry, rebuilt only from its own record (BRR's ring basis, extended).
+
+    The record's accepted calibration (each label at its own recorded wavelength), its plan's 1-D bins, window and
+    the geometric mask the reducer applied; no current control, raw file or external mask is read. A profile binds
+    to the saved axis: the record's bins must reproduce its float32 bytes exactly, or support is refused.
+    """
+
+    def __init__(self, ring: Any, applied_mask: np.ndarray | None, plan_1d: Any) -> None:
+        self._ring, self._mask, self._plan = ring, applied_mask, plan_1d
+        self._digest = _mask_digest(applied_mask)
+        self._integrators: dict[float, Any] = {}
+
+    def integrator_for(self, label: int) -> Any:
+        """``label``'s pyFAI integrator at its own recorded wavelength, or None for a label the basis refuses."""
+        snapshot = self._ring.frame_snapshot(int(label))
+        if snapshot is None:
+            return None
+        wavelength = float(snapshot["wavelength"])
+        if wavelength not in self._integrators:
+            from dataclasses import replace
+            from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+            calibration = self._ring.calibration
+            self._integrators[wavelength] = detector_calibration_to_integrator(
+                replace(calibration, poni=replace(calibration.poni, wavelength=wavelength)))
+        return self._integrators[wavelength]
+
+    def profile(self, label: int, *, axis_values: Any, axis_unit: str, cancel=None) -> AngularSupportProfile:
+        """``label``'s reconstructed support over its saved axis (origin ``reconstructed``), or the named reason."""
+        facts = dict(origin=SupportOrigin.RECONSTRUCTED, radial_unit=str(axis_unit))
+        refusal = self._ring.frame_reason(int(label))
+        if refusal:
+            return AngularSupportProfile.unavailable(SupportReason.LEGACY_INSUFFICIENT, detail=refusal, **facts)
+        plan = self._plan
+        if str(axis_unit) != str(plan.unit):
+            return AngularSupportProfile.unavailable(
+                SupportReason.LEGACY_INSUFFICIENT, detail="the saved axis unit is not the record's plan unit", **facts)
+        from xrd_tools.integrate.single import integrate_1d
+        ai = self.integrator_for(label)
+        offset = float(getattr(plan, "azimuth_offset", 0.0) or 0.0)
+        window_range = None if plan.azimuth_range is None else (plan.azimuth_range[0] - offset,
+                                                                plan.azimuth_range[1] - offset)
+        reduced = integrate_1d(np.zeros(self._ring.shape, np.float32), ai, npt=plan.npt, unit=plan.unit,
+                               method=plan.method, mask=self._mask, radial_range=plan.radial_range,
+                               azimuth_range=window_range)
+        centres = np.asarray(reduced.radial, dtype=np.float64)
+        saved = np.ascontiguousarray(np.asarray(axis_values), dtype=np.float32)
+        if centres.astype(np.float32).tobytes() != saved.tobytes():
+            return AngularSupportProfile.unavailable(
+                SupportReason.LEGACY_INSUFFICIENT, detail="the record's bins do not reproduce the saved axis", **facts)
+        edges = edges_from_centres(centres, plan.radial_range)
+        if edges is None:
+            return AngularSupportProfile.unavailable(
+                SupportReason.LEGACY_INSUFFICIENT, detail="the record's bins are not a uniform grid", **facts)
+        window = admitted_window(plan.azimuth_range, reducer="int_standard", offset_deg=offset,
+                                 chi_disc_at_pi=bool(getattr(ai, "chiDiscAtPi", True)))
+        request = AngularSupportRequest(
+            poses=(SupportPose.from_integrator(ai, self._mask, mask_digest=self._digest),), convention="detector_chi",
+            radial_unit=str(axis_unit), bin_edges=edges, wavelength_m=float(ai.wavelength), window=window,
+            origin=SupportOrigin.RECONSTRUCTED, provenance={"reconstructed_from": "record", "mask_sha256": self._digest})
+        return angular_support(request, cancel=cancel)
+
+
+def support_basis_from_saved(run_configuration: Any, energy_selection: Any, *, labels, mask: SavedSupportMask,
+                             shape, epochs=None, kind: str = "run", monochromator_wavelength_m=None,
+                             unreadable=()) -> "SavedSupportBasis | SupportRefusal":
+    """An older Int output's support basis from its own record, or a typed refusal (never a guess).
+
+    Geometry, energy and plan come from BRR's :func:`~xrd_tools.session.readiness.ring_basis_from_saved` (the same
+    calibration, plan route and Append-epoch rule); ``shape`` is the detector shape the record states and must agree
+    with the detector; ``mask`` is the tri-state user-mask fact. Legacy Average and Reintegrate refuse (D4); a
+    grazing-incidence or non-radial record is not reconstructed.
+    """
+    from xrd_tools.session.readiness import RingBasis, ring_basis_from_saved
+    if kind == "average":
+        return SupportRefusal(SupportReason.AVERAGE_RESULT)
+    if kind == "reintegrate":
+        return SupportRefusal(SupportReason.LEGACY_REINTEGRATE)
+    ring = ring_basis_from_saved(run_configuration, energy_selection, labels=labels,
+                                 monochromator_wavelength_m=monochromator_wavelength_m, epochs=epochs, kind="run",
+                                 unreadable=unreadable)
+    if not isinstance(ring, RingBasis) or ring.calibration is None or ring.plan is None:
+        return SupportRefusal(SupportReason.LEGACY_INSUFFICIENT, str(getattr(ring, "reason", "") or ""))
+    if ring.plan.gi is not None:
+        return SupportRefusal(SupportReason.LEGACY_INSUFFICIENT, "grazing-incidence records are not reconstructed")
+    plan_1d = ring.plan.integration_1d
+    if plan_1d is None or str(plan_1d.unit) not in SUPPORTED_UNITS:
+        return SupportRefusal(SupportReason.NOT_RADIAL_PROFILE)
+    try:
+        stated = tuple(int(size) for size in shape)
+    except (TypeError, ValueError):
+        stated = ()
+    if stated != tuple(ring.shape):
+        return SupportRefusal(SupportReason.LEGACY_INSUFFICIENT, "the stated detector shape contradicts the detector")
+    if type(mask) is not SavedSupportMask or not mask.signed:
+        return SupportRefusal(SupportReason.LEGACY_INSUFFICIENT, "the record does not state whether a mask applied")
+    explicit = None
+    if mask.sha256 is not None:
+        if mask.indices is None:
+            return SupportRefusal(SupportReason.LEGACY_INSUFFICIENT, "the record names a mask without its pixels")
+        indices = np.asarray(mask.indices)
+        size = int(ring.shape[0]) * int(ring.shape[1])
+        if indices.ndim != 1 or indices.dtype.kind not in "iu" or (indices.size and (
+                int(indices.min()) < 0 or int(indices.max()) >= size)):
+            return SupportRefusal(SupportReason.LEGACY_INSUFFICIENT, "the record's mask pixels lie outside the detector")
+        explicit = np.zeros(size, bool)
+        explicit[indices] = True
+        explicit = explicit.reshape(ring.shape)
+    from dataclasses import replace
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    from xrd_tools.integrate.detector_mask import mask_with_detector
+    base = detector_calibration_to_integrator(replace(ring.calibration, poni=replace(
+        ring.calibration.poni, wavelength=float(ring.base["wavelength"]))))
+    applied = mask_with_detector(base, explicit)
+    if applied is not None:
+        applied = np.array(applied, dtype=bool, order="C", copy=True)
+        applied.setflags(write=False)
+    return SavedSupportBasis(ring, applied, plan_1d)
 
 
 # --------------------------------------------------------------------------------------------- Stitch union

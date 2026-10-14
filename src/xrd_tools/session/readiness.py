@@ -1170,6 +1170,10 @@ class RingBasis:
     labels: frozenset[int]
     eligible: frozenset[int]
     shape: tuple[int, int]
+    #: The record's own accepted calibration and plan, as the basis resolved them (COVERAGE-SUPPORT-20261013's saved
+    #: support basis extends this one rather than reading the record again); None only for a hand-built basis.
+    calibration: Any = None
+    plan: Any = None
 
     @property
     def kind(self) -> str:
@@ -1258,8 +1262,8 @@ def ring_basis_from_saved(run_configuration, energy_selection, *, labels, monoch
         one, two, values = execution_plan_shape(
             run_configuration['bai_1d_args'], run_configuration['bai_2d_args'],
             FrozenGIConfiguration.from_dict(run_configuration['gi']), run_configuration['processing_mode'])
-        base = effective_ring_geometry(calibration, integrator=integrator,
-                                       plan=build_native_int_reduction_plan_from_args(one, two, **values))
+        plan = build_native_int_reduction_plan_from_args(one, two, **values)
+        base = effective_ring_geometry(calibration, integrator=integrator, plan=plan)
         shape = tuple(int(size) for size in integrator.detector.shape)
     except (KeyError, TypeError, ValueError, AttributeError):
         return RingRefusal(gf.SAVED_RECORD_MALFORMED_REASON)
@@ -1268,7 +1272,7 @@ def ring_basis_from_saved(run_configuration, energy_selection, *, labels, monoch
         return RingRefusal(reason)
     held = frozenset(labels)
     return RingBasis(base, MappingProxyType(frame_ring_wavelengths(energy_selection)), held,
-                     held & frozenset(epochs[-1] if epochs else ()) if per_frame else held, shape)
+                     held & frozenset(epochs[-1] if epochs else ()) if per_frame else held, shape, calibration, plan)
 
 
 def ring_basis_for_record(path, *, entry='entry', labels):
