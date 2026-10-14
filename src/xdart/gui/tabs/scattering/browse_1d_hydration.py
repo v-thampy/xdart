@@ -152,6 +152,8 @@ class Browse1DModeInventory:
     axis: Browse1DRowKey
     intensity: Browse1DRowKey
     sigma: Browse1DRowKey | None = None
+    #: the primary mode's saved angular coverage row (COVERAGE-SUPPORT-20261013), when the label has one
+    angular_support: Browse1DRowKey | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -161,6 +163,8 @@ class Browse1DModeInventory:
             or type(self.intensity) is not Browse1DRowKey
             or self.sigma is not None
             and type(self.sigma) is not Browse1DRowKey
+            or self.angular_support is not None
+            and type(self.angular_support) is not Browse1DRowKey
         ):
             raise TypeError("Browse 1-D mode inventory is invalid")
         coordinate = (self.axis.frame, self.axis.label)
@@ -168,21 +172,26 @@ class Browse1DModeInventory:
             (self.intensity.frame, self.intensity.label) != coordinate
             or self.sigma is not None
             and (self.sigma.frame, self.sigma.label) != coordinate
+            or self.angular_support is not None
+            and (self.angular_support.frame, self.angular_support.label) != coordinate
             or self.axis.name != browse_1d_row_name(self.mode, "axis")
             or self.intensity.name
             != browse_1d_row_name(self.mode, "intensity")
             or self.sigma is not None
             and self.sigma.name != browse_1d_row_name(self.mode, "sigma")
+            or self.angular_support is not None
+            and self.angular_support.name != browse_1d_row_name(self.mode, "angular_support")
         ):
             raise ValueError("Browse 1-D mode inventory changed identity")
 
     @property
     def keys(self) -> tuple[Browse1DRowKey, ...]:
-        return (
+        keys = (
             (self.axis, self.intensity)
             if self.sigma is None
             else (self.axis, self.intensity, self.sigma)
         )
+        return keys if self.angular_support is None else (*keys, self.angular_support)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -290,6 +299,10 @@ class Browse1DHydrationLane:
         self._queued: _HydrationTask | None = None
         self._wanted_identity: object | None = None
         self._known_keys: dict[tuple[int, int], tuple[object, ...]] = {}
+        #: Each hydrated label's saved angular support profile (COVERAGE-SUPPORT-20261013), built once when its rows
+        #: are stored: a profile with values only while its row is resident (its bytes are the cache's), a reason
+        #: while the label is known. The same object is every projection's (a display conversion keeps it).
+        self._support_profiles: dict[tuple[int, int], object] = {}
         self._completions: SimpleQueue[Browse1DHydrationCompletion] = (
             SimpleQueue()
         )
@@ -347,10 +360,11 @@ class Browse1DHydrationLane:
             axis = by_name.pop(axis_name, None)
             intensity = by_name.pop(intensity_name, None)
             sigma = by_name.pop(sigma_name, None)
+            support = by_name.pop(browse_1d_row_name(mode, "angular_support"), None)
             if axis is None or intensity is None:
                 raise RuntimeError("Browse 1-D expected mode is incomplete")
             modes.append(Browse1DModeInventory(
-                mode, axis, intensity, sigma,
+                mode, axis, intensity, sigma, support,
             ))
         if by_name or (not scalar_row.modes_1d and value):
             raise RuntimeError("Browse 1-D expected inventory has extra keys")
@@ -766,6 +780,7 @@ class Browse1DHydrationLane:
             axis_name = browse_1d_row_name(mode, "axis")
             intensity_name = browse_1d_row_name(mode, "intensity")
             sigma_name = browse_1d_row_name(mode, "sigma")
+            support_name = browse_1d_row_name(mode, "angular_support")
             expected_names.update((axis_name, intensity_name))
             axis_values = borrowed.get(axis_name, source.axis.values)
             intensity = borrowed.get(intensity_name, intensity)
@@ -774,12 +789,19 @@ class Browse1DHydrationLane:
                 sigma = borrowed.get(sigma_name, sigma)
             elif sigma_name in borrowed:
                 raise ValueError("Browse 1-D survivor has an unexpected sigma")
+            # a resident support row keeps the profile it was stored with; a fresh one comes from this read
+            support = source.support(target.label)
+            if support_name in borrowed:
+                support = self._resident_support(target, borrowed[support_name])
+            if support is not None and support.available:
+                expected_names.add(support_name)
             modes.append(Frame1DModeRows(
                 mode,
                 Axis(axis_label, axis_unit, axis_log, axis_values),
                 (target.label,),
                 (intensity,),
                 None if sigma is None else (sigma,),
+                None if support is None else (support,),
             ))
         extras = set(borrowed).difference(expected_names)
         if extras:
@@ -791,6 +813,23 @@ class Browse1DHydrationLane:
             tuple(modes),
             rows.primary_mode,
         )
+
+    def _resident_support(self, target: Browse1DHydrationTarget, array: object):
+        """The profile stored with ``target``'s resident angular support row ``array``."""
+        with self._lock:
+            profile = self._support_profiles.get((target.ordinal, target.label))
+        if profile is None or not profile.available or profile.supported_deg is not array:
+            raise ValueError("Browse 1-D resident angular support lost its profile")
+        return profile
+
+    def angular_support(self, ordinal: int, label: int, borrowed: object = None):
+        """``label``'s saved angular support for display: the profile stored with its resident row (``borrowed``, the
+        projection's own borrow of that row), else its reason; None when unknown."""
+        with self._lock:
+            profile = self._support_profiles.get((ordinal, label))
+        if profile is None or not profile.available:
+            return profile
+        return profile if borrowed is not None and profile.supported_deg is borrowed else None
 
     @staticmethod
     def _release_borrows(task: _HydrationTask) -> None:
@@ -822,8 +861,21 @@ class Browse1DHydrationLane:
             task.request.catalog, singleton, target.ordinal, target.label,
             cancelled=lambda: self._checkpoint(task),
         )
+        primary = singleton.mode(singleton.primary_mode) if singleton.primary_mode is not None else None
+        support = None if primary is None else primary.support(target.label)
+        # a profile with values lives exactly as long as its resident row: an evicted row's bytes are not kept here
+        resident = {(key.frame, key.label) for key in task.request.cache.resident_keys
+                    if key.name.endswith(":angular_support")}
+        coordinate = (target.ordinal, target.label)
         with self._lock:
-            self._known_keys[(target.ordinal, target.label)] = keys
+            self._known_keys[coordinate] = keys
+            if support is None:
+                self._support_profiles.pop(coordinate, None)
+            else:
+                self._support_profiles[coordinate] = support
+            for known, profile in tuple(self._support_profiles.items()):
+                if profile.available and known not in resident or known not in self._known_keys:
+                    del self._support_profiles[known]
         self._protect_keys(task, target, keys)
 
     def _protect_complete_targets(
@@ -1043,6 +1095,7 @@ class Browse1DHydrationLane:
                 except Empty:
                     break
             self._known_keys.clear()
+            self._support_profiles.clear()
             self._closed = True
             return True
 

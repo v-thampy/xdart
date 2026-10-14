@@ -9,7 +9,7 @@ profile's integrated_1d mode group (Int top level; Stitch label 1):
     ``ssrl_angular_support_metric``, ``units`` = "deg" and ``ssrl_angular_support_axis_sha256`` (the group's float32
     ``axis_1`` bytes the bins describe).
 ``angular_support_meta``
-    UTF-8 JSON (K,), at most 4096 bytes each: the profile's facts (:meth:`AngularSupportProfile.metadata`).
+    UTF-8 JSON (K,), fixed-length 4096 bytes (NUL-padded), one row's facts each (:meth:`AngularSupportProfile.metadata`).
 ``angular_support_rows``
     int64 (M, 2): [frame label, table row].
 ``angular_support_row_digest``
@@ -372,14 +372,17 @@ class SupportTableWriter:
             deg.attrs[METRIC_ATTR] = SUPPORT_METRIC
             deg.attrs["units"] = "deg"
             deg.attrs[AXIS_SHA256_ATTR] = axis_sha256(group["axis_1"][()])
-            group.create_dataset(_META, shape=(0,), maxshape=(None,), chunks=(64,),
-                                 dtype=h5py.string_dtype("utf-8"))
+            # fixed-length UTF-8, not variable-length: the finite replacement seal hashes every result dataset as
+            # bounded numeric slabs and refuses object dtypes (record_writer._finite_result_dataset_blocks); one row
+            # per chunk, as the degrees, so the NUL padding compresses away
+            group.create_dataset(_META, shape=(0,), maxshape=(None,), chunks=(1,),
+                                 dtype=h5py.string_dtype("utf-8", MAX_META_BYTES), **self._compression)
         deg, meta = group[_DEG], group[_META]
         start = deg.shape[0]
         deg.resize(start + len(new_rows), axis=0)
         deg[start:] = values
         meta.resize(start + len(new_rows), axis=0)
-        meta[start:] = [text for _row, text in new_rows]
+        meta[start:] = np.array([text.encode("utf-8") for _row, text in new_rows], dtype=meta.dtype)
         self._table.extend(new_rows)
 
     def _write_entries(self, group: Any, *, rewrite: bool, updated: list[int]) -> None:

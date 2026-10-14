@@ -3259,7 +3259,7 @@ class ScientificView(QtWidgets.QFrame):
         trace never unchecks the option: while it is on the strip stays shown, with its note."""
         on = state.plot_options.show_angular_support
         drawn, reasons = [], []
-        if aggregate or state.plot_mode in {"Average", "Sum"}:
+        if aggregate or state.plot_mode in {"Average", "Sum", "Waterfall"}:  # a waterfall drawn as image or offsets
             reasons.append(REASON_TEXT[SupportReason.AGGREGATE_TRACE])
         elif not traces:
             reasons.append(_NO_TRACE_SUPPORT)

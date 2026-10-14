@@ -11,7 +11,7 @@ import math
 import sys
 from threading import RLock
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from weakref import ReferenceType, ref
 
 import h5py
@@ -416,6 +416,9 @@ class Frame1DModeRows:
     labels: tuple[int, ...]
     intensity_rows: tuple[np.ndarray, ...]
     sigma_rows: tuple[np.ndarray, ...] | None = None
+    #: Each label's saved angular support (COVERAGE-SUPPORT-20261013), aligned with ``labels``: the primary mode
+    #: carries one AngularSupportProfile per label (values or the reason), every other mode None.
+    support_rows: tuple[Any, ...] | None = None
 
     def __post_init__(self) -> None:
         if type(self.mode) is not str or not self.mode:
@@ -470,9 +473,28 @@ class Frame1DModeRows:
                 for row in sigma_rows
             )
 
+        support_rows = self.support_rows
+        if support_rows is not None:
+            from xrd_tools.core.angular_support import AngularSupportProfile
+            if (type(support_rows) is not tuple or len(support_rows) != len(labels)
+                    or any(type(item) is not AngularSupportProfile for item in support_rows)):
+                raise ValueError("support_rows must align exactly with labels")
+            for item in support_rows:
+                if item.available:
+                    _exact_readonly_float64_vector(item.supported_deg, role="angular support row", points=points)
+
         object.__setattr__(self, "labels", tuple(labels))
         object.__setattr__(self, "intensity_rows", intensity_rows)
         object.__setattr__(self, "sigma_rows", sigma_rows)
+
+    def support(self, label: int):
+        """``label``'s saved angular support profile, or None (another mode, or not a selected label)."""
+        if self.support_rows is None or type(label) is not int or label < 0:
+            return None
+        index = bisect_left(self.labels, label)
+        if index == len(self.labels) or self.labels[index] != label:
+            return None
+        return self.support_rows[index]
 
     def row(
         self, label: int,
@@ -2630,6 +2652,10 @@ class FrameViewReader:
                 sigmas: list[np.ndarray] | None = (
                     [] if plan.has_sigma else None
                 )
+                # the primary mode's saved angular support, decoded as read() decodes it (one strict reader)
+                supports: list[object] | None = (
+                    [] if mode == self._primary_mode_1d else None
+                )
                 for label, row in plan.rows:
                     checkpoint()
                     intensity = _read_1d_row(
@@ -2656,6 +2682,9 @@ class FrameViewReader:
                         if sigma is None:
                             raise AssertionError("qualified sigma row is unavailable")
                         sigmas.append(sigma)
+                    if supports is not None:
+                        supports.append(self._saved_support(group, label, intensity))
+                        checkpoint()
                 mode_results.append(bundle._callback(
                     Frame1DModeRows,
                     mode=mode,
@@ -2663,6 +2692,7 @@ class FrameViewReader:
                     labels=tuple(mode_labels),
                     intensity_rows=tuple(intensities),
                     sigma_rows=None if sigmas is None else tuple(sigmas),
+                    support_rows=None if supports is None else tuple(supports),
                 ))
                 checkpoint()
 
