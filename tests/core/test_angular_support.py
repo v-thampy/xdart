@@ -150,31 +150,46 @@ def _gi_expected(edges, unit, ai, mask, incident, tilt, orientation, window=None
     return np.asarray(out)
 
 
-def _raster(poses, edges, unit, wavelength_m, sub=6, chi_cell_deg=0.05, radial_cells=8):
-    """Independent union estimate: sub-pixel points of every unmasked pixel of every (ai, mask) pose."""
-    nbins = len(edges) - 1
-    cells = int(round(360 / chi_cell_deg))
-    occupied = np.zeros((nbins * radial_cells, cells), bool)
-    offsets = (np.arange(sub) + .5) / sub - .5
+def _ring_union(poses, edges, unit, wavelength_m, bins, lines=12, samples=50_000):
+    """Independent union estimate for flat detector poses: rays around each ring meet each pose's detector plane.
+
+    For every (ai, mask) pose the detector plane comes from pyFAI's forward geometry at three pixel corners; each
+    ray (2θ, χ) is intersected with it, mapped to pixel coordinates and kept when it lands on an unmasked pixel.
+    The union is the share of χ samples any pose reaches; ``lines`` radii per bin, uniform in the native unit.
+    """
+    chi = (np.arange(samples) + .5) * 2 * np.pi / samples - np.pi
+    planes = []
     for ai, mask in poses:
-        height, width = ai.detector.shape
-        rows, cols = np.nonzero(~mask) if mask is not None else np.indices((height, width)).reshape(2, -1)
-        for dr in offsets:
-            for dc in offsets:
-                d1, d2 = rows + dr, cols + dc
-                tth = ai.tth(d1, d2)
-                chi = np.degrees(ai.chi(d1, d2))
-                if unit.startswith("q_"):
-                    scale = {"q_A^-1": 1e10, "q_nm^-1": 1e9}[unit]
-                    native = 4 * np.pi * np.sin(tth / 2) / (wavelength_m * scale)
-                else:
-                    native = np.degrees(tth) if unit == "2th_deg" else tth
-                position = (native - edges[0]) / (edges[-1] - edges[0]) * nbins * radial_cells
-                keep = (position >= 0) & (position < nbins * radial_cells)
-                chi_index = np.floor((chi[keep] + 180.0) / chi_cell_deg).astype(int) % cells
-                occupied[position[keep].astype(int), chi_index] = True
-    supported = occupied.sum(axis=1).reshape(nbins, radial_cells) * chi_cell_deg
-    return supported.mean(axis=1)
+        _z, y, x = ai.calc_pos_zyx(d1=np.array([-.5, .5, -.5]), d2=np.array([-.5, -.5, .5]))
+        z = _z
+        p00 = np.array([x[0], y[0], z[0]])
+        e_row = np.array([x[1], y[1], z[1]]) - p00
+        e_col = np.array([x[2], y[2], z[2]]) - p00
+        planes.append((p00, e_row, e_col, np.cross(e_row, e_col), ai.detector.shape, mask))
+    out = np.zeros(len(bins))
+    for slot, b in enumerate(bins):
+        lo, hi = edges[b], edges[b + 1]
+        native = lo + (np.arange(lines) + .5) * (hi - lo) / lines
+        values = []
+        for tth in _two_theta(native, unit, wavelength_m):
+            ray = np.stack((np.sin(tth) * np.cos(chi), np.sin(tth) * np.sin(chi), np.full_like(chi, np.cos(tth))), 1)
+            covered = np.zeros(samples, bool)
+            for p00, e_row, e_col, normal, (height, width), mask in planes:
+                reach = ray @ normal
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    scale = (p00 @ normal) / reach
+                ahead = np.isfinite(scale) & (scale > 0)
+                point = ray[ahead] * scale[ahead, None] - p00
+                gram = np.array([[e_row @ e_row, e_row @ e_col], [e_row @ e_col, e_col @ e_col]])
+                row, col = np.linalg.solve(gram, np.stack((point @ e_row, point @ e_col))).reshape(2, -1)
+                inside = (row >= 0) & (row < height) & (col >= 0) & (col < width)
+                hit = np.flatnonzero(ahead)[inside]
+                if mask is not None:
+                    hit = hit[~mask[row[inside].astype(int), col[inside].astype(int)]]
+                covered[hit] = True
+            values.append(360.0 * covered.mean())
+        out[slot] = np.mean(values)
+    return out
 
 
 def _request(ai, mask, unit, edges, window, *, convention="detector_chi", gi=None, poses=None):
@@ -807,9 +822,8 @@ def test_k7_legacy_record_sufficiency(tmp_path):
 # --------------------------------------------------------------------------------------------------------- K8
 
 def _stitch_source(tmp_path, poses, images):
-    from xrd_tools.analysis.module_transaction import ModuleKind, ModuleSourceReceipt
-    from xrd_tools.analysis.scan_operations import AnalysisDisposition, MetadataColumnSelector, MetadataTablePlan, \
-        run_metadata_table
+    from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleKind, ModuleSourceReceipt
+    from xrd_tools.analysis.scan_operations import AnalysisDisposition, MetadataTablePlan, run_metadata_table
     from xrd_tools.sources.selection import image_series_spec
     import tifffile
     root = tmp_path / "source"
@@ -823,7 +837,7 @@ def _stitch_source(tmp_path, poses, images):
     table = run_metadata_table(MetadataTablePlan(image_series_spec(root / "scan_0001.tif", metadata_format="txt")))
     assert table.disposition is AnalysisDisposition.COMPLETED
     return ModuleSourceReceipt.from_metadata_table(
-        table, kind=ModuleKind.STITCH, selected_labels=(1, len(poses)),
+        table, kind=ModuleKind.STITCH, selected_labels=tuple(range(1, len(poses) + 1)),
         resolved_selectors=(MetadataColumnSelector("I0"), MetadataColumnSelector("del"),
                             MetadataColumnSelector("nu")))
 
@@ -831,12 +845,11 @@ def _stitch_source(tmp_path, poses, images):
 def _stitch(tmp_path, poses, images, *, azimuth=None, unit="q_A^-1", policy=None, conditioning=None):
     import hashlib
     from tests.core.test_stitch_operation import _goniometer_record
-    from xrd_tools.analysis.module_transaction import ModuleOutputRequest
-    from xrd_tools.analysis.scan_operations import MetadataColumnSelector
+    from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleOutputRequest
     from xrd_tools.analysis.stitch_operation import (StitchGeometryInput, StitchGeometryKind, StitchOperationPlan,
                                                      capture_stitch_geometry, prepare_stitch_operation,
                                                      run_stitch_operation)
-    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactOverwrite
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
     source = _stitch_source(tmp_path, poses, images)
     geometry_path = tmp_path / "geometry.json"
     geometry_path.write_text(json.dumps(_goniometer_record()), encoding="utf-8")
@@ -844,16 +857,15 @@ def _stitch(tmp_path, poses, images, *, azimuth=None, unit="q_A^-1", policy=None
         geometry_path, StitchGeometryKind.PYFAI_GONIOMETER_JSON,
         expected_sha256=hashlib.sha256(geometry_path.read_bytes()).hexdigest(),
         source_motors=(("del_angle", "del"), ("nu_angle", "nu"))))
-    kwargs = dict(mode="1d", npt_1d=96, npt_rad_2d=48, npt_azim_2d=32, unit=unit,
-                  radial_range=(0.5, 5.0) if unit == "q_A^-1" else (5.0, 50.0), azimuth_range=azimuth,
+    kwargs = dict(mode="1d", npt_1d=96, npt_rad_2d=48, npt_azim_2d=32, unit=unit, native_records=True,
+                  radial_range=(0.5, 5.0) if unit == "q_A^-1" else (5.0, 50.0), azimuth_range_1d=azimuth,
                   monitor_selector=MetadataColumnSelector("I0"), max_frame_bytes=64 * 1024 * 1024)
     if conditioning is not None:
         kwargs["conditioning"] = conditioning
     plan = StitchOperationPlan(geometry, **kwargs)
-    output_root = tmp_path / "output"
-    output_root.mkdir()
-    output = ModuleOutputRequest(output_root / "stitched.nexus", AnalysisArtifactKind.STITCH_1D,
-                                 AnalysisArtifactOverwrite.CREATE_NEW)
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    target = resolve_finite_output_target(tmp_path, "native", operation_token="stitch-1d")
+    output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D, artifact_family="native")
     request = prepare_stitch_operation(source, output, plan, project_root=tmp_path)
     return request, run_stitch_operation(request, **({} if policy is None else {"angular_support": policy}))
 
@@ -883,15 +895,12 @@ def test_k8_stitch_contributor_union(tmp_path):
     assert support.provenance["included_contributors"] == 4, "the screened-out empty frame is not geometry"
     assert support.provenance["unique_poses"] == 2, "repeated poses are computed once"
     edges = support.edges
-    middle = slice(8, 88)
-    # the raster's χ cell must exceed its sub-pixel point spacing at the smallest compared 2θ
-    smallest = 2 * math.asin(edges[8] * 1.0 / (4 * math.pi))
-    cell = max(0.05, math.degrees(3 * (172e-6 / 0.2) / (6 * math.sin(smallest))))
-    expected = _raster([(_pose_ai(0.0, 0.0), None), (_pose_ai(8.0, 0.0), None)], edges, "q_A^-1", 1e-10,
-                       chi_cell_deg=cell)
-    assert np.all(np.abs(support.supported_deg[middle] - expected[middle]) <= TOL * 360)
-    with_excluded = _raster([(_pose_ai(0.0, 0.0), None), (_pose_ai(8.0, 0.0), None), (_pose_ai(24.0, 0.0), None)],
-                            edges, "q_A^-1", 1e-10, chi_cell_deg=cell)
+    compared = list(range(2, 40, 2))
+    expected = _ring_union([(_pose_ai(0.0, 0.0), None), (_pose_ai(8.0, 0.0), None)], edges, "q_A^-1", 1e-10,
+                           compared)
+    assert np.all(np.abs(support.supported_deg[compared] - expected) <= TOL * 360)
+    with_excluded = _ring_union([(_pose_ai(0.0, 0.0), None), (_pose_ai(8.0, 0.0), None),
+                                 (_pose_ai(24.0, 0.0), None)], edges, "q_A^-1", 1e-10, compared)
     assert np.max(with_excluded - expected) > TOL * 360, "fixture: the excluded pose would have added support"
     # value-invalid pixels inside an included frame stay geometrically covered; intensity is unchanged
     hot = ones.copy()
