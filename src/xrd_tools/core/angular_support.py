@@ -66,6 +66,8 @@ class SupportReason(str, Enum):
     LEGACY_REINTEGRATE = "legacy_reintegrate"
     LEGACY_STITCH = "legacy_stitch"
     PENDING = "pending"
+    #: “Record angular coverage” was off when the result was processed (decision 6): never reconstructed.
+    RECORDING_DISABLED = "recording_disabled"
 
 
 #: One sentence per reason, shown wherever a profile has no support (tooltips, the strip, hover).
@@ -96,6 +98,8 @@ REASON_TEXT: Mapping[SupportReason, str] = MappingProxyType({
     SupportReason.LEGACY_REINTEGRATE: "Older Reintegrate result: reprocess it to record angular coverage.",
     SupportReason.LEGACY_STITCH: "Older Stitch result: reprocess it to record angular coverage.",
     SupportReason.PENDING: "Computing angular coverage…",
+    SupportReason.RECORDING_DISABLED: (
+        "Angular coverage was not recorded: “Record angular coverage” was off when this result was processed."),
 })
 
 

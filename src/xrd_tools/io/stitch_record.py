@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import h5py
 import numpy as np
@@ -88,7 +89,9 @@ class StitchedMap:
 class StitchRecord:
     """A stitched record as read back: I(q), the GI cuts as ``(mode, pattern)`` pairs in
     ``GI_MODES`` order (() without GI), the wavelength (Å) or None, the contributing-frames
-    manifest (JSON) or None, a Stitch 2D's map or None, and a GI Stitch 2D's q_ip-q_oop map or None."""
+    manifest (JSON) or None, a Stitch 2D's map or None, and a GI Stitch 2D's q_ip-q_oop map or None.
+    ``angular_support`` is I(q)'s saved angular support (origin ``saved``), or the reason it has none: an older
+    Stitch result without it is ``legacy_stitch`` (D6), never reconstructed."""
 
     pattern: StitchedPattern
     gi: tuple[tuple[str, StitchedPattern], ...]
@@ -96,6 +99,7 @@ class StitchRecord:
     frames_json: str | None
     map: StitchedMap | None = None
     gi_map: StitchedMap | None = None
+    angular_support: Any = None
 
 
 def _float32(group: h5py.Group, name: str, values) -> None:
@@ -106,14 +110,16 @@ def write_stitch_record(entry: h5py.Group, target: str | Path, pattern: Stitched
                         gi: tuple[tuple[str, StitchedPattern], ...] = (), wavelength_A: float | None = None,
                         frame_records=None, frames_json: str | None = None,
                         source_base: str | Path | None = None,
-                        stitched_map: StitchedMap | None = None, gi_map: StitchedMap | None = None) -> h5py.Group:
+                        stitched_map: StitchedMap | None = None, gi_map: StitchedMap | None = None,
+                        angular_support=None) -> h5py.Group:
     """Write a stitched pattern into ``entry`` of a fresh document from ``open_nexus_writer`` whose
     logical path is ``target``, and return the new ``entry/stitch`` group.
 
     ``gi`` holds ``(mode, pattern)`` pairs with distinct modes 'q_ip' and 'q_oop', written in
     ``GI_MODES`` order. ``frame_records`` are ``write_contributing_frames`` records and ``frames_json``
     their manifest. ``stitched_map`` is a Stitch 2D's map, written with ``pattern`` as one Int 2D row;
-    ``gi_map`` a GI Stitch 2D's q_ip-q_oop map, beside it.
+    ``gi_map`` a GI Stitch 2D's q_ip-q_oop map, beside it. ``angular_support`` (an ``AngularSupportProfile``) is
+    saved with the primary I(q) row, label 1, outside the Stitch fingerprint (COVERAGE-SUPPORT-20261013).
     """
     from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
     from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
@@ -151,11 +157,16 @@ def write_stitch_record(entry: h5py.Group, target: str | Path, pattern: Stitched
                                    value.azimuthal_unit)
 
     rows = [(primary, pattern), *gi]
+    support = angular_support
+    if support is not None and support.supported_deg is not None \
+            and support.supported_deg.size != np.asarray(pattern.axis).size:
+        support = None  # never bind support to bins it does not describe
     for position, (mode, value) in enumerate(rows):
         writer.write_batch([RecordWrite(
             label=LABEL, result_1d=IntegrationResult1D(value.axis, value.intensity, value.sigma, value.unit),
             result_2d=None if stitched_map is None or position else result_2d(stitched_map),
-            mode_1d=mode, mode_2d=primary_2d, write_frame_record=position == 0)])  # an extra mode joins the row
+            mode_1d=mode, mode_2d=primary_2d, write_frame_record=position == 0,  # an extra mode joins the row
+            angular_support=support if position == 0 else None)])
     if gi_map is not None:
         writer.write_batch([RecordWrite(label=LABEL, result_2d=result_2d(gi_map), mode_2d=GI_MAP,
                                         write_frame_record=False)])
@@ -185,7 +196,7 @@ def write_stitch_record(entry: h5py.Group, target: str | Path, pattern: Stitched
 
 
 def write_stitch_projection(entry: h5py.Group, target: str | Path, projection, *, frame_records=None,
-                            source_base: str | Path | None = None) -> h5py.Group:
+                            source_base: str | Path | None = None, angular_support=None) -> h5py.Group:
     """Write a Stitch 1D result projection (``analysis_artifact``), the exact bytes its fingerprint
     describes: I(q), its GI cuts, the wavelength and contributors manifest it carries; or a Stitch 2D
     one's map and I(q) (its ``profile``)."""
@@ -196,7 +207,8 @@ def write_stitch_projection(entry: h5py.Group, target: str | Path, projection, *
                                wavelength_A=projection.wavelength_A, frame_records=frame_records,
                                frames_json=projection.frame_manifest_json, source_base=source_base,
                                stitched_map=StitchedMap.from_projection(projection) if two_d else None,
-                               gi_map=None if projection.gi_map is None else StitchedMap.from_projection(projection.gi_map))
+                               gi_map=None if projection.gi_map is None else StitchedMap.from_projection(projection.gi_map),
+                               angular_support=angular_support)
 
 
 def is_stitch_record(entry: h5py.Group) -> bool:
@@ -306,7 +318,22 @@ def _read(handle: h5py.File, entry: str, container: Path) -> StitchRecord:
                           else _map(groups.integrated_2d if name == MAP else groups.mode_group("2d", mode), diagnostics))
     if stitched[GI_MAP] is not None and not gi:
         raise ValueError("a GI map goes beside a GI Stitch 2D's cuts")
-    return StitchRecord(pattern, tuple(gi), wavelength, frames_json, stitched[MAP], stitched[GI_MAP])
+    return StitchRecord(pattern, tuple(gi), wavelength, frames_json, stitched[MAP], stitched[GI_MAP],
+                        _saved_support(groups.integrated_1d, pattern.intensity))
+
+
+def _saved_support(group: h5py.Group, intensity) -> Any:
+    """I(q)'s saved angular support (label 1), or its reason: absent is an older Stitch result (D6)."""
+    from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin, SupportReason
+    from xrd_tools.io.angular_support import AngularSupportFormatError, SupportTableReader
+    try:
+        profile = SupportTableReader(group, frame_count=1).profile(LABEL, intensity)
+    except AngularSupportFormatError as error:
+        return AngularSupportProfile.unavailable(SupportReason.MALFORMED_SAVED_SUPPORT, origin=SupportOrigin.SAVED,
+                                                 detail=str(error))
+    if profile.reason is SupportReason.NO_SAVED_SUPPORT:
+        return AngularSupportProfile.unavailable(SupportReason.LEGACY_STITCH, origin=SupportOrigin.SAVED)
+    return profile
 
 
 def read_stitch_record(source: str | Path | h5py.File, *, entry: str = "entry") -> StitchRecord:

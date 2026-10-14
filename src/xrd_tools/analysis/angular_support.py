@@ -35,6 +35,7 @@ from xrd_tools.core.angular_support import (
 
 __all__ = [
     "AdmittedWindow",
+    "DEFAULT_RECORD_ANGULAR_SUPPORT",
     "AngularSupportPolicy",
     "AngularSupportRequest",
     "RunSupportCapture",
@@ -54,6 +55,9 @@ __all__ = [
     "xu_corner_grid",
 ]
 
+#: Whether new results record angular support unless a setting says otherwise (decision 6): the one default every
+#: owner follows (AngularSupportPolicy, Int's run option and Stitch's row).
+DEFAULT_RECORD_ANGULAR_SUPPORT = True
 #: Native radial units a support profile can describe.
 SUPPORTED_UNITS = ("q_A^-1", "q_nm^-1", "2th_deg", "2th_rad")
 #: Reducer window rules (see :func:`admitted_window`).
@@ -86,10 +90,11 @@ class AngularSupportPolicy:
 
     ``max_geometry_keys`` bounds how many distinct detector geometries (pose, geometric mask, χ_GI angles) one Run
     may compute; beyond it support is unavailable with ``over_budget`` while intensity processing is unchanged.
-    ``None`` leaves it unbounded. ``enabled=False`` captures nothing (no profile at all).
+    ``None`` leaves it unbounded. ``enabled=False`` (“Record angular coverage” off) computes nothing: every eligible
+    profile carries ``recording_disabled`` and only that reason is saved.
     """
 
-    enabled: bool = True
+    enabled: bool = DEFAULT_RECORD_ANGULAR_SUPPORT
     max_geometry_keys: int | None = None
 
     def __post_init__(self) -> None:
@@ -1140,6 +1145,8 @@ class RunSupportCapture:
         """The Run's support for one frame's native profile (origin ``run``), or its named reason."""
         facts = dict(radial_unit=radial_unit, convention=convention, origin=SupportOrigin.RUN,
                      requested_window_deg=window.requested_deg)
+        if not self.policy.enabled:
+            return AngularSupportProfile.unavailable(SupportReason.RECORDING_DISABLED, **facts)
         if radial_unit not in SUPPORTED_UNITS:
             return AngularSupportProfile.unavailable(SupportReason.UNSUPPORTED_UNIT, detail=radial_unit, **facts)
         if window.reason is not None:

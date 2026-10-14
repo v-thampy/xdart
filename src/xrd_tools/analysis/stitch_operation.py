@@ -3204,11 +3204,11 @@ def _gi_map(gi_map):
             diagnostics.coverage, diagnostics.normalization)
 
 
-def _write_record(entry, target, projection, native_args) -> None:
+def _write_record(entry, target, projection, native_args, angular_support=None) -> None:
     """A Stitch 1D result, or a native Stitch 2D's map and I(q), as an Int record (``stitch_record``),
-    from its exact projection."""
+    from its exact projection, with its primary profile's angular support (outside the fingerprint)."""
     write_stitch_projection(entry, target, projection, frame_records=native_args.get("frame_records"),
-                            source_base=native_args.get("source_base"))
+                            source_base=native_args.get("source_base"), angular_support=angular_support)
 
 
 class StitchOperationExecution:
@@ -3501,7 +3501,8 @@ class StitchOperationExecution:
         diagnostics = scientific.diagnostics
         if (scientific.map is None) is not (plan.mode == "1d"):
             return self._terminal(ModuleDisposition.FAILED, "INVALID_SCIENCE_RESULT")
-        self._angular_support = _stitch_support(support, payload, plan.radial_range, cancel_token)
+        self._angular_support = _stitch_support(support, payload, plan.radial_range, cancel_token,
+                                                policy=self._support_policy)
         try:
             if scientific.map is None:
                 result = dict(kind=AnalysisArtifactKind.STITCH_1D, axes=(("q", payload.radial),),
@@ -3612,7 +3613,7 @@ class StitchOperationExecution:
         def writer(entry) -> None:
             revalidate_xu_stitch_calibration(plan.calibration)
             _write_record(entry, self.request.module.output.target, result_projection,
-                          _native_artifact_args(self.request, records))
+                          _native_artifact_args(self.request, records), self._angular_support)
             revalidate_xu_stitch_calibration(plan.calibration)
 
         try:
@@ -3768,7 +3769,7 @@ class StitchOperationExecution:
             return self._terminal(ModuleDisposition.FAILED, "INVALID_SCIENCE_RESULT")
         self._angular_support = _stitch_support(
             support, payload if self.request.plan.mode == "1d" else profile[0] if native_map else None,
-            self.request.plan.radial_range, cancel_token)
+            self.request.plan.radial_range, cancel_token, policy=self._support_policy)
         try:
             if self.request.plan.mode == "1d":
                 axes = (("q", payload.radial),)
@@ -3832,7 +3833,7 @@ class StitchOperationExecution:
         def writer(entry) -> None:
             _revalidate_geometry(self.request.plan.geometry)
             _write_record(entry, self.request.module.output.target, result_projection,
-                          _native_artifact_args(self.request, records))
+                          _native_artifact_args(self.request, records), self._angular_support)
             _revalidate_geometry(self.request.plan.geometry)
 
         def prepublish_check() -> None:
@@ -3966,11 +3967,19 @@ def _xu_support_accumulator(policy):
     return XuSupportAccumulator(policy)
 
 
-def _stitch_support(accumulator, profile, radial_range, cancel_token):
-    """The union's support over ``profile``'s own bins; a kernel failure never fails the Stitch."""
-    if accumulator is None or profile is None:
-        return None
+def _stitch_support(accumulator, profile, radial_range, cancel_token, *, policy=None):
+    """The union's support over ``profile``'s own bins; a kernel failure never fails the Stitch.
+
+    With “Record angular coverage” off (``policy.enabled`` False) nothing was accumulated and the native profile
+    carries ``recording_disabled``; a result without a native radial profile carries none.
+    """
     from xrd_tools.core.angular_support import AngularSupportProfile, SupportReason
+    if profile is None:
+        return None
+    if policy is not None and not policy.enabled:
+        return AngularSupportProfile.unavailable(SupportReason.RECORDING_DISABLED, radial_unit=str(profile.unit))
+    if accumulator is None:
+        return None
     try:
         return accumulator.profile(radial=profile.radial, unit=str(profile.unit), radial_range=radial_range,
                                    cancel=None if cancel_token is None else cancel_token.is_set)

@@ -6228,7 +6228,7 @@ def _support_capture(policy: Any):
     policy = AngularSupportPolicy() if policy is None else policy
     if type(policy) is not AngularSupportPolicy:
         raise TypeError("angular_support must be an AngularSupportPolicy or None")
-    return RunSupportCapture(policy) if policy.enabled else None
+    return RunSupportCapture(policy)  # off (decision 6): its frames carry recording_disabled, nothing computed
 
 
 def _support_unavailable(reason: Any, unit: str, detail: str = "") -> Any:
@@ -6262,6 +6262,8 @@ def _standard_frame_support(capture: Any, ai: Any, explicit: np.ndarray | None, 
         return None
     if chi_mode:
         return _support_unavailable(SupportReason.NOT_RADIAL_PROFILE, unit)
+    if not capture.policy.enabled:  # “Record angular coverage” off: no mask or kernel work at all
+        return _support_unavailable(SupportReason.RECORDING_DISABLED, unit)
 
     def build():
         mask, digest = capture.applied_mask(ai, explicit, bound=bound)
@@ -6287,6 +6289,8 @@ def _gi_frame_support(capture: Any, fi: Any, explicit: np.ndarray | None, plan: 
         return None
     if gi.mode_1d is not GI1DMode.Q_TOTAL:
         return _support_unavailable(SupportReason.NOT_RADIAL_PROFILE, str(getattr(r1d, "unit", "") or unit))
+    if not capture.policy.enabled:  # “Record angular coverage” off: no mask or kernel work at all
+        return _support_unavailable(SupportReason.RECORDING_DISABLED, unit)
 
     def build():
         mask, digest = capture.applied_mask(fi, explicit, bound=False)

@@ -674,6 +674,8 @@ class ScanSession:
                 # the streaming path's per-frame contract (B-1 regression fix).
                 strict=strict if strict is not None else StrictPolicy.loud(),
                 retain_products=False,
+                # COVERAGE-SUPPORT-20261013 decision 6: the Run's frozen “Record angular coverage” policy
+                angular_support=None if self._policy is None else self._policy.angular_support,
                 # The writer nulls frame.image after each write so the source-array
                 # reference doesn't pin ~18 MB/frame for the session's life (xdart's
                 # PERF-3); a later consumer reloads via Frame.load_image.  Default
@@ -818,6 +820,9 @@ class ScanSession:
             if inflight_max is not None and int(inflight_max) != alloc.reduction_inflight:
                 raise ValueError(f"inflight_max {int(inflight_max)} != explicit "
                                  f"grant {alloc.reduction_inflight}")
+        if prior is not None and prior.angular_support is not None:  # the Run's frozen support policy survives
+            from dataclasses import replace as _replace
+            policy = _replace(policy, angular_support=prior.angular_support)
         self._policy = policy
         bind(alloc)
         return alloc

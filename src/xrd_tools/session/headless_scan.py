@@ -66,6 +66,10 @@ def _validate_policy(
         raise TypeError("policy must be an exact SessionPolicy or None")
     if type(policy.allocation) is not SessionResourceAllocation:
         raise TypeError("policy must carry an exact SessionResourceAllocation")
+    if policy.angular_support is not None:
+        from xrd_tools.analysis.angular_support import AngularSupportPolicy
+        if type(policy.angular_support) is not AngularSupportPolicy:
+            raise TypeError("policy.angular_support must be an exact AngularSupportPolicy or None")
 
     image = scan.frames[0].image
     descriptor = SimpleNamespace(

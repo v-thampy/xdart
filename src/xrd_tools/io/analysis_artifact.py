@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from typing import Any
 
 import h5py
 import numpy as np
@@ -930,6 +931,9 @@ class AnalysisArtifactPayload:
     profile: AnalysisArtifactResultProjection | None = None
     #: A GI Stitch 2D's q_ip-q_oop map, its read-only 2-D projection; None otherwise.
     gi_map: AnalysisArtifactResultProjection | None = None
+    #: A Stitch result's I(q) angular support as saved (origin ``saved``), or the reason it has none
+    #: (an older Stitch result: ``legacy_stitch``); None for an artifact without a native radial profile.
+    angular_support: Any = None
 
     def __post_init__(
         self,
@@ -3016,6 +3020,7 @@ def read_analysis_artifact(
                 gi=projection.gi,
                 profile=projection.profile,
                 gi_map=projection.gi_map,
+                angular_support=_content.angular_support,
             )
 
         with h5py.File(shown, "r") as handle:

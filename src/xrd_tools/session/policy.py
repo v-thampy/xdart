@@ -2,6 +2,8 @@
 """The ONE run-policy owner: each run owns one immutable SessionPolicy, so a
 policy built inside the cadence decision is a second owner.  Stdlib only."""
 from __future__ import annotations
+
+from typing import Any
 import os
 import logging
 from dataclasses import dataclass
@@ -52,9 +54,11 @@ class FlushPolicy:
 
 @dataclass(frozen=True, slots=True)
 class SessionPolicy:
-    """One cadence owner plus, for a coordinated run, one resource allocation."""
+    """One cadence owner plus, for a coordinated run, one resource allocation, and the Run's angular support
+    policy (an ``AngularSupportPolicy``; None: the default — COVERAGE-SUPPORT-20261013 decision 6)."""
     flush: FlushPolicy = FlushPolicy()
     allocation: SessionResourceAllocation | None = None
+    angular_support: Any = None
 
     def should_flush(self, *, frames_since_flush: int,
                      unsaved_in_memory: int | None = None,
