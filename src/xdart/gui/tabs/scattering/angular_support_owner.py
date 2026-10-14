@@ -72,6 +72,8 @@ class AngularSupportOwner(QtCore.QObject):
         missing = tuple(sorted(shown - self._completed.keys()))
         if missing:
             self._requests.ask(source.request(missing))
+        else:
+            self._requests.ask(None)  # a wholly retained selection retires an obsolete expansion
         return dict(self._completed)
 
     def completed_requests(self) -> int:

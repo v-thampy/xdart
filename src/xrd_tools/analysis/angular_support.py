@@ -1267,6 +1267,10 @@ class SavedSupportBasis:
             return None
         wavelength = float(snapshot["wavelength"])
         if wavelength not in self._integrators:
+            # A shown energy-scan batch shares this basis. Keep only its current
+            # wavelength: completed frames need their profile, not a detector-sized
+            # pyFAI integration cache for every energy visited.
+            self._integrators.clear()
             from dataclasses import replace
             from xrd_tools.integrate.calibration import detector_calibration_to_integrator
             calibration = self._ring.calibration
