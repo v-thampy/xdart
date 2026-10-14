@@ -404,20 +404,22 @@ def _horizontal_q(ai, gi):
 
 
 def _boundary_edges(valid: np.ndarray):
-    """Directed pixel edges with an unmasked pixel on their left, in (column a, row b) with b upward."""
+    """Directed pixel edges with an unmasked pixel on their left, in (column a, row b) with b upward.
+
+    Only boundary pixels are indexed: no detector-sized coordinate array is built.
+    """
     height, width = valid.shape
     padded = np.zeros((height + 2, width + 2), bool)
     padded[1:-1, 1:-1] = valid
-    rows, cols = np.indices((height, width))
     starts, ends = [], []
-    for neighbour, start, end in (
-            (padded[:-2, 1:-1], (rows, cols), (rows, cols + 1)),            # low-b edge, toward +a
-            (padded[1:-1, 2:], (rows, cols + 1), (rows + 1, cols + 1)),     # high-a edge, toward +b
-            (padded[2:, 1:-1], (rows + 1, cols + 1), (rows + 1, cols)),     # high-b edge, toward −a
-            (padded[1:-1, :-2], (rows + 1, cols), (rows, cols))):           # low-a edge, toward −b
-        keep = valid & ~neighbour
-        starts.append(np.stack((start[0][keep], start[1][keep]), axis=1))
-        ends.append(np.stack((end[0][keep], end[1][keep]), axis=1))
+    for neighbour, (r0, c0), (r1, c1) in (
+            (padded[:-2, 1:-1], (0, 0), (0, 1)),      # low-b edge, toward +a
+            (padded[1:-1, 2:], (0, 1), (1, 1)),       # high-a edge, toward +b
+            (padded[2:, 1:-1], (1, 1), (1, 0)),       # high-b edge, toward −a
+            (padded[1:-1, :-2], (1, 0), (0, 0))):     # low-a edge, toward −b
+        rows, cols = np.nonzero(valid & ~neighbour)
+        starts.append(np.stack((rows + r0, cols + c0), axis=1))
+        ends.append(np.stack((rows + r1, cols + c1), axis=1))
     return np.concatenate(starts).astype(float), np.concatenate(ends).astype(float)
 
 
@@ -430,13 +432,36 @@ def _signed_area(mapper, row: int, col: int, side=None) -> float:
     return float(.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
 
 
-def _orientation(mapper, valid: np.ndarray, side=None, horizontal_sign=None) -> int:
-    """+1 when the pose keeps the left side on the left in the polar plane, else −1 (measured on far pixels)."""
-    rows, cols = np.nonzero(valid if horizontal_sign is None else valid & (horizontal_sign == side))
+def _orientation_pixels(valid: np.ndarray, side=None, corner_sign=None, wanted: int = 9):
+    """Up to ``wanted`` unmasked pixels spread over the detector (wholly on χ_GI half ``side`` if given),
+    found on a sparse grid first so a large detector never indexes all its pixels."""
+    height, width = valid.shape
+
+    def admissible(rows, cols):
+        keep = valid[rows, cols]
+        if corner_sign is not None:
+            keep &= ((corner_sign[rows, cols] == side) & (corner_sign[rows + 1, cols] == side)
+                     & (corner_sign[rows, cols + 1] == side) & (corner_sign[rows + 1, cols + 1] == side))
+        return rows[keep], cols[keep]
+
+    grid_rows, grid_cols = np.meshgrid(np.linspace(0, height - 1, 33).astype(int),
+                                       np.linspace(0, width - 1, 33).astype(int), indexing="ij")
+    rows, cols = admissible(grid_rows.ravel(), grid_cols.ravel())
+    if not rows.size:
+        rows, cols = np.nonzero(valid)
+        rows, cols = admissible(rows, cols)
+    if not rows.size:
+        return rows, cols
+    picks = np.unique(np.linspace(0, rows.size - 1, min(rows.size, wanted)).astype(int))
+    return rows[picks], cols[picks]
+
+
+def _orientation(mapper, valid: np.ndarray, side=None, corner_sign=None) -> int:
+    """+1 when the pose keeps the left side on the left in the polar plane, else −1 (measured on spread pixels)."""
+    rows, cols = _orientation_pixels(valid, side, corner_sign)
     if not rows.size:
         return 0
-    picks = np.unique(np.linspace(0, rows.size - 1, min(rows.size, 9)).astype(int))
-    areas = [_signed_area(mapper, int(rows[i]), int(cols[i]), side) for i in picks]
+    areas = [_signed_area(mapper, int(row), int(col), side) for row, col in zip(rows, cols)]
     signs = {int(np.sign(area)) for area in areas if abs(area) > 1e-18}
     if len(signs) != 1:
         raise ValueError("the detector's orientation in (2θ, φ) is not uniform")
@@ -649,9 +674,7 @@ def support_footprint(pose: SupportPose, convention: str, *, cancel=None) -> Sup
             starts, ends = pieces[side]
             if not starts.size:
                 continue
-            pixel_sign = np.where((corner_sign[:-1, :-1] == side) & (corner_sign[1:, 1:] == side)
-                                  & (corner_sign[:-1, 1:] == side) & (corner_sign[1:, :-1] == side), side, 0)
-            sigma = _orientation(mapper, valid, side, pixel_sign)
+            sigma = _orientation(mapper, valid, side, corner_sign)
             if sigma == 0:
                 continue
             t0, p0, t1, p1 = _subdivide(mapper, starts, ends, float(side), cancel)
