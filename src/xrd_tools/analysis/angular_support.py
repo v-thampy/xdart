@@ -239,6 +239,7 @@ class SupportPose:
 
     def __post_init__(self) -> None:
         geometry = json.loads(json.dumps(dict(self.geometry), sort_keys=True, default=_json_default))
+        geometry.pop("wavelength", None)  # footprints are wavelength-independent; an energy scan is one pose
         object.__setattr__(self, "geometry", geometry)
         mask = self.mask
         if mask is not None:
@@ -342,8 +343,13 @@ class SupportFootprint:
 
 
 def _integrator(geometry: Mapping[str, Any]):
-    import pyFAI
-    return pyFAI.load(dict(geometry))
+    """pyFAI's own geometry for a detached config, built without pyFAI's per-load ``gc.collect()`` (whose cost
+    grows with the host process's heap)."""
+    from pyFAI.geometry import Geometry
+    loaded = Geometry()
+    loaded.auto_gc = False
+    loaded.set_config(dict(geometry))
+    return loaded
 
 
 def _qualification(ai) -> str:
@@ -631,13 +637,44 @@ def _gi_pieces(ai, valid: np.ndarray, horizontal, cancel, pole=None):
     return out, corner_sign
 
 
-def support_footprint(pose: SupportPose, convention: str, *, cancel=None) -> SupportFootprint:
-    """The wavelength-independent boundary of one pose in (2θ, φ), or the named reason it has none."""
-    try:
-        ai = _integrator(pose.geometry)
-    except Exception as error:  # a geometry pyFAI cannot load is not qualified
-        return SupportFootprint(pose.key, convention, reason=SupportReason.UNQUALIFIED_GEOMETRY,
-                                detail=f"geometry not loadable: {type(error).__name__}")
+class SupportGeometryCache:
+    """A small thread-safe cache one Run keeps across its poses (see :func:`support_footprint`)."""
+
+    def __init__(self, limit: int = 4) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self._items: dict = {}
+        self._limit = int(limit)
+
+    def get(self, key):
+        with self._lock:
+            return self._items.get(key)
+
+    def put(self, key, value) -> None:
+        with self._lock:
+            if key not in self._items and len(self._items) >= self._limit:
+                self._items.pop(next(iter(self._items)))
+            self._items[key] = value
+
+
+def support_footprint(pose: SupportPose, convention: str, *, cancel=None,
+                      cache: SupportGeometryCache | None = None) -> SupportFootprint:
+    """The wavelength-independent boundary of one pose in (2θ, φ), or the named reason it has none.
+
+    ``cache`` (a caller-owned :class:`SupportGeometryCache`) keeps each geometry's loaded pyFAI geometry, and χ_GI's
+    detector-plane pieces between poses differing only by incidence angle at zero tilt: q_horz, hence the cut, does
+    not depend on it; only the mapping to (2θ, χ_GI) is recomputed.
+    """
+    geometry = json.dumps(pose.geometry, sort_keys=True)
+    ai = None if cache is None else cache.get(("geometry", geometry))
+    if ai is None:
+        try:
+            ai = _integrator(pose.geometry)
+        except Exception as error:  # a geometry pyFAI cannot load is not qualified
+            return SupportFootprint(pose.key, convention, reason=SupportReason.UNQUALIFIED_GEOMETRY,
+                                    detail=f"geometry not loadable: {type(error).__name__}")
+        if cache is not None:
+            cache.put(("geometry", geometry), ai)
     unqualified = _qualification(ai)
     if unqualified:
         return SupportFootprint(pose.key, convention, reason=SupportReason.UNQUALIFIED_GEOMETRY, detail=unqualified)
@@ -646,10 +683,10 @@ def support_footprint(pose: SupportPose, convention: str, *, cancel=None) -> Sup
         return SupportFootprint(pose.key, convention, reason=SupportReason.UNQUALIFIED_GEOMETRY,
                                 detail=f"mask shape {pose.mask.shape} differs from the detector's {shape}")
     valid = np.ones(shape, bool) if pose.mask is None else ~pose.mask
-    # (row, col) corner coordinates; boundary edges are directed (col right, row up) with the region on the left
-    start_ab, end_ab = _boundary_edges(valid)
     try:
         if convention == "detector_chi":
+            # (row, col) corner coordinates; boundary edges are directed (col right, row up), region on the left
+            start_ab, end_ab = _boundary_edges(valid)
             mapper = _mapper(ai, convention, None)
             sigma = _orientation(mapper, valid)
             if sigma == 0:
@@ -664,10 +701,17 @@ def support_footprint(pose: SupportPose, convention: str, *, cancel=None) -> Sup
             order = np.argsort(seam_t, kind="stable")
             return SupportFootprint(pose.key, convention, t0, p0, t1, p1, sign, seam_t[order], seam_sign[order],
                                     inside)
-        horizontal = _horizontal_q(ai, pose.gi)
-        pole = _pole(ai)
-        inside = pole is not None and 0 <= pole[0] < shape[0] and 0 <= pole[1] < shape[1]
-        pieces, corner_sign = _gi_pieces(ai, valid, horizontal, cancel, pole if inside else None)
+        reusable = cache is not None and pose.gi[1] == 0.0
+        cut_key = ("gi_cut", geometry, pose.mask_digest, pose.gi[2]) if reusable else None
+        cached = cache.get(cut_key) if reusable else None
+        if cached is None:
+            horizontal = _horizontal_q(ai, pose.gi)
+            pole = _pole(ai)
+            inside = pole is not None and 0 <= pole[0] < shape[0] and 0 <= pole[1] < shape[1]
+            cached = _gi_pieces(ai, valid, horizontal, cancel, pole if inside else None)
+            if reusable:
+                cache.put(cut_key, cached)
+        pieces, corner_sign = cached
         mapper = _mapper(ai, convention, pose.gi)
         parts = []
         for side in (1, -1):
@@ -937,10 +981,12 @@ class RunSupportCapture:
 
     Shared by every reduction worker of one Run (thread-safe). It never touches intensity: a frame over the budget
     gets ``over_budget`` while its reduction is unchanged. Footprints are kept least-recently-used within
-    ``cache_bytes``; distinct geometry keys are counted for the budget whether or not their footprints stay cached.
+    ``cache_bytes`` and ``cache_keys``; distinct geometry keys are counted for the budget whether or not their
+    footprints stay cached. A new footprint or line table is computed by one worker while the others wait for it.
     """
 
-    def __init__(self, policy: AngularSupportPolicy | None = None, *, cache_bytes: int = 64 << 20) -> None:
+    def __init__(self, policy: AngularSupportPolicy | None = None, *, cache_bytes: int = 64 << 20,
+                 cache_keys: int = 8) -> None:
         import threading
         self.policy = policy if policy is not None else AngularSupportPolicy()
         self._lock = threading.Lock()
@@ -949,7 +995,10 @@ class RunSupportCapture:
         self._masks: dict[tuple[int, int], tuple[Any, Any, np.ndarray | None, str]] = {}
         self._tables: dict[tuple, SupportLineTable] = {}
         self._profiles: dict[tuple, AngularSupportProfile] = {}
+        self._geometry = SupportGeometryCache()
+        self._flights: dict[tuple, Any] = {}
         self._cache_bytes = int(cache_bytes)
+        self._cache_keys = int(cache_keys)
 
     @property
     def geometry_keys(self) -> int:
@@ -990,6 +1039,28 @@ class RunSupportCapture:
             self._masks[key] = (explicit if not bound else detector_mask, detector_mask, applied, digest)
         return applied, digest
 
+    def _once(self, key: tuple, lookup: Callable[[], Any], compute: Callable[[], Any], cancel) -> Any:
+        """``lookup()`` (under the lock), else ``compute()`` by one worker while the others wait for its result."""
+        import threading
+        while True:
+            with self._lock:
+                found = lookup()
+                if found is not None:
+                    return found
+                flight = self._flights.setdefault(key, threading.Lock())
+            if flight.acquire(timeout=0.05):
+                break
+            _check(cancel)
+        try:
+            with self._lock:
+                found = lookup()
+            return found if found is not None else compute()
+        finally:
+            with self._lock:
+                if self._flights.get(key) is flight:
+                    del self._flights[key]
+            flight.release()
+
     def _footprint(self, pose: SupportPose, convention: str, cancel) -> SupportFootprint | None:
         key = (pose.key, convention)
         with self._lock:
@@ -1002,14 +1073,17 @@ class RunSupportCapture:
                 if budget is not None and len(self._keys) >= budget:
                     return None
                 self._keys.add(key)
-        footprint = support_footprint(pose, convention, cancel=cancel)
-        with self._lock:
-            self._footprints[key] = footprint
-            total = sum(item.nbytes for item in self._footprints.values())
-            while total > self._cache_bytes and len(self._footprints) > 1:
-                oldest = next(iter(self._footprints))
-                total -= self._footprints.pop(oldest).nbytes
-        return footprint
+
+        def compute() -> SupportFootprint:
+            footprint = support_footprint(pose, convention, cancel=cancel, cache=self._geometry)
+            with self._lock:
+                self._footprints[key] = footprint
+                total = sum(item.nbytes for item in self._footprints.values())
+                while len(self._footprints) > 1 and (total > self._cache_bytes
+                                                     or len(self._footprints) > self._cache_keys):
+                    total -= self._footprints.pop(next(iter(self._footprints))).nbytes
+            return footprint
+        return self._once(("footprint", key), lambda: self._footprints.get(key), compute, cancel)
 
     def profile(self, *, integrator: Any, mask: np.ndarray | None, mask_digest: str, convention: str,
                 radial_unit: str, centres: Any, wavelength_m: float | None, window: AdmittedWindow,
@@ -1047,21 +1121,34 @@ class RunSupportCapture:
             wavelength_m=wavelength_m, window=window, provenance=dict(provenance or {}, mask_sha256=mask_digest))
         table = None
         if footprint.reason is None:
-            edges_t = _native_two_theta(edges, radial_unit, wavelength_m) if radial_unit in SUPPORTED_UNITS else None
-            needed = 0.0 if edges_t is None else _needed_spacing(edges_t, 8)
-            with self._lock:
-                table = self._tables.get(reuse)
-            if needed > 0 and (table is None or not table.serves(edges_t, needed)):
-                # the first table is exactly the direct computation's; a later finer or wider need (an energy
-                # scan's next wavelength) rebuilds once with headroom instead of at every frame
-                spacing = needed if table is None else min(needed, table.spacing) / 2
-                lo = float(edges_t[0]) - spacing if table is None else min(table.cell_start, float(edges_t[0]) - spacing)
-                hi = float(edges_t[-1]) + spacing if table is None else max(table.cell_stop, float(edges_t[-1]) + spacing)
-                table = support_line_table((footprint,), window, spacing=spacing, start=lo, stop=hi, cancel=cancel)
+            edges_t = _native_two_theta(edges, radial_unit, wavelength_m)
+            needed = _needed_spacing(edges_t, 8)
+
+            def serving() -> SupportLineTable | None:
+                found = self._tables.get(reuse)
+                return found if found is not None and found.serves(edges_t, needed) else None
+
+            def build() -> SupportLineTable:
                 with self._lock:
-                    self._tables[reuse] = table
+                    old = self._tables.get(reuse)
+                # the first table is exactly the direct computation's; a later finer or wider need (an energy scan's
+                # next wavelength, in either direction) rebuilds with headroom, never at every frame: the spacing
+                # halves only when a finer one is needed, and the range grows by a quarter of the span on each side
+                if old is None:
+                    spacing, lo, hi = needed, float(edges_t[0]) - needed, float(edges_t[-1]) + needed
+                else:
+                    spacing = old.spacing if old.spacing <= needed * (1 + 1e-12) else needed / 2
+                    margin = spacing + .25 * float(edges_t[-1] - edges_t[0])
+                    lo = min(old.cell_start, float(edges_t[0]) - margin)
+                    hi = max(old.cell_stop, float(edges_t[-1]) + margin)
+                built = support_line_table((footprint,), window, spacing=spacing, start=lo, stop=hi, cancel=cancel)
+                with self._lock:
+                    self._tables[reuse] = built
                     while len(self._tables) > 16:
                         self._tables.pop(next(iter(self._tables)))
+                return built
+            if needed > 0:
+                table = self._once(("table", reuse), serving, build, cancel)
         profile = angular_support(request, cancel=cancel, footprints={pose.key: footprint}, table=table)
         with self._lock:
             self._profiles[exact] = profile
