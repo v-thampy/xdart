@@ -851,9 +851,10 @@ def stitch_2d_streaming(
     flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION,
     workers: int = 1,
     progress: Callable[[int], object] | None = None,
+    support: Any = None,
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
     """Sequential 2-D MultiGeometry merge retaining one detector frame per worker (``workers`` as
-    :func:`stitch_1d_streaming`)."""
+    :func:`stitch_1d_streaming`). A map has no native radial profile: ``support`` records nothing here."""
 
     result, _gi, _profile = _streaming_multigeometry(
         images,
@@ -877,6 +878,7 @@ def stitch_2d_streaming(
         flat_min_fraction=flat_min_fraction,
         workers=workers,
         progress=progress,
+        support=support,
     )
     return _stitch_2d_payload(result)
 
