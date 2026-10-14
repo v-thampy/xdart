@@ -221,6 +221,7 @@ def _streaming_multigeometry(
     profile_azimuth_range: tuple[float, float] | None = None,
     workers: int = 1,
     progress: Callable[[int], object] | None = None,
+    support: Any = None,
 ):
     """Returns (pyFAI's merged result, each GI cut's [signal, normalization, count, axis] in the plan's
     order, or () without GI, and with ``profile_npt`` beside a 2-D map pyFAI's merged I(q) over every χ,
@@ -297,6 +298,12 @@ def _streaming_multigeometry(
                 azimuth_range=profile_azimuth, workers=workers)
     gi_bins = {} if gi is None else _gi_bins(integrator_factory, gi_angles, gi)
     gi_totals = None
+    if support is not None:
+        # angular support follows the native radial profile: a 1-D Stitch's I(q), or the I(q) beside a map
+        if mode == "1d":
+            support.window(azimuth_range, fixed_azimuth)
+        elif profile_npt is not None:
+            support.window(profile_azimuth_range, profile_azimuth)
 
     def add_gi(parts):
         nonlocal gi_totals
@@ -471,26 +478,31 @@ def _streaming_multigeometry(
                     signal -= float(frame_dark[valid].sum())
                 total = (float('nan') if statistics is not None and not statistics.exposure_multiplier
                          else signal / monitor)
+            # the geometric pose only (the operation's mask with the detector's), never value-invalid pixels
+            member = (None if support is None or (mode == "2d" and profile_npt is None)
+                      else support.pose(integrator, mask))
             return (result, profile, gi_part, total, np.asarray(result.radial, dtype=float),
-                    np.asarray(result.azimuthal, dtype=float) if mode == "2d" else None)
+                    np.asarray(result.azimuthal, dtype=float) if mode == "2d" else None, member)
         finally:
             integrator.reset(collect_garbage=False)
 
-    def absorb(result, gi_part, profile):
-        """Add one kept frame's sums to the merged ones."""
+    def absorb(result, gi_part, profile, member=None):
+        """Add one kept frame's sums to the merged ones (and its pose to the angular support union)."""
         nonlocal aggregate, profile_aggregate
         with numexpr_lock:  # pyFAI's union recomputes the means with numexpr
             aggregate = result if aggregate is None else aggregate.union(result)
             if profile is not None:
                 profile_aggregate = profile if profile_aggregate is None else profile_aggregate.union(profile)
         add_gi(gi_part)
+        if support is not None:
+            support.include(member)
 
     merged = 0
 
     def merge(part):
         """Merge one frame's sums, in frame order."""
         nonlocal radial, azimuthal, merged
-        result, profile, gi_part, total, current_radial, current_azimuthal = part
+        result, profile, gi_part, total, current_radial, current_azimuthal, member = part
         if radial is None:
             radial = current_radial.copy()
         elif not np.array_equal(radial, current_radial):
@@ -503,15 +515,15 @@ def _streaming_multigeometry(
         if frame_screen is None:
             absorb(copy.deepcopy(result) if aggregate is None else result, gi_part,
                    None if profile is None else
-                   copy.deepcopy(profile) if profile_aggregate is None else profile)
+                   copy.deepcopy(profile) if profile_aggregate is None else profile, member)
         else:
             # Hold this frame until its row neighbours are known; merge the
             # released frames in their original order.
             kept_profile = None if profile is None else copy.deepcopy(profile)
-            for (held, held_gi, held_profile), verdict in frame_screen.push(
-                    total, (copy.deepcopy(result), gi_part, kept_profile)):
+            for (held, held_gi, held_profile, held_member), verdict in frame_screen.push(
+                    total, (copy.deepcopy(result), gi_part, kept_profile, member)):
                 if not verdict.excluded:
-                    absorb(held, held_gi, held_profile)
+                    absorb(held, held_gi, held_profile, held_member)
         merged += 1
         if progress is not None:
             progress(merged)
@@ -538,9 +550,9 @@ def _streaming_multigeometry(
     else:
         raise ValueError("streaming Stitch received more integrators than declared")
     if frame_screen is not None:
-        for (held, held_gi, held_profile), verdict in frame_screen.finish():
+        for (held, held_gi, held_profile, held_member), verdict in frame_screen.finish():
             if not verdict.excluded:
-                absorb(held, held_gi, held_profile)
+                absorb(held, held_gi, held_profile, held_member)
         if aggregate is None:
             raise ValueError("every Stitch frame was excluded as a dropped frame")
     if aggregate is None or radial is None:
@@ -730,6 +742,7 @@ def stitch_1d_streaming(
     workers: int = 1,
     progress: Callable[[int], object] | None = None,
     azimuth_range: tuple[float, float] | None = None,
+    support: Any = None,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics,
            tuple[tuple[IntegrationResult1D, StitchDiagnostics], ...]]:
     """Sequential MultiGeometry merge that retains only one detector frame per worker
@@ -765,6 +778,7 @@ def stitch_1d_streaming(
         gi_angles=gi_angles,
         workers=workers,
         progress=progress,
+        support=support,
     )
     payload, diagnostics = _stitch_1d_payload(result, unit)
     return payload, diagnostics, tuple(gi_cut_result(totals, GI_UNITS[cut])
@@ -894,6 +908,7 @@ def stitch_2d_with_1d_streaming(
     workers: int = 1,
     progress: Callable[[int], object] | None = None,
     azimuth_range_1d: tuple[float, float] | None = None,
+    support: Any = None,
 ) -> tuple:
     """The 2-D map and I(q) beside it, as an Int 2D record holds them, from one pass over the frames:
     the map as :func:`stitch_2d_streaming` makes it, and I(q) over every χ in ``npt_1d`` bins as
@@ -934,6 +949,7 @@ def stitch_2d_with_1d_streaming(
         profile_azimuth_range=azimuth_range_1d,
         workers=workers,
         progress=progress,
+        support=support,
     )
     cuts = tuple(gi_cut_result(totals, GI_UNITS[cut]) for cut, totals in zip(() if gi is None else gi.cuts, gi_totals))
     gi_map = None if gi is None else gi_map_result(gi_totals[-1])

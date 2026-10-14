@@ -277,6 +277,9 @@ class XuStitchRuntimeGeometry:
     frame_solid_angle: Callable[[float, float], np.ndarray] | None = None
     #: xrayutilities sample displacement in mm (the detector distance's units), version 3 only.
     sampledis: tuple[float, float, float] | None = None
+    #: The same detector as ``hxrd`` evaluated at pixel corners ((N+1) channels, cch + 0.5): angular support's
+    #: footprints in XU's own geometry (COVERAGE-SUPPORT-20261013). None for a geometry built without it.
+    corner_hxrd: object = None
 
     def __post_init__(self, _claim: object) -> None:
         static = self.solid_angle is not None
@@ -533,38 +536,47 @@ def resolve_xu_stitch_effective_geometry(
         if not math.isclose(selected["energy_eV"], energy, rel_tol=1e-14):
             runtime_energy = (float(selected["energy_eV"]), float(selected["wavelength_m"]) * 1e10,
                               float(xu.en2lam(selected["energy_eV"])))
-    qconversion = xu.QConversion(
-        xu_asset["sample_axes"],
-        xu_asset["detector_axes"],
-        xu_asset["incident_beam"],
-    )
-    hxrd = xu.HXRD(
-        xu_asset["inplane_reference"],
-        xu_asset["surface_normal_reference"],
-        geometry=xu_asset["geometry"],
-        en=energy if runtime_energy is None else runtime_energy[0],
-        qconv=qconversion,
-    )
-    if (
-        float(hxrd._wl) != (acquisition["xu_mapping_wavelength_A"] if runtime_energy is None else runtime_energy[2])
-    ):
-        raise XuStitchScienceRefused(
-            "XU_WAVELENGTH_MISMATCH", "XU mapping wavelength projection changed"
-        )
     extended = {} if asset_version != 3 else {
         "detrot": float(detector_asset["detrot_deg"]), "tilt": float(detector_asset["tilt_deg"]),
         "tiltazimuth": float(detector_asset["tiltazimuth_deg"])}
-    hxrd.Ang2Q.init_area(
-        *xu_asset["camera"],
-        cch1=float(detector_asset["cch1_px"]),
-        cch2=float(detector_asset["cch2_px"]),
-        Nch1=shape[0],
-        Nch2=shape[1],
-        pwidth1=float(detector_asset["pixel1_m"]) * 1e3,
-        pwidth2=float(detector_asset["pixel2_m"]) * 1e3,
-        distance=float(detector_asset["distance_m"]) * 1e3,
-        **extended,
-    )
+
+    def area_hxrd(half_pixel: float, extra: int):
+        """The asset's diffractometer with its area detector; ``half_pixel``/``extra`` move the channel grid to
+        the pixel corners (each its own QConversion: xrayutilities keeps the area on it)."""
+        qconversion = xu.QConversion(
+            xu_asset["sample_axes"],
+            xu_asset["detector_axes"],
+            xu_asset["incident_beam"],
+        )
+        built = xu.HXRD(
+            xu_asset["inplane_reference"],
+            xu_asset["surface_normal_reference"],
+            geometry=xu_asset["geometry"],
+            en=energy if runtime_energy is None else runtime_energy[0],
+            qconv=qconversion,
+        )
+        if (
+            float(built._wl) != (acquisition["xu_mapping_wavelength_A"] if runtime_energy is None
+                                 else runtime_energy[2])
+        ):
+            raise XuStitchScienceRefused(
+                "XU_WAVELENGTH_MISMATCH", "XU mapping wavelength projection changed"
+            )
+        built.Ang2Q.init_area(
+            *xu_asset["camera"],
+            cch1=float(detector_asset["cch1_px"]) + half_pixel,
+            cch2=float(detector_asset["cch2_px"]) + half_pixel,
+            Nch1=shape[0] + extra,
+            Nch2=shape[1] + extra,
+            pwidth1=float(detector_asset["pixel1_m"]) * 1e3,
+            pwidth2=float(detector_asset["pixel2_m"]) * 1e3,
+            distance=float(detector_asset["distance_m"]) * 1e3,
+            **extended,
+        )
+        return built
+
+    hxrd = area_hxrd(0.0, 0)
+    corner_hxrd = area_hxrd(0.5, 1)
     projection = XuStitchEffectiveGeometryProjection(
         receipt.semantic_fingerprint,
         f"{type(detector).__module__}.{type(detector).__qualname__}",
@@ -590,7 +602,7 @@ def resolve_xu_stitch_effective_geometry(
         # xrayutilities takes the displacement in the detector distance's units (mm).
         return XuStitchRuntimeGeometry(
             projection, hxrd, frozen_mask, None, _RUNTIME_GEOMETRY_FACTORY,
-            frame_solid_angle, tuple(float(value) for value in acquisition["sampledis_mm"]),
+            frame_solid_angle, tuple(float(value) for value in acquisition["sampledis_mm"]), corner_hxrd,
         )
     # The reference bytes, not the host's: every host integrates with the
     # array the projection's solid_angle_sha256 names.
@@ -604,6 +616,7 @@ def resolve_xu_stitch_effective_geometry(
         frozen_mask,
         frozen_solid,
         _RUNTIME_GEOMETRY_FACTORY,
+        corner_hxrd=corner_hxrd,
     )
 
 
@@ -734,7 +747,8 @@ class XuPowderQProvider:
         self._nu_offset = float(acquisition["detector_offsets_deg"]["nu"])
         self._del_offset = float(acquisition["detector_offsets_deg"]["del"])
 
-    def frame(self, *, nu: float, del_: float) -> XuPowderQFrameLease:
+    def frame(self, *, nu: float, del_: float, corners: bool = False) -> XuPowderQFrameLease:
+        """The pose's q at pixel centres, or with ``corners`` at the (N+1)×(M+1) pixel corners."""
         if any(type(value) not in {int, float} or not math.isfinite(float(value)) for value in (nu, del_)):
             raise XuStitchScienceRefused(
                 "INVALID_METADATA_VALUE", "XU detector angles must be finite"
@@ -743,7 +757,14 @@ class XuPowderQProvider:
         # ``sampledis`` is passed, so it is passed only when it is nonzero.
         displaced = ({} if self.geometry.sampledis is None or not any(self.geometry.sampledis)
                      else {"sampledis": list(self.geometry.sampledis)})
-        area = self.geometry.hxrd.Ang2Q.area(
+        shape = self.geometry.projection.shape
+        hxrd = self.geometry.hxrd
+        if corners:
+            if self.geometry.corner_hxrd is None:
+                raise XuStitchScienceRefused("XU_CORNERS_UNAVAILABLE", "this XU geometry has no corner grid")
+            hxrd = self.geometry.corner_hxrd
+            shape = (shape[0] + 1, shape[1] + 1)
+        area = hxrd.Ang2Q.area(
             0.0,
             0.0,
             0.0,
@@ -752,7 +773,7 @@ class XuPowderQProvider:
             float(del_) - self._del_offset,
             **displaced,
         )
-        return XuPowderQFrameLease(area, self.geometry.projection.shape, camera=self.geometry.projection.camera)
+        return XuPowderQFrameLease(area, shape, camera=self.geometry.projection.camera)
 
 
 def _polarization_axes(asset) -> tuple[np.ndarray, np.ndarray]:
@@ -1264,8 +1285,12 @@ def run_xu_hist_stitch_1d(
     azimuth_range_1d: tuple[float, float] | None = None,
     allow_extrapolation: bool = False,
     metadata_energy_eV: float | None = None,
+    support: object = None,
 ) -> XuStitchScienceResult:
     """Run native Q or 2theta histogram bins; omitted bounds scout all geometry.
+
+    ``support`` (an ``XuSupportAccumulator``) collects each included frame's pose for angular support: the
+    calibrated detector mask with the external mask, never the frame's flat, dark or value invalid pixels.
 
     ``allow_extrapolation`` admits poses beyond the export validation envelope,
     recording their count and warning; all other scientific checks still apply.
@@ -1572,6 +1597,10 @@ def run_xu_hist_stitch_1d(
         if mask is not None:
             if type(mask) is not np.ndarray or mask.dtype != np.dtype(bool) or mask.shape != geometry.projection.shape:
                 raise ValueError("external mask must be boolean with the calibrated detector shape")
+        geometric_mask = geometry.mask if mask is None else np.logical_or(geometry.mask, mask)
+        members = {}
+        if support is not None:
+            support.window(azimuth_range_1d)
         # admitted by Int's owners (corrections.frame_preparation, shared with the pyFAI path and RSM)
         dark, dark_invalid = correction_image(dark, "dark")
         flat, flat_invalid = correction_image(flat, "flat", min_fraction=flat_min_fraction)
@@ -1632,6 +1661,9 @@ def run_xu_hist_stitch_1d(
             if cancel_token is not None and cancel_token.is_set():
                 raise XuStitchCancelled("CANCELLED")
             label, del_value, nu_value, monitor = frame_inputs[index]
+            if support is not None:
+                members[index] = support.xu_pose(geometry, acquisition, nu=nu_value, del_=del_value,
+                                                 mask=geometric_mask)
             return _xu_frame_arrays(
                 source,
                 label,
@@ -1659,15 +1691,16 @@ def run_xu_hist_stitch_1d(
 
         def compute(index, arrays, owned_refs):
             """The frame's histograms (NumPy only: a frame worker's share)."""
-            return _xu_frame_histograms(arrays, owned_refs, q_edges=q_edges, gi_cuts=gi_cuts[index],
-                                        map_edges=map_edges, chi_window=azimuth_range_1d,
-                                        positive_total_screening=not differences[index])
+            return (*_xu_frame_histograms(arrays, owned_refs, q_edges=q_edges, gi_cuts=gi_cuts[index],
+                                          map_edges=map_edges, chi_window=azimuth_range_1d,
+                                          positive_total_screening=not differences[index]),
+                    members.pop(index, None))
 
         def merge(histograms):
             """Add one frame's histograms, in frame order (the screen holds a frame until its row
             neighbours are known)."""
             nonlocal release_count, merged
-            d_signal, d_normalization, d_count, d_total, d_gi, d_map = histograms
+            d_signal, d_normalization, d_count, d_total, d_gi, d_map, member = histograms
             release_count += 1
             if (
                 not np.isfinite(d_signal).all()
@@ -1682,11 +1715,15 @@ def run_xu_hist_stitch_1d(
                 )
             if frame_screen is None:
                 accumulate(d_signal, d_normalization, d_count, d_gi, d_map)
+                if support is not None:
+                    support.include(member)
             else:
                 for held, verdict in frame_screen.push(
-                        d_total, (d_signal, d_normalization, d_count, d_gi, d_map)):
+                        d_total, (d_signal, d_normalization, d_count, d_gi, d_map, member)):
                     if not verdict.excluded:
-                        accumulate(*held)
+                        accumulate(*held[:5])
+                        if support is not None:
+                            support.include(held[5])
             merged += 1
             if progress_callback is not None:
                 progress_callback(merged, len(labels))
@@ -1703,7 +1740,9 @@ def run_xu_hist_stitch_1d(
         if frame_screen is not None:
             for held, verdict in frame_screen.finish():
                 if not verdict.excluded:
-                    accumulate(*held)
+                    accumulate(*held[:5])
+                    if support is not None:
+                        support.include(held[5])
             if not any(not verdict.excluded for verdict in frame_screen.verdicts):
                 raise XuStitchScienceRefused(
                     "STITCH_ALL_FRAMES_DROPPED", "every frame was excluded as a dropped frame"

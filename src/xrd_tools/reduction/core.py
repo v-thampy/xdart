@@ -680,6 +680,9 @@ class FrameReduction:
         compare=False,
     )
     write_frame_record: bool = True
+    #: The Run's angular support of ``result_1d`` (COVERAGE-SUPPORT-20261013): an
+    #: ``AngularSupportProfile`` (available or with its reason), or None when the Run captures none.
+    angular_support_1d: Any = field(default=None, repr=False, compare=False)
 
 
 def _plan_mode_keys(plan: ReductionPlan | None) -> tuple[str, str]:
@@ -3320,6 +3323,9 @@ class ReductionSession:
     # RAISES on missing-normalization / GI-all-dummy instead of writing bad
     # data; the xdart GUI passes StrictPolicy.graceful() (never abort a save).
     strict: StrictPolicy = field(default_factory=StrictPolicy.loud)
+    # COVERAGE-SUPPORT-20261013: angular support capture (an AngularSupportPolicy; None = the default
+    # policy). Support never changes intensity; disabled, frames carry no profile.
+    angular_support: Any = None
     # H10-C1: ONE narrow synchronous acceptance-admission hook, invoked on the
     # CALLER thread inside submit() in publication order (§18.2) — Future bound,
     # the same undecided ticket queued, inventory staged, THEN this authority runs
@@ -3530,6 +3536,7 @@ class ReductionSession:
             ai=ai,
             fi=fi,
             initial_incident_angle=self._initial_incident_angle,
+            support=_support_capture(self.angular_support),
         )
         self.integrator_provider_builds = 1
         # Validate BEFORE acquiring resources: sink.begin() opens an h5 handle
@@ -4646,6 +4653,7 @@ def run_reduction(
     inflight_max: int | None = None,
     retain_products: bool | None = None,
     strict: StrictPolicy | None = None,
+    angular_support: Any = None,
 ) -> ReductionResult:
     """Run a headless reduction job over all frames in ``scan`` or a source.
 
@@ -4739,6 +4747,7 @@ def run_reduction(
         inflight_max=inflight_max,
         retain_products=retain_products,
         strict=strict if strict is not None else StrictPolicy.loud(),
+        angular_support=angular_support,
     ) as session:
         if execution == "streaming":
             # Streaming drains via submit() (process() is rejected); feed every
@@ -5282,12 +5291,15 @@ class _ReductionIntegratorProvider:
         ai: Any,
         fi: Any,
         initial_incident_angle: float | None,
+        support: Any = None,
     ) -> None:
         self.scan = scan
         self.plan = plan
         self.ai = ai
         self.fi = fi
         self.initial_incident_angle = initial_incident_angle
+        #: The Run's angular support capture (one per Run, shared by every worker), or None.
+        self.support = support
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
         # An energy scan reduces each frame at its own wavelength on a private integrator;
@@ -5948,6 +5960,8 @@ def _reduce_frame(
     )
     frame_mask = _combined_mask(None, frame.mask, image.shape, frame_masks)
     extra_results_2d: dict[str, IntegrationResult2D] | None = None
+    support_capture = getattr(integrators, "support", None)
+    angular_support_1d = None
 
     if plan.gi is not None:
         mask = (
@@ -5977,6 +5991,9 @@ def _reduce_frame(
             )
             if plan.integration_1d is not None else None
         )
+        if support_capture is not None and r1d is not None:
+            angular_support_1d = _gi_frame_support(
+                support_capture, fi, mask, plan, p1_frame, incident_angle, r1d, grouped)
         r2d = (
             _run_gi_2d(
                 image,
@@ -6106,6 +6123,9 @@ def _reduce_frame(
                 )
                 if p1 is not None else None
             )
+        if support_capture is not None and r1d is not None and p1 is not None:
+            angular_support_1d = _standard_frame_support(
+                support_capture, ai, integration_mask, detector_mask_is_bound, p1, r1d, chi_mode, grouped)
         # S-4: re-add chi_offset to the 1D chi OUTPUT axis (mirror the 2D
         # r2d.azimuthal += azimuth_offset below), so the written Mode-A (chi_deg)
         # chi axis matches the 2D cake chi instead of staying in the raw pyFAI
@@ -6175,6 +6195,7 @@ def _reduce_frame(
         extra_results_2d=extra_results_2d,
         metadata=dict(frame.metadata),
         corrected_image=corrected_image,
+        angular_support_1d=angular_support_1d,
     )
     if include_worker_thumbnail_prep:
         # Every execution backend must carry native threshold membership to
@@ -6190,6 +6211,77 @@ def _reduce_frame(
         )
         reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(thumbnail_mask, background, plan)
     return reduction
+
+
+def _support_capture(policy: Any):
+    """The Run's capture owner for ``policy`` (None: the default policy), or None when capture is disabled."""
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy, RunSupportCapture
+    policy = AngularSupportPolicy() if policy is None else policy
+    if type(policy) is not AngularSupportPolicy:
+        raise TypeError("angular_support must be an AngularSupportPolicy or None")
+    return RunSupportCapture(policy) if policy.enabled else None
+
+
+def _support_unavailable(reason: Any, unit: str, detail: str = "") -> Any:
+    from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin
+    return AngularSupportProfile.unavailable(reason, origin=SupportOrigin.RUN, radial_unit=unit, detail=detail)
+
+
+def _guarded_support(build: Callable[[], Any], unit: str) -> Any:
+    """Support never fails a frame: an unexpected kernel error is logged and named, intensity unaffected."""
+    from xrd_tools.core.angular_support import SupportReason
+    try:
+        return build()
+    except _ReductionCancelled:
+        raise
+    except Exception as error:  # noqa: BLE001 - support is derived, never a reason to lose a frame
+        logger.exception("angular support capture failed")
+        return _support_unavailable(SupportReason.UNQUALIFIED_GEOMETRY, unit,
+                                    f"support capture failed: {type(error).__name__}")
+
+
+def _standard_frame_support(capture: Any, ai: Any, explicit: np.ndarray | None, bound: bool,
+                            p1: Integration1DPlan, r1d: IntegrationResult1D, chi_mode: bool, grouped: bool) -> Any:
+    """Support of an Int Standard native radial profile, from the mask and window the reducer applied."""
+    from xrd_tools.analysis.angular_support import admitted_window
+    from xrd_tools.core.angular_support import SupportReason
+    unit = str(getattr(r1d, "unit", "") or getattr(p1, "unit", "") or "")
+    if grouped:
+        return _support_unavailable(SupportReason.AVERAGE_RESULT, unit)
+    if chi_mode:
+        return _support_unavailable(SupportReason.NOT_RADIAL_PROFILE, unit)
+
+    def build():
+        mask, digest = capture.applied_mask(ai, explicit, bound=bound)
+        window = admitted_window(p1.azimuth_range, reducer="int_standard",
+                                 offset_deg=float(p1.azimuth_offset or 0.0),
+                                 chi_disc_at_pi=bool(getattr(ai, "chiDiscAtPi", True)))
+        return capture.profile(integrator=ai, mask=mask, mask_digest=digest, convention="detector_chi",
+                               radial_unit=unit, centres=r1d.radial, wavelength_m=getattr(ai, "wavelength", None),
+                               window=window, radial_range=p1.radial_range)
+    return _guarded_support(build, unit)
+
+
+def _gi_frame_support(capture: Any, fi: Any, explicit: np.ndarray | None, plan: ReductionPlan,
+                      p1: Integration1DPlan, incident_angle: float, r1d: IntegrationResult1D, grouped: bool) -> Any:
+    """Support of Int's GI total-q profile in χ_GI (its fast path admits the full turn, its polar path a window)."""
+    from xrd_tools.analysis.angular_support import admitted_window
+    from xrd_tools.core.angular_support import SupportReason
+    gi = plan.gi
+    unit = "q_A^-1" if "A^-1" in str(getattr(p1, "unit", "") or "") else "q_nm^-1"
+    if grouped:
+        return _support_unavailable(SupportReason.AVERAGE_RESULT, unit)
+    if gi.mode_1d is not GI1DMode.Q_TOTAL:
+        return _support_unavailable(SupportReason.NOT_RADIAL_PROFILE, str(getattr(r1d, "unit", "") or unit))
+
+    def build():
+        mask, digest = capture.applied_mask(fi, explicit, bound=False)
+        window = admitted_window(p1.azimuth_range, reducer="int_gi_total_q")
+        angles = (float(incident_angle), float(gi.tilt_angle), int(gi.sample_orientation))
+        return capture.profile(integrator=fi, mask=mask, mask_digest=digest, convention="gi_chi",
+                               radial_unit=unit, centres=r1d.radial, wavelength_m=getattr(fi, "wavelength", None),
+                               window=window, gi=angles, radial_range=p1.radial_range)
+    return _guarded_support(build, unit)
 
 
 def _wants_poisson(plan: ReductionPlan) -> bool:

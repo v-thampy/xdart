@@ -16,6 +16,7 @@ from enum import Enum
 import hashlib
 import importlib.metadata
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -132,6 +133,8 @@ SAMPLE_POSITIONS = ("calibrated", "rotation_axis")
 #: pyFAI error models a MultiGeometry Stitch may request (None = no sigma).
 STITCH_ERROR_MODELS = (None, "poisson")
 
+
+logger = logging.getLogger(__name__)
 
 class StitchGeometryKind(str, Enum):
     PYFAI_GONIOMETER_JSON = "pyfai_goniometer_json"
@@ -3072,6 +3075,8 @@ class StitchOperationResult:
     payload: AnalysisArtifactPayload | None = None
     #: dropped-frame screening summary (policy, excluded/empty/partial labels)
     frame_screen: Mapping[str, object] | None = None
+    #: the Run's angular support of the native radial profile (union of included contributors), or None
+    angular_support: Any = None
 
     def __post_init__(self) -> None:
         committed = self.terminal.disposition is ModuleDisposition.COMMITTED
@@ -3223,6 +3228,8 @@ class StitchOperationExecution:
         self._revision = 0
         self._frame_screen = None
         self._progress_callback: Callable[[ModuleProgress], object] | None = None
+        self._support_policy = None
+        self._angular_support = None
 
     def __copy__(self):
         raise TypeError("stitch operation execution is not copyable")
@@ -3277,7 +3284,8 @@ class StitchOperationExecution:
         total: int,
     ) -> StitchOperationResult:
         if terminal.disposition is not ModuleDisposition.COMMITTED:
-            value = StitchOperationResult(self.request, terminal, frame_screen=self._frame_screen)
+            value = StitchOperationResult(self.request, terminal, frame_screen=self._frame_screen,
+                                          angular_support=self._angular_support)
             self._result = value
             self._state = "done"
             return value
@@ -3364,7 +3372,8 @@ class StitchOperationExecution:
                 "strict MultiGeometry Stitch unexpectedly changed artifact version",
             )
         self._emit("reload", total, total)
-        value = StitchOperationResult(self.request, terminal, payload, frame_screen=self._frame_screen)
+        value = StitchOperationResult(self.request, terminal, payload, frame_screen=self._frame_screen,
+                                      angular_support=self._angular_support)
         self._result = value
         self._verification_terminal = terminal
         self._state = "done"
@@ -3408,11 +3417,13 @@ class StitchOperationExecution:
                     self._emit("science", 1 + done, total)
 
                 screen = FrameScreen(plan.frame_screen, labels, _frame_screen_rows(self.request))
+                support = _xu_support_accumulator(self._support_policy)
                 scientific = run_xu_hist_stitch_1d(
                     plan.calibration,
                     source,
                     frame_indices=labels,
                     frame_screen=screen,
+                    support=support,
                     unit=plan.unit,
                     radial_range=plan.radial_range,
                     conditioning=plan.conditioning,
@@ -3490,6 +3501,7 @@ class StitchOperationExecution:
         diagnostics = scientific.diagnostics
         if (scientific.map is None) is not (plan.mode == "1d"):
             return self._terminal(ModuleDisposition.FAILED, "INVALID_SCIENCE_RESULT")
+        self._angular_support = _stitch_support(support, payload, plan.radial_range, cancel_token)
         try:
             if scientific.map is None:
                 result = dict(kind=AnalysisArtifactKind.STITCH_1D, axes=(("q", payload.radial),),
@@ -3621,8 +3633,11 @@ class StitchOperationExecution:
         cancel_token: threading.Event | None = None,
         progress_callback: Callable[[ModuleProgress], object] | None = None,
         workers: int = 1,
+        angular_support=None,
     ) -> StitchOperationResult:
-        """``workers``: the frames integrated at once (Int's Cores, capped as Int caps them:
+        """``angular_support``: the support capture policy (an ``AngularSupportPolicy``; None: the default).
+
+        ``workers``: the frames integrated at once (Int's Cores, capped as Int caps them:
         ``reduction_worker_cap``); the result is the same for any count, so it is no part of the request.
         pyFAI MultiGeometry integrates them on the workers; xrayutilities keeps its own work on this
         thread (its runtime is one per process) and bins them on the workers."""
@@ -3636,6 +3651,11 @@ class StitchOperationExecution:
             raise ValueError("Stitch workers must be a positive int")
         self._state = "running"
         self._progress_callback = progress_callback
+        from xrd_tools.analysis.angular_support import AngularSupportPolicy
+        policy = AngularSupportPolicy() if angular_support is None else angular_support
+        if type(policy) is not AngularSupportPolicy:
+            raise TypeError("angular_support must be an AngularSupportPolicy or None")
+        self._support_policy = policy
         if type(self.request.plan) is XuStitchOperationPlan:
             return self._run_xu(cancel_token=cancel_token, workers=reduction_worker_cap(workers))
         labels = self.request.module.source.selected_labels
@@ -3695,6 +3715,7 @@ class StitchOperationExecution:
 
                 screen = FrameScreen(self.request.plan.frame_screen, labels,
                                      _frame_screen_rows(self.request))
+                support = _support_accumulator(self._support_policy, self.request.plan)
                 scientific = run_stitch(
                     runtime_plan,
                     oriented,
@@ -3705,6 +3726,7 @@ class StitchOperationExecution:
                     frame_record_callback=frame_callback,
                     frame_screen=screen,
                     workers=reduction_worker_cap(workers),
+                    angular_support=support,
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts, self._frame_screen, oriented)
@@ -3744,6 +3766,9 @@ class StitchOperationExecution:
                            or type(profile[0]) is not IntegrationResult1D
                            or type(profile[1]) is not StitchDiagnostics):
             return self._terminal(ModuleDisposition.FAILED, "INVALID_SCIENCE_RESULT")
+        self._angular_support = _stitch_support(
+            support, payload if self.request.plan.mode == "1d" else profile[0] if native_map else None,
+            self.request.plan.radial_range, cancel_token)
         try:
             if self.request.plan.mode == "1d":
                 axes = (("q", payload.radial),)
@@ -3908,15 +3933,51 @@ def run_stitch_operation(
     progress_callback: Callable[[ModuleProgress], object] | None = None,
     coordinator=None,
     workers: int = 1,
+    angular_support=None,
 ) -> StitchOperationResult:
-    """Run one prepared Stitch operation, retaining cleanup in its exception."""
+    """Run one prepared Stitch operation, retaining cleanup in its exception.
+
+    ``angular_support`` is the support capture policy (None: the default policy)."""
 
     execution = StitchOperationExecution(request, coordinator=coordinator)
     return execution.run(
         cancel_token=cancel_token,
         progress_callback=progress_callback,
         workers=workers,
+        angular_support=angular_support,
     )
+
+
+def _support_accumulator(policy, plan):
+    """The union owner for a MultiGeometry Stitch with a native radial profile, or None."""
+    if policy is None or not policy.enabled:
+        return None
+    if plan.mode == "2d" and not plan.native_records:
+        return None  # a map without its I(q) profile has no native radial profile
+    from xrd_tools.analysis.angular_support import StitchSupportAccumulator
+    return StitchSupportAccumulator(policy, backend="multigeometry")
+
+
+def _xu_support_accumulator(policy):
+    """The union owner for an xrayutilities Stitch (its I(q) is always the native radial profile), or None."""
+    if policy is None or not policy.enabled:
+        return None
+    from xrd_tools.analysis.angular_support import XuSupportAccumulator
+    return XuSupportAccumulator(policy)
+
+
+def _stitch_support(accumulator, profile, radial_range, cancel_token):
+    """The union's support over ``profile``'s own bins; a kernel failure never fails the Stitch."""
+    if accumulator is None or profile is None:
+        return None
+    from xrd_tools.core.angular_support import AngularSupportProfile, SupportReason
+    try:
+        return accumulator.profile(radial=profile.radial, unit=str(profile.unit), radial_range=radial_range,
+                                   cancel=None if cancel_token is None else cancel_token.is_set)
+    except Exception as error:  # noqa: BLE001 - support is derived, never a reason to lose a Stitch
+        logger.exception("Stitch angular support failed")
+        return AngularSupportProfile.unavailable(SupportReason.UNQUALIFIED_GEOMETRY, radial_unit=str(profile.unit),
+                                                 detail=f"support capture failed: {type(error).__name__}")
 
 
 __all__ = [

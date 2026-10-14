@@ -506,6 +506,7 @@ def run_stitch(
     frame_record_callback: Callable[[int, np.ndarray], None] | None = None,
     frame_screen: Any = None,
     workers: int = 1,
+    angular_support: Any = None,
 ) -> AnalysisResult:
     """Run MultiGeometry stitching over one headless frame source or a GROUP.
 
@@ -842,6 +843,7 @@ def run_stitch(
                 payload, auxiliary, *profile, gi_cuts, gi_map = stitch_2d_with_1d_streaming(
                     _iter_images(report=False), len(labels), integrator_series.__iter__, npt_1d=plan.npt_1d,
                     gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers, progress=merged,
+                    support=angular_support,
                     **(dict(unit_1d=plan.unit, radial_range_1d=plan.radial_range) if own_map else {}),
                     **_chi_window(plan, "azimuth_range_1d"),
                     **arguments)
@@ -867,7 +869,7 @@ def run_stitch(
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
                 frame_screen=frame_screen, gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers,
-                progress=merged, **_chi_window(plan, "azimuth_range"), **corrections,
+                progress=merged, support=angular_support, **_chi_window(plan, "azimuth_range"), **corrections,
             )
         else:
             assert integrators is not None
