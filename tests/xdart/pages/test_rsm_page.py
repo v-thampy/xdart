@@ -1446,23 +1446,29 @@ def test_the_source_is_stitchs_rows_and_the_member_table_is_gone(qapp, tmp_path)
     try:
         assert not hasattr(page, "member_table") and not any(
             hasattr(page, f"member_{name}_button") for name in ("add", "remove", "up", "down", "preset"))
-        keys = ("source_kind", "spec_path", "subdirs", "name_filter", "image_dir", "image_stem", "scan_mode", "scan")
+        # LT-SMALL-FIXES-20261014 (LT-006, maintainer's layout, October 14): the Source-kind row is gone; the Project's
+        # Data format and the Files/Folder menu on the first path row, with Directory's Subdirs, make the kind
+        keys = ("input_mode", "spec_path", "subdirs", "name_filter", "image_dir", "image_stem", "scan_mode", "scan")
         assert all(page.controls.source_card.isAncestorOf(page._rows[key]) for key in keys)
-        assert (page._fields["source_kind"].path, page._fields["subdirs"].path) == (SOURCE_TYPE, SOURCE_RECURSIVE)
-        assert page._rows["source_kind"].parentWidget() is page._rows["subdirs"].parentWidget()  # one row
-        assert page._fields["source_kind"].choices == ("Spec", "NeXus", "Directory")
+        assert (page._fields["input_mode"].path, page._fields["subdirs"].path) == (("Source", "input_mode"),
+                                                                                   SOURCE_RECURSIVE)
+        assert (page._rows["input_mode"].parentWidget() is page._rows["subdirs"].parentWidget()
+                is page._rows["spec_path"].parentWidget())  # one row
+        assert page._fields["input_mode"].choices == ("files", "directory") and "source_kind" not in page._fields
+        assert page._value("source_kind") == "Spec"
+        assert all(field.path != SOURCE_TYPE for field in page._fields.values())
         assert page._source_paths == () and page._value("scan") == "1"  # no preset: Stitch's empty Source
 
         def shown():
             return {key for key in keys if not page._rows[key].isHidden()}
-        assert shown() == {"source_kind", "spec_path", "image_dir", "image_stem", "scan_mode", "scan"}
+        assert shown() == {"input_mode", "spec_path", "image_dir", "image_stem", "scan_mode", "scan"}
         page.set_field("scan_mode", "All Scans")
         assert "scan" not in shown()
         page.set_field("source_kind", "Directory")
-        assert shown() == {"source_kind", "spec_path", "subdirs", "name_filter", "image_dir", "image_stem"}
-        assert page._rows["spec_path"].label.text() == "Folder"
+        assert shown() == {"input_mode", "spec_path", "subdirs", "name_filter", "image_dir", "image_stem"}
+        assert page._rows["input_mode"].label.text() == "Folder"
         page.set_field("source_kind", "NeXus")
-        assert shown() == {"source_kind", "spec_path"} and page._rows["spec_path"].label.text() == "NeXus files"
+        assert shown() == {"input_mode", "spec_path"} and page._rows["input_mode"].label.text() == "NeXus File"
         page.set_sources([str(tmp_path / "a.nxs"), str(tmp_path / "b.nxs")])
         assert page._value("spec_path") == "2 files selected"
         page.set_field("source_kind", "Spec")  # each kind keeps its own files
