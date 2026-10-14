@@ -1021,7 +1021,6 @@ def test_k9_stitch_saved_support_and_legacy(tmp_path):
     plain = read_analysis_artifact(_off_request.module.output.target)
     np.testing.assert_array_equal(payload.intensity, plain.intensity)
     np.testing.assert_array_equal(payload.coverage, plain.coverage)
-    assert payload.result_fingerprint == plain.result_fingerprint, "support stays outside the fingerprint"
     # an older Stitch result (no support datasets) is refused, never reconstructed (D6). Decision 6: recording off
     # now records that it was off, so the older form is a written result with its support removed.
     older = tmp_path / "older.nexus"
@@ -1029,7 +1028,11 @@ def test_k9_stitch_saved_support_and_legacy(tmp_path):
     with h5py.File(older, "r+") as handle:
         for name in ANGULAR_SUPPORT_DATASETS:
             del handle["entry/integrated_1d"][name]
-    assert read_analysis_artifact(older).angular_support.reason is SupportReason.LEGACY_STITCH
+    older_payload = read_analysis_artifact(older)
+    assert older_payload.angular_support.reason is SupportReason.LEGACY_STITCH
+    # the same result with and without its support: only support differs, so the fingerprint must not (two Stitches
+    # in different directories always differ by their own provenance — test-only oracle repair)
+    assert older_payload.result_fingerprint == payload.result_fingerprint, "support stays outside the fingerprint"
     assert REASON_TEXT[SupportReason.LEGACY_STITCH] == \
         "Older Stitch result: reprocess it to record angular coverage."
     # membership replacement: a new run's provenance names its own membership
