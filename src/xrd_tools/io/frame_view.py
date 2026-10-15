@@ -3058,13 +3058,18 @@ class FrameViewReader:
             return view
 
     def _support_table(self, group):
-        """The primary group's validated support index (an index, never values), cached per group, or its error."""
+        """The primary group's validated support index (an index, never values), cached per group, or its error.
+
+        The table is bounded by the group's own stored row count (its qualified ``frame_index`` shape, metadata
+        only), never by this reader's frame map: a target reader maps one label (ANGULAR-SUPPORT-TARGET-FRAME-BOUND).
+        """
         from xrd_tools.io.angular_support import AngularSupportFormatError, SupportTableReader, recorded_off
         table = self._support_tables.get(group.name)
         if table is None:
+            inventory = _required_direct_dataset(group, "frame_index", role=f"{group.name}/frame_index")
+            rows = 0 if inventory is None else int(_qualify_frame_index(group, inventory).shape[0])
             try:
-                table = SupportTableReader(group, frame_count=len(self._map_1d_modes.get(self._primary_mode_1d, {})),
-                                           recording_off=recorded_off(self._entry))
+                table = SupportTableReader(group, frame_count=rows, recording_off=recorded_off(self._entry))
             except AngularSupportFormatError as error:
                 table = error
             self._support_tables[group.name] = table
