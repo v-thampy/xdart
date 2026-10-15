@@ -139,7 +139,8 @@ def _config_from_plan(plan: Any) -> dict[str, Any]:
 
 
 #: per dimension: its arguments, its GI mode and the ranges a GI freeze fixes when the Run left them automatic
-_GI_RUN_FREEZE = (("bai_1d_args", "1d", ("radial_range",)), ("bai_2d_args", "2d", ("x_range", "y_range")))
+_GI_RUN_FREEZE = (("bai_1d_args", "1d", ("radial_range", "azimuth_range")),
+                  ("bai_2d_args", "2d", ("x_range", "y_range", "radial_range", "azimuth_range")))
 
 
 def gi_aligned_run_configuration(run_configuration: Any, config: Mapping[str, Any]) -> Any:
