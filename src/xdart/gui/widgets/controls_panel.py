@@ -76,7 +76,8 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "how many degrees of its χ window the detector's unmasked pixels reach in every radial bin. Plot Options' "
         "“Show angular coverage” only displays it. This is angular reach, not a pixel count, and it never changes "
         "intensity. Off by default; turn On to compute and save it. When it is off, the result records that it was "
-        "off, and Browse does not reconstruct it. The choice belongs to the output: Append (and Reintegrate) keep "
+        "off. Show can compute coverage on demand for qualifying saved Standard Int results; Stitch needs it recorded. "
+        "The recording choice belongs to the output: Append (and Reintegrate) keep "
         "the one an output was created with, and the Run says so when that differs from this setting; a new output "
         "or Overwrite takes this setting."),
     ("Mask", "Threshold"): (

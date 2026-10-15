@@ -24,7 +24,8 @@ COVERAGE_TOOLTIP = (
 ANGULAR_SUPPORT_TOOLTIP = (
     "Show angular coverage below the 1-D plot: for each radial bin, the share of the profile's χ window "
     "(360° without one) that unmasked detector pixels reach, saved with the result when it was processed "
-    "(or reconstructed for an older result that qualifies). This is angular reach, not a pixel count, and it never "
+    "(or computed on demand for a saved Standard Int result that qualifies, even if recording was Off). "
+    "Stitch requires recorded angular coverage. This is angular reach, not a pixel count, and it never "
     "changes intensity. Hover for the degrees over a bin. Display only: Okay applies it and Cancel discards the "
     "change; whether a Run records coverage is Processing's “Record angular coverage”."
 )

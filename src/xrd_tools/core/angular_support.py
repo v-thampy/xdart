@@ -66,7 +66,7 @@ class SupportReason(str, Enum):
     LEGACY_REINTEGRATE = "legacy_reintegrate"
     LEGACY_STITCH = "legacy_stitch"
     PENDING = "pending"
-    #: “Record angular coverage” was off when the result was processed (decision 6): never reconstructed.
+    #: “Record angular coverage” was off when processed; saved Standard Int may qualify for display reconstruction.
     RECORDING_DISABLED = "recording_disabled"
 
 
