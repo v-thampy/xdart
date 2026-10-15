@@ -2950,8 +2950,10 @@ class NexusSink:
                 (scan, plan), include_inputs=writer.fresh
             )
             if self._run_configuration is not None:
-                config["run_configuration"] = copy.deepcopy(
-                    self._run_configuration,
+                from xrd_tools.reduction.provenance_config import gi_aligned_run_configuration
+                # a GI Run records the settings it ran: its modes and its freeze's ranges (G1)
+                config["run_configuration"] = gi_aligned_run_configuration(
+                    self._run_configuration, config,
                 )
             if self._source_execution is not None:
                 config["source_execution"] = copy.deepcopy(

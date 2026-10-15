@@ -2548,19 +2548,23 @@ def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, targ
     # A GI energy scan's common grid comes from its Run's scouts; Reintegrate does not repeat them yet.
     _reject(gi["enabled"] and "frame_energies_eV" in (shared.get("energy_selection") or {}),
             "Reintegrate does not yet repeat a GI energy scan; run it again instead")
-    if not gi["enabled"] or gi["resolved_motor"] == "Manual": return selected, None
-    try: bootstrap = float(observed.gi_values[observed.labels[0]])
+    if not gi["enabled"]: return selected, None
+    # A Manual run's frames all sit at its recorded angle, with no motor readings (the bootstrap stays None, as the
+    # recipe checks it against them): its automatic ranges are frozen as its Run froze them, over its first and last
+    # frames (LT-SMALL-FIXES-20261014 G1; maintainer, October 14: "Freeze Manual GI").
+    manual = gi["resolved_motor"] == "Manual"
+    try: bootstrap = None if manual else float(observed.gi_values[observed.labels[0]]); angle = float(gi["th_val"]) if manual else bootstrap
     except (KeyError, TypeError, ValueError) as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
-    _reject(not math.isfinite(bootstrap), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
+    _reject(not math.isfinite(angle), "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
     from xrd_tools.reduction.core import Frame, Scan, _apply_gi_freeze_policy, _gi_1d_freeze_key, _gi_2d_freeze_keys, prepare_gi_freeze; metadata_keys, include_geometry = _fact_projection(selected, shared)
     class Manifest: scan_manifest = lambda self: [(label, {gi["resolved_motor"]: value}) for label, value in observed.gi_values.items()]
     plan, diagnostic = prepare_gi_freeze(Manifest(), _core_plan(selected, shared, observed.mask), incidence_motor=gi["resolved_motor"])
     _reject(diagnostic.status == "unverifiable", "GI metadata extrema are unverifiable"); missing = _gi_1d_freeze_key(plan) is not None or bool(_gi_2d_freeze_keys(plan))
     if not missing: return selected, bootstrap
-    scouts = diagnostic.scout_indices if diagnostic.status == "frozen" else (observed.labels[0],); plan = plan if diagnostic.status == "frozen" else __import__("dataclasses").replace(plan, extra={**plan.extra, "gi_freeze_scout_indices": list(scouts)})
+    scouts = diagnostic.scout_indices if diagnostic.status == "frozen" else tuple(dict.fromkeys((observed.labels[0], observed.labels[-1]))) if manual else (observed.labels[0],); plan = plan if diagnostic.status == "frozen" else __import__("dataclasses").replace(plan, extra={**plan.extra, "gi_freeze_scout_indices": list(scouts)})
     holder = {"frame": None}; frames = []
     for label in scouts:
-        frame = Frame(label, metadata={gi["resolved_motor"]: observed.gi_values[label]}); frames.append(frame)
+        frame = Frame(label, metadata={} if manual else {gi["resolved_motor"]: observed.gi_values[label]}); frames.append(frame)
         def load(current, label=label):
             import h5py; from xrd_tools.io.record_writer import _decode_replacement_fact
             prior = holder["frame"]; _scrub_frame(prior) if prior is not None else None; _event(cancel_token)
@@ -2575,11 +2579,12 @@ def _prepare_gi_scouts(target, entry, observed, selected, shared, snapshot, targ
             holder["frame"] = current; return image
         frame.loader = load
     calibration, integrator, fi = _calibration(shared, bootstrap)
-    try: frozen = _apply_gi_freeze_policy(plan, Scan("reintegrate-scout", frames, poni=None if calibration is None else calibration.poni, integrator=integrator), freeze_policy="scout_union", fi=fi, initial_incident_angle=bootstrap)
+    try: frozen = _apply_gi_freeze_policy(plan, Scan("reintegrate-scout", frames, poni=None if calibration is None else calibration.poni, integrator=integrator), freeze_policy="scout_union", fi=fi, initial_incident_angle=angle)
     except __import__("xrd_tools.io.record_writer", fromlist=["WriterStateError"]).WriterStateError as error: raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
     finally: [_scrub_frame(frame) for frame in frames]
     from xrd_tools.reduction.provenance_config import _integration_1d_args, _integration_2d_args
-    _reject(_gi_1d_freeze_key(frozen) is not None or _gi_2d_freeze_keys(frozen), "GI range freeze is incomplete"); args = (_integration_1d_args(frozen.integration_1d, frozen.gi) if selected["dimension"] == "1d" else _integration_2d_args(frozen.integration_2d, frozen.gi)); args.pop(f"gi_mode_{selected['dimension']}", None); return {**selected, "bai_args": args}, bootstrap
+    _reject(_gi_1d_freeze_key(frozen) is not None or _gi_2d_freeze_keys(frozen), "GI range freeze is incomplete"); args = (_integration_1d_args(frozen.integration_1d, frozen.gi) if selected["dimension"] == "1d" else _integration_2d_args(frozen.integration_2d, frozen.gi)); args.pop(f"gi_mode_{selected['dimension']}", None)
+    return {**selected, "bai_args": json.loads(json.dumps(args))}, bootstrap  # JSON values: a 2-D freeze's x/y ranges are tuples
 def _requirements(shape, dtype, selected, shared):
     terms = _background_resource_terms(shared["background"]["mode"], shape)
     descriptor = SimpleNamespace(frame_shape=shape, dtype=_native_dtype('<f8' if 'point_images' in shared else dtype))
