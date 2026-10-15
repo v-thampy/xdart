@@ -73,8 +73,12 @@ class _OwnedExport:
         from xdart.gui.widgets.file_dialogs import save_later
         if self.owner is not None and isQObjectAlive(self.owner):
             # the callback holds this exporter: the dialog replaces its current one when its target changes
-            self.fileDialog = save_later(self.owner, "Export", file_filter=filter, opts=opts,
-                                         on_selected=lambda path, exporter=self: exporter.fileSaveFinished(path))
+            def selected(path):
+                self.fileDialog = dialog  # upstream completion must read this Save's filter/options
+                self.fileSaveFinished(path)
+
+            dialog = save_later(self.owner, "Export", file_filter=filter, opts=opts, on_selected=selected)
+            self.fileDialog = dialog
 
     def export(self, *args, **kwargs):
         owner = self.owner
