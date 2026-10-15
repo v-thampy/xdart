@@ -265,6 +265,58 @@ def _calibration_files(root):
 
 
 @pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
+def test_quick_use_for_both_copies_only_the_effective_folder(qapp, tmp_path, page_name):
+    """Separate SPEC locations keep Auto stems; either Quick folder can be copied once, including a draft."""
+    from xdart.gui.widgets.controls_panel import ActionButton
+    page, dialog = _window(qapp, tmp_path / 'project', page_name)
+    try:
+        _quick_card(dialog)
+        rows = dialog._quick_rows
+        buttons = {}
+        for prefix in ('beam_', ''):
+            found = [button for button in rows[prefix + 'images'].findChildren(ActionButton)
+                     if button.text() == 'Use for both']
+            assert len(found) == 1, 'each Quick Image Path needs its own Use for both action'
+            buttons[prefix] = found[0]
+            assert not buttons[prefix].isEnabled() and buttons[prefix].toolTip()
+            for key in ('images', 'stem'):
+                assert rows[prefix + key].current_value() == ''
+                assert 'auto' in rows[prefix + key].editor.placeholderText().lower()
+            spec = tmp_path / (prefix or 'calibrant') / 'scan'
+            spec.parent.mkdir()
+            spec.write_text('#F scan\n')
+            _commit(rows[prefix + 'source'].editor, str(spec))
+        _wait(dialog)
+        # Copying Auto means the source SPEC's actual folder, not another blank Auto value.
+        _click(buttons['beam_'])
+        _wait(dialog)
+        assert dialog._spec().options['image_dir'] == str(tmp_path / 'beam_')
+        assert dialog._text('beam_images') == ''
+        assert dialog._text('images') == str(tmp_path / 'beam_')
+        assert (dialog._text('beam_stem'), dialog._text('stem')) == ('', '')
+        # Reverse direction: the typed full path is used even before Return, and explicit stems survive.
+        _commit(rows['beam_stem'].editor, 'direct_')
+        _commit(rows['stem'].editor, 'powder_')
+        common = tmp_path / 'all images'
+        common.mkdir()
+        _type(rows['images'].editor, str(common))
+        _click(buttons[''])
+        _wait(dialog)
+        assert (dialog._text('images'), dialog._text('beam_images')) == (str(common), str(common))
+        assert (dialog._text('beam_stem'), dialog._text('stem')) == ('direct_', 'powder_')
+        # Editing either folder afterwards does not link them; clearing restores that role's Auto.
+        _type(rows['images'].editor, '')
+        QTest.keyClick(rows['images'].editor, QtCore.Qt.Key.Key_Backspace)
+        QTest.keyClick(rows['images'].editor, QtCore.Qt.Key.Key_Return)
+        _wait(dialog)
+        assert dialog._text('beam_images') == str(common) and dialog._text('images') == ''
+        assert dialog._spec().options['image_dir'] == str(tmp_path / 'calibrant')
+        assert (dialog._text('beam_stem'), dialog._text('stem')) == ('direct_', 'powder_')
+    finally:
+        _close(qapp, page, dialog)
+
+
+@pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
 def test_quick_card_placement_and_shared_values(qapp, tmp_path, monkeypatch, page_name):
     """Q1 (A1, A2): the card's two scans are the same values as 2 · Rough geometry's and 3 · Calibrant scan's,
     edited in either place, full paths kept behind the file name; a scan number edited on the card keeps tab 3's

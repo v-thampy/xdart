@@ -559,6 +559,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._quick_detected_generation = None
         #: canonical key -> the card's row showing it (beam_source, beam_scan, source, scan)
         self._quick_rows = {}
+        self._quick_folder_buttons = {}
         #: key -> its file row's chooser, so another row can browse as it does (the Quick card's)
         self._choosers = {}
         self._fields = {}
@@ -1208,7 +1209,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                 else SourceKind.SPEC) if prefix else (
                     SourceKind.NEXUS_STACK if self.source_kind.currentData() == 'nexus_stack' else SourceKind.SPEC)
         spec = self._spec(beam=bool(prefix))
-        folder = self._text(prefix + 'images') or str(Path(path).expanduser().absolute().parent)
+        folder = self._image_folder(prefix)
         self._auto_placeholders(prefix)
         self._source_details_inputs_key = self._source_details_input_key(prefix)
         self._start('source_details', (prefix, spec, folder, self._text(prefix + 'stem')))
@@ -1754,6 +1755,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         its own), the window's Threshold (Advanced's, likewise; maintainer, 2026-10-08) and one action that runs the
         window's own direct-beam fit, metadata read and Refine from the rough geometry (_quick_advance). Its mask is
         the Detector panel's one Mask file, exposed just above (LT-009: no duplicate row)."""
+        from .orientation_views import action
         self.quick_card = SectionCard('Quick calibration')
         tip = ('Fit direct-beam distance (2 · Rough geometry), Read metadata (3 · Calibrant scan), then Refine '
                'automatically from the rough geometry (4 · Calibrate and fit), one after another. It stops at the '
@@ -1790,6 +1792,12 @@ class CalibrationDialog(QtWidgets.QDialog):
             form.addRow(file_row.label, file_row)
             images_row = FormRow(label='Image Path', path=('Calibration', 'Quick', prefix + 'images'),
                                  value='', browse=True)  # under its scan's file row, which names the role
+            copy_folder = action('Use for both',
+                f"Copy this {scan.lower()} scan's image folder once to the other scan. Auto uses this SPEC "
+                "file's folder. Each scan keeps its own Image Stem; clear a field to restore Auto.", self)
+            self._quick_folder_buttons[prefix] = copy_folder
+            copy_folder.clicked.connect(lambda _checked=False, prefix=prefix: self._quick_copy_folder(prefix))
+            images_row.add_trailing_widget(copy_folder)
             stem_row = FormRow(label='Image Stem', path=('Calibration', 'Quick', prefix + 'stem'), value='')
             stem_row.label.setMinimumWidth(0)
             images_row.add_trailing_widget(stem_row, 1)
@@ -1802,6 +1810,8 @@ class CalibrationDialog(QtWidgets.QDialog):
                                               'here or there.')
             for key, row in ((prefix + 'source', file_row), (prefix + 'images', images_row)):
                 row.browseRequested.connect(lambda _path, key=key: self._browse(key, self._choosers[key]))
+                row.draftChanged.connect(self._sync_quick_folder_buttons)
+                self._fields[key].textChanged.connect(self._sync_quick_folder_buttons)
         self.quick_threshold = self._threshold_row()  # Advanced's threshold: one state, shown on both rows
         form.addRow(self.quick_threshold.label, self.quick_threshold)
         self._show_threshold()
@@ -1867,6 +1877,34 @@ class CalibrationDialog(QtWidgets.QDialog):
             rows[prefix + 'source'].label.setText(f"{role} {'NeXus' if nexus else 'SPEC'} file")
             rows[prefix + 'scan'].setVisible(not nexus)
             rows[prefix + 'entry'].setVisible(not series and self._shared_nexus_entry is None)
+        self._sync_quick_folder_buttons()
+
+    def _sync_quick_folder_buttons(self, *_args):
+        for prefix, button in self._quick_folder_buttons.items():
+            rows = self._quick_rows
+            reason = ''
+            if self._quick_stage is not None or (self._owner.busy and self._job not in ('beam_detect', 'source_details')):
+                reason = 'Available when the current calibration operation ends.'
+            elif self.rough_mode.currentData() != 'scan':
+                reason = 'Select Direct-beam scan in Rough geometry to use both scan folders.'
+            elif self.beam_source_kind.currentData() == 'nexus' or self.source_kind.currentData() == 'nexus_stack':
+                reason = 'Both scans must use SPEC files with image folders.'
+            elif not (str(rows[prefix + 'images'].current_value()).strip()
+                      or str(rows[prefix + 'source'].current_value()).strip()):
+                reason = "Select this scan's SPEC file or enter its Image Path first."
+            button.apply_spec(replace(button.spec, enabled=not reason, reason=reason))
+
+    def _quick_copy_folder(self, prefix):
+        """One explicit folder copy through the existing commits; stems remain independent."""
+        if not self._quick_folder_buttons[prefix].isEnabled():
+            return
+        for key in (prefix + 'source', prefix + 'images'):
+            self._quick_commit(key, self._quick_rows[key].current_value())
+        self._quick_commit(('' if prefix else 'beam_') + 'images', self._image_folder(prefix))
+
+    def _image_folder(self, prefix=''):
+        path = self._text(prefix + 'source')
+        return self._text(prefix + 'images') or (str(Path(path).resolve().parent) if path else '')
 
     def _build_distance(self):
         layout, form = self._form('2 · Rough geometry', 'rough')
@@ -2765,7 +2803,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                              **({'nexus_entry': self._shared_nexus_entry} if self._shared_nexus_entry else {})})
             # a blank folder is the SPEC file's, as in Stitch; a blank stem is the source's default
             options = {'scan': self._text(prefix + 'scan'),
-                       'image_dir': self._text(prefix + 'images') or str(Path(path).resolve().parent),
+                       'image_dir': self._image_folder(prefix),
                        'read_image_kwargs': self._reader()}
             if self._text(prefix + 'stem'):
                 options['image_stem'] = self._text(prefix + 'stem')
@@ -3677,6 +3715,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _sync_quick_button(self):
         """Every start and end of a job comes here: the Quick button and the job buttons follow it."""
         self._sync_job_buttons()
+        self._sync_quick_folder_buttons()
         if not hasattr(self, 'quick_button'):
             return
         active = self._quick_stage is not None
