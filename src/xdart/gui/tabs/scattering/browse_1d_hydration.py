@@ -238,7 +238,7 @@ class _HydrationTask:
 
     __slots__ = (
         "request", "signature", "cancelled", "thread", "running",
-        "reader", "reader_entered", "borrows", "status", "diagnostic",
+        "reader", "reader_entered", "borrows", "held", "status", "diagnostic",
         "cleanup_pending",
     )
 
@@ -255,6 +255,9 @@ class _HydrationTask:
         self.reader: object | None = None
         self.reader_entered = False
         self.borrows: list[object] = []
+        #: each row key's latest borrow in ``borrows``: a key is borrowed again only after its earlier borrow was
+        #: released, so this is the only one of its borrows that can still be held
+        self.held: dict[object, object] = {}
         self.status: Browse1DHydrationStatus | None = None
         self.diagnostic = ""
         self.cleanup_pending = False
@@ -711,10 +714,9 @@ class Browse1DHydrationLane:
 
     @staticmethod
     def _borrow_is_held(task: _HydrationTask, key: object) -> bool:
-        return any(
-            not borrowed.released and borrowed.key == key
-            for borrowed in task.borrows
-        )
+        # one lookup, not a scan of every borrow of the request per key (INT-PERF-DIRECT-20261015)
+        borrowed = task.held.get(key)
+        return borrowed is not None and not borrowed.released
 
     def _protect_keys(
         self,
@@ -731,9 +733,11 @@ class Browse1DHydrationLane:
             ):
                 raise ValueError("Browse 1-D expected inventory changed target")
             if not self._borrow_is_held(task, key):
-                task.borrows.append(task.request.cache.borrow(
+                borrowed = task.request.cache.borrow(
                     target.ordinal, target.label, key.name,
-                ))
+                )
+                task.borrows.append(borrowed)
+                task.held[borrowed.key] = borrowed
         actual = tuple(
             key for key in task.request.cache.resident_keys
             if key.frame == target.ordinal and key.label == target.label
@@ -837,6 +841,8 @@ class Browse1DHydrationLane:
             borrowed = task.borrows[0]
             borrowed.release()
             task.borrows.pop(0)
+            if task.held.get(borrowed.key) is borrowed:
+                del task.held[borrowed.key]
 
     @staticmethod
     def _close_reader(task: _HydrationTask) -> None:
