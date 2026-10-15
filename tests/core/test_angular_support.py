@@ -329,10 +329,22 @@ def _int_scan(ai, images, name="k", mask=None):
     return Scan(name, [Frame(index, image=image, mask=mask) for index, image in enumerate(images)], integrator=ai)
 
 
+#: pass no angular support policy at all, so the API's own default applies (INT-PERF-REGRESSION-20261014 A4)
+_OMITTED = object()
+
+
+def _explicit(policy):
+    """Coverage science asks for recording explicitly (Off by default since INT-PERF-REGRESSION-20261014): None is
+    explicit On, ``_OMITTED`` passes nothing, any other policy is passed as given."""
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy
+    if policy is _OMITTED:
+        return {}
+    return {"angular_support": AngularSupportPolicy(enabled=True) if policy is None else policy}
+
+
 def _run(plan, scan, policy=None):
     from xrd_tools.reduction import run_reduction
-    kwargs = {} if policy is None else {"angular_support": policy}
-    return run_reduction(plan, scan, execution="chunked", executor=False, **kwargs)
+    return run_reduction(plan, scan, execution="chunked", executor=False, **_explicit(policy))
 
 
 def test_k2b_value_conditioning_never_reduces_support_and_intensity_is_unchanged():
@@ -598,7 +610,7 @@ def test_k5_capture_and_availability(tmp_path):
 
     # D3: an over-budget Run keeps its intensity and names its reason
     over = _run(ReductionPlan(integration_1d=Integration1DPlan(npt=40, unit="2th_deg")), _int_scan(ai, images),
-                AngularSupportPolicy(max_geometry_keys=0))
+                AngularSupportPolicy(enabled=True, max_geometry_keys=0))
     plain_run = _run(ReductionPlan(integration_1d=Integration1DPlan(npt=40, unit="2th_deg")), _int_scan(ai, images),
                      AngularSupportPolicy(enabled=False))
     for index in range(3):
@@ -624,9 +636,20 @@ def _energy_scan_views(energies, unit):
                          integration_2d=Integration2DPlan(npt_rad=64, npt_azim=36, unit=unit),
                          extra={"energy_selection": scan.extra["energy_selection"]})
     store = FrameRecordStore()
+    # coverage science asks for recording explicitly (Off by default since INT-PERF-REGRESSION-20261014), through an
+    # exact validated session policy, as R3 does
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy
+    from xrd_tools.session.policy import requirements_from, resolve_session_policy
+    image = frames[0].image
+    policy = resolve_session_policy(
+        requirements_from(SimpleNamespace(frame_shape=image.shape, dtype=image.dtype), plan),
+        envelope_bytes=8 * 1024 ** 3, env={})
     session = open_headless_scan_session(
         scan, plan, sink=MemorySink(), record_store=store, executor=1,
-        ring_geometry=readiness.effective_ring_geometry(accepted, integrator=scan.integrator))
+        ring_geometry=readiness.effective_ring_geometry(accepted, integrator=scan.integrator),
+        policy=replace(policy, angular_support=AngularSupportPolicy(enabled=True)))
     for frame in frames:
         session.submit(frame)
     session.finish()
@@ -901,7 +924,7 @@ def _stitch(tmp_path, poses, images, *, azimuth=None, unit="q_A^-1", policy=None
     target = resolve_finite_output_target(tmp_path, "native", operation_token="stitch-1d")
     output = ModuleOutputRequest(target, AnalysisArtifactKind.STITCH_1D, artifact_family="native")
     request = prepare_stitch_operation(source, output, plan, project_root=tmp_path)
-    return request, run_stitch_operation(request, **({} if policy is None else {"angular_support": policy}))
+    return request, run_stitch_operation(request, **_explicit(policy))
 
 
 def _pose_ai(delta, nu):
@@ -984,7 +1007,7 @@ def test_k8b_xu_corners_and_support(tmp_path):
     mean /= np.linalg.norm(mean, axis=-1, keepdims=True)
     angle = np.arccos(np.clip(np.sum(mean * vectors(tth_centre, chi_centre), axis=-1), -1, 1))
     assert float(np.max(angle)) <= 2e-6, "XU corners are half-pixel exact about XU's own centres"
-    result = run_stitch_operation(request)
+    result = run_stitch_operation(request, **_explicit(None))  # coverage science asks for recording explicitly
     support = result.angular_support
     assert support.available and support.provenance["backend"] == "xu_hist"
     assert np.all((support.supported_deg >= 0) & (support.supported_deg <= support.window_deg + 1e-9))

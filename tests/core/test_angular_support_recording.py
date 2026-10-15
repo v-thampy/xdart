@@ -4,6 +4,9 @@ The maintainer's addition at the step-3 disposition: “Record angular coverage�
 AngularSupportPolicy (SessionPolicy.angular_support for Int, the Stitch operation's policy argument). Off skips the
 computation and its coverage arrays and records an explicit disabled reason; the default is one constant. Spies wrap
 the real kernel; nothing is faked. New APIs are imported inside each row.
+
+INT-PERF-REGRESSION-20261014 Stage A: the maintainer switched the default Off (“Switch the default to Off”); R1 and R3
+now pin Off, and A4 pins an omitted policy against explicit On and Off for Int and Stitch.
 """
 from unittest import mock
 
@@ -13,11 +16,11 @@ import numpy as np
 from tests.core.test_angular_support import _planar, _saved_int, _stitch
 
 
-def test_r1_the_default_is_one_constant_and_it_is_on():
+def test_r1_the_default_is_one_constant_and_it_is_off():
     from xrd_tools.analysis.angular_support import AngularSupportPolicy, DEFAULT_RECORD_ANGULAR_SUPPORT
     from xrd_tools.core.angular_support import REASON_TEXT, SupportReason
     from xrd_tools.session.policy import SessionPolicy
-    assert DEFAULT_RECORD_ANGULAR_SUPPORT is True
+    assert DEFAULT_RECORD_ANGULAR_SUPPORT is False, "Off by default (INT-PERF-REGRESSION-20261014 Stage A)"
     assert AngularSupportPolicy().enabled is DEFAULT_RECORD_ANGULAR_SUPPORT
     assert SessionPolicy().angular_support is None, "None means the default policy"
     assert SupportReason.RECORDING_DISABLED.value == "recording_disabled"
@@ -86,7 +89,9 @@ def test_r3_session_policy_carries_the_int_policy():
         session.finish()
         return [next(iter(store.get(frame.index).results_1d.values())).angular_support for frame in frames]
 
-    assert all(item.available for item in published(None))
+    assert all(item.reason is SupportReason.RECORDING_DISABLED for item in published(None)), \
+        "no Int policy is the default policy, which records nothing"
+    assert all(item.available for item in published(AngularSupportPolicy(enabled=True)))
     off = published(AngularSupportPolicy(enabled=False))
     assert all(item.reason is SupportReason.RECORDING_DISABLED for item in off)
 
@@ -108,3 +113,28 @@ def test_r4_stitch_off_skips_computation_and_records_its_reason(tmp_path):
     saved = read_analysis_artifact(target).angular_support
     assert saved.reason is SupportReason.RECORDING_DISABLED and saved.origin is SupportOrigin.SAVED
     assert read_stitch_record(target).angular_support.reason is SupportReason.RECORDING_DISABLED
+
+
+def test_a4_an_omitted_policy_is_the_default_and_explicit_policies_win(tmp_path):
+    """INT-PERF-REGRESSION-20261014 A4: headless Int and Stitch given no policy record nothing, since the default is
+    Off; explicit AngularSupportPolicy(enabled=True/False) is honored either way, and recording never changes
+    intensity."""
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy
+    from xrd_tools.core.angular_support import SupportReason
+    from xrd_tools.reduction import Integration1DPlan, ReductionPlan
+    from tests.core.test_angular_support import _OMITTED, _int_scan, _run
+    ai = _planar(shape=(120, 160), poni=(0.006013, 0.008007))
+    images = [np.full((120, 160), 50.0, np.float32)]
+    plan = ReductionPlan(integration_1d=Integration1DPlan(npt=40, unit="2th_deg", method="csr"))
+    omitted, on, off = (_run(plan, _int_scan(ai, images), policy).frames[0] for policy in
+                        (_OMITTED, AngularSupportPolicy(enabled=True), AngularSupportPolicy(enabled=False)))
+    assert omitted.angular_support_1d.reason is SupportReason.RECORDING_DISABLED, "no Int policy: Off"
+    assert on.angular_support_1d.available, "explicit On records"
+    assert off.angular_support_1d.reason is SupportReason.RECORDING_DISABLED
+    np.testing.assert_array_equal(omitted.result_1d.intensity, on.result_1d.intensity)
+    ones = np.full((195, 487), 200, np.uint16)
+    poses = ((0.0, 0.0), (8.0, 0.0))
+    _request, stitched = _stitch(tmp_path / "omitted", poses, [ones] * 2, policy=_OMITTED)
+    assert stitched.angular_support.reason is SupportReason.RECORDING_DISABLED, "no Stitch policy: Off"
+    _request, stitched = _stitch(tmp_path / "on", poses, [ones] * 2, policy=AngularSupportPolicy(enabled=True))
+    assert stitched.angular_support.available, "explicit On records"

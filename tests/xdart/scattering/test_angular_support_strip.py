@@ -74,7 +74,9 @@ def _hover(view):
 
 def _masked_series(root, *, mode='Int 1D', unit='2th_deg', energies=(16, 16), output_mode='Overwrite', one=None,
                    band=BAND):
-    """A Run of a perpendicular Pilatus 100K with one masked column band (analytic expectation)."""
+    """A Run of a perpendicular Pilatus 100K with one masked column band (analytic expectation). Coverage science
+    asks for recording explicitly, Off being the default since INT-PERF-REGRESSION-20261014; a row about the default
+    itself removes the option."""
     root.mkdir(parents=True, exist_ok=True)
     intent = _series(root, energies, mode=mode, unit=unit, one={'npt': 32, 'method': 'csr', **(one or {})},
                      poni_text=PERPENDICULAR, output_mode=output_mode)
@@ -82,6 +84,7 @@ def _masked_series(root, *, mode='Int 1D', unit='2th_deg', energies=(16, 16), ou
     mask[:, band[0]:band[1]] = 1
     np.save(root / 'mask.npy', mask)
     intent.mask_file = str(root / 'mask.npy')
+    intent.run_options['record_angular_support'] = True
     return intent
 
 
@@ -431,6 +434,14 @@ def test_d8_stitch_run_browse_and_exclusions(qapp, tmp_path):
     try:
         page.load_form(replace(_native_form(tmp_path, 'multigeometry', scans='1'), mode='1d'))
         _stitch_wait(page, qapp)
+        # coverage science asks for recording through the real control (Off by default since INT-PERF-REGRESSION-20261014)
+        from pyqtgraph.Qt import QtWidgets
+        pill, = [button for button in page.findChildren(QtWidgets.QAbstractButton)
+                 if button.isCheckable() and button.accessibleName() == 'Record angular coverage']
+        if not pill.isChecked():
+            pill.click()
+            qapp.processEvents()
+        assert pill.isChecked()
         page.run_bar.startButton.click()
         _stitch_wait(page, qapp)
         target = page._owner.prepared.request.module.output.target

@@ -10,8 +10,8 @@ These rows use real pages, real clicks and the shared owners' own reconciliation
 by the recording, strip, plot-options, shading and grid files.
 
 - C1: Int's and Stitch's recording pill says On or Off through clicks, a Stitch save and reopen, and the shared
-  owner's reconciliation, a busy lock included. The bool and its default are unchanged, and recording never changes
-  the display choice.
+  owner's reconciliation, a busy lock included. The bool is unchanged and recording never changes the display choice;
+  the default is Off since INT-PERF-REGRESSION-20261014, so a fresh pill says Off and an explicit On comes first.
 - C2: "Show angular coverage" is a display choice, and its tooltip says so. Cancel discards it; Okay applies it, as
   a plot option only.
 - C3: "2D pixel coverage" and "Shade uncovered bins" are unavailable for an ordinary Int result. The reason says it
@@ -63,10 +63,17 @@ def test_c1_the_recording_pill_says_on_or_off_in_int_and_stitch(qapp, tmp_path):
     from xdart.gui.widgets.controls_panel import PillRow
     from xrd_tools.analysis.angular_support import DEFAULT_RECORD_ANGULAR_SUPPORT
     from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
-    assert DEFAULT_RECORD_ANGULAR_SUPPORT is True
-    with _page(qapp, _masked_series(tmp_path / "int")) as (page, view, _observed):
+    # INT-PERF-REGRESSION-20261014 Stage A: Off by default. A fresh pill says Off; an explicit On comes first, then the
+    # same On -> Off -> On transitions as before.
+    assert DEFAULT_RECORD_ANGULAR_SUPPORT is False
+    intent = _masked_series(tmp_path / "int")
+    del intent.run_options["record_angular_support"]  # a fresh Int page
+    with _page(qapp, intent) as (page, view, _observed):
         pill = _pill(page)
         shown = view.plot_options_dialog.projection.show_angular_support
+        assert not pill.isChecked() and pill.text() == f"{LABEL}: Off"
+        pill.click()
+        qapp.processEvents()
         assert pill.isChecked() and pill.text() == f"{LABEL}: On"
         pill.click()
         qapp.processEvents()
@@ -78,6 +85,9 @@ def test_c1_the_recording_pill_says_on_or_off_in_int_and_stitch(qapp, tmp_path):
     page = StitchPage(empty_host_services(_Status()))
     try:
         pill = _pill(page)
+        assert not pill.isChecked() and pill.text() == f"{LABEL}: Off"
+        pill.click()
+        qapp.processEvents()
         assert pill.isChecked() and pill.text() == f"{LABEL}: On"
         pill.click()
         qapp.processEvents()
@@ -89,6 +99,9 @@ def test_c1_the_recording_pill_says_on_or_off_in_int_and_stitch(qapp, tmp_path):
         qapp.processEvents()
     fresh = StitchPage(empty_host_services(_Status()))
     try:
+        _pill(fresh).click()  # On first, so reopening the saved Off is a real restoration
+        qapp.processEvents()
+        assert _pill(fresh).isChecked() and _pill(fresh).text() == f"{LABEL}: On"
         apply_page_settings(fresh, document)
         qapp.processEvents()
         assert not _pill(fresh).isChecked() and _pill(fresh).text() == f"{LABEL}: Off", "reopened, it says Off"

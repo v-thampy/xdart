@@ -32,7 +32,7 @@ def test_an_energy_scan_is_one_geometry_with_a_bounded_number_of_table_builds(di
     centres = np.linspace(1.0, 9.0, 400)
     edges = np.r_[centres - .5 * (centres[1] - centres[0]), centres[-1] + .5 * (centres[1] - centres[0])]
     window = admitted_window(None, reducer="int_standard")
-    capture = RunSupportCapture(AngularSupportPolicy())
+    capture = RunSupportCapture(AngularSupportPolicy(enabled=True))
     wavelengths = np.linspace(1.0e-10, 1.1e-10, 40)[::direction]
     with mock.patch.object(kernel, "support_line_table", wraps=kernel.support_line_table) as built:
         profiles = []
@@ -84,7 +84,7 @@ def test_workers_sharing_a_run_compute_a_new_geometry_and_its_table_once():
     mask = _band_mask((400, 500))
     digest = SupportPose.from_integrator(ai, mask).mask_digest
     centres = np.linspace(1.0, 9.0, 400)
-    capture = RunSupportCapture(AngularSupportPolicy())
+    capture = RunSupportCapture(AngularSupportPolicy(enabled=True))
     start = threading.Barrier(4)
     results, errors = [None] * 4, []
 
@@ -119,7 +119,7 @@ def test_workers_starting_an_incidence_scan_compute_its_shared_cut_once():
     mask[:, 300:305] = True
     digest = SupportPose.from_integrator(ai, mask).mask_digest
     centres = np.linspace(0.5, 3.5, 200)
-    capture = RunSupportCapture(AngularSupportPolicy())
+    capture = RunSupportCapture(AngularSupportPolicy(enabled=True))
     start = threading.Barrier(4)
     results, errors = [None] * 4, []
 
@@ -154,7 +154,7 @@ def test_workers_equal_masks_share_one_copy_and_a_frame_mask_is_not_kept_alive()
     ai.detector.mask = _band_mask((400, 500)).astype(np.int8)
     workers = [copy.deepcopy(ai) for _ in range(4)]  # as each reduction worker deep-copies its integrator
     assert len({id(worker.detector.mask) for worker in workers}) == 4
-    capture = RunSupportCapture(AngularSupportPolicy())
+    capture = RunSupportCapture(AngularSupportPolicy(enabled=True))
     applied = [capture.applied_mask(worker, None, bound=True) for worker in workers]
     assert len({id(mask) for mask, _digest in applied}) == 1, "equal worker masks share one read-only copy"
     assert len({digest for _mask, digest in applied}) == 1 and not applied[0][0].flags.writeable

@@ -49,11 +49,14 @@ def test_g1_int_control_is_frozen_at_run_start_and_off_records_its_reason(qapp, 
     from xrd_tools.io.frame_view import FrameViewReader
     with _page(qapp, _masked_series(tmp_path)) as (page, view, observed):
         control = _control(page)
-        assert control.isChecked() is DEFAULT_RECORD_ANGULAR_SUPPORT, 'the default is the one constant'
+        # the series asks for recording explicitly (the default itself is pinned by A1, Off since
+        # INT-PERF-REGRESSION-20261014); an Off equal to the default is stored as no option
+        assert control.isChecked(), 'the series asks for recording'
         assert 'angular' in control.toolTip().lower(), 'the control explains itself'
         control.click()
         qapp.processEvents()
-        assert page._intents.snapshot().thaw().run_options['record_angular_support'] is False
+        run_options = page._intents.snapshot().thaw().run_options
+        assert run_options.get('record_angular_support', DEFAULT_RECORD_ANGULAR_SUPPORT) is False
         opened = []
         real = dynamic_output.open_headless_scan_session
 
@@ -79,10 +82,11 @@ def test_g2_the_int_preference_persists_across_sessions(qapp, isolated_settings,
     try:
         page = window.page_handle.widget
         control = _control(page)
-        assert control.isChecked()
+        # INT-PERF-REGRESSION-20261014: a fresh session is Off; a deliberate On is the choice that must persist
+        assert not control.isChecked(), 'a fresh session records nothing'
         control.click()
         qapp.processEvents()
-        assert page._intents.snapshot().thaw().run_options['record_angular_support'] is False
+        assert page._intents.snapshot().thaw().run_options['record_angular_support'] is True
         window.close()
         qapp.processEvents()
     finally:
@@ -92,8 +96,8 @@ def test_g2_the_int_preference_persists_across_sessions(qapp, isolated_settings,
     restored = Main()
     try:
         page = restored.page_handle.widget
-        assert page._intents.snapshot().thaw().run_options['record_angular_support'] is False
-        assert not _control(page).isChecked(), 'the restored session shows it off'
+        assert page._intents.snapshot().thaw().run_options['record_angular_support'] is True
+        assert _control(page).isChecked(), 'the restored session shows it on'
     finally:
         restored.close()
         restored.deleteLater()
@@ -143,8 +147,12 @@ def test_g4_stitch_setting_persists_is_frozen_at_run_start_and_off_records_its_r
     try:
         control = _control(page)
         assert control.isChecked() is DEFAULT_RECORD_ANGULAR_SUPPORT and 'angular' in control.toolTip().lower()
+        assert not control.isChecked(), 'Off by default (INT-PERF-REGRESSION-20261014)'
         page.load_form(replace(_native_form(tmp_path, 'multigeometry', scans='1'), mode='1d'))
         _stitch_wait(page, qapp)
+        control.click()  # explicitly On, then the user's Off below is the value the Run must freeze
+        qapp.processEvents()
+        assert control.isChecked()
         control.click()
         qapp.processEvents()
         document = page_settings(page)
@@ -172,6 +180,8 @@ def test_g4_stitch_setting_persists_is_frozen_at_run_start_and_off_records_its_r
         qapp.processEvents()
     fresh = StitchPage(empty_host_services(_Status()))
     try:
+        _control(fresh).click()  # On first, so restoring the saved Off is a real change
+        qapp.processEvents()
         assert _control(fresh).isChecked()
         apply_page_settings(fresh, document)
         qapp.processEvents()
@@ -180,3 +190,71 @@ def test_g4_stitch_setting_persists_is_frozen_at_run_start_and_off_records_its_r
         fresh.shutdown()
         fresh.deleteLater()
         qapp.processEvents()
+
+
+# ---------------------------------------------------------------------------------------------------- A1, A3
+
+def test_a1_a_fresh_int_page_records_nothing_and_skips_capture(qapp, tmp_path, monkeypatch):
+    """INT-PERF-REGRESSION-20261014 A1: with no recording option, Int's control shows Off and the frozen Run records
+    nothing. Its output carries the Off marker and no coverage datasets, and the real capture is never asked."""
+    import h5py
+    from xrd_tools.analysis.angular_support import RunSupportCapture
+    from xrd_tools.io.schema import ANGULAR_SUPPORT_DATASETS, ANGULAR_SUPPORT_RECORDING_ATTR
+    intent = _masked_series(tmp_path)
+    del intent.run_options['record_angular_support']  # the default itself
+    asked = []
+    real = RunSupportCapture.profile
+
+    def profile(self, *args, **kwargs):  # the real capture, only counted
+        asked.append(1)
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(RunSupportCapture, 'profile', profile)
+    with _page(qapp, intent) as (page, view, observed):
+        control = _control(page)
+        assert not control.isChecked() and control.text() == f'{LABEL}: Off', 'Off by default'
+        assert 'record_angular_support' not in page._intents.snapshot().thaw().run_options, 'the default is no option'
+        _run(qapp, page, observed)
+        _browsing(qapp, page)
+    assert not asked, 'recording Off asks the capture for nothing'
+    with h5py.File(written(tmp_path / 'run.nexus', 'Int 1D'), 'r') as handle:
+        assert handle['entry'].attrs[ANGULAR_SUPPORT_RECORDING_ATTR] == 'off'
+        assert not any(name in handle['entry/integrated_1d'] for name in ANGULAR_SUPPORT_DATASETS)
+
+
+def test_a3_missing_true_and_false_round_trip_in_int_and_stitch(qapp, tmp_path):
+    """INT-PERF-REGRESSION-20261014 A3: a missing recording choice follows the Off default and a represented True or
+    False wins, in Int's intent and in Stitch's saved settings. No earlier intent is inferred from a missing value."""
+    from tests.xdart.pages.test_stitch_page import _Status
+    from xdart.gui.pages.services import empty_host_services
+    from xdart.gui.tabs.stitch.page import StitchPage
+    from xdart.gui.tabs.stitch.settings import apply_page_settings, page_settings
+    for value, expected in ((None, False), (True, True), (False, False)):
+        intent = _masked_series(tmp_path / f'int-{value}')
+        del intent.run_options['record_angular_support']
+        if value is not None:
+            intent.run_options['record_angular_support'] = value
+        with _page(qapp, intent) as (page, _view, _observed):
+            assert _control(page).isChecked() is expected, f'Int with {value!r}'
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        document = page_settings(page)
+    finally:
+        page.shutdown()
+        page.deleteLater()
+        qapp.processEvents()
+    for value, expected in ((None, False), (True, True), (False, False)):
+        fields = {key: item for key, item in document['fields'].items() if key != 'record_angular_support'}
+        if value is not None:
+            fields['record_angular_support'] = value
+        fresh = StitchPage(empty_host_services(_Status()))
+        try:
+            if value is False:
+                _control(fresh).click()  # On first, so the saved False is a real change
+                qapp.processEvents()
+            apply_page_settings(fresh, {**document, 'fields': fields})
+            qapp.processEvents()
+            assert _control(fresh).isChecked() is expected, f'Stitch with {value!r}'
+        finally:
+            fresh.shutdown()
+            fresh.deleteLater()
+            qapp.processEvents()
