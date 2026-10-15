@@ -151,7 +151,7 @@ def test_c3_2d_pixel_coverage_says_it_needs_a_stitch_intensity_map(qapp):
     _view, dialog, _commands = _options(qapp)
     box = dialog.show_coverage_holes
     group = box.parentWidget()
-    assert isinstance(group, QtWidgets.QGroupBox) and group.title() == "2D pixel coverage"
+    assert isinstance(group, QtWidgets.QGroupBox) and group.title() == "2D pixel coverage (Stitch only)"
     assert box.text() == "Shade uncovered bins" and not box.isEnabled(), "an ordinary Int result has no pixel coverage"
     assert "Stitch" in box.toolTip() and "Show angular coverage" in box.toolTip(), box.toolTip()
     dialog.set_coverage_available(True)

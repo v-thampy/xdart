@@ -123,7 +123,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         other.addWidget(self.show_angular_support, 1, 0, 1, 2)
         self.set_angular_support_available(True)
 
-        support = self._section(layout, "2D pixel coverage")
+        support = self._section(layout, "2D pixel coverage (Stitch only)")
         support.parentWidget().setToolTip(COVERAGE_TOOLTIP)
         self.show_coverage_holes = QtWidgets.QCheckBox("Shade uncovered bins")
         support.addWidget(self.show_coverage_holes, 0, 0)

@@ -237,7 +237,7 @@ def test_e3_ui4_scientific_controls_have_exact_local_and_global_order(
         assert [
             group.title()
             for group in dialog.findChildren(QtWidgets.QGroupBox)
-        ] == ["Waterfall", "Overlay", "Other", "2D pixel coverage"]  # 2D pixel coverage: COVERAGE-EXPORT C (was 2-D Support)
+        ] == ["Waterfall", "Overlay", "Other", "2D pixel coverage (Stitch only)"]
         assert dialog.waterfall_stop.specialValueText() == "End"
         assert dialog.show_legend.isCheckable()
     finally:
