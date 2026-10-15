@@ -65,6 +65,14 @@ class RectViewBox(pg.ViewBox):
         pg.ViewBox.__init__(self, *args, **kwds)
         self.setMouseMode(self.RectMode)
 
+    def itemChange(self, change, value):
+        result = pg.ViewBox.itemChange(self, change, value)
+        if change == QtWidgets.QGraphicsItem.GraphicsItemChange.ItemSceneHasChanged and self.scene() is not None:
+            # the scene's Export... opens the plots' shared dialog (PLOT-EXPORT-TARGET-TYPE), routed once per scene
+            from xdart.gui.widgets.plot_export import attach
+            attach(self.scene())
+        return result
+
     def mouseClickEvent(self, ev):
         # Middle-click → auto-range.  Right-click falls through to
         # pyqtgraph's ViewBox.mouseClickEvent, which calls

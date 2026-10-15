@@ -79,6 +79,39 @@ def browse(parent, title: str, *, folder: bool = False, many: bool = False, save
     return picks
 
 
+def save_later(parent, title: str, *, file_filter=ANY_FILTER, opts=None, on_selected) -> object:
+    """A Save dialog that stays open beside ``parent`` (non-modal, owned by it) and calls ``on_selected(path)``
+    once a file is chosen; nothing is called when it is cancelled. The plots' shared Export dialog asks for its
+    file this way (:mod:`xdart.gui.widgets.plot_export`). It is pyqtgraph's own Save dialog, started and remembered
+    by the shared Browse rule. ``file_filter`` is one filter or a list of them; ``opts`` ride on the dialog for the
+    exporter's own completion. Deleting ``parent`` retires the dialog.
+    """
+    from pyqtgraph.Qt import QtWidgets
+    from pyqtgraph.widgets.FileDialog import FileDialog
+
+    dialog = FileDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.setFileMode(QtWidgets.QFileDialog.FileMode.AnyFile)
+    dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptMode.AcceptSave)
+    if isinstance(file_filter, str):
+        dialog.setNameFilter(file_filter)
+    elif file_filter:
+        dialog.setNameFilters(list(file_filter))
+    start = browse_start_dir()
+    if start:
+        dialog.setDirectory(start)
+    dialog.opts = dict(opts or {})
+
+    def chosen(path):
+        remember_browse_path(path)
+        on_selected(path)
+
+    dialog.fileSelected.connect(chosen)
+    dialog.finished.connect(dialog.deleteLater)  # chosen or cancelled, it retires: none accumulate under parent
+    dialog.show()
+    return dialog
+
+
 def browse_spec(parent, title: str, *, many: bool = False, current: str = "",
                 fallback: str = "") -> list[str]:
     """Show folders, extensionless files and case-insensitive .spec files; validate picked content.
@@ -118,5 +151,5 @@ def browse_spec(parent, title: str, *, many: bool = False, current: str = "",
 __all__ = [
     "ANY_FILTER", "BACKGROUND_IMAGE_FILTER", "CALIBRATION_FILTER", "CORRECTION_FILTER",
     "DETECTOR_SOURCE_FILTER", "MASK_FILTER", "NEXUS_FILTER", "PONI_FILTER", "SETTINGS_FILTER",
-    "ask", "browse", "browse_spec",
+    "ask", "browse", "browse_spec", "save_later",
 ]
