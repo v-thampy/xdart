@@ -170,6 +170,7 @@ class AdvancedSettingsValues:
     dark_file: object = ""
     flat_file: object = ""
     flat_min_fraction: object = DEFAULT_MIN_FLAT_FRACTION
+    record_angular_support: object = DEFAULT_RECORD_ANGULAR_SUPPORT
 
 
 def advanced_settings_values(
@@ -201,6 +202,7 @@ def advanced_settings_values(
         dark_file=intent.dark_file,
         flat_file=intent.flat_file,
         flat_min_fraction=intent.flat_min_fraction,
+        record_angular_support=intent.run_options.get("record_angular_support", DEFAULT_RECORD_ANGULAR_SUPPORT),
     )
 
 
@@ -281,6 +283,9 @@ def reduce_advanced_settings(
     cutoff = _finite_float(values.flat_min_fraction)
     if isinstance(cutoff, EditRefusal) or not 0.0 <= cutoff < 1.0:
         return EditRefusal("The flat cutoff must be from 0 % to below 100 % of the median.")
+    recording = reduce_control_edit(snapshot, RECORD_ANGULAR_SUPPORT, values.record_angular_support)
+    if isinstance(recording, EditRefusal):
+        return recording
     desired = AdvancedSettingsValues(
         one_d=one_d,
         two_d=two_d,
@@ -293,10 +298,11 @@ def reduce_advanced_settings(
         dark_file=values.dark_file.strip(),
         flat_file=values.flat_file.strip(),
         flat_min_fraction=cutoff,
+        record_angular_support=values.record_angular_support,
     )
     if desired == current:
         return EditNoChange()
-    candidate = snapshot.thaw()
+    candidate = snapshot.thaw() if isinstance(recording, EditNoChange) else recording
     _install_advanced_dimension(
         candidate.bai_1d_args,
         current.one_d,

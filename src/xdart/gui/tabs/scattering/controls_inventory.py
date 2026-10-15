@@ -55,7 +55,7 @@ SOURCE_META = ("Signal", "meta_ext")
 SOURCE_ENERGY = ("Source", "energy_preference")
 AVERAGE_SCAN = ("Signal", "series_average")
 #: Whether a Run records each 1-D profile's angular coverage (COVERAGE-SUPPORT-20261013 decision 6); kept in
-#: ``RunIntent.run_options["record_angular_support"]`` and shared by Stitch's Processing row.
+#: ``RunIntent.run_options["record_angular_support"]`` and shared by Int's and Stitch's Advanced editors.
 RECORD_ANGULAR_SUPPORT = ("Int1D", "record_angular_support")
 BACKGROUND_TYPE = ("BG", "bg_type")
 BACKGROUND_FILE = ("BG", "File")
@@ -309,6 +309,12 @@ SOURCE_FORMAT_SUFFIXES = {
 }
 
 
+def recording_control_field(value=DEFAULT_RECORD_ANGULAR_SUPPORT) -> ControlFormField:
+    """The shared Advanced recording pill, with the existing identity, label and bool semantics."""
+    return ControlFormField(SectionId.PROCESSING, "Record angular coverage", RECORD_ANGULAR_SUPPORT,
+                            value=value, kind=ControlFieldKind.BOOL)
+
+
 def project_control_fields(
     values: Mapping[tuple[str, ...], object] | None = None,
     choices: Mapping[tuple[str, ...], Sequence[object]] | None = None,
@@ -400,7 +406,6 @@ def project_control_fields(
             kind=spec.kind,
         )
 
-    add(SectionId.PROCESSING, "Record angular coverage", RECORD_ANGULAR_SUPPORT, kind=ControlFieldKind.BOOL)
     if source_type != "Single Image" and AVERAGE_SCAN in values:
         add(
             SectionId.PROCESSING,

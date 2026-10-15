@@ -886,6 +886,9 @@ class StitchPage(QtWidgets.QWidget):
         self._map_card.setVisible(False)
         # Int's Advanced dialog, its groups the page's shared rows (Codex's reuse audits, 2026-10-01)
         self.advanced = AdvancedDialog(self, title="Advanced — Stitch 1D", object_name="stitchAdvancedDialog")
+        recording = self.advanced.add_group("Integrate 1D", (self._rows["record_angular_support"],))
+        recording.setToolTip("Recording options for the 1-D profiles written by Stitch 1D and Stitch 2D.")
+        recording.title.setToolTip(recording.toolTip())
         self.point_images = PointImagesSettings()
         self.advanced.add_section(self.point_images)
         self.point_images.changed.connect(self._point_images_edited)
@@ -978,7 +981,7 @@ class StitchPage(QtWidgets.QWidget):
             buttons[action] for action in (ControlAction.PREVIEW, ControlAction.RETRY, ControlAction.ADVANCED_PROCESSING))
         self.preview_button.setToolTip("Check the inputs and list what a Run stitches, without stitching.")
         self.retry_button.setToolTip("Retry the last result's saving or cleanup.")
-        self.advanced_button.setToolTip("The source, geometry, frame and correction settings.")
+        self.advanced_button.setToolTip("The integration, source, geometry, frame and correction settings.")
         # Preview's lines: the shared read-only text window (Codex's combined stage-2b review F2)
         self.preview_dialog = ReadOnlyTextWindow("Stitch preview", (680, 480), self)
         self.preview_text = self.preview_dialog.pane
@@ -1202,7 +1205,7 @@ class StitchPage(QtWidgets.QWidget):
         """This page's Processing fields by key, as Int projects them (``project_control_fields``: its labels,
         the range rows' following the axes, and its rules: a range's bounds are greyed under Auto, the
         Threshold's limits when it is off); Stitch's GI ranges and Monitor with Int's range rule."""
-        from xdart.gui.tabs.scattering.controls_inventory import project_control_fields
+        from xdart.gui.tabs.scattering.controls_inventory import project_control_fields, recording_control_field
 
         def current(key):
             return self._value(key) if key in self._rows else self._fields[key].value
@@ -1216,6 +1219,7 @@ class StitchPage(QtWidgets.QWidget):
         projected = {field.path: field for field in project_control_fields(values, {
             INT_1D_AXIS: tuple(_GI_AXES) if grazing else _STANDARD_AXES,
             INT_2D_AXIS: _GI_MAP_AXES if grazing else _STANDARD_MAP_AXES})}
+        projected[RECORD_ANGULAR_SUPPORT] = recording_control_field(current("record_angular_support"))
         fields = normalization.normalization_fields(  # the Normalization group, shared with RSM
             {**self._fields, "monitor": replace(self._fields["monitor"],
                                                choices=self._monitor_choices(current("monitor")))},
