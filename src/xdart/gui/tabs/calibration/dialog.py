@@ -641,6 +641,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.geometry_editor.changed.connect(self._beam_geometry_changed)
         self.beam_source_kind.currentIndexChanged.connect(self._invalidate_beam_detection)
         self.rough_mode.currentIndexChanged.connect(self._invalidate_beam_detection)
+        for combo in (self.source_kind, self.beam_source_kind):  # a RAW type is known only for an image series
+            combo.currentIndexChanged.connect(self._caption_model)
+        self._caption_model()
         # the motion advice follows every input of the fit's identity and of step 1's arm, after the handlers above
         for key in self._DIRECT_BEAM_ADVICE_FIELDS:
             field = self._fields[key]
@@ -2037,10 +2040,13 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def _caption_model(self, *_args):
         """The Model box names each detector with its native rows × columns; the chosen one adds the pixel type when
-        it is known, typed under a Manual RAW layout (LT-009: no "RAW" and no invented type; the detector default's
-        int32 is the RAW reader's default, and TIFF, Eiger and NeXus files carry their own)."""
+        it is known, typed under a Manual RAW layout while a scan reads an image series (LT-009: no "RAW" and no
+        invented type; the detector default's int32 is the RAW reader's default, and TIFF, Eiger and NeXus files carry
+        their own)."""
         combo = self._fields['beam_detector']
-        dtype = self._text('dtype') if self.raw_layout.currentData() == 'manual' else ''
+        kinds = (getattr(self, 'source_kind', None), getattr(self, 'beam_source_kind', None))  # None while built
+        series = None in kinds or kinds[0].currentData() == 'spec' or kinds[1].currentData() == 'spec_series'
+        dtype = self._text('dtype') if series and self.raw_layout.currentData() == 'manual' else ''
         for index in range(combo.count()):
             caption = self._model_captions.get(combo.itemData(index), combo.itemText(index))
             caption += f' · {dtype}' if dtype and index == combo.currentIndex() else ''

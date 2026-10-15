@@ -448,8 +448,9 @@ def instrument_figure(instrument, readings, *, pose='zero-readback example'):
             circles.append(InstrumentCircle(name, axis, angle, tuple(prefix @ vector), instrument.motor(name),
                                             readback, zero, role))
             prefix = prefix @ ArbRotation(vector, angle).matrix
-    lanes = [.95-_LABEL_LANE*i for i in range(len(circles))]
+    lanes = [.95-_LABEL_LANE*i for i in range(len(circles))]  # top to bottom
     extent = ((-1.1, _LABEL_COLUMN+1.9), (min(-1.2, lanes[-1]-.3), 1.2))
+    bases = [np.array((0., .12*(i-(len(circles)-1)/2), 0.)) for i in range(len(circles))]
     views = (('Side view', (1, 0), ('Lab y (beam)', 'Lab x (up)')),
              ('Top view', (1, 2), ('Lab y (beam)', 'Lab z')),
              ('Looking downstream', (2, 0), ('Lab z (left)', 'Lab x (up)')))
@@ -466,9 +467,12 @@ def instrument_figure(instrument, readings, *, pose='zero-readback example'):
             markers.append(Marker('incident beam', start, 'beam',
                                   'The incident beam runs along this line of sight (lab +y) into the sample.'))
         markers.append(Marker('sample', project((0., 0., 0.)), 'sample', 'The sample, at the origin.'))
-        for i, (circle, lane) in enumerate(zip(circles, lanes)):
-            axis = np.asarray(circle.lab_axis)
-            base = np.array((0., .12*(i-(len(circles)-1)/2), 0.))
+        # the lanes follow the arrows' tips from the top, so the leaders run side by side rather than cross
+        tips = [project(base+.6*np.asarray(circle.lab_axis)) for circle, base in zip(circles, bases)]
+        order = sorted(range(len(circles)), key=lambda i: (-round(tips[i][1], 6), tips[i][0]))
+        lane_of = {i: lanes[rank] for rank, i in enumerate(order)}
+        for i, (circle, base) in enumerate(zip(circles, bases)):
+            axis, lane = np.asarray(circle.lab_axis), lane_of[i]
             tooltip = (f'{circle.name} ({circle.role} circle), motor {circle.motor}: signed axis {circle.axis}; '
                        f'readback {circle.readback:g}° − zero {circle.zero:g}° = {circle.angle_deg:g}°. A positive '
                        'angle turns right-handed about the axis; sample and detector stacks are independent.')
