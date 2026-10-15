@@ -817,8 +817,16 @@ class CalibrationDialog(QtWidgets.QDialog):
                 return (False, 'Select the calibrant source and scan the frames were staged from (3 · Calibrant scan), '
                                'or start a New session for this source.', 'select', self._fields['source'])
             prediction = self._prediction is not None and self._prediction[0] == self._calibrated_key()
+            seed_path = self._text('refine_seed_path')
+            seed_state = getattr(self, '_refine_seed_state', None)
+            seed_ready = bool(seed_path) and seed_state == (seed_path, '')
             if not ((self.fit is not None and self.fit.asset.get('calibration')) or prediction
-                    or self._rough_record() is not None or self._text('refine_seed_path')):
+                    or self._rough_record() is not None or seed_ready):
+                if seed_path and self.refine_seed.currentData() == 'file':
+                    problem = (seed_state[1] if seed_state is not None and seed_state[0] == seed_path else
+                               'Select a readable geometry file.')
+                    return (False, f'{problem} Choose a valid fixed geometry file (4 · Calibrate and fit).',
+                            'calibrate', self._fields['refine_seed_path'])
                 return (False, 'Enter or load a fixed rough geometry (2 · Rough geometry), or name a geometry file '
                                '(4 · Calibrate and fit), to check these frames against.', 'rough', self.rough_mode)
             cached = getattr(self, '_mask_cache', None)
@@ -1672,6 +1680,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._show('refine_seed_path', from_file)
         note = (self._seed_file_problem(self._text('refine_seed_path'))
                 if from_file and self._text('refine_seed_path') else None) or ''
+        # Reuse this existing validation on readiness projections; the path alone is not fixed geometry, and
+        # Orientation must not open/read the seed again on each edit or checklist refresh.
+        self._refine_seed_state = (self._text('refine_seed_path'), note) if from_file else None
         self.refine_seed_note.setText(note)
         self.refine_seed_note.setVisible(bool(note))
 
