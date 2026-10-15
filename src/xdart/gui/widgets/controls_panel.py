@@ -75,10 +75,10 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "Record angular coverage (On or Off): with each new 1-D profile (Int 2D writes them too), compute and save "
         "how many degrees of its χ window the detector's unmasked pixels reach in every radial bin. Plot Options' "
         "“Show angular coverage” only displays it. This is angular reach, not a pixel count, and it never changes "
-        "intensity. On by default; turn Off to skip the work: the result then records that it was off, and Browse "
-        "does not reconstruct it. The choice belongs to the output: Append (and Reintegrate) keep the one an "
-        "output was created with, and the Run says so when that differs from this setting; a new output or "
-        "Overwrite takes this setting."),
+        "intensity. Off by default; turn On to compute and save it. When it is off, the result records that it was "
+        "off, and Browse does not reconstruct it. The choice belongs to the output: Append (and Reintegrate) keep "
+        "the one an output was created with, and the Run says so when that differs from this setting; a new output "
+        "or Overwrite takes this setting."),
     ("Mask", "Threshold"): (
         "Exclude values outside the inclusive [min, max] band per frame. "
         "Automatic: values at or above the detector's saturation are left out. "

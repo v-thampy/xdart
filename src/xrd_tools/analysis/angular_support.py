@@ -62,8 +62,10 @@ __all__ = [
 ]
 
 #: Whether new results record angular support unless a setting says otherwise (decision 6): the one default every
-#: owner follows (AngularSupportPolicy, Int's run option and Stitch's row).
-DEFAULT_RECORD_ANGULAR_SUPPORT = True
+#: owner follows (AngularSupportPolicy, Int's run option and Stitch's row). Off since INT-PERF-REGRESSION-20261014
+#: (maintainer: "Switch the default to Off"): recording costs time per frame, so it is opt-in; a saved explicit
+#: choice still wins, and an output keeps the choice it was created with.
+DEFAULT_RECORD_ANGULAR_SUPPORT = False
 #: Native radial units a support profile can describe.
 SUPPORTED_UNITS = ("q_A^-1", "q_nm^-1", "2th_deg", "2th_rad")
 #: Reducer window rules (see :func:`admitted_window`).
