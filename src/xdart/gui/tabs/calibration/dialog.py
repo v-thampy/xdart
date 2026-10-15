@@ -1725,7 +1725,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._fields['del_motor'] = self.geometry_editor.motor_edit('del')
         self._fields['nu_motor'] = self.geometry_editor.motor_edit('nu')
         for circle in ('nu', 'del', 'tth'):  # the zeros and senses place the rough arm and start every fit
-            self.geometry_editor.zero_edit(circle).editingFinished.connect(self._render_frames)
+            # GeometryEditor.changed already invalidates the finding as the zero changes. Focus-out while
+            # folding Config only refreshes the view; it must not invalidate the unchanged scientific key again.
+            self.geometry_editor.zero_edit(circle).editingFinished.connect(
+                lambda: self._render_frames(invalidate_orientation=False))
             self.geometry_editor.zero_edit(circle).textChanged.connect(self._bounds_edited)
             self.geometry_editor.axis_box(circle).currentIndexChanged.connect(self._render_frames)
 
