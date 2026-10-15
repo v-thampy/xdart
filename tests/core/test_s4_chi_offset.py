@@ -67,10 +67,12 @@ def seam_poni(tmp_path_factory):
     return path
 
 
-def _integrator(poni, at_pi=True):
+def _integrator(poni, at_pi=True, wavelength=None):
     from xrd_tools.integrate.calibration import (
         detector_calibration_to_integrator, load_detector_calibration)
     ai = detector_calibration_to_integrator(load_detector_calibration(poni))
+    if wavelength is not None:
+        ai.wavelength = wavelength
     if not at_pi:
         ai.setChiDiscAtZero()
     return ai
@@ -87,10 +89,7 @@ def _image(poni):
     return image.astype(np.float32)
 
 
-def _reduce(poni, out, window, offset, *, npt, method="no", at_pi=True, support=False):
-    """One real Run of the frame: its q, I(chi) or cake result and its captured 1-D support."""
-    from xrd_tools.analysis.angular_support import AngularSupportPolicy
-    from xrd_tools.reduction import Frame, MemorySink, Scan, run_reduction
+def _args(out, window, offset, npt, method="no"):
     args = {"method": method, "radial_range": Q_BAND, "polarization_factor": 0.99,
             "monitor": "i0", "chi_offset": offset}
     if window is not None:
@@ -101,11 +100,25 @@ def _reduce(poni, out, window, offset, *, npt, method="no", at_pi=True, support=
         args.update(npt=npt, unit="chi_deg", chi_npt_rad=100)
     else:
         args.update(npt=npt, unit="q_A^-1", error_model="poisson")
+    return args
+
+
+def _masking(poni, static):
+    """Hot pixels excluded by value (frame-mask path) or as a static run mask (bound-mask path)."""
+    return {"detector_mask": _image(poni) >= HOT} if static else {"threshold_max": HOT / 10}
+
+
+def _reduce(poni, out, window, offset, *, npt, method="no", at_pi=True, support=False,
+            wavelength=None, static=False):
+    """One real Run of the frame: its q, I(chi) or cake result and its captured 1-D support."""
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy
+    from xrd_tools.reduction import Frame, MemorySink, Scan, run_reduction
+    args = _args(out, window, offset, npt, method)
     one, two = (None, args) if out == "cake" else (args, None)
     plan = build(one, two, integrate_1d=one is not None, integrate_2d=two is not None,
-                 threshold_max=HOT / 10, detector_shape=SHAPE)
+                 detector_shape=SHAPE, **_masking(poni, static))
     scan = Scan("seam", [Frame(1, image=_image(poni), metadata={"i0": 2.0})],
-                integrator=_integrator(poni, at_pi))
+                integrator=_integrator(poni, at_pi, wavelength))
     sink = MemorySink()
     run_reduction(plan, scan, sink, execution="chunked", executor=False,
                   angular_support=AngularSupportPolicy(enabled=support))
@@ -209,6 +222,7 @@ def test_w7_seam_support_describes_the_directions_reduced(seam_poni):
     _, support = _reduce(seam_poni, "q", window, offset, npt=50, support=True)
     _, reference, _ = _zero_reference(seam_poni, "q", window, offset, npt=50, support=True)
     assert support.available and reference.available, (support.reason, reference.reason)
+    assert support.requested_window_deg == window, "the panel request, never the moved raw interval"
     widths = sum(hi - lo for lo, hi in support.effective_window_deg)
     np.testing.assert_allclose(widths, 60.0, rtol=0, atol=1e-9)
     _same(support.supported_deg, reference.supported_deg)
@@ -227,6 +241,40 @@ def test_w7_non_crossing_and_degenerate_support_are_unchanged(seam_poni):
 @pytest.mark.parametrize("out", OUTS)
 def test_w8_zero_offset_seam_window(seam_poni, out):
     _seam_row(seam_poni, out, (160.0, 200.0), 0.0, npt=_npt(out, 40))
+
+
+def test_w9_seam_q_beside_non_crossing_cake_across_frame_energies(seam_poni):
+    """One Run: a seam q window beside a non-crossing cake, energies A, B, A through the real energy
+    binder, plus a later unlisted label at the base energy; static run mask (bound-mask path)."""
+    from dataclasses import replace
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    from xrd_tools.integrate.calibration import load_detector_calibration
+    from xrd_tools.reduction import Frame, MemorySink, Scan, run_reduction
+    from xrd_tools.session.readiness import bind_native_int_source_energy
+    image = _image(seam_poni)
+    scan = Scan("seam", [Frame(label, image=image, metadata={"i0": 2.0, "energy": kev})
+                         for label, kev in ((1, 12.0), (2, 13.0), (3, 12.0))])
+    bind_native_int_source_energy(scan, load_detector_calibration(seam_poni))
+    selection = scan.extra["energy_selection"]
+    base = scan.integrator
+    accepted = (base.chiDiscAtPi, base.wavelength)
+    scan.frames.append(Frame(4, image=image, metadata={"i0": 2.0, "energy": 14.0}))
+    (q_window, q_offset), cake_window = SEAMS["lower"], (20.0, 80.0)
+    plan = build(_args("q", q_window, q_offset, 50), _args("cake", cake_window, 30.0, 60),
+                 detector_shape=SHAPE, **_masking(seam_poni, True))
+    plan = replace(plan, extra={**plan.extra, "energy_selection": selection})
+    sink = MemorySink()
+    run_reduction(plan, scan, sink, execution="chunked", executor=False)
+    assert (base.chiDiscAtPi, base.wavelength) == accepted, "the accepted base AI is untouched"
+    own = dict(zip(selection["frame_labels"], selection["frame_energies_eV"]))
+    for label in (1, 2, 3, 4):
+        wavelength = energy_eV_to_wavelength_m(own[label]) if label in own else accepted[1]
+        q_ref, _, _ = _zero_reference(seam_poni, "q", q_window, q_offset, npt=50,
+                                      wavelength=wavelength, static=True)
+        cake_ref, _ = _reduce(seam_poni, "cake", (-10.0, 50.0), 0.0, npt=60,
+                              wavelength=wavelength, static=True)
+        _check("q", sink.frames[label].result_1d, q_ref)
+        _check("cake", sink.frames[label].result_2d, cake_ref, axis=cake_ref.azimuthal + 30.0)
 
 
 @pytest.mark.parametrize("case,out", [(case, out) for case in DIAGNOSTICS for out in OUTS
