@@ -290,6 +290,49 @@ def test_651_labels_read_once_then_fully_resident_avoids_io(tmp_path) -> None:
     cache.close()
 
 
+def test_custody_checks_grow_linearly_with_the_requested_labels(
+    tmp_path, monkeypatch,
+) -> None:
+    """A request's custody proof asks each row key's borrow a bounded number of times, so 256 labels cost about four
+    times 64 labels, not sixteen (INT-PERF-DIRECT-20261015: the held-borrow check scanned every borrow of the request
+    for every key, 5.09 million reads for 651 labels). Both the reading request and the fully resident one count."""
+    from xdart.gui.tabs.scattering.browse_1d_hydration import (
+        Browse1DHydrationLane,
+    )
+    from xrd_tools.io.browse_1d_cache import Browse1DBorrow
+
+    reads = [0]
+    real = Browse1DBorrow.released
+
+    def counted(borrow) -> bool:  # the real state, only counted
+        reads[0] += 1
+        return real.fget(borrow)
+
+    monkeypatch.setattr(Browse1DBorrow, "released", property(counted))
+
+    def custody_reads(count: int) -> int:
+        root = tmp_path / f"labels-{count}"
+        root.mkdir()
+        context, selection, frames, catalog, cache = _scope(root, count)
+        factory = _ReaderFactory(catalog)
+        lane = Browse1DHydrationLane(context, open_reader=factory)
+        reads[0] = 0
+        assert lane.submit(selection, frames) is not None
+        assert _drain(lane)
+        assert lane.submit(selection, frames) is not None
+        assert not _drain(lane)
+        assert factory.read_labels == [catalog.labels]
+        assert len(cache.resident_keys) == 2 * count
+        observed = reads[0]
+        assert lane.release()
+        cache.close()
+        return observed
+
+    small, large = custody_reads(64), custody_reads(256)
+    assert large <= 6 * small, ("custody checks grow faster than the labels", small, large)
+    assert large <= 8 * 2 * 256, ("custody checks are not bounded per row key", large)
+
+
 def test_partial_repair_substitutes_exact_borrowed_survivor(tmp_path) -> None:
     from xdart.gui.tabs.scattering.browse_1d_hydration import (
         Browse1DHydrationLane,
