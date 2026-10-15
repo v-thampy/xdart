@@ -716,35 +716,31 @@ class PhysicalRootAuthority:
 
         if type(token) is not _LeaseToken:
             raise TypeError("physical-root release requires an opaque lease token")
-        semantic = token.semantic
+        self._release_tokens((token,))
+
+    def _release_tokens(self, tokens: tuple[_LeaseToken, ...]) -> None:
+        """Retire exact opaque lease tokens in one validated transition.
+
+        Token-primary, semantic-secondary as one release: a token whose binding is missing or no longer its own
+        semantic (stale, or the authority closed) is a no-op, and a repeated token counts once. Each attempt builds
+        its delta from a snapshot taken outside the swap lock, so a losing or replaced state, and any root only it
+        held, is dropped after the lock is released (INT-PERF-DIRECT-20261015)."""
+
+        if any(type(token) is not _LeaseToken for token in tokens):
+            raise TypeError("physical-root release requires an opaque lease token")
+        unique = tuple({id(token): token for token in tokens}.values())
         while True:
-            with self._lock:
-                state = self._state
-            binding: _SemanticBinding | None = None
-            candidate = _binding_for_token(state, token)
-            if candidate is not None and candidate.semantic is semantic:
-                binding = candidate
-            if binding is None:
-                return
-            entry = _root_entry(state, binding.root_identity)
-            if entry is None:
-                raise RuntimeError("physical-root authority state is inconsistent")
-            bindings = tuple(
-                item for item in state.bindings if item.token is not binding.token
+            state = self._snapshot_state()
+            live = tuple(
+                token for token in unique
+                if (binding := _binding_for_token(state, token)) is not None
+                and binding.semantic is token.semantic
             )
-            roots: list[_RootEntry] = []
-            for item in state.roots:
-                if item.identity != entry.identity:
-                    roots.append(item)
-                elif item.references > 1:
-                    roots.append(
-                        _RootEntry(
-                            item.identity, item.root, item.nbytes,
-                            item.references - 1,
-                        )
-                    )
-            replacement = _indexed_state(
-                tuple(roots), bindings, state.gate, state.phase, state.closed,
+            if not live:
+                return
+            projected = _validate_projection(state, live, {}, {}, self._limit)
+            replacement = _replacement_state(
+                state, live, (), projected, gate=state.gate, phase=state.phase,
             )
             with self._lock:
                 if self._state is state:
@@ -765,10 +761,31 @@ class PhysicalRootAuthority:
         del old_state
 
 
+def release_leases(leases) -> None:
+    """Release ``leases`` (PhysicalRootLease objects of one authority) in one validated authority transition.
+
+    The whole sequence is checked before anything changes: a non-lease or a second authority is refused. Already
+    released leases are skipped, so an empty or all-released sequence is a no-op. Leases are marked released only
+    after the transition succeeds; if it raises, every lease stays owned for a retry (INT-PERF-DIRECT-20261015)."""
+
+    leases = tuple(leases)
+    if any(type(lease) is not PhysicalRootLease for lease in leases):
+        raise TypeError("release_leases requires PhysicalRootLease objects")
+    if len({id(lease._authority) for lease in leases}) > 1:
+        raise ValueError("release_leases requires the leases of one authority")
+    pending = tuple(lease for lease in leases if not lease._released)
+    if not pending:
+        return
+    pending[0]._authority._release_tokens(tuple(lease._token for lease in pending))
+    for lease in pending:
+        lease._released = True
+
+
 __all__ = [
     "PhysicalRootAuthority",
     "PhysicalRootFact",
     "PhysicalRootLease",
     "PhysicalRootReservation",
     "physical_root_fact",
+    "release_leases",
 ]

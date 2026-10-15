@@ -17,7 +17,7 @@ import numpy as np
 
 from xrd_tools.core.physical_memory import (
     PhysicalRootAuthority, PhysicalRootFact, PhysicalRootLease,
-    PhysicalRootReservation, physical_root_fact,
+    PhysicalRootReservation, physical_root_fact, release_leases,
 )
 
 if TYPE_CHECKING:
@@ -676,18 +676,9 @@ class Browse1DCache(_LinearObject):
         if type(pending) is PhysicalRootReservation:
             pending.rollback()
         else:
-            failed = []
-            first_error = None
-            for lease in pending:
-                try:
-                    lease.release()
-                except BaseException as error:
-                    failed.append(lease)
-                    if first_error is None:
-                        first_error = error
-            self._pending = tuple(failed) or None
-            if first_error is not None:
-                raise first_error
+            # one authority transition for the whole tuple, however many rows an eviction or close detached
+            # (INT-PERF-DIRECT-20261015); if it raises, every lease stays pending and owned for retry_cleanup()
+            release_leases(pending)
         self._pending = None
 
     def _store_rows(self, frame: int, label: int,
