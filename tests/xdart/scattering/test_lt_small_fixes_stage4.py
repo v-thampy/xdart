@@ -432,5 +432,6 @@ def test_g1_a_new_gi_run_reintegrates_both_dimensions_and_again(tmp_path, radial
     output = open_scan(reintegrate(artifact, "2d"))
     for label in labels:
         np.testing.assert_array_equal(np.asarray(output.get_2d(label).intensity), two_d[label])
-    # the 1-D successor Reintegrates again: the settings it records are stable
-    same_1d(reintegrate(first, "1d"))
+    # Reintegrating the Run's output again replaces its 1-D slot with the same values (a Reintegrate output itself is
+    # not reintegrated: stable operation slots refuse chaining, ADR-0010)
+    same_1d(reintegrate(artifact, "1d"))
