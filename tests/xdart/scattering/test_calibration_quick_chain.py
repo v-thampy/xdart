@@ -788,6 +788,32 @@ def test_quick_refuses_non_scan_rough_modes(qapp, tmp_path, monkeypatch, mode):
 
 
 @pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
+def test_quick_rough_mode_projects_the_canonical_selection(qapp, tmp_path, page_name):
+    page, dialog = _window(qapp, tmp_path / 'project', page_name)
+    try:
+        fields = set(dialog.settings()['fields'])
+        choices = set(dialog.settings()['choices'])
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        row = dialog.quick_rough_mode
+        assert isinstance(row, FormRow) and row.toolTip() and row.label.toolTip()
+        assert row.editor.currentData() == 'manual', 'opening Quick does not change the selected mode'
+        dialog.tabs.setCurrentIndex(0)
+        row.editor.setFocus()
+        QTest.keyClick(row.editor, QtCore.Qt.Key.Key_Home)  # choose Direct-beam scan through the real control
+        _settle()
+        assert dialog.rough_mode.currentData() == row.editor.currentData() == 'scan'
+        assert dialog._quick_rows['beam_source'].isVisible()
+        assert dialog._quick_rows['beam_scan'].isVisible()
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        assert row.editor.currentData() == 'skip'
+        assert dialog._quick_rows['beam_source'].isHidden()
+        assert set(dialog.settings()['fields']) == fields
+        assert set(dialog.settings()['choices']) == choices, 'the projection adds no saved mode of its own'
+    finally:
+        _close(qapp, page, dialog)
+
+
+@pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
 def test_tabbing_from_the_card_file_to_its_scan_shows_the_reset_scan(qapp, tmp_path, page_name):
     """Q1, added after Claude's self-review of 6d00dc8b: a new calibrant file typed on the card and left with Tab
     resets the scan to 1 (as tab 3 does), and the card's scan box, which now has the focus, shows that 1 rather than

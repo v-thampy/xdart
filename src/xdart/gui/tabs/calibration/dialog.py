@@ -1767,6 +1767,15 @@ class CalibrationDialog(QtWidgets.QDialog):
         form = self._quick_form = QtWidgets.QFormLayout(body)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        modes = {self.rough_mode.itemData(i): self.rough_mode.itemText(i) for i in range(self.rough_mode.count())}
+        self.quick_rough_mode = FormRow(label='Rough geometry', path=('Calibration', 'Quick', 'rough_mode'),
+            value=self.rough_mode.currentData(), kind='combo', choices=tuple(modes), choice_labels=modes)
+        self.quick_rough_mode.set_purpose_tooltip(
+            'The same selection as 2 · Rough geometry. Quick calibration requires Direct-beam scan; '
+            'select it to show and choose that scan. Enter the distance and Skip remain available for manual calibration.')
+        self.quick_rough_mode.valueChanged.connect(
+            lambda _path, value: self.rough_mode.setCurrentIndex(self.rough_mode.findData(value)))
+        form.addRow(self.quick_rough_mode.label, self.quick_rough_mode)
         for scan, prefix, tab in (('Direct-beam', 'beam_', '2 · Rough geometry'), ('Calibrant', '', '3 · Calibrant scan')):
             file_row = FormRow(label=f'{scan} SPEC file', path=('Calibration', 'Quick', prefix + 'source'), value='',
                                browse=True)
@@ -1847,6 +1856,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         number for a NeXus file, and the tab's word for the kind of file."""
         if not self._quick_rows:
             return
+        combo = self.quick_rough_mode.editor
+        combo.setCurrentIndex(combo.findData(self.rough_mode.currentData()))
         measured = self.rough_mode.currentData() == 'scan'
         for prefix, role, kind, nexus_kind, shown in (
                 ('beam_', 'Direct-beam', self.beam_source_kind.currentData(), 'nexus', measured),
