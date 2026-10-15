@@ -2515,7 +2515,21 @@ def test_gi_bootstrap_freezes_before_sink_with_bounded_roots_and_stable_snapshot
     from xrd_tools.reduction import GIMode
     import xrd_tools.reduction.core as core
     module = _module()
-    for name, quiet_gi, disabled_motor, expected_angle in (("disabled", None, None, None), ("disabled-named", None, "theta", None), ("manual", GIMode(incidence_motor="Manual", incident_angle=.3), None, .3)):
+    # LT-SMALL-FIXES-20261014 G1 (maintainer, October 14: "Freeze Manual GI"): a Manual GI artifact's automatic ranges are
+    # now frozen over its first and last frames at its recorded angle, without a motor bootstrap; GI disabled stays quiet
+    manual = _seed_existing(tmp_path, gi=GIMode(incidence_motor="Manual", incident_angle=.3), name="gi-manual")
+    manual_scouts = []
+    def manual_freeze(plan, scan, *, freeze_policy, fi, initial_incident_angle, **_kwargs):
+        manual_scouts.append(tuple(frame.index for frame in scan.frames)); assert freeze_policy == "scout_union" and initial_incident_angle == .3
+        for frame in scan.frames: frame.loader(frame)
+        return replace(plan, integration_1d=replace(plan.integration_1d, radial_range=(.1, 1.)))
+    with monkeypatch.context() as patch:
+        patch.setattr(core, "_apply_gi_freeze_policy", manual_freeze)
+        manual_plan = module.ReintegratePlan.from_artifact(manual.target, entry="entry", dimension="1d", preparation=manual.preparation)
+    assert manual_scouts == [(2, 9)] and manual_plan.gi_bootstrap_incidence is None
+    assert tuple(manual_plan.selected_plan["bai_args"]["radial_range"]) == (.1, 1.)
+    assert module._core_plan(manual_plan.selected_plan, manual_plan.requested_shared_science).gi.incident_angle == .3
+    for name, quiet_gi, disabled_motor, expected_angle in (("disabled", None, None, None), ("disabled-named", None, "theta", None)):
         quiet = _seed_existing(tmp_path, gi=quiet_gi, disabled_motor=disabled_motor, name=f"gi-{name}")
         if disabled_motor:
             with h5py.File(quiet.target, "r+") as handle: del handle["entry/scan_data/theta"]; handle["entry/scan_data"]["theta"] = h5py.SoftLink("/missing")
