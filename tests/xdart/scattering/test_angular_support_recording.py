@@ -223,17 +223,20 @@ def test_a1_a_fresh_int_page_records_nothing_and_skips_capture(qapp, tmp_path, m
 
 def test_a3_missing_true_and_false_round_trip_in_int_and_stitch(qapp, tmp_path):
     """INT-PERF-REGRESSION-20261014 A3: a missing recording choice follows the Off default and a represented True or
-    False wins, in Int's intent and in Stitch's saved settings. No earlier intent is inferred from a missing value."""
+    False wins, through Int's profile codec and Stitch's saved settings. No earlier intent is inferred."""
     from tests.xdart.pages.test_stitch_page import _Status
     from xdart.gui.pages.services import empty_host_services
     from xdart.gui.tabs.stitch.page import StitchPage
     from xdart.gui.tabs.stitch.settings import apply_page_settings, page_settings
+    from xrd_tools.session import dump_run_intent_profile, load_run_intent_profile
     for value, expected in ((None, False), (True, True), (False, False)):
         intent = _masked_series(tmp_path / f'int-{value}')
         del intent.run_options['record_angular_support']
         if value is not None:
             intent.run_options['record_angular_support'] = value
-        with _page(qapp, intent) as (page, _view, _observed):
+        restored = load_run_intent_profile(dump_run_intent_profile(intent))
+        assert restored.run_options == intent.run_options, 'profile preserves missing versus represented choices'
+        with _page(qapp, restored) as (page, _view, _observed):
             assert _control(page).isChecked() is expected, f'Int with {value!r}'
     page = StitchPage(empty_host_services(_Status()))
     try:
