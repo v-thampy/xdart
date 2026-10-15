@@ -442,10 +442,13 @@ def test_k3_periodic_footprints_and_tangency():
     got = angular_support(_request(ai, None, "2th_deg", edges, shifted)).supported_deg
     assert np.all(np.abs(got - _expected(edges, "2th_deg", ai, rect, windows=_deg((-20, 70)))) <= TOL * 90)
 
-    # an offset-shifted full turn collapses in pyFAI (p01): reachable directions are lost → named refusal
-    collapsed = admitted_window((-180., 180.), reducer="int_standard", offset_deg=30.)
-    refused = angular_support(_request(ai, None, "2th_deg", edges, collapsed))
-    assert refused.reason is SupportReason.WINDOW_TRUNCATED and refused.supported_deg is None
+    # an offset-shifted full turn collapses in pyFAI alone (p01), but Int reduces a radial full turn as Auto:
+    # every direction, the request kept (PRE-RELEASE-CORRECTNESS-20261015 C1/C3 replaces the old refusal)
+    turned = admitted_window((-180., 180.), reducer="int_standard", offset_deg=30.)
+    assert turned.requested_deg == (-180., 180.) and turned.denominator_deg == 360. and turned.lost_deg == ()
+    np.testing.assert_allclose(angular_support(_request(ai, None, "2th_deg", edges, turned)).supported_deg,
+                               angular_support(_request(ai, None, "2th_deg", edges, full)).supported_deg,
+                               rtol=0, atol=1e-9)
     # beyond ±180°: pyFAI keeps [160°, 180°) of (-200°, -160°); the lost [-180°, -160°) is reachable here
     beyond = admitted_window((-200., -160.), reducer="int_standard")
     assert angular_support(_request(ai, None, "2th_deg", edges, beyond)).reason is SupportReason.WINDOW_TRUNCATED
