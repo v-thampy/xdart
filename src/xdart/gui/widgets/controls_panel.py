@@ -72,12 +72,13 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
     ("Signal", "series_average"): (
         "Average all frames in the series into one frame before integration."),
     ("Int1D", "record_angular_support"): (
-        "Record angular coverage: with each new 1-D profile, compute and save how many degrees of its χ window "
-        "the detector's unmasked pixels reach in every radial bin (shown by Plot Options' “Angular coverage” "
-        "strip). This is angular reach, not a pixel count, and it never changes intensity. Turn off to skip the "
-        "work: the result then records that it was off, and Browse does not reconstruct it. The choice belongs "
-        "to the output: Append (and Reintegrate) keep the one an output was created with, and the Run says so "
-        "when that differs from this setting; a new output or Overwrite takes this setting."),
+        "Record angular coverage (On or Off): with each new 1-D profile (Int 2D writes them too), compute and save "
+        "how many degrees of its χ window the detector's unmasked pixels reach in every radial bin. Plot Options' "
+        "“Show angular coverage” only displays it. This is angular reach, not a pixel count, and it never changes "
+        "intensity. On by default; turn Off to skip the work: the result then records that it was off, and Browse "
+        "does not reconstruct it. The choice belongs to the output: Append (and Reintegrate) keep the one an "
+        "output was created with, and the Run says so when that differs from this setting; a new output or "
+        "Overwrite takes this setting."),
     ("Mask", "Threshold"): (
         "Exclude values outside the inclusive [min, max] band per frame. "
         "Automatic: values at or above the detector's saturation are left out. "
@@ -137,6 +138,16 @@ def _field_tooltip(path, reason: str = "") -> str:
     """Resolve a control's hover tooltip: the disabled `reason` takes precedence
     (so a locked control explains WHY), else the descriptive help text."""
     return (reason or "") or _FIELD_TOOLTIPS.get(tuple(path), "")
+
+
+#: Toggles whose text says their state after the label ("Record angular coverage: On"); the accessible name
+#: stays the label (COVERAGE-EXPORT-FOLLOWUP-20261014, the maintainer's approved wording).
+_STATE_TEXT_PATHS = frozenset({("Int1D", "record_angular_support")})
+
+
+def _toggle_text(path, label: str, checked: bool) -> str:
+    """A toggle's text: its label, followed by On or Off for the toggles that say their state."""
+    return f"{label}: {'On' if checked else 'Off'}" if tuple(path) in _STATE_TEXT_PATHS else label
 
 
 _SOURCE_ENERGY_PATH = ("Source", "energy_preference")
@@ -816,10 +827,12 @@ class FormRow(QtWidgets.QWidget):
             # GI/threshold/saturation toggles.  Mirroring that behavior keeps
             # checked-but-disabled controls visibly checked during active runs.
             self.label.hide()
-            editor = QtWidgets.QPushButton(label)
+            editor = QtWidgets.QPushButton(_toggle_text(self._path, label, bool(value)))
+            editor.setAccessibleName(label)
             editor.setObjectName("controlsToggleButton")
             editor.setCheckable(True)
             editor.setChecked(bool(value))
+            editor.toggled.connect(lambda checked: editor.setText(_toggle_text(self._path, label, checked)))
             editor.toggled.connect(
                 lambda checked: self._emit_edit(bool(checked))
             )
@@ -1052,6 +1065,7 @@ class FormRow(QtWidgets.QWidget):
                 checked = bool(field.value)
                 if self.editor.isChecked() != checked:
                     self.editor.setChecked(checked)
+                self.editor.setText(_toggle_text(self._path, self.label.text(), checked))
             elif self._kind == "combo":
                 # The projected ``field.choices`` are the authoritative combo
                 # vocabulary; construction-time items must not outlive them.
@@ -1518,7 +1532,8 @@ class PillRow(QtWidgets.QWidget):
         lay.setSpacing(6)
         self._pills: list[tuple[tuple[str, ...], QtWidgets.QPushButton]] = []
         for field in fields:
-            btn = QtWidgets.QPushButton(field.label)
+            btn = QtWidgets.QPushButton(_toggle_text(field.path, field.label, bool(field.value)))
+            btn.setAccessibleName(field.label)
             # Reuse the accent-when-checked toggle styling, but content-sized and
             # fully rounded, via a DEDICATED object name (grouped with
             # controlsToggleButton in the theme).  The fully-rounded radius
@@ -1534,6 +1549,8 @@ class PillRow(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed
             )
             path = tuple(field.path)
+            btn.toggled.connect(
+                lambda checked, p=path, b=btn, text=field.label: b.setText(_toggle_text(p, text, checked)))
             btn.toggled.connect(
                 lambda checked, p=path: self.valueChanged.emit(p, bool(checked))
             )
@@ -1562,6 +1579,7 @@ class PillRow(QtWidgets.QWidget):
                     btn.setChecked(checked)
             finally:
                 btn.blockSignals(was_blocked)
+            btn.setText(_toggle_text(path, field.label, checked))
             btn.setEnabled(bool(field.enabled))
             btn.setToolTip(_field_tooltip(field.path, field.reason))
         return True

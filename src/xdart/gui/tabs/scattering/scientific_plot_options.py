@@ -17,18 +17,21 @@ WATERFALL_Y_AXIS_CHOICES = (
 )
 INTENSITY_SCALE_CHOICES = ("Linear", "Sqrt", "Log")
 COVERAGE_TOOLTIP = (
-    "Shade Q–χ bins that received no contributing pixels. Coverage includes pixel splitting "
-    "and does not measure angular completeness."
+    "2D pixel coverage: shade Q–χ bins that received no contributing pixels. Coverage includes pixel splitting "
+    "and does not measure angular completeness; that is the 1-D angular coverage “Show angular coverage” displays."
 )
 #: The 1-D strip's option (COVERAGE-SUPPORT-20261013): angular reach, not Int's 2-D pixel coverage above.
 ANGULAR_SUPPORT_TOOLTIP = (
     "Show angular coverage below the 1-D plot: for each radial bin, the share of the profile's χ window "
-    "(360° without one) that unmasked detector pixels reach, saved with the result when it was processed. "
-    "This is angular reach, not a pixel count, and it never changes intensity. Hover for the degrees over a bin."
+    "(360° without one) that unmasked detector pixels reach, saved with the result when it was processed "
+    "(or reconstructed for an older result that qualifies). This is angular reach, not a pixel count, and it never "
+    "changes intensity. Hover for the degrees over a bin. Display only: Okay applies it and Cancel discards the "
+    "change; whether a Run records coverage is Processing's “Record angular coverage”."
 )
-GRID_TOOLTIP = ('Show detector-frame q contours and χ half-rays with the effective Run plan’s χ offset. '
-                'Display only; available on Standard Int frames with a uniform flat detector (q contours only on '
-                'a saved output’s frames).')
+GRID_TOOLTIP = ('Detector coordinate grid: q contours and χ half-rays over the raw detector image (not the reduced '
+                'Q–χ map), with the effective Run plan’s χ offset. Display only; available on Standard Int frames '
+                'with a uniform flat detector. A Run’s frames show q and χ; a saved output’s frames in Browse show q '
+                'contours only.')
 
 #: Every 1-D plot option: its command path and its ``ScientificPlotOptions`` field, the one table the
 #: view emits and every page applies (Codex general audit AUD-8).
@@ -114,12 +117,12 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.intensity_scale.addItems(INTENSITY_SCALE_CHOICES)
         other.addWidget(self.show_legend, 0, 0)
         other.addWidget(self.intensity_scale, 0, 1)
-        # the 1-D plot's angular coverage strip, kept apart from 2-D Support's pixel-coverage shading below
-        self.show_angular_support = QtWidgets.QCheckBox("Angular coverage")
+        # the 1-D plot's angular coverage strip, kept apart from the 2D pixel-coverage shading below
+        self.show_angular_support = QtWidgets.QCheckBox("Show angular coverage")
         other.addWidget(self.show_angular_support, 1, 0, 1, 2)
         self.set_angular_support_available(True)
 
-        support = self._section(layout, "2-D Support")
+        support = self._section(layout, "2D pixel coverage")
         support.parentWidget().setToolTip(COVERAGE_TOOLTIP)
         self.show_coverage_holes = QtWidgets.QCheckBox("Shade uncovered bins")
         support.addWidget(self.show_coverage_holes, 0, 0)
@@ -137,7 +140,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
         # Calibrants and reference phases live in the Tools panel's Reference Phases window
         # (REFERENCE-PHASES-20261011); this dialog keeps the coordinate grid.
-        self.coordinate_grid = self.add_choice('Coordinate grid', ('Off', 'q', 'χ', 'q + χ'),
+        self.coordinate_grid = self.add_choice('Detector coordinate grid', ('Off', 'q', 'χ', 'q + χ'),
                                                'Off', tooltip=GRID_TOOLTIP)
         self.set_grid_available(False, visible=False)
         self.reconcile(self._projection)
@@ -184,7 +187,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.show_coverage_holes.setEnabled(available)
         self.show_coverage_holes.setToolTip(
             COVERAGE_TOOLTIP if available else COVERAGE_TOOLTIP +
-            " Available on a Stitch Q–χ intensity map with stored coverage."
+            " Available on a Stitch Q–χ intensity map that carries pixel coverage; an Int result has none."
         )
 
     def set_angular_support_mounted(self, mounted: bool) -> None:
