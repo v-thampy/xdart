@@ -550,6 +550,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.saved_mask = ''
         #: The page's Data format once it has set this window's sources (None: a window no page has set)
         self._data_format = None
+        self._shared_nexus_entry = None  # None: standalone editor; a page owns its Entry option.
         self._owner = SingleWorkerOwner(_run_job)
         #: Quick calibration: the step it is on (1-3; None when idle), the job it waits for, whether Cancel was
         #: pressed, and the inputs its direct-beam check last ran on (_quick_advance)
@@ -1206,11 +1207,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         kind = (SourceKind.NEXUS_STACK if self.beam_source_kind.currentData() == 'nexus'
                 else SourceKind.SPEC) if prefix else (
                     SourceKind.NEXUS_STACK if self.source_kind.currentData() == 'nexus_stack' else SourceKind.SPEC)
-        spec = SourceSpec(Path(path).expanduser().absolute(), kind,
-                          entry=self._text(prefix + 'entry') or 'entry',
-                          options={'scan': self._text(prefix + 'scan')} if kind is SourceKind.SPEC else {})
-        if not prefix:
-            spec = self._spec()
+        spec = self._spec(beam=bool(prefix))
         folder = self._text(prefix + 'images') or str(Path(path).expanduser().absolute().parent)
         self._auto_placeholders(prefix)
         self._source_details_inputs_key = self._source_details_input_key(prefix)
@@ -1411,7 +1408,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _sync_source_rows(self, *_args):
         kind = self.source_kind.currentData()
         spec = kind != 'nexus_stack'
-        for key, shown in (('scan', spec), ('images', spec), ('entry', kind != 'spec')):
+        for key, shown in (('scan', spec), ('images', spec),
+                           ('entry', kind != 'spec' and self._shared_nexus_entry is None)):
             self._show(key, shown)
         self._label('source').setText('SPEC file' if spec else 'NeXus file')
         self._sync_quick_rows()
@@ -1868,7 +1866,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._quick_form.setRowVisible(rows[prefix + 'images'], shown and not nexus)
             rows[prefix + 'source'].label.setText(f"{role} {'NeXus' if nexus else 'SPEC'} file")
             rows[prefix + 'scan'].setVisible(not nexus)
-            rows[prefix + 'entry'].setVisible(not series)
+            rows[prefix + 'entry'].setVisible(not series and self._shared_nexus_entry is None)
 
     def _build_distance(self):
         layout, form = self._form('2 · Rough geometry', 'rough')
@@ -2238,7 +2236,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         visible = {'rough_distance': mode == 'manual', 'beam_source': scan,
                    'beam_scan': scan and kind != 'nexus', 'beam_image_file': False,
                    'beam_images': scan and kind != 'nexus', 'beam_stem': scan and kind != 'nexus',
-                   'beam_entry': scan and kind != 'spec_series',
+                   'beam_entry': scan and kind != 'spec_series' and self._shared_nexus_entry is None,
                    **dict.fromkeys(self._GEOMETRY_ROWS, mode != 'skip')}
         form = self._beam_form
         for key, shown in visible.items():
@@ -2344,6 +2342,23 @@ class CalibrationDialog(QtWidgets.QDialog):
                 combo.setCurrentIndex(index)  # its own handlers: rows, energy and detection invalidation
         return True
 
+    def set_nexus_entry(self, value):
+        """Project's optional shared override; Auto preserves imported role defaults until explicitly changed."""
+        if self._owner.busy:
+            return False
+        value = str(value or '').strip()
+        previous = self._shared_nexus_entry
+        self._shared_nexus_entry = value
+        if value or previous:
+            for key in ('entry', 'beam_entry'):
+                target = value or 'entry'
+                if self._text(key) != target:
+                    self._set_field_text(key, target)
+                    self._fields[key].editingFinished.emit()
+        self._sync_source_rows()
+        self._sync_rough_rows()
+        return True
+
     def set_source_context(self, source: SourceSpec, *, image_rotation=0, del_motor=None, nu_motor=None,
                            geometry_path=None, image_flip=False):
         if self._owner.busy:
@@ -2358,7 +2373,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         opts = source.options
         for key, value in [('source', source.uri), ('scan', opts.get('scan', '1')),
                            ('images', opts.get('image_dir', '')), ('stem', opts.get('image_stem', '')),
-                           ('entry', source.entry or 'entry'), ('del_motor', del_motor), ('nu_motor', nu_motor)]:
+                           ('entry', self._shared_nexus_entry or source.entry or 'entry'),
+                           ('del_motor', del_motor), ('nu_motor', nu_motor)]:
             if value is not None:  # psic's del/nu motors, when given (set_instrument names them all)
                 self._fields[key].setText(str(value))
         reader = opts.get('read_image_kwargs', {})
@@ -2735,19 +2751,23 @@ class CalibrationDialog(QtWidgets.QDialog):
         else:
             kind = SourceKind.NEXUS_STACK if self.source_kind.currentData() == 'nexus_stack' else SourceKind.SPEC
         options = {}
+        entry = self._shared_nexus_entry or self._text(prefix + 'entry') or 'entry'
         if kind is SourceKind.SPEC:
             if (beam and self.beam_source_kind.currentData() == 'spec_container'
                     and self._text('beam_image_file') and not self._text('beam_images') and not self._text('beam_stem')):
-                return SourceSpec(Path(path).resolve(), kind, entry=self._text('beam_entry') or 'entry',
-                    options={'scan': self._text('beam_scan'), 'image_file': self._text('beam_image_file')})
+                return SourceSpec(Path(path).resolve(), kind, entry=entry,
+                    options={'scan': self._text('beam_scan'), 'image_file': self._text('beam_image_file'),
+                             **({'nexus_entry': self._shared_nexus_entry} if self._shared_nexus_entry else {})})
             # a blank folder is the SPEC file's, as in Stitch; a blank stem is the source's default
             options = {'scan': self._text(prefix + 'scan'),
                        'image_dir': self._text(prefix + 'images') or str(Path(path).resolve().parent),
                        'read_image_kwargs': self._reader()}
             if self._text(prefix + 'stem'):
                 options['image_stem'] = self._text(prefix + 'stem')
+        if self._shared_nexus_entry and self._data_format != 'spec_series':
+            options['nexus_entry'] = self._shared_nexus_entry
         return self.point_images.options(SourceSpec(Path(path).resolve(), kind,
-            entry=self._text('beam_entry' if beam else 'entry') or 'entry', options=options))
+            entry=entry, options=options))
 
     def _start(self, kind, arguments):
         if os.environ.get('XDART_DEBUG_ORIENTATION'):

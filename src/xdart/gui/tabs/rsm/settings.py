@@ -66,7 +66,7 @@ def apply_page_settings(page, document: Any) -> None:
         for key, value in zip(_GRID_FIELDS, _GRIDS[legacy], strict=True):
             fields.setdefault(key, str(value))
     check_fields(page, fields, _OPEN_CHOICES)
-    first = ("data_format", "input_mode")  # first: the format and input make the kind that shows its own rows
+    first = ("data_format", "nexus_entry", "input_mode")  # before sources: format and optional entry
     for key in first:
         if key in fields:
             page.set_field(key, fields[key])

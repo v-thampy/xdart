@@ -67,6 +67,61 @@ def _settings(name):
     return settings.page_settings, settings.apply_page_settings
 
 
+@pytest.mark.parametrize('name', ('Stitch', 'RSM'))
+def test_shared_entry_options_follow_format_and_reach_both_calibration_roles(qapp, tmp_path, name):
+    from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+    page = _page(name, tmp_path)
+    dialog = None
+    try:
+        options = page.source_options
+        assert isinstance(options, AdvancedDialog)
+        assert options.entry is page._rows['nexus_entry']
+        assert options.entry.current_value() == ''
+        assert options.entry.editor.placeholderText() == 'Auto'
+        for token in FORMATS:
+            _choose(qapp, page._rows['data_format'], token)
+            assert _shown(options.button, page) is (token != 'spec_series')
+        _choose(qapp, page._rows['data_format'], 'spec_container')
+        options.button.click()
+        assert options.isVisible() and options.entry.toolTip() and options.button.toolTip()
+        QtTest.QTest.keyClicks(options.entry.editor, 'detector_entry')
+        QtTest.QTest.keyClick(options.entry.editor, QtCore.Qt.Key.Key_Return)
+        qapp.processEvents()
+        assert page._value('nexus_entry') == 'detector_entry'
+        source = tmp_path / 'sample.spec'
+        source.write_text('#F sample\n#S 1 ascan del 0 1 1 1\n#N 1\n#L del\n0\n1\n')
+        page.set_sources((str(source),))
+        selection = (page._source_selection() if name == 'Stitch'
+                     else page._resolution_request(outputs=False)[0])
+        assert selection.nexus_entry == 'detector_entry'
+        options.close()
+        dialog = _dialog(name, page)
+        for prefix in ('', 'beam_'):
+            dialog._set_field_text(prefix + 'source', str(tmp_path / 'source.spec'))
+            spec = dialog._spec(beam=bool(prefix))
+            assert spec.entry == 'detector_entry' and spec.options['nexus_entry'] == 'detector_entry'
+            assert not _shown(dialog._quick_rows[prefix + 'entry'], dialog)
+            assert not dialog._row_visible(prefix + 'entry')
+        save, restore = _settings(name)
+        document = save(page)
+        assert document['fields']['nexus_entry'] == 'detector_entry'
+        page.set_field('nexus_entry', 'different')
+        _wait(dialog)
+        restore(page, document)
+        _wait(dialog)
+        assert page._value('nexus_entry') == 'detector_entry'
+        assert dialog._text('entry') == dialog._text('beam_entry') == 'detector_entry'
+        page.set_field('nexus_entry', '')
+        _wait(dialog)
+        for prefix in ('', 'beam_'):
+            spec = dialog._spec(beam=bool(prefix))
+            assert spec.entry == 'entry' and 'nexus_entry' not in spec.options
+        page.source_options.reconcile('spec_container', enabled=False, reason='A calibration job is running.')
+        assert not options.button.isEnabled() and 'calibration job' in options.button.toolTip()
+    finally:
+        _shut(qapp, page, dialog)
+
+
 def _choose(qapp, row, token):
     """A user's choice in a combo row: real arrow keys on the closed menu, Qt's activation, which FormRow commits
     on the next event-loop turn (it ignores a programmatic index change). The shown item needs no key."""
@@ -169,7 +224,7 @@ def test_f1_the_page_format_sets_its_calibration_roles_and_quick_rows(qapp, tmp_
             for prefix, role in (('', 'Calibrant'), ('beam_', 'Direct-beam')):
                 quick = dialog._quick_rows
                 assert _shown(quick[prefix + 'scan'], dialog) is spec_rows, (token, prefix)
-                assert _shown(quick[prefix + 'entry'], dialog) is entry, (token, prefix)
+                assert not _shown(quick[prefix + 'entry'], dialog), (token, prefix)
                 for key in ('images', 'stem'):
                     assert _shown(quick[prefix + key], dialog) is spec_rows, (token, prefix, key)
                 assert quick[prefix + 'source'].label.text() == f"{role} {'SPEC' if spec_rows else 'NeXus'} file"

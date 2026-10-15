@@ -29,7 +29,7 @@ SETTINGS_VERSION = STITCH_SETTINGS.version
 SESSION_KEY = STITCH_SETTINGS.session_key
 #: Applied first, in this order: each resets other fields to its own defaults (the Data format and Files/Folder
 #: make the source kind, whose files the sources then select).
-_FIRST = ("backend", "data_format", "input_mode", "unit", "map_axis")
+_FIRST = ("backend", "data_format", "nexus_entry", "input_mode", "unit", "map_axis")
 #: Shown from the source selection, not an input of its own.
 _DERIVED = frozenset({"spec_path"})
 #: Restored as one threshold policy, not field by field.
