@@ -569,6 +569,26 @@ def test_cancelled_load_retires_exact_worker_after_inert_completion(
     loader.close()
 
 
+@pytest.mark.parametrize("at_pi", (True, False), ids=("chi_disc_at_pi", "chi_disc_at_zero"))
+def test_tiny_integrator_copies_the_real_chi_discontinuity(tmp_path: Path, at_pi: bool):
+    # Run construction's ring geometry reads the integrator's chi convention;
+    # the shared tiny adapter must carry the calibrated value, never assume pi.
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from xrd_tools.integrate.calibration import (
+        detector_calibration_to_integrator,
+        load_detector_calibration,
+    )
+
+    poni = tmp_path / "tiny.poni"
+    write_poni(poni)
+    calibrated = detector_calibration_to_integrator(load_detector_calibration(poni))
+    if at_pi:
+        calibrated.setChiDiscAtPi()
+    else:
+        calibrated.setChiDiscAtZero()
+    assert _TinyIntegrator(calibrated).chiDiscAtPi is calibrated.chiDiscAtPi is at_pi
+
+
 @pytest.mark.parametrize(
     "gi_enabled",
     (False, True),
