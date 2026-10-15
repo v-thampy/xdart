@@ -394,7 +394,7 @@ def test_several_phases_have_colours_legend_and_independent_families(qapp, tmp_p
         assert calibrant
         view.options.click(); qapp.processEvents()
         grid_label = next(label for label in view.plot_options_dialog.findChildren(QtWidgets.QLabel)
-                          if label.text() == 'Coordinate grid')
+                          if label.text() == 'Detector coordinate grid')
         grid_label.parentWidget().findChild(QtWidgets.QComboBox).setCurrentText('q')
         view.plot_options_dialog.accept_button.click(); qapp.processEvents(); _settle(qapp, view)
         grid = tuple(view.raw.overlay_families['grid'])

@@ -21,10 +21,12 @@ LABEL = "Record angular coverage"
 
 
 def _control(widget):
-    """The shared control as a user finds it: the one checkable button labelled “Record angular coverage”."""
+    """The shared control as a user finds it: the one checkable button named “Record angular coverage”, whose text
+    says its state (COVERAGE-EXPORT-FOLLOWUP-20261014 Stage C: “Record angular coverage: On” or “… Off”)."""
     found = [button for button in widget.findChildren(QtWidgets.QAbstractButton)
-             if button.isCheckable() and button.text() == LABEL]
+             if button.isCheckable() and button.accessibleName() == LABEL]
     assert len(found) == 1, f"{len(found)} “{LABEL}” controls"
+    assert found[0].text() == f"{LABEL}: {'On' if found[0].isChecked() else 'Off'}", found[0].text()
     return found[0]
 
 

@@ -10,8 +10,8 @@ from tests.xdart.scattering.test_predicted_ring_overlays import qapp, run_page, 
 
 def control(view):
     labels = [x for x in view.plot_options_dialog.findChildren(QtWidgets.QLabel)
-              if x.text() == 'Coordinate grid']
-    assert len(labels) == 1, 'Plot Options must contain the Coordinate grid choice'
+              if x.text() == 'Detector coordinate grid']
+    assert len(labels) == 1, 'Plot Options must contain the Detector coordinate grid choice'
     return labels[0].parentWidget().findChild(QtWidgets.QComboBox)
 
 
