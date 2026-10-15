@@ -260,7 +260,7 @@ def test_b4_errorbars_ragged_and_mixed_plots_export_and_hdf5_refuses_a_cleared_c
     _answer(qapp, _export(qapp, dialog3), tmp_path, "ragged.h5")
     with h5py.File(tmp_path / "ragged.h5", "r") as handle:
         group = handle["Export"]
-        stored = sorted((np.asarray(group[name]).tolist() for name in group), key=len)
+        stored = sorted((np.asarray(group[name]).tolist() for name in group), key=lambda rows: len(rows[0]))
     assert stored == [[[0.0, 1.0, 2.0], [9.0, 8.0, 7.0]], [[0.0, 1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0, 5.0]]]
     _click_format(qapp, dialog3, CSV)
     _answer(qapp, _export(qapp, dialog3), tmp_path, "ragged.csv")
