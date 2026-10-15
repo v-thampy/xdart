@@ -111,16 +111,17 @@ class ReferenceLines(pg.ItemGroup):
         self.lines.setData(x, y, connect='finite')
 
     def hover_entries(self, point, pixel):
-        """Tooltip entries for the drawn lines within ``HOVER_PX`` of view ``point`` (``pixel``: the view's size of
-        one screen pixel), in line order; none above a line's drawn top."""
+        """Tooltip entries for the drawn lines within ``HOVER_PX`` screen pixels of view ``point`` (``pixel``: the
+        view's size of one screen pixel), in line order: the distance to each drawn stick as a segment, the image
+        index's convention (HELP-HOVER-ENDPOINT-REACH), so a corner beyond a stick's end is not within reach."""
         box = self.getViewBox()
         if not self.line_values or box is None or not self.isVisible():
             return ()
         low, high = box.viewRange()[1]
-        reach_x, reach_y = HOVER_PX * abs(pixel[0]), HOVER_PX * abs(pixel[1])
         tops = low + self._fractions * (high - low)
-        under = ((np.abs(self._x - point.x()) <= reach_x) & (point.y() >= low - reach_y)
-                 & (point.y() <= tops + reach_y))
+        across = (self._x - point.x()) / abs(pixel[0])
+        along = np.maximum(0., np.maximum(point.y() - tops, low - point.y())) / abs(pixel[1])
+        under = np.hypot(across, along) <= HOVER_PX
         return tuple(reference_entry(self.line_values[index], self.color) for index in np.flatnonzero(under))
 
 

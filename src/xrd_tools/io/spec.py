@@ -119,6 +119,18 @@ def read_spec_scan_table(
 _SPEC_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
+def _spec_row_problem(tokens, labels):
+    """The first token of one physical data row that is not a complete number of its ``#L`` column, as (column
+    index, label, token), or None: a missing or an extra token is one too. The selected-row rule every SPEC reader
+    shares (the strict scan validator below and the public metadata reader's bounded point scan)."""
+    for index in range(max(len(tokens), len(labels))):
+        token = tokens[index] if index < len(tokens) else None
+        label = labels[index] if index < len(labels) else "<extra>"
+        if index >= len(labels) or token is None or not _SPEC_NUMBER.fullmatch(token):
+            return index, label, token
+    return None
+
+
 def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
     """Guard silx's permissive conversion using the selected scan's physical rows.
 
@@ -147,16 +159,14 @@ def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
             if mca_continuation or line.startswith("@"):
                 mca_continuation = line.endswith("\\")
                 continue
-            tokens = line.split()
-            for index in range(max(len(tokens), len(labels))):
-                token = tokens[index] if index < len(tokens) else None
-                label = labels[index] if index < len(labels) else "<extra>"
-                if index >= len(labels) or token is None or not _SPEC_NUMBER.fullmatch(token):
-                    raise ValueError(
-                        f"SPEC {spec_file}, scan {scan_data.number}.{scan_data.order}, "
-                        f"physical row {physical_row}, column {index + 1} ({label!r}): "
-                        f"expected a complete decimal/scientific numeric token, got {token!r}"
-                    )
+            problem = _spec_row_problem(line.split(), labels)
+            if problem is not None:
+                index, label, token = problem
+                raise ValueError(
+                    f"SPEC {spec_file}, scan {scan_data.number}.{scan_data.order}, "
+                    f"physical row {physical_row}, column {index + 1} ({label!r}): "
+                    f"expected a complete decimal/scientific numeric token, got {token!r}"
+                )
 
 
 def read_spec_scan_columns(

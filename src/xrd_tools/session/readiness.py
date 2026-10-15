@@ -1297,7 +1297,7 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
     Each frame's own recorded energy decides (eV or keV by its size; an impossible one
     counts as none). Only when no frame records one does the source's energy or wavelength
     apply. A varying series is an energy scan, which Int reduces frame by frame at each
-    frame's own energy (``frame_labels`` and ``frame_energies_eV``); the sensor parallax
+    frame's own energy (``frame_labels`` and ``frame_energies_eV``); an enabled sensor parallax
     correction, computed at one energy, cannot follow it. Such a scan, and one whose per-frame
     energies would not fit the run's saved settings, raise :class:`EnergyScanRefused`.
     """
@@ -1321,7 +1321,9 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
                                                   wavelength_unit=WavelengthUnit.ANGSTROM))
     selection = resolve_acquisition_energy(calibration.poni.wavelength, energies, allow_energy_scan=per_frame)
     if 'frame_energies_eV' in selection:
-        if calibration.parallax is not None:
+        # enabled parallax only, as the conversion owner applies it: an explicit False (a sensor-equipped PONI v3, or
+        # Advanced's override with Enable parallax cleared) reduces each frame at its energy (LT-SMALL-FIXES S1)
+        if calibration.parallax is True:
             raise EnergyScanRefused(
                 'an energy scan cannot use the sensor parallax correction, which is computed at one energy. To '
                 'reduce each frame at its own energy, turn parallax off: in Advanced, "Detector sensor / parallax '

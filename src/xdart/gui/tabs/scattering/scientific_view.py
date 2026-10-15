@@ -1524,6 +1524,10 @@ class ScientificView(QtWidgets.QFrame):
 
     def _reconcile_phase_overlay(self, state, navigation):
         from xrd_tools import geometry_figures as gf
+        # a closed tool's Add CIF… worker that has finished lets its parse go at the next refresh, not only at this
+        # view's shutdown (HELP-RETIRED-ADD-PAYLOAD); one still reading stays, and its close does not wait
+        self._retired_phase_workers = [worker for worker in self._retired_phase_workers
+                                       if worker.close().status is not PageCleanup.CLEAN]
         options, window = state.plot_options, self.reference_phases
         visible = state.processing_mode != '2D Viewer'
         window.set_available(visible, '' if visible else 'Reference phases are unavailable in the 2D Viewer.')

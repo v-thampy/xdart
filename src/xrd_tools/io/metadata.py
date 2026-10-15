@@ -585,7 +585,11 @@ def _bounded_spec_point_snapshot(path: Path, scan_number: int, image_number: int
     and each scanned line retain the caller's bound; physical scanning has its
     own 32 MiB bound. Motor-name updates preceding the first matching scan are
     inherited. Keeping the last requested-or-earlier row preserves clamping.
+    Every data row of the selected scan, the discarded ones too, is checked
+    against its ``#L`` labels as it passes (``_spec_row_problem``): one
+    malformed row raises ValueError, never a shifted or substituted point.
     """
+    from xrd_tools.io.spec import _spec_row_problem
     if type(limit) is not int or limit <= 0:
         raise ValueError("max_input_bytes must be a positive integer")
     headers: dict[bytes, bytes] = {}
@@ -594,6 +598,7 @@ def _bounded_spec_point_snapshot(path: Path, scan_number: int, image_number: int
     active = False
     file_header = True
     row_index = 0
+    labels = None
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
         if before.st_size > _SPEC_POINT_FILE_MAX_BYTES:
@@ -625,10 +630,19 @@ def _bounded_spec_point_snapshot(path: Path, scan_number: int, image_number: int
                     mca_continuation = line.endswith(b"\\")
                     continue
                 if line.startswith(b"#"):
+                    if marker == b"#L":  # silx's labels: separated by two or more spaces
+                        labels = tuple(re.split(r"\s{2,}", line[2:].decode("utf-8", "replace").strip()))
                     selected.extend(raw)
                 elif line:
                     if line.endswith(b"\\"):
                         raise MetadataInputTooLarge("bounded SPEC point requires an unwrapped data row")
+                    problem = None if labels is None else _spec_row_problem(
+                        line.decode("utf-8", "replace").split(), labels)
+                    if problem is not None:
+                        column, label, token = problem
+                        raise ValueError(
+                            f"SPEC {path}, scan {scan_number}, data row {row_index + 1}, column {column + 1} "
+                            f"({label!r}): expected a complete decimal/scientific numeric token, got {token!r}")
                     if row_index <= image_number:
                         point = raw if raw.endswith(b"\n") else raw + b"\n"
                     row_index += 1
@@ -1303,7 +1317,11 @@ def _read_spec_metadata_observed(
     -------
     dict[str, float]
         Counters for the image point merged with motor positions.
-        Returns ``{}`` on any error.
+        Returns ``{}`` on any error. A selected scan holding a malformed row
+        (a non-number, a missing or an extra column) is one: silx would skip
+        that row and shift every later one onto the wrong image
+        (FINITE-SPEC-INVALID-LINE-SHIFT), so no read of that scan returns a
+        row, with one warning per read.
     """
     try:
         from silx.io.specfile import SpecFile  # noqa: PLC0415
@@ -1340,10 +1358,13 @@ def _read_spec_metadata_observed(
                                                 max_input_bytes)
                     if spec_point_snapshot else _bounded_metadata_snapshot(
                         spec_file, max_input_bytes, _with_revision=True))
+        from xrd_tools.io.spec import _validate_spec_numeric_tokens
         if observed is None:
             revision = _metadata_path_revision(spec_file)
             sf = SpecFile(str(spec_file))
             scan = sf[f"{scan_number}.1"]
+            # the strict scan validator reads the selected scan's physical rows itself (no second parser)
+            _validate_spec_numeric_tokens(spec_file, scan, tuple(str(label) for label in scan.labels))
             npts = scan.data.shape[1]
             img_idx = min(image_number, npts - 1)
             counters = {label: float(scan.data_column_by_name(label)[img_idx])
@@ -1370,6 +1391,8 @@ def _read_spec_metadata_observed(
             scratch_handle.close()
             parser = SpecFile(str(scratch))
             scan = parser[f"{scan_number}.1"]
+            if not spec_point_snapshot:  # the bytes silx parsed; a point's whole scan was checked as it was copied
+                _validate_spec_numeric_tokens(scratch, scan, tuple(str(label) for label in scan.labels))
             npts = scan.data.shape[1]
             img_idx = min(0 if spec_point_snapshot else image_number, npts - 1)
             counters = {label: float(scan.data_column_by_name(label)[img_idx])
