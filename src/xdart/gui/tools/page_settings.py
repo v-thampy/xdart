@@ -79,6 +79,9 @@ class SettingsKind:
                           "threshold_max": plain(state.threshold_max),
                           "mask_saturation": bool(state.mask_saturation)},
             "calibration": page._calibration_settings_now(),
+            # A migrated default is not the user's answer to conflicting legacy roles. Keep the readiness need
+            # through Save/close/reopen until a real format choice settles it (LT terminal F2).
+            **({"data_format_conflict": page._format_choice} if getattr(page, "_format_choice", "") else {}),
             **sections,
         }
 
@@ -122,8 +125,11 @@ def document_data_format(document: dict[str, Any]) -> tuple[dict[str, Any], str]
         # a kind this version lacks refuses the whole document, never half read (as every choice a row cannot hold)
         raise ValueError(f"Source: {fields['source_kind']!r} is not one of its choices")
     current = {key: fields[key] for key in ("data_format", "input_mode") if key in fields}
+    conflict = document.get("data_format_conflict", "")
+    if not isinstance(conflict, str):
+        raise ValueError("Data format conflict is malformed")
     if current or "source_kind" not in fields:
-        return current, ""
+        return current, conflict
     calibration = document.get("calibration") if isinstance(document.get("calibration"), dict) else {}
     inputs, choices = calibration.get("fields") or {}, calibration.get("choices") or {}
 
