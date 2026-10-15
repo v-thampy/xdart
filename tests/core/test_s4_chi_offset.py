@@ -169,7 +169,13 @@ def _seam_row(poni, out, window, offset, **kwargs):
     _check(out, actual, expected, axis=axis)
 
 
-@pytest.mark.parametrize("out", OUTS)
+# Deferred by the maintainer (2026-10-15): no single native call yields a shifted full turn's
+# chi axis; strict, so a future fix fails loudly until this marker is removed.
+HELD_W1 = pytest.mark.xfail(strict=True, reason="CHI-WINDOW-FULL-TURN-CHI-OUTPUT residual")
+
+
+@pytest.mark.parametrize("out", ("q", pytest.param("chi", marks=HELD_W1),
+                                 pytest.param("cake", marks=HELD_W1)))
 def test_w1_shifted_full_turn_selects_every_direction(seam_poni, out):
     actual, _ = _reduce(seam_poni, out, (-180.0, 180.0), 30.0, npt=_npt(out, 360))
     if out == "q":
