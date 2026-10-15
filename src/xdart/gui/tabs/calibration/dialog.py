@@ -1164,6 +1164,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             f'auto · {path.parent}' if path else "auto · the SPEC file's folder")
         self._fields[prefix + 'stem'].setPlaceholderText(
             f"auto · {path.stem if path else '<SPEC name>'}_scan{first[1] if first else '<N>'}_")
+        for key in (prefix + 'images', prefix + 'stem'):
+            self._quick_mirror(key)
 
     def _browse(self, key, chooser):
         from xdart.gui.widgets.file_dialogs import browse, browse_spec
@@ -1818,7 +1820,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         card, nor a focused file row (a file row takes no set while it holds the focus); a focused scan box that holds
         no draft does follow (Tab from a new file to its scan: the reset scan, not the old file's)."""
         row = self._quick_rows.get(key)
-        if row is None or (row.editor.hasFocus() and (row.editor.isModified() or key.endswith(('source', 'images')))):
+        if row is None:
+            return
+        row.editor.setPlaceholderText(self._fields[key].placeholderText())
+        if row.editor.hasFocus() and (row.editor.isModified() or key.endswith(('source', 'images'))):
             return
         value = self._text(key)
         if row.current_value() != value:
@@ -3862,6 +3867,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                             self._update_fit_source_label()
                         if automatic is not None:
                             self._fields[prefix + 'stem'].setPlaceholderText(f'auto · {automatic}')
+                            self._quick_mirror(prefix + 'stem')
                         unchanged = self._source_details_orientation_inputs == (
                             self._orientation_key(), self._source_energy_eV)
                         self._render_frames(invalidate_orientation=not unchanged)

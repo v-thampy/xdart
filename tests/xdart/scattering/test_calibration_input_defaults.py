@@ -53,6 +53,12 @@ def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path)
         assert dialog._fields['rough_energy'].maximumWidth() == 300
         assert dialog._row_visible('images') and dialog._row_visible('entry')
         assert 'beam_scan001_' in dialog._fields['stem'].placeholderText()
+        assert dialog._text('images') == dialog._text('stem') == ''
+        for key in ('images', 'stem'):
+            quick = dialog._quick_rows[key].editor
+            assert quick.text() == ''
+            assert quick.placeholderText() == dialog._fields[key].placeholderText()
+        assert dialog._quick_rows['images'].editor.placeholderText() == f'auto · {tmp_path}'
         assert dialog._spec().kind is SourceKind.SPEC
         assert dialog.frames == ()  # Refine reads the scan without staged manual-calibration frames.
         assert dialog._calibrant_source_ready()
@@ -72,6 +78,8 @@ def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path)
             again.set_data_format('spec_container')
             assert again.source_kind.currentData() == 'spec_container'
             assert again._spec() == dialog._spec()
+            for key in ('images', 'stem'):
+                assert again._quick_rows[key].editor.placeholderText() == again._fields[key].placeholderText()
         finally:
             again.close()
     finally:
