@@ -5396,9 +5396,27 @@ class _ReductionIntegratorProvider:
         self._local.ai = ai
         return ai
 
+    def alternate(self, ai: Any, frame: Frame, shape: tuple[int, ...]) -> Any:
+        """``ai`` with its chi discontinuity at zero: one per worker and standard integrator.
+
+        Cloned from the integrator the frame already uses (calibration, bound mask, energy), it
+        then follows each frame's energy as that one does; ``ai`` itself is never changed.
+        """
+        cached = getattr(self._local, "alternate", None)
+        if cached is None or cached[0] is not ai:
+            from xrd_tools.integrate.calibration import _clone_integrator_preserving_calibration
+            with _PYFAI_COLD_GEOMETRY_LOCK:
+                clone = _clone_integrator_preserving_calibration(ai)
+                clone.setChiDiscAtZero()
+                clone.reset_engines(collect_garbage=False)
+                self._warm_standard_centers(clone, (int(shape[0]), int(shape[1])))
+            cached = self._local.alternate = (ai, clone)
+        self.at_frame_energy(cached[1], frame, shape, warm=True)
+        return cached[1]
+
     def _unbound_standard(self) -> Any:
         """Discard an optional bound clone and return the established AI path."""
-        for name in ("ai", "run_mask_binding"):
+        for name in ("ai", "run_mask_binding", "alternate"):
             try:
                 delattr(self._local, name)
             except AttributeError:
@@ -5414,6 +5432,7 @@ class _ReductionIntegratorProvider:
         """Cache a negative admission without rebuilding on every frame."""
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, False)
+        self._local.alternate = None
         return ai, False
 
     def _warm_standard_centers(
@@ -5523,6 +5542,7 @@ class _ReductionIntegratorProvider:
 
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, True)
+        self._local.alternate = None  # a new binding retires the previous alternate
         return ai, True
 
     def at_frame_energy(
@@ -6128,6 +6148,10 @@ def _reduce_frame(
         at_energy = getattr(integrators, "at_frame_energy", None)
         if at_energy is not None:
             at_energy(ai, frame, image.shape, warm=True)
+        # Each dimension takes its own native chi-window call (_native_azimuth_window).
+        ai_1d, range_1d, turn_1d = (
+            (ai, None, 0.0) if p1 is None else _windowed_integrator(
+                integrators, ai, frame, image.shape, p1, radial=not chi_mode))
         if chi_mode:
             # Non-GI azimuthal profile (Mode A): the output axis is chi, while
             # radial_range is the q band to integrate over.  Mirror
@@ -6143,12 +6167,11 @@ def _reduce_frame(
             # off the offset-labeled axes integrates the SAME bins as the 2D.  The
             # output axis is relabeled +offset below.  (Raw range passed straight
             # through would integrate 90deg off the 2D for the default offset.)
-            _chi_azimuth_range = _integration_azimuth_range(p1)
-            if _chi_azimuth_range is not None:
-                chi_extra.setdefault("azimuth_range", _chi_azimuth_range)
+            if range_1d is not None:
+                chi_extra.setdefault("azimuth_range", range_1d)
             r1d = integrate_radial(
                 image,
-                ai,
+                ai_1d,
                 npt=p1.npt,
                 npt_rad=p1.npt_rad,
                 radial_unit="q_A^-1",
@@ -6165,13 +6188,13 @@ def _reduce_frame(
             r1d = (
                 integrate_1d(
                     image,
-                    ai,
+                    ai_1d,
                     npt=p1.npt,
                     unit=p1.unit,
                     method=p1.method,
                     mask=integration_mask,
                     radial_range=p1.radial_range,
-                    azimuth_range=_integration_azimuth_range(p1),
+                    azimuth_range=range_1d,
                     error_model=p1.error_model,
                     polarization_factor=p1.polarization_factor,
                     normalization_factor=_normalization_for(
@@ -6184,28 +6207,32 @@ def _reduce_frame(
             )
         if support_capture is not None and r1d is not None and p1 is not None:
             angular_support_1d = _standard_frame_support(
-                support_capture, ai, integration_mask, detector_mask_is_bound, p1, r1d, chi_mode, grouped,
+                support_capture, ai_1d, integration_mask, detector_mask_is_bound, p1, r1d, chi_mode, grouped,
                 cancel_token)
         # S-4: re-add chi_offset to the 1D chi OUTPUT axis (mirror the 2D
         # r2d.azimuthal += azimuth_offset below), so the written Mode-A (chi_deg)
         # chi axis matches the 2D cake chi instead of staying in the raw pyFAI
         # frame 90deg out.  Standard mode only (GI keeps azimuth_offset 0).
+        # A window moved by a whole turn returns to the panel interval too.
+        shift_1d = float(getattr(p1, "azimuth_offset", 0.0) or 0.0) - turn_1d
         if (r1d is not None and p1 is not None
                 and str(getattr(p1, "unit", "") or "").lower() == "chi_deg"
-                and getattr(p1, "azimuth_offset", 0.0)):
-            r1d.radial = (np.asarray(r1d.radial, dtype=float)
-                          + float(p1.azimuth_offset))
+                and shift_1d):
+            r1d.radial = np.asarray(r1d.radial, dtype=float) + shift_1d
+        ai_2d, range_2d, turn_2d = (
+            (ai, None, 0.0) if plan.integration_2d is None else _windowed_integrator(
+                integrators, ai, frame, image.shape, p2_frame, radial=False))
         r2d = (
             integrate_2d(
                 image,
-                ai,
+                ai_2d,
                 npt_rad=p2_frame.npt_rad,
                 npt_azim=p2_frame.npt_azim,
                 unit=p2_frame.unit,
                 method=p2_frame.method,
                 mask=integration_mask,
                 radial_range=p2_frame.radial_range,
-                azimuth_range=_integration_azimuth_range(p2_frame),
+                azimuth_range=range_2d,
                 error_model=p2_frame.error_model,
                 polarization_factor=p2_frame.polarization_factor,
                 normalization_factor=_normalization_for(
@@ -6216,8 +6243,10 @@ def _reduce_frame(
             )
             if plan.integration_2d is not None else None
         )
-        if r2d is not None and plan.integration_2d.azimuth_offset:
-            r2d.azimuthal = r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
+        if r2d is not None:
+            shift_2d = float(plan.integration_2d.azimuth_offset or 0.0) - turn_2d
+            if shift_2d:
+                r2d.azimuthal = r2d.azimuthal + shift_2d
 
     if _DEBUG_UNCERTAINTY and r1d is not None:
         p1 = plan.integration_1d
@@ -6558,6 +6587,41 @@ def _integration_azimuth_range(
     lo, hi = plan.azimuth_range
     offset = float(plan.azimuth_offset)
     return lo - offset, hi - offset
+
+
+def _native_azimuth_window(
+    plan: "Integration1DPlan | Integration2DPlan", *, radial: bool,
+) -> tuple[tuple[float, float] | None, float | None]:
+    """The one native pyFAI call for ``plan``'s chi window: (raw range, whole turn or None).
+
+    pyFAI wraps each endpoint into [-180, 180) and no pixel chi lies beyond, so a raw window
+    past +-180 loses its wrapped part. A radial full turn admits every direction: Auto. A window
+    inside one turn of [0, 360] is moved there by ``turn`` for an integrator whose discontinuity
+    is at zero; the caller removes ``turn`` from a chi axis. Any other window keeps its call.
+    """
+    raw = _integration_azimuth_range(plan)
+    if raw is None:
+        return None, None
+    if radial and plan.azimuth_range[1] - plan.azimuth_range[0] == 360.0:
+        return None, None
+    lo, hi = raw
+    if -180.0 <= lo < hi <= 180.0:
+        return raw, None
+    turn = -360.0 * float(np.floor(lo / 360.0))
+    if not lo < hi <= 360.0 - turn:
+        return raw, None
+    return (lo + turn, hi + turn), turn
+
+
+def _windowed_integrator(
+    integrators: "_ReductionIntegratorProvider", ai: Any, frame: Frame, shape: tuple[int, ...],
+    plan: "Integration1DPlan | Integration2DPlan", *, radial: bool,
+) -> tuple[Any, tuple[float, float] | None, float]:
+    """``plan``'s integrator, raw chi range and the whole turn its chi axis carries."""
+    window, turn = _native_azimuth_window(plan, radial=radial)
+    if turn is None:
+        return ai, window, 0.0
+    return integrators.alternate(ai, frame, shape), window, turn
 
 
 def _coerce_gi_1d_mode(mode: GI1DMode | str) -> GI1DMode:

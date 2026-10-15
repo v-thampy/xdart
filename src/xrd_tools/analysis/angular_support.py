@@ -187,7 +187,8 @@ def admitted_window(requested_deg: tuple[float, float] | None, *, reducer: str, 
                     scouted_deg: tuple[float, float] | None = None) -> AdmittedWindow:
     """The χ directions ``reducer`` admits for ``requested_deg``, by that reducer's own rule.
 
-    * ``int_standard``: Int's offset subtraction, then pyFAI's normalize_azimuth_range with ``chi_disc_at_pi``.
+    * ``int_standard``: Int's offset subtraction, then pyFAI's normalize_azimuth_range with ``chi_disc_at_pi``, the
+      discontinuity of the integrator Int used; a full turn admits every direction (Int reduces it as Auto).
     * ``int_gi_total_q``: no window is the full-turn fast path; a window is χ_GI on the polar path, refused
       outside [−180°, 180°] (pyFAI wraps it there rather than clamping).
     * ``stitch_multigeometry``: MultiGeometry's normalisation (χ discontinuity at π); without a window the pixel-centre
@@ -222,7 +223,10 @@ def admitted_window(requested_deg: tuple[float, float] | None, *, reducer: str, 
     else:
         shift = float(offset_deg) if reducer == "int_standard" else 0.0
         raw = (lo - shift, hi - shift)
-        admitted = _pyfai_admitted(*raw, chi_disc_at_pi if reducer == "int_standard" else True)
+        if reducer == "int_standard" and width == 360.0:
+            admitted = _FULL  # Int reduces a radial full turn as Auto: every direction
+        else:
+            admitted = _pyfai_admitted(*raw, chi_disc_at_pi if reducer == "int_standard" else True)
     lost = _subtract(_circle(*raw), admitted)
     return AdmittedWindow(requested, denominator, admitted, lost)
 
@@ -1291,10 +1295,16 @@ class SavedSupportBasis:
             return AngularSupportProfile.unavailable(
                 SupportReason.LEGACY_INSUFFICIENT, detail="the saved axis unit is not the record's plan unit", **facts)
         from xrd_tools.integrate.single import integrate_1d
+        from xrd_tools.reduction.core import _integration_azimuth_range
+        window_range = _integration_azimuth_range(plan)
+        if window_range is not None and _subtract(_circle(*window_range), _pyfai_admitted(*window_range, True)):
+            # pyFAI's pi rule cut this window before Int's seam correction and not after it; the
+            # record cannot say which reducer wrote it, so its admitted directions are unknown.
+            return AngularSupportProfile.unavailable(
+                SupportReason.LEGACY_INSUFFICIENT, detail="historical chi-window admission cannot be established",
+                **facts)
         ai = self.integrator_for(label)
         offset = float(getattr(plan, "azimuth_offset", 0.0) or 0.0)
-        window_range = None if plan.azimuth_range is None else (plan.azimuth_range[0] - offset,
-                                                                plan.azimuth_range[1] - offset)
         reduced = integrate_1d(np.zeros(self._ring.shape, np.float32), ai, npt=plan.npt, unit=plan.unit,
                                method=plan.method, mask=self._mask, radial_range=plan.radial_range,
                                azimuth_range=window_range)
