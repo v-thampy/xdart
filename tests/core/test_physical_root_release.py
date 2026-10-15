@@ -74,7 +74,8 @@ def test_o4b_release_leases_is_one_checked_batch():
     foreign.close()
 
 
-def test_l1_a_lost_swap_retries_and_drops_roots_outside_the_lock(monkeypatch):
+@pytest.mark.parametrize("winning_semantic", ("s0", "s1"), ids=("same_lease", "other_lease"))
+def test_l1_a_lost_swap_retries_and_drops_roots_outside_the_lock(monkeypatch, winning_semantic):
     from xrd_tools.core.physical_memory import release_leases
     authority = PhysicalRootAuthority(1024)
     root = np.zeros(64, np.uint8)
@@ -89,12 +90,16 @@ def test_l1_a_lost_swap_retries_and_drops_roots_outside_the_lock(monkeypatch):
         calls.append(1)
         built = real(*args, **kwargs)
         if len(calls) == 1:
-            leases["s1"].release()
+            # If the winner also removes s0, its root is held only by the losing snapshot: replacing that
+            # snapshot must not run its finalizer under the lock. The other-lease case requires a new delta.
+            leases[winning_semantic].release()
         return built
     monkeypatch.setattr(physical_memory, "_replacement_state", replacement_state)
     release_leases([leases["s0"]])
     gc.collect()
-    assert len(calls) == 3, "the batch lost its first swap to the other release and retried"
+    assert len(calls) == (2 if winning_semantic == "s0" else 3), "the lost swap recomputes live victims"
     assert observed == [False], "the released root died once, with the authority lock not held"
+    assert authority.retained_bytes == (32 if winning_semantic == "s0" else 0)
+    leases["s1"].release()
     assert (authority.retained_bytes, authority.retained_root_count, authority.semantic_references) == (0, 0, 0)
     authority.close()
