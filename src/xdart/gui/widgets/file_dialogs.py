@@ -34,6 +34,20 @@ def export_name(result: str, tool: str, extension: str) -> str:
     return f'{stem}_{tool}{extension}'
 
 
+def _restore_parent(parent) -> None:
+    """Return to the surviving window that opened a blocking picker, without showing a hidden parent."""
+    from pyqtgraph.Qt import QtWidgets
+
+    if parent is not None:
+        try:
+            window = parent.window()
+            if window.isVisible() and QtWidgets.QApplication.activeModalWidget() in (None, window):
+                window.raise_()
+                window.activateWindow()
+        except RuntimeError:  # The parent may have been deleted during the nested chooser loop.
+            pass
+
+
 def ask(parent, title: str, *, start: str = "", folder: bool = False, many: bool = False,
         save: bool = False, file_filter: str = ANY_FILTER) -> list[str]:
     """The one place a file dialog opens (Codex's Stitch/Int reuse audit R5): ask for a folder, a file or
@@ -43,17 +57,21 @@ def ask(parent, title: str, *, start: str = "", folder: bool = False, many: bool
     once it is accepted) calls this."""
     from pyqtgraph.Qt import QtWidgets
 
-    if save:
-        chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(parent, title, start, file_filter)
+    try:
+        if save:
+            chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(parent, title, start, file_filter)
+            return [chosen] if chosen else []
+        if folder:
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(parent, title, start)
+            return [chosen] if chosen else []
+        if many:
+            picks, _filter = QtWidgets.QFileDialog.getOpenFileNames(parent, title, start, file_filter)
+            return list(picks or ())
+        chosen, _filter = QtWidgets.QFileDialog.getOpenFileName(parent, title, start, file_filter)
         return [chosen] if chosen else []
-    if folder:
-        chosen = QtWidgets.QFileDialog.getExistingDirectory(parent, title, start)
-        return [chosen] if chosen else []
-    if many:
-        picks, _filter = QtWidgets.QFileDialog.getOpenFileNames(parent, title, start, file_filter)
-        return list(picks or ())
-    chosen, _filter = QtWidgets.QFileDialog.getOpenFileName(parent, title, start, file_filter)
-    return [chosen] if chosen else []
+    finally:
+        # Native pickers can activate the main window instead of the modeless window that opened them.
+        _restore_parent(parent)
 
 
 def browse(parent, title: str, *, folder: bool = False, many: bool = False, save: bool = False,
@@ -139,6 +157,7 @@ def browse_spec(parent, title: str, *, many: bool = False, current: str = "",
         picks = dialog.selectedFiles() if dialog.exec() == QtWidgets.QDialog.Accepted else []
     finally:
         dialog.deleteLater()
+        _restore_parent(parent)
     if picks:
         remember_browse_path(picks[0])
     refused = [path for path in picks if not is_spec_file(path)]

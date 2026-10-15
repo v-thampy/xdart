@@ -276,24 +276,38 @@ def test_typed_beam_pixel_follows_the_camera_but_not_pyfais_origin(qapp, tmp_pat
         dialog.close()
 
 
-def test_escape_dismisses_a_real_file_chooser_and_keeps_calibration_open(qapp, tmp_path):
-    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+@pytest.mark.parametrize('key, chooser_kind', [('beam_source', 'spec'), ('source', 'image'), ('images', 'dir')])
+def test_escape_dismisses_a_real_file_chooser_and_keeps_calibration_open(qapp, tmp_path, key, chooser_kind):
+    from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
+    main = QtWidgets.QMainWindow()
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path), parent=main)
+    main.show()
     dialog.show()
+    dialog.activateWindow()
+    qapp.processEvents()
     dismissed = []
     def escape():
         chooser = QtWidgets.QApplication.activeModalWidget()
         assert isinstance(chooser, QtWidgets.QFileDialog)
+        if chooser_kind != 'spec':
+            # Model the native picker's reported return to main, using real Qt activation and cancellation.
+            chooser.finished.connect(lambda _result: main.activateWindow())
         QtTest.QTest.keyClick(chooser, QtCore.Qt.Key.Key_Escape)
         dismissed.append(True)
     try:
         QtCore.QTimer.singleShot(50, escape)
-        dialog._browse('beam_source', 'spec')
-        assert dismissed and dialog.isVisible() and dialog._text('beam_source') == ''
+        dialog._browse(key, NEXUS_FILTER if chooser_kind == 'image' else chooser_kind)
+        qapp.processEvents()
+        assert dismissed and dialog.isVisible() and dialog._text(key) == ''
+        assert qapp.activeWindow() is dialog, 'the chooser returns focus to Calibration, not the main window'
         # The release of Escape can reach the retained parent after a native chooser exits.
         QtTest.QTest.keyClick(dialog, QtCore.Qt.Key.Key_Escape)
         assert dialog.isVisible()
     finally:
         dialog.close()
+        dialog.deleteLater()
+        main.close()
+        main.deleteLater()
 
 
 def test_saved_wavelength_migrates_to_energy_with_the_same_physical_value(qapp, tmp_path):
