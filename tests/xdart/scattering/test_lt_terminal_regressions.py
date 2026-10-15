@@ -49,7 +49,8 @@ def test_unresolved_legacy_format_choice_survives_settings_roundtrip(qapp, tmp_p
         _shut(qapp, page)
 
 
-def test_config_collapse_with_focused_unchanged_zero_preserves_orientation(qapp, tmp_path):
+@pytest.mark.parametrize('draft', (False, True), ids=('unchanged', 'unfinished-valid-edit'))
+def test_config_collapse_with_focused_zero_preserves_orientation(qapp, tmp_path, draft):
     from tests.xdart.scattering.test_orientation_diagnosis import dialog_at_fit
     from tests.xdart.scattering.test_lt_calibration_compact import _box, _config, _instrument, _press
     dialog = dialog_at_fit(tmp_path)
@@ -63,6 +64,9 @@ def test_config_collapse_with_focused_unchanged_zero_preserves_orientation(qapp,
         zero.setFocus()
         qapp.processEvents()
         assert zero.hasFocus()
+        if draft:
+            from tests.xdart.scattering.test_calibration_quick_chain import _type
+            _type(zero, '1.25')
         before = (dialog.geometry_editor.value(), dialog.fit, dialog._orientation_key())
         _press(button)
         _press(button)
