@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import numpy as np
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.results_table import (
@@ -109,5 +108,8 @@ def test_an_analyzer_phase_fits_rows_are_its_phases_fractions_and_cell() -> None
     entry = {"phase_fractions": {"TiN": 0.75, "HfO2": 0.25}, "lattice_params": {"TiN": {"a": 4.24, "b": 4.24}}}
     assert phase_outcome_rows(entry, ()) == (PHASE_OUTCOME_HEADERS, (
         ("TiN", "0.750", "4.2400", "4.2400", "—"), ("HfO2", "0.250", "—", "—", "—")))
-    assert phase_outcome_rows(None, ("TiN",)) == (PHASE_OUTCOME_HEADERS, (("TiN", "nan", "—", "—", "—"),))
-    assert np.isnan(float(phase_outcome_rows(None, ("TiN",))[1][0][1]))
+    # LT-SMALL-FIXES-20261014 V2: an absent fraction shows "—", as the owner presents it, and its reason as a row
+    assert phase_outcome_rows(None, ("TiN",)) == (PHASE_OUTCOME_HEADERS, (("TiN", "—", "—", "—", "—"),))
+    withheld = {"phase_fractions_reason": "fractions withheld: the fit did not converge"}
+    assert phase_outcome_rows(withheld, ("TiN",)) == (PHASE_OUTCOME_HEADERS, (
+        ("TiN", "—", "—", "—", "—"), ("fractions withheld: the fit did not converge", "—", "—", "—", "—")))
