@@ -87,6 +87,30 @@ def resolve_spec_image_scan(path: str | Path, *, meta_dir: str | Path | None = N
     return observed.source_path, f"{scan}.1"
 
 
+def _spec_image_layout(path, read_image_kwargs, nexus_entry=None):
+    """One layout/selector for SPEC admission and optional point grouping."""
+    from xrd_tools.io.image import DetectorImageLayout, _HDF5_READ_EXTS, read_detector_image_layout
+
+    if nexus_entry and Path(path).suffix.lower() in _HDF5_READ_EXTS:
+        from xrd_tools.io.nexus import list_entries
+        from xrd_tools.sources.descriptor import describe_container
+        from xrd_tools.sources.probe import ProbeState
+
+        if nexus_entry not in list_entries(path):
+            raise ValueError(f"{Path(path).name}: NeXus entry {nexus_entry!r} is not present")
+        descriptor = describe_container(path, entry=nexus_entry)
+        if (descriptor.state is not ProbeState.READY or descriptor.dataset_path is None
+                or descriptor.kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
+            raise ValueError(f"{Path(path).name}:{nexus_entry}: {descriptor.reason or 'not a raw detector source'}")
+        layout = DetectorImageLayout(tuple(descriptor.frame_shape), descriptor.dtype.str,
+                                     descriptor.frame_count, descriptor.saturation)
+        return layout, descriptor.dataset_path
+    return read_detector_image_layout(path, **{
+        key: value for key, value in read_image_kwargs.items()
+        if key in {"detector_shape", "detector", "raw_dtype", "raw_header_skip"}
+    }), None
+
+
 class SpecSource(BaseFrameSource):
     """FrameSource over ONE scan of a SPEC file (metadata; raw images optional).
 
@@ -105,6 +129,8 @@ class SpecSource(BaseFrameSource):
     read_image_kwargs
         Passed to :func:`xrd_tools.io.image.read_image` (e.g. ``detector_shape``
         / ``raw_dtype`` / ``raw_header_skip`` for headerless raw binaries).
+    nexus_entry
+        Exact detector-container entry override; omitted retains automatic discovery.
     """
 
     kind = SourceKind.SPEC
@@ -114,7 +140,8 @@ class SpecSource(BaseFrameSource):
                  image_stem: str | None = None,
                  require_complete_images: bool = False,
                  read_image_kwargs: Mapping[str, Any] | None = None,
-                 point_images: Mapping[str, Any] | None = None) -> None:
+                 point_images: Mapping[str, Any] | None = None,
+                 nexus_entry: str | None = None) -> None:
         from xrd_tools.io.spec import (
             get_spec_scanned_axes,
             list_spec_scans,
@@ -156,12 +183,18 @@ class SpecSource(BaseFrameSource):
         # agnostic).
         self.image_dir = Path(image_dir) if image_dir else None
         self._read_image_kwargs = dict(read_image_kwargs or {})
+        if nexus_entry is not None and (type(nexus_entry) is not str or "\0" in nexus_entry):
+            raise ValueError("NeXus entry must be a group name")
+        nexus_entry = nexus_entry.strip() if nexus_entry else None
+        self._container_dataset_paths = {}
         from xrd_tools.sources.point_images import PointImagePolicy
         self.point_image_policy = (None if point_images is None else
                                    PointImagePolicy.from_dict(point_images))
         source_options = dict(scan=self.scan_key, image_dir=str(self.image_dir) if self.image_dir else None,
                               image_stem=image_stem, require_complete_images=require_complete_images,
                               read_image_kwargs=self._read_image_kwargs)
+        if nexus_entry:
+            source_options["nexus_entry"] = nexus_entry
         if self.point_image_policy is not None:
             source_options["point_images"] = self.point_image_policy.to_dict()
         source_spec = SourceSpec(self.path, SourceKind.SPEC, options=source_options)
@@ -169,12 +202,13 @@ class SpecSource(BaseFrameSource):
         if self.image_dir is not None and self.scan_key is not None:
             stem = image_stem or self._default_image_stem(self.scan_key)
             files = find_spec_image_files(self.image_dir, self.path.stem, self.scan_key, image_stem)
+            if (require_complete_images or self.point_image_policy is not None or nexus_entry) and files:
+                layout_options = {key: value for key, value in self._read_image_kwargs.items() if key != "detector"}
+                inspected = [_spec_image_layout(path, layout_options, nexus_entry) for path in files]
+                layouts = [layout for layout, _selector in inspected]
+                self._container_dataset_paths = {path: selector for path, (_layout, selector)
+                                                 in zip(files, inspected) if selector is not None}
             if (require_complete_images or self.point_image_policy is not None) and files:
-                from xrd_tools.io.image import read_detector_image_layout
-                layouts = [read_detector_image_layout(path, **{
-                    key: value for key, value in self._read_image_kwargs.items()
-                    if key in {"detector_shape", "raw_dtype", "raw_header_skip"}
-                }) for path in files]
                 frames = sum(layout.frame_count for layout in layouts)
                 if self.point_image_policy is not None:
                     if npts <= 0 or frames != npts * self.point_image_policy.images_per_point:
@@ -194,7 +228,7 @@ class SpecSource(BaseFrameSource):
                         numbers = [int(match[1]) for match in positions]
                         if numbers not in [list(range(frames)), list(range(1, frames + 1))]:
                             raise ValueError(f"SPEC scan {self.scan_key}: image point numbers contain gaps or duplicates")
-            if (require_complete_images or self.point_image_policy is not None) and files:
+            if (require_complete_images or self.point_image_policy is not None or nexus_entry) and files:
                 self._frame_map = [(path, i) for path, layout in zip(files, layouts)
                                    for i in range(layout.frame_count)]
             elif len(files) == 1 and npts and npts > 1:
@@ -255,6 +289,13 @@ class SpecSource(BaseFrameSource):
         match ``scan50``; override via ``image_stem`` for other conventions."""
         scan_n = str(scan_key).split(".")[0]
         return f"{self.path.stem}_scan{scan_n}_"
+
+    def _image_read_options(self, path):
+        options = dict(self._read_image_kwargs)
+        selector = self._container_dataset_paths.get(path)
+        if selector is not None:
+            options.update(dataset_path=selector, exact_frame=True)
+        return options
 
     # ---- FrameSource API ------------------------------------------------
     @property
@@ -324,7 +365,7 @@ class SpecSource(BaseFrameSource):
         path, frame = self._frame_map[int(index)]
         from xrd_tools.io.image import read_image
         return np.asarray(
-            read_image(path, frame=frame, **self._read_image_kwargs),
+            read_image(path, frame=frame, **self._image_read_options(path)),
             dtype=float)
 
     def load_native_frame(self, index: int) -> np.ndarray:
@@ -335,7 +376,7 @@ class SpecSource(BaseFrameSource):
         if path is None:
             raise NotImplementedError("SPEC source has no detector images")
         from xrd_tools.io.image import read_image
-        options = {key: value for key, value in self._read_image_kwargs.items()
+        options = {key: value for key, value in self._image_read_options(path).items()
                    if key not in {"threshold", "mask", "preserve_dtype", "exact_frame"}}
         return read_image(path, frame=frame, preserve_dtype=True, exact_frame=True, **options)
 
@@ -360,10 +401,10 @@ class SpecSource(BaseFrameSource):
                 PointImagePolicy(1, 'select'), conditioning, saturation,
                 poisson=poisson, native_transform=native_transform)
         locators = self.point_raw_locators(index)
-        options = {key: value for key, value in self._read_image_kwargs.items()
-                   if key not in {"threshold", "mask", "preserve_dtype", "exact_frame"}}
         def native(position):
             path, frame = locators[position]
+            options = {key: value for key, value in self._image_read_options(path).items()
+                       if key not in {"threshold", "mask", "preserve_dtype", "exact_frame"}}
             return read_image(path, frame=frame, preserve_dtype=True, exact_frame=True, **options)
         return combine_point_statistics(native, range(len(locators)), policy, conditioning, saturation,
                                         poisson=poisson, native_transform=native_transform)

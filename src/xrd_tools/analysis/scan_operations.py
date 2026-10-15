@@ -927,7 +927,8 @@ def _snapshot(
                      source_frame_index, revision)
                 )
                 grouped_locators = getattr(source, "point_raw_locators", None)
-                if callable(grouped_locators) and getattr(source, "point_image_policy", None) is not None:
+                if callable(grouped_locators) and (getattr(source, "point_image_policy", None) is not None
+                                                  or options.get("nexus_entry")):
                     for raw_path, _raw_index in grouped_locators(label):
                         raw_lexical = _lexical_absolute(raw_path)
                         candidate = raw_lexical.resolve(strict=False)
@@ -941,7 +942,8 @@ def _snapshot(
                         if candidate.suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus", ".cxi"} and candidate not in qualified_raw:
                             from xrd_tools.sources.execution_graph import qualify_source_execution_graph
                             from xrd_tools.sources.descriptor import describe_container
-                            native = describe_container(candidate, entry=getattr(source, "_read_image_kwargs", {}).get("entry", "entry"))
+                            native = describe_container(candidate, entry=options.get("nexus_entry") or
+                                getattr(source, "_read_image_kwargs", {}).get("entry", "entry"))
                             graph = qualify_source_execution_graph(SourceSpec(raw_lexical, native.kind, entry=native.resolved_entry),
                                 cancelled=None if cancel_token is None else cancel_token.is_set)
                             stamp = graph.stamp

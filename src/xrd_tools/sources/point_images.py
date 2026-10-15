@@ -141,8 +141,7 @@ def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
     if not isinstance(spec, SourceSpec):
         raise TypeError("point image inspection requires a SourceSpec")
     if spec.kind is SourceKind.SPEC:
-        from xrd_tools.io.image import read_detector_image_layout
-        from xrd_tools.sources.spec import SpecSource, find_spec_image_files
+        from xrd_tools.sources.spec import SpecSource, find_spec_image_files, _spec_image_layout
 
         options = dict(spec.options)
         metadata = SpecSource(spec.uri, scan=options.get("scan"))
@@ -151,9 +150,9 @@ def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
             return None
         files = find_spec_image_files(directory, Path(spec.uri).stem, metadata.scan_key,
                                      options.get("image_stem"))
-        decode = {key: value for key, value in dict(options.get("read_image_kwargs") or {}).items()
-                  if key in {"detector_shape", "detector", "raw_dtype", "raw_header_skip"}}
-        count = sum(read_detector_image_layout(path, **decode).frame_count for path in files)
+        decode = dict(options.get("read_image_kwargs") or {})
+        count = sum(_spec_image_layout(path, decode, options.get("nexus_entry"))[0].frame_count
+                    for path in files)
         return detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), count)
     if spec.kind is SourceKind.TIFF_SERIES:
         from xrd_tools.sources.spec import SpecSource, find_spec_image_files, resolve_spec_image_scan

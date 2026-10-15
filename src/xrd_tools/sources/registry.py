@@ -582,6 +582,7 @@ def _spec_open(spec: SourceSpec) -> FrameSource:
             image_stem=opts.get("image_stem"),
             require_complete_images=opts.get("require_complete_images", False),
             read_image_kwargs=opts.get("read_image_kwargs"),
+            nexus_entry=opts.get("nexus_entry"),
             point_images=opts.get("point_images"))
     except PointImagesRequired as error:
         from dataclasses import replace

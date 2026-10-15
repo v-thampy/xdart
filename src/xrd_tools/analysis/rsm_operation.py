@@ -1485,6 +1485,7 @@ def _project_source_options(
         "metadata_column_projection",
         "point_images",
         "require_complete_images",
+        "nexus_entry",
     }
     if (
         analysis.resolved_entry is not None

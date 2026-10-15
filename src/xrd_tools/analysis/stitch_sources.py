@@ -29,6 +29,8 @@ class StitchSourceSelection:
     recursive: bool = False
     name_filter: str = ""
     point_image_choices: tuple[tuple[str, str, PointImagePolicy], ...] = ()
+    #: Blank retains discovery of all entries; an explicit page override is exact.
+    nexus_entry: str = ""
 
     def __post_init__(self):
         if self.kind not in {"Spec", "NeXus", "Directory"} or type(self.paths) is not tuple or not self.paths:
@@ -40,6 +42,9 @@ class StitchSourceSelection:
             raise ValueError("Directory mode requires one folder")
         if self.kind == "Spec" and not self.stitch_all:
             parse_stitch_scan_groups(self.scans)
+        if type(self.nexus_entry) is not str or "\0" in self.nexus_entry:
+            raise ValueError("NeXus entry must be a group name")
+        object.__setattr__(self, "nexus_entry", self.nexus_entry.strip())
         if "\0" in self.image_dir or any(c in self.image_stem for c in ("/", "\\", "\0")):
             raise ValueError("Image directory or stem is invalid")
         if type(self.recursive) is not bool or type(self.name_filter) is not str:
@@ -62,7 +67,8 @@ class StitchSourceSelection:
             ("filter", self.name_filter) if self.name_filter else ()) + (
             ("point_images", tuple((uri, scan, tuple(policy.to_dict().items()))
                                   for uri, scan, policy in self.point_image_choices))
-            if self.point_image_choices else ())
+            if self.point_image_choices else ()) + (
+            ("nexus_entry", self.nexus_entry) if self.nexus_entry else ())
 
 
 #: Files a Directory's SPEC search never opens: detector images, their notes, containers, results.
@@ -122,7 +128,11 @@ def stitch_selection_frames(selection: StitchSourceSelection):
         return None
     if selection.kind == "NeXus":
         try:
-            counts = tuple((Path(path).name, describe_container(path).frame_count) for path in selection.paths)
+            if selection.nexus_entry and any(selection.nexus_entry not in list_entries(path)
+                                             for path in selection.paths):
+                return None
+            counts = tuple((Path(path).name, describe_container(
+                path, entry=selection.nexus_entry or "entry").frame_count) for path in selection.paths)
         except (OSError, ValueError, LookupError):
             return None
         return sum(count for _name, count in counts), tuple(f"{name}: {count} frames" for name, count in counts)
@@ -203,6 +213,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             "scan": key, "image_dir": selection.image_dir or str(path.parent),
             "image_stem": stem or None, "read_image_kwargs": dict(read_image_kwargs),
             "require_complete_images": True,
+            **({"nexus_entry": selection.nexus_entry} if selection.nexus_entry else {}),
         })
         spec = confirmed(spec)
         if spec is None:
@@ -241,10 +252,12 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                 groups.append(tuple(members))
 
     def nexus_members(path, *, directory=False):
-        kind = describe_container(path).kind
+        if selection.nexus_entry and selection.nexus_entry not in list_entries(path):
+            raise ValueError(f"{path.name}: NeXus entry {selection.nexus_entry!r} is not present")
+        kind = describe_container(path, entry=selection.nexus_entry or "entry").kind
         if kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
             raise ValueError(f"{path.name} is not a raw NeXus detector source")
-        entries = tuple(list_entries(path))
+        entries = (selection.nexus_entry,) if selection.nexus_entry else tuple(list_entries(path))
         if not entries:
             raise ValueError(f"{path.name} has no NeXus entries")
         # Each file remains one output/group; its exact entries contribute.
