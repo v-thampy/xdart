@@ -2748,6 +2748,7 @@ class StitchPage(QtWidgets.QWidget):
                 geometry = self._instrument()  # before the window exists: settings, or migrated
                 self._calibration_dialog = CalibrationDialog(
                     CalibrationContext("Stitch", str(self._value("project_root"))), parent=self)
+                self._project_data_format()  # bind shared options before source metadata work starts
                 saved = self._calibration_settings or {}
                 if saved:
                     self._calibration_dialog.apply_settings(saved)

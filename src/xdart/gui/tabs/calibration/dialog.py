@@ -2349,12 +2349,15 @@ class CalibrationDialog(QtWidgets.QDialog):
         value = str(value or '').strip()
         previous = self._shared_nexus_entry
         self._shared_nexus_entry = value
+        changed = []
         if value or previous:
             for key in ('entry', 'beam_entry'):
                 target = value or 'entry'
                 if self._text(key) != target:
                     self._set_field_text(key, target)
-                    self._fields[key].editingFinished.emit()
+                    changed.append(key)
+        for key in changed:  # commit both roles before either metadata request starts
+            self._fields[key].editingFinished.emit()
         self._sync_source_rows()
         self._sync_rough_rows()
         return True
@@ -2472,6 +2475,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         except (ValueError, TypeError):
             pass  # an older settings file: the del/nu fields below still name the arm
         fields = dict(values.get('fields') or {})
+        if self._shared_nexus_entry:
+            fields.update(entry=self._shared_nexus_entry, beam_entry=self._shared_nexus_entry)
         from xrd_tools.core.energy import wavelength_m_to_energy_eV
         if fields.get('rough_wavelength') and not fields.get('rough_energy'):
             try:

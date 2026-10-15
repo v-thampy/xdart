@@ -29,6 +29,19 @@ def _multi_entry(path, images=None):
     return images
 
 
+def test_explicit_entry_for_calibration_never_falls_back_to_another_group(tmp_path):
+    path = tmp_path / 'calibrant.nxs'
+    images = _multi_entry(path)
+    with pytest.raises(ValueError, match='missing.*not present'):
+        open_source(SourceSpec(path, SourceKind.NEXUS_STACK, entry='missing', options={'nexus_entry': 'missing'}))
+    source = open_source(SourceSpec(path, SourceKind.NEXUS_STACK, entry='experiment',
+                                   options={'nexus_entry': 'experiment'}))
+    try:
+        np.testing.assert_array_equal(source.load_frame(2), images[2])
+    finally:
+        source.close()
+
+
 @pytest.mark.parametrize("kind", ("NeXus", "Directory"))
 def test_explicit_nexus_entry_filters_members_reads_pixels_and_preserves_auto(tmp_path, kind):
     path = tmp_path / "scan.nxs"

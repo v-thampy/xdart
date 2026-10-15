@@ -1810,6 +1810,7 @@ class RSMPage(QtWidgets.QWidget):
                 context = CalibrationContext("RSM", project, detector=_CALIBRATION_DETECTOR,
                                              camera=DetectorCamera(*_CALIBRATION_CAMERA))
                 self._calibration_dialog = CalibrationDialog(context, parent=self)
+                self._project_data_format()  # bind shared options before source metadata work starts
                 saved = self._calibration_settings or {}
                 if saved:
                     self._calibration_dialog.apply_settings(saved)
