@@ -147,9 +147,12 @@ class Text:
     xy: tuple[float, float]
     text: str
     tooltip: str
+    #: the point of the text placed at ``xy``, as fractions of its width and height from its top left
+    anchor: tuple[float, float] = (0., 0.)
 
     def __post_init__(self):
         object.__setattr__(self, 'xy', tuple(_points((self.xy,))[0]))
+        object.__setattr__(self, 'anchor', tuple(_points((self.anchor,))[0]))
 
 
 @dataclass(frozen=True)
@@ -165,12 +168,19 @@ class Figure:
     texts: tuple[Text, ...] = ()
     image: np.ndarray | None = field(default=None, compare=False, repr=False)
     display_binning: DisplayBinning | None = None
+    #: ((x low, x high), (y low, y high)): the box drawn, its labels included (a schematic's); None, the overlays' range
+    extent: tuple[tuple[float, float], tuple[float, float]] | None = None
 
     def __post_init__(self):
         for values, kind in ((self.curves, Curve), (self.markers, Marker),
                              (self.arrows, Arrow), (self.texts, Text)):
             if type(values) is not tuple or any(type(v) is not kind for v in values):
                 raise TypeError('figure overlays are typed tuples')
+        if self.extent is not None:
+            box = _points(self.extent)
+            if box.shape != (2, 2) or not (box[:, 0] < box[:, 1]).all():
+                raise ValueError('a figure extent is ((x low, x high), (y low, y high))')
+            object.__setattr__(self, 'extent', tuple(tuple(map(float, pair)) for pair in box))
         if self.image is not None:
             image = np.array(self.image, copy=True)
             if image.ndim != 2:
@@ -379,8 +389,14 @@ def residual_example():
 class InstrumentCircle:
     name: str
     axis: str
+    #: the circle's physical angle: ``readback`` − ``zero``, the zero subtracted once
     angle_deg: float
     lab_axis: tuple[float, float, float]
+    motor: str = ''
+    readback: float = 0.
+    zero: float = 0.
+    #: 'sample' or 'detector', its stack
+    role: str = ''
 
 
 @dataclass(frozen=True)
@@ -390,11 +406,24 @@ class InstrumentFigure:
     reason: str = ''
 
 
-def instrument_figure(instrument, readings):
+#: the instrument schematic's one shared key and explanation, under its last view (LT-007: not one per view)
+_INSTRUMENT_KEY = ('Key: the incident beam travels along lab +y to the sample at the origin; a + marks a direction '
+                   'along the line of sight. Solid arcs: sample circles; dashed arcs: detector-arm circles; a dotted '
+                   "leader joins each label to its circle's arrow, the signed rotation axis in the lab frame (x up, "
+                   'y along the beam, z left looking downstream). A positive angle turns right-handed about its axis; '
+                   "each motor's zero is subtracted once. Configured conventions, not validated senses; not to scale.")
+#: the label column beside the drawing, its lanes' spacing (data units: the schematic is not to scale)
+_LABEL_COLUMN, _LABEL_LANE = 1.2, .38
+
+
+def instrument_figure(instrument, readings, *, pose='zero-readback example'):
     """Project the configured, separate sample and detector stacks in three views.
 
-    Schematic locations are illustrative. Axis directions and nested rotations
-    come from InstrumentGeometry and xrayutilities, never the drawing mockups.
+    Schematic locations are illustrative and not to scale. Axis directions and nested rotations
+    come from InstrumentGeometry and xrayutilities, never the drawing mockups. Every view names ``pose``
+    (the readbacks drawn: a selected frame's, or an explicit zero-readback example) and keeps each circle's
+    label in a column beside the drawing, one lane each, joined to its axis by a dotted leader, so no two
+    labels meet whatever the projection (LT-007); the last view carries the one shared key and explanation.
     """
     from xrd_tools.session.instrument import InstrumentGeometry
     from xrayutilities.math import getVector, ArbRotation, rotarb
@@ -414,35 +443,53 @@ def instrument_figure(instrument, readings):
                 continue
             axis = axes[name]
             vector = getVector(axis)
-            angle = float(readings[instrument.motor(name)])-(instrument.zero(name) or 0.)
-            circles.append(InstrumentCircle(name, axis, angle, tuple(prefix @ vector)))
+            readback, zero = float(readings[instrument.motor(name)]), float(instrument.zero(name) or 0.)
+            angle = readback-zero
+            circles.append(InstrumentCircle(name, axis, angle, tuple(prefix @ vector), instrument.motor(name),
+                                            readback, zero, role))
             prefix = prefix @ ArbRotation(vector, angle).matrix
+    lanes = [.95-_LABEL_LANE*i for i in range(len(circles))]
+    extent = ((-1.1, _LABEL_COLUMN+1.9), (min(-1.2, lanes[-1]-.3), 1.2))
+    views = (('Side view', (1, 0), ('Lab y (beam)', 'Lab x (up)')),
+             ('Top view', (1, 2), ('Lab y (beam)', 'Lab z')),
+             ('Looking downstream', (2, 0), ('Lab z (left)', 'Lab x (up)')))
     panels = []
-    for title, pair, labels in (('Side view', (1, 0), ('Lab y (beam)', 'Lab x (up)')),
-                               ('Top view', (1, 2), ('Lab y (beam)', 'Lab z')),
-                               ('Looking downstream', (2, 0), ('Lab z (left)', 'Lab x (up)'))):
-        project = lambda vector: tuple(np.asarray(vector)[list(pair)])
-        arrows = [Arrow('incident beam', project((0., -.8, 0.)), project((0., .8, 0.)),
-                        'beam', 'Lab +y points downstream along the incident beam.')]
-        curves, texts = [], []
-        for i, circle in enumerate(circles):
+    for index, (title, pair, labels) in enumerate(views):
+        def project(vector, pair=pair):
+            return tuple(np.asarray(vector, dtype=float)[list(pair)])
+        arrows, markers, curves, texts = [], [], [], []
+        start, end = project((0., -.95, 0.)), project((0., -.45, 0.))
+        if np.hypot(*np.subtract(end, start)) > .05:
+            arrows.append(Arrow('incident beam', start, end, 'beam',
+                                'The incident beam travels along lab +y to the sample at the origin.'))
+        else:
+            markers.append(Marker('incident beam', start, 'beam',
+                                  'The incident beam runs along this line of sight (lab +y) into the sample.'))
+        markers.append(Marker('sample', project((0., 0., 0.)), 'sample', 'The sample, at the origin.'))
+        for i, (circle, lane) in enumerate(zip(circles, lanes)):
             axis = np.asarray(circle.lab_axis)
-            base = np.array((0., .12*i, 0.))
-            arrows.append(Arrow(circle.name, project(base), project(base+.6*axis), 'predicted',
-                f'{circle.name}: signed axis {circle.axis}, readback minus zero {circle.angle_deg:g}°. '
-                'Positive sense follows the right-hand rule; sample and detector stacks are independent.'))
+            base = np.array((0., .12*(i-(len(circles)-1)/2), 0.))
+            tooltip = (f'{circle.name} ({circle.role} circle), motor {circle.motor}: signed axis {circle.axis}; '
+                       f'readback {circle.readback:g}° − zero {circle.zero:g}° = {circle.angle_deg:g}°. A positive '
+                       'angle turns right-handed about the axis; sample and detector stacks are independent.')
+            tip = project(base+.6*axis)
+            if np.hypot(*np.subtract(tip, project(base))) > .05:
+                arrows.append(Arrow(circle.name, project(base), tip, circle.role, tooltip))
+            else:
+                tip = project(base)
+                markers.append(Marker(circle.name, tip, circle.role, tooltip+' Its axis runs along this line of sight.'))
             normal = np.eye(3)[int(np.argmin(abs(axis)))]
             tangent = np.cross(axis, normal); tangent /= np.linalg.norm(tangent)
             arc = [project(base+.15*rotarb(tangent, axis, angle)) for angle in np.linspace(0, 80, 25)]
-            curves.append(Curve(circle.name+' positive sense', arc, 'predicted',
-                                f'Positive rotation about the signed lab axis of {circle.name}.'))
-            texts.append(Text(circle.name, project(base+.7*axis),
-                              f'{circle.name} {circle.angle_deg:g}°', arrows[-1].tooltip))
-        panels.append(Figure(f'{instrument.geometry}: {title}', *labels, 'schematic',
-            'Computed schematic, looking in the declared lab view; positions are not to scale. '
-            'Configured conventions, not experimentally validated circle senses. '
-            'Zero is subtracted once; reversed sense is carried by the signed axis.',
-            curves=tuple(curves), arrows=tuple(arrows), texts=tuple(texts)))
+            curves.append(Curve(circle.name+' positive sense', arc, circle.role,
+                                f'Positive rotation about the signed lab axis of {circle.name} ({circle.role}).'))
+            curves.append(Curve(circle.name+' label', (tip, (_LABEL_COLUMN-.05, lane)), 'leader',
+                                f"Joins {circle.name}'s label to its axis."))
+            texts.append(Text(circle.name, (_LABEL_COLUMN, lane), f'{circle.name} {circle.angle_deg:g}°', tooltip,
+                              anchor=(0., .5)))
+        panels.append(Figure(f'{instrument.geometry} · {title} · {pose}', *labels, 'schematic',
+            _INSTRUMENT_KEY if index == len(views)-1 else '', curves=tuple(curves), markers=tuple(markers),
+            arrows=tuple(arrows), texts=tuple(texts), extent=extent))
     return InstrumentFigure(tuple(circles), tuple(panels))
 
 

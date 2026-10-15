@@ -510,6 +510,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._orientation_geometry = None
         self._orientation_figure = None
         self._schematic_readings = None  # None is an explicitly labelled zero-pose example, not metadata.
+        self._schematic_pose = 'zero-readback example'
+        #: the fields the checklist's Instrument and Orientation check rows show when not ready (LT-008, LT-009)
+        self._instrument_field = self._orientation_field = None
         self._beam_detection = None
         self._beam_generation = 0
         self._beam_problem = 'Select a direct-beam source and scan'
@@ -688,19 +691,36 @@ class CalibrationDialog(QtWidgets.QDialog):
             return
         from xrd_tools.integrate.calibration_checklist import ChecklistFacts, calibration_checklist
         instrument_ready, instrument_message = False, 'Describe the instrument, detector and camera.'
+        # the field each check reads: the row's navigation shows it, opening a hidden Config (LT-009)
+        field = self.geometry_editor.geometry
         try:
             geometry = self.geometry_editor.value()
             geometry.stitch_arm()
+            field = self.geometry_editor.problem_field() or field
             self._zeros()
+            field = self._fields['beam_detector']
             if detector_shape(self._text('beam_detector')) is None:
                 raise ValueError('Select a known detector.')
+            field = self._fields['beam_orientation']
             if int(self._text('beam_orientation')) not in dict(DETECTOR_ORIENTATIONS):
                 raise ValueError('Select a supported first-pixel orientation.')
+            field = self.camera.rotation
             self.camera.value()
+            problem = self._detector_config_problem()
+            if problem is not None:
+                message, field = problem
+                raise ValueError(message)
             instrument_ready = True
             instrument_message = f'{geometry.geometry} · {self._text("beam_detector")} · configured camera; orientation check is optional.'
         except (ValueError, TypeError, KeyError, RuntimeError) as error:
             instrument_message = str(error)
+        self._instrument_field = None if instrument_ready else field
+        ready, reason, target, self._orientation_field = self._orientation_readiness()
+        waiting = self._owner.busy
+        if waiting:
+            ready, reason, target = False, ('Checking orientation…' if self._job == 'orientation' else
+                                            'Wait for the running operation to finish, or cancel it.'), 'orientation'
+        self._project_orientation(ready, reason)
         mode = self.rough_mode.currentData()
         stale = mode == 'scan' and self._distance_result is not None and not self._distance_fresh()
         rough_ready = False
@@ -724,7 +744,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             fit_message=(summary.splitlines() or [''])[0] if self.fit is not None
             else 'Fit the calibrated frames or refine the scan.',
             fit_detail=summary if self.fit is not None else '',
-            saved_current_fit=self.fit is not None and self._saved_ring_fit is self.fit)
+            saved_current_fit=self.fit is not None and self._saved_ring_fit is self.fit,
+            orientation_ready=ready or waiting, orientation_waiting=waiting, orientation_target=target,
+            **({} if ready else {'orientation_message': reason}))
         self._checklist_rows = calibration_checklist(facts)
         tips = {(i, c): row.text if c == 0 else
                 f'{row.state}: current owner readiness or provenance; no scientific quality verdict.' if c == 1
@@ -745,16 +767,101 @@ class CalibrationDialog(QtWidgets.QDialog):
         target = self._checklist_rows[row].target
         if target == 'orientation':
             self.open_orientation_check()
+        elif row == len(self._checklist_rows) - 1:  # the check cannot run: its reason, where it is fixed (LT-008)
+            self._show_tab(target)
+            self._reveal(self._orientation_field)
+            self.status.setText(self._checklist_rows[row].message)
         elif target == 'inspect' and self.fit is not None:
             self._show_calibration_fit()
         else:
             self._show_tab('calibrate' if target in ('fit', 'inspect', 'save') else target)
             if target in ('fit', 'inspect', 'save'):
                 (self.save_button if target == 'save' else self.fit_button).setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+            elif target == 'instrument':
+                self._reveal(self._instrument_field or self.geometry_editor.geometry)
             else:
-                {'instrument': self.geometry_editor.geometry, 'rough': self.rough_mode,
-                 'select': self._fields['source'], 'calibrate': self.frame_table}[target].setFocus(
+                {'rough': self.rough_mode, 'select': self._fields['source'], 'calibrate': self.frame_table}[target].setFocus(
                      QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def _orientation_readiness(self):
+        """Whether the Orientation check can run on the window's current inputs and, when not, why, the step that fixes
+        it and the field to show there (LT-008): one fact for the checklist, the footer entry, the panel's Run, its
+        finding pane and the checklist's navigation, read from the window's own owners with the run's own checks and
+        no file read. Staged frames need the camera, motor mapping and source they were staged with, a fixed arm to
+        predict their rings (the run reads its file) and a Mask file the window could read (its cached read); no
+        frames, a current direct-beam fit. The run checks again (_start_orientation)."""
+        if self.frames:
+            message = self._staged_camera_message()
+            if message:
+                return False, message, 'instrument', self.camera.rotation
+            try:
+                geometry = self.geometry_editor.value()
+                arm = geometry.stitch_arm()
+            except (ValueError, TypeError, KeyError):
+                arm = None
+            if arm != self._frame_motors:
+                field = self.geometry_editor.geometry
+                if arm is not None:  # the motor box of the circle whose motor differs
+                    played = 'del' if arm[0] != self._frame_motors[0] else 'nu'
+                    circle = next((c for c in geometry.circles if geometry.as_psic().get(c, c) == played), None)
+                    field = self.geometry_editor.motor_edit(circle) if circle is not None else field
+                staged = ', '.join(f'{circle} → {motor}' for circle, motor in zip(('del', 'nu'), self._frame_motors)
+                                   if motor)
+                return (False, f'Restore the motor mapping the frames were staged with ({staged}) in '
+                               '1 · Instrument ▸ Diffractometer Config, or start a New session for this mapping.',
+                        'instrument', field)
+            if self._staged_source_mismatch():
+                return (False, 'Select the calibrant source and scan the frames were staged from (3 · Calibrant scan), '
+                               'or start a New session for this source.', 'select', self._fields['source'])
+            prediction = self._prediction is not None and self._prediction[0] == self._calibrated_key()
+            if not ((self.fit is not None and self.fit.asset.get('calibration')) or prediction
+                    or self._rough_record() is not None or self._text('refine_seed_path')):
+                return (False, 'Enter or load a fixed rough geometry (2 · Rough geometry), or name a geometry file '
+                               '(4 · Calibrate and fit), to check these frames against.', 'rough', self.rough_mode)
+            cached = getattr(self, '_mask_cache', None)
+            if (self._text('mask') and cached is not None and cached[1] is None and cached[0][0] == self._text('mask')
+                    and (len(cached[0]) == 2 or cached[0][3] == self.camera.value().to_xu())):
+                return (False, f"The Detector panel's Mask file cannot be read: {self._text('mask')}. Choose a readable "
+                               'one (1 · Instrument).', 'instrument', self._fields['mask'])
+            try:
+                self._saturation_value()
+            except ValueError:
+                return (False, 'Type the saturation as a positive whole count, or leave it blank '
+                               '(1 · Instrument ▸ Detector Config).', 'instrument', self._fields['saturation'])
+        elif self._distance_result is None:
+            return (False, 'Fit the direct-beam distance (2 · Rough geometry), or stage calibrant frames '
+                           '(3 · Calibrant scan), to check the orientation.', 'rough', self.rough_mode)
+        elif not self._distance_fresh():
+            return False, self._STALE_DISTANCE, 'rough', self.rough_mode
+        return True, '', 'orientation', None
+
+    def _detector_config_problem(self):
+        """The first malformed entry in Detector Config, as (refusal, field), or None: the Instrument row of the
+        checklist names it and its navigation shows it (LT-009). The jobs read these as before."""
+        def raw_shape():
+            if len(tuple(int(value) for value in self._text('shape').split(','))) != 2:
+                raise ValueError('two values')
+        for key, check, refusal in (
+                ('header', lambda: int(self._text('header')), 'Header (bytes) must be a whole number'),
+                ('shape', raw_shape, 'RAW images rows, cols must be two whole numbers'),
+                ('dtype', lambda: np.dtype(self._text('dtype')), 'RAW images type must be a NumPy type, such as int32'),
+                ('saturation', self._saturation_value, 'Saturation (counts) must be blank or a positive whole count')):
+            try:
+                check()
+            except (ValueError, TypeError):
+                return f'Detector Config: {refusal}.', self._fields[key]
+        return None
+
+    def _project_orientation(self, ready, reason):
+        """The readiness fact on the footer entry, the panel's Run and, while it shows no finding, its finding pane:
+        disabled with the reason, never a stale message (LT-008)."""
+        footer = self.orientation_button
+        footer.apply_spec(replace(footer.spec, enabled=ready, reason='' if ready else reason))
+        panel = self.orientation_panel
+        if panel is not None:
+            panel.set_readiness(ready, reason)
+            if not ready and not self._owner.busy and panel.finding is None:
+                panel.finding_pane.set_text(reason)
 
     def open_orientation_check(self):
         if self.orientation_panel is None:
@@ -770,6 +877,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.orientation_panel.candidate_row.editor.currentIndexChanged.connect(self._orientation_candidate_changed)
         self.orientation_panel.set_frames(self.frames)
         self.orientation_panel.busy(self._owner.busy)
+        self._refresh_checklist()  # its Run and finding pane take the readiness fact
         self.tabs.setCurrentWidget(self.orientation_panel)
         self.show(); self.raise_(); self.activateWindow()
 
@@ -790,9 +898,15 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._refresh_checklist()
 
     def _start_orientation(self, *_args):
+        if self._owner.busy:
+            return
+        ready, reason, _target, _field = self._orientation_readiness()
+        if not ready:  # Run is disabled then; the readiness fact refuses a run asked for anyway (LT-008)
+            self.status.setText(reason)
+            self.orientation_panel.finding_pane.set_text(reason)
+            return
+
         def go():
-            if self._owner.busy:
-                return
             panel = self.orientation_panel
             preview_camera, preview_senses = self.camera.value(), (1, 1)
             if panel.finding is not None:
@@ -832,9 +946,11 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._orientation_pending_key = self._orientation_key()
             panel.invalidate()
             self._start('orientation', (self._orientation_pending_key, mode, options))
-        self._guard(go)
-        if not self._owner.busy and self.orientation_panel is not None:
-            self.orientation_panel.finding_pane.set_text(self.status.text())
+        try:
+            go()
+        except Exception as error:  # the run's own checks: its refusal, not another status message, in the pane
+            self.status.setText(str(error))
+            self.orientation_panel.finding_pane.set_text(str(error))
 
     def _orientation_candidate_changed(self, *_args):
         panel = self.orientation_panel
@@ -869,7 +985,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if circle is None:
             self.status.setText('Select a measured detector circle to show its motor direction.')
             return
-        self.geometry_editor.axis_box(circle).setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        self._reveal(self.geometry_editor.axis_box(circle))  # inside Diffractometer Config (LT-009)
 
     def _orientation_feature(self, _key, column, row):
         panel = self.orientation_panel
@@ -896,25 +1012,25 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._redraw_schematic()
         self.instrument_schematic.show(); self.instrument_schematic.raise_()
 
-    def set_schematic_readbacks(self, readings):
+    def set_schematic_readbacks(self, readings, pose='selected readbacks'):
+        """Draw the schematic at these motor readbacks; ``pose`` names them in its titles (LT-007)."""
         self._schematic_readings = dict(readings)
+        self._schematic_pose = pose
         self._redraw_schematic()
 
     def _schematic_frame_selected(self):
         row = self.frame_table.currentRow()
         if 0 <= row < len(self.frames):
-            self.set_schematic_readbacks(self.frames[row].motors)
+            self.set_schematic_readbacks(self.frames[row].motors, f'frame {self.frames[row].index} readbacks')
 
     def _redraw_schematic(self, *_args):
         if self.instrument_schematic is None:
             return
         geometry = self.geometry_editor.value()
         readings = self._schematic_readings
-        if readings is None:
+        if readings is None:  # an explicit example, named as such in the titles and the message pane
             readings = {motor: 0. for _, motor in geometry.motors}
-        self.instrument_schematic.show_geometry(geometry, readings)
-        if self._schematic_readings is None:
-            self.instrument_schematic.legend.appendPlainText('\nExplicit zero-readback example; no frame readbacks selected.')
+        self.instrument_schematic.show_geometry(geometry, readings, self._schematic_pose)
 
     def _form(self, title, key):
         widget = QtWidgets.QWidget()
@@ -1583,6 +1699,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         layout.insertWidget(0, self._diffractometer_box)
         layout.insertWidget(1, self._detector_box)
         layout.addStretch(1)
+        self.geometry_editor.changed.connect(self._diffractometer_title)
+        self._diffractometer_title()
         self.geometry_editor.changed.connect(self._geometry_edited)
         self.geometry_editor.changed.connect(self.geometryChanged.emit)
         self.geometry_editor.changed.connect(self._bounds_edited)
@@ -1597,12 +1715,28 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.geometry_editor.zero_edit(circle).textChanged.connect(self._bounds_edited)
             self.geometry_editor.axis_box(circle).currentIndexChanged.connect(self._render_frames)
 
+    def _diffractometer_title(self, *_args):
+        """The Diffractometer panel's title summarises the selected geometry and whether its motor names and senses
+        are its standard ones (LT-009), visible with Config hidden; the tooltip names what differs."""
+        summary, tip = self.geometry_editor.summary()
+        self._diffractometer_box.setTitle(f'Diffractometer · {summary}')
+        self._diffractometer_box.setToolTip(tip)
+
+    def _reveal(self, widget):
+        """Focus ``widget``, first showing the Config that holds it when hidden (LT-009: a field named as a problem is
+        shown where it is fixed)."""
+        for card in (self.geometry_editor.config, self._detector_config):
+            if card.isAncestorOf(widget):
+                card.set_collapsed(False)
+        widget.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
     def _build_quick(self):
-        """Quick calibration (M6, maintainer 2026-10-08): a card at the top of 1 · Instrument with the two scans that
-        identify a calibration, their file and scan number (the values 2 · Rough geometry and 3 · Calibrant scan use,
-        edited in either place; no second copy, nothing saved of its own), the window's Mask file and Threshold (the
-        Detector panel's file and Advanced's threshold, likewise; maintainer, 2026-10-08) and one action that runs the
-        window's own direct-beam fit, metadata read and Refine from the rough geometry (_quick_advance)."""
+        """Quick calibration (M6, maintainer 2026-10-08): a card in 1 · Instrument, below the Diffractometer and
+        Detector panels (LT-009), with the two scans that identify a calibration, their file and scan number (the
+        values 2 · Rough geometry and 3 · Calibrant scan use, edited in either place; no second copy, nothing saved of
+        its own), the window's Threshold (Advanced's, likewise; maintainer, 2026-10-08) and one action that runs the
+        window's own direct-beam fit, metadata read and Refine from the rough geometry (_quick_advance). Its mask is
+        the Detector panel's one Mask file, exposed just above (LT-009: no duplicate row)."""
         self.quick_card = SectionCard('Quick calibration')
         tip = ('Fit direct-beam distance (2 · Rough geometry), Read metadata (3 · Calibrant scan), then Refine '
                'automatically from the rough geometry (4 · Calibrate and fit), one after another. It stops at the '
@@ -1642,12 +1776,6 @@ class CalibrationDialog(QtWidgets.QDialog):
                                               'here or there.')
             for key, row in ((prefix + 'source', file_row), (prefix + 'images', images_row)):
                 row.browseRequested.connect(lambda _path, key=key: self._browse(key, self._choosers[key]))
-        mask_row = FormRow(label='Mask file', path=('Calibration', 'Quick', 'mask'), value='', browse=True)
-        form.addRow(mask_row.label, mask_row)
-        self._quick_project('mask', mask_row, "The Detector panel's Mask file, edited here or there: pixels left out "
-                                              'everywhere in this calibration; saving the calibration makes it the '
-                                              "page's Mask File.")
-        mask_row.browseRequested.connect(lambda _path: self._browse('mask', self._choosers['mask']))
         self.quick_threshold = self._threshold_row()  # Advanced's threshold: one state, shown on both rows
         form.addRow(self.quick_threshold.label, self.quick_threshold)
         self._show_threshold()
@@ -1655,7 +1783,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.quick_button.clicked.connect(self._quick_start)
         form.addRow(self.quick_button)
         self.quick_card.add_row(body)
-        self._instrument_layout.insertWidget(0, self.quick_card)
+        self._instrument_layout.insertWidget(self._instrument_layout.indexOf(self._detector_box) + 1, self.quick_card)
         self._sync_quick_rows()
         self._sync_quick_button()
 
@@ -1673,8 +1801,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         card, nor a focused file row (a file row takes no set while it holds the focus); a focused scan box that holds
         no draft does follow (Tab from a new file to its scan: the reset scan, not the old file's)."""
         row = self._quick_rows.get(key)
-        if row is None or (row.editor.hasFocus() and (row.editor.isModified() or key.endswith(('source', 'images'))
-                                                      or key == 'mask')):
+        if row is None or (row.editor.hasFocus() and (row.editor.isModified() or key.endswith(('source', 'images')))):
             return
         value = self._text(key)
         if row.current_value() != value:
@@ -1818,15 +1945,43 @@ class CalibrationDialog(QtWidgets.QDialog):
         panel = self._detector_panel = QtWidgets.QGroupBox('Detector')
         form = QtWidgets.QFormLayout(panel)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self._choice(form, 'beam_detector', 'Model', list(detector_choices(raw_details=True)),
-                     'Pilatus300kw', tip='The detector model (pyFAI); it sets the pixel size and shape.')
+        # one primary row, Model · Rotation · Config, then the Mask file; the rest in Config, collapsed at first
+        # (LT-009; maintainer, 2026-10-14: "Inline expansion")
+        from xdart.gui.widgets.controls_panel import SubsectionCard
+        self._model_captions = dict((name, label) for label, name in detector_choices(shapes=True))
+        self._model_labels = dict((name, label) for label, name in detector_choices())
+        self._choice(form, 'beam_detector', 'Model', list(detector_choices(shapes=True)), 'Pilatus300kw',
+                     tip="The detector model (pyFAI), its native rows × columns and, when Config's RAW layout is "
+                         'Manual, the pixel type typed there; it sets the pixel size and shape. The detector default '
+                         'reads headerless RAW frames as int32; TIFF images and Eiger or NeXus files carry their own '
+                         'type.')
+        from xdart.gui.widgets.camera_editor import CameraEditor
+        self.camera = CameraEditor(rotation_apart=True)
+        config = self._detector_config = SubsectionCard('')
+        config_button = config.external_trigger(
+            'Config', 'Show or hide the RAW layout and header, the camera flips and reset, the first-pixel corner and '
+                      'the saturation. Showing or hiding changes no value and keeps any draft.')
+        self._formrows['beam_detector'].add_trailing_widget(self.camera.rotation_row, 0)
+        self._formrows['beam_detector'].add_trailing_widget(config_button, 0)
+        self._edit(form, 'mask', 'Mask file', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
+                   tip='Pixels to leave out everywhere in this calibration: the direct-beam fit, pyFAI-calib2 '
+                       '(its mask), the automatic refinement\'s ring search and the expected rings. Drawn on '
+                       f'the stored image (before the camera\'s turn), as {self.context.page}\'s Mask File is; saving '
+                       f'the calibration makes it {self.context.page}\'s Mask File.')
+        self._fields['mask'].editingFinished.connect(self._render_frames)
+        form.addRow(config)
+        body = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(body)  # Config's own rows
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        config.add_row(body)
         self.raw_layout = self._combo(form, 'RAW layout', [('Detector default', 'factory'), ('Manual', 'manual')],
-            host='beam_detector', tip='Detector default: its rows and columns, with the RAW reader default int32. '
+            tip='Detector default: its rows and columns, with the RAW reader default int32. '
                 'Manual: override the stored RAW layout; the physical detector model and pixel pitch stay selected. '
                 'TIFF, Eiger and NeXus carry their own layout.')
-        self._row_of[self.raw_layout].setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum,
-                                                   QtWidgets.QSizePolicy.Policy.Preferred)
-        self._attach('header', 'beam_detector', 'Header (bytes)', '0', width=75,
+        self._formrows['raw_layout'] = self._row_of[self.raw_layout]
+        self._rows['raw_layout'] = (form, self._row_of[self.raw_layout])
+        self._attach('header', 'raw_layout', 'Header (bytes)', '0', width=75,
                      tip='Bytes to skip before pixels in a headerless RAW file; unused for TIFF, Eiger and NeXus.')
         reader = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(reader)
@@ -1847,12 +2002,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._tip(raw_tip, form.labelForField(reader))
         self.raw_layout.currentIndexChanged.connect(self._sync_raw_layout)
         self._sync_raw_layout()
-        # The shared mounting editor keeps signed lab axes internally (maintainer, 2026-10-02).
-        from xdart.gui.widgets.camera_editor import CameraEditor
-        self.camera = CameraEditor()
+        # The shared mounting editor keeps signed lab axes internally (maintainer, 2026-10-02); its rotation sits on
+        # the Model row, its flips, reset and image size here
         form.addRow('Camera orientation (lab frame)', self.camera)
-        self._tip(self._CAMERA_TIP, self.camera.rotation, self.camera.fliplr, self.camera.flipud,
-                  form.labelForField(self.camera))
+        self._tip(self._CAMERA_TIP, self.camera.rotation, self.camera.rotation_label, self.camera.fliplr,
+                  self.camera.flipud, form.labelForField(self.camera))
         self._image_size = self.camera.image_size
         corners = {3: 'bottom right (pyFAI default)', 1: 'top left', 2: 'top right', 4: 'bottom left'}
         self._choice(form, 'beam_orientation', 'First pixel (pyFAI orientation)',
@@ -1875,13 +2029,23 @@ class CalibrationDialog(QtWidgets.QDialog):
                        'the image type\'s maximum. Eiger\'s physical cutoff depends on acquisition settings; '
                        'type the file\'s cutoff to use it. A typed value stays when the detector changes.')
         self._show_saturation_hint()
-        self._edit(form, 'mask', 'Mask file', chooser='Masks (*.edf *.tif *.tiff *.npy);;All files (*)',
-                   tip='Pixels to leave out everywhere in this calibration: the direct-beam fit, pyFAI-calib2 '
-                       '(its mask), the automatic refinement\'s ring search and the expected rings. Drawn on '
-                       f'the stored image (before the camera\'s turn), as {self.context.page}\'s Mask File is; saving '
-                       f'the calibration makes it {self.context.page}\'s Mask File.')
-        self._fields['mask'].editingFinished.connect(self._render_frames)
+        for signal in (self._fields['beam_detector'].currentIndexChanged, self.raw_layout.currentIndexChanged,
+                       self._fields['dtype'].textChanged):
+            signal.connect(self._caption_model)
+        self._caption_model()
         return panel
+
+    def _caption_model(self, *_args):
+        """The Model box names each detector with its native rows × columns; the chosen one adds the pixel type when
+        it is known, typed under a Manual RAW layout (LT-009: no "RAW" and no invented type; the detector default's
+        int32 is the RAW reader's default, and TIFF, Eiger and NeXus files carry their own)."""
+        combo = self._fields['beam_detector']
+        dtype = self._text('dtype') if self.raw_layout.currentData() == 'manual' else ''
+        for index in range(combo.count()):
+            caption = self._model_captions.get(combo.itemData(index), combo.itemText(index))
+            caption += f' · {dtype}' if dtype and index == combo.currentIndex() else ''
+            if combo.itemText(index) != caption:
+                combo.setItemText(index, caption)
 
     _ROUGH_NOTES = {
         'scan': 'A direct-beam scan: SPEC supplies the angles for an image series or an Eiger/NeXus container; '
@@ -1938,7 +2102,7 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _update_image_size(self, *_args):
         """The detector image's width × height, as the beam pixel is read (turned by the Detector panel's camera); a
         quarter turn also says the stored image's size and the turn."""
-        model = self._fields['beam_detector'].currentText().partition(' [')[0]
+        model = self._model_labels.get(self._text('beam_detector'), self._text('beam_detector'))
         shape = detector_shape(self._text('beam_detector'))
         if shape is None:
             self._detector_panel.setTitle(f'Detector · {model} · orientation: '
@@ -2571,6 +2735,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._timer.start()
         self._sync_quick_button()
         self.busyChanged.emit(True)
+        self._refresh_checklist()  # the Orientation check waits: the checklist, footer and Run say so (LT-008)
 
     def _job_status(self, detail):
         """A calibrant preview reports in its panel; the message box keeps the fit result."""
@@ -3385,6 +3550,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.frame_table.selectRow(0)
         self.session_label.setText(f'Session: {self.session_dir / "calibration-session.json"}')
         self._sync_arm_model()
+        self._refresh_checklist()  # the expected rings read the mask once: the Orientation check's readiness knows it
 
     def _new_session(self):
         if self._owner.busy:
@@ -3622,6 +3788,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._calibration_fit_window is not None:
             self._calibration_fit_window.preview_busy(False)
         self.busyChanged.emit(False)
+        self._refresh_checklist()  # the Orientation check's Run follows its readiness, never busy alone (LT-008)
         if terminal.status is OperationTerminalStatus.RETURNED:
             result = terminal.payload
             if type(result) is PointImageDetection:
@@ -3803,8 +3970,10 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._close_after_save = False
             self._job_status(terminal.failure_message)
         if kind == 'orientation' and self.orientation_panel is not None:
-            if terminal.status is not OperationTerminalStatus.RETURNED:
-                self.orientation_panel.finding_pane.set_text(self.status.text())
+            if terminal.status is OperationTerminalStatus.CANCELLED:
+                self.orientation_panel.finding_pane.set_text('Cancelled. No finding was adopted.')
+            elif terminal.status is not OperationTerminalStatus.RETURNED:
+                self.orientation_panel.finding_pane.set_text(terminal.failure_message)
             elif self._orientation_pending_key != self._orientation_key() and not self._close_pending:
                 self.orientation_panel.finding_pane.set_text('Inputs changed during the check; run again. No stale finding was adopted.')
         if kind == 'beam_detect':

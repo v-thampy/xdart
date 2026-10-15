@@ -29,15 +29,23 @@ class CameraEditor(QtWidgets.QWidget):
 
     changed = QtCore.Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, rotation_apart=False):
+        """``rotation_apart``: the Rotation label and box form ``rotation_row``, which the host mounts on a row of its
+        own (the calibration window's Detector Model row, LT-009); the flips, reset and image size stay here."""
         super().__init__(parent)
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.rotation = ControlsComboBox()
         for rotation, caption in _ROTATION_LABELS.items():
             self.rotation.addItem(caption, rotation)
-        layout.addWidget(QtWidgets.QLabel('Rotation'))
-        layout.addWidget(self.rotation, 1)
+        self.rotation_label = QtWidgets.QLabel('Rotation')
+        self.rotation_row = QtWidgets.QWidget()
+        rotation_layout = QtWidgets.QHBoxLayout(self.rotation_row)
+        rotation_layout.setContentsMargins(0, 0, 0, 0)
+        rotation_layout.addWidget(self.rotation_label)
+        rotation_layout.addWidget(self.rotation, 1)
+        if not rotation_apart:
+            layout.addWidget(self.rotation_row, 1)
         self.fliplr = QtWidgets.QPushButton('Flip ⇔')
         self.flipud = QtWidgets.QPushButton('Flip ⇕')
         self.fliplr.setAccessibleName('Flip left/right')

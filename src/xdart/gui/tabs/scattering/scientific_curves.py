@@ -27,8 +27,9 @@ def reference_entry(value, color):
 
 def add_curve_item(plot, curve, color, *, xy=None):
     points = curve.xy if xy is None else xy
-    style = (QtCore.Qt.PenStyle.DashLine if curve.role == 'predicted'
-             else QtCore.Qt.PenStyle.DotLine if curve.role == 'tie'
+    # an instrument schematic's detector-arm circles dash as a prediction does, its label leaders dot (LT-007)
+    style = (QtCore.Qt.PenStyle.DashLine if curve.role in ('predicted', 'detector')
+             else QtCore.Qt.PenStyle.DotLine if curve.role in ('tie', 'leader')
              else QtCore.Qt.PenStyle.SolidLine)
     item = plot.plot(points[:, 0], points[:, 1],
                      pen=pg.mkPen(color, width=2, style=style), name=curve.name)
@@ -39,8 +40,8 @@ def add_curve_item(plot, curve, color, *, xy=None):
 
 
 def add_text_item(plot, text, color, *, xy=None):
-    """Shared passive Figure label, in the caller's displayed coordinates."""
-    item = pg.TextItem(text.text, color=color)
+    """Shared passive Figure label, in the caller's displayed coordinates, placed by its anchor."""
+    item = pg.TextItem(text.text, color=color, anchor=getattr(text, 'anchor', (0, 0)))
     item.setPos(*(text.xy if xy is None else xy))
     item.setToolTip(text.tooltip)
     item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)

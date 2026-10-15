@@ -24,6 +24,11 @@ class ChecklistFacts:
     fit_detail: str = ""
     saved_current_fit: bool = False
     orientation_message: str = "Optional: inspect orientation evidence; no camera or sense is applied."
+    #: the Orientation check's one readiness fact (LT-008): whether it can run with the window's current inputs, or
+    #: (message) why not and (target) the step whose controls fix it; waiting while another operation runs
+    orientation_ready: bool = True
+    orientation_waiting: bool = False
+    orientation_target: str = "orientation"
 
 
 @dataclass(frozen=True)
@@ -50,7 +55,8 @@ def calibration_checklist(facts: ChecklistFacts) -> tuple[ChecklistRow, ...]:
         "Done" if facts.source_ready else "Needs input",
         "Done" if facts.frame_count >= 3 and facts.complete_count == facts.frame_count else "Needs input",
         fit, "Optional" if facts.fit_present else "Needs input",
-        "Done" if facts.fit_present and facts.saved_current_fit else "Needs input", "Optional",
+        "Done" if facts.fit_present and facts.saved_current_fit else "Needs input",
+        "Waiting" if facts.orientation_waiting else "Optional" if facts.orientation_ready else "Needs input",
     )
     frames = facts.frame_message
     if 0 < facts.frame_count < 3:
@@ -61,7 +67,7 @@ def calibration_checklist(facts: ChecklistFacts) -> tuple[ChecklistRow, ...]:
                 else "Save the current ring fit, then validate it on an informative frame.",
                 facts.orientation_message)
     details = ("", "", "", "", facts.fit_detail, facts.fit_detail, "", "")
-    targets = ("instrument", "rough", "select", "calibrate", "fit", "inspect", "save", "orientation")
+    targets = ("instrument", "rough", "select", "calibrate", "fit", "inspect", "save", facts.orientation_target)
     return tuple(ChecklistRow(label, text, state, message, target, detail)
                  for (label, text), state, message, target, detail
                  in zip((*CALIBRATION_STEPS, _ORIENTATION_STEP), states, messages, targets, details, strict=True))

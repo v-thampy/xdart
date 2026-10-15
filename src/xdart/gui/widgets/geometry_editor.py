@@ -14,7 +14,7 @@ from dataclasses import replace
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from xdart.gui.widgets.controls_panel import ControlsComboBox
+from xdart.gui.widgets.controls_panel import ControlsComboBox, SubsectionCard
 from xrd_tools.session.instrument import (
     GEOMETRIES, GEOMETRY_LABELS, LAB_FRAME, PLANE_LABELS, PSIC_AXES, InstrumentGeometry, signed_axis,
 )
@@ -51,24 +51,41 @@ class GeometryEditor(QtWidgets.QWidget):
     def __init__(self, parent=None, *, used=(), used_by=''):
         super().__init__(parent)
         self._used, self._used_by = frozenset(used), str(used_by)
-        self._form = QtWidgets.QFormLayout(self)
-        self._form.setContentsMargins(0, 0, 0, 0)
-        self._form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
-        self.geometry = ControlsComboBox()
-        for key, label in GEOMETRY_LABELS.items():
-            self.geometry.addItem(label, key)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        # exposed: the geometry's Type and its Config (LT-009; maintainer, 2026-10-14: "Inline expansion"); the
+        # circles' motors, senses and zeros, the plane and the senses reset sit in Config, collapsed at first
         picker = QtWidgets.QWidget(self)
         picker_layout = QtWidgets.QHBoxLayout(picker)
         picker_layout.setContentsMargins(0, 0, 0, 0)
-        picker_layout.addWidget(self.geometry)
-        self.default_senses = QtWidgets.QPushButton('↺', picker)
+        type_label = QtWidgets.QLabel('Type')
+        self.geometry = ControlsComboBox()
+        for key, label in GEOMETRY_LABELS.items():
+            self.geometry.addItem(label, key)
+        tip = ('The diffractometer geometry: psic (6-circle), fourc (4-circle) or twoc (2-circle). Config holds its '
+               "circles' motors, rotation senses and zeros.")
+        type_label.setToolTip(tip)
+        self.geometry.setToolTip(tip)
+        self.config = SubsectionCard('')
+        self.config_button = self.config.external_trigger(
+            'Config', "Show or hide each circle's motor, rotation sense and zero, the scattering plane and the "
+                      'standard-senses reset. Showing or hiding changes no value and keeps any draft.')
+        for widget in (type_label, self.geometry, self.config_button):
+            picker_layout.addWidget(widget)
+        picker_layout.addStretch(1)
+        outer.addWidget(picker)
+        body = QtWidgets.QWidget()
+        self._form = QtWidgets.QFormLayout(body)
+        self._form.setContentsMargins(0, 0, 0, 0)
+        self._form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        self.default_senses = QtWidgets.QPushButton('↺')
         self.default_senses.setToolTip("Restore the selected diffractometer's standard motor senses. "
                                       "Keep motor names, zero offsets and scattering plane.")
         self.default_senses.setFixedWidth(32)
         self.default_senses.clicked.connect(self._default_senses)
-        picker_layout.addWidget(self.default_senses)
-        picker_layout.addStretch(1)
-        self._form.addRow('Diffractometer', picker)
+        senses_label = QtWidgets.QLabel('Standard senses')
+        senses_label.setToolTip(self.default_senses.toolTip())
+        self._form.addRow(senses_label, self.default_senses)
         self.plane = ControlsComboBox()
         for key, label in PLANE_LABELS.items():
             self.plane.addItem(label, key)
@@ -113,6 +130,8 @@ class GeometryEditor(QtWidgets.QWidget):
         self.frame_note.setObjectName('geometryFrameNote')
         self.frame_note.setWordWrap(True)
         self._form.addRow(self.frame_note)
+        self.config.add_row(body)
+        outer.addWidget(self.config)
         self.geometry.currentIndexChanged.connect(self._geometry_changed)
         self.plane.currentIndexChanged.connect(self._geometry_changed)
         self._geometry_changed()
@@ -145,6 +164,38 @@ class GeometryEditor(QtWidgets.QWidget):
         operation refuses them rather than read them as blank (Codex review F4)."""
         return tuple(circle for circle, _role in GEOMETRIES[self.geometry.currentData()]
                      if isinstance(self._zero_text(circle), str))
+
+    def problem_field(self):
+        """The box of the first malformed zero (``invalid_zeros``), which a host reveals in Config, or None."""
+        invalid = self.invalid_zeros()
+        return self._zeros[invalid[0]] if invalid else None
+
+    def summary(self) -> tuple[str, str]:
+        """The panel title's summary, "psic (6-circle) · standard" or "… · custom", and its tooltip (LT-009). Custom
+        when a motor's name or a circle's rotation sense differs from the selected geometry's standard; a zero,
+        typed or fitted, never makes it custom. A pure psic mirror (mu, chi and nu reversed) is custom too, named as
+        such with any other circle it still reverses. The current values, not a physical validation."""
+        value = self.value()
+        renamed = [(circle, motor) for circle, motor in value.motors if motor != circle]
+        custom = bool(renamed or value.reversed_circles)
+        facts = []
+        if renamed:
+            facts.append('renamed motors: ' + ', '.join(f'{circle} → {motor}' for circle, motor in renamed))
+        if value.is_mirror():
+            residual = value.mirror_residual()
+            facts.append("psic's left-right mirror (mu, chi and nu reversed)"
+                         + (', with ' + ', '.join(residual) + ' still reversed in the mirror' if residual else ''))
+        elif value.reversed_circles:
+            facts.append('reversed senses: ' + ', '.join(value.reversed_circles))
+        label = GEOMETRY_LABELS[value.geometry]
+        tip = (f'Custom {label}: ' + '; '.join(facts) + '.' if custom else
+               f'Standard {label}: every motor named as its circle and every circle turning in '
+               f"{value.geometry}'s standard sense.")
+        if value.geometry != 'psic':
+            tip += f' Scattering plane: {PLANE_LABELS[value.plane]}.'
+        tip += (' Zero offsets, typed or fitted, do not change this; ↺ in Config restores the standard senses only. '
+                'A summary of the current values, not a physical validation.')
+        return f"{label} · {'custom' if custom else 'standard'}", tip
 
     def value(self) -> InstrumentGeometry:
         geometry = self.geometry.currentData()

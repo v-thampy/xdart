@@ -534,6 +534,7 @@ class _KeyedFigurePanel:
         self.viewbox = RectViewBox()
         self.plot = pg.PlotWidget(viewBox=self.viewbox)
         apply_seaborn_plot_style(self.plot.getPlotItem(), grid=False)
+        self._tick_lengths = {name: self.plot.getAxis(name).style['tickLength'] for name in ('bottom', 'left')}
         self.viewbox.setAspectLocked(True, ratio=1)
         self.caption = QtWidgets.QLabel()
         self.caption.setWordWrap(True)
@@ -563,6 +564,10 @@ class _KeyedFigurePanel:
         units = figure.units if figure.units == 'px' else None
         self.plot.setLabel('bottom', figure.x_label, units=units)
         self.plot.setLabel('left', figure.y_label, units=figure.units or None)
+        schematic = figure.units == 'schematic'  # not to scale: its axes name directions, with no dimensional ticks
+        for name in ('bottom', 'left'):          # (LT-007); any other figure drawn here has them
+            self.plot.getAxis(name).setStyle(showValues=not schematic,
+                                             tickLength=0 if schematic else self._tick_lengths[name])
         self.viewbox.invertY(figure.units == 'px')
         if figure.image is not None:
             self._image_shape = figure.image.shape
@@ -587,7 +592,10 @@ class _KeyedFigurePanel:
             self._overlay(item, arrow.tooltip)
         for text in figure.texts:
             self.overlay_items.append(add_text_item(self.plot, text, color))
-        self.viewbox.autoRange()
+        if figure.extent is None:
+            self.viewbox.autoRange()
+        else:  # the box a schematic draws in, its labels included (labels do not widen the auto range)
+            self.viewbox.setRange(xRange=figure.extent[0], yRange=figure.extent[1], padding=0)
 
     def _overlay(self, item, tooltip):
         item.setToolTip(tooltip)

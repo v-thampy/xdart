@@ -39,6 +39,8 @@ class OrientationPanel(SectionCard):
         self.finding = None
         #: the selected hypothesis's (camera, senses), kept across a re-run so a reordered finding keeps it
         self._selected = None
+        #: whether a check can start, and why not (the dialog's readiness fact, LT-008), and whether one runs
+        self._ready, self._reason, self._busy = True, '', False
         self.frame_row = FormRow(label='Frame', path=('orientation', 'frame'), value=None, kind='combo')
         self.frame_row.set_purpose_tooltip('Choose a staged calibration frame by its identity and motor pose.')
         self.step_row = FormRow(label='Step', path=('orientation', 'step'), value='Beam and rings', kind='combo',
@@ -93,13 +95,26 @@ class OrientationPanel(SectionCard):
         del blocked
 
     def busy(self, value):
-        self.run_button.setEnabled(not value)
+        self._busy = bool(value)
         self.cancel_button.setEnabled(value)
         for row in (self.frame_row, self.step_row, self.candidate_row, self.feature_row):
             row.setEnabled(not value)
         self.show_camera_button.setEnabled(not value)
         self.show_sign_button.setEnabled(not value)
         self.set_status_text('Checking…' if value else '')
+        self._sync_run()
+
+    def set_readiness(self, ready, reason=''):
+        """Whether a check can start with the dialog's current inputs and, when not, why (LT-008): Run follows this
+        and ``busy`` together, never ``busy`` alone."""
+        self._ready, self._reason = bool(ready), str(reason)
+        self._sync_run()
+
+    def _sync_run(self):
+        from dataclasses import replace
+        enabled = self._ready and not self._busy
+        reason = '' if enabled else self._reason or 'Wait for the running operation to finish, or cancel it.'
+        self.run_button.apply_spec(replace(self.run_button.spec, enabled=enabled, reason=reason))
 
     def invalidate(self, *_args):
         self.finding = None
@@ -152,20 +167,25 @@ class OrientationPanel(SectionCard):
 
 class InstrumentSchematicWindow(ReadOnlyTextWindow):
     def __init__(self, parent):
-        super().__init__('Instrument geometry', (960, 740), parent)
+        # the views above an adjustable split, the messages below opening five lines tall (LT-007)
+        super().__init__('Instrument geometry', (1000, 820), parent, message_lines=5)
         self.legend = self.pane
-        self.legend.setToolTip('Configured circle axes, motor readbacks, zeros and signed senses; structural agreement is not physical validation.')
+        self.legend.setToolTip("The pose drawn, then each circle's motor readback, zero and resulting angle and its "
+                               'stack; configured conventions, not a physical validation.')
         self.figure_view = ScientificView(self)
         self.figure_view.setToolTip('Computed side, top and downstream views from the current instrument; right-click for native Export.')
         self.insert_content(self.figure_view)
         self.projection = None
 
-    def show_geometry(self, geometry, readings):
+    def show_geometry(self, geometry, readings, pose='zero-readback example'):
         from xrd_tools.geometry_figures import instrument_figure
-        self.projection = instrument_figure(geometry, readings)
+        self.projection = instrument_figure(geometry, readings, pose=pose)
         if self.projection.reason:
             self.legend.set_text(self.projection.reason); self.figure_view.hide()
         else:
-            self.legend.set_text('\n'.join(f'{c.name}: {c.axis}, readback − zero {c.angle_deg:g}°'
-                                           for c in self.projection.circles))
+            lines = ['Explicit zero-readback example: every motor reads 0°; not a measured pose.'
+                     if pose == 'zero-readback example' else f'Drawn at the {pose}.']
+            lines += [f'{c.name} ({c.role}) · motor {c.motor}: readback {c.readback:g}° − zero {c.zero:g}° = '
+                      f'{c.angle_deg:g}° about {c.axis}' for c in self.projection.circles]
+            self.legend.set_text('\n'.join(lines))
             show_figures(self.figure_view, self.projection.panels); self.figure_view.show()

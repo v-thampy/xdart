@@ -490,6 +490,7 @@ class SubsectionCard(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("controlsSubsectionCard")
         self._collapsed = False
+        self._trigger = None  # (button, text) when a host row shows and hides the body (external_trigger)
         outer = QtWidgets.QVBoxLayout(self)
         self._outer_layout = outer
         outer.setContentsMargins(0, 0, 0, 0)
@@ -594,6 +595,22 @@ class SubsectionCard(QtWidgets.QFrame):
         self._collapsed = bool(collapsed)
         self.body.setVisible(not self._collapsed)
         self.toggle.setText("▸" if self._collapsed else "▾")
+        if self._trigger is not None:
+            button, text = self._trigger
+            button.setText(f"{text} {'▸' if self._collapsed else '▾'}")
+
+    def external_trigger(self, text: str, tooltip: str) -> QtWidgets.QToolButton:
+        """A button that shows and hides the body from a host row beside the controls it configures (LT-009's
+        inline Config, maintainer, 2026-10-14: "Inline expansion"); the card's own header hides. Collapsed at first.
+        Showing or hiding changes only what is shown: the body's editors, their values and drafts stay."""
+        button = QtWidgets.QToolButton()
+        button.setAutoRaise(True)
+        button.setToolTip(tooltip)
+        button.clicked.connect(self.toggle_collapsed)
+        self._trigger = (button, text)
+        self.header.hide()
+        self.set_collapsed(True)
+        return button
 
     def add_row(self, widget: QtWidgets.QWidget) -> None:
         self.body_layout.addWidget(widget)
