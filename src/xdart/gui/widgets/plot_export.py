@@ -82,7 +82,7 @@ class _OwnedExport:
 
     def export(self, *args, **kwargs):
         owner = self.owner
-        if owner is None or not isQObjectAlive(owner):
+        if owner is None or not isQObjectAlive(owner) or not isQObjectAlive(owner.scene):
             return None  # its dialog went with the plot's view: nothing to report and nothing written
         reason = (unavailable(self.upstream, self.item) if isQObjectAlive(self.item)
                   else "The plot this export was opened for is gone.")
@@ -112,6 +112,7 @@ class SharedPlotExportDialog(ExportDialog):
     def __init__(self, scene, view):
         super().__init__(scene)
         self.setParent(view, QtCore.Qt.WindowType.Window)
+        scene.destroyed.connect(self.deleteLater)
         self.status = QtWidgets.QLabel()
         self.status.setObjectName("plotExportStatus")
         self.status.setWordWrap(True)
