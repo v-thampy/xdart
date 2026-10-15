@@ -141,10 +141,11 @@ def test_detector_picker_describes_raw_defaults_and_manual_header_reads_pixels(q
     try:
         picker = dialog._fields['beam_detector']
         assert dialog._text('beam_detector') == 'Eiger2_500k'
-        assert '512 × 1028' in picker.currentText() and 'RAW int32' in picker.currentText()
+        # LT-SMALL-FIXES-20261014, LT-009: no "RAW" in the compact caption; the RAW details sit in Detector Config
+        assert '512 × 1028' in picker.currentText() and 'RAW' not in picker.currentText()
         assert not dialog._row_visible('raw')
         assert dialog._fields['shape'].isReadOnly() and dialog._fields['dtype'].isReadOnly()
-        assert dialog._parts['header'][0] == 'beam_detector'
+        assert dialog._parts['header'][0] == 'raw_layout'
         assert dialog.camera.parent().layout().labelForField(dialog.camera).text() == 'Camera orientation (lab frame)'
         spec = tmp_path / 'small'
         spec.write_text('#F small\n#O0 nu\n#S 1 ascan del 0 0 0 1\n#P0 0\n#N 1\n#L del\n0\n')

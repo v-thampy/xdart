@@ -1,5 +1,5 @@
-"""Quick calibration (CALIBRATION-QUICK-CHAIN-20261008, M6): one action at the top of 1 · Instrument that fits the
-direct-beam scan, reads the calibrant scan's metadata and refines automatically from the rough geometry, through the
+"""Quick calibration (CALIBRATION-QUICK-CHAIN-20261008, M6): one action in 1 · Instrument, below the Diffractometer and
+Detector sections (LT-009), that fits the direct-beam scan, reads the calibrant scan's metadata and refines automatically from the rough geometry, through the
 window's own jobs, in the calibration window Stitch and RSM share. It stops at the first problem and names the step,
 keeps what it completed, and never saves.
 
@@ -124,7 +124,8 @@ def _close(qapp, page, dialog):
 
 
 def _quick_card(dialog):
-    """The one Quick calibration card, shown at the top of 1 · Instrument above the instrument and detector."""
+    """The one Quick calibration card, shown in 1 · Instrument below the Diffractometer and Detector sections
+    (LT-SMALL-FIXES-20261014, LT-009: "Place Quick calibration below Diffractometer and Detector")."""
     tabs = dialog.tabs
     index = next(i for i in range(tabs.count()) if tabs.tabText(i) == '1 · Instrument')
     tabs.setCurrentIndex(index)
@@ -133,11 +134,14 @@ def _quick_card(dialog):
     cards = [card for card in page.findChildren(SectionCard) if card.title.text() == 'QUICK CALIBRATION']
     assert len(cards) == 1, 'no Quick calibration card in 1 · Instrument'
     card = cards[0]
-    assert card.isVisible() and card.parentWidget().layout().indexOf(card) == 0
+    layout = card.parentWidget().layout()
+    boxes = [box for box in page.findChildren(QtWidgets.QGroupBox)
+             if box.title().split(' · ')[0] in ('Diffractometer', 'Detector')]
+    assert card.isVisible() and len(boxes) == 2
     top = card.mapTo(page, QtCore.QPoint(0, 0)).y()
-    for box in page.findChildren(QtWidgets.QGroupBox):
-        if box.title() in ('Diffractometer', 'Detector'):
-            assert top < box.mapTo(page, QtCore.QPoint(0, 0)).y()
+    for box in boxes:
+        assert layout.indexOf(box) < layout.indexOf(card)
+        assert top >= box.mapTo(page, QtCore.QPoint(0, box.height())).y()
     return card
 
 
@@ -400,9 +404,9 @@ def test_quick_card_follows_restore_and_session_resume(qapp, tmp_path, monkeypat
 @pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
 def test_quick_card_shares_the_windows_threshold_and_mask(qapp, tmp_path, monkeypatch, page_name):
     """Maintainer, 2026-10-08: the card carries the window's Threshold (Int's shared row and rules, on by default:
-    saturated pixels left out) and its Mask file (which becomes the page's Mask File), each the same value as
-    4 · Calibrate and fit's Advanced and the Detector panel's, edited in either place, with their tooltips; the
-    card's 📁 is the Detector panel's, and the window saves no key of its own for them."""
+    saturated pixels left out), the same value as 4 · Calibrate and fit's Advanced, edited in either place, with its
+    tooltips. Its Mask file is the Detector panel's one row, exposed above the card (LT-SMALL-FIXES-20261014, LT-009:
+    "remove its duplicate Mask file row"): the card holds none, and the window saves no key of its own for it."""
     from xdart.gui.widgets import file_dialogs
     from xdart.gui.widgets.controls_panel import RangeRow
     from xrd_tools.integrate.stitch_conditioning import StitchConditioning
@@ -425,20 +429,20 @@ def test_quick_card_shares_the_windows_threshold_and_mask(qapp, tmp_path, monkey
         assert dialog._conditioning().mode == 'off' and not threshold._toggle[1].isChecked()
         threshold._toggle[1].setChecked(True)
         assert dialog._conditioning().mode == 'manual' and window._toggle[1].isChecked()
-        masks = [row for row in card.findChildren(FormRow) if row.label.text() == 'Mask file']
-        assert len(masks) == 1 and masks[0].label.toolTip()
+        assert not [row for row in card.findChildren(FormRow) if row.label.text() == 'Mask file']
+        masks = [row for row in card.parentWidget().findChildren(FormRow) if row.label.text() == 'Mask file']
+        assert len(masks) == 1 and masks[0].label.toolTip() and masks[0].editor is dialog._fields['mask']
         mask = masks[0]
-        drawn, other, picked = tmp_path / 'drawn.npy', tmp_path / 'other.npy', tmp_path / 'picked.npy'
-        for path in (drawn, other, picked):
+        assert mask.isVisible() and not card.isAncestorOf(mask)
+        drawn, picked = tmp_path / 'drawn.npy', tmp_path / 'picked.npy'
+        for path in (drawn, picked):
             np.save(path, np.zeros((4, 4), bool))
-        _commit(mask.editor, str(drawn))  # card → Detector panel
+        _commit(mask.editor, str(drawn))
         assert dialog._text('mask') == str(drawn) == mask.current_value()
-        _commit(dialog._fields['mask'], str(other))  # Detector panel → card
-        assert mask.current_value() == str(other)
         dialog._fields['mask'].clearFocus()  # a file row takes no set while it holds the focus
         calls = []
         monkeypatch.setattr(file_dialogs, 'browse', lambda *a, **k: calls.append(k.get('file_filter')) or [str(picked)])
-        _click(mask.browse_button)  # the card's 📁 is the Detector panel's
+        _click(mask.browse_button)
         assert calls == ['Masks (*.edf *.tif *.tiff *.npy);;All files (*)']
         assert dialog._text('mask') == str(picked) == mask.current_value()
         saved = dialog.settings()

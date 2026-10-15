@@ -125,6 +125,10 @@ def test_each_detector_circle_takes_its_motor_zero_beside_its_motor(qapp):
     boxes = lambda: [c for c in editor._zeros if editor._zeros[c].isVisibleTo(editor)  # noqa: E731
                      and editor._form.isRowVisible(editor._rows[c])]
     editor.show()
+    # LT-SMALL-FIXES-20261014, LT-009: the zeros sit in the editor's inline Config, collapsed at first
+    config = [b for b in editor.findChildren(QtWidgets.QToolButton) if b.text().startswith('Config')]
+    assert len(config) == 1 and not boxes()
+    config[0].click()
     # deferred item 7: every circle has its zero beside its motor, the sample's too (blank: 0)
     assert boxes() == ['mu', 'eta', 'chi', 'phi', 'nu', 'del'] and editor.value().zeros == ()
     assert set(editor._zeros) == {'mu', 'eta', 'th', 'chi', 'phi', 'nu', 'del', 'tth'}

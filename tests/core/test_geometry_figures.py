@@ -246,7 +246,9 @@ def test_instrument_figures_match_presets_zeros_and_reversed_circle_stacks():
         figure = gf.instrument_figure(value, {m: 0. for _, m in value.motors})
         assert tuple(c.axis for c in figure.circles) == preset.sample_circles+preset.detector_circles
         assert all(c.angle_deg == 0 for c in figure.circles)
-        assert len(figure.panels) == 3 and all(p.caption and p.arrows for p in figure.panels)
+        # LT-SMALL-FIXES-20261014, LT-007: one shared explanation for the three views, not one per view
+        assert len(figure.panels) == 3 and all(p.arrows for p in figure.panels)
+        assert sum(bool(p.caption) for p in figure.panels) == 1
         reversed_value = replace(value, zeros=((value.circles[0], 3.),), reversed_circles=(value.circles[0],))
         readings = {m: 8. for _, m in value.motors}
         forward = gf.instrument_figure(value, readings)
