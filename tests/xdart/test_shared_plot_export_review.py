@@ -56,6 +56,9 @@ def test_scene_destruction_retires_export_and_pending_save_before_host(
         dialog.close()
         scene.deleteLater()
         _xdart_qt_harness.deliver_deferred_deletes()
+        # Scene destruction posts the owned dialog's deletion for the next event turn.
+        qapp.processEvents()
+        _xdart_qt_harness.deliver_deferred_deletes()
         assert shiboken6.isValid(view), "scene-first destruction is distinct from host deletion"
         assert not any(shiboken6.isValid(item) for item in (dialog, pending, select_box))
         assert hooked == [] and list(tmp_path.iterdir()) == []
