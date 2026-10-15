@@ -7,6 +7,7 @@ are imported inside each row, so a missing API fails only its own row; the paren
 kickoff's freeze record. Expected values come from tests/core/test_angular_support.py's independent models.
 """
 import math
+import os
 import shutil
 import time
 from pathlib import Path
@@ -348,6 +349,37 @@ def test_d5_legacy_reconstruction_coalesces_and_cleans_up(qapp, tmp_path):
         _enable(qapp, view, on=False)
         assert owner.shutdown().status.name == 'CLEAN'
         assert not _curves(view)
+
+
+# ------------------------------------------------------------------- W7L (PRE-RELEASE-CORRECTNESS-20261015)
+
+# The older-form copy a real ae6f0453 Run wrote (retained leaf); its row exists only when it is named.
+PARENT_SEAM_RECORD = os.environ.get('XDART_CHI_SEAM_PARENT_RECORD')
+
+
+@pytest.mark.parametrize('record', ('current',) + (('parent',) if PARENT_SEAM_RECORD else ()))
+def test_w7l_older_seam_window_output_refuses_reconstruction(qapp, tmp_path, record):
+    """An older q output with a shifted full-turn chi window cannot show which directions its
+    reducer admitted; matching saved q bins never make that full support."""
+    from xrd_tools.analysis.angular_support import SavedSupportRequest, reconstruct_saved_support
+    from xrd_tools.core.angular_support import SupportOrigin, SupportReason
+    from xrd_tools.io.frame_view import FrameViewReader
+    from xrd_tools.io.output_transaction import capture_target_snapshot
+    if record == 'parent':
+        legacy = Path(shutil.copy2(PARENT_SEAM_RECORD, tmp_path / 'legacy.nexus'))
+    else:
+        output = _fresh(qapp, tmp_path / 'run', unit='q_A^-1', one={
+            'radial_range': [0.5, 3.0], 'azimuth_range': [-180.0, 180.0], 'chi_offset': 30.0})
+        legacy = _legacy_copy(output, tmp_path / 'legacy.nexus')
+    with FrameViewReader(legacy) as reader:
+        labels = tuple(reader.labels())
+    request = SavedSupportRequest(str(legacy), 'entry', capture_target_snapshot(legacy), labels, labels)
+    profiles = reconstruct_saved_support(request)
+    assert labels and sorted(profiles) == sorted(labels)
+    for profile in profiles.values():
+        assert profile.origin is SupportOrigin.RECONSTRUCTED and not profile.available
+        assert profile.reason is SupportReason.LEGACY_INSUFFICIENT
+        assert profile.detail == 'historical chi-window admission cannot be established'
 
 
 # ---------------------------------------------------------------------------------------------------- D6
