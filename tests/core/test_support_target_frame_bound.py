@@ -116,6 +116,7 @@ def test_a2_sparse_labels_and_a_partial_secondary_mode_bound_by_the_primary_rows
             np.testing.assert_array_equal(view.intensity_1d, np.full(4, label + 1.0))
         with FrameViewReader(target, resolve_source=False, target_frame=label) as reader:
             record = reader.read_record(label)
+        with FrameViewReader(target, resolve_source=False) as reader:  # read_1d_rows needs the full inventory
             rows_view = reader.read_1d_rows((label,))
         np.testing.assert_array_equal(record.view_1d("q_total").intensity_1d, np.full(4, label + 1.0))
         if number % 3 == 0:
