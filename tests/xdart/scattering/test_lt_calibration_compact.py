@@ -85,12 +85,15 @@ def _orientation_row(table):
 
 
 def _activate(table, row):
-    """Activate a checklist row with a real double click."""
+    """Activate a checklist row as a person double-clicks it: a click, then the second press reported as a double
+    click (a lone synthetic double click reaches no row, the view having seen no press)."""
     item = table.item(row, 0)
     table.scrollToItem(item)
     QtWidgets.QApplication.processEvents()
-    QtTest.QTest.mouseDClick(table.viewport(), QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.KeyboardModifier.NoModifier,
-                             table.visualItemRect(item).center())
+    centre = table.visualItemRect(item).center()
+    left, plain = QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.KeyboardModifier.NoModifier
+    QtTest.QTest.mouseClick(table.viewport(), left, plain, centre)
+    QtTest.QTest.mouseDClick(table.viewport(), left, plain, centre)
     QtWidgets.QApplication.processEvents()
 
 
