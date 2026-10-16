@@ -11,10 +11,11 @@ from unittest import mock
 import h5py
 
 from tests.xdart.scattering._output_slots import written
-from tests.xdart.scattering.test_angular_support_recording import _control, _run_off
+from tests.xdart.scattering.test_angular_support_recording import _run_off
 from tests.xdart.scattering.test_angular_support_strip import (
     _command, _curves, _enable, _fresh, _legacy_copy, _masked_series, _wait)
 from tests.xdart.scattering.test_browse_reference_rings_run import _page, _reopen, _run
+from tests.xdart.scattering.test_coverage_control_clarity import _int_recording
 from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F401
 
 
@@ -24,16 +25,16 @@ def test_g6_append_keeps_an_off_outputs_choice_and_says_so(qapp, tmp_path):
     from xrd_tools.io.frame_view import FrameViewReader
     _run_off(qapp, tmp_path)  # the output is created with recording off
     with _page(qapp, _masked_series(tmp_path, energies=(16, 16, 16), output_mode='Append')) as (page, view, observed):
-        control = _control(page)
-        if not control.isChecked():
-            control.click()
-            qapp.processEvents()
-        assert control.isChecked(), 'the pill asks for recording'
+        # LF-007: Int's pill lives in Advanced → Integrate 1D; each read opens the real modal action again
+        if not _int_recording(qapp, page).isChecked():
+            _int_recording(qapp, page, toggle=True)
+        assert _int_recording(qapp, page).isChecked(), 'the pill asks for recording'
         with mock.patch.object(kernel, 'support_footprint', wraps=kernel.support_footprint) as footprints:
             _run(qapp, page, observed)
         assert footprints.call_count == 0, 'the Append Run inherits off and computes nothing'
         details = ' '.join(str(getattr(event, 'detail', '') or '') for event in observed)
         assert 'angular coverage' in details.lower() and 'off' in details.lower(), details
+        control = _int_recording(qapp, page)
         assert control.isChecked(), 'the pill keeps the preference for new outputs'
         assert 'Append' in control.toolTip(), 'the pill explains that Append keeps an output’s choice'
     with FrameViewReader(written(tmp_path / 'run.nexus', 'Int 1D')) as reader:

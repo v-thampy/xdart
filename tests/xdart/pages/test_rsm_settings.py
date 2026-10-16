@@ -49,6 +49,8 @@ def _every_input(root):
         "geometry_path": "calibration/rsm_canonical.json", "mask_path": "mask.npy", "refinement": False,
         # LT-SMALL-FIXES-20261014: the page's Data format and Files/Folder are its inputs; they make the source kind
         "data_format": "nexus", "input_mode": "directory",
+        # LIVE-TEST-FIXES-20261015 (02229b09): the shared Entry beside the Data format
+        "nexus_entry": "experiment",
         "subdirs": True, "name_filter": "scan -bad", "image_dir": "source/images",
         "image_stem": "{spec}_scan{scan}_", "scan_mode": "All Scans", "scan": "[1-2]",
         "ub_from": "Typed", "ub_row1": "1 0 0", "ub_row2": "0 1 0", "ub_row3": "0 0 1",

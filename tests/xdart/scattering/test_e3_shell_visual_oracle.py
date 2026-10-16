@@ -118,11 +118,14 @@ def test_e3_ui4_viewport_structure_is_exact(
         assert not shell.findChildren(
             QtWidgets.QAbstractButton, "e3PaneMenu"
         )
+        # The shared phase source (Plot Options since 65e8168a, the Reference
+        # Phases window since 9f42d07d) reuses BrowserView with its Metadata
+        # action hidden; the shell offers the user one.
         assert len(
             [
                 widget
                 for widget in shell.findChildren(QtWidgets.QAbstractButton)
-                if widget.text() == "Metadata"
+                if widget.text() == "Metadata" and widget.isVisibleTo(shell)
             ]
         ) == 1
     finally:
@@ -269,10 +272,12 @@ def test_e3_ui6_compact_shell_continuity_at_review_viewports(
             QtWidgets.QLabel, "toolsHeader"
         )
         tool_buttons = shell.tools.findChildren(QtWidgets.QPushButton)
-        # Plot Metadata left Int's tools column for the shared metadata popup (2fa82580).
+        # Plot Metadata left Int's tools column for the shared metadata popup (2fa82580);
+        # REFERENCE-PHASES-20261011 added its launcher after Phase Fitting (9f42d07d).
         assert [button.text() for button in tool_buttons] == [
             "∧ Peak Fitting",
             "≈ Phase Fitting",
+            "┆ Reference Phases",
             "▣ ROI Statistics",
             "◇ Open Selected in NeXpy",
             "▦ silx HDF5 Viewer…",
