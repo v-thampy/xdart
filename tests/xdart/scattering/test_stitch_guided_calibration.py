@@ -244,7 +244,9 @@ def test_a_frame_without_energy_takes_the_windows_wavelength_never_pyfais_defaul
 
 def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
+    from tests.xdart.scattering.test_calibration_ring_scheduling import _close, _settle
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
     dialog.threshold_range._toggle[1].setChecked(False)  # no staged image here: the threshold's mask reads one (test_calibration_threshold)
     dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20'),)
     dialog._render_frames()
@@ -252,18 +254,19 @@ def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
     assert 'calibrate one frame' in dialog.frame_table.item(0, 5).toolTip()  # it then predicts the rest
     dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))
     dialog._render_frames()
-    cell = dialog.frame_table.item(0, 5)
-    assert cell.text() and cell.text() != '—' and cell.toolTip().startswith('Ring ')
+    (text, tip), = _settle(dialog)  # the worker's rings, once they arrive
+    assert text not in ('', '—', 'none', '…') and tip.startswith('Ring ')
     from xdart.gui.pages.values import PageCleanup
-    assert dialog.shutdown().status is PageCleanup.CLEAN
-    dialog.close()
+    assert _close(dialog).status is PageCleanup.CLEAN  # retried while the ring worker returns
 
 
 def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from xdart.gui.tabs.calibration.dialog import _pyfai_arguments
     from pyFAI.io.ponifile import PoniFile
     from tests.core.test_calibration_seed import _frame, _record
+    from tests.xdart.scattering.test_calibration_ring_scheduling import _settle
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
     dialog.threshold_range._toggle[1].setChecked(False)  # no staged image here: the threshold's mask reads one (test_calibration_threshold)
     assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
         '1 · Instrument', '2 · Rough geometry', '3 · Calibrant scan', '4 · Calibrate and fit']
@@ -290,7 +293,8 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
         dialog._set_field_text(key, value)
     dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))  # a calibration file too
     dialog._render_frames()
-    assert dialog.frame_table.item(0, 5).toolTip().startswith('Ring ')
+    (text, tip), = _settle(dialog)
+    assert text not in ('', '—', 'none', '…') and tip.startswith('Ring ')
     arguments = _pyfai_arguments(dialog.frames[0], dialog._seed_options())
     seeded = PoniFile(arguments[3])
     assert seeded.dist == pytest.approx(0.5)  # this session's rough geometry, not the file
@@ -804,7 +808,9 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
     waiting = tuple(replace(frame, poni_path='', poni_sha256='', npt_path='', npt_sha256='', pairing_policy='',
                             control_image_sha256='') for frame in calibrated[1:])
     true_arm = StackedDetectorArm(**truth).to_pyfai_goniometer(calibration)
+    from tests.xdart.scattering.test_calibration_ring_scheduling import _settle
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
     try:
         # The native arm's physical motor zeros, typed beside the motors.
         dialog.geometry_editor.zero_edit('del').setText(f'{np.rad2deg(.05):.12g}')
@@ -814,6 +820,7 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
             dialog._set_field_text(key, value)
         dialog.frames = (calibrated[0], *waiting)
         dialog._render_frames()
+        _settle(dialog)  # the rough guess's rings, once they arrive
         expected = [ring_summary(predict_frame_seed(true_arm, frame).rings) for frame in waiting]
         # the rough guess misnumbers them (it has the calibrated frame's PONI energy since 33b439bf, where it had a
         # 1 Å placeholder, so the first now agrees by chance: '15–20')
@@ -824,6 +831,7 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
             QtWidgets.QApplication.processEvents()        # qWait holds the GIL from the worker
             time.sleep(.005)
         assert not dialog.active() and dialog._prediction is not None, dialog.status.text()
+        _settle(dialog)  # the prediction's rings, once they arrive
         assert [dialog.frame_table.item(row, 5).text() for row in (1, 2, 3)] == expected
         seeded = PoniFile(_pyfai_arguments(waiting[0], dialog._seed_options())[3])
         true_seed = predict_frame_seed(true_arm, waiting[0]).integrator

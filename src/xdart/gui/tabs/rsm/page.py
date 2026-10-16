@@ -404,6 +404,9 @@ class RSMPage(QtWidgets.QWidget):
         # the shared calibration and mask windows (tabs/calibration), opened with RSM's context
         self._authoring_dialogs = []
         self._calibration_dialog = None
+        #: A released calibration window still closing (its ring worker returning): at most this one, retired on the
+        #: authoring timer once CLEAN (_retire_calibration_dialog).
+        self._calibration_retiring = None
         self._calibration_project = None
         # the calibration window's saved inputs (File ▸ Load Settings, the last session, or the window a Project
         # change closed), applied when the window is created
@@ -1721,7 +1724,9 @@ class RSMPage(QtWidgets.QWidget):
         self.mask_button.setEnabled(idle)
         for dialog in self._authoring_dialogs:
             dialog.setEnabled(not busy and not self._closing and (not authoring or dialog.active()))
-        if not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs):
+        self._retire_calibration_dialog()
+        if (not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs)
+                and self._calibration_retiring is None):
             self._authoring_timer.stop()
         self.run_bar.set_mode_row_enabled(idle)
         self.advanced.set_editors_enabled(idle)
@@ -1804,6 +1809,9 @@ class RSMPage(QtWidgets.QWidget):
             if self._calibration_dialog is not None and self._calibration_project != project:
                 self._calibration_settings = self._calibration_dialog.settings()
                 self._release_calibration_dialog()
+            self._retire_calibration_dialog()
+            if self._calibration_dialog is None and self._calibration_retiring is not None:
+                raise ValueError("The previous calibration window is still closing; press Calibrate again in a moment")
             unconfigured = False
             if self._calibration_dialog is None:
                 from xrd_tools.core.geometry.camera import DetectorCamera
@@ -1837,17 +1845,32 @@ class RSMPage(QtWidgets.QWidget):
 
     def _release_calibration_dialog(self):
         """Let the retained calibration window go (a Project change, or a settings document with no window): it is
-        hidden and no longer the page's. An idle window is shut down at once (its session recorded, as at close) and
-        leaves the authoring windows, its memory with it, so repeated loads or Project changes do not pile up hidden
-        windows; one still working stays among them, and ``close_page`` shuts it down with the others."""
+        hidden and no longer the page's. An idle window is shut down (its session recorded, as at close) and leaves the
+        authoring windows, its memory with it, so repeated loads or Project changes do not pile up hidden windows: at
+        once, or once its ring worker has returned (_retire_calibration_dialog); one still working stays among them,
+        and ``close_page`` shuts it down with the others."""
         dialog = self._calibration_dialog
         if dialog is None:
             return
         dialog.hide()
         self._calibration_dialog = None
-        if not dialog.active() and dialog.shutdown().status is PageCleanup.CLEAN:
+        if not dialog.active():
+            self._calibration_retiring = dialog
+            self._retire_calibration_dialog()
+
+    def _retire_calibration_dialog(self):
+        """Shut down the released calibration window (GUI-PERF-02: its ring worker may still be returning): once its
+        receipt is CLEAN it leaves the authoring windows and is deleted; until then the authoring timer asks again
+        (``_sync_actions``), and Calibrate waits for it rather than opening another."""
+        dialog = self._calibration_retiring
+        if dialog is None:
+            return
+        if dialog.shutdown().status is PageCleanup.CLEAN:
+            self._calibration_retiring = None
             self._authoring_dialogs.remove(dialog)
             dialog.deleteLater()
+        else:
+            self._authoring_timer.start()
 
     def _adopt_calibration(self, path, _backend=None):
         """A calibration the window saved: the Calibration row takes it (and its mask, the detector's)."""

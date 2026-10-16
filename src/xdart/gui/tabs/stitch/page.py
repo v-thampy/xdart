@@ -451,6 +451,9 @@ class StitchPage(QtWidgets.QWidget):
         self._raw_pending = False
         self._raw_frame_view = None
         self._calibration_dialog = None
+        #: A released calibration window still closing (its ring worker returning): at most this one, retired on the
+        #: authoring timer once CLEAN (_retire_calibration_dialog).
+        self._calibration_retiring = None
         # Saved calibration-dialog inputs, applied when the dialog is created.
         self._calibration_settings = None
         # (action, start directory) -> path for File ▸ Save/Load Settings; tests replace it.
@@ -2745,6 +2748,9 @@ class StitchPage(QtWidgets.QWidget):
             if self._calibration_dialog is not None and self._calibration_project != project:
                 self._calibration_settings = self._calibration_dialog.settings()
                 self._release_calibration_dialog()
+            self._retire_calibration_dialog()
+            if self._calibration_dialog is None and self._calibration_retiring is not None:
+                raise ValueError("The previous calibration window is still closing; press Calibrate again in a moment")
             # The processing scan only fills a new dialog with no calibration source: the
             # calibrant scan is usually another scan, and saved or edited inputs are kept.
             unconfigured = False
@@ -2785,17 +2791,32 @@ class StitchPage(QtWidgets.QWidget):
 
     def _release_calibration_dialog(self):
         """Let the retained calibration window go (a Project change, or a settings document with no window): it is
-        hidden and no longer the page's. An idle window is shut down at once (its session recorded, as at close) and
-        leaves the authoring windows, its memory with it, so repeated loads or Project changes do not pile up hidden
-        windows; one still working stays among them, and ``shutdown`` shuts it down with the others."""
+        hidden and no longer the page's. An idle window is shut down (its session recorded, as at close) and leaves the
+        authoring windows, its memory with it, so repeated loads or Project changes do not pile up hidden windows: at
+        once, or once its ring worker has returned (_retire_calibration_dialog); one still working stays among them,
+        and ``shutdown`` shuts it down with the others."""
         dialog = self._calibration_dialog
         if dialog is None:
             return
         dialog.hide()
         self._calibration_dialog = None
-        if not dialog.active() and dialog.shutdown().status is PageCleanup.CLEAN:
+        if not dialog.active():
+            self._calibration_retiring = dialog
+            self._retire_calibration_dialog()
+
+    def _retire_calibration_dialog(self):
+        """Shut down the released calibration window (GUI-PERF-02: its ring worker may still be returning): once its
+        receipt is CLEAN it leaves the authoring windows and is deleted; until then the authoring timer asks again
+        (``_sync_actions``), and Calibrate waits for it rather than opening another."""
+        dialog = self._calibration_retiring
+        if dialog is None:
+            return
+        if dialog.shutdown().status is PageCleanup.CLEAN:
+            self._calibration_retiring = None
             self._authoring_dialogs.remove(dialog)
             dialog.deleteLater()
+        else:
+            self._authoring_timer.start()
 
     def _adopt_calibration(self, path, backend):
         if self._closing or self._calibration_project != str(self._value("project_root")):
@@ -3482,8 +3503,10 @@ class StitchPage(QtWidgets.QWidget):
             widget.setToolTip(_CORES_TIP)
         for dialog in self._authoring_dialogs:
             dialog.setEnabled(not busy and not self._closing and (not authoring or dialog.active()))
+        self._retire_calibration_dialog()
         if (not any(dialog.isVisible() or dialog.active() for dialog in self._authoring_dialogs)
-                and not any(host.dialog.isVisible() or host.computing for host in self._fit_hosts.values())):
+                and not any(host.dialog.isVisible() or host.computing for host in self._fit_hosts.values())
+                and self._calibration_retiring is None):
             self._authoring_timer.stop()
         self._sync_fit_tools()
         for row in self._rows.values():

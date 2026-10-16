@@ -17,6 +17,7 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationCancelled, OperationTerminalStatus
+from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.controls_panel import FormRow, SectionCard
 from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
 from xdart.gui.widgets.read_only_text import ReadOnlyTextPane
@@ -152,6 +153,41 @@ def _frame_energy_known(frame, seed):
     wavelength, or a real calibration's (the rough geometry's is a placeholder without one)."""
     return bool(frame.energy_eV or seed.get('wavelength_A') or any(
         seed.get(key) is not None for key in ('record', 'prediction', 'file')) or seed.get('frames'))
+
+
+@dataclass(frozen=True, eq=False)
+class _RingRequest:
+    """The staged frames' expected rings to predict, from the window's inputs captured once on the GUI thread
+    (GUI-PERF-02). ``key`` is what they are predicted from: the frames' identities, the calibrant, the calibration (its
+    record's SHA-256, or its file), the mask's state, the threshold band and the saturation."""
+    key: tuple
+    frames: tuple
+    record: object
+    calibrant: str
+    del_motor: str | None
+    nu_motor: str | None
+    mask: object
+    conditioning: object
+    saturation: int | None
+
+
+def _predict_rings(request, cancelled, _publish):
+    """The ring worker's job: each frame's predicted rings in table order (None where the kernel refuses that frame),
+    by the unchanged headless kernel, stopping between frames once cancelled. The integrator is display-only: no
+    forced process-wide garbage collection on this thread."""
+    from xrd_tools.integrate.calibration_seed import predict_frame_seed
+    rings = []
+    for frame in request.frames:
+        if cancelled.is_set():
+            raise OperationCancelled('ring prediction cancelled')
+        try:
+            rings.append(predict_frame_seed(
+                request.record, frame, calibrant=request.calibrant, del_motor=request.del_motor,
+                nu_motor=request.nu_motor, mask=request.mask, conditioning=request.conditioning,
+                saturation=request.saturation, collect_garbage=False).rings)
+        except (ValueError, KeyError, OSError):
+            rings.append(None)
+    return tuple(rings)
 
 
 def _dispatch_job(request, cancelled, publish):
@@ -493,8 +529,13 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._checklist_fit_outdated = False
         #: The arm fitted to the calibrated frames: (their identities, record); see _seed_options.
         self._prediction = None
-        #: Predicted rings per (frame, calibrant, calibration): see _expected_rings.
-        self._ring_cache = {}
+        #: The staged frames' expected rings, predicted by one worker beside the job lane and only while the window
+        #: is shown (GUI-PERF-02): ``_rings`` is the one result shown, (its request's key, each frame's rings or the
+        #: failure's message). The job is bound late, so a test can hold it at its entry.
+        self._rings = None
+        self._ring_requests = LatestRequestOwner(
+            lambda request, cancelled, publish: _predict_rings(request, cancelled, publish), self._rings_done,
+            same=lambda a, b: a.key == b.key, parent=self)
         #: Calibration's threshold, Int's rule and Int's default: on, Auto leaving saturated pixels out (maintainer,
         #: 2026-10-08); shown by every row in _threshold_rows (Advanced's, the Quick card's).
         self._threshold_state = ThresholdState()
@@ -1473,7 +1514,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._threshold_state = result
             self._show_threshold()
             self._invalidate_beam_detection()
-            self._ring_cache.clear()
+            self._forget_rings()
             self._invalidate_fit()
             self._render_frames()
             self._save_session_quietly()
@@ -2640,7 +2681,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         values['choices'].update(rough_mode={'data': 'manual'}, refine_seed={'data': 'file'})
         self.apply_settings(values)
         self._prediction = None
-        self._ring_cache.clear()
+        self._forget_rings()
         self._saved_setup = self._setup_state()
         self._loaded_calibration_kind = seed['calibration_kind']
         self.setWindowTitle(f'{self.context.page} calibration · {path.name}')
@@ -2962,8 +3003,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         turned = self._turned_detector()  # a quarter turn: and the model it was fitted turned (item 8)
         return key if turned is None else (*key, json.dumps(turned, sort_keys=True))
 
-    def _expected_rings(self, frame):
-        """The calibrant rings predicted on this frame (None without a calibration)."""
+    def _ring_request(self):
+        """The staged frames' ring prediction for the window's inputs, captured once (None: nothing to predict from: no
+        frames, no calibration yet, or a draft saturation, which is not a predicted pixel range)."""
+        if not self.frames:
+            return None
         seed = self._seed_options()
         record = next((value for value in (seed['record'], seed['prediction'], seed['rough'], seed['file'])
                        if value is not None), None)
@@ -2973,20 +3017,67 @@ class CalibrationDialog(QtWidgets.QDialog):
         try:
             saturation = self._saturation_value() if band.mode != 'off' else None
         except ValueError:
-            return None  # a draft saturation is not a predicted pixel range
+            return None
+        import copy
         import hashlib
-        key = (frame.identity, seed['calibrant'], hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+        key = (tuple(frame.identity for frame in self.frames), seed['calibrant'],
+               hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
                if isinstance(record, dict) else record, self._mask_state(), band, saturation)
-        if key not in self._ring_cache:
-            from xrd_tools.integrate.calibration_seed import predict_frame_seed
-            try:
-                self._ring_cache[key] = predict_frame_seed(
-                    record, frame, calibrant=seed['calibrant'], del_motor=seed['del_motor'],
-                    nu_motor=seed['nu_motor'], mask=self._loaded_mask(), conditioning=band,
-                    saturation=saturation).rings
-            except (ValueError, KeyError, OSError):
-                self._ring_cache[key] = None
-        return self._ring_cache[key]
+        return _RingRequest(key, self.frames, copy.deepcopy(record) if isinstance(record, dict) else record,
+                            seed['calibrant'], seed['del_motor'], seed['nu_motor'], self._loaded_mask(), band,
+                            saturation)
+
+    _NO_RINGS_YET = ('No calibration to predict from yet: enter a rough geometry (2 · Rough geometry) or a geometry '
+                     'file, or calibrate one frame: the others are then predicted from it.')
+
+    def _ring_cell(self, row, request):
+        """Row ``row``'s Expected rings cell, (text, tooltip), for ``request``: the rings shown when they are its, else
+        pending."""
+        if request is None:
+            return '—', self._NO_RINGS_YET
+        if self._rings is None or self._rings[0] != request.key:
+            return '…', ("Predicting this frame's calibrant rings from the current geometry; "
+                         'they appear here when ready.')
+        rings = self._rings[1]
+        if isinstance(rings, str):
+            return '—', f'The rings could not be predicted: {rings}'
+        rings = rings[row]
+        if rings is None:
+            return '—', self._NO_RINGS_YET
+        return (ring_summary(rings) or 'none',
+                '\n'.join(f'Ring {ring.number} · 2θ {ring.two_theta_deg:.2f}° · d {ring.d_spacing_A:.4f} Å'
+                          for ring in rings) or 'No calibrant ring reaches this frame.')
+
+    def _show_ring_cells(self, request):
+        """Each staged row's Expected rings cell for ``request``, in place: the selection stays."""
+        if self.frame_table.rowCount() != len(self.frames):
+            return
+        for row in range(len(self.frames)):
+            item = self.frame_table.item(row, 5)
+            if item is not None:
+                text, tip = self._ring_cell(row, request)
+                item.setText(text)
+                item.setToolTip(tip)
+
+    def _ask_rings(self, request):
+        """Ask the ring worker for ``request`` while the window is shown; a hidden window predicts nothing."""
+        self._ring_requests.ask(request if self.isVisible() else None)
+
+    def _rings_done(self, request, terminal):
+        """The worker's rings for ``request``, still the one asked for: the one result shown, filled into its cells. An
+        unexpected failure shows no rings and its exception (the three refusals are a frame's None)."""
+        if not self.isVisible():
+            return False
+        self._rings = (request.key, terminal.payload if terminal.status is OperationTerminalStatus.RETURNED
+                       else f'{terminal.failure_type}: {terminal.failure_message}')
+        if request.key[0] == tuple(frame.identity for frame in self.frames):
+            self._show_ring_cells(request)
+        return True
+
+    def _forget_rings(self):
+        """The rings shown are no longer current: the next render predicts them again."""
+        self._rings = None
+        self._ring_requests.forget()
 
     def _import(self):
         def go():
@@ -3611,8 +3702,18 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._owner.busy and self._job == 'stitch_preview':
             self._cancel()
 
+    def showEvent(self, event):
+        """Shown (again): the rings are asked for the window's inputs as they are now."""
+        super().showEvent(event)
+        request = self._ring_request()
+        self._show_ring_cells(request)
+        self._ask_rings(request)
+
     def hideEvent(self, event):
-        """The fit windows go with this window (closed, hidden, or shut down by the host)."""
+        """The fit windows go with this window (closed, hidden, or shut down by the host), and so does its ring
+        prediction: a hidden window predicts and adopts nothing."""
+        self._ring_requests.release()
+        self._rings = None
         for window in (self._direct_beam_fit_window, self._calibration_fit_window, self.instrument_schematic):
             if window is not None:
                 window.close()
@@ -3671,6 +3772,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self.orientation_panel.set_frames(self.frames)
         self._update_fit_source_label()
         self._refresh_energy_hint()  # a calibrated frame's PONI file can supply the energy
+        request = self._ring_request()  # after the energy hint: the rough geometry takes the PONI files' energy
         rows, tips = [], {}
         for row, frame in enumerate(self.frames):
             # the frame's own detector image (and its frame number inside a multi-frame file)
@@ -3678,13 +3780,8 @@ class CalibrationDialog(QtWidgets.QDialog):
             values = [str(frame.index), ', '.join(f'{k}={v:g}' for k, v in frame.motors.items()),
                       image, Path(frame.poni_path).name if frame.complete else '—',
                       'Complete' if frame.complete else 'Needs PONI + points']
-            rings = self._expected_rings(frame)
-            values.append('—' if rings is None else ring_summary(rings) or 'none')
-            ring_tip = ('No calibration to predict from yet: enter a rough geometry (2 · Rough geometry) or a '
-                        'geometry file, or calibrate one frame: the others are then predicted from it.'
-                        if rings is None
-                        else '\n'.join(f'Ring {ring.number} · 2θ {ring.two_theta_deg:.2f}° · d {ring.d_spacing_A:.4f} Å'
-                                        for ring in rings) or 'No calibrant ring reaches this frame.')
+            ring_text, ring_tip = self._ring_cell(row, request)
+            values.append(ring_text)
             for column, value in enumerate(values):
                 tips[row, column] = (f'{frame.raw_path}\nstaged for pyFAI: {frame.image_path}' if column == 2
                                      else ring_tip if column == 5 else f'{frame.poni_path}\n{frame.npt_path}')
@@ -3694,8 +3791,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self.frames:
             self.frame_table.selectRow(0)
         self.session_label.setText(f'Session: {self.session_dir / "calibration-session.json"}')
+        self._ask_rings(request)
         self._sync_arm_model()
-        self._refresh_checklist()  # the expected rings read the mask once: the Orientation check's readiness knows it
+        self._refresh_checklist()  # the ring request read the mask once: the Orientation check's readiness knows it
 
     def _new_session(self):
         if self._owner.busy:
@@ -4291,9 +4389,9 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._quick_stage = self._quick_kind = None
         self._beam_probe_timer.stop()
         self._timer.stop()
-        receipt = self._owner.close()
-        if receipt.status is PageCleanup.CLEAN:
+        receipt, rings = self._owner.close(), self._ring_requests.shutdown()
+        if receipt.status is PageCleanup.CLEAN and rings.status is PageCleanup.CLEAN:
             self._save_session_quietly()
             self._help_owner.shutdown()
             self.hide()
-        return receipt
+        return receipt if receipt.status is PageCleanup.PENDING else rings

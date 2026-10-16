@@ -157,8 +157,11 @@ def test_detector_selection_supplies_whole_auto_counts_to_frame_prediction(qapp,
         record = rough_arm_record(distance_m=.05, detector='Pilatus100k', beam_px=(243, 97),
                                   wavelength_m=.7293e-10)
         dialog._prediction = (dialog._calibrated_key(), record)
+        from tests.xdart.scattering.test_calibration_ring_scheduling import _settle
+        dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
         dialog._render_frames()  # the actual ring prediction path from the live traceback
-        assert dialog.frame_table.item(0, 5).text() not in ('—', 'none')
+        (text, tip), = _settle(dialog)
+        assert text not in ('', '—', 'none', '…') and tip.startswith('Ring ')
         assert type(dialog._saturation_value()) is int
         assert dialog._saturation_value() == 1048575
         assert type(dialog._beam_fit_options()['saturation']) is int
@@ -196,11 +199,15 @@ def test_the_calibration_band_masks_pyfai_and_prediction_without_rewriting_pixel
         record = rough_arm_record(distance_m=.05, detector='Pilatus100k', beam_px=(243, 97),
                                   wavelength_m=.7293e-10)
         dialog._prediction = (dialog._calibrated_key(), record)
-        assert dialog._expected_rings(staged)
+        from tests.xdart.scattering.test_calibration_ring_scheduling import _settle
+        dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
+        dialog._render_frames()
+        (text, tip), = _settle(dialog)  # the staged frame's predicted rings, from the table
+        assert text not in ('', '—', 'none', '…') and tip.startswith('Ring ')
         edit(dialog.threshold_range, 'min', 10)
         edit(dialog.threshold_range, 'max', 10.5)
         edit(dialog.threshold_range, 'min', 10.5)  # no pixel survives
-        assert dialog._expected_rings(staged) == ()
+        assert _settle(dialog) == [('none', 'No calibrant ring reaches this frame.')]
         assert hashlib.sha256(open(staged.image_path, 'rb').read()).hexdigest() == before
         np.testing.assert_array_equal(fabio.open(staged.image_path).data, image)
         # Calibration threshold is absent from direct-beam options; the shared mask remains there.
