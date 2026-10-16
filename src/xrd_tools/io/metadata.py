@@ -466,8 +466,8 @@ def _dir_listing_lower(directory: Path) -> dict[str, Path]:
     return listing
 
 
-def _fresh_listing(directory: Path, listings: dict) -> tuple[frozenset, dict[str, Path]]:
-    """*directory*'s regular files, listed now, once per ``listings`` and never in the process-wide cache."""
+def _fresh_listing(directory: Path, listings: dict) -> tuple[frozenset, dict[str, str]]:
+    """*directory*'s regular file names, and each by its lowercase, listed once per ``listings`` (never process-wide)."""
     found = listings.get(directory)
     if found is None:
         try:
@@ -475,7 +475,7 @@ def _fresh_listing(directory: Path, listings: dict) -> tuple[frozenset, dict[str
                 names = [entry.name for entry in entries if entry.is_file()]
         except OSError:  # an unreadable listing shows no sidecar: callers then wait or check strictly
             names = []
-        found = listings[directory] = (frozenset(names), {name.lower(): directory / name for name in names})
+        found = listings[directory] = (frozenset(names), {name.lower(): name for name in names})
     return found
 
 
@@ -483,7 +483,7 @@ def _existing_path_case_insensitive(candidate: Path, listings: dict | None = Non
     """Return an existing sibling matching *candidate.name*, exact case first (in ``listings`` if given)."""
     if listings is not None:
         names, lower = _fresh_listing(candidate.parent, listings)
-        return candidate if candidate.name in names else lower.get(candidate.name.lower())
+        return candidate if candidate.name in names else (name := lower.get(candidate.name.lower())) and candidate.parent / name
     # S-20: exact-case fast path -- ONE stat, no directory listing (the common
     # case: sidecars are correctly cased).
     try:

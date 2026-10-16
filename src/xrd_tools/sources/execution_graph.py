@@ -670,10 +670,10 @@ class LivePrefixProof:
                 if cancelled is not None and not index % 256 and cancelled():
                     raise RuntimeError("admission cancelled")
                 now, expected = _alias_now(binding, parents), targets[binding.target_id]
-                if now is None or _path_key(now[0]) != _path_key(binding.resolved_path):
+                if now is None or now[0] != binding.resolved_path and _path_key(now[0]) != _path_key(binding.resolved_path):
                     return False
-                key = _path_key(expected.resolved_path)
                 if now[1] != _revision(expected.state):
+                    key = _path_key(expected.resolved_path)
                     if expected.roles != ("image_metadata",) or not grown.get(key):
                         return False
                     moved[key] = (expected.resolved_path, now[1])
