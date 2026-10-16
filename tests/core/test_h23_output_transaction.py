@@ -4719,6 +4719,9 @@ def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
         "xdart/gui/tabs/scattering/page.py",
         "xdart/gui/tabs/scattering/processed_browser.py",
         "xdart/gui/tabs/scattering/workspace_operations.py",
+        # Since 7dec88d0 a saved output's coverage support is rebuilt between
+        # read-only revalidations of its load's target snapshot.
+        "xrd_tools/analysis/angular_support.py",
         # Since 947d93fb a confirmed calibration replacement is saved through
         # replace_into_place.
         "xrd_tools/integrate/stitch_calibration.py",
@@ -4755,6 +4758,9 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
         "get_output_transaction_coordinator",
     )
     allowed = {
+        # Since 7dec88d0 a saved output's coverage support is rebuilt between
+        # read-only revalidations of its load's target snapshot.
+        "xrd_tools/analysis/angular_support.py",
         # Since 947d93fb a confirmed calibration replacement is saved through
         # replace_into_place.
         "xrd_tools/integrate/stitch_calibration.py",
@@ -4783,3 +4789,12 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
         "the C2/headless transaction surface has unexpected mounts or lost an "
         f"allowed route: {sorted(observed)}"
     )
+    # angular_support only revalidates a snapshot; it never stages, leases or
+    # publishes.
+    support = ast.parse((source_root / "xrd_tools/analysis/angular_support.py")
+                        .read_text(encoding="utf-8"))
+    assert {alias.name for node in ast.walk(support)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "xrd_tools.io.output_transaction"
+            for alias in node.names} == {"TargetChanged",
+                                         "revalidate_target_snapshot"}

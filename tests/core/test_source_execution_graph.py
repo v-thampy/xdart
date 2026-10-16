@@ -2531,16 +2531,12 @@ def test_tiff_metadata_cap_precedes_auto_txt_pdi_generic_and_spec_parsers(
     assert unrestricted.source_path == ordinary and unrestricted.values["I0"] == 1.0
     ordinary.unlink()
 
-    class Scan:
-        data = np.array([[1.0]])
-        labels = ("I0",)
-        motor_names = ("theta",)
-        def data_column_by_name(self, _name): return np.array([1.0])
-        def motor_position_by_name(self, _name): return 2.0
-    class Spec:
-        def __init__(self, path): parser_calls.append(("spec", Path(path)))
-        def __getitem__(self, _key): return Scan()
-        def close(self): pass
+    real_spec_file = silx_spec.SpecFile
+    class Spec:  # silx's real parser; each admission recorded
+        def __init__(self, path):
+            parser_calls.append(("spec", Path(path))); self._parser = real_spec_file(path)
+        def __getitem__(self, key): return self._parser[key]
+        def close(self): self._parser.close()
 
     monkeypatch.setattr(silx_spec, "SpecFile", Spec)
     parsers = {
@@ -2576,7 +2572,10 @@ def test_tiff_metadata_cap_precedes_auto_txt_pdi_generic_and_spec_parsers(
         sidecar.unlink()
 
     spec_source = tmp_path / "experiment"
-    spec_source.write_bytes(exact_bytes)
+    spec_scan = b"#F experiment\n#E 1\n#O0 theta\n\n#S 1 ascan theta 0 1 1 1\n#P0 2\n#N 1\n#L I0\n1\n"
+    spec_exact = spec_scan + b"\n" * ((1 << 16) - len(spec_scan))
+    assert len(spec_exact) == 1 << 16
+    spec_source.write_bytes(spec_exact)
     parser_calls.clear()
     observed = metadata_io.read_image_metadata_observed(
         image, meta_format="spec", max_input_bytes=1 << 16,
@@ -2584,7 +2583,7 @@ def test_tiff_metadata_cap_precedes_auto_txt_pdi_generic_and_spec_parsers(
     assert observed.values == {"I0": 1.0, "theta": 2.0}
     assert observed.source_path == spec_source
     assert len(parser_calls) == 1 and parser_calls[0][0] == "spec"
-    spec_source.write_bytes(exact_bytes + b"x")
+    spec_source.write_bytes(spec_exact + b"x")
     parser_calls.clear()
     with pytest.raises(metadata_io.MetadataInputTooLarge):
         metadata_io.read_image_metadata_observed(
@@ -2659,16 +2658,12 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
 
     image = tmp_path / "experiment_scan1_0.tif"
     tifffile.imwrite(image, np.ones((2, 2), dtype="u1"))
-    source = tmp_path / "experiment"; source.write_text("#F experiment\n")
+    source = tmp_path / "experiment"
+    source.write_text("#F experiment\n#E 1\n#O0 theta\n\n#S 1 ascan theta 0 1 1 1\n#P0 4\n#N 1\n#L I0\n3\n")
     scratch = []; events = []
+    real_spec_file = silx_spec.SpecFile
 
-    class Scan:
-        data = np.array([[3.0]])
-        labels = ("I0",)
-        motor_names = ("theta",)
-        def data_column_by_name(self, _name): return np.array([3.0])
-        def motor_position_by_name(self, _name): return 4.0
-    class Parser:
+    class Parser:  # silx's real parser behind a recorder that injects the original faults
         bounded = True
         fail_body = False
         fail_close = False
@@ -2676,15 +2671,17 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
             self.path = Path(path); scratch.append(self.path); events.append("open")
             assert ((self.path != source and self.path.read_bytes() == source.read_bytes())
                     if self.bounded else self.path == source)
-        def __getitem__(self, _key):
+            self._parser = real_spec_file(path)
+        def __getitem__(self, key):
             events.append("body")
             if self.fail_body:
                 if isinstance(self.fail_body, BaseException): raise self.fail_body
                 raise ValueError("parser body")
-            return Scan()
+            return self._parser[key]
         def close(self):
             events.append("close")
             assert self.path.exists()
+            self._parser.close()
             if self.fail_close:
                 raise OSError("parser close")
 
@@ -2769,7 +2766,8 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
                 image, meta_format="spec", max_input_bytes=1 << 16,
             )
     assert events == ["open", "body", "close", "unlink"]
-    assert len(scratch) == 1 and scratch.pop().exists()
+    assert len(scratch) == 1 and scratch[0].exists()
+    scratch.pop().unlink()  # the injected unlink failure left it behind
 
     events.clear(); Parser.fail_body = True
     observed = metadata_io.read_image_metadata_observed(

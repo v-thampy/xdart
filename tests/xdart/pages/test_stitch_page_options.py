@@ -677,8 +677,9 @@ def test_the_experiment_rows_and_action_buttons_are_ints(qapp):
 
 def test_stitchs_advanced_is_ints_advanced_dialog_with_its_three_groups(qapp):
     """Codex's reuse audits (2026-10-01): Stitch's Advanced was its own QDialog of cards and a Close button, a
-    copy of Int's Advanced dialog. It is now Int's AdvancedDialog: its three groups of the page's shared rows,
-    non-modal, Close, retitled for the mode, locked while the page is busy."""
+    copy of Int's Advanced dialog. It is now Int's AdvancedDialog: groups of the page's shared rows (with Int's
+    Integrate 1D recording group since a14db34f, 2026-10-15) and its Images per point section, non-modal, Close,
+    retitled for the mode, locked while the page is busy."""
     from pyqtgraph.Qt import QtWidgets
     from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
     from xdart.gui.widgets.controls_panel import SubsectionCard
@@ -687,9 +688,11 @@ def test_stitchs_advanced_is_ints_advanced_dialog_with_its_three_groups(qapp):
         assert isinstance(page.advanced, AdvancedDialog) and not page.advanced.isModal()
         assert page.advanced.buttons.standardButtons() == QtWidgets.QDialogButtonBox.StandardButton.Close
         cards = {card.title.text(): card for card in page.advanced.findChildren(SubsectionCard)}
-        assert set(cards) == {"Source and geometry", "Frames and sample", "Corrections", "Images per point"}
+        assert set(cards) == {"Integrate 1D", "Source and geometry", "Frames and sample", "Corrections",
+                              "Images per point"}
         assert cards["Corrections"] is page.corrections_card
-        for title, keys in (("Source and geometry", ("geometry_kind", "detector_rows", "raw_dtype", "camera",
+        for title, keys in (("Integrate 1D", ("record_angular_support",)),
+                            ("Source and geometry", ("geometry_kind", "detector_rows", "raw_dtype", "camera",
                                                      "frame_step", "max_frame_mib", "output_family")),
                             ("Frames and sample", ("frame_check", "sample_position")),
                             ("Corrections", ("solid_angle", "polarization", "dark_path", "flat_cutoff"))):
