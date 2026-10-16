@@ -1835,8 +1835,9 @@ def _not_a_row(spec_path: Path, scan_number: int, scan: _SpecScan, index: int) -
 
 def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None, *,
                      published: int | None = None, cancelled=None, after: SpecScanExtent | None = None,
-                     cache: dict | None = None) -> SpecPoints | None:
-    """Every image's own SPEC row, from one read of their scan.
+                     cache: dict | None = None, frames: int | None = None) -> SpecPoints | None:
+    """Every image's own SPEC row, from one read of their scan; with ``frames``, the one image is a
+    {spec}_scanN_master container whose frame k (of ``frames``) is row k of the scan its name gives.
 
     Each image's name gives its SPEC file (the reader's own folder search),
     scan and row, as for :func:`read_image_metadata`.  A row is valid when its
@@ -1866,6 +1867,8 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
             raise ValueError("SPEC points need at least one image")
         return None
     resolved = [_resolve_spec_image(path, meta_dir) for path in paths]
+    if frames is not None:
+        paths, resolved = paths * frames, [value and (*value[:2], k) for value in resolved for k in range(frames)]
     scans = {value[:2] for value in resolved if value is not None}
     if len(scans) > 1:
         if live:

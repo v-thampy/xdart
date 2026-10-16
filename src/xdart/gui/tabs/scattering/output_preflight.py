@@ -1346,8 +1346,9 @@ def materialize_live_directory_group(
             transient,
             session,
             deferred.entries[0],
-            cancelled=cancelled,
-            published_members=published_members,
+            cancelled=cancelled,  # a container's published frames: its SPEC rows' fence (R5b)
+            published_members=published_members if published_graph is None or published_graph.descriptor is None
+            else published_graph.stamp.frame_count,
             prefix=prefix, spec_cache=spec_cache, recheck=recheck,
         )
     except RuntimeError as error:
@@ -2099,14 +2100,17 @@ def _directory_items(
             spec = SourceSpec(
                 candidate.path, descriptor.kind,
                 entry=descriptor.resolved_entry or descriptor.requested_entry,
-                options={} if series is None else dict(selected_source.options),
+                # A Live series keeps its selection; a Live SPEC run binds each frame to its row (R5b).
+                options=dict(selected_source.options) if series is not None else
+                {"metadata_format": "spec"} if _is_live(configuration) and metadata_format == "spec" else {},
             )
             graph = _qualify_for_admission(
                 spec,
                 selected_container=SelectedContainerInput(
                     state, candidate.adapter_id, descriptor,
                 ),
-                cancelled=cancelled,
+                cancelled=cancelled, infer_point_images=not _is_live(configuration),
+                published_members=published_members, spec_cache=spec_cache,  # a container's published frames
             )
         output_directory: Path | None = None
         if _save_path_is_directory(output_root):

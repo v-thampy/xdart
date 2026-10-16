@@ -136,6 +136,26 @@ class EmptyMetadataProvider(MetadataProvider):
         return self._wavelength_unit
 
 
+class RowsMetadataProvider(MetadataProvider):
+    """Each frame's already admitted row (a Live SPEC container's SPEC rows): value-only, so the reduction reads
+    exactly what admission read, with the SPEC rules TIFF members get; a frame without one is an error."""
+
+    def __init__(self, rows) -> None:
+        self._rows = tuple(rows)
+        if any(row is None for row in self._rows):
+            raise ValueError("a container frame has no admitted SPEC row")
+
+    def metadata_for(self, frame_index: int) -> Mapping[str, Any]:
+        if not 0 <= int(frame_index) < len(self._rows):
+            raise IndexError(f"container frame {frame_index} has no admitted SPEC row")
+        return dict(self._rows[int(frame_index)])
+
+    complete_metadata_for = metadata_for
+
+    def frame_count(self) -> int | None:
+        return len(self._rows)
+
+
 class BlueskyMetadataProvider(MetadataProvider):
     """Lazy per-frame metadata for a Bluesky/apstools NXWriter container.
 

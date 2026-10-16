@@ -280,6 +280,8 @@ class AdmittedMetadataSource:
     # In memory only, likewise: a sidecar member's values as admission read
     # them, which a live Run reuses while its proof holds.
     read_values: Mapping[str, Any] | None = field(default=None, compare=False)
+    # In memory only, likewise: a container frame's index (its master is source_path), R5b.
+    frame_index: int | None = field(default=None, compare=False)
     def __post_init__(self) -> None:
         if (type(self.source_path) is not str or not os.path.isabs(self.source_path)
                 or self.metadata_file is not None
@@ -289,7 +291,8 @@ class AdmittedMetadataSource:
                 or self.spec_values is not None
                 and (type(self.spec_values) is not MappingProxyType or self.spec_extent is None)
                 or self.read_values is not None
-                and (type(self.read_values) is not MappingProxyType or self.spec_extent is not None)):
+                and (type(self.read_values) is not MappingProxyType or self.spec_extent is not None)
+                or self.frame_index is not None and (type(self.frame_index) is not int or self.frame_index < 0)):
             raise TypeError("admitted metadata source is invalid")
     def as_dict(self) -> dict[str, Any]:
         return {"source_path": self.source_path, "metadata_file": (
@@ -381,11 +384,13 @@ class SourceExecutionStamp:
             or len({value.motor for value in self.admitted_motor_values}) != 1
         ):
             raise ValueError("admitted motor values must align with every source member")
-        if self.metadata_sources and (
-            self.adapter_id != "tiff_series" or not self.members
+        if self.metadata_sources and ((
+            not self.members or any(value.frame_index is not None for value in self.metadata_sources)
             or tuple(value.source_path for value in self.metadata_sources)
             != tuple(member.path for member in self.members)
-        ):
+        ) if self.adapter_id == "tiff_series" else (  # a container's logical frames 0..frame_count-1 (R5b)
+            self.members or tuple(value.frame_index for value in self.metadata_sources) != tuple(range(self.frame_count))
+            or any(value.source_path != self.file.path for value in self.metadata_sources))):
             raise ValueError("metadata sources must align with every TIFF member")
         owner = "image_file" if self.adapter_id == "tiff_series" else self.adapter_id
         occurrences = (((self.file, "source_file", owner),)
@@ -1039,10 +1044,33 @@ def _drain_qualification(handle: Any, slot: Any) -> bool:
     return retried
 
 
+def _container_spec_sources(path: Path, file: SourceFileState, frames: int, source: SourceSpec, *, published: int,
+                            cancelled, spec_cache) -> tuple[AdmittedMetadataSource, ...]:
+    """A Live SPEC container's rows (R5b): its {spec}_scanN_master names the SPEC file and scan, and frame k is
+    row k, read once by the TIFF members' strict reader; a published frame whose row is gone keeps none."""
+    from xrd_tools.io.metadata import read_spec_points
+    try:
+        points = read_spec_points((path,), meta_dir=source.options.get("meta_dir"), published=published,
+                                  cancelled=cancelled, cache=spec_cache, frames=frames)
+    except SpecRowPending as error:
+        raise SourceRevisionChanged(str(error)) from error
+    if points is None or points.path is None:
+        raise ValueError(f"{path.name} names no SPEC scan; choose another metadata source")
+    _cancelled(cancelled)
+    state = None if points.extent is None else SourceFileState.capture(points.path)
+    if state is not None and not spec_extent_holds(points.extent):
+        raise MetadataRevisionChanged(f"container metadata source changed during admission: {points.path}",
+                                      image_path=path, metadata_path=points.path)
+    return tuple(AdmittedMetadataSource(file.path, state, spec_extent=points.extent, frame_index=index,
+                                        spec_values=None if state is None else MappingProxyType(dict(read.values)))
+                 for index, read in enumerate(points.reads))
+
+
 def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader_binding: str | None,
                        cancelled: Callable[[], bool] | None,
                        expected: PreparedSourceExecutionGraph | None = None,
-                       selected: SelectedContainerInput | None = None) -> PreparedSourceExecutionGraph | None:
+                       selected: SelectedContainerInput | None = None, infer_point_images: bool = True,
+                       published: int = 0, spec_cache: dict | None = None) -> PreparedSourceExecutionGraph | None:
     from xrd_tools.io.bluesky_nexus import resolve_nxentry, validate_average_container_metadata_inputs
     from xrd_tools.io.nexus import _NexusDatasetOwnerSlot, _ResolvedNexusStack
     from xrd_tools.sources.adapters import candidate_owner
@@ -1146,11 +1174,19 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
                     else "NXpositioner values under entry/sample or entry/instrument, or NXdata axes")
                 raise ValueError(f"selected motor {selected_motor!r} is not in {path.name}'s supported scan "
                                  f"metadata ({where}); choose Manual or a SPEC/NeXus metadata source")
+            # A Live Run's SPEC selection binds each frame to its own row (R5b); finite containers keep their own.
+            live = not (infer_point_images if expected is None else expected.infers_point_images)
+            metadata = _container_spec_sources(path, before, descriptor.frame_count, source, cancelled=cancelled,
+                published=published if expected is None else descriptor.frame_count, spec_cache=spec_cache) \
+                if live and not reader_binding and source.options.get("metadata_format") == "spec" else ()
             group = descriptor.scan_name or path.stem.removesuffix("_master")
             execution = SourceSpec(path, descriptor.kind, metadata_uri=source.metadata_uri,
                 entry=descriptor.resolved_entry or entry_name, options=dict(source.options))
             adapter_id = "nexus_hdf5" if reader_binding else owner_id
             if expected is not None:
+                if len(metadata) != len(expected.stamp.metadata_sources) or not all(
+                        map(_metadata_holds, metadata, expected.stamp.metadata_sources)):
+                    raise SourceRevisionChanged("container metadata source changed")
                 if external_index != len(expected.stamp.external_members) or dependency_index != len(expected.stamp.dependency_files):
                     raise SourceRevisionChanged("container dependency graph cardinality changed")
                 _same(before, expected.stamp.file, "container source changed")
@@ -1170,7 +1206,7 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
                 detector_shape=tuple(descriptor.frame_shape), native_dtype=np.dtype(descriptor.dtype).str,
                 descriptor=descriptor, external_members=tuple(external_members),
                 dependency_files=tuple(dependencies), motor_names=None if all_motors is None else tuple(all_motors),
-                scanned_motor_names=scanned)
+                scanned_motor_names=scanned, metadata_sources=metadata, infers_point_images=infer_point_images)
 
         if reader_binding:
             return _drain_average_qualification(handle, slot, complete)
@@ -1247,7 +1283,8 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
     if source.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
         return _qualify_container(source, selected_motor=selected_motor,
                                   reader_binding=reader_binding, cancelled=cancelled,
-                                  selected=selected_container)
+                                  selected=selected_container, infer_point_images=infer_point_images,
+                                  published=published_members, spec_cache=spec_cache)
     raise ValueError(f"source kind {source.kind.value} is unsupported for Average")
 def requalify_source_execution_graph(source: SourceSpec, expected: PreparedSourceExecutionGraph,
         *, selected_motor: str | None = None, reader_binding: str | None = None,
@@ -1302,7 +1339,9 @@ def published_metadata_drift(published: PreparedSourceExecutionGraph,
     source drift that the existing validators own, so none is returned for it.
     """
     old, new = published.stamp, current.stamp
-    if old.adapter_id != "tiff_series" or new.adapter_id != "tiff_series" or len(old.members) > len(new.members):
+    # A TIFF series' members, or a SPEC container's logical frames (R5b), in order.
+    if old.adapter_id != new.adapter_id or old.adapter_id != "tiff_series" and not old.metadata_sources \
+            or len(old.members) > len(new.members) or len(old.metadata_sources) > len(new.metadata_sources):
         return ()
     # Metadata-only policy cannot hide a rewritten raw member. Leave every
     # raw file-state change to the existing source/Append validators.
@@ -1331,7 +1370,7 @@ def validate_consumed_metadata(value: PreparedSourceExecutionGraph,
     later members (each of them required) are checked.
     """
     stamp = value.stamp
-    if value.infers_point_images or stamp.adapter_id != "tiff_series":
+    if value.infers_point_images:  # a finite graph; a live container checks its SPEC frames (R5b)
         return
     motors = stamp.admitted_motor_values
     for index, source in enumerate(stamp.metadata_sources[start:], start):

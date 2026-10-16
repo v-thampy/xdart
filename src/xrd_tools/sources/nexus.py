@@ -234,6 +234,10 @@ class NexusStackSource(BaseFrameSource):
         provider = self._metadata_provider()
         return provider.metadata_energy_is_eV if provider is not None else False
 
+    def bind_metadata_provider(self, provider: MetadataProvider) -> None:
+        """Serve every frame's metadata from ``provider`` (a Live SPEC container's admitted rows)."""
+        self._provider_cache = provider
+
     def _metadata_provider(self) -> MetadataProvider | None:
         cache = self.__dict__.get("_provider_cache", _UNSET)
         if cache is not _UNSET:

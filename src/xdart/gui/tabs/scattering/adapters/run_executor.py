@@ -47,6 +47,7 @@ from xrd_tools.sources.execution_graph import (
     LivePrefixProof, published_metadata_drift, validate_consumed_metadata,
 )
 from xrd_tools.sources.nexus import NexusStackSource
+from xrd_tools.sources.metadata_provider import RowsMetadataProvider
 from xrd_tools.sources.point_images import PointImageSource
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.selection import DirectorySourceSpec, live_metadata_format
@@ -1484,6 +1485,9 @@ class StandardRunExecutor:
                 cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
                 try:
                     run.source = NexusStackSource(item.source_path, entry=item.source_spec.entry or 'entry', cursor=cursor)
+                    if item.graph.stamp.metadata_sources:  # a Live SPEC container: each frame's admitted row (R5b)
+                        run.source.bind_metadata_provider(RowsMetadataProvider(
+                            value.spec_values for value in item.graph.stamp.metadata_sources))
                     if source_spec.options.get('point_images') is not None:
                         run.source = PointImageSource(run.source, source_spec)
                 except Exception:
