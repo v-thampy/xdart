@@ -134,6 +134,66 @@ def test_e3_ui4_viewport_structure_is_exact(
         qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 
 
+def test_e3_ui4_narrow_top_bar_scrolls_instead_of_overlapping(
+    qapp: QtWidgets.QApplication,
+) -> None:
+    """PRERELEASE-REDS-20261016: at the narrowest review viewport the top
+    bar keeps every control at its own width and scrolls, so Log stays
+    reachable; tools a page adds later (RSM's) extend the scroll too."""
+    shell = ScatteringWorkspaceShell()
+    shell.apply_state(make_shell_projection())
+    shell.resize(1024, 900)
+    shell.show()
+    try:
+        qapp.processEvents()
+        science = shell.scientific
+        bar = science.norm.parentWidget()
+        (area,) = [
+            area
+            for area in shell.findChildren(
+                QtWidgets.QScrollArea, "e3ScrollableToolbar"
+            )
+            if area.widget() is bar
+        ]
+
+        def assert_scrolls_without_overlap() -> None:
+            row = science._top_bar_row
+            shown = [
+                row.itemAt(index).widget()
+                for index in range(row.count())
+                if row.itemAt(index).widget() is not None
+                and row.itemAt(index).widget().isVisibleTo(bar)
+            ]
+            spans = [
+                (widget.geometry().left(), widget.geometry().right())
+                for widget in shown
+            ]
+            assert all(
+                left[1] < right[0] for left, right in zip(spans, spans[1:])
+            ), spans
+            assert bar.width() >= row.minimumSize().width()
+            assert area.horizontalScrollBar().maximum() > 0
+            area.ensureWidgetVisible(science.log_scale)
+            qapp.processEvents()
+            log = science.log_scale.geometry().translated(
+                bar.pos()
+            )
+            assert 0 <= log.left() and log.right() < area.viewport().width()
+            area.horizontalScrollBar().setValue(0)
+
+        assert_scrolls_without_overlap()
+        science.set_page_tools(
+            ("viewer", "3D Viewer", "Open the 3D Viewer."),
+            ("slice", "Custom Slice", "Open a custom slice."),
+        )
+        qapp.processEvents()
+        assert_scrolls_without_overlap()
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
 @pytest.mark.parametrize(
     ("width", "height"),
     [(1440, 900), (1920, 1080), (1024, 900)],
