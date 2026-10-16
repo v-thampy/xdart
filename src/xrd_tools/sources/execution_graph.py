@@ -280,8 +280,9 @@ class AdmittedMetadataSource:
     # In memory only, likewise: a sidecar member's values as admission read
     # them, which a live Run reuses while its proof holds.
     read_values: Mapping[str, Any] | None = field(default=None, compare=False)
-    # In memory only, likewise: a container frame's index (its master is source_path), R5b.
+    # In memory only, likewise: a container frame's index (its master is source_path), R5b, and its scan's #L labels.
     frame_index: int | None = field(default=None, compare=False)
+    spec_columns: tuple[str, ...] | None = field(default=None, compare=False)
     def __post_init__(self) -> None:
         if (type(self.source_path) is not str or not os.path.isabs(self.source_path)
                 or self.metadata_file is not None
@@ -292,7 +293,8 @@ class AdmittedMetadataSource:
                 and (type(self.spec_values) is not MappingProxyType or self.spec_extent is None)
                 or self.read_values is not None
                 and (type(self.read_values) is not MappingProxyType or self.spec_extent is not None)
-                or self.frame_index is not None and (type(self.frame_index) is not int or self.frame_index < 0)):
+                or self.frame_index is not None and (type(self.frame_index) is not int or self.frame_index < 0)
+                or self.spec_columns is not None and (type(self.spec_columns) is not tuple or self.spec_values is None)):
             raise TypeError("admitted metadata source is invalid")
     def as_dict(self) -> dict[str, Any]:
         return {"source_path": self.source_path, "metadata_file": (
@@ -748,16 +750,36 @@ def graph_saturation(graph: PreparedSourceExecutionGraph, *, detector: object = 
         if dtype is None and graph.descriptor.dtype is not None:
             dtype = np.dtype(graph.descriptor.dtype).str
     elif graph.stamp.members:
-        options = dict(graph.execution_source.options)
-        layout = read_detector_image_layout(
-            graph.stamp.members[0].path,
-            raw_dtype=str(options.get("raw_dtype", "int32")),
-            raw_header_skip=int(options.get("raw_header_skip", 0)),
-            detector_shape=options.get("detector_shape"),
-            detector=options.get("detector"),
-        )
-        recorded, dtype = layout.saturation, dtype or layout.dtype
+        recorded, layout_dtype = _image_saturation(graph.stamp.members[0].path, graph.execution_source)
+        dtype = dtype or layout_dtype
     return resolve_detector_saturation(recorded=recorded, detector=detector, dtype=dtype)
+
+
+def selected_saturation(source: SourceSpec, *, detector: object = None):
+    """A Live Image Series' automatic ceiling before any member is admitted, by graph_saturation's rule: what its
+    selected container's descriptor or selected image's header records (one scan's images share it)."""
+    from xrd_tools.core.invalid import resolve_detector_saturation
+    from xrd_tools.sources.descriptor import describe_container
+
+    path = Path(source.options.get("selected_file") or source.uri).expanduser()
+    if source.kind is SourceKind.NEXUS_STACK:
+        descriptor = describe_container(path, entry=source.entry or "entry")
+        recorded, dtype = descriptor.saturation, None if descriptor.dtype is None else np.dtype(descriptor.dtype).str
+    else:
+        recorded, dtype = _image_saturation(str(path), source)
+    return resolve_detector_saturation(recorded=recorded, detector=detector, dtype=dtype)
+
+
+def _image_saturation(path: str, source: SourceSpec) -> tuple[int | None, str]:
+    options = dict(source.options)
+    layout = read_detector_image_layout(
+        path,
+        raw_dtype=str(options.get("raw_dtype", "int32")),
+        raw_header_skip=int(options.get("raw_header_skip", 0)),
+        detector_shape=options.get("detector_shape"),
+        detector=options.get("detector"),
+    )
+    return layout.saturation, layout.dtype
 
 
 def _frozen_options(value: Any) -> Any:
@@ -1062,7 +1084,8 @@ def _container_spec_sources(path: Path, file: SourceFileState, frames: int, sour
         raise MetadataRevisionChanged(f"container metadata source changed during admission: {points.path}",
                                       image_path=path, metadata_path=points.path)
     return tuple(AdmittedMetadataSource(file.path, state, spec_extent=points.extent, frame_index=index,
-                                        spec_values=None if state is None else MappingProxyType(dict(read.values)))
+                                        spec_values=None if state is None else MappingProxyType(dict(read.values)),
+                                        spec_columns=None if state is None else points.columns)
                  for index, read in enumerate(points.reads))
 
 
@@ -1399,14 +1422,6 @@ def source_snapshots_projection(value: PreparedSourceExecutionGraph, *, writer: 
     if stamp.members:
         snapshots = {state.path: {"adapter_id": stamp.adapter_id, **state.as_dict(),
             "frame_count": 1, "self_contained": True} for state in stamp.members}
-        for metadata in stamp.metadata_sources:
-            state = metadata.metadata_file
-            if state is not None:
-                if state.path in snapshots and {key: snapshots[state.path].get(key) for key in state.as_dict()} != state.as_dict():
-                    raise ValueError("conflicting source snapshot state")
-                snapshots[state.path] = {"adapter_id": "image_metadata", **state.as_dict(),
-                    "frame_count": 0, "self_contained": True,
-                    "source_role": "image_metadata"}
     else:
         snapshot = {"adapter_id": stamp.adapter_id, **stamp.file.as_dict(),
                     "frame_count": stamp.frame_count}
@@ -1427,6 +1442,14 @@ def source_snapshots_projection(value: PreparedSourceExecutionGraph, *, writer: 
                 "frame_count": 0, "self_contained": True,
                 "source_role": "detector_dependency",
             }
+    for metadata in stamp.metadata_sources:  # a TIFF member's, or a Live SPEC container's, metadata file
+        state = metadata.metadata_file
+        if state is not None:
+            if state.path in snapshots and {key: snapshots[state.path].get(key) for key in state.as_dict()} != state.as_dict():
+                raise ValueError("conflicting source snapshot state")
+            snapshots[state.path] = {"adapter_id": "image_metadata", **state.as_dict(),
+                "frame_count": 0, "self_contained": True,
+                "source_role": "image_metadata"}
     if not writer: return snapshots
     allowed = {"adapter_id", "size", "mtime_ns", "frame_count", "dataset_path", "self_contained"}
     return {path: {key: item for key, item in snapshot.items()

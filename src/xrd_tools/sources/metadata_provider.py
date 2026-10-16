@@ -138,12 +138,16 @@ class EmptyMetadataProvider(MetadataProvider):
 
 class RowsMetadataProvider(MetadataProvider):
     """Each frame's already admitted row (a Live SPEC container's SPEC rows): value-only, so the reduction reads
-    exactly what admission read, with the SPEC rules TIFF members get; a frame without one is an error."""
+    exactly what admission read, with the SPEC rules TIFF members get; a frame without one is an error.
+    ``columns`` (the scan's ``#L`` labels) are its motors, as SpecSource's: each one's value in every row."""
 
-    def __init__(self, rows) -> None:
-        self._rows = tuple(rows)
+    def __init__(self, rows, columns=()) -> None:
+        self._rows, self._columns = tuple(rows), tuple(columns)
         if any(row is None for row in self._rows):
             raise ValueError("a container frame has no admitted SPEC row")
+
+    def motors(self) -> dict[str, np.ndarray]:
+        return {name: np.asarray([row[name] for row in self._rows]) for name in self._columns}
 
     def metadata_for(self, frame_index: int) -> Mapping[str, Any]:
         if not 0 <= int(frame_index) < len(self._rows):

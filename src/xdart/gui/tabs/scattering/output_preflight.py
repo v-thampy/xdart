@@ -629,19 +629,20 @@ def _admitted_saturation(
 
     A single source takes the value it records (its container, or its first
     image's header: one scan's images share it), else the calibration detector's
-    documented counter limit for integer data. A Directory run shares one
-    science identity and qualifies its files only after it starts, so it takes
-    the documented limit alone. None: the data type's rule, as before.
+    documented counter limit for integer data; a Live Image Series, admitted only
+    after it starts, takes its selected container's or image's. A Directory run
+    shares one science identity and qualifies its files only after it starts, so
+    it takes the documented limit alone. None: the data type's rule, as before.
     """
     from xrd_tools.core.invalid import resolve_detector_saturation
-    from xrd_tools.sources.execution_graph import graph_saturation
+    from xrd_tools.sources.execution_graph import graph_saturation, selected_saturation
 
     detector = None if assets.poni_values is None else assets.poni_values[7]
-    resolved = (
-        graph_saturation(items[0].graph, detector=detector)
-        if type(source) is SourceSpec and items
-        else resolve_detector_saturation(detector=detector)
-    )
+    if type(source) is SourceSpec:
+        resolved = (graph_saturation(items[0].graph, detector=detector) if items
+                    else selected_saturation(source, detector=detector))
+    else:
+        resolved = resolve_detector_saturation(detector=detector)
     return None if resolved is None or resolved.source == "dtype" else resolved.value
 def inspect_output(
     item: PlannedOutput,

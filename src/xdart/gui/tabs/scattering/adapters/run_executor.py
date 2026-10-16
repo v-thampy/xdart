@@ -1485,9 +1485,9 @@ class StandardRunExecutor:
                 cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
                 try:
                     run.source = NexusStackSource(item.source_path, entry=item.source_spec.entry or 'entry', cursor=cursor)
-                    if item.graph.stamp.metadata_sources:  # a Live SPEC container: each frame's admitted row (R5b)
+                    if (rows := item.graph.stamp.metadata_sources):  # a Live SPEC container: each frame's admitted row (R5b)
                         run.source.bind_metadata_provider(RowsMetadataProvider(
-                            value.spec_values for value in item.graph.stamp.metadata_sources))
+                            (value.spec_values for value in rows), rows[0].spec_columns or ()))
                     if source_spec.options.get('point_images') is not None:
                         run.source = PointImageSource(run.source, source_spec)
                 except Exception:

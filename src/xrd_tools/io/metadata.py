@@ -1756,8 +1756,8 @@ def _same_number(left: float, right: float) -> bool:
 
 def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
                       own_rows: Sequence[tuple[float, ...]] | None = None,
-                      row_count: int | None = None, cancelled=None) -> list[dict[str, float]]:
-    """Each requested row's counters, with the scan's motor positions, parsed by silx.
+                      row_count: int | None = None, cancelled=None) -> tuple[list[dict[str, float]], tuple[str, ...]]:
+    """Each requested row's counters, with the scan's motor positions, parsed by silx, and its ``#L`` labels.
 
     silx reads files only, so ``payload`` (one scan) goes through a scratch
     file.  With ``own_rows`` (each requested row's numbers as its own line
@@ -1773,6 +1773,7 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
     primary: BaseException | None = None
     cleanup_error: BaseException | None = None
     values: list[dict[str, float]] = []
+    labels: tuple[str, ...] = ()
     try:
         scratch_handle = tempfile.NamedTemporaryFile(prefix="xdart-spec-", delete=False)
         scratch = Path(scratch_handle.name)
@@ -1788,6 +1789,7 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
                     for row, own in zip(rows, own_rows)):
                 raise _SpecParseDisagreement(f"silx read scan {scan_number} differently from its lines")
         motors = {name: float(scan.motor_position_by_name(name)) for name in scan.motor_names}
+        labels = tuple(dict.fromkeys(scan.labels))
         values.extend({**counters, **motors} for counters in _spec_counters(scan, rows))
     except BaseException as exc:
         primary = exc
@@ -1811,7 +1813,7 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
         raise MetadataScratchCleanupFailed(
             f"SPEC snapshot close/unlink failed: {cleanup_error}"
         ) from cleanup_error
-    return values
+    return values, labels
 
 
 @dataclass(frozen=True, slots=True)
@@ -1825,6 +1827,7 @@ class SpecPoints:
     path: Path | None
     extent: SpecScanExtent | None
     reads: tuple[ImageMetadataRead, ...]
+    columns: tuple[str, ...] = ()  # the scan's ``#L`` labels, once each: its rows' column view
 
 
 def _not_a_row(spec_path: Path, scan_number: int, scan: _SpecScan, index: int) -> str:
@@ -1910,7 +1913,7 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
     own = [tuple(float(token) for token in scan.lines[scan.rows[number]].split()) for number in numbers]
     _spec_cancelled(cancelled)
     try:
-        values = _spec_rows_values(
+        values, columns = _spec_rows_values(
             b"".join(scan.header) + b"".join(scan.lines[:scan.rows[needed - 1] + 1]),
             scan_number, numbers, own_rows=own, row_count=needed, cancelled=cancelled)
     except (MetadataScratchCleanupFailed, InterruptedError):
@@ -1925,7 +1928,7 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
                        scan_number, spec_path, exc_info=True)
         return None
     return SpecPoints(spec_path, scan.extent.through(needed),
-                      tuple(ImageMetadataRead(value, spec_path) for value in values))
+                      tuple(ImageMetadataRead(value, spec_path) for value in values), columns)
 
 
 def _spec_revision(path: Path) -> tuple[int, ...]:
