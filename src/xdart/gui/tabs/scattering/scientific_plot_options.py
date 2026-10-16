@@ -16,6 +16,7 @@ WATERFALL_Y_AXIS_CHOICES = (
     "Time (minutes)",
 )
 INTENSITY_SCALE_CHOICES = ("Linear", "Sqrt", "Log")
+SHARE_AXIS_TOOLTIP = "Pan and zoom matching coordinates together across the displayed plots."
 COVERAGE_TOOLTIP = (
     "2D pixel coverage: shade Q–χ bins that received no contributing pixels. Coverage includes pixel splitting "
     "and does not measure angular completeness; that is the 1-D angular coverage “Show angular coverage” displays."
@@ -122,6 +123,9 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.show_angular_support = QtWidgets.QCheckBox("Show angular coverage")
         other.addWidget(self.show_angular_support, 1, 0, 1, 2)
         self.set_angular_support_available(True)
+        self.share_axis = QtWidgets.QCheckBox("Share Axis")
+        other.addWidget(self.share_axis, 2, 0, 1, 2)
+        self.reconcile_share_axis(False, False)
 
         support = self._section(layout, "2D pixel coverage (Stitch only)")
         support.parentWidget().setToolTip(COVERAGE_TOOLTIP)
@@ -178,6 +182,13 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
     def set_waterfall_visible(self, visible: bool) -> None:
         self._waterfall_group.setVisible(bool(visible))
+
+    def reconcile_share_axis(self, checked: bool, available: bool) -> None:
+        """Mirror the view's existing sharing control; the checkbox is only an Okay/Cancel draft."""
+        self.share_axis.setChecked(checked)
+        self.share_axis.setEnabled(available)
+        self.share_axis.setToolTip(SHARE_AXIS_TOOLTIP + " Okay applies the change; Cancel discards it." +
+            ("" if available else " Available when displayed plots have matching coordinates."))
 
     def mount_display_scale(self, controls: QtWidgets.QWidget) -> None:
         """Mount the view's existing live display controls above Okay/Cancel."""

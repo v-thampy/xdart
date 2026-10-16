@@ -2979,7 +2979,10 @@ class StitchPage(QtWidgets.QWidget):
         if self._member_preferences is not None:
             self._draw_member()
             return
-        self.scientific.set_hidden_tools("norm", "raw", "raw_pane")
+        hidden = ("norm", "raw", "raw_pane")
+        if self._mode == "Stitch 2D":
+            hidden += ("share_axis",)
+        self.scientific.set_hidden_tools(*hidden)
         self.scientific.set_plot_modes("Single", "Overlay", "Average", "Sum", "Waterfall")
         self._draw_projection("Int 2D" if self._mode == "Stitch 2D" else "Int 1D")
         self.curve.setLabel("left", scaled_intensity_label(self._diagnostic,

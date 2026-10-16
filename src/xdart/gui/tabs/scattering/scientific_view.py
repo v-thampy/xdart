@@ -48,6 +48,7 @@ from .scientific_axes import (
 )
 from .scientific_plot_options import (
     PLOT_OPTION_BINDINGS,
+    SHARE_AXIS_TOOLTIP,
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
@@ -1333,6 +1334,7 @@ class ScientificView(QtWidgets.QFrame):
         self.share_axis = QtWidgets.QPushButton("Share Axis")
         self.share_axis.setCheckable(True)
         self.share_axis.setMinimumWidth(90)
+        self.share_axis.setToolTip(SHARE_AXIS_TOOLTIP)
         self.previous_frame = QtWidgets.QToolButton()
         self.previous_frame.setObjectName("e4FrameNavigationButton")
         self.previous_frame.setText("<")
@@ -1406,6 +1408,7 @@ class ScientificView(QtWidgets.QFrame):
         self.plot_options_dialog.accepted.connect(
             self._accept_plot_options
         )
+        self.plot_options_dialog.rejected.connect(self._sync_share_axis_options)
         self.clear.clicked.connect(
             lambda: self._emit(ShellCommandKind.CLEAR_1D)
         )
@@ -1414,6 +1417,7 @@ class ScientificView(QtWidgets.QFrame):
                 ShellCommandKind.SET_SHARE_AXIS, bool(value)
             )
         )
+        self.share_axis.toggled.connect(self._sync_share_axis_options)
         self.frame_selector.currentIndexChanged.connect(
             self._frame_selected
         )
@@ -1429,6 +1433,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def _show_plot_options(self) -> None:
         self._emit(ShellCommandKind.SHOW_WATERFALL_OPTIONS)
+        self._sync_share_axis_options()
         self.plot_options_dialog.show()
         self.plot_options_dialog.raise_()
         self.plot_options_dialog.activateWindow()
@@ -1436,6 +1441,8 @@ class ScientificView(QtWidgets.QFrame):
     def _accept_plot_options(self) -> None:
         prior = self.plot_options_dialog.projection
         edited = self.plot_options_dialog.edited_options()
+        share_axis = (self.plot_options_dialog.share_axis.isChecked()
+                      if self.plot_options_dialog.share_axis.isEnabled() else self.share_axis.isChecked())
         self.plotOptionsAccepted.emit()
         for path, field in PLOT_OPTION_BINDINGS:
             old_value = getattr(prior, field)
@@ -1446,6 +1453,10 @@ class ScientificView(QtWidgets.QFrame):
                     new_value,
                     path,
                 )
+        self.share_axis.setChecked(share_axis)  # the existing SET_SHARE_AXIS route, with no second preference
+
+    def _sync_share_axis_options(self, *_args) -> None:
+        self.plot_options_dialog.reconcile_share_axis(self.share_axis.isChecked(), self.share_axis.isEnabled())
 
     def _remove_phase_drawings(self, identifier):
         family = 'phase:' + identifier
@@ -3879,6 +3890,7 @@ class ScientificView(QtWidgets.QFrame):
             # a fresh re-flow follow epoch like the scheduled ones do.
             self._reflow_follows = 0
             self._align_curve_under_cake()
+        self._sync_share_axis_options()
 
     # -- the keyed layout: display_logic's repeated PanelKey roles (the H11/WS-X2 seam) -----------------------
     def reconcile_keyed(self, state: KeyedPanelsProjection) -> None:
@@ -3962,6 +3974,7 @@ class ScientificView(QtWidgets.QFrame):
         self._keyed_coordinates = {}
         self.clear_keyed()
         self.share_axis.setEnabled(False)
+        self._sync_share_axis_options()
         self._apply_hidden_tools()
 
     def keyed_panel(self, key: PanelKey):
@@ -4043,6 +4056,7 @@ class ScientificView(QtWidgets.QFrame):
         self._keyed_coordinates = self._keyed_axes(state)
         self.share_axis.setEnabled(bool(self._keyed_coordinates))
         self._set_share_link(state.share_axis)
+        self._sync_share_axis_options()
         self._refresh_keyed_intensity()
 
         if all(type(panel) is KeyedFigureProjection for panel in state.panels):
@@ -4321,7 +4335,7 @@ class ScientificView(QtWidgets.QFrame):
     #: Top-bar tools a host page may leave out, by name (some name several widgets).
     _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button",
                    "raw_pane": "raw", "slice": ("slice", "slice_center", "slice_width", "pin"),
-                   "phases": "phases", "viewer_controls": "viewer_intensity_row"}
+                   "phases": "phases", "viewer_controls": "viewer_intensity_row", "share_axis": "share_axis"}
     _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
 
     def set_plot_modes(self, *names: str) -> None:
@@ -4344,6 +4358,7 @@ class ScientificView(QtWidgets.QFrame):
         ('raw_pane': Stitch's map has no one detector image; Int 2D's layout keeps its cake),
         and the χ (c/w) slice with its Pin ('slice': RSM's keyed layout has no cake to cut).
         'viewer_controls' leaves out the keyed/viewer bottom Share Axis, Options and intensity row.
+        'share_axis' leaves its main button out while keeping its mirror in Options.
         Int shows them all."""
         unknown = set(names) - set(self._HOST_TOOLS)
         if unknown:
