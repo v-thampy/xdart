@@ -776,6 +776,18 @@ def test_j0_06r_resumed_stop_seen_first_by_worker_commits_stopped_prefix(
         signal = run.stop_signal
         finish_current = output.finish_current
 
+        def accounted(graph, when: str) -> None:
+            snapshot = graph["accounting"].snapshot()
+            facts[f"run_generation_{when}"] = snapshot.run_generation
+            facts[f"accepted_{when}"] = tuple(sorted(
+                int(key.logical_frame_identity[1])
+                for key in snapshot.accepted
+            ))
+            facts[f"persisted_{when}"] = tuple(sorted({
+                int(key.logical_frame_identity[1])
+                for key, _mode, _target in snapshot.persisted
+            }))
+
         def observed_finish_current(*args, **kwargs):
             graph = output._current
             writer = graph["nexus"]._writer
@@ -785,14 +797,19 @@ def test_j0_06r_resumed_stop_seen_first_by_worker_commits_stopped_prefix(
                 epoch_labels=writer.append_decision.labels,
                 written_at_finish=writer.written_labels,
             )
+            accounted(graph, "at_finish")
             try:
                 return finish_current(*args, **kwargs)
             except BaseException as error:
                 facts["finish_error"] = repr(error)
                 raise
             finally:
-                facts["finalization_started"] = writer.finalization_started
-                worker_finished.set()
+                try:
+                    facts["finalization_started"] = writer.finalization_started
+                    facts["written_final"] = writer.written_labels
+                    accounted(graph, "final")
+                finally:
+                    worker_finished.set()
 
         def held_set():
             # Stop has published run.stop_requested; its output graph has not
@@ -835,6 +852,7 @@ def test_j0_06r_resumed_stop_seen_first_by_worker_commits_stopped_prefix(
         receipt = rig.close()
     facts["close_receipt"] = receipt
     if run is not None:
+        facts["run_generation"] = run.identity.generation
         facts["retained"] = tuple(
             name for name in ("session", "sink", "output", "source")
             if getattr(run, name) is not None
@@ -855,6 +873,7 @@ def test_j0_06r_resumed_stop_seen_first_by_worker_commits_stopped_prefix(
     written = facts["written_at_finish"]
     assert committed == tuple(range(1, len(committed) + 1)), facts
     assert len(written) <= len(committed) < 179, (committed, facts)
+    assert committed == facts["written_final"], (committed, facts)
 
 
 def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
