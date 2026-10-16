@@ -57,6 +57,7 @@ from xrd_tools.io import (
     ProcessedScan,
     get_raw_frame,
 )
+from xrd_tools.io.append import decode_committed_append_prefix
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import image_series_spec
@@ -747,6 +748,113 @@ def test_j0_06_stop_is_fail_closed_without_orphan_work(
             assert receipt.cleanup_status is CleanupStatus.CLEANED
             worker = rig.loader._worker
             assert worker is None or not worker.is_alive()
+
+
+def test_j0_06r_resumed_stop_seen_first_by_worker_commits_stopped_prefix(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Linux CI 38871428679: the resumed run's worker observed Stop before
+    its output graph did, finished the full-size epoch, and close stayed
+    CLEANUP_PENDING.  Hold Stop's GUI thread at exactly that point."""
+    rig = _mount(
+        monkeypatch,
+        tmp_path,
+        labels=tuple(range(1, 180)),
+        reduction_delay=0.001,
+    )
+    facts: dict[str, object] = {}
+    armed, worker_finished = Event(), Event()
+    run = None
+    body_error = None
+    try:
+        _run(rig)
+        _pause(rig)
+        rig.shell.run_controls.startButton.click()
+        _wait(rig.app, lambda: rig.lifecycle.phase is RunPhase.RUNNING)
+        run = rig.executor._active
+        output = run.output
+        signal = run.stop_signal
+        finish_current = output.finish_current
+
+        def observed_finish_current(*args, **kwargs):
+            graph = output._current
+            writer = graph["nexus"]._writer
+            facts.update(
+                worker_saw_stop=run.stop_requested,
+                graph_stop_requested=graph["stop_requested"],
+                epoch_labels=writer.append_decision.labels,
+                written_at_finish=writer.written_labels,
+            )
+            try:
+                return finish_current(*args, **kwargs)
+            except BaseException as error:
+                facts["finish_error"] = repr(error)
+                raise
+            finally:
+                facts["finalization_started"] = writer.finalization_started
+                worker_finished.set()
+
+        def held_set():
+            # Stop has published run.stop_requested; its output graph has not
+            # yet been told.  Let the worker settle what it observed first.
+            try:
+                if armed.is_set():
+                    armed.clear()
+                    facts["worker_finished_first"] = worker_finished.wait(
+                        timeout=10.0
+                    )
+            finally:
+                Event.set(signal)
+
+        monkeypatch.setattr(output, "finish_current", observed_finish_current)
+        monkeypatch.setattr(signal, "set", held_set)
+        armed.set()
+        rig.shell.run_controls.stopButton.click()
+        _wait(
+            rig.app,
+            lambda: rig.lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED},
+            diagnostic=lambda: f"{rig.lifecycle.phase.value} {facts}",
+        )
+        _wait(rig.app, lambda: not rig.controller.browse_pending)
+        facts["phase"] = rig.lifecycle.phase.value
+        facts["notice"] = rig.page._notice_text
+        facts["run_primary"] = run.primary
+        facts["run_cleanup_failures"] = tuple(run.cleanup_failures)
+        assert facts.get("worker_finished_first") is True, facts
+        assert facts["worker_saw_stop"] is True, facts
+        assert facts["graph_stop_requested"] is False, facts
+        assert len(facts["written_at_finish"]) < 179, facts
+        assert "finish_error" not in facts, facts
+        assert rig.lifecycle.phase is RunPhase.IDLE, facts
+        assert not rig.shell.run_controls.stopButton.isEnabled()
+    except Exception as error:
+        body_error = error
+    finally:
+        armed.clear()
+        worker_finished.set()
+        receipt = rig.close()
+    facts["close_receipt"] = receipt
+    if run is not None:
+        facts["retained"] = tuple(
+            name for name in ("session", "sink", "output", "source")
+            if getattr(run, name) is not None
+        )
+        facts["run_worker_alive"] = (
+            run.worker is not None and run.worker.is_alive()
+        )
+    if body_error is not None:
+        raise AssertionError(
+            f"J0-06R body failed first: {body_error!r}; {facts}"
+        ) from body_error
+    assert receipt.cleanup_status is CleanupStatus.CLEANED, facts
+    assert facts["retained"] == () and not facts["run_worker_alive"], facts
+    loader = rig.loader._worker
+    assert loader is None or not loader.is_alive()
+    with h5py.File(rig.output, "r") as handle:
+        committed = decode_committed_append_prefix(handle).intent.labels
+    written = facts["written_at_finish"]
+    assert committed == tuple(range(1, len(committed) + 1)), facts
+    assert len(written) <= len(committed) < 179, (committed, facts)
 
 
 def test_j0_07_b_to_c_releases_b_before_c_and_retains_failed_owner(
