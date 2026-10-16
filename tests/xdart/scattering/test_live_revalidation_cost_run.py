@@ -1375,6 +1375,7 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
         measured['finish'] = work.net('finish', stopping, time.monotonic())
     except AssertionError:
         record_property('deadline_phase', phase)
+        print(f'P1 {name} {points} failed in {phase}; terminals {_terminals([*events, *executor.drain_events()])}')
         raise
     finally:
         if not _terminal(events):
