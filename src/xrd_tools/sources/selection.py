@@ -175,7 +175,8 @@ def image_series_spec(
     The selected member supplies its own suffix and parsed scan stem.  Hidden
     fields from another source mode therefore cannot affect membership, and
     selecting frame 4 does not silently redefine the series as frames 4 onward.
-    Enumeration is name-only; no image payload is opened.
+    Enumeration is name-only: only a sibling whose name matches the series is
+    checked for being a file, and no image payload is opened.
     """
     selected = Path(selected_file).expanduser()
     metadata_policy = normalize_metadata_format(metadata_format)
@@ -205,15 +206,14 @@ def image_series_spec(
         except OSError:
             siblings = ()
         for sibling in siblings:
-            if not sibling.is_file():
-                continue
             sibling_match = candidate_re.match(sibling.name)
-            if sibling_match is not None:
-                members.append((
-                    int(sibling_match.group(1)),
-                    sibling.name.casefold(),
-                    sibling,
-                ))
+            if sibling_match is None or not sibling.is_file():
+                continue
+            members.append((
+                int(sibling_match.group(1)),
+                sibling.name.casefold(),
+                sibling,
+            ))
         files = tuple(
             member[2] for member in sorted(members, key=lambda item: item[:2]))
         if not files and selected.is_file():

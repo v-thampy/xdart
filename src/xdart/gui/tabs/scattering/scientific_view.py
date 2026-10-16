@@ -2843,6 +2843,7 @@ class ScientificView(QtWidgets.QFrame):
     ) -> None:
         browse_snapshot = state.browse_trace_snapshot
         if browse_snapshot is not None:
+            owned_by_id = {id(frame): frame for frame in navigation.frames}
             if (
                 type(browse_snapshot) is not BrowseTraceSnapshot
                 or not browse_snapshot.science_contract
@@ -2855,7 +2856,7 @@ class ScientificView(QtWidgets.QFrame):
                 or tuple(trace.frame for trace in state.traces)
                 != browse_snapshot.display_frames
                 or any(
-                    not any(owned is frame for owned in navigation.frames)
+                    owned_by_id.get(id(frame)) is not frame
                     for frame in browse_snapshot.logical_frames
                 )
             ):
