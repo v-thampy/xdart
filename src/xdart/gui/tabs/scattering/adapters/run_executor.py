@@ -1444,7 +1444,9 @@ class StandardRunExecutor:
         output.drop_released_predecessor(predecessor)
 
     def _construct(self, run: _StandardRun, *, item: PlannedOutput | None=None, labels: tuple[int, ...] | None=None, decision: AdmittedOutput | None=None) -> _StandardRun:
-        proof, run.live_admission_proof = run.live_admission_proof, None
+        proof = getattr(run, 'live_admission_proof', None)
+        if proof is not None:
+            run.live_admission_proof = None
         configuration, capture = (run.configuration, run.capture)
         if configuration is None or capture is None:
             raise RuntimeError('run construction shell is incomplete')
@@ -2117,9 +2119,8 @@ class StandardRunExecutor:
                         # Discovery and registrations as they are before the
                         # strict check: a proof rebuilt on its pass holds both.
                         registry = registry_identity()
-                        seen = observe_live_members(
-                            configuration, retained.decision.item.graph,
-                        )
+                        seen = observe_live_members(configuration, [
+                            member.path for member in retained.decision.item.source_stamp.members])
                         try:
                             validate_planned_source(
                                 retained.decision.item,

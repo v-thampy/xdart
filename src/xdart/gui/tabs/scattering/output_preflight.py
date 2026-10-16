@@ -1180,21 +1180,15 @@ def _live_metadata_ready(
     return ready, reason
 
 
-def observe_live_members(
-    configuration: FrozenRunConfiguration, graph: PreparedSourceExecutionGraph,
-) -> dict[str, object]:
-    """Every member's sidecar observation now, from fresh listings, by record key."""
+def observe_live_members(configuration: FrozenRunConfiguration, paths) -> dict[str, object]:
+    """Each image's sidecar observation now, from fresh listings, by record key."""
     from xrd_tools.io.metadata import live_sidecar_observation
 
     source = configuration.thaw_source_spec()
     fmt = source.metadata_format if type(source) is DirectorySourceSpec else None
-    if fmt in (None, "spec"):
-        return {}
     listings: dict = {}
-    return {
-        observation_key(member.path): live_sidecar_observation(member.path, fmt, listings=listings)
-        for member in graph.stamp.members
-    }
+    return {} if fmt in (None, "spec") else {
+        observation_key(path): live_sidecar_observation(path, fmt, listings=listings) for path in paths}
 
 
 def _prefix_current_rebased(
@@ -1206,7 +1200,8 @@ def _prefix_current_rebased(
     """The strict published-prefix check; its pass rebases the output's proof
     on the discovery and registrations observed before it."""
     proof = proof if proof is not None and proof.graph is graph else None
-    seen = None if proof is None else observe_live_members(configuration, graph)
+    seen = None if proof is None else observe_live_members(
+        configuration, [member.path for member in graph.stamp.members])
     registry = registry_identity()
     if not _published_prefix_current(graph, cancelled):
         return False
@@ -1307,6 +1302,12 @@ def materialize_live_directory_group(
             published_members=published_members,
             observe_from=covered, spec_cache=spec_cache,
         )
+        if covered and count > covered and proof.verified_at == checked and not proof.holds(cancelled=cancelled):
+            # A publication proves its prefix in its own poll; one that changed
+            # is looked at again in full, as an uncovered poll would.
+            covered, (count, waiting) = 0, _live_metadata_ready(
+                configuration, group, sidecar_observations,
+                published_members=published_members, spec_cache=spec_cache)
         if count == 0:
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting,
@@ -1333,10 +1334,9 @@ def materialize_live_directory_group(
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason="listing the directory before admission",
             )
-        # A publication proves its prefix in this poll; the members after it
-        # are then the only ones read, captured and proved strictly.
-        if covered and (proof.verified_at != checked or proof.holds(cancelled=cancelled)):
-            prefix = published_graph
+        # The prefix proved in this poll: only the members after it are read,
+        # captured and proved strictly.
+        prefix = published_graph if covered else None
 
     ready = RunCandidatePlan(
         group.plan.generation,
@@ -1346,7 +1346,17 @@ def materialize_live_directory_group(
         group.plan.name_filter,
         tuple(value.descriptor for value in observations),
     )
-    registry = registry_identity()
+    registry, source, admitted = registry_identity(), configuration.thaw_source_spec(), []
+    fmt = source.metadata_format if type(source) is DirectorySourceSpec else None
+    # The discovery the in-poll proof compares with is taken before qualification.
+    record = sidecar_observations if sidecar_observations is not None else observe_live_members(
+        configuration, ready.paths)
+
+    def recheck(graph: PreparedSourceExecutionGraph) -> bool:
+        admitted.append(LivePrefixProof(graph, record=record, registry=registry, metadata_format=fmt,
+                                        start=0 if prefix is None else len(prefix.stamp.members)))
+        return admitted[-1].holds(cancelled=cancelled)
+
     try:
         deferred = _deferred_directory_plan(
             receipt.candidate,
@@ -1369,6 +1379,7 @@ def materialize_live_directory_group(
             published_members=published_members,
             prefix=prefix,
             spec_cache=spec_cache,
+            recheck=recheck,
         )
     except RuntimeError as error:
         if error.args == ("admission cancelled",):
@@ -1396,16 +1407,12 @@ def materialize_live_directory_group(
         RunIntent.from_frozen(configuration),
         (decision.item,),
     )
-    source = configuration.thaw_source_spec()
     return LiveDirectoryAttempt(
         group,
         ProbeState.READY,
         decision=decision,
         partial=len(physical_paths) < len(group.physical_paths),
-        proof=LivePrefixProof(
-            decision.item.graph, record=sidecar_observations, registry=registry,
-            metadata_format=source.metadata_format if type(source) is DirectorySourceSpec else None,
-            start=0 if prefix is None else len(prefix.stamp.members)),
+        proof=admitted[-1],
     )
 
 
@@ -1418,9 +1425,12 @@ def materialize_deferred_output(
     published_members: int = 0,
     prefix: PreparedSourceExecutionGraph | None = None,
     spec_cache: dict | None = None,
+    recheck: Callable[[PreparedSourceExecutionGraph], bool] | None = None,
 ) -> tuple[AdmittedOutput | None, int, int]:
     """``prefix`` and ``spec_cache``: see :func:`_deferred_directory_plan` and
-    :func:`qualify_source_execution_graph`; the proved prefix is not proved again."""
+    :func:`qualify_source_execution_graph`.  ``recheck`` (a live admission's
+    in-poll proof) is the second look at a qualified TIFF series, which is not
+    validated again; a container still is."""
     deferred = receipt.deferred_directory
     if (
         type(deferred) is not DeferredDirectoryPlan
@@ -1489,8 +1499,10 @@ def materialize_deferred_output(
         item=item,
         cancelled=cancelled,
         proven=proven,
-        revalidate=not _is_live(receipt.candidate),
+        revalidate=recheck is None or item.descriptor is not None,
     )
+    if recheck is not None and not recheck(item.graph):
+        raise SourceRevisionChanged(f"live source changed during admission: {item.target.name}")
     _validate_targets(
         receipt.candidate,
         receipt.candidate.source,
@@ -1516,9 +1528,8 @@ def _validate_deferred_entry_states(
     """Require one deferred cursor to remain inside its admitted revision.
 
     ``proven`` holds a live prefix's states its proof held in this poll: they
-    are not proved again.  ``revalidate=False`` (a live admission, which the
-    Run's construction validates or re-proves) skips validating the new graph
-    a second time."""
+    are not proved again.  ``revalidate=False`` (a live TIFF admission, whose
+    in-poll proof is its second look) skips validating the new graph again."""
 
     is_cancelled = _not_cancelled if cancelled is None else cancelled
     proven = proven or {}
