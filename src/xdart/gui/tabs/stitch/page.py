@@ -507,7 +507,7 @@ class StitchPage(QtWidgets.QWidget):
         self._result_keys = {}
         #: The view's settings as Int keeps them: plot mode and axis, plot options, color map and log
         #: scale, and for a map its image axis, slice and pins.
-        self._view = ScientificPreferences()
+        self._view = ScientificPreferences(share_axis=True)
         self._member_preferences = self._member_frame_view = self._member_key = None
         #: The last map projection shown (a pin takes its slice); None while a pattern shows.
         self._last_map_state = None
