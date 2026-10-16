@@ -10,6 +10,7 @@ Parent polarity at 8f4a48a3 is in the task's CHECKPOINT.md; P1's bars are frozen
 """
 import os
 import statistics
+import sys
 import threading
 import time
 
@@ -20,6 +21,7 @@ import pytest
 import silx.io.specfile as silx_specfile
 
 import xrd_tools.io.metadata as metadata
+import xrd_tools.sources.directory_index as directory_index
 import xrd_tools.sources.execution_graph as execution_graph
 import xrd_tools.sources.image as image_source
 import xrd_tools.sources.registry  # noqa: F401  # register built-in readers
@@ -33,6 +35,7 @@ from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering.adapters.dynamic_output import DynamicOutputAdapter
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
+from xdart.gui.tabs.scattering.events import CleanupStatus, ExecutorClosed
 from xrd_tools.io.nexus import read_scan_metadata
 from xrd_tools.reduction.core import ReductionSession
 from xrd_tools.session.run_configuration import GIIntent, RunIntent
@@ -48,8 +51,6 @@ CONTENT = ('qualify_read', 'reduce_read', 'spec_scan_read', 'spec_rows', 'silx_o
 PILATUS, TINY = (195, 487), (16, 16)
 LABELS = ('del', 'i0', *(f'c{j}' for j in range(2, 22)))
 SPEC_HEAD = '#F calibrant\n#E 1\n#O0 th  chi\n\n'
-#: Bars frozen at the checkpoint from the parent measurements: (family, points) -> {phase: (p50 s, p95 s)}.
-BARS: dict[tuple[str, int], dict[str, tuple[float | None, float | None]]] = {}
 
 
 class _Work:
@@ -114,6 +115,15 @@ class _Work:
                             timed('commit_epoch', DynamicOutputAdapter.commit_epoch))
         monkeypatch.setattr(DynamicOutputAdapter, 'finish_all', timed('finish', DynamicOutputAdapter.finish_all))
         monkeypatch.setattr(DirectoryIndex, 'poll', timed('discovery', DirectoryIndex.poll))
+        real_admitted = StandardRunExecutor._execute_admitted
+
+        def admitted(executor, run):
+            try:
+                return real_admitted(executor, run)
+            finally:
+                record('work_exit')  # Stop's t1: the worker has left its work
+        monkeypatch.setattr(StandardRunExecutor, '_execute_admitted', admitted)
+        monkeypatch.setattr(StandardRunExecutor, '_cleanup', timed('cleanup', StandardRunExecutor._cleanup))
         if not counters:
             return
         wrap(metadata, 'read_image_metadata_observed', 'qualify_read', lambda a: str(a[0]))
@@ -390,7 +400,7 @@ def _content(found, published=()):
 
 def _report(row, phase, found):
     """Print one phase's counted work (calls per seam; rows, frames and seconds summed) for the record."""
-    summed = {'spec_rows', 'to_scan_frames', 'drain', 'commit_epoch', 'finish', 'discovery'}
+    summed = {'spec_rows', 'to_scan_frames', 'drain', 'commit_epoch', 'finish', 'discovery', 'cleanup'}
     counts = {seam: round(sum(values), 3) if seam in summed else len(values)
               for seam, values in sorted(found.items()) if seam != 'drain_start'}
     print(f'WORK {row} {phase}: {counts}')
@@ -474,6 +484,9 @@ def test_r1_a_live_family_does_only_new_work_at_idle_pending_and_arrival(tmp_pat
         attempts = _settled(executor, identity, n + 1, deadline)
         found = work.window(mark, time.monotonic())
         _report(name, 'arrival_1', found)
+        constructs = [at for at, _detail in work.times('construct', mark)]
+        if not any(mark <= at - took and at <= constructs[0] for at, took in work.times('discovery', mark)):
+            problems.append('the landed frame was admitted without a real listing after it landed')
         _arrived, reread = _content(found, published)
         if reread:
             problems.append(f'one arrival re-read the published metadata of {len(reread)} members')
@@ -567,6 +580,20 @@ def test_r2b_every_settled_output_is_swept_for_drift_within_one_second(tmp_path,
         found = work.window(polls[2], polls[13])
         _report('r2b', 'idle_11_polls_3_outputs', found)
         idle, _ = _content(found)
+        # A new frame whose directory stamp lags (held at its pre-write identity) is still listed within 1 s.
+        real_identity = getattr(directory_index, 'directory_identity', None)
+        held = {os.fspath(raw): real_identity(raw)} if real_identity else {}
+
+        def lagging(path):
+            work.record('identity_held' if os.fspath(path) in held else 'identity')
+            return held.get(os.fspath(path)) or real_identity(path)
+        monkeypatch.setattr(directory_index, 'directory_identity', lagging, raising=False)
+        written = time.monotonic()
+        _Sidecar(raw, PILATUS, stem='scan2').frame(3)
+        _wait(executor, events, lambda values: len(set(_labels(values, 'scan2'))) >= 4 or _terminal(values), 10.)
+        held.clear()
+        listed = [at for at, took in work.times('discovery', written) if at - took >= written]
+        lag = min(listed) - written if listed else None
         (raw / 'scan1_0001.txt').write_text(SIDECARS['txt'](99.))  # a published sidecar changes
         changed = time.monotonic()
         _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values), 10.)
@@ -576,6 +603,8 @@ def test_r2b_every_settled_output_is_swept_for_drift_within_one_second(tmp_path,
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert _said(events, 'scan1_0001.txt'), 'the drift names the changed sidecar'
     assert (noticed <= 1. + 2 * POLL, idle) == (True, {}), (round(noticed, 3), idle)
+    assert lag is not None and lag <= 1., f'a lagging directory stamp hid the new frame for {lag} s'
+    assert work.times('identity_held'), 'the held directory identity was never consulted'
 
 
 # --- R3: invalidation after reuse is established (the parent's exact outcomes preserved) ------------------------
@@ -952,14 +981,22 @@ def test_r5b_spec_with_an_eiger_master_binds_each_frame_to_its_own_row(tmp_path)
 
 # --- R6: Stop within 1 s through cleanup ------------------------------------------------------------------------
 
-def _timed_stop(executor, identity, events):
-    """(t2 - t0, t3 - t0, terminals): STOPPED drained and close() returned, after stop() was accepted."""
+def _timed_stop(executor, identity, events, work):
+    """(t1, t2, t3) seconds after t0 = just before stop(), and the terminals: t1 the worker left its work
+    (None if it never started), t2 STOPPED drained, t3 close() returned the exact CLEANED receipt."""
     t0 = time.monotonic()
     executor.stop(identity)
     _wait(executor, events, _terminal, 120.)
     t2 = time.monotonic()
-    executor.close(identity)
-    return t2 - t0, time.monotonic() - t0, _terminals(events)
+    closed = executor.close(identity)
+    t3 = time.monotonic()
+    assert closed == ExecutorClosed(identity, CleanupStatus.CLEANED), closed
+    exits = [at for at, _detail in work.times('work_exit', t0)]
+    return (exits[0] - t0 if exits else None), t2 - t0, t3 - t0, _terminals(events)
+
+
+def _stop_line(label, t1, t2, t3):
+    return f'STOP {label} t1={"-" if t1 is None else f"{t1:.3f}"} t2={t2:.3f} t3={t3:.3f}'
 
 
 @pytest.mark.parametrize('moment', ['idle', 'pending', 'publication'])
@@ -987,10 +1024,11 @@ def test_r6a_stop_ends_a_small_live_run_within_one_second(tmp_path, monkeypatch,
             for k in range(4, 24):
                 spec.frame(1, k)
         assert entered.wait(60.), f'the {moment} moment was never reached'
-        reached, closed, terminal = _timed_stop(executor, identity, events)
+        left, reached, closed, terminal = _timed_stop(executor, identity, events, work)
     finally:
         if not _terminal(events):
             _stop(executor, identity, events)
+    print(_stop_line(moment, left, reached, closed))
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert closed <= 1., f'Stop at {moment}: STOPPED after {reached:.3f} s, closed after {closed:.3f} s'
 
@@ -1009,10 +1047,11 @@ def test_r6b_stop_while_a_5000_row_spec_arrival_is_qualified_ends_within_one_sec
     events = []
     try:
         assert entered.wait(900.), 'the 5000-row qualification did not start within 15 minutes'
-        reached, closed, terminal = _timed_stop(executor, identity, events)
+        left, reached, closed, terminal = _timed_stop(executor, identity, events, work)
     finally:
         if not _terminal(events):
             _stop(executor, identity, events)
+    print(_stop_line('spec5000', left, reached, closed))
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert closed <= 1., f'STOPPED after {reached:.3f} s, closed after {closed:.3f} s'
 
@@ -1086,6 +1125,20 @@ def test_r7b_gi_live_keeps_each_frames_own_incidence_motor(tmp_path, monkeypatch
 PERF = ('spec_tiff', 'txt', 'nexus', 'eiger', 'aggregate')
 #: The GUI's default bins (1D 1000; 2D 1000 x 360): the containers carry the epoch-commit/finish split.
 REALISTIC = {'npt': 1000, 'method': 'csr'}, {'npt_rad': 1000, 'npt_azim': 360, 'method': 'csr'}
+#: Ratified at the checkpoint (docs 3814fcaf; D1 idle/pending and latency at 6b52675e): overhead (p50 s,
+#: p95 s) per phase and size, local APFS.
+_PHASE_BARS = {
+    'idle': {100: (.020, .040), 500: (.020, .040), 5000: (.020, .060)},
+    'pending': {100: (.020, .040), 500: (.020, .040), 5000: (.020, .060)},
+    'arrival_1': {100: (.100, .200), 500: (.120, .250), 5000: (.250, .500)},
+    'arrival_10': {100: (.300, .500), 500: (.350, .600), 5000: (.600, 1.)},
+    'arrival_latency': {100: (.30, .30), 500: (.35, .35), 5000: (.60, .60)},  # write to first construct, p95
+    'stop_closed': {100: (1., 1.), 500: (1., 1.), 5000: (1., 1.)},
+}
+#: Every P1 row's bars. The containers have no pending phase in this fixture: N/A, never a pass.
+BARS = {(name, points): {phase: sizes[points] for phase, sizes in _PHASE_BARS.items()
+                         if phase != 'pending' or name not in ('nexus', 'eiger')}
+        for name in PERF for points in (100, 500, 5000)}
 
 
 class _Feed:
@@ -1179,25 +1232,33 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
     executor = StandardRunExecutor(join_timeout=2.)
     identity = _start(executor, feed.intent(tmp_path, raw), request_value=7200 + 10 * PERF.index(name)
                       + (500, 5000, 100).index(points))
-    events, measured, phase, terminal, problems = [], {}, 'initial', [], []
+    events, measured, phase, terminal, problems, footprint = [], {}, 'initial', [], [], None
     deadline, started = time.monotonic() + 900., time.monotonic()
     initial = 1 if name == 'aggregate' else (points if name not in ('nexus', 'eiger') else points)
+    pending = name not in ('nexus', 'eiger')
     try:
         _wait(executor, events, feed.count(initial), 900.)
         record_property('initial_admission_and_reduction_s', round(time.monotonic() - started, 3))
         phase = 'idle'
         polls = work.await_polls(time.monotonic(), 12, deadline)
         measured['idle'] = [work.overhead(a, b) for a, b in zip(polls[1:11], polls[2:12])]
-        measured['idle_discovery'] = [sum(took for _at, took in work.times('discovery', a, b))
-                                      for a, b in zip(polls[1:11], polls[2:12])]
+        # Every real listing in the idle span (a skipped poll reports none); no gap between listings over 1 s.
+        listed = work.times('discovery', polls[1], polls[11])
+        measured['idle_discovery_call'] = [took for _at, took in listed]
+        record_property('idle_listings', len(listed))
+        ends = [at for at, _took in work.times('discovery', 0., polls[1])][-1:] + [at for at, _took in listed]
+        assert ends and max(b - a for a, b in zip(ends, [*ends[1:], polls[11]])) <= 1., 'idle listing gap'
         phase = 'pending'
-        if feed.pending():
+        if pending:
+            feed.pending()
             polls = work.await_polls(time.monotonic(), 12, deadline)
             measured['pending'] = [work.overhead(a, b) for a, b in zip(polls[1:11], polls[2:12])]
             target = len(feed.published(events)) + 1
             feed.land()
             _wait(executor, events, feed.count(target), max(1., deadline - time.monotonic()))
-        measured['commit_epoch_net'], measured['reduction_excluded'] = [], []
+            assert len(feed.published(events)) == target, 'pending: frame progress'
+        for key in ('commit_epoch_net', 'reduction_excluded', 'arrival_latency'):
+            measured[key] = []
         for burst, key, repeats in ((1, 'arrival_1', 10), (10, 'arrival_10', 3)):
             phase, measured[key] = key, []
             for _repeat in range(repeats):
@@ -1206,22 +1267,31 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
                 for _index in range(burst):
                     feed.frame()
                 _wait(executor, events, feed.count(target), max(1., deadline - time.monotonic()))
+                assert len(feed.published(events)) == target, f'{key}: frame progress'
                 constructs = [at for at, _detail in work.times('construct', mark)]
                 # The poll that admits the frames may have started before they were written.
                 first = [at for at in work.polls() if at <= constructs[0]][-1]
                 after = work.await_polls(constructs[-1], 1, deadline)[0]
+                commits = work.net('commit_epoch', first, after)
+                assert commits, f'{key}: no epoch commit'
                 measured[key].append(work.overhead(first, after))
-                measured['commit_epoch_net'] += work.net('commit_epoch', first, after)
+                measured['commit_epoch_net'] += commits
                 measured['reduction_excluded'].append(sum(took for _at, took in work.times('drain', first, after)))
+                measured['arrival_latency'].append(constructs[0] - mark)
         # The growing output only: later scans append to a settled scan's SPEC file after its qualification.
         grown = [value for value in executor.processed_live_revisions(identity)
                  if not value.partial and value.decision.item.graph.group_key == feed.stem]
         assert grown or name in ('nexus', 'eiger'), 'the growing output has no settled attempt'
         problems = _differential(grown)
+        if points == 5000:
+            footprint = _reuse_footprint(executor, identity, events)
         phase = 'stop'
         work.await_polls(time.monotonic(), 2, deadline)
         stopping = time.monotonic()
-        _reached, closed, terminal = _timed_stop(executor, identity, events)
+        left, reached, closed, terminal = _timed_stop(executor, identity, events, work)
+        record_property('stop_t1_s', None if left is None else round(left, 4))
+        record_property('stop_t2_s', round(reached, 4))
+        record_property('stop_cleanup_s', round(sum(took for _at, took in work.times('cleanup', stopping)), 4))
         measured['stop_closed'] = [closed]
         measured['finish'] = work.net('finish', stopping, time.monotonic())
     except AssertionError:
@@ -1239,9 +1309,33 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
             print(f'P1 {name} {points} {key} n={len(values)} p50={p50:.4f}s p95={p95:.4f}s')
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert not problems, problems
-    failed = {}
-    for key, (bar50, bar95) in BARS.get((name, points), {}).items():
+    counts = {key: len(values) for key, values in measured.items()}
+    assert counts == {'idle': 10, 'idle_discovery_call': counts['idle_discovery_call'], **({'pending': 10} if pending
+                      else {}), 'commit_epoch_net': counts['commit_epoch_net'], 'reduction_excluded': 13,
+                      'arrival_latency': 13, 'arrival_1': 10, 'arrival_10': 3, 'stop_closed': 1, 'finish': 1}, counts
+    assert counts['commit_epoch_net'] >= 13, counts
+    assert len(feed.published(events)) == initial + int(pending) + 40, 'frame progress'
+    if footprint is not None:
+        per_frame, fixed, accepted = footprint
+        record_property('reuse_bytes_per_frame', round(per_frame / accepted, 1))
+        record_property('reuse_fixed_bytes', fixed)
+        assert per_frame <= 4096 * accepted and per_frame + fixed <= 20 << 20, footprint
+    failed, bars = {}, BARS[(name, points)]
+    assert set(bars) <= set(measured), f'barred phases never measured: {set(bars) - set(measured)}'
+    for key, (bar50, bar95) in bars.items():
         p50, p95 = _quantiles(measured[key])
-        if bar50 is not None and p50 > bar50 or bar95 is not None and p95 > bar95:
+        if p50 > bar50 or p95 > bar95:
             failed[key] = (round(p50, 4), round(p95, 4), bar50, bar95)
     assert not failed, failed
+
+
+def _reuse_footprint(executor, identity, events):
+    """(per-frame bytes, fixed bytes, accepted frames) of the Run's retained reuse state, summed flat over its
+    records: tuples of primitive values whose first value is the frame they serve, or None if fixed."""
+    records = executor.live_reuse_records(identity)
+    kinds = {type(value) for record in records for value in record}
+    assert kinds <= {str, int, float, bool, type(None)}, f'retained reuse state holds {kinds}'
+    sizes = [(record[0] is None, sys.getsizeof(record) + sum(map(sys.getsizeof, record))) for record in records]
+    accepted = len({(str(event.artifact), event.frame_key.local_frame_label) for event in events
+                    if event.kind is StandardEventKind.FRAME_READY})
+    return sum(size for fixed, size in sizes if not fixed), sum(size for fixed, size in sizes if fixed), accepted
