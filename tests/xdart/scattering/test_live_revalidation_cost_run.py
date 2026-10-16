@@ -306,8 +306,9 @@ class _Nexus:
 class _Eiger:
     """An Eiger master with external data chunks; the last chunk grows."""
 
-    def __init__(self, raw, shape, frames, chunk=100):
-        self.raw, self.shape, self.master, self.chunks = raw, shape, raw / 'scan_master.h5', []
+    def __init__(self, raw, shape, frames, chunk=100, stem='scan'):
+        self.raw, self.shape, self.stem, self.chunks = raw, shape, stem, []
+        self.master = raw / f'{stem}_master.h5'
         remaining = frames
         while remaining > 0:
             self._chunk(min(chunk, remaining))
@@ -321,7 +322,7 @@ class _Eiger:
                 data[f'data_{index:06d}'] = h5py.ExternalLink(path.name, '/entry/data/data')
 
     def _chunk(self, frames):
-        path = self.raw / f'scan_data_{len(self.chunks) + 1:06d}.h5'
+        path = self.raw / f'{self.stem}_data_{len(self.chunks) + 1:06d}.h5'
         with h5py.File(path, 'w') as handle:
             handle.create_dataset('entry/data/data', data=np.ones((frames, *self.shape), dtype=np.uint16),
                                   maxshape=(None, *self.shape), chunks=(1, *self.shape))
@@ -923,60 +924,125 @@ def test_r4c_a_complete_malformed_spec_row_for_a_new_frame_fails_loudly(tmp_path
 
 # --- R5: entry modes the maintainer named ----------------------------------------------------------------------
 
-def test_r5a_live_on_an_image_series_follows_that_series_only(tmp_path, monkeypatch):
+#: R5a: selected file, output stem, frames at Start, metadata policy, and the column (and values) its four frames give.
+R5A = {'spec': ('calibrant_scan001_0000.tif', 'calibrant_scan001', 3, 'spec', 'i0', (100., 101., 102., 103.)),
+       'txt': ('scan_0000.tif', 'scan', 3, 'txt', 'I0', (0., 1., 2., 3.)),
+       'single': ('lone.tif', 'lone', 1, None, None, None), 'container': ('eiger_master.h5', 'eiger', 2, None, None, None)}
+
+
+@pytest.mark.parametrize('case', list(R5A))
+def test_r5a_live_on_an_image_series_follows_that_series_only(tmp_path, case):
+    """A numbered series gains only its own numbered members (not another scan, suffix or name); TIFF+txt waits
+    for each member's sidecar; an unnumbered image, or a selected Eiger master as it grows, is exactly that file."""
     raw = tmp_path / 'raw'
     raw.mkdir()
-    spec = _Spec(raw, PILATUS)
+    selected, stem, first, fmt, key, values = R5A[case]
+    spec, cars = _Spec(raw, PILATUS), _Sidecar(raw, PILATUS)
     spec.scan(1)
     for k in range(3):
-        spec.frame(1, k)
-    source = image_series_spec(raw / 'calibrant_scan001_0000.tif', metadata_format='spec')
+        spec.frame(1, k) if case == 'spec' else cars.frame(k)
+    eiger = _Eiger(raw, PILATUS, 2, chunk=1, stem='eiger') if case == 'container' else _tiff(raw / 'lone.tif', 7, PILATUS)
     executor = StandardRunExecutor(join_timeout=2.)
-    identity = _start(executor, _intent(tmp_path, raw, PILATUS, source=source), request_value=7140)
+    identity = _start(executor, _intent(tmp_path, raw, PILATUS, source=image_series_spec(raw / selected, metadata_format=fmt)),
+                      request_value=7140 + list(R5A).index(case))
     events = []
     try:
-        _wait(executor, events, _count_labels('calibrant_scan001', 3), 60.)
+        _wait(executor, events, _count_labels(stem, first), 60.)
         _settle(executor, events, .5)
-        spec.frame(1, 3)
-        spec.scan(2)
-        spec.frame(2, 0)  # another scan in the same folder is not this series
-        _wait(executor, events, _count_labels('calibrant_scan001', 4), 20.)
+        if case == 'spec':
+            spec.frame(1, 3), spec.scan(2), spec.frame(2, 0), _raw(raw / 'calibrant_scan001_0004.raw', 9, PILATUS)
+        elif case == 'txt':
+            cars.image(3)
+            _settle(executor, events, .5)
+            assert len(set(_labels(events, stem))) == 3, 'a member was reduced before its sidecar'
+            cars.sidecar(3)
+        elif case == 'single':
+            _tiff(raw / 'lone_0001.tif', 8, PILATUS)
+        else:
+            eiger.grow(), _Eiger(raw, PILATUS, 1, stem='later')
+        _wait(executor, events, _count_labels(stem, first + (case != 'single')), 20.)
         _settle(executor, events, .5)
     finally:
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
-    assert _column(_counted(tmp_path, 'calibrant_scan001')[1], 'i0') == (100., 101., 102., 103.)
-    assert _counted(tmp_path, 'calibrant_scan002')[0] is None
+    labels, record = _counted(tmp_path, stem)
+    assert labels is not None and len(labels) == first + (case != 'single'), labels
+    assert key is None or _column(record, key) == values, _column(record, key)
+    others = {'calibrant_scan001', 'calibrant_scan002', 'scan', 'lone', 'eiger', 'later'} - {stem}
+    assert not [other for other in others if _counted(tmp_path, other)[0] is not None]
 
 
-def test_r5b_spec_with_an_eiger_master_binds_each_frame_to_its_own_row(tmp_path):
-    raw = tmp_path / 'raw'
+R5B = ('grow', 'rows', 'malformed', 'drift', 'reread', 'stop')
+
+
+@pytest.mark.parametrize('case', R5B)
+def test_r5b_spec_with_an_eiger_master_binds_each_frame_to_its_own_row(tmp_path, monkeypatch, case):
+    """Frame k of {spec}_scanN_master is row k of scan N, across two external chunks as the last one grows: the
+    master waits until each frame has its row (a later row waits for its frame), a malformed row fails loudly, a
+    published row rewritten stops the output, a new row rewritten as construction starts is read again, and Stop
+    during the arrival's SPEC read ends the Run within 1 s."""
+    raw, stem = tmp_path / 'raw', 'calibrant_scan001'
     raw.mkdir()
-    spec = _Spec(raw, PILATUS)
+    spec, eiger = _Spec(raw, PILATUS), _Eiger(raw, PILATUS, 4, chunk=2, stem=stem)
     spec.scan(1)
-    for k in range(4):
+    for k in range(3 if case == 'rows' else 4):
         spec.row(1, k)
-    member, master = raw / 'calibrant_scan001_data_000001.h5', raw / 'calibrant_scan001_master.h5'
-    with h5py.File(member, 'w') as handle:
-        handle.create_dataset('entry/data/data', data=np.ones((4, *PILATUS), dtype=np.uint16),
-                              maxshape=(None, *PILATUS), chunks=(1, *PILATUS))
-    with h5py.File(master, 'w') as handle:
-        entry = handle.create_group('entry')
-        entry.attrs['NX_class'] = 'NXentry'
-        data = entry.create_group('data')
-        data.attrs['NX_class'] = 'NXdata'
-        data['data_000001'] = h5py.ExternalLink(member.name, '/entry/data/data')
+    work, read, entered, closed = _Work(monkeypatch, counters=False), metadata._read_spec_scan, threading.Event(), None
+    construct = StandardRunExecutor._construct
+
+    def held(*args, cancelled=None):  # the arrival's own SPEC read waits for Stop
+        if cancelled is not None:
+            entered.set()
+            while not cancelled():
+                time.sleep(.01)
+        return read(*args, cancelled=cancelled)
+
+    def rewritten(executor, run, **kwargs):  # the new row changes as its construction starts
+        monkeypatch.setattr(StandardRunExecutor, '_construct', construct)
+        _same_size_rewrite(spec.path, '0.4 104 ', '0.4 904 ')
+        return construct(executor, run, **kwargs)
     executor = StandardRunExecutor(join_timeout=2.)
     identity = _start(executor, _intent(tmp_path, raw, PILATUS, suffix='_master.h5', fmt='spec'),
-                      request_value=7141)
+                      request_value=7144 + R5B.index(case))
     events = []
     try:
-        _wait(executor, events, _count_labels('calibrant_scan001', 4), 60.)
-        _settle(executor, events, .5)
+        if case == 'rows':
+            _settle(executor, events, 1.)
+            assert not _labels(events, stem), 'frames were reduced before every one had its row'
+            spec.row(1, 3), spec.row(1, 4)  # the extra row waits for its frame
+        _wait(executor, events, _count_labels(stem, 4), 60.)
+        _settle_reuse(executor, identity, work, events, 4, time.monotonic() + 60.)
+        if case == 'malformed':
+            with spec.path.open('a') as stream:
+                stream.write('0.4 104 not-a-number\n')
+        elif case == 'drift':
+            _same_size_rewrite(spec.path, '0.1 101 ', '0.1 109 ')
+        elif case in ('stop', 'reread'):
+            monkeypatch.setattr(*((metadata, '_read_spec_scan', held) if case == 'stop' else
+                                  (StandardRunExecutor, '_construct', rewritten)))
+        if case not in ('rows', 'malformed'):
+            spec.row(1, 4)
+        eiger.grow()
+        if case == 'stop':
+            assert entered.wait(30.), 'the arrival never read its SPEC rows'
+            closed = _timed_stop(executor, identity, events, work)
+        else:
+            _wait(executor, events, lambda values: _terminal(values) or _said(values, 'stopped growing')
+                  or len(set(_labels(values, stem))) >= 5, 30.)
+            _settle(executor, events, .5)
     finally:
-        terminal = _stop(executor, identity, events)
-    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
-    assert _column(_counted(tmp_path, 'calibrant_scan001')[1], 'i0') == (100., 101., 102., 103.)
+        terminal = closed[3] if closed is not None else _stop(executor, identity, events)
+    labels, record = _counted(tmp_path, stem)
+    if case == 'malformed':
+        assert [kind for kind, _detail in terminal][-1:] == ['FAILED'] and 'row 5' in str(terminal), terminal
+    else:
+        assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert closed is None or closed[2] <= 1., closed
+    assert labels == tuple(range(4 if case in ('malformed', 'drift', 'stop') else 5)), labels
+    assert case != 'drift' or _said(events, 'stopped growing')
+    assert _column(record, 'i0') == (100., 101., 102., 103., 904. if case == 'reread' else 104.)[:len(labels)]
+    assert _column(record, 'c2') == (2., 3., 4., 5., 6.)[:len(labels)]
+    assert _column(record, 'del') == pytest.approx((0., .1, .2, .3, .4)[:len(labels)], rel=1e-6, abs=0)
 
 
 # --- R6: Stop within 1 s through cleanup ------------------------------------------------------------------------
@@ -1144,8 +1210,9 @@ BARS = {(name, points): {phase: sizes[points] for phase, sizes in _PHASE_BARS.it
 class _Feed:
     """The next frame of a performance source: complete, or its image now and its metadata later.
 
-    SPEC+TIFF carries 20 MB of earlier-scan history; the aggregate's SPEC file holds only its own scans.
-    NeXus runs 1D+2D and Eiger 1D, both on a Pilatus-sized detector with the GUI's default bins."""
+    SPEC+TIFF and SPEC+Eiger carry 20 MB of earlier-scan history; the aggregate's SPEC file holds only its own
+    scans. NeXus runs 1D+2D and SPEC+Eiger 1D (frame k is row k; a row lands before its frame), both on a
+    Pilatus-sized detector with the GUI's default bins."""
 
     def __init__(self, name, raw, points):
         self.name, self.k, self.slot = name, 0, '_int2d' if name == 'nexus' else '_int1d'
@@ -1169,8 +1236,14 @@ class _Feed:
             for k in range(points):
                 self.owner.frame(k)
         else:
-            self.owner = _Nexus(raw, PILATUS, points) if name == 'nexus' else _Eiger(raw, PILATUS, points)
-            self.stem, self.first = ('scan_0' if name == 'nexus' else 'scan'), 0
+            self.owner = _Nexus(raw, PILATUS, points) if name == 'nexus' else _Eiger(raw, PILATUS, points,
+                                                                                         stem='calibrant_scan001')
+            self.stem, self.first = ('scan_0' if name == 'nexus' else 'calibrant_scan001'), 0
+            if name == 'eiger':
+                self.spec, self.k = _Spec(raw, TINY, history_bytes=20 << 20), points
+                self.spec.scan(1)
+                for k in range(points):
+                    self.spec.row(1, k)
 
     def frame(self):
         if self.name in ('spec_tiff', 'aggregate'):
@@ -1178,6 +1251,8 @@ class _Feed:
         elif self.name == 'txt':
             self.owner.frame(self.k)
         else:
+            if self.name == 'eiger':
+                self.spec.row(1, self.k)
             self.owner.grow()
         self.k += 1
 
@@ -1202,7 +1277,7 @@ class _Feed:
             return _intent(tmp_path, raw, PILATUS, suffix='.nxs', fmt=None, processing='Int 2D', one=REALISTIC[0],
                            two=REALISTIC[1])
         if self.name == 'eiger':
-            return _intent(tmp_path, raw, PILATUS, suffix='_master.h5', fmt=None, one=REALISTIC[0])
+            return _intent(tmp_path, raw, PILATUS, suffix='_master.h5', fmt='spec', one=REALISTIC[0])
         return _intent(tmp_path, raw, TINY, fmt='txt' if self.name == 'txt' else 'spec')
 
     def published(self, events):
@@ -1233,15 +1308,18 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
     identity = _start(executor, feed.intent(tmp_path, raw), request_value=7200 + 10 * PERF.index(name)
                       + (500, 5000, 100).index(points))
     events, measured, phase, terminal, problems, footprint = [], {}, 'initial', [], [], None
-    deadline, started = time.monotonic() + 900., time.monotonic()
+    budget = 1800. if (name, points) == ('spec_tiff', 5000) else 900.  # amended for SPEC+TIFF 5000 (docs 6209206a)
+    deadline, started = time.monotonic() + budget, time.monotonic()
     initial = 1 if name == 'aggregate' else (points if name not in ('nexus', 'eiger') else points)
     pending = name not in ('nexus', 'eiger')
     try:
-        _wait(executor, events, feed.count(initial), 900.)
+        _wait(executor, events, feed.count(initial), budget)
         record_property('initial_admission_and_reduction_s', round(time.monotonic() - started, 3))
+        print(f'P1 {name} {points} initial admission and reduction {time.monotonic() - started:.1f}s')
         phase = 'idle'
         polls = work.await_polls(time.monotonic(), 12, deadline)
         measured['idle'] = [work.overhead(a, b) for a, b in zip(polls[1:11], polls[2:12])]
+        print(f'P1 {name} {points} idle polls (s, listings)', [(round(work.overhead(a, b), 4), len(work.times('discovery', a, b))) for a, b in zip(polls[1:11], polls[2:12])])
         # Every real listing in the idle span (a skipped poll reports none); no gap between listings over 1 s.
         listed = work.times('discovery', polls[1], polls[11])
         measured['idle_discovery_call'] = [took for _at, took in listed]
@@ -1253,6 +1331,7 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
             feed.pending()
             polls = work.await_polls(time.monotonic(), 12, deadline)
             measured['pending'] = [work.overhead(a, b) for a, b in zip(polls[1:11], polls[2:12])]
+            print(f'P1 {name} {points} pending polls (s, listings)', [(round(work.overhead(a, b), 4), len(work.times('discovery', a, b))) for a, b in zip(polls[1:11], polls[2:12])])
             target = len(feed.published(events)) + 1
             feed.land()
             _wait(executor, events, feed.count(target), max(1., deadline - time.monotonic()))
