@@ -111,6 +111,21 @@ def test_a_stitch_2d_shows_its_map_as_int_2d_without_the_raw_pane(qapp, tmp_path
         view, state = page.scientific, page._last_map_state
         assert view.raw.isHidden() and not view.cake.isHidden() and not view.image_splitter.isHidden()
         assert state.processing_mode == "Int 2D" and state.title == page.results.currentItem().text()
+        assert state.share_axis and view.share_axis.isChecked()
+        assert view.share_axis.isHidden()
+        # Off is an explicit viewing choice: later redraws must not reapply the default.
+        view.options.click()
+        assert view.plot_options_dialog.share_axis.isChecked()
+        view.plot_options_dialog.share_axis.click()
+        view.plot_options_dialog.accept_button.click()
+        assert not page._view.share_axis and not page._last_map_state.share_axis
+        page._draw()
+        assert not view.share_axis.isChecked()
+        view.options.click()
+        assert not view.plot_options_dialog.share_axis.isChecked()
+        view.plot_options_dialog.share_axis.click()
+        view.plot_options_dialog.accept_button.click()
+        assert page._view.share_axis and page._last_map_state.share_axis
         cake = np.asarray(payload.intensity.T, dtype=float)  # (χ, q), as Int's frame holds a map
         np.testing.assert_array_equal(state.heavy.cake, cake)
         np.testing.assert_array_equal(state.traces[0].intensity, payload.profile.intensity)  # I(q) below

@@ -507,7 +507,7 @@ class StitchPage(QtWidgets.QWidget):
         self._result_keys = {}
         #: The view's settings as Int keeps them: plot mode and axis, plot options, color map and log
         #: scale, and for a map its image axis, slice and pins.
-        self._view = ScientificPreferences()
+        self._view = ScientificPreferences(share_axis=True)
         self._member_preferences = self._member_frame_view = self._member_key = None
         #: The last map projection shown (a pin takes its slice); None while a pattern shows.
         self._last_map_state = None
@@ -2979,7 +2979,10 @@ class StitchPage(QtWidgets.QWidget):
         if self._member_preferences is not None:
             self._draw_member()
             return
-        self.scientific.set_hidden_tools("norm", "raw", "raw_pane")
+        hidden = ("norm", "raw", "raw_pane")
+        if self._mode == "Stitch 2D":
+            hidden += ("share_axis",)
+        self.scientific.set_hidden_tools(*hidden)
         self.scientific.set_plot_modes("Single", "Overlay", "Average", "Sum", "Waterfall")
         self._draw_projection("Int 2D" if self._mode == "Stitch 2D" else "Int 1D")
         self.curve.setLabel("left", scaled_intensity_label(self._diagnostic,

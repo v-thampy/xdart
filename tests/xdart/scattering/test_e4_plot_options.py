@@ -221,6 +221,40 @@ def test_live_image_axis_flip_keeps_shared_plot_axis_converged() -> None:
     assert owner._preferences.plot_axis == "2theta"
 
 
+def test_share_axis_in_options_mirrors_the_existing_view_command(qapp):
+    view = ScientificView()
+    state = make_shell_projection(plot_mode="Single")
+    commands = []
+    view.commandRequested.connect(commands.append)
+    try:
+        _reconcile(view, replace(state.scientific, share_axis=True), state.navigation)
+        assert view.share_axis.isChecked() and not view.share_axis.isHidden()
+        view.options.click()
+        dialog = view.plot_options_dialog
+        assert dialog.share_axis.isChecked() and dialog.share_axis.isEnabled()
+        assert dialog.share_axis.toolTip()
+        commands.clear()
+        dialog.share_axis.click()
+        assert view.share_axis.isChecked()  # a draft until Okay
+        dialog.cancel_button.click()
+        assert commands == [] and view.share_axis.isChecked()
+        view.options.click()
+        assert dialog.share_axis.isChecked()
+        commands.clear()
+        dialog.share_axis.click()
+        dialog.accept_button.click()
+        assert commands == [ShellCommand(ShellCommandKind.SET_SHARE_AXIS, False)]
+        assert not view.share_axis.isChecked()
+        view.share_axis.click()
+        assert dialog.share_axis.isChecked()  # the existing main control still mirrors back
+        _reconcile(view, replace(state.scientific, processing_mode="Int 1D", share_axis=False), state.navigation)
+        view.options.click()
+        assert not dialog.share_axis.isEnabled()
+        assert "coordinate" in dialog.share_axis.toolTip()
+    finally:
+        view.close()
+
+
 def test_plot_options_dialog_has_production_sections_and_emits_typed_edits(
     qapp: QtWidgets.QApplication,
 ) -> None:

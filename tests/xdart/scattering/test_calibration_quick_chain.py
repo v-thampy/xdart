@@ -23,6 +23,7 @@ from xdart.gui.widgets.controls_panel import FormRow, SectionCard
 from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from xrd_tools.core.geometry.camera import STITCH_CAMERA, UPRIGHT_CAMERA, DetectorCamera
 from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _page_with_dialog, _wait
+from tests.xdart.scattering.test_browse_reference_rings_run import _pump
 
 WAVELENGTH = .7293e-10
 #: LaB6 frames: four nu rows of four del angles, as the RSM camera probe and the guided rows space them
@@ -147,7 +148,8 @@ def _quick_card(dialog):
 
 def _card_rows(card, scan):
     """The card's file row for ``scan`` ('Direct-beam' or 'Calibrant') and the scan-number row beside it."""
-    rows = [row for row in card.findChildren(FormRow) if row.label.text().startswith(scan)]
+    rows = [row for row in card.findChildren(FormRow)
+            if row.label.text().startswith(scan) and row.browse_button is not None]
     assert len(rows) == 1, [row.label.text() for row in card.findChildren(FormRow)]
     number = [row for row in rows[0].findChildren(FormRow) if row.label.text() == 'Scan']
     assert len(number) == 1
@@ -367,7 +369,7 @@ def test_quick_card_placement_and_shared_values(qapp, tmp_path, monkeypatch, pag
         assert (dialog._text('source'), dialog._text('scan'), dialog._text('images'), dialog._text('stem'),
                 dialog._text('rough_energy')) == tab3
         assert ring_file.current_value() == str(other) and ring_scan.current_value() == '1'
-        # the rows follow the tabs' rows: NeXus files have no scan number; Enter the distance and Skip no direct beam
+        # NeXus files have no scan number; Quick always exposes its direct-beam route.
         dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('nexus_stack'))
         assert not ring_scan.isVisibleTo(card) and ring_file.label.text() == 'Calibrant NeXus file'
         dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('spec'))
@@ -378,7 +380,7 @@ def test_quick_card_placement_and_shared_values(qapp, tmp_path, monkeypatch, pag
         assert beam_scan.isVisibleTo(card) and beam_file.label.text() == 'Direct-beam SPEC file'
         for mode in ('manual', 'skip'):
             dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData(mode))
-            assert not beam_file.isVisibleTo(card) and ring_file.isVisibleTo(card)
+            assert beam_file.isVisibleTo(card) and ring_file.isVisibleTo(card)
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))
         assert beam_file.isVisibleTo(card)
         # the card's 📁 is the tab's: SPEC files, or NeXus files for a NeXus source, and the pick is the tab's value
@@ -395,7 +397,7 @@ def test_quick_card_placement_and_shared_values(qapp, tmp_path, monkeypatch, pag
         assert calls == ['spec', NEXUS_FILTER]
         dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('spec'))
         _wait(dialog)
-        # a scan typed on the card and not committed is the one Quick uses (Quick then refuses: Enter the distance)
+        # a scan typed on the card and not committed is the one Quick uses
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
         _type(ring_scan.editor, '12')
         _click(_quick_button(card))
@@ -546,11 +548,11 @@ def test_quick_calibrates_the_real_17_2_pair_with_the_windows_defaults(qapp, tmp
     assert {path.name: path.stat().st_mtime_ns for path in data.iterdir()} == before
 
 
-def test_quick_chain_ends_at_refine_summary_without_saving(qapp, tmp_path, monkeypatch):
+def test_quick_chain_resumes_then_saves_and_uses_geometry(qapp, tmp_path, monkeypatch):
     """Q2: on a matched pair Quick fits the direct-beam scan (no motion warning), reads the calibrant's metadata and
-    refines from the rough geometry: it ends on Refine's summary and window, the stitched preview then reporting in
-    its own panel while the message box keeps the fit; nothing is saved or adopted; Start from is the one control it
-    sets. Numbers: only the rough-start Refine row's approved tolerances."""
+    refines from the rough geometry. Its common session restores the completed fit without rerunning it; the
+    explicit finish action saves and adopts geometry only after its session can be written. Cancel and a write
+    failure keep both windows open. Numbers: the rough-start Refine row's approved tolerances."""
     pair = _stitch_pair(tmp_path / 'data')
     page, dialog = _page_with_dialog(tmp_path / 'project')
     saved = []
@@ -594,6 +596,47 @@ def test_quick_chain_ends_at_refine_summary_without_saving(qapp, tmp_path, monke
         assert refined['del_offset'] == pytest.approx(truth['del_offset'], abs=2e-3)
         assert refined['nu_offset'] == pytest.approx(truth['nu_offset'], abs=2e-3)
         assert dialog.fit.rms_q < .005, dialog.fit.rms_q
+        # A normal calibration session retains Quick's shared settings and completed fit, not only staged frames.
+        session = dialog.session_dir / 'calibration-session.json'
+        assert session.is_file(), 'Quick must save a resumable session even without staged frames'
+        original = dialog.fit
+        original_beam = dialog._distance_result
+        dialog.refine_calibrant.setCurrentText('CeO2')
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        from xdart.gui.widgets import file_dialogs
+        with monkeypatch.context() as picker:
+            picker.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
+            dialog.open_session_button.click()
+            _pump(qapp, lambda: dialog.fit is not None and not dialog.active())
+        assert dialog.fit is not original
+        np.testing.assert_array_equal(dialog.fit.asset['calibration']['param'], original.asset['calibration']['param'])
+        np.testing.assert_array_equal(dialog.fit.point_residuals['dq'], original.point_residuals['dq'])
+        assert dialog.refine_calibrant.currentText() == dialog.quick_calibrant.editor.currentText() == 'LaB6'
+        assert dialog.rough_mode.currentData() == 'scan' and dialog._distance_fresh()
+        assert dialog._distance_result is not original_beam
+        assert started.count('refine') == started.count('distance') == 1, 'resume never reruns either fit'
+        window = dialog._calibration_fit_window
+        assert window.isVisible() and window.panels.currentWidget() is window.view
+        # Cancel and a real session-write failure keep both windows and the result available.
+        monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName', staticmethod(lambda *args: ('', '')))
+        window.save_button.click()
+        assert dialog.isVisible() and window.isVisible() and not dialog.active()
+        target = dialog.project_root / 'finished.json'
+        monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName', staticmethod(lambda *args: (str(target), '')))
+        blocked = session.with_suffix('.tmp')
+        blocked.mkdir()
+        window.save_button.click()
+        _wait(dialog)
+        assert dialog.isVisible() and window.isVisible() and dialog.fit is not None
+        assert not saved and 'calibration-session' in dialog.status.text()
+        blocked.rename(blocked.with_suffix('.blocked'))
+        window.save_button.click()
+        _wait(dialog)
+        assert len(saved) == 1 and Path(page._value('geometry_path')) == target
+        assert not dialog.isVisible() and not window.isVisible()
+        from xrd_tools.integrate.stitch_calibration import load_calibration_session
+        _frames, _arm, _policy, restored = load_calibration_session(session, with_resume=True)
+        assert restored.fit is not None and restored.matches_source(dialog._spec())
     finally:
         _close(qapp, page, dialog)
 
@@ -815,50 +858,47 @@ def test_quick_preserves_rsm_defaults(qapp, tmp_path, monkeypatch, outcome):
 
 
 @pytest.mark.parametrize('mode', ['manual', 'skip'])
-def test_quick_refuses_non_scan_rough_modes(qapp, tmp_path, monkeypatch, mode):
-    """Q8 (D1): with Enter the distance or Skip, Quick refuses at step 1 on 2 · Rough geometry, starts no job and
-    changes no mode or value; reading the metadata by hand still works."""
-    pair = _stitch_pair(tmp_path / 'data')
+def test_quick_explicitly_selects_the_direct_beam_route(qapp, tmp_path, monkeypatch, mode):
+    """LF-008 supersedes D1: Quick selects its beam route; manual inputs remain available in their tab."""
     page, dialog = _page_with_dialog(tmp_path / 'project')
     try:
         card = _quick_card(dialog)
-        _configure(dialog, card, pair, camera=UPRIGHT_CAMERA)
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData(mode))
         if mode == 'manual':
             _commit(dialog._fields['rough_distance'], '500')
         _wait(dialog)
         started = _starts(dialog, monkeypatch)
         status = _run(dialog, card)
-        _assert_stopped(dialog, card, status, 1, 'choose "Direct-beam scan" in 2 · Rough geometry')
-        assert started == [] and dialog.rough_mode.currentData() == mode
+        assert dialog.rough_mode.currentData() == 'scan'
+        assert status.startswith(STOPPED + STEPS[1][0]), 'missing beam input still stops at the beam step'
+        assert 'distance' not in started and 'refine' not in started
         assert dialog._text('rough_distance') == ('500' if mode == 'manual' else '')
-        _click(dialog.list_button)
-        _wait(dialog)
-        assert started == ['enumerate'] and dialog._calibrant_source_ready()
     finally:
         _close(qapp, page, dialog)
 
 
 @pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
-def test_quick_rough_mode_projects_the_canonical_selection(qapp, tmp_path, page_name):
+def test_quick_groups_project_the_shared_calibrant(qapp, tmp_path, page_name):
     page, dialog = _window(qapp, tmp_path / 'project', page_name)
     try:
         fields = set(dialog.settings()['fields'])
         choices = set(dialog.settings()['choices'])
-        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
-        row = dialog.quick_rough_mode
+        card = _quick_card(dialog)
+        headers = [label for label in card.findChildren(QtWidgets.QLabel)
+                   if label.objectName() == 'controlsGroupHeader']
+        assert [label.text() for label in headers] == [
+            '1 · Direct-beam scan', '2 · Calibrant scan', '3 · Conditioning']
+        assert all(label.toolTip() for label in headers)
+        assert not any(row.label.text() == 'Rough geometry' for row in card.findChildren(FormRow))
+        row = dialog.quick_calibrant
         assert isinstance(row, FormRow) and row.toolTip() and row.label.toolTip()
-        assert row.editor.currentData() == 'manual', 'opening Quick does not change the selected mode'
-        dialog.tabs.setCurrentIndex(0)
-        row.editor.setFocus()
-        QTest.keyClick(row.editor, QtCore.Qt.Key.Key_Home)  # choose Direct-beam scan through the real control
-        _settle()
-        assert dialog.rough_mode.currentData() == row.editor.currentData() == 'scan'
-        assert dialog._quick_rows['beam_source'].isVisible()
-        assert dialog._quick_rows['beam_scan'].isVisible()
+        assert row.editor.currentText() == dialog.refine_calibrant.currentText() == 'LaB6'
+        _commit(row.editor.lineEdit(), 'CeO2')
+        assert dialog.refine_calibrant.currentText() == 'CeO2'
+        dialog.refine_calibrant.setCurrentText('custom powder')
+        assert row.editor.currentText() == 'custom powder', 'custom names use the same editable owner'
         dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
-        assert row.editor.currentData() == 'skip'
-        assert dialog._quick_rows['beam_source'].isHidden()
+        assert dialog._quick_rows['beam_source'].isVisible()
         assert set(dialog.settings()['fields']) == fields
         assert set(dialog.settings()['choices']) == choices, 'the projection adds no saved mode of its own'
     finally:

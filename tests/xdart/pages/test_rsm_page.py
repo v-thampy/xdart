@@ -1230,8 +1230,7 @@ def test_ints_colour_map_and_log_redraw_the_six(qapp, monkeypatch):
 
 
 def test_ints_intensity_controls_and_share_axis_drive_the_six(qapp, monkeypatch):
-    """G13 unit 1 (decision 1's toolbar: "colour map, Log, intensity, Set BG ... and Share Axis"): under the six,
-    Int's intensity controls set one set of levels for the three slices, and Share Axis, a command the page keeps
+    """Int's intensity controls set one set of levels for the three slices, and Share Axis in Options, a command the page keeps
     and draws back, links each coordinate across the panels: H on the HK and LH slices and the H projection."""
     monkeypatch.setattr(page_module, "make_rsm_viewer_values", {"payload": _values()}.__getitem__)
     page = _page(qapp, owner=_Owner())
@@ -1244,7 +1243,7 @@ def test_ints_intensity_controls_and_share_axis_drive_the_six(qapp, monkeypatch)
         span = (min(pair[0] for pair in mapped), max(pair[1] for pair in mapped))
         assert len(levels) == 1
         np.testing.assert_allclose(levels.pop(), span)
-        assert not view.viewer_intensity.isHidden() and not view.share_axis.isHidden()
+        assert not view.viewer_intensity.isHidden() and view.share_axis.isHidden()
         assert view.keyed_projection.share_axis and view.share_axis.isChecked()
         hk, _kl, lh = _slices(view)
         hk.canvas.imageViewBox.setXRange(0.2, 0.6, padding=0)
@@ -1252,7 +1251,15 @@ def test_ints_intensity_controls_and_share_axis_drive_the_six(qapp, monkeypatch)
         h_plot = view.keyed_panel(h_projection.key).plot.getViewBox()
         for box, axis in ((lh.canvas.imageViewBox, 1), (h_plot, 0)):
             np.testing.assert_allclose(box.viewRange()[axis], (0.2, 0.6))
-        view.share_axis.click()
+        view.options.click()
+        assert view.plot_options_dialog.share_axis.isChecked()
+        view.plot_options_dialog.share_axis.click()
+        view.plot_options_dialog.cancel_button.click()
+        assert view.keyed_projection.share_axis
+        view.options.click()
+        assert view.plot_options_dialog.share_axis.isChecked()
+        view.plot_options_dialog.share_axis.click()
+        view.plot_options_dialog.accept_button.click()
         assert not view.keyed_projection.share_axis
         hk.canvas.imageViewBox.setXRange(0.3, 0.5, padding=0)
         np.testing.assert_allclose(lh.canvas.imageViewBox.viewRange()[1], (0.2, 0.6))
