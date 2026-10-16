@@ -105,7 +105,7 @@ def _txt(path: str | Path, *, counters=(), motors=()) -> None:
     row = lambda items: ", ".join(f"{name} = {value}" for name, value in items)
     Path(path).with_suffix(".txt").write_text(
         f"# Counters\n{row(counters)}\n# Motors\n{row(motors)}\n"
-        "User: p36, time: Mon Jan 15 10:30:00 2024  # Temp\n"
+        "User: p36, time: Mon Jan 15 10:30:00 2024  # Temp\n", newline="\n",
     )
 
 

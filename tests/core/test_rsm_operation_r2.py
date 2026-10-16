@@ -84,7 +84,7 @@ def _write_member(
 {ordinal}.0 1 10 101
 {ordinal + 1}.0 2 20 110
 """,
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     for label in range(2):
         tifffile.imwrite(

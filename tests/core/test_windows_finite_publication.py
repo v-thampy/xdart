@@ -6,7 +6,8 @@ files. On a descriptor host the ``host`` arm keeps the POSIX dir_fd branch; ``na
 replays the CRT text-mode boundary (``test_stream_seed_preserves_binary_bytes``): DIAGNOSTIC ONLY.
 Rows: W01-W08 science; W09-W12 binary bytes; W13-W24 custody; W25-W28 parent state/adoption/capacity;
 W29-W34 calibration pair; W36-W38, W40 retry/flush; W41 Average reload (D1); W42 links (D2); W43-W45
-identity (D3); W46 path length (T5). Applicability (T4): every row applies on NTFS and SMB, except that
+identity (D3); W46 path length (T5); W47 Windows-width identities (hosted NTFS, 2026-10-16).
+Applicability (T4): every row applies on NTFS and SMB, except that
 W19 (hard link) and W42's symlink cell report INCOMPLETE (skip) where the link cannot be created, and
 W42's junction cell is N/A on SMB (junctions need local NTFS; W16-W18 and W42's symlink cell cover it).
 """
@@ -843,3 +844,16 @@ def test_w46_deep_parent_candidate_beyond_max_path(tmp_path, arm):
     facts = _publish(session, capture_target_snapshot(target))
     assert facts.published and facts.error is None and _values(target) == [46]
     assert _leftovers(parent) == []
+
+class _WindowsWidth(_ZeroInode):  # Windows Python 3.12+: a 64-bit volume serial and a file ID up to 128 bits
+    def __init__(self, real):
+        self._real, self.st_dev, self.st_ino = real, real.st_dev | 1 << 63, real.st_ino | 1 << 127
+
+@pytest.mark.parametrize("flow", (test_w14_existing_slot_is_replaced_atomically,
+                                  test_w27_seeded_adoption_publishes_releases_and_strands_nothing),
+                         ids=("W47-replace", "W47-seeded"))
+def test_w47_windows_width_identities_publish(tmp_path, monkeypatch, arm, flow):
+    """The hosted runner's NTFS reported st_dev 15923074127169020758 (> 2**63 - 1); identities have no width bound."""
+    for name in ("stat", "lstat", "fstat"):
+        monkeypatch.setattr(os, name, lambda *a, _real=getattr(os, name), **k: _WindowsWidth(_real(*a, **k)))
+    flow(tmp_path, arm)
