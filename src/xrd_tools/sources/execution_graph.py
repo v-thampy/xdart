@@ -734,7 +734,8 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         published = (None if infer_point_images else
                      len(files) if expected is not None else published_members)
         try:
-            spec_points = read_spec_points(files, meta_dir=qualified.get("meta_dir"), published=published)
+            spec_points = read_spec_points(files, meta_dir=qualified.get("meta_dir"), published=published,
+                                           cancelled=cancelled)
         except SpecRowPending as error:
             raise SourceRevisionChanged(str(error)) from error
         if spec_points is not None and spec_points.extent is not None:

@@ -18,6 +18,8 @@ the GUI's ``scan_source_widget.py`` still calls it directly.
 
 from __future__ import annotations
 
+import errno
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -200,6 +202,82 @@ def collect_candidates(directory, *, recursive: bool = False,
         except OSError:
             continue  # vanished mid-walk; not a candidate this poll
         out.append(Candidate(f, owner.id, stat.st_size, stat.st_mtime_ns))
+    return out
+
+
+#: The stat errors ``Path.is_file`` reads as "not a regular file".
+_NOT_A_FILE_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _scandir_files(directory: Path):
+    """``(path, name, stat)`` per regular file in *directory*, as ``Path.iterdir`` + ``is_file`` sees them."""
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            try:
+                regular = entry.is_file()
+            except OSError as error:
+                if error.errno not in _NOT_A_FILE_ERRNOS:
+                    raise
+                continue
+            if regular:
+                yield entry.path, entry.name, entry.stat
+
+
+def collect_owned_candidates(directory, *, recursive: bool = False,
+                             name_filter: str | None = None,
+                             memo: dict | None = None) -> list[Candidate]:
+    """:func:`collect_candidates` for one DirectoryIndex poll: the same candidates.
+
+    One registry copy serves the whole listing, so no adapter predicate runs
+    under the registry lock.  ``memo`` belongs to the caller's index.  While
+    every registered adapter is a built-in whose predicate is a pure filename
+    rule (``registry.PURE_NAME_PREDICATES``), it keeps each listed path's
+    owner from poll to poll; any other registry, or any change of it, asks
+    every predicate again.  A file whose path, owner and stamp are unchanged
+    keeps its previous :class:`Candidate` object.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        if memo is not None:
+            memo.clear()
+        return []
+    name_ok = compile_filter(name_filter)
+    _ensure_builtin_adapters_registered()
+    from xrd_tools.sources.adapters import candidate_owner_among, registry_entries, registry_identity
+    from xrd_tools.sources.registry import PURE_NAME_PREDICATES
+
+    entries = registry_entries()
+    registry = registry_identity(entries)
+    pure = all(entry.builtin and entry.adapter.is_candidate in PURE_NAME_PREDICATES for entry in entries)
+    memo = {} if memo is None else memo
+    owners = memo.get("owners", {}) if pure and memo.get("registry") == registry else {}
+    previous = memo.get("candidates", {})
+    listed = (
+        ((str(f), f.name, f.stat) for f in _iter_files_unordered(directory, True))
+        if recursive else _scandir_files(directory)
+    )
+    kept_owners: dict = {}
+    kept: dict[str, Candidate] = {}
+    out: list[Candidate] = []
+    for key, name, stat_of in listed:
+        if not name_ok(name):
+            continue
+        owner = owners[key] if key in owners else candidate_owner_among(entries, Path(key))
+        kept_owners[key] = owner
+        if owner is None:
+            continue
+        try:
+            state = stat_of()
+        except OSError:
+            continue  # vanished mid-walk; not a candidate this poll
+        candidate = previous.get(key)
+        if candidate is None or (candidate.adapter_id, candidate.size, candidate.mtime_ns) != (
+                owner.id, state.st_size, state.st_mtime_ns):
+            candidate = Candidate(Path(key), owner.id, state.st_size, state.st_mtime_ns)
+        kept[key] = candidate
+        out.append(candidate)
+    memo.clear()
+    memo.update(candidates=kept, **({"registry": registry, "owners": kept_owners} if pure else {}))
     return out
 
 

@@ -39,6 +39,7 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources import open_source
+from xrd_tools.sources.adapters import registry_identity
 from xrd_tools.sources.base import source_metadata_energy_eV
 from xrd_tools.sources.point_images import PointImagesRequired
 from xrd_tools.sources.cursor import open_container_cursor
@@ -1466,7 +1467,7 @@ class StandardRunExecutor:
                     parallax=override.parallax,
                 )
             from xrd_tools.session.readiness import bind_native_int_source_energy, effective_ring_geometry
-            run.scan = run.source.to_scan(output_path=artifact)
+            run.scan = run.source.to_scan(output_path=artifact, cancelled=cancelled)
             if item is not None:
                 # A live Run reduces only the SPEC values its admission read.
                 validate_consumed_metadata(
@@ -1999,10 +2000,24 @@ class StandardRunExecutor:
 
         with _run_effect(run):
             publish(force=True)
+        # The last poll's groups, reused while the session returns the same
+        # Snapshot object under the same adapter registrations.
+        grouped: tuple[object, tuple[object, ...], tuple[object, ...]] | None = None
         while not run.stop_requested:
             with _run_effect(run):
                 observation = session.observe(refresh=True)
-                groups = live_directory_groups(receipt, observation)
+                registry = registry_identity()
+                if (
+                    grouped is None
+                    or grouped[0] is not observation.discovered_snapshot
+                    or grouped[1] != registry
+                ):
+                    grouped = (
+                        observation.discovered_snapshot,
+                        registry,
+                        live_directory_groups(receipt, observation),
+                    )
+                groups = grouped[2]
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
                 publish()

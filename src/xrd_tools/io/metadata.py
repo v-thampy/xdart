@@ -1367,8 +1367,7 @@ def _read_spec_metadata_observed(
             _validate_spec_numeric_tokens(spec_file, scan, tuple(str(label) for label in scan.labels))
             npts = scan.data.shape[1]
             img_idx = min(image_number, npts - 1)
-            counters = {label: float(scan.data_column_by_name(label)[img_idx])
-                        for label in scan.labels}
+            (counters,) = _spec_counters(scan, (img_idx,))
             motors = {name: float(scan.motor_position_by_name(name))
                       for name in scan.motor_names}
             return ImageMetadataRead(
@@ -1395,8 +1394,7 @@ def _read_spec_metadata_observed(
                 _validate_spec_numeric_tokens(scratch, scan, tuple(str(label) for label in scan.labels))
             npts = scan.data.shape[1]
             img_idx = min(0 if spec_point_snapshot else image_number, npts - 1)
-            counters = {label: float(scan.data_column_by_name(label)[img_idx])
-                        for label in scan.labels}
+            (counters,) = _spec_counters(scan, (img_idx,))
             motors = {name: float(scan.motor_position_by_name(name))
                       for name in scan.motor_names}
             result = ImageMetadataRead(
@@ -1620,7 +1618,13 @@ def _spec_count(text: bytes) -> int | None:
         return None
 
 
-def _read_spec_scan(path: Path, scan_number: int) -> _SpecScan | None:
+def _spec_cancelled(cancelled) -> None:
+    """Stop a SPEC read for a Stop: the error qualification's callers already translate."""
+    if cancelled is not None and cancelled():
+        raise InterruptedError("source qualification cancelled")
+
+
+def _read_spec_scan(path: Path, scan_number: int, *, cancelled=None) -> _SpecScan | None:
     """Read the first ``#S scan_number`` block of a SPEC file, up to its last complete line.
 
     Like the bounded point snapshot, the file-header lines in effect are the
@@ -1629,11 +1633,13 @@ def _read_spec_scan(path: Path, scan_number: int) -> _SpecScan | None:
     out.  A line without its newline is still being written and ends the read.
     The file is copied once, up to the size it had when opened: bytes rewritten
     or truncated meanwhile cannot fault the read, as they could under a mapped
-    view.  ``None`` when the file holds no such scan.
+    view.  ``None`` when the file holds no such scan.  ``cancelled`` is asked
+    after the copy and every few thousand lines.
     """
     with path.open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
         data = stream.read(size) if size > 0 else b""
+    _spec_cancelled(cancelled)
     start = _find_spec_scan(data, scan_number)
     if start is None:
         return None
@@ -1660,6 +1666,8 @@ def _read_spec_scan(path: Path, scan_number: int) -> _SpecScan | None:
     declared = labels = None
     position, mca = start, False
     while position < len(data):
+        if not len(lines) % 4096:
+            _spec_cancelled(cancelled)
         end = data.find(b"\n", position)
         if end < 0:
             break
@@ -1708,13 +1716,32 @@ def _resolve_spec_image(image_path: Path, meta_dir: Path | str | None) -> tuple[
     return None
 
 
+def _spec_counters(scan, rows: Sequence[int]) -> list[dict[str, float]]:
+    """Each row's counters, one value per label from the label's first column.
+
+    silx's ``data_column_by_name`` re-reads its column on every call, so a
+    per-row, per-label lookup costs rows x labels column reads.  This takes the
+    scan's table once and reads each label's first column, the column that
+    lookup returns.  A table that does not have one row per label keeps the
+    per-label lookup, so its failure stays the one silx raises.
+    """
+    labels = tuple(scan.labels)
+    table = scan.data
+    if getattr(table, "ndim", 0) != 2 or table.shape[0] < len(labels):
+        return [{label: float(scan.data_column_by_name(label)[row]) for label in labels} for row in rows]
+    first: dict[str, int] = {}
+    for index, label in enumerate(labels):
+        first.setdefault(label, index)
+    return [{label: float(table[index, row]) for label, index in first.items()} for row in rows]
+
+
 def _same_number(left: float, right: float) -> bool:
     return left == right or left != left and right != right
 
 
 def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
                       own_rows: Sequence[tuple[float, ...]] | None = None,
-                      row_count: int | None = None) -> list[dict[str, float]]:
+                      row_count: int | None = None, cancelled=None) -> list[dict[str, float]]:
     """Each requested row's counters, with the scan's motor positions, parsed by silx.
 
     silx reads files only, so ``payload`` (one scan) goes through a scratch
@@ -1738,6 +1765,7 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
         scratch_handle.close()
         parser = SpecFile(str(scratch))
         scan = parser[f"{scan_number}.1"]
+        _spec_cancelled(cancelled)
         if own_rows is not None:
             table = scan.data
             if table.ndim != 2 or table.shape[1] != row_count or any(
@@ -1745,9 +1773,7 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
                     for row, own in zip(rows, own_rows)):
                 raise _SpecParseDisagreement(f"silx read scan {scan_number} differently from its lines")
         motors = {name: float(scan.motor_position_by_name(name)) for name in scan.motor_names}
-        for row in rows:
-            counters = {label: float(scan.data_column_by_name(label)[row]) for label in scan.labels}
-            values.append({**counters, **motors})
+        values.extend({**counters, **motors} for counters in _spec_counters(scan, rows))
     except BaseException as exc:
         primary = exc
     finally:
@@ -1793,7 +1819,7 @@ def _not_a_row(spec_path: Path, scan_number: int, scan: _SpecScan, index: int) -
 
 
 def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None, *,
-                     published: int | None = None) -> SpecPoints | None:
+                     published: int | None = None, cancelled=None) -> SpecPoints | None:
     """Every image's own SPEC row, from one read of their scan.
 
     Each image's name gives its SPEC file (the reader's own folder search),
@@ -1830,8 +1856,11 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
     spec_path = scan_number = scan = None
     if scans:
         ((spec_path, scan_number),) = scans
+        _spec_cancelled(cancelled)
         try:
-            scan = _read_spec_scan(spec_path, scan_number)
+            scan = _read_spec_scan(spec_path, scan_number, cancelled=cancelled)
+        except InterruptedError:  # a Stop, not a file that went away
+            raise
         except OSError:  # the file went away under the read
             scan = None
     numbers = tuple(None if value is None else value[2] for value in resolved)
@@ -1851,11 +1880,12 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
             if number is None or number >= valid:
                 raise SpecRowPending(f"waiting for the SPEC row of {path.name}")
     own = [tuple(float(token) for token in scan.lines[scan.rows[number]].split()) for number in numbers]
+    _spec_cancelled(cancelled)
     try:
         values = _spec_rows_values(
             b"".join(scan.header) + b"".join(scan.lines[:scan.rows[needed - 1] + 1]),
-            scan_number, numbers, own_rows=own, row_count=needed)
-    except MetadataScratchCleanupFailed:
+            scan_number, numbers, own_rows=own, row_count=needed, cancelled=cancelled)
+    except (MetadataScratchCleanupFailed, InterruptedError):
         raise
     except Exception as error:
         if isinstance(error.__cause__, MetadataScratchCleanupFailed):

@@ -11,8 +11,9 @@ from __future__ import annotations
 import threading
 import time
 import logging
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from xrd_tools.sources.directory_index import (
@@ -153,6 +154,11 @@ class DirectoryIndexSession:
         self._probe_time_budget_s = float(probe_time_budget_s)
         self._probe_candidates = bool(probe_candidates)
         self._probe_excluded: set[Candidate] = set()
+        # A lazy (non-probing) session returns its last observation again while
+        # the index returns the same Snapshot and no probe result moved.
+        self._results_version = 0
+        self._last: tuple[Snapshot, int, DirectoryObservation] | None = None
+        self._paths: tuple[Snapshot, Mapping[Path, Candidate]] | None = None
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xdart-directory-index")
         self._closed = False
@@ -289,7 +295,9 @@ class DirectoryIndexSession:
             )
             self._active = config
             self._results.clear()
+            self._results_version += 1
             self._visible_candidates = ()
+            self._last = None
 
         index = self._index
         snapshot = (
@@ -297,6 +305,21 @@ class DirectoryIndexSession:
             if refresh or reconfigured or index.snapshot.generation == 0
             else index.snapshot
         )
+        last = self._last
+        if (
+            last is not None
+            and not self._probe_candidates
+            and last[0] is snapshot
+            and last[1] == self._results_version
+            and last[2].request_generation == generation
+        ):
+            # Same Snapshot object, no probe result moved and nothing to probe:
+            # exactly the observation a rebuild would make, with an empty delta.
+            return replace(
+                last[2], delta=IndexDelta(), content_opens=0, stale_drops=0,
+                elapsed_s=time.perf_counter() - started,
+            )
+        raw_snapshot = snapshot
         name_ok = compile_filter(config.name_filter)
 
         def included(candidate: Candidate) -> bool:
@@ -314,11 +337,7 @@ class DirectoryIndexSession:
             snapshot.generation, candidates, snapshot.root,
             snapshot.recursive, config.name_filter)
         current = snapshot.by_path()
-        self._results = {
-            path: stored
-            for path, stored in self._results.items()
-            if current.get(path) == stored[0]
-        }
+        self._prune_results(current)
 
         content_opens = 0
         stale_drops = 0
@@ -372,21 +391,18 @@ class DirectoryIndexSession:
                         reason=f"{type(exc).__name__}: {exc}",
                     )
                 self._results[candidate.path] = (candidate, result)
+                self._results_version += 1
 
         # A probe can race a file mutation or owner flip.  Re-poll before
         # publishing so no stale candidate identity reaches the GUI or Run.
         if stale_drops:
-            snapshot = index.poll()
+            snapshot = raw_snapshot = index.poll()
             candidates = tuple(filter(included, snapshot.candidates))
             snapshot = Snapshot(
                 snapshot.generation, candidates, snapshot.root,
                 snapshot.recursive, config.name_filter)
             current = snapshot.by_path()
-            self._results = {
-                path: stored
-                for path, stored in self._results.items()
-                if current.get(path) == stored[0]
-            }
+            self._prune_results(current)
 
         prior_by_path = {
             candidate.path: candidate for candidate in self._visible_candidates
@@ -435,7 +451,7 @@ class DirectoryIndexSession:
             snapshot.recursive,
             snapshot.name_filter,
         )
-        return DirectoryObservation(
+        observation = DirectoryObservation(
             request_generation=generation,
             discovered_snapshot=snapshot,
             ready_snapshot=ready_snapshot,
@@ -446,6 +462,18 @@ class DirectoryIndexSession:
             elapsed_s=time.perf_counter() - started,
             unprobed_count=unprobed_count,
         )
+        self._last = (raw_snapshot, self._results_version, observation)
+        return observation
+
+    def _prune_results(self, current: Mapping[Path, Candidate]) -> None:
+        kept = {
+            path: stored
+            for path, stored in self._results.items()
+            if current.get(path) == stored[0]
+        }
+        if len(kept) != len(self._results):
+            self._results_version += 1
+        self._results = kept
 
     def _probe_candidate_on_owner(
         self,
@@ -463,7 +491,18 @@ class DirectoryIndexSession:
             config,
             refresh,
         )
-        current = observation.discovered_snapshot.by_path().get(candidate.path)
+        return self._probe_exact(observation, candidate, force_reprobe)
+
+    def _probe_exact(
+        self,
+        observation: DirectoryObservation,
+        candidate: Candidate,
+        force_reprobe: bool,
+    ) -> CandidateObservation:
+        snapshot = observation.discovered_snapshot
+        if self._paths is None or self._paths[0] is not snapshot:
+            self._paths = (snapshot, snapshot.by_path())
+        current = self._paths[1].get(candidate.path)
         if current != candidate:
             raise StaleCandidateError(
                 f"{candidate.path} changed before its deferred probe"
@@ -473,14 +512,65 @@ class DirectoryIndexSession:
             raise RuntimeError("directory index session has no active index")
         if force_reprobe:
             index.discard_probe_resolution(current)
-            self._results.pop(current.path, None)
+            if self._results.pop(current.path, None) is not None:
+                self._results_version += 1
         stored = self._results.get(candidate.path)
         retrying = index.retry_state(candidate.path) is not None
         if stored is not None and stored[0] == current and not retrying:
             return CandidateObservation(current, stored[1])
         result = index.probe_candidate(current)
         self._results[current.path] = (current, result)
+        self._results_version += 1
         return CandidateObservation(current, result)
+
+    def probe_candidates(
+        self,
+        candidates,
+        *,
+        refresh: bool = False,
+        reprobe: bool = False,
+        stop_unready: bool = True,
+        cancelled=None,
+    ) -> tuple[CandidateObservation, ...]:
+        """Probe several frozen candidates in one serialized owner call.
+
+        Each candidate, in order, gets exactly what :meth:`probe_candidate`
+        (with ``reprobe``, :meth:`reprobe_candidate`) would give it, against
+        one observation.  With ``stop_unready`` the call ends after the first
+        result that is not READY.  A stale candidate raises
+        StaleCandidateError once the earlier ones are recorded, as the
+        one-by-one calls did.  ``cancelled`` is asked before each candidate and
+        raises RuntimeError("admission cancelled").
+        """
+
+        candidates = tuple(candidates)
+        if any(type(candidate) is not Candidate for candidate in candidates):
+            raise TypeError("candidate probe requires an exact Candidate")
+        generation, config = self._request()
+        return self._executor.submit(
+            self._probe_candidates_on_owner,
+            generation,
+            config,
+            candidates,
+            bool(refresh),
+            bool(reprobe),
+            bool(stop_unready),
+            cancelled,
+        ).result()
+
+    def _probe_candidates_on_owner(
+        self, generation, config, candidates, refresh, reprobe, stop_unready, cancelled,
+    ) -> tuple[CandidateObservation, ...]:
+        observation = self._observe_on_owner(generation, config, refresh)
+        observed: list[CandidateObservation] = []
+        for candidate in candidates:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("admission cancelled")
+            value = self._probe_exact(observation, candidate, reprobe)
+            observed.append(value)
+            if stop_unready and value.result.state is not ProbeState.READY:
+                break
+        return tuple(observed)
 
     def close(self) -> None:
         with self._lock:

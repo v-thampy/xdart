@@ -1203,31 +1203,27 @@ def materialize_live_directory_group(
     any other outcome is admitted as before.
     """
 
-    observations = []
-    for candidate in group.plan.candidates:
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        try:
-            observed = (
-                session.reprobe_candidate(candidate, refresh=False)
-                if reprobe
-                else session.probe_candidate(candidate, refresh=False)
-            )
-        except StaleCandidateError as error:
-            return LiveDirectoryAttempt(
-                group,
-                ProbeState.IN_PROGRESS,
-                reason=str(error),
-            )
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        observations.append(observed)
-        if observed.result.state is not ProbeState.READY:
-            return LiveDirectoryAttempt(
-                group,
-                observed.result.state,
-                reason=observed.result.reason,
-            )
+    try:
+        observations = list(session.probe_candidates(
+            group.plan.candidates,
+            refresh=False,
+            reprobe=reprobe,
+            cancelled=cancelled,
+        ))
+    except StaleCandidateError as error:
+        return LiveDirectoryAttempt(
+            group,
+            ProbeState.IN_PROGRESS,
+            reason=str(error),
+        )
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    if observations and observations[-1].result.state is not ProbeState.READY:
+        return LiveDirectoryAttempt(
+            group,
+            observations[-1].result.state,
+            reason=observations[-1].result.reason,
+        )
     physical_paths = group.physical_paths
     if sidecar_observations is not None:
         count, waiting = _live_metadata_ready(
@@ -1337,14 +1333,13 @@ def materialize_deferred_output(
     ready: list[Candidate] = []
     descriptors: list[ContainerDescriptor | None] = []
     skipped = 0
-    for candidate in entry.candidates:
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        # ``validate_admitted_receipt`` refreshes and reconciles the complete
-        # name/stat snapshot once before execution.  Refreshing again here
-        # would rescan the whole directory for every member (O(N^2)); the
-        # exact-one probe itself revalidates this candidate after opening it.
-        observed = session.probe_candidate(candidate, refresh=False)
+    # ``validate_admitted_receipt`` refreshes and reconciles the complete
+    # name/stat snapshot once before execution.  Refreshing again here would
+    # rescan the whole directory for every member (O(N^2)); each exact probe
+    # revalidates its candidate, all on one owner call.
+    for observed in session.probe_candidates(
+        entry.candidates, refresh=False, stop_unready=False, cancelled=cancelled,
+    ):
         descriptor = observed.descriptor
         if observed.result.state is ProbeState.READY and (
             descriptor is not None
