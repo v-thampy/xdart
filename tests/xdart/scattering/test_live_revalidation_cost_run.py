@@ -1005,9 +1005,15 @@ def test_r5c_a_live_series_signs_the_saturation_its_selected_image_records(tmp_p
     for value, (selected, stem) in enumerate((('cut_0000.tif', 'cut'), ('eiger_master.h5', 'eiger'))):
         source = image_series_spec(raw / selected, metadata_format=None)
         finite = graph_saturation(qualify_source_execution_graph(source), detector=None)
+        pending = tmp_path / 'pending.h5'
+        if value:
+            eiger.chunks[0].rename(pending)  # the master records its ceiling before its chunk lands
         executor, events = StandardRunExecutor(join_timeout=2.), []
         identity = _start(executor, _intent(tmp_path, raw, PILATUS, source=source), request_value=7170 + value)
         try:
+            if value:
+                _wait(executor, events, lambda _values: len(signed) > value, 10.)
+                pending.rename(eiger.chunks[0])
             _wait(executor, events, _count_labels(stem, 2), 60.)
         finally:
             terminal = _stop(executor, identity, events)
