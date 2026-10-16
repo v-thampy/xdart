@@ -1599,11 +1599,12 @@ class _SpecScan:
     columns: int | None  # the declared column count: ``#N``, else the ``#L`` labels
     extent: SpecScanExtent  # through every complete row
 
-    def valid_rows(self, limit: int) -> int:
-        """How many leading rows, of the first ``limit``, hold ``columns`` numbers each."""
+    def valid_rows(self, limit: int, start: int = 0) -> int:
+        """How many leading rows, of the first ``limit``, hold ``columns`` numbers each;
+        the first ``start`` are known to."""
         from xrd_tools.io.spec import _SPEC_NUMBER
 
-        for index, position in enumerate(self.rows[:limit]):
+        for index, position in enumerate(self.rows[start:limit], start):
             tokens = self.lines[position].split()
             if not tokens or self.columns is not None and len(tokens) != self.columns:
                 return index
@@ -1849,7 +1850,8 @@ def _not_a_row(spec_path: Path, scan_number: int, scan: _SpecScan, index: int) -
 
 
 def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None, *,
-                     published: int | None = None, cancelled=None) -> SpecPoints | None:
+                     published: int | None = None, cancelled=None, after: SpecScanExtent | None = None,
+                     cache: dict | None = None) -> SpecPoints | None:
     """Every image's own SPEC row, from one read of their scan.
 
     Each image's name gives its SPEC file (the reader's own folder search),
@@ -1869,7 +1871,11 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
     valid, every image comes back without metadata and ``extent`` is ``None``,
     for the caller's published-metadata fence; otherwise an image whose row is
     not there yet raises SpecRowPending, and one at or after a complete line
-    that is not a valid row raises SpecRowInvalid naming that line.
+    that is not a valid row raises SpecRowInvalid naming that line.  With
+    ``after``, the extent the images before these were admitted through, those
+    rows are neither checked nor read again; ``None`` unless the scan still
+    holds their bytes.  ``cache`` (spec_rows_ready's) gives the scan it read at
+    the file's current revision, once.
     """
     paths = tuple(_lexical_absolute(path) for path in image_paths)
     live = published is not None
@@ -1887,16 +1893,23 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
     if scans:
         ((spec_path, scan_number),) = scans
         _spec_cancelled(cancelled)
+        known = None if cache is None else cache.get((spec_path, scan_number))
         try:
-            scan = _read_spec_scan(spec_path, scan_number, cancelled=cancelled)
+            if known is not None and known[2] is not None and _spec_revision(spec_path) == known[0]:
+                scan, cache[spec_path, scan_number] = known[2], (*known[:2], None)
+            else:
+                scan = _read_spec_scan(spec_path, scan_number, cancelled=cancelled)
         except InterruptedError:  # a Stop, not a file that went away
             raise
         except OSError:  # the file went away under the read
             scan = None
+    start = 0 if after is None else len(after.marks) - 1
+    if after is not None and (scan is None or not scan.extent.extends(after)):
+        return None
     numbers = tuple(None if value is None else value[2] for value in resolved)
-    needed = max((number for number in numbers if number is not None), default=-1) + 1
+    needed = max(max((number for number in numbers if number is not None), default=-1) + 1, start)
     rows = 0 if scan is None else len(scan.rows)
-    valid = 0 if scan is None else scan.valid_rows(needed)
+    valid = 0 if scan is None else scan.valid_rows(needed, start)
     if not live:
         if scan is None or None in numbers or needed > valid:
             return None
@@ -1944,7 +1957,8 @@ def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | No
     is written, so one look is enough.  An image whose name gives no SPEC
     file, or whose file or scan does not exist yet, is not ready.  ``cache``
     (the Run's) keeps each scan's row count for the file revision it was
-    read at, so an unchanged file is not read again.
+    read at, so an unchanged file is not read again, and the scan read for
+    :func:`read_spec_points` to take.
     """
     rows: dict[tuple[Path, int], int] = {}
     for index, path in enumerate(image_paths):
@@ -1962,7 +1976,7 @@ def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | No
                     scan = _read_spec_scan(spec_path, scan_number)
                     count = 0 if scan is None else len(scan.rows)
                     if cache is not None and _spec_revision(spec_path) == revision:
-                        cache[spec_path, scan_number] = (revision, count)
+                        cache[spec_path, scan_number] = (revision, count, scan)
             except (OSError, ValueError):
                 return index
             rows[spec_path, scan_number] = count

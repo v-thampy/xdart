@@ -33,6 +33,7 @@ verdict); it is deliberately not a metadata cache.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
@@ -45,6 +46,17 @@ from xrd_tools.sources.probe import ProbeResult, ProbeState
 _UNSET: Any = object()
 
 _Stamp = tuple[int, int]
+
+
+def directory_identity(path: str | Path) -> tuple[int, ...] | None:
+    """A path's device, inode, size, mtime_ns and ctime_ns: what an entry added,
+    removed or renamed in a directory, or a write to a file, moves.  ``None``
+    when it cannot be stat'ed."""
+    try:
+        state = os.stat(path)
+    except OSError:
+        return None
+    return state.st_dev, state.st_ino, state.st_size, state.st_mtime_ns, state.st_ctime_ns
 
 #: Probe states that leave a candidate's finality in doubt — the ONLY states
 #: DirectoryIndex tracks bounded retry for (handoff: "retry state associated

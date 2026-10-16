@@ -20,7 +20,7 @@ import pytest
 import xrd_tools.io.metadata as metadata
 import xrd_tools.sources.registry  # noqa: F401  # register built-in readers
 from tests.xdart.scattering._e2sd_support import write_poni
-from tests.xdart.scattering.test_live_metadata_race_run import _reregister_image_adapter
+from tests.xdart.scattering.test_live_metadata_race_run import _construct_strictly, _reregister_image_adapter
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _start
 from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
@@ -531,6 +531,7 @@ def test_p1_a_change_inside_the_construct_recheck_is_still_rescued(tmp_path, mon
         return real_read(path, *args, **kwargs)
     monkeypatch.setattr(run_executor, 'validate_planned_source', validate)
     monkeypatch.setattr(metadata, 'read_txt_metadata', read)
+    _construct_strictly(monkeypatch, raw / 'scan_0001.tif', 2)
     executor, identity = _run(tmp_path, raw, 'txt', 3200)
     events = []
     try:

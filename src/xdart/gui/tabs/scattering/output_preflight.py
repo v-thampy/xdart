@@ -47,6 +47,7 @@ from xrd_tools.sources.point_images import PointImagePolicy, PointImagesRequired
 from xrd_tools.sources.execution_graph import (
     _CapturedSourceTopology,
     _capture_source_topology,
+    _held,
     _same_source_revision,
     _source_state_key,
     _topology_from_captured_state,
@@ -57,6 +58,7 @@ from xrd_tools.sources.execution_graph import (
     SelectedContainerInput,
     SourceRevisionChanged,
     admitted_metadata_current,
+    proven_states,
     qualify_source_execution_graph,
     source_snapshots_projection,
     validate_source_execution_graph,
@@ -92,10 +94,11 @@ def validate_source_aliases(
     stamp: SourceExecutionStamp,
     *,
     cancelled: Callable[[], bool] | None = None,
+    proven: dict[str, SourceFileState] | None = None,
 ) -> ValidatedSourceAliases:
     """Prove every raw alias and target twice in deterministic order."""
 
-    identity, targets = _validate_source_aliases_shared(stamp, cancelled=cancelled)
+    identity, targets = _validate_source_aliases_shared(stamp, cancelled=cancelled, proven=proven)
     return ValidatedSourceAliases(identity, targets)
 
 
@@ -368,6 +371,9 @@ class LiveDirectoryAttempt:
     # READY for only the group's leading members: a later one is still waiting
     # for its metadata, so the group must not settle on this attempt.
     partial: bool = False
+    # READY: the proof of what this poll admitted (the members after a prefix
+    # proved in it), which construction re-checks instead of validating again.
+    proof: LivePrefixProof | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not (
@@ -805,9 +811,13 @@ def _deferred_directory_plan(
     discovered_paths: tuple[Path, ...],
     *,
     cancelled: Callable[[], bool],
+    prefix: PreparedSourceExecutionGraph | None = None,
 ) -> DeferredDirectoryPlan:
+    """``prefix``: a live output's published graph whose proof held in this
+    poll; its members keep their admitted states, unproved again."""
     if not plan.candidates:
         raise RuntimeError("source has no matching candidates")
+    proven = proven_states(prefix)
     staged: list[
         tuple[
             tuple[Candidate, ...],
@@ -825,10 +835,12 @@ def _deferred_directory_plan(
         for source_candidate in group:
             if cancelled():
                 raise RuntimeError("admission cancelled")
+            state = proven.get(str(source_candidate.path))
+            if state is None or (state.size, state.mtime_ns) != source_candidate.version_stamp:
+                state = _capture_exact_candidate_state(source_candidate)
             captured_topologies.append(
                 _topology_from_captured_state(
-                    _capture_exact_candidate_state(source_candidate),
-                    candidate_owner_id=source_candidate.adapter_id,
+                    state, candidate_owner_id=source_candidate.adapter_id,
                 )
             )
             if cancelled():
@@ -884,6 +896,7 @@ def _deferred_directory_plan(
             ) in staged
             for path in paths
         ),
+        proven,
     )
     entries: list[DeferredDirectoryEntry] = []
     for (
@@ -920,10 +933,11 @@ def _deferred_directory_plan(
         ):
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            _validate_exact_candidate_state(
-                source_candidate,
-                topology.followed_state,
-            )
+            if proven.get(str(source_candidate.path)) is not topology.followed_state:
+                _validate_exact_candidate_state(
+                    source_candidate,
+                    topology.followed_state,
+                )
             if cancelled():
                 raise RuntimeError("admission cancelled")
             protected.append(topology)
@@ -956,6 +970,7 @@ def _deferred_directory_plan(
         protected_map = {
             _source_state_key(value.raw_path): value
             for value in protected
+            if proven.get(value.followed_state.path) is not value.followed_state
         }
         _verify_source_states(protected_map, cancelled=cancelled)
         entries.append(DeferredDirectoryEntry(
@@ -992,6 +1007,7 @@ def _validate_deferred_targets(
     plan: RunCandidatePlan,
     targets: tuple[Path, ...],
     external_paths: tuple[Path, ...],
+    proven: dict[str, SourceFileState] | None = None,
 ) -> None:
     source = configuration.source
     if type(source) is not DirectorySourceSpec:
@@ -1000,11 +1016,18 @@ def _validate_deferred_targets(
         tuple(candidate.path for candidate in plan.candidates)
         + external_paths
     )
+    # A proved prefix member is its admitted state: its resolution and identity.
+    held = [(proven or {}).get(str(path)) for path in raw_paths]
     raw_norms = {
-        os.path.normcase(os.path.realpath(path)) for path in raw_paths
+        os.path.normcase(os.path.realpath(path) if state is None else state._resolved_path_at_capture)
+        for path, state in zip(raw_paths, held)
     }
-    raw_inodes: set[tuple[int, int]] = set()
-    for path in raw_paths:
+    raw_inodes: set[tuple[int, int]] = {
+        (state.device, state.inode) for state in held if state is not None
+    }
+    for path, state in zip(raw_paths, held):
+        if state is not None:
+            continue
         try:
             stat = path.stat()
         except OSError:
@@ -1269,9 +1292,11 @@ def materialize_live_directory_group(
             reason=observations[-1].result.reason,
         )
     physical_paths = group.physical_paths
+    prefix = None
     if sidecar_observations is not None:
         # A current proof covers the published members (each output is proved
         # again within LivePrefixProof.PERIOD_S): only later members are looked at.
+        checked = None if proof is None else proof.verified_at
         covered = (
             published_members
             if proof is not None and proof.graph is published_graph
@@ -1302,6 +1327,16 @@ def materialize_live_directory_group(
             )
         observations = observations[:count]
         physical_paths = physical_paths[:count]
+        if getattr(session, "listing_deferred", False):
+            # An admission needs a real listing in its own poll (D1): the next one.
+            session.force_listing()
+            return LiveDirectoryAttempt(
+                group, ProbeState.IN_PROGRESS, reason="listing the directory before admission",
+            )
+        # A publication proves its prefix in this poll; the members after it
+        # are then the only ones read, captured and proved strictly.
+        if covered and (proof.verified_at != checked or proof.holds(cancelled=cancelled)):
+            prefix = published_graph
 
     ready = RunCandidatePlan(
         group.plan.generation,
@@ -1311,12 +1346,14 @@ def materialize_live_directory_group(
         group.plan.name_filter,
         tuple(value.descriptor for value in observations),
     )
+    registry = registry_identity()
     try:
         deferred = _deferred_directory_plan(
             receipt.candidate,
             ready,
             physical_paths,
             cancelled=cancelled,
+            prefix=prefix,
         )
         transient = replace(
             receipt,
@@ -1330,6 +1367,8 @@ def materialize_live_directory_group(
             deferred.entries[0],
             cancelled=cancelled,
             published_members=published_members,
+            prefix=prefix,
+            spec_cache=spec_cache,
         )
     except RuntimeError as error:
         if error.args == ("admission cancelled",):
@@ -1357,11 +1396,16 @@ def materialize_live_directory_group(
         RunIntent.from_frozen(configuration),
         (decision.item,),
     )
+    source = configuration.thaw_source_spec()
     return LiveDirectoryAttempt(
         group,
         ProbeState.READY,
         decision=decision,
         partial=len(physical_paths) < len(group.physical_paths),
+        proof=LivePrefixProof(
+            decision.item.graph, record=sidecar_observations, registry=registry,
+            metadata_format=source.metadata_format if type(source) is DirectorySourceSpec else None,
+            start=0 if prefix is None else len(prefix.stamp.members)),
     )
 
 
@@ -1372,7 +1416,11 @@ def materialize_deferred_output(
     *,
     cancelled: Callable[[], bool],
     published_members: int = 0,
+    prefix: PreparedSourceExecutionGraph | None = None,
+    spec_cache: dict | None = None,
 ) -> tuple[AdmittedOutput | None, int, int]:
+    """``prefix`` and ``spec_cache``: see :func:`_deferred_directory_plan` and
+    :func:`qualify_source_execution_graph`; the proved prefix is not proved again."""
     deferred = receipt.deferred_directory
     if (
         type(deferred) is not DeferredDirectoryPlan
@@ -1380,7 +1428,8 @@ def materialize_deferred_output(
         or not any(value is entry for value in deferred.entries)
     ):
         raise TypeError("deferred output is not owned by this receipt")
-    _validate_deferred_entry_states(entry, cancelled=cancelled)
+    proven = proven_states(prefix)
+    _validate_deferred_entry_states(entry, cancelled=cancelled, proven=proven)
     if entry.skip_reason:
         return None, 0, len(entry.physical_paths)
 
@@ -1420,13 +1469,15 @@ def materialize_deferred_output(
             subset,
             cancelled=cancelled,
             published_members=published_members,
+            prefix=prefix,
+            spec_cache=spec_cache,
         )
     except (ValueError, OSError):
         # A semantic/schema failure remains terminal when every admitted
         # source state is still exact.  If the same failure followed a real
         # byte/dependency drift, this exact revalidation raises the typed Live
         # retry signal instead.
-        _validate_deferred_entry_states(entry, cancelled=cancelled)
+        _validate_deferred_entry_states(entry, cancelled=cancelled, proven=proven)
         raise
     if len(items) != 1:
         raise ValueError("deferred source group did not produce one output")
@@ -1437,6 +1488,8 @@ def materialize_deferred_output(
         entry,
         item=item,
         cancelled=cancelled,
+        proven=proven,
+        revalidate=not _is_live(receipt.candidate),
     )
     _validate_targets(
         receipt.candidate,
@@ -1444,6 +1497,7 @@ def materialize_deferred_output(
         (item,),
         cancelled=cancelled,
         run_plan=deferred,
+        proven=proven,
     )
     decision = inspect_output(item, receipt.candidate, entry.fact)
     if item.source_spec.kind is SourceKind.TIFF_SERIES:
@@ -1456,11 +1510,19 @@ def _validate_deferred_entry_states(
     *,
     item: PlannedOutput | None = None,
     cancelled: Callable[[], bool] | None = None,
+    proven: dict[str, SourceFileState] | None = None,
+    revalidate: bool = True,
 ) -> None:
-    """Require one deferred cursor to remain inside its admitted revision."""
+    """Require one deferred cursor to remain inside its admitted revision.
+
+    ``proven`` holds a live prefix's states its proof held in this poll: they
+    are not proved again.  ``revalidate=False`` (a live admission, which the
+    Run's construction validates or re-proves) skips validating the new graph
+    a second time."""
 
     is_cancelled = _not_cancelled if cancelled is None else cancelled
-    if item is not None:
+    proven = proven or {}
+    if item is not None and revalidate:
         # The complete JIT stamp is the first owner capable of proving every
         # raw alias binding.  Run that proof before the older deferred-state
         # fences so no alias drift can be classified without its frozen
@@ -1476,7 +1538,10 @@ def _validate_deferred_entry_states(
         _source_state_key(value.raw_path): value
         for value in topologies
     }
-    _verify_source_states(topology_map, cancelled=is_cancelled)
+    _verify_source_states({
+        key: value for key, value in topology_map.items()
+        if proven.get(value.followed_state.path) is not value.followed_state
+    }, cancelled=is_cancelled)
     frozen = {
         _source_state_key(value.raw_path): value.followed_state
         for value in topologies
@@ -1504,6 +1569,8 @@ def _validate_deferred_entry_states(
     for state, role in occurrences:
         if is_cancelled():
             raise RuntimeError("admission cancelled")
+        if proven.get(state.path) is state:
+            continue
         accepted = frozen.get(_source_state_key(state.path))
         if accepted is None:
             # TIFF sidecars and selected HDF5 dependencies are discovered and
@@ -1905,6 +1972,8 @@ def _qualify_for_admission(
     cancelled: Callable[[], bool],
     infer_point_images: bool = True,
     published_members: int = 0,
+    prefix: PreparedSourceExecutionGraph | None = None,
+    spec_cache: dict | None = None,
 ) -> PreparedSourceExecutionGraph:
     try:
         return qualify_source_execution_graph(
@@ -1912,6 +1981,7 @@ def _qualify_for_admission(
             selected_container=selected_container, cancelled=cancelled,
             infer_point_images=infer_point_images,
             published_members=published_members,
+            prefix=prefix, spec_cache=spec_cache,
         )
     except InterruptedError as error:
         if error.args != ("source qualification cancelled",):
@@ -1966,6 +2036,8 @@ def _directory_items(
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
     published_members: int = 0,
+    prefix: PreparedSourceExecutionGraph | None = None,
+    spec_cache: dict | None = None,
 ) -> tuple[PlannedOutput, ...]:
     output_root, items, consumed = Path(configuration.save_path), [], set()
     resolved_output_root = None
@@ -2026,6 +2098,7 @@ def _directory_items(
                 # Live never infers images per point: an image waits for its row.
                 infer_point_images=not _is_live(configuration),
                 published_members=published_members,
+                prefix=prefix, spec_cache=spec_cache,
             )
         else:
             consumed.add(candidate.path)
@@ -2146,15 +2219,39 @@ def _validate_targets(
     *,
     cancelled: Callable[[], bool] | None = None,
     run_plan: DeferredDirectoryPlan | None = None,
+    proven: dict[str, SourceFileState] | None = None,
 ) -> None:
     raw: tuple[Path, ...] = ()
+    proven = proven or {}
     for item in items:
         identity = validate_source_aliases(
             item.source_stamp,
             cancelled=cancelled,
+            proven=proven,
         )
-        raw += tuple(Path(binding.raw_path) for binding in identity.identity.aliases)
-        raw += tuple(Path(target.resolved_path) for target in identity.targets)
+        # A proved prefix input keeps its admitted resolution and identity, so
+        # only the output could have become it: that is checked once below.
+        targets = identity.targets
+        raw += tuple(Path(binding.raw_path) for binding in identity.identity.aliases
+                     if not _held(proven, binding.raw_path, targets[binding.target_id].state))
+        raw += tuple(Path(target.resolved_path) for target in targets
+                     if not _held(proven, target.resolved_path, target.state))
+        if not proven:
+            continue
+        try:
+            output = os.stat(item.target)
+        except OSError:
+            output = None
+        resolved = os.path.normcase(os.path.realpath(item.target))
+        if any(
+            output is not None and (output.st_dev, output.st_ino) == (held.device, held.inode)
+            or os.path.normcase(held._resolved_path_at_capture or held.path) == resolved
+            for held in proven.values()
+        ):
+            raise OutputCollisionError(
+                f"Reduction output '{item.target}' is the same file as a raw input; "
+                "choose a separate Save Path."
+            )
     if run_plan is not None:
         # Directory JIT: this group's dependencies are in hand, so refuse to
         # read ANY output target of the run as raw data (a raw container that

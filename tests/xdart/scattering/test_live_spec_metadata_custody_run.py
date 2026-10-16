@@ -225,6 +225,16 @@ def _hold_inside_validation(monkeypatch, paths):
             released.wait(30.)
         return real_spec_file(*args, **kwargs)
 
+    real_qualify = output_preflight.qualify_source_execution_graph
+
+    def qualify(*args, **kwargs):  # a Live admission's own reads are its JIT validation of a new frame
+        state.validating = getattr(state, 'selected', False)
+        try:
+            return real_qualify(*args, **kwargs)
+        finally:
+            state.validating = False
+
+    monkeypatch.setattr(output_preflight, 'qualify_source_execution_graph', qualify)
     monkeypatch.setattr(run_executor, 'materialize_live_directory_group', materialize)
     monkeypatch.setattr(output_preflight, 'validate_source_execution_graph', validate)
     monkeypatch.setattr(specfile, 'SpecFile', spec_file)

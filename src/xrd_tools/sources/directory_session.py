@@ -16,6 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from xrd_tools.sources import directory_index
 from xrd_tools.sources.directory_index import (
     DirectoryIndex,
     IndexDelta,
@@ -159,6 +160,12 @@ class DirectoryIndexSession:
         self._results_version = 0
         self._last: tuple[Snapshot, int, DirectoryObservation] | None = None
         self._paths: tuple[Snapshot, Mapping[Path, Candidate]] | None = None
+        # D1: the paths a Live Run watches (None: off), a forced listing, and
+        # the last real listing's start with what a deferral must find unchanged.
+        self._watched: tuple[Path, ...] | None = None
+        self._force = False
+        self._listed: tuple[float, tuple] | None = None
+        self.listing_deferred = False
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xdart-directory-index")
         self._closed = False
@@ -300,11 +307,13 @@ class DirectoryIndexSession:
             self._last = None
 
         index = self._index
-        snapshot = (
-            index.poll()
-            if refresh or reconfigured or index.snapshot.generation == 0
-            else index.snapshot
-        )
+        deferred = refresh and self._defers(index, reconfigured)
+        if (refresh and not deferred) or reconfigured or index.snapshot.generation == 0:
+            if self._watched is not None:
+                self._listed = (time.monotonic(), self._watch(index))
+            snapshot = index.poll()
+        else:
+            snapshot = index.snapshot
         last = self._last
         if (
             last is not None
@@ -571,6 +580,46 @@ class DirectoryIndexSession:
             if stop_unready and value.result.state is not ProbeState.READY:
                 break
         return tuple(observed)
+
+    #: A deferred listing (D1) is younger than this, so a real one follows
+    #: within a poll and its work more: inside 1 s.
+    LISTING_AGE_S = 0.75
+
+    def defer_listing(self, watched) -> None:
+        """For a Live Run's session (D1): a refreshing observation keeps the last
+        real listing while it is under LISTING_AGE_S old and nothing watched
+        moved: the registrations, the watched directories, and ``watched`` paths
+        (files that change in place or are still pending).  ``None`` turns it
+        off; :meth:`force_listing` makes the next one list."""
+        self._watched = None if watched is None else tuple(watched)
+
+    def force_listing(self) -> None:
+        self._force = True
+
+    def _watch(self, index) -> tuple:
+        from xrd_tools.sources.adapters import registry_identity
+        snapshot = index.snapshot
+        directories = (index.root, *(sorted({value.path.parent for value in snapshot.candidates})
+                                     if snapshot.recursive else ()))
+        return (registry_identity(), *map(directory_index.directory_identity, directories),
+                *((path, directory_index.directory_identity(path)) for path in self._watched or ()))
+
+    def _defers(self, index, reconfigured: bool) -> bool:
+        forced, self._force, listed = self._force, False, self._listed
+        self.listing_deferred = not (forced or reconfigured) and self._watched is not None and (
+            listed is not None and index.snapshot.generation != 0
+            and time.monotonic() - listed[0] < self.LISTING_AGE_S and listed[1] == self._watch(index))
+        return self.listing_deferred
+
+    def reuse_records(self) -> tuple[tuple, ...]:
+        """The paths this session and its index keep between polls for reuse
+        (discovery's memo, the last observation's path map), one record each."""
+        def records():
+            memo = {} if self._index is None else self._index._discovery
+            paths = () if self._paths is None else self._paths[1]
+            return tuple((None, str(path)) for path in (
+                *memo.get("candidates", ()), *memo.get("owners", ()), *paths))
+        return self._executor.submit(records).result()
 
     def close(self) -> None:
         with self._lock:

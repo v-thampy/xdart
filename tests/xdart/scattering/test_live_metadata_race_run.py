@@ -45,6 +45,21 @@ def _reregister_image_adapter(monkeypatch, image):
         replace(entry.adapter), entry.builtin, entry.seq + 100000))
 
 
+def _construct_strictly(monkeypatch, image, members):
+    """Make the construction of a group of ``members`` images validate the whole group again.
+
+    Construction re-checks the proof of what its poll admitted; a registration change as it starts fails that
+    proof, so construction validates the group (the strict re-check these rows exercise).
+    """
+    real = StandardRunExecutor._construct
+
+    def construct(executor, run, **kwargs):
+        if kwargs.get('item') is not None and len(kwargs['item'].source_stamp.members) == members:
+            _reregister_image_adapter(monkeypatch, image)
+        return real(executor, run, **kwargs)
+    monkeypatch.setattr(StandardRunExecutor, '_construct', construct)
+
+
 def _labels(events):
     return {event.frame_key.local_frame_label for event in events if event.kind is StandardEventKind.FRAME_READY}
 

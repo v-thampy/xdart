@@ -460,9 +460,12 @@ class _StandardRun:
         default_factory=dict
     )
     live_revision_lock: Lock = field(default_factory=Lock)
-    # Live reuse: physical target key -> the proof of its published prefix.
-    # Run-owned; cleared when the Live loop ends.
+    # Live reuse: physical target key -> the proof of its published prefix,
+    # and SPEC readiness by (SPEC file, scan).  Run-owned; cleared with the loop.
     live_proofs: dict[str, Any] = field(default_factory=dict)
+    live_spec_cache: dict[Any, Any] = field(default_factory=dict)
+    # The proof of what the Live poll admitted, for the construction it calls.
+    live_admission_proof: Any = None
     # Live outputs that stopped growing because a published frame's metadata
     # changed: physical target key -> the reason every later status carries.
     live_blocked: dict[str, str] = field(default_factory=dict)
@@ -1357,6 +1360,28 @@ class StandardRunExecutor:
         with run.live_revision_lock:
             return tuple(run.processed_live_revisions.values())
 
+    def live_reuse_records(self, run_identity: RunIdentity) -> tuple[tuple, ...]:
+        """What a Live Run keeps between polls to reuse its proofs, flat: each
+        record holds primitive values, the first the frame label it serves or
+        ``None`` for an output's or the Run's own state."""
+        run = self._exact_run(run_identity)
+        session = None if run is None or run.resources is None else run.resources.directory_session
+        records = [] if session is None else list(session.reuse_records())
+        for (path, scan), (revision, count, read) in tuple(() if run is None else run.live_spec_cache.items()):
+            records.append((None, str(path), scan, *revision, count,
+                            *(() if read is None else (line.decode('latin-1') for line in read.lines))))
+        for target, proof in tuple(() if run is None else run.live_proofs.items()):
+            stamp = proof.graph.stamp
+            records.append((None, target, proof.verified_at, *(value for entry in proof.registry for value in entry),
+                            *(value for key, seen in tuple(proof.spec_revisions.items()) for value in (key, *seen))))
+            for label, (path, seen) in enumerate(proof.observations, stamp.first_label + proof.start):
+                records.append((label, path, *(value for sidecar, revision in seen or () for value in
+                                               (sidecar, *(revision or (None,))))))
+            for label, source in enumerate(stamp.metadata_sources, stamp.first_label):
+                if source.read_values is not None:
+                    records.append((label, *source.read_values, *source.read_values.values()))
+        return tuple(records)
+
     def acquisition_context(self, run_identity: RunIdentity):
         run = self._exact_run(run_identity)
         runtime = None if run is None else run.context_runtime
@@ -1419,6 +1444,7 @@ class StandardRunExecutor:
         output.drop_released_predecessor(predecessor)
 
     def _construct(self, run: _StandardRun, *, item: PlannedOutput | None=None, labels: tuple[int, ...] | None=None, decision: AdmittedOutput | None=None) -> _StandardRun:
+        proof, run.live_admission_proof = run.live_admission_proof, None
         configuration, capture = (run.configuration, run.capture)
         if configuration is None or capture is None:
             raise RuntimeError('run construction shell is incomplete')
@@ -1449,7 +1475,10 @@ class StandardRunExecutor:
             run.scan = None
 
         try:
-            if item is not None:
+            # A Live item re-checks the proof of what its poll admitted; only a
+            # failed proof validates the whole graph again.
+            if item is not None and (proof is None or proof.graph is not item.graph
+                                     or not proof.holds(cancelled=cancelled)):
                 validate_planned_source(item, cancelled=cancelled)
             if item is not None and item.candidate is not None and (item.descriptor is not None) and (item.descriptor.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
                 cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
@@ -1462,6 +1491,13 @@ class StandardRunExecutor:
                     raise
             else:
                 run.source = open_source(source_spec)
+            if proof is not None and hasattr(run.source, 'retain_metadata'):
+                # The proved prefix's frames keep the values their admission read.
+                run.source.retain_metadata({
+                    label: values for label, source in enumerate(
+                        item.graph.stamp.metadata_sources[:proof.start], item.graph.stamp.first_label)
+                    if (values := source.read_values if source.spec_values is None else source.spec_values)
+                    is not None})
             admission = None if run.resources is None else run.resources.admission
             assets = None if admission is None else admission.scientific_assets
             calibration = (
@@ -1485,6 +1521,7 @@ class StandardRunExecutor:
                 validate_consumed_metadata(
                     item.graph,
                     {int(frame.index): frame.metadata for frame in run.scan.frames},
+                    start=0 if proof is None else proof.start,
                 )
             calibration = bind_native_int_source_energy(run.scan, calibration,
                 metadata_wavelength_A=(None if item is None or item.descriptor is None
@@ -1971,7 +2008,8 @@ class StandardRunExecutor:
         ] = {}
         retry_revisions: dict[str, tuple[object, ...]] = {}
         # SPEC readiness by SPEC file revision: no read while it is unchanged.
-        spec_cache: dict[object, object] = {}
+        spec_cache = run.live_spec_cache
+        spec_cache.clear()
         run.live_proofs.clear()
         # Each image's sidecar as last seen; admission waits until it holds still.
         sidecar_observations: dict[str, tuple[tuple[str, object], ...]] = {}
@@ -2037,6 +2075,7 @@ class StandardRunExecutor:
                     discovered_paths.update(group.physical_paths)
                 publish()
 
+            watched: list[Path] = []  # files the next poll must see change at once (D1)
             for group in groups:
                 if run.stop_requested:
                     return True
@@ -2107,6 +2146,7 @@ class StandardRunExecutor:
                             0 if retained is None or retained.decision is None
                             else len(retained.decision.item.source_stamp.members)
                         )
+                        watched.extend(group.physical_paths[published:])
                         self._release_predecessor_before_target(
                             run, group.target,
                         )
@@ -2182,6 +2222,7 @@ class StandardRunExecutor:
                             item.source_spec.kind is SourceKind.TIFF_SERIES
                         )
                         try:
+                            run.live_admission_proof = attempt.proof
                             self._construct(
                                 run,
                                 item=item,
@@ -2258,6 +2299,12 @@ class StandardRunExecutor:
                 if stopped or run.stop_requested:
                     return True
 
+            with run.live_revision_lock:
+                containers = tuple(value.decision.item.source_stamp for value in run.processed_live_revisions.values()
+                                   if value.decision is not None and value.decision.item.descriptor is not None)
+            # Containers grow in place and their external chunks are never listed.
+            session.defer_listing((*watched, *(Path(state.path) for stamp in containers for state in (
+                stamp.file, *(member.file for member in stamp.external_members), *stamp.dependency_files))))
             run.stop_signal.wait(_LIVE_DIRECTORY_POLL_S)
         return True
 
@@ -2949,7 +2996,7 @@ class StandardRunExecutor:
         ))
 
     def _cleanup(self, run: _StandardRun, primary: DetachedDiagnostic | None=None) -> ExecutorClosed:
-        run.live_proofs.clear()
+        run.live_proofs.clear(); run.live_spec_cache.clear()
         with run.cleanup_lock:
             if primary is not None and run.primary is None:
                 run.primary = primary

@@ -11,7 +11,7 @@ import threading
 import xrd_tools.io.metadata as metadata
 from tests.xdart.scattering._e2sd_support import write_poni
 from tests.xdart.scattering.test_live_metadata_race_run import (
-    _arrive, _labels, _reregister_image_adapter, _terminal,
+    _arrive, _construct_strictly, _labels, _reregister_image_adapter, _terminal,
 )
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _drain_until, _start
 from xdart.gui.tabs.scattering.adapters import run_executor
@@ -92,6 +92,7 @@ def test_gs2_stop_while_a_new_frame_is_validated_for_reduction_ends_stopped(tmp_
     """Preservation: here `_construct`'s own re-validation already turns the cancellation into a stop (probe p05)."""
     inside, pressed = _held(monkeypatch, lambda item: len(item.source_stamp.members) == 2)
     raw, executor, identity = _run(tmp_path, 2622)
+    _construct_strictly(monkeypatch, raw / 'scan_0001.tif', 2)
     events = []
     try:
         events += _drain_until(executor, lambda values: 1 in _labels(values), timeout=60.)

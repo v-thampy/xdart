@@ -277,6 +277,9 @@ class AdmittedMetadataSource:
     # In memory only, likewise: the values that row gave at admission.  A live
     # Run's reduction read must consume exactly these.
     spec_values: Mapping[str, Any] | None = field(default=None, compare=False)
+    # In memory only, likewise: a sidecar member's values as admission read
+    # them, which a live Run reuses while its proof holds.
+    read_values: Mapping[str, Any] | None = field(default=None, compare=False)
     def __post_init__(self) -> None:
         if (type(self.source_path) is not str or not os.path.isabs(self.source_path)
                 or self.metadata_file is not None
@@ -284,7 +287,9 @@ class AdmittedMetadataSource:
                 or self.spec_extent is not None
                 and (type(self.spec_extent) is not SpecScanExtent or self.metadata_file is None)
                 or self.spec_values is not None
-                and (type(self.spec_values) is not MappingProxyType or self.spec_extent is None)):
+                and (type(self.spec_values) is not MappingProxyType or self.spec_extent is None)
+                or self.read_values is not None
+                and (type(self.read_values) is not MappingProxyType or self.spec_extent is not None)):
             raise TypeError("admitted metadata source is invalid")
     def as_dict(self) -> dict[str, Any]:
         return {"source_path": self.source_path, "metadata_file": (
@@ -464,6 +469,19 @@ def admitted_metadata_current(stamp: SourceExecutionStamp, state: SourceFileStat
     return bool(extents) and all(spec_extent_holds(extent) for extent in extents)
 
 
+def proven_states(graph: PreparedSourceExecutionGraph | None) -> dict[str, SourceFileState]:
+    """A live prefix graph's member and metadata-file states, by path."""
+    stamp = None if graph is None else graph.stamp
+    return {} if stamp is None else {state.path: state for state in (*stamp.members, *(
+        source.metadata_file for source in stamp.metadata_sources if source.metadata_file is not None))}
+
+
+def _held(proven: Mapping[str, SourceFileState], path: str, state: SourceFileState) -> bool:
+    """Whether ``proven`` holds ``path`` resolved to ``state``'s path at its revision."""
+    held = proven.get(path)
+    return held is not None and _resolved(held) == state.path and _revision(held) == _revision(state)
+
+
 def validate_source_aliases(
     stamp: SourceExecutionStamp,
     *,
@@ -471,8 +489,11 @@ def validate_source_aliases(
     resolve_alias: Callable[[str], str] | None = None,
     capture_target: Callable[[str], SourceFileState] | None = None,
     candidate_owner_id: Callable[[str], str | None] | None = None, check_candidate_owner: bool = True,
+    proven: Mapping[str, SourceFileState] | None = None,
 ) -> tuple[SourceExecutionIdentityV1, tuple[CanonicalSourceTarget, ...]]:
-    """Prove every admitted lexical alias and canonical target twice."""
+    """Prove every admitted lexical alias and canonical target twice; one that
+    ``proven`` (:func:`proven_states` of a live prefix proved this poll) holds
+    at the same resolution and revision is not proved again."""
     if type(stamp) is not SourceExecutionStamp:
         raise TypeError("source alias validation requires an execution stamp")
     if resolve_alias is None:
@@ -488,6 +509,8 @@ def validate_source_aliases(
         for binding in stamp.source_aliases:
             if is_cancelled():
                 raise RuntimeError("admission cancelled")
+            if proven and _held(proven, binding.raw_path, targets[binding.target_id].state):
+                continue
             try:
                 resolved = resolve_alias(binding.raw_path)
             except (OSError, RuntimeError) as error:
@@ -610,6 +633,9 @@ class LivePrefixProof:
     that revision).  The adapter registrations and each member's sidecar
     discovery, from fresh listings, must be unchanged.  ``False`` sends the
     caller to the strict path, whose errors are the ones it always raised.
+    With ``start``, only the members from ``start`` on, their metadata files
+    and a moved SPEC file are proved: a construction's re-check of the new
+    members a prefix proof admitted in the same poll.
     """
 
     #: A settled or waiting output is proved again at least this often: within
@@ -621,9 +647,15 @@ class LivePrefixProof:
         return time.monotonic() - self.verified_at < self.PERIOD_S or self.holds(cancelled=cancelled)
 
     def __init__(self, graph: PreparedSourceExecutionGraph, *, metadata_format: str | None = None,
-                 record: Mapping[str, Any] | None = None, registry: tuple | None = None) -> None:
-        self.graph, self.metadata_format = graph, metadata_format
+                 record: Mapping[str, Any] | None = None, registry: tuple | None = None,
+                 start: int = 0) -> None:
+        self.graph, self.metadata_format, self.start = graph, metadata_format, start
         self.spec_revisions: dict[str, tuple[int, ...]] = {}
+        stamp = graph.stamp
+        later = {state.path for state in (*stamp.members[start:], *(
+            source.metadata_file for source in stamp.metadata_sources[start:] if source.metadata_file))}
+        self.bindings = stamp.source_aliases if not start else tuple(
+            binding for binding in stamp.source_aliases if binding.raw_path in later)
         self.rebase(record or {}, registry)
 
     def rebase(self, record: Mapping[str, Any], registry: tuple | None) -> None:
@@ -632,7 +664,8 @@ class LivePrefixProof:
         from xrd_tools.sources.adapters import registry_identity
         fmt = self.metadata_format
         self.observations = () if fmt in (None, "spec") else tuple(
-            (member.path, record.get(observation_key(member.path))) for member in self.graph.stamp.members)
+            (member.path, record.get(observation_key(member.path)))
+            for member in self.graph.stamp.members[self.start:])
         self.registry = registry_identity() if registry is None else registry
         self.verified_at = time.monotonic()
 
@@ -642,11 +675,11 @@ class LivePrefixProof:
         from xrd_tools.sources.registry import name_pure_registry
         if registry_identity() != self.registry:
             return False
-        stamp = self.graph.stamp
+        stamp, bindings = self.graph.stamp, self.bindings
         targets, grown, moved = stamp.canonical_targets, _spec_extents(stamp), {}
         for _sweep in range(2):
-            parents = _resolve_parents(stamp.source_aliases)
-            for index, binding in enumerate(stamp.source_aliases):
+            parents = _resolve_parents(bindings)
+            for index, binding in enumerate(bindings):
                 if cancelled is not None and not index % 256 and cancelled():
                     raise RuntimeError("admission cancelled")
                 now, expected = _alias_now(binding, parents), targets[binding.target_id]
@@ -657,12 +690,12 @@ class LivePrefixProof:
                     if expected.roles != ("image_metadata",) or not grown.get(key):
                         return False
                     moved[key] = (expected.resolved_path, now[1])
-            if _resolve_parents(stamp.source_aliases) != parents:
+            if _resolve_parents(bindings) != parents:
                 return False
         if not name_pure_registry() and any(
                 binding.candidate_owner_id is not None
                 and _candidate_owner_id(binding.raw_path) != binding.candidate_owner_id
-                for binding in stamp.source_aliases):
+                for binding in bindings):
             return False
         for key, (path, revision) in moved.items():
             if self.spec_revisions.get(key) != revision:
@@ -803,7 +836,9 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                    expected: PreparedSourceExecutionGraph | None = None,
                    force_compact: bool = False,
                    infer_point_images: bool = True,
-                   published_members: int = 0) -> PreparedSourceExecutionGraph | None:
+                   published_members: int = 0,
+                   prefix: PreparedSourceExecutionGraph | None = None,
+                   spec_cache: dict | None = None) -> PreparedSourceExecutionGraph | None:
     options = dict(source.options); marker = options.pop("average_compact_series_v1", None)
     if marker is not None and marker is not True: raise ValueError("compact Average TIFF marker is invalid")
     if marker is True and ({"files", "admitted_motor_values"} & set(options)):
@@ -844,6 +879,16 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     common: list[str] | None = None; layout = None
     metadata_format = (grouped_source.metadata_format if grouped_source is not None
                        else qualified.get("metadata_format", "auto"))
+    # A live Run's published members whose proof just held (``prefix``) keep
+    # their admitted facts; only later members are read, into the graph a
+    # full qualification gives (shared SPEC facts re-based on this read).
+    known = len(prefix.stamp.members) if (
+        prefix is not None and expected is None and not infer_point_images and not compact
+        and grouped_source is None and not reader_binding and len(prefix.stamp.members) < len(files)
+        and tuple(member.path for member in prefix.stamp.members) == files[:len(prefix.stamp.members)]
+        and _source_policy(SourceSpec(source.uri, SourceKind.TIFF_SERIES, metadata_uri=source.metadata_uri,
+                                      entry=source.entry), qualified)
+        == _source_policy(prefix.execution_source, dict(prefix.execution_source.options))) else 0
     from xrd_tools.io.metadata import ImageMetadataRead, read_spec_points
     spec_points = spec_state = None
     if metadata_format == "spec" and grouped_source is None and not compact and not reader_binding:
@@ -854,9 +899,16 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         # published, so any change shows as a difference.
         published = (None if infer_point_images else
                      len(files) if expected is not None else published_members)
+        after = prefix.stamp.metadata_sources[0].spec_extent if known else None
+        known = known if after is not None else 0
         try:
-            spec_points = read_spec_points(files, meta_dir=qualified.get("meta_dir"), published=published,
-                                           cancelled=cancelled)
+            spec_points = None if not known else read_spec_points(
+                files[known:], meta_dir=qualified.get("meta_dir"), published=0, cancelled=cancelled,
+                after=after, cache=spec_cache)
+            if spec_points is None:  # no prefix, or its rows changed: every member's row
+                known, spec_points = 0, read_spec_points(
+                    files, meta_dir=qualified.get("meta_dir"), published=published, cancelled=cancelled,
+                    cache=spec_cache)
         except SpecRowPending as error:
             raise SourceRevisionChanged(str(error)) from error
         if spec_points is not None and spec_points.extent is not None:
@@ -866,7 +918,18 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                 raise MetadataRevisionChanged(
                     f"TIFF metadata source changed during admission: {spec_points.path}",
                     image_path=files[0], metadata_path=spec_points.path)
+    if known:
+        common = list(prefix.motor_names or ())
+        selected_motor_complete &= len(prefix.stamp.admitted_motor_values) == known
     for index, value in enumerate(files):
+        if index < known:
+            source_value = prefix.stamp.metadata_sources[index]
+            members.append(prefix.stamp.members[index])
+            metadata_sources.append(source_value if spec_state is None else AdmittedMetadataSource(
+                source_value.source_path, spec_state, spec_extent=spec_points.extent,
+                spec_values=source_value.spec_values))
+            if selected_motor_complete: motor_rows.append(prefix.stamp.admitted_motor_values[index])
+            continue
         _cancelled(cancelled); path = Path(value); before = SourceFileState.capture(path)
         current = None
         if compact or grouped_source is not None:
@@ -881,7 +944,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         _cancelled(cancelled)
         # With the scan's one SPEC read, both reads are that read and both states its one capture.
         first = (ImageMetadataRead({}, None) if metadata_format is None else
-                 spec_points.reads[index] if spec_points is not None else
+                 spec_points.reads[index - known] if spec_points is not None else
                  _read_member_metadata(path, metadata_format, meta_dir=qualified.get("meta_dir"),
                     max_input_bytes=(1 << 16) if reader_binding else None,
                     spec_point_snapshot=bool(reader_binding)))
@@ -890,7 +953,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                        None if first.source_path is None else SourceFileState.capture(first.source_path))
         _cancelled(cancelled)
         second = (ImageMetadataRead({}, None) if metadata_format is None else
-                  spec_points.reads[index] if spec_points is not None else
+                  spec_points.reads[index - known] if spec_points is not None else
                   _read_member_metadata(path, metadata_format, meta_dir=qualified.get("meta_dir"),
                     max_input_bytes=(1 << 16) if reader_binding else None,
                     spec_point_snapshot=bool(reader_binding)))
@@ -909,7 +972,8 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         spec_read = spec_points is not None and spec_points.extent is not None
         metadata = AdmittedMetadataSource(before.path, second_state,
             spec_extent=spec_points.extent if spec_read else None,
-            spec_values=MappingProxyType(dict(second.values)) if spec_read else None)
+            spec_values=MappingProxyType(dict(second.values)) if spec_read else None,
+            read_values=None if spec_read or infer_point_images else MappingProxyType(dict(second.values)))
         motors = _finite_motors(dict(second.values))
         common = list(motors) if common is None else [name for name in common if name in motors]
         motor = None
@@ -1168,7 +1232,9 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
         reader_binding: str | None = None,
         selected_container: SelectedContainerInput | None = None,
         cancelled: Callable[[], bool] | None = None,
-        infer_point_images: bool = True, published_members: int = 0) -> PreparedSourceExecutionGraph:
+        infer_point_images: bool = True, published_members: int = 0,
+        prefix: PreparedSourceExecutionGraph | None = None,
+        spec_cache: dict | None = None) -> PreparedSourceExecutionGraph:
     """Qualify one source; ``infer_point_images=False`` (a live Run) never infers images per point.
 
     A live TIFF series under SPEC metadata also holds each member to its own
@@ -1176,6 +1242,8 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
     Run, come back without metadata when their rows are gone, for the
     published-metadata fence; a later member whose row is not there yet is a
     SourceRevisionChanged, and one whose row is not a valid row a ValueError.
+    ``prefix`` (a live TIFF series' published graph, its proof held this poll)
+    and ``spec_cache`` (the Run's SPEC readiness cache) let only new members be read.
     """
     if type(source) is not SourceSpec: raise TypeError("source must be an exact SourceSpec")
     if type(published_members) is not int or published_members < 0:
@@ -1194,7 +1262,8 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
     if source.kind is SourceKind.TIFF_SERIES:
         return _qualify_tiff(source, selected_motor=selected_motor,
             reader_binding=reader_binding, cancelled=cancelled,
-            infer_point_images=infer_point_images, published_members=published_members)
+            infer_point_images=infer_point_images, published_members=published_members,
+            prefix=prefix, spec_cache=spec_cache)
     if source.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
         return _qualify_container(source, selected_motor=selected_motor,
                                   reader_binding=reader_binding, cancelled=cancelled,
@@ -1270,7 +1339,7 @@ def _same_value(actual: Any, admitted: Any) -> bool:
         return float(actual) == float(admitted) or math.isnan(float(actual)) and math.isnan(float(admitted))
     return actual == admitted
 def validate_consumed_metadata(value: PreparedSourceExecutionGraph,
-                               consumed: Mapping[int, Mapping[str, Any]]) -> None:
+                               consumed: Mapping[int, Mapping[str, Any]], *, start: int = 0) -> None:
     """Require a live Run's reduction read to consume exactly the SPEC values its admission read.
 
     ``consumed`` maps frame labels to the metadata the reduction read for
@@ -1278,14 +1347,18 @@ def validate_consumed_metadata(value: PreparedSourceExecutionGraph,
     memory; a row rewritten or gone since admission reads differently (or as
     another row), which is a SourceRevisionChanged before anything is
     published.  The selected motor is compared as the reader overrides it
-    with its admitted value.  Finite graphs are not checked.
+    with its admitted value.  Finite graphs are not checked.  With ``start``
+    (members a prefix proof covers, served their admitted values), only later
+    members are checked, and each of them must have been consumed.
     """
     stamp = value.stamp
     if value.infers_point_images or stamp.adapter_id != "tiff_series":
         return
     motors = stamp.admitted_motor_values
-    for index, source in enumerate(stamp.metadata_sources):
+    for index, source in enumerate(stamp.metadata_sources[start:], start):
         actual = consumed.get(stamp.first_label + index)
+        if source.spec_values is not None and actual is None and start:
+            raise SourceRevisionChanged(f"TIFF metadata was not consumed: {source.source_path}")
         if source.spec_values is None or actual is None:
             continue
         expected = dict(source.spec_values)
