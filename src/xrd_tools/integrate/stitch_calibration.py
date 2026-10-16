@@ -831,12 +831,15 @@ def _session_resume_from_record(value):
         beam['used'] = np.asarray(beam['used'], dtype=bool)
         count = len(beam['angles_deg'])
         if (not count or any(np.ndim(beam[key]) != 1 or len(beam[key]) != count
-                            for key in (*_BEAM_FLOAT_ARRAYS, 'used', 'frame_ids', 'point_ids', 'rejection_reasons'))
+                            for key in (*_BEAM_FLOAT_ARRAYS, 'used'))
+                or any(len(beam[key]) != count for key in ('frame_ids', 'point_ids', 'rejection_reasons'))
                 or not np.isfinite(beam['angles_deg']).all() or beam['distance_m'] <= 0
                 or any(type(beam[key]) not in (int, float) or not math.isfinite(beam[key])
                        for key in ('distance_m', 'distance_std_m', 'pixel_pitch_m', 'slope_deg_per_pixel', 'intercept_px'))):
             raise ValueError('invalid calibration resume direct beam arrays')
-        for key in ('frame_ids', 'point_ids', 'rejection_reasons', 'image_shape'):
+        for key in ('frame_ids', 'point_ids'):
+            beam[key] = tuple(tuple(item) if isinstance(item, list) else item for item in beam[key])
+        for key in ('rejection_reasons', 'image_shape'):
             beam[key] = tuple(beam[key])
         beam['beam_pixel'] = None if beam['beam_pixel'] is None else tuple(beam['beam_pixel'])
         beam = DirectBeamResult(**beam)

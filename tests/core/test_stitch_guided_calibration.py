@@ -126,7 +126,9 @@ def test_complete_calibration_session_resumes_settings_fit_and_direct_beam(tmp_p
     angles = np.array([8.1, 7.7, 7.13, 7., 6.82, 6.2, 5.7])
     images, _expected, beam_pixel = beam_images(angles)
     images[2] = None
-    beam = run(angles, images, beam=beam_pixel)
+    frame_ids = tuple((tmp_path / 'beam_master.h5', index) for index in range(len(angles)))
+    point_ids = tuple(('8.1', index) for index in range(len(angles)))
+    beam = run(angles, images, beam=beam_pixel, frame_ids=frame_ids, point_ids=point_ids)
     source = SourceSpec(Path(frames[0].source_uri), SourceKind.IMAGE_FILE,
                         options={'rotation': 0, 'read_image_kwargs': {'detector_shape': frames[0].shape}})
     setup = {'text': {'source_path': str(source.uri), 'calibrant': 'LaB6'}, 'checks': {'scales': False}}
@@ -146,6 +148,8 @@ def test_complete_calibration_session_resumes_settings_fit_and_direct_beam(tmp_p
     assert restored.direct_beam.zero_beam_pixel == beam.zero_beam_pixel
     np.testing.assert_array_equal(restored.direct_beam.centres_px, beam.centres_px)
     np.testing.assert_array_equal(restored.direct_beam.used, beam.used)
+    assert restored.direct_beam.frame_ids == tuple((str(path), index) for path, index in frame_ids)
+    assert restored.direct_beam.point_ids == point_ids
     assert restored.direct_beam_context == {'energy_eV': 10000., 'held': {'nu': 0.}}
     assert b'NaN' not in path.read_bytes()
 
