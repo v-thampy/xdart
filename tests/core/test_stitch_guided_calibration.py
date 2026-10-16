@@ -127,8 +127,8 @@ def test_complete_calibration_session_resumes_settings_fit_and_direct_beam(tmp_p
     images, _expected, beam_pixel = beam_images(angles)
     images[2] = None
     beam = run(angles, images, beam=beam_pixel)
-    source = SourceSpec(frames[0].source_uri, SourceKind.IMAGE_FILE,
-                        options={'rotation': 0, 'detector_shape': list(frames[0].shape)})
+    source = SourceSpec(Path(frames[0].source_uri), SourceKind.IMAGE_FILE,
+                        options={'rotation': 0, 'read_image_kwargs': {'detector_shape': frames[0].shape}})
     setup = {'text': {'source_path': str(source.uri), 'calibrant': 'LaB6'}, 'checks': {'scales': False}}
     resume = CalibrationSessionResume(setup, fit, source, beam,
                                      {'energy_eV': 10000., 'held': {'nu': 0.}})
@@ -136,7 +136,8 @@ def test_complete_calibration_session_resumes_settings_fit_and_direct_beam(tmp_p
     loaded, arm, policy, restored = load_calibration_session(path, with_resume=True)
     assert len(loaded) == (0 if quick else len(frames)) and arm == ('del', 'nu') and policy is None
     assert json.loads(path.read_text())['version'] == 7 and restored.setup == setup
-    assert restored.fit.asset == json.loads(json.dumps(fit.asset)) and restored.fit_source == source
+    assert restored.fit.asset == json.loads(json.dumps(fit.asset)) and restored.matches_source(source)
+    assert not restored.matches_source(replace(source, entry='other'))
     assert restored.fit.rms_q == fit.rms_q and restored.fit.n_points == fit.n_points
     for key in ('q', 'dq', 'frame', 'kept'):
         np.testing.assert_array_equal(restored.fit.point_residuals[key], fit.point_residuals[key])

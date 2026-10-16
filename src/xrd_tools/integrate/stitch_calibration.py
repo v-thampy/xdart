@@ -714,6 +714,17 @@ class CalibrationSessionResume:
     direct_beam: DirectBeamResult | None = None
     direct_beam_context: dict | None = None
 
+    def matches_source(self, spec):
+        """Compare retained source selection after JSON path/sequence normalization, without opening it."""
+        return (self.fit_source is not None and type(spec) is SourceSpec
+                and _session_json(_session_source_record(self.fit_source)) == _session_json(_session_source_record(spec)))
+
+
+def _session_source_record(source):
+    return None if source is None else {'uri': str(source.uri), 'kind': source.kind.value,
+        'entry': source.entry, 'metadata_uri': None if source.metadata_uri is None else str(source.metadata_uri),
+        'options': dict(source.options)}
+
 
 def _session_json(value):
     def convert(item):
@@ -748,9 +759,7 @@ def _session_resume_record(resume):
             beam[key] = [None if math.isnan(v) else float(v) for v in array]
     value = _session_json({'setup': resume.setup,
         'fit': None if resume.fit is None else asdict(resume.fit),
-        'fit_source': None if source is None else {'uri': str(source.uri), 'kind': source.kind.value,
-            'entry': source.entry, 'metadata_uri': None if source.metadata_uri is None else str(source.metadata_uri),
-            'options': dict(source.options)},
+        'fit_source': _session_source_record(source),
         'direct_beam': beam, 'direct_beam_context': resume.direct_beam_context})
     _session_resume_from_record(value)
     return value
