@@ -852,14 +852,17 @@ class _WindowsWidth(_ZeroInode):  # Windows Python 3.12+: a 64-bit volume serial
     def __init__(self, real):
         self._real, self.st_dev, self.st_ino = real, real.st_dev | 1 << 63, real.st_ino | 1 << 127
 
-@pytest.mark.parametrize("flow", (test_w14_existing_slot_is_replaced_atomically,
-                                  test_w27_seeded_adoption_publishes_releases_and_strands_nothing),
-                         ids=("W47-replace", "W47-seeded"))
+@pytest.mark.parametrize("flow", (lambda t, m, a: test_w14_existing_slot_is_replaced_atomically(t, a),
+                                  lambda t, m, a: test_w27_seeded_adoption_publishes_releases_and_strands_nothing(t, a),
+                                  lambda t, m, a: test_w01_w02_average_publishes_replaces_and_reopens(t, m, a, False),
+                                  lambda t, m, a: test_w03_w06_stitch_publishes_replaces_and_reopens(t, a, ("multigeometry", "1d")),
+                                  lambda t, m, a: test_w07_w08_rsm_v2_publishes_replaces_and_reopens(t, m, a, "hkl")),
+                         ids=("W47-replace", "W47-seeded", "W47-average", "W47-stitch", "W47-rsm"))
 def test_w47_windows_width_identities_publish(tmp_path, monkeypatch, arm, flow):
     """The hosted runner's NTFS reported st_dev 15923074127169020758 (> 2**63 - 1); identities have no width bound."""
     for name in ("stat", "lstat", "fstat"):
         monkeypatch.setattr(os, name, lambda *a, _real=getattr(os, name), **k: _WindowsWidth(_real(*a, **k)))
-    flow(tmp_path, arm)
+    flow(tmp_path, monkeypatch, arm)
 
 @pytest.mark.parametrize("flow", (lambda t, m, a: test_w03_w06_stitch_publishes_replaces_and_reopens(t, a, ("multigeometry", "1d")),
                                   lambda t, m, a: test_w07_w08_rsm_v2_publishes_replaces_and_reopens(t, m, a, "hkl")),
