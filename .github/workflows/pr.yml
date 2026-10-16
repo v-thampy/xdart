@@ -93,6 +93,13 @@ jobs:
         env:
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-browse-session.json
           XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-browse-settings.ini
+      # Average, Stitch and RSM publication on the runner's local NTFS; SMB needs an actual share.
+      - name: Publish and reopen finite results without directory descriptors
+        run: >-
+          pixi run --locked python -m pytest tests/core/test_windows_finite_publication.py -q -ra --timeout=300
+        env:
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-finite-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-finite-settings.json
 
   architecture-guards:
     runs-on: ubuntu-latest

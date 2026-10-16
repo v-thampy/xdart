@@ -17,7 +17,7 @@ from xrd_tools.io.append import AppendIntent, science_fingerprint
 from xrd_tools.io.image import load_mask, read_detector_image_layout
 from xrd_tools.io.nexus_record import _average_count_chunks, _average_count_digest
 from xrd_tools.io.output_transaction import (
-    StreamTerminal, TargetSnapshot, capture_target_snapshot,
+    StreamTerminal, TargetSnapshot, _normalize_target, capture_target_snapshot,
 )
 from xrd_tools.io.finite_artifact import _FinitePublicationSession
 from xrd_tools.io.nexus import open_nexus_writer
@@ -682,8 +682,10 @@ def _seal_published(path: str, ordinal: int) -> StreamTerminal:
     """
     observed = capture_target_snapshot(path)
     _reject(not observed.exists, 'AVERAGE_PUBLICATION_VANISHED')
+    # The seal names the slot by its canonical identity, as every streamed seal does; the public
+    # file keeps the caller's spelling (on Windows the two differ in case).
     return StreamTerminal(
-        path, int(observed.size), observed.digest, int(ordinal),
+        _normalize_target(path), int(observed.size), observed.digest, int(ordinal),
         int(observed.device), int(observed.inode),
         int(observed.mtime_ns), int(observed.ctime_ns),
     )
@@ -718,7 +720,7 @@ def _committed_average_mismatch(result: AverageScanResult, target: str | Path, e
     except Exception:
         return 'target'
     if result.target != expected or result.entry != entry: return 'target' if result.target != expected else 'entry'
-    if type(commit) is not StreamTerminal or commit.target != expected or type(commit.ordinal) is not int or commit.ordinal <= 0: return 'commit'
+    if type(commit) is not StreamTerminal or commit.target != _normalize_target(expected) or type(commit.ordinal) is not int or commit.ordinal <= 0: return 'commit'
     try: persisted = read_provenance(expected, entry=entry)['config'][_COUNT_POLICY]; snapshot = capture_target_snapshot(expected)
     except Exception: return 'commit'
     if type(persisted) is not dict or persisted.get('operation_identity') != result.operation_identity or persisted.get('science_identity') != result.science_identity: return 'operation' if type(persisted) is not dict or persisted.get('operation_identity') != result.operation_identity else 'science'

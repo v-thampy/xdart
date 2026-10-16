@@ -24,10 +24,12 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import stat
 import threading
 from typing import Callable, ContextManager
 
+from xrd_tools.io import descriptor_path
 from xrd_tools.io.output_path import (
     NEW_OUTPUT_SUFFIX,
     artifact_family_from_source,
@@ -80,6 +82,56 @@ _fsync = os.fsync
 
 def _fsync_parent(descriptor: int) -> None:
     _fsync(descriptor)
+
+
+# Descriptor-relative custody where the platform has directory descriptors.  Windows has none, so its
+# named arm holds the admitted parent's own handle and addresses entries through that handle's final
+# path.  Read at call time, so a descriptor host can force the named arm (PR #1's _DESCRIPTOR_WALK idiom).
+_DESCRIPTOR_CUSTODY = (
+    all(function in getattr(os, "supports_dir_fd", ()) for function in (os.open, os.stat, os.unlink))
+    and hasattr(os, "O_DIRECTORY")
+)
+# IsReparseTagNameSurrogate: a junction-like reparse point that stands for another path.
+_REPARSE_NAME_SURROGATE = 0x20000000
+
+
+def _is_link(value: os.stat_result) -> bool:
+    return stat.S_ISLNK(value.st_mode) or bool(
+        getattr(value, "st_reparse_tag", 0) & _REPARSE_NAME_SURROGATE
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _NamedParent:
+    """An admitted output parent held without POSIX descriptor custody.
+
+    ``descriptor`` is the directory itself (on Windows held without delete sharing, so it cannot be
+    renamed or removed meanwhile).  Entries are addressed through its current final path, never through
+    the caller's lexical alias, and the caller's named parent is rechecked at every mutation boundary.
+    """
+
+    descriptor: int
+    identity: tuple[int, int]
+
+    def entry(self, name: str) -> str:
+        return os.path.join(descriptor_path.descriptor_final_path(self.descriptor), name)
+
+
+def _parent_handle(parent: "int | _NamedParent") -> int:
+    return parent if type(parent) is int else parent.descriptor
+
+
+def _entry_lstat(parent: "int | _NamedParent", name: str) -> os.stat_result:
+    if type(parent) is int:
+        return os.stat(name, dir_fd=parent, follow_symlinks=False)
+    return os.lstat(parent.entry(name))
+
+
+def _require_usable_identity(value: os.stat_result, role: str) -> None:
+    # Every custody guard keys on (st_dev, st_ino); a volume that reports no file identity would make
+    # them vacuous, so it is refused before any candidate exists.
+    if int(value.st_ino) == 0:
+        raise FiniteArtifactIntegrityError(f"finite {role} has no usable file identity")
 
 
 class FiniteArtifactError(RuntimeError):
@@ -1682,6 +1734,8 @@ def _entry_open(
         os.O_RDONLY
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0)
+        # Windows CRT text mode would fold CRLF and stop at 0x1A inside every HDF5 signature.
+        | getattr(os, "O_BINARY", 0)
     )
     if parent_descriptor is None:
         return os.open(normalized, flags)
@@ -1794,10 +1848,12 @@ def _snapshot_path(path: Path | str) -> FiniteFileSnapshot:
 
 
 def _snapshot_at(
-    parent_descriptor: int,
+    parent_descriptor: "int | _NamedParent",
     name: str,
     shown_path: Path | str,
 ) -> FiniteFileSnapshot:
+    if type(parent_descriptor) is not int:
+        return _snapshot_path(parent_descriptor.entry(name))
     return _snapshot_from_capture(
         shown_path,
         *_capture_regular(
@@ -1845,10 +1901,12 @@ def _observe_regular(path: Path | str) -> tuple[int, int, int, int, int, int]:
 
 
 def _observe_regular_at(
-    parent_descriptor: int,
+    parent_descriptor: "int | _NamedParent",
     name: str,
     shown_path: Path | str,
 ) -> tuple[int, int, int, int, int, int]:
+    if type(parent_descriptor) is not int:
+        return _observe_regular(parent_descriptor.entry(name))
     state, _digest_value = _capture_regular(
         shown_path,
         parent_descriptor=parent_descriptor,
@@ -1872,10 +1930,12 @@ def _try_observe(path: Path | str) -> tuple[int, int, int, int, int, int] | None
 
 
 def _try_observe_at(
-    parent_descriptor: int,
+    parent_descriptor: "int | _NamedParent",
     name: str,
     shown_path: Path | str,
 ) -> tuple[int, int, int, int, int, int] | None:
+    if type(parent_descriptor) is not int:
+        return _try_observe(parent_descriptor.entry(name))
     try:
         os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except FileNotFoundError:
@@ -1896,7 +1956,7 @@ def _require_source(admission: FiniteSourceAdmission) -> FiniteFileSnapshot:
 
 
 def _unlink_candidate(
-    parent_descriptor: int,
+    parent_descriptor: "int | _NamedParent",
     path: Path,
     expected: FiniteFileSnapshot,
 ) -> None:
@@ -1907,9 +1967,12 @@ def _unlink_candidate(
     adapters may use it concurrently, but an actor with the same filesystem
     credentials must not replace this randomized private name between the
     ownership observation and ``unlinkat``.  Public final names are never
-    removed by this helper.
+    removed by this helper.  A named parent removes the candidate through a
+    handle proven to be it (``_dispose_named_candidate``), never by name.
     """
 
+    if type(parent_descriptor) is not int:
+        return _dispose_named_candidate(parent_descriptor, path, expected)
     try:
         current = os.stat(
             path.name,
@@ -1931,6 +1994,44 @@ def _unlink_candidate(
         os.unlink(path.name, dir_fd=parent_descriptor)
     except FileNotFoundError:
         return
+
+
+def _dispose_named_candidate(
+    parent: _NamedParent,
+    path: Path,
+    expected: FiniteFileSnapshot,
+) -> None:
+    """Remove the owned candidate through a descriptor proven to be it, wherever it now lives.
+
+    Where the platform cannot delete through a descriptor (POSIX), this refuses and the caller
+    reports the exact orphan; a name is never unlinked on the strength of an earlier observation.
+    """
+    try:
+        descriptor = descriptor_path.open_leaf_for_disposal(parent.entry(path.name))
+    except FileNotFoundError:
+        return
+    primary = None
+    try:
+        current = os.fstat(descriptor)
+        if (
+            _is_link(current)
+            or not stat.S_ISREG(current.st_mode)
+            or (int(current.st_dev), int(current.st_ino)) != (expected.device, expected.inode)
+            or descriptor_path.created_leaf_misplacement(descriptor, parent.identity, path.name)
+        ):
+            raise FiniteArtifactIntegrityError(f"candidate cleanup refused a foreign object: {path}")
+        if not descriptor_path.dispose_created_leaf(descriptor):
+            raise FiniteArtifactIntegrityError(f"candidate cannot be disposed of through its handle: {path}")
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_error = _close_descriptor_once(descriptor)
+        if close_error is not None:
+            if primary is not None:
+                _attach_secondary_close(primary, close_error, "candidate disposal")
+            else:
+                raise FiniteArtifactIntegrityError("finite candidate disposal descriptor close is incomplete") from close_error
 
 
 def _bounded_diagnostic(prefix: str, error: BaseException) -> str:
@@ -2001,7 +2102,9 @@ def _release_publication_slot(hold: object | None, *, coordinator=None) -> BaseE
     return None
 
 
-def _open_publication_parent(target: Path) -> tuple[int, tuple[int, int, int, int, int, int]]:
+def _open_publication_parent(target: Path) -> tuple["int | _NamedParent", tuple[int, int, int, int, int, int]]:
+    if not _DESCRIPTOR_CUSTODY:
+        return _open_named_parent(target)
     parent = target.parent
     try:
         named_before = os.lstat(parent)
@@ -2017,22 +2120,60 @@ def _open_publication_parent(target: Path) -> tuple[int, tuple[int, int, int, in
                 or _state(named_before)[:3] != _state(opened)[:3]
                 or _state(opened)[:3] != _state(named_after)[:3]):
             raise FiniteArtifactIntegrityError("finite output parent changed during admission")
+        _require_usable_identity(opened, "output parent")
         return descriptor, _state(opened)
     except BaseException:
         _close_descriptor_once(descriptor)
         raise
 
 
-def _require_publication_parent(target: Path, descriptor: int, admitted: tuple[int, int, int, int, int, int]) -> None:
-    opened, named = os.fstat(descriptor), os.lstat(target.parent)
+def _open_named_parent(target: Path) -> tuple[_NamedParent, tuple[int, int, int, int, int, int]]:
+    """The same immediate-parent contract without dir_fd: a named non-link directory, held by handle."""
+    parent = target.parent
+    try:
+        named_before = os.lstat(parent)
+    except OSError as error:
+        raise FiniteArtifactIntegrityError("finite output parent cannot be admitted") from error
+    if _is_link(named_before) or not stat.S_ISDIR(named_before.st_mode):
+        raise FiniteArtifactIntegrityError("finite output parent must be a named non-symlink directory")
+    try:
+        descriptor = descriptor_path.open_directory(str(parent))
+    except OSError as error:
+        raise FiniteArtifactIntegrityError("finite output parent cannot be admitted") from error
+    try:
+        opened, named_after = os.fstat(descriptor), os.lstat(parent)
+        if (_is_link(named_after) or _is_link(opened) or not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(named_after.st_mode)
+                or _state(named_before)[:3] != _state(opened)[:3]
+                or _state(opened)[:3] != _state(named_after)[:3]):
+            raise FiniteArtifactIntegrityError("finite output parent changed during admission")
+        _require_usable_identity(opened, "output parent")
+        return _NamedParent(descriptor, (int(opened.st_dev), int(opened.st_ino))), _state(opened)
+    except BaseException:
+        _close_descriptor_once(descriptor)
+        raise
+
+
+def _require_publication_parent(target: Path, descriptor: "int | _NamedParent", admitted: tuple[int, int, int, int, int, int]) -> None:
+    if type(descriptor) is int:
+        opened, named = os.fstat(descriptor), os.lstat(target.parent)
+    else:
+        try:
+            opened, named = os.fstat(descriptor.descriptor), os.lstat(target.parent)
+        except OSError as error:
+            raise FiniteArtifactIntegrityError("finite output parent changed") from error
+        if _is_link(named):
+            raise FiniteArtifactIntegrityError("finite output parent changed")
     if (_state(opened)[:3] != admitted[:3] or _state(named)[:3] != admitted[:3]
             or stat.S_ISLNK(named.st_mode) or not stat.S_ISDIR(opened.st_mode)
             or not stat.S_ISDIR(named.st_mode)):
         raise FiniteArtifactIntegrityError("finite output parent changed")
 
 
-def _reserve_publication_candidate(parent_descriptor: int, target: Path, identity: str, *, suffix: str = ".candidate") -> FiniteFileSnapshot:
+def _reserve_publication_candidate(parent_descriptor: "int | _NamedParent", target: Path, identity: str, *, suffix: str = ".candidate") -> FiniteFileSnapshot:
     name = f".xdart-finite-{identity}-{secrets.token_hex(16)}{suffix}"
+    if type(parent_descriptor) is not int:
+        return _reserve_named_candidate(parent_descriptor, name)
     path = target.parent / name
     try:
         descriptor = os.open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=parent_descriptor)
@@ -2063,8 +2204,63 @@ def _reserve_publication_candidate(parent_descriptor: int, target: Path, identit
     return captured
 
 
-def _fsync_publication_candidate(parent_descriptor: int, path: Path, expected: FiniteFileSnapshot) -> None:
-    descriptor = os.open(path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_descriptor)
+def _reserve_named_candidate(parent: _NamedParent, name: str) -> FiniteFileSnapshot:
+    """Create the candidate by name, exclusively, and prove where it landed before any byte is written."""
+    path = parent.entry(name)
+    try:
+        descriptor = descriptor_path.create_exclusive_leaf(path, mode=0o600)
+    except FileExistsError as error:
+        raise FiniteArtifactCollision(f"finite private candidate already exists: {name}") from error
+    except OSError as error:  # e.g. a path this host cannot create: typed, and before any effect
+        raise FiniteArtifactIntegrityError(f"finite private candidate cannot be created: {error}") from error
+    provisional = None
+    try:
+        refusal = descriptor_path.created_leaf_misplacement(descriptor, parent.identity, name)
+        state = os.fstat(descriptor)
+        if refusal is None and (not stat.S_ISREG(state.st_mode) or int(state.st_ino) == 0):
+            refusal = f"{path}: not a regular file with a usable file identity"
+        if refusal is not None:
+            raise FiniteArtifactIntegrityError(f"finite candidate reservation refused: {refusal}")
+        provisional = FiniteFileSnapshot(_resolved_parent_path(path), int(state.st_size), hashlib.sha256(b"").hexdigest(), int(state.st_dev), int(state.st_ino), int(state.st_mode), int(state.st_mtime_ns), int(state.st_ctime_ns))
+    except BaseException as primary:
+        # Until a receipt exists, the exclusive creation handle is the cleanup authority, even if
+        # observing its metadata failed. Never lose the leaf just because reserve could not return.
+        primary.hidden_orphan = None
+        try:
+            if not descriptor_path.dispose_created_leaf(descriptor):
+                primary.hidden_orphan = descriptor_path.descriptor_final_path(descriptor)
+                primary.add_note(f"{FINITE_CANDIDATE_CLEANUP_WARNING}:{primary.hidden_orphan}")
+        except BaseException as cleanup_error:
+            primary.hidden_orphan = path
+            primary.add_note(_bounded_diagnostic(FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error) + f":{path}")
+        close_error = _close_descriptor_once(descriptor)
+        if close_error is not None:
+            _attach_secondary_close(primary, close_error, "candidate reservation")
+        raise
+    close_error = _close_descriptor_once(descriptor)
+    try:
+        if close_error is not None:
+            raise FiniteArtifactIntegrityError("finite candidate reservation close is incomplete") from close_error
+        captured = _snapshot_at(parent, name, path)
+        # Windows candidates inherit the parent ACL: no POSIX mode is claimed there (D5).
+        if (not _same_object(captured, provisional) or captured.inode == 0
+                or os.name != "nt" and stat.S_IMODE(captured.mode) != 0o600):
+            raise FiniteArtifactIntegrityError("finite candidate changed during reservation")
+    except BaseException as primary:
+        hidden, cleanup_error = _cleanup_publication_candidate(parent, Path(path), provisional)
+        primary.hidden_orphan = hidden
+        if cleanup_error is not None:
+            primary.add_note(_bounded_diagnostic(FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error) + f":{hidden}")
+        raise
+    return captured
+
+
+def _fsync_publication_candidate(parent_descriptor: "int | _NamedParent", path: Path, expected: FiniteFileSnapshot) -> None:
+    if type(parent_descriptor) is int:
+        descriptor = os.open(path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_descriptor)
+    else:  # Windows flushes only a writable handle; the identity check below proves the reopened inode
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(parent_descriptor.entry(path.name), flags)
     primary = None
     try:
         state = os.fstat(descriptor)
@@ -2083,16 +2279,22 @@ def _fsync_publication_candidate(parent_descriptor: int, path: Path, expected: F
                 raise FiniteArtifactIntegrityError("finite candidate fsync descriptor close is incomplete") from close_error
 
 
-def _cleanup_publication_candidate(parent_descriptor: int, path: Path, authority: FiniteFileSnapshot) -> tuple[str | None, BaseException | None]:
+def _cleanup_publication_candidate(parent_descriptor: "int | _NamedParent", path: Path, authority: FiniteFileSnapshot) -> tuple[str | None, BaseException | None]:
     try:
         _unlink_candidate(parent_descriptor, path, authority)
         return None, None
     except BaseException as error:
         try:
             current = _try_observe_at(parent_descriptor, path.name, path)
+            # A named parent names where its orphan lives now, even after the parent itself moved.
+            shown = str(path) if type(parent_descriptor) is int else parent_descriptor.entry(path.name)
         except BaseException:
-            current = None
-        return (str(path) if current is not None and current[:2] == (authority.device, authority.inode) else None), error
+            try:
+                current = _state(_entry_lstat(parent_descriptor, path.name))
+                shown = str(path) if type(parent_descriptor) is int else parent_descriptor.entry(path.name)
+            except BaseException:
+                current, shown = None, str(path)
+        return (shown if current is not None and current[:2] == (authority.device, authority.inode) else None), error
 
 
 @dataclass(frozen=True, slots=True)
@@ -2207,14 +2409,19 @@ class _FinitePublicationSession:
                 descriptor, self.target, secrets.token_hex(16), suffix=".nexus",
             )
             self._candidate = Path(self._reservation.path)
-        except BaseException:
+        except BaseException as error:
+            self.hidden_orphan = getattr(error, "hidden_orphan", None)
             self.abort()
             raise
 
     def open_document(self, opener: Callable[[Path], object]) -> object:
-        self._require_parent()
+        descriptor = self._require_parent()
         if self._document is not None:
             raise RuntimeError("finite publication document is already open")
+        if self._reservation is None or _observe_regular_at(
+            descriptor, self.candidate.name, self.candidate,
+        ) != _snapshot_state(self._reservation):
+            raise FiniteArtifactIntegrityError("finite candidate changed before document open")
         self._document = opener(self.candidate)
         return self._document
 
@@ -2251,7 +2458,7 @@ class _FinitePublicationSession:
         descriptor, self._parent_descriptor = self._parent_descriptor, None
         self._parent_state = None
         if descriptor is not None:
-            self._warning(FINITE_DESCRIPTOR_CLOSE_WARNING, _close_descriptor_once(descriptor))
+            self._warning(FINITE_DESCRIPTOR_CLOSE_WARNING, _close_descriptor_once(_parent_handle(descriptor)))
 
     def _discard(self) -> None:
         if self._candidate is not None and self._parent_descriptor is not None and self._reservation is not None:
@@ -2293,7 +2500,10 @@ class _FinitePublicationSession:
             if expected_target is not None and capture_target_snapshot(self.target) != expected_target:
                 raise FiniteArtifactIntegrityError("finite public target changed")
             rename_attempted = True
-            replace_into_place(candidate.name, self.target.name, verb="publish", src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            if type(descriptor) is int:
+                replace_into_place(candidate.name, self.target.name, verb="publish", src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            else:  # full paths from the held parent's proven location, never the process directory
+                replace_into_place(descriptor.entry(candidate.name), descriptor.entry(self.target.name), verb="publish")
             renamed = self._published = True
             try:
                 observed = _try_observe_at(descriptor, self.target.name, self.target)
@@ -2303,10 +2513,14 @@ class _FinitePublicationSession:
             if observed is None or observed[:2] != (expected.device, expected.inode):
                 raise FiniteArtifactIntegrityError("finite slot changed under an exclusive hold")
             terminal = observe(self.target, ordinal)
-            try:
-                _fsync_parent(descriptor)
-            except BaseException as error:
-                self._warning(FINITE_PARENT_DIRECTORY_FSYNC_WARNING, error)
+            if type(descriptor) is not int:  # no directory barrier is claimed: say so, never skip silently
+                self._warning(FINITE_PARENT_DIRECTORY_FSYNC_WARNING,
+                              OSError("no directory barrier is confirmed for a parent without dir_fd"))
+            else:
+                try:
+                    _fsync_parent(descriptor)
+                except BaseException as error:
+                    self._warning(FINITE_PARENT_DIRECTORY_FSYNC_WARNING, error)
             return _FinitePublicationFacts(True, terminal, None)
         except BaseException as error:
             primary = error
@@ -2335,7 +2549,7 @@ class _FinitePublicationSession:
                     # rule: an occupied name after an ambiguous rename is not
                     # proof that nothing was published.
                     try:
-                        os.stat(self.target.name, dir_fd=descriptor, follow_symlinks=False)
+                        _entry_lstat(descriptor, self.target.name)
                     except FileNotFoundError:
                         raise observation_error
                     renamed = self._published = True
@@ -2450,9 +2664,13 @@ class FiniteArtifactPublisher:
             (source.size + 9) // 10,
         )
         required = source.size + margin
-        observed = os.fstatvfs(parent_descriptor)
-        fragment = int(observed.f_frsize)
-        available = int(observed.f_bavail) * fragment
+        if type(parent_descriptor) is int:
+            observed = os.fstatvfs(parent_descriptor)
+            fragment = int(observed.f_frsize)
+            available = int(observed.f_bavail) * fragment
+        else:  # no fstatvfs without directory descriptors: the admitted parent's own volume
+            fragment = 1
+            available = int(shutil.disk_usage(descriptor_path.descriptor_final_path(parent_descriptor.descriptor)).free)
         if fragment <= 0 or available < 0:
             raise FiniteArtifactIntegrityError(
                 "finite candidate filesystem capacity is unavailable"
@@ -2480,12 +2698,12 @@ class FiniteArtifactPublisher:
     ) -> tuple[FiniteCandidateBinding, _BindingOwner]:
         flags = (
             os.O_RDWR if writable else os.O_RDONLY
-        ) | getattr(os, "O_NOFOLLOW", 0)
+        ) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         try:
-            descriptor = os.open(
-                candidate.name,
-                flags,
-                dir_fd=parent_descriptor,
+            descriptor = (
+                os.open(candidate.name, flags, dir_fd=parent_descriptor)
+                if type(parent_descriptor) is int
+                else os.open(parent_descriptor.entry(candidate.name), flags)
             )
         except OSError as error:
             raise FiniteArtifactIntegrityError(
@@ -2618,17 +2836,18 @@ class FiniteArtifactPublisher:
             raise FiniteArtifactIntegrityError(
                 "finite seed admission does not match the request source snapshot"
             )
-        source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        target_flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        binary = getattr(os, "O_BINARY", 0)  # raw copies must never pass through CRT text mode
+        source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | binary
+        target_flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | binary
         source_descriptor = os.open(source.path, source_flags)
         target_descriptor: int | None = None
         primary: BaseException | None = None
         close_cause: BaseException | None = None
         try:
-            target_descriptor = os.open(
-                candidate_path.name,
-                target_flags,
-                dir_fd=parent_descriptor,
+            target_descriptor = (
+                os.open(candidate_path.name, target_flags, dir_fd=parent_descriptor)
+                if type(parent_descriptor) is int
+                else os.open(parent_descriptor.entry(candidate_path.name), target_flags)
             )
             opened_source = os.fstat(source_descriptor)
             opened_target = os.fstat(target_descriptor)
@@ -2966,7 +3185,7 @@ class FiniteArtifactPublisher:
             try:
                 self._acquire_slot()
             except BaseException:
-                _close_descriptor_once(parent_descriptor)
+                _close_descriptor_once(_parent_handle(parent_descriptor))
                 raise
             candidate: Path | None = None
             reservation: FiniteFileSnapshot | None = None
@@ -3005,7 +3224,7 @@ class FiniteArtifactPublisher:
                             ))
                         except BaseException:
                             pass
-                close_error = _close_descriptor_once(parent_descriptor)
+                close_error = _close_descriptor_once(_parent_handle(parent_descriptor))
                 if close_error is None:
                     return
                 diagnostics.append(_bounded_diagnostic(

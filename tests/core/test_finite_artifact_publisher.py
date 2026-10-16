@@ -644,7 +644,7 @@ def test_private_candidate_is_factory_owned_mode_0600_and_not_public_nexus(
 
     result = _publish(request, writer=writer, prepublish=prepublish)
     assert result.disposition is FiniteArtifactDisposition.COMMITTED
-    assert observed["mode"] == 0o600
+    assert os.name == "nt" or observed["mode"] == 0o600  # Windows inherits the parent ACL (D5)
     assert not Path(observed["path"]).exists()
     binding = observed["binding"]
     assert binding.closed
