@@ -1395,7 +1395,7 @@ def test_p1b_b12_stop_cancel_preserves_exact_durable_prefix(
             self.submits += 1
             return True
 
-        def finish_current(self):
+        def finish_current(self, *, stopped=False):
             return SimpleNamespace(failed=False, cancelled=False)
 
     class WorkerPeerSession(PeerSession):

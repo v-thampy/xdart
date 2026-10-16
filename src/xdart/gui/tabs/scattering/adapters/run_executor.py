@@ -2511,7 +2511,7 @@ class StandardRunExecutor:
                 if not finished_current:
                     result = output.commit_epoch()
                 else:
-                    result = output.finish_current()
+                    result = output.finish_current(stopped=run.stop_requested)
             except BaseException as error:
                 session_error = error
             _perf_add(run, "finish_writer_seal", monotonic() - seal_started)
