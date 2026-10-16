@@ -1157,6 +1157,8 @@ def _live_metadata_ready(
         if ready == len(candidates):
             return ready, ""
         return ready, f"waiting for the SPEC row of {Path(candidates[ready].path).name}"
+    if SourceKind.IMAGE_FILE not in getattr(get_adapter(candidates[0].adapter_id), "kinds", (SourceKind.IMAGE_FILE,)):
+        return len(candidates), ""  # a container's own metadata: sidecars are an image policy
     from xrd_tools.io.metadata import live_sidecar_observation
 
     ready, reason, listings = len(candidates), "", {}
