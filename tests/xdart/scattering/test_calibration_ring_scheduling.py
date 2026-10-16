@@ -6,8 +6,12 @@ a superseded edit's rings are never shown; the rings neither wait for nor hold t
 Calibrate and predict jobs); the window's close receipt covers their worker, and nothing arrives after it. The rings
 are the headless kernel's (``predict_frame_seed``), exactly: per-frame energy, geometry, masks and invalid pixels.
 
+Only a shown window predicts: an accepted close lets its prediction go, nothing is adopted while it is hidden, and
+reopening asks again for the current inputs (an ignored close keeps the prediction). A page letting its window go
+retains at most that one retiring window until its worker's receipt is CLEAN, then deletes it (R7).
+
 ``_KernelStarts`` observes which threads start the prediction kernels (``sys.monitoring`` PY_START); it replaces
-nothing.
+nothing. ``_hold_rings`` holds the real ring job at its entry for deterministic ordering; the real job then runs.
 """
 from dataclasses import replace
 import os
@@ -122,6 +126,8 @@ def _window(tmp_path, poni):
     for key, value in (('rough_distance', '390'), ('beam_pixel', f'{poni.poni2 / 172e-6:.1f}, {poni.poni1 / 172e-6:.1f}')):
         dialog._set_field_text(key, value)
     dialog.session_dir = tmp_path / 'frames'
+    dialog.show()  # only a shown window predicts its rings
+    QtWidgets.QApplication.processEvents()
     return dialog
 
 
@@ -133,6 +139,20 @@ def _close(dialog):
         receipt = dialog.shutdown()
     dialog.close()
     return receipt
+
+
+def _hold_rings(monkeypatch):
+    """Hold the real ring job at its entry until ``gate`` is set (``entered`` says it waits); the real job then runs."""
+    from xdart.gui.tabs.calibration import dialog as module
+    gate, entered = threading.Event(), threading.Event()
+    real = getattr(module, '_predict_rings', None)
+
+    def held(request, cancelled, publish):
+        entered.set()
+        gate.wait(60)
+        return real(request, cancelled, publish)
+    monkeypatch.setattr(module, '_predict_rings', held, raising=False)
+    return gate, entered
 
 
 def test_the_table_appears_at_once_and_every_frames_rings_come_from_the_worker(tmp_path, request):
@@ -253,6 +273,7 @@ def test_a_real_sessions_rings_are_predicted_off_the_gui_thread(tmp_path, reques
         for key, value in (('rough_distance', f"{policy['distance_seed_m'] * 1000:.12g}"), ('beam_pixel', '514, 256')):
             dialog._set_field_text(key, value)
         dialog.frames = frames
+        dialog.show()
         dialog._render_frames()
         _settle(dialog)
         assert dialog._conditioning().mode == 'auto'
@@ -276,3 +297,128 @@ def test_a_real_sessions_rings_are_predicted_off_the_gui_thread(tmp_path, reques
         assert _close(dialog).status is PageCleanup.CLEAN
     finally:
         dialog.close()
+
+
+def test_a_closed_window_adopts_nothing_and_reopening_asks_for_the_current_rings(tmp_path, monkeypatch):
+    """R6: an accepted close lets the window's prediction go and nothing returns to the hidden window; reopening with
+    changed inputs before the old prediction drains shows only the current rings, from the same owner; an ignored close
+    (Cancel in the unsaved-setup prompt) keeps the visible window's prediction. The calibration lane stays idle."""
+    from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
+    gate, entered = _hold_rings(monkeypatch)
+    frames, poni = _staged(tmp_path)
+    dialog = _window(tmp_path, poni)
+    qapp = QtWidgets.QApplication.instance()
+    try:
+        dialog.frames = frames
+        dialog._render_frames()  # LaB6's rings asked for; the job waits at its entry
+        assert entered.wait(10)
+        lab6 = _expected(dialog, frames)
+        dialog.close()  # accepted: hidden, its prediction let go
+        assert not dialog.isVisible() and not dialog.active()
+        hidden = []
+        with _KernelStarts() as starts:
+            gate.set()  # the held job returns to a hidden window
+            for _ in range(40):
+                qapp.processEvents()
+                time.sleep(.005)
+                hidden.append(_cells(dialog))
+        assert starts.starts == []  # nothing is predicted for a hidden window
+        assert all(text == PENDING for state in hidden for text, _ in state)  # and nothing is adopted
+        # reopened, then closed again while its prediction waits; edited while hidden; reopened before it drains
+        gate.clear()
+        entered.clear()
+        dialog.show()
+        assert entered.wait(10)
+        dialog.close()
+        dialog.refine_calibrant.setCurrentText('CeO2')
+        dialog.show()
+        assert not dialog.active()
+        seen = []
+        gate.set()
+        cells = _settle(dialog, seen)
+        latest = _expected(dialog, frames)
+        assert cells == latest and latest != lab6
+        stale = {cell for cell in lab6 if cell not in latest}
+        assert stale and not any(cell in stale for state in seen for cell in state)
+        # an ignored close: Cancel in the unsaved-setup prompt keeps the visible window's prediction
+        gate.clear()
+        entered.clear()
+        dialog._saved_setup = dialog._setup_state()
+        phi = dialog.geometry_editor.axis_box('phi')
+        assert phi.findData(-1) >= 0
+        phi.setCurrentIndex(phi.findData(-1))  # a setup edit: closing now asks first
+        dialog.refine_calibrant.setCurrentText('Si')  # new inputs asked; the job waits at its entry
+        assert entered.wait(10)
+        _close_with(dialog, qapp, 'Cancel')
+        assert dialog.isVisible() and not dialog.active()
+        gate.set()
+        assert _settle(dialog) == _expected(dialog, frames)
+        phi.setCurrentIndex(phi.findData(1))  # the setup as saved: the final close asks nothing
+        assert _close(dialog).status is PageCleanup.CLEAN
+    finally:
+        gate.set()
+        dialog.close()
+
+
+@pytest.mark.parametrize('kind', ['Stitch', 'RSM'])
+def test_a_page_retires_one_released_window_once_its_worker_is_clean(tmp_path, monkeypatch, kind):
+    """R7: a page letting its calibration window go (a Project change) while the window's ring worker runs keeps that
+    one retiring window, refuses a replacement with a reason meanwhile and keeps its own inputs usable; once the worker
+    returns, its existing authoring timer retires the window (out of its windows, deleted) without closing the page,
+    and the next Calibrate opens a new window. The page then closes CLEAN."""
+    import shiboken6
+    from PySide6 import QtCore
+    from xdart.gui.pages.services import empty_host_services
+    from tests.xdart.pages.test_stitch_page import _Status
+    if kind == 'Stitch':
+        from xdart.gui.tabs.stitch.page import StitchPage as Page
+    else:
+        from xdart.gui.tabs.rsm.page import RSMPage as Page
+    qapp = QtWidgets.QApplication.instance()
+    gate, entered = _hold_rings(monkeypatch)
+    frames, poni = _staged(tmp_path)
+    page = Page(empty_host_services(_Status()))
+    try:
+        page.set_field('project_root', str(tmp_path / 'first'))
+        page._calibrate()
+        dialog = page._calibration_dialog
+        assert dialog is not None and dialog.isVisible()
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        for key, value in (('rough_distance', '390'), ('beam_pixel', f'{poni.poni2 / 172e-6:.1f}, {poni.poni1 / 172e-6:.1f}')):
+            dialog._set_field_text(key, value)
+        dialog.session_dir = tmp_path / 'frames'
+        dialog.frames = frames
+        dialog._render_frames()
+        assert entered.wait(10)  # the window's ring worker is running
+        page.set_field('project_root', str(tmp_path / 'second'))
+        for _ in range(3):  # Calibrate on the new Project: the old window is let go; a replacement waits for it
+            page._calibrate()
+            qapp.processEvents()
+            calibration = [each for each in page._authoring_dialogs if type(each) is CalibrationDialog]
+            assert calibration == [dialog] and page._calibration_dialog is None and not dialog.isVisible()
+            assert 'closing' in page.run_bar.readinessLabel.full_text()
+            assert not page.active() and page.calibrate_button.isEnabled()  # the page's inputs stay usable
+        gate.set()  # the worker returns; the page's authoring timer retires the window
+        until = time.monotonic() + 30
+        while dialog in page._authoring_dialogs and time.monotonic() < until:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert dialog not in page._authoring_dialogs
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+        assert not shiboken6.isValid(dialog)
+        page._calibrate()
+        again = page._calibration_dialog
+        assert again is not None and again.isVisible()
+        assert [each for each in page._authoring_dialogs if type(each) is CalibrationDialog] == [again]
+    finally:
+        gate.set()
+        until = time.monotonic() + 30
+        close = getattr(page, 'shutdown', None) or page.close_page
+        receipt = close()
+        while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+            qapp.processEvents()
+            time.sleep(.005)
+            receipt = close()
+        assert receipt.status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
