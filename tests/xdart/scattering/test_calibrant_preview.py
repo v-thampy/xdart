@@ -57,6 +57,8 @@ def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(r
         dialog.show()
         dialog._show_calibration_fit()
         window = dialog._calibration_fit_window
+        assert window.pattern_view.vertical_splitter.isHidden(), 'never show the initial Int layout while stitching'
+        assert window.pattern_view.viewer_intensity_row.isHidden()
         assert 'calculated |q| − expected ring |q|' in window.summary.text()
         assert window.plot.getPlotItem().getAxis('bottom').labelText == 'del motor angle (°)'
         assert isinstance(window.pattern_view, ScientificView)
@@ -68,6 +70,7 @@ def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(r
             time.sleep(.02)
         state = window.pattern_view.keyed_projection
         assert state is not None, dialog.status.text()
+        assert state.share_axis, 'the stacked preview shares Q by default'
         assert '3 frames' in state.status
         image, trace = state.panels
         assert image.image.shape == (image.y_axis.values.size, image.x_axis.values.size)

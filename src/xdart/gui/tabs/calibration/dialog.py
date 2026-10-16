@@ -38,6 +38,7 @@ from xrd_tools.integrate.stitch_calibration import (
     load_calibration_session, pair_validation_angles, save_calibration_pair, save_calibration_session,
     scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
     direct_beam_scan_motor, open_calibration_beam_scan,
+    CalibrationSessionResume,
 )
 from .fit_windows import (
     PARAMETER_LABELS, RECORD_LABELS, CalibrationFitWindow, DirectBeamFitWindow, calibration_fit_text, direct_beam_fit_text,
@@ -539,6 +540,8 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._loaded_calibration_kind = None
         self._fit_setup = None
         self._close_after_save = False
+        self._finish_after_save = False
+        self._pending_session_resume = None
         #: The arm the staged frames read: (del, nu), or (2θ, None) for fourc/twoc.
         self._frame_motors = ('del', 'nu')
         #: The instrument the current fit recorded; any other value leaves it unsaveable.
@@ -2473,7 +2476,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     _QUICK_TIP = ('Fits the direct-beam scan, reads the calibrant scan\'s metadata, then refines automatically from the '
                   'rough geometry. Starting Quick selects Direct-beam scan in the shared Rough geometry setting; '
                   'every other setting is the same as the tabs. It stops at the '
-                  'first problem, never saves, and changes no camera, motor sense or zero.')
+                  'first problem and changes no camera, motor sense or zero. A resumable session is recorded; '
+                  'geometry is exported only with Save geometry and use.')
 
     #: The freedom every fit keeps about its estimates (maintainer, 2026-09-29), with defaults.
     _BOUND_DEFAULTS = {'zero_freedom': '2', 'mount_freedom': '2', 'displacement_limit': '0.05',
@@ -2724,13 +2728,22 @@ class CalibrationDialog(QtWidgets.QDialog):
                 **({'conditioning': self._conditioning().to_dict()} if self._conditioning().mode != 'off' else {})}
 
     def _save_session(self, policy=None):
-        """Record the session's frames with the fit policy (combined Stitch review F2): when frames are
+        """Record shared inputs, results and any staged frames with the fit policy: when frames are
         prepared, a row calibrated or imported, a Fit or Refine done (the policy that job took), and
         at close. A malformed entry leaves the file as it was."""
         policy = self._fit_policy() if policy is None else policy
-        if not self.frames or self._frame_motors is None or policy is None:
+        if policy is None:
             return
-        save_calibration_session(self.session_dir, self.frames, arm=self._frame_motors, fit_policy=policy)
+        beam = self._distance_result if self._distance_fresh() else None
+        context = (dict(key=self._distance_key, detection=self._beam_detection[1:],
+                        energy_eV=self._distance_energy_eV, held=self._distance_held,
+                        warning=self._distance_warning, provenance=self._distance_record(beam))
+                   if beam is not None else None)
+        resume = CalibrationSessionResume(self.settings(), self.fit,
+            self._fit_source if self.fit is not None else None, beam, context)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        arm = self._frame_motors if self.frames else self.geometry_editor.value().stitch_arm()
+        return save_calibration_session(self.session_dir, self.frames, arm=arm, fit_policy=policy, resume=resume)
 
     def _apply_fit_policy(self, policy):
         """A session's recorded choices into the window: its Diffractometer first, since the zeros are
@@ -3174,6 +3187,15 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.fit, scan_angles=self._scan_angles(self.fit))))
         self._guard(go)
 
+    def _save_and_close(self):
+        """Finish through the existing pair writer; only a successful session and handoff close the windows."""
+        if self.active():
+            return
+        self._finish_after_save = True
+        self._save()
+        if not self._owner.busy:  # Cancel in the picker, or a refusal before starting the writer
+            self._finish_after_save = False
+
     def _setup_state(self):
         """The instrument/detector setup that changes the meaning of a saved calibration."""
         return (self.geometry_editor.value(), self.camera.value(),
@@ -3479,7 +3501,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._start('distance', request)
         self._guard(go)
 
-    def _show_direct_beam_fit(self):
+    def _show_direct_beam_fit(self, *, show=True):
         """The direct-beam fit in its own window, with the distance (opened after every fit)."""
         if self._distance_result is None:
             self.status.setText('Fit a direct-beam scan first.')
@@ -3489,8 +3511,9 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._direct_beam_fit_window = DirectBeamFitWindow(self)
         self._direct_beam_fit_window.show_result(self._distance_result, self._distance_energy_eV,
                                                  self._distance_held, self._distance_warning)
-        self._direct_beam_fit_window.show()
-        self._direct_beam_fit_window.raise_()
+        if show:
+            self._direct_beam_fit_window.show()
+            self._direct_beam_fit_window.raise_()
         self.show_fit_button.setEnabled(True)
 
     def _direct_beam_motion_warning(self):
@@ -3547,19 +3570,21 @@ class CalibrationDialog(QtWidgets.QDialog):
                                                  self._distance_held, advice)
                             if self._distance_fresh() else self._STALE_DISTANCE)
 
-    def _show_calibration_fit(self):
+    def _show_calibration_fit(self, *, preview=True):
         """The ring fit (Fit or Refine) in its own window, with what it found (opened after every fit)."""
         if self.fit is None:
             self.status.setText('Fit the calibrated frames or refine first.')
             return
         if self._calibration_fit_window is None:
-            self._calibration_fit_window = CalibrationFitWindow(self)
+            self._calibration_fit_window = CalibrationFitWindow(self, page=self.context.page)
             self._calibration_fit_window.previewRequested.connect(self._stitch_preview)
             self._calibration_fit_window.previewClosed.connect(self._cancel_preview)
-        self._calibration_fit_window.show_result(self.fit, self._fit_kind)
+            self._calibration_fit_window.saveRequested.connect(self._save_and_close)
+        self._calibration_fit_window.show_result(self.fit, self._fit_kind, preview=preview)
         self._calibration_fit_window.show()
         self._calibration_fit_window.raise_()
         self.show_calibration_fit_button.setEnabled(True)
+        self._sync_job_buttons()
 
     def _preview_inputs(self):
         return (id(self.fit), self._spec(), self._orientation(), self._text('mask'),
@@ -3684,7 +3709,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.status.setText('New session. Earlier saved session files remain available.')
 
     def _resume(self):
-        if self._owner.busy:
+        if self.active():
             return
         def go():
             from xdart.gui.widgets.file_dialogs import browse
@@ -3692,16 +3717,28 @@ class CalibrationDialog(QtWidgets.QDialog):
                            fallback=str(self.project_root))
             path = picks[0] if picks else ''
             if path:
-                frames, arm, policy = load_calibration_session(path, with_arm=True, with_policy=True)
+                frames, arm, policy, resume = load_calibration_session(path, with_resume=True)
                 # an older session names no arm: del and nu in order, or a vertical 2θ arm
-                motors = arm or (tuple(frames[0].motors) + (None,))[:2]
-                if (policy is not None and 'instrument_geometry' not in policy
+                motors = arm or ((tuple(frames[0].motors) + (None,))[:2] if frames
+                                 else self.geometry_editor.value().stitch_arm())
+                if (resume is None and policy is not None and 'instrument_geometry' not in policy
                         and tuple(self.geometry_editor.value().stitch_arm()) != tuple(motors)):
                     # a version-4 session's zeros are by circle of its arm: never read by another
                     raise ValueError(f"this session's arm is del = {motors[0] or 'held'}, nu = {motors[1] or 'held'}: "
                                      'choose that Diffractometer under 1 · Instrument, then open it again')
                 self.frames, self._frame_motors = frames, motors
                 self.session_dir = Path(path).parent
+                if resume is not None:
+                    self._invalidate_fit()
+                    self._pending_session_resume = resume
+                    self.apply_settings(resume.setup)
+                    if policy is not None:
+                        self._apply_fit_policy(policy)
+                    self._prediction = None
+                    self._render_frames()
+                    self.status.setText('Restoring calibration inputs and checking source metadata…')
+                    self._restore_session_when_ready(resume)
+                    return
                 if policy is not None:  # its own zeros and bounds, before anything is predicted (Codex F6)
                     self._apply_fit_policy(policy)
                 self._invalidate_fit()
@@ -3715,6 +3752,42 @@ class CalibrationDialog(QtWidgets.QDialog):
                 elif 'refine_energy' not in policy:
                     self.status.setText('This session records no energy, motor-scale or Diffractometer choice: '
                                         'the window\'s are used.')
+        self._guard(go)
+
+    def _restore_session_when_ready(self, resume):
+        if self._pending_session_resume is not resume:
+            return
+        if self._owner.busy or self._beam_probe_timer.isActive() or self._pending_source_details is not None:
+            QtCore.QTimer.singleShot(20, lambda: self._restore_session_when_ready(resume))
+            return
+        self._pending_session_resume = None
+        def go():
+            source = self._spec() if resume.fit is not None else None
+            if resume.fit is not None and not resume.matches_source(source):
+                raise ValueError('Session inputs differ from the retained fit source. Check the page Entry and '
+                                 'calibrant inputs; the saved session and fit are unchanged.')
+            context = resume.direct_beam_context or {}
+            if resume.direct_beam is not None and context.get('detection'):
+                self._beam_detection = (self._beam_generation, *context['detection'])
+                if context.get('key') == self._direct_beam_key():
+                    self._distance_result, self._distance_key = resume.direct_beam, context['key']
+                    self._distance_energy_eV = context.get('energy_eV')
+                    self._distance_held, self._distance_warning = context.get('held', {}), context.get('warning')
+                    self._distance_provenance = context.get('provenance')
+                    self._distance_provenance_key = self._distance_key
+                    self._render_direct_beam_advice()
+                    self._show_direct_beam_fit(show=False)
+            if resume.fit is not None:
+                self.fit, self._fit_source = resume.fit, source
+                self._fit_kind = ('refine' if resume.fit.asset['provenance'].get('automatic_refinement') else 'fit')
+                self._fit_instrument = resume.fit.asset['provenance'].get('instrument_geometry')
+                self._fit_setup = self._setup_state()
+                self.fit_summary.setPlainText(fit_summary_text(resume.fit))
+                self._show_tab('calibrate')
+                self._show_calibration_fit(preview=False)  # retained residuals; stitching remains an explicit request
+            self._sync_job_buttons()
+            self._refresh_checklist()
+            self.status.setText('Calibration session restored; no fit was rerun.')
         self._guard(go)
 
     #: The buttons that start a job wait while one runs (maintainer, 2026-10-09): the background direct-beam probe
@@ -3732,6 +3805,11 @@ class CalibrationDialog(QtWidgets.QDialog):
                 button.setEnabled(not self._owner.busy)
         if hasattr(self, 'save_button'):  # it saves the adopted fit: enabled with one, as adoption sets it
             self.save_button.setEnabled(self.fit is not None and not self._owner.busy)
+        if self._calibration_fit_window is not None:
+            enabled = self.fit is not None and not self.active()
+            self._calibration_fit_window.set_save_enabled(enabled,
+                '' if enabled else 'Wait for the current operation to finish.' if self.active()
+                else 'Fit or refine the current inputs before saving.')
 
     def _sync_quick_button(self):
         """Every start and end of a job comes here: the Quick button and the job buttons follow it."""
@@ -4022,6 +4100,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                         window.show_preview(result)
                     self._preview_key = None
                 elif kind == 'save':  # the ring fit, or the direct-beam geometry (_save_rough)
+                    finish, self._finish_after_save = self._finish_after_save, False
                     if self._close_after_save:
                         from xrd_tools.integrate.stitch_calibration import paired_xu_calibration
                         paired_xu_calibration(result.pyfai_path)
@@ -4061,12 +4140,14 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.status.setText(f'Frame {result.index} saved. ' + (
                         'Next: Calibrate selected frame…' if pending else 'All frames calibrated: fit them below, then save.'))
                 elif kind == 'save':  # a direct-beam geometry saved against its scan's motion still says so
+                    if finish and self._save_session() is None:
+                        raise ValueError('Record a valid calibration session before closing.')
                     advice = (self._distance_warning
                               if self._loaded_calibration_kind == 'direct_beam_not_ring_fitted' else None)
                     self.status.setText(saved_pair_text(result) if advice is None
                                         else f'⚠ {advice}\n{saved_pair_text(result)}')
                     self.calibrationSaved.emit(result.pyfai_path, 'multigeometry')  # once, with both files written
-                    if self._close_after_save:
+                    if self._close_after_save or finish:
                         self._close_after_save = False
                         self.close()
                 elif kind == 'beam_detect':
@@ -4083,12 +4164,15 @@ class CalibrationDialog(QtWidgets.QDialog):
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:
                 self._close_after_save = False
+                self._finish_after_save = False
                 self._job_status(str(error))
         elif terminal.status is OperationTerminalStatus.CANCELLED:
             self._close_after_save = False
+            self._finish_after_save = False
             self._job_status('Cancelled. Previously completed frames and saved files are retained.')
         else:
             self._close_after_save = False
+            self._finish_after_save = False
             self._job_status(terminal.failure_message)
         if kind == 'orientation' and self.orientation_panel is not None:
             if terminal.status is OperationTerminalStatus.CANCELLED:
@@ -4128,6 +4212,7 @@ class CalibrationDialog(QtWidgets.QDialog):
             page.setEnabled(enabled or key == 'orientation')
 
     def closeEvent(self, event):
+        self._pending_session_resume = None
         if (not self._owner.busy and self._saved_setup is not None
                 and self._setup_state() != self._saved_setup):
             box = QtWidgets.QMessageBox(self)
@@ -4197,11 +4282,12 @@ class CalibrationDialog(QtWidgets.QDialog):
 
     def active(self):
         """Whether host navigation must retain this window's worker."""
-        return self._owner.busy
+        return self._owner.busy or self._pending_session_resume is not None
 
     def shutdown(self):
         """Host Exit: cancel and return the existing retryable close receipt."""
         from xdart.gui.pages.values import PageCleanup
+        self._pending_session_resume = None
         self._quick_stage = self._quick_kind = None
         self._beam_probe_timer.stop()
         self._timer.stop()

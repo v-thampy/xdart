@@ -17,6 +17,7 @@ import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView
+from xrd_tools.session.display_logic import PanelKey, PanelRole
 
 #: The fitted parameters in plain words, with their units (fit_bounds' public names; maintainer,
 #: 2026-09-29: "the zero hold etc are not very descriptive and helpful"). pyFAI's axes: 1 vertical
@@ -132,12 +133,16 @@ class CalibrationFitWindow(FitWindow):
 
     previewRequested = QtCore.Signal()
     previewClosed = QtCore.Signal()
+    saveRequested = QtCore.Signal()
+    _IMAGE = PanelKey(PanelRole.SLICE_2D, 'calibrant')
+    _TRACE = PanelKey(PanelRole.PROJ_1D, 'calibrant')
+    _LAYOUT = ((_IMAGE,), (_TRACE,))
     _UPPER = FitPanel(title='Ring residuals versus motor angle',
                       y_label='Δ|q| (10⁻³ Å⁻¹)', zero_line=True)
     _LOWER = FitPanel(title='Ring residuals versus expected ring Q',
                       x_label='Expected ring Q (Å⁻¹)', y_label='Δ|q| (10⁻³ Å⁻¹)', zero_line=True)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, page='Stitch'):
         super().__init__(parent, 'calibrationFitWindow', 'Calibration fit')
         self.view.reconcile(FitProjection(self._UPPER, self._LOWER))
         from xdart.gui.tabs.scattering.scientific_view import ScientificView
@@ -146,15 +151,26 @@ class CalibrationFitWindow(FitWindow):
         self.layout().removeWidget(self.view)
         self.layout().addWidget(self.panels)
         self.pattern_view = ScientificView(self)
-        self.pattern_view.set_hidden_tools('norm', 'background', 'raw', 'slice', 'phases')
+        self.pattern_view.set_hidden_tools('norm', 'background', 'raw', 'slice', 'phases', 'viewer_controls')
+        self.pattern_view.prepare_keyed_layout(self._LAYOUT)
         self.pattern_view.set_page_tools(('preview', 'Stitch calibrant',
             'Stitch the complete calibrant scan with the fitted geometry (no files are written).'))
         self.pattern_view.commandRequested.connect(self._pattern_command)
         self.panels.addTab(self.pattern_view, 'Stitched calibrant')
         self.panels.addTab(self.view, 'Fit residuals')
         self.panels.currentChanged.connect(self._panel_changed)
+        from .orientation_views import action
+        self.save_button = action(f'Save geometry and use in {page}',
+            'Save the validated geometry and resumable calibration session, use it in the page, then close '
+            'both calibration windows. Cancel or a save failure keeps the result open.', self)
+        self.save_button.clicked.connect(lambda: self.saveRequested.emit())
+        self.layout().addWidget(self.save_button)
+        self.set_save_enabled(False, 'Fit or refine the current inputs before saving.')
         self._fit = None
         self._preview_busy = False
+
+    def set_save_enabled(self, enabled, reason=''):
+        self.save_button.apply_spec(replace(self.save_button.spec, enabled=enabled, reason=reason))
 
     def _panel_changed(self, index):
         if (self.panels.widget(index) is self.pattern_view
@@ -195,29 +211,31 @@ class CalibrationFitWindow(FitWindow):
             AxisProjection, KeyedImageProjection, KeyedTraceProjection, KeyedPanelsProjection)
         from xrd_tools.session.display_logic import PanelKey, PanelRole
         from xrd_tools.session.rsm_viewer_model import rsm_axis_bounds
-        image_key, trace_key = PanelKey(PanelRole.SLICE_2D, 'calibrant'), PanelKey(PanelRole.PROJ_1D, 'calibrant')
+        image_key, trace_key = self._IMAGE, self._TRACE
         cake, profile = result.payload, result.profile[0]
         axis = lambda values, label: AxisProjection(np.asarray(values), label,
             edges=rsm_axis_bounds(values))
         preview = result.provenance['calibrant_preview']
         count = preview['frame_count']
-        self.pattern_view.reconcile_keyed(KeyedPanelsProjection(((image_key,), (trace_key,)), (
+        self.pattern_view.reconcile_keyed(KeyedPanelsProjection(self._LAYOUT, (
             KeyedImageProjection(image_key, 'Stitched calibrant', cake.intensity.T,
                 axis(cake.radial, 'Q (Å⁻¹)'), axis(cake.azimuthal, 'χ (°)'), 0, (), navigation=False),
             KeyedTraceProjection(trace_key, 'Stitched intensity profile',
                 axis(profile.radial, 'Q (Å⁻¹)'), profile.intensity, 'I (a.u.)')),
-            title=f"{preview['label']} · fitted geometry", status=f'{count} frames · solid angle on · polarization off · normalization None'))
+            title=f"{preview['label']} · fitted geometry", status=f'{count} frames · solid angle on · polarization off · normalization None',
+            log_scale=self.pattern_view.log_scale.isChecked(), color_map=self.pattern_view.color_map.currentText(),
+            share_axis=True))
 
     def closeEvent(self, event):
         self.previewClosed.emit()
         super().closeEvent(event)
 
-    def show_result(self, fit, kind='fit'):
+    def show_result(self, fit, kind='fit', *, preview=True):
         """Plot ``fit`` (a ``CalibrationFit``; ``kind`` 'fit' or 'refine') and say what it found."""
         self.setWindowTitle('Automatic refinement' if kind == 'refine' else 'Calibration fit')
         if fit is not self._fit:
             self.clear_preview()
-            self.panels.setCurrentWidget(self.pattern_view)
+            self.panels.setCurrentWidget(self.pattern_view if preview else self.view)
             QtCore.QTimer.singleShot(0, lambda: self.isVisible() and self._panel_changed(self.panels.currentIndex()))
         self._fit = fit
         provenance = fit.asset.get('provenance', {})
