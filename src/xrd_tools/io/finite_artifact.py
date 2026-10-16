@@ -253,12 +253,12 @@ class FiniteFileSnapshot:
                     self.ctime_ns,
                 )
             )
+            # No width bound on the identity: Windows reports a 64-bit volume serial (st_dev) and, since
+            # Python 3.12, file IDs up to 128 bits (st_ino); a hosted NTFS st_dev exceeded 2**63 - 1.
             or any(
                 value > _I64_MAX
                 for value in (
                     self.size,
-                    self.device,
-                    self.inode,
                     self.mode,
                     self.mtime_ns,
                     self.ctime_ns,
@@ -1273,7 +1273,8 @@ def admit_finite_artifact_lineage(value: str | bytes) -> FiniteArtifactLineage:
             or set(terminal) != terminal_keys
             or any(
                 type(terminal.get(key)) is not int
-                or not 0 <= terminal[key] <= _I64_MAX
+                or terminal[key] < 0
+                or key not in ("device", "inode") and terminal[key] > _I64_MAX  # identities are unbounded
                 for key in ("ctime_ns", "device", "inode", "mtime_ns", "size")
             )
             or type(terminal.get("digest")) is not str
