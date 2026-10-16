@@ -30,11 +30,14 @@ from tests.xdart.scattering.test_live_qualify_refusal_run import (
 from tests.xdart.scattering.test_p1b_output_graph import _start
 from xdart.gui.tabs.scattering import output_preflight
 from xdart.gui.tabs.scattering.adapters import run_executor
+from xdart.gui.tabs.scattering.adapters.dynamic_output import DynamicOutputAdapter
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+from xdart.gui.tabs.scattering.display_values import StandardEventKind
 from xrd_tools.io.nexus import read_scan_metadata
 from xrd_tools.reduction.core import ReductionSession
 from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xrd_tools.sources.base import BaseFrameSource
+from xrd_tools.sources.directory_index import DirectoryIndex
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.execution_graph import SourceFileState, qualify_source_execution_graph
 from xrd_tools.sources.selection import DirectorySourceSpec, image_series_spec
@@ -94,10 +97,23 @@ class _Work:
         def construct(executor, run, **kwargs):
             record('construct')
             return real_construct(executor, run, **kwargs)
+
+        def timed(seam, real):
+            def call(*args, **kwargs):
+                started = time.monotonic()
+                try:
+                    return real(*args, **kwargs)
+                finally:
+                    record(seam, time.monotonic() - started)
+            return call
         monkeypatch.setattr(StandardRunExecutor, '_execute_live_directory', live)
         monkeypatch.setattr(DirectoryIndexSession, 'observe', observe)
         monkeypatch.setattr(ReductionSession, 'drain', drain)
         monkeypatch.setattr(StandardRunExecutor, '_construct', construct)
+        monkeypatch.setattr(DynamicOutputAdapter, 'commit_epoch',
+                            timed('commit_epoch', DynamicOutputAdapter.commit_epoch))
+        monkeypatch.setattr(DynamicOutputAdapter, 'finish_all', timed('finish', DynamicOutputAdapter.finish_all))
+        monkeypatch.setattr(DirectoryIndex, 'poll', timed('discovery', DirectoryIndex.poll))
         if not counters:
             return
         wrap(metadata, 'read_image_metadata_observed', 'qualify_read', lambda a: str(a[0]))
@@ -150,8 +166,15 @@ class _Work:
         return self.polls(after)[:count]
 
     def overhead(self, start, end):
-        """One poll's overhead: its interval less the loop's wait and the new frames' reduction."""
-        return end - start - POLL - sum(detail for _at, detail in self.times('drain', start, end))
+        """The overhead of the polls starting in [start, end): the interval less each loop wait and the new
+        frames' reduction."""
+        waits = len([at for at in self.polls(start) if at < end])
+        return end - start - POLL * waits - sum(detail for _at, detail in self.times('drain', start, end))
+
+    def net(self, seam, start, end):
+        """Each ``seam`` call ending in [start, end): its duration less the reduction drained inside it."""
+        return [took - sum(drained for _at, drained in self.times('drain', done - took, done + 1e-9))
+                for done, took in self.times(seam, start, end)]
 
 
 def _revision(path):
@@ -301,12 +324,14 @@ class _Eiger:
             data[-count:] = 2
 
 
-def _intent(tmp_path, raw, shape, *, suffix='.tif', fmt='spec', mode='Overwrite', gi=None, source=None):
+def _intent(tmp_path, raw, shape, *, suffix='.tif', fmt='spec', mode='Overwrite', gi=None, source=None,
+            processing='Int 1D', one=None, two=None):
     return RunIntent(
         source_spec=source or DirectorySourceSpec(raw, suffixes=(suffix,), metadata_format=fmt),
         poni_file=str(_poni(tmp_path, shape)), project_root=str(raw), save_path=str(tmp_path / 'processed'),
-        output_mode=mode, processing_mode='Int 1D', live_mode=True, max_cores=1,
-        bai_1d_args={'npt': 8, 'method': 'numpy'}, **({} if gi is None else {'gi': gi}))
+        output_mode=mode, processing_mode=processing, live_mode=True, max_cores=1,
+        bai_1d_args=one or {'npt': 8, 'method': 'numpy'}, **({} if gi is None else {'gi': gi}),
+        **({} if two is None else {'bai_2d_args': two}))
 
 
 def _counted(tmp_path, stem):
@@ -365,7 +390,7 @@ def _content(found, published=()):
 
 def _report(row, phase, found):
     """Print one phase's counted work (calls per seam; rows, frames and seconds summed) for the record."""
-    summed = {'spec_rows', 'to_scan_frames', 'drain'}
+    summed = {'spec_rows', 'to_scan_frames', 'drain', 'commit_epoch', 'finish', 'discovery'}
     counts = {seam: round(sum(values), 3) if seam in summed else len(values)
               for seam, values in sorted(found.items()) if seam != 'drain_start'}
     print(f'WORK {row} {phase}: {counts}')
@@ -1056,18 +1081,23 @@ def test_r7b_gi_live_keeps_each_frames_own_incidence_motor(tmp_path, monkeypatch
     assert _column(_counted(tmp_path, 'scan_gi')[1], 'th') == tuple(float(np.float32(v)) for v in (.1, .2, .3, .4))
 
 
-# --- P1: whole-poll overhead per poll type at 500 and 5000 points (bars frozen at the checkpoint) --------------
+# --- P1: whole-poll overhead per poll type at 100, 500 and 5000 points (bars frozen at the checkpoint) ---------
 
 PERF = ('spec_tiff', 'txt', 'nexus', 'eiger', 'aggregate')
+#: The GUI's default bins (1D 1000; 2D 1000 x 360): the containers carry the epoch-commit/finish split.
+REALISTIC = {'npt': 1000, 'method': 'csr'}, {'npt_rad': 1000, 'npt_azim': 360, 'method': 'csr'}
 
 
 class _Feed:
-    """The next frame of a performance source: complete, or its image now and its metadata later."""
+    """The next frame of a performance source: complete, or its image now and its metadata later.
+
+    SPEC+TIFF carries 20 MB of earlier-scan history; the aggregate's SPEC file holds only its own scans.
+    NeXus runs 1D+2D and Eiger 1D, both on a Pilatus-sized detector with the GUI's default bins."""
 
     def __init__(self, name, raw, points):
-        self.name, self.k = name, 0
+        self.name, self.k, self.slot = name, 0, '_int2d' if name == 'nexus' else '_int1d'
         if name in ('spec_tiff', 'aggregate'):
-            self.owner = _Spec(raw, TINY, history_bytes=20 << 20)
+            self.owner = _Spec(raw, TINY, history_bytes=20 << 20 if name == 'spec_tiff' else 0)
             scans = 10 if name == 'aggregate' else 1
             for scan in range(1, scans + 1):
                 self.owner.scan(scan)
@@ -1086,7 +1116,7 @@ class _Feed:
             for k in range(points):
                 self.owner.frame(k)
         else:
-            self.owner = _Nexus(raw, TINY, points) if name == 'nexus' else _Eiger(raw, TINY, points)
+            self.owner = _Nexus(raw, PILATUS, points) if name == 'nexus' else _Eiger(raw, PILATUS, points)
             self.stem, self.first = ('scan_0' if name == 'nexus' else 'scan'), 0
 
     def frame(self):
@@ -1115,9 +1145,20 @@ class _Feed:
         self.k += 1
 
     def intent(self, tmp_path, raw):
-        if self.name in ('nexus', 'eiger'):
-            return _intent(tmp_path, raw, TINY, suffix='.nxs' if self.name == 'nexus' else '_master.h5', fmt=None)
+        if self.name == 'nexus':
+            return _intent(tmp_path, raw, PILATUS, suffix='.nxs', fmt=None, processing='Int 2D', one=REALISTIC[0],
+                           two=REALISTIC[1])
+        if self.name == 'eiger':
+            return _intent(tmp_path, raw, PILATUS, suffix='_master.h5', fmt=None, one=REALISTIC[0])
         return _intent(tmp_path, raw, TINY, fmt='txt' if self.name == 'txt' else 'spec')
+
+    def published(self, events):
+        """The frame labels this source's output has published."""
+        return {event.frame_key.local_frame_label for event in events
+                if event.kind is StandardEventKind.FRAME_READY and f'{self.stem}{self.slot}' in str(event.artifact)}
+
+    def count(self, total):
+        return lambda values: len(self.published(values)) >= total or _terminal(values)
 
 
 def _quantiles(values):
@@ -1125,7 +1166,7 @@ def _quantiles(values):
     return statistics.median(ordered), ordered[min(len(ordered) - 1, int(round(.95 * (len(ordered) - 1))))]
 
 
-@pytest.mark.parametrize('points', [500, 5000])
+@pytest.mark.parametrize('points', [100, 500, 5000])
 @pytest.mark.parametrize('name', PERF)
 def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_property, name, points):
     raw = tmp_path / 'raw'
@@ -1133,43 +1174,56 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
     built = time.monotonic()
     feed = _Feed(name, raw, points)
     record_property('fixture_build_s', round(time.monotonic() - built, 3))
-    record_property('detector_shape', 'x'.join(map(str, TINY)))
+    record_property('detector_shape', 'x'.join(map(str, PILATUS if name in ('nexus', 'eiger') else TINY)))
     work = _Work(monkeypatch, counters=False)
     executor = StandardRunExecutor(join_timeout=2.)
     identity = _start(executor, feed.intent(tmp_path, raw), request_value=7200 + 10 * PERF.index(name)
-                      + (points == 5000))
-    events, measured, phase, terminal = [], {}, 'initial', []
+                      + (500, 5000, 100).index(points))
+    events, measured, phase, terminal, problems = [], {}, 'initial', [], []
     deadline, started = time.monotonic() + 900., time.monotonic()
     initial = 1 if name == 'aggregate' else (points if name not in ('nexus', 'eiger') else points)
     try:
-        _wait(executor, events, _count_labels(feed.stem, initial), 900.)
+        _wait(executor, events, feed.count(initial), 900.)
         record_property('initial_admission_and_reduction_s', round(time.monotonic() - started, 3))
         phase = 'idle'
         polls = work.await_polls(time.monotonic(), 12, deadline)
         measured['idle'] = [work.overhead(a, b) for a, b in zip(polls[1:11], polls[2:12])]
+        measured['idle_discovery'] = [sum(took for _at, took in work.times('discovery', a, b))
+                                      for a, b in zip(polls[1:11], polls[2:12])]
         phase = 'pending'
         if feed.pending():
             polls = work.await_polls(time.monotonic(), 12, deadline)
             measured['pending'] = [work.overhead(a, b) for a, b in zip(polls[1:11], polls[2:12])]
-            target = len(set(_labels(events, feed.stem))) + 1
+            target = len(feed.published(events)) + 1
             feed.land()
-            _wait(executor, events, _count_labels(feed.stem, target), max(1., deadline - time.monotonic()))
+            _wait(executor, events, feed.count(target), max(1., deadline - time.monotonic()))
+        measured['commit_epoch_net'], measured['reduction_excluded'] = [], []
         for burst, key, repeats in ((1, 'arrival_1', 10), (10, 'arrival_10', 3)):
             phase, measured[key] = key, []
             for _repeat in range(repeats):
                 mark = time.monotonic()
-                target = len(set(_labels(events, feed.stem))) + burst
+                target = len(feed.published(events)) + burst
                 for _index in range(burst):
                     feed.frame()
-                _wait(executor, events, _count_labels(feed.stem, target), max(1., deadline - time.monotonic()))
+                _wait(executor, events, feed.count(target), max(1., deadline - time.monotonic()))
                 constructs = [at for at, _detail in work.times('construct', mark)]
+                # The poll that admits the frames may have started before they were written.
+                first = [at for at in work.polls() if at <= constructs[0]][-1]
                 after = work.await_polls(constructs[-1], 1, deadline)[0]
-                before = [at for at in work.polls(mark) if at <= constructs[-1]][-1]
-                measured[key].append(work.overhead(before, after))
+                measured[key].append(work.overhead(first, after))
+                measured['commit_epoch_net'] += work.net('commit_epoch', first, after)
+                measured['reduction_excluded'].append(sum(took for _at, took in work.times('drain', first, after)))
+        # The growing output only: later scans append to a settled scan's SPEC file after its qualification.
+        grown = [value for value in executor.processed_live_revisions(identity)
+                 if not value.partial and value.decision.item.graph.group_key == feed.stem]
+        assert grown or name in ('nexus', 'eiger'), 'the growing output has no settled attempt'
+        problems = _differential(grown)
         phase = 'stop'
         work.await_polls(time.monotonic(), 2, deadline)
+        stopping = time.monotonic()
         _reached, closed, terminal = _timed_stop(executor, identity, events)
         measured['stop_closed'] = [closed]
+        measured['finish'] = work.net('finish', stopping, time.monotonic())
     except AssertionError:
         record_property('deadline_phase', phase)
         raise
@@ -1177,11 +1231,14 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
         if not _terminal(events):
             terminal = _stop(executor, identity, events)
         for key, values in measured.items():
+            if not values:
+                continue
             p50, p95 = _quantiles(values)
             record_property(f'{key}_p50_s', round(p50, 4))
             record_property(f'{key}_p95_s', round(p95, 4))
             print(f'P1 {name} {points} {key} n={len(values)} p50={p50:.4f}s p95={p95:.4f}s')
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert not problems, problems
     failed = {}
     for key, (bar50, bar95) in BARS.get((name, points), {}).items():
         p50, p95 = _quantiles(measured[key])

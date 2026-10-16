@@ -65,31 +65,32 @@ def _silx_rows(spec, scan, rows):
         parser.close()
 
 
-@pytest.mark.parametrize('history_bytes', [0, 20 << 20], ids=['fresh', 'history20mb'])
-def test_c1_read_spec_points_returns_silx_per_label_values_live_and_finite(tmp_path, history_bytes):
-    raw, spec, scan = _spec_file(tmp_path, rows=60, history_bytes=history_bytes)
-    images = _images(raw, scan, 60)
-    expected = _silx_rows(spec, scan, range(60))
-    assert expected[0]['i0'] == scan * 1e6 + 1, 'the duplicate label resolves to its first column'
-    assert expected[0]['th'] == 0.5, 'the motor wins over the counter of the same name'
-    live = read_spec_points(images, published=59)
-    finite = read_spec_points(images)
-    assert live is not None and finite is not None
-    for points in (live, finite):
-        assert points.path == spec
-        assert [dict(read.values) for read in points.reads] == expected
-        assert all(read.source_path == spec for read in points.reads)
-    assert live.extent == finite.extent and len(live.extent.marks) == 61
+def test_c1_read_spec_points_returns_silx_per_label_values_live_and_finite(tmp_path):
+    for history_bytes in (0, 20 << 20):  # a fresh file, then 20 MB of earlier scans
+        (tmp_path / str(history_bytes)).mkdir()
+        raw, spec, scan = _spec_file(tmp_path / str(history_bytes), rows=60, history_bytes=history_bytes)
+        images = _images(raw, scan, 60)
+        expected = _silx_rows(spec, scan, range(60))
+        assert expected[0]['i0'] == scan * 1e6 + 1, 'the duplicate label resolves to its first column'
+        assert expected[0]['th'] == 0.5, 'the motor wins over the counter of the same name'
+        live = read_spec_points(images, published=59)
+        finite = read_spec_points(images)
+        assert live is not None and finite is not None
+        for points in (live, finite):
+            assert points.path == spec
+            assert [dict(read.values) for read in points.reads] == expected
+            assert all(read.source_path == spec for read in points.reads)
+        assert live.extent == finite.extent and len(live.extent.marks) == 61
 
 
-@pytest.mark.parametrize('max_input_bytes', [None, 1 << 26], ids=['live_reader', 'bounded_snapshot'])
-def test_c2_the_per_frame_spec_reader_returns_silx_per_label_values_and_clamps(tmp_path, max_input_bytes):
+def test_c2_the_per_frame_spec_reader_returns_silx_per_label_values_and_clamps(tmp_path):
     raw, spec, scan = _spec_file(tmp_path, rows=40, history_bytes=2 << 20)
-    for k in (0, 17, 39, 45):
-        image = raw / f'calibrant_scan{scan:03d}_{k:04d}.tif'
-        read = read_image_metadata_observed(image, 'spec', max_input_bytes=max_input_bytes)
-        assert read.source_path == spec
-        assert dict(read.values) == _silx_rows(spec, scan, [min(k, 39)])[0], k
+    for max_input_bytes in (None, 1 << 26):  # the live reader, then the bounded snapshot
+        for k in (0, 17, 39, 45):
+            image = raw / f'calibrant_scan{scan:03d}_{k:04d}.tif'
+            read = read_image_metadata_observed(image, 'spec', max_input_bytes=max_input_bytes)
+            assert read.source_path == spec
+            assert dict(read.values) == _silx_rows(spec, scan, [min(k, 39)])[0], (max_input_bytes, k)
 
 
 def _tiff(path, value):
