@@ -114,6 +114,78 @@ def test_resumed_control_points_require_retained_image_binding(tmp_path):
                                model_image_sha256=calibration_image_identity(np.ones(frame.shape))[1])
 
 
+@pytest.mark.parametrize('quick', (False, True))
+def test_complete_calibration_session_resumes_settings_fit_and_direct_beam(tmp_path, quick):
+    from xrd_tools.integrate.stitch_calibration import CalibrationSessionResume
+    from tests.core.test_direct_beam import beam_images, run
+    controls, calibration = _native_stacked_controls()
+    staged = tmp_path / 'staged'
+    staged.mkdir()
+    frames = _frames(staged, controls, calibration.poni)
+    fit = fit_calibration(frames, distance_bounds_m=(.37, .41))
+    angles = np.array([8.1, 7.7, 7.13, 7., 6.82, 6.2, 5.7])
+    images, _expected, beam_pixel = beam_images(angles)
+    images[2] = None
+    frame_ids = tuple((tmp_path / 'beam_master.h5', index) for index in range(len(angles)))
+    point_ids = tuple(('8.1', index) for index in range(len(angles)))
+    beam = run(angles, images, beam=beam_pixel, frame_ids=frame_ids, point_ids=point_ids)
+    source = SourceSpec(Path(frames[0].source_uri), SourceKind.IMAGE_FILE,
+                        options={'rotation': 0, 'read_image_kwargs': {'detector_shape': frames[0].shape}})
+    setup = {'text': {'source_path': str(source.uri), 'calibrant': 'LaB6'}, 'checks': {'scales': False}}
+    resume = CalibrationSessionResume(setup, fit, source, beam,
+                                     {'energy_eV': 10000., 'held': {'nu': 0.}})
+    path = save_calibration_session(tmp_path, () if quick else frames, arm=('del', 'nu'), resume=resume)
+    loaded, arm, policy, restored = load_calibration_session(path, with_resume=True)
+    assert len(loaded) == (0 if quick else len(frames)) and arm == ('del', 'nu') and policy is None
+    assert json.loads(path.read_text())['version'] == 7 and restored.setup == setup
+    assert restored.fit.asset == json.loads(json.dumps(fit.asset)) and restored.matches_source(source)
+    assert not restored.matches_source(replace(source, entry='other'))
+    assert restored.fit.rms_q == fit.rms_q and restored.fit.n_points == fit.n_points
+    for key in ('q', 'dq', 'frame', 'kept'):
+        np.testing.assert_array_equal(restored.fit.point_residuals[key], fit.point_residuals[key])
+    assert restored.fit.point_residuals['frames'] == fit.point_residuals['frames']
+    assert restored.direct_beam.distance_m == beam.distance_m
+    assert restored.direct_beam.zero_beam_pixel == beam.zero_beam_pixel
+    np.testing.assert_array_equal(restored.direct_beam.centres_px, beam.centres_px)
+    np.testing.assert_array_equal(restored.direct_beam.used, beam.used)
+    assert restored.direct_beam.frame_ids == tuple((str(path), index) for path, index in frame_ids)
+    assert restored.direct_beam.point_ids == point_ids
+    assert restored.direct_beam_context == {'energy_eV': 10000., 'held': {'nu': 0.}}
+    assert b'NaN' not in path.read_bytes()
+
+
+def test_complete_calibration_session_rejects_invalid_resume_and_preserves_size_limit(tmp_path):
+    from xrd_tools.integrate.stitch_calibration import CalibrationSessionResume
+    from tests.core.test_stitch_operation import _goniometer_record
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit
+    fit = CalibrationFit('multigeometry', {'calibration': _goniometer_record(), 'provenance': {
+        'source_motors': {'del_angle': 'del', 'nu_angle': 'nu'}}}, .001, 10., 2, 'retained')
+    source = SourceSpec(tmp_path / 'original.nxs', SourceKind.NEXUS_STACK, entry='experiment')
+    resume = CalibrationSessionResume({'text': {}}, fit, source)
+    path = save_calibration_session(tmp_path, (), resume=resume)
+    original = path.read_bytes()
+    for bad in (replace(resume, fit_source=None), replace(resume, setup={'large': 'x' * (1 << 20)}),
+                replace(resume, fit=replace(fit, asset={'calibration': {}, 'provenance': {}}))):
+        with pytest.raises(ValueError):
+            save_calibration_session(tmp_path, (), resume=bad)
+        assert path.read_bytes() == original
+    record = json.loads(original)
+    record['resume']['fit']['point_residuals'] = {'q': [1.], 'dq': [], 'frame': [0], 'kept': [True],
+                                                'frames': [[0, {'del': 1., 'nu': 2.}]]}
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match='residual'):
+        load_calibration_session(path, with_resume=True)
+    record = json.loads(original)
+    record['resume']['extra'] = True
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match='resume'):
+        load_calibration_session(path, with_resume=True)
+    record = {'schema': 'xdart.stitch_calibration_session', 'version': 2, 'frames': []}
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match='frame count'):
+        load_calibration_session(path)
+
+
 def test_mg_fit_saved_json_reloads_actual_importer_and_bad_inputs_refuse(tmp_path):
     from xrd_tools.core.geometry import Diffractometer
     from xrd_tools.integrate.multi import create_multigeometry_integrators_from_geometry

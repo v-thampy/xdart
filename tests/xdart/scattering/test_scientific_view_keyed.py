@@ -3,12 +3,14 @@ seam, drawn under Int's own top bar. The RSM page's 2×3 is its first consumer; 
 build it."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 pytest.importorskip("pyqtgraph")
 
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import (
@@ -45,12 +47,17 @@ def test_a_keyed_layout_draws_its_panels_under_ints_top_bar_and_gives_ints_layou
     view = ScientificView()
     try:
         assert view._keyed_area is None  # Int's and Stitch's views never build it
+        view.prepare_keyed_layout(_state().layout)
+        assert view.keyed_projection is None
+        assert view.vertical_splitter.isHidden() and view.frame_selector.isHidden()
+        assert view.keyed_panel(_K).curve.getData() == (None, None)
         view.reconcile_keyed(_state(color_map="magma", log_scale=True))
         assert view.keyed_projection is not None and not view._keyed_area.isHidden()
         assert view.vertical_splitter.isHidden() and view.frame_selector.isHidden()
         np.testing.assert_array_equal(view.keyed_panel(_HK).pane.canvas.raw_image, np.arange(6.0).reshape(2, 3).T)
         x, y = view.keyed_panel(_K).curve.getData()
-        np.testing.assert_array_equal(y, [1.0, 2.0, 4.0])
+        np.testing.assert_allclose(y, np.log10([1.0, 2.0, 4.0]))
+        assert view.keyed_panel(_K).plot.getAxis('left').labelText == 'Log Mean I'
         assert view.color_map.currentText() == "magma" and view.log_scale.isChecked()
         assert view.title.text() == "result" and view.status.text() == "facts"
         view.show()
@@ -61,6 +68,11 @@ def test_a_keyed_layout_draws_its_panels_under_ints_top_bar_and_gives_ints_layou
         assert view._keyed_area.isHidden() and not view.vertical_splitter.isHidden()
         assert not view.frame_selector.isHidden()
         assert view.plot_action_group.isAncestorOf(view.options)
+        view.set_hidden_tools('viewer_controls')
+        view.prepare_keyed_layout(_state().layout)
+        assert view.viewer_intensity_row.isHidden()
+        view.reconcile_keyed(_state())
+        assert view.viewer_intensity_row.isHidden()
     finally:
         view.deleteLater()
         qapp.processEvents()
@@ -363,7 +375,49 @@ def test_log_moves_the_keyed_levels_into_what_the_panes_draw(qapp):
         assert span[1] < 4.0 < linear[0][1]  # log10 of at most 2000
         view.reconcile_keyed(_rsm_state())
         np.testing.assert_allclose(_slice_levels(view), linear)
+        for logged in (True, False):
+            view.reconcile_keyed(_state(log_scale=logged))
+            for key in (_H, _K):
+                np.testing.assert_allclose(view.keyed_panel(key).curve.getData()[1],
+                                           np.log10([1, 2, 4]) if logged else [1, 2, 4])
+                assert view.keyed_panel(key).plot.getAxis('left').labelText == ('Log Mean I' if logged else 'Mean I')
     finally:
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_single_column_keyed_image_and_trace_share_coordinate_columns(qapp):
+    """A calibration preview's Q coordinate lands on the same screen column in its image and profile."""
+    state = _state()
+    state = replace(state, layout=((_HK,), (_H,)), panels=(state.panel(_HK), state.panel(_H)), share_axis=True)
+    view = ScientificView()
+    try:
+        view.resize(900, 720)
+        view.reconcile_keyed(state)
+        view.show()
+        QtTest.QTest.qWait(100)
+        image = view.keyed_panel(_HK).pane.canvas
+        trace = view.keyed_panel(_H).plot
+
+        def columns(q):
+            return tuple(widget.mapToGlobal(widget.mapFromScene(box.mapViewToScene(QtCore.QPointF(q, 0)))).x()
+                         for widget, box in ((image.image_win, image.imageViewBox), (trace, trace.getViewBox())))
+
+        for q in (1., 2., 3.):
+            left, right = columns(q)
+            assert abs(left - right) <= 2, (q, left, right)
+        image.imageViewBox.setXRange(1.2, 2.5, padding=0)
+        QtTest.QTest.qWait(100)
+        for q in (1.3, 2.3):
+            left, right = columns(q)
+            assert abs(left - right) <= 2, (q, left, right)
+        trace.getViewBox().setXRange(1.1, 2.7, padding=0)
+        QtTest.QTest.qWait(100)
+        for q in (1.3, 2.3):
+            left, right = columns(q)
+            assert abs(left - right) <= 2, (q, left, right)
+    finally:
+        view.close()
         view.deleteLater()
         qapp.processEvents()
 

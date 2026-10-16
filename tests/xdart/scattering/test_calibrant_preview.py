@@ -57,6 +57,8 @@ def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(r
         dialog.show()
         dialog._show_calibration_fit()
         window = dialog._calibration_fit_window
+        assert window.pattern_view.vertical_splitter.isHidden(), 'never show the initial Int layout while stitching'
+        assert window.pattern_view.viewer_intensity_row.isHidden()
         assert 'calculated |q| − expected ring |q|' in window.summary.text()
         assert window.plot.getPlotItem().getAxis('bottom').labelText == 'del motor angle (°)'
         assert isinstance(window.pattern_view, ScientificView)
@@ -68,10 +70,25 @@ def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(r
             time.sleep(.02)
         state = window.pattern_view.keyed_projection
         assert state is not None, dialog.status.text()
+        assert state.share_axis, 'the stacked preview shares Q by default'
         assert '3 frames' in state.status
         image, trace = state.panels
         assert image.image.shape == (image.y_axis.values.size, image.x_axis.values.size)
         assert np.nanmax(trace.intensity) > 0
+        pane = window.pattern_view.keyed_panel(image.key).pane
+        (reference,) = pane.overlay_families['calibrant-reference']
+        from xrd_tools.integrate.calibration import pyfai_calibrant
+        q = np.sort(2 * np.pi / np.asarray(pyfai_calibrant('LaB6').dspacing))
+        wavelength = fit.asset['calibration']['wavelength'] * 1e10
+        expected = q[(q >= image.x_axis.values.min()) & (q <= image.x_axis.values.max())
+                     & (q <= 4 * np.pi / wavelength)]
+        assert expected.size
+        np.testing.assert_allclose(reference.xData[::3], expected, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(reference.xData[1::3], expected, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(reference.yData[::3], image.y_axis.edges[0])
+        np.testing.assert_allclose(reference.yData[1::3], image.y_axis.edges[1])
+        assert 'LaB6' in reference.toolTip() and 'Display only' in reference.toolTip()
+        marker_x = reference.xData.copy()
         app.processEvents()
         rows = window.pattern_view._keyed_area
         assert isinstance(rows, QtWidgets.QSplitter) and rows.count() == 2
@@ -83,6 +100,8 @@ def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(r
         window.pattern_view.commandRequested.emit(ShellCommand(ShellCommandKind.SET_LOG_SCALE, True))
         assert window.pattern_view.keyed_projection.log_scale
         assert rows.sizes() == resized
+        (reference,) = pane.overlay_families['calibrant-reference']
+        np.testing.assert_array_equal(reference.xData, marker_x)
         window.panels.setCurrentWidget(window.view)
         fit = replace(fit)
         dialog.fit = fit
@@ -94,6 +113,7 @@ def test_preview_worker_draws_the_stitched_map_and_pattern_and_retires_on_edit(r
             time.sleep(.02)
         assert window.pattern_view.keyed_projection is not None
         window.clear_preview()
+        assert not pane.overlay_families
         window.previewRequested.emit()
         window.close()  # actual worker cancellation; completion must not reopen/adopt a hidden view
         until = time.monotonic() + 15
