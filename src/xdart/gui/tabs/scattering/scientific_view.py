@@ -507,14 +507,16 @@ class _KeyedTracePanel:
         self.readout = PlotCursorReadout(self.plot)
         self.curve = self.plot.plot(connect="finite")
 
-    def draw(self, panel, color) -> None:
-        self.curve.setData(np.asarray(panel.axis.values, dtype=float), np.asarray(panel.intensity, dtype=float),
+    def draw(self, panel, color, log_scale=False) -> None:
+        scale = "Log" if log_scale else "Linear"
+        self.curve.setData(np.asarray(panel.axis.values, dtype=float),
+                           _scaled_intensity(np.asarray(panel.intensity, dtype=float), scale),
                            **data_curve_style(color))
         self.plot.setTitle(panel.title)
         self.plot.setToolTip(f"{panel.title}. Drag to zoom into this curve; right-click for plot controls.")
         label, unit = _axis_presentation(panel.axis.label, panel.axis.unit)
         self.plot.setLabel("bottom", label, units=unit or None)
-        self.plot.setLabel("left", panel.y_label)
+        self.plot.setLabel("left", _scaled_intensity_label(panel.y_label, scale))
 
     def clear(self) -> None:
         self.curve.setData([], [])
@@ -3943,6 +3945,25 @@ class ScientificView(QtWidgets.QFrame):
         """The keyed layout drawn now, or None."""
         return self._keyed_shown
 
+    def prepare_keyed_layout(self, layout: tuple[tuple[PanelKey, ...], ...]) -> None:
+        """Mount empty keyed panels while their worker is pending, without inventing a scientific projection."""
+        if (type(layout) is not tuple or not layout
+                or any(type(row) is not tuple or not row for row in layout)):
+            raise TypeError("a keyed layout is nonempty rows of PanelKeys")
+        keys = tuple(key for row in layout for key in row)
+        if (any(type(key) is not PanelKey or key.role not in {
+                PanelRole.SLICE_2D, PanelRole.PROJ_1D, PanelRole.FIGURE} for key in keys)
+                or len(set(keys)) != len(keys)):
+            raise TypeError("a keyed layout has distinct supported PanelKeys")
+        self._enter_keyed_layout()
+        self._link_keyed_axes(False)
+        if layout != self._keyed_layout:
+            self._build_keyed(layout)
+        self._keyed_coordinates = {}
+        self.clear_keyed()
+        self.share_axis.setEnabled(False)
+        self._apply_hidden_tools()
+
     def keyed_panel(self, key: PanelKey):
         """A keyed panel's widgets (an image panel's ``pane``, ``previous``, ``selector`` and ``next``; a 1-D
         panel's ``plot`` and ``curve``), for its host's checks."""
@@ -4003,6 +4024,8 @@ class ScientificView(QtWidgets.QFrame):
             widgets = self._keyed_panels[panel.key]
             if type(panel) is KeyedImageProjection:
                 widgets.draw(panel, state.color_map, state.log_scale)
+            elif type(widgets) is _KeyedTracePanel:
+                widgets.draw(panel, color, state.log_scale)
             else:
                 widgets.draw(panel, color)
         blockers = [QtCore.QSignalBlocker(widget) for widget in (self.color_map, self.log_scale, self.share_axis)]
@@ -4030,6 +4053,7 @@ class ScientificView(QtWidgets.QFrame):
                     widget.hide()
         else:
             self._restore_figure_chrome()
+        self._apply_hidden_tools()
 
     def _keyed_axes(self, state: KeyedPanelsProjection) -> dict[tuple[str, str], tuple[tuple[pg.ViewBox, int], ...]]:
         """The keyed panels' axes (view box, 0 for x or 1 for y) by the coordinate each draws, its label and unit,
@@ -4056,7 +4080,16 @@ class ScientificView(QtWidgets.QFrame):
         then follow each other's pan and zoom along it. Off, they are independent, and the 1-D panels follow their
         data again, as Int's 1-D plot does when Share Axis goes off."""
         self._unlink_keyed_axes()
-        if on:
+        stacked = self._keyed_stacked_pair()
+        if on and stacked is not None:
+            # An image above its profile shares screen columns, as Int's cake and curve do. Other keyed
+            # layouts (RSM's several coordinates, including x/y links) keep their coordinate-range links.
+            _, image_box, _, trace_box = stacked
+            for signal, slot in ((image_box.sigXRangeChanged, self._on_cake_xrange_changed),
+                                 (trace_box.sigXRangeChanged, self._on_curve_xrange_changed)):
+                signal.connect(slot)
+                self._keyed_links.append((signal, slot))
+        elif on:
             for axes in self._keyed_coordinates.values():
                 first, axis = axes[0]
                 self._sync_keyed_axis(axes, tuple(first.viewRange()[axis]), axes[0])
@@ -4070,6 +4103,20 @@ class ScientificView(QtWidgets.QFrame):
                 if type(widgets) is _KeyedTracePanel:
                     widgets.plot.getViewBox().enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
         self._keyed_share_on = bool(on and self._keyed_coordinates)
+        if self._keyed_share_on and stacked is not None:
+            self._schedule_curve_under_cake()
+
+    def _keyed_stacked_pair(self):
+        """A single image above its profile on the same x coordinate, eligible for Int's pixel alignment."""
+        if len(self._keyed_layout) != 2 or any(len(row) != 1 for row in self._keyed_layout):
+            return None
+        image, trace = (self._keyed_panels[row[0]] for row in self._keyed_layout)
+        if type(image) is not _KeyedImagePanel or type(trace) is not _KeyedTracePanel:
+            return None
+        image_box, trace_box = image.pane.canvas.imageViewBox, trace.plot.getViewBox()
+        if ((image_box, 0), (trace_box, 0)) not in self._keyed_coordinates.values():
+            return None
+        return image.pane.canvas.image_win, image_box, trace.plot, trace_box
 
     def _unlink_keyed_axes(self) -> None:
         for signal, slot in self._keyed_links:
@@ -4169,6 +4216,12 @@ class ScientificView(QtWidgets.QFrame):
                     widgets = _KeyedFigurePanel(key, self.figureImageClicked.emit)
                 else:
                     raise ValueError(f"a keyed layout draws SLICE_2D and PROJ_1D panels, not {key.role.value}")
+                if type(widgets) in {_KeyedImagePanel, _KeyedTracePanel}:
+                    widget, box = ((widgets.pane.canvas.image_win, widgets.pane.canvas.imageViewBox)
+                                   if type(widgets) is _KeyedImagePanel
+                                   else (widgets.plot, widgets.plot.getViewBox()))
+                    widget.installEventFilter(self)
+                    box.sigResized.connect(self._on_share_view_resized)
                 across.addWidget(widgets.container, 1)
                 self._keyed_panels[key] = widgets
             self._keyed_area.addWidget(container)
@@ -4184,6 +4237,7 @@ class ScientificView(QtWidgets.QFrame):
             self._keyed_area.setObjectName("e7KeyedPanels")
             self._keyed_area.setChildrenCollapsible(False)
             self._keyed_area.setHandleWidth(8)
+            self._keyed_area.splitterMoved.connect(self._on_share_geometry_changed)
             self._main_layout.insertWidget(self._main_layout.indexOf(self.vertical_splitter) + 1,
                                            self._keyed_area, 1)
         self.drop_viewer_loading_snapshot()
@@ -4212,6 +4266,7 @@ class ScientificView(QtWidgets.QFrame):
             widget.setVisible(True)
         self.options.show()
         self._layout_mode = self._processing_mode = "keyed"
+        self._apply_hidden_tools()
 
     def _leave_keyed_layout(self) -> None:
         self._restore_figure_chrome()
@@ -4266,7 +4321,7 @@ class ScientificView(QtWidgets.QFrame):
     #: Top-bar tools a host page may leave out, by name (some name several widgets).
     _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button",
                    "raw_pane": "raw", "slice": ("slice", "slice_center", "slice_width", "pin"),
-                   "phases": "phases"}
+                   "phases": "phases", "viewer_controls": "viewer_intensity_row"}
     _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
 
     def set_plot_modes(self, *names: str) -> None:
@@ -4288,6 +4343,7 @@ class ScientificView(QtWidgets.QFrame):
         normalization channel, 1-D Background or raw popup), the raw detector pane
         ('raw_pane': Stitch's map has no one detector image; Int 2D's layout keeps its cake),
         and the χ (c/w) slice with its Pin ('slice': RSM's keyed layout has no cake to cut).
+        'viewer_controls' leaves out the keyed/viewer bottom Share Axis, Options and intensity row.
         Int shows them all."""
         unknown = set(names) - set(self._HOST_TOOLS)
         if unknown:
@@ -4540,12 +4596,12 @@ class ScientificView(QtWidgets.QFrame):
                 self._cake_x_pinned_by_share = False
 
     def _on_cake_xrange_changed(self, *_args) -> None:
-        if not self._share_link_on or self._share_axis_syncing:
+        if not self._pixel_share_active() or self._share_axis_syncing:
             return
         self._schedule_curve_under_cake()
 
     def _on_curve_xrange_changed(self, *_args) -> None:
-        if not self._share_link_on or self._share_axis_syncing:
+        if not self._pixel_share_active() or self._share_axis_syncing:
             return
         self._schedule_cake_under_curve()
 
@@ -4572,11 +4628,11 @@ class ScientificView(QtWidgets.QFrame):
 
     def _on_share_geometry_changed(self, *_args) -> None:
         self._layout_viewer_loading_snapshot()
-        if self._share_link_on:
+        if self._pixel_share_active():
             self._schedule_curve_under_cake()
 
     def _on_share_view_resized(self, *_args) -> None:
-        if self._share_link_on:
+        if self._pixel_share_active():
             self._schedule_curve_under_cake(from_reflow=True)
 
     def eventFilter(self, watched, event) -> bool:
@@ -4605,18 +4661,18 @@ class ScientificView(QtWidgets.QFrame):
             }
         ):
             self._layout_viewer_loading_snapshot()
+        stacked = self._keyed_stacked_pair()
         if (
-            watched
-            in {
+            (watched in {
                 self.cake.canvas.image_win,
                 self.curve,
                 self.waterfall.canvas.image_win,
-            }
+            } or (stacked is not None and watched in (stacked[0], stacked[2])))
             and event.type() in {
                 QtCore.QEvent.Type.Resize,
                 QtCore.QEvent.Type.Show,
             }
-            and self._share_link_on
+            and self._pixel_share_active()
         ):
             self._schedule_curve_under_cake()
         return super().eventFilter(watched, event)
@@ -4624,8 +4680,12 @@ class ScientificView(QtWidgets.QFrame):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._layout_viewer_loading_snapshot()
-        if self._share_link_on:
+        if self._pixel_share_active():
             self._schedule_curve_under_cake()
+
+    def _pixel_share_active(self) -> bool:
+        return self._share_link_on or (self._layout_mode == "keyed" and self._keyed_share_on
+                                      and self._keyed_stacked_pair() is not None)
 
     def _schedule_curve_under_cake(self, *, from_reflow: bool = False) -> None:
         # Coalesce onto the first pending pair instead of restarting a
@@ -4710,18 +4770,19 @@ class ScientificView(QtWidgets.QFrame):
         return float(left), float(right)
 
     def _share_geometry(self):
-        cake_widget = self.cake.canvas.image_win
-        curve_widget, curve_view = self._active_bottom_plot()
-        if not (
-            self._share_link_on
-            and cake_widget.isVisible()
-            and curve_widget.isVisible()
-            and self._rendered_cake_axis_key is not None
-            and self._rendered_cake_axis_key
-            == self._rendered_trace_axis_key
-        ):
+        if self._layout_mode == "keyed":
+            stacked = self._keyed_stacked_pair()
+            if not self._keyed_share_on or stacked is None:
+                return None
+            cake_widget, cake_view, curve_widget, curve_view = stacked
+        else:
+            cake_widget, cake_view = self.cake.canvas.image_win, self.cake.canvas.imageViewBox
+            curve_widget, curve_view = self._active_bottom_plot()
+            if not (self._share_link_on and self._rendered_cake_axis_key is not None
+                    and self._rendered_cake_axis_key == self._rendered_trace_axis_key):
+                return None
+        if not cake_widget.isVisible() or not curve_widget.isVisible():
             return None
-        cake_view = self.cake.canvas.imageViewBox
         cake_span = self._global_xspan(cake_widget, cake_view)
         curve_span = self._global_xspan(curve_widget, curve_view)
         if (
@@ -4801,7 +4862,8 @@ class ScientificView(QtWidgets.QFrame):
                 enable=False,
             )
             cake_view.setXRange(*desired, padding=0.0)
-            self._cake_x_pinned_by_share = True
+            if self._layout_mode != "keyed":
+                self._cake_x_pinned_by_share = True
         finally:
             self._share_axis_syncing = prior_syncing
 
