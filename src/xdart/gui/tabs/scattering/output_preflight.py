@@ -1258,6 +1258,7 @@ def materialize_live_directory_group(
     any other outcome is admitted as before.
     """
 
+    fresh = getattr(session, "fresh", frozenset())  # first seen by this poll's listing
     try:
         observations = list(session.probe_candidates(
             group.plan.candidates, refresh=False, reprobe=reprobe, cancelled=cancelled))
@@ -1285,6 +1286,11 @@ def materialize_live_directory_group(
             # is looked at again in full, as an uncovered poll would.
             covered, (count, waiting) = 0, _live_metadata_ready(
                 configuration, group, sidecar_observations, published_members=published_members, spec_cache=spec_cache)
+        # A file only this listing has seen waits for another: one that ran during writes can show
+        # a later file and miss an earlier one, and frame labels follow the members' order.
+        if (cut := next((index for index, value in enumerate(group.plan.candidates[published_members:count],
+                                                             published_members) if value.path in fresh), None)) is not None:
+            count, waiting = cut, f"confirming {Path(group.plan.candidates[cut].path).name} in another listing"
         if count == 0:
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting,

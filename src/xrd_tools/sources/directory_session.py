@@ -169,6 +169,10 @@ class DirectoryIndexSession:
         self._force = False
         self._listed: tuple[float, tuple, tuple] | None = None
         self.listing_deferred = False
+        # The paths the last refreshing observation saw first: a listing concurrent with
+        # writes can show a newer file and miss an older one, so a Live Run admits a
+        # file only once a later listing has seen it again.
+        self.fresh: frozenset[Path] = frozenset()
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xdart-directory-index")
         self._closed = False
@@ -323,6 +327,7 @@ class DirectoryIndexSession:
                 and last[1] == self._results_version and last[2].request_generation == generation):
             # Same Snapshot object, no probe result moved and nothing to probe:
             # exactly the observation a rebuild would make, with an empty delta.
+            self.fresh = frozenset() if refresh else self.fresh
             return replace(last[2], delta=IndexDelta(), content_opens=0, stale_drops=0,
                            elapsed_s=time.perf_counter() - started)
         raw_snapshot = snapshot
@@ -429,6 +434,7 @@ class DirectoryIndexSession:
                 if candidate.path not in current_by_path),
         )
         self._visible_candidates = snapshot.candidates
+        self.fresh = frozenset(candidate.path for candidate in delta.added) if refresh else self.fresh
 
         queued_result = ProbeResult(
             ProbeState.IN_PROGRESS,
