@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from typing import TYPE_CHECKING
 import uuid
 
 import numpy as np
@@ -19,6 +20,8 @@ import numpy as np
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.core.geometry import ImageOrientation
 from xrd_tools.integrate.refine import ControlFrame, refine_goniometer
+if TYPE_CHECKING:
+    from xrd_tools.integrate.direct_beam import DirectBeamResult
 
 
 def _sha(path: str | Path, cap: int = 512 << 20) -> str:
@@ -514,7 +517,7 @@ def calibration_frame_mask(frame, mask=None, *, conditioning=None, saturation=No
     return bad
 
 
-def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
+def save_calibration_session(directory, frames, *, arm=None, fit_policy=None, resume=None):
     """``arm`` (del, nu motors; None for a held circle) makes it version 3: a resumed
     session then knows which circle a single arm's one motor is (vertical or horizontal).
     ``fit_policy`` ({'bounds': ArmFitBounds record, 'distance_seed_m', 'distance_bounds_m'}) makes it
@@ -522,7 +525,8 @@ def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
     With the energy choice ('refine_energy', 'energy_bound_eV'), the motor scales ('fit_motor_scales')
     and the Diffractometer the zeros are read by ('instrument_geometry') it is version 5: a resumed
     session fits with its own choices and circles (combined Stitch review F1, F3).
-    With calibration-only ``conditioning`` it is version 6; older policies retain their version."""
+    With calibration-only ``conditioning`` it is version 6; older policies retain their version.
+    ``resume`` retains canonical setup and current results in version 7, including Quick without staged frames."""
     path = Path(directory) / 'calibration-session.json'
     payload = {'schema': 'xdart.stitch_calibration_session', 'version': 2,
                'frames': [_session_row(frame) for frame in frames]}
@@ -534,8 +538,16 @@ def save_calibration_session(directory, frames, *, arm=None, fit_policy=None):
         policy = _session_policy(fit_policy)
         payload.update(version=6 if 'conditioning' in policy else 5 if 'refine_energy' in policy else 4,
                        fit_policy=policy)
+    if resume is not None:
+        record = _session_resume_record(resume)
+        if not 0 <= len(payload['frames']) <= 32:
+            raise ValueError('invalid calibration frame count')
+        payload.update(version=7, arm=payload.get('arm'), fit_policy=payload.get('fit_policy'), resume=record)
+    raw = json.dumps(payload, indent=2, allow_nan=False).encode('utf-8')
+    if len(raw) > 1 << 20:
+        raise ValueError('calibration session exceeds the size limit')
     temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(payload, indent=2, allow_nan=False))
+    temporary.write_bytes(raw)
     temporary.replace(path)
     return path
 
@@ -578,10 +590,11 @@ def _session_policy(policy):
             'distance_bounds_m': None if limits is None else [float(v) for v in limits], **extra}
 
 
-def load_calibration_session(path, *, with_arm=False, with_policy=False):
+def load_calibration_session(path, *, with_arm=False, with_policy=False, with_resume=False):
     """The session's frames; with ``with_arm``, also its arm (None before version 3); with
     ``with_policy``, also its fit policy (None before version 4; the energy, scale and instrument
-    choices from version 5, calibration-only conditioning from version 6)."""
+    choices from version 5, calibration-only conditioning from version 6).
+    ``with_resume`` returns (frames, arm, policy, CalibrationSessionResume or None)."""
     path = Path(path)
     if path.stat().st_size > 1 << 20:
         raise ValueError('calibration session exceeds the size limit')
@@ -589,20 +602,29 @@ def load_calibration_session(path, *, with_arm=False, with_policy=False):
     version = value.get('version')
     keys = ({'schema', 'version', 'frames'} | ({'arm'} if version in (3, 4, 5, 6) else set())
             | ({'fit_policy'} if version in (4, 5, 6) else set()))
-    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or version not in (1, 2, 3, 4, 5, 6):
+    if version == 7:
+        keys |= {'arm', 'fit_policy', 'resume'}
+    if set(value) != keys or value['schema'] != 'xdart.stitch_calibration_session' or version not in (1, 2, 3, 4, 5, 6, 7):
         raise ValueError('unsupported calibration session')
-    policy = _session_policy(value['fit_policy']) if version in (4, 5, 6) else None
-    if policy is not None and (('refine_energy' in policy) != (version in (5, 6))
+    policy = (_session_policy(value['fit_policy']) if version in (4, 5, 6)
+              or version == 7 and value['fit_policy'] is not None else None)
+    if version != 7 and policy is not None and (('refine_energy' in policy) != (version in (5, 6))
                                or ('conditioning' in policy) != (version == 6)):
         raise ValueError('unsupported calibration session fit policy')
-    if not 1 <= len(value['frames']) <= 32:
+    if not (0 if version == 7 else 1) <= len(value['frames']) <= 32:
         raise ValueError('invalid calibration frame count')
     frames = tuple(CalibrationFrame(**{**row, 'shape': tuple(row['shape'])}) for row in value['frames'])
     for frame in frames:
         # Legacy rows retain their files, but absent model/image binding means
         # they are incomplete until the user recalibrates or explicitly imports.
         validate_frame_files(frame, require_points=frame.complete)
-    arm = _session_arm(value, frames) if version in (3, 4, 5, 6) else None
+    arm = (_session_arm(value, frames) if version in (3, 4, 5, 6)
+           or version == 7 and value['arm'] is not None else None)
+    if version == 7 and policy is not None and arm is None:
+        raise ValueError('a session records its fit policy with its arm')
+    resume = _session_resume_from_record(value['resume']) if version == 7 else None
+    if with_resume:
+        return frames, arm, policy, resume
     if with_policy:
         return frames, arm, policy
     return (frames, arm) if with_arm else frames
@@ -678,9 +700,138 @@ class CalibrationFit:
     condition_number: float
     n_points: int
     message: str
-    #: the fit's control points, for display only (never saved): ``RefineResult.point_residuals``
+    #: the fit's control points, for display and session resume: ``RefineResult.point_residuals``
     #: and "frames", each control frame's scan index and circle readings
     point_residuals: dict = field(default_factory=dict, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class CalibrationSessionResume:
+    """Canonical calibration inputs and typed retained results; no source pixels are read on restore."""
+    setup: dict
+    fit: CalibrationFit | None = None
+    fit_source: SourceSpec | None = None
+    direct_beam: DirectBeamResult | None = None
+    direct_beam_context: dict | None = None
+
+
+def _session_json(value):
+    def convert(item):
+        if isinstance(item, np.ndarray):
+            return item.tolist()
+        if isinstance(item, np.generic):
+            return item.item()
+        if isinstance(item, Path):
+            return str(item)
+        raise ValueError('unsupported calibration resume value')
+    return json.loads(json.dumps(value, default=convert, allow_nan=False))
+
+
+def _session_resume_record(resume):
+    from xrd_tools.integrate.direct_beam import DirectBeamResult
+    if type(resume) is not CalibrationSessionResume:
+        raise ValueError('unsupported calibration resume')
+    if resume.fit is not None and type(resume.fit) is not CalibrationFit:
+        raise ValueError('invalid calibration resume fit')
+    source = resume.fit_source
+    if source is not None and type(source) is not SourceSpec:
+        raise ValueError('invalid calibration resume fit source')
+    beam = resume.direct_beam
+    if beam is not None and type(beam) is not DirectBeamResult:
+        raise ValueError('invalid calibration resume direct beam')
+    beam = None if beam is None else asdict(beam)
+    if beam is not None:
+        for key in _BEAM_FLOAT_ARRAYS:
+            array = np.asarray(beam[key], dtype=float)
+            if np.isinf(array).any():
+                raise ValueError('invalid calibration resume direct beam array')
+            beam[key] = [None if math.isnan(v) else float(v) for v in array]
+    value = _session_json({'setup': resume.setup,
+        'fit': None if resume.fit is None else asdict(resume.fit),
+        'fit_source': None if source is None else {'uri': str(source.uri), 'kind': source.kind.value,
+            'entry': source.entry, 'metadata_uri': None if source.metadata_uri is None else str(source.metadata_uri),
+            'options': dict(source.options)},
+        'direct_beam': beam, 'direct_beam_context': resume.direct_beam_context})
+    _session_resume_from_record(value)
+    return value
+
+
+_BEAM_FLOAT_ARRAYS = ('angles_deg', 'centres_px', 'centre_std_px', 'predictions_px', 'residuals_px')
+
+
+def _session_resume_from_record(value):
+    from dataclasses import fields
+    from xrd_tools.integrate.direct_beam import DirectBeamResult
+    if (type(value) is not dict or set(value) != {field.name for field in fields(CalibrationSessionResume)}
+            or type(value['setup']) is not dict or value['direct_beam_context'] is not None
+            and type(value['direct_beam_context']) is not dict):
+        raise ValueError('unsupported calibration resume')
+    _session_json(value)
+    fit, source, beam = value['fit'], value['fit_source'], value['direct_beam']
+    if (fit is None) != (source is None):
+        raise ValueError('calibration resume fit and source must be paired')
+    if source is not None:
+        if (type(source) is not dict or set(source) != {'uri', 'kind', 'entry', 'metadata_uri', 'options'}
+                or type(source['uri']) is not str or not source['uri'] or type(source['options']) is not dict
+                or any(source[key] is not None and type(source[key]) is not str for key in ('entry', 'metadata_uri'))):
+            raise ValueError('invalid calibration resume fit source')
+        source = SourceSpec(**source)
+        if type(fit) is not dict or set(fit) != {field.name for field in fields(CalibrationFit)}:
+            raise ValueError('invalid calibration resume fit')
+        if (fit['backend'] not in {'multigeometry', 'xu_hist'} or type(fit['n_points']) is not int
+                or fit['n_points'] < 1 or type(fit['message']) is not str
+                or any(type(fit[key]) not in (int, float) or not 0 <= fit[key] < math.inf
+                       for key in ('rms_q', 'condition_number'))
+                or type(fit['asset']) is not dict or set(fit['asset']) != {'calibration', 'provenance'}):
+            raise ValueError('invalid calibration resume fit')
+        calibration, provenance = fit['asset']['calibration'], fit['asset']['provenance']
+        try:
+            if fit['backend'] == 'xu_hist':
+                from xrd_tools.analysis.xu_stitch_calibration import parse_xu_stitch_calibration_bytes
+                parse_xu_stitch_calibration_bytes(_calibration_bytes(calibration))
+            else:
+                from xrd_tools.core.geometry import Diffractometer
+                Diffractometer.from_pyfai_goniometer(calibration, source_motors=provenance.get('source_motors'))
+        except (KeyError, TypeError, AttributeError, NotImplementedError) as error:
+            raise ValueError('invalid calibration resume fit geometry') from error
+        residuals = dict(fit['point_residuals'])
+        if residuals:
+            if set(residuals) != {'q', 'dq', 'frame', 'kept', 'frames'}:
+                raise ValueError('invalid calibration resume residuals')
+            for key, dtype in (('q', float), ('dq', float), ('frame', int), ('kept', bool)):
+                raw = np.asarray(residuals[key])
+                if (raw.ndim != 1 or key == 'frame' and raw.dtype.kind not in 'iu'
+                        or key == 'kept' and raw.dtype.kind != 'b' or key in ('q', 'dq') and raw.dtype.kind not in 'iuf'):
+                    raise ValueError('invalid calibration resume residuals')
+                residuals[key] = raw.astype(dtype)
+            if len({len(residuals[key]) for key in ('q', 'dq', 'frame', 'kept')}) != 1:
+                raise ValueError('invalid calibration resume residual lengths')
+            residuals['frames'] = tuple((int(index), dict(motors)) for index, motors in residuals['frames'])
+            if not np.isfinite(residuals['q']).all() or not np.isfinite(residuals['dq']).all() or any(
+                    not 0 <= index < len(residuals['frames']) for index in residuals['frame']):
+                raise ValueError('invalid calibration resume residuals')
+        fit = CalibrationFit(**{**fit, 'point_residuals': residuals})
+    if beam is not None:
+        if type(beam) is not dict or set(beam) != {field.name for field in fields(DirectBeamResult)}:
+            raise ValueError('invalid calibration resume direct beam')
+        beam = dict(beam)
+        if np.asarray(beam['used']).dtype.kind != 'b':
+            raise ValueError('invalid calibration resume direct beam mask')
+        for key in _BEAM_FLOAT_ARRAYS:
+            beam[key] = np.asarray([np.nan if item is None else item for item in beam[key]], dtype=float)
+        beam['used'] = np.asarray(beam['used'], dtype=bool)
+        count = len(beam['angles_deg'])
+        if (not count or any(np.ndim(beam[key]) != 1 or len(beam[key]) != count
+                            for key in (*_BEAM_FLOAT_ARRAYS, 'used', 'frame_ids', 'point_ids', 'rejection_reasons'))
+                or not np.isfinite(beam['angles_deg']).all() or beam['distance_m'] <= 0
+                or any(type(beam[key]) not in (int, float) or not math.isfinite(beam[key])
+                       for key in ('distance_m', 'distance_std_m', 'pixel_pitch_m', 'slope_deg_per_pixel', 'intercept_px'))):
+            raise ValueError('invalid calibration resume direct beam arrays')
+        for key in ('frame_ids', 'point_ids', 'rejection_reasons', 'image_shape'):
+            beam[key] = tuple(beam[key])
+        beam['beam_pixel'] = None if beam['beam_pixel'] is None else tuple(beam['beam_pixel'])
+        beam = DirectBeamResult(**beam)
+    return CalibrationSessionResume(value['setup'], fit, source, beam, value['direct_beam_context'])
 
 
 def stitch_calibrant_preview(fit: CalibrationFit, spec: SourceSpec, *, mask=None, conditioning=None,
