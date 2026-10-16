@@ -1238,6 +1238,8 @@ def _restore_owned_entries(changed, prior, scratch, error):
             else:
                 backup = scratch / destination.name
                 backup.write_bytes(prior[destination])
+                if _file_identity(destination) != ours:
+                    raise OSError('another writer replaced it during restore preparation')
                 replace_into_place(backup, destination, verb='restore calibration')
         except OSError as failure:
             kept = None
@@ -1285,10 +1287,12 @@ def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cance
             destinations = (partner.with_suffix(partner.suffix + '.provenance.json'), partner,
                             target.with_suffix(target.suffix + '.provenance.json'), target)
             prior = {}
+            prior_identity = {}
             for destination in destinations:
                 if destination.is_symlink() or (destination.exists() and not destination.is_file()):
                     raise ValueError(f'{destination.name} is not a regular calibration file')
                 prior[destination] = destination.read_bytes() if destination.exists() else None
+                prior_identity[destination] = _file_identity(destination)
             # Each entry we changed maps to the identity we put there (None: we removed it). A move that
             # reports an error after it took effect is still ours, so its identity, not the call's
             # return, decides; rollback touches only entries that still hold what we put there.
@@ -1301,7 +1305,8 @@ def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cance
                         try:
                             replace_into_place(prepared, destination)
                         except OSError:
-                            if _file_identity(destination) != changed[destination]:
+                            if (_file_identity(prepared) == changed[destination]
+                                    and _file_identity(destination) == prior_identity[destination]):
                                 del changed[destination]
                             raise
                     elif destination.exists():

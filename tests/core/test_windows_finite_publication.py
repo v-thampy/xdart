@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import threading
 from types import SimpleNamespace
 
@@ -45,7 +46,6 @@ _WINDOWS = os.name == "nt"
 _DESCRIPTOR_HOST = os.open in os.supports_dir_fd
 _ARMS = ("host", "named") if _DESCRIPTOR_HOST else ("host",)
 
-
 @pytest.fixture(params=_ARMS)
 def arm(request, monkeypatch):
     """``named`` is the no-dir_fd arm: native on Windows, forced and diagnostic-only elsewhere. Disposal
@@ -54,7 +54,6 @@ def arm(request, monkeypatch):
         monkeypatch.setattr(finite_module, "_DESCRIPTOR_CUSTODY", False)
     named = request.param == "named" or not _DESCRIPTOR_HOST
     return SimpleNamespace(named=named, disposes=_WINDOWS or not named)
-
 
 @pytest.fixture(params=("host",) if _WINDOWS else ("host", "crt-emulated"))
 def crt(request, monkeypatch):
@@ -83,10 +82,8 @@ def crt(request, monkeypatch):
     for name, value in (("open", crt_open), ("read", crt_read), ("write", crt_write), ("close", crt_close)):
         monkeypatch.setattr(os, name, value)
 
-
 def _leftovers(directory) -> list[Path]:
     return sorted(path for path in Path(directory).iterdir() if path.name.startswith(".xdart-finite-"))
-
 
 def _start(target, values=(1, 2, 3)) -> _FinitePublicationSession:
     session = _FinitePublicationSession(target)
@@ -95,28 +92,23 @@ def _start(target, values=(1, 2, 3)) -> _FinitePublicationSession:
     assert session.close_document()
     return session
 
-
 def _publish(session, expected):
     return session.publish(expected, ordinal=session.ordinal,
                            observe=lambda path, ordinal: _seal_published(str(path), ordinal))
 
-
 def _values(path) -> list[int]:
     with h5py.File(path, "r") as handle:
         return handle["value"][()].tolist()
-
 
 def _prior(target, values=(1,)):
     facts = _publish(_start(target, values), capture_target_snapshot(target))
     assert facts.published and facts.error is None
     return target.read_bytes(), target.stat()
 
-
 def _assert_prior(target, prior) -> None:
     raw, state = prior
     assert target.read_bytes() == raw
     assert (target.stat().st_dev, target.stat().st_ino) == (state.st_dev, state.st_ino)
-
 
 def _assert_discarded(session, arm, directory) -> None:
     left = _leftovers(directory)
@@ -126,22 +118,18 @@ def _assert_discarded(session, arm, directory) -> None:
         assert len(left) == 1 and session.hidden_orphan is not None, (left, session.hidden_orphan)
         assert os.path.samefile(session.hidden_orphan, left[0])
 
-
 def _raising(error):
     def fail(*_args, **_kwargs):
         raise error
     return fail
 
-
 def _assert_slot_free(target) -> None:
     coordinator = get_output_transaction_coordinator()
     coordinator.release_target(coordinator.hold_target(str(target), label="probe"))
 
-
 def _parent_descriptor(session) -> int:
     parent = session._parent_descriptor
     return parent if type(parent) is int else parent.descriptor
-
 
 @pytest.mark.parametrize("two_d", (False, True), ids=("W01-average-1d", "W02-average-2d"))
 def test_w01_w02_average_publishes_replaces_and_reopens(tmp_path, monkeypatch, arm, two_d):
@@ -174,7 +162,6 @@ def test_w01_w02_average_publishes_replaces_and_reopens(tmp_path, monkeypatch, a
     assert (states[0].st_dev, states[0].st_ino) != (states[1].st_dev, states[1].st_ino)
     assert _leftovers(tmp_path) == []
 
-
 def _stitch_requests(tmp_path, cell):
     from xrd_tools.analysis.module_transaction import ModuleOutputRequest
     from xrd_tools.analysis.stitch_operation import prepare_stitch_operation
@@ -193,7 +180,6 @@ def _stitch_requests(tmp_path, cell):
         plan = replace(original.plan, native_records=True, mode=mode, npt_1d=npt, **grid, **extra)
         output = ModuleOutputRequest(target, kind, overwrite, artifact_family=family)
         yield prepare_stitch_operation(original.module.source, output, plan, project_root=tmp_path)
-
 
 @pytest.mark.parametrize("cell", (("multigeometry", "1d"), ("xu_hist", "1d"), ("multigeometry", "2d"),
                                   ("xu_hist", "2d")),
@@ -220,7 +206,6 @@ def test_w03_w06_stitch_publishes_replaces_and_reopens(tmp_path, arm, cell):
     assert fingerprints[0] != fingerprints[1]
     assert (states[0].st_dev, states[0].st_ino) != (states[1].st_dev, states[1].st_ino)
     assert _leftovers(target.parent) == []
-
 
 @pytest.mark.parametrize("frame", ("hkl", "q"), ids=("W07-rsm-hkl", "W08-rsm-q"))
 def test_w07_w08_rsm_v2_publishes_replaces_and_reopens(tmp_path, monkeypatch, arm, frame):
@@ -252,7 +237,6 @@ def test_w07_w08_rsm_v2_publishes_replaces_and_reopens(tmp_path, monkeypatch, ar
     assert (states[0].st_dev, states[0].st_ino) != (states[1].st_dev, states[1].st_ino)
     assert _leftovers(target.parent) == []
 
-
 def _hdf5(path: Path) -> bytes:
     with h5py.File(path, "w") as handle:
         handle.create_dataset("value", data=np.arange(4096, dtype="<u2"))
@@ -260,13 +244,11 @@ def _hdf5(path: Path) -> bytes:
     assert raw.startswith(b"\x89HDF\r\n\x1a\n")
     return raw
 
-
 def _corpus(path: Path) -> bytes:
     unit = b"\r\n\x1a\n\r\x1a" + bytes(range(256))
     raw = unit * (finite_module._COPY_BLOCK_BYTES // len(unit) + 3)  # CR/LF/0x1A across block edges
     path.write_bytes(raw)
     return raw
-
 
 @pytest.mark.parametrize("kind", ("hdf5", "corpus"), ids=("W09-capture-hdf5", "W10-capture-corpus"))
 def test_w09_w10_capture_hashes_every_binary_byte(tmp_path, crt, kind):
@@ -274,7 +256,6 @@ def test_w09_w10_capture_hashes_every_binary_byte(tmp_path, crt, kind):
     raw = (_hdf5 if kind == "hdf5" else _corpus)(path)
     snapshot = capture_finite_source(path).snapshot
     assert (snapshot.size, snapshot.digest) == (len(raw), hashlib.sha256(raw).hexdigest())
-
 
 def _seeded_publish(request, admission, raw: bytes):
     def validate(binding):
@@ -296,7 +277,6 @@ def _seeded_publish(request, admission, raw: bytes):
         adapter, inspect_committed=inspect, seed=admission, accept_validated_commit=lambda _v: None,
     )
 
-
 @pytest.mark.parametrize("kind", ("hdf5", "corpus"), ids=("W11-seed-hdf5", "W12-seed-corpus"))
 def test_w11_w12_seeded_copy_is_byte_identical(tmp_path, arm, crt, kind):
     source = tmp_path / "source.nexus"
@@ -309,11 +289,9 @@ def test_w11_w12_seeded_copy_is_byte_identical(tmp_path, arm, crt, kind):
     assert Path(request.output_artifact).read_bytes() == raw and source.read_bytes() == raw
     assert _leftovers(tmp_path) == []
 
-
 def _fixed_names(monkeypatch, letter: str) -> Path:
     monkeypatch.setattr(finite_module, "secrets", SimpleNamespace(token_hex=lambda n: letter * (2 * n)))
     return Path(f".xdart-finite-{letter * 32}-{letter * 32}.nexus")
-
 
 def test_w13_candidate_collision_preserves_the_foreign_occupant(tmp_path, arm, monkeypatch):
     foreign = tmp_path / _fixed_names(monkeypatch, "c")
@@ -325,7 +303,6 @@ def test_w13_candidate_collision_preserves_the_foreign_occupant(tmp_path, arm, m
     assert not session.slot_held
     _assert_slot_free(tmp_path / "slot.nexus")
 
-
 def test_w14_existing_slot_is_replaced_atomically(tmp_path, arm):
     target = tmp_path / "slot.nexus"
     _raw, before = _prior(target, (1, 2, 3))
@@ -335,7 +312,6 @@ def test_w14_existing_slot_is_replaced_atomically(tmp_path, arm):
     assert facts.terminal.inode == target.stat().st_ino != before.st_ino
     assert _leftovers(tmp_path) == []  # the named arm reports its unconfirmed directory barrier:
     assert any(FINITE_PARENT_DIRECTORY_FSYNC_WARNING in item for item in session.diagnostics) is arm.named
-
 
 def test_w15_target_substituted_after_admission_is_refused(tmp_path, arm):
     target = tmp_path / "slot.nexus"
@@ -348,7 +324,6 @@ def test_w15_target_substituted_after_admission_is_refused(tmp_path, arm):
         _publish(session, expected)
     assert target.read_bytes() == b"foreign"
     _assert_discarded(session, arm, tmp_path)
-
 
 @pytest.mark.parametrize("level", ("parent", "ancestor"), ids=("W16-parent", "W17-ancestor"))
 def test_w16_w17_exchange_after_admission_never_publishes_elsewhere(tmp_path, arm, level):
@@ -375,11 +350,9 @@ def test_w16_w17_exchange_after_admission_never_publishes_elsewhere(tmp_path, ar
     assert list(parent.iterdir()) == []
     _assert_discarded(session, arm, moved_parent)
 
-
 def _substitute(path: Path, raw: bytes = b"foreign") -> None:
     path.unlink()
     path.write_bytes(raw)
-
 
 @pytest.mark.parametrize("moment", ("before-write", "after-close"), ids=("W18-before-write", "W40-before-flush"))
 def test_w18_w40_substituted_candidate_is_refused_and_never_deleted(tmp_path, arm, moment):
@@ -389,6 +362,13 @@ def test_w18_w40_substituted_candidate_is_refused_and_never_deleted(tmp_path, ar
     candidate = session.candidate
     if moment == "before-write":
         _substitute(candidate)
+        try:
+            with pytest.raises(FiniteArtifactIntegrityError, match="candidate changed"):
+                session.open_document(lambda path: h5py.File(path, "w"))
+        finally:
+            session.abort()
+        assert candidate.read_bytes() == b"foreign" and session.hidden_orphan is None
+        return
     document = session.open_document(lambda path: h5py.File(path, "w"))
     document.create_dataset("value", data=[1])
     assert session.close_document()
@@ -400,7 +380,6 @@ def test_w18_w40_substituted_candidate_is_refused_and_never_deleted(tmp_path, ar
     assert not target.exists() and candidate.read_bytes() == foreign
     assert session.hidden_orphan is None
     assert any(FINITE_CANDIDATE_CLEANUP_WARNING in note for note in raised.value.__notes__)
-
 
 def test_w19_hard_linked_source_alias_is_refused(tmp_path, monkeypatch, arm):
     from tests.core.test_p36_average import _stub_integrators
@@ -424,7 +403,6 @@ def test_w19_hard_linked_source_alias_is_refused(tmp_path, monkeypatch, arm):
     assert result.disposition == "REFUSED" and result.diagnostic_code == "AVERAGE_OUTPUT_IS_SOURCE"
     assert raw.read_bytes() == before and _leftovers(tmp_path) == []
 
-
 def test_w20_foreign_cleanup_occupant_is_preserved(tmp_path, arm):
     session = _start(tmp_path / "slot.nexus")
     _substitute(session.candidate)
@@ -432,7 +410,6 @@ def test_w20_foreign_cleanup_occupant_is_preserved(tmp_path, arm):
     assert session.candidate.read_bytes() == b"foreign" and session.hidden_orphan is None
     assert any(FINITE_CANDIDATE_CLEANUP_WARNING in item for item in session.diagnostics)
     assert not session.slot_held
-
 
 @pytest.mark.parametrize("fault", ("before", "after"), ids=("W21-before-effect", "W22-after-own-effect"))
 def test_w21_w22_replacement_fault_keeps_one_truth(tmp_path, monkeypatch, arm, fault):
@@ -456,7 +433,6 @@ def test_w21_w22_replacement_fault_keeps_one_truth(tmp_path, monkeypatch, arm, f
     assert facts.published and facts.error is None and _values(target) == [2]
     assert _leftovers(tmp_path) == []
 
-
 @pytest.mark.parametrize("occupant", ("regular", "directory"), ids=("W23-regular", "W23-directory"))
 def test_w23_ambiguous_foreign_occupant_keeps_its_verdict(tmp_path, monkeypatch, arm, occupant):
     target = tmp_path / "slot.nexus"
@@ -478,7 +454,6 @@ def test_w23_ambiguous_foreign_occupant_keeps_its_verdict(tmp_path, monkeypatch,
         assert facts.published and type(facts.error) is FiniteArtifactCollision and target.is_dir()
     assert _leftovers(tmp_path) == [] and session.hidden_orphan is None
 
-
 def test_w24_cleanup_failure_names_the_exact_hidden_orphan(tmp_path, monkeypatch, arm):
     session = _start(tmp_path / "slot.nexus")
     candidate = session.candidate
@@ -490,7 +465,6 @@ def test_w24_cleanup_failure_names_the_exact_hidden_orphan(tmp_path, monkeypatch
         assert session.abort()
     assert candidate.exists() and os.path.samefile(session.hidden_orphan, candidate)
     assert any(FINITE_CANDIDATE_CLEANUP_WARNING in item for item in session.diagnostics)
-
 
 @pytest.mark.parametrize("arm", ("named",), indirect=True)
 def test_w25_named_parent_publishes_without_descriptor_relative_calls(tmp_path, monkeypatch, arm):
@@ -513,7 +487,6 @@ def test_w25_named_parent_publishes_without_descriptor_relative_calls(tmp_path, 
     assert facts.published and facts.error is None and _values(target) == [1, 2, 3]
     assert relative == [] and closes.count(parent) == 1 and session._parent_descriptor is None
     assert any(FINITE_PARENT_DIRECTORY_FSYNC_WARNING in item for item in session.diagnostics)
-
 
 @pytest.mark.parametrize("case", ("abort", "failed-reserve", "duplicate-reserve"),
                          ids=("W26-abort", "W26-failed-reserve", "W26-duplicate-reserve"))
@@ -542,7 +515,6 @@ def test_w26_owner_retirement_never_leaks_or_steals_the_slot(tmp_path, monkeypat
     assert not session.slot_held and session._parent_descriptor is None
     _assert_slot_free(target)
 
-
 def test_w27_seeded_adoption_publishes_releases_and_strands_nothing(tmp_path, arm):
     source = tmp_path / "source.nexus"
     raw = _hdf5(source)
@@ -556,6 +528,39 @@ def test_w27_seeded_adoption_publishes_releases_and_strands_nothing(tmp_path, ar
     assert any(FINITE_PARENT_DIRECTORY_FSYNC_WARNING in item for item in result.diagnostics) is arm.named
     _assert_slot_free(target)
 
+@pytest.mark.parametrize("fault", ("fstat", "_snapshot_at"))
+@pytest.mark.parametrize("arm", ("named",), indirect=True)
+def test_named_reservation_observation_failure_keeps_cleanup_authority(tmp_path, monkeypatch, arm, fault):
+    owner = os if fault == "fstat" else finite_module
+    original = getattr(owner, fault)
+    def fail_once(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if fault == "fstat" and not stat.S_ISREG(result.st_mode):
+            return result
+        monkeypatch.setattr(owner, fault, original)
+        raise OSError("injected reservation observation failure")
+    monkeypatch.setattr(owner, fault, fail_once)
+    session = _FinitePublicationSession(tmp_path / "slot.nexus")
+    with pytest.raises(OSError, match="reservation observation failure"):
+        session.reserve()
+    _assert_discarded(session, arm, tmp_path)
+    assert not session.slot_held
+
+@pytest.mark.parametrize("arm", ("named",), indirect=True)
+def test_named_disposal_retains_secondary_close_failure(tmp_path, monkeypatch, arm):
+    session = _start(tmp_path / "slot.nexus")
+    parent, candidate, reserved = session._parent_descriptor, session.candidate, session._reservation
+    original = finite_module._close_descriptor_once
+    def close_then_report(descriptor):
+        return original(descriptor) or OSError("injected disposal close failure")
+    monkeypatch.setattr(finite_module, "_close_descriptor_once", close_then_report)
+    try:
+        with pytest.raises(FiniteArtifactIntegrityError) as raised:
+            finite_module._unlink_candidate(parent, candidate, reserved)
+        assert "close" in str(raised.value) or any("close" in note for note in getattr(raised.value, "__notes__", ()))
+    finally:
+        monkeypatch.setattr(finite_module, "_close_descriptor_once", original)
+        session.abort()
 
 def test_w28_capacity_refusal_preserves_source_and_prior(tmp_path, monkeypatch, arm):
     source = tmp_path / "source.nexus"
@@ -579,7 +584,6 @@ def test_w28_capacity_refusal_preserves_source_and_prior(tmp_path, monkeypatch, 
 
 _ANGLES = [(6.0, -10.0), (15.0, 3.0), (25.0, 6.0)]
 
-
 @pytest.fixture(scope="module")
 def calibration_fit(tmp_path_factory):
     from tests.core.test_stitch_autocalibration import ROW_ANGLES, five_parameter_seed, ring_scan
@@ -587,22 +591,18 @@ def calibration_fit(tmp_path_factory):
     scan = ring_scan(tmp_path_factory.mktemp("fit") / "scan", [(d, 0.0) for d in (6.0, 20.0, 34.0)])
     return refine_arm_from_scan(scan, five_parameter_seed(ROW_ANGLES), max_frames=3)
 
-
 def _pair_files(tmp_path):
     target = tmp_path / "saved.json"
     return target, (target.with_suffix(".json.provenance.json"), target, tmp_path / "saved.xu.json",
                     tmp_path / "saved.xu.json.provenance.json")
-
 
 def _changed(fit):
     asset = copy.deepcopy(fit.asset)
     asset["calibration"]["param"][asset["calibration"]["param_names"].index("dist")] += 0.001
     return replace(fit, asset=asset)
 
-
 def _snapshot_pair(files):
     return {path: path.read_bytes() for path in files}
-
 
 def test_w29_w30_w31_pair_create_overwrite_and_prior_preservation(tmp_path, calibration_fit):
     from xrd_tools.integrate.stitch_calibration import paired_xu_calibration, save_calibration_pair
@@ -628,9 +628,10 @@ def test_w29_w30_w31_pair_create_overwrite_and_prior_preservation(tmp_path, cali
                               overwrite=True)
     assert _snapshot_pair(files) == current and not tuple(tmp_path.glob(".xdart-calibration-*"))
 
-
-@pytest.mark.parametrize("fault", ("before-move", "after-move", "restore-fails", "foreign-occupant"),
-                         ids=("W32-before-move", "W33-after-move", "W34-restore-fails", "W34-foreign"))
+@pytest.mark.parametrize("fault", ("before-move", "after-move", "restore-fails", "foreign-occupant",
+                                  "after-move-foreign", "foreign-during-restore"),
+                         ids=("W32-before-move", "W33-after-move", "W34-restore-fails", "W34-foreign",
+                              "W34-after-move-foreign", "W34-foreign-during-restore"))
 def test_w32_w34_pair_failure_restores_owned_entries_and_reports(tmp_path, monkeypatch, calibration_fit, fault):
     from xrd_tools.integrate.stitch_calibration import save_calibration_pair
     target, files = _pair_files(tmp_path)
@@ -638,6 +639,15 @@ def test_w32_w34_pair_failure_restores_owned_entries_and_reports(tmp_path, monke
     prior = _snapshot_pair(files)
     real = transaction_module.replace_into_place
     calls = []
+    foreign = tmp_path / "foreign"
+    foreign.write_bytes(b"foreign")
+    write = Path.write_bytes
+    def substitute_during_backup(path, raw):
+        result = write(path, raw)
+        if fault == "foreign-during-restore" and path.name == files[2].name and len(calls) >= 3:
+            os.replace(foreign, files[2])
+        return result
+    monkeypatch.setattr(Path, "write_bytes", substitute_during_backup)
 
     def injected(source, destination, *args, **kwargs):
         calls.append((Path(destination).name, kwargs.get("verb", "publish")))
@@ -648,10 +658,12 @@ def test_w32_w34_pair_failure_restores_owned_entries_and_reports(tmp_path, monke
             return real(source, destination, *args, **kwargs)
         if fault == "before-move" and publish_index == 1:
             raise OSError("injected before move")
-        if fault == "after-move" and publish_index == 2:
+        if fault in ("after-move", "after-move-foreign") and publish_index == 2:
             real(source, destination, *args, **kwargs)
+            if fault == "after-move-foreign":
+                os.replace(foreign, destination)
             raise OSError("injected after move")
-        if fault in ("restore-fails", "foreign-occupant") and publish_index == 3:
+        if fault in ("restore-fails", "foreign-occupant", "foreign-during-restore") and publish_index == 3:
             if fault == "foreign-occupant":
                 _substitute(files[2])  # another writer replaced an entry we had moved
             raise OSError("injected third move")
@@ -659,21 +671,20 @@ def test_w32_w34_pair_failure_restores_owned_entries_and_reports(tmp_path, monke
     monkeypatch.setattr(transaction_module, "replace_into_place", injected)
     with pytest.raises(OSError, match="injected") as raised:
         save_calibration_pair(_changed(calibration_fit), target, validation_angles=_ANGLES, overwrite=True)
-    unrestored = files[2] if fault in ("restore-fails", "foreign-occupant") else None
+    unrestored = files[2] if fault in ("restore-fails", "foreign-occupant", "after-move-foreign", "foreign-during-restore") else None
     for path in files:
         if path != unrestored:
             assert path.read_bytes() == prior[path], path.name
     if unrestored is None:
         assert not tuple(tmp_path.glob(".xdart-calibration-*"))
         return
-    if fault == "foreign-occupant":
+    if fault in ("foreign-occupant", "after-move-foreign", "foreign-during-restore"):
         assert unrestored.read_bytes() == b"foreign"  # never clobber an entry we no longer own
     notes = " ".join(getattr(raised.value, "__notes__", ()))
     assert "rollback incomplete" in notes and unrestored.name in notes
     kept = [path for path in tmp_path.rglob("*") if path.is_file() and path not in files
             and path.read_bytes() == prior[unrestored]]
     assert kept, "the prior bytes of an unrestored entry must stay recoverable"
-
 
 def test_w36_held_open_prior_released_within_the_retry_window_publishes(tmp_path, arm):
     target = tmp_path / "slot.nexus"
@@ -690,7 +701,6 @@ def test_w36_held_open_prior_released_within_the_retry_window_publishes(tmp_path
         holder.close()
     assert facts.published and facts.error is None and _values(target) == [2]
     assert _leftovers(tmp_path) == []
-
 
 @pytest.mark.parametrize("error", ("held-open", "generic"), ids=("W37-exhaustion", "W38-generic-not-retried"))
 def test_w37_w38_failed_replacement_preserves_the_prior_slot(tmp_path, monkeypatch, arm, error):
@@ -715,7 +725,6 @@ def test_w37_w38_failed_replacement_preserves_the_prior_slot(tmp_path, monkeypat
         assert type(raised.value) is OSError and len(calls) == 1
     _assert_prior(target, prior)
     _assert_discarded(session, arm, tmp_path)
-
 
 def test_w41_mixed_case_average_reload_keeps_spelling_and_canonical_identity(tmp_path, monkeypatch):
     from tests.core.test_p36_average import _run_average_scan, _series, _stub_integrators
@@ -747,7 +756,6 @@ def test_w41_mixed_case_average_reload_keeps_spelling_and_canonical_identity(tmp
     assert sealed == os.path.normcase(os.path.abspath(sealed))  # begin_browse's writer-seal condition
     assert sealed == os.path.normcase(os.path.abspath(directive.target))
 
-
 def _make_link(kind: str, link: Path, real: Path) -> None:
     if kind == "junction":
         import _winapi
@@ -756,7 +764,6 @@ def _make_link(kind: str, link: Path, real: Path) -> None:
         link.symlink_to(real, target_is_directory=True)
     except OSError as error:
         pytest.skip(f"INCOMPLETE: this host cannot create a directory symlink ({error})")
-
 
 @pytest.mark.parametrize("kind", ("junction", "symlink") if _WINDOWS else ("symlink",))
 @pytest.mark.parametrize("layout", ("parent", "ancestor"), ids=("W42-parent-link", "W42-ancestor-link"))
@@ -779,7 +786,6 @@ def test_w42_immediate_parent_link_refused_ancestor_link_admitted(tmp_path, arm,
     assert facts.published and facts.error is None and _values(real / "sub" / "slot.nexus") == [1, 2, 3]
     assert _leftovers(real / "sub") == []
 
-
 def test_w43_w44_identities_are_distinct_nonzero_and_survive_the_rename(tmp_path, arm):
     states = []
     for name in ("one.nexus", "two.nexus"):
@@ -792,13 +798,11 @@ def test_w43_w44_identities_are_distinct_nonzero_and_survive_the_rename(tmp_path
     inodes = {state.st_ino for state in states} | {tmp_path.stat().st_ino}
     assert 0 not in inodes and len(inodes) == 3  # W43
 
-
 class _ZeroInode:  # a stat view whose filesystem reports no file identity
     def __init__(self, real):
         self._real, self.st_ino = real, 0
     def __getattr__(self, name):
         return getattr(self._real, name)
-
 
 def test_w45_unavailable_identity_is_refused_before_any_candidate(tmp_path, monkeypatch, arm):
     """Synthetic and DIAGNOSTIC: proves the guard, never a claim about a native server."""
@@ -810,7 +814,6 @@ def test_w45_unavailable_identity_is_refused_before_any_candidate(tmp_path, monk
         session.reserve()
     monkeypatch.undo()
     assert not session.slot_held and _leftovers(tmp_path) == []
-
 
 def test_w46_deep_parent_candidate_beyond_max_path(tmp_path, arm):
     parent = tmp_path

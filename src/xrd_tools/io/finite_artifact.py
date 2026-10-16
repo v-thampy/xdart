@@ -2010,6 +2010,7 @@ def _dispose_named_candidate(
         descriptor = descriptor_path.open_leaf_for_disposal(parent.entry(path.name))
     except FileNotFoundError:
         return
+    primary = None
     try:
         current = os.fstat(descriptor)
         if (
@@ -2021,8 +2022,16 @@ def _dispose_named_candidate(
             raise FiniteArtifactIntegrityError(f"candidate cleanup refused a foreign object: {path}")
         if not descriptor_path.dispose_created_leaf(descriptor):
             raise FiniteArtifactIntegrityError(f"candidate cannot be disposed of through its handle: {path}")
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        _close_descriptor_once(descriptor)
+        close_error = _close_descriptor_once(descriptor)
+        if close_error is not None:
+            if primary is not None:
+                _attach_secondary_close(primary, close_error, "candidate disposal")
+            else:
+                raise FiniteArtifactIntegrityError("finite candidate disposal descriptor close is incomplete") from close_error
 
 
 def _bounded_diagnostic(prefix: str, error: BaseException) -> str:
@@ -2204,35 +2213,45 @@ def _reserve_named_candidate(parent: _NamedParent, name: str) -> FiniteFileSnaps
         raise FiniteArtifactCollision(f"finite private candidate already exists: {name}") from error
     except OSError as error:  # e.g. a path this host cannot create: typed, and before any effect
         raise FiniteArtifactIntegrityError(f"finite private candidate cannot be created: {error}") from error
-    provisional = refusal = None
+    provisional = None
     try:
         refusal = descriptor_path.created_leaf_misplacement(descriptor, parent.identity, name)
         state = os.fstat(descriptor)
         if refusal is None and (not stat.S_ISREG(state.st_mode) or int(state.st_ino) == 0):
             refusal = f"{path}: not a regular file with a usable file identity"
-        if refusal is not None and not descriptor_path.dispose_created_leaf(descriptor):
-            refusal += "; an empty candidate is left there"
-        if refusal is None:
-            provisional = FiniteFileSnapshot(_resolved_parent_path(path), int(state.st_size), hashlib.sha256(b"").hexdigest(), int(state.st_dev), int(state.st_ino), int(state.st_mode), int(state.st_mtime_ns), int(state.st_ctime_ns))
-    finally:
+        if refusal is not None:
+            raise FiniteArtifactIntegrityError(f"finite candidate reservation refused: {refusal}")
+        provisional = FiniteFileSnapshot(_resolved_parent_path(path), int(state.st_size), hashlib.sha256(b"").hexdigest(), int(state.st_dev), int(state.st_ino), int(state.st_mode), int(state.st_mtime_ns), int(state.st_ctime_ns))
+    except BaseException as primary:
+        # Until a receipt exists, the exclusive creation handle is the cleanup authority, even if
+        # observing its metadata failed. Never lose the leaf just because reserve could not return.
+        primary.hidden_orphan = None
+        try:
+            if not descriptor_path.dispose_created_leaf(descriptor):
+                primary.hidden_orphan = descriptor_path.descriptor_final_path(descriptor)
+                primary.add_note(f"{FINITE_CANDIDATE_CLEANUP_WARNING}:{primary.hidden_orphan}")
+        except BaseException as cleanup_error:
+            primary.hidden_orphan = path
+            primary.add_note(_bounded_diagnostic(FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error) + f":{path}")
         close_error = _close_descriptor_once(descriptor)
-    if refusal is not None:
-        raise FiniteArtifactIntegrityError(f"finite candidate reservation refused: {refusal}")
-    if close_error is not None:
-        try:
-            _unlink_candidate(parent, Path(path), provisional)
-        except BaseException:
-            pass
-        raise FiniteArtifactIntegrityError("finite candidate reservation close is incomplete") from close_error
-    captured = _snapshot_at(parent, name, path)
-    # Windows candidates inherit the parent ACL: no POSIX mode is claimed there (D5).
-    if (not _same_object(captured, provisional) or captured.inode == 0
-            or os.name != "nt" and stat.S_IMODE(captured.mode) != 0o600):
-        try:
-            _unlink_candidate(parent, Path(path), provisional)
-        except BaseException:
-            pass
-        raise FiniteArtifactIntegrityError("finite candidate changed during reservation")
+        if close_error is not None:
+            _attach_secondary_close(primary, close_error, "candidate reservation")
+        raise
+    close_error = _close_descriptor_once(descriptor)
+    try:
+        if close_error is not None:
+            raise FiniteArtifactIntegrityError("finite candidate reservation close is incomplete") from close_error
+        captured = _snapshot_at(parent, name, path)
+        # Windows candidates inherit the parent ACL: no POSIX mode is claimed there (D5).
+        if (not _same_object(captured, provisional) or captured.inode == 0
+                or os.name != "nt" and stat.S_IMODE(captured.mode) != 0o600):
+            raise FiniteArtifactIntegrityError("finite candidate changed during reservation")
+    except BaseException as primary:
+        hidden, cleanup_error = _cleanup_publication_candidate(parent, Path(path), provisional)
+        primary.hidden_orphan = hidden
+        if cleanup_error is not None:
+            primary.add_note(_bounded_diagnostic(FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error) + f":{hidden}")
+        raise
     return captured
 
 
@@ -2270,7 +2289,11 @@ def _cleanup_publication_candidate(parent_descriptor: "int | _NamedParent", path
             # A named parent names where its orphan lives now, even after the parent itself moved.
             shown = str(path) if type(parent_descriptor) is int else parent_descriptor.entry(path.name)
         except BaseException:
-            current, shown = None, str(path)
+            try:
+                current = _state(_entry_lstat(parent_descriptor, path.name))
+                shown = str(path) if type(parent_descriptor) is int else parent_descriptor.entry(path.name)
+            except BaseException:
+                current, shown = None, str(path)
         return (shown if current is not None and current[:2] == (authority.device, authority.inode) else None), error
 
 
@@ -2386,14 +2409,19 @@ class _FinitePublicationSession:
                 descriptor, self.target, secrets.token_hex(16), suffix=".nexus",
             )
             self._candidate = Path(self._reservation.path)
-        except BaseException:
+        except BaseException as error:
+            self.hidden_orphan = getattr(error, "hidden_orphan", None)
             self.abort()
             raise
 
     def open_document(self, opener: Callable[[Path], object]) -> object:
-        self._require_parent()
+        descriptor = self._require_parent()
         if self._document is not None:
             raise RuntimeError("finite publication document is already open")
+        if self._reservation is None or _observe_regular_at(
+            descriptor, self.candidate.name, self.candidate,
+        ) != _snapshot_state(self._reservation):
+            raise FiniteArtifactIntegrityError("finite candidate changed before document open")
         self._document = opener(self.candidate)
         return self._document
 
