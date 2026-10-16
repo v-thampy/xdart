@@ -974,12 +974,10 @@ def test_r4d_a_new_spec_member_waits_for_a_second_real_listing(tmp_path, monkeyp
     finally:
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
-    seen = {str(raw / f'calibrant_scan001_{k:04d}.tif') for k in range(3)}
-    early = []
+    seen, early = {str(raw / f'calibrant_scan001_{k:04d}.tif') for k in range(3)}, []
     for at, members in admitted:
-        if at > started:
-            early += [path for path in members if path not in seen
-                      and sum(path in paths for done, paths in listed if done < at) < 2]
+        early += [path for path in members if at > started and path not in seen
+                  and sum(path in paths for done, paths in listed if done < at) < 2]
         seen.update(members)
     assert not early, f'admitted on the listing that first saw them: {early}'
     labels, record = _counted(tmp_path, 'calibrant_scan001')
@@ -1007,9 +1005,8 @@ def test_r5c_a_live_series_signs_the_saturation_its_selected_image_records(tmp_p
     for value, (selected, stem) in enumerate((('cut_0000.tif', 'cut'), ('eiger_master.h5', 'eiger'))):
         source = image_series_spec(raw / selected, metadata_format=None)
         finite = graph_saturation(qualify_source_execution_graph(source), detector=None)
-        executor = StandardRunExecutor(join_timeout=2.)
+        executor, events = StandardRunExecutor(join_timeout=2.), []
         identity = _start(executor, _intent(tmp_path, raw, PILATUS, source=source), request_value=7170 + value)
-        events = []
         try:
             _wait(executor, events, _count_labels(stem, 2), 60.)
         finally:
@@ -1303,20 +1300,34 @@ def test_r7b_gi_live_keeps_each_frames_own_incidence_motor(tmp_path, monkeypatch
 PERF = ('spec_tiff', 'txt', 'nexus', 'eiger', 'aggregate')
 #: The GUI's default bins (1D 1000; 2D 1000 x 360): the containers carry the epoch-commit/finish split.
 REALISTIC = {'npt': 1000, 'method': 'csr'}, {'npt_rad': 1000, 'npt_azim': 360, 'method': 'csr'}
-#: Ratified at the checkpoint (docs 3814fcaf; D1 idle/pending and latency at 6b52675e): overhead (p50 s,
-#: p95 s) per phase and size, local APFS.
-_PHASE_BARS = {
-    'idle': {100: (.020, .040), 500: (.020, .040), 1500: (.020, .060)},
-    'pending': {100: (.020, .040), 500: (.020, .040), 1500: (.020, .060)},
-    'arrival_1': {100: (.100, .200), 500: (.120, .250), 1500: (.250, .500)},
-    'arrival_10': {100: (.300, .500), 500: (.350, .600), 1500: (.600, 1.)},
-    'arrival_latency': {100: (.30, .30), 500: (.35, .35), 1500: (.60, .60)},  # write to first construct, p95
-    'stop_closed': {100: (1., 1.), 500: (1., 1.), 1500: (1., 1.)},
+
+
+def _bars(idle, arrival_1, arrival_10, latency, pending=None):
+    return {'idle': idle, **({} if pending is None else {'pending': pending}), 'arrival_1': arrival_1,
+            'arrival_10': arrival_10, 'arrival_latency': (latency, latency), 'stop_closed': (1., 1.)}
+
+
+#: Overhead bars (p50 s, p95 s), frozen before terminal (docs c810658f) from each row's own native leaf (leaves/cal,
+#: cal3, m2b/d1-p1-500): max(checkpoint bar, 1.5 x measured), rounded up to 0.01 s; 100/500 idle and pending keep
+#: p50 .020, p95 max(.040, 1.5 x measured). Latency (write to first construct) gates its p95; SPEC+TIFF 500's leaf
+#: predates d2c853da, so one poll is added before the margin. Stop: 1 s. Containers have no pending phase: N/A.
+BARS = {
+    ('spec_tiff', 100): _bars(idle=(.02, .04), pending=(.02, .04), arrival_1=(.20, .22), arrival_10=(1.01, 1.04), latency=.49),
+    ('spec_tiff', 500): _bars(idle=(.02, .05), pending=(.02, .06), arrival_1=(.54, .65), arrival_10=(1.55, 1.70), latency=.63),
+    ('spec_tiff', 1500): _bars(idle=(.02, .06), pending=(.07, .10), arrival_1=(.78, .96), arrival_10=(2.25, 2.41), latency=.94),
+    ('txt', 100): _bars(idle=(.02, .04), pending=(.02, .04), arrival_1=(.14, .20), arrival_10=(.34, .50), latency=.42),
+    ('txt', 500): _bars(idle=(.02, .09), pending=(.02, .11), arrival_1=(.34, .41), arrival_10=(.72, .79), latency=.59),
+    ('txt', 1500): _bars(idle=(.02, .13), pending=(.07, .14), arrival_1=(.76, .95), arrival_10=(1.70, 2.89), latency=.84),
+    ('nexus', 100): _bars(idle=(.02, .04), arrival_1=(.18, .20), arrival_10=(.72, .73), latency=.30),
+    ('nexus', 500): _bars(idle=(.02, .04), arrival_1=(.47, .52), arrival_10=(1.57, 1.64), latency=.35),
+    ('nexus', 1500): _bars(idle=(.02, .06), arrival_1=(1.04, 1.05), arrival_10=(3.07, 3.09), latency=.60),
+    ('eiger', 100): _bars(idle=(.02, .04), arrival_1=(.25, .26), arrival_10=(.46, .50), latency=.35),
+    ('eiger', 500): _bars(idle=(.02, .04), arrival_1=(.35, .37), arrival_10=(.64, .66), latency=.41),
+    ('eiger', 1500): _bars(idle=(.02, .06), arrival_1=(.61, .63), arrival_10=(1.08, 1.11), latency=.60),
+    ('aggregate', 100): _bars(idle=(.02, .04), pending=(.02, .07), arrival_1=(.12, .20), arrival_10=(.30, .50), latency=.47),
+    ('aggregate', 500): _bars(idle=(.02, .05), pending=(.02, .10), arrival_1=(.15, .25), arrival_10=(.37, .60), latency=.59),
+    ('aggregate', 1500): _bars(idle=(.03, .09), pending=(.03, .19), arrival_1=(.26, .50), arrival_10=(.60, 1.00), latency=.90),
 }
-#: Every P1 row's bars. The containers have no pending phase in this fixture: N/A, never a pass.
-BARS = {(name, points): {phase: sizes[points] for phase, sizes in _PHASE_BARS.items()
-                         if phase != 'pending' or name not in ('nexus', 'eiger')}
-        for name in PERF for points in (100, 500, 1500)}
 
 
 class _Feed:
@@ -1513,6 +1524,7 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
         record_property('reuse_fixed_bytes', fixed)
         assert per_frame <= 4096 * accepted and per_frame + fixed <= 20 << 20, footprint
     failed, bars = {}, BARS[(name, points)]
+    assert set(bars) == {'idle', 'arrival_1', 'arrival_10', 'arrival_latency', 'stop_closed', *['pending'] * pending}
     assert set(bars) <= set(measured), f'barred phases never measured: {set(bars) - set(measured)}'
     for key, (bar50, bar95) in bars.items():
         p50, p95 = _quantiles(measured[key])
