@@ -443,10 +443,12 @@ class SectionCard(QtWidgets.QFrame):
     def add_row(self, widget: QtWidgets.QWidget) -> None:
         self.body_layout.addWidget(widget)
 
-    def add_group_header(self, text: str) -> None:
+    def add_group_header(self, text: str, *, tooltip: str = "") -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
         label.setObjectName("controlsGroupHeader")
+        label.setToolTip(tooltip)
         self.add_row(label)
+        return label
 
     def embedded_visible(self) -> bool:
         """The embedded widget's EXPLICIT projection state (§21.5 req 2).

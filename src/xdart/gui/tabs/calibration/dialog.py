@@ -1763,20 +1763,27 @@ class CalibrationDialog(QtWidgets.QDialog):
         self.quick_card.setToolTip(tip)
         self.quick_card.title.setToolTip(tip)
         self.quick_card.status.setToolTip('The step Quick calibration is on, where it stopped, or that it finished.')
-        body = QtWidgets.QWidget()
-        form = self._quick_form = QtWidgets.QFormLayout(body)
-        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
-        modes = {self.rough_mode.itemData(i): self.rough_mode.itemText(i) for i in range(self.rough_mode.count())}
-        self.quick_rough_mode = FormRow(label='Rough geometry', path=('Calibration', 'Quick', 'rough_mode'),
-            value=self.rough_mode.currentData(), kind='combo', choices=tuple(modes), choice_labels=modes)
-        self.quick_rough_mode.set_purpose_tooltip(
-            'The same selection as 2 · Rough geometry. Quick calibration requires Direct-beam scan; '
-            'select it to show and choose that scan. Enter the distance and Skip remain available for manual calibration.')
-        self.quick_rough_mode.valueChanged.connect(
-            lambda _path, value: self.rough_mode.setCurrentIndex(self.rough_mode.findData(value)))
-        form.addRow(self.quick_rough_mode.label, self.quick_rough_mode)
-        for scan, prefix, tab in (('Direct-beam', 'beam_', '2 · Rough geometry'), ('Calibrant', '', '3 · Calibrant scan')):
+        self._quick_forms = {}
+        for number, (scan, prefix, tab) in enumerate(
+                (('Direct-beam', 'beam_', '2 · Rough geometry'), ('Calibrant', '', '3 · Calibrant scan')), 1):
+            if number > 1:
+                self.quick_card.body_layout.addSpacing(6)
+            self.quick_card.add_group_header(f'{number} · {scan} scan',
+                tooltip=f"The {scan.lower()} scan used by Quick calibration; the same inputs as {tab}.")
+            body = QtWidgets.QWidget()
+            form = self._quick_forms[prefix] = QtWidgets.QFormLayout(body)
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            if not prefix:
+                self.quick_calibrant = FormRow(label='Calibrant', path=('Calibration', 'Quick', 'calibrant'),
+                    value=self.refine_calibrant.currentText(), kind='combo',
+                    choices=tuple(self.refine_calibrant.itemText(i) for i in range(self.refine_calibrant.count())))
+                self.quick_calibrant.editor.setEditable(True)
+                self.quick_calibrant.set_purpose_tooltip(
+                    'The powder standard: the same editable Calibrant choice as 3 · Calibrant scan.')
+                self.quick_calibrant.valueChanged.connect(lambda *_args: self._quick_calibrant_commit())
+                self.quick_calibrant.editor.lineEdit().editingFinished.connect(self._quick_calibrant_commit)
+                self.refine_calibrant.currentTextChanged.connect(self._sync_quick_calibrant)
+                form.addRow(self.quick_calibrant.label, self.quick_calibrant)
             file_row = FormRow(label=f'{scan} SPEC file', path=('Calibration', 'Quick', prefix + 'source'), value='',
                                browse=True)
             scan_row = FormRow(label='Scan', path=('Calibration', 'Quick', prefix + 'scan'), value='')
@@ -1812,6 +1819,12 @@ class CalibrationDialog(QtWidgets.QDialog):
                 row.browseRequested.connect(lambda _path, key=key: self._browse(key, self._choosers[key]))
                 row.draftChanged.connect(self._sync_quick_folder_buttons)
                 self._fields[key].textChanged.connect(self._sync_quick_folder_buttons)
+            self.quick_card.add_row(body)
+        self.quick_card.body_layout.addSpacing(6)
+        self.quick_card.add_group_header('3 · Conditioning',
+            tooltip='Pixel conditioning shared with the rest of the calibration window.')
+        body = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(body)
         self.quick_threshold = self._threshold_row()  # Advanced's threshold: one state, shown on both rows
         form.addRow(self.quick_threshold.label, self.quick_threshold)
         self._show_threshold()
@@ -1822,6 +1835,18 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._instrument_layout.insertWidget(self._instrument_layout.indexOf(self._detector_box) + 1, self.quick_card)
         self._sync_quick_rows()
         self._sync_quick_button()
+
+    def _quick_calibrant_commit(self):
+        combo = self.quick_calibrant.editor
+        self.refine_calibrant.setCurrentText(combo.currentText())
+        combo.lineEdit().setModified(False)
+
+    def _sync_quick_calibrant(self, value):
+        combo = self.quick_calibrant.editor
+        if combo.lineEdit().hasFocus() and combo.lineEdit().isModified():
+            return
+        if combo.currentText() != value:
+            combo.setCurrentText(value)
 
     def _quick_project(self, key, row, tip):
         """The card's ``row`` for the window's field ``key``: one value, edited on the card or in its tab."""
@@ -1864,16 +1889,13 @@ class CalibrationDialog(QtWidgets.QDialog):
         number for a NeXus file, and the tab's word for the kind of file."""
         if not self._quick_rows:
             return
-        combo = self.quick_rough_mode.editor
-        combo.setCurrentIndex(combo.findData(self.rough_mode.currentData()))
-        measured = self.rough_mode.currentData() == 'scan'
-        for prefix, role, kind, nexus_kind, shown in (
-                ('beam_', 'Direct-beam', self.beam_source_kind.currentData(), 'nexus', measured),
-                ('', 'Calibrant', self.source_kind.currentData(), 'nexus_stack', True)):
+        for prefix, role, kind, nexus_kind in (
+                ('beam_', 'Direct-beam', self.beam_source_kind.currentData(), 'nexus'),
+                ('', 'Calibrant', self.source_kind.currentData(), 'nexus_stack')):
             nexus, series = kind == nexus_kind, kind in ('spec', 'spec_series')
             rows = self._quick_rows
-            self._quick_form.setRowVisible(rows[prefix + 'source'], shown)
-            self._quick_form.setRowVisible(rows[prefix + 'images'], shown and not nexus)
+            self._quick_forms[prefix].setRowVisible(rows[prefix + 'source'], True)
+            self._quick_forms[prefix].setRowVisible(rows[prefix + 'images'], not nexus)
             rows[prefix + 'source'].label.setText(f"{role} {'NeXus' if nexus else 'SPEC'} file")
             rows[prefix + 'scan'].setVisible(not nexus)
             rows[prefix + 'entry'].setVisible(not series and self._shared_nexus_entry is None)
@@ -1885,8 +1907,6 @@ class CalibrationDialog(QtWidgets.QDialog):
             reason = ''
             if self._quick_stage is not None or (self._owner.busy and self._job not in ('beam_detect', 'source_details')):
                 reason = 'Available when the current calibration operation ends.'
-            elif self.rough_mode.currentData() != 'scan':
-                reason = 'Select Direct-beam scan in Rough geometry to use both scan folders.'
             elif self.beam_source_kind.currentData() == 'nexus' or self.source_kind.currentData() == 'nexus_stack':
                 reason = 'Both scans must use SPEC files with image folders.'
             elif not (str(rows[prefix + 'images'].current_value()).strip()
@@ -2451,7 +2471,8 @@ class CalibrationDialog(QtWidgets.QDialog):
     _QUICK_CANCELLED = 'Cancelled; the steps completed before it are kept.'
     _QUICK_NO_FRAMES = 'the calibrant scan lists no frames (3 · Calibrant scan).'
     _QUICK_TIP = ('Fits the direct-beam scan, reads the calibrant scan\'s metadata, then refines automatically from the '
-                  'rough geometry, with these scans and every other setting as the tabs have them. It stops at the '
+                  'rough geometry. Starting Quick selects Direct-beam scan in the shared Rough geometry setting; '
+                  'every other setting is the same as the tabs. It stops at the '
                   'first problem, never saves, and changes no camera, motor sense or zero.')
 
     #: The freedom every fit keeps about its estimates (maintainer, 2026-09-29), with defaults.
@@ -3729,12 +3750,11 @@ class CalibrationDialog(QtWidgets.QDialog):
         the rough geometry, one after another, stopping at the first problem (_quick_advance)."""
         if self._quick_stage is not None or self._owner.busy:
             return
+        self.rough_mode.setCurrentIndex(self.rough_mode.findData('scan'))
+        self._quick_calibrant_commit()
         for key, row in self._quick_rows.items():  # a scan typed on the card and not yet committed is the one used
             if row.editor.isModified() and row.current_value() != self._text(key):
                 row.editor.editingFinished.emit()
-        if self.rough_mode.currentData() != 'scan':
-            self._quick_stop(1, self._QUICK_NEEDS_SCAN)
-            return
         self._quick_cancelled, self._quick_detected_generation = False, None
         self._quick_stage, self._quick_kind = 1, None
         self._quick_progress()
