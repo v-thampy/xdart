@@ -1213,6 +1213,45 @@ class SavedCalibration:
     xu_transfer: dict | None = None
 
 
+def _file_identity(path):
+    try:
+        state = Path(path).lstat()
+    except FileNotFoundError:
+        return None
+    return int(state.st_dev), int(state.st_ino)
+
+
+def _restore_owned_entries(changed, prior, scratch, error):
+    """Undo a failed pair replacement entry by entry, restoring only what we still own.
+
+    A restore that fails, or an entry another writer replaced meanwhile, does not stop the
+    others; its prior bytes are kept beside it and the incomplete rollback is reported.
+    """
+    from xrd_tools.io.output_transaction import replace_into_place
+    incomplete = []
+    for destination, ours in reversed(tuple(changed.items())):
+        try:
+            if _file_identity(destination) != ours:
+                raise OSError('another writer replaced it')
+            if prior[destination] is None:
+                destination.unlink(missing_ok=True)
+            else:
+                backup = scratch / destination.name
+                backup.write_bytes(prior[destination])
+                replace_into_place(backup, destination, verb='restore calibration')
+        except OSError as failure:
+            kept = None
+            if prior[destination] is not None:
+                kept = destination.with_name(f'.{destination.name}.xdart-prior-{uuid.uuid4().hex[:8]}')
+                try:
+                    kept.write_bytes(prior[destination])
+                except OSError as lost:
+                    kept = f'unavailable ({lost})'
+            incomplete.append(f'{destination.name} not restored ({failure}); prior bytes kept at {kept}')
+    if incomplete:
+        error.add_note('calibration rollback incomplete: ' + '; '.join(incomplete))
+
+
 def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cancelled=None,
                           progress=None, overwrite=False) -> SavedCalibration:
     """Save a pyFAI fit and its xrayutilities partner beside it (``xu_partner_path``).
@@ -1250,24 +1289,31 @@ def save_calibration_pair(fit: CalibrationFit, path, *, validation_angles, cance
                 if destination.is_symlink() or (destination.exists() and not destination.is_file()):
                     raise ValueError(f'{destination.name} is not a regular calibration file')
                 prior[destination] = destination.read_bytes() if destination.exists() else None
-            changed = []
+            # Each entry we changed maps to the identity we put there (None: we removed it). A move that
+            # reports an error after it took effect is still ours, so its identity, not the call's
+            # return, decides; rollback touches only entries that still hold what we put there.
+            changed = {}
             try:
                 for destination in destinations:
                     prepared = Path(scratch) / destination.name
                     if prepared.exists():
-                        replace_into_place(prepared, destination)
-                        changed.append(destination)
+                        changed[destination] = _file_identity(prepared)
+                        try:
+                            replace_into_place(prepared, destination)
+                        except OSError:
+                            if _file_identity(destination) != changed[destination]:
+                                del changed[destination]
+                            raise
                     elif destination.exists():
-                        destination.unlink()
-                        changed.append(destination)
-            except OSError:
-                for destination in reversed(changed):
-                    if prior[destination] is None:
-                        destination.unlink(missing_ok=True)
-                    else:
-                        backup = Path(scratch) / destination.name
-                        backup.write_bytes(prior[destination])
-                        replace_into_place(backup, destination, verb='restore calibration')
+                        changed[destination] = None
+                        try:
+                            destination.unlink()
+                        except OSError:
+                            if destination.exists():
+                                del changed[destination]
+                            raise
+            except OSError as error:
+                _restore_owned_entries(changed, prior, Path(scratch), error)
                 raise
             return replace(saved, pyfai_path=str(target),
                            xu_path=str(partner) if saved.xu_path is not None else None)

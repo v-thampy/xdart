@@ -770,7 +770,9 @@ class WorkspaceOperationOwner:
                 request_catalog=True,
             )
         directive = AverageReloadDirective(
-            successor,
+            # The seal's canonical spelling of the same slot (it differs from `successor` in case on
+            # Windows); Browse reopens exactly what the writer sealed.
+            commit_identity.target,
             entry,
             commit_identity,
             state.source_root,
