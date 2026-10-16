@@ -223,18 +223,13 @@ def _scandir_files(directory: Path):
                 yield entry.path, entry.name, entry.stat
 
 
-def collect_owned_candidates(directory, *, recursive: bool = False,
-                             name_filter: str | None = None,
+def collect_owned_candidates(directory, *, recursive: bool = False, name_filter: str | None = None,
                              memo: dict | None = None) -> list[Candidate]:
-    """:func:`collect_candidates` for one DirectoryIndex poll: the same candidates.
+    """:func:`collect_candidates` for one DirectoryIndex poll, against one registry copy.
 
-    One registry copy serves the whole listing, so no adapter predicate runs
-    under the registry lock.  ``memo`` belongs to the caller's index.  While
-    every registered adapter is a built-in whose predicate is a pure filename
-    rule (``registry.PURE_NAME_PREDICATES``), it keeps each listed path's
-    owner from poll to poll; any other registry, or any change of it, asks
-    every predicate again.  A file whose path, owner and stamp are unchanged
-    keeps its previous :class:`Candidate` object.
+    ``memo`` (the index's) keeps each listed path's owner while only name-pure
+    built-ins are registered (``registry.PURE_NAME_PREDICATES``) and the
+    registry is unchanged, and an unchanged file's :class:`Candidate` object.
     """
     directory = Path(directory)
     if not directory.is_dir():
@@ -252,10 +247,8 @@ def collect_owned_candidates(directory, *, recursive: bool = False,
     memo = {} if memo is None else memo
     owners = memo.get("owners", {}) if pure and memo.get("registry") == registry else {}
     previous = memo.get("candidates", {})
-    listed = (
-        ((str(f), f.name, f.stat) for f in _iter_files_unordered(directory, True))
-        if recursive else _scandir_files(directory)
-    )
+    listed = (((str(f), f.name, f.stat) for f in _iter_files_unordered(directory, True))
+              if recursive else _scandir_files(directory))
     kept_owners: dict = {}
     kept: dict[str, Candidate] = {}
     out: list[Candidate] = []

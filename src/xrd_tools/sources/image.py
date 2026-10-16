@@ -297,8 +297,7 @@ class TiffSeriesSource(BaseFrameSource):
         ))
 
     def retain_metadata(self, values: Mapping[int, Mapping[str, Any]]) -> None:
-        """Serve these frames the metadata values given (a live Run's admitted
-        values for frames its proof holds) instead of reading them again."""
+        """Serve these frames (a live Run's proved prefix) their admitted values, unread."""
         self._retained = values
 
     def metadata_for(

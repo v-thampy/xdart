@@ -470,25 +470,17 @@ def _fresh_listing(directory: Path, listings: dict) -> tuple[frozenset, dict[str
     """*directory*'s regular files, listed now, once per ``listings`` and never in the process-wide cache."""
     found = listings.get(directory)
     if found is None:
-        names: list[str] = []
         try:
             with os.scandir(directory) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_file():
-                            names.append(entry.name)
-                    except OSError:
-                        continue
-        except OSError:
-            pass
+                names = [entry.name for entry in entries if entry.is_file()]
+        except OSError:  # an unreadable listing shows no sidecar: callers then wait or check strictly
+            names = []
         found = listings[directory] = (frozenset(names), {name.lower(): directory / name for name in names})
     return found
 
 
 def _existing_path_case_insensitive(candidate: Path, listings: dict | None = None) -> Path | None:
-    """Return an existing sibling matching *candidate.name*, exact case first.
-
-    With ``listings`` (a caller's own fresh listings), both looks use it."""
+    """Return an existing sibling matching *candidate.name*, exact case first (in ``listings`` if given)."""
     if listings is not None:
         names, lower = _fresh_listing(candidate.parent, listings)
         return candidate if candidate.name in names else lower.get(candidate.name.lower())
@@ -1108,8 +1100,7 @@ def live_sidecar_observation(
     selects; Auto names every allow-listed candidate that exists now.  ``()``
     means none exists.  Nothing is opened or parsed: the live owner compares two
     observations a poll apart before it admits the frame.  ``listings`` (the
-    caller's own, filled fresh) replaces the process-wide listing cache.
-    """
+    caller's own fresh ones) replace the process-wide listing cache."""
 
     image = _lexical_absolute(image_path)
     meta_format_norm = str(meta_format).strip().lower()
@@ -1665,8 +1656,7 @@ def _read_spec_scan(path: Path, scan_number: int, *, cancelled=None) -> _SpecSca
     The file is copied once, up to the size it had when opened: bytes rewritten
     or truncated meanwhile cannot fault the read, as they could under a mapped
     view.  ``None`` when the file holds no such scan.  ``cancelled`` is asked
-    after the copy and every few thousand lines.
-    """
+    after the copy and every few thousand lines."""
     with path.open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
         data = stream.read(size) if size > 0 else b""
@@ -1748,14 +1738,8 @@ def _resolve_spec_image(image_path: Path, meta_dir: Path | str | None) -> tuple[
 
 
 def _spec_counters(scan, rows: Sequence[int]) -> list[dict[str, float]]:
-    """Each row's counters, one value per label from the label's first column.
-
-    silx's ``data_column_by_name`` re-reads its column on every call, so a
-    per-row, per-label lookup costs rows x labels column reads.  This takes the
-    scan's table once and reads each label's first column, the column that
-    lookup returns.  A table that does not have one row per label keeps the
-    per-label lookup, so its failure stays the one silx raises.
-    """
+    """Each row's counters from one read of the scan's table, each label's first column (the one
+    ``data_column_by_name``, which re-reads its column per call, returns); an unusual table keeps that lookup."""
     labels = tuple(scan.labels)
     table = scan.data
     if getattr(table, "ndim", 0) != 2 or table.shape[0] < len(labels):
@@ -1871,12 +1855,10 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
     valid, every image comes back without metadata and ``extent`` is ``None``,
     for the caller's published-metadata fence; otherwise an image whose row is
     not there yet raises SpecRowPending, and one at or after a complete line
-    that is not a valid row raises SpecRowInvalid naming that line.  With
-    ``after``, the extent the images before these were admitted through, those
-    rows are neither checked nor read again; ``None`` unless the scan still
-    holds their bytes.  ``cache`` (spec_rows_ready's) gives the scan it read at
-    the file's current revision, once.
-    """
+    that is not a valid row raises SpecRowInvalid naming that line.  ``after``
+    (the extent earlier images were admitted through): their rows are not read
+    again, and ``None`` unless the scan still holds them; ``cache``: see
+    :func:`spec_rows_ready`."""
     paths = tuple(_lexical_absolute(path) for path in image_paths)
     live = published is not None
     if not paths:
@@ -1957,9 +1939,7 @@ def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | No
     is written, so one look is enough.  An image whose name gives no SPEC
     file, or whose file or scan does not exist yet, is not ready.  ``cache``
     (the Run's) keeps each scan's row count for the file revision it was
-    read at, so an unchanged file is not read again, and the scan read for
-    :func:`read_spec_points` to take.
-    """
+    read at, and the scan itself once for read_spec_points."""
     rows: dict[tuple[Path, int], int] = {}
     for index, path in enumerate(image_paths):
         resolved = _resolve_spec_image(_lexical_absolute(path), meta_dir)

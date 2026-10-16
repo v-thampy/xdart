@@ -1361,9 +1361,8 @@ class StandardRunExecutor:
             return tuple(run.processed_live_revisions.values())
 
     def live_reuse_records(self, run_identity: RunIdentity) -> tuple[tuple, ...]:
-        """What a Live Run keeps between polls to reuse its proofs, flat: each
-        record holds primitive values, the first the frame label it serves or
-        ``None`` for an output's or the Run's own state."""
+        """What a Live Run keeps between polls for reuse, as records of primitive values whose
+        first is the frame label served, or ``None`` for an output's or the Run's own state."""
         run = self._exact_run(run_identity)
         session = None if run is None or run.resources is None else run.resources.directory_session
         records = [] if session is None else list(session.reuse_records())
@@ -1447,6 +1446,7 @@ class StandardRunExecutor:
         proof = getattr(run, 'live_admission_proof', None)
         if proof is not None:
             run.live_admission_proof = None
+            proof = proof if item is not None and proof.graph is item.graph else None
         configuration, capture = (run.configuration, run.capture)
         if configuration is None or capture is None:
             raise RuntimeError('run construction shell is incomplete')
@@ -1479,8 +1479,7 @@ class StandardRunExecutor:
         try:
             # A Live item re-checks the proof of what its poll admitted; only a
             # failed proof validates the whole graph again.
-            if item is not None and (proof is None or proof.graph is not item.graph
-                                     or not proof.holds(cancelled=cancelled)):
+            if item is not None and (proof is None or not proof.holds(cancelled=cancelled)):
                 validate_planned_source(item, cancelled=cancelled)
             if item is not None and item.candidate is not None and (item.descriptor is not None) and (item.descriptor.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
                 cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
@@ -1495,11 +1494,9 @@ class StandardRunExecutor:
                 run.source = open_source(source_spec)
             if proof is not None and hasattr(run.source, 'retain_metadata'):
                 # The proved prefix's frames keep the values their admission read.
-                run.source.retain_metadata({
-                    label: values for label, source in enumerate(
-                        item.graph.stamp.metadata_sources[:proof.start], item.graph.stamp.first_label)
-                    if (values := source.read_values if source.spec_values is None else source.spec_values)
-                    is not None})
+                run.source.retain_metadata({label: values for label, source in enumerate(
+                    item.graph.stamp.metadata_sources[:proof.start], item.graph.stamp.first_label)
+                    if (values := source.read_values if source.spec_values is None else source.spec_values) is not None})
             admission = None if run.resources is None else run.resources.admission
             assets = None if admission is None else admission.scientific_assets
             calibration = (
@@ -2062,16 +2059,8 @@ class StandardRunExecutor:
             with _run_effect(run):
                 observation = session.observe(refresh=True)
                 registry = registry_identity()
-                if (
-                    grouped is None
-                    or grouped[0] is not observation.discovered_snapshot
-                    or grouped[1] != registry
-                ):
-                    grouped = (
-                        observation.discovered_snapshot,
-                        registry,
-                        live_directory_groups(receipt, observation),
-                    )
+                if grouped is None or grouped[0] is not observation.discovered_snapshot or grouped[1] != registry:
+                    grouped = (observation.discovered_snapshot, registry, live_directory_groups(receipt, observation))
                 groups = grouped[2]
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
@@ -2130,9 +2119,7 @@ class StandardRunExecutor:
                             settled_revisions.pop(target_key, None)
                         else:
                             run.live_proofs[target_key] = _live_proof(
-                                configuration, retained.decision.item.graph,
-                                seen, registry,
-                            )
+                                configuration, retained.decision.item.graph, seen, registry)
                             continue
                 try:
                     with _run_effect(run):
@@ -2277,9 +2264,7 @@ class StandardRunExecutor:
                         with run.live_revision_lock:
                             run.processed_live_revisions[target_key] = attempt
                         run.live_proofs[target_key] = _live_proof(
-                            configuration, decision.item.graph,
-                            sidecar_observations, registry,
-                        )
+                            configuration, decision.item.graph, sidecar_observations, registry)
                         if not attempt.partial:
                             # A partial attempt leaves members still waiting
                             # for their metadata: retry them next poll.

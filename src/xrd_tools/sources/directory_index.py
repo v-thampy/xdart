@@ -49,9 +49,7 @@ _Stamp = tuple[int, int]
 
 
 def directory_identity(path: str | Path) -> tuple[int, ...] | None:
-    """A path's device, inode, size, mtime_ns and ctime_ns: what an entry added,
-    removed or renamed in a directory, or a write to a file, moves.  ``None``
-    when it cannot be stat'ed."""
+    """(device, inode, size, mtime_ns, ctime_ns), which an entry or a write moves; ``None`` if unstattable."""
     try:
         state = os.stat(path)
     except OSError:
@@ -271,8 +269,7 @@ class DirectoryIndex:
         is cleared, since the tracked file no longer matches what is on disk.
         """
         fresh_list = collect_owned_candidates(
-            self._root, recursive=self._recursive, name_filter=self._name_filter,
-            memo=self._discovery)
+            self._root, recursive=self._recursive, name_filter=self._name_filter, memo=self._discovery)
         fresh_by_path = {c.path: c for c in fresh_list}
         prior = self._snapshot
         prior_by_path = prior.by_path()

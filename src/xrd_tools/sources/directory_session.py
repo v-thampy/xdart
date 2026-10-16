@@ -315,19 +315,12 @@ class DirectoryIndexSession:
         else:
             snapshot = index.snapshot
         last = self._last
-        if (
-            last is not None
-            and not self._probe_candidates
-            and last[0] is snapshot
-            and last[1] == self._results_version
-            and last[2].request_generation == generation
-        ):
+        if (last is not None and not self._probe_candidates and last[0] is snapshot
+                and last[1] == self._results_version and last[2].request_generation == generation):
             # Same Snapshot object, no probe result moved and nothing to probe:
             # exactly the observation a rebuild would make, with an empty delta.
-            return replace(
-                last[2], delta=IndexDelta(), content_opens=0, stale_drops=0,
-                elapsed_s=time.perf_counter() - started,
-            )
+            return replace(last[2], delta=IndexDelta(), content_opens=0, stale_drops=0,
+                           elapsed_s=time.perf_counter() - started)
         raw_snapshot = snapshot
         name_ok = compile_filter(config.name_filter)
 
@@ -475,11 +468,7 @@ class DirectoryIndexSession:
         return observation
 
     def _prune_results(self, current: Mapping[Path, Candidate]) -> None:
-        kept = {
-            path: stored
-            for path, stored in self._results.items()
-            if current.get(path) == stored[0]
-        }
+        kept = {path: stored for path, stored in self._results.items() if current.get(path) == stored[0]}
         if len(kept) != len(self._results):
             self._results_version += 1
         self._results = kept
@@ -502,12 +491,8 @@ class DirectoryIndexSession:
         )
         return self._probe_exact(observation, candidate, force_reprobe)
 
-    def _probe_exact(
-        self,
-        observation: DirectoryObservation,
-        candidate: Candidate,
-        force_reprobe: bool,
-    ) -> CandidateObservation:
+    def _probe_exact(self, observation: DirectoryObservation, candidate: Candidate,
+                     force_reprobe: bool) -> CandidateObservation:
         snapshot = observation.discovered_snapshot
         if self._paths is None or self._paths[0] is not snapshot:
             self._paths = (snapshot, snapshot.by_path())
@@ -532,44 +517,20 @@ class DirectoryIndexSession:
         self._results_version += 1
         return CandidateObservation(current, result)
 
-    def probe_candidates(
-        self,
-        candidates,
-        *,
-        refresh: bool = False,
-        reprobe: bool = False,
-        stop_unready: bool = True,
-        cancelled=None,
-    ) -> tuple[CandidateObservation, ...]:
-        """Probe several frozen candidates in one serialized owner call.
-
-        Each candidate, in order, gets exactly what :meth:`probe_candidate`
-        (with ``reprobe``, :meth:`reprobe_candidate`) would give it, against
-        one observation.  With ``stop_unready`` the call ends after the first
-        result that is not READY.  A stale candidate raises
-        StaleCandidateError once the earlier ones are recorded, as the
-        one-by-one calls did.  ``cancelled`` is asked before each candidate and
-        raises RuntimeError("admission cancelled").
-        """
-
+    def probe_candidates(self, candidates, *, refresh: bool = False, reprobe: bool = False,
+                         stop_unready: bool = True, cancelled=None) -> tuple[CandidateObservation, ...]:
+        """:meth:`probe_candidate` (with ``reprobe``, :meth:`reprobe_candidate`) for each candidate in
+        order, against one observation in one owner call; ``stop_unready`` ends after the first that is
+        not READY, a stale one raises once the earlier are recorded, and ``cancelled`` is asked before each."""
         candidates = tuple(candidates)
         if any(type(candidate) is not Candidate for candidate in candidates):
             raise TypeError("candidate probe requires an exact Candidate")
         generation, config = self._request()
-        return self._executor.submit(
-            self._probe_candidates_on_owner,
-            generation,
-            config,
-            candidates,
-            bool(refresh),
-            bool(reprobe),
-            bool(stop_unready),
-            cancelled,
-        ).result()
+        return self._executor.submit(self._probe_candidates_on_owner, generation, config, candidates,
+                                     bool(refresh), bool(reprobe), bool(stop_unready), cancelled).result()
 
-    def _probe_candidates_on_owner(
-        self, generation, config, candidates, refresh, reprobe, stop_unready, cancelled,
-    ) -> tuple[CandidateObservation, ...]:
+    def _probe_candidates_on_owner(self, generation, config, candidates, refresh, reprobe, stop_unready,
+                                   cancelled) -> tuple[CandidateObservation, ...]:
         observation = self._observe_on_owner(generation, config, refresh)
         observed: list[CandidateObservation] = []
         for candidate in candidates:
@@ -586,11 +547,9 @@ class DirectoryIndexSession:
     LISTING_AGE_S = 0.75
 
     def defer_listing(self, watched) -> None:
-        """For a Live Run's session (D1): a refreshing observation keeps the last
-        real listing while it is under LISTING_AGE_S old and nothing watched
-        moved: the registrations, the watched directories, and ``watched`` paths
-        (files that change in place or are still pending).  ``None`` turns it
-        off; :meth:`force_listing` makes the next one list."""
+        """D1, a Live Run's session: a refreshing observation keeps the last real listing while it is
+        under LISTING_AGE_S old and the registrations, the watched directories and ``watched`` files
+        (pending or growing in place) are unchanged; ``None`` turns it off."""
         self._watched = None if watched is None else tuple(watched)
 
     def force_listing(self) -> None:
@@ -612,8 +571,7 @@ class DirectoryIndexSession:
         return self.listing_deferred
 
     def reuse_records(self) -> tuple[tuple, ...]:
-        """The paths this session and its index keep between polls for reuse
-        (discovery's memo, the last observation's path map), one record each."""
+        """One record per path kept between polls for reuse (discovery's memo, the path map)."""
         def records():
             memo = {} if self._index is None else self._index._discovery
             paths = () if self._paths is None else self._paths[1]

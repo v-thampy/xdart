@@ -491,9 +491,8 @@ def validate_source_aliases(
     candidate_owner_id: Callable[[str], str | None] | None = None, check_candidate_owner: bool = True,
     proven: Mapping[str, SourceFileState] | None = None,
 ) -> tuple[SourceExecutionIdentityV1, tuple[CanonicalSourceTarget, ...]]:
-    """Prove every admitted lexical alias and canonical target twice; one that
-    ``proven`` (:func:`proven_states` of a live prefix proved this poll) holds
-    at the same resolution and revision is not proved again."""
+    """Prove every admitted lexical alias and canonical target twice, but none that ``proven``
+    (:func:`proven_states` of a live prefix proved this poll) holds at its resolution and revision."""
     if type(stamp) is not SourceExecutionStamp:
         raise TypeError("source alias validation requires an execution stamp")
     if resolve_alias is None:
@@ -607,10 +606,8 @@ def _resolve_parents(bindings: tuple[SourceAliasBinding, ...]) -> dict[str, str 
 
 
 def _alias_now(binding: SourceAliasBinding, parents: dict[str, str | None]):
-    """``(resolved path, revision)`` of one alias now, ``None`` if it is gone.
-
-    A regular-file leaf under a resolved parent costs one no-follow stat; any
-    other leaf takes the existing full resolve and capture."""
+    """``(resolved path, revision)`` of one alias now (``None``: gone): a no-follow stat for a
+    regular-file leaf under a resolved parent, the full resolve and capture for any other."""
     try:
         state = os.lstat(binding.raw_path)
         parent = parents.get(os.path.dirname(binding.raw_path))
@@ -624,18 +621,10 @@ def _alias_now(binding: SourceAliasBinding, parents: dict[str, str | None]):
 
 
 class LivePrefixProof:
-    """What a Live Run proved about one published output, re-checked cheaply.
-
-    Recorded only from a graph a strict bracket admitted.  :meth:`holds` repeats
-    validate_source_aliases' two sweeps with each distinct parent resolved
-    before and after a sweep and a no-follow stat per leaf, then gives a SPEC
-    file that only grew one coherent check of its retained extents (kept for
-    that revision).  The adapter registrations and each member's sidecar
-    discovery, from fresh listings, must be unchanged.  ``False`` sends the
-    caller to the strict path, whose errors are the ones it always raised.
-    With ``start``, only the members from ``start`` on, their metadata files
-    and a moved SPEC file are proved: a construction's re-check of the new
-    members a prefix proof admitted in the same poll.
+    """What a Live Run proved about one admitted graph, re-checked cheaply: :meth:`holds` repeats
+    validate_source_aliases' two sweeps (distinct parents resolved before and after, a no-follow stat
+    per regular leaf), checks a grown SPEC file's extents once per revision, and requires unchanged
+    registrations and sidecar discovery (fresh listings).  ``start``: only later members are proved.
     """
 
     #: A settled or waiting output is proved again at least this often: within
@@ -647,25 +636,23 @@ class LivePrefixProof:
         return time.monotonic() - self.verified_at < self.PERIOD_S or self.holds(cancelled=cancelled)
 
     def __init__(self, graph: PreparedSourceExecutionGraph, *, metadata_format: str | None = None,
-                 record: Mapping[str, Any] | None = None, registry: tuple | None = None,
-                 start: int = 0) -> None:
+                 record: Mapping[str, Any] | None = None, registry: tuple | None = None, start: int = 0) -> None:
         self.graph, self.metadata_format, self.start = graph, metadata_format, start
         self.spec_revisions: dict[str, tuple[int, ...]] = {}
         stamp = graph.stamp
-        later = {state.path for state in (*stamp.members[start:], *(
-            source.metadata_file for source in stamp.metadata_sources[start:] if source.metadata_file))}
-        self.bindings = stamp.source_aliases if not start else tuple(
-            binding for binding in stamp.source_aliases if binding.raw_path in later)
+        self.bindings = stamp.source_aliases
+        if start:
+            later = {state.path for state in (*stamp.members[start:], *(
+                source.metadata_file for source in stamp.metadata_sources[start:] if source.metadata_file))}
+            self.bindings = tuple(binding for binding in self.bindings if binding.raw_path in later)
         self.rebase(record or {}, registry)
 
     def rebase(self, record: Mapping[str, Any], registry: tuple | None) -> None:
-        """Take the members' sidecar observations from the Run's ``record`` and
-        the registrations the graph was last strictly proved under."""
+        """Take the members' sidecar observations from ``record`` and the graph's last registrations."""
         from xrd_tools.sources.adapters import registry_identity
         fmt = self.metadata_format
         self.observations = () if fmt in (None, "spec") else tuple(
-            (member.path, record.get(observation_key(member.path)))
-            for member in self.graph.stamp.members[self.start:])
+            (member.path, record.get(observation_key(member.path))) for member in self.graph.stamp.members[self.start:])
         self.registry = registry_identity() if registry is None else registry
         self.verified_at = time.monotonic()
 
@@ -836,8 +823,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                    expected: PreparedSourceExecutionGraph | None = None,
                    force_compact: bool = False,
                    infer_point_images: bool = True,
-                   published_members: int = 0,
-                   prefix: PreparedSourceExecutionGraph | None = None,
+                   published_members: int = 0, prefix: PreparedSourceExecutionGraph | None = None,
                    spec_cache: dict | None = None) -> PreparedSourceExecutionGraph | None:
     options = dict(source.options); marker = options.pop("average_compact_series_v1", None)
     if marker is not None and marker is not True: raise ValueError("compact Average TIFF marker is invalid")
@@ -882,13 +868,11 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     # A live Run's published members whose proof just held (``prefix``) keep
     # their admitted facts; only later members are read, into the graph a
     # full qualification gives (shared SPEC facts re-based on this read).
-    known = len(prefix.stamp.members) if (
-        prefix is not None and expected is None and not infer_point_images and not compact
-        and grouped_source is None and not reader_binding and len(prefix.stamp.members) < len(files)
-        and tuple(member.path for member in prefix.stamp.members) == files[:len(prefix.stamp.members)]
-        and _source_policy(SourceSpec(source.uri, SourceKind.TIFF_SERIES, metadata_uri=source.metadata_uri,
-                                      entry=source.entry), qualified)
-        == _source_policy(prefix.execution_source, dict(prefix.execution_source.options))) else 0
+    old = () if prefix is None or expected is not None or infer_point_images or compact or reader_binding \
+        or grouped_source is not None else tuple(member.path for member in prefix.stamp.members)
+    known = len(old) if 0 < len(old) < len(files) and old == files[:len(old)] and _source_policy(SourceSpec(
+        source.uri, SourceKind.TIFF_SERIES, metadata_uri=source.metadata_uri, entry=source.entry), qualified) \
+        == _source_policy(prefix.execution_source, dict(prefix.execution_source.options)) else 0
     from xrd_tools.io.metadata import ImageMetadataRead, read_spec_points
     spec_points = spec_state = None
     if metadata_format == "spec" and grouped_source is None and not compact and not reader_binding:
@@ -902,13 +886,11 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
         after = prefix.stamp.metadata_sources[0].spec_extent if known else None
         known = known if after is not None else 0
         try:
-            spec_points = None if not known else read_spec_points(
-                files[known:], meta_dir=qualified.get("meta_dir"), published=0, cancelled=cancelled,
-                after=after, cache=spec_cache)
+            spec_points = None if not known else read_spec_points(files[known:], meta_dir=qualified.get(
+                "meta_dir"), published=0, cancelled=cancelled, after=after, cache=spec_cache)
             if spec_points is None:  # no prefix, or its rows changed: every member's row
-                known, spec_points = 0, read_spec_points(
-                    files, meta_dir=qualified.get("meta_dir"), published=published, cancelled=cancelled,
-                    cache=spec_cache)
+                known, spec_points = 0, read_spec_points(files, meta_dir=qualified.get(
+                    "meta_dir"), published=published, cancelled=cancelled, cache=spec_cache)
         except SpecRowPending as error:
             raise SourceRevisionChanged(str(error)) from error
         if spec_points is not None and spec_points.extent is not None:
@@ -1233,8 +1215,7 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
         selected_container: SelectedContainerInput | None = None,
         cancelled: Callable[[], bool] | None = None,
         infer_point_images: bool = True, published_members: int = 0,
-        prefix: PreparedSourceExecutionGraph | None = None,
-        spec_cache: dict | None = None) -> PreparedSourceExecutionGraph:
+        prefix: PreparedSourceExecutionGraph | None = None, spec_cache: dict | None = None) -> PreparedSourceExecutionGraph:
     """Qualify one source; ``infer_point_images=False`` (a live Run) never infers images per point.
 
     A live TIFF series under SPEC metadata also holds each member to its own
@@ -1242,8 +1223,7 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
     Run, come back without metadata when their rows are gone, for the
     published-metadata fence; a later member whose row is not there yet is a
     SourceRevisionChanged, and one whose row is not a valid row a ValueError.
-    ``prefix`` (a live TIFF series' published graph, its proof held this poll)
-    and ``spec_cache`` (the Run's SPEC readiness cache) let only new members be read.
+    ``prefix`` (a live published graph proved this poll) and ``spec_cache``: only new members are read.
     """
     if type(source) is not SourceSpec: raise TypeError("source must be an exact SourceSpec")
     if type(published_members) is not int or published_members < 0:
@@ -1347,9 +1327,8 @@ def validate_consumed_metadata(value: PreparedSourceExecutionGraph,
     memory; a row rewritten or gone since admission reads differently (or as
     another row), which is a SourceRevisionChanged before anything is
     published.  The selected motor is compared as the reader overrides it
-    with its admitted value.  Finite graphs are not checked.  With ``start``
-    (members a prefix proof covers, served their admitted values), only later
-    members are checked, and each of them must have been consumed.
+    with its admitted value.  Finite graphs are not checked.  ``start``: only
+    later members (each of them required) are checked.
     """
     stamp = value.stamp
     if value.infers_point_images or stamp.adapter_id != "tiff_series":

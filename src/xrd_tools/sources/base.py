@@ -101,11 +101,8 @@ class BaseFrameSource(ABC):
             chunk_labels = labels[start:start + chunk_size]
             yield np.stack([self.load_frame(idx) for idx in chunk_labels]), chunk_labels
 
-    def to_scan(self, *, name: str | None = None,
-                cancelled: Callable[[], bool] | None = None, **kwargs: Any) -> Scan:
-        """Every frame as one :class:`Scan`; ``cancelled`` is asked before each
-        frame and raises RuntimeError("admission cancelled").  It is this
-        method's own argument, never a Scan keyword."""
+    def to_scan(self, *, name: str | None = None, cancelled: Callable[[], bool] | None = None, **kwargs: Any) -> Scan:
+        """Every frame as one Scan; ``cancelled`` (never a Scan keyword) is asked before each frame."""
         frames = []
         for frame in self.iter_frames():
             if cancelled is not None and cancelled():
