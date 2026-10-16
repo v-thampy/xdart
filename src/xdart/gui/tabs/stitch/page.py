@@ -732,6 +732,11 @@ class StitchPage(QtWidgets.QWidget):
         # Source rows and files, and the calibration window's calibrant and direct-beam sources, follow it
         self._field(project, SectionId.PROJECT, "data_format", "Data format", DEFAULT_DATA_FORMAT,
                     choices=DATA_FORMATS, choice_labels=DATA_FORMAT_LABELS, path=("Project", "data_format"))
+        from xdart.gui.widgets.data_format_options import DataFormatOptions
+        entry = self._field(None, SectionId.PROJECT, "nexus_entry", "Entry", path=("Project", "nexus_entry"))
+        self.source_options = DataFormatOptions(self, entry)
+        self._rows["data_format"].add_trailing_widget(self.source_options.button)
+        self._rows["nexus_entry"].valueChanged.connect(self._data_format_changed)
         self._sync_format_tip()
         self._rows["data_format"].valueChanged.connect(self._data_format_changed)
         self._rows["data_format"].editor.activated.connect(self._data_format_chosen)
@@ -881,6 +886,9 @@ class StitchPage(QtWidgets.QWidget):
         self._map_card.setVisible(False)
         # Int's Advanced dialog, its groups the page's shared rows (Codex's reuse audits, 2026-10-01)
         self.advanced = AdvancedDialog(self, title="Advanced — Stitch 1D", object_name="stitchAdvancedDialog")
+        recording = self.advanced.add_group("Integrate 1D", (self._rows["record_angular_support"],))
+        recording.setToolTip("Recording options for the 1-D profiles written by Stitch 1D and Stitch 2D.")
+        recording.title.setToolTip(recording.toolTip())
         self.point_images = PointImagesSettings()
         self.advanced.add_section(self.point_images)
         self.point_images.changed.connect(self._point_images_edited)
@@ -973,7 +981,7 @@ class StitchPage(QtWidgets.QWidget):
             buttons[action] for action in (ControlAction.PREVIEW, ControlAction.RETRY, ControlAction.ADVANCED_PROCESSING))
         self.preview_button.setToolTip("Check the inputs and list what a Run stitches, without stitching.")
         self.retry_button.setToolTip("Retry the last result's saving or cleanup.")
-        self.advanced_button.setToolTip("The source, geometry, frame and correction settings.")
+        self.advanced_button.setToolTip("The integration, source, geometry, frame and correction settings.")
         # Preview's lines: the shared read-only text window (Codex's combined stage-2b review F2)
         self.preview_dialog = ReadOnlyTextWindow("Stitch preview", (680, 480), self)
         self.preview_text = self.preview_dialog.pane
@@ -1197,7 +1205,7 @@ class StitchPage(QtWidgets.QWidget):
         """This page's Processing fields by key, as Int projects them (``project_control_fields``: its labels,
         the range rows' following the axes, and its rules: a range's bounds are greyed under Auto, the
         Threshold's limits when it is off); Stitch's GI ranges and Monitor with Int's range rule."""
-        from xdart.gui.tabs.scattering.controls_inventory import project_control_fields
+        from xdart.gui.tabs.scattering.controls_inventory import project_control_fields, recording_control_field
 
         def current(key):
             return self._value(key) if key in self._rows else self._fields[key].value
@@ -1211,6 +1219,7 @@ class StitchPage(QtWidgets.QWidget):
         projected = {field.path: field for field in project_control_fields(values, {
             INT_1D_AXIS: tuple(_GI_AXES) if grazing else _STANDARD_AXES,
             INT_2D_AXIS: _GI_MAP_AXES if grazing else _STANDARD_MAP_AXES})}
+        projected[RECORD_ANGULAR_SUPPORT] = recording_control_field(current("record_angular_support"))
         fields = normalization.normalization_fields(  # the Normalization group, shared with RSM
             {**self._fields, "monitor": replace(self._fields["monitor"],
                                                choices=self._monitor_choices(current("monitor")))},
@@ -1388,6 +1397,7 @@ class StitchPage(QtWidgets.QWidget):
     def _project_data_format(self):
         if self._calibration_dialog is not None:
             self._calibration_dialog.set_data_format(self._value("data_format"))
+            self._calibration_dialog.set_nexus_entry(self._value("nexus_entry"))
 
     def _sync_format_tip(self, idle=True, authoring=False):
         """The Data format's purpose, an older document's conflict to settle, and why it waits while locked."""
@@ -1395,6 +1405,8 @@ class StitchPage(QtWidgets.QWidget):
                 else " It waits for this page's work to finish.")
         self._tip("data_format", DATA_FORMAT_PURPOSE + (" " + self._format_choice if self._format_choice else "")
                   + wait)
+        if hasattr(self, "source_options"):
+            self.source_options.reconcile(self._value("data_format"), enabled=idle, reason=wait.strip())
 
     def _processing_axis_changed(self, *_args):
         """An Axis choice: a change of unit resets its range to the unit's defaults (every 1-D axis but 2θ
@@ -1449,7 +1461,7 @@ class StitchPage(QtWidgets.QWidget):
             self._backend_changed()
         elif key == "spec_path":
             self._source_path_edited(field.path, value)
-        elif key == "data_format":
+        elif key in {"data_format", "nexus_entry"}:
             self._data_format_changed(field.path, value)
         elif key in {"input_mode", "scan_mode"}:
             self._source_changed(field.path, value)
@@ -1536,7 +1548,8 @@ class StitchPage(QtWidgets.QWidget):
             image_dir=str(value("image_dir")), image_stem=str(value("image_stem")),
             recursive=directory and bool(value("subdirs")),
             name_filter=str(value("name_filter")).strip() if directory else "",
-            point_image_choices=self.point_images.choices)
+            point_image_choices=self.point_images.choices,
+            nexus_entry=str(value("nexus_entry")).strip() if value("data_format") != "spec_series" else "")
 
     def _point_images_edited(self):
         self._source_admission = None
@@ -2708,15 +2721,18 @@ class StitchPage(QtWidgets.QWidget):
         if not self._source_paths or self._value("source_kind") == "Directory":
             return None
         path = self._source_paths[0]
+        entry = str(self._value("nexus_entry")).strip() if self._value("data_format") != "spec_series" else ""
         if self._value("source_kind") == "NeXus":
-            return SourceSpec(path, SourceKind.NEXUS_STACK)
+            return SourceSpec(path, SourceKind.NEXUS_STACK, entry=entry or "entry",
+                              options={"nexus_entry": entry} if entry else {})
         scan = parse_stitch_scan_groups(str(self._value("scan") or "1"))[0][0]
         stem = str(self._value("image_stem")).format(spec=Path(path).stem, scan=scan.split(".")[0], occurrence=scan)
         return SourceSpec(path, SourceKind.SPEC, options={
             "scan": scan, "image_dir": str(self._value("image_dir")),
             "image_stem": stem or None,
             "read_image_kwargs": dict(detector_shape=(int(self._value("detector_rows")), int(self._value("detector_cols"))),
-                raw_dtype=str(self._value("raw_dtype")), raw_header_skip=int(self._value("raw_header_skip")))})
+                raw_dtype=str(self._value("raw_dtype")), raw_header_skip=int(self._value("raw_header_skip"))),
+            **({"nexus_entry": entry} if entry else {})})
 
     def _calibrate(self):
         from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
@@ -2736,6 +2752,7 @@ class StitchPage(QtWidgets.QWidget):
                 geometry = self._instrument()  # before the window exists: settings, or migrated
                 self._calibration_dialog = CalibrationDialog(
                     CalibrationContext("Stitch", str(self._value("project_root"))), parent=self)
+                self._project_data_format()  # bind shared options before source metadata work starts
                 saved = self._calibration_settings or {}
                 if saved:
                     self._calibration_dialog.apply_settings(saved)

@@ -3328,13 +3328,14 @@ class ScientificView(QtWidgets.QFrame):
 
     @staticmethod
     def _rebuildable(source, trace) -> bool:
-        """Whether ``trace`` is a frame of the shown older Int output (``source``) that saved no coverage (D5)."""
+        """Whether the shown Int output saved no coverage; the headless owner qualifies its saved facts."""
         profile = trace.angular_support
-        return (profile is not None and profile.reason is SupportReason.NO_SAVED_SUPPORT and source is not None
+        return (profile is not None and profile.reason in {SupportReason.NO_SAVED_SUPPORT, SupportReason.RECORDING_DISABLED}
+                and source is not None
                 and trace.frame.artifact == source.artifact)
 
     def _rebuilt_profiles(self, source, traces) -> dict:
-        """The shown older output's rebuilt profiles: one ask of the owner for all its shown frames, which keeps
+        """The shown output's rebuilt profiles: one ask of the owner for all its shown frames, which keeps
         exactly those and rebuilds only the missing; with none shown, the owner lets go of what it kept."""
         labels = [int(trace.frame.local_frame_label) for trace in traces if self._rebuildable(source, trace)]
         if not labels:
@@ -3343,9 +3344,8 @@ class ScientificView(QtWidgets.QFrame):
         return self.angular_support_owner.profiles(source, labels)
 
     def _strip_profile(self, source, trace, rebuilt):
-        """``trace``'s profile; for a frame of the shown older Int output that saved none, its reconstruction from
-        the output's own record (``rebuilt``), pending meanwhile (D5). Nothing else is rebuilt: a result recorded with
-        "Record angular coverage" off names that instead."""
+        """The saved profile, or requested reconstruction from the shown Int output's own record, pending meanwhile.
+        Recording Off still skips Run-time work; Show may compute qualifying saved Standard Int frames on demand."""
         profile = trace.angular_support
         if not self._rebuildable(source, trace):
             return profile

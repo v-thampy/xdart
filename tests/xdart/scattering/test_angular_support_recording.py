@@ -2,8 +2,10 @@
 
 The maintainer's addition at the step-3 disposition: “Record angular coverage”, default on, in Int and Stitch through
 the existing shared settings/editor owners; the preference persists and is frozen at Run start; Off skips the
-computation and coverage arrays, records an explicit disabled reason and prevents automatic Browse reconstruction of
-those results; previously saved coverage remains displayable. Rows G1-G4 click the real control, run through the real
+computation and coverage arrays and records an explicit disabled reason; previously saved coverage remains displayable.
+LIVE-TEST-FIXES-20261015 allows requested Browse reconstruction of qualifying Standard Int Off results. Stitch still
+requires recorded coverage. LF-007 moves recording into Advanced → Integrate 1D; Int edits use its real modal action.
+Rows G1-G4 click the real control, run through the real
 executor, close and restore the real session, reopen in Browse and drive the real Stitch page. New APIs are imported
 inside each row, so a missing API fails only its own row.
 """
@@ -16,6 +18,7 @@ from tests.xdart.scattering.test_angular_support_strip import _curves, _enable, 
 from tests.xdart.scattering.test_browse_reference_rings_run import _browsing, _page, _pump, _reopen, _run
 from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F401
 from tests.xdart.pages.test_scattering_page import isolated_settings  # noqa: F401
+from tests.xdart.scattering.test_coverage_control_clarity import _int_recording
 
 LABEL = "Record angular coverage"
 
@@ -30,14 +33,13 @@ def _control(widget):
     return found[0]
 
 
-def _run_off(qapp, root):
+def _run_off(qapp, root, *, mode='Int 1D'):
     """A Run with the control turned off through its real button; returns the output path."""
-    with _page(qapp, _masked_series(root)) as (page, view, observed):
-        _control(page).click()
-        qapp.processEvents()
+    with _page(qapp, _masked_series(root, mode=mode)) as (page, view, observed):
+        _int_recording(qapp, page, toggle=True)
         _run(qapp, page, observed)
         _browsing(qapp, page)
-    return written(root / 'run.nexus', 'Int 1D')
+    return written(root / 'run.nexus', mode)
 
 
 # ---------------------------------------------------------------------------------------------------- G1
@@ -48,13 +50,12 @@ def test_g1_int_control_is_frozen_at_run_start_and_off_records_its_reason(qapp, 
     from xrd_tools.core.angular_support import SupportReason
     from xrd_tools.io.frame_view import FrameViewReader
     with _page(qapp, _masked_series(tmp_path)) as (page, view, observed):
-        control = _control(page)
+        control = _int_recording(qapp, page)
         # the series asks for recording explicitly (the default itself is pinned by A1, Off since
         # INT-PERF-REGRESSION-20261014); an Off equal to the default is stored as no option
         assert control.isChecked(), 'the series asks for recording'
         assert 'angular' in control.toolTip().lower(), 'the control explains itself'
-        control.click()
-        qapp.processEvents()
+        _int_recording(qapp, page, toggle=True)
         run_options = page._intents.snapshot().thaw().run_options
         assert run_options.get('record_angular_support', DEFAULT_RECORD_ANGULAR_SUPPORT) is False
         opened = []
@@ -81,11 +82,10 @@ def test_g2_the_int_preference_persists_across_sessions(qapp, isolated_settings,
     window = Main()
     try:
         page = window.page_handle.widget
-        control = _control(page)
+        control = _int_recording(qapp, page)
         # INT-PERF-REGRESSION-20261014: a fresh session is Off; a deliberate On is the choice that must persist
         assert not control.isChecked(), 'a fresh session records nothing'
-        control.click()
-        qapp.processEvents()
+        _int_recording(qapp, page, toggle=True)
         assert page._intents.snapshot().thaw().run_options['record_angular_support'] is True
         window.close()
         qapp.processEvents()
@@ -97,7 +97,7 @@ def test_g2_the_int_preference_persists_across_sessions(qapp, isolated_settings,
     try:
         page = restored.page_handle.widget
         assert page._intents.snapshot().thaw().run_options['record_angular_support'] is True
-        assert _control(page).isChecked(), 'the restored session shows it on'
+        assert _int_recording(qapp, page).isChecked(), 'the restored session shows it on'
     finally:
         restored.close()
         restored.deleteLater()
@@ -106,13 +106,16 @@ def test_g2_the_int_preference_persists_across_sessions(qapp, isolated_settings,
 
 # ---------------------------------------------------------------------------------------------------- G3
 
-def test_g3_browse_names_disabled_results_and_keeps_saved_coverage(qapp, tmp_path):
-    from xrd_tools.core.angular_support import REASON_TEXT, SupportOrigin, SupportReason
+@pytest.mark.parametrize('mode', ['Int 1D', 'Int 2D'])
+def test_g3_browse_reconstructs_disabled_int_and_keeps_saved_coverage(qapp, tmp_path, mode):
+    import hashlib
+    from xrd_tools.core.angular_support import SupportOrigin
+    from tests.xdart.scattering.test_angular_support_strip import _analytic, TOL
     recorded = _fresh(qapp, tmp_path / 'on')
-    disabled = _run_off(qapp, tmp_path / 'off')
-    with _page(qapp, _masked_series(tmp_path / 'browse')) as (page, view, _observed):
-        _control(page).click()  # recording is off in this session; it never governs what is displayed
-        qapp.processEvents()
+    disabled = _run_off(qapp, tmp_path / 'off', mode=mode)
+    before = hashlib.sha256(disabled.read_bytes()).digest()
+    with _page(qapp, _masked_series(tmp_path / 'browse', band=(20, 120), one={'npt': 64})) as (page, view, _observed):
+        _int_recording(qapp, page, toggle=True)  # recording never governs what is displayed
         _enable(qapp, view)
         _reopen(qapp, page, recorded)
         _wait(qapp, lambda: bool(_curves(view)))
@@ -122,11 +125,19 @@ def test_g3_browse_names_disabled_results_and_keeps_saved_coverage(qapp, tmp_pat
         # repaint (else "previous Browse cleanup is pending", by design and with the strip off too, as at cf49f3cb)
         assert _pump(qapp, lambda: not page._context_controller.browse_preview_polling_needed, 30.)
         _reopen(qapp, page, disabled)
-        _wait(qapp, lambda: REASON_TEXT[SupportReason.RECORDING_DISABLED] in view.angular_support_message())
         owner = view.angular_support_owner
-        _pump(qapp, lambda: False, 1.0)
-        assert not _curves(view) and not owner.computing and owner.completed_requests() == 0, \
-            'an intentionally disabled result is never reconstructed'
+        _wait(qapp, lambda: bool(_curves(view)) and not owner.computing, seconds=10.)
+        (_data, profile), = _curves(view).values()
+        assert profile.origin is SupportOrigin.RECONSTRUCTED and profile.available
+        np.testing.assert_allclose(profile.supported_deg, _analytic(profile), atol=TOL * 360)
+        computed = owner.completed_requests()
+        assert computed > 0
+        page._refresh_shell()
+        qapp.processEvents()
+        assert owner.completed_requests() == computed, 'unchanged display reuses the reconstruction'
+        _enable(qapp, view, on=False)
+        assert not _curves(view) and owner.retained_keys() == 0
+    assert hashlib.sha256(disabled.read_bytes()).digest() == before, 'display leaves the saved scan untouched'
 
 
 # ---------------------------------------------------------------------------------------------------- G4
@@ -210,7 +221,7 @@ def test_a1_a_fresh_int_page_records_nothing_and_skips_capture(qapp, tmp_path, m
         return real(self, *args, **kwargs)
     monkeypatch.setattr(RunSupportCapture, 'profile', profile)
     with _page(qapp, intent) as (page, view, observed):
-        control = _control(page)
+        control = _int_recording(qapp, page)
         assert not control.isChecked() and control.text() == f'{LABEL}: Off', 'Off by default'
         assert 'record_angular_support' not in page._intents.snapshot().thaw().run_options, 'the default is no option'
         _run(qapp, page, observed)
@@ -237,7 +248,7 @@ def test_a3_missing_true_and_false_round_trip_in_int_and_stitch(qapp, tmp_path):
         restored = load_run_intent_profile(dump_run_intent_profile(intent))
         assert restored.run_options == intent.run_options, 'profile preserves missing versus represented choices'
         with _page(qapp, restored) as (page, _view, _observed):
-            assert _control(page).isChecked() is expected, f'Int with {value!r}'
+            assert _int_recording(qapp, page).isChecked() is expected, f'Int with {value!r}'
     page = StitchPage(empty_host_services(_Status()))
     try:
         document = page_settings(page)

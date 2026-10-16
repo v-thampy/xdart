@@ -1,12 +1,12 @@
 """The one owner of a view's angular coverage reconstructions (COVERAGE-SUPPORT-20261013, D5).
 
-An older Int output saved no angular coverage; Browse alone may rebuild a frame's from the output's own record
+A saved Int output has no angular coverage; Browse alone may rebuild a frame's from the output's own record
 (``xrd_tools.analysis.angular_support.reconstruct_saved_support``). The strip's view mounts this owner and asks it, once
 per draw, for the shown frames of that output: one request for the whole shown set, its basis built once. The owner
 keeps exactly the shown set's completed profiles, so a redraw, a reorder or a smaller selection asks for nothing, and
 a changed selection keeps every frame still shown and asks one job for the rest (the shared ``LatestRequestOwner``:
-one computation running, the latest asked for winning). Nothing else is reconstructed: saved, run, disabled (“Record
-angular coverage” off) and Stitch results carry their own profile or reason, and the view never asks for them.
+one computation running, the latest asked for winning). Qualifying Standard Int results recorded Off use this same
+display-only path. Saved coverage, Run frames and Stitch results carry their own profile or reason.
 """
 from __future__ import annotations
 

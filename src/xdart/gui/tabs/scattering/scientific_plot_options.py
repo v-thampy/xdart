@@ -24,7 +24,8 @@ COVERAGE_TOOLTIP = (
 ANGULAR_SUPPORT_TOOLTIP = (
     "Show angular coverage below the 1-D plot: for each radial bin, the share of the profile's χ window "
     "(360° without one) that unmasked detector pixels reach, saved with the result when it was processed "
-    "(or reconstructed for an older result that qualifies). This is angular reach, not a pixel count, and it never "
+    "(or computed on demand for a saved Standard Int result that qualifies, even if recording was Off). "
+    "Stitch requires recorded angular coverage. This is angular reach, not a pixel count, and it never "
     "changes intensity. Hover for the degrees over a bin. Display only: Okay applies it and Cancel discards the "
     "change; whether a Run records coverage is Processing's “Record angular coverage”."
 )
@@ -122,7 +123,7 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         other.addWidget(self.show_angular_support, 1, 0, 1, 2)
         self.set_angular_support_available(True)
 
-        support = self._section(layout, "2D pixel coverage")
+        support = self._section(layout, "2D pixel coverage (Stitch only)")
         support.parentWidget().setToolTip(COVERAGE_TOOLTIP)
         self.show_coverage_holes = QtWidgets.QCheckBox("Shade uncovered bins")
         support.addWidget(self.show_coverage_holes, 0, 0)

@@ -550,6 +550,10 @@ class RSMPage(QtWidgets.QWidget):
         cards[SectionId.PROJECT].add_row(self._row(
             SectionId.PROJECT, "data_format", "Data format", DEFAULT_DATA_FORMAT, DATA_FORMATS, False,
             path=("Project", "data_format"), choice_labels=DATA_FORMAT_LABELS))
+        from xdart.gui.widgets.data_format_options import DataFormatOptions
+        entry = self._row(SectionId.PROJECT, "nexus_entry", "Entry", "", (), False, path=("Project", "nexus_entry"))
+        self.source_options = DataFormatOptions(self, entry)
+        self._rows["data_format"].add_trailing_widget(self.source_options.button)
         self._rows["data_format"].editor.activated.connect(self._data_format_chosen)
         self._sync_format_tip()
         fields = tuple(self._new_field(SectionId.PROCESSING, key, axis, "40")
@@ -1077,21 +1081,21 @@ class RSMPage(QtWidgets.QWidget):
                 self._adopt_sources((text,) if text else ())
                 self._source_shown = text
                 self._show_source_tip()
-        elif key in {"data_format", "input_mode", "scan_mode"}:
+        elif key in {"data_format", "nexus_entry", "input_mode", "scan_mode"}:
             self._source_changed(key)
-        if key == "data_format":
+        if key in {"data_format", "nexus_entry"}:
             self._project_data_format()
         if key == "output_path":
             self._output_suggested = not str(self._value("output_path")).strip()
         if key == "geometry_path":
             self._sync_calibration_window()
         if key in {"geometry_path", "project_root", "refinement", "spec_path", "scan_mode", "scan",
-                   "data_format", "input_mode", "image_dir", "image_stem"}:
+                   "data_format", "nexus_entry", "input_mode", "image_dir", "image_stem"}:
             self._show_early_ceiling()
         if key in {"project_root", "spec_path", "scan_mode", "scan", "normalization"} and "normalization" in self._rows:
             self._refresh_normalization()  # a kind's own files come through set_sources
         if key in {"coordinates", "ub_from", "ub_spec_path", "ub_scan", "project_root", "spec_path",
-                   "scan", "scan_mode", "data_format", "input_mode"}:
+                   "scan", "scan_mode", "data_format", "nexus_entry", "input_mode"}:
             self._render_ub()
         if key == "coordinates" or key in _GRID_FIELDS:
             self._render_grid_labels()
@@ -1169,6 +1173,7 @@ class RSMPage(QtWidgets.QWidget):
     def _project_data_format(self):
         if self._calibration_dialog is not None:
             self._calibration_dialog.set_data_format(self._value("data_format"))
+            self._calibration_dialog.set_nexus_entry(self._value("nexus_entry"))
 
     def _sync_format_tip(self, idle=True, authoring=False):
         """The Data format's purpose, an older document's conflict to settle, and why it waits while locked."""
@@ -1176,6 +1181,8 @@ class RSMPage(QtWidgets.QWidget):
                 else " It waits for this page's work to finish.")
         self._tip("data_format", DATA_FORMAT_PURPOSE + (" " + self._format_choice if self._format_choice else "")
                   + wait)
+        if hasattr(self, "source_options"):
+            self.source_options.reconcile(self._value("data_format"), enabled=idle, reason=wait.strip())
 
     def _source_files(self, root):
         """The chosen files or folder, a relative one inside the Project (the selection would take it from
@@ -1186,7 +1193,7 @@ class RSMPage(QtWidgets.QWidget):
         """Everything the Source's member groups are found from, as committed (the cache's key)."""
         return (str(self._value("project_root")).strip(), self._source_paths,
                 *(str(self._value(key)) for key in (
-                    "source_kind", "scan_mode", "scan", "image_dir", "image_stem", "subdirs", "name_filter",
+                    "source_kind", "nexus_entry", "scan_mode", "scan", "image_dir", "image_stem", "subdirs", "name_filter",
                     "frame_first", "frame_last", "frame_step", "adv_rows", "adv_columns", "adv_dtype",
                     "adv_header", "adv_angle_mapping")), self.point_images.choices)
 
@@ -1216,7 +1223,8 @@ class RSMPage(QtWidgets.QWidget):
             image_stem=str(self._value("image_stem")).strip() if kind != "NeXus" else "",
             recursive=directory and bool(self._value("subdirs")),
             name_filter=str(self._value("name_filter")).strip() if directory else "",
-            point_image_choices=self.point_images.choices)
+            point_image_choices=self.point_images.choices,
+            nexus_entry=str(self._value("nexus_entry")).strip() if self._value("data_format") != "spec_series" else "")
         options = dict(
             frame_selector=rsm_frame_selector(self._value("frame_first"), self._value("frame_last"),
                                               self._value("frame_step")),
@@ -1760,8 +1768,10 @@ class RSMPage(QtWidgets.QWidget):
             return None
         root = Path(project).expanduser()
         path = Path(self._source_files(root)[0])
+        entry = str(self._value("nexus_entry")).strip() if self._value("data_format") != "spec_series" else ""
         if kind == "NeXus":
-            return SourceSpec(str(path), SourceKind.NEXUS_STACK)
+            return SourceSpec(str(path), SourceKind.NEXUS_STACK, entry=entry or "entry",
+                              options={"nexus_entry": entry} if entry else {})
         try:  # a Selection or stem readiness refuses opens the window without a scan
             if self._value("scan_mode") == "All Scans":
                 from xrd_tools.io.spec import list_spec_scans
@@ -1775,7 +1785,8 @@ class RSMPage(QtWidgets.QWidget):
         images = str(self._value("image_dir")).strip()
         return SourceSpec(str(path), SourceKind.SPEC, options={
             "scan": scan, "image_dir": str(self._inside(root, images, "Images")) if images else str(path.parent),
-            "image_stem": stem or None, "read_image_kwargs": self._reader_options()})
+            "image_stem": stem or None, "read_image_kwargs": self._reader_options(),
+            **({"nexus_entry": entry} if entry else {})})
 
     def _calibrate(self):
         """Calibrate: the shared calibration window with RSM's context ("Save geometry and use in RSM"), so RSM
@@ -1799,6 +1810,7 @@ class RSMPage(QtWidgets.QWidget):
                 context = CalibrationContext("RSM", project, detector=_CALIBRATION_DETECTOR,
                                              camera=DetectorCamera(*_CALIBRATION_CAMERA))
                 self._calibration_dialog = CalibrationDialog(context, parent=self)
+                self._project_data_format()  # bind shared options before source metadata work starts
                 saved = self._calibration_settings or {}
                 if saved:
                     self._calibration_dialog.apply_settings(saved)

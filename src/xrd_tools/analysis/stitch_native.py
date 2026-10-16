@@ -332,14 +332,16 @@ def _snapshot(path, manifest, rotation, flip=False):
     snapshot = {"size": before[3], "mtime_ns": before[4], "rotation": rotation,
                 **({"flip_horizontal": True} if flip else {})}  # a mirrored camera's, only then
     if path.suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus", ".cxi"}:
-        desc = describe_container(path, entry=manifest.source_entry or "entry")
+        desc = describe_container(path, entry=options.get("nexus_entry") or manifest.source_entry or "entry")
         if not desc.frame_shape or desc.dtype is None or desc.frame_count < 1:
             _refuse("RAW_LAYOUT_UNAVAILABLE", "detector container has no exact layout")
         shape, dtype, count = tuple(desc.frame_shape), np.dtype(desc.dtype), desc.frame_count
         recorded = desc.saturation
         snapshot.update(adapter_id=desc.adapter_id or "nexus_hdf5",
                         self_contained=bool(desc.self_contained))
-        if len(desc.segment_paths) > 1:
+        if options.get("nexus_entry") and desc.dataset_path is not None:
+            snapshot["dataset_path"] = desc.dataset_path
+        elif len(desc.segment_paths) > 1:
             # Keep the master-global frame selector for the shared Eiger reader;
             # selecting only its first dataset would misaddress later segments.
             if path.suffix.lower() not in {".h5", ".hdf5"} or not path.stem.endswith("_master"):

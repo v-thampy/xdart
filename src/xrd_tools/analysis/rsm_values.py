@@ -407,7 +407,8 @@ def rsm_member_groups(
                     stem = spec_image_stem(files[0], path.stem, key)
             members.append(RSMScanMemberForm(path, key, spec.options["image_dir"], stem, frame_selector,
                                              tuple(detector_shape), raw_dtype, raw_header_skip,
-                                             motor_selectors, point_images=spec.options.get("point_images")))
+                                             motor_selectors, point_images=spec.options.get("point_images"),
+                                             nexus_entry=spec.options.get("nexus_entry", "")))
         if members:
             groups.append(tuple(members))
     return tuple(groups), tuple(skipped)
@@ -491,6 +492,7 @@ class RSMScanMemberForm:
     raw_header_skip: int
     motor_selectors: tuple[tuple[str, MetadataColumnSelector], ...]
     point_images: Mapping[str, object] | None = None
+    nexus_entry: str = ""
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -500,6 +502,9 @@ class RSMScanMemberForm:
             raise ValueError("RSM member SPEC path must be extensionless")
         if type(self.scan) is not str or _SCAN.fullmatch(self.scan) is None:
             raise ValueError("RSM member scan must be an exact N or N.M selector")
+        if (type(self.nexus_entry) is not str or self.nexus_entry.strip() != self.nexus_entry
+                or "\0" in self.nexus_entry):
+            raise ValueError("RSM member NeXus entry must be a group name")
         if (
             type(self.image_stem) is not str
             or not self.image_stem
@@ -551,6 +556,8 @@ class RSMScanMemberForm:
                 for role, selector in motors
             ),
         )
+        if self.nexus_entry:
+            canonical += ("nexus_entry", self.nexus_entry)
         object.__setattr__(
             self,
             "fingerprint",
@@ -1949,6 +1956,7 @@ def prepare_rsm_tool_v2(
                     (selector.name, selector.occurrence) for selector in selectors
                 ),
                 **({} if member.point_images is None else {"point_images": dict(member.point_images)}),
+                **({"nexus_entry": member.nexus_entry} if member.nexus_entry else {}),
             },
         )
         table = member_table(source_spec)

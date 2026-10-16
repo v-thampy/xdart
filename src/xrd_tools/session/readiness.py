@@ -519,6 +519,7 @@ class ControlAction(str, Enum):
     REINTEGRATE_1D = "reintegrate_1d"
     REINTEGRATE_2D = "reintegrate_2d"
     ADVANCED_PROCESSING = "advanced_processing"
+    SOURCE_OPTIONS = "source_options"
     #: Another page's own Processing actions on the same row (Stitch: check the
     #: inputs and list the outputs; retry a finalization that did not complete).
     PREVIEW = "preview"

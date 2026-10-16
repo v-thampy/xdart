@@ -6,6 +6,8 @@ COVERAGE-CONTROL-CLARITY, with the wordings the maintainer approved on October 1
 - Plot Options shows "Show angular coverage", a "2D pixel coverage" section with "Shade uncovered bins", and
   "Detector coordinate grid".
 Keys, defaults and behavior are unchanged, and each tooltip says what its control does and when it is unavailable.
+LIVE-TEST-FIXES-20261015 LF-007 relocates recording to Advanced → Integrate 1D in both pages, preserving
+Int's Okay/Cancel submission and Stitch's immediate editing.
 These rows use real pages, real clicks and the shared owners' own reconciliation. Behavior beyond them stays pinned
 by the recording, strip, plot-options, shading and grid files.
 
@@ -22,7 +24,7 @@ by the recording, strip, plot-options, shading and grid files.
 """
 from dataclasses import replace
 
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 from tests.xdart.scattering.e3_shell_support import make_shell_projection
 from tests.xdart.scattering.test_angular_support_strip import _masked_series
@@ -38,6 +40,42 @@ def _pill(widget):
     found = [button for button in widget.findChildren(QtWidgets.QAbstractButton)
              if button.isCheckable() and button.accessibleName() == LABEL]
     assert len(found) == 1, f"{len(found)} controls named '{LABEL}' for assistive technology"
+    return found[0]
+
+
+def _int_recording(qapp, page, *, toggle=False, accept=True):
+    """Use the real modal Advanced action; Cancel discards its local recording edit."""
+    from xdart.gui.widgets.controls_panel import ActionButton
+    from xrd_tools.session.readiness import ControlAction
+    assert not [button for button in page._shell.controls.findChildren(QtWidgets.QAbstractButton)
+                if button.accessibleName() == LABEL], 'recording belongs in Advanced, not the main 1-D card'
+    advanced = next(button for button in page._shell.controls.findChildren(ActionButton)
+                    if button.spec.action is ControlAction.ADVANCED_PROCESSING)
+    found, errors = [], []
+
+    def edit():
+        dialog = page._advanced_dialog
+        try:
+            pill = _pill(dialog)
+            group = pill.parentWidget()
+            while group is not None and not isinstance(group, QtWidgets.QGroupBox):
+                group = group.parentWidget()
+            assert group is not None and group.title() == 'Integrate 1D'
+            found.append(pill)
+            if toggle:
+                pill.click()
+        except Exception as error:
+            errors.append(error)
+        finally:
+            if dialog is not None:
+                dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok if accept and not errors
+                                      else QtWidgets.QDialogButtonBox.StandardButton.Cancel).click()
+
+    QtCore.QTimer.singleShot(0, edit)
+    advanced.click()
+    qapp.processEvents()
+    assert not errors, str(errors)
+    assert len(found) == 1
     return found[0]
 
 
@@ -69,22 +107,28 @@ def test_c1_the_recording_pill_says_on_or_off_in_int_and_stitch(qapp, tmp_path):
     intent = _masked_series(tmp_path / "int")
     del intent.run_options["record_angular_support"]  # a fresh Int page
     with _page(qapp, intent) as (page, view, _observed):
-        pill = _pill(page)
+        pill = _int_recording(qapp, page)
         shown = view.plot_options_dialog.projection.show_angular_support
         assert not pill.isChecked() and pill.text() == f"{LABEL}: Off"
-        pill.click()
-        qapp.processEvents()
+        revision = page._intents.revision
+        _int_recording(qapp, page, toggle=True, accept=False)
+        assert page._intents.revision == revision, 'Cancel discards the local toggle'
+        pill = _int_recording(qapp, page, toggle=True)
         assert pill.isChecked() and pill.text() == f"{LABEL}: On"
-        pill.click()
-        qapp.processEvents()
+        assert page._intents.snapshot().thaw().run_options['record_angular_support'] is True
+        pill = _int_recording(qapp, page, toggle=True)
         assert not pill.isChecked() and pill.text() == f"{LABEL}: Off"
+        assert 'record_angular_support' not in page._intents.snapshot().thaw().run_options
         assert view.plot_options_dialog.projection.show_angular_support == shown, "recording never changes display"
-        pill.click()
-        qapp.processEvents()
+        pill = _int_recording(qapp, page, toggle=True)
         assert pill.isChecked() and pill.text() == f"{LABEL}: On"
     page = StitchPage(empty_host_services(_Status()))
     try:
         pill = _pill(page)
+        assert page.advanced.isAncestorOf(pill), 'Stitch recording belongs in Advanced'
+        from xdart.gui.widgets.controls_panel import SubsectionCard
+        assert any(card.isAncestorOf(pill) and card.title.text() == 'Integrate 1D'
+                   for card in page.advanced.findChildren(SubsectionCard))
         assert not pill.isChecked() and pill.text() == f"{LABEL}: Off"
         pill.click()
         qapp.processEvents()
@@ -151,7 +195,7 @@ def test_c3_2d_pixel_coverage_says_it_needs_a_stitch_intensity_map(qapp):
     _view, dialog, _commands = _options(qapp)
     box = dialog.show_coverage_holes
     group = box.parentWidget()
-    assert isinstance(group, QtWidgets.QGroupBox) and group.title() == "2D pixel coverage"
+    assert isinstance(group, QtWidgets.QGroupBox) and group.title() == "2D pixel coverage (Stitch only)"
     assert box.text() == "Shade uncovered bins" and not box.isEnabled(), "an ordinary Int result has no pixel coverage"
     assert "Stitch" in box.toolTip() and "Show angular coverage" in box.toolTip(), box.toolTip()
     dialog.set_coverage_available(True)

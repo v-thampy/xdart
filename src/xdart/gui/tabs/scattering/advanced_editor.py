@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -18,8 +18,9 @@ from .controls_editing import (
     advanced_settings_values,
 )
 from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
-from xdart.gui.widgets.controls_panel import SubsectionCard
+from xdart.gui.widgets.controls_panel import PillRow, SubsectionCard
 from xdart.gui.widgets.file_dialogs import CORRECTION_FILTER as _CORRECTION_FILTER
+from .controls_inventory import RECORD_ANGULAR_SUPPORT, recording_control_field
 
 #: Browse titles for the detector-correction images, by role.
 _CORRECTION_TITLES = {"dark": "Choose dark", "flat": "Choose flat field"}
@@ -232,6 +233,9 @@ class AdvancedSettingsDialog(AdvancedDialog):
             "Integrate 1D",
             ADVANCED_METHODS_1D,
         )
+        self._recording_field = recording_control_field()
+        self.record_angular_support = PillRow((self._recording_field,))
+        self.one_d.solid_angle.parentWidget().layout().addRow(self.record_angular_support)
         self.two_d = self._dimension_group(
             forms,
             "Integrate 2D",
@@ -382,6 +386,8 @@ class AdvancedSettingsDialog(AdvancedDialog):
             raise TypeError("values must be AdvancedSettingsValues")
         self._load_dimension(self.one_d, values.one_d)
         self._load_dimension(self.two_d, values.two_d)
+        self.record_angular_support.apply_fields({RECORD_ANGULAR_SUPPORT:
+            replace(self._recording_field, value=values.record_angular_support)})
         self._gi_enabled = values.gi_enabled
         gi_enabled = bool(values.gi_enabled)
         blocker = QtCore.QSignalBlocker(self.gi_method)
@@ -507,6 +513,7 @@ class AdvancedSettingsDialog(AdvancedDialog):
             dark_file=self.dark_file.text(),
             flat_file=self.flat_file.text(),
             flat_min_fraction=round(self.flat_min_percent.value(), 1) / 100.0,
+            record_angular_support=dict(self.record_angular_support.current_edits())[RECORD_ANGULAR_SUPPORT],
         )
 
     @staticmethod

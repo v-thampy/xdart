@@ -1000,7 +1000,7 @@ def _project_source_options(analysis, root: Path) -> str:
         )
     options = dict(analysis.source_spec.options)
     if analysis.resolved_kind is SourceKind.SPEC:
-        allowed = {"scan", "image_dir", "image_stem", "read_image_kwargs", "require_complete_images", "point_images"}
+        allowed = {"scan", "image_dir", "image_stem", "read_image_kwargs", "require_complete_images", "point_images", "nexus_entry"}
         if (
             analysis.resolved_entry is not None
             or not analysis.resolved_scan

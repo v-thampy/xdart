@@ -100,6 +100,13 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
         spec = SourceSpec(uri_or_spec, kind, options=opts)
 
     kind = coerce_source_kind(spec.kind)
+    if kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER} and spec.options.get("nexus_entry"):
+        from xrd_tools.io.nexus import list_entries
+        entry = spec.options["nexus_entry"]
+        if entry != spec.entry:
+            raise ValueError("NeXus entry override must match the source entry")
+        if entry not in list_entries(spec.uri):
+            raise ValueError(f"{Path(spec.uri).name}: NeXus entry {entry!r} is not present")
     if kind is SourceKind.PROCESSED_NEXUS:
         # A caller-supplied kind and a .nexus suffix are not admission.  Current
         # processed records must pass exact schema/structure qualification
@@ -582,6 +589,7 @@ def _spec_open(spec: SourceSpec) -> FrameSource:
             image_stem=opts.get("image_stem"),
             require_complete_images=opts.get("require_complete_images", False),
             read_image_kwargs=opts.get("read_image_kwargs"),
+            nexus_entry=opts.get("nexus_entry"),
             point_images=opts.get("point_images"))
     except PointImagesRequired as error:
         from dataclasses import replace
