@@ -35,7 +35,7 @@ from xrd_tools.io.output_safety import (
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
 from xrd_tools.io.stat_identity import identity_ctime_ns
-from xrd_tools.sources.adapters import candidate_owner, get_adapter
+from xrd_tools.sources.adapters import candidate_owner, get_adapter, registry_identity
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.directory_index import StaleCandidateError
@@ -51,6 +51,8 @@ from xrd_tools.sources.execution_graph import (
     _source_state_key,
     _topology_from_captured_state,
     _verify_source_states,
+    LivePrefixProof,
+    observation_key,
     PreparedSourceExecutionGraph,
     SelectedContainerInput,
     SourceRevisionChanged,
@@ -1099,6 +1101,8 @@ def _live_metadata_ready(
     observations: dict[str, tuple[tuple[str, object], ...]],
     *,
     published_members: int = 0,
+    observe_from: int = 0,
+    spec_cache: dict | None = None,
 ) -> tuple[int, str]:
     """How many leading members of a Live group have their metadata ready.
 
@@ -1128,17 +1132,20 @@ def _live_metadata_ready(
         from xrd_tools.io.metadata import spec_rows_ready
 
         exempt = min(published_members, len(candidates))
-        ready = exempt + spec_rows_ready(tuple(Path(value.path) for value in candidates[exempt:]))
+        ready = exempt + spec_rows_ready(tuple(Path(value.path) for value in candidates[exempt:]),
+                                         cache=spec_cache)
         if ready == len(candidates):
             return ready, ""
         return ready, f"waiting for the SPEC row of {Path(candidates[ready].path).name}"
     from xrd_tools.io.metadata import live_sidecar_observation
 
-    ready, reason = len(candidates), ""
+    ready, reason, listings = len(candidates), "", {}
     for index, candidate in enumerate(candidates):
+        if index < observe_from:
+            continue  # a published member its output's current proof covers
         image = Path(candidate.path)
-        seen = live_sidecar_observation(image, meta_format)
-        key = os.path.normcase(os.path.abspath(image))
+        seen = live_sidecar_observation(image, meta_format, listings=listings)
+        key = observation_key(image)
         previous = observations.get(key)
         observations[key] = seen
         if ready == len(candidates) and (
@@ -1148,6 +1155,41 @@ def _live_metadata_ready(
         ):
             ready, reason = index, f"waiting for the metadata of {image.name}"
     return ready, reason
+
+
+def observe_live_members(
+    configuration: FrozenRunConfiguration, graph: PreparedSourceExecutionGraph,
+) -> dict[str, object]:
+    """Every member's sidecar observation now, from fresh listings, by record key."""
+    from xrd_tools.io.metadata import live_sidecar_observation
+
+    source = configuration.thaw_source_spec()
+    fmt = source.metadata_format if type(source) is DirectorySourceSpec else None
+    if fmt in (None, "spec"):
+        return {}
+    listings: dict = {}
+    return {
+        observation_key(member.path): live_sidecar_observation(member.path, fmt, listings=listings)
+        for member in graph.stamp.members
+    }
+
+
+def _prefix_current_rebased(
+    configuration: FrozenRunConfiguration,
+    graph: PreparedSourceExecutionGraph,
+    proof: LivePrefixProof | None,
+    cancelled: Callable[[], bool],
+) -> bool:
+    """The strict published-prefix check; its pass rebases the output's proof
+    on the discovery and registrations observed before it."""
+    proof = proof if proof is not None and proof.graph is graph else None
+    seen = None if proof is None else observe_live_members(configuration, graph)
+    registry = registry_identity()
+    if not _published_prefix_current(graph, cancelled):
+        return False
+    if proof is not None:
+        proof.rebase(seen, registry)
+    return True
 
 
 def _published_prefix_current(
@@ -1189,6 +1231,8 @@ def materialize_live_directory_group(
     sidecar_observations: dict[str, tuple[tuple[str, object], ...]] | None = None,
     published_members: int = 0,
     published_graph: PreparedSourceExecutionGraph | None = None,
+    proof: LivePrefixProof | None = None,
+    spec_cache: dict | None = None,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
@@ -1226,9 +1270,17 @@ def materialize_live_directory_group(
         )
     physical_paths = group.physical_paths
     if sidecar_observations is not None:
+        # A current proof covers the published members (each output is proved
+        # again within LivePrefixProof.PERIOD_S): only later members are looked at.
+        covered = (
+            published_members
+            if proof is not None and proof.graph is published_graph
+            and proof.current(cancelled=cancelled) else 0
+        )
         count, waiting = _live_metadata_ready(
             configuration, group, sidecar_observations,
             published_members=published_members,
+            observe_from=covered, spec_cache=spec_cache,
         )
         if count == 0:
             return LiveDirectoryAttempt(
@@ -1238,7 +1290,9 @@ def materialize_live_directory_group(
             published_graph is not None
             and count < len(group.plan.candidates)
             and count <= len(published_graph.stamp.members)
-            and _published_prefix_current(published_graph, cancelled)
+            and (covered or _prefix_current_rebased(
+                configuration, published_graph, proof, cancelled,
+            ))
         ):
             # A frame waits and the published frames are exactly as admitted:
             # re-admitting them would only repeat their admission (and, in
@@ -2173,7 +2227,7 @@ __all__ = [
     "ValidatedSourceAliases",
     "execution_plan_values", "native_int_reduction_plan", "inspect_output",
     "materialize_deferred_output",
-    "live_directory_groups", "materialize_live_directory_group",
+    "live_directory_groups", "materialize_live_directory_group", "observe_live_members",
     "OutputFact", "prepare_output", "source_snapshots",
     "target_state_matches", "validate_admitted_receipt",
     "validate_planned_source", "validate_source_aliases",

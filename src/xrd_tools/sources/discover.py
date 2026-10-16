@@ -244,11 +244,11 @@ def collect_owned_candidates(directory, *, recursive: bool = False,
     name_ok = compile_filter(name_filter)
     _ensure_builtin_adapters_registered()
     from xrd_tools.sources.adapters import candidate_owner_among, registry_entries, registry_identity
-    from xrd_tools.sources.registry import PURE_NAME_PREDICATES
+    from xrd_tools.sources.registry import name_pure_registry
 
     entries = registry_entries()
     registry = registry_identity(entries)
-    pure = all(entry.builtin and entry.adapter.is_candidate in PURE_NAME_PREDICATES for entry in entries)
+    pure = name_pure_registry(entries)
     memo = {} if memo is None else memo
     owners = memo.get("owners", {}) if pure and memo.get("registry") == registry else {}
     previous = memo.get("candidates", {})

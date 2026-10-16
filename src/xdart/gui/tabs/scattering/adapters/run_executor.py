@@ -43,7 +43,9 @@ from xrd_tools.sources.adapters import registry_identity
 from xrd_tools.sources.base import source_metadata_energy_eV
 from xrd_tools.sources.point_images import PointImagesRequired
 from xrd_tools.sources.cursor import open_container_cursor
-from xrd_tools.sources.execution_graph import published_metadata_drift, validate_consumed_metadata
+from xrd_tools.sources.execution_graph import (
+    LivePrefixProof, published_metadata_drift, validate_consumed_metadata,
+)
 from xrd_tools.sources.nexus import NexusStackSource
 from xrd_tools.sources.point_images import PointImageSource
 from xrd_tools.sources.probe import ProbeState
@@ -82,7 +84,7 @@ from ..output_preflight import (
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     native_int_reduction_plan, materialize_deferred_output,
-    live_directory_groups, materialize_live_directory_group,
+    live_directory_groups, materialize_live_directory_group, observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
 )
@@ -458,6 +460,9 @@ class _StandardRun:
         default_factory=dict
     )
     live_revision_lock: Lock = field(default_factory=Lock)
+    # Live reuse: physical target key -> the proof of its published prefix.
+    # Run-owned; cleared when the Live loop ends.
+    live_proofs: dict[str, Any] = field(default_factory=dict)
     # Live outputs that stopped growing because a published frame's metadata
     # changed: physical target key -> the reason every later status carries.
     live_blocked: dict[str, str] = field(default_factory=dict)
@@ -563,6 +568,13 @@ def _observe_quartile_completion(run: _StandardRun) -> None:
         run.perf_quartiles_enabled = False
         run.perf_quartiles = None
         logger.exception("[PERF-QUARTILE] telemetry disabled after snapshot failure")
+
+
+def _live_proof(configuration, graph, record, registry) -> LivePrefixProof:
+    """A published Live output's proof, with its members' sidecar observations from ``record``."""
+    source = configuration.thaw_source_spec()
+    fmt = source.metadata_format if type(source) is DirectorySourceSpec else None
+    return LivePrefixProof(graph, metadata_format=fmt, record=record, registry=registry)
 
 
 def _directory_status(
@@ -1958,6 +1970,9 @@ class StandardRunExecutor:
             tuple[tuple[object, ...], SourceExecutionIdentityV1 | None],
         ] = {}
         retry_revisions: dict[str, tuple[object, ...]] = {}
+        # SPEC readiness by SPEC file revision: no read while it is unchanged.
+        spec_cache: dict[object, object] = {}
+        run.live_proofs.clear()
         # Each image's sidecar as last seen; admission waits until it holds still.
         sidecar_observations: dict[str, tuple[tuple[str, object], ...]] = {}
         discovered_paths: set[Path] = set(deferred.discovered_paths)
@@ -2051,7 +2066,21 @@ class StandardRunExecutor:
                         raise RuntimeError(
                             "settled Live source identity lost its exact attempt"
                         )
+                    proof = run.live_proofs.get(target_key)
                     with _run_effect(run):
+                        # The drift sweep: each settled output's proof is
+                        # re-checked within the sweep period; only a change
+                        # reaches the strict validator below.
+                        if proof is not None and proof.graph is retained.decision.item.graph \
+                                and proof.current(cancelled=lambda: run.stop_requested):
+                            continue
+                        run.live_proofs.pop(target_key, None)
+                        # Discovery and registrations as they are before the
+                        # strict check: a proof rebuilt on its pass holds both.
+                        registry = registry_identity()
+                        seen = observe_live_members(
+                            configuration, retained.decision.item.graph,
+                        )
                         try:
                             validate_planned_source(
                                 retained.decision.item,
@@ -2060,6 +2089,10 @@ class StandardRunExecutor:
                         except SourceRevisionChanged:
                             settled_revisions.pop(target_key, None)
                         else:
+                            run.live_proofs[target_key] = _live_proof(
+                                configuration, retained.decision.item.graph,
+                                seen, registry,
+                            )
                             continue
                 try:
                     with _run_effect(run):
@@ -2077,6 +2110,8 @@ class StandardRunExecutor:
                         self._release_predecessor_before_target(
                             run, group.target,
                         )
+                        # The registrations this attempt is qualified under.
+                        registry = registry_identity()
                         attempt = materialize_live_directory_group(
                             receipt,
                             configuration,
@@ -2090,6 +2125,8 @@ class StandardRunExecutor:
                                 None if retained is None or retained.decision is None
                                 else retained.decision.item.graph
                             ),
+                            proof=run.live_proofs.get(target_key),
+                            spec_cache=spec_cache,
                         )
                         if attempt.state is ProbeState.IN_PROGRESS:
                             if attempt.revision_changed:
@@ -2197,6 +2234,10 @@ class StandardRunExecutor:
                     ):
                         with run.live_revision_lock:
                             run.processed_live_revisions[target_key] = attempt
+                        run.live_proofs[target_key] = _live_proof(
+                            configuration, decision.item.graph,
+                            sidecar_observations, registry,
+                        )
                         if not attempt.partial:
                             # A partial attempt leaves members still waiting
                             # for their metadata: retry them next poll.
@@ -2908,6 +2949,7 @@ class StandardRunExecutor:
         ))
 
     def _cleanup(self, run: _StandardRun, primary: DetachedDiagnostic | None=None) -> ExecutorClosed:
+        run.live_proofs.clear()
         with run.cleanup_lock:
             if primary is not None and run.primary is None:
                 run.primary = primary

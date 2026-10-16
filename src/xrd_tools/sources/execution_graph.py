@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import hashlib, json, math, os, posixpath
 from pathlib import Path
+from stat import S_ISREG
 import threading, time
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -563,6 +564,126 @@ def validate_source_state_sweep(
             )
     if is_cancelled():
         raise InterruptedError("source state sweep cancelled")
+
+
+def observation_key(path: str | Path) -> str:
+    """The key of one image in a Live Run's sidecar-observation record."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _resolve_parents(bindings: tuple[SourceAliasBinding, ...]) -> dict[str, str | None]:
+    parents: dict[str, str | None] = {}
+    for binding in bindings:
+        parent = os.path.dirname(binding.raw_path)
+        if parent not in parents:
+            try:
+                parents[parent] = str(Path(parent).resolve(strict=True))
+            except (OSError, RuntimeError):
+                parents[parent] = None
+    return parents
+
+
+def _alias_now(binding: SourceAliasBinding, parents: dict[str, str | None]):
+    """``(resolved path, revision)`` of one alias now, ``None`` if it is gone.
+
+    A regular-file leaf under a resolved parent costs one no-follow stat; any
+    other leaf takes the existing full resolve and capture."""
+    try:
+        state = os.lstat(binding.raw_path)
+        parent = parents.get(os.path.dirname(binding.raw_path))
+        if parent is not None and S_ISREG(state.st_mode):
+            return (os.path.join(parent, os.path.basename(binding.raw_path)),
+                    (state.st_size, state.st_mtime_ns, state.st_ctime_ns, state.st_dev, state.st_ino))
+        resolved = _resolve_source_alias(binding.raw_path)
+        return resolved, _revision(_capture_canonical_source_target(resolved))
+    except (OSError, RuntimeError):
+        return None
+
+
+class LivePrefixProof:
+    """What a Live Run proved about one published output, re-checked cheaply.
+
+    Recorded only from a graph a strict bracket admitted.  :meth:`holds` repeats
+    validate_source_aliases' two sweeps with each distinct parent resolved
+    before and after a sweep and a no-follow stat per leaf, then gives a SPEC
+    file that only grew one coherent check of its retained extents (kept for
+    that revision).  The adapter registrations and each member's sidecar
+    discovery, from fresh listings, must be unchanged.  ``False`` sends the
+    caller to the strict path, whose errors are the ones it always raised.
+    """
+
+    #: A settled or waiting output is proved again at least this often: within
+    #: one second with a poll and its work to spare.
+    PERIOD_S = 0.75
+
+    def current(self, *, cancelled: Callable[[], bool] | None = None) -> bool:
+        """``holds()``, unless it already held within :attr:`PERIOD_S`."""
+        return time.monotonic() - self.verified_at < self.PERIOD_S or self.holds(cancelled=cancelled)
+
+    def __init__(self, graph: PreparedSourceExecutionGraph, *, metadata_format: str | None = None,
+                 record: Mapping[str, Any] | None = None, registry: tuple | None = None) -> None:
+        self.graph, self.metadata_format = graph, metadata_format
+        self.spec_revisions: dict[str, tuple[int, ...]] = {}
+        self.rebase(record or {}, registry)
+
+    def rebase(self, record: Mapping[str, Any], registry: tuple | None) -> None:
+        """Take the members' sidecar observations from the Run's ``record`` and
+        the registrations the graph was last strictly proved under."""
+        from xrd_tools.sources.adapters import registry_identity
+        fmt = self.metadata_format
+        self.observations = () if fmt in (None, "spec") else tuple(
+            (member.path, record.get(observation_key(member.path))) for member in self.graph.stamp.members)
+        self.registry = registry_identity() if registry is None else registry
+        self.verified_at = time.monotonic()
+
+    def holds(self, *, cancelled: Callable[[], bool] | None = None) -> bool:
+        from xrd_tools.io.metadata import live_sidecar_observation
+        from xrd_tools.sources.adapters import registry_identity
+        from xrd_tools.sources.registry import name_pure_registry
+        if registry_identity() != self.registry:
+            return False
+        stamp = self.graph.stamp
+        targets, grown, moved = stamp.canonical_targets, _spec_extents(stamp), {}
+        for _sweep in range(2):
+            parents = _resolve_parents(stamp.source_aliases)
+            for index, binding in enumerate(stamp.source_aliases):
+                if cancelled is not None and not index % 256 and cancelled():
+                    raise RuntimeError("admission cancelled")
+                now, expected = _alias_now(binding, parents), targets[binding.target_id]
+                if now is None or _path_key(now[0]) != _path_key(binding.resolved_path):
+                    return False
+                key = _path_key(expected.resolved_path)
+                if now[1] != _revision(expected.state):
+                    if expected.roles != ("image_metadata",) or not grown.get(key):
+                        return False
+                    moved[key] = (expected.resolved_path, now[1])
+            if _resolve_parents(stamp.source_aliases) != parents:
+                return False
+        if not name_pure_registry() and any(
+                binding.candidate_owner_id is not None
+                and _candidate_owner_id(binding.raw_path) != binding.candidate_owner_id
+                for binding in stamp.source_aliases):
+            return False
+        for key, (path, revision) in moved.items():
+            if self.spec_revisions.get(key) != revision:
+                try:
+                    after = None if not all(map(spec_extent_holds, grown[key])) else os.stat(path)
+                except OSError:
+                    after = None
+                if after is None or (after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+                                     after.st_dev, after.st_ino) != revision:
+                    return False
+                self.spec_revisions[key] = revision
+        listings: dict = {}
+        for image, seen in self.observations:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("admission cancelled")
+            if live_sidecar_observation(image, self.metadata_format, listings=listings) != seen:
+                return False
+        self.verified_at = time.monotonic()
+        return True
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedSourceExecutionGraph:
     execution_source: SourceSpec; source_path: str; stamp: SourceExecutionStamp

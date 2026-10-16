@@ -466,8 +466,32 @@ def _dir_listing_lower(directory: Path) -> dict[str, Path]:
     return listing
 
 
-def _existing_path_case_insensitive(candidate: Path) -> Path | None:
-    """Return an existing sibling matching *candidate.name*, exact case first."""
+def _fresh_listing(directory: Path, listings: dict) -> tuple[frozenset, dict[str, Path]]:
+    """*directory*'s regular files, listed now, once per ``listings`` and never in the process-wide cache."""
+    found = listings.get(directory)
+    if found is None:
+        names: list[str] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file():
+                            names.append(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        found = listings[directory] = (frozenset(names), {name.lower(): directory / name for name in names})
+    return found
+
+
+def _existing_path_case_insensitive(candidate: Path, listings: dict | None = None) -> Path | None:
+    """Return an existing sibling matching *candidate.name*, exact case first.
+
+    With ``listings`` (a caller's own fresh listings), both looks use it."""
+    if listings is not None:
+        names, lower = _fresh_listing(candidate.parent, listings)
+        return candidate if candidate.name in names else lower.get(candidate.name.lower())
     # S-20: exact-case fast path -- ONE stat, no directory listing (the common
     # case: sidecars are correctly cased).
     try:
@@ -730,7 +754,7 @@ def _is_non_image_companion(path: Path, image_path: Path) -> bool:
     )
 
 
-def _iter_auto_sidecar_candidates(image_path: Path):
+def _iter_auto_sidecar_candidates(image_path: Path, listings: dict | None = None):
     """Yield auto sidecar candidates: allow-listed extensions ONLY, ranked by
     :data:`_AUTO_SIDECAR_EXTENSIONS`, append-form (``image.tif.<ext>``) before
     replace-form (``image.<ext>``).
@@ -741,8 +765,8 @@ def _iter_auto_sidecar_candidates(image_path: Path):
     rather than listing the whole directory (S-20 stat-first)."""
     seen: set[Path] = set()
     for ext in _AUTO_SIDECAR_EXTENSIONS:
-        append = _existing_path_case_insensitive(Path(str(image_path) + f".{ext}"))
-        replace = _existing_path_case_insensitive(image_path.with_suffix(f".{ext}"))
+        append = _existing_path_case_insensitive(Path(str(image_path) + f".{ext}"), listings)
+        replace = _existing_path_case_insensitive(image_path.with_suffix(f".{ext}"), listings)
         # Preserve the on-disk case in the cached suffix (reconstruction is
         # case-insensitive either way, but keep it faithful).
         for candidate, convention, start in (
@@ -1076,14 +1100,15 @@ def read_image_metadata(
 
 
 def live_sidecar_observation(
-    image_path: Path | str, meta_format: str,
+    image_path: Path | str, meta_format: str, *, listings: dict | None = None,
 ) -> tuple[tuple[str, MetadataSourceRevision | None], ...]:
     """The sidecar files a live Run waits on for one image, with their revisions.
 
     An explicit sidecar format names the one file :func:`_find_sidecar`
     selects; Auto names every allow-listed candidate that exists now.  ``()``
     means none exists.  Nothing is opened or parsed: the live owner compares two
-    observations a poll apart before it admits the frame.
+    observations a poll apart before it admits the frame.  ``listings`` (the
+    caller's own, filled fresh) replaces the process-wide listing cache.
     """
 
     image = _lexical_absolute(image_path)
@@ -1091,11 +1116,16 @@ def live_sidecar_observation(
     if meta_format_norm == "auto":
         found = tuple(
             candidate for candidate, _convention, _suffix
-            in _iter_auto_sidecar_candidates(image)
+            in _iter_auto_sidecar_candidates(image, listings)
         )
-    else:
+    elif listings is None:
         sidecar = _find_sidecar(image, meta_format_norm)
         found = () if sidecar is None else (sidecar,)
+    else:  # _find_sidecar's two looks, against the caller's listings
+        ext = meta_format_norm[1:] if meta_format_norm.startswith(".") else meta_format_norm
+        sidecar = ext and (_existing_path_case_insensitive(image.with_suffix(f".{ext}"), listings)
+                           or _existing_path_case_insensitive(Path(str(image) + f".{ext}"), listings))
+        found = (sidecar,) if sidecar else ()
     return tuple((str(path), _metadata_path_revision(path)) for path in found)
 
 
@@ -1900,13 +1930,21 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
                       tuple(ImageMetadataRead(value, spec_path) for value in values))
 
 
-def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None) -> int:
+def _spec_revision(path: Path) -> tuple[int, ...]:
+    state = os.stat(path)
+    return state.st_size, state.st_mtime_ns, state.st_ctime_ns, state.st_dev, state.st_ino
+
+
+def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None, *,
+                    cache: dict | None = None) -> int:
     """How many leading images already have their own complete SPEC row.
 
     A live Run admits an image under SPEC metadata only then: no other point's
     row is borrowed while its own is missing.  A row is final once its newline
     is written, so one look is enough.  An image whose name gives no SPEC
-    file, or whose file or scan does not exist yet, is not ready.
+    file, or whose file or scan does not exist yet, is not ready.  ``cache``
+    (the Run's) keeps each scan's row count for the file revision it was
+    read at, so an unchanged file is not read again.
     """
     rows: dict[tuple[Path, int], int] = {}
     for index, path in enumerate(image_paths):
@@ -1916,10 +1954,18 @@ def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | No
         spec_path, scan_number, number = resolved
         if (spec_path, scan_number) not in rows:
             try:
-                scan = _read_spec_scan(spec_path, scan_number)
+                revision = _spec_revision(spec_path)
+                known = None if cache is None else cache.get((spec_path, scan_number))
+                if known is not None and known[0] == revision:
+                    count = known[1]
+                else:
+                    scan = _read_spec_scan(spec_path, scan_number)
+                    count = 0 if scan is None else len(scan.rows)
+                    if cache is not None and _spec_revision(spec_path) == revision:
+                        cache[spec_path, scan_number] = (revision, count)
             except (OSError, ValueError):
                 return index
-            rows[spec_path, scan_number] = 0 if scan is None else len(scan.rows)
+            rows[spec_path, scan_number] = count
         if number >= rows[spec_path, scan_number]:
             return index
     return len(image_paths)
