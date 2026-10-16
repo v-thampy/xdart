@@ -320,10 +320,11 @@ def test_f2_source_identity_and_int_composition_are_unchanged(qapp, tmp_path):
     from xdart.gui.widgets.controls_panel import ControlsPanel
     from xrd_tools.analysis.stitch_sources import StitchSourceSelection
     from xrd_tools.session.readiness import ControlFieldKind, ControlFormField, SectionId
-    # the persisted selection identity keeps its tokens and its fields (no format element)
+    # the persisted selection identity keeps its tokens and its fields (no format element); LF-005's optional
+    # exact NeXus Entry is the one addition, and blank (Auto) adds no token
     assert [field.name for field in dataclasses.fields(StitchSourceSelection)] == [
         'kind', 'paths', 'scans', 'stitch_all', 'image_dir', 'image_stem', 'recursive', 'name_filter',
-        'point_image_choices']
+        'point_image_choices', 'nexus_entry']
     page = _page('Stitch', tmp_path)
     try:
         spec = tmp_path / 'sample.spec'
@@ -333,6 +334,7 @@ def test_f2_source_identity_and_int_composition_are_unchanged(qapp, tmp_path):
             page.set_sources(paths)
             selection = page._source_selection()
             assert selection.kind == kind and selection.fingerprint_value[0] == kind
+            assert selection.nexus_entry == '' and 'nexus_entry' not in selection.fingerprint_value
     finally:
         _shut(qapp, page)
     # Int's own source rows: the composer without the opt-in groups lays them out exactly as before
