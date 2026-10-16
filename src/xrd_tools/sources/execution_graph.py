@@ -1176,17 +1176,12 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
                                  f"metadata ({where}); choose Manual or a SPEC/NeXus metadata source")
             # A Live Run's SPEC selection binds each frame to its own row (R5b); finite containers keep their own.
             live = not (infer_point_images if expected is None else expected.infers_point_images)
-            metadata = _container_spec_sources(path, before, descriptor.frame_count, source, cancelled=cancelled,
-                published=published if expected is None else descriptor.frame_count, spec_cache=spec_cache) \
-                if live and not reader_binding and source.options.get("metadata_format") == "spec" else ()
+            bind = live and not reader_binding and source.options.get("metadata_format") == "spec"
             group = descriptor.scan_name or path.stem.removesuffix("_master")
             execution = SourceSpec(path, descriptor.kind, metadata_uri=source.metadata_uri,
                 entry=descriptor.resolved_entry or entry_name, options=dict(source.options))
             adapter_id = "nexus_hdf5" if reader_binding else owner_id
             if expected is not None:
-                if len(metadata) != len(expected.stamp.metadata_sources) or not all(
-                        map(_metadata_holds, metadata, expected.stamp.metadata_sources)):
-                    raise SourceRevisionChanged("container metadata source changed")
                 if external_index != len(expected.stamp.external_members) or dependency_index != len(expected.stamp.dependency_files):
                     raise SourceRevisionChanged("container dependency graph cardinality changed")
                 _same(before, expected.stamp.file, "container source changed")
@@ -1199,6 +1194,11 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
                 _same(_source_policy(execution, dict(execution.options)),
                       _source_policy(expected.execution_source, dict(expected.execution_source.options)),
                       "container source read policy changed")
+                # Only an unchanged container's rows are read again: every frame as published.
+                if bind != bool(expected.stamp.metadata_sources) or bind and not all(map(_metadata_holds, _container_spec_sources(
+                        path, before, descriptor.frame_count, source, published=descriptor.frame_count,
+                        cancelled=cancelled, spec_cache=spec_cache), expected.stamp.metadata_sources)):
+                    raise SourceRevisionChanged("container metadata source changed")
                 return None
             return freeze_source_execution_graph(source, execution, source_path=path,
                 group_key=group, reader_binding=reader_binding, file=before,
@@ -1206,7 +1206,9 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
                 detector_shape=tuple(descriptor.frame_shape), native_dtype=np.dtype(descriptor.dtype).str,
                 descriptor=descriptor, external_members=tuple(external_members),
                 dependency_files=tuple(dependencies), motor_names=None if all_motors is None else tuple(all_motors),
-                scanned_motor_names=scanned, metadata_sources=metadata, infers_point_images=infer_point_images)
+                scanned_motor_names=scanned, infers_point_images=infer_point_images,
+                metadata_sources=_container_spec_sources(path, before, descriptor.frame_count, source, published=published,
+                                                         cancelled=cancelled, spec_cache=spec_cache) if bind else ())
 
         if reader_binding:
             return _drain_average_qualification(handle, slot, complete)
