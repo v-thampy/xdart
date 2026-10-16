@@ -6,7 +6,8 @@ files. On a descriptor host the ``host`` arm keeps the POSIX dir_fd branch; ``na
 replays the CRT text-mode boundary (``test_stream_seed_preserves_binary_bytes``): DIAGNOSTIC ONLY.
 Rows: W01-W08 science; W09-W12 binary bytes; W13-W24 custody; W25-W28 parent state/adoption/capacity;
 W29-W34 calibration pair; W36-W38, W40 retry/flush; W41 Average reload (D1); W42 links (D2); W43-W45
-identity (D3); W46 path length (T5). Applicability (T4): every row applies on NTFS and SMB, except that
+identity (D3); W46 path length (T5); W47 Windows-width identities, W48 win32 ctime seam (hosted NTFS, 2026-10-16).
+Applicability (T4): every row applies on NTFS and SMB, except that
 W19 (hard link) and W42's symlink cell report INCOMPLETE (skip) where the link cannot be created, and
 W42's junction cell is N/A on SMB (junctions need local NTFS; W16-W18 and W42's symlink cell cover it).
 """
@@ -31,6 +32,7 @@ import pytest
 
 import xrd_tools.io.finite_artifact as finite_module
 import xrd_tools.io.output_transaction as transaction_module
+import xrd_tools.io.stat_identity as stat_identity_module
 from xrd_tools.io.finite_artifact import (
     FINITE_CANDIDATE_CLEANUP_WARNING, FINITE_PARENT_DIRECTORY_FSYNC_WARNING, FiniteArtifactCapacityError,
     FiniteArtifactCollision, FiniteArtifactDisposition, FiniteArtifactError, FiniteArtifactIntegrityError,
@@ -771,6 +773,8 @@ def test_w42_immediate_parent_link_refused_ancestor_link_admitted(tmp_path, arm,
     real = tmp_path / "real"
     (real / "sub").mkdir(parents=True)
     link = tmp_path / "alias"
+    if kind == "junction" and str(tmp_path).startswith("\\\\"):  # T4: a junction is a local NTFS construct
+        pytest.skip("N/A: junction cell on an SMB share")
     try:
         _make_link(kind, link, real if layout == "ancestor" else real / "sub")
     except OSError as error:  # only the junction cell reaches here
@@ -843,3 +847,27 @@ def test_w46_deep_parent_candidate_beyond_max_path(tmp_path, arm):
     facts = _publish(session, capture_target_snapshot(target))
     assert facts.published and facts.error is None and _values(target) == [46]
     assert _leftovers(parent) == []
+
+class _WindowsWidth(_ZeroInode):  # Windows Python 3.12+: a 64-bit volume serial and a file ID up to 128 bits
+    def __init__(self, real):
+        self._real, self.st_dev, self.st_ino = real, real.st_dev | 1 << 63, real.st_ino | 1 << 127
+
+@pytest.mark.parametrize("flow", (lambda t, m, a: test_w14_existing_slot_is_replaced_atomically(t, a),
+                                  lambda t, m, a: test_w27_seeded_adoption_publishes_releases_and_strands_nothing(t, a),
+                                  lambda t, m, a: test_w01_w02_average_publishes_replaces_and_reopens(t, m, a, False),
+                                  lambda t, m, a: test_w03_w06_stitch_publishes_replaces_and_reopens(t, a, ("multigeometry", "1d")),
+                                  lambda t, m, a: test_w07_w08_rsm_v2_publishes_replaces_and_reopens(t, m, a, "hkl")),
+                         ids=("W47-replace", "W47-seeded", "W47-average", "W47-stitch", "W47-rsm"))
+def test_w47_windows_width_identities_publish(tmp_path, monkeypatch, arm, flow):
+    """The hosted runner's NTFS reported st_dev 15923074127169020758 (> 2**63 - 1); identities have no width bound."""
+    for name in ("stat", "lstat", "fstat"):
+        monkeypatch.setattr(os, name, lambda *a, _real=getattr(os, name), **k: _WindowsWidth(_real(*a, **k)))
+    flow(tmp_path, monkeypatch, arm)
+
+@pytest.mark.parametrize("flow", (lambda t, m, a: test_w03_w06_stitch_publishes_replaces_and_reopens(t, a, ("multigeometry", "1d")),
+                                  lambda t, m, a: test_w07_w08_rsm_v2_publishes_replaces_and_reopens(t, m, a, "hkl")),
+                         ids=("W48-stitch", "W48-rsm"))
+def test_w48_win32_ctime_seam_still_seals_analysis_receipts(tmp_path, monkeypatch, arm, flow):
+    """Synthetic on POSIX: win32 zeroes ctime in comparable revisions, so a receipt must compare like with like."""
+    monkeypatch.setattr(stat_identity_module, "IDENTITY_CARRIES_CTIME", False)
+    flow(tmp_path, monkeypatch, arm)

@@ -146,7 +146,7 @@ def _source_receipt(tmp_path: Path, *, selected=(1, 3)) -> ModuleSourceReceipt:
             "# Motors\n"
             f"del = {5 * index}, nu = {index}\n"
             "User: stitch, time: Mon Jan 15 10:30:00 2024  # Temp\n",
-            encoding="utf-8",
+            encoding="utf-8", newline="\n",
         )
     table = run_metadata_table(
         MetadataTablePlan(
@@ -239,7 +239,7 @@ def _xu_prepared(
         "# Motors\n"
         f"del = {del_value}, nu = {nu_value}\n"
         "User: stitch, time: Mon Jan 15 10:30:00 2024  # Temp\n",
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     table = run_metadata_table(
         MetadataTablePlan(

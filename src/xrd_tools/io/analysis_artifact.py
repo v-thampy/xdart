@@ -1189,7 +1189,7 @@ class AnalysisArtifactReceipt:
             or type(self.inspection) is not AnalysisArtifactInspection
             or self.inspection.path != self.request.target
             or self.inspection.storage_revision
-            != stream_terminal_object_revision(self.terminal)
+            != _comparable_terminal_revision(self.terminal)
             or self.inspection.kind is not self.request.kind
             or self.inspection.request_fingerprint
             != self.request.request_fingerprint
@@ -1633,6 +1633,12 @@ def _stat_revision(state: os.stat_result) -> tuple[int, int, int, int, int]:
         int(state.st_mtime_ns),
         identity_ctime_ns(state.st_ctime_ns),
     )
+
+
+def _comparable_terminal_revision(terminal: StreamTerminal) -> tuple[int, int, int, int, int] | None:
+    """A terminal's descriptor-view revision in ``_stat_revision``'s comparable form (the win32 ctime seam)."""
+    revision = stream_terminal_object_revision(terminal)
+    return None if revision is None else (*revision[:4], identity_ctime_ns(revision[4]))
 
 
 def _opened_hdf_revision(handle: h5py.File) -> tuple[int, int, int, int, int]:

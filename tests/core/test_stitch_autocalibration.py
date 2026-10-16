@@ -37,7 +37,7 @@ def ring_scan(root, angles=ROW_ANGLES, scale=None, energy_ratio=1.0, dtype='<i4'
         image.astype(dtype).tofile(images / f'ring_scan1_{index:04d}.raw')
     lines = '\n'.join(f'{d} {n}' for d, n in angles)
     (root / 'ring').write_text('#F ring\n#E 1\n#D today\n#O0 del nu\n#S 1 ascan del 6 34 11 1\n'
-                               f'#D today\n#P0 0 0\n#N 2\n#L del  nu\n{lines}\n')
+                               f'#D today\n#P0 0 0\n#N 2\n#L del  nu\n{lines}\n', newline='\n')
     return SourceSpec(root / 'ring', SourceKind.SPEC, options={
         'scan': '1', 'image_dir': str(images), 'image_stem': 'ring_scan1_',
         'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': np.dtype(dtype).name}})
