@@ -159,6 +159,67 @@ def is_single_image_spec(source: object) -> bool:
     )
 
 
+_CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs", ".nexus", ".cxi"})
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesBound:
+    """One selected Image Series' members, by :func:`image_series_spec`'s rule: with a ``stem``, the folder's files
+    named stem, ``_`` or ``-``, digits and ``suffix`` (case-insensitively; numeric, then casefolded-name order);
+    without (an unnumbered image, or a NeXus/Eiger container however it grows), exactly ``leaf``."""
+
+    parent: str
+    leaf: str
+    suffix: str
+    stem: str | None = None
+
+    @classmethod
+    def of(cls, selected: str | Path) -> SeriesBound:
+        path = Path(selected).expanduser()
+        match = None if path.suffix.lower() in _CONTAINER_SUFFIXES else _FRAME_SUFFIX.match(path.stem)
+        return cls(str(path.parent), path.name, path.suffix, match.group(1) if match and path.suffix else None)
+
+    def key(self, name: str) -> tuple[int, str] | None:
+        """``name``'s place in the series (number, casefolded name); None when it is not a member."""
+        if self.stem is None:
+            return (0, name.casefold()) if name == self.leaf else None
+        match = re.fullmatch(rf"{re.escape(self.stem)}[_-](\d+){re.escape(self.suffix)}", name, re.IGNORECASE)
+        return None if match is None else (int(match.group(1)), name.casefold())
+
+
+@dataclass(frozen=True, slots=True)
+class LiveSelection:
+    """What a Live Run watches for its selection: a Folder's own rules, or an Image Series (or its selected
+    container) bound to its members in its parent folder, with the metadata policy their images are read by."""
+
+    root: Path
+    recursive: bool
+    name_filter: str | None
+    suffixes: tuple[str, ...]
+    metadata_format: str | None
+    series: SeriesBound | None = None
+
+
+def live_selection(source: object) -> LiveSelection | None:
+    """``source`` as a Live Run follows it; None for a selection Live runs once (a Single Image, a SPEC file)."""
+    if type(source) is DirectorySourceSpec:
+        return LiveSelection(source.root, source.recursive, source.name_filter, source.suffixes,
+                             source.metadata_format)
+    if type(source) is not SourceSpec or source.kind is not SourceKind.NEXUS_STACK and (
+            source.kind is not SourceKind.TIFF_SERIES or "pattern" not in source.options
+            or is_single_image_spec(source)):
+        return None
+    bound = SeriesBound.of(source.options.get("selected_file") or source.uri)
+    return LiveSelection(Path(bound.parent), False, None, (bound.suffix.lower(),),
+                         source.options.get("metadata_format"), bound)
+
+
+def live_metadata_format(source: object) -> str | None:
+    """The metadata policy a Live Run reads ``source``'s images by; None when it is off or Live does not follow."""
+    selection = live_selection(source)
+    return None if selection is None else selection.metadata_format
+
+
 def image_series_spec(
     selected_file: str | Path,
     *,
@@ -179,41 +240,28 @@ def image_series_spec(
     """
     selected = Path(selected_file).expanduser()
     metadata_policy = normalize_metadata_format(metadata_format)
-    if selected.suffix.lower() in {
-        ".h5", ".hdf5", ".nxs", ".nexus", ".cxi",
-    }:
+    if selected.suffix.lower() in _CONTAINER_SUFFIXES:
         return SourceSpec(
             selected,
             SourceKind.NEXUS_STACK,
             options={"metadata_format": metadata_policy},
         )
-    match = _FRAME_SUFFIX.match(selected.stem)
+    bound = SeriesBound.of(selected)
     suffix = selected.suffix
-    if match is None or not suffix:
+    if bound.stem is None:
         files = (selected,)
         scan_name = selected.stem
         pattern = selected.name
     else:
-        scan_name = match.group(1)
-        candidate_re = re.compile(
-            rf"^{re.escape(scan_name)}[_-](\d+){re.escape(suffix)}$",
-            re.IGNORECASE,
-        )
+        scan_name = bound.stem
         members: list[tuple[int, str, Path]] = []
         try:
             siblings = selected.parent.iterdir()
         except OSError:
             siblings = ()
         for sibling in siblings:
-            if not sibling.is_file():
-                continue
-            sibling_match = candidate_re.match(sibling.name)
-            if sibling_match is not None:
-                members.append((
-                    int(sibling_match.group(1)),
-                    sibling.name.casefold(),
-                    sibling,
-                ))
+            if sibling.is_file() and (key := bound.key(sibling.name)) is not None:
+                members.append((*key, sibling))
         files = tuple(
             member[2] for member in sorted(members, key=lambda item: item[:2]))
         if not files and selected.is_file():

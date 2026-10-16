@@ -42,7 +42,7 @@ from xrd_tools.sources.directory_index import StaleCandidateError
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.run_plan import RunCandidatePlan
-from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.selection import DirectorySourceSpec, live_metadata_format, live_selection
 from xrd_tools.sources.point_images import PointImagePolicy, PointImagesRequired, inspect_point_images
 from xrd_tools.sources.execution_graph import (
     _CapturedSourceTopology,
@@ -515,16 +515,15 @@ def prepare_output(
     directory_discovered_paths: tuple[Path, ...] = ()
     if cancelled():
         raise RuntimeError("admission cancelled")
-    if type(source) is DirectorySourceSpec:
+    # A Folder, or in Live an Image Series bound to its members, is watched by one session.
+    if (watch := live_selection(source)) is not None and (type(source) is DirectorySourceSpec or intent.live_mode):
         session = DirectoryIndexSession(
             retry_deadline=(float("inf") if intent.live_mode else None),
             probe_candidates=False,
         )
         session_owner(session)
-        session.configure(
-            source.root, recursive=source.recursive,
-            name_filter=source.name_filter, suffixes=source.suffixes,
-        )
+        session.configure(watch.root, recursive=watch.recursive, name_filter=watch.name_filter,
+                          suffixes=watch.suffixes, series=watch.series)
         observation = session.observe(refresh=True)
         discovered = observation.discovered_snapshot
         complete_plan = RunCandidatePlan.from_snapshot(discovered)
@@ -827,7 +826,7 @@ def _deferred_directory_plan(
             str,
         ]
     ] = []
-    for group in _directory_candidate_groups(plan):
+    for group, name in _output_groups(configuration, plan):
         if cancelled():
             raise RuntimeError("admission cancelled")
         captured_topologies: list[_CapturedSourceTopology] = []
@@ -846,12 +845,6 @@ def _deferred_directory_plan(
                 raise RuntimeError("admission cancelled")
         candidate_states = tuple(captured_topologies)
         representative = group[0]
-        adapter = get_adapter(representative.adapter_id)
-        if adapter is None:
-            raise ValueError(
-                f"candidate {representative.path} lost its adapter"
-            )
-        name = adapter.scan_name(representative.path)
         target = _directory_target(configuration, plan, representative, name)
         # Directory admission remains name/stat-only. Exact container and
         # external-dependency inspection belongs to the one JIT materializer.
@@ -1005,8 +998,8 @@ def _validate_deferred_targets(
     external_paths: tuple[Path, ...],
     proven: dict[str, SourceFileState] | None = None,
 ) -> None:
-    source = configuration.source
-    if type(source) is not DirectorySourceSpec:
+    source = live_selection(configuration.source)
+    if source is None:
         raise TypeError("deferred targets require a directory source")
     raw_paths = (
         tuple(candidate.path for candidate in plan.candidates)
@@ -1056,7 +1049,7 @@ def _validate_deferred_targets(
             input_files=protected,
             watched_dirs=(source.root,),
             recursive=source.recursive,
-            container_directory_mode=True,
+            container_directory_mode=source.series is None,  # a series' bound already keeps outputs out
         )
 
 
@@ -1084,12 +1077,7 @@ def live_directory_groups(
         RunCandidatePlan.from_snapshot(discovered)
     )
     groups: list[LiveDirectoryGroup] = []
-    for candidates in _directory_candidate_groups(current):
-        adapter = get_adapter(candidates[0].adapter_id)
-        if adapter is None:
-            raise ValueError(
-                f"candidate {candidates[0].path} lost its adapter"
-            )
+    for candidates, name in _output_groups(receipt.candidate, current):
         subset = RunCandidatePlan(
             current.generation,
             candidates,
@@ -1103,10 +1091,30 @@ def live_directory_groups(
                 receipt.candidate,
                 current,
                 candidates[0],
-                adapter.scan_name(candidates[0].path),
+                name,
             ),
             subset.paths,
         ))
+    return tuple(groups)
+
+
+def _output_groups(configuration: FrozenRunConfiguration | OutputCandidate,
+                   plan: RunCandidatePlan) -> tuple[tuple[tuple[Candidate, ...], str], ...]:
+    """The plan's output groups and scan names: a Live numbered Image Series is one group in its own members'
+    order under its own name; otherwise each adapter's scan name groups the files of one folder."""
+    selected = (configuration.thaw_source_spec() if type(configuration) is FrozenRunConfiguration
+                else configuration.source)
+    watch = live_selection(selected) if _is_live(configuration) else None
+    series = None if watch is None else watch.series
+    if series is not None and series.stem is not None:
+        return ((tuple(sorted(plan.candidates, key=lambda value: series.key(value.path.name))), series.stem),) \
+            if plan.candidates else ()
+    groups = []
+    for group in _directory_candidate_groups(plan):
+        adapter = get_adapter(group[0].adapter_id)
+        if adapter is None:
+            raise ValueError(f"candidate {group[0].path} lost its adapter")
+        groups.append((group, adapter.scan_name(group[0].path)))
     return tuple(groups)
 
 
@@ -1137,10 +1145,7 @@ def _live_metadata_ready(
     """
 
     candidates = group.plan.candidates
-    source = configuration.thaw_source_spec()
-    meta_format = (
-        source.metadata_format if type(source) is DirectorySourceSpec else None
-    )
+    meta_format = live_metadata_format(configuration.thaw_source_spec())
     if meta_format is None:
         return len(candidates), ""
     if meta_format == "spec":
@@ -1176,8 +1181,7 @@ def observe_live_members(configuration: FrozenRunConfiguration, paths) -> dict[s
     """Each image's sidecar observation now, from fresh listings, by record key."""
     from xrd_tools.io.metadata import live_sidecar_observation
 
-    source = configuration.thaw_source_spec()
-    fmt = source.metadata_format if type(source) is DirectorySourceSpec else None
+    fmt = live_metadata_format(configuration.thaw_source_spec())
     listings: dict = {}
     return {} if fmt in (None, "spec") else {
         observation_key(path): live_sidecar_observation(path, fmt, listings=listings) for path in paths}
@@ -1313,8 +1317,8 @@ def materialize_live_directory_group(
         group.plan.name_filter,
         tuple(value.descriptor for value in observations),
     )
-    registry, source, admitted = registry_identity(), configuration.thaw_source_spec(), []
-    fmt = source.metadata_format if type(source) is DirectorySourceSpec else None
+    registry, admitted = registry_identity(), []
+    fmt = live_metadata_format(configuration.thaw_source_spec())
     # The discovery the in-poll proof compares with is taken before qualification.
     record = sidecar_observations if sidecar_observations is not None else observe_live_members(
         configuration, ready.paths)
@@ -2020,11 +2024,11 @@ def _directory_items(
         if type(configuration) is FrozenRunConfiguration
         else configuration.source
     )
-    metadata_format = (
-        selected_source.metadata_format
-        if type(selected_source) is DirectorySourceSpec
-        else "auto"
-    )
+    watch = live_selection(selected_source)
+    metadata_format = "auto" if watch is None else watch.metadata_format
+    # A Live Image Series keeps its own selection: options, name and members' order.
+    series = None if watch is None or not _is_live(configuration) else watch.series
+    groups = {value.path: group for group in _output_groups(configuration, plan) for value in group[0]}
     for candidate in plan.candidates:
         if cancelled():
             raise RuntimeError("admission cancelled")
@@ -2036,26 +2040,16 @@ def _directory_items(
             adapter = get_adapter(candidate.adapter_id)
             if adapter is None or SourceKind.IMAGE_FILE not in adapter.kinds:
                 raise ValueError(f"candidate {candidate.path} lost its descriptor")
-            name = adapter.scan_name(candidate.path)
-            grouped = []
-            for value in plan.candidates:
-                if cancelled():
-                    raise RuntimeError("admission cancelled")
-                if (
-                    value.adapter_id == candidate.adapter_id
-                    and value.path.parent == candidate.path.parent
-                    and adapter.scan_name(value.path) == name
-                ):
-                    grouped.append(value)
-            members = tuple(grouped)
+            members, name = groups[candidate.path]
             consumed.update(value.path for value in members)
             spec = SourceSpec(
                 candidate.path.parent, SourceKind.TIFF_SERIES,
                 options={
                     "selected_file": str(candidate.path),
-                    "files": tuple(value.path for value in members),
                     "scan_name": name,
                     "metadata_format": metadata_format,
+                    **({} if series is None else dict(selected_source.options)),
+                    "files": tuple(value.path for value in members),
                 },
             )
             graph = _qualify_for_admission(
@@ -2105,6 +2099,7 @@ def _directory_items(
             spec = SourceSpec(
                 candidate.path, descriptor.kind,
                 entry=descriptor.resolved_entry or descriptor.requested_entry,
+                options={} if series is None else dict(selected_source.options),
             )
             graph = _qualify_for_admission(
                 spec,

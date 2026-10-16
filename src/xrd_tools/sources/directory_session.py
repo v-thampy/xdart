@@ -26,6 +26,7 @@ from xrd_tools.sources.directory_index import (
 )
 from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.probe import ProbeResult, ProbeState
+from xrd_tools.sources.selection import SeriesBound
 from xrd_tools.core.filters import compile_filter
 
 
@@ -38,13 +39,14 @@ class DirectorySessionConfig:
     recursive: bool = False
     name_filter: str | None = None
     suffixes: tuple[str, ...] = ()
+    series: SeriesBound | None = None  # a Live Image Series: only its members
 
     @classmethod
-    def build(cls, root, *, recursive=False, name_filter=None, suffixes=()):
+    def build(cls, root, *, recursive=False, name_filter=None, suffixes=(), series=None):
         normalized = tuple(str(item).lower() for item in suffixes if item)
         return cls(
             Path(root).expanduser(), bool(recursive), name_filter or None,
-            normalized)
+            normalized, series)
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,11 +184,11 @@ class DirectoryIndexSession:
             return self._desired
 
     def configure(
-        self, root, *, recursive=False, name_filter=None, suffixes=(),
+        self, root, *, recursive=False, name_filter=None, suffixes=(), series=None,
     ) -> int:
         config = DirectorySessionConfig.build(
             root, recursive=recursive, name_filter=name_filter,
-            suffixes=suffixes)
+            suffixes=suffixes, series=series)
         with self._lock:
             if self._closed:
                 raise RuntimeError("directory index session is closed")
@@ -328,6 +330,8 @@ class DirectoryIndexSession:
 
         def included(candidate: Candidate) -> bool:
             name = candidate.path.name
+            if config.series is not None and config.series.key(name) is None:
+                return False
             low = name.lower()
             suffix = next(
                 (item for item in config.suffixes if low.endswith(item)), "")

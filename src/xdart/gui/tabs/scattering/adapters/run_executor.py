@@ -49,7 +49,7 @@ from xrd_tools.sources.execution_graph import (
 from xrd_tools.sources.nexus import NexusStackSource
 from xrd_tools.sources.point_images import PointImageSource
 from xrd_tools.sources.probe import ProbeState
-from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.selection import DirectorySourceSpec, live_metadata_format
 from ..contracts import (
     AdmittedOutput, AdmissionFailure, AdmissionReceipt, AdmissionReleased,
     AdmissionToken,
@@ -575,9 +575,8 @@ def _observe_quartile_completion(run: _StandardRun) -> None:
 
 def _live_proof(configuration, graph, record, registry) -> LivePrefixProof:
     """A published Live output's proof, with its members' sidecar observations from ``record``."""
-    source = configuration.thaw_source_spec()
-    fmt = source.metadata_format if type(source) is DirectorySourceSpec else None
-    return LivePrefixProof(graph, metadata_format=fmt, record=record, registry=registry)
+    return LivePrefixProof(graph, metadata_format=live_metadata_format(configuration.thaw_source_spec()),
+                           record=record, registry=registry)
 
 
 def _directory_status(
