@@ -2,9 +2,9 @@
 #
 #   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/ORG/xdart/main/scripts/install_xdart.ps1 | iex"
 #
-# Same design as install_xdart.sh (docs/design/design_install_and_update_jul2026.md):
-# a pixi workspace in a private app root — conda-forge compiled I/O stack +
-# PyPI xdart[gui] in one solve.  Nothing assumed on the machine.  Re-run to upgrade.
+# Same design as install_xdart.sh: a pixi workspace in a private app root —
+# conda-forge compiled I/O stack and xrayutilities + PyPI xdart[gui] in one solve.
+# Nothing assumed on the machine.  Re-run to upgrade.
 $ErrorActionPreference = "Stop"
 
 $AppRoot   = if ($env:XDART_INSTALL_ROOT) { $env:XDART_INSTALL_ROOT } else { "$env:LOCALAPPDATA\xdart" }
@@ -13,6 +13,11 @@ $ExtrasToml = ((($env:XDART_EXTRAS, "gui" -ne $null)[0]).Split(",") |
     ForEach-Object { $_.Trim() } | Where-Object { $_ } |
     ForEach-Object { '"' + $_ + '"' }) -join ", "
 if (-not $ExtrasToml) { $ExtrasToml = '"gui"' }
+# [rsm]'s xrayutilities is compiled: its wheels bundle a second OpenMP runtime that
+# aborts beside conda-forge's.  "gui" and "all" include "rsm": take it, and [rsm]'s
+# NumPy pin, from conda-forge.  Keep in sync with pyproject [rsm] and install_xdart.sh.
+$XuConda = ""
+if ($ExtrasToml -match '"(gui|rsm|all)"') { $XuConda = "numpy = `"==2.5.1`"`nxrayutilities = `"==1.7.12`"" }
 $BinDir    = "$AppRoot\bin"
 $PythonPin = "3.13.*"
 New-Item -ItemType Directory -Force -Path $AppRoot, $BinDir | Out-Null
@@ -59,6 +64,7 @@ hdf5 = "*"
 blosc = "*"
 c-blosc2 = "*"
 lz4-c = "*"
+$XuConda
 
 [pypi-dependencies]
 $PypiDep

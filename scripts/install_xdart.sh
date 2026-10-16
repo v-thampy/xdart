@@ -3,16 +3,16 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ORG/xdart/main/scripts/install_xdart.sh | bash
 #
-# Design (docs/design/design_install_and_update_jul2026.md): a pixi WORKSPACE in a
-# private app root — conda-forge supplies the compiled I/O stack (the builds
-# measured fastest for Eiger bitshuffle/LZ4 decode), PyPI supplies xdart[gui],
-# both resolved in ONE solve with a lockfile.  Nothing is assumed on the machine
+# Design: a pixi WORKSPACE in a private app root — conda-forge supplies the
+# compiled I/O stack (the builds measured fastest for Eiger bitshuffle/LZ4 decode)
+# and the GUI's compiled xrayutilities, PyPI supplies xdart[gui], both resolved
+# in ONE solve with a lockfile.  Nothing is assumed on the machine
 # (no conda/mamba/python needed); nothing touches an existing conda setup.
 # Re-running this script upgrades in place; so does `pixi update` in the app root.
 set -euo pipefail
 
 APP_ROOT="${XDART_INSTALL_ROOT:-$HOME/.local/share/xdart}"
-BIN_DIR="$HOME/.local/bin"
+BIN_DIR="${XDART_BIN_DIR:-$HOME/.local/bin}"   # where the `xdart` launcher goes
 PYTHON_PIN="3.13.*"     # default interpreter; keep in sync with CI matrix
 mkdir -p "$APP_ROOT" "$BIN_DIR"
 
@@ -34,8 +34,7 @@ case "$(uname -s)-$(uname -m)" in
 esac
 # Extras: XDART_EXTRAS is a comma list (default "gui"), e.g.
 #   XDART_EXTRAS="gui,fitting"  or  XDART_EXTRAS="all"
-# Note: "rsm"/"all" pulls xrayutilities, which has no macOS-arm64 wheels (source
-# build needs compilers) — GUI users should stay on the default.
+# "gui" and "all" include "rsm", whose xrayutilities comes from conda-forge below.
 # XDART_LOCAL_SOURCE=/path/to/checkout installs from a local tree (pre-release
 # testing / development) instead of PyPI.
 EXTRAS_TOML=""
@@ -45,6 +44,13 @@ for _e in "${_extras[@]}"; do
     [ -n "$_e" ] && EXTRAS_TOML="${EXTRAS_TOML:+$EXTRAS_TOML, }\"$_e\""
 done
 [ -n "$EXTRAS_TOML" ] || EXTRAS_TOML='"gui"'
+# [rsm]'s xrayutilities is compiled: it has no macOS-arm64 wheel, and its wheels
+# bundle a second OpenMP runtime that aborts beside conda-forge's.  Take it, and
+# [rsm]'s NumPy pin, from conda-forge.  Keep in sync with pyproject [rsm].
+XU_CONDA=""
+case "$EXTRAS_TOML" in *'"gui"'*|*'"rsm"'*|*'"all"'*)
+    XU_CONDA=$'numpy = "==2.5.1"\nxrayutilities = "==1.7.12"' ;;
+esac
 GUI_FALLBACK=""
 if [ -n "${XDART_LOCAL_SOURCE:-}" ]; then
     PYPI_DEP="xdart = { path = \"$XDART_LOCAL_SOURCE\", extras = [$EXTRAS_TOML] }"
@@ -74,6 +80,7 @@ hdf5 = "*"
 blosc = "*"
 c-blosc2 = "*"
 lz4-c = "*"
+$XU_CONDA
 
 [pypi-dependencies]
 $PYPI_DEP
@@ -143,6 +150,6 @@ case ":$PATH:" in
             echo "        2. still wrong? that install is earlier on PATH — launch"
             echo "           $BIN_DIR/xdart directly, or 'pip uninstall xdart' (or the legacy 'xrd-tools') in the old env."
         fi ;;
-    *) echo "NOTE: add $BIN_DIR to your PATH, e.g.:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
+    *) echo "NOTE: add $BIN_DIR to your PATH, e.g.:  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc" ;;
 esac
 echo "Upgrade later: re-run this script, or:  $PIXI update --manifest-path $APP_ROOT/pixi.toml"

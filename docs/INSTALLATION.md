@@ -37,12 +37,15 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
   (`%LOCALAPPDATA%\xdart` on Windows) and never edits your shell config or an
   existing conda install.
 - **Fast by construction** — it uses the conda-forge builds of the HDF5/compression
-  stack (the fastest Eiger bitshuffle/LZ4 decode) plus `xdart[gui]` from PyPI,
-  resolved in one solve with a lockfile. This is the same layering the manual
-  conda steps below do — only assembled for you.
+  stack (the fastest Eiger bitshuffle/LZ4 decode) and of the GUI's compiled
+  xrayutilities (with its NumPy pin), plus `xdart[gui]` from PyPI, resolved in one
+  solve with a lockfile. This is the same layering the manual conda steps below
+  do — only assembled for you.
 - **Launch** with `xdart`. **Upgrade** using the [private-workspace instructions below](#updating-an-installer-workspace).
 - **Extras**: set `XDART_EXTRAS` before the command, e.g.
   `curl -fsSL … | XDART_EXTRAS="gui,notebook" bash` on macOS/Linux.
+- **Folders**: `XDART_INSTALL_ROOT` chooses the workspace folder. On macOS/Linux,
+  `XDART_BIN_DIR` chooses where the `xdart` launcher goes (default `~/.local/bin`).
 - If `xdart` launches an old version, run `hash -r` (or open a new terminal) — the
   installer prints the specifics when it detects a shadowing install.
 
@@ -82,12 +85,16 @@ your shell).
 mamba create -n xrd python=3.13 -y
 mamba activate xrd
 
-# 2. the conda-forge fast I/O stack, then the xdart GUI from PyPI
-mamba install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
+# 2. the conda-forge fast I/O stack and the GUI's compiled xrayutilities,
+#    then the xdart GUI from PyPI
+mamba install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c numpy==2.5.1 xrayutilities==1.7.12
 pip install "xdart[gui]"
 ```
 
 then launch with `xdart`. (Already have an environment? Just run step 2 in it.)
+The GUI's Stitch and RSM tools need `xrayutilities` 1.7.12, which is compiled. Take
+it, and the NumPy version it is pinned with, from conda-forge as shown. `pip` then
+finds both already installed.
 
 ## Using pip / uv
 
@@ -103,6 +110,14 @@ then launch with `xdart`. Note the Eiger bitshuffle/LZ4 decode is measurably slo
 with the pure-pip HDF5 wheels than the conda-forge builds
 ([see below](#performance-install-the-hdf5-stack-from-conda-forge)), and
 lz4-compressed outputs need `hdf5plugin` (a base dep) to read outside xdart.
+
+A pip GUI install is **best-effort**. The supported GUI installations are the
+[Pixi global installation](../README.md#quick-start), the one-line installer and
+the conda route above. `xdart[gui]` includes `xrayutilities==1.7.12`, which has no
+macOS Apple Silicon wheel, so pip builds it from source there, which needs
+compilers. Its wheels also bundle an OpenMP runtime that can abort beside
+conda-forge libraries in a mixed environment. The headless `pip install xdart`
+below is unaffected.
 
 The GUI installation includes **[NeXpy](https://nexpy.github.io/nexpy/)** for opening
 the selected processed NeXus file and

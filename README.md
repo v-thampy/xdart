@@ -51,7 +51,9 @@ fitting, and analysis of processed results.
 
 To update later, close xdart and run `pixi global update xdart`.
 
-[Alternate installation methods and more details](docs/INSTALLATION.md)
+[Alternate installation methods and more details](docs/INSTALLATION.md).
+Supported GUI installations use Pixi or conda-forge, which provide the compiled
+xrayutilities the GUI needs. A pip GUI install is best-effort.
 
 **Notebooks (after installation):** the installation above includes
 JupyterLab, marimo, and the notebook widgets. Run
@@ -353,6 +355,13 @@ rejection.
 
 - **Int 1D / Int 2D** save processed NeXus files under the Project Save Path.
 - **Int 1D (XYE)** saves text patterns in a scan-specific output directory.
+- **Stitch 1D / Stitch 2D** save their 1D profile beside the NeXus result as
+  `iq_<result>.xye`, or `itth_<result>.xye` for a 2θ axis. A grazing-incidence
+  Stitch also saves each of its saved Qip/Qoop cuts as `iqip_<result>.xye` or
+  `iqoop_<result>.xye`. Their third column is the √|I| estimate, because these
+  cuts carry no uncertainty; each file's header says so.
+- To save another cut of a displayed plot, such as a cut of a 2D map, use the
+  plot's own export menu. SVG plot export is not available in this release; use PNG.
 - NeXus output carries processing metadata and calibration information for
   subsequent analysis.
 
