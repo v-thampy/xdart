@@ -10,7 +10,9 @@ import threading
 
 import xrd_tools.io.metadata as metadata
 from tests.xdart.scattering._e2sd_support import write_poni
-from tests.xdart.scattering.test_live_metadata_race_run import _arrive, _labels, _terminal
+from tests.xdart.scattering.test_live_metadata_race_run import (
+    _arrive, _construct_strictly, _labels, _reregister_image_adapter, _terminal,
+)
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _drain_until, _start
 from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
@@ -76,6 +78,7 @@ def test_gs1_stop_while_the_live_loop_rechecks_a_settled_group_ends_stopped(tmp_
     try:
         events += _drain_until(executor, lambda values: 1 in _labels(values), timeout=60.)
         armed.set()  # frame 1 is reduced and settles: the loop's next validation re-checks its group
+        _reregister_image_adapter(monkeypatch, _raw / 'scan_0001.tif')  # which a registration change makes strict
         assert inside.wait(30.), 'the live loop re-validated the settled group'
         executor.stop(identity)
         pressed.set()
@@ -89,6 +92,7 @@ def test_gs2_stop_while_a_new_frame_is_validated_for_reduction_ends_stopped(tmp_
     """Preservation: here `_construct`'s own re-validation already turns the cancellation into a stop (probe p05)."""
     inside, pressed = _held(monkeypatch, lambda item: len(item.source_stamp.members) == 2)
     raw, executor, identity = _run(tmp_path, 2622)
+    _construct_strictly(monkeypatch, raw / 'scan_0001.tif', 2)
     events = []
     try:
         events += _drain_until(executor, lambda values: 1 in _labels(values), timeout=60.)

@@ -20,6 +20,7 @@ import pytest
 import xrd_tools.io.metadata as metadata
 import xrd_tools.sources.registry  # noqa: F401  # register built-in readers
 from tests.xdart.scattering._e2sd_support import write_poni
+from tests.xdart.scattering.test_live_metadata_race_run import _construct_strictly, _reregister_image_adapter
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _start
 from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
@@ -157,6 +158,7 @@ def test_q1_a_sidecar_rewritten_inside_the_settled_recheck_is_retried_then_its_o
         _wait(executor, events, lambda values: 1 in _labels(values) or _terminal(values))
         digest, published = _published(executor, identity)
         armed.set()  # frame 1 is reduced and settled: the loop's next re-check reads its sidecar
+        _reregister_image_adapter(monkeypatch, raw / 'scan_0001.tif')  # once a registration change makes it strict
         _wait(executor, events, lambda values: _said(values, 'scan_0001.txt') or _terminal(values))
         _settle(executor, events)
     finally:
@@ -469,6 +471,7 @@ def test_q7_an_unrelated_read_error_in_a_live_recheck_still_fails_the_run(tmp_pa
     try:
         _wait(executor, events, lambda values: 1 in _labels(values) or _terminal(values))
         armed.set()
+        _reregister_image_adapter(monkeypatch, raw / 'scan_0001.tif')  # the next re-check reads metadata
         _wait(executor, events, _terminal)
     finally:
         terminal = _stop(executor, identity, events)
@@ -528,6 +531,7 @@ def test_p1_a_change_inside_the_construct_recheck_is_still_rescued(tmp_path, mon
         return real_read(path, *args, **kwargs)
     monkeypatch.setattr(run_executor, 'validate_planned_source', validate)
     monkeypatch.setattr(metadata, 'read_txt_metadata', read)
+    _construct_strictly(monkeypatch, raw / 'scan_0001.tif', 2)
     executor, identity = _run(tmp_path, raw, 'txt', 3200)
     events = []
     try:

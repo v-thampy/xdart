@@ -32,6 +32,34 @@ def _arrive(directory, index):
     partial.replace(image)
 
 
+def _reregister_image_adapter(monkeypatch, image):
+    """Register the image adapter again under its own id.
+
+    A Live Run re-reads a settled output's metadata only when something changed;
+    a registration change is one, so the Run's next re-check is a strict read.
+    """
+    from dataclasses import replace
+    from xrd_tools.sources import adapters
+    entry = adapters._ADAPTERS[adapters.candidate_owner(image).id]
+    monkeypatch.setitem(adapters._ADAPTERS, entry.adapter.id, adapters._Entry(
+        replace(entry.adapter), entry.builtin, entry.seq + 100000))
+
+
+def _construct_strictly(monkeypatch, image, members):
+    """Make the construction of a group of ``members`` images validate the whole group again.
+
+    Construction re-checks the proof of what its poll admitted; a registration change as it starts fails that
+    proof, so construction validates the group (the strict re-check these rows exercise).
+    """
+    real = StandardRunExecutor._construct
+
+    def construct(executor, run, **kwargs):
+        if kwargs.get('item') is not None and len(kwargs['item'].source_stamp.members) == members:
+            _reregister_image_adapter(monkeypatch, image)
+        return real(executor, run, **kwargs)
+    monkeypatch.setattr(StandardRunExecutor, '_construct', construct)
+
+
 def _labels(events):
     return {event.frame_key.local_frame_label for event in events if event.kind is StandardEventKind.FRAME_READY}
 
@@ -65,6 +93,7 @@ def test_gr1_a_live_run_keeps_going_when_a_frame_lands_during_a_metadata_read(tm
     try:
         events += _drain_until(executor, lambda values: 1 in _labels(values), timeout=60.)
         reduced.set()
+        _reregister_image_adapter(monkeypatch, raw / 'scan_0001.tif')  # the next re-check reads metadata
         events += _drain_until(executor, lambda values: 2 in _labels(events + list(values)) or _terminal(values),
                                timeout=60.)
         failed = [event for event in events if event.kind is StandardEventKind.FAILED]

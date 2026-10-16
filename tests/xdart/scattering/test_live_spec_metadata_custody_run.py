@@ -19,6 +19,7 @@ import silx.io.specfile as specfile
 import xrd_tools.io.metadata as metadata
 import xrd_tools.sources.image as image_source
 from tests.xdart.scattering._e2sd_support import write_poni
+from tests.xdart.scattering.test_live_metadata_race_run import _reregister_image_adapter
 from tests.xdart.scattering.test_live_qualify_refusal_run import (
     _labels, _said, _settle, _stop, _terminal, _wait, _worker,
 )
@@ -224,6 +225,16 @@ def _hold_inside_validation(monkeypatch, paths):
             released.wait(30.)
         return real_spec_file(*args, **kwargs)
 
+    real_qualify = output_preflight.qualify_source_execution_graph
+
+    def qualify(*args, **kwargs):  # a Live admission's own reads are its JIT validation of a new frame
+        state.validating = getattr(state, 'selected', False)
+        try:
+            return real_qualify(*args, **kwargs)
+        finally:
+            state.validating = False
+
+    monkeypatch.setattr(output_preflight, 'qualify_source_execution_graph', qualify)
     monkeypatch.setattr(run_executor, 'materialize_live_directory_group', materialize)
     monkeypatch.setattr(output_preflight, 'validate_source_execution_graph', validate)
     monkeypatch.setattr(specfile, 'SpecFile', spec_file)
@@ -243,6 +254,8 @@ def test_r7_r8_stop_inside_a_live_spec_validation_read_ends_stopped(tmp_path, mo
         if ready:
             _row(spec, 1, 2)
         _image(raw, 1, 2)
+        # A Live Run validates a published prefix strictly only after a change; a registration is one.
+        _reregister_image_adapter(monkeypatch, raw / f'{SCAN1}_0001.tif')
         assert inside.wait(30.), 'the Run is inside a SPEC read of its live validation'
         executor.stop(identity)
         released.set()

@@ -33,18 +33,28 @@ verdict); it is deliberately not a metadata cache.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from xrd_tools.sources.discover import Candidate, collect_candidates, sort_candidates
+from xrd_tools.sources.discover import Candidate, collect_owned_candidates, sort_candidates
 from xrd_tools.sources.probe import ProbeResult, ProbeState
 
 _UNSET: Any = object()
 
 _Stamp = tuple[int, int]
+
+
+def directory_identity(path: str | Path) -> tuple[int, ...] | None:
+    """(device, inode, size, mtime_ns, ctime_ns), which an entry or a write moves; ``None`` if unstattable."""
+    try:
+        state = os.stat(path)
+    except OSError:
+        return None
+    return state.st_dev, state.st_ino, state.st_size, state.st_mtime_ns, state.st_ctime_ns
 
 #: Probe states that leave a candidate's finality in doubt — the ONLY states
 #: DirectoryIndex tracks bounded retry for (handoff: "retry state associated
@@ -182,6 +192,9 @@ class DirectoryIndex:
         # sticky for its stamp without reopening a window.  A tiny value map,
         # not a metadata cache; cleared per-path on change/removal/reconfigure.
         self._terminal: dict[Path, tuple[_Stamp, ProbeResult]] = {}
+        # Discovery's per-index memo (collect_owned_candidates): listed paths'
+        # owners and Candidate objects, cleared with the configuration.
+        self._discovery: dict = {}
 
     @property
     def snapshot(self) -> Snapshot:
@@ -234,6 +247,7 @@ class DirectoryIndex:
         self._last_delta = _EMPTY_DELTA
         self._retries.clear()
         self._terminal.clear()
+        self._discovery.clear()
         return True
 
     def poll(self) -> Snapshot:
@@ -254,8 +268,8 @@ class DirectoryIndex:
         (R1-R3); provisional and terminal state for every changed/removed path
         is cleared, since the tracked file no longer matches what is on disk.
         """
-        fresh_list = collect_candidates(
-            self._root, recursive=self._recursive, name_filter=self._name_filter)
+        fresh_list = collect_owned_candidates(
+            self._root, recursive=self._recursive, name_filter=self._name_filter, memo=self._discovery)
         fresh_by_path = {c.path: c for c in fresh_list}
         prior = self._snapshot
         prior_by_path = prior.by_path()

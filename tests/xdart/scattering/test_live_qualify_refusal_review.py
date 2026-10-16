@@ -4,6 +4,7 @@ import threading
 import pytest
 import xrd_tools.io.metadata as metadata
 
+from tests.xdart.scattering.test_live_metadata_race_run import _reregister_image_adapter
 from tests.xdart.scattering.test_live_qualify_refusal_run import (
     SIDECARS, _frame, _labels, _output, _published, _run, _said, _settle,
     _stop, _terminal, _wait, _worker,
@@ -114,6 +115,8 @@ def test_stop_inside_a_live_admission_metadata_read_ends_stopped(tmp_path, monke
         _published(executor, identity)
         armed.set()
         _frame(raw, 'scan', 2, 'txt', 2.0, sidecar=False)
+        # A Live Run validates a published prefix strictly only after a change; a registration is one.
+        _reregister_image_adapter(monkeypatch, raw / 'scan_0001.tif')
         assert inside.wait(30.), 'admission is inside a real metadata read'
         executor.stop(identity)
         released.set()

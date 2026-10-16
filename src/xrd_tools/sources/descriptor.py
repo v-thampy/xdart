@@ -505,6 +505,7 @@ def describe_container_from_open(
         path=path, size=size, mtime_ns=mtime_ns, adapter_id=adapter_id,
         scan_name=scan_name, requested_entry=entry, resolved_entry=resolved_entry,
         is_bluesky=is_bluesky, finalized=finalized, motor_names=motor_names,
+        saturation=_read_saturation(entry_grp),  # recorded even while an external chunk is still arriving
     )
 
     # Processed xdart output is a decisive terminal skip — never raw input.
@@ -616,7 +617,7 @@ def describe_container_from_open(
         dtype=facts["dtype"], dataset_shape=facts["dataset_shape"],
         chunks=facts["chunks"], compression=facts["compression"], is_2d=facts["is_2d"],
         self_contained=_stack_is_self_contained(h5f, paths),
-        wavelength=wavelength, saturation=_read_saturation(entry_grp), **common)
+        wavelength=wavelength, **common)
 
 
 def _describe_container_from_open_with_binding(

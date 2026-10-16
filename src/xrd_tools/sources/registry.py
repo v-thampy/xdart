@@ -616,6 +616,21 @@ def _live_open(spec: SourceSpec) -> FrameSource:
     return LiveFrameSource(name=str(spec.uri))
 
 
+#: Built-in candidate predicates that read the path's name alone (suffix and
+#: stem; never a stat or the content).  While only built-ins with these
+#: predicates are registered, a DirectoryIndex may keep each listed path's
+#: owner from one poll to the next.
+PURE_NAME_PREDICATES = frozenset({_nexus_is_candidate, _image_is_candidate, _tiff_series_is_candidate,
+                                  _spec_is_candidate, _live_is_candidate})
+
+
+def name_pure_registry(entries=None) -> bool:
+    """Whether every registered adapter is a built-in with a PURE_NAME_PREDICATES predicate."""
+    from xrd_tools.sources.adapters import registry_entries
+    entries = registry_entries() if entries is None else entries
+    return all(entry.builtin and entry.adapter.is_candidate in PURE_NAME_PREDICATES for entry in entries)
+
+
 def _register_builtin_adapters() -> None:
     from xrd_tools.sources.adapters import SourceFormatAdapter, register_adapter
 

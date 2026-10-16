@@ -132,6 +132,7 @@ class TiffSeriesSource(BaseFrameSource):
         self.raw_header_skip = int(raw_header_skip)
         self._admitted_motor_by_index: dict[int, tuple[str, float]] = {}
         self._observed_metadata_sources: dict[int, Path | None] = {}
+        self._retained: Mapping[int, Mapping[str, Any]] = {}
         snapshots = tuple(admitted_motor_values)
         if snapshots:
             if len(snapshots) != len(self.files):
@@ -295,6 +296,10 @@ class TiffSeriesSource(BaseFrameSource):
             preserve_dtype=True,
         ))
 
+    def retain_metadata(self, values: Mapping[int, Mapping[str, Any]]) -> None:
+        """Serve these frames (a live Run's proved prefix) their admitted values, unread."""
+        self._retained = values
+
     def metadata_for(
         self, index: int, *, max_input_bytes: int | None = None,
         spec_point_snapshot: bool = False,
@@ -302,7 +307,10 @@ class TiffSeriesSource(BaseFrameSource):
         if self._point_source is not None:
             return self._point_source.metadata_for(int(index) - 1)
         path = self._path_for(index)
-        if self.metadata_format is None:
+        retained = self._retained.get(int(index))
+        if retained is not None:
+            metadata = dict(retained)
+        elif self.metadata_format is None:
             metadata = {}
             self._observed_metadata_sources[int(index)] = None
         else:

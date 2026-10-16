@@ -466,8 +466,24 @@ def _dir_listing_lower(directory: Path) -> dict[str, Path]:
     return listing
 
 
-def _existing_path_case_insensitive(candidate: Path) -> Path | None:
-    """Return an existing sibling matching *candidate.name*, exact case first."""
+def _fresh_listing(directory: Path, listings: dict) -> tuple[frozenset, dict[str, str]]:
+    """*directory*'s regular file names, and each by its lowercase, listed once per ``listings`` (never process-wide)."""
+    found = listings.get(directory)
+    if found is None:
+        try:
+            with os.scandir(directory) as entries:
+                names = [entry.name for entry in entries if entry.is_file()]
+        except OSError:  # an unreadable listing shows no sidecar: callers then wait or check strictly
+            names = []
+        found = listings[directory] = (frozenset(names), {name.lower(): name for name in names})
+    return found
+
+
+def _existing_path_case_insensitive(candidate: Path, listings: dict | None = None) -> Path | None:
+    """Return an existing sibling matching *candidate.name*, exact case first (in ``listings`` if given)."""
+    if listings is not None:
+        names, lower = _fresh_listing(candidate.parent, listings)
+        return candidate if candidate.name in names else (name := lower.get(candidate.name.lower())) and candidate.parent / name
     # S-20: exact-case fast path -- ONE stat, no directory listing (the common
     # case: sidecars are correctly cased).
     try:
@@ -730,7 +746,7 @@ def _is_non_image_companion(path: Path, image_path: Path) -> bool:
     )
 
 
-def _iter_auto_sidecar_candidates(image_path: Path):
+def _iter_auto_sidecar_candidates(image_path: Path, listings: dict | None = None):
     """Yield auto sidecar candidates: allow-listed extensions ONLY, ranked by
     :data:`_AUTO_SIDECAR_EXTENSIONS`, append-form (``image.tif.<ext>``) before
     replace-form (``image.<ext>``).
@@ -741,8 +757,8 @@ def _iter_auto_sidecar_candidates(image_path: Path):
     rather than listing the whole directory (S-20 stat-first)."""
     seen: set[Path] = set()
     for ext in _AUTO_SIDECAR_EXTENSIONS:
-        append = _existing_path_case_insensitive(Path(str(image_path) + f".{ext}"))
-        replace = _existing_path_case_insensitive(image_path.with_suffix(f".{ext}"))
+        append = _existing_path_case_insensitive(Path(str(image_path) + f".{ext}"), listings)
+        replace = _existing_path_case_insensitive(image_path.with_suffix(f".{ext}"), listings)
         # Preserve the on-disk case in the cached suffix (reconstruction is
         # case-insensitive either way, but keep it faithful).
         for candidate, convention, start in (
@@ -1076,26 +1092,31 @@ def read_image_metadata(
 
 
 def live_sidecar_observation(
-    image_path: Path | str, meta_format: str,
+    image_path: Path | str, meta_format: str, *, listings: dict | None = None,
 ) -> tuple[tuple[str, MetadataSourceRevision | None], ...]:
     """The sidecar files a live Run waits on for one image, with their revisions.
 
     An explicit sidecar format names the one file :func:`_find_sidecar`
     selects; Auto names every allow-listed candidate that exists now.  ``()``
     means none exists.  Nothing is opened or parsed: the live owner compares two
-    observations a poll apart before it admits the frame.
-    """
+    observations a poll apart before it admits the frame.  ``listings`` (the
+    caller's own fresh ones) replace the process-wide listing cache."""
 
     image = _lexical_absolute(image_path)
     meta_format_norm = str(meta_format).strip().lower()
     if meta_format_norm == "auto":
         found = tuple(
             candidate for candidate, _convention, _suffix
-            in _iter_auto_sidecar_candidates(image)
+            in _iter_auto_sidecar_candidates(image, listings)
         )
-    else:
+    elif listings is None:
         sidecar = _find_sidecar(image, meta_format_norm)
         found = () if sidecar is None else (sidecar,)
+    else:  # _find_sidecar's two looks, against the caller's listings
+        ext = meta_format_norm[1:] if meta_format_norm.startswith(".") else meta_format_norm
+        sidecar = ext and (_existing_path_case_insensitive(image.with_suffix(f".{ext}"), listings)
+                           or _existing_path_case_insensitive(Path(str(image) + f".{ext}"), listings))
+        found = (sidecar,) if sidecar else ()
     return tuple((str(path), _metadata_path_revision(path)) for path in found)
 
 
@@ -1367,8 +1388,7 @@ def _read_spec_metadata_observed(
             _validate_spec_numeric_tokens(spec_file, scan, tuple(str(label) for label in scan.labels))
             npts = scan.data.shape[1]
             img_idx = min(image_number, npts - 1)
-            counters = {label: float(scan.data_column_by_name(label)[img_idx])
-                        for label in scan.labels}
+            (counters,) = _spec_counters(scan, (img_idx,))
             motors = {name: float(scan.motor_position_by_name(name))
                       for name in scan.motor_names}
             return ImageMetadataRead(
@@ -1395,8 +1415,7 @@ def _read_spec_metadata_observed(
                 _validate_spec_numeric_tokens(scratch, scan, tuple(str(label) for label in scan.labels))
             npts = scan.data.shape[1]
             img_idx = min(0 if spec_point_snapshot else image_number, npts - 1)
-            counters = {label: float(scan.data_column_by_name(label)[img_idx])
-                        for label in scan.labels}
+            (counters,) = _spec_counters(scan, (img_idx,))
             motors = {name: float(scan.motor_position_by_name(name))
                       for name in scan.motor_names}
             result = ImageMetadataRead(
@@ -1571,11 +1590,12 @@ class _SpecScan:
     columns: int | None  # the declared column count: ``#N``, else the ``#L`` labels
     extent: SpecScanExtent  # through every complete row
 
-    def valid_rows(self, limit: int) -> int:
-        """How many leading rows, of the first ``limit``, hold ``columns`` numbers each."""
+    def valid_rows(self, limit: int, start: int = 0) -> int:
+        """How many leading rows, of the first ``limit``, hold ``columns`` numbers each;
+        the first ``start`` are known to."""
         from xrd_tools.io.spec import _SPEC_NUMBER
 
-        for index, position in enumerate(self.rows[:limit]):
+        for index, position in enumerate(self.rows[start:limit], start):
             tokens = self.lines[position].split()
             if not tokens or self.columns is not None and len(tokens) != self.columns:
                 return index
@@ -1620,7 +1640,13 @@ def _spec_count(text: bytes) -> int | None:
         return None
 
 
-def _read_spec_scan(path: Path, scan_number: int) -> _SpecScan | None:
+def _spec_cancelled(cancelled) -> None:
+    """Stop a SPEC read for a Stop: the error qualification's callers already translate."""
+    if cancelled is not None and cancelled():
+        raise InterruptedError("source qualification cancelled")
+
+
+def _read_spec_scan(path: Path, scan_number: int, *, cancelled=None) -> _SpecScan | None:
     """Read the first ``#S scan_number`` block of a SPEC file, up to its last complete line.
 
     Like the bounded point snapshot, the file-header lines in effect are the
@@ -1629,11 +1655,12 @@ def _read_spec_scan(path: Path, scan_number: int) -> _SpecScan | None:
     out.  A line without its newline is still being written and ends the read.
     The file is copied once, up to the size it had when opened: bytes rewritten
     or truncated meanwhile cannot fault the read, as they could under a mapped
-    view.  ``None`` when the file holds no such scan.
-    """
+    view.  ``None`` when the file holds no such scan.  ``cancelled`` is asked
+    after the copy and every few thousand lines."""
     with path.open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
         data = stream.read(size) if size > 0 else b""
+    _spec_cancelled(cancelled)
     start = _find_spec_scan(data, scan_number)
     if start is None:
         return None
@@ -1660,6 +1687,8 @@ def _read_spec_scan(path: Path, scan_number: int) -> _SpecScan | None:
     declared = labels = None
     position, mca = start, False
     while position < len(data):
+        if not len(lines) % 4096:
+            _spec_cancelled(cancelled)
         end = data.find(b"\n", position)
         if end < 0:
             break
@@ -1708,14 +1737,27 @@ def _resolve_spec_image(image_path: Path, meta_dir: Path | str | None) -> tuple[
     return None
 
 
+def _spec_counters(scan, rows: Sequence[int]) -> list[dict[str, float]]:
+    """Each row's counters from one read of the scan's table, each label's first column (the one
+    ``data_column_by_name``, which re-reads its column per call, returns); an unusual table keeps that lookup."""
+    labels = tuple(scan.labels)
+    table = scan.data
+    if getattr(table, "ndim", 0) != 2 or table.shape[0] < len(labels):
+        return [{label: float(scan.data_column_by_name(label)[row]) for label in labels} for row in rows]
+    first: dict[str, int] = {}
+    for index, label in enumerate(labels):
+        first.setdefault(label, index)
+    return [{label: float(table[index, row]) for label, index in first.items()} for row in rows]
+
+
 def _same_number(left: float, right: float) -> bool:
     return left == right or left != left and right != right
 
 
 def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
                       own_rows: Sequence[tuple[float, ...]] | None = None,
-                      row_count: int | None = None) -> list[dict[str, float]]:
-    """Each requested row's counters, with the scan's motor positions, parsed by silx.
+                      row_count: int | None = None, cancelled=None) -> tuple[list[dict[str, float]], tuple[str, ...]]:
+    """Each requested row's counters, with the scan's motor positions, parsed by silx, and its ``#L`` labels.
 
     silx reads files only, so ``payload`` (one scan) goes through a scratch
     file.  With ``own_rows`` (each requested row's numbers as its own line
@@ -1731,6 +1773,7 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
     primary: BaseException | None = None
     cleanup_error: BaseException | None = None
     values: list[dict[str, float]] = []
+    labels: tuple[str, ...] = ()
     try:
         scratch_handle = tempfile.NamedTemporaryFile(prefix="xdart-spec-", delete=False)
         scratch = Path(scratch_handle.name)
@@ -1738,6 +1781,7 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
         scratch_handle.close()
         parser = SpecFile(str(scratch))
         scan = parser[f"{scan_number}.1"]
+        _spec_cancelled(cancelled)
         if own_rows is not None:
             table = scan.data
             if table.ndim != 2 or table.shape[1] != row_count or any(
@@ -1745,9 +1789,8 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
                     for row, own in zip(rows, own_rows)):
                 raise _SpecParseDisagreement(f"silx read scan {scan_number} differently from its lines")
         motors = {name: float(scan.motor_position_by_name(name)) for name in scan.motor_names}
-        for row in rows:
-            counters = {label: float(scan.data_column_by_name(label)[row]) for label in scan.labels}
-            values.append({**counters, **motors})
+        labels = tuple(dict.fromkeys(scan.labels))
+        values.extend({**counters, **motors} for counters in _spec_counters(scan, rows))
     except BaseException as exc:
         primary = exc
     finally:
@@ -1770,7 +1813,7 @@ def _spec_rows_values(payload: bytes, scan_number: int, rows: Sequence[int], *,
         raise MetadataScratchCleanupFailed(
             f"SPEC snapshot close/unlink failed: {cleanup_error}"
         ) from cleanup_error
-    return values
+    return values, labels
 
 
 @dataclass(frozen=True, slots=True)
@@ -1784,6 +1827,7 @@ class SpecPoints:
     path: Path | None
     extent: SpecScanExtent | None
     reads: tuple[ImageMetadataRead, ...]
+    columns: tuple[str, ...] = ()  # the scan's ``#L`` labels, once each: its rows' column view
 
 
 def _not_a_row(spec_path: Path, scan_number: int, scan: _SpecScan, index: int) -> str:
@@ -1793,8 +1837,10 @@ def _not_a_row(spec_path: Path, scan_number: int, scan: _SpecScan, index: int) -
 
 
 def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None, *,
-                     published: int | None = None) -> SpecPoints | None:
-    """Every image's own SPEC row, from one read of their scan.
+                     published: int | None = None, cancelled=None, after: SpecScanExtent | None = None,
+                     cache: dict | None = None, frames: int | None = None) -> SpecPoints | None:
+    """Every image's own SPEC row, from one read of their scan; with ``frames``, the one image is a
+    {spec}_scanN_master container whose frame k (of ``frames``) is row k of the scan its name gives.
 
     Each image's name gives its SPEC file (the reader's own folder search),
     scan and row, as for :func:`read_image_metadata`.  A row is valid when its
@@ -1813,8 +1859,10 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
     valid, every image comes back without metadata and ``extent`` is ``None``,
     for the caller's published-metadata fence; otherwise an image whose row is
     not there yet raises SpecRowPending, and one at or after a complete line
-    that is not a valid row raises SpecRowInvalid naming that line.
-    """
+    that is not a valid row raises SpecRowInvalid naming that line.  ``after``
+    (the extent earlier images were admitted through): their rows are not read
+    again, and ``None`` unless the scan still holds them; ``cache``: see
+    :func:`spec_rows_ready`."""
     paths = tuple(_lexical_absolute(path) for path in image_paths)
     live = published is not None
     if not paths:
@@ -1822,6 +1870,8 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
             raise ValueError("SPEC points need at least one image")
         return None
     resolved = [_resolve_spec_image(path, meta_dir) for path in paths]
+    if frames is not None:
+        paths, resolved = paths * frames, [value and (*value[:2], k) for value in resolved for k in range(frames)]
     scans = {value[:2] for value in resolved if value is not None}
     if len(scans) > 1:
         if live:
@@ -1830,14 +1880,24 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
     spec_path = scan_number = scan = None
     if scans:
         ((spec_path, scan_number),) = scans
+        _spec_cancelled(cancelled)
+        known = None if cache is None else cache.get((spec_path, scan_number))
         try:
-            scan = _read_spec_scan(spec_path, scan_number)
+            if known is not None and known[2] is not None and _spec_revision(spec_path) == known[0]:
+                scan, cache[spec_path, scan_number] = known[2], (*known[:2], None)
+            else:
+                scan = _read_spec_scan(spec_path, scan_number, cancelled=cancelled)
+        except InterruptedError:  # a Stop, not a file that went away
+            raise
         except OSError:  # the file went away under the read
             scan = None
+    start = 0 if after is None else len(after.marks) - 1
+    if after is not None and (scan is None or not scan.extent.extends(after)):
+        return None
     numbers = tuple(None if value is None else value[2] for value in resolved)
-    needed = max((number for number in numbers if number is not None), default=-1) + 1
+    needed = max(max((number for number in numbers if number is not None), default=-1) + 1, start)
     rows = 0 if scan is None else len(scan.rows)
-    valid = 0 if scan is None else scan.valid_rows(needed)
+    valid = 0 if scan is None else scan.valid_rows(needed, start)
     if not live:
         if scan is None or None in numbers or needed > valid:
             return None
@@ -1851,11 +1911,12 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
             if number is None or number >= valid:
                 raise SpecRowPending(f"waiting for the SPEC row of {path.name}")
     own = [tuple(float(token) for token in scan.lines[scan.rows[number]].split()) for number in numbers]
+    _spec_cancelled(cancelled)
     try:
-        values = _spec_rows_values(
+        values, columns = _spec_rows_values(
             b"".join(scan.header) + b"".join(scan.lines[:scan.rows[needed - 1] + 1]),
-            scan_number, numbers, own_rows=own, row_count=needed)
-    except MetadataScratchCleanupFailed:
+            scan_number, numbers, own_rows=own, row_count=needed, cancelled=cancelled)
+    except (MetadataScratchCleanupFailed, InterruptedError):
         raise
     except Exception as error:
         if isinstance(error.__cause__, MetadataScratchCleanupFailed):
@@ -1867,17 +1928,24 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
                        scan_number, spec_path, exc_info=True)
         return None
     return SpecPoints(spec_path, scan.extent.through(needed),
-                      tuple(ImageMetadataRead(value, spec_path) for value in values))
+                      tuple(ImageMetadataRead(value, spec_path) for value in values), columns)
 
 
-def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None) -> int:
+def _spec_revision(path: Path) -> tuple[int, ...]:
+    state = os.stat(path)
+    return state.st_size, state.st_mtime_ns, state.st_ctime_ns, state.st_dev, state.st_ino
+
+
+def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | None = None, *,
+                    cache: dict | None = None) -> int:
     """How many leading images already have their own complete SPEC row.
 
     A live Run admits an image under SPEC metadata only then: no other point's
     row is borrowed while its own is missing.  A row is final once its newline
     is written, so one look is enough.  An image whose name gives no SPEC
-    file, or whose file or scan does not exist yet, is not ready.
-    """
+    file, or whose file or scan does not exist yet, is not ready.  ``cache``
+    (the Run's) keeps each scan's row count for the file revision it was
+    read at, and the scan itself once for read_spec_points."""
     rows: dict[tuple[Path, int], int] = {}
     for index, path in enumerate(image_paths):
         resolved = _resolve_spec_image(_lexical_absolute(path), meta_dir)
@@ -1886,10 +1954,18 @@ def spec_rows_ready(image_paths: Sequence[Path | str], meta_dir: Path | str | No
         spec_path, scan_number, number = resolved
         if (spec_path, scan_number) not in rows:
             try:
-                scan = _read_spec_scan(spec_path, scan_number)
+                revision = _spec_revision(spec_path)
+                known = None if cache is None else cache.get((spec_path, scan_number))
+                if known is not None and known[0] == revision:
+                    count = known[1]
+                else:
+                    scan = _read_spec_scan(spec_path, scan_number)
+                    count = 0 if scan is None else len(scan.rows)
+                    if cache is not None and _spec_revision(spec_path) == revision:
+                        cache[spec_path, scan_number] = (revision, count, scan)
             except (OSError, ValueError):
                 return index
-            rows[spec_path, scan_number] = 0 if scan is None else len(scan.rows)
+            rows[spec_path, scan_number] = count
         if number >= rows[spec_path, scan_number]:
             return index
     return len(image_paths)

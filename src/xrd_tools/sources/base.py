@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -101,8 +101,14 @@ class BaseFrameSource(ABC):
             chunk_labels = labels[start:start + chunk_size]
             yield np.stack([self.load_frame(idx) for idx in chunk_labels]), chunk_labels
 
-    def to_scan(self, *, name: str | None = None, **kwargs: Any) -> Scan:
-        return Scan(name or self.name, list(self.iter_frames()), **kwargs)
+    def to_scan(self, *, name: str | None = None, cancelled: Callable[[], bool] | None = None, **kwargs: Any) -> Scan:
+        """Every frame as one Scan; ``cancelled`` (never a Scan keyword) is asked before each frame."""
+        frames = []
+        for frame in self.iter_frames():
+            if cancelled is not None and cancelled():
+                raise RuntimeError("admission cancelled")
+            frames.append(frame)
+        return Scan(name or self.name, frames, **kwargs)
 
 
 def ensure_frame_source(source: FrameSource | Scan | BaseFrameSource) -> FrameSource:
