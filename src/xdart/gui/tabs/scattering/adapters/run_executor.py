@@ -2099,10 +2099,12 @@ class StandardRunExecutor:
                     proof = run.live_proofs.get(target_key)
                     with _run_effect(run):
                         # The drift sweep: each settled output's proof is
-                        # re-checked within the sweep period; only a change
+                        # re-checked within the sweep period (a container,
+                        # which grows in place, every poll); only a change
                         # reaches the strict validator below.
-                        if proof is not None and proof.graph is retained.decision.item.graph \
-                                and proof.current(cancelled=lambda: run.stop_requested):
+                        if proof is not None and proof.graph is retained.decision.item.graph and (
+                                proof.current if retained.decision.item.descriptor is None
+                                else proof.holds)(cancelled=lambda: run.stop_requested):
                             continue
                         run.live_proofs.pop(target_key, None)
                         # Discovery and registrations as they are before the

@@ -8,6 +8,7 @@ may share this session without racing directory polls or probe bookkeeping.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import logging
@@ -164,7 +165,7 @@ class DirectoryIndexSession:
         # the last real listing's start with what a deferral must find unchanged.
         self._watched: tuple[Path, ...] | None = None
         self._force = False
-        self._listed: tuple[float, tuple] | None = None
+        self._listed: tuple[float, tuple, tuple] | None = None
         self.listing_deferred = False
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xdart-directory-index")
@@ -310,7 +311,8 @@ class DirectoryIndexSession:
         deferred = refresh and self._defers(index, reconfigured)
         if (refresh and not deferred) or reconfigured or index.snapshot.generation == 0:
             if self._watched is not None:
-                self._listed = (time.monotonic(), self._watch(index))
+                directories = self._directories(index)
+                self._listed = (time.monotonic(), directories, self._watch(directories))
             snapshot = index.poll()
         else:
             snapshot = index.snapshot
@@ -555,19 +557,28 @@ class DirectoryIndexSession:
     def force_listing(self) -> None:
         self._force = True
 
-    def _watch(self, index) -> tuple:
+    @staticmethod
+    def _directories(index) -> tuple:
+        """The watched directories: the root, and with Subdirs its immediate subfolders (the bounded plan)."""
+        if not index.snapshot.recursive:
+            return (index.root,)
+        try:
+            with os.scandir(index.root) as entries:
+                return (index.root, *sorted(entry.path for entry in entries if entry.is_dir()))
+        except OSError:
+            return (index.root,)
+
+    def _watch(self, directories) -> tuple:
         from xrd_tools.sources.adapters import registry_identity
-        snapshot = index.snapshot
-        directories = (index.root, *(sorted({value.path.parent for value in snapshot.candidates})
-                                     if snapshot.recursive else ()))
         return (registry_identity(), *map(directory_index.directory_identity, directories),
                 *((path, directory_index.directory_identity(path)) for path in self._watched or ()))
 
     def _defers(self, index, reconfigured: bool) -> bool:
+        from xrd_tools.sources.registry import name_pure_registry  # only name-pure owners may skip a listing
         forced, self._force, listed = self._force, False, self._listed
         self.listing_deferred = not (forced or reconfigured) and self._watched is not None and (
-            listed is not None and index.snapshot.generation != 0
-            and time.monotonic() - listed[0] < self.LISTING_AGE_S and listed[1] == self._watch(index))
+            listed is not None and index.snapshot.generation != 0 and name_pure_registry()
+            and time.monotonic() - listed[0] < self.LISTING_AGE_S and listed[2] == self._watch(listed[1]))
         return self.listing_deferred
 
     def reuse_records(self) -> tuple[tuple, ...]:

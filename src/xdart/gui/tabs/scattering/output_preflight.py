@@ -1531,11 +1531,13 @@ def _validate_deferred_entry_states(
             if value.metadata_file is not None
         )
     )
+    checked: set[int] = set()  # a SPEC file is every member's metadata file: one state, checked once
     for state, role in occurrences:
         if is_cancelled():
             raise RuntimeError("admission cancelled")
-        if proven.get(state.path) is state:
+        if proven.get(state.path) is state or id(state) in checked:
             continue
+        checked.add(id(state))
         accepted = frozen.get(_source_state_key(state.path))
         if accepted is None:
             # TIFF sidecars and selected HDF5 dependencies are discovered and
