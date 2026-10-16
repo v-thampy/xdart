@@ -1521,8 +1521,8 @@ class BrowserView(QtWidgets.QFrame):
             and current is not self.frames.currentIndex().data(_USER_ROLE)
             and _same_frame_identities(self._ui_selected_frames(), (current,))
         ):
-            self._trace_frames = _catalog_ordered_membership(
-                self.frame_model.frames, self._trace_frames, (current,)
+            self._trace_frames = _membership_after_intent(
+                self.frame_model.frames, self._trace_frames, (current,), intent
             )
             self._queue_frame_command(
                 ShellCommand(
@@ -1769,14 +1769,6 @@ def _same_frame_identities(
     )
 
 
-def _catalog_ordered_membership(catalog, *groups):
-    return tuple(
-        frame
-        for frame in catalog
-        if any(frame is member for group in groups for member in group)
-    )
-
-
 def _catalog_range(catalog, anchor, endpoint):
     positions = {
         id(frame): index for index, frame in enumerate(catalog)
@@ -1805,15 +1797,10 @@ def _command_belongs_to_catalog(
     command: ShellCommand,
     catalog: tuple[DisplayFrameKey, ...],
 ) -> bool:
+    identities = {id(frame) for frame in catalog}
     return (
-        (
-            command.frame is None
-            or any(frame is command.frame for frame in catalog)
-        )
-        and all(
-            any(frame is candidate for candidate in catalog)
-            for frame in command.frames
-        )
+        (command.frame is None or id(command.frame) in identities)
+        and all(id(frame) in identities for frame in command.frames)
     )
 
 
