@@ -233,7 +233,9 @@ def inspect_contributing_frames(entry, provenance):
     rows = manifest["records"]
     if type(rows) is not list or not 1 <= len(rows) <= _MAX_FRAMES:
         fail("contributing frame count exceeds bound")
-    if _bounded_attr_text(entry, "source_base") != manifest["source_base"]:
+    declared = manifest["source_base"]
+    # stamp_source_base stamps the POSIX spelling; the manifest keeps the native one (they differ on Windows).
+    if type(declared) is not str or not declared or _bounded_attr_text(entry, "source_base") != Path(declared).as_posix():
         fail("contributing frame Project binding differs")
     base = _text(manifest["source_base"], "Project root")
     if str(Path(base).expanduser().absolute()) != base:
