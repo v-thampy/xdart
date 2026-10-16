@@ -1156,6 +1156,21 @@ def _threshold_is_configured(
     return low is not None and (upper is None or (high is not None and low <= high))
 
 
+class _ToolbarContent(QtWidgets.QWidget):
+    """A scrollable toolbar's row: at least ``minimum_width`` wide and never
+    narrower than its controls need.  An explicit minimum width would replace
+    the row's own minimum, so controls added later (the Phases toggle, a
+    page's tools) would overlap instead of scrolling."""
+
+    def __init__(self, minimum_width: int) -> None:
+        super().__init__()
+        self._minimum_width = int(minimum_width)
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        hint = super().minimumSizeHint()
+        return QtCore.QSize(max(self._minimum_width, hint.width()), hint.height())
+
+
 def scrollable_toolbar(
     row: QtWidgets.QLayout,
     *,
@@ -1174,9 +1189,8 @@ def scrollable_toolbar(
         horizontal_inset,
         0,
     )
-    content = QtWidgets.QWidget()
+    content = _ToolbarContent(minimum_width)
     content.setLayout(row)
-    content.setMinimumWidth(minimum_width)
     area = QtWidgets.QScrollArea()
     area.setObjectName("e3ScrollableToolbar")
     area.setWidgetResizable(True)
