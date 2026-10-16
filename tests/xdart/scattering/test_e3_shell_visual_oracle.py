@@ -158,6 +158,12 @@ def test_e3_ui4_narrow_top_bar_scrolls_instead_of_overlapping(
 
         def assert_scrolls_without_overlap() -> None:
             row = science._top_bar_row
+            # a changed row reaches the scroll area through posted layout
+            # requests: let them settle (bounded) before reading geometry
+            for _ in range(50):
+                if bar.width() >= row.minimumSize().width():
+                    break
+                qapp.processEvents()
             shown = [
                 row.itemAt(index).widget()
                 for index in range(row.count())
