@@ -225,6 +225,12 @@ class CalibrationFitWindow(FitWindow):
             title=f"{preview['label']} · fitted geometry", status=f'{count} frames · solid angle on · polarization off · normalization None',
             log_scale=self.pattern_view.log_scale.isChecked(), color_map=self.pattern_view.color_map.currentText(),
             share_axis=True))
+        provenance = self._fit.asset['provenance'] if self._fit is not None else {}
+        calibrant = (provenance.get('automatic_refinement') or {}).get('calibrant')
+        reason = self.pattern_view.set_keyed_calibrant_reference(image_key, calibrant, preview['wavelength_m'])
+        self.pattern_view.page_tool('preview').setToolTip(
+            'Stitch the complete calibrant scan with the fitted geometry (no files are written). ' +
+            (reason if reason else f'Dashed {calibrant} reference peaks use the fitted wavelength. Display only.'))
 
     def closeEvent(self, event):
         self.previewClosed.emit()

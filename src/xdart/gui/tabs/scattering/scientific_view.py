@@ -1698,7 +1698,6 @@ class ScientificView(QtWidgets.QFrame):
             self._emit(ShellCommandKind.SET_PLOT_OPTION, references, ('other', 'phase_references'))
 
     def _draw_phase_overlays(self):
-        from xrd_tools.geometry_figures import Curve
         self._draw_phase_legends()
         if self._phase_display_contract is None:
             return
@@ -1739,9 +1738,7 @@ class ScientificView(QtWidgets.QFrame):
                 if measurement != 'Grazing' and cake is not None and cake_y is not None:
                     cake_values = positions_for_axis(family.q_lines,
                         {'q_A^-1': 'q', '2th_deg': '2theta'}.get(cake[0], ''), wavelength).values
-                    cuts = tuple(Curve(family.name, np.asarray(((value, cake_y[1][0]), (value, cake_y[1][1]))),
-                                       'predicted', tip, value=line_value)
-                                 for value, line_value in zip(cake_values, family.line_values))
+                    cuts = self._reference_cuts(family, cake_values, cake_y[1], tip)
                 drawing = (family, scalars, rings, cuts)
                 self._phase_drawings[identifier] = drawing
             self.cake.render_overlay_family(name, drawing[3], color=color, joined=True)
@@ -3981,6 +3978,40 @@ class ScientificView(QtWidgets.QFrame):
         """A keyed panel's widgets (an image panel's ``pane``, ``previous``, ``selector`` and ``next``; a 1-D
         panel's ``plot`` and ``curve``), for its host's checks."""
         return self._keyed_panels[key]
+
+    @staticmethod
+    def _reference_cuts(family, positions, y_bounds, tooltip):
+        from xrd_tools.geometry_figures import Curve
+        return tuple(Curve(family.name, np.asarray(((value, y_bounds[0]), (value, y_bounds[1]))),
+                           'predicted', tooltip, value=line_value)
+                     for value, line_value in zip(positions, family.line_values))
+
+    def set_keyed_calibrant_reference(self, key: PanelKey, name: str | None, wavelength_m: float) -> str:
+        """Draw one calibrant's expected Q lines with the shared phase provider/painter; return an unavailable reason.
+
+        Lines survive presentation redraws and leave with clear_keyed(). No phase-library entry is created.
+        """
+        from xrd_tools.analysis.phase_references import calibrant_entry
+        widgets = self._keyed_panels.get(key)
+        if type(widgets) is not _KeyedImagePanel or self._keyed_shown is None:
+            raise KeyError(f'no shown keyed image panel {key!r}')
+        widgets.pane.render_overlay_family('calibrant-reference', ())
+        if not name:
+            return 'This fit does not record a calibrant identity; no reference positions are inferred.'
+        panel = self._keyed_shown.panel(key)
+        x, y = self._phase_axis(panel.x_axis), self._phase_axis(panel.y_axis)
+        if x is None or x[0] != 'q_A^-1' or y is None:
+            return 'Calibrant reference positions require a Q map.'
+        if not np.isfinite(wavelength_m) or wavelength_m <= 0:
+            return 'Calibrant reference positions require the fitted wavelength.'
+        try:
+            entry = calibrant_entry(name)
+        except ValueError as error:
+            return str(error)
+        family, = self._phase_job(PhaseOverlayRequest((entry,), 0., 'q', x[1], wavelength_m * 1e10), None, None)
+        cuts = self._reference_cuts(family, family.q_lines, panel.y_axis.edges or y[1], self._phase_tip(family))
+        widgets.pane.render_overlay_family('calibrant-reference', cuts, color=reference_colors(1)[0], joined=True)
+        return family.reason
 
     def set_keyed_region(self, key: PanelKey, region: RectRegion | None) -> None:
         """Show ``region`` as a rectangle the user can move and resize on the keyed image panel ``key`` (None: no
