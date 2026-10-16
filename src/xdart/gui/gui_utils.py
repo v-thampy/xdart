@@ -4,6 +4,7 @@
 """
 
 # Standard library imports
+import math
 import os
 import json
 
@@ -82,6 +83,13 @@ class RectViewBox(pg.ViewBox):
             self.autoRange()
             return
         pg.ViewBox.mouseClickEvent(self, ev)
+
+    def wheelEvent(self, ev, axis=None):
+        pg.ViewBox.wheelEvent(self, ev, axis=axis)
+        if ev.isAccepted():
+            # Settle the zoomed view now, as the next paint would (LF-012): pyqtgraph otherwise applies it inside
+            # that paint, which moves every item mid-paint and queues a second paint for each trackpad step.
+            self.prepareForPaint()
             
     def mouseDragEvent(self, ev, axis=None):
         ev.accept()  ## we accept all buttons
@@ -116,6 +124,74 @@ class RectViewBox(pg.ViewBox):
             if x is not None or y is not None:
                 self.translateBy(x=x, y=y)
             self.sigRangeChangedManually.emit(self.state['mouseEnabled'])
+
+
+#: device transforms that keep a horizontal line horizontal and a pixel row a row (PySide's enums do not order)
+_AXIS_ALIGNED = (QtGui.QTransform.TransformationType.TxNone, QtGui.QTransform.TransformationType.TxTranslate,
+                 QtGui.QTransform.TransformationType.TxScale)
+
+
+def _is_grid_row(pen, start, end):
+    """Whether a tick spec is a horizontal 1-px cosmetic solid line with square caps, the kind of line whose lit
+    pixels :class:`GridAxisItem` reproduces exactly."""
+    return (start.y() == end.y() and pen.isCosmetic() and pen.widthF() <= 1.
+            and pen.style() == QtCore.Qt.PenStyle.SolidLine
+            and pen.capStyle() == QtCore.Qt.PenCapStyle.SquareCap
+            and pen.brush().style() == QtCore.Qt.BrushStyle.SolidPattern)
+
+
+class GridAxisItem(pg.AxisItem):
+    """pyqtgraph's axis, filling its horizontal grid lines as the device-pixel rows they light (LF-012).
+
+    For a plot styled with the seaborn grid, built as ``axisItems={"left": GridAxisItem("left")}``. Its grid lines
+    are translucent 1-px cosmetic lines, which Qt blends one pixel at a time; filling the same row as one span
+    costs about a sixtieth of that at 2x. An aliased cosmetic line from device (x0, y) to (x1, y) lights row
+    floor(y), columns floor(x0) to floor(x1). The rows are mapped through the painter's own transform at paint
+    time, so a layout move, a render offset and every screen scale stay exact, and they are drawn after the
+    axis's text, which they never overlap. A painter that is not raster or not axis-aligned, a line under one
+    device pixel long, and a picture recorded outside this class's ``paint`` keep pyqtgraph's lines.
+    """
+
+    #: the horizontal grid lines left out of the cached picture, which ``paint`` fills itself
+    grid_rows = ()
+    _painting = False
+
+    def paint(self, p, opt, widget):
+        if self.picture is None:  # pyqtgraph records a new picture below (or none, without draw specs)
+            self.grid_rows = ()
+        self._painting = True
+        p.save()
+        try:
+            pg.AxisItem.paint(self, p, opt, widget)
+        finally:
+            p.restore()
+            self._painting = False
+        if not self.grid_rows:
+            return
+        device = p.deviceTransform()
+        engine = p.paintEngine()
+        fill = (engine is not None and engine.type() == QtGui.QPaintEngine.Type.Raster
+                and device.type() in _AXIS_ALIGNED and device.m11() > 0. and device.m22() > 0.)
+        inverse = device.inverted()[0]
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        for pen, start, end in self.grid_rows:
+            first, last = device.map(start), device.map(end)
+            left, right = sorted((first.x(), last.x()))
+            if fill and right - left >= 1.:
+                row = QtCore.QRectF(math.floor(left), math.floor(first.y()),
+                                    math.floor(right) - math.floor(left) + 1., 1.)
+                p.fillRect(inverse.mapRect(row), pen.color())
+            else:
+                p.setPen(pen)
+                p.drawLine(start, end)
+        p.restore()
+
+    def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
+        if self._painting:
+            self.grid_rows = tuple(spec for spec in tickSpecs if _is_grid_row(*spec))
+            tickSpecs = [spec for spec in tickSpecs if not _is_grid_row(*spec)]
+        pg.AxisItem.drawPicture(self, p, axisSpec, tickSpecs, textSpecs)
 
 
 class DFTableModel(QtCore.QAbstractTableModel):

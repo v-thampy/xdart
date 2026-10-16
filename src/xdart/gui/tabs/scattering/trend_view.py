@@ -26,7 +26,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.analysis.peak_fit_util import CURVE_PENS, FAMILY_LABELS, X_UNIT_FAMILIES, group_families
-from xdart.gui.gui_utils import RectViewBox
+from xdart.gui.gui_utils import GridAxisItem, RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style, plot_font
 from xdart.gui.widgets.controls_panel import FormRow
 
@@ -166,7 +166,7 @@ class TrendView(QtWidgets.QWidget):
         self.note.setObjectName(f"{name}Note")
         self.note.hide()
         layout.addWidget(self.note)
-        self.plot = pg.PlotWidget(viewBox=RectViewBox())
+        self.plot = pg.PlotWidget(viewBox=RectViewBox(), axisItems={"left": GridAxisItem("left")})
         apply_seaborn_plot_style(self.plot.getPlotItem(), grid=True)
         self.plot.setMinimumHeight(min_height)
         self.legend = self.plot.addLegend(offset=(-10, 10))

@@ -43,9 +43,21 @@ class HoverTooltip(QtCore.QObject):
 
 
 def data_curve_style(color):
-    """Universal Int style for measured 1-D data, including keyed projections."""
+    """Universal Int style for measured 1-D data, including keyed projections. No range limit (LF-012):
+    pyqtgraph's default rebuilt every curve at each zoom step, and at extreme zoom clipped a steep flank's points
+    so that the line crossed the view away from the data."""
     return dict(pen=pg.mkPen(color=color, width=1.4, style=QtCore.Qt.PenStyle.SolidLine),
-                symbol="o", symbolSize=4, symbolBrush=color, symbolPen=color, connect="finite")
+                symbol="o", symbolSize=4, symbolBrush=color, symbolPen=color, connect="finite",
+                dynamicRangeLimit=None)
+
+
+def segmented_data_curve(item):
+    """``item``, a data curve in :func:`data_curve_style`, drawn as line segments (LF-012). Qt strokes an
+    antialiased 1.4-px polyline through its general path stroker at about ten times the cost. The segments meet
+    under each point's opaque symbol, so the curve looks the same; only where a dense, noisy curve's strokes
+    overlap away from the symbols do a few antialiased edge pixels inside its band blend a little differently."""
+    item.curve.setSegmentedLineMode("on")
+    return item
 
 
 class PlotCursorReadout:

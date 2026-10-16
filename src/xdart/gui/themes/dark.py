@@ -1578,7 +1578,10 @@ def apply_seaborn_plot_style(plot, *, font_pt: int | None = None,
         size.
     grid
         Whether to enable gridlines.  True for 1D / line plots,
-        False for image / heatmap plots.
+        False for image / heatmap plots.  Build a grid plot with
+        ``axisItems={"left": GridAxisItem("left")}`` (``xdart.gui.gui_utils``):
+        it fills the horizontal gridlines as the pixel rows they light, the
+        same pixels at a fraction of the paint cost (LF-012).
     """
     try:
         import pyqtgraph as pg  # noqa: F401

@@ -82,6 +82,9 @@ class ReferenceLines(pg.ItemGroup):
         self.color = color
         self.lines = pg.PlotCurveItem(pen=pg.mkPen(color, width=1.4, style=QtCore.Qt.PenStyle.DashLine),
                                       connect='finite')  # dashed, apart from measured traces (D4)
+        # each reflection its own line (LF-012): Qt dashes the lines one by one instead of stroking one long dashed
+        # path, the same pixels at a fraction of the paint cost
+        self.lines.setSegmentedLineMode('on')
         self._x = np.asarray(self.reference_positions, dtype=float)
         self.addItem(self.lines)
         for item in (self, self.lines):

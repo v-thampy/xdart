@@ -23,7 +23,7 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xdart.gui.gui_utils import RectViewBox
+from xdart.gui.gui_utils import GridAxisItem, RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.widgets.scientific_plot import PlotCursorReadout, trace_colors
 
@@ -172,11 +172,11 @@ class FitView(QtWidgets.QWidget):
             self.summary.setTextInteractionFlags(self.summary.textInteractionFlags()
                                                  | QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
             layout.addWidget(self.summary)
-        self.plot = pg.PlotWidget(viewBox=RectViewBox())
+        self.plot = pg.PlotWidget(viewBox=RectViewBox(), axisItems={"left": GridAxisItem("left")})
         apply_seaborn_plot_style(self.plot.getPlotItem(), grid=True)
         self.plot.addLegend(offset=(-10, 10))
         self._readout = PlotCursorReadout(self.plot)
-        self.residuals = pg.PlotWidget(viewBox=RectViewBox())
+        self.residuals = pg.PlotWidget(viewBox=RectViewBox(), axisItems={"left": GridAxisItem("left")})
         apply_seaborn_plot_style(self.residuals.getPlotItem(), grid=True)
         if upper_min_height is not None:
             self.plot.setMinimumHeight(upper_min_height)

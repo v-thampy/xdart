@@ -10,6 +10,7 @@ from xdart.gui.widgets.scientific_plot import (
     reference_colors,
     trace_colors,
     data_curve_style,
+    segmented_data_curve,
 )
 
 from dataclasses import dataclass, replace
@@ -26,7 +27,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.modules.display_context import (
     Viewer2DRendererClearReceipt, Viewer2DRendererClearRequest,
 )
-from xdart.gui.gui_utils import RectViewBox
+from xdart.gui.gui_utils import GridAxisItem, RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.widgets.intensity_controls import IntensityControls
 from xrd_tools.session.display_logic import (
@@ -501,11 +502,11 @@ class _KeyedTracePanel:
 
     def __init__(self, key: PanelKey) -> None:
         self.key = key
-        self.container = self.plot = pg.PlotWidget(viewBox=RectViewBox())
+        self.container = self.plot = pg.PlotWidget(viewBox=RectViewBox(), axisItems={"left": GridAxisItem("left")})
         self.plot.setObjectName(f"e7KeyedPlot_{key.instance}")
         apply_seaborn_plot_style(self.plot.getPlotItem(), grid=True)
         self.readout = PlotCursorReadout(self.plot)
-        self.curve = self.plot.plot(connect="finite")
+        self.curve = segmented_data_curve(self.plot.plot(connect="finite"))
 
     def draw(self, panel, color) -> None:
         self.curve.setData(np.asarray(panel.axis.values, dtype=float), np.asarray(panel.intensity, dtype=float),
@@ -747,7 +748,7 @@ class ScientificView(QtWidgets.QFrame):
         one_d_layout.setContentsMargins(0, 0, 0, 0)
         # as the 2-D views and the retired Static Scan page: left-drag draws a box to zoom into
         # (pyqtgraph's default pans), middle-click shows all, right-click keeps pyqtgraph's menu
-        self.curve = pg.PlotWidget(viewBox=RectViewBox())
+        self.curve = pg.PlotWidget(viewBox=RectViewBox(), axisItems={"left": GridAxisItem("left")})
         self.curve.setObjectName("e3OneDPlot")
         apply_seaborn_plot_style(self.curve.getPlotItem(), grid=True)
         self.curve.getPlotItem().layout.setContentsMargins(
@@ -773,7 +774,7 @@ class ScientificView(QtWidgets.QFrame):
         # COVERAGE-SUPPORT-20261013: the opt-in angular coverage strip, a passive readout of the shown traces'
         # profiles. Its plot area takes the 1-D plot's exact horizontal geometry and x range, mirrored one way so
         # the curve's own autorange is never touched; its percentage axis is fixed at 0–100.
-        self.angular_support_plot = pg.PlotWidget()
+        self.angular_support_plot = pg.PlotWidget(axisItems={"left": GridAxisItem("left")})
         self.angular_support_plot.setObjectName("angularSupportStrip")
         strip = self.angular_support_plot.getPlotItem()
         apply_seaborn_plot_style(strip, grid=True)
@@ -3196,7 +3197,7 @@ class ScientificView(QtWidgets.QFrame):
                     measured = slice(valid[0], valid[-1] + 1) if valid.size else slice(0, 0)
                     plot_x, plot_y = plot_x[measured], plot_y[measured]
             if item is None:
-                item = self.curve.plot(
+                item = segmented_data_curve(self.curve.plot(
                     plot_x,
                     _offset_intensity(
                         plot_y,
@@ -3205,7 +3206,7 @@ class ScientificView(QtWidgets.QFrame):
                     ),
                     name=title,
                     **data_curve_style(style_contract),
-                )
+                ))
                 self._curve_items_by_key[key] = item
             else:
                 if data_changed:
