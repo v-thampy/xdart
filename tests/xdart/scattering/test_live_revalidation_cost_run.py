@@ -36,13 +36,15 @@ from xdart.gui.tabs.scattering.adapters.dynamic_output import DynamicOutputAdapt
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
 from xdart.gui.tabs.scattering.events import CleanupStatus, ExecutorClosed
+from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io.nexus import read_scan_metadata
 from xrd_tools.reduction.core import ReductionSession
 from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xrd_tools.sources.base import BaseFrameSource
 from xrd_tools.sources.directory_index import DirectoryIndex
 from xrd_tools.sources.directory_session import DirectoryIndexSession
-from xrd_tools.sources.execution_graph import SourceFileState, qualify_source_execution_graph
+from xrd_tools.sources.execution_graph import SourceFileState, graph_saturation, qualify_source_execution_graph
+from xrd_tools.sources.nexus import NexusStackSource
 from xrd_tools.sources.selection import DirectorySourceSpec, image_series_spec
 
 POLL = run_executor._LIVE_DIRECTORY_POLL_S
@@ -217,10 +219,12 @@ def _raw(path, value, shape):
 
 
 class _Spec:
-    """SPEC + TIFF or raw images, SSRL names, 22 columns; i0 of point k of scan s is 100 * s + k."""
+    """SPEC + TIFF or raw images, SSRL names, 22 columns; i0 of point k of scan s is 100 * s + k. With ``energy``
+    the last column is ``energy``: k + 21 keV, so every frame has its own."""
 
-    def __init__(self, raw, shape, suffix='.tif', history_bytes=0):
+    def __init__(self, raw, shape, suffix='.tif', history_bytes=0, energy=False):
         self.raw, self.shape, self.suffix, self.path = raw, shape, suffix, raw / 'calibrant'
+        self.labels = (*LABELS[:-1], 'energy') if energy else LABELS
         parts, size, scan = [SPEC_HEAD], len(SPEC_HEAD), 1000
         while size < history_bytes:  # earlier scans the Live Run does not reduce: no image names them
             scan += 1
@@ -229,9 +233,8 @@ class _Spec:
             size += len(text)
         self.path.write_text(''.join(parts))
 
-    @staticmethod
-    def _header(scan):
-        return f'#S {scan} ascan th 0 1 10 1\n#P0 0.5 1\n#N {len(LABELS)}\n#L ' + '  '.join(LABELS) + '\n'
+    def _header(self, scan):
+        return f'#S {scan} ascan th 0 1 10 1\n#P0 0.5 1\n#N {len(LABELS)}\n#L ' + '  '.join(self.labels) + '\n'
 
     @staticmethod
     def _line(scan, k):
@@ -371,23 +374,33 @@ def _settled(executor, identity, frames, deadline):
 
 
 def _differential(attempts):
-    """Every settled TIFF-series graph equals a fresh full qualification, in-memory facts included."""
+    """Every settled graph equals a fresh full qualification, in-memory facts included: a TIFF series' members, and
+    a container at its logical frame count (each frame's index, SPEC row and extent, and the reader policy)."""
     problems = []
     for attempt in attempts:
         graph = attempt.decision.item.graph
-        if graph.stamp.adapter_id != 'tiff_series':
-            continue
+        frames = graph.stamp.frame_count
         fresh = qualify_source_execution_graph(
             graph.execution_source, infer_point_images=graph.infers_point_images,
-            published_members=len(graph.stamp.members))
-        if fresh != graph:
-            problems.append(f'{graph.group_key}: graph differs from a fresh qualification')
+            published_members=len(graph.stamp.members) or frames)
+        mine, theirs = graph.stamp.metadata_sources, fresh.stamp.metadata_sources
+        if graph.stamp.members or fresh.stamp.frame_count == frames:
+            if fresh != graph:
+                problems.append(f'{graph.group_key}: graph differs from a fresh qualification')
+        elif fresh.stamp.frame_count < frames or (fresh.execution_source, fresh.reader_binding, fresh.group_key) != (
+                graph.execution_source, graph.reader_binding, graph.group_key):  # a container that grew since
+            problems.append(f'{graph.group_key}: the container no longer extends its settled graph')
         if fresh.infers_point_images != graph.infers_point_images:
             problems.append(f'{graph.group_key}: infers_point_images differs')
-        for mine, theirs in zip(graph.stamp.metadata_sources, fresh.stamp.metadata_sources, strict=True):
-            if (mine.spec_extent, dict(mine.spec_values or {})) != (theirs.spec_extent,
-                                                                    dict(theirs.spec_values or {})):
-                problems.append(f'{mine.source_path}: retained SPEC extent/values differ')
+        if not graph.stamp.members and (len(mine) not in (0, frames) or len(theirs) < len(mine)):
+            problems.append(f'{graph.group_key}: {len(mine)} admitted rows for {frames} frames')
+        for ours, fresh_row in zip(mine, theirs):
+            extent = fresh_row.spec_extent
+            if not graph.stamp.members and extent is not None and ours.spec_extent is not None:
+                extent = extent.through(len(ours.spec_extent.marks) - 1)
+            if (ours.frame_index, ours.spec_extent, dict(ours.spec_values or {})) != (
+                    fresh_row.frame_index, extent, dict(fresh_row.spec_values or {})):
+                problems.append(f'{ours.source_path} frame {ours.frame_index}: retained SPEC row/extent differ')
     return problems
 
 
@@ -922,6 +935,90 @@ def test_r4c_a_complete_malformed_spec_row_for_a_new_frame_fails_loudly(tmp_path
     assert 'row 4' in str(terminal) and _counted(tmp_path, 'calibrant_scan001')[0] == (1, 2, 3)
 
 
+def test_r4d_a_new_spec_member_waits_for_a_second_real_listing(tmp_path, monkeypatch):
+    """d2c853da: a member first seen by a poll's listing is admitted only once a later real listing (listing reuse
+    on) has seen it too, so one listing that misses earlier members never publishes a gapped series; the saved
+    labels, sources and i0 stay in creation order."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    spec = _Spec(raw, PILATUS)
+    spec.scan(1)
+    for k in range(3):
+        spec.frame(1, k)
+    listed, admitted, poll, construct = [], [], DirectoryIndex.poll, StandardRunExecutor._construct
+
+    def listing(index):
+        snapshot = poll(index)
+        listed.append((time.monotonic(), {str(path) for path in snapshot.by_path()}))
+        return snapshot
+
+    def constructing(executor, run, *, item=None, **kwargs):
+        if item is not None:
+            admitted.append((time.monotonic(), [member.path for member in item.graph.stamp.members]))
+        return construct(executor, run, item=item, **kwargs)
+    monkeypatch.setattr(DirectoryIndex, 'poll', listing)
+    monkeypatch.setattr(StandardRunExecutor, '_construct', constructing)
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, raw, PILATUS), request_value=7134)
+    events = []
+    try:
+        _wait(executor, events, _count_labels('calibrant_scan001', 3), 60.)
+        _settle(executor, events, .5)
+        started = time.monotonic()
+        spec.frame(1, 3)
+        _wait(executor, events, _count_labels('calibrant_scan001', 4), 30.)
+        for k in range(4, 14):
+            spec.frame(1, k)
+        _wait(executor, events, _count_labels('calibrant_scan001', 14), 30.)
+        _settle(executor, events, .5)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    seen = {str(raw / f'calibrant_scan001_{k:04d}.tif') for k in range(3)}
+    early = []
+    for at, members in admitted:
+        if at > started:
+            early += [path for path in members if path not in seen
+                      and sum(path in paths for done, paths in listed if done < at) < 2]
+        seen.update(members)
+    assert not early, f'admitted on the listing that first saw them: {early}'
+    labels, record = _counted(tmp_path, 'calibrant_scan001')
+    assert labels == tuple(range(1, 15)) and _column(record, 'i0') == tuple(100. + k for k in range(14))
+    with h5py.File(tmp_path / 'processed' / 'calibrant_scan001_int1d.nexus', 'r') as handle:
+        sources = [handle[f'entry/frames/frame_{label:04d}/source/path'][()].decode() for label in labels]
+    assert sources == [f'calibrant_scan001_{k:04d}.tif' for k in range(14)], sources
+
+
+def test_r5c_a_live_series_signs_the_saturation_its_selected_image_records(tmp_path, monkeypatch):
+    """Automatic saturation masking: a Live Image Series (TIFF members, or a selected Eiger master) signs the
+    ceiling its selected image or container records, as the finite series does, not the Folder rule."""
+    import tifffile
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    for k in range(2):
+        tifffile.imwrite(raw / f'cut_{k:04d}.tif', np.full(PILATUS, k, dtype=np.uint32),
+                         description='# Count_cutoff 400 counts\n')
+    eiger = _Eiger(raw, PILATUS, 2, chunk=1, stem='eiger')
+    with h5py.File(eiger.master, 'a') as handle:
+        handle['entry/instrument/detector/saturation_value'] = 900
+    signed, admitted = [], output_preflight._admitted_saturation
+    monkeypatch.setattr(output_preflight, '_admitted_saturation',
+                        lambda *args: (signed.append(admitted(*args)), signed[-1])[1])
+    for value, (selected, stem) in enumerate((('cut_0000.tif', 'cut'), ('eiger_master.h5', 'eiger'))):
+        source = image_series_spec(raw / selected, metadata_format=None)
+        finite = graph_saturation(qualify_source_execution_graph(source), detector=None)
+        executor = StandardRunExecutor(join_timeout=2.)
+        identity = _start(executor, _intent(tmp_path, raw, PILATUS, source=source), request_value=7170 + value)
+        events = []
+        try:
+            _wait(executor, events, _count_labels(stem, 2), 60.)
+        finally:
+            terminal = _stop(executor, identity, events)
+        assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+        assert (finite.value, finite.source, signed[-1]) == ((400, 900)[value], 'recorded', (400, 900)[value]), (
+            finite, signed)
+
+
 # --- R5: entry modes the maintainer named ----------------------------------------------------------------------
 
 #: R5a: selected file, output stem, frames at Start, metadata policy, and the column (and values) its four frames give.
@@ -980,15 +1077,18 @@ def test_r5b_spec_with_an_eiger_master_binds_each_frame_to_its_own_row(tmp_path,
     """Frame k of {spec}_scanN_master is row k of scan N, across two external chunks as the last one grows: the
     master waits until each frame has its row (a later row waits for its frame), a malformed row fails loudly, a
     published row rewritten stops the output, a new row rewritten as construction starts is read again, and Stop
-    during the arrival's SPEC read ends the Run within 1 s."""
+    during the arrival's SPEC read ends the Run within 1 s. Each frame is reduced at its own row's energy; the
+    frames' source carries the rows' columns as its motors, and the SPEC file is in the source snapshots."""
     raw, stem = tmp_path / 'raw', 'calibrant_scan001'
     raw.mkdir()
-    spec, eiger = _Spec(raw, PILATUS), _Eiger(raw, PILATUS, 4, chunk=2, stem=stem)
+    spec, eiger = _Spec(raw, PILATUS, energy=True), _Eiger(raw, PILATUS, 4, chunk=2, stem=stem)
     spec.scan(1)
     for k in range(3 if case == 'rows' else 4):
         spec.row(1, k)
     work, read, entered, closed = _Work(monkeypatch, counters=False), metadata._read_spec_scan, threading.Event(), None
-    construct = StandardRunExecutor._construct
+    construct, bind, bound = StandardRunExecutor._construct, NexusStackSource.bind_metadata_provider, []
+    monkeypatch.setattr(NexusStackSource, 'bind_metadata_provider',
+                        lambda source, provider: (bound.append(provider), bind(source, provider))[1])
 
     def held(*args, cancelled=None):  # the arrival's own SPEC read waits for Stop
         if cancelled is not None:
@@ -1012,6 +1112,8 @@ def test_r5b_spec_with_an_eiger_master_binds_each_frame_to_its_own_row(tmp_path,
             spec.row(1, 3), spec.row(1, 4)  # the extra row waits for its frame
         _wait(executor, events, _count_labels(stem, 4), 60.)
         _settle_reuse(executor, identity, work, events, 4, time.monotonic() + 60.)
+        settled = executor.processed_live_revisions(identity)
+        differential = _differential(settled)
         if case == 'malformed':
             with spec.path.open('a') as stream:
                 stream.write('0.4 104 not-a-number\n')
@@ -1043,6 +1145,16 @@ def test_r5b_spec_with_an_eiger_master_binds_each_frame_to_its_own_row(tmp_path,
     assert _column(record, 'i0') == (100., 101., 102., 103., 904. if case == 'reread' else 104.)[:len(labels)]
     assert _column(record, 'c2') == (2., 3., 4., 5., 6.)[:len(labels)]
     assert _column(record, 'del') == pytest.approx((0., .1, .2, .3, .4)[:len(labels)], rel=1e-6, abs=0)
+    selection = read_provenance(tmp_path / 'processed' / f'{stem}_int1d.nexus')['config']['energy_selection']
+    energies = dict(zip(selection['frame_labels'], selection['frame_energies_eV']))
+    assert len(set(energies.values())) == 4 and energies == {k: 1000. * (21 + k) for k in energies}, selection
+    assert not differential, differential
+    snapshots = output_preflight.source_snapshots(settled[0].decision.item)
+    assert snapshots[str(spec.path)]['source_role'] == 'image_metadata', snapshots
+    motors = bound[-1].motors()
+    assert set(motors) == set(spec.labels), motors
+    assert all(list(motors[name]) == [bound[-1].metadata_for(k)[name] for k in range(bound[-1].frame_count())]
+               for name in motors), motors
 
 
 # --- R6: Stop within 1 s through cleanup ------------------------------------------------------------------------
@@ -1186,7 +1298,7 @@ def test_r7b_gi_live_keeps_each_frames_own_incidence_motor(tmp_path, monkeypatch
     assert _column(_counted(tmp_path, 'scan_gi')[1], 'th') == tuple(float(np.float32(v)) for v in (.1, .2, .3, .4))
 
 
-# --- P1: whole-poll overhead per poll type at 100, 500 and 5000 points (bars frozen at the checkpoint) ---------
+# --- P1: whole-poll overhead per poll type at 100, 500 and 1500 points (bars frozen before terminal) ----------
 
 PERF = ('spec_tiff', 'txt', 'nexus', 'eiger', 'aggregate')
 #: The GUI's default bins (1D 1000; 2D 1000 x 360): the containers carry the epoch-commit/finish split.
@@ -1194,17 +1306,17 @@ REALISTIC = {'npt': 1000, 'method': 'csr'}, {'npt_rad': 1000, 'npt_azim': 360, '
 #: Ratified at the checkpoint (docs 3814fcaf; D1 idle/pending and latency at 6b52675e): overhead (p50 s,
 #: p95 s) per phase and size, local APFS.
 _PHASE_BARS = {
-    'idle': {100: (.020, .040), 500: (.020, .040), 5000: (.020, .060)},
-    'pending': {100: (.020, .040), 500: (.020, .040), 5000: (.020, .060)},
-    'arrival_1': {100: (.100, .200), 500: (.120, .250), 5000: (.250, .500)},
-    'arrival_10': {100: (.300, .500), 500: (.350, .600), 5000: (.600, 1.)},
-    'arrival_latency': {100: (.30, .30), 500: (.35, .35), 5000: (.60, .60)},  # write to first construct, p95
-    'stop_closed': {100: (1., 1.), 500: (1., 1.), 5000: (1., 1.)},
+    'idle': {100: (.020, .040), 500: (.020, .040), 1500: (.020, .060)},
+    'pending': {100: (.020, .040), 500: (.020, .040), 1500: (.020, .060)},
+    'arrival_1': {100: (.100, .200), 500: (.120, .250), 1500: (.250, .500)},
+    'arrival_10': {100: (.300, .500), 500: (.350, .600), 1500: (.600, 1.)},
+    'arrival_latency': {100: (.30, .30), 500: (.35, .35), 1500: (.60, .60)},  # write to first construct, p95
+    'stop_closed': {100: (1., 1.), 500: (1., 1.), 1500: (1., 1.)},
 }
 #: Every P1 row's bars. The containers have no pending phase in this fixture: N/A, never a pass.
 BARS = {(name, points): {phase: sizes[points] for phase, sizes in _PHASE_BARS.items()
                          if phase != 'pending' or name not in ('nexus', 'eiger')}
-        for name in PERF for points in (100, 500, 5000)}
+        for name in PERF for points in (100, 500, 1500)}
 
 
 class _Feed:
@@ -1294,7 +1406,7 @@ def _quantiles(values):
     return statistics.median(ordered), ordered[min(len(ordered) - 1, int(round(.95 * (len(ordered) - 1))))]
 
 
-@pytest.mark.parametrize('points', [100, 500, 5000])
+@pytest.mark.parametrize('points', [100, 500, 1500])
 @pytest.mark.parametrize('name', PERF)
 def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_property, name, points):
     raw = tmp_path / 'raw'
@@ -1306,9 +1418,9 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
     work = _Work(monkeypatch, counters=False)
     executor = StandardRunExecutor(join_timeout=2.)
     identity = _start(executor, feed.intent(tmp_path, raw), request_value=7200 + 10 * PERF.index(name)
-                      + (500, 5000, 100).index(points))
+                      + (500, 1500, 100).index(points))
     events, measured, phase, terminal, problems, footprint = [], {}, 'initial', [], [], None
-    budget = 1800. if (name, points) == ('spec_tiff', 5000) else 900.  # amended for SPEC+TIFF 5000 (docs 6209206a)
+    budget = 900.
     deadline, started = time.monotonic() + budget, time.monotonic()
     initial = 1 if name == 'aggregate' else (points if name not in ('nexus', 'eiger') else points)
     pending = name not in ('nexus', 'eiger')
@@ -1358,11 +1470,11 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
                 measured['reduction_excluded'].append(sum(took for _at, took in work.times('drain', first, after)))
                 measured['arrival_latency'].append(constructs[0] - mark)
         # The growing output only: later scans append to a settled scan's SPEC file after its qualification.
-        grown = [value for value in executor.processed_live_revisions(identity)
-                 if not value.partial and value.decision.item.graph.group_key == feed.stem]
-        assert grown or name in ('nexus', 'eiger'), 'the growing output has no settled attempt'
+        grown = [value for value in executor.processed_live_revisions(identity) if not value.partial and (
+            name in ('nexus', 'eiger') or value.decision.item.graph.group_key == feed.stem)]
+        assert grown, 'the growing output has no settled attempt'
         problems = _differential(grown)
-        if points == 5000:
+        if points == 1500:
             footprint = _reuse_footprint(executor, identity, events)
         phase = 'stop'
         work.await_polls(time.monotonic(), 2, deadline)
