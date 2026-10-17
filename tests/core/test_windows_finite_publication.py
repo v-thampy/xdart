@@ -997,6 +997,7 @@ def _pin_spies(monkeypatch, *, fail_pin_close=False):
         descriptor = real_open(path, flags, *args, **kwargs)
         if flags & os.O_EXCL and ".xdart-finite-" in str(path):
             created.append(descriptor)
+            closes.clear()  # descriptor numbers recur: count closes from the pin's creation onward
         return descriptor
 
     def spy_parent(target):
