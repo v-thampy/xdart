@@ -868,9 +868,9 @@ x86-64 (`linux-64`), and Windows x86-64 (`win-64`). All three use
 or regenerate the lockfile on each machine. See the
 [fresh Windows setup and native checks](docs/INSTALLATION.md#windows-fresh-editable-install).
 Windows dependencies are locked; native application validation remains pending.
-Known limitation: **Reintegrate 1-D/2-D**, **Average Scan**, **Stitch 1D**, and
-**RSM** are not yet available on Windows. Run, Append, and Browse do not use
-their publication path.
+The finite-save path for **Reintegrate 1-D/2-D**, **Average Scan**, **Stitch 1D/2D**
+and **RSM** is implemented. Native Windows/SMB publication and GUI interaction
+still need their own release qualification.
 
 After saving or committing local work, update an existing supported checkout with:
 
