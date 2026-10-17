@@ -357,13 +357,6 @@ def _substitute(path: Path, raw: bytes = b"foreign") -> None:
     path.unlink()
     path.write_bytes(raw)
 
-def _mount_type(path) -> str:
-    """F5 receipt: the filesystem type holding *path* (Linux ``/proc/mounts``), else ``n/a``."""
-    mounts = Path("/proc/mounts")
-    rows = [line.split() for line in mounts.read_text().splitlines()] if mounts.exists() else []
-    return max((row for row in rows if str(path).startswith(row[1])), key=lambda row: len(row[1]),
-               default=("", "", "n/a"))[2]
-
 @pytest.mark.parametrize("moment", ("before-write", "after-close"), ids=("W18-before-write", "W40-before-flush"))
 def test_w18_w40_substituted_candidate_is_refused_and_never_deleted(tmp_path, arm, moment):
     target = tmp_path / "slot.nexus"
@@ -373,7 +366,7 @@ def test_w18_w40_substituted_candidate_is_refused_and_never_deleted(tmp_path, ar
     reserved = finite_module._snapshot_state(session._reservation)  # F5 receipts: (dev, ino, mode, size, mtime, ctime)
     if moment == "before-write":
         _substitute(candidate)
-        print("F5", moment, _mount_type(tmp_path), "reserved", reserved,
+        print("F5", moment, "reserved", reserved,
               "replacement", finite_module._state(os.lstat(candidate)), flush=True)
         try:
             with pytest.raises(FiniteArtifactIntegrityError, match="candidate changed") as refused:
@@ -392,7 +385,7 @@ def test_w18_w40_substituted_candidate_is_refused_and_never_deleted(tmp_path, ar
     if moment == "after-close":
         _substitute(candidate)
     foreign = candidate.read_bytes()
-    print("F5", moment, _mount_type(tmp_path), "reserved", reserved, "closed", closed,
+    print("F5", moment, "reserved", reserved, "closed", closed,
           "replacement", finite_module._state(os.lstat(candidate)), flush=True)
     with pytest.raises(FiniteArtifactIntegrityError, match="candidate changed") as raised:
         facts = _publish(session, capture_target_snapshot(target))
@@ -428,7 +421,7 @@ def test_w20_foreign_cleanup_occupant_is_preserved(tmp_path, arm):
     session = _start(tmp_path / "slot.nexus")
     closed = finite_module._state(os.lstat(session.candidate))
     _substitute(session.candidate)
-    print("F5 W20", _mount_type(tmp_path), "reserved", finite_module._snapshot_state(session._reservation),
+    print("F5 W20", "reserved", finite_module._snapshot_state(session._reservation),
           "closed", closed, "replacement", finite_module._state(os.lstat(session.candidate)), flush=True)
     assert session.abort()
     print("F5 W20 exists", session.candidate.exists(), "orphan", session.hidden_orphan,
@@ -474,8 +467,7 @@ def test_w23_ambiguous_foreign_occupant_keeps_its_verdict(tmp_path, monkeypatch,
         raise OSError("ambiguous rename")
     monkeypatch.setattr(finite_module, "replace_into_place", foreign_after)
     session = _start(target)
-    print("F5 W23", occupant, _mount_type(tmp_path), "reserved", finite_module._snapshot_state(session._reservation),
-          flush=True)
+    print("F5 W23", occupant, "reserved", finite_module._snapshot_state(session._reservation), flush=True)
     if occupant == "regular":
         with pytest.raises(OSError, match="ambiguous rename"):
             facts = _publish(session, capture_target_snapshot(target))
