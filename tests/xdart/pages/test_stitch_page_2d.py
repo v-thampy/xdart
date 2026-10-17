@@ -110,6 +110,8 @@ def test_the_rows_a_run_lists_keep_their_order_when_the_catalog_lands(qapp, tmp_
         page.run_bar.startButton.click()
         _wait(page, qapp)
         assert entered.wait(10)
+        page.browser.clear_result_selection()  # the run selected its result; the batch below is the no-selection one
+        _wait(page, qapp)
         held = page.browser.listed_results()
         batch = [target.label for target in page._fit_batch("peak")]
         release.set()
