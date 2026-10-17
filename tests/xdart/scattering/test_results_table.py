@@ -113,3 +113,24 @@ def test_an_analyzer_phase_fits_rows_are_its_phases_fractions_and_cell() -> None
     withheld = {"phase_fractions_reason": "fractions withheld: the fit did not converge"}
     assert phase_outcome_rows(withheld, ("TiN",)) == (PHASE_OUTCOME_HEADERS, (
         ("TiN", "—", "—", "—", "—"), ("fractions withheld: the fit did not converge", "—", "—", "—", "—")))
+
+
+def test_a_lattice_fits_withheld_fraction_reason_reaches_both_phase_tables(tmp_path) -> None:
+    # Split from tests/core/test_lattice_phase_fit_contract.py (its store half stays there): the core runner has no GUI
+    # libraries, so the shared tables' rows of a real lattice fit are pinned here.
+    from tests.core.test_lattice_phase_fit_contract import _plan, _stored_lattice_fit
+    from xrd_tools.analysis.display_fit_operations import run_displayed_phase_fit
+    from xrd_tools.analysis.phase_references import PhaseLibrary
+    result, entry = _stored_lattice_fit()
+    _, rows = phase_outcome_rows(entry, ("positions",))
+    assert rows[0][0] == "positions" and rows[0][1] == "—"
+    assert rows[0][2:] == ("4.1000", "4.1000", "4.1000")
+    assert any(result.phase_fractions_reason in str(cell) for row in rows for cell in row)
+    library = PhaseLibrary(tmp_path / "library")
+    lattice = library.add_lattice("positions", a=4.1, space_group="Pm-3m")
+    displayed = run_displayed_phase_fit(_plan(tmp_path, (lattice,)))
+    _, rows = phase_result_rows(displayed)
+    phase_rows = [row for row in rows if row[3] == "phase"]
+    assert len(phase_rows) == 1 and phase_rows[0][0:2] == ("positions", "—")
+    assert "a=" in phase_rows[0][2]
+    assert any(displayed.phase_fractions_reason in str(cell) for row in rows for cell in row)

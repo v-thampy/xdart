@@ -92,7 +92,7 @@ def _execute(intent: RunIntent, assets, monkeypatch, request: int = 1):
     from xrd_tools.session import readiness
     configuration, observed = intent.freeze(), []
     class ProbeSource:
-        def to_scan(self, *, output_path):
+        def to_scan(self, *, output_path, cancelled=None):
             return Scan(name="probe", frames=[], output_path=output_path)
         def close(self): return None
 

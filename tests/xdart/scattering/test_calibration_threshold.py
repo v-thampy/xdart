@@ -62,7 +62,7 @@ def test_calibration_threshold_uses_shared_transitions_and_restores_its_session(
         again.session_dir = tmp_path / 'source' / 'staged'
         again._save_session()
         path = again.session_dir / 'calibration-session.json'
-        assert json.loads(path.read_text())['version'] == 6
+        assert json.loads(path.read_text())['version'] == 7  # resumable record (6a7e9f14)
         _, _, policy = load_calibration_session(path, with_policy=True)
         dialog._apply_fit_policy(policy)
         assert dialog._conditioning() == again._conditioning()

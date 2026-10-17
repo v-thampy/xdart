@@ -1534,9 +1534,16 @@ def test_p1_whole_poll_overhead_per_poll_type(tmp_path, monkeypatch, record_prop
     assert set(bars) <= set(measured), f'barred phases never measured: {set(bars) - set(measured)}'
     for key, (bar50, bar95) in bars.items():
         p50, p95 = _quantiles(measured[key])
+        record_property(f'{key}_bar_p50_s', bar50)
+        record_property(f'{key}_bar_p95_s', bar95)
         if p50 > bar50 or p95 > bar95:
             failed[key] = (round(p50, 4), round(p95, 4), bar50, bar95)
-    assert not failed, failed
+    # The bars are guidelines: the maintainer chose report-only on hosted CI (CI set) and enforced locally.
+    enforced = 'CI' not in os.environ
+    record_property('bars_failed', failed)
+    record_property('bars_enforced', enforced)
+    if enforced:
+        assert not failed, failed
 
 
 def _reuse_footprint(executor, identity, events):

@@ -276,7 +276,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from xdart.gui.tabs.calibration.dialog import _pyfai_arguments
     from pyFAI.io.ponifile import PoniFile
     from tests.core.test_calibration_seed import _frame, _record
-    from tests.xdart.scattering.test_calibration_ring_scheduling import _settle
+    from tests.xdart.scattering.test_calibration_ring_scheduling import _close, _settle
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
     try:
         dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
@@ -321,7 +321,7 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
         assert not visible('beam_pixel') and dialog._seed_options()['rough'] is None
         assert PoniFile(_pyfai_arguments(dialog.frames[0], dialog._seed_options())[3]).dist == pytest.approx(0.39)
         from xdart.gui.pages.values import PageCleanup
-        assert dialog.shutdown().status is PageCleanup.CLEAN
+        assert _close(dialog).status is PageCleanup.CLEAN  # retried while the ring worker returns
         dialog.close()
     finally:
         _dispose(dialog)
@@ -342,7 +342,8 @@ def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
         assert label == 'tth (detector)  ·  used by Stitch'
         assert dialog.geometry_editor.axis_box('tth').currentText() == 'z-'  # psic's del, vertical plane
         from xdart.gui.pages.values import PageCleanup
-        assert dialog.shutdown().status is PageCleanup.CLEAN
+        from tests.xdart.scattering.test_calibration_ring_scheduling import _close
+        assert _close(dialog).status is PageCleanup.CLEAN  # retried while the metadata worker returns
         dialog.close()
     finally:
         _dispose(dialog)
