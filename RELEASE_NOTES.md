@@ -39,13 +39,14 @@ requirements.
   catalog arrives. The newest result remains current but need not be the last
   row. No-selection fit batches follow the visible order; selected batches use
   the existing selection order.
-- Finite-result saves on POSIX preserve file identity through validation and
-  cleanup, protecting files substituted outside the operation.
+- On Linux and macOS, Stitch, RSM, Average and Reintegrate saves no longer delete
+  or publish a file that another process put in their place.
 - Calibration dialogs release their windows and pending restore callbacks with
   their owners, reducing retained GUI memory.
 - Live input discovery reuses unchanged identities and avoids repeated checks
-  while retaining strict admission and publication checks. First-seen files
-  still require confirmation; network directory visibility remains relevant.
+  while retaining strict admission and publication checks. A newly seen file is
+  processed once a second directory listing confirms it; network directory
+  visibility remains relevant.
 
 ### Upgrading and installation
 
