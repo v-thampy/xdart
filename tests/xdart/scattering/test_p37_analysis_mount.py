@@ -228,13 +228,34 @@ def _check_item(widget, name, checked=True):
                              QtCore.Qt.CheckState.Unchecked)
 
 
+def test_metadata_row_headers_remain_default_unless_explicitly_selected(qapp):
+    from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog
+    result = _table()
+    dialog = MetadataResultDialog()
+    try:
+        dialog.adopt_result(result)
+        assert dialog.table.verticalHeaderItem(0) is None
+        dialog.adopt_result(result, selected_labels=(3, 1), row_labels=("2-3", "2-1"))
+        assert dialog.table.verticalHeaderItem(0).text() == "2-3"
+        assert dialog.table.rowCount() == 2
+        for index, original in enumerate((2, 0)):
+            assert float(dialog.table.item(index, 0).text()) == result.columns[0].numeric[original]
+        dialog.clear_result()
+        dialog.adopt_result(result)
+        assert dialog.table.verticalHeaderItem(0) is None
+    finally:
+        dialog.close()
+
+
 def test_p37b_literal_commands_open_four_singletons_and_share_scan_roi_mount() -> None:
-    # This is the genuine parent RED: the terminal P3-7A parent has only three
-    # tools and no ROI route.  The production fix adds the literal fourth row.
+    # Plot Metadata is in the shared popup; ROI remains a tool. Literal routes
+    # remain accepted for existing command consumers. REFERENCE-PHASES-20261011 added
+    # the Reference Phases launcher, which opens a view-owned window (no analysis mount).
+    from xdart.gui.tabs.scattering.tools_view import REFERENCE_PHASES_TOOLTIP
     assert ToolsView._TOOLS == (
         ("\u2227 Peak Fitting", "peak_fitting"),
         ("\u2248 Phase Fitting", "phase_fitting"),
-        ("\u25a4 Plot Metadata", "plot_metadata"),
+        ("\u2506 Reference Phases", "reference_phases", REFERENCE_PHASES_TOOLTIP),
         ("\u25a3 ROI Statistics", "roi_statistics"),
     )
     from xdart.gui.tabs.scattering.analysis_mount import MOUNT_TARGETS
@@ -1595,6 +1616,7 @@ def test_p37b_scan_plot_submits_headless_defaults_normalization_and_roi_kind(
         dialog.set_vnext_metadata(table)
         dialog._vnext_rendering = True
         try:
+            _check_item(dialog.y_list, "frame_index", checked=False)
             _check_item(dialog.y_list, "signal")
             _check_item(dialog.r_list, "motor")
             dialog.norm_combo.setCurrentText("signal")
@@ -1742,9 +1764,137 @@ def test_p37b_roi_preview_and_scan_share_slot_and_preserve_typed_diagnostics(
         assert page._scan_roi_result is completed
         assert page._scan_roi_result.diagnostics == (
             "ROI_INVALID_MASK_IGNORED",)
-        assert dialog.status.text() == "OK"
+        assert dialog._vnext_roi_result is completed
+        assert page._analysis_kind == "scan_plot"
+        assert dialog.status.text() == "Running scan plot…"
         for name in completed.signal_names:
             assert dialog.y_list.findItems(name, QtCore.Qt.MatchFlag.MatchExactly)
+    finally:
+        _close_page(page, qapp)
+
+
+def _roi_navigation_table(tmp_path, *, changed_shape=False, shape=(4, 4), missing_label=None):
+    import tifffile
+    from xrd_tools.core import IntegrationResult1D
+    from xrd_tools.io.nexus import open_nexus_writer, write_integrated_stack
+    from xrd_tools.io.nexus_record import frame_record_key, write_frame_record
+    from xrd_tools.analysis.scan_operations import run_metadata_table
+
+    path = tmp_path / "navigation.nexus"
+    labels = (3, 7, 11)
+    with open_nexus_writer(path) as handle:
+        entry = handle["entry"]
+        write_integrated_stack(entry, frame_indices=labels, results_1d=[
+            IntegrationResult1D(radial=np.arange(3.0), intensity=np.ones(3),
+                                unit="q_A^-1") for _ in labels])
+        for label in labels:
+            raw = tmp_path / f"raw_{label}.tif"
+            frame_shape = (5, 5) if changed_shape and label == 11 else shape
+            if label != missing_label:
+                tifffile.imwrite(raw, np.full(frame_shape, label, dtype=np.uint16))
+            write_frame_record(entry.require_group("frames"), frame_record_key(None, label),
+                               source_path=raw, source_frame_index=0)
+    table = run_metadata_table(MetadataTablePlan(
+        SourceSpec(path, SourceKind.PROCESSED_NEXUS)))
+    assert table.disposition is AnalysisDisposition.COMPLETED
+    assert table.labels == labels
+    return table
+
+
+@pytest.mark.parametrize("settlement", ("latest", "close", "source"))
+def test_roi_preview_navigation_keeps_marks_and_only_adopts_latest_real_frame(
+        tmp_path, monkeypatch, qapp, settlement):
+    import xrd_tools.analysis.scan_operations as operations
+
+    table = _roi_navigation_table(tmp_path)
+    page = _page()
+    release, ready = Event(), Event()
+    real_preview = operations.run_roi_preview
+    completed = []
+
+    def delayed(plan, **kwargs):
+        result = real_preview(plan, **kwargs)
+        completed.append(result)
+        if plan.label == 7:
+            ready.set()
+            assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(operations, "run_roi_preview", delayed)
+    try:
+        page._open_analysis_mount("scan_roi")
+        dialog = page._scan_roi_dialog
+        dialog.set_vnext_metadata(table)
+        dialog.roi_btn.click(); page._run_timer.stop()
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        picker = dialog._roi_dialog
+        assert picker is not None, completed[0].code
+        panel = picker.scientific.keyed_panel(picker._image_key)
+        assert tuple(panel.selector.itemText(i) for i in range(panel.selector.count())) == (
+            "3", "7", "11")
+        assert panel.selector.toolTip() and panel.previous.toolTip() and panel.next.toolTip()
+        picker.bg_check.setChecked(True)
+        signals = tuple(picker.roi_signals())
+        marks = (picker._rois[0].rect, picker._rois[0].bg_rect)
+        panel.next.click(); page._run_timer.stop()
+        identity = page._analysis_identity
+        assert ready.wait(5)
+        assert not picker.compute_btn.isEnabled()
+        panel.selector.setCurrentIndex(2); page._run_timer.stop()
+        if settlement == "close":
+            dialog.close()
+        elif settlement == "source":
+            dialog.source_widget.dir_check.setChecked(True)
+        release.set()
+        page._consume_analysis_update(_finish(page._analysis_slot, identity))
+        assert page._scan_roi_result is (completed[0] if settlement == "latest" else None)
+        page._run_timer.timeout.emit(); page._run_timer.stop()
+        if settlement != "latest":
+            assert picker._image is None
+            if settlement == "source": assert dialog._roi_dialog is picker
+            assert page._analysis_identity is None
+            assert [result.label for result in completed] == [3, 7]
+            return
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        assert dialog._roi_dialog is picker
+        assert (picker._rois[0].rect, picker._rois[0].bg_rect) == marks
+        assert tuple(picker.roi_signals()) == signals
+        assert picker.compute_btn.isEnabled()
+        np.testing.assert_array_equal(picker._image, np.full((4, 4), 11))
+        assert page._roi_preview_binding[4] == 11
+        picker.scale_log_btn.click()
+        assert panel.selector.currentText() == "11" and panel.selector.count() == 3
+        picker.compute_btn.click(); page._run_timer.stop()
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        assert dialog._vnext_roi_result.disposition is AnalysisDisposition.COMPLETED
+        assert dialog._vnext_roi_result.completed_labels == table.labels
+    finally:
+        release.set()
+        _close_page(page, qapp)
+
+
+def test_roi_preview_shape_change_preserves_accepted_image_and_marks(tmp_path, qapp):
+    table = _roi_navigation_table(tmp_path, changed_shape=True)
+    page = _page()
+    try:
+        page._open_analysis_mount("scan_roi")
+        dialog = page._scan_roi_dialog
+        dialog.set_vnext_metadata(table)
+        dialog.roi_btn.click(); page._run_timer.stop()
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        picker = dialog._roi_dialog
+        panel = picker.scientific.keyed_panel(picker._image_key)
+        assert panel.selector.count() == 3
+        signals = tuple(picker.roi_signals())
+        previous = page._scan_roi_result
+        panel.selector.setCurrentIndex(2); page._run_timer.stop()
+        page._consume_analysis_update(_finish(page._analysis_slot, page._analysis_identity))
+        assert dialog._roi_dialog is picker and page._scan_roi_result is previous
+        assert tuple(picker.roi_signals()) == signals
+        np.testing.assert_array_equal(picker._image, np.full((4, 4), 3))
+        assert "shape" in picker.status.text().lower()
+        assert panel.selector.currentText() == "3" and picker.compute_btn.isEnabled()
+        assert page._roi_preview_binding[4] == 3
     finally:
         _close_page(page, qapp)
 
@@ -2400,7 +2550,7 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
     try:
         page._open_analysis_mount("scan_roi"); dialog = page._scan_roi_dialog
         table = replace(_table(fingerprint="retained-table"),
-                        storage_bytes=64 << 20)
+                        storage_bytes=32 << 20)
         page._metadata_result = table; dialog.set_vnext_metadata(table)
         dialog._vnext_rendering = True
         try: _check_item(dialog.r_list, "signal")
@@ -2470,7 +2620,7 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
             table_fingerprint=table.table_fingerprint, x_name="motor",
             x=np.arange(3.0), trace_names=("signal",),
             original_identities=("signal",), traces=(np.arange(3.0),),
-            storage_bytes=64 << 20)
+            storage_bytes=32 << 20)
         assert consume("scan_plot", scan, scan_request)
         old_items = tuple(dialog.plot.listDataItems()); old_right = tuple(
             dialog.right_vb.addedItems); old_request = dialog._vnext_scan_request
@@ -2489,27 +2639,27 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
         assert (tuple(dialog.plot.listDataItems()), tuple(dialog.right_vb.addedItems)) == (
             old_items, old_right)
 
-        roi = replace(over_roi, storage_bytes=64 << 20)
+        roi = replace(over_roi, storage_bytes=32 << 20)
         assert consume("roi_scan", roi, roi_request)
         assert page._scan_roi_result is dialog._vnext_roi_result is roi
-        assert dialog._vnext_scan_result is dialog._vnext_scan_request is None
-        assert not dialog.plot.listDataItems() and not dialog.right_vb.addedItems
+        assert dialog._vnext_scan_result is scan and dialog._vnext_scan_request is old_request
+        assert (tuple(dialog.plot.listDataItems()), tuple(dialog.right_vb.addedItems)) == (old_items, old_right)
         retained = (page._metadata_result, page._scan_roi_result,
                     dialog._vnext_table_result, dialog._vnext_scan_result,
                     dialog._vnext_roi_result)
         unique = {id(value): value for value in retained if value is not None}
-        assert sum(value.storage_bytes for value in unique.values()) == 128 << 20
+        assert sum(value.storage_bytes for value in unique.values()) == 96 << 20
 
         assert consume("scan_plot", scan, scan_request)
         assert (page._scan_roi_result is dialog._vnext_scan_result is scan
-                and dialog._vnext_roi_result is None)
+                and dialog._vnext_roi_result is roi)
         preview_request = ("roi_preview", (), (table.receipt,
                            table.table_fingerprint, table.labels, table.labels[0]))
         preview = RoiPreviewResult(
             AnalysisDisposition.COMPLETED, "OK", receipt=table.receipt,
             table_fingerprint=table.table_fingerprint, labels=table.labels,
             label=table.labels[0], image=np.ones((3, 3)),
-            result_fingerprint="retained-preview", storage_bytes=64 << 20)
+            result_fingerprint="retained-preview", storage_bytes=32 << 20)
         assert consume("roi_preview", preview, preview_request)
         picker = dialog._roi_dialog; binding = page._roi_preview_binding; destroyed = []
         picker.destroyed.connect(lambda *_args: destroyed.append(True))
@@ -2531,11 +2681,11 @@ def test_p37b_shared_scan_roi_replacement_retires_prior_payload_graph_only_after
         assert consume("metadata", replacement, replacement_facts)
         assert page._metadata_result is dialog._vnext_table_result is replacement
         assert page._scan_roi_result is page._roi_preview_binding is None
-        assert dialog._roi_dialog is None
+        assert dialog._roi_dialog is picker and picker._image is None
         assert not dialog.plot.listDataItems() and not dialog.right_vb.addedItems
         QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
         qapp.processEvents()
-        assert destroyed == [True]
+        assert not destroyed
 
         page._scan_roi_result = scan
         dialog.set_vnext_scan_result(scan, scan_request[2])
@@ -2603,6 +2753,7 @@ def test_p37b_batch_live_texture_export_writer_and_private_average_are_absent(
     from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.help_topics import diagnostic_text
 
     assert HELD_REASONS == {
         "peak_live": "P3_7_LIVE_FITTING_UNAVAILABLE",
@@ -2621,15 +2772,15 @@ def test_p37b_batch_live_texture_export_writer_and_private_average_are_absent(
     try:
         scan, peak, phase = dialogs
         assert not scan.save_btn.isEnabled()
-        assert scan.save_btn.toolTip() == HELD_REASONS["export"]
+        assert scan.save_btn.toolTip() == diagnostic_text(HELD_REASONS["export"])
         assert not peak.live_check.isEnabled() and not peak.live_check.isChecked()
-        assert peak.live_check.toolTip() == HELD_REASONS["peak_live"]
+        assert peak.live_check.toolTip() == diagnostic_text(HELD_REASONS["peak_live"])
         assert not peak.batch_btn.isEnabled()
-        assert peak.batch_btn.toolTip() == HELD_REASONS["peak_batch"]
+        assert peak.batch_btn.toolTip() == diagnostic_text(HELD_REASONS["peak_batch"])
         assert not phase.texture_combo.isEnabled()
-        assert phase.texture_combo.toolTip() == HELD_REASONS["phase_texture"]
+        assert phase.texture_combo.toolTip() == diagnostic_text(HELD_REASONS["phase_texture"])
         assert not phase.batch_btn.isEnabled()
-        assert phase.batch_btn.toolTip() == HELD_REASONS["phase_batch"]
+        assert phase.batch_btn.toolTip() == diagnostic_text(HELD_REASONS["phase_batch"])
     finally:
         for dialog in dialogs: dialog.close()
         qapp.processEvents()
@@ -2660,3 +2811,64 @@ def test_p37b_legacy_dialog_defaults_remain_reachable_only_for_canonical_callers
     finally:
         for dialog in dialogs: dialog.close()
         qapp.processEvents()
+
+
+def test_metadata_dialog_selects_among_a_results_sources(qapp):
+    """Codex's Stitch/Int reuse audit R3: a result read from several sources (a grouped Stitch result's member
+    scans) gets the shared dialog's own source selector, not a page-built one. The first source shows at once
+    with its note; another replaces it; a source whose table is not complete shows its code."""
+    from dataclasses import replace
+    from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog, MetadataSource
+    first, second = _table(), _table(fingerprint="other")
+    missing = replace(_table(), disposition=AnalysisDisposition.REFUSED, code="SOURCE_CHANGED")
+    dialog = MetadataResultDialog()
+    try:
+        assert dialog.source_selector is None  # a one-table result has none
+        dialog.adopt_sources((MetadataSource("scan 1", first, (1, 2), ("1-0", "1-1"), "2 contributing frames"),
+                              MetadataSource("scan 2", second, (3,), ("2-0",)),
+                              MetadataSource("scan 3", missing)))
+        assert dialog.source_selector.count() == 3 and dialog.layout().indexOf(dialog.source_selector) == 0
+        assert dialog.table.rowCount() == 2 and dialog.table.verticalHeaderItem(0).text() == "1-0"
+        assert dialog.status.text() == "2 contributing frames"
+        dialog.source_selector.setCurrentIndex(1)
+        assert dialog.table.rowCount() == 1 and dialog.table.verticalHeaderItem(0).text() == "2-0"
+        assert dialog.status.text() == "OK"
+        dialog.source_selector.setCurrentIndex(2)
+        assert dialog.table.rowCount() == 0 and dialog.status.text() == "SOURCE_CHANGED"
+    finally:
+        dialog.close()
+
+
+def test_int_metadata_popup_plot_uses_detached_rows_and_outlives_popup(qapp, tmp_path):
+    from xrd_tools.analysis.scan_operations import run_metadata_table
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    spec = tmp_path / "scan"
+    spec.write_text("#F scan\n#E 1\n#D today\n#O0 del\n\n"
+                    "#S 1 ascan del 0 2 2 1\n#D today\n#P0 0\n"
+                    "#N 2\n#L del  diode\n0 10\n1 20\n2 30\n")
+    result = run_metadata_table(MetadataTablePlan(spec, kind="spec", scan="1"))
+    page = _page()
+    try:
+        page._open_analysis_mount("metadata")
+        popup = page._metadata_dialog
+        assert not popup.plot_button.isEnabled()
+        assert popup.plot_button.toolTip()
+        popup.adopt_result(result, selected_labels=(2, 0), row_labels=("2", "0"))
+        popup.plot_button.click()
+        plot = page._metadata_plot_dialog
+        assert isinstance(plot, ScanPlotDialog)
+        assert plot.parentWidget() is page and plot.isVisible()
+        assert plot.source_widget.isHidden() and plot.roi_btn.isHidden()
+        np.testing.assert_array_equal(plot._table["diode"], [30, 10])
+        popup.clear_result()
+        assert not popup.plot_button.isEnabled()
+        popup.close(); qapp.processEvents()
+        assert plot.isVisible()
+        _check_item(plot.y_list, "diode")
+        plot.x_combo.setCurrentText("frame_index")
+        assert any(np.array_equal(curve.getData()[1], [30, 10])
+                   for curve in plot.plot.listDataItems())
+        page.close_workspace(); qapp.processEvents()
+        assert page._metadata_plot_dialog is None
+    finally:
+        _close_page(page, qapp)

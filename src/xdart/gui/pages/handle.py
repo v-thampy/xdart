@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Protocol, TYPE_CHECKING
 
-from .values import ActionOutcome, CloseReceipt, PageCapability, PageKey
+from .values import ActionCompleted, ActionOutcome, ActionRefused, CloseReceipt, PageCapability, PageKey
 
 if TYPE_CHECKING:
     from pyqtgraph import QtWidgets
@@ -14,6 +14,23 @@ if TYPE_CHECKING:
 
 class OpenFolderPort(Protocol):
     def request(self) -> ActionOutcome: ...
+
+
+class BrowserDirectoryPort(Protocol):
+    """The current browser location, carried between retained workspaces."""
+
+    @property
+    def directory(self) -> str | None: ...
+
+    def set_directory(self, path: str) -> ActionOutcome: ...
+
+
+class ProjectLocationPort(Protocol):
+    """Project and output folder defaults, used only when a page has no Project."""
+
+    def location(self) -> tuple[str, str]: ...
+
+    def inherit(self, location: tuple[str, str]) -> None: ...
 
 
 class SettingsPersistencePort(Protocol):
@@ -30,6 +47,22 @@ class WriteModePort(Protocol):
     def toggle(self) -> ActionOutcome: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RunBarWriteMode:
+    """The write-mode port of a page whose ``RunControlsBar`` holds its Append/Replace choice (Stitch, RSM): the
+    shortcut clicks the bar's own toggle, so the page hears it as any click; refused while the bar holds the
+    toggle locked (a run)."""
+
+    run_bar: object
+
+    def toggle(self) -> ActionOutcome:
+        button = self.run_bar.writeModeButton
+        if not button.isEnabled():
+            return ActionRefused("Append/Replace cannot change during a run")
+        button.click()
+        return ActionCompleted(f"write-mode-{self.run_bar.write_mode().casefold()}")
+
+
 class SlicePinPort(Protocol):
     def pin(self) -> ActionOutcome: ...
 
@@ -44,6 +77,14 @@ class AppMenuHosts:
     help_menu: "QtWidgets.QMenu"
     analysis_menu: "QtWidgets.QMenu | None" = None
     tool_requested: object | None = None
+    #: a signal (page key, processing mode): open that page in that mode (Codex audit G-F3)
+    mode_requested: object | None = None
+
+
+class ProcessingModePort(Protocol):
+    """Select one of the page's processing modes (another page asked for it by name)."""
+
+    def select(self, mode: str) -> ActionOutcome: ...
 
 
 class AppMenusPort(Protocol):
@@ -67,6 +108,9 @@ class PageHandle:
     activity: RunActivityPort | None = None
     app_menus: AppMenusPort | None = None
     diagnostics: LayoutDiagnosticsPort | None = None
+    processing_mode: ProcessingModePort | None = None
+    browser_directory: BrowserDirectoryPort | None = None
+    project_location: ProjectLocationPort | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key:
@@ -90,6 +134,7 @@ _PORTS = {
     PageCapability.RUN_ACTIVITY: "activity",
     PageCapability.APP_MENU_HOSTS: "app_menus",
     PageCapability.LAYOUT_DIAGNOSTICS: "diagnostics",
+    PageCapability.PROCESSING_MODE: "processing_mode",
 }
 
 

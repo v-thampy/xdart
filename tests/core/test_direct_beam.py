@@ -155,6 +155,37 @@ def test_integer_saturation_and_bad_shape():
     assert 'shape' in result.rejection_reasons[3]
 
 
+@pytest.mark.parametrize('damage', ['static_only', 'saturation', 'core'])
+def test_masked_uint32_sentinel_is_not_valid_saturation(damage):
+    angles = [8., 7.5, 7., 6.5, 6.]
+    images, _, _ = beam_images(angles)
+    # Corrected counts above 65535 are valid; the acquisition cutoff is explicit.
+    images = [(image * 25).astype('uint32') for image in images]
+    mask = np.zeros(images[0].shape, bool)
+    mask[22, 12] = True
+    for image in images:
+        image[22, 12] = np.iinfo('uint32').max
+    expected = np.ones(5, bool)
+    if damage == 'saturation':
+        images[1][22, 20] = 200000  # Unmasked and away from the beam core.
+        expected[1] = False
+    elif damage == 'core':
+        mask[22, 80] = True
+        images[2][22, 80] = np.iinfo('uint32').max
+        expected[2] = False
+    result = run(angles, images, mask=mask, saturation=200000)
+    np.testing.assert_array_equal(result.used, expected)
+    assert result.distance_m == pytest.approx(.08, rel=1e-4)
+    assert result.intercept_px == pytest.approx(80., abs=.001)
+    if damage == 'saturation':
+        assert 'saturated' in result.rejection_reasons[1]
+    elif damage == 'core':
+        assert 'masked/gap' in result.rejection_reasons[2]
+    # Removing the static mask makes the very same sentinel invalid saturation.
+    with pytest.raises(ValueError, match='saturated pixels'):
+        run(angles, images, saturation=200000)
+
+
 def test_linear_notebook_comparison():
     angles = np.array([7.15,7.08,7.,6.97,6.88])
     images, centres, _ = beam_images(angles)
@@ -235,6 +266,227 @@ def test_format_reader_and_exact_frame_references(tmp_path,kind):
         refs[2]=(path,99,'/custom/data')
         result=run(angles,refs)
         assert not result.used[2] and result.rejection_reasons[2]
+
+
+@pytest.mark.parametrize('layout', ['nexus', 'external_link', 'bluesky'])
+def test_nexus_native_references_and_streams_preserve_selected_rows(tmp_path, layout):
+    import h5py
+    from xrd_tools.io.image import read_image
+    from xrd_tools.io.nexus import open_nexus_image_stack
+    from xrd_tools.sources import ContainerCursor
+
+    angles = np.array([8., 7.5, 7., 6.5, 6.])
+    images = np.asarray(beam_images(angles)[0])
+    images = (images * 25).astype('uint32')
+    mask = np.zeros(images.shape[1:], bool)
+    mask[22, 12] = True
+    images[:, 22, 12] = np.iinfo('uint32').max
+    path = tmp_path / 'beam_master.h5'
+    if layout == 'external_link':
+        part = tmp_path / 'beam_data_000001.h5'
+        with h5py.File(part, 'w') as f:
+            f['entry/data/data'] = images
+    with h5py.File(path, 'w') as f:
+        entry = f.create_group('entry')
+        entry.attrs['NX_class'] = 'NXentry'
+        data = entry.create_group('data')
+        data.attrs['NX_class'] = 'NXdata'
+        data.attrs['signal'] = 'image'
+        if layout == 'external_link':
+            data['image'] = h5py.ExternalLink(part.name, '/entry/data/data')
+            entry['instrument/detector/detectorSpecific/nimages'] = 1
+        else:
+            data['image'] = images
+        if layout == 'bluesky':
+            f.attrs['creator'] = 'NXWriter'
+            entry['end_time'] = np.bytes_('2026-09-23T00:00:00')
+            entry['instrument/bluesky/metadata/motors'] = np.bytes_('!!python/tuple\n- del\n')
+            entry['instrument/positioners/del/value'] = angles
+            data['del'] = angles
+            data['image'].attrs['signal_type'] = 'detector'
+    with open_nexus_image_stack(path) as stack:
+        assert stack.shape == images.shape  # Actual frames, not header nimages.
+    selected = (4, 0, 2)  # Deliberate reordered subset of a larger container.
+    refs = tuple((path, i) for i in selected)
+    points = tuple(('scan-8', i) for i in selected)
+    kwargs = dict(mask=mask, saturation=200000, frame_ids=refs, point_ids=points)
+    raw = run(angles[list(selected)], refs, **kwargs)
+    masked = run(angles[list(selected)],
+        (read_image(p, frame=i, mask=mask, exact_frame=True) for p, i in refs), **kwargs)
+    with ContainerCursor(path) as cursor:
+        motor = cursor.metadata_provider().motors()['del'] if layout == 'bluesky' else angles
+        assert len(motor) == cursor.frame_count
+        streamed = run(motor[list(selected)],
+            (cursor.read_frame(i) for i in selected), **kwargs)
+    for result in (raw, masked, streamed):
+        assert result.used.all()
+        assert result.frame_ids == refs and result.point_ids == points
+        np.testing.assert_array_equal(result.angles_deg, angles[list(selected)])
+        np.testing.assert_allclose(result.centres_px, raw.centres_px, atol=1e-6, rtol=0)
+        assert result.distance_mm == pytest.approx(80., rel=1e-4)
+    if layout == 'bluesky':
+        automatic = calibrate_direct_beam_scan(path, detector='Detector', detector_config=config(),
+            beam_pixel=(80, 22), angle_zero_deg=7., mask=mask, saturation=200000)
+        assert automatic.used.all()
+        np.testing.assert_array_equal(automatic.angles_deg, angles)
+
+
+@pytest.fixture
+def direct_beam_sources(tmp_path):
+    import h5py
+    angles = np.array([8., 7.5, 7., 6.5, 6.])
+    images = (np.asarray(beam_images(angles)[0]) * 25).astype('uint32')
+    images[:, 22, 12] = np.iinfo('uint32').max
+    mask = np.zeros(images.shape[1:], bool)
+    mask[22, 12] = True
+    spec = tmp_path / 'beam.spec'
+    spec.write_text('#F beam\n#O0 eta\n\n#S 8 ascan del 8 6 4 1\n#P0 0\n#N 1\n#L del\n'
+                    + '\n'.join(str(a) for a in angles) + '\n')
+    nexus = tmp_path / 'beam.nxs'
+    with h5py.File(nexus, 'w') as f:
+        f.create_group('entry').attrs['NX_class'] = 'NXentry'
+        f['entry/data/del'] = angles
+        f['entry/data/image'] = images
+    master = tmp_path / 'beam_master.h5'
+    with h5py.File(master, 'w') as f:
+        f.create_group('entry').attrs['NX_class'] = 'NXentry'
+        f['entry/data/data_000001'] = h5py.ExternalLink(nexus.name, '/entry/data/image')
+        f['entry/instrument/detector/detectorSpecific/nimages'] = 1
+    options = dict(detector='Detector', detector_config=config(),
+                   beam_pixel=(71, 22), angle_zero_deg=7., mask=mask, saturation=200000)
+    return spec, nexus, master, angles, options
+
+
+@pytest.mark.parametrize('kind', ['spec_eiger', 'nexus', 'explicit_eiger'])
+def test_single_scan_wrapper_loads_sources(direct_beam_sources, kind):
+    spec, nexus, master, angles, options = direct_beam_sources
+    if kind == 'spec_eiger':
+        result = calibrate_direct_beam_scan(spec, '8.1', image_file=master, **options)
+        assert result.point_ids == tuple(('8.1', i) for i in range(5))
+    elif kind == 'nexus':
+        result = calibrate_direct_beam_scan(nexus, **options)
+    else:
+        result = calibrate_direct_beam_scan(master, angles_deg=angles, **options)
+    path = nexus if kind == 'nexus' else master
+    assert result.frame_ids == tuple((path, i) for i in range(5))
+    np.testing.assert_array_equal(result.angles_deg, angles)
+    assert result.used.all()
+    assert result.distance_mm == pytest.approx(80., rel=1e-4)
+    assert result.intercept_px == pytest.approx(80., abs=.001)  # Free, not beam x=71.
+
+
+def test_source_loader_is_lazy_closes_and_preserves_subset(direct_beam_sources):
+    import h5py
+    from xrd_tools.integrate import open_direct_beam_scan
+    spec, nexus, master, angles, options = direct_beam_sources
+    before = h5py.h5f.get_obj_count()
+    with open_direct_beam_scan(spec, '8.1', image_file=master,
+                               frame_indices=(4, 0, 2)) as inputs:
+        frames = list(inputs.images)
+        assert all(frame.image is None for frame in frames)
+        np.testing.assert_array_equal(inputs.angles_deg, angles[[4, 0, 2]])
+        assert inputs.frame_ids == tuple((master, i) for i in (4, 0, 2))
+        assert inputs.point_ids == tuple(('8.1', i) for i in (4, 0, 2))
+        result = calibrate_direct_beam(inputs.angles_deg, frames,
+            frame_ids=inputs.frame_ids, point_ids=inputs.point_ids, **options)
+        assert result.used.all()
+    assert h5py.h5f.get_obj_count() == before
+    with pytest.raises(ValueError):
+        calibrate_direct_beam_scan(nexus, **{**options, 'beam_pixel': (-1, -1)})
+    assert h5py.h5f.get_obj_count() == before
+
+
+def test_source_wrapper_count_mismatch_and_explicit_subset(direct_beam_sources):
+    import h5py
+    spec, nexus, master, angles, options = direct_beam_sources
+    with h5py.File(nexus, 'r+') as f:
+        del f['entry/data/del']
+        f['entry/data/del'] = angles[:4]
+    with pytest.raises(ValueError, match='count'):
+        calibrate_direct_beam_scan(nexus, **options)
+    result = calibrate_direct_beam_scan(nexus, frame_indices=(3, 0, 2), **options)
+    np.testing.assert_array_equal(result.angles_deg, angles[[3, 0, 2]])
+    assert result.frame_ids == tuple((nexus, i) for i in (3, 0, 2))
+    with pytest.raises(ValueError, match='angle'):
+        calibrate_direct_beam_scan(nexus, frame_indices=(0, 2, 4), **options)
+
+
+def test_source_wrapper_rejects_missing_motor_and_conflicting_inputs(direct_beam_sources):
+    spec, nexus, master, angles, options = direct_beam_sources
+    with pytest.raises(ValueError, match='del'):
+        calibrate_direct_beam_scan(master, **options)
+    with pytest.raises(ValueError, match='eta'):
+        calibrate_direct_beam_scan(spec, 8, motor='eta', image_file=master, **options)
+    with pytest.raises(ValueError, match='either|only one'):
+        calibrate_direct_beam_scan(spec, 8, images=(), image_file=master, **options)
+
+
+def test_frame_source_labels_metadata_and_read_rejections(tmp_path):
+    import tifffile
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.sources import MemoryFrameSource
+    angles = [8., 7.5, 7., 6.5, 6.]
+    labels = (10, 20, 30, 40, 50)
+    frames = []
+    for label, angle, image in zip(labels, angles, beam_images(angles)[0]):
+        path = tmp_path / f'{label}.tif'
+        if label != 30:
+            tifffile.imwrite(path, image.astype('float32'))
+        frames.append(ScanFrame(index=label, source_path=path, metadata={'del': angle}))
+    source = MemoryFrameSource(frames, name='run-uid')
+    result = calibrate_direct_beam_scan(source, detector='Detector', detector_config=config(),
+                                       beam_pixel=(80, 22), angle_zero_deg=7.)
+    assert result.frame_ids == tuple(('run-uid', label) for label in labels)
+    assert result.point_ids == result.frame_ids
+    np.testing.assert_array_equal(result.angles_deg, angles)
+    np.testing.assert_array_equal(result.used, [1, 1, 0, 1, 1])
+    assert 'FileNotFoundError' in result.rejection_reasons[2]
+    assert source.load_frame(10).shape == (45, 161)  # Caller still owns its source.
+
+
+def test_caller_source_explicit_angles_and_original_labels():
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.sources import MemoryFrameSource
+    angles = np.array([8., 7.5, 7., 6.5, 6.])
+    labels = (10, 20, 30, 40, 50)
+    source = MemoryFrameSource([ScanFrame(index=i, image=image)
+        for i, image in zip(labels, beam_images(angles)[0])], name='remote-run-uid')
+    result = calibrate_direct_beam_scan(source, angles_deg=angles, frame_indices=(50, 10, 30),
+        detector='Detector', detector_config=config(), beam_pixel=(80, 22), angle_zero_deg=7.)
+    np.testing.assert_array_equal(result.angles_deg, angles[[4, 0, 2]])
+    assert result.frame_ids == tuple(('remote-run-uid', i) for i in (50, 10, 30))
+    assert result.used.all()
+
+
+def test_caller_cursor_remains_open_and_nondefault_entry(direct_beam_sources):
+    import h5py
+    from xrd_tools.sources import ContainerCursor, NexusStackSource
+    _, nexus, master, angles, options = direct_beam_sources
+    with ContainerCursor(master) as cursor:
+        source = NexusStackSource(master, cursor=cursor)
+        result = calibrate_direct_beam_scan(source, angles_deg=angles, **options)
+        assert result.used.all()
+        assert cursor.read_frame(0).dtype == np.dtype('uint32')
+    with h5py.File(nexus, 'r+') as f:
+        f.move('entry', 'measurement')
+    result = calibrate_direct_beam_scan(nexus, entry='measurement', **options)
+    assert result.used.all()
+    np.testing.assert_array_equal(result.angles_deg, angles)
+
+
+def test_nexus_angle_read_does_not_materialize_images(direct_beam_sources, monkeypatch):
+    import h5py
+    from xrd_tools.io.nexus import read_nexus
+    _, nexus, _, angles, _ = direct_beam_sources
+    reads = []
+    original = h5py.Dataset.__array__
+    def observed_read(dataset, *args, **kwargs):
+        reads.append(dataset.name)
+        return original(dataset, *args, **kwargs)  # Spy only; actual HDF5 reads.
+    monkeypatch.setattr(h5py.Dataset, '__array__', observed_read)
+    result = read_nexus(nexus, motor_names=['del'], counter_names=[])
+    np.testing.assert_array_equal(result.angles['del'], angles)
+    assert '/entry/data/image' not in reads
 
 
 def test_import_is_lazy_and_headless():
@@ -329,6 +581,199 @@ def test_streaming_does_not_retain_input_frames():
             previous.append(weakref.ref(image))
             yield image
             del image
-    result=run(angles,stream())
+    ids = tuple(('run-uid', event) for event in (18, 3, 25, 4, 6))
+    result=run(angles,stream(),frame_ids=ids,point_ids=ids)
     assert result.used.all()
+    assert result.frame_ids == result.point_ids == ids
     assert all(ref() is None for ref in previous)
+
+
+def test_find_beam_spot_ignores_a_hot_pixel_and_a_gap():
+    """The automatic beam pixel (maintainer, 2026-09-29): the brightest 5×5 sum, refined as a
+    centroid; a lone hot pixel brighter than the beam's peak and a module gap do not attract it."""
+    from xrd_tools.integrate.direct_beam import find_beam_spot
+    yy, xx = np.indices((45, 161))
+    image = 12 + .015*xx + 4000*np.exp(-.5*(((xx-80.3)/1.6)**2+((yy-22.6)/1.6)**2))
+    image[5, 150] = 30000.  # hotter than the beam's peak, alone
+    gap = np.zeros(image.shape, bool)
+    gap[:, 60:64] = True  # a module gap crossing the beam's row
+    image[gap] = -1
+    assert find_beam_spot(image, gap) == pytest.approx((80.3, 22.6), abs=.05)
+    with pytest.raises(ValueError, match='no direct-beam spot stands clear'):
+        find_beam_spot(12 + .015*xx)
+
+
+def test_the_beam_pixel_is_found_on_the_frame_nearest_the_zero():
+    angles = np.array([8.1, 7.7, 7.13, 7., 6.82, 6.2, 5.7])
+    images, expected, beam = beam_images(angles)
+    images[3] = None  # the zero frame is missing: the next nearest, 7.13°, shows the beam
+    found = calibrate_direct_beam(angles, iter(images), detector='Detector', detector_config=config(),
+                                  angle_zero_deg=7.)
+    assert found.beam_pixel == pytest.approx((expected[2], beam[1]), abs=.05)
+    given = run(angles, iter(images), beam=beam)  # the same strips as a typed beam pixel
+    assert given.beam_pixel == beam and found.distance_m == given.distance_m
+    flat = [np.full((45, 161), 12.) for _ in angles]
+    with pytest.raises(ValueError, match='no frame shows the direct beam; enter the beam pixel'):
+        calibrate_direct_beam(angles, iter(flat), detector='Detector', detector_config=config(), angle_zero_deg=7.)
+
+
+def test_the_beam_spot_is_found_on_the_real_17_2_direct_beam_scan():
+    """17-2's direct-beam scan 3 (nu −5…5°, Pilatus 300K-W .raw, headerless): the spot found at the
+    zero is the beamline's recorded direct-beam pixel (its ROIs centre on 279, 97), and the fit equals
+    the one from that pixel typed in."""
+    import os
+    from xrd_tools.integrate.direct_beam import calibrate_direct_beam_scan
+    configured = os.environ.get("XDART_TEST_DATA")
+    if not configured:
+        pytest.skip("XDART_TEST_DATA is not configured")
+    root = Path(configured) / "stitching" / "data" / "direct_beam"
+    if not (root / "direct_beam").is_file():
+        pytest.skip("XDART_TEST_DATA lacks stitching/data/direct_beam")
+    common = dict(scan="3", motor="nu", image_dir=root, filename_template="b_thampy_direct_beam_scan{scan}_{point:04d}.raw",
+                  reader_options={"detector_shape": (195, 1475), "raw_dtype": "int32", "raw_header_skip": 0},
+                  detector="Pilatus300kw", motion="horizontal", angle_zero_deg=0.)
+    found = calibrate_direct_beam_scan(root / "direct_beam", beam_pixel=None, **common)
+    typed = calibrate_direct_beam_scan(root / "direct_beam", beam_pixel=(279., 97.), **common)
+    assert found.beam_pixel == pytest.approx((279., 97.), abs=.5)
+    assert found.used.all() and found.distance_m == typed.distance_m
+
+
+@pytest.mark.parametrize('motion,shape,pitches,true_zero', [
+    ('horizontal', (45, 161), (120e-6, 80e-6), (70., 22.)),
+    ('vertical', (171, 39), (55e-6, 130e-6), (19., 80.)),
+])
+def test_the_zero_angle_beam_pixel_is_the_fits_intercept_not_the_strip_locator(motion, shape, pitches, true_zero):
+    """Codex review F1: with no frame at the zero, the spot found on the nearest frame only places
+    the strips; the zero-angle beam is the fitted centre along the motion, the strip across it."""
+    angles = np.array([6.6, 6.8, 7.2, 7.4])  # the zero is 7°, and no frame is at it
+    images, _expected, origin = beam_images(angles, shape=shape, pitches=pitches, motion=motion,
+                                            centre=true_zero)
+    result = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(shape, pitches),
+                                   beam_pixel=None, angle_zero_deg=7., motion=motion)
+    axis = 0 if motion == 'horizontal' else 1
+    assert abs(result.beam_pixel[axis] - origin[axis]) > 1  # the nearest frame is not at the zero
+    assert result.zero_beam_pixel == pytest.approx(origin, abs=.05)
+    linear = calibrate_direct_beam(angles, images, detector='Detector', detector_config=config(shape, pitches),
+                                   beam_pixel=None, angle_zero_deg=7., motion=motion, model='linear')
+    assert linear.zero_beam_pixel == pytest.approx(origin, abs=.2)
+
+
+def _grouped_beam_source(tmp_path, operation, *, damage=None, image_index=2):
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.sources.point_images import PointImagePolicy
+    from xrd_tools.sources.registry import open_source
+
+    angles = np.array([8., 7.5, 7., 6.5, 6.])
+    images, centres, beam = beam_images(angles)
+    raw = []
+    for image in images:
+        first = image.astype(np.uint16)
+        second = (2 * image).astype(np.uint16)
+        if damage == 'signed':
+            first = np.full(image.shape, 1200, dtype=np.uint16)
+            second = (1200 + image - 50).astype(np.uint16)
+        raw.extend((first, second))
+    if damage in {'cutoff', 'dtype', 'unused'}:
+        raw[2][22, 20] = np.iinfo(np.uint16).max if damage == 'dtype' else 9000
+    path = tmp_path / 'beam'
+    path.write_text('#F beam\n#O0 del\n\n#S 1 ascan del 8 6 4 1\n#P0 7\n#N 1\n#L del\n'
+                    + '\n'.join(str(angle) for angle in angles) + '\n')
+    for index, image in enumerate(raw):
+        image.tofile(tmp_path / f'beam_scan1_{index:04}.raw')
+    policy = PointImagePolicy(2, operation, image_index=image_index)
+    source = open_source(SourceSpec(path, SourceKind.SPEC, options={
+        'scan': '1.1', 'image_dir': str(tmp_path), 'require_complete_images': True,
+        'point_images': policy.to_dict(),
+        'read_image_kwargs': {'detector_shape': (45, 161), 'raw_dtype': 'uint16'}}))
+    options = dict(detector='Detector', detector_config=config(), beam_pixel=beam, angle_zero_deg=7.)
+    return source, angles, centres, options
+
+
+@pytest.mark.parametrize('damage,saturation', [('cutoff', 9000), ('dtype', None)])
+def test_grouped_direct_beam_rejects_native_saturation_hidden_by_average(tmp_path, damage, saturation):
+    source, angles, centres, options = _grouped_beam_source(tmp_path, 'average', damage=damage)
+    try:
+        result = calibrate_direct_beam_scan(source, saturation=saturation, **options)
+        np.testing.assert_array_equal(result.used, [True, False, True, True, True])
+        assert 'saturated pixels in beam strip/ROI' in result.rejection_reasons[1]
+        assert result.distance_m == pytest.approx(.08, rel=2e-4)
+        np.testing.assert_array_equal(result.angles_deg, angles)
+        np.testing.assert_allclose(result.centres_px[result.used], centres[result.used], atol=.002)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+@pytest.mark.parametrize('operation', ['average', 'select', 'difference'])
+def test_grouped_direct_beam_clean_points_preserve_gaussian_fit(tmp_path, operation):
+    source, angles, centres, options = _grouped_beam_source(tmp_path, operation)
+    try:
+        result = calibrate_direct_beam_scan(source, **options)
+        assert result.used.all()
+        assert result.distance_m == pytest.approx(.08, rel=2e-4)
+        np.testing.assert_allclose(result.centres_px, centres, atol=.002)
+        np.testing.assert_array_equal(result.angles_deg, angles)
+        assert result.point_ids == tuple((source.path, label) for label in source.frame_indices)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+def test_grouped_direct_beam_select_ignores_unused_native_saturation(tmp_path):
+    source, _angles, centres, options = _grouped_beam_source(tmp_path, 'select', damage='unused')
+    try:
+        result = calibrate_direct_beam_scan(source, saturation=9000, **options)
+        assert result.used.all()
+        np.testing.assert_allclose(result.centres_px, centres, atol=.002)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+@pytest.mark.parametrize('exclusion', ['mask', 'roi', 'strip'])
+def test_grouped_direct_beam_native_saturation_respects_static_strip_and_roi(tmp_path, exclusion):
+    source, _angles, centres, options = _grouped_beam_source(tmp_path, 'average', damage='cutoff')
+    if exclusion == 'mask':
+        mask = np.zeros((45, 161), dtype=bool)
+        mask[22, 20] = True
+        options['mask'] = mask
+    elif exclusion == 'roi':
+        options['roi'] = (45, 19, 116, 26)
+    else:
+        # The same used native value, outside the fitted horizontal strip.
+        raw_path = tmp_path / 'beam_scan1_0002.raw'
+        image = np.fromfile(raw_path, dtype=np.uint16).reshape(45, 161)
+        image[22, 20], image[5, 20] = image[5, 20], image[22, 20]
+        image.tofile(raw_path)
+    try:
+        result = calibrate_direct_beam_scan(source, saturation=9000, **options)
+        assert result.used.all()
+        np.testing.assert_allclose(result.centres_px, centres, atol=.002)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+def test_grouped_direct_beam_difference_keeps_signed_background_and_positive_peak(tmp_path):
+    source, _angles, centres, options = _grouped_beam_source(tmp_path, 'difference', damage='signed')
+    try:
+        assert (source.load_frame(0) < 0).any()
+        result = calibrate_direct_beam_scan(source, **options)
+        assert result.used.all()
+        assert result.distance_m == pytest.approx(.08, rel=2e-4)
+        np.testing.assert_allclose(result.centres_px, centres, atol=.002)
+    finally:
+        getattr(source, 'close', lambda: None)()
+
+
+def test_grouped_direct_beam_motion_skips_native_saturated_endpoint(tmp_path):
+    from xrd_tools.integrate.direct_beam import infer_direct_beam_motion, open_direct_beam_scan
+
+    source, _angles, _centres, options = _grouped_beam_source(tmp_path, 'average', damage='cutoff')
+    try:
+        with open_direct_beam_scan(source, frame_indices=(1, 2, 3, 4)) as scan:
+            images = list(scan.images)
+            motion, displacement, endpoints = infer_direct_beam_motion(images,
+                detector=options['detector'], detector_config=options['detector_config'],
+                saturation=9000, return_details=True)
+        assert motion == 'horizontal'
+        assert displacement[0] > 0
+        assert endpoints == (1, 3)
+    finally:
+        getattr(source, 'close', lambda: None)()

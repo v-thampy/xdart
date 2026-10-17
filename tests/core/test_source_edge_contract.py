@@ -90,6 +90,7 @@ def _dangling_canonical(tmp_path):
         spec = det.create_group("detectorSpecific")
         spec.create_dataset("pixel_mask", data=np.zeros((32, 32), np.uint32))
         spec.create_dataset("flatfield", data=np.ones((32, 32), np.float32))
+        spec.create_dataset("eiger_fw_version", data="release-2022.1.2")  # the DECTRIS vendor block
     return master, target
 
 

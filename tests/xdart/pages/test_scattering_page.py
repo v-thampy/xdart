@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from threading import current_thread
 
@@ -24,9 +25,9 @@ from xdart.gui.pages.catalog import (
     BUILTIN_DESCRIPTORS,
     BUILTIN_PAGES,
     DEFAULT_PAGE_KEY,
-    RSM_TOOL,
+    RSM_PAGE,
     SCATTERING_WORKSPACE_PAGE,
-    STITCH_TOOL,
+    STITCH_PAGE,
 )
 from xdart.gui.pages.registry import PageRegistry
 from xdart.gui.pages.values import (
@@ -61,29 +62,27 @@ def isolated_settings(tmp_path, monkeypatch):
 def test_catalog_registers_current_workspace_first_and_as_default():
     assert tuple(page.key for page in BUILTIN_PAGES) == (
         "scattering-workspace",
+        "stitch",
+        "rsm",
     )
     assert DEFAULT_PAGE_KEY == "scattering-workspace"
     assert BUILTIN_PAGES[0] is SCATTERING_WORKSPACE_PAGE
-    assert BUILTIN_DESCRIPTORS == (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)
-    assert STITCH_TOOL.key == STITCH_TOOL_KEY == "stitch"
-    assert (
-        STITCH_TOOL.label,
-        STITCH_TOOL.category,
-        STITCH_TOOL.order,
-        STITCH_TOOL.tool_kind,
-    ) == ("Stitching", "analysis", 100, "processing")
-    assert RSM_TOOL.key == RSM_TOOL_KEY == "rsm"
-    assert (
-        RSM_TOOL.label,
-        RSM_TOOL.category,
-        RSM_TOOL.order,
-        RSM_TOOL.tool_kind,
-    ) == ("Reciprocal Space Map", "analysis", 110, "processing")
+    assert BUILTIN_DESCRIPTORS == BUILTIN_PAGES
+    assert STITCH_PAGE.key == STITCH_TOOL_KEY == "stitch"
+    # the native RSM workspace (AUD-9) on the RSM tool's key
+    assert RSM_PAGE.key == RSM_TOOL_KEY == "rsm"
+    assert (RSM_PAGE.label, RSM_PAGE.category, RSM_PAGE.order, RSM_PAGE.lifecycle) == (
+        "RSM", "workspace", 200, PageLifecycle.RETAINED)
+    assert RSM_PAGE.capabilities == frozenset({  # File ▸ Save/Load Settings as Stitch's (G12)
+        PageCapability.OPEN_FOLDER, PageCapability.SETTINGS_PERSISTENCE, PageCapability.RUN_CONTROL,
+        PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE,
+        PageCapability.WRITE_MODE_TOGGLE,
+    })
 
 
 def test_scattering_descriptor_declares_the_frozen_adoption_ports():
     page = SCATTERING_WORKSPACE_PAGE
-    assert page.lifecycle is PageLifecycle.EXIT_ONLY
+    assert page.lifecycle is PageLifecycle.RETAINED
     assert page.order == 0
     assert page.capabilities == frozenset({
         PageCapability.OPEN_FOLDER,
@@ -93,6 +92,7 @@ def test_scattering_descriptor_declares_the_frozen_adoption_ports():
         PageCapability.SLICE_PIN,
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
+        PageCapability.PROCESSING_MODE,  # another page's mode box selects a mode here (Codex audit G-F3)
     })
 
 
@@ -104,9 +104,9 @@ def test_default_selection_is_the_current_workspace():
     assert registry.select(
         "scattering-workspace", DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
     assert registry.select(
-        STITCH_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
+        STITCH_TOOL_KEY, DEFAULT_PAGE_KEY) is STITCH_PAGE
     assert registry.select(
-        RSM_TOOL_KEY, DEFAULT_PAGE_KEY) is SCATTERING_WORKSPACE_PAGE
+        RSM_TOOL_KEY, DEFAULT_PAGE_KEY) is RSM_PAGE
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +136,13 @@ def test_catalog_import_does_not_import_the_scattering_package():
     assert "lazy-ok" in result.stdout
 
 
-def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
+def test_builtin_stitch_selection_retains_native_page_and_integration_workspace(
         qapp, isolated_settings):
     from xdart.gui.pages.values import ActionCompleted
 
     window = _mounted_host(None)
     try:
-        assert STITCH_TOOL.key not in window._tool_handles
+        assert STITCH_TOOL_KEY not in window._tool_handles
         assert window.ui.menuAnalysis is None
         page = window.page_handle.widget
         assert page.findChild(QtWidgets.QToolButton, "analysisMenuButton") is None
@@ -152,65 +152,239 @@ def test_builtin_stitch_action_constructs_one_idle_tool_only_when_opened(
         assert combo.findText("Stitch 2D") >= 0
         assert combo.findText("RSM") >= 0
         requested = []
-        page.toolRequested.connect(requested.append)
+        page.modeRequested.connect(lambda key, mode: requested.append((key, mode)))
+        prior_intent = page._intents.snapshot()
         combo.setCurrentText("Stitch 1D")
-        assert page._shell.run_controls.startButton.isEnabled()
-        page._shell.run_controls.startButton.click()
         qapp.processEvents()
-        handle = window._tool_handles[STITCH_TOOL.key]
-        assert handle.widget.objectName() == "stitchToolDialog"
-        assert handle.widget.parity_hold.text() == (
-            "Mode: 1-D only · 2-D held pending the scan-14 orientation parity oracle"
-        )
-        combo.setCurrentText("Stitch 2D")
-        assert not page._shell.run_controls.startButton.isEnabled()
-        page._shell.run_controls.startButton.click()
-        qapp.processEvents()
-        assert requested == ["stitch"]
-        assert handle.widget.source_widget._external_execution is True
-        assert handle.widget.source_widget._probe_executor is None
+        assert window.selected_page_key == STITCH_PAGE.key
+        handle = window._page_handles[STITCH_PAGE.key]
+        assert handle.widget.objectName() == "stitchPage"
+        assert not handle.widget.isWindow()
+        assert window.centralWidget().currentWidget() is handle.widget
         assert handle.activity.active() is False
-        assert window.open_tool(STITCH_TOOL.key) == ActionCompleted("stitch")
-        assert window._tool_handles[STITCH_TOOL.key] is handle
-        assert RSM_TOOL.key not in window._tool_handles
-        assert handle.close().status is PageCleanup.CLEAN
+        assert page._intents.snapshot() == prior_intent
+        handle.widget.set_field("scan", "14")
+        assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
+        assert window.main_widget is page
+        assert combo.currentText() == prior_intent.thaw().processing_mode
+        combo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        assert window.page_handle is handle
+        assert handle.activity.active() is False
+        assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
+        combo.setCurrentText("Stitch 2D")  # the Stitch page, in Stitch 2D (STITCH-2D-20260930)
+        qapp.processEvents()
+        assert window.page_handle is handle and handle.widget._mode == "Stitch 2D"
+        assert requested == [("stitch", "Stitch 1D"), ("stitch", "Stitch 1D"), ("stitch", "Stitch 2D")]
+        assert handle.activity.active() is False
+        assert window.open_tool(STITCH_TOOL_KEY) == ActionCompleted("stitch")
+        assert window._page_handles[STITCH_PAGE.key] is handle
+        assert handle.widget._value("scan") == "14"
+        assert STITCH_TOOL_KEY not in window._tool_handles
+        assert RSM_TOOL_KEY not in window._tool_handles
     finally:
         window.close()
         window.deleteLater()
         qapp.processEvents()
 
 
-def test_builtin_rsm_action_constructs_one_idle_tool_only_when_opened(
+def test_a_mode_chosen_on_stitch_opens_the_integration_page_in_that_mode(qapp, isolated_settings):
+    """Codex audit G-F3: Int 1D/2D and the Viewers chosen on Stitch's mode box reach the integration
+    page as that mode (combo and intent), through its own mode command; the generic return keeps it."""
+    window = _mounted_host(None)
+    try:
+        page = window.page_handle.widget
+        combo = page._shell.run_controls.modeCombo
+        combo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        stitch = window._page_handles[STITCH_PAGE.key].widget
+        for mode in ("1D Viewer", "2D Viewer", "Int 1D", "Int 2D"):
+            assert window.selected_page_key == STITCH_PAGE.key
+            stitch.run_bar.modeCombo.setCurrentText(mode)
+            qapp.processEvents()
+            assert window.selected_page_key == SCATTERING_WORKSPACE_PAGE.key, mode
+            assert combo.currentText() == mode
+            assert page._intents.snapshot().thaw().processing_mode == mode
+            assert stitch.run_bar.modeCombo.currentText() == "Stitch 1D"  # Stitch's own box is unchanged
+            combo.setCurrentText("Stitch 1D")
+            qapp.processEvents()
+        # the generic return (Stitch's menu entry) leaves the integration page's mode as it was
+        stitch.toolRequested.emit(str(SCATTERING_WORKSPACE_PAGE.key))
+        qapp.processEvents()
+        assert window.selected_page_key == SCATTERING_WORKSPACE_PAGE.key
+        assert page._intents.snapshot().thaw().processing_mode == "Int 2D"
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_stitch_selection_obeys_active_integration_page_fence(
         qapp, isolated_settings):
+    from xdart.gui.tabs.scattering.events import PreflightRefused
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+
+    window = _mounted_host(None)
+    page = window.main_widget
+    request = page._lifecycle.begin_start()
+    try:
+        assert page._lifecycle.phase is RunPhase.PREPARING
+        prior_intent = page._intents.snapshot()
+        page._shell.run_controls.modeCombo.setCurrentText("Stitch 1D")
+        qapp.processEvents()
+        assert window.main_widget is page
+        assert STITCH_PAGE.key not in window._page_handles
+        assert page._intents.snapshot() == prior_intent
+        assert page._lifecycle.phase is RunPhase.PREPARING
+    finally:
+        page._lifecycle.preflight_refused(PreflightRefused(request.request_id))
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_builtin_rsm_selection_mounts_the_native_page_from_every_mode_box(
+        qapp, isolated_settings):
+    """AUD-9: RSM is a native workspace page on the RSM key. Int's mode box navigates to it (as it does to
+    Stitch), Int's Run on an RSM intent and the host's open_tool("rsm") select it, and its own mode box goes
+    back to Int's or Stitch's page in the mode chosen; no RSM dialog is built."""
     from xdart.gui.pages.values import ActionCompleted
 
     window = _mounted_host(None)
     try:
-        page_widget = window.main_widget
-        selected_page_key = window.selected_page_key
-        assert RSM_TOOL.key not in window._tool_handles
         assert window.ui.menuAnalysis is None
         page = window.page_handle.widget
-        page._shell.run_controls.modeCombo.setCurrentText("RSM")
-        assert page._shell.run_controls.startButton.isEnabled()
-        page._shell.run_controls.startButton.click()
+        combo = page._shell.run_controls.modeCombo
+        prior_intent = page._intents.snapshot()
+        combo.setCurrentText("RSM")
         qapp.processEvents()
-        handle = window._tool_handles[RSM_TOOL.key]
-        dialog = handle.widget
-        assert handle.key == RSM_TOOL_KEY
-        assert dialog.objectName() == "rsmToolDialog"
-        assert dialog.isWindow()
-        assert dialog.parent() is window
+        assert window.selected_page_key == RSM_PAGE.key
+        handle = window._page_handles[RSM_PAGE.key]
+        rsm = handle.widget
+        assert rsm.objectName() == "rsmPage" and not rsm.isWindow()
+        assert window.centralWidget().currentWidget() is rsm
         assert handle.activity.active() is False
-        dialog.close()
+        assert page._intents.snapshot() == prior_intent  # the integration intent is kept for the return
+        assert window._tool_handles == {}
+        for mode, key in (("Int 2D", SCATTERING_WORKSPACE_PAGE.key), ("Stitch 2D", STITCH_PAGE.key)):
+            rsm.run_bar.modeCombo.setCurrentText(mode)
+            qapp.processEvents()
+            assert window.selected_page_key == key, mode
+            assert rsm.run_bar.modeCombo.currentText() == "RSM"  # the RSM page's own box is unchanged
+            assert window.open_tool(RSM_TOOL_KEY) == ActionCompleted("rsm")
+            assert window.page_handle is handle
+        assert window.select_page(STITCH_PAGE.key) == ActionCompleted(str(STITCH_PAGE.key))
+        window.page_handle.widget.run_bar.modeCombo.setCurrentText("RSM")  # Stitch's mode box
         qapp.processEvents()
-        assert not dialog.isVisible()
-        assert window.open_tool(RSM_TOOL.key) == ActionCompleted("rsm")
-        assert window._tool_handles[RSM_TOOL.key] is handle
-        assert window._tool_handles[RSM_TOOL.key].widget is dialog
-        assert window.main_widget is page_widget
-        assert window.selected_page_key == selected_page_key
-        assert STITCH_TOOL.key not in window._tool_handles
+        assert window.page_handle is handle
+        assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
+        page.toolRequested.emit("rsm")  # Int's Run on an RSM intent (an older session's)
+        qapp.processEvents()
+        assert window.page_handle is handle and window._tool_handles == {}
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_the_write_mode_shortcut_toggles_stitch_and_rsm_append_and_replace(qapp, isolated_settings):
+    """G8c (Codex's RSM stage-2 review, question 4): Stitch and RSM declare the host's write-mode capability
+    through one shared port (``RunBarWriteMode``): the shortcut flips their run bar's Append/Replace as a click
+    does (the page's tooltip follows), and is refused while a run holds the toggle."""
+    from xdart.gui.pages.values import ActionCompleted, ActionRefused
+
+    window = _mounted_host(None)
+    try:
+        for key in (STITCH_PAGE.key, RSM_PAGE.key):
+            assert window.select_page(key) == ActionCompleted(str(key))
+            bar = window.page_handle.widget.run_bar
+            before, tip = bar.write_mode(), bar.writeModeButton.toolTip()
+            after = "Append" if before == "Overwrite" else "Overwrite"
+            assert window._shortcut_toggle_write_mode() == ActionCompleted(f"write-mode-{after.casefold()}"), key
+            assert bar.write_mode() == after and bar.writeModeButton.toolTip() != tip, key
+            bar.set_mode_row_enabled(False)  # a run holds it
+            assert type(window._shortcut_toggle_write_mode()) is ActionRefused and bar.write_mode() == after
+            bar.set_mode_row_enabled(True)
+            assert window._shortcut_toggle_write_mode() == ActionCompleted(f"write-mode-{before.casefold()}")
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_the_file_menus_save_and_load_settings_reach_stitch_and_rsm(qapp, isolated_settings, tmp_path):
+    """G12 (ledger row 3: "File ▸ Save/Load Settings ... mirror the Stitch page"): the host's File ▸ Save
+    Settings and Load Settings (Ctrl+S, Ctrl+O) are enabled on Stitch and RSM and reach each page's own settings
+    through its settings port; a document saved by one page is refused by the other, naming the page."""
+    import json
+    from xdart.gui.pages.values import ActionCompleted, ActionRefused
+
+    window = _mounted_host(None)
+    try:
+        saved = {}
+        for key, label in ((STITCH_PAGE.key, "Stitch"), (RSM_PAGE.key, "RSM")):
+            assert window.select_page(key) == ActionCompleted(str(key))
+            assert window.actionSaveSettings.isEnabled() and window.actionLoadSettings.isEnabled(), key
+            page = window.page_handle.widget
+            page.set_field("project_root", str(tmp_path))
+            path = tmp_path / f"{key}-settings.json"
+            page._settings_path_chooser = lambda action, start, path=path: str(path)
+            outcome = label.casefold()
+            assert window._shortcut_save_settings() == ActionCompleted(f"{outcome}-settings-saved"), key
+            assert json.loads(path.read_text())["kind"] == f"xdart-{outcome}-settings"
+            before = page.settings()
+            assert window._shortcut_load_settings() == ActionCompleted(f"{outcome}-settings-loaded"), key
+            assert page.settings() == before
+            saved[key] = path
+        for key, other, label in ((STITCH_PAGE.key, RSM_PAGE.key, "Stitch"), (RSM_PAGE.key, STITCH_PAGE.key, "RSM")):
+            assert window.select_page(key) == ActionCompleted(str(key))
+            window.page_handle.widget._settings_path_chooser = lambda action, start, path=saved[other]: str(path)
+            assert window._shortcut_load_settings() == ActionRefused(f"not an xdart {label} settings file"), key
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+#: Int's own modes: its run bar's mode list less Stitch's and RSM's.
+_INT_MODES = ("Int 1D", "Int 2D", "Int 1D (XYE)", "1D Viewer", "2D Viewer")
+
+
+def test_rsm_is_reachable_from_every_mode_and_reaches_each_one(qapp, isolated_settings):
+    """AUD-9 stage 2 (the maintainer, 2026-10-01: RSM "should be reachable from any of the other modes"). The
+    one mode list is on Int's, Stitch's and RSM's run bars: choosing RSM opens the RSM page from Int in each
+    of its modes and from Stitch in each of its, and choosing any other mode on the RSM page opens that
+    mode's page in it."""
+    from xdart.gui.pages.values import ActionCompleted
+
+    window = _mounted_host(None)
+    try:
+        integration = window.page_handle.widget
+        combo = integration._shell.run_controls.modeCombo
+        for mode in _INT_MODES:
+            combo.setCurrentText(mode)
+            qapp.processEvents()
+            assert integration._intents.snapshot().thaw().processing_mode == mode
+            combo.setCurrentText("RSM")
+            qapp.processEvents()
+            assert window.selected_page_key == RSM_PAGE.key, mode
+            assert window.select_page(DEFAULT_PAGE_KEY) == ActionCompleted(str(DEFAULT_PAGE_KEY))
+        for mode in ("Stitch 1D", "Stitch 2D"):
+            assert window.select_page(STITCH_PAGE.key) == ActionCompleted(str(STITCH_PAGE.key))
+            stitch = window.page_handle.widget
+            assert stitch.select_mode(mode) and stitch.run_bar.modeCombo.currentText() == mode
+            stitch.run_bar.modeCombo.setCurrentText("RSM")
+            qapp.processEvents()
+            assert window.selected_page_key == RSM_PAGE.key, mode
+        rsm = window.page_handle.widget
+        for mode in (*_INT_MODES, "Stitch 1D", "Stitch 2D"):
+            assert window.open_tool(RSM_TOOL_KEY) == ActionCompleted("rsm")
+            rsm.run_bar.modeCombo.setCurrentText(mode)
+            qapp.processEvents()
+            page = window.page_handle.widget
+            if mode.startswith("Stitch"):
+                assert (window.selected_page_key, page._mode) == (STITCH_PAGE.key, mode)
+            else:
+                assert (window.selected_page_key, page._intents.snapshot().thaw().processing_mode) == (
+                    SCATTERING_WORKSPACE_PAGE.key, mode)
+            assert rsm.run_bar.modeCombo.currentText() == "RSM"
     finally:
         window.close()
         window.deleteLater()
@@ -225,6 +399,219 @@ def _mounted_host(selected_key=None):
     from xdart import _gui_main
 
     return _gui_main.Main(selected_page_key=selected_key)
+
+
+@pytest.mark.parametrize("page_key,relative", [
+    ("stitch", True), ("stitch", False), ("rsm", True), ("rsm", False),
+])
+def test_cold_native_start_lists_saved_output_folder(
+        qapp, isolated_settings, tmp_path, monkeypatch, page_key, relative):
+    from xdart.gui.themes.typography import application_settings
+    from xdart.utils.session import load_session, save_session
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    project = tmp_path / "project"
+    output = project / "processed"
+    output.mkdir(parents=True)
+    artifact = output / "scan.nexus"
+    artifact.touch()
+    nested = output / "nested"
+    nested.mkdir()
+    target = output / "chosen_rsm.nexus" if page_key == "rsm" else output
+    saved_output = str(target.relative_to(project) if relative else target)
+    document = {"kind": f"xdart-{page_key}-settings", "version": 1,
+                "fields": {"project_root": str(project), "output_path": saved_output}}
+    if page_key == "stitch":
+        document["mode"] = "Stitch 2D"
+    save_session({f"{page_key}_settings": document})
+    settings = application_settings()
+    settings.setValue("page.selected", page_key)
+    settings.sync()
+    role = QtCore.Qt.ItemDataRole.UserRole
+    window = _mounted_host()
+    try:
+        assert window.selected_page_key == page_key
+        assert tuple(window._page_handles) == (page_key,)  # Int was never mounted
+        page = window.main_widget
+        deadline = time.monotonic() + 5
+        expected = {str(artifact), str(nested)}
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            listed = {page.browser.scans.item(i).data(role)
+                      for i in range(page.browser.scans.count())}
+            if expected.issubset(listed):
+                break
+            time.sleep(.005)
+        assert expected.issubset(listed), "cold native browser did not list saved output"
+        assert page.browser.directory_label._path == str(output)
+        assert not page.browser.directory_label.isHidden()
+        assert page.browser.current_result() is None  # listing never opens an artifact
+        assert page._result_browser._owner.explicit_directory is False
+        assert page._value("output_path") == saved_output
+        assert load_session()[f"{page_key}_settings"] == document
+        assert window.page_handle.project_location.location() == (str(project), str(output))
+    finally:
+        window.close()
+        deadline = time.monotonic() + 5
+        while window.isVisible() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert not window.isVisible(), "native browser close did not reach CLEAN"
+        window.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("page_key", ["stitch", "rsm"])
+def test_cold_native_start_without_project_keeps_browser_unset(
+        qapp, isolated_settings, monkeypatch, page_key):
+    from xdart.gui.themes.typography import application_settings
+
+    monkeypatch.delenv("XDART_SESSION_FRESH", raising=False)
+    settings = application_settings()
+    settings.setValue("page.selected", page_key)
+    settings.sync()
+    window = _mounted_host()
+    try:
+        assert window.selected_page_key == page_key
+        assert window.page_handle.browser_directory.directory is None
+        assert window.main_widget.browser.scans.count() == 0
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_rsm_status_text_does_not_widen_controls_column(
+        qapp, isolated_settings, tmp_path):
+    from xdart.gui.widgets.controls_panel import SectionCard, SubsectionCard
+
+    window = _mounted_host("rsm")
+    try:
+        page = window.main_widget
+        page.set_field("project_root", str(tmp_path))
+        controls, splitter = page.controls, page.splitter
+        labels = [card.status for card in controls.findChildren(SectionCard)]
+        labels += [card.status for card in controls.findChildren(SubsectionCard)]
+        assert labels
+        for label in labels:
+            label.setText("ready")
+            label.show()
+        qapp.processEvents()
+        before = (controls.minimumSizeHint().width(),
+                  splitter.widget(2).minimumSizeHint().width())
+        message = "Calibration / source / grid diagnostic " * 40
+        for label in labels:
+            label.setText(message)
+            label.setToolTip(message)
+        qapp.processEvents()
+        after = (controls.minimumSizeHint().width(),
+                 splitter.widget(2).minimumSizeHint().width())
+        assert after == before, "status text changed the controls column's minimum width"
+        for label in labels:
+            assert label.text() == message  # retain the existing QLabel text contract
+            assert label.toolTip() == message
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_mode_switch_keeps_current_browser_folder(qapp, isolated_settings, tmp_path):
+    from pyqtgraph.Qt import QtTest
+
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (selected / "scan.nexus").touch()
+    nested = selected / "nested"
+    nested.mkdir()
+    (nested / "inside.nexus").touch()
+    role = QtCore.Qt.ItemDataRole.UserRole
+
+    def paths(browser):
+        return tuple(browser.scans.item(i).data(role) for i in range(browser.scans.count()))
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            if predicate():
+                return
+            time.sleep(.005)
+        assert predicate(), "browser folder/catalog did not settle"
+
+    window = _mounted_host(DEFAULT_PAGE_KEY)
+    try:
+        integration = window.main_widget
+        integration._shell.run_controls.modeCombo.setCurrentText("Int 2D")
+        integration._set_browser_directory(str(selected), explicit=True)
+        wait_for(lambda: str(selected / "scan.nexus") in paths(integration._shell.browser))
+        expected = paths(integration._shell.browser)
+        prior_intent = integration._intents.snapshot()
+        integration._shell.run_controls.modeCombo.setCurrentText("Stitch 2D")
+        stitch = window.main_widget
+        wait_for(lambda: stitch.browser.directory_label._path == str(selected)
+                 and paths(stitch.browser) == expected)
+        assert not stitch.browser.directory_label.isHidden()
+        assert stitch.browser.current_result() is None  # catalog transfer does not open a file
+        assert integration._intents.snapshot() == prior_intent
+
+        # A real directory gesture navigates, never attempts to open a result.
+        row = paths(stitch.browser).index(str(nested))
+        stitch.browser.scans.setCurrentRow(row)
+        QtTest.QTest.keyClick(stitch.browser.scans, QtCore.Qt.Key.Key_Return)
+        wait_for(lambda: stitch.browser.directory_label._path == str(nested)
+                 and str(nested / "inside.nexus") in paths(stitch.browser))
+        expected_nested = paths(stitch.browser)
+        stitch.run_bar.modeCombo.setCurrentText("RSM")
+        rsm = window.main_widget
+        wait_for(lambda: rsm.browser.directory_label._path == str(nested)
+                 and paths(rsm.browser) == expected_nested)
+        assert not rsm.browser.directory_label.isHidden()
+        window.select_page(DEFAULT_PAGE_KEY)
+        wait_for(lambda: integration._shell.browser.directory_label._path == str(nested)
+                 and paths(integration._shell.browser) == expected_nested)
+        assert integration._intents.snapshot() == prior_intent
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+def test_a_fresh_mode_inherits_project_and_save_folder_but_keeps_its_own(qapp, isolated_settings, tmp_path):
+    from xdart.gui.tabs.scattering.controls_inventory import PROJECT_ROOT, SAVE_PATH
+
+    project = tmp_path / "project"
+    project.mkdir()
+    save = project / "processed"
+    window = _mounted_host(DEFAULT_PAGE_KEY)
+    try:
+        integration = window.main_widget
+        integration._on_field_value(PROJECT_ROOT, str(project))
+        integration._on_field_value(SAVE_PATH, "processed")
+        prior_intent = integration._intents.snapshot()
+        integration._shell.run_controls.modeCombo.setCurrentText("Stitch 2D")
+        stitch = window.main_widget
+        assert stitch._value("project_root") == str(project)
+        assert stitch._value("output_path") == str(save)
+        stitch.run_bar.modeCombo.setCurrentText("RSM")
+        rsm = window.main_widget
+        assert rsm._value("project_root") == str(project)
+        assert Path(rsm._value("output_path")).parent == save
+        assert Path(rsm._value("output_path")).name.endswith("_rsm.nexus")
+        own = tmp_path / "rsm-project"
+        own.mkdir()
+        rsm.set_field("project_root", str(own))
+        rsm.set_field("output_path", str(own / "chosen.nexus"))
+        window.select_page(DEFAULT_PAGE_KEY)
+        integration._shell.run_controls.modeCombo.setCurrentText("RSM")
+        assert window.main_widget is rsm
+        assert rsm._value("project_root") == str(own)
+        assert rsm._value("output_path") == str(own / "chosen.nexus")
+        assert integration._intents.snapshot() == prior_intent
+    finally:
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
 
 
 def test_host_hides_only_the_redundant_vnext_application_statusbar(
@@ -752,6 +1139,28 @@ def test_default_cores_follow_the_small_ram_worker_cap(
         assert intent.max_cores == expected
         # What the run will resolve from that Cores value, on the same host.
         assert staging.reduction_worker_cap(intent.max_cores) == expected
+    finally:
+        assert handle.close().status is PageCleanup.CLEAN
+        handle.widget.deleteLater()
+        qapp.processEvents()
+
+
+def test_a_fresh_session_applies_polarization_by_default(
+        qapp, isolated_settings, monkeypatch):
+    """POL-1: SSRL beams are strongly horizontally polarized; fresh runs correct for it."""
+    from xdart.gui.tabs.scattering.controls_editing import advanced_settings_values
+
+    monkeypatch.setenv("XDART_SESSION_FRESH", "1")
+    handle = _build_mounted_workspace(None, SimpleNamespaceStatus())
+    try:
+        snapshot = handle.widget._intents.snapshot()
+        values = advanced_settings_values(snapshot)
+        for dimension in (values.one_d, values.two_d):
+            assert dimension.apply_polarization is True
+            assert dimension.polarization_factor == 0.99
+        frozen = snapshot.thaw().freeze()
+        assert frozen.bai_1d_args["polarization_factor"] == 0.99
+        assert frozen.bai_2d_args["polarization_factor"] == 0.99
     finally:
         assert handle.close().status is PageCleanup.CLEAN
         handle.widget.deleteLater()

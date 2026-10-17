@@ -203,21 +203,10 @@ def enumerate_processed_artifacts(
         return ()
     if cancelled is not None and cancelled.is_set():
         return ()
-    parent_entries = tuple(
-        entry for entry in directories if entry.label == ".."
-    )
-    entries = sorted(
-        (
-            *(entry for entry in directories if entry.label != ".."),
-            *artifacts,
-        ),
-        key=lambda entry: natural_name_key(
-            entry.label.removesuffix("/")
-            if entry.is_directory
-            else entry.label
-        ),
-    )
-    return (*parent_entries, *entries)
+    return tuple(sorted(
+        (*directories, *artifacts),
+        key=lambda entry: catalog_order_key(entry.label, entry.is_directory),
+    ))
 
 
 def _directory_modified_ns(
@@ -278,6 +267,13 @@ def _parent_navigation_entry(
     )
 
 
+def catalog_order_key(label: str, is_directory: bool = False) -> tuple[bool, tuple[tuple[int, object], ...], str]:
+    """A browser row's place: ".." first, then the natural name (a directory without its "/"), then the exact
+    name, so names the natural key ties (scan02, scan2) never fall back on read or arrival order."""
+    name = label.removesuffix("/") if is_directory else label
+    return name != "..", natural_name_key(name), name
+
+
 def natural_name_key(value: str) -> tuple[tuple[int, object], ...]:
     """Return a case-insensitive key with numeric components ordered as ints."""
 
@@ -291,6 +287,7 @@ def natural_name_key(value: str) -> tuple[tuple[int, object], ...]:
 __all__ = [
     "BrowserCatalogEntry",
     "DirectoryModifiedCache",
+    "catalog_order_key",
     "enumerate_processed_artifacts",
     "natural_name_key",
     "processed_directory",

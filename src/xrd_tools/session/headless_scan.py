@@ -66,6 +66,10 @@ def _validate_policy(
         raise TypeError("policy must be an exact SessionPolicy or None")
     if type(policy.allocation) is not SessionResourceAllocation:
         raise TypeError("policy must carry an exact SessionResourceAllocation")
+    if policy.angular_support is not None:
+        from xrd_tools.analysis.angular_support import AngularSupportPolicy
+        if type(policy.angular_support) is not AngularSupportPolicy:
+            raise TypeError("policy.angular_support must be an exact AngularSupportPolicy or None")
 
     image = scan.frames[0].image
     descriptor = SimpleNamespace(
@@ -73,13 +77,17 @@ def _validate_policy(
         dtype=getattr(image, "dtype", None),
     )
     supplied = policy.allocation.requirements
+    point = (scan.frames[0].metadata or {}).get('point_images')
+    point_bytes = 16 * int(np.prod(descriptor.frame_shape)) if point is not None else 0
+    if supplied.source_auxiliary_bytes != point_bytes // 2:
+        raise ValueError('explicit allocation has invalid point variance resource terms')
     terms = (
         supplied.background_bytes,
         supplied.resolver_background_bytes,
         supplied.worker_background_bytes,
         supplied.background_binding_bytes,
     )
-    if background_plan is None and terms != (0, 0, 0, 0):
+    if background_plan is None and terms != (0, 0, point_bytes, 0):
         raise ValueError("active allocation requires an exact Background plan")
     background = (
         FrameBackgroundPlan() if background_plan is None else background_plan
@@ -88,12 +96,12 @@ def _validate_policy(
         raise TypeError("Background plan must be exact")
     pixels = int(np.prod(descriptor.frame_shape))
     expected = (
-        (0, 0, 0, 0)
+        (0, 0, point_bytes, 0)
         if background.mode == "None"
         else (
             8 * pixels,
             25 * pixels if background.mode == "Series Average" else 8 * pixels,
-            8 * pixels,
+            8 * pixels + point_bytes,
             64 * 1024**2,
         )
     )
@@ -106,6 +114,7 @@ def _validate_policy(
         resolver_background_bytes=supplied.resolver_background_bytes,
         worker_background_bytes=supplied.worker_background_bytes,
         background_binding_bytes=supplied.background_binding_bytes,
+        source_auxiliary_bytes=supplied.source_auxiliary_bytes,
     )
     validated = resolve_session_policy(
         actual,
@@ -127,6 +136,7 @@ def open_headless_scan_session(
     sink: Any = None,
     inflight_max: int | None = None,
     record_store: FrameRecordStore | None = None,
+    ring_geometry: Mapping | None = None,
     record_store_persisted_on_write: bool = False,
     nexus_target: str | None = None,
     xye_target: str | None = None,
@@ -229,6 +239,7 @@ def open_headless_scan_session(
         cancel_token=cancel_token,
         clear_frame_images=True,
         record_store=record_store,
+        ring_geometry=ring_geometry,
         record_store_persisted_on_write=record_store_persisted_on_write,
         targets_by_mode=targets,
         store_targets_by_mode=store_targets,

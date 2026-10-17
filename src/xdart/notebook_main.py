@@ -1,8 +1,8 @@
-"""Start JupyterLab, or register a kernel, with this installation's Python.
+"""Start JupyterLab or marimo, or register a kernel, with this installation's Python.
 
 ``pixi global install xdart`` puts only xdart's own commands on PATH, so the
-JupyterLab installed beside it has no command of its own.  ``xdart-notebook``
-is that command: it runs the JupyterLab of the environment xdart lives in, so
+notebook frontends installed beside it have no commands of their own.
+``xdart-notebook`` runs them in the environment xdart lives in, so
 ``xrd_tools``, the notebook widgets, and the compression filters are all the
 ones the GUI uses.  Nothing here imports Qt.
 """
@@ -13,9 +13,11 @@ import importlib.util
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 _USAGE = """\
 usage: xdart-notebook [JupyterLab arguments ...]
+       xdart-notebook --marimo PATH.py [marimo edit arguments ...]
        xdart-notebook --register-kernel [--name NAME] [--display-name TEXT] [--replace]
 
 Start JupyterLab from the xdart installation, for the example notebooks and
@@ -23,11 +25,14 @@ the notebooks exported by Help -> Export Analyze Results Notebook.
 
   xdart-notebook                     open JupyterLab in the current folder
   xdart-notebook results.ipynb       open one notebook
+  xdart-notebook --marimo results.py edit an existing marimo notebook in this
+                                     Python environment (without a sandbox)
   xdart-notebook --register-kernel   offer this Python to VS Code or another
                                      Jupyter as the kernel "Python (xdart)"
 
-Every other argument goes to JupyterLab unchanged; `xdart-notebook --help-all`
-lists them.
+Ordinary arguments go to JupyterLab unchanged; `xdart-notebook --help-all`
+lists them. The explicit --marimo route passes its remaining arguments to
+marimo edit; it requires an existing .py notebook and never guesses a format.
 """
 
 _TAKEN = """\
@@ -71,6 +76,18 @@ def main(argv: list[str] | None = None) -> int:
     if arguments[:1] in (["-h"], ["--help"]):
         print(_USAGE, end="")
         return 0
+    if arguments[:1] == ["--marimo"]:
+        arguments.pop(0)
+        if "--register-kernel" in arguments:
+            print("--marimo cannot be combined with --register-kernel", file=sys.stderr)
+            return 2
+        if not arguments or Path(arguments[0]).suffix != ".py" or not Path(arguments[0]).is_file():
+            print("--marimo requires an existing .py notebook as its first argument", file=sys.stderr)
+            return 2
+        if importlib.util.find_spec("marimo") is None:
+            print(_MISSING, end="", file=sys.stderr)
+            return 1
+        return _run("marimo", ["edit", "--no-sandbox", *arguments])
     register = "--register-kernel" in arguments
     needed = "ipykernel" if register else "jupyterlab"
     if importlib.util.find_spec(needed) is None:

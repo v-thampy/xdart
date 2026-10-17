@@ -23,6 +23,21 @@ from xrd_tools.io.schema import (
 )
 
 
+def test_input_and_display_geometry_use_one_immutable_contract():
+    from xrd_tools.core import FrameGeometry, ViewFrameGeometry
+    from xrd_tools.core.frame_view import FrameGeometry as DisplayGeometry
+
+    assert FrameGeometry is ViewFrameGeometry is DisplayGeometry
+    poni = {"dist": 0.3}
+    geometry = FrameGeometry(rot1=0.1, incident_angle=0.2, poni=poni)
+    view = FrameView(label=1, geometry=geometry)
+    assert view.geometry is geometry
+    poni["dist"] = 0.4
+    assert geometry.poni["dist"] == 0.3
+    with pytest.raises(TypeError):
+        geometry.poni["dist"] = 0.5
+
+
 def _current_entry(handle):
     entry = handle.create_group("entry")
     entry.attrs["NX_class"] = "NXentry"

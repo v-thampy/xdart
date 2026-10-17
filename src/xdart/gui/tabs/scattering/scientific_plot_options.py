@@ -1,6 +1,8 @@
-"""Passive 1-D plot options and the production waterfall activation policy."""
+"""Passive scientific plot options and the production waterfall activation policy."""
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -14,16 +16,58 @@ WATERFALL_Y_AXIS_CHOICES = (
     "Time (minutes)",
 )
 INTENSITY_SCALE_CHOICES = ("Linear", "Sqrt", "Log")
-
-PLOT_OPTION_COMMAND_PATHS = (
-    ("waterfall", "y_axis"),
-    ("waterfall", "start"),
-    ("waterfall", "stop"),
-    ("waterfall", "step"),
-    ("overlay", "offset"),
-    ("other", "legend"),
-    ("other", "intensity_scale"),
+SHARE_AXIS_TOOLTIP = "Pan and zoom matching coordinates together across the displayed plots."
+COVERAGE_TOOLTIP = (
+    "2D pixel coverage: shade Q–χ bins that received no contributing pixels. Coverage includes pixel splitting "
+    "and does not measure angular completeness; that is the 1-D angular coverage “Show angular coverage” displays."
 )
+#: The 1-D strip's option (COVERAGE-SUPPORT-20261013): angular reach, not Int's 2-D pixel coverage above.
+ANGULAR_SUPPORT_TOOLTIP = (
+    "Show angular coverage below the 1-D plot: for each radial bin, the share of the profile's χ window "
+    "(360° without one) that unmasked detector pixels reach, saved with the result when it was processed "
+    "(or computed on demand for a saved Standard Int result that qualifies, even if recording was Off). "
+    "Stitch requires recorded angular coverage. This is angular reach, not a pixel count, and it never "
+    "changes intensity. Hover for the degrees over a bin. Display only: Okay applies it and Cancel discards the "
+    "change; whether a Run records coverage is Processing's “Record angular coverage”."
+)
+GRID_TOOLTIP = ('Detector coordinate grid: q contours and χ half-rays over the raw detector image (not the reduced '
+                'Q–χ map), with the effective Run plan’s χ offset. Display only; available on Standard Int frames '
+                'with a uniform flat detector. A Run’s frames show q and χ; a saved output’s frames in Browse show q '
+                'contours only.')
+
+#: Every 1-D plot option: its command path and its ``ScientificPlotOptions`` field, the one table the
+#: view emits and every page applies (Codex general audit AUD-8).
+PLOT_OPTION_BINDINGS = (
+    (("waterfall", "y_axis"), "waterfall_y_axis"),
+    (("waterfall", "start"), "waterfall_start"),
+    (("waterfall", "stop"), "waterfall_stop"),
+    (("waterfall", "step"), "waterfall_step"),
+    (("overlay", "offset"), "overlay_offset"),
+    (("other", "legend"), "show_legend"),
+    (("other", "intensity_scale"), "intensity_scale"),
+    (("other", "coverage_holes"), "show_coverage_holes"),
+    (("other", "coordinate_grid"), "coordinate_grid"),
+    (("other", "phase_references"), "phase_references"),
+    (("other", "phase_min_intensity"), "phase_min_intensity"),
+    (("other", "phase_global_floor"), "phase_global_floor"),
+    (("other", "phase_floors"), "phase_floors"),
+    (("other", "phase_references_shown"), "phase_references_shown"),
+    (("other", "angular_support"), "show_angular_support"),
+)
+
+
+def plot_option_update(options: ScientificPlotOptions, path, value) -> ScientificPlotOptions | None:
+    """``options`` with the option at command ``path`` set to ``value``; None for an unknown path or a
+    value the option refuses (``ScientificPlotOptions`` validates each; an integer offset is a float)."""
+    field = dict(PLOT_OPTION_BINDINGS).get(path)
+    if field is None:
+        return None
+    if field == "overlay_offset" and type(value) is int:
+        value = float(value)
+    try:
+        return replace(options, **{field: value})
+    except (TypeError, ValueError):
+        return None
 
 
 class PlotOptionsDialog(QtWidgets.QDialog):
@@ -32,15 +76,19 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        show_waterfall: bool = True,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("e4PlotOptionsDialog")
-        self.setWindowTitle("1-D Plot Options")
+        self.setWindowTitle("Plot Options")
         self.setModal(False)
         self._projection = ScientificPlotOptions()
 
         layout = QtWidgets.QVBoxLayout(self)
         waterfall = self._section(layout, "Waterfall")
+        self._waterfall_group = waterfall.parentWidget()
+        self._waterfall_group.setVisible(show_waterfall)
         waterfall.addWidget(QtWidgets.QLabel("Y-Axis"), 0, 0)
         waterfall.addWidget(QtWidgets.QLabel("Start"), 0, 1)
         waterfall.addWidget(QtWidgets.QLabel("Stop"), 0, 2)
@@ -71,6 +119,19 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.intensity_scale.addItems(INTENSITY_SCALE_CHOICES)
         other.addWidget(self.show_legend, 0, 0)
         other.addWidget(self.intensity_scale, 0, 1)
+        # the 1-D plot's angular coverage strip, kept apart from the 2D pixel-coverage shading below
+        self.show_angular_support = QtWidgets.QCheckBox("Show angular coverage")
+        other.addWidget(self.show_angular_support, 1, 0, 1, 2)
+        self.set_angular_support_available(True)
+        self.share_axis = QtWidgets.QCheckBox("Share Axis")
+        other.addWidget(self.share_axis, 2, 0, 1, 2)
+        self.reconcile_share_axis(False, False)
+
+        support = self._section(layout, "2D pixel coverage (Stitch only)")
+        support.parentWidget().setToolTip(COVERAGE_TOOLTIP)
+        self.show_coverage_holes = QtWidgets.QCheckBox("Shade uncovered bins")
+        support.addWidget(self.show_coverage_holes, 0, 0)
+        self.set_coverage_available(False)
 
         buttons = QtWidgets.QHBoxLayout()
         buttons.addStretch(1)
@@ -82,16 +143,26 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.accept_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
 
+        # Calibrants and reference phases live in the Tools panel's Reference Phases window
+        # (REFERENCE-PHASES-20261011); this dialog keeps the coordinate grid.
+        self.coordinate_grid = self.add_choice('Detector coordinate grid', ('Off', 'q', 'χ', 'q + χ'),
+                                               'Off', tooltip=GRID_TOOLTIP)
+        self.set_grid_available(False, visible=False)
         self.reconcile(self._projection)
 
     @staticmethod
     def _section(
         outer: QtWidgets.QVBoxLayout,
         title: str,
+        *,
+        index: int | None = None,
     ) -> QtWidgets.QGridLayout:
         group = QtWidgets.QGroupBox(title)
         grid = QtWidgets.QGridLayout(group)
-        outer.addWidget(group)
+        if index is None:
+            outer.addWidget(group)
+        else:
+            outer.insertWidget(index, group)
         return grid
 
     @staticmethod
@@ -109,6 +180,73 @@ class PlotOptionsDialog(QtWidgets.QDialog):
     def projection(self) -> ScientificPlotOptions:
         return self._projection
 
+    def set_waterfall_visible(self, visible: bool) -> None:
+        self._waterfall_group.setVisible(bool(visible))
+
+    def reconcile_share_axis(self, checked: bool, available: bool) -> None:
+        """Mirror the view's existing sharing control; the checkbox is only an Okay/Cancel draft."""
+        self.share_axis.setChecked(checked)
+        self.share_axis.setEnabled(available)
+        self.share_axis.setToolTip(SHARE_AXIS_TOOLTIP + " Okay applies the change; Cancel discards it." +
+            ("" if available else " Available when displayed plots have matching coordinates."))
+
+    def mount_display_scale(self, controls: QtWidgets.QWidget) -> None:
+        """Mount the view's existing live display controls above Okay/Cancel."""
+        layout = self.layout()
+        layout.insertWidget(layout.count() - 1, controls)
+
+    def set_coverage_available(self, available: bool) -> None:
+        self.show_coverage_holes.setEnabled(available)
+        self.show_coverage_holes.setToolTip(
+            COVERAGE_TOOLTIP if available else COVERAGE_TOOLTIP +
+            " Available on a Stitch Q–χ intensity map that carries pixel coverage; an Int result has none."
+        )
+
+    def set_angular_support_mounted(self, mounted: bool) -> None:
+        """Offer the option only where the strip can show a 1-D profile (Int, Stitch, the 1D Viewer): not in RSM's
+        keyed panels or the 2D Viewer. Hiding it never changes what the user chose."""
+        self.show_angular_support.setVisible(bool(mounted))
+
+    def set_angular_support_available(self, available: bool, reason: str = "") -> None:
+        """Say whether the shown traces have angular coverage, and why not: the option stays as the user set it
+        (an unavailable trace never unchecks it), so it remains editable either way."""
+        self.show_angular_support.setToolTip(
+            ANGULAR_SUPPORT_TOOLTIP if available or not reason else f"{ANGULAR_SUPPORT_TOOLTIP} {reason}")
+
+    def add_choice(self, label: str, choices: tuple[str, ...], value: str, *, tooltip: str = '') -> QtWidgets.QComboBox:
+        """A host's own choice among ``choices``, built here above the buttons (Codex's Stitch/Int reuse
+        audit R3: Stitch's Diagnostic was a combo box the page built). Returns the editor; the host
+        applies its value on ``ScientificView.plotOptionsAccepted`` and resets it on ``rejected``."""
+        if not choices or value not in choices:
+            raise ValueError("a plot-options choice needs its choices and a value among them")
+        editor = QtWidgets.QComboBox()
+        editor.setObjectName("e4PlotOptionsHostChoice")
+        editor.addItems(choices)
+        editor.setCurrentText(value)
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        caption = QtWidgets.QLabel(label)
+        caption.setToolTip(tooltip); editor.setToolTip(tooltip); row.setToolTip(tooltip)
+        layout.addWidget(caption)
+        layout.addWidget(editor)
+        outer = self.layout()
+        outer.insertWidget(outer.count() - 1, row)
+        return editor
+
+    def set_grid_available(self, available: bool, reason: str = '', *, note: str = '',
+                           visible: bool = True) -> None:
+        """Enable the grid row, or disable it with its reason; ``note`` informs while it is enabled (a saved
+        output's frame withholds χ half-rays)."""
+        from xrd_tools.geometry_figures import GRID_RUN_REASON
+        tip = (GRID_TOOLTIP + (' ' + note if note else '') if available
+               else GRID_TOOLTIP + ' ' + (reason or GRID_RUN_REASON))
+        self.coordinate_grid.setEnabled(available)
+        row = self.coordinate_grid.parentWidget()
+        row.setVisible(visible)
+        for widget in (row, self.coordinate_grid, row.findChild(QtWidgets.QLabel)):
+            widget.setToolTip(tip)
+
     def reconcile(self, options: ScientificPlotOptions) -> None:
         if type(options) is not ScientificPlotOptions:
             raise TypeError("plot options must be an exact frozen value")
@@ -120,6 +258,9 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             self.overlay_offset,
             self.show_legend,
             self.intensity_scale,
+            self.show_coverage_holes,
+            self.coordinate_grid,
+            self.show_angular_support,
         )
         blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
         self.waterfall_y_axis.clear()
@@ -133,11 +274,16 @@ class PlotOptionsDialog(QtWidgets.QDialog):
         self.overlay_offset.setValue(options.overlay_offset)
         self.show_legend.setChecked(options.show_legend)
         self.intensity_scale.setCurrentText(options.intensity_scale)
+        self.show_coverage_holes.setChecked(options.show_coverage_holes)
+        self.coordinate_grid.setCurrentText(options.coordinate_grid)
+        self.show_angular_support.setChecked(options.show_angular_support)
         self._projection = options
         del blockers
 
     def edited_options(self) -> ScientificPlotOptions:
-        return ScientificPlotOptions(
+        # The reference-phase fields are the window's; they pass through unchanged.
+        return replace(
+            self._projection,
             waterfall_y_axis=self.waterfall_y_axis.currentText(),
             waterfall_start=self.waterfall_start.value(),
             waterfall_stop=self.waterfall_stop.value(),
@@ -145,6 +291,9 @@ class PlotOptionsDialog(QtWidgets.QDialog):
             overlay_offset=float(self.overlay_offset.value()),
             show_legend=self.show_legend.isChecked(),
             intensity_scale=self.intensity_scale.currentText(),
+            show_coverage_holes=self.show_coverage_holes.isChecked(),
+            coordinate_grid=self.coordinate_grid.currentText(),
+            show_angular_support=self.show_angular_support.isChecked(),
         )
 
     def reject(self) -> None:
@@ -153,9 +302,11 @@ class PlotOptionsDialog(QtWidgets.QDialog):
 
 
 __all__ = [
+    "ANGULAR_SUPPORT_TOOLTIP",
     "INTENSITY_SCALE_CHOICES",
-    "PLOT_OPTION_COMMAND_PATHS",
+    "PLOT_OPTION_BINDINGS",
     "PlotOptionsDialog",
     "WATERFALL_Y_AXIS_CHOICES",
+    "plot_option_update",
     "waterfall_should_be_active",
 ]

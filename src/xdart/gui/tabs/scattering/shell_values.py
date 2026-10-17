@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from os.path import normcase
 from types import MappingProxyType
@@ -10,6 +12,8 @@ from typing import Mapping
 
 import numpy as np
 
+from xrd_tools.core.angular_support import AngularSupportProfile
+from xrd_tools.session.display_logic import PanelKey, PanelRole
 from xrd_tools.session.readiness import ControlsProjection
 
 from .browser_catalog import BrowserCatalogEntry, natural_name_key
@@ -66,6 +70,19 @@ class ShellCommandKind(str, Enum):
     RUN_ACTION = "run_action"
     STOP = "stop"
     SET_OUTPUT_POLICY = "set_output_policy"
+    #: a results-profile Data Browser (another page's results list): one result chosen, or Open… pressed
+    SELECT_RESULT = "select_result"
+    OPEN_RESULT = "open_result"
+    #: an extended results list's selection changed (its value: the selected identities); a result's own
+    #: entry chosen in the second pane (Stitch's contributing frame); its Raw image action pressed
+    SELECT_RESULTS = "select_results"
+    SELECT_RESULT_FRAME = "select_result_frame"
+    SHOW_RAW_IMAGE = "show_raw_image"
+    #: a keyed layout's image panel stepped to another index along its normal (an RSM slice): its value the
+    #: index, its path the panel's instance (``PanelKey.instance``)
+    SET_PANEL_INDEX = "set_panel_index"
+    #: a host page's own tool button pressed (``ScientificView.set_page_tools``): its value the tool's name
+    PAGE_TOOL = "page_tool"
 
 
 class FrameSelectionIntent(str, Enum):
@@ -78,7 +95,7 @@ class FrameSelectionIntent(str, Enum):
 @dataclass(frozen=True, slots=True)
 class ShellCommand:
     kind: ShellCommandKind
-    value: Scalar = None
+    value: Scalar | tuple[tuple[str, bool], ...] | tuple[tuple[str, float], ...] = None
     path: tuple[str, ...] = ()
     frame: DisplayFrameKey | None = None
     frames: tuple[DisplayFrameKey, ...] = ()
@@ -88,7 +105,19 @@ class ShellCommand:
     def __post_init__(self) -> None:
         if type(self.kind) is not ShellCommandKind:
             raise TypeError("shell command kind must be exact")
-        if not _scalar_is_valid(self.value):
+        phase_selection = (self.kind is ShellCommandKind.SET_PLOT_OPTION
+            and self.path == ("other", "phase_references") and type(self.value) is tuple
+            and len(self.value) <= 8 and all(type(item) is tuple and len(item) == 2
+                and type(item[0]) is str and bool(item[0]) and type(item[1]) is bool for item in self.value)
+            and len({item[0] for item in self.value}) == len(self.value))
+        # REFERENCE-PHASES-20261011: per-phase minimums, (phase id, percent) pairs
+        phase_floors = (self.kind is ShellCommandKind.SET_PLOT_OPTION
+            and self.path == ("other", "phase_floors") and type(self.value) is tuple
+            and len(self.value) <= 8 and all(type(item) is tuple and len(item) == 2
+                and type(item[0]) is str and bool(item[0]) and type(item[1]) in (int, float)
+                and math.isfinite(item[1]) for item in self.value)
+            and len({item[0] for item in self.value}) == len(self.value))
+        if not _scalar_is_valid(self.value) and not phase_selection and not phase_floors:
             raise TypeError("shell command values must be detached scalars")
         if (
             type(self.path) is not tuple
@@ -298,10 +327,172 @@ class AxisProjection:
     values: np.ndarray
     label: str
     unit: str = ""
+    #: The image's outer edges along this axis, when they are not its first and last values: an axis of bin
+    #: centres gives its bins' outer edges (half a bin beyond the first and last centre), so each pixel sits
+    #: at its bin's centre (an RSM slice: Codex's RSM stage-1 review F3). None: the first and last values.
+    edges: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if type(self.values) is not np.ndarray or self.values.ndim != 1:
             raise TypeError("axis values must be a one-dimensional ndarray")
+        if self.edges is not None:
+            if (type(self.edges) is not tuple or len(self.edges) != 2
+                    or any(type(value) is not float or not math.isfinite(value) for value in self.edges)
+                    or not self.edges[0] < self.edges[1]):
+                raise TypeError("axis edges must be two finite increasing floats")
+
+
+#: A keyed image panel's presentations (``KeyedImageProjection.presentation``).
+KEYED_IMAGE_PRESENTATIONS = ("shared", "own", "signed")
+
+
+@dataclass(frozen=True, slots=True)
+class RectRegion:
+    """A rectangle on a keyed image panel (``ScientificView.set_keyed_region``), typed by the coordinates it is in.
+
+    ``x`` and ``y`` are its (low, high) along the panel's x axis (the image's columns) and y axis (its rows), in the
+    panel's own coordinates; ``x_axis`` and ``y_axis`` are those axes' (label, unit), which say what the numbers
+    are: a detector's pixels (an ROI picked on a detector image) or a slice's coordinates (H and K, Qx and Qz: a
+    region to fit). The view refuses a region whose axes are not the ones its panel draws. One type for both:
+    ``index_bounds`` gives the rows and columns whose bins lie inside, on either (FIT-TOOLS-2026-10, Codex's design
+    review F7: "Track D's detector ROI and F's slice ROI should use that same typed region API")."""
+
+    x: tuple[float, float]
+    y: tuple[float, float]
+    x_axis: tuple[str, str]
+    y_axis: tuple[str, str]
+
+    def __post_init__(self) -> None:
+        for bounds in (self.x, self.y):
+            if (type(bounds) is not tuple or len(bounds) != 2
+                    or any(type(value) not in {int, float} or not math.isfinite(value) for value in bounds)
+                    or not bounds[0] < bounds[1]):
+                raise TypeError("a region's x and y are (low, high): two finite increasing numbers")
+        for axis in (self.x_axis, self.y_axis):
+            if type(axis) is not tuple or len(axis) != 2 or any(type(part) is not str for part in axis):
+                raise TypeError("a region's axes are (label, unit) text")
+        object.__setattr__(self, "x", (float(self.x[0]), float(self.x[1])))
+        object.__setattr__(self, "y", (float(self.y[0]), float(self.y[1])))
+
+    def index_bounds(self, x_values: np.ndarray, y_values: np.ndarray) -> tuple[slice, slice]:
+        """The rows and columns, as ``(rows, columns)`` slices of a (y, x) image, whose bin centres (the panel's axis
+        values, increasing or decreasing) lie inside the rectangle, edges included: views of the image, no copies.
+        An empty slice where none does."""
+        return tuple(_inside(np.asarray(values, dtype=float), bounds)
+                     for values, bounds in ((y_values, self.y), (x_values, self.x)))
+
+
+def _inside(values: np.ndarray, bounds: tuple[float, float]) -> slice:
+    found = np.flatnonzero((values >= bounds[0]) & (values <= bounds[1]))
+    return slice(0, 0) if found.size == 0 else slice(int(found[0]), int(found[-1]) + 1)
+
+
+@dataclass(frozen=True, slots=True)
+class KeyedImageProjection:
+    """One image panel of a keyed layout (``display_logic``'s repeated ``PanelKey`` roles, the H11/WS-X2
+    seam): an RSM slice. ``image`` is (y, x), as Int's cake; ``index`` of ``index_count`` is where the slice is
+    taken along its plane's normal, each index captioned by ``index_captions``."""
+
+    key: PanelKey
+    title: str
+    image: np.ndarray
+    x_axis: AxisProjection
+    y_axis: AxisProjection
+    index: int
+    index_captions: tuple[str, ...]
+    #: False for a plane with no index to step (Custom Slice): no navigation is drawn, ``index`` is 0 and
+    #: ``index_captions`` is empty
+    navigation: bool = True
+    #: How the panel is presented (FIT-TOOLS-2026-10, Codex's design review F7): "shared", the view's colour map and
+    #: Log and the levels every shared slice takes from the intensity controls (RSM's slices; a fit's data and
+    #: model); "own", the view's colour map and Log with the panel's own automatic levels; "signed", a signed
+    #: difference (a fit's residual): linear whatever Log says, a diverging map and its own symmetric limits, so its
+    #: sign and zero always show
+    presentation: str = "shared"
+
+    def __post_init__(self) -> None:
+        if type(self.key) is not PanelKey or self.key.role is not PanelRole.SLICE_2D:
+            raise TypeError("a keyed image panel is a SLICE_2D PanelKey")
+        if self.presentation not in KEYED_IMAGE_PRESENTATIONS:
+            raise TypeError(f"a keyed image's presentation is one of {KEYED_IMAGE_PRESENTATIONS}")
+        if (type(self.image) is not np.ndarray or self.image.ndim != 2
+                or self.image.shape != (self.y_axis.values.size, self.x_axis.values.size)):
+            raise TypeError("a keyed image is (y, x) on its two axes")
+        if type(self.navigation) is not bool:
+            raise TypeError("a keyed image's navigation is a bool")
+        if not self.navigation:
+            if self.index != 0 or self.index_captions != ():
+                raise TypeError("a keyed image without navigation has index 0 and no captions")
+        elif (type(self.index_captions) is not tuple or not self.index_captions
+                or any(type(caption) is not str for caption in self.index_captions)
+                or type(self.index) is not int or not 0 <= self.index < len(self.index_captions)):
+            raise TypeError("a keyed image's index is one of its captions")
+
+
+@dataclass(frozen=True, slots=True)
+class KeyedTraceProjection:
+    """One 1-D panel of a keyed layout: an RSM mean projection along ``axis``."""
+
+    key: PanelKey
+    title: str
+    axis: AxisProjection
+    intensity: np.ndarray
+    y_label: str
+
+    def __post_init__(self) -> None:
+        if type(self.key) is not PanelKey or self.key.role is not PanelRole.PROJ_1D:
+            raise TypeError("a keyed trace panel is a PROJ_1D PanelKey")
+        if type(self.intensity) is not np.ndarray or self.intensity.shape != self.axis.values.shape:
+            raise TypeError("a keyed trace's intensity follows its axis")
+
+
+@dataclass(frozen=True, slots=True)
+class KeyedFigureProjection:
+    """A source-free computed figure, rendered by the full ScientificView."""
+
+    key: PanelKey
+    title: str
+    figure: object
+
+    def __post_init__(self):
+        from xrd_tools.geometry_figures import Figure
+        if type(self.key) is not PanelKey or self.key.role is not PanelRole.FIGURE:
+            raise TypeError('a keyed figure requires a FIGURE PanelKey')
+        if not isinstance(self.figure, Figure):
+            raise TypeError('a keyed figure requires a computed Figure')
+
+
+@dataclass(frozen=True, slots=True)
+class KeyedPanelsProjection:
+    """A keyed layout for ``ScientificView.reconcile_keyed``: rows of ``PanelKey``s (``DisplayState.layout``),
+    each drawn from its one panel, under the view's own top bar (colour map, Log, Set BG), with the view's own
+    intensity controls and Share Axis (``share_axis``: the panels drawing one coordinate pan and zoom together)."""
+
+    layout: tuple[tuple[PanelKey, ...], ...]
+    panels: tuple[KeyedImageProjection | KeyedTraceProjection | KeyedFigureProjection, ...]
+    title: str = ""
+    status: str = ""
+    color_map: str = "Default"
+    log_scale: bool = False
+    background_enabled: bool = False
+    background_set: bool = False
+    #: why the background is (or is not) drawn, for the Set BG button's tip (``apply_keyed_presentation_background``)
+    background_note: str = ""
+    share_axis: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.share_axis) is not bool:
+            raise TypeError("a keyed layout's share_axis is a bool")
+        keys = [key for row in self.layout for key in row]
+        if (type(self.layout) is not tuple or not keys
+                or any(type(row) is not tuple for row in self.layout)
+                or len(set(keys)) != len(keys)
+                or sorted(map(repr, keys)) != sorted(repr(panel.key) for panel in self.panels)
+                or len(self.panels) != len(keys)):
+            raise TypeError("a keyed layout draws each of its keys from exactly one panel")
+
+    def panel(self, key: PanelKey) -> KeyedImageProjection | KeyedTraceProjection | KeyedFigureProjection:
+        return next(panel for panel in self.panels if panel.key == key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +502,10 @@ class TraceProjection:
     intensity: np.ndarray
     title: str = ""
     epoch: float | None = None
+    wavelength_m: float | None = None
+    #: This native profile's angular coverage, or the reason it has none (COVERAGE-SUPPORT-20261013); None when its
+    #: producer carries none. A display conversion of the axis keeps the profile, each bin's own result.
+    angular_support: AngularSupportProfile | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -320,10 +515,18 @@ class TraceProjection:
             or self.intensity.shape != self.axis.values.shape
         ):
             raise TypeError("trace projection is invalid")
+        if self.angular_support is not None and (
+            type(self.angular_support) is not AngularSupportProfile
+            or self.angular_support.available and self.angular_support.supported_deg.shape != self.intensity.shape
+        ):
+            raise TypeError("trace angular support must be its own profile's AngularSupportProfile or None")
         if self.epoch is not None and (
             type(self.epoch) is not float or not np.isfinite(self.epoch)
         ):
             raise TypeError("trace epoch must be a finite float or None")
+        if self.wavelength_m is not None and (type(self.wavelength_m) is not float
+                or not math.isfinite(self.wavelength_m) or self.wavelength_m <= 0):
+            raise TypeError("trace wavelength must be a positive finite float or None")
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -439,10 +642,17 @@ class HeavyProjection:
     cake_y: AxisProjection | None = None
     detector_shape: tuple[int, int] | None = None
     detector_source: str = "none"
+    cake_coverage: np.ndarray | None = None
+    ring_geometry: Mapping | None = None
+    #: ``"saved"`` when ``ring_geometry`` was rebuilt from a Browse output's own record
+    #: (BROWSE-REFERENCE-RINGS-20261013) rather than published by the Run being shown.
+    ring_origin: str = ""
 
     def __post_init__(self) -> None:
         if type(self.frame) is not DisplayFrameKey:
             raise TypeError("heavy projection frame must be exact")
+        if self.ring_origin not in {"", "saved"}:
+            raise ValueError("ring origin must be exact")
         if self.raw is not None and (
             type(self.raw) is not np.ndarray or self.raw.ndim != 2
         ):
@@ -466,6 +676,15 @@ class HeavyProjection:
             raise TypeError("detector shape must be an exact positive pair")
         if self.detector_source not in {"none", "thumbnail", "full"}:
             raise ValueError("detector source must be exact")
+        if self.cake_coverage is not None and (
+            type(self.cake_coverage) is not np.ndarray
+            or self.cake is None
+            or self.cake_coverage.shape != self.cake.shape
+            or self.cake_coverage.dtype.kind not in "fiu"
+            or not np.isfinite(self.cake_coverage).all()
+            or (self.cake_coverage < 0).any()
+        ):
+            raise ValueError("cake coverage must be finite nonnegative counts matching the image")
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +696,19 @@ class ScientificPlotOptions:
     overlay_offset: float = 5.0
     show_legend: bool = True
     intensity_scale: str = "Linear"
+    show_coverage_holes: bool = False
+    coordinate_grid: str = 'Off'
+    phase_references: tuple[tuple[str, bool], ...] = ()
+    phase_min_intensity: float = 5.
+    #: "Same minimum for all phases" (REFERENCE-PHASES-20261011): on, ``phase_min_intensity`` applies to every CIF
+    #: phase; off, each uses its own ``phase_floors`` value. Stored values survive the switch.
+    phase_global_floor: bool = True
+    #: per-phase minimum intensities ((listed phase id, percent), ...), in list order
+    phase_floors: tuple[tuple[str, float], ...] = ()
+    #: the top bar's Phases toggle (C6): off draws no reference phase, keeping the list, flags and minimums
+    phase_references_shown: bool = True
+    #: the opt-in angular coverage strip below the 1-D plot (COVERAGE-SUPPORT-20261013); display only
+    show_angular_support: bool = False
 
     def __post_init__(self) -> None:
         if type(self.waterfall_y_axis) is not str or not self.waterfall_y_axis:
@@ -496,6 +728,73 @@ class ScientificPlotOptions:
             raise TypeError("legend visibility must be boolean")
         if self.intensity_scale not in {"Linear", "Sqrt", "Log"}:
             raise ValueError("unsupported 1-D intensity scale")
+        if type(self.show_coverage_holes) is not bool:
+            raise TypeError("coverage shading must be boolean")
+        if self.coordinate_grid not in ('Off', 'q', 'χ', 'q + χ'):
+            raise ValueError('unsupported coordinate grid')
+        if (type(self.phase_references) is not tuple or len(self.phase_references) > 8
+                or any(type(row) is not tuple or len(row) != 2 or type(row[0]) is not str
+                       or not row[0] or type(row[1]) is not bool for row in self.phase_references)
+                or len({row[0] for row in self.phase_references}) != len(self.phase_references)):
+            raise ValueError('select at most eight unique phase IDs with visibility flags')
+        if (type(self.phase_min_intensity) not in (int, float)
+                or not math.isfinite(self.phase_min_intensity) or not 0 <= self.phase_min_intensity <= 100):
+            raise ValueError('phase floor must be between 0 and 100 percent')
+        if type(self.phase_global_floor) is not bool:
+            raise TypeError('the global phase floor switch must be boolean')
+        listed = {row[0] for row in self.phase_references}
+        if (type(self.phase_floors) is not tuple or len(self.phase_floors) > 8
+                or any(type(row) is not tuple or len(row) != 2 or row[0] not in listed
+                       or type(row[1]) not in (int, float) or not math.isfinite(row[1]) or not 0 <= row[1] <= 100
+                       for row in self.phase_floors)
+                or len({row[0] for row in self.phase_floors}) != len(self.phase_floors)):
+            raise ValueError('per-phase floors name listed phases once each, between 0 and 100 percent')
+        if type(self.phase_references_shown) is not bool:
+            raise TypeError('the reference phases switch must be boolean')
+        if type(self.show_angular_support) is not bool:
+            raise TypeError('the angular coverage strip switch must be boolean')
+
+
+def phase_reference_document(options: ScientificPlotOptions) -> dict:
+    """The saved reference-phase section of Int's session and Stitch's settings (its ``global_floor`` and
+    ``floors`` keys are additive since REFERENCE-PHASES-20261011, ``shown`` since HELP-RESIDUALS-20261011)."""
+    return {"references": [list(row) for row in options.phase_references],
+            "min_intensity": options.phase_min_intensity,
+            "global_floor": options.phase_global_floor,
+            "floors": [list(row) for row in options.phase_floors],
+            "shown": options.phase_references_shown}
+
+
+def restore_phase_references(options: ScientificPlotOptions, document) -> ScientificPlotOptions:
+    """``options`` with a saved reference-phase section. An older document (no switch, no floors) restores the
+    global minimum; a saved minimum naming a phase that is no longer listed is dropped; no ``shown`` means on."""
+    references = tuple(tuple(row) for row in document.get("references", options.phase_references))
+    listed = {row[0] for row in references if row}
+    floors = tuple((row[0], row[1]) for row in (tuple(item) for item in document.get("floors", ()))
+                   if len(row) == 2 and row[0] in listed)
+    return replace(options, phase_references=references,
+                   phase_min_intensity=document.get("min_intensity", options.phase_min_intensity),
+                   phase_global_floor=document.get("global_floor", True), phase_floors=floors,
+                   phase_references_shown=document.get("shown", True))
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SavedSupportSource:
+    """A Browse Int output's facts a frame's angular coverage may be rebuilt from (COVERAGE-SUPPORT-20261013, D5):
+    the name its frames carry (``artifact``), the file read, its entry, the load's snapshot and its frames. Scalars
+    only: no handle, frame or array crosses into the reconstruction."""
+
+    artifact: str
+    path: str
+    entry: str
+    snapshot: object
+    labels: tuple[int, ...]
+
+    def request(self, labels):
+        """The one reconstruction request for the output's shown frames ``labels``."""
+        from xrd_tools.analysis.angular_support import SavedSupportRequest
+        return SavedSupportRequest(self.path, self.entry, self.snapshot, self.labels,
+                                   tuple(sorted(int(label) for label in labels)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,6 +806,9 @@ class ScientificProjection:
     processing_mode: str = "Int 2D"
     measurement_mode: str = "Standard"
     gi_mode_1d: str = ""
+    #: Every 1-D GI mode the shown results carry (a stitched GI result: q_total and its cut); the
+    #: 1-D plot then offers all their axes. Empty: ``gi_mode_1d``'s alone.
+    gi_modes_1d: tuple[str, ...] = ()
     #: The GI mode of the 2-D map being SHOWN (the pane's choice among
     #: ``gi_maps``), which is what the cake-derived 1-D axes follow.
     gi_mode_2d: str = ""
@@ -551,8 +853,23 @@ class ScientificProjection:
     # Whole detached cut batches replace history, including empty/refused rows.
     # Acquisition's incremental trace publications keep their existing merge.
     replace_trace_history: bool = False
+    #: Whether the authoritative display selection is the acquisition, rather than Browse or a viewer.
+    #: Frame RunIdentity alone cannot distinguish Browse, which can retain the acquisition's identity.
+    acquisition_selected: bool = False
+    #: A Browse Int frame's saved rings (BROWSE-REFERENCE-RINGS-20261013): the specific reason its output's
+    #: record refuses them, or, when it supplies them, whether they wait for the frame's image.
+    saved_ring_reason: str = ""
+    saved_ring_expected: bool = False
+    #: A Browse Int output the strip may rebuild older frames' angular coverage from (COVERAGE-SUPPORT-20261013, D5)
+    saved_support_source: SavedSupportSource | None = None
 
     def __post_init__(self) -> None:
+        if type(self.acquisition_selected) is not bool:
+            raise TypeError("acquisition selection must be boolean")
+        if type(self.saved_ring_reason) is not str or type(self.saved_ring_expected) is not bool:
+            raise TypeError("saved ring availability must be exact")
+        if self.saved_support_source is not None and type(self.saved_support_source) is not SavedSupportSource:
+            raise TypeError("the saved support source must be exact")
         if self.detector_mode not in {"thumbnail", "full"}:
             raise ValueError("detector mode must be exact")
         if type(self.detector_available) is not bool or type(self.detector_pending) is not bool:
@@ -721,8 +1038,14 @@ __all__ = [
     "FrameSelectionIntent",
     "FrameNavigationProjection",
     "HeavyProjection",
+    "KEYED_IMAGE_PRESENTATIONS",
+    "KeyedImageProjection",
+    "KeyedFigureProjection",
+    "KeyedPanelsProjection",
+    "KeyedTraceProjection",
     "ProgressProjection",
     "PinnedTraceProjection",
+    "RectRegion",
     "RunStripProjection",
     "ScientificPlotOptions",
     "ScientificProjection",

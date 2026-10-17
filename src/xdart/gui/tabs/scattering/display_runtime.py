@@ -110,13 +110,17 @@ class DisplayArtifact:
     light_unsubscribe: Callable[[], None] | None = None
     mask: np.ndarray | None = None
     mask_saturation: bool = True
+    #: The run's resolved automatic ceiling when it is not the data type's
+    #: maximum (decision 39); the stamped ceiling below never exceeds it.
+    saturation: int | None = None
     measurement_mode: str = "Standard"
     gi_incidence_motor: str = ""
     gi_resolved_motor: str = ""
     gi_mode_1d: str = ""
     gi_mode_2d: str = ""
     #: The accepted detector saturation ceiling, stamped ONCE from the first
-    #: live frame's native integer dtype (single writer:
+    #: live frame: its native integer dtype's, or the run's resolved saturation
+    #: when lower or when the frame is float (single writer:
     #: :meth:`RunDisplayState.stamp_saturation_ceiling`).  ``None`` means the
     #: accepted saturation input is unavailable and a toggle-ON preview
     #: fallback fails closed instead of guessing a ceiling.
@@ -132,6 +136,10 @@ class DisplayArtifact:
     #: successful tail of :meth:`RunDisplayState.retain_frame`, so revision 0
     #: is never observable and a failed retain leaves the prior value.
     norm_aggregate: ScanNormAggregate | None = None
+    #: Accepted reduction bounds, retained for this artifact's Full Raw reads.
+    #: Later page edits never reinterpret an earlier run's detector preview.
+    threshold_min: float | None = None
+    threshold_max: float | None = None
 
 
 class RunDisplayState:
@@ -290,12 +298,15 @@ class RunDisplayState:
         mask: np.ndarray | None,
         mask_saturation: bool,
         measurement_mode: str,
+        saturation: int | None = None,
         gi_incidence_motor: str = "",
         gi_resolved_motor: str = "",
         gi_mode_1d: str = "",
         gi_mode_2d: str = "",
         wavelength_m: float | None = None,
         source_base: str | None = None,
+        threshold_min: float | None = None,
+        threshold_max: float | None = None,
     ) -> DisplayArtifact:
         if not self._configured:
             self.configure(
@@ -328,7 +339,10 @@ class RunDisplayState:
             source_base=source_base,
             mask=frozen_mask,
             mask_saturation=bool(mask_saturation),
+            saturation=saturation,
             measurement_mode=measurement_mode,
+            threshold_min=None if threshold_min is None else float(threshold_min),
+            threshold_max=None if threshold_max is None else float(threshold_max),
             gi_incidence_motor=gi_incidence_motor,
             gi_resolved_motor=gi_resolved_motor,
             gi_mode_1d=gi_mode_1d,
@@ -1055,11 +1069,17 @@ class RunDisplayState:
     def stamp_saturation_ceiling(
         self, owner: DisplayArtifact, image: object
     ) -> None:
-        """Stamp the dtype-derived ceiling once from the exact live frame;
-        a float frame yields none and a toggle-ON fallback then fails closed
-        rather than inventing one."""
+        """Stamp the ceiling once from the exact live frame: its integer dtype's,
+        or the run's resolved saturation (decision 39) when lower, and for a
+        float frame the resolved one alone (a recorded cutoff: Codex terminal
+        review F1). A float frame without one yields none, and a toggle-ON
+        fallback then fails closed rather than inventing one."""
         if owner.saturation_ceiling is None:
-            owner.saturation_ceiling = integer_saturation_ceiling(image)
+            ceiling = integer_saturation_ceiling(image)
+            if owner.saturation is not None:
+                resolved = float(owner.saturation)
+                ceiling = resolved if ceiling is None else min(ceiling, resolved)
+            owner.saturation_ceiling = ceiling
 
     def _request_preview(
         self,
@@ -1148,6 +1168,9 @@ class RunDisplayState:
                 return DetectorPreviewProjection.unavailable(), key
             projection_mask = art.mask
             policy = {
+                "apply_threshold": art.threshold_min is not None or art.threshold_max is not None,
+                "threshold_min": art.threshold_min,
+                "threshold_max": art.threshold_max,
                 "mask_saturation": bool(art.mask_saturation),
                 "saturation_ceiling": art.saturation_ceiling,
             }
@@ -1307,6 +1330,21 @@ class RunDisplayState:
             )
         presentation_generation = prepared.token.presentation_generation
         view = preview.view
+        # The disk owns pixels/results, never a current-session ring snapshot.
+        # commit_preview already fenced artifact, canonical key and both stores.
+        retained = art.publications.get(key.local_frame_label)
+        if (retained is not None and retained.view.label == key.local_frame_label
+                and retained.generation == art.publications.generation
+                and retained.view.geometry is not None
+                and retained.view.geometry.poni is not None):
+            from xrd_tools.core.scan import FrameGeometry
+            geometry = view.geometry or FrameGeometry()
+            view = replace(view, geometry=replace(geometry, poni=retained.view.geometry.poni))
+            native_shape = retained.view.extra.get('detector_shape')
+            if native_shape is not None:
+                view = replace(view, extra={**view.extra, 'detector_shape': native_shape})
+        # get() composes borrowed light-1D arrays: release them before replacement.
+        del retained
         if preview.raw is not None:
             view = replace(
                 view,

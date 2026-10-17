@@ -213,6 +213,24 @@ def candidate_owner(path: Path) -> SourceFormatAdapter | None:
     return best.adapter if best is not None else None
 
 
+def registry_entries() -> tuple[_Entry, ...]:
+    """One copy of the registry, taken under its lock (no adapter callback runs while it is held)."""
+    _ensure_builtin_adapters()
+    return _snapshot_entries()
+
+
+def registry_identity(entries: tuple[_Entry, ...] | None = None) -> tuple[tuple[int, bool, int], ...]:
+    """Each adapter object, tier and sequence: any re-registration, even under the same id, changes it."""
+    entries = registry_entries() if entries is None else entries
+    return tuple((id(entry.adapter), entry.builtin, entry.seq) for entry in entries)
+
+
+def candidate_owner_among(entries: tuple[_Entry, ...], path: Path) -> SourceFormatAdapter | None:
+    """:func:`candidate_owner` for *path* against one :func:`registry_entries` copy."""
+    best = _best(e for e in entries if e.adapter.is_candidate(path))
+    return best.adapter if best is not None else None
+
+
 def explicit_source_owner(
     path: Path,
     kind: SourceKind | str,

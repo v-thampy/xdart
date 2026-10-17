@@ -597,7 +597,8 @@ def _background_pair(descriptor_bytes, fingerprint) -> tuple[bytes, str]:
     def decoded(raw, shape): _background_require(type(raw) is dict and set(raw) == {"shape", "dtype", "sha256"} and type(raw["shape"]) is list and all(type(part) is int for part in raw["shape"]) and tuple(raw["shape"]) == shape and hex64(raw["sha256"]) and type(raw["dtype"]) is str and len(raw["dtype"]) == 3 and raw["dtype"][0] in "<>=|" and raw["dtype"][1] in "iuf" and raw["dtype"][2] in "1248", "background decoded fact is malformed"); dtype = np.dtype(raw["dtype"]); _background_require(dtype.str == raw["dtype"] and 1 <= dtype.itemsize <= 8, "background decoded dtype is malformed")
     def metadata_source(raw): _background_require(raw is None or type(raw) is dict and set(raw) == {"locator", "state", "sha256"} and path(raw["locator"]) and state(raw["state"]) and hex64(raw["sha256"]), "background metadata source is malformed")
     positive = lambda tagged: type(number := _untag(tagged)) is float and np.isfinite(number) and number > 0 and _tag(number) == tagged
-    keys = {"Single BG File": {"version", "mode", "policy", "frame_fact", "source", "metadata_items", "metadata_source", "decoded", "result_sha256"}, "Series Average": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "normalization", "result_sha256"}, "BG Directory": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "metadata_items", "metadata_source", "decoded", "result_sha256"}}; _background_require(value.get("mode") == mode and type(value.get("version")) is int and value["version"] == 1 and set(value) == keys[mode] and hex64(value["result_sha256"]), "background descriptor schema is invalid"); shape = fact[4]
+    keys = {"Single BG File": {"version", "mode", "policy", "frame_fact", "source", "metadata_items", "metadata_source", "decoded", "result_sha256"}, "Series Average": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "normalization", "result_sha256"}, "BG Directory": {"version", "mode", "policy", "frame_fact", "manifest", "selected", "metadata_items", "metadata_source", "decoded", "result_sha256"}}; last_saved = mode == "BG Directory" and policy["match_rule"] == "Last Saved Before Frame"  # records the frame's file time
+    _background_require(value.get("mode") == mode and type(value.get("version")) is int and value["version"] == 1 and set(value) == keys[mode] | ({"frame_saved_ns"} if last_saved else set()) and hex64(value["result_sha256"]) and (not last_saved or type(value["frame_saved_ns"]) is int and value["frame_saved_ns"] >= 0), "background descriptor schema is invalid"); shape = fact[4]
     if mode == "Single BG File":
         source = value["source"]; _background_require(type(source) is dict and set(source) == {"locator", "state", "sha256", "hdf", "decoded"} and path(source["locator"]) and source["locator"] == policy["locator"] and state(source["state"]) and hex64(source["sha256"]), "background source fact is malformed"); decoded(source["decoded"], shape); hdf = source["hdf"]
         _background_require((hdf is None) == (policy["dataset_path"] is None) and (hdf is None or type(hdf) is dict and set(hdf) == {"dataset_path", "frame_index", "shape", "dtype"} and hdf["dataset_path"] == policy["dataset_path"] and type(hdf["frame_index"]) is int and hdf["frame_index"] == policy["frame_index"] and type(hdf["shape"]) is list and len(hdf["shape"]) in {2, 3} and all(type(part) is int and part > 0 for part in hdf["shape"]) and tuple(hdf["shape"][-2:]) == shape and (len(hdf["shape"]) == 2 and hdf["frame_index"] == 0 or len(hdf["shape"]) == 3 and 0 <= hdf["frame_index"] < hdf["shape"][0]) and type(hdf["dtype"]) is str and decoded({"shape": hdf["shape"][-2:], "dtype": hdf["dtype"], "sha256": "0" * 64}, shape) is None), "background HDF proof is malformed"); projected = items(value["metadata_items"]); norm = policy["normalization_key"]; _background_require(value["decoded"] == source["decoded"] and tuple(row[0] for row in projected) == tuple(key for key in (norm,) if key) and bool(projected) == (value["metadata_source"] is not None) and (norm is None or positive(dict(fact[5])[norm]) and positive(dict(projected)[norm])), "background Single projection differs"); metadata_source(value["metadata_source"])
@@ -674,14 +675,20 @@ def write_frame_source_ref(
         "frame_count": "frame_count",
         "dataset_path": "dataset_path",
         "self_contained": "self_contained",
+        "raw_shape": "raw_shape",
+        "raw_dtype": "raw_dtype",
+        "raw_header_bytes": "raw_header_bytes",
+        "rotation": "rotation",
     }
     for key, attr_name in attr_names.items():
         value = snapshot.get(key)
         if value is None:
             continue
         try:
-            if key in {"size", "mtime_ns", "frame_count"}:
+            if key in {"size", "mtime_ns", "frame_count", "raw_header_bytes", "rotation"}:
                 value = int(value)
+            elif key == "raw_shape":
+                value = tuple(int(n) for n in value)
             elif key == "self_contained":
                 value = bool(value)
             else:
@@ -696,6 +703,64 @@ def write_frame_source_ref(
             )
 
 
+def write_point_source_ref(frame_grp, point_images, source_constituents, *, source_base=None):
+    """Ordered additive native references; old readers cannot pick one operand."""
+    from xrd_tools.sources.point_images import PointImagePolicy
+    policy = PointImagePolicy.from_dict(point_images)
+    contributors = tuple(source_constituents)
+    expected = 1 if policy.operation == "select" else policy.images_per_point
+    if len(contributors) != expected:
+        raise ValueError("point source constituents do not match the policy")
+    source = _nxcollection(frame_grp, "source")
+    source.attrs["point_images"] = json.dumps(policy.to_dict(), sort_keys=True, separators=(",", ":"))
+    members = _nxcollection(source, "constituents")
+    for ordinal, member in enumerate(contributors):
+        record = _nxcollection(members, f"{ordinal:04d}")
+        write_frame_source_ref(record, member["source_path"], member["source_frame_index"], source_base=source_base, source_snapshot=member.get("source_snapshot"))
+        # Reuse the existing pointer encoding without an extra nested source owner.
+        encoded = record["source"]
+        for name in tuple(encoded):
+            record.move(f"source/{name}", name)
+        for name, value in encoded.attrs.items():
+            record.attrs[name] = value
+        del record["source"]
+
+
+def read_point_source_ref(source):
+    """Read the exact ordered point references without decoding any pixels."""
+    from xrd_tools.sources.point_images import PointImagePolicy
+    if not isinstance(source, h5py.Group) or "constituents" not in source:
+        return None
+    value = source.attrs.get("point_images")
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    policy = PointImagePolicy.from_dict(json.loads(value))
+    members = source["constituents"]
+    expected = 1 if policy.operation == "select" else policy.images_per_point
+    if (not isinstance(members, h5py.Group) or set(source) != {"constituents"}
+            or tuple(members) != tuple(f"{index:04d}" for index in range(expected))):
+        raise ValueError("point source constituents are malformed")
+    snapshots = {"adapter_id": "adapter_id", "size": "file_size", "mtime_ns": "file_mtime_ns", "frame_count": "frame_count", "dataset_path": "dataset_path", "self_contained": "self_contained", "raw_shape": "raw_shape", "raw_dtype": "raw_dtype", "raw_header_bytes": "raw_header_bytes", "rotation": "rotation"}
+    constituents = []
+    for name, member in members.items():
+        if not isinstance(member, h5py.Group) or set(member) != {"path", "frame_index"}:
+            raise ValueError("point source constituent is malformed")
+        if (not isinstance(members.get(name, getlink=True), h5py.HardLink)
+                or any(not isinstance(member.get(key, getlink=True), h5py.HardLink) for key in member)
+                or not isinstance(member["path"], h5py.Dataset) or member["path"].shape != ()
+                or h5py.check_string_dtype(member["path"].dtype) is None
+                or not isinstance(member["frame_index"], h5py.Dataset) or member["frame_index"].shape != ()
+                or member["frame_index"].dtype.kind not in "iu"):
+            raise ValueError("point source constituent pointer is malformed")
+        path = member["path"].asstr()[()]
+        index = int(member["frame_index"][()])
+        if not path or index < 0:
+            raise ValueError("point source constituent is malformed")
+        snapshot = {key: tuple(int(part) for part in value) if key == "raw_shape" else value.item() if hasattr(value, "item") else value for key, attr in snapshots.items() if (value := member.attrs.get(attr)) is not None}
+        constituents.append({"source_path": path, "source_frame_index": index, "source_snapshot": snapshot})
+    return policy.to_dict(), tuple(constituents)
+
+
 def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                        thumbnail=None, thumbnail_dtype: str = "uint8",
                        thumbnail_mask_baked: bool = True,
@@ -703,7 +768,8 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                        source_path=None, source_frame_index: int = 0,
                        timestamp=None, source_base=None,
                        source_snapshot=None, background_dependency_bytes=None,
-                       background_dependency_fingerprint=None) -> h5py.Group:
+                       background_dependency_fingerprint=None,
+                       source_constituents=(), point_images=None) -> h5py.Group:
     """Write one complete per-frame record group (idempotent per key).
 
     Per the v2 schema, per-frame groups carry *only* metadata + thumbnail —
@@ -720,7 +786,9 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
             mask_baked=thumbnail_mask_baked,
             thumbnail_mask=thumbnail_mask,
         )
-    if source_path and "source" not in fg:
+    if source_constituents and "source" not in fg:
+        write_point_source_ref(fg, point_images, source_constituents, source_base=source_base)
+    elif source_path and "source" not in fg:
         write_frame_source_ref(fg, source_path, source_frame_index,
                                source_base=source_base,
                                source_snapshot=source_snapshot)
@@ -738,6 +806,7 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
                          timestamp=None, source_base=None,
                          source_snapshot=None, background_dependency_bytes=None,
                          background_dependency_fingerprint=None,
+                         source_constituents=(), point_images=None,
                          _prepared_thumbnail: _PreparedThumbnail | None = None,
                          ) -> h5py.Group:
     """Replace one direct per-frame record through an atomic sibling stage."""
@@ -764,6 +833,8 @@ def replace_frame_record(frames_grp: h5py.Group, frame_key: str, *,
             timestamp=timestamp,
             source_base=source_base,
             source_snapshot=source_snapshot,
+            source_constituents=source_constituents,
+            point_images=point_images,
             background_dependency_bytes=background_dependency_bytes,
             background_dependency_fingerprint=background_dependency_fingerprint,
         )
@@ -812,7 +883,7 @@ def frame_record_key(scan_label, frame_index: int) -> str:
 
 
 def write_contributing_frames(entry_grp: h5py.Group, records, *,
-                              source_base=None) -> int:
+                              source_base=None, bounded: bool = False) -> int:
     """Write the per-frame **source records** for a Stitch/RSM result — the
     enabler for the raw-image popup (resolve a contributing frame from the saved
     ``.nexus``).  ``records`` is an iterable of mappings with ``frame_index`` and
@@ -832,11 +903,37 @@ def write_contributing_frames(entry_grp: h5py.Group, records, *,
                       if r.get("scan_label") is not None}, key=str):
         _nxcollection(frames, f"scan_{sl}")
     for r in records:
-        write_frame_record(
+        frame = write_frame_record(
             frames, frame_record_key(r.get("scan_label"), r["frame_index"]),
             source_path=r.get("source_path"),
             source_frame_index=int(r.get("source_frame_index") or 0),
-            thumbnail=r.get("thumbnail"), source_base=source_base)
+            thumbnail=r.get("thumbnail"), source_base=source_base,
+            source_snapshot=r.get("source_snapshot"),
+            source_constituents=r.get("source_constituents", ()),
+            point_images=r.get("point_images"),
+            thumbnail_dtype=r.get("thumbnail_dtype", "uint8"),
+            thumbnail_mask_baked=r.get("thumbnail_mask_baked", True),
+            mask_baked=r.get("mask_baked", True),
+            thumbnail_mask=r.get("thumbnail_mask"))
+        if "identity" in r:
+            frame.create_dataset("identity_json", data=np.bytes_(json.dumps(
+                r["identity"], sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False).encode()))
+    if bounded:
+        # Shared record encoding, with finite-artifact bounded text storage.
+        from xrd_tools.io.nexus import _bounded_text_attr
+        _bounded_text_attr(entry_grp, "source_base", str(entry_grp.attrs["source_base"]))
+        def bound_text(_name, obj):
+            for key, value in tuple(obj.attrs.items()):
+                if isinstance(value, str):
+                    _bounded_text_attr(obj, key, value)
+            if isinstance(obj, h5py.Group) and "path" in obj:
+                path = obj["path"]
+                value = path.asstr()[()]
+                del obj["path"]
+                obj.create_dataset("path", data=np.bytes_(value.encode()))
+        bound_text("", frames)
+        frames.visititems(bound_text)
     return len(records)
 
 
@@ -907,7 +1004,7 @@ def harvest_frame_records(source, *, scan_labels=None, selected_labels=None,
     """Build the ``frame_records`` list for a Stitch/RSM result from its source(s).
 
     Mirrors what :class:`~xrd_tools.reduction.NexusSink` writes per frame, but for
-    a *whole-result* writer (:func:`write_stitched` / :func:`write_rsm` via
+    a *whole-result* writer (a Stitch record / :func:`write_rsm` via
     :func:`write_contributing_frames`).  ``source`` may be a single FrameSource, a
     sequence of them (the ``run_rsm`` grouping), or a
     :class:`~xrd_tools.sources.composite.CompositeFrameSource` (the ``run_stitch``
@@ -1078,19 +1175,23 @@ def drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
             data = data[keep_mask]
         datasets.append((
             key, data, dict(obj.attrs.items()),
-            _recreate_filter_kwargs(obj), row_aligned, obj.chunks,
+            _recreate_filter_kwargs(obj), row_aligned, obj.chunks, obj.maxshape,
         ))
 
     del parent[name]
     new_group = parent.create_group(name)
     for key, value in group_attrs.items():
         new_group.attrs[key] = value
-    for (key, data, attrs, filter_kwargs, row_aligned, chunks) in datasets:
+    for (key, data, attrs, filter_kwargs, row_aligned, chunks, maxshape) in datasets:
         kwargs = {}
         if row_aligned:
             kwargs["maxshape"] = (None,) + tuple(np.asarray(data).shape[1:])
             if chunks is not None:
                 kwargs["chunks"] = chunks
+        elif chunks is not None:
+            # Optional label-keyed tables are not frame-aligned, but must remain
+            # appendable after row surgery just as they were before it.
+            kwargs.update(chunks=chunks, maxshape=maxshape)
         kwargs.update(filter_kwargs)
         # A filter requires chunking; restore the source chunks if the recreate
         # path above didn't already set them (non-row-aligned filtered datasets).
@@ -1099,3 +1200,8 @@ def drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
         ds = new_group.create_dataset(key, data=data, **kwargs)
         for attr_key, value in attrs.items():
             ds.attrs[attr_key] = value
+    # dropped labels' saved angular support goes with their rows (the one codec retires the entries)
+    from xrd_tools.io.angular_support import has_angular_support, write_angular_support
+    if has_angular_support(new_group):
+        dropped = {int(label) for label in labels[~keep_mask]}
+        write_angular_support(new_group, {label: None for label in sorted(dropped)}, intensity_rows={})

@@ -13,14 +13,18 @@ from .external_tools import (
 )
 from .shell_values import ShellCommand, ShellCommandKind
 
+#: The Tools button that opens ScientificView's Reference Phases window (REFERENCE-PHASES-20261011).
+REFERENCE_PHASES_TOOLTIP = ("Show reference lines and detector rings for calibrants, CIF phases and lattices, each with its own colour, legend entry and minimum intensity. Display only.")
+
 
 class ToolsView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
 
+    #: Int's analysis launchers: (label, command value[, tooltip])
     _TOOLS = (
         ("∧ Peak Fitting", "peak_fitting"),
         ("≈ Phase Fitting", "phase_fitting"),
-        ("▤ Plot Metadata", "plot_metadata"),
+        ("┆ Reference Phases", "reference_phases", REFERENCE_PHASES_TOOLTIP),
         ("▣ ROI Statistics", "roi_statistics"),
     )
     _EXTERNAL_VIEWERS = (
@@ -28,7 +32,9 @@ class ToolsView(QtWidgets.QFrame):
         ("▦ silx HDF5 Viewer…", "silx_h5viewer"),
     )
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(self, parent: QtWidgets.QWidget | None = None, *,
+                 page_tools: tuple[tuple[str, str, str], ...] | None = None,
+                 external_viewers: bool = True) -> None:
         super().__init__(parent)
         self.setObjectName("e3ToolsView")
         layout = QtWidgets.QVBoxLayout(self)
@@ -49,9 +55,11 @@ class ToolsView(QtWidgets.QFrame):
         tools_layout = QtWidgets.QVBoxLayout(self.tool_content)
         self._tools_layout = tools_layout
         self._tool_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for label, value in self._TOOLS:
+        for label, value, *tooltip in self._TOOLS if page_tools is None else ():
             button = QtWidgets.QPushButton(label)
             button.setObjectName(f"e3Tool_{value}")
+            if tooltip:
+                button.setToolTip(tooltip[0])
             button.clicked.connect(
                 lambda _checked=False, target=value: self.commandRequested.emit(
                     ShellCommand(ShellCommandKind.LAUNCH_TOOL, target)
@@ -59,7 +67,18 @@ class ToolsView(QtWidgets.QFrame):
             )
             tools_layout.addWidget(button)
             self._tool_buttons[value] = button
-        for label, value in self._EXTERNAL_VIEWERS:
+        for name, label, tooltip in page_tools or ():
+            button = QtWidgets.QPushButton(label)
+            button.setObjectName(f"e3Tool_{name}")
+            button.setToolTip(tooltip)
+            button.clicked.connect(
+                lambda _checked=False, target=name: self.commandRequested.emit(
+                    ShellCommand(ShellCommandKind.PAGE_TOOL, target)
+                )
+            )
+            tools_layout.addWidget(button)
+            self._tool_buttons[name] = button
+        for label, value in self._EXTERNAL_VIEWERS if external_viewers else ():
             button = QtWidgets.QPushButton(label)
             button.setObjectName(f"e3Tool_{value}")
             button.clicked.connect(
@@ -82,7 +101,12 @@ class ToolsView(QtWidgets.QFrame):
             QtWidgets.QSizePolicy.Policy.Maximum,
         )
         self._apply_spacing()
-        self.reconcile_external(unavailable_external_tools())
+        if external_viewers:
+            self.reconcile_external(unavailable_external_tools())
+
+    def page_tool(self, name: str) -> QtWidgets.QPushButton:
+        """A mounted page tool, for the page's capability/readiness projection."""
+        return self._tool_buttons[name]
 
     def reconcile_external(self, projection: ExternalToolsProjection) -> None:
         if type(projection) is not ExternalToolsProjection:
@@ -151,4 +175,18 @@ class ToolsView(QtWidgets.QFrame):
         self.updateGeometry()
 
 
-__all__ = ["ToolsView"]
+class BrowserToolsColumn(QtWidgets.QFrame):
+    """Int's browser above its scrollable analysis tools, shared by native pages."""
+
+    def __init__(self, browser: QtWidgets.QWidget, tools: ToolsView) -> None:
+        super().__init__()
+        self.setObjectName("e3BrowserColumn")
+        self.setMinimumWidth(255)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(browser, 1)
+        layout.addWidget(tools, 0)
+
+
+__all__ = ["BrowserToolsColumn", "ToolsView"]

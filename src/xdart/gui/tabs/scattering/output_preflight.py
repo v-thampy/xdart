@@ -2,19 +2,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
 from typing import Any, Callable
 import numpy as np
 from xrd_tools.core.filters import compile_filter
+from xrd_tools.corrections.detector import (
+    DEFAULT_MIN_FLAT_FRACTION,
+    DetectorImageCheck,
+    check_detector_image,
+)
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.integrate.calibration import (
     apply_sensor_parallax,
     load_detector_calibration,
 )
 from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
-from xrd_tools.io.image import read_detector_image_layout
+from xrd_tools.io.image import read_detector_image_layout, read_image
 from xrd_tools.io.output_path import (
     FINITE_OPERATION_SLOTS,
     OVERWRITE_MODE,
@@ -29,24 +35,30 @@ from xrd_tools.io.output_safety import (
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
 from xrd_tools.io.stat_identity import identity_ctime_ns
-from xrd_tools.sources.adapters import candidate_owner, get_adapter
+from xrd_tools.sources.adapters import candidate_owner, get_adapter, registry_identity
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.directory_index import StaleCandidateError
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.run_plan import RunCandidatePlan
-from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.selection import DirectorySourceSpec, live_metadata_format, live_selection
+from xrd_tools.sources.point_images import PointImagePolicy, PointImagesRequired, inspect_point_images
 from xrd_tools.sources.execution_graph import (
     _CapturedSourceTopology,
     _capture_source_topology,
+    _held,
     _same_source_revision,
     _source_state_key,
     _topology_from_captured_state,
     _verify_source_states,
+    LivePrefixProof,
+    observation_key,
     PreparedSourceExecutionGraph,
     SelectedContainerInput,
     SourceRevisionChanged,
+    admitted_metadata_current,
+    proven_states,
     qualify_source_execution_graph,
     source_snapshots_projection,
     validate_source_execution_graph,
@@ -60,6 +72,7 @@ from .contracts import (
 from .source_metadata import ordered_motor_intersection
 
 load_poni = load_detector_calibration
+_LOG = logging.getLogger(__name__)
 
 _SCIENTIFIC_ASSET_STREAM_CHUNK_BYTES = 1 << 16
 _SCIENTIFIC_MASK_COMPATIBILITY_FLOOR_BYTES = 64 << 20
@@ -81,10 +94,11 @@ def validate_source_aliases(
     stamp: SourceExecutionStamp,
     *,
     cancelled: Callable[[], bool] | None = None,
+    proven: dict[str, SourceFileState] | None = None,
 ) -> ValidatedSourceAliases:
     """Prove every raw alias and target twice in deterministic order."""
 
-    identity, targets = _validate_source_aliases_shared(stamp, cancelled=cancelled)
+    identity, targets = _validate_source_aliases_shared(stamp, cancelled=cancelled, proven=proven)
     return ValidatedSourceAliases(identity, targets)
 
 
@@ -115,6 +129,7 @@ class OutputCandidate:
         cls, capture: StartCapture,
         assets: AcceptedScientificAssets | None = None,
         gi_motor_choices: tuple[str, ...] | None = None,
+        saturation: int | None = None,
     ) -> "OutputCandidate":
         intent = capture.intent_snapshot.thaw()
         if (
@@ -128,9 +143,10 @@ class OutputCandidate:
         if type(source) not in {SourceSpec, DirectorySourceSpec}:
             raise ValueError("output admission requires a supported source")
         accepted = assets or _load_scientific_assets(intent)
-        if accepted.poni_parallax is not None:
-            intent.poni_values = accepted.poni_projection
-        frozen = intent.freeze(gi_motor_choices=gi_motor_choices)
+        signed = accepted.signed_poni_values
+        if signed is not None:
+            intent.poni_values = signed
+        frozen = intent.freeze(gi_motor_choices=gi_motor_choices, saturation=saturation)
         processing = frozen.as_provenance()
         processing["accepted_scientific_assets"] = {
             "poni_values": accepted.poni_projection,
@@ -138,6 +154,9 @@ class OutputCandidate:
             "poni_sha256": accepted.poni_sha256,
             "mask_sha256": accepted.mask_sha256,
         }
+        for key in ("flat_sha256", "dark_sha256"):
+            if getattr(accepted, key) is not None:
+                processing["accepted_scientific_assets"][key] = getattr(accepted, key)
         return cls(
             source, str(intent.poni_file), str(intent.mask_file), str(intent.save_path),
             json.dumps(
@@ -349,6 +368,12 @@ class LiveDirectoryAttempt:
     decision: AdmittedOutput | None = None
     reason: str = ""
     revision_changed: bool = False
+    # READY for only the group's leading members: a later one is still waiting
+    # for its metadata, so the group must not settle on this attempt.
+    partial: bool = False
+    # READY: the proof of what this poll admitted (the members after a prefix
+    # proved in it), which construction re-checks instead of validating again.
+    proof: LivePrefixProof | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not (
@@ -366,6 +391,8 @@ class LiveDirectoryAttempt:
                 not self.revision_changed
                 or self.state is ProbeState.IN_PROGRESS
             )
+            and type(self.partial) is bool
+            and (not self.partial or self.state is ProbeState.READY)
         ):
             raise TypeError("live directory attempt is invalid")
 
@@ -473,22 +500,30 @@ def prepare_output(
         raise TypeError("admission requires typed StartCapture")
     snapshot = capture.intent_snapshot
     intent = snapshot.thaw()
+    if type(intent.source_spec) is SourceSpec:
+        detection = inspect_point_images(intent.source_spec)
+        if detection is not None:
+            if intent.live_mode:
+                raise ValueError('Multiple images per point are unavailable in Live; choose a finite run.')
+            raw_policy = intent.source_spec.options.get('point_images')
+            policy = None if raw_policy is None else PointImagePolicy.from_dict(raw_policy)
+            if policy is None or policy.images_per_point != detection.images_per_point:
+                raise PointImagesRequired(detection)
     assets = _load_scientific_assets(intent, cancelled=cancelled)
     candidate = OutputCandidate.from_start_capture(capture, assets)
     source, choices, deferred = candidate.source, None, None
     directory_discovered_paths: tuple[Path, ...] = ()
     if cancelled():
         raise RuntimeError("admission cancelled")
-    if type(source) is DirectorySourceSpec:
+    # A Folder, or in Live an Image Series bound to its members, is watched by one session.
+    if (watch := live_selection(source)) is not None and (type(source) is DirectorySourceSpec or intent.live_mode):
         session = DirectoryIndexSession(
             retry_deadline=(float("inf") if intent.live_mode else None),
             probe_candidates=False,
         )
         session_owner(session)
-        session.configure(
-            source.root, recursive=source.recursive,
-            name_filter=source.name_filter, suffixes=source.suffixes,
-        )
+        session.configure(watch.root, recursive=watch.recursive, name_filter=watch.name_filter,
+                          suffixes=watch.suffixes, series=watch.series)
         observation = session.observe(refresh=True)
         discovered = observation.discovered_snapshot
         complete_plan = RunCandidatePlan.from_snapshot(discovered)
@@ -547,6 +582,13 @@ def prepare_output(
             candidate = OutputCandidate.from_start_capture(
                 capture, assets, choices
             )
+    automatic = intent.threshold.mask_saturation and not intent.threshold.apply_threshold
+    saturation = _admitted_saturation(source, items, assets) if automatic else None
+    if saturation is not None:
+        # signed with the resolved ceiling before any Append inspection (decision 39)
+        candidate = OutputCandidate.from_start_capture(
+            capture, assets, choices, saturation=saturation,
+        )
     if deferred is None:
         _validate_targets(
             candidate,
@@ -574,7 +616,34 @@ def prepare_output(
         deferred_directory=deferred,
         directory_discovered_file_count=len(directory_discovered_paths),
         directory_discovered_paths=directory_discovered_paths,
+        saturation=saturation,
     )
+
+
+def _admitted_saturation(
+    source: SourceSpec | DirectorySourceSpec,
+    items: tuple[PlannedOutput, ...],
+    assets: AcceptedScientificAssets,
+) -> int | None:
+    """The run's resolved automatic ceiling (decision 39), bound before signing.
+
+    A single source takes the value it records (its container, or its first
+    image's header: one scan's images share it), else the calibration detector's
+    documented counter limit for integer data; a Live Image Series, admitted only
+    after it starts, takes its selected container's or image's. A Directory run
+    shares one science identity and qualifies its files only after it starts, so
+    it takes the documented limit alone. None: the data type's rule, as before.
+    """
+    from xrd_tools.core.invalid import resolve_detector_saturation
+    from xrd_tools.sources.execution_graph import graph_saturation, selected_saturation
+
+    detector = None if assets.poni_values is None else assets.poni_values[7]
+    if type(source) is SourceSpec:
+        resolved = (graph_saturation(items[0].graph, detector=detector) if items
+                    else selected_saturation(source, detector=detector))
+    else:
+        resolved = resolve_detector_saturation(detector=detector)
+    return None if resolved is None or resolved.source == "dtype" else resolved.value
 def inspect_output(
     item: PlannedOutput,
     configuration: FrozenRunConfiguration | OutputCandidate,
@@ -612,28 +681,7 @@ def inspect_output(
     )
 
 
-def _background_frame_fact(frame, plan, shape, selector=None) -> tuple[object, ...]:
-    """Freeze one bounded, array-free target fact for Background qualification."""
-    path = str(Path(frame.source_path).resolve(strict=False))
-    keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
-    items = []
-    for key in keys:
-        matches = (value for name, value in frame.metadata.items() if type(name) is str and name.casefold() == key.casefold())
-        value = next(matches, items)
-        if value is items or next(matches, items) is not items: raise ValueError("target Background metadata is absent or ambiguous")
-        value = value.item() if isinstance(value, np.generic) else value
-        if type(value) is bool: tagged = ("bool", value)
-        elif isinstance(value, (int, float)) and not isinstance(value, bool) and (not isinstance(value, int) or abs(value) <= float.fromhex("0x1.fffffffffffffp+1023")) and np.isfinite(numeric := float(value)):
-            tagged = ("number", numeric.hex())
-        elif type(value) is str and len(value) <= 4085 and len(value.encode("utf-8")) <= 4085: tagged = ("text", value)
-        elif type(value) is bytes and len(value) <= 2042: tagged = ("bytes", value.hex())
-        else: raise ValueError("target Background metadata scalar is unsupported")
-        if len(json.dumps(tagged, separators=(",", ":")).encode()) > 4096: raise ValueError("target Background scalar exceeds cap")
-        items.append((key, tagged))
-    fact = (int(frame.index), path, selector, int(frame.source_frame_index or 0), tuple(shape), tuple(items))
-    if len(json.dumps(fact, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) > 24_576:
-        raise ValueError("target Background frame fact exceeds cap")
-    return fact
+from xrd_tools.reduction.background import background_frame_fact as _background_frame_fact
 
 
 def _merge_background_binding(bindings, binding, *, limit: int):
@@ -653,44 +701,10 @@ def _merge_background_binding(bindings, binding, *, limit: int):
     return tuple(sorted((*bindings, binding), key=lambda value: value[0]))
 
 
-def _background_resource_terms(plan, pixels: int) -> tuple[int, int, int, int]:
-    from xrd_tools.reduction import FrameBackgroundPlan
-    if type(plan) is not FrameBackgroundPlan or type(pixels) is not int or pixels <= 0:
-        raise TypeError("Background resource inputs are not exact")
-    if plan.mode == "None": return 0, 0, 0, 0
-    return 8 * pixels, (25 if plan.mode == "Series Average" else 8) * pixels, \
-        8 * pixels, 64 * 1024 ** 2
+from xrd_tools.reduction.background import background_resource_terms as _background_resource_terms
 
 
-def _directory_candidate_groups(
-    plan: RunCandidatePlan,
-) -> tuple[tuple[Candidate, ...], ...]:
-    groups: list[tuple[Candidate, ...]] = []
-    consumed: set[Path] = set()
-    for candidate in plan.candidates:
-        if candidate.path in consumed:
-            continue
-        adapter = get_adapter(candidate.adapter_id)
-        if adapter is None:
-            raise ValueError(
-                f"directory candidate lost adapter {candidate.adapter_id!r}"
-            )
-        if SourceKind.IMAGE_FILE in adapter.kinds:
-            name = adapter.scan_name(candidate.path)
-            members = tuple(
-                value
-                for value in plan.candidates
-                if (
-                    value.adapter_id == candidate.adapter_id
-                    and value.path.parent == candidate.path.parent
-                    and adapter.scan_name(value.path) == name
-                )
-            )
-        else:
-            members = (candidate,)
-        consumed.update(value.path for value in members)
-        groups.append(members)
-    return tuple(groups)
+from xrd_tools.sources.run_plan import directory_candidate_groups as _directory_candidate_groups
 
 
 def _save_path_is_directory(path: Path) -> bool:
@@ -797,9 +811,12 @@ def _deferred_directory_plan(
     discovered_paths: tuple[Path, ...],
     *,
     cancelled: Callable[[], bool],
+    prefix: PreparedSourceExecutionGraph | None = None,
 ) -> DeferredDirectoryPlan:
+    """``prefix``: a live published graph proved this poll, whose members keep their admitted states."""
     if not plan.candidates:
         raise RuntimeError("source has no matching candidates")
+    proven = proven_states(prefix)
     staged: list[
         tuple[
             tuple[Candidate, ...],
@@ -810,29 +827,25 @@ def _deferred_directory_plan(
             str,
         ]
     ] = []
-    for group in _directory_candidate_groups(plan):
+    for group, name in _output_groups(configuration, plan):
         if cancelled():
             raise RuntimeError("admission cancelled")
         captured_topologies: list[_CapturedSourceTopology] = []
         for source_candidate in group:
             if cancelled():
                 raise RuntimeError("admission cancelled")
+            state = proven.get(str(source_candidate.path))
+            if state is None or (state.size, state.mtime_ns) != source_candidate.version_stamp:
+                state = _capture_exact_candidate_state(source_candidate)
             captured_topologies.append(
                 _topology_from_captured_state(
-                    _capture_exact_candidate_state(source_candidate),
-                    candidate_owner_id=source_candidate.adapter_id,
+                    state, candidate_owner_id=source_candidate.adapter_id,
                 )
             )
             if cancelled():
                 raise RuntimeError("admission cancelled")
         candidate_states = tuple(captured_topologies)
         representative = group[0]
-        adapter = get_adapter(representative.adapter_id)
-        if adapter is None:
-            raise ValueError(
-                f"candidate {representative.path} lost its adapter"
-            )
-        name = adapter.scan_name(representative.path)
         target = _directory_target(configuration, plan, representative, name)
         # Directory admission remains name/stat-only. Exact container and
         # external-dependency inspection belongs to the one JIT materializer.
@@ -876,6 +889,7 @@ def _deferred_directory_plan(
             ) in staged
             for path in paths
         ),
+        proven,
     )
     entries: list[DeferredDirectoryEntry] = []
     for (
@@ -912,10 +926,8 @@ def _deferred_directory_plan(
         ):
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            _validate_exact_candidate_state(
-                source_candidate,
-                topology.followed_state,
-            )
+            if proven.get(str(source_candidate.path)) is not topology.followed_state:
+                _validate_exact_candidate_state(source_candidate, topology.followed_state)
             if cancelled():
                 raise RuntimeError("admission cancelled")
             protected.append(topology)
@@ -948,6 +960,7 @@ def _deferred_directory_plan(
         protected_map = {
             _source_state_key(value.raw_path): value
             for value in protected
+            if proven.get(value.followed_state.path) is not value.followed_state
         }
         _verify_source_states(protected_map, cancelled=cancelled)
         entries.append(DeferredDirectoryEntry(
@@ -966,24 +979,41 @@ def _deferred_directory_plan(
     )
 
 
+def _correction_paths(configuration: object) -> tuple[str, ...]:
+    """The flat-field and dark files an output must never overwrite.
+
+    Admission guards receive the signed ``OutputCandidate``, which carries them
+    only in its processing mapping; a frozen configuration has them as fields.
+    """
+    if type(configuration) is OutputCandidate:
+        values = configuration.processing_mapping()
+    else:
+        values = {key: getattr(configuration, key, "") for key in ("flat_file", "dark_file")}
+    return tuple(str(values[key]) for key in ("flat_file", "dark_file") if values.get(key))
+
+
 def _validate_deferred_targets(
     configuration: OutputCandidate,
     plan: RunCandidatePlan,
     targets: tuple[Path, ...],
     external_paths: tuple[Path, ...],
+    proven: dict[str, SourceFileState] | None = None,
 ) -> None:
-    source = configuration.source
-    if type(source) is not DirectorySourceSpec:
+    source = live_selection(configuration.source)
+    if source is None:
         raise TypeError("deferred targets require a directory source")
     raw_paths = (
         tuple(candidate.path for candidate in plan.candidates)
         + external_paths
     )
-    raw_norms = {
-        os.path.normcase(os.path.realpath(path)) for path in raw_paths
-    }
-    raw_inodes: set[tuple[int, int]] = set()
-    for path in raw_paths:
+    # A proved prefix member is its admitted state: its resolution and identity.
+    held = [(proven or {}).get(str(path)) for path in raw_paths]
+    raw_norms = {os.path.normcase(os.path.realpath(path) if state is None else state._resolved_path_at_capture)
+                 for path, state in zip(raw_paths, held)}
+    raw_inodes: set[tuple[int, int]] = {(state.device, state.inode) for state in held if state is not None}
+    for path, state in zip(raw_paths, held):
+        if state is not None:
+            continue
         try:
             stat = path.stat()
         except OSError:
@@ -991,7 +1021,8 @@ def _validate_deferred_targets(
         raw_inodes.add((int(stat.st_dev), int(stat.st_ino)))
     protected = tuple(
         Path(value)
-        for value in (configuration.poni_file, configuration.mask_file)
+        for value in (configuration.poni_file, configuration.mask_file,
+                      *_correction_paths(configuration))
         if value
     )
     seen: set[str] = set()
@@ -1019,7 +1050,7 @@ def _validate_deferred_targets(
             input_files=protected,
             watched_dirs=(source.root,),
             recursive=source.recursive,
-            container_directory_mode=True,
+            container_directory_mode=source.series is None,  # a series' bound already keeps outputs out
         )
 
 
@@ -1047,12 +1078,7 @@ def live_directory_groups(
         RunCandidatePlan.from_snapshot(discovered)
     )
     groups: list[LiveDirectoryGroup] = []
-    for candidates in _directory_candidate_groups(current):
-        adapter = get_adapter(candidates[0].adapter_id)
-        if adapter is None:
-            raise ValueError(
-                f"candidate {candidates[0].path} lost its adapter"
-            )
+    for candidates, name in _output_groups(receipt.candidate, current):
         subset = RunCandidatePlan(
             current.generation,
             candidates,
@@ -1066,11 +1092,144 @@ def live_directory_groups(
                 receipt.candidate,
                 current,
                 candidates[0],
-                adapter.scan_name(candidates[0].path),
+                name,
             ),
             subset.paths,
         ))
     return tuple(groups)
+
+
+def _output_groups(configuration: FrozenRunConfiguration | OutputCandidate,
+                   plan: RunCandidatePlan) -> tuple[tuple[tuple[Candidate, ...], str], ...]:
+    """The plan's output groups and scan names: a Live numbered Image Series is one group in its own members'
+    order under its own name; otherwise each adapter's scan name groups the files of one folder."""
+    selected = (configuration.thaw_source_spec() if type(configuration) is FrozenRunConfiguration
+                else configuration.source)
+    watch = live_selection(selected) if _is_live(configuration) else None
+    series = None if watch is None else watch.series
+    if series is not None and series.stem is not None:
+        return ((tuple(sorted(plan.candidates, key=lambda value: series.key(value.path.name))), series.stem),) \
+            if plan.candidates else ()
+    groups = []
+    for group in _directory_candidate_groups(plan):
+        adapter = get_adapter(group[0].adapter_id)
+        if adapter is None:
+            raise ValueError(f"candidate {group[0].path} lost its adapter")
+        groups.append((group, adapter.scan_name(group[0].path)))
+    return tuple(groups)
+
+
+def _live_metadata_ready(
+    configuration: FrozenRunConfiguration,
+    group: LiveDirectoryGroup,
+    observations: dict[str, tuple[tuple[str, object], ...]],
+    *,
+    published_members: int = 0,
+    observe_from: int = 0,
+    spec_cache: dict | None = None,
+) -> tuple[int, str]:
+    """How many leading members of a Live group have their metadata ready.
+
+    A member is ready when its selected sidecar (an explicit format) or its
+    Auto candidates look the same on two observations a poll apart, and an
+    explicit sidecar exists, so a new frame waits for a sidecar still being
+    written or about to land.  Under Auto, no sidecar on both observations
+    still means no metadata.  Under SPEC a new member is ready once its own
+    SPEC row is complete: a row is final once written, so one look suffices
+    (qualification then proves it), and no other point's row is ever borrowed;
+    published members are not re-gated.  Metadata-off Runs do not wait.
+    ``observations`` is the Run's own record, one entry per image, replaced at
+    every look. Published members may have lost their sidecar: after the
+    observation settles they must reach the published-metadata drift fence,
+    rather than wait forever as if they were new frames.
+    Also returns why the first member that is not ready waits.
+    """
+
+    candidates = group.plan.candidates
+    meta_format = live_metadata_format(configuration.thaw_source_spec())
+    if meta_format is None:
+        return len(candidates), ""
+    if meta_format == "spec":
+        from xrd_tools.io.metadata import spec_rows_ready
+
+        exempt = min(published_members, len(candidates))
+        ready = exempt + spec_rows_ready(tuple(Path(value.path) for value in candidates[exempt:]),
+                                         cache=spec_cache)
+        if ready == len(candidates):
+            return ready, ""
+        return ready, f"waiting for the SPEC row of {Path(candidates[ready].path).name}"
+    if SourceKind.IMAGE_FILE not in getattr(get_adapter(candidates[0].adapter_id), "kinds", (SourceKind.IMAGE_FILE,)):
+        return len(candidates), ""  # a container's own metadata: sidecars are an image policy
+    from xrd_tools.io.metadata import live_sidecar_observation
+
+    ready, reason, listings = len(candidates), "", {}
+    for index, candidate in enumerate(candidates):
+        if index < observe_from:
+            continue  # a published member its output's current proof covers
+        image = Path(candidate.path)
+        seen = live_sidecar_observation(image, meta_format, listings=listings)
+        key = observation_key(image)
+        previous = observations.get(key)
+        observations[key] = seen
+        if ready == len(candidates) and (
+            previous != seen
+            or any(revision is None for _path, revision in seen)
+            or (meta_format != "auto" and not seen and index >= published_members)
+        ):
+            ready, reason = index, f"waiting for the metadata of {image.name}"
+    return ready, reason
+
+
+def observe_live_members(configuration: FrozenRunConfiguration, paths) -> dict[str, object]:
+    """Each image's sidecar observation now, from fresh listings, by record key."""
+    from xrd_tools.io.metadata import live_sidecar_observation
+
+    fmt = live_metadata_format(configuration.thaw_source_spec())
+    listings: dict = {}
+    return {} if fmt in (None, "spec") else {
+        observation_key(path): live_sidecar_observation(path, fmt, listings=listings) for path in paths}
+
+
+def _prefix_current_rebased(configuration: FrozenRunConfiguration, graph: PreparedSourceExecutionGraph,
+                            proof: LivePrefixProof | None, cancelled: Callable[[], bool]) -> bool:
+    """The strict published-prefix check; a pass rebases the proof on what was observed before it."""
+    proof = proof if proof is not None and proof.graph is graph else None
+    seen = None if proof is None else observe_live_members(
+        configuration, [member.path for member in graph.stamp.members])
+    registry = registry_identity()
+    if not _published_prefix_current(graph, cancelled):
+        return False
+    if proof is not None:
+        proof.rebase(seen, registry)
+    return True
+
+
+def _published_prefix_current(
+    graph: PreparedSourceExecutionGraph, cancelled: Callable[[], bool],
+) -> bool:
+    """Whether the published frames' admitted graph still validates exactly.
+
+    :func:`validate_source_execution_graph` proves its aliases and candidate
+    owners, every raw member's exact state, every metadata dependency read
+    again (SPEC rows strictly, their extent extended), the admitted motor
+    values, read policy and cardinality.  A Stop inside it is admission's
+    cancellation; any other failure means "not current" and is left to
+    admission, so its existing policy (the published-metadata fence, the
+    Append guard) decides.
+    """
+    try:
+        validate_source_execution_graph(graph, cancelled=cancelled)
+    except RuntimeError as error:
+        if error.args == ("admission cancelled",):
+            raise
+        return False
+    except InterruptedError as error:
+        if error.args == ("source qualification cancelled",):
+            raise RuntimeError("admission cancelled") from error
+        return False
+    except Exception:
+        return False
+    return True
 
 
 def materialize_live_directory_group(
@@ -1081,38 +1240,83 @@ def materialize_live_directory_group(
     *,
     cancelled: Callable[[], bool],
     reprobe: bool = False,
+    sidecar_observations: dict[str, tuple[tuple[str, object], ...]] | None = None,
+    published_members: int = 0,
+    published_graph: PreparedSourceExecutionGraph | None = None,
+    proof: LivePrefixProof | None = None,
+    spec_cache: dict | None = None,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
     Provisional or concurrently changing bytes produce a typed retry-later
     result.  Output collision/configuration failures remain hard failures.
+    With ``sidecar_observations`` (the live Run's record), only the group's
+    leading members whose metadata is ready are admitted
+    (:func:`_live_metadata_ready`); a later ready member waits behind an
+    earlier pending one, and such an attempt is ``partial``.  When nothing
+    beyond the published frames is ready, the attempt waits without admission
+    while ``published_graph`` (their admitted graph) still validates exactly;
+    any other outcome is admitted as before.
     """
 
-    observations = []
-    for candidate in group.plan.candidates:
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        try:
-            observed = (
-                session.reprobe_candidate(candidate, refresh=False)
-                if reprobe
-                else session.probe_candidate(candidate, refresh=False)
-            )
-        except StaleCandidateError as error:
+    fresh = getattr(session, "fresh", frozenset())  # first seen by this poll's listing
+    try:
+        observations = list(session.probe_candidates(
+            group.plan.candidates, refresh=False, reprobe=reprobe, cancelled=cancelled))
+    except StaleCandidateError as error:
+        return LiveDirectoryAttempt(group, ProbeState.IN_PROGRESS, reason=str(error))
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    if observations and observations[-1].result.state is not ProbeState.READY:
+        return LiveDirectoryAttempt(group, observations[-1].result.state, reason=observations[-1].result.reason)
+    physical_paths = group.physical_paths
+    prefix = None
+    if sidecar_observations is not None:
+        # A current proof covers the published members (each output is proved
+        # again within LivePrefixProof.PERIOD_S): only later members are looked at.
+        checked = None if proof is None else proof.verified_at
+        covered = published_members if proof is not None and proof.graph is published_graph \
+            and proof.current(cancelled=cancelled) else 0
+        count, waiting = _live_metadata_ready(
+            configuration, group, sidecar_observations,
+            published_members=published_members,
+            observe_from=covered, spec_cache=spec_cache,
+        )
+        if covered and count > covered and proof.verified_at == checked and not proof.holds(cancelled=cancelled):
+            # A publication proves its prefix in its own poll; one that changed
+            # is looked at again in full, as an uncovered poll would.
+            covered, (count, waiting) = 0, _live_metadata_ready(
+                configuration, group, sidecar_observations, published_members=published_members, spec_cache=spec_cache)
+        # A file only this listing has seen waits for another: one that ran during writes can show
+        # a later file and miss an earlier one, and frame labels follow the members' order.
+        if (cut := next((index for index, value in enumerate(group.plan.candidates[published_members:count],
+                                                             published_members) if value.path in fresh), None)) is not None:
+            count, waiting = cut, f"confirming {Path(group.plan.candidates[cut].path).name} in another listing"
+        if count == 0:
             return LiveDirectoryAttempt(
-                group,
-                ProbeState.IN_PROGRESS,
-                reason=str(error),
+                group, ProbeState.IN_PROGRESS, reason=waiting,
             )
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        observations.append(observed)
-        if observed.result.state is not ProbeState.READY:
+        if (
+            published_graph is not None
+            and count < len(group.plan.candidates)
+            and count <= len(published_graph.stamp.members)
+            and (covered or _prefix_current_rebased(configuration, published_graph, proof, cancelled))
+        ):
+            # A frame waits and the published frames are exactly as admitted:
+            # re-admitting them would only repeat their admission (and, in
+            # Append mode, its same-extent preview against a grown SPEC file).
             return LiveDirectoryAttempt(
-                group,
-                observed.result.state,
-                reason=observed.result.reason,
+                group, ProbeState.IN_PROGRESS, reason=waiting,
             )
+        observations = observations[:count]
+        physical_paths = physical_paths[:count]
+        if getattr(session, "listing_deferred", False):
+            # An admission needs a real listing in its own poll (D1): the next one.
+            session.force_listing()
+            return LiveDirectoryAttempt(group, ProbeState.IN_PROGRESS, reason="listing the directory before admission")
+        # The prefix proved in this poll: only the members after it are read,
+        # captured and proved strictly.
+        prefix = published_graph if covered else None
 
     ready = RunCandidatePlan(
         group.plan.generation,
@@ -1122,29 +1326,49 @@ def materialize_live_directory_group(
         group.plan.name_filter,
         tuple(value.descriptor for value in observations),
     )
+    registry, admitted = registry_identity(), []
+    fmt = live_metadata_format(configuration.thaw_source_spec())
+    # The discovery the in-poll proof compares with is taken before qualification.
+    record = sidecar_observations if sidecar_observations is not None else observe_live_members(
+        configuration, ready.paths)
+
+    def recheck(graph: PreparedSourceExecutionGraph) -> bool:
+        admitted.append(LivePrefixProof(graph, record=record, registry=registry, metadata_format=fmt,
+                                        start=0 if prefix is None else len(prefix.stamp.members)))
+        return admitted[-1].holds(cancelled=cancelled)
+
     try:
         deferred = _deferred_directory_plan(
             receipt.candidate,
             ready,
-            group.physical_paths,
+            physical_paths,
             cancelled=cancelled,
+            prefix=prefix,
         )
         transient = replace(
             receipt,
             deferred_directory=deferred,
-            directory_discovered_file_count=len(group.physical_paths),
-            directory_discovered_paths=group.physical_paths,
+            directory_discovered_file_count=len(physical_paths),
+            directory_discovered_paths=physical_paths,
         )
         decision, _ready_files, _skipped_files = materialize_deferred_output(
             transient,
             session,
             deferred.entries[0],
-            cancelled=cancelled,
+            cancelled=cancelled,  # a container's published frames: its SPEC rows' fence (R5b)
+            published_members=published_members if published_graph is None or published_graph.descriptor is None
+            else published_graph.stamp.frame_count,
+            prefix=prefix, spec_cache=spec_cache, recheck=recheck,
         )
     except RuntimeError as error:
         if error.args == ("admission cancelled",):
             raise
         raise
+    except InterruptedError as error:
+        # JIT source revalidation has the same Stop token as qualification.
+        if error.args != ("source qualification cancelled",):
+            raise
+        raise RuntimeError("admission cancelled") from error
     except SourceRevisionChanged as error:
         return LiveDirectoryAttempt(
             group,
@@ -1166,6 +1390,8 @@ def materialize_live_directory_group(
         group,
         ProbeState.READY,
         decision=decision,
+        partial=len(physical_paths) < len(group.physical_paths),
+        proof=admitted[-1],
     )
 
 
@@ -1175,7 +1401,12 @@ def materialize_deferred_output(
     entry: DeferredDirectoryEntry,
     *,
     cancelled: Callable[[], bool],
+    published_members: int = 0,
+    prefix: PreparedSourceExecutionGraph | None = None, spec_cache: dict | None = None,
+    recheck: Callable[[PreparedSourceExecutionGraph], bool] | None = None,
 ) -> tuple[AdmittedOutput | None, int, int]:
+    """``recheck`` (a live admission's in-poll proof) is a TIFF series' second look, instead of a
+    second validation (a container keeps it); ``prefix``/``spec_cache``: as in _directory_items."""
     deferred = receipt.deferred_directory
     if (
         type(deferred) is not DeferredDirectoryPlan
@@ -1183,21 +1414,21 @@ def materialize_deferred_output(
         or not any(value is entry for value in deferred.entries)
     ):
         raise TypeError("deferred output is not owned by this receipt")
-    _validate_deferred_entry_states(entry, cancelled=cancelled)
+    proven = proven_states(prefix)
+    _validate_deferred_entry_states(entry, cancelled=cancelled, proven=proven)
     if entry.skip_reason:
         return None, 0, len(entry.physical_paths)
 
     ready: list[Candidate] = []
     descriptors: list[ContainerDescriptor | None] = []
     skipped = 0
-    for candidate in entry.candidates:
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        # ``validate_admitted_receipt`` refreshes and reconciles the complete
-        # name/stat snapshot once before execution.  Refreshing again here
-        # would rescan the whole directory for every member (O(N^2)); the
-        # exact-one probe itself revalidates this candidate after opening it.
-        observed = session.probe_candidate(candidate, refresh=False)
+    # ``validate_admitted_receipt`` refreshes and reconciles the complete
+    # name/stat snapshot once before execution.  Refreshing again here would
+    # rescan the whole directory for every member (O(N^2)); each exact probe
+    # revalidates its candidate, all on one owner call.
+    for observed in session.probe_candidates(
+        entry.candidates, refresh=False, stop_unready=False, cancelled=cancelled,
+    ):
         descriptor = observed.descriptor
         if observed.result.state is ProbeState.READY and (
             descriptor is not None
@@ -1223,13 +1454,15 @@ def materialize_deferred_output(
             receipt.candidate,
             subset,
             cancelled=cancelled,
+            published_members=published_members,
+            prefix=prefix, spec_cache=spec_cache,
         )
     except (ValueError, OSError):
         # A semantic/schema failure remains terminal when every admitted
         # source state is still exact.  If the same failure followed a real
         # byte/dependency drift, this exact revalidation raises the typed Live
         # retry signal instead.
-        _validate_deferred_entry_states(entry, cancelled=cancelled)
+        _validate_deferred_entry_states(entry, cancelled=cancelled, proven=proven)
         raise
     if len(items) != 1:
         raise ValueError("deferred source group did not produce one output")
@@ -1240,13 +1473,17 @@ def materialize_deferred_output(
         entry,
         item=item,
         cancelled=cancelled,
+        proven=proven, revalidate=recheck is None or item.descriptor is not None,
     )
+    if recheck is not None and not recheck(item.graph):
+        raise SourceRevisionChanged(f"live source changed during admission: {item.target.name}")
     _validate_targets(
         receipt.candidate,
         receipt.candidate.source,
         (item,),
         cancelled=cancelled,
         run_plan=deferred,
+        proven=proven,
     )
     decision = inspect_output(item, receipt.candidate, entry.fact)
     if item.source_spec.kind is SourceKind.TIFF_SERIES:
@@ -1259,11 +1496,14 @@ def _validate_deferred_entry_states(
     *,
     item: PlannedOutput | None = None,
     cancelled: Callable[[], bool] | None = None,
+    proven: dict[str, SourceFileState] | None = None, revalidate: bool = True,
 ) -> None:
-    """Require one deferred cursor to remain inside its admitted revision."""
+    """Require one deferred cursor to remain inside its admitted revision; ``proven`` states (a live
+    prefix proved this poll) are not proved again, and ``revalidate=False`` skips the graph's validation."""
 
     is_cancelled = _not_cancelled if cancelled is None else cancelled
-    if item is not None:
+    proven = proven or {}
+    if item is not None and revalidate:
         # The complete JIT stamp is the first owner capable of proving every
         # raw alias binding.  Run that proof before the older deferred-state
         # fences so no alias drift can be classified without its frozen
@@ -1279,7 +1519,8 @@ def _validate_deferred_entry_states(
         _source_state_key(value.raw_path): value
         for value in topologies
     }
-    _verify_source_states(topology_map, cancelled=is_cancelled)
+    _verify_source_states({key: value for key, value in topology_map.items()
+                           if proven.get(value.followed_state.path) is not value.followed_state}, cancelled=is_cancelled)
     frozen = {
         _source_state_key(value.raw_path): value.followed_state
         for value in topologies
@@ -1304,9 +1545,13 @@ def _validate_deferred_entry_states(
             if value.metadata_file is not None
         )
     )
+    checked: set[int] = set()  # a SPEC file is every member's metadata file: one state, checked once
     for state, role in occurrences:
         if is_cancelled():
             raise RuntimeError("admission cancelled")
+        if proven.get(state.path) is state or id(state) in checked:
+            continue
+        checked.add(id(state))
         accepted = frozen.get(_source_state_key(state.path))
         if accepted is None:
             # TIFF sidecars and selected HDF5 dependencies are discovered and
@@ -1319,6 +1564,8 @@ def _validate_deferred_entry_states(
                 "image_metadata",
             } and state.matches_disk():
                 continue
+            if role == "image_metadata" and admitted_metadata_current(stamp, state):
+                continue  # a SPEC file that only grew past its members' rows
             raise SourceRevisionChanged(
                 "source dependency escaped admitted revision: "
                 f"{state.path}"
@@ -1704,11 +1951,18 @@ def _qualify_for_admission(
     selected_motor: str | None = None,
     selected_container: SelectedContainerInput | None = None,
     cancelled: Callable[[], bool],
+    infer_point_images: bool = True,
+    published_members: int = 0,
+    prefix: PreparedSourceExecutionGraph | None = None,
+    spec_cache: dict | None = None,
 ) -> PreparedSourceExecutionGraph:
     try:
         return qualify_source_execution_graph(
             source, selected_motor=selected_motor,
             selected_container=selected_container, cancelled=cancelled,
+            infer_point_images=infer_point_images,
+            published_members=published_members,
+            prefix=prefix, spec_cache=spec_cache,
         )
     except InterruptedError as error:
         if error.args != ("source qualification cancelled",):
@@ -1740,6 +1994,12 @@ def _gi_enabled(
     return bool(type(gi) is dict and gi.get("enabled"))
 
 
+def _is_live(configuration: FrozenRunConfiguration | OutputCandidate) -> bool:
+    if type(configuration) is FrozenRunConfiguration:
+        return bool(configuration.live_mode)
+    return bool(configuration.processing_mapping().get("live_mode"))
+
+
 def _uses_eager_directory_descriptors(
     configuration: FrozenRunConfiguration | OutputCandidate,
 ) -> bool:
@@ -1756,6 +2016,9 @@ def _directory_items(
     plan: RunCandidatePlan,
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
+    published_members: int = 0,
+    prefix: PreparedSourceExecutionGraph | None = None,
+    spec_cache: dict | None = None,
 ) -> tuple[PlannedOutput, ...]:
     output_root, items, consumed = Path(configuration.save_path), [], set()
     resolved_output_root = None
@@ -1771,11 +2034,11 @@ def _directory_items(
         if type(configuration) is FrozenRunConfiguration
         else configuration.source
     )
-    metadata_format = (
-        selected_source.metadata_format
-        if type(selected_source) is DirectorySourceSpec
-        else "auto"
-    )
+    watch = live_selection(selected_source)
+    metadata_format = "auto" if watch is None else watch.metadata_format
+    # A Live Image Series keeps its own selection: options, name and members' order.
+    series = None if watch is None or not _is_live(configuration) else watch.series
+    groups = {value.path: group for group in _output_groups(configuration, plan) for value in group[0]}
     for candidate in plan.candidates:
         if cancelled():
             raise RuntimeError("admission cancelled")
@@ -1787,32 +2050,26 @@ def _directory_items(
             adapter = get_adapter(candidate.adapter_id)
             if adapter is None or SourceKind.IMAGE_FILE not in adapter.kinds:
                 raise ValueError(f"candidate {candidate.path} lost its descriptor")
-            name = adapter.scan_name(candidate.path)
-            grouped = []
-            for value in plan.candidates:
-                if cancelled():
-                    raise RuntimeError("admission cancelled")
-                if (
-                    value.adapter_id == candidate.adapter_id
-                    and value.path.parent == candidate.path.parent
-                    and adapter.scan_name(value.path) == name
-                ):
-                    grouped.append(value)
-            members = tuple(grouped)
+            members, name = groups[candidate.path]
             consumed.update(value.path for value in members)
             spec = SourceSpec(
                 candidate.path.parent, SourceKind.TIFF_SERIES,
                 options={
                     "selected_file": str(candidate.path),
-                    "files": tuple(value.path for value in members),
                     "scan_name": name,
                     "metadata_format": metadata_format,
+                    **({} if series is None else dict(selected_source.options)),
+                    "files": tuple(value.path for value in members),
                 },
             )
             graph = _qualify_for_admission(
                 spec,
                 selected_motor=_selected_tiff_gi_motor(configuration),
                 cancelled=cancelled,
+                # Live never infers images per point: an image waits for its row.
+                infer_point_images=not _is_live(configuration),
+                published_members=published_members,
+                prefix=prefix, spec_cache=spec_cache,
             )
         else:
             consumed.add(candidate.path)
@@ -1852,13 +2109,17 @@ def _directory_items(
             spec = SourceSpec(
                 candidate.path, descriptor.kind,
                 entry=descriptor.resolved_entry or descriptor.requested_entry,
+                # A Live series keeps its selection; a Live SPEC run binds each frame to its row (R5b).
+                options=dict(selected_source.options) if series is not None else
+                {"metadata_format": "spec"} if _is_live(configuration) and metadata_format == "spec" else {},
             )
             graph = _qualify_for_admission(
                 spec,
                 selected_container=SelectedContainerInput(
                     state, candidate.adapter_id, descriptor,
                 ),
-                cancelled=cancelled,
+                cancelled=cancelled, infer_point_images=not _is_live(configuration),
+                published_members=published_members, spec_cache=spec_cache,  # a container's published frames
             )
         output_directory: Path | None = None
         if _save_path_is_directory(output_root):
@@ -1908,65 +2169,24 @@ def validate_planned_source(
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
     is_cancelled = _not_cancelled if cancelled is None else cancelled
-    validate_source_execution_graph(
-        item.graph, cancelled=is_cancelled,
-    )
+    try:
+        validate_source_execution_graph(
+            item.graph, cancelled=is_cancelled,
+        )
+    except InterruptedError as error:
+        # The same cancellation token as admission (_qualify_for_admission),
+        # so a Stop during a live re-check stops the Run instead of failing it.
+        if error.args != ("source qualification cancelled",):
+            raise
+        raise RuntimeError("admission cancelled") from error
 def source_snapshots(item: PlannedOutput) -> dict[str, dict[str, Any]]:
     return source_snapshots_projection(
         item.graph, writer=False
     )
-def execution_plan_values(
-    configuration: FrozenRunConfiguration,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    threshold, gi = configuration.threshold, configuration.gi
-    one, two = configuration.bai_1d_args, configuration.bai_2d_args
-    if gi.enabled:
-        one["gi_mode_1d"], two["gi_mode_2d"] = gi.mode_1d, gi.mode_2d
-    manual = gi.enabled and gi.effective_motor == "Manual"
-    return one, two, {
-        "gi_enabled": gi.enabled,
-        "gi_incident_angle": gi.th_val if manual else None,
-        "incidence_motor": gi.effective_motor if gi.enabled and not manual else None,
-        "tilt_angle": gi.tilt_angle, "sample_orientation": gi.sample_orientation,
-        "integrate_1d": True,
-        "integrate_2d": not (
-            "Viewer" not in configuration.processing_mode
-            and "1D" in configuration.processing_mode
-            and "2D" not in configuration.processing_mode
-        ),
-        "threshold_min": (
-            threshold.threshold_min if threshold.apply_threshold else None
-        ),
-        "threshold_max": (
-            threshold.threshold_max if threshold.apply_threshold else None
-        ),
-        "mask_saturation": threshold.mask_saturation,
-    }
+from xrd_tools.session.readiness import execution_plan_values
 
 
-def native_int_reduction_plan(
-    configuration: FrozenRunConfiguration, *, companion_modes_2d: bool = False,
-):
-    """Translate one frozen Controls configuration into its mask-free plan.
-
-    *companion_modes_2d* is set only by an ordinary Run: it alone integrates the
-    GI companion map the "Q-χ + Qip-Qoop" choice selects.  Average and the XYE
-    naming lookup stay single-mode.
-
-    Scientific assets are admitted independently of control intent. The
-    ordinary run path attaches its already-authenticated detector mask after
-    this pure translation; Average keeps the mask in its calibration state so
-    it can apply the accepted static mask while accumulating detector pixels.
-    """
-
-    from xrd_tools.session.readiness import (
-        build_native_int_reduction_plan_from_args,
-    )
-
-    one, two, values = execution_plan_values(configuration)
-    return build_native_int_reduction_plan_from_args(
-        one, two, declare_companion_modes_2d=companion_modes_2d, **values,
-    )
+from xrd_tools.session.readiness import native_int_reduction_plan
 def _validate_targets(
     configuration: FrozenRunConfiguration | OutputCandidate,
     source: SourceSpec | DirectorySourceSpec,
@@ -1974,15 +2194,30 @@ def _validate_targets(
     *,
     cancelled: Callable[[], bool] | None = None,
     run_plan: DeferredDirectoryPlan | None = None,
+    proven: dict[str, SourceFileState] | None = None,
 ) -> None:
     raw: tuple[Path, ...] = ()
+    proven = proven or {}
     for item in items:
         identity = validate_source_aliases(
             item.source_stamp,
             cancelled=cancelled,
+            proven=proven,
         )
-        raw += tuple(Path(binding.raw_path) for binding in identity.identity.aliases)
-        raw += tuple(Path(target.resolved_path) for target in identity.targets)
+        # A proved prefix input keeps its admitted resolution and identity, so
+        # only the output could have become it: that is checked once below.
+        targets = identity.targets
+        raw += tuple(Path(binding.raw_path) for binding in identity.identity.aliases
+                     if not _held(proven, binding.raw_path, targets[binding.target_id].state))
+        raw += tuple(Path(target.resolved_path) for target in targets
+                     if not _held(proven, target.resolved_path, target.state))
+        output = _path_state(item.target) if proven else None
+        resolved = os.path.normcase(os.path.realpath(item.target)) if proven else None
+        if any(type(output) is tuple and output[3:5] == (held.device, held.inode)
+               or os.path.normcase(held._resolved_path_at_capture or held.path) == resolved
+               for held in proven.values()):
+            raise OutputCollisionError(
+                f"Reduction output '{item.target}' is the same file as a raw input; choose a separate Save Path.")
     if run_plan is not None:
         # Directory JIT: this group's dependencies are in hand, so refuse to
         # read ANY output target of the run as raw data (a raw container that
@@ -1997,6 +2232,7 @@ def _validate_targets(
     protected = tuple(
         Path(value) for value in (
             configuration.poni_file, configuration.mask_file,
+            *_correction_paths(configuration),
             source.metadata_uri if type(source) is SourceSpec else None,
         ) if value
     )
@@ -2012,275 +2248,29 @@ def _validate_targets(
             recursive=bool(getattr(source, "recursive", False)),
             container_directory_mode=type(source) is DirectorySourceSpec,
         )
-def _load_scientific_assets(
-    intent: RunIntent,
-    *,
-    cancelled: Callable[[], bool] = _not_cancelled,
-) -> AcceptedScientificAssets:
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    calibration, poni_digest = _load_stable_asset(
-        intent.poni_file,
-        lambda path, data: load_poni(path, data=data)
-        if load_poni is load_detector_calibration else load_poni(path),
-        max_bytes=1 << 20,
-    )
-    # The optional v3 override is absent from legacy intent projections and
-    # helper-owned, RunIntent-compatible views.
-    override = getattr(intent, "poni_v3_override", None)
-    if override is not None:
-        if calibration is None:
-            raise ValueError(
-                "an enabled PONI v3 override requires a selected PONI"
-            )
-        calibration = apply_sensor_parallax(
-            calibration,
-            material=override.material,
-            thickness_m=override.thickness_m,
-            parallax=override.parallax,
-        )
-    mask, mask_digest = _load_stable_mask_asset(
-        intent.mask_file, calibration, cancelled=cancelled,
-    )
-    poni = None if calibration is None else calibration.poni
-    poni_values = None if poni is None else (
-        float(poni.dist), float(poni.poni1), float(poni.poni2), float(poni.rot1),
-        float(poni.rot2), float(poni.rot3), float(poni.wavelength),
-        str(poni.detector),
-    )
-    accepted = (
-        None if mask is None
-        else np.ascontiguousarray(mask, dtype=bool)
-    )
-    config_json = None if calibration is None else json.dumps(
-        dict(calibration.detector_config), sort_keys=True, separators=(",", ":"),
-        allow_nan=False,
-    )
-    return AcceptedScientificAssets(
-        poni_values, None if accepted is None else accepted.dtype.str,
-        None if accepted is None else tuple(accepted.shape),
-        None if accepted is None else accepted.tobytes(),
-        poni_digest, mask_digest, config_json,
-        None if calibration is None else calibration.parallax,
-    )
-def _scientific_mask_layout(path: Path) -> tuple[tuple[int, int], np.dtype]:
-    if path.suffix.casefold() == ".npy":
-        value = np.load(path, allow_pickle=False, mmap_mode="r")
-        try:
-            shape = tuple(value.shape)
-            dtype = np.dtype(value.dtype)
-        finally:
-            mapping = getattr(value, "_mmap", None)
-            if mapping is not None:
-                mapping.close()
-        frame_count = 1
-    else:
-        layout = read_detector_image_layout(path)
-        shape, dtype, frame_count = (
-            tuple(layout.shape), np.dtype(layout.dtype), layout.frame_count,
-        )
-    if (
-        len(shape) != 2 or any(type(value) is not int or value <= 0 for value in shape)
-        or frame_count != 1 or dtype.kind not in "biuf" or dtype.itemsize > 8
-        or int(shape[0]) * int(shape[1]) * dtype.itemsize
-        > _SCIENTIFIC_MASK_MAX_DECODED_BYTES
-    ):
-        raise ValueError(f"scientific mask schema is unsupported: {path}")
-    return (int(shape[0]), int(shape[1])), dtype
-def _scientific_mask_file_limit(
-    calibration: object | None,
-) -> int:
-    shape = None
-    config = getattr(calibration, "detector_config", None)
-    if isinstance(config, dict) or hasattr(config, "get"):
-        shape = config.get("max_shape")
-        if shape is None:
-            shape = config.get("shape")
-    valid = (
-        type(shape) in {tuple, list}
-        and len(shape) == 2
-        and all(type(value) is int and value > 0 for value in shape)
-    )
-    if valid:
-        pixels = int(shape[0]) * int(shape[1])
-        itemsize = 8
-        if pixels * itemsize > _SCIENTIFIC_MASK_MAX_DECODED_BYTES:
-            raise ValueError("calibration mask shape exceeds the decoded limit")
-    else:
-        pixels = _SCIENTIFIC_MASK_MAX_DECODED_BYTES
-        itemsize = 1
-    return max(
-        _SCIENTIFIC_MASK_COMPATIBILITY_FLOOR_BYTES,
-        itemsize * pixels + _SCIENTIFIC_MASK_HEADER_ALLOWANCE_BYTES,
-    )
-def _asset_state(path: Path) -> tuple[int, ...]:
-    state = path.stat()
-    return (
-        state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
-        state.st_dev, state.st_ino,
-    )
-def _asset_descriptor_state(stream: object) -> tuple[int, ...]:
-    # Compared against the pathname view above: ctime on the win32 seam.
-    state = os.fstat(stream.fileno())
-    return (
-        state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns),
-        state.st_dev, state.st_ino,
-    )
-def _stream_asset(
-    path: Path, *, target: Path | None = None, max_bytes: int,
-    cancelled: Callable[[], bool] = _not_cancelled,
-) -> tuple[tuple[int, ...], str]:
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    digest = hashlib.sha256()
-    total = 0
-    output = None if target is None else target.open("xb")
-    try:
-        try:
-            stream = path.open("rb")
-        except FileNotFoundError:
-            raise
-        with stream:
-            opened = _asset_descriptor_state(stream)
-            try:
-                before = _asset_state(path)
-            except FileNotFoundError as exc:
-                raise ValueError(
-                    f"scientific asset changed while admitted: {path}"
-                ) from exc
-            if before != opened:
-                raise ValueError(
-                    f"scientific asset changed while admitted: {path}"
-                )
-            while True:
-                if cancelled():
-                    raise RuntimeError("admission cancelled")
-                payload = stream.read(_SCIENTIFIC_ASSET_STREAM_CHUNK_BYTES)
-                if not payload:
-                    break
-                total += len(payload)
-                if total > max_bytes:
-                    raise ValueError(
-                        f"scientific asset exceeds {max_bytes} bytes: {path}"
-                    )
-                digest.update(payload)
-                if output is not None:
-                    output.write(payload)
-            finished = _asset_descriptor_state(stream)
-    finally:
-        if output is not None:
-            output.close()
-    try:
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        after = _asset_state(path)
-    except FileNotFoundError as exc:
-        raise ValueError(
-            f"scientific asset changed while admitted: {path}"
-        ) from exc
-    if after != before or finished != opened:
-        raise ValueError(f"scientific asset changed while admitted: {path}")
-    return before, digest.hexdigest()
-def _load_stable_mask_asset(
-    path_text: object, calibration: object | None,
-    *,
-    cancelled: Callable[[], bool] = _not_cancelled,
-) -> tuple[object | None, str | None]:
-    if type(path_text) is not str or not path_text:
-        return None, None
-    path = Path(path_text)
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    try:
-        limit = _scientific_mask_file_limit(calibration)
-    except FileNotFoundError:
-        return None, None
-    with tempfile.TemporaryDirectory(prefix="xdart-mask-preflight-") as root:
-        snapshot = Path(root) / ("mask" + path.suffix)
-        try:
-            before_state, before_digest = _stream_asset(
-                path, target=snapshot, max_bytes=limit,
-                cancelled=cancelled,
-            )
-        except FileNotFoundError:
-            return None, None
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        shape, dtype = _scientific_mask_layout(snapshot)
-        snapshot_limit = max(
-            _SCIENTIFIC_MASK_COMPATIBILITY_FLOOR_BYTES,
-            int(shape[0]) * int(shape[1]) * int(dtype.itemsize)
-            + _SCIENTIFIC_MASK_HEADER_ALLOWANCE_BYTES,
-        )
-        if snapshot.stat().st_size > snapshot_limit:
-            raise ValueError(f"scientific mask schema is unsupported: {path}")
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        value = load_mask(snapshot)
-        if cancelled():
-            raise RuntimeError("admission cancelled")
-        try:
-            after_state, after_digest = _stream_asset(
-                path, max_bytes=limit, cancelled=cancelled,
-            )
-        except FileNotFoundError as exc:
-            raise ValueError(
-                f"scientific asset changed while admitted: {path}"
-            ) from exc
-    if after_state != before_state or after_digest != before_digest:
-        raise ValueError(f"scientific asset changed while admitted: {path}")
-    if value.dtype != np.dtype(bool) or tuple(value.shape) != shape:
-        raise ValueError(f"scientific mask schema is unsupported: {path}")
-    return value, before_digest
-def _load_stable_asset(
-    path_text: object, loader: Callable[[Path, bytes], object],
-    *, max_bytes: int | None = None,
-) -> tuple[object | None, str | None]:
-    if type(path_text) is not str or not path_text:
-        return None, None
-    path = Path(path_text)
-    def observation() -> tuple[tuple[int, ...], bytes]:
-        try:
-            stream = path.open("rb")
-        except FileNotFoundError:
-            raise
-        with stream:
-            opened = _asset_descriptor_state(stream)
-            try:
-                state = _asset_state(path)
-            except FileNotFoundError as exc:
-                raise ValueError(
-                    f"scientific asset changed while admitted: {path}"
-                ) from exc
-            if state != opened:
-                raise ValueError(
-                    f"scientific asset changed while admitted: {path}"
-                )
-            payload = stream.read() if max_bytes is None else stream.read(max_bytes + 1)
-            finished = _asset_descriptor_state(stream)
-        if max_bytes is not None and len(payload) > max_bytes:
-            raise ValueError(f"scientific asset exceeds {max_bytes} bytes: {path}")
-        try:
-            after = _asset_state(path)
-        except FileNotFoundError as exc:
-            raise ValueError(
-                f"scientific asset changed while admitted: {path}"
-            ) from exc
-        if after != state or finished != opened:
-            raise ValueError(f"scientific asset changed while admitted: {path}")
-        return state, payload
-    try:
-        before_state, before = observation()
-    except FileNotFoundError:
-        return None, None
-    value = loader(path, before)
-    try:
-        after_state, after = observation()
-    except FileNotFoundError as exc:
-        raise ValueError(f"scientific asset changed while admitted: {path}") from exc
-    if after_state != before_state or after != before:
-        raise ValueError(f"scientific asset changed while admitted: {path}")
-    return value, hashlib.sha256(before).hexdigest()
+def _load_scientific_assets(intent, *, cancelled=_not_cancelled):
+    # Preserve this public preflight seam, including traced calibration loaders.
+    from xrd_tools.session.scientific_assets import load_scientific_assets
+    return load_scientific_assets(intent, cancelled=cancelled, calibration_loader=load_poni)
+from xrd_tools.session.scientific_assets import _scientific_mask_layout
+from xrd_tools.session.scientific_assets import _scientific_mask_file_limit
+from xrd_tools.session.scientific_assets import _asset_state
+from xrd_tools.session.scientific_assets import _asset_descriptor_state
+from xrd_tools.session.scientific_assets import _stream_asset
+from xrd_tools.session.scientific_assets import _load_stable_mask_asset
+from xrd_tools.session.scientific_assets import _detector_facts
+
+
+from xrd_tools.session.scientific_assets import _read_correction_image
+
+
+from xrd_tools.session.scientific_assets import inspect_detector_correction
+
+
+from xrd_tools.session.scientific_assets import _load_stable_correction_asset
+
+
+from xrd_tools.session.scientific_assets import _load_stable_asset
 def _lexical_key(path: Path | str) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
 
@@ -2300,7 +2290,7 @@ __all__ = [
     "ValidatedSourceAliases",
     "execution_plan_values", "native_int_reduction_plan", "inspect_output",
     "materialize_deferred_output",
-    "live_directory_groups", "materialize_live_directory_group",
+    "live_directory_groups", "materialize_live_directory_group", "observe_live_members",
     "OutputFact", "prepare_output", "source_snapshots",
     "target_state_matches", "validate_admitted_receipt",
     "validate_planned_source", "validate_source_aliases",

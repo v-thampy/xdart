@@ -43,6 +43,119 @@ _PUBLIC_RUNNERS = {
 }
 
 
+def test_metadata_plot_columns_detach_the_selected_rows_and_preserve_text(tmp_path):
+    from dataclasses import replace
+    from xrd_tools.analysis.scan_operations import (
+        MetadataColumn, MetadataTablePlan, metadata_plot_columns, run_metadata_table,
+    )
+    spec = tmp_path / "scan"
+    spec.write_text("#F scan\n#E 1\n#D today\n#O0 del\n\n"
+                    "#S 1 ascan del 0 2 2 1\n#D today\n#P0 0\n"
+                    "#N 2\n#L del  diode\n0 10\n1 20\n2 30\n")
+    result = run_metadata_table(MetadataTablePlan(spec, kind="spec", scan="1"))
+    assert result.code == "OK"
+    result = replace(result, columns=(*result.columns,
+        MetadataColumn("note", "text", "none", None, ('a, b', None, 'c\n"d"'), 0)))
+    projected = metadata_plot_columns(result, (2, 0))
+    assert tuple(projected) == tuple(column.name for column in result.columns)
+    np.testing.assert_array_equal(projected["frame_index"], [2, 0])
+    np.testing.assert_array_equal(projected["diode"], [30, 10])
+    assert list(projected["note"]) == ['c\n"d"', 'a, b']
+    assert not projected["diode"].flags.writeable
+    assert not np.shares_memory(projected["diode"], result.columns[2].numeric)
+    np.testing.assert_array_equal(metadata_plot_columns(result)["diode"], [10, 20, 30])
+    with pytest.raises(KeyError):
+        metadata_plot_columns(result, (99,))
+
+
+def test_scan_table_alignment_and_streaming_csv_preserve_legacy_policy(tmp_path):
+    import csv
+
+    table = {
+        "frame_index": np.array([5.0, np.nan, 7.4, 5.0]),
+        "roi": np.array([10.0, 20.0, np.nan, 40.0]),
+        "label": np.array(['a,"b', "line\nbreak"], dtype=object),
+        "scalar": 8.0,
+        "not_a_column": np.ones((2, 2)),
+    }
+    before = {name: np.array(value, copy=True) for name, value in table.items()}
+    assert analysis.scan_frame_rows(table) == {5: 3, 7: 2}
+    assert analysis.scan_frame_rows({"short": [1], "long": [1, 2, 3]}) == {
+        0: 0, 1: 1, 2: 2,
+    }
+    assert analysis.scan_frame_rows({}) == {}
+    columns = ["frame_index", "roi", "label", "scalar"]
+    assert analysis.scan_table_columns(table) == columns
+    path = tmp_path / "scan.csv"
+    analysis.write_scan_table_csv(table, path)
+    with path.open(newline="") as stream:
+        rows = list(csv.reader(stream))
+    assert rows == [columns, ["5.0", "10.0", 'a,"b', "8.0"],
+                    ["nan", "20.0", "line\nbreak", ""],
+                    ["7.4", "nan", "", ""], ["5.0", "40.0", "", ""]]
+    for name, value in table.items():
+        np.testing.assert_equal(value, before[name])
+    empty = tmp_path / "empty.csv"
+    analysis.write_scan_table_csv({}, empty)
+    assert empty.read_bytes() == b"\r\n"
+    with pytest.raises(IsADirectoryError):
+        analysis.write_scan_table_csv(table, tmp_path)
+
+
+def test_scan_table_policy_public_imports_and_execution_remain_qt_free(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from xrd_tools.analysis import scan_frame_rows, scan_table_columns, write_scan_table_csv
+assert scan_frame_rows({'frame_index': [2.5, 3.5, 2.49, float('inf')]}) == {2: 2, 4: 1}
+assert scan_table_columns({'text': ['one'], 'matrix': [[1, 2]]}) == ['text']
+write_scan_table_csv({'text': ['one']}, sys.argv[1])
+assert not any(name.startswith(('PySide', 'PyQt', 'pyqtgraph', 'xdart.gui')) for name in sys.modules)
+""", str(tmp_path / "headless.csv")], capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "headless.csv").read_bytes() == b"text\r\none\r\n"
+
+
+def test_scan_plot_default_axes_are_headless_numeric_motor_policy():
+    defaults = _public("scan_plot_defaults")
+    table = {
+        "frame_index": np.arange(3, dtype=float),
+        "parked": np.ones(3),
+        "th": np.array([0.0, np.nan, 2.0]),
+        "tie": np.arange(3, dtype=float),
+        "ROI1": np.array([1.0, 2.0, 90000.0]),
+        "PHOTOD": np.array([10.0, 11.0, 12.0]),
+        "mon": np.ones(3),
+        "empty": np.full(3, np.nan),
+        "text": np.array(["a", "b", "c"]),
+    }
+    assert defaults(table, ("parked", "th", "tie", "empty", "text")) == (
+        "th", "PHOTOD")
+    assert defaults(table, ("tie", "th")) == ("tie", "PHOTOD")
+    assert defaults(table, ("parked",)) == ("frame_index", "PHOTOD")
+    assert defaults(table, ("th",), x="PHOTOD") == ("PHOTOD", "mon")
+    assert defaults({k: table[k] for k in ("frame_index", "th", "ROI1")},
+                    ("th",)) == ("th", "frame_index")
+    assert defaults({"empty": table["empty"], "text": table["text"]}) == (None, None)
+
+
+def test_scan_plot_real_spec_default_counter_is_case_insensitive(tmp_path):
+    source = tmp_path / "default_axes_spec"
+    source.write_text(
+        "#F default_axes_spec\n#E 1\n#S 1 ascan th 0 2 2 1\n"
+        "#N 3\n#L th  PHOTOD  ROI1\n0 10 900\n1 11 800\n2 12 700\n",
+        encoding="utf-8",
+    )
+    table = analysis.run_metadata_table(analysis.MetadataTablePlan(
+        SourceSpec(source, SourceKind.SPEC, options={"scan": "1.1"})))
+    _assert_terminal(table, "COMPLETED", "OK")
+    plot = analysis.run_scan_plot(analysis.ScanPlotPlan(), table)
+    _assert_terminal(plot, "COMPLETED", "OK")
+    assert plot.trace_names == ("PHOTOD",)
+    np.testing.assert_array_equal(plot.x, [0, 1, 2])
+
+
 class _CanonicalMode(Enum):
     SELECTED = 2
 
@@ -2039,11 +2152,14 @@ import sys
 from pathlib import Path
 import numpy as np
 import tifffile
-from xrd_tools.analysis import MetadataTablePlan, run_metadata_table
+from xrd_tools.analysis import MetadataTablePlan, run_metadata_table, scan_plot_defaults
 source = Path(sys.argv[1]) / "metadata_0001.tif"
 tifffile.imwrite(source, np.ones((2, 2), dtype=np.uint16))
 result = run_metadata_table(MetadataTablePlan(source=source, selection="image_series"))
 assert result.disposition.value == "completed", result
+assert scan_plot_defaults({"frame_index": np.arange(2), "mon": np.ones(2)}) == ("frame_index", "mon")
+assert not any(name.startswith(("xdart", "PySide6", "PyQt5", "PyQt6", "pyqtgraph"))
+               for name in sys.modules)
 assert not any(name.startswith(("xrd_tools.io.record_writer", "xrd_tools.io.output_transaction"))
                for name in sys.modules)
 '''

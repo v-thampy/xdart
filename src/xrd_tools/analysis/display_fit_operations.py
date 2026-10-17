@@ -16,6 +16,12 @@ from typing import Any
 import numpy as np
 
 from xrd_tools.analysis.axis_units import require_inverse_angstrom
+from xrd_tools.analysis.phase_references import (
+    MAX_PHASES as _MAX_PHASES, MAX_CIF_BYTES as _MAX_CIF_BYTES,
+    MAX_TOTAL_CIF_BYTES as _MAX_TOTAL_CIF_BYTES,
+    MAX_REFLECTIONS_PER_PHASE as _MAX_REFLECTIONS_PER_PHASE,
+    MAX_REFLECTIONS_TOTAL as _MAX_REFLECTIONS_TOTAL,
+)
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
     InvalidCanonicalValue,
@@ -23,17 +29,15 @@ from xrd_tools.analysis.scan_operations import (
     _canonical_frame_charge,
     _digest,
     _owned,
+    _owned_missing,
 )
 __all__ = [
     "DisplayedTraceReceipt", "DisplayedTraceInput", "DisplayedPeakFitPlan", "DisplayedPeakFitResult",
     "CifAssetReceipt", "DisplayedPhaseFitPlan", "DisplayedPhaseFitResult",
-    "run_displayed_peak_fit", "run_displayed_phase_fit",
+    "run_displayed_peak_fit", "run_displayed_phase_fit", "displayed_fit_axis",
 ]
 _MAX_TRACE_POINTS = 1_000_000
 _MAX_TRACE_BYTES, _MAX_FIT_BYTES = 16 * 1024 * 1024, 64 * 1024 * 1024
-_MAX_PHASES = 8
-_MAX_CIF_BYTES, _MAX_TOTAL_CIF_BYTES = 4 * 1024 * 1024, 16 * 1024 * 1024
-_MAX_REFLECTIONS_PER_PHASE, _MAX_REFLECTIONS_TOTAL = 2048, 4096
 _MAX_FIT_PARAMETERS, _MAX_PARAMETER_NAME_BYTES = 512, 256
 _MAX_PARAMETER_NAMES_BYTES = 64 * 1024
 _MAX_DIAGNOSTIC_BYTES = 1024
@@ -61,6 +65,8 @@ def _frozen_array(value: Any) -> np.ndarray:
     result = _owned(value)
     if result.ndim != 1 or result.dtype.kind not in "biuf":
         raise ValueError("displayed traces require a numeric rank-1 array")
+    if not np.isfinite(result).all():
+        result = _owned_missing(np.where(np.isfinite(result), result, np.nan))
     return result
 @dataclass(frozen=True, slots=True)
 class DisplayedTraceReceipt:
@@ -86,6 +92,7 @@ class DisplayedTraceInput:
     receipt: DisplayedTraceReceipt
     trace_fingerprint: str = ""
     storage_bytes: int = 0
+    sigma: np.ndarray | None = None
     def __post_init__(self) -> None:
         if not isinstance(self.receipt, DisplayedTraceReceipt) or any(type(value) is not str for value in (self.label, self.axis_unit, self.title)) or type(self.epoch) is not int:
             raise TypeError("invalid displayed trace identity")
@@ -96,11 +103,17 @@ class DisplayedTraceInput:
             axis, intensity, self.label,
             self.axis_unit, self.title, self.epoch, _receipt_value(self.receipt),
         )
-        fingerprint = _digest(identity)
+        if self.sigma is not None:
+            sigma = _frozen_array(self.sigma)
+            if sigma.shape != intensity.shape:
+                raise ValueError("displayed sigma and intensity must have equal shape")
+            object.__setattr__(self, "sigma", sigma)
+            identity += ("sigma", sigma)
+        fingerprint = _digest(identity, allow_missing=True)
         object.__setattr__(self, "axis", axis)
         object.__setattr__(self, "intensity", intensity)
         object.__setattr__(self, "trace_fingerprint", fingerprint)
-        object.__setattr__(self, "storage_bytes", _canonical_charge((identity, fingerprint)))
+        object.__setattr__(self, "storage_bytes", _canonical_charge((identity, fingerprint), allow_missing=True))
 @dataclass(frozen=True, slots=True)
 class DisplayedPeakFitPlan:
     trace: DisplayedTraceInput
@@ -117,6 +130,7 @@ class DisplayedPeakFitPlan:
     center_bounds_delta: float | None = None
     fraction_init: float = 0.5
     max_nfev: int | None = None
+    use_uncertainties: bool = False
     def __post_init__(self) -> None:
         object.__setattr__(self, "manual_centers", _tuple_once(self.manual_centers))
         for name in ("fit_bounds", "sigma_bounds", "amplitude_bounds"):
@@ -173,10 +187,17 @@ class DisplayedPhaseFitPlan:
     lattice_pct: float = 0.05
     min_intensity: float = 0.0
     max_nfev: int | None = None
+    use_uncertainties: bool = False
+    phase_entries: tuple[Any, ...] = ()
+    #: each phase's own minimum intensity, aligned with ``phase_names`` (REFERENCE-PHASES-20261011); empty: every
+    #: phase uses ``min_intensity``. A lattice phase's value is ignored (it has no intensities).
+    phase_min_intensities: tuple[float, ...] = ()
     def __post_init__(self) -> None:
         object.__setattr__(self, "cif_paths", tuple(Path(p) for p in _tuple_once(self.cif_paths)))
         object.__setattr__(self, "expected_hashes", _tuple_once(self.expected_hashes))
         object.__setattr__(self, "phase_names", _tuple_once(self.phase_names))
+        object.__setattr__(self, "phase_entries", _tuple_once(self.phase_entries))
+        object.__setattr__(self, "phase_min_intensities", _tuple_once(self.phase_min_intensities))
 @dataclass(frozen=True, slots=True)
 class DisplayedPhaseFitResult:
     disposition: AnalysisDisposition
@@ -204,6 +225,8 @@ class DisplayedPhaseFitResult:
     marker_positions: np.ndarray | None = None
     storage_bytes: int = 0
     result_fingerprint: str = ""
+    phase_names: tuple[str, ...] = ()
+    phase_fractions_reason: str = ""
 class _Refusal(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -228,13 +251,27 @@ def _fit_trace(trace: DisplayedTraceInput) -> None:
     if trace.storage_bytes > _MAX_TRACE_BYTES:
         raise _Refusal("TRACE_BYTE_LIMIT_EXCEEDED", "trace byte limit exceeded")
 def _fit_plan_value(plan: DisplayedPeakFitPlan) -> tuple[Any, ...]:
-    return (
+    value = (
         plan.trace.trace_fingerprint, plan.fit_bounds, plan.selection_mode,
         plan.manual_centers, plan.n_peaks, plan.model, plan.background,
         plan.sigma_init, plan.sigma_bounds, plan.amplitude_init,
         plan.amplitude_bounds, plan.center_bounds_delta, plan.fraction_init,
         plan.max_nfev,
     )
+    return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
+
+def _fit_sigma(plan, mask: np.ndarray) -> np.ndarray | None:
+    """Use measured uncertainties only when explicitly requested, on admitted fit samples."""
+    if type(plan.use_uncertainties) is not bool:
+        raise _Refusal("INVALID_FIT_UNCERTAINTIES", "use_uncertainties must be a bool")
+    if not plan.use_uncertainties:
+        return None
+    if plan.trace.sigma is None:
+        raise _Refusal("FIT_UNCERTAINTIES_REQUIRED", "this input has no measured uncertainties")
+    sigma = plan.trace.sigma[mask]
+    if not np.all(np.isfinite(sigma) & (sigma > 0)):
+        raise _Refusal("INVALID_FIT_UNCERTAINTIES", "fitted uncertainties must be finite and positive")
+    return sigma
 def _terminal(result_type, disposition, plan: Any, code: str, message: str):
     trace = getattr(plan, "trace", None)
     keywords = {}
@@ -284,6 +321,17 @@ def _auto_peak_policy(x: np.ndarray, y: np.ndarray) -> tuple[float, ...]:
         key=lambda item: float(item[1]), reverse=True,
     )[:12]
     return tuple(sorted(float(x[index]) for index, _ in ranked))
+def _fitted_mask(trace: DisplayedTraceInput, bounds: tuple[float, float]) -> np.ndarray:
+    return ((trace.axis >= bounds[0]) & (trace.axis <= bounds[1])
+            & np.isfinite(trace.axis) & np.isfinite(trace.intensity))
+def displayed_fit_axis(plan: DisplayedPeakFitPlan | DisplayedPhaseFitPlan) -> np.ndarray:
+    """The axis values a completed displayed fit's arrays (fit, background, residual, components) are on: the
+    trace's finite samples, within a peak fit's bounds (its whole finite extent when it has none)."""
+    trace = plan.trace
+    finite = trace.axis[np.isfinite(trace.axis)]
+    extent = (float(np.min(finite)), float(np.max(finite))) if finite.size else (0.0, 0.0)
+    bounds = getattr(plan, "fit_bounds", None) or extent
+    return trace.axis[_fitted_mask(trace, bounds)]
 def _validate_peak(plan: DisplayedPeakFitPlan) -> tuple[np.ndarray, np.ndarray, tuple[float, ...] | None, int]:
     if not isinstance(plan, DisplayedPeakFitPlan):
         raise _Refusal("INVALID_PEAK_PLAN", "plan has the wrong type")
@@ -322,7 +370,8 @@ def _validate_peak(plan: DisplayedPeakFitPlan) -> tuple[np.ndarray, np.ndarray, 
         raise _Refusal("INVALID_PEAK_PLAN", "invalid fraction")
     if plan.max_nfev is not None and (type(plan.max_nfev) is not int or not 1 <= plan.max_nfev <= 100_000):
         raise _Refusal("INVALID_PEAK_PLAN", "invalid max_nfev")
-    mask = (plan.trace.axis >= bounds[0]) & (plan.trace.axis <= bounds[1]) & np.isfinite(plan.trace.axis) & np.isfinite(plan.trace.intensity)
+    mask = _fitted_mask(plan.trace, bounds)
+    _fit_sigma(plan, mask)
     x, y = plan.trace.axis[mask], plan.trace.intensity[mask]
     positions = tuple(sorted(float(v) for v in plan.manual_centers)) or None
     count = len(positions) if positions else plan.n_peaks
@@ -399,6 +448,12 @@ def run_displayed_peak_fit(
             PeakFitPlan, runner = _load_peak_backend()
         except ImportError:
             return _peak_refusal(plan, "PEAK_FIT_DEPENDENCY_UNAVAILABLE", "Peak fitting dependency unavailable")
+        fit_kwargs = {} if plan.max_nfev is None else {"max_nfev": plan.max_nfev}
+        finite_axis = plan.trace.axis[np.isfinite(plan.trace.axis)]
+        sigma = _fit_sigma(plan, _fitted_mask(plan.trace, plan.fit_bounds or
+                           (float(np.min(finite_axis)), float(np.max(finite_axis)))))
+        if sigma is not None:
+            fit_kwargs["weights"] = 1.0 / sigma
         backend_plan = PeakFitPlan(
             positions=positions, n_peaks=count, model=plan.model,
             background=plan.background, sigma_init=plan.sigma_init,
@@ -406,7 +461,7 @@ def run_displayed_peak_fit(
             amplitude_bounds=plan.amplitude_bounds,
             center_bounds_delta=plan.center_bounds_delta,
             fraction_init=plan.fraction_init,
-            fit_kwargs={} if plan.max_nfev is None else {"max_nfev": plan.max_nfev},
+            fit_kwargs=fit_kwargs,
         )
         try:
             payload = runner(backend_plan, x, y).payload
@@ -429,7 +484,7 @@ def run_displayed_peak_fit(
         selected = [np.asarray(value, dtype=float) for key, value in components.items() if "background" in str(key).lower() or str(key).lower().startswith("bg")]
         background = _result_array(sum(selected, np.zeros(x.size)), x.size)
         size = _result_add(size, background)
-        residual = _result_array(fit_result.residual, x.size)
+        residual = _result_array(y - fit if plan.use_uncertainties else fit_result.residual, x.size)
         size = _result_add(size, residual)
         markers = _owned(np.asarray(payload.peak_centers, dtype=float))
         if markers.ndim != 1 or markers.size > 12 or not np.isfinite(markers).all():
@@ -456,18 +511,29 @@ def run_displayed_peak_fit(
 def _phase_plan_value(
     plan: DisplayedPhaseFitPlan, wavelength_angstrom: float,
 ) -> tuple[Any, ...]:
-    return (
+    value = (
         plan.trace.trace_fingerprint, plan.cif_paths, plan.expected_hashes,
         plan.phase_names, wavelength_angstrom,
         plan.prefit_background, plan.phase_profile,
         plan.lattice_pct, plan.min_intensity, plan.max_nfev,
     )
+    if plan.phase_entries:
+        value += (("phase_entries", tuple((entry.id, entry.name, entry.source_kind, entry.lattice) for entry in plan.phase_entries)),)
+    if plan.phase_min_intensities:
+        value += (("phase_min_intensities", plan.phase_min_intensities),)
+    return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
 def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
     if not isinstance(plan, DisplayedPhaseFitPlan):
         raise _Refusal("INVALID_PHASE_PLAN", "plan has the wrong type")
     _fit_trace(plan.trace)
-    count = len(plan.cif_paths)
-    if not 1 <= count <= _MAX_PHASES or len(plan.expected_hashes) != count or len(plan.phase_names) != count:
+    count = len(plan.phase_entries) if plan.phase_entries else len(plan.cif_paths)
+    if plan.phase_entries:
+        from .phase_references import PhaseEntry
+        if plan.cif_paths or plan.expected_hashes or any(not isinstance(entry, PhaseEntry) for entry in plan.phase_entries):
+            raise _Refusal("INVALID_PHASE_PLAN", "invalid phase entry mode")
+        if tuple(entry.name for entry in plan.phase_entries) != plan.phase_names:
+            raise _Refusal("INVALID_PHASE_PLAN", "phase entry names do not match")
+    if not 1 <= count <= _MAX_PHASES or (not plan.phase_entries and len(plan.expected_hashes) != count) or len(plan.phase_names) != count:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid CIF tuple lengths")
     if any(type(name) is not str or not name or len(name.encode("utf-8")) > 256 for name in plan.phase_names) or len(set(plan.phase_names)) != count:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid phase names")
@@ -479,9 +545,13 @@ def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid phase option")
     if not _valid_number(plan.lattice_pct, minimum=0, maximum=0.25) or not _valid_number(plan.min_intensity, minimum=0, maximum=100):
         raise _Refusal("INVALID_PHASE_PLAN", "invalid phase numeric option")
+    if plan.phase_min_intensities and (len(plan.phase_min_intensities) != count or not all(
+            _valid_number(value, minimum=0, maximum=100) for value in plan.phase_min_intensities)):
+        raise _Refusal("INVALID_PHASE_PLAN", "invalid per-phase minimum intensities")
     if plan.max_nfev is not None and (type(plan.max_nfev) is not int or not 1 <= plan.max_nfev <= 100_000):
         raise _Refusal("INVALID_PHASE_PLAN", "invalid max_nfev")
     finite = np.isfinite(plan.trace.axis) & np.isfinite(plan.trace.intensity)
+    _fit_sigma(plan, finite)
     if np.count_nonzero(finite) < 10:
         raise _Refusal("INSUFFICIENT_FIT_POINTS", "phase fit needs ten finite points")
     return float(plan.wavelength_angstrom)
@@ -536,43 +606,51 @@ def run_displayed_phase_fit(
         finite = np.isfinite(plan.trace.axis) & np.isfinite(plan.trace.intensity)
         x, y = plan.trace.axis[finite], plan.trace.intensity[finite]
         q_range = (float(np.min(x)), float(np.max(x)))
-        receipts, phases, markers, total_bytes, total_reflections = [], [], [], 0, 0
-        for index, (path, name, expected) in enumerate(zip(plan.cif_paths, plan.phase_names, plan.expected_hashes)):
+        from .phase_references import PhaseEntry, prepare_phase_models
+        receipts, entries, markers, total_bytes = [], [], [], 0
+        sources = tuple(plan.phase_entries) if plan.phase_entries else tuple(
+            zip(plan.cif_paths, plan.phase_names, plan.expected_hashes))
+        for index, source in enumerate(sources):
             if cancel_token is not None and cancel_token.is_set():
                 return _cancelled_phase(plan)
+            if isinstance(source, PhaseEntry) and source.source_kind == "lattice":
+                entries.append(source)
+                continue
+            if isinstance(source, PhaseEntry):
+                if source.cif_path is None:
+                    raise _Refusal("CIF_UNAVAILABLE", "library CIF path is unavailable")
+                path, name, expected = source.cif_path, source.name, source.id
+            else:
+                path, name, expected = source
             raw, receipt = _capture_cif(path, name, expected)
             total_bytes += len(raw)
             if total_bytes > _MAX_TOTAL_CIF_BYTES:
                 raise _Refusal("CIF_BYTE_LIMIT_EXCEEDED", "cumulative CIF byte limit exceeded")
-            try:
-                text = raw.decode("utf-8-sig", errors="strict")
-                structure = Structure.from_str(text, fmt="cif")
-                phase = PhaseModel(name)
-                phase.structure = structure
-                phase.calculate_peaks(wavelength=wavelength_angstrom)
-            except (UnicodeError, ValueError) as exc:
-                raise _Refusal("CIF_PARSE_FAILED", "CIF could not be parsed") from exc
-            admitted = tuple(
-                peak for peak in phase.peaks
-                if q_range[0] <= float(peak.q) <= q_range[1]
-                and float(peak.intensity) >= plan.min_intensity
-            )
-            if len(admitted) > _MAX_REFLECTIONS_PER_PHASE:
-                raise _Refusal("PHASE_REFLECTION_LIMIT_EXCEEDED", "per-phase reflection limit exceeded")
-            total_reflections += len(admitted)
-            if total_reflections > _MAX_REFLECTIONS_TOTAL:
-                raise _Refusal("PHASE_REFLECTION_LIMIT_EXCEEDED", "cumulative reflection limit exceeded")
-            markers.extend(float(peak.q) for peak in admitted)
-            receipts.append(receipt); phases.append(phase)
-            _progress(progress_callback, index + 1, len(plan.cif_paths) + 1)
+            entries.append(PhaseEntry(receipt.sha256, name, "cif", raw, cif_path=path))
+            receipts.append(receipt)
+            _progress(progress_callback, index + 1, len(sources) + 1)
             if cancel_token is not None and cancel_token.is_set():
                 return _cancelled_phase(plan)
+        try:
+            phases, references = prepare_phase_models(
+                *entries, wavelength_angstrom=wavelength_angstrom, q_range=q_range,
+                min_intensity=plan.min_intensity, floors=plan.phase_min_intensities or None,
+                model_class=PhaseModel, structure_class=Structure,
+            )
+        except ValueError as exc:
+            code = "PHASE_REFLECTION_LIMIT_EXCEEDED" if "reflection limit" in str(exc) else "CIF_PARSE_FAILED"
+            raise _Refusal(code, str(exc)) from exc
+        markers.extend(peak.q for reference in references for peak in reference.reflections)
         profile_extra = 1 if plan.phase_profile in {"pseudovoigt", "voigt"} else 0
-        if 1 + len(phases) * (8 + 3 + profile_extra + 2) > _MAX_FIT_PARAMETERS:
+        heights = sum(len(phase.peaks) for phase in phases if getattr(phase, "source_kind", "") == "lattice")
+        if 1 + len(phases) * (8 + 3 + profile_extra + 2) + heights > _MAX_FIT_PARAMETERS:
             raise _Refusal("FIT_PARAMETER_LIMIT_EXCEEDED", "predicted fit parameter limit exceeded")
-        fitter = PhaseFitter(x, y, prefit_background=plan.prefit_background)
-        for phase in phases:
-            fitter.add_phase(phase, q_range=q_range, min_intensity=plan.min_intensity)
+        sigma = _fit_sigma(plan, finite)
+        fitter = PhaseFitter(x, y, prefit_background=plan.prefit_background) if sigma is None else PhaseFitter(
+            x, y, sigma, prefit_background=plan.prefit_background)
+        floors = plan.phase_min_intensities or (plan.min_intensity,) * len(phases)
+        for phase, floor in zip(phases, floors):  # the same per-phase value at both filter sites
+            fitter.add_phase(phase, q_range=q_range, min_intensity=floor)
         params = fitter.build_parameters(
             lattice_pct=plan.lattice_pct, phase_profile=plan.phase_profile,
             texture="none",
@@ -605,15 +683,16 @@ def run_displayed_phase_fit(
         size = _result_base(scalar_floor)
         message = _fit_message(backend.lmfit_result.message)
         size = _result_grow(size, len(message.encode("utf-8")))
+        fractions_reason = getattr(backend, "phase_fractions_reason", "")
         fractions_map = backend.phase_fractions()
         if not isinstance(fractions_map, Mapping) or (
-            len(fractions_map) != len(plan.phase_names)
+            len(fractions_map) != (0 if fractions_reason else len(plan.phase_names))
             or any(type(key) is not str for key in fractions_map)
-            or set(fractions_map) != set(plan.phase_names)
+            or set(fractions_map) != (set() if fractions_reason else set(plan.phase_names))
         ):
             raise _Refusal("FIT_RESULT_LIMIT_EXCEEDED", "invalid phase fractions")
         fraction_values = []
-        for name in plan.phase_names:
+        for name in (() if fractions_reason else plan.phase_names):
             try:
                 value = float(fractions_map[name])
             except (TypeError, ValueError, OverflowError) as exc:
@@ -653,6 +732,8 @@ def run_displayed_phase_fit(
             plan.trace.label, plan.trace.axis_unit, names, values, errors,
             fractions, lattice,
         )
+        if fractions_reason:
+            scalar += (("phase_fractions_reason", fractions_reason),)
         size = _result_base(scalar)
         fit = _result_array(fitter.eval_model(backend.params), x.size)
         size = _result_add(size, fit)
@@ -672,7 +753,7 @@ def run_displayed_phase_fit(
         components = tuple(component_values)
         arrays = (fit, background, residual, marker_array, *components)
         fingerprint = _digest((scalar, arrays))
-        _progress(progress_callback, len(plan.cif_paths) + 1, len(plan.cif_paths) + 1)
+        _progress(progress_callback, len(sources) + 1, len(sources) + 1)
         if cancel_token is not None and cancel_token.is_set():
             return _cancelled_phase(plan)
         return DisplayedPhaseFitResult(
@@ -685,6 +766,7 @@ def run_displayed_phase_fit(
             label=plan.trace.label, axis_unit=plan.trace.axis_unit,
             parameter_names=names, parameter_values=values,
             parameter_stderr=errors, phase_fractions=fractions,
+            phase_names=plan.phase_names, phase_fractions_reason=fractions_reason,
             lattice_parameters=lattice, phase_components=components,
             fit=fit, background=background, residual=residual,
             marker_positions=marker_array, storage_bytes=size,

@@ -12,6 +12,8 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from enum import Enum
+import logging
+import os
 from typing import Callable
 
 from xrd_tools.core.scan import SourceKind, SourceSpec
@@ -489,6 +491,19 @@ class SourceSelectionOwner:
         self._mode = source_mode(source)
         self._history[self._mode] = source
 
+    def automatic_motor_for(self, snapshot: RunIntentSnapshot) -> str | None:
+        """Return only the source-owned Auto choice for this exact launch intent."""
+        intent = snapshot.thaw()
+        motor = intent.gi.incidence_motor
+        if os.environ.get("XDART_DEBUG_PRERUN") == "1":
+            logging.getLogger(__name__).warning(
+                "prerun.auto_capture revision=%s enabled=%s motor=%r marker=%r source=%r",
+                snapshot.revision, intent.gi.enabled, motor,
+                self._automatic_motor, intent.source_spec,
+            )
+        return (motor if intent.gi.enabled and motor != "Manual"
+                and self._automatic_motor_matches(snapshot) else None)
+
     def _automatic_motor_matches(self, snapshot: RunIntentSnapshot) -> bool:
         marker = self._automatic_motor
         if marker is _NO_AUTOMATIC_GI_MOTOR:
@@ -504,6 +519,11 @@ class SourceSelectionOwner:
         automatic: bool,
     ) -> None:
         source = snapshot.thaw().source_spec
+        if os.environ.get("XDART_DEBUG_PRERUN") == "1":
+            logging.getLogger(__name__).warning(
+                "prerun.motor_edit revision=%s automatic=%s value=%r source=%r",
+                snapshot.revision, automatic, value, source,
+            )
         self._deliberate_manual_source = (
             source
             if not automatic and value == "Manual"

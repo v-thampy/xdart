@@ -14,6 +14,7 @@ from xdart.gui.tabs.scattering.controls_inventory import (
 )
 from xdart.gui.tabs.scattering.controls_projection import project_controls
 from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
+from xdart.gui.tabs.scattering.scientific_axes import DERIVED_Q_CHI
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_projection import (
     ScientificPreferences,
@@ -253,6 +254,35 @@ def test_retained_hydration_keeps_last_actually_rendered_gi_cake_identity() -> N
     finally:
         view.close()
 
+
+@pytest.mark.parametrize("resident", [False, True])
+def test_a_derived_map_is_shared_only_once_its_cake_is_drawn(resident) -> None:
+    """HOSTED-REDS-20261017 F1: a nonresident frame showing the derived q–χ map draws no cake yet (the view retains
+    the last one), so its native GI trace axis stands; resident, Share follows the derived cake actually drawn."""
+    qip = np.linspace(-3.0, 3.0, 7)
+    qoop = np.linspace(0.0, 4.0, 5)
+    base = make_shell_projection(frame_count=1, selected_index=0, heavy_indices=(0,), plot_mode="Single")
+    frame = base.navigation.current
+    payload = StandardDisplayPayload(0, frame, "GI frame", FrameView(
+        frame.local_frame_label, axis_1d=Axis("Q_ip", "qip_A^-1", values=qip),
+        intensity_1d=np.linspace(1.0, 2.0, qip.size), axis_2d_x=Axis("Q_ip", "qip_A^-1", values=qip),
+        axis_2d_y=Axis("Q_oop", "qoop_A^-1", values=qoop), intensity_2d=np.arange(35, dtype=float).reshape(5, 7),
+        two_d_kind=TwoDKind.QIP_QOOP, raw=np.ones((3, 4), dtype=float)),
+        measurement_mode="GI", gi_incidence_motor="halpha", gi_resolved_motor="halpha",
+        gi_mode_1d="q_ip", gi_mode_2d="qip_qoop", wavelength_m=1.0e-10)
+    preferences = ScientificPreferences(plot_axis="q_ip", image_axis=DERIVED_Q_CHI, plot_mode="Single",
+                                        share_axis=True)
+    state = build_scientific_projection((payload,), base.navigation,
+                                        frozenset({frame}) if resident else frozenset(), preferences, "")
+    assert state.derived_2d and state.image_axis == DERIVED_Q_CHI
+    if resident:
+        assert state.heavy is not None and state.heavy.cake is not None
+        assert state.plot_axis == "Q"
+        assert state.traces[0].axis.unit == state.heavy.cake_x.unit
+    else:
+        assert state.heavy is None and state.retain_display
+        assert state.plot_axis == "q_ip"
+        assert state.traces[0].axis.unit == "qip_A^-1"
 
 def test_gi_qoop_native_repoints_to_cake_derived_qip_for_share() -> None:
     qip = np.linspace(-3.0, 3.0, 7)

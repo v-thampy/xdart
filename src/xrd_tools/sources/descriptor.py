@@ -83,6 +83,8 @@ class ContainerDescriptor:
     motor_names: tuple[str, ...] | None = None
     is_bluesky: bool = False
     finalized: bool = True
+    #: The detector saturation the file records (decision 39), or None.
+    saturation: int | None = None
 
     @property
     def version_stamp(self) -> tuple[int, int] | None:
@@ -428,11 +430,14 @@ def describe_container_from_open(
         return descriptor
 
     from xrd_tools.io.bluesky_nexus import is_bluesky_nxwriter, resolve_nxentry
-    from xrd_tools.io.image import _is_eiger_master
+    from xrd_tools.io.image import eiger_vendor_master
     from xrd_tools.io.nexus import (
         UnsupportedDetectorRankError,
         _read_energy,
+        _read_saturation,
         _read_wavelength,
+        acquisition_motor_names,
+        acquisition_wavelength,
     )
     from xrd_tools.io.processed_scan_id import (
         ProcessedXdartInputError,
@@ -483,16 +488,24 @@ def describe_container_from_open(
     scan_name = _scan_name(path)
 
     motor_names = None
-    if entry_grp is not None:
+    if entry_grp is not None and is_bluesky:
         try:
             from xrd_tools.io.bluesky_nexus import bluesky_all_motor_names
             motor_names = tuple(bluesky_all_motor_names(entry_grp))
         except Exception:
             pass
+    elif entry_grp is not None:
+        # Any other entry names the motors its supported acquisition metadata
+        # resolves (io.nexus.acquisition_items, as its frames' provider reads
+        # them), which needs the frame count: set once READY below.  A
+        # detector-only Eiger master names none; its motors come from a SPEC,
+        # NeXus or txt companion (maintainer, 2026-10-09).
+        motor_names = ()
     common: dict[str, Any] = dict(
         path=path, size=size, mtime_ns=mtime_ns, adapter_id=adapter_id,
         scan_name=scan_name, requested_entry=entry, resolved_entry=resolved_entry,
         is_bluesky=is_bluesky, finalized=finalized, motor_names=motor_names,
+        saturation=_read_saturation(entry_grp),  # recorded even while an external chunk is still arriving
     )
 
     # Processed xdart output is a decisive terminal skip — never raw input.
@@ -516,7 +529,7 @@ def describe_container_from_open(
             reason="integrated result groups are not raw detector frames",
             **common)
 
-    kind = SourceKind.EIGER_MASTER if _is_eiger_master(path) else SourceKind.NEXUS_STACK
+    kind = SourceKind.EIGER_MASTER if eiger_vendor_master(entry_grp) else SourceKind.NEXUS_STACK
 
     try:
         if _apstools_flat_nxdata_contract(h5f, entry_grp):
@@ -577,7 +590,8 @@ def describe_container_from_open(
     wavelength: float | None = None
     if entry_grp is not None:
         try:
-            wl = _read_wavelength(entry_grp, _read_energy(entry_grp))
+            wl = (_read_wavelength(entry_grp, _read_energy(entry_grp)) if is_bluesky
+                  else acquisition_wavelength(entry_grp, facts["frame_count"]))
             wavelength = float(wl) if _finite(wl) else None
         except Exception:
             wavelength = None
@@ -590,6 +604,11 @@ def describe_container_from_open(
         state, reason = ProbeState.IMAGELESS, "zero-frame detector dataset"
     else:
         state, reason = ProbeState.READY, "detector dataset present"
+    if entry_grp is not None and not is_bluesky and facts["frame_count"] > 0:
+        try:
+            common["motor_names"] = acquisition_motor_names(entry_grp, facts["frame_count"])
+        except Exception:
+            pass
 
     return ContainerDescriptor(
         state=state, kind=kind, reason=reason,
@@ -618,9 +637,10 @@ def _describe_container_from_open_with_binding(
     import h5py
 
     from xrd_tools.io.nexus import (
-        _bind_nexus_stack_from_entry, _read_energy, _read_wavelength,
+        _bind_nexus_stack_from_entry, _read_energy, _read_saturation,
+        _read_wavelength, acquisition_wavelength,
     )
-    from xrd_tools.io.image import _is_eiger_master
+    from xrd_tools.io.image import eiger_vendor_master
 
     selected = Path(path)
     if candidate is not None:
@@ -658,14 +678,13 @@ def _describe_container_from_open_with_binding(
         finalized = (not is_bluesky) or "end_time" in resolved_entry_group
         wavelength = None
         try:
-            raw = _read_wavelength(
-                resolved_entry_group, _read_energy(resolved_entry_group),
-            )
+            raw = (_read_wavelength(resolved_entry_group, _read_energy(resolved_entry_group))
+                   if is_bluesky else acquisition_wavelength(resolved_entry_group, frame_count))
             wavelength = float(raw) if _finite(raw) else None
         except Exception:
             pass
         resolved = resolved_entry_group.name.strip("/").split("/")[-1] or entry
-        kind = (SourceKind.EIGER_MASTER if _is_eiger_master(selected)
+        kind = (SourceKind.EIGER_MASTER if eiger_vendor_master(resolved_entry_group)
                 else SourceKind.NEXUS_STACK)
         descriptor = ContainerDescriptor(
             path=selected, size=size, mtime_ns=mtime_ns, adapter_id=adapter_id,
@@ -686,6 +705,7 @@ def _describe_container_from_open_with_binding(
             ),
             wavelength=wavelength, motor_names=all_names,
             is_bluesky=is_bluesky, finalized=finalized,
+            saturation=_read_saturation(resolved_entry_group),
         )
         return descriptor, binding
     except BaseException as primary:

@@ -242,6 +242,17 @@ class StandardDisplayPayload:
     #: q_ip–q_oop cake for display (never a stored or direct ``q_chi`` result).
     derived_2d: bool = False
 
+    def __post_init__(self) -> None:
+        # Ordinary Run publications carry the already-bound, per-frame
+        # wavelength. File views have no transient PONI and keep the existing
+        # artifact fallback; consumers never reconstruct energy from a source.
+        geometry = self.view.geometry
+        snapshot = None if geometry is None else geometry.poni
+        value = None if snapshot is None else snapshot.get("wavelength")
+        if (isinstance(value, (int, float, np.floating))
+                and np.isfinite(value) and value > 0.):
+            object.__setattr__(self, "wavelength_m", float(value))
+
 
 def companion_views_2d(record: FrameRecord | None) -> dict[str, FrameView]:
     """The complete non-active 2-D views of *record*, by mode key."""

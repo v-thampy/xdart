@@ -33,6 +33,74 @@ def _payload(result: FrameBackgroundResult) -> dict:
 def _root(value):
     while isinstance(value, np.ndarray): value = value.base
     return value
+
+
+def test_real_single_rebind_uses_stat_proof_and_matches_cold(monkeypatch, tmp_path):
+    """Actual Rayonix TIFF, production decoder and Single capsule; timings are attribution only."""
+    from time import perf_counter
+    from xrd_tools.reduction import background as module
+
+    source = Path(os.environ.get("XDART_TEST_DATA", "/Users/vthampy/repos/test_data")) / "Tiff" / "LaB6_detz190_dety72_th5_03261554_0001.tif"
+    if not source.is_file():
+        pytest.skip("actual Rayonix TIFF is unavailable")
+    original = hashlib.sha256(source.read_bytes()).hexdigest()
+    image = module.read_image(source)
+    shape = tuple(image.shape)
+    del image
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=0.37)
+    first_fact = _fact(tmp_path / "first.tif", shape=shape)
+    started = perf_counter()
+    first = resolve_frame_background(plan, first_fact)
+    cold_seconds = perf_counter() - started
+    assert first.disposition == "RESOLVED"
+    prepared = module._prepare_single_frame_background(plan, first_fact, first)
+    assert prepared is not None
+    calls = []
+    real_digest = module._digest
+
+    def observed_digest(path, cancelled):
+        calls.append(path)
+        return real_digest(path, cancelled)
+
+    monkeypatch.setattr(module, "_digest", observed_digest)
+    started = perf_counter()
+    for label in range(1, 11):
+        fact = _fact(tmp_path / "next.tif", label=label, shape=shape)
+        rebound = module._rebind_single_frame_background(prepared, plan, fact)
+        assert rebound is not None and rebound.background is first.background
+    rebind_seconds = perf_counter() - started
+    repeated_hashes = len(calls)
+    expected = resolve_frame_background(plan, fact)
+    assert rebound.descriptor_bytes == expected.descriptor_bytes
+    assert rebound.fingerprint == expected.fingerprint
+    np.testing.assert_array_equal(rebound.background, expected.background)
+    assert (rebound.variance_factor, rebound.scale) == (expected.variance_factor, expected.scale)
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == original
+    print(f"SINGLE_BG_COLD_SECONDS={cold_seconds:.6f} TEN_REBINDS_SECONDS={rebind_seconds:.6f} REBIND_FILE_HASHES={repeated_hashes} RETAINED_BACKGROUND_BYTES={first.background.nbytes}")
+    assert repeated_hashes == 0
+
+
+@pytest.mark.parametrize("suffix", [".edf", ".img", ".tif"])
+def test_single_external_edf_pixels_never_keep_a_capsule(tmp_path, suffix):
+    """Real content-detected EDF reader must reread its external pixel file."""
+    import fabio
+    from xrd_tools.reduction import background as module
+
+    shape = (3, 4)
+    member, payload = tmp_path / f"bg_1{suffix}", tmp_path / "pixels.bin"
+    payload.write_bytes(np.full(shape, 3, dtype="<u2").tobytes())
+    fabio.edfimage.EdfImage(data=np.zeros(shape, dtype="<u2"), header={
+        "EDF_BinaryFileName": payload.name, "EDF_BinaryFileSize": "24", "EDF_BinaryFilePosition": "0",
+    }).write(str(member))
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(member))
+    fact = _fact(tmp_path / "target.tif", shape=shape)
+    initial = resolve_frame_background(plan, fact)
+    np.testing.assert_array_equal(initial.background, np.full(shape, 3.0))
+    assert module._prepare_single_frame_background(plan, fact, initial) is None
+    payload.write_bytes(np.full(shape, 9, dtype="<u2").tobytes())
+    np.testing.assert_array_equal(resolve_frame_background(plan, fact).background, np.full(shape, 9.0))
+
+
 def test_none_is_zero_io_and_identity_neutral(monkeypatch, tmp_path: Path) -> None:
     from xrd_tools.reduction import background as module
     fact = _fact(tmp_path / "absent.tif"); touched = []; event = Event(); event.set()
@@ -260,12 +328,12 @@ def test_prepared_single_rejects_same_content_path_replacement(
     )
     assert prepared is not None
 
-    real_digest = module._digest
+    real_state = module._source_state
     replaced = False
 
-    def replace_after_digest(path, cancelled):
+    def replace_after_state(path, cancelled):
         nonlocal replaced
-        receipt = real_digest(path, cancelled)
+        receipt = real_state(path, cancelled)
         if not replaced:
             replacement = path.with_name("replacement.tif")
             replacement.write_bytes(path.read_bytes())
@@ -273,7 +341,7 @@ def test_prepared_single_rejects_same_content_path_replacement(
             replaced = True
         return receipt
 
-    monkeypatch.setattr(module, "_digest", replace_after_digest)
+    monkeypatch.setattr(module, "_source_state", replace_after_state)
     assert module._rebind_single_frame_background(
         prepared, plan, _fact(target, label=2),
     ) is None
@@ -717,3 +785,244 @@ def test_shape_nonfinite_and_stable_read_refusals(monkeypatch, tmp_path: Path) -
         dataset_path="/entry/data/data_000001", frame_index=0), _fact(target))
     assert processed.disposition == "REFUSED"
     monkeypatch.setattr(processed_scan_id, "has_processed_output_markers_file", real_processed)
+
+
+def test_dark_corrected_flag_keeps_older_mappings_and_reports_no_scale(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    source, target = _files(tmp_path, ("background.tif", "target.tif"))
+    _decoder(monkeypatch, {source.name: np.full((2, 2), 30, dtype=np.uint16)})
+    plain = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=2.0)
+    marked = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=2.0,
+                                 dark_corrected=True)
+    assert "dark_corrected" not in plain.to_mapping()  # existing records keep their mapping
+    assert marked.to_mapping() == {**plain.to_mapping(), "dark_corrected": True}
+    assert FrameBackgroundPlan.from_mapping(plain.to_mapping()) == plain
+    assert FrameBackgroundPlan.from_mapping(marked.to_mapping()) == marked
+    for bad in ({**plain.to_mapping(), "dark_corrected": False},
+                {**plain.to_mapping(), "dark_corrected": 1}):
+        with pytest.raises(ValueError):
+            FrameBackgroundPlan.from_mapping(bad)
+    assert resolve_frame_background(plain, _fact(target)).scale == 2.0
+    result = resolve_frame_background(marked, _fact(target))
+    # the reducer then subtracts the Background as it is: no factor to remove a dark with
+    assert result.disposition == "RESOLVED" and result.scale is None
+    np.testing.assert_array_equal(result.background, np.full((2, 2), 60.0))
+
+
+def test_directory_last_saved_before_frame(monkeypatch, tmp_path: Path) -> None:
+    """Darks collected during a scan: each frame takes the Background file saved last,
+    not after the frame's own file."""
+    root = tmp_path / "darks"; root.mkdir()
+    frames = tmp_path / "frames"; frames.mkdir()
+    early, late, tied = _files(root, ("dark_a.tif", "dark_b.tif", "dark_c.tif"))
+    first, second, before_any = _files(frames, ("scan_0001.tif", "scan_0002.tif", "scan_0000.tif"))
+    second_s = 1_000_000_000
+    for path, seconds in ((early, 10), (first, 20), (late, 30), (second, 40), (before_any, 5),
+                          (tied, 100)):
+        os.utime(path, ns=(seconds * second_s, seconds * second_s))
+    _decoder(monkeypatch, {early.name: np.full((2, 2), 1.0), late.name: np.full((2, 2), 2.0),
+                           tied.name: np.full((2, 2), 3.0)})
+    plan = FrameBackgroundPlan(mode="BG Directory", locator=str(root),
+                               match_rule="Last Saved Before Frame")
+    for frame, value in ((first, 1.0), (second, 2.0)):
+        result = resolve_frame_background(plan, _fact(frame))
+        assert result.disposition == "RESOLVED", result.diagnostics
+        np.testing.assert_array_equal(result.background, np.full((2, 2), value))
+    body = _payload(resolve_frame_background(plan, _fact(second)))
+    assert body["selected"] == str(late.resolve()) and body["frame_saved_ns"] == 40 * second_s
+    refused = resolve_frame_background(plan, _fact(before_any))
+    assert refused.disposition == "REFUSED" and "no Background file was saved before" in refused.diagnostics[0]
+    os.utime(tied, ns=(30 * second_s, 30 * second_s))  # saved together with dark_b: the later name
+    np.testing.assert_array_equal(resolve_frame_background(plan, _fact(second)).background,
+                                  np.full((2, 2), 3.0))
+    moved = resolve_frame_background(plan, _fact(second))
+    later = root / "dark_z.tif"; later.write_bytes(b"later")  # saved after the frame
+    os.utime(later, ns=(90 * second_s, 90 * second_s))
+    assert resolve_frame_background(plan, _fact(second)).fingerprint == moved.fingerprint
+    os.utime(tied, ns=(31 * second_s, 31 * second_s))  # a changed file time changes the record
+    assert resolve_frame_background(plan, _fact(second)).fingerprint != moved.fingerprint
+    container = resolve_frame_background(plan, _fact(first, dataset="/entry/data/data"))
+    assert container.disposition == "REFUSED" and "one image file per frame" in container.diagnostics[0]
+    shared = FrameBackgroundPlan(mode="BG Directory", locator=str(frames),
+                                 match_rule="Last Saved Before Frame")
+    for name in ("dark_d.tif",):
+        (frames / name).write_bytes(b"dark"); os.utime(frames / name, ns=(15 * second_s, 15 * second_s))
+    _decoder(monkeypatch, {"dark_d.tif": np.full((2, 2), 4.0)})
+    unfiltered = resolve_frame_background(shared, _fact(second))
+    assert unfiltered.disposition == "REFUSED" and "Filename Filter" in unfiltered.diagnostics[0]
+    filtered = resolve_frame_background(
+        FrameBackgroundPlan(mode="BG Directory", locator=str(frames), filename_filter="dark",
+                            match_rule="Last Saved Before Frame"), _fact(second))
+    np.testing.assert_array_equal(filtered.background, np.full((2, 2), 4.0))
+
+
+def test_the_dark_comes_off_the_background_before_scale_and_normalization(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """With a dark (and "BG dark-corrected" unticked) the frame loses
+    factor · (Background − dark), factor = Scale × monitor ratio."""
+    from xrd_tools.reduction import Frame, ReductionPlan
+    from xrd_tools.reduction import background as module
+    from xrd_tools.reduction.core import _dark_corrected_background
+
+    source, target = _files(tmp_path, ("background.tif", "target.tif"))
+    sidecar = source.with_suffix(".txt"); sidecar.write_text("monitor=2")
+    _decoder(monkeypatch, {source.name: np.full((2, 2), 30.0)})
+    monkeypatch.setattr(module, "read_image_metadata_observed",
+                        lambda *_args, **_kwargs: ImageMetadataRead({"monitor": 2.0}, sidecar))
+    plan = FrameBackgroundPlan(mode="Single BG File", locator=str(source), scale=1.5,
+                               normalization_key="monitor", metadata_format="txt")
+    result = resolve_frame_background(
+        plan, _fact(target, metadata=(("monitor", ("number", float(4.0).hex())),)))
+    assert result.disposition == "RESOLVED" and result.scale == 3.0  # 1.5 × 4 / 2
+    np.testing.assert_array_equal(result.background, np.full((2, 2), 90.0))
+    frame = Frame(0, image=np.zeros((2, 2)), metadata={}, background=result.background,
+                  background_scale=result.scale)
+    corrected = _dark_corrected_background(frame, ReductionPlan(dark=np.full((2, 2), 10.0)))
+    np.testing.assert_array_equal(corrected, np.full((2, 2), 60.0))  # 3 × (30 − 10)
+
+
+def test_a_series_capsule_rebinds_by_stat_byte_for_byte_and_resolves_again_on_any_change(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """BG-SERIES-REREAD (maintainer, 2026-09-30, on the per-frame proof: "Stat check (my recommendation): yes"):
+    a run resolves its Series Average once; a later frame rebinds it after a stat proof (the member set listed
+    again; every member's and metadata file's state) and scales the mean by its own normalization. Byte for
+    byte the full resolution's result, for the same and for other normalizations; any member or metadata
+    change, or a member added, resolves in full."""
+    from xrd_tools.reduction import background as module
+    one, two, three, target = _files(tmp_path, ("bg_1.tif", "bg_2.tif", "bg_3.tif", "target_1.tif"))
+    calls = _decoder(monkeypatch, {one.name: np.array([[1., np.nan], [3., 5.]]),  # uneven counts
+                                   two.name: np.array([[3., 7.], [np.nan, 7.]]),
+                                   three.name: np.array([[5., 9.], [9., np.nan]])})
+    sidecars = {path.resolve(): path.with_suffix(".txt") for path in (one, two, three)}
+    for value in sidecars.values():
+        value.write_text("stable")
+    monitors = {one.resolve(): 2.0, two.resolve(): 4.0, three.resolve(): 6.0}
+    monkeypatch.setattr(module, "read_image_metadata_observed", lambda path, **kwargs: ImageMetadataRead(
+        {"monitor": monitors[Path(path).resolve()]}, sidecars[Path(path).resolve()]))
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(two), normalization_key="monitor",
+                               metadata_format="txt")
+
+    def fact(label, monitor):
+        return _fact(target, label=label, metadata=(("monitor", ("number", float(monitor).hex())),))
+    with module.series_capsule_requested({}) as held:
+        first = resolve_frame_background(plan, fact(0, 6.0))
+    capsule = held["series"]
+    assert first.disposition == "RESOLVED" and len(calls) == 3  # each member read once
+    previous = None
+    for label, monitor in ((1, 6.0), (2, 3.0), (3, 3.0), (4, 6.0)):
+        rebound = module._rebind_series_frame_background(capsule, plan, fact(label, monitor))
+        reads = len(calls)
+        full = resolve_frame_background(plan, fact(label, monitor))
+        assert len(calls) == reads + 3 and rebound.disposition == "RESOLVED"
+        assert (rebound.descriptor_bytes, rebound.fingerprint) == (full.descriptor_bytes, full.fingerprint)
+        np.testing.assert_array_equal(rebound.background, full.background)
+        np.testing.assert_array_equal(np.asarray(rebound.variance_factor), np.asarray(full.variance_factor))
+        assert rebound.scale == full.scale
+        if label == 3:  # the last frame's normalization: its result again
+            assert rebound.background is previous.background
+        previous = rebound
+    assert len(calls) == 3 + 3 * 4  # the rebinds read nothing; each full resolution reads every member
+    assert module._rebind_series_frame_background(capsule, plan, fact(5, 6.0)).disposition == "RESOLVED"
+    os.utime(sidecars[three.resolve()], ns=(1, 1))  # a metadata file touched
+    assert module._rebind_series_frame_background(capsule, plan, fact(6, 6.0)) is None
+    with module.series_capsule_requested({}) as held:
+        resolve_frame_background(plan, fact(7, 6.0))
+    capsule = held["series"]
+    three.write_bytes(b"source-changed")  # a member rewritten
+    assert module._rebind_series_frame_background(capsule, plan, fact(8, 6.0)) is None
+    with module.series_capsule_requested({}) as held:
+        resolve_frame_background(plan, fact(9, 6.0))
+    capsule = held["series"]
+    (tmp_path / "bg_4.tif").write_bytes(b"source-new")  # a member added
+    assert module._rebind_series_frame_background(capsule, plan, fact(10, 6.0)) is None
+    assert resolve_frame_background(plan, fact(11, 6.0)).disposition != "RESOLVED"  # bg_4 has no decoder value
+
+
+def _monitor_sidecar(path: Path, monitor: float) -> None:
+    path.write_text(f"# Counters\nmonitor = {monitor}\n# Motors\ndel = 0.0\n"
+                    "User: review, time: Mon Jan 15 10:30:00 2024  # Temp\n")
+
+
+def test_a_series_whose_metadata_is_reached_through_a_link_keeps_no_capsule(tmp_path: Path) -> None:
+    """Codex BG-SERIES F1, its reproduction with the real TIFF and metadata readers: a member's sidecar is a
+    symbolic link. The receipt names the resolved file only, so a link retargeted to another valid sidecar
+    left every recorded state unchanged and the rebind reused a background 3.5 times too large. No capsule is
+    kept for such a Series (each frame resolves in full, as before BG-SERIES-REREAD); without the link one is."""
+    import tifffile
+    from xrd_tools.reduction import background as module
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"bg_{index}.tif"
+        tifffile.imwrite(path, np.arange(15, dtype=np.float32).reshape(3, 5) + 2 * index + 1)
+        _monitor_sidecar(path.with_suffix(".txt"), (2, 5, 11)[index])
+        paths.append(path)
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(paths[0]), normalization_key="monitor",
+                               metadata_format="txt")
+    target = _fact(tmp_path / "target_0.tif", shape=(3, 5), metadata=(("monitor", ("number", (3.0).hex())),))
+    with module.series_capsule_requested({}) as held:
+        assert resolve_frame_background(plan, target).disposition == "RESOLVED"
+    assert "series" in held  # the control: plain sidecars keep a capsule
+    old_meta, new_meta = tmp_path / "old_monitor.txt", tmp_path / "new_monitor.txt"
+    _monitor_sidecar(old_meta, 5)
+    _monitor_sidecar(new_meta, 50)
+    alias = paths[1].with_suffix(".txt")
+    alias.unlink()
+    alias.symlink_to(old_meta)
+    with module.series_capsule_requested({}) as held:
+        initial = resolve_frame_background(plan, target)
+    assert initial.disposition == "RESOLVED" and initial.background[0, 0] == 1.5  # mean 3 × 3 / 6
+    assert "series" not in held
+    alias.unlink()
+    alias.symlink_to(new_meta)
+    retargeted = resolve_frame_background(plan, target)
+    assert retargeted.background[0, 0] == pytest.approx(3 * 3 / 21, abs=0)  # monitors 2, 50, 11
+    assert retargeted.fingerprint != initial.fingerprint
+
+
+@pytest.mark.parametrize("suffix", [".edf", ".img", ".tif"])
+def test_a_series_whose_pixels_live_in_another_file_keeps_no_capsule(tmp_path: Path, suffix: str) -> None:
+    """Codex BG-SERIES F2 and its re-review F1, with the real readers: fabio reads an EDF's pixels from the file
+    its header names in ``EDF_BinaryFileName``, which no stat of the member proves, so rewriting only that file
+    left the rebind on the old pixels. Fabio detects EDF by content, so the same holds for an EDF named
+    ``.img`` or ``.tif``, which the first fix (an ``.edf`` suffix test) missed. No capsule is kept for such a
+    member; an EDF holding its own pixels, under the same name, keeps one."""
+    import fabio
+    from xrd_tools.reduction import background as module
+    shape = (3, 4)
+    own = tmp_path / f"own_1{suffix}"
+    fabio.edfimage.EdfImage(data=np.full(shape, 5, dtype="<u2")).write(str(own))
+    fact = _fact(tmp_path / "target_1.tif", shape=shape)
+    with module.series_capsule_requested({}) as held:
+        assert resolve_frame_background(FrameBackgroundPlan(mode="Series Average", locator=str(own)),
+                                        fact).disposition == "RESOLVED"
+    assert "series" in held  # the control
+    member, payload = tmp_path / f"bg_1{suffix}", tmp_path / "pixels.bin"
+    payload.write_bytes(np.full(shape, 3, dtype="<u2").tobytes())
+    fabio.edfimage.EdfImage(data=np.zeros(shape, dtype="<u2"), header={
+        "EDF_BinaryFileName": payload.name, "EDF_BinaryFileSize": "24", "EDF_BinaryFilePosition": "0",
+    }).write(str(member))
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(member))
+    with module.series_capsule_requested({}) as held:
+        initial = resolve_frame_background(plan, fact)
+    np.testing.assert_array_equal(initial.background, np.full(shape, 3.0))
+    assert "series" not in held
+    payload.write_bytes(np.full(shape, 9, dtype="<u2").tobytes())
+    np.testing.assert_array_equal(resolve_frame_background(plan, fact).background, np.full(shape, 9.0))
+
+
+def test_a_raw_binary_series_keeps_its_capsule(tmp_path: Path) -> None:
+    """The control for the content check: a ``.raw`` member fabio cannot open is decoded as raw binary, whose
+    bytes are its pixels, so its Series keeps the capsule (the 17-2 Pilatus case)."""
+    from xrd_tools.reduction import background as module
+    shape = (3, 4)
+    for index in (1, 2):
+        (tmp_path / f"bg_{index}.raw").write_bytes(np.full(shape, index, dtype="<i4").tobytes())
+    plan = FrameBackgroundPlan(mode="Series Average", locator=str(tmp_path / "bg_1.raw"))
+    fact = _fact(tmp_path / "target_1.tif", shape=shape)
+    with module.series_capsule_requested({}) as held:
+        result = resolve_frame_background(plan, fact)
+    assert result.disposition == "RESOLVED" and "series" in held
+    np.testing.assert_array_equal(result.background, np.full(shape, 1.5))

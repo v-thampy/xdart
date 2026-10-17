@@ -1,0 +1,650 @@
+"""Real source commits, camera coordinates and chooser cancellation in the retained window."""
+import time
+import os
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pytest
+from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
+
+from xdart.gui.pages.values import PageCleanup
+from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
+from xrd_tools.core.energy import energy_eV_to_wavelength_m, wavelength_m_to_energy_eV
+from xrd_tools.core.geometry import ImageOrientation
+from xrd_tools.core.geometry.camera import DetectorCamera, stitch_camera
+
+
+@pytest.fixture(scope='module')
+def qapp():
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def settle(dialog, timeout=5):
+    limit = time.monotonic() + timeout
+    while dialog.active() and time.monotonic() < limit:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)  # release the GIL as the normal Qt event loop does for the worker
+    assert not dialog.active()
+
+
+def commit(dialog, key, text):
+    dialog._set_field_text(key, str(text))
+    QtTest.QTest.keyClick(dialog._fields[key], QtCore.Qt.Key.Key_Return)
+    settle(dialog)
+
+
+def _dispose(dialog, timeout=30):
+    """Retire a test-owned window through its own cleanup receipt, then delete it: a closed but undeleted window
+    keeps every widget it built alive in the test process (QT-TEST-LIFECYCLE)."""
+    limit = time.monotonic() + timeout
+    receipt = dialog.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < limit:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)
+        receipt = dialog.shutdown()
+    assert receipt.status is PageCleanup.CLEAN, receipt
+    dialog.deleteLater()
+
+
+def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path):
+    from tests.xdart.scattering.test_stitch_guided_calibration import _beam_container
+    from xrd_tools.sources import SourceKind
+    nexus, _, _ = _beam_container(tmp_path)
+    nexus.rename(tmp_path / 'beam_scan001_master.h5')
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#O0 nu  energy\n#S 1 ascan del 1 -1 4 1\n#P0 4 7000.6716669638\n'
+                    '#N 1\n#L del\n1\n.5\n0\n-.5\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    try:
+        index = dialog.source_kind.findData('spec_container')
+        assert index >= 0
+        dialog.source_kind.setCurrentIndex(index)
+        commit(dialog, 'source', spec)
+        assert dialog._text('rough_energy') == ''
+        assert 'Auto · 7.0007 keV from SPEC' in dialog._fields['rough_energy'].placeholderText()
+        assert dialog._fields['rough_energy'].maximumWidth() == 300
+        assert dialog._row_visible('images') and dialog._row_visible('entry')
+        assert 'beam_scan001_' in dialog._fields['stem'].placeholderText()
+        assert dialog._text('images') == dialog._text('stem') == ''
+        for key in ('images', 'stem'):
+            quick = dialog._quick_rows[key].editor
+            assert quick.text() == ''
+            assert quick.placeholderText() == dialog._fields[key].placeholderText()
+        assert dialog._quick_rows['images'].editor.placeholderText() == f'auto · {tmp_path}'
+        assert dialog._spec().kind is SourceKind.SPEC
+        assert dialog.frames == ()  # Refine reads the scan without staged manual-calibration frames.
+        assert dialog._calibrant_source_ready()
+        assert '5 images' in dialog.active_source_row.editor.text()
+        dialog.list_button.click()
+        settle(dialog)
+        assert len(dialog._choices) == 5, dialog.status.text()
+        dialog.prepare_button.click()
+        settle(dialog)
+        assert len(dialog.frames) == 5, dialog.status.text()
+        assert all(Path(frame.image_path).is_file() for frame in dialog.frames)
+        again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+        try:
+            again.apply_settings(dialog.settings())
+            # LT-SMALL-FIXES-20261014 (LT-004/LT-005): the source kind is the page's Data format's, not a saved choice
+            assert 'source_kind' not in dialog.settings()['choices']
+            again.set_data_format('spec_container')
+            assert again.source_kind.currentData() == 'spec_container'
+            assert again._spec() == dialog._spec()
+            for key in ('images', 'stem'):
+                assert again._quick_rows[key].editor.placeholderText() == again._fields[key].placeholderText()
+        finally:
+            again.close()
+            _dispose(again)
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_calibrant_metadata_only_spec_is_not_ready_for_refinement(qapp, tmp_path):
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#O0 nu  energy\n#S 1 ascan del 1 -1 2 1\n#P0 0 11000\n'
+                    '#N 1\n#L del\n1\n0\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('spec_container'))
+        commit(dialog, 'source', spec)
+        assert '11.0000 keV from SPEC' in dialog._fields['rough_energy'].placeholderText()
+        assert not dialog._calibrant_source_ready()
+        assert '0 images' in dialog.active_source_row.editor.text()
+        assert 'folder' in dialog.active_source_row.editor.text().lower()
+        dialog.refine_button.click()
+        assert not dialog.active()
+        assert dialog.fit is None
+        assert 'calibrant source' in dialog.status.text().lower()
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_rough_rows_share_existing_controls_and_keep_mode_visibility(qapp, tmp_path):
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        assert dialog._parts['beam_entry'][0] == 'beam_source_kind'
+        assert dialog._parts['rough_mount'][0] == 'beam_pixel'
+        assert 'beam_motor' not in dialog._fields and not hasattr(dialog, 'motion')
+        assert dialog._label('beam_pixel').text() == 'Direct beam pixel (x, y)'
+        assert dialog.beam_readiness.title.isHidden()
+        assert dialog.beam_readiness.objectName() == 'controlsInlineReadiness'
+        assert dialog.tabs.cornerWidget().text() == '?'
+        for kind in ('spec_series', 'spec_container', 'nexus'):
+            dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(kind))
+            assert dialog._row_visible('beam_entry') == (kind != 'spec_series')
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        assert dialog._row_visible('beam_pixel') and dialog._row_visible('rough_mount')
+        assert not dialog._row_visible('beam_entry') and dialog.beam_readiness.isHidden()
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        assert not dialog._row_visible('beam_pixel') and not dialog._row_visible('rough_mount')
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))
+        assert dialog._row_visible('beam_entry') and not dialog.beam_readiness.isHidden()
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_calibrant_nexus_context_still_selects_the_nexus_choice(qapp, tmp_path):
+    from xrd_tools.sources import SourceKind, SourceSpec
+    dialog = CalibrationDialog(CalibrationContext('RSM', tmp_path))
+    try:
+        dialog.set_source_context(SourceSpec(tmp_path / 'scan.nxs', SourceKind.NEXUS_STACK))
+        assert dialog.source_kind.currentData() == 'nexus_stack'
+        assert not dialog._row_visible('images') and dialog._row_visible('entry')
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_detector_picker_describes_raw_defaults_and_manual_header_reads_pixels(qapp, tmp_path):
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.integrate.stitch_calibration import capture_calibration_frames
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Eiger2_500k'))
+    again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        picker = dialog._fields['beam_detector']
+        assert dialog._text('beam_detector') == 'Eiger2_500k'
+        # LT-SMALL-FIXES-20261014, LT-009: no "RAW" in the compact caption; the RAW details sit in Detector Config
+        assert '512 × 1028' in picker.currentText() and 'RAW' not in picker.currentText()
+        assert not dialog._row_visible('raw')
+        assert dialog._fields['shape'].isReadOnly() and dialog._fields['dtype'].isReadOnly()
+        assert dialog._parts['header'][0] == 'raw_layout'
+        assert dialog.camera.parent().layout().labelForField(dialog.camera).text() == 'Camera orientation (lab frame)'
+        spec = tmp_path / 'small'
+        spec.write_text('#F small\n#O0 nu\n#S 1 ascan del 0 0 0 1\n#P0 0\n#N 1\n#L del\n0\n')
+        image = np.arange(24, dtype='<u2').reshape(4, 6)
+        (tmp_path / 'small_scan1_0000.raw').write_bytes(b'header16bytes!!!' + image.tobytes())
+        source = SourceSpec(spec, SourceKind.SPEC, options={'scan': '1', 'image_dir': str(tmp_path),
+            'read_image_kwargs': {'detector_shape': image.shape, 'raw_dtype': 'uint16', 'raw_header_skip': 16}})
+        dialog.set_source_context(source)
+        assert dialog.raw_layout.currentData() == 'manual' and dialog._row_visible('raw')
+        assert not dialog._fields['shape'].isReadOnly() and not dialog._fields['dtype'].isReadOnly()
+        staged = capture_calibration_frames(dialog._spec(), [0], tmp_path / 'staged')
+        import fabio
+        np.testing.assert_array_equal(fabio.open(staged[0].image_path).data, image)
+        again.apply_settings(dialog.settings())
+        assert again.raw_layout.currentData() == 'manual' and again._reader() == dialog._reader()
+        again.raw_layout.setCurrentIndex(again.raw_layout.findData('factory'))
+        assert again._text('shape') == '512, 1028' and again._text('dtype') == 'int32'
+        assert again._text('header') == '16'  # byte offset is independent of the detector model
+    finally:
+        dialog.close()
+        _dispose(dialog)
+        again.close()
+        _dispose(again)
+
+
+def test_detector_change_drops_the_previous_detectors_beam_pixel(qapp, tmp_path):
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog._set_field_text('beam_pixel', '280, 97')
+        dialog._set_field_text('beam_detector', 'Eiger2_500k')
+        assert dialog._text('beam_pixel') == ''
+        assert '1028 × 512' in dialog._image_size.text()
+        assert 'found on the frame' in dialog._fields['beam_pixel'].placeholderText()
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_camera_names_the_diffractometers_lab_frame(qapp, tmp_path):
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        label = dialog.camera.parentWidget().layout().labelForField(dialog.camera)
+        assert 'lab frame' in label.text().lower()
+        assert 'Diffractometer' in dialog.camera.rotation.toolTip()
+        assert 'x up' in dialog.camera.rotation.toolTip()
+        assert 'z to the left' in dialog.camera.fliplr.toolTip()
+        assert 'pyFAI\'s frame, rows x+, columns z−' in dialog.camera.rotation.toolTip()
+        assert 'does not determine' in dialog.camera.rotation.toolTip()
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+@pytest.mark.parametrize('page', ['Stitch', 'RSM'])
+def test_detector_header_tracks_the_model_and_camera_image_correction(qapp, tmp_path, page):
+    dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
+    try:
+        dialog._set_field_text('beam_detector', 'Eiger2_500k')
+        assert dialog._detector_panel.title() == 'Detector · Eiger2 500k · 1028 × 512 px (W × H) · orientation: upright'
+        dialog.camera.set_value(DetectorCamera('z+', 'x-'))
+        assert '512 × 1028 px (W × H)' in dialog._detector_panel.title()
+        assert dialog._detector_panel.title().endswith('orientation: 90° CW, horizontal flip')
+        assert dialog._image_size.text() == '512 × 1028 px (W × H)'
+        title = dialog._detector_panel.title()
+        dialog._set_field_text('beam_orientation', '1')
+        assert dialog._detector_panel.title() == title
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        assert dialog._detector_panel.title().startswith('Detector · Pilatus 100k ·')
+        dialog.camera.default_button.click()
+        assert dialog._detector_panel.title().endswith('orientation: upright')
+        assert dialog._text('beam_orientation') == '1'
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_saturation_shows_the_documented_auto_value_and_keeps_manual_overrides(qapp, tmp_path):
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog._set_field_text('beam_source', tmp_path / 'beam')
+        field = dialog._fields['saturation']
+        assert dialog._text('saturation') == ''  # the hint is Auto, as in Int's threshold
+        assert '1048575' in field.placeholderText()
+        assert dialog._beam_fit_options()['saturation'] == 1048575
+        dialog._set_field_text('saturation', '12345')
+        dialog._set_field_text('beam_detector', 'Eiger2_500k')
+        assert field.text() == '12345'
+        assert dialog._beam_fit_options()['saturation'] == 12345
+        dialog._set_field_text('saturation', '')
+        assert 'acquisition' in field.placeholderText()
+        assert 'saturation' not in dialog._beam_fit_options()
+        again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+        try:
+            again.apply_settings(dialog.settings())
+            assert again._text('saturation') == ''
+            assert again._fields['saturation'].placeholderText() == field.placeholderText()
+        finally:
+            again.close()
+            _dispose(again)
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+@pytest.mark.parametrize('rotation,flip', [(r, f) for r in (0, 90, 180, 270) for f in (False, True)])
+@pytest.mark.parametrize('page', ['Stitch', 'RSM'])
+def test_typed_beam_pixel_follows_the_camera_but_not_pyfais_origin(qapp, tmp_path, rotation, flip, page):
+    dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
+    try:
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        dialog.camera.set_value(stitch_camera(ImageOrientation()))
+        dialog._set_field_text('beam_pixel', '280, 97')
+        image = np.zeros((195, 487), dtype=np.uint8)
+        image[97, 280] = 1
+        orientation = ImageOrientation(rotation=rotation, flip_horizontal=flip)
+        dialog.camera.set_value(stitch_camera(orientation))
+        y, x = np.argwhere(orientation.apply(image))[0]
+        assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (x, y)
+        dialog._set_field_text('beam_orientation', '1')
+        assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (x, y)
+        dialog.camera.default_button.click()
+        assert tuple(map(float, dialog._text('beam_pixel').split(','))) == (206, 97)
+        assert dialog._orientation() == ImageOrientation(rotation=180)
+        assert dialog._text('beam_orientation') == '1'
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+@pytest.mark.parametrize('key, chooser_kind', [('beam_source', 'spec'), ('source', 'image'), ('images', 'dir')])
+def test_escape_dismisses_a_real_file_chooser_and_keeps_calibration_open(qapp, tmp_path, key, chooser_kind):
+    from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
+    main = QtWidgets.QMainWindow()
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path), parent=main)
+    main.show()
+    dialog.show()
+    dialog.activateWindow()
+    qapp.processEvents()
+    dismissed = []
+    def escape():
+        chooser = QtWidgets.QApplication.activeModalWidget()
+        assert isinstance(chooser, QtWidgets.QFileDialog)
+        if chooser_kind != 'spec':
+            # Model the native picker's reported return to main, using real Qt activation and cancellation.
+            chooser.finished.connect(lambda _result: main.activateWindow())
+        QtTest.QTest.keyClick(chooser, QtCore.Qt.Key.Key_Escape)
+        dismissed.append(True)
+    try:
+        QtCore.QTimer.singleShot(50, escape)
+        dialog._browse(key, NEXUS_FILTER if chooser_kind == 'image' else chooser_kind)
+        qapp.processEvents()
+        assert dismissed and dialog.isVisible() and dialog._text(key) == ''
+        assert qapp.activeWindow() is dialog, 'the chooser returns focus to Calibration, not the main window'
+        # The release of Escape can reach the retained parent after a native chooser exits.
+        QtTest.QTest.keyClick(dialog, QtCore.Qt.Key.Key_Escape)
+        assert dialog.isVisible()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        main.close()
+        main.deleteLater()
+
+
+def test_saved_wavelength_migrates_to_energy_with_the_same_physical_value(qapp, tmp_path):
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.apply_settings({'fields': {'rough_wavelength': '0.7293'}})
+        energy = float(wavelength_m_to_energy_eV(.7293e-10)) / 1000
+        assert dialog._formrows['rough_energy'].label.text() == 'Energy (keV)'
+        assert dialog._parts['rough_energy'][0] == 'calibrant'
+        assert dialog._formrows['rough_energy'].isAncestorOf(dialog._fields['rough_energy'])
+        assert dialog._text('rough_energy') == f'{energy:.4f}'
+        assert dialog._rough_wavelength_A() == pytest.approx(.7293, rel=5e-6)
+        assert 'rough_wavelength' not in dialog.settings()['fields']
+        again = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+        try:
+            again.apply_settings(dialog.settings())
+            assert again._rough_wavelength_A() == dialog._rough_wavelength_A()
+        finally:
+            again.close()
+            _dispose(again)
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_committed_spec_scan_updates_energy_without_reading_images(qapp, tmp_path):
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#O0 energy\n#S 1 ascan del 1 -1 1 1\n#P0 11270\n#N 1\n#L del\n1\n-1\n'
+                    '#S 2 ascan del 1 -1 1 1\n#P0 16000\n#N 1\n#L del\n1\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    try:
+        commit(dialog, 'source', spec)
+        assert dialog._text('rough_energy') == ''
+        assert dialog._source_energy_eV == 11270
+        assert dialog._rough_wavelength_A() == pytest.approx(float(energy_eV_to_wavelength_m(11270)) * 1e10)
+        commit(dialog, 'scan', '2')
+        assert dialog._text('rough_energy') == ''
+        assert dialog._source_energy_eV == 16000
+        commit(dialog, 'scan', '99')
+        assert dialog._text('rough_energy') == ''  # no stale scan energy or first-scan fallback
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_committed_nexus_wavelength_updates_energy(qapp, tmp_path):
+    nexus = tmp_path / 'beam.nxs'
+    with h5py.File(nexus, 'w') as handle:
+        handle['entry/data/data'] = np.zeros((2, 3, 5), dtype=np.uint16)
+        handle['entry/instrument/monochromator/wavelength'] = 1.1
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    try:
+        dialog.source_kind.setCurrentIndex(dialog.source_kind.findData('nexus_stack'))
+        commit(dialog, 'source', nexus)
+        assert dialog._text('rough_energy') == ''
+        assert dialog._source_energy_eV == pytest.approx(float(wavelength_m_to_energy_eV(1.1e-10)))
+        assert dialog._rough_wavelength_A() == pytest.approx(1.1)
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+_TWO_ENERGIES = ('#O0 energy\n#S 1 ascan del 1 -1 1 1\n#P0 11270\n#N 1\n#L del\n1\n-1\n'
+                 '#S 2 ascan del 1 -1 1 1\n#P0 16000\n#N 1\n#L del\n1\n-1\n')
+
+
+def _record_reads(dialog):
+    """The roles ('' calibrant, 'beam_' direct beam) of each metadata read the window starts; the read runs."""
+    reads, start = [], dialog._start
+
+    def recorded(kind, *args):
+        if kind == 'source_details':
+            reads.append(args[0][0])
+        return start(kind, *args)
+    dialog._start = recorded
+    return reads
+
+
+def _leave(qapp, dialog, key, away, *typed):
+    """Real focus into a source field, each of ``typed`` replacing its text, then focus to ``away``."""
+    dialog.activateWindow()
+    field = dialog._fields[key]
+    field.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+    qapp.processEvents()
+    assert field.hasFocus()
+    for text in typed:
+        field.selectAll()
+        QtTest.QTest.keyClicks(field, text)
+    away.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+    qapp.processEvents()
+    assert not field.hasFocus()
+    settle(dialog)
+
+
+def test_a_calibrant_field_left_unchanged_reads_nothing_again(qapp, tmp_path, monkeypatch):
+    """HOSTED-REDS-20261017 F3: focus leaving a source field its role's last read already used starts no read; a
+    changed value, an edit undone before leaving, Return and choosing the same file again all read."""
+    from xdart.gui.widgets import file_dialogs
+    spec = tmp_path / 'calibrant'
+    spec.write_text('#F calibrant\n' + _TWO_ENERGIES)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    reads = _record_reads(dialog)
+    try:
+        commit(dialog, 'source', spec)
+        assert reads == [''] and dialog._source_energy_eV == 11270
+        dialog._show_tab('select')
+        away = dialog.list_button
+        _leave(qapp, dialog, 'source', away)
+        _leave(qapp, dialog, 'scan', away)
+        assert reads == ['']
+        _leave(qapp, dialog, 'scan', away, '2')
+        assert reads == ['', ''] and dialog._source_energy_eV == 16000
+        _leave(qapp, dialog, 'scan', away, '1', '2')  # undone: the energy it cleared is read again
+        assert reads == ['', '', ''] and dialog._source_energy_eV == 16000
+        dialog._fields['scan'].setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        QtTest.QTest.keyClick(dialog._fields['scan'], QtCore.Qt.Key.Key_Return)
+        settle(dialog)
+        assert reads == ['', '', '', '']
+        monkeypatch.setattr(file_dialogs, 'browse_spec', lambda *args, **kwargs: [str(spec)])
+        dialog._formrows['source'].browse_button.click()
+        settle(dialog)
+        assert reads == ['', '', '', '', ''] and dialog._source_energy_eV == 11270  # a picked file starts at scan 1
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_a_direct_beam_field_left_unchanged_reads_nothing_again(qapp, tmp_path):
+    """HOSTED-REDS-20261017 F3: the direct beam's source reads on its own inputs, as the calibrant's does, and
+    neither role's read stands for the other's."""
+    calibrant, direct = tmp_path / 'calibrant', tmp_path / 'direct'
+    calibrant.write_text('#F calibrant\n' + _TWO_ENERGIES)
+    direct.write_text('#F direct\n' + _TWO_ENERGIES)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    reads = _record_reads(dialog)
+    try:
+        commit(dialog, 'source', calibrant)
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))
+        commit(dialog, 'beam_source', direct)
+        assert reads == ['', 'beam_']
+        dialog._show_tab('rough')
+        away = dialog.rough_mode
+        _leave(qapp, dialog, 'beam_source', away)
+        _leave(qapp, dialog, 'beam_scan', away)
+        assert reads == ['', 'beam_']
+        _leave(qapp, dialog, 'beam_scan', away, '2')
+        assert reads == ['', 'beam_', 'beam_']
+        dialog._show_tab('select')
+        _leave(qapp, dialog, 'scan', dialog.list_button)
+        assert reads == ['', 'beam_', 'beam_'] and dialog._source_energy_eV == 11270
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+_PONI_HINT = "Auto · 16.0000 keV from the calibrated frames' PONI files"
+
+
+def test_a_blank_energy_takes_the_calibrated_frames_poni_wavelength(qapp, tmp_path):
+    """Maintainer, 2026-10-09: "if there is no typed in energy but there is a poni file, it should use the energy
+    from the poni file". With nothing typed and no recorded energy, the calibrated frames' PONI wavelength is the
+    window's (the one Fit reads), and the Auto hint names it; a typed or recorded energy still comes first, and
+    PONI files that disagree give none."""
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.integrate.refine import ControlFrame
+    from tests.core.test_stitch_guided_calibration import _frames
+    control = ControlFrame([1, 2], [3, 4], [0, 0], {'del': 10., 'nu': 2.})
+    poni = PONI(dist=.39, poni1=.01, poni2=.02, wavelength=7.749012402075016e-11, detector='Pilatus300kw')
+    (tmp_path / 'agree').mkdir()
+    (tmp_path / 'other').mkdir()
+    frames = _frames(tmp_path / 'agree', (control, control), poni)
+    other, = _frames(tmp_path / 'other', (control,), PONI(dist=.39, poni1=.01, poni2=.02, wavelength=1e-10,
+                                                          detector='Pilatus300kw'))
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        assert dialog._rough_wavelength_A() is None
+        dialog.frames = frames
+        dialog._render_frames()
+        assert dialog._rough_wavelength_A() == pytest.approx(.7749012402075016, rel=1e-12, abs=0)
+        assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
+        spec = tmp_path / 'other.spec'
+        spec.write_text('#F other\n#S 1 ascan del 1 -1 1 1\n#N 1\n#L del\n1\n-1\n')
+        dialog._set_field_text('source', spec)  # frames staged from another scan say nothing about this one
+        assert dialog._rough_wavelength_A() is None
+        assert dialog._fields['rough_energy'].placeholderText() == 'Auto · scan energy unavailable'
+        dialog._set_field_text('source', '')
+        assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
+        dialog._set_field_text('rough_energy', '12')  # typed comes first
+        assert dialog._rough_wavelength_A() == pytest.approx(float(energy_eV_to_wavelength_m(12000)) * 1e10,
+                                                             rel=1e-12, abs=0)
+        dialog._set_field_text('rough_energy', '')
+        dialog._show_source_energy(11270.)  # then the scan's recorded energy
+        assert dialog._rough_wavelength_A() == pytest.approx(float(energy_eV_to_wavelength_m(11270)) * 1e10,
+                                                             rel=1e-12, abs=0)
+        assert dialog._fields['rough_energy'].placeholderText() == 'Auto · 11.2700 keV from SPEC'
+        dialog._show_source_energy(None)
+        assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
+        dialog.frames = (*frames, other)
+        dialog._render_frames()
+        assert dialog._rough_wavelength_A() is None
+        assert dialog._fields['rough_energy'].placeholderText() == 'Auto · scan energy unavailable'
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_the_real_del_only_scan_7_takes_its_saved_poni_files_energy(qapp, tmp_path):
+    """The maintainer's case (2026-10-09): 17-2's del-only scan 7 records an impossible energy (-2165.0213 eV), and
+    five of its frames were calibrated in June, their PONI files at 16 keV. Opened on scan 7 as a page opens it,
+    staged and the June pairs imported, with nothing typed: the window takes their 16 keV, so pyFAI opens frames
+    at it and Save as calibration needs no typed energy."""
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.integrate.stitch_calibration import adopt_calibration_pair, capture_calibration_frames
+    from tests.core.test_single_detector_arm import _del_only_root
+    root = _del_only_root().resolve()
+    spec = SourceSpec(root / 'calibration/LaB6_16keV', SourceKind.SPEC, options={
+        'scan': '7', 'image_dir': str(root / 'images'), 'image_stem': 'b_thampy_LaB6_16keV_scan7_',
+        'read_image_kwargs': {'detector_shape': (195, 1475), 'raw_dtype': 'int32'}})
+    indices, june = (2, 5, 15, 30, 38), root / 'processed_data'
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.set_source_context(spec, image_rotation=0)
+        settle(dialog, timeout=30)
+        assert dialog._source_energy_eV is None  # the impossible readback is no energy
+        staged = capture_calibration_frames(dialog._spec(), indices, tmp_path / 'session')  # as Prepare stages
+        dialog.frames = tuple(adopt_calibration_pair(frame, june / f'b_thampy_LaB6_16keV_scan7_{index:04d}.poni',
+                                                     june / f'b_thampy_LaB6_16keV_scan7_{index:04d}.npt')
+                              for frame, index in zip(staged, indices))
+        dialog._render_frames()
+        assert not dialog._staged_source_mismatch()
+        assert dialog._rough_wavelength_A() == pytest.approx(.7749012402075016, rel=1e-12, abs=0)
+        assert dialog._fields['rough_energy'].placeholderText() == _PONI_HINT
+        assert dialog._seed_options()['wavelength_A'] == dialog._rough_wavelength_A()  # pyFAI's frames open at it
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        for key, value in (('beam_detector', 'Pilatus300kw'), ('rough_distance', '1000'), ('beam_pixel', '100, 97')):
+            dialog._set_field_text(key, value)
+        fit = dialog._rough_fit()  # Save as calibration's geometry
+        assert fit.asset['calibration']['wavelength'] == pytest.approx(7.749012402075016e-11, rel=1e-12, abs=0)
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_spec_container_uses_auto_folder_and_padded_stem(qapp, tmp_path):
+    from tests.xdart.scattering.test_stitch_guided_calibration import _beam_container
+    nexus, _, _ = _beam_container(tmp_path)
+    master = tmp_path / 'beam_scan001_master.h5'
+    nexus.rename(master)
+    spec = tmp_path / 'beam'
+    spec.write_text('#F beam\n#O0 nu  energy\n#S 1 ascan del 1 -1 4 1\n#P0 4 16000\n#N 1\n#L del\n'
+                    '1\n.5\n0\n-.5\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    try:
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec_container'))
+        commit(dialog, 'beam_source', spec)
+        assert dialog._row_visible('beam_images') and dialog._row_visible('beam_stem')
+        assert not dialog._row_visible('beam_image_file')
+        assert 'beam_scan001_' in dialog._fields['beam_stem'].placeholderText()
+        source = dialog._spec(beam=True)
+        assert source.options['image_dir'] == str(tmp_path)
+        assert source.options.get('image_file') is None  # the shared source chooses the actual container
+        dialog._set_field_text('beam_detector', 'Pilatus100k')
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        detect(dialog)
+        dialog.beam_button.click()
+        settle(dialog)
+        assert dialog._distance_result is not None, dialog.status.text()
+        assert dialog._distance_result.distance_m == pytest.approx(.5, rel=1e-3)
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_direct_beam_source_does_not_overwrite_the_calibrants_energy(qapp, tmp_path):
+    spec = tmp_path / 'direct'
+    spec.write_text('#F direct\n#O0 energy\n#S 1 ascan del 1 -1 1 1\n#P0 11270\n#N 1\n#L del\n1\n-1\n')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog._set_field_text('rough_energy', '17')
+        commit(dialog, 'beam_source', spec)
+        assert dialog._text('rough_energy') == '17'
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_the_real_eiger_del_scan_fits_with_auto_motion_and_no_energy(qapp, tmp_path):
+    root = Path(os.environ.get('XDART_TEST_DATA', '/nonexistent')) / 'stitching/GIXRD_Fatigue_Radha'
+    if not (root / 'direct_beam_dist_p33m_scan001_master.h5').is_file():
+        pytest.skip('direct-beam Eiger scan unavailable')
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
+        dialog.camera.set_value(stitch_camera(ImageOrientation()))  # frozen scan's native reference frame
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData('spec_container'))
+        dialog._set_field_text('beam_detector', 'Eiger2_500k')
+        dialog._set_field_text('beam_source', root / 'direct_beam_dist_p33m')
+        assert dialog._text('rough_energy') == ''
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        detect(dialog)
+        dialog.beam_button.click()
+        settle(dialog, timeout=30)
+        assert dialog._distance_result is not None, dialog.status.text()
+        assert dialog._distance_result.distance_m == pytest.approx(.335321322566, rel=1e-7)
+        assert np.count_nonzero(dialog._distance_result.used) == 51
+        assert dialog._text('rough_energy') == ''
+    finally:
+        dialog.close()
+        _dispose(dialog)

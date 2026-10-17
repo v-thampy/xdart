@@ -111,17 +111,35 @@ def _write_scalar(grp, name: str, value: Any) -> None:
     grp[name] = value
 
 
-def _write_json(grp, name: str, payload: Any) -> None:
-    """Store ``payload`` as a compact JSON string at ``grp[name]``."""
-    text = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
+def _config_json(payload: Any) -> str:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
+
+
+def _config_ceiling(name: str) -> int:
     from xrd_tools.io.append import (
         _MAX_REPLACEMENT_CONFIG_UTF8_BYTES,
         _MAX_REPLACEMENT_LINEAGE_UTF8_BYTES,
     )
-    ceiling = (_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES
-               if name == "source_execution"
-               else _MAX_REPLACEMENT_CONFIG_UTF8_BYTES)
-    if len(text.encode("utf-8")) > ceiling:
+    return (_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES
+            if name == "source_execution"
+            else _MAX_REPLACEMENT_CONFIG_UTF8_BYTES)
+
+
+def config_entry_overflow(name: str, payload: Any) -> tuple[int, int] | None:
+    """``(UTF-8 bytes, ceiling)`` when *payload* is too large for ``reduction/config/<name>``, else None.
+
+    The writer's own encoding and ceiling, so a caller can refuse up front what the
+    writer would refuse when the run saves its settings.
+    """
+    size = len(_config_json(payload).encode("utf-8"))
+    ceiling = _config_ceiling(name)
+    return (size, ceiling) if size > ceiling else None
+
+
+def _write_json(grp, name: str, payload: Any) -> None:
+    """Store ``payload`` as a compact JSON string at ``grp[name]``."""
+    text = _config_json(payload)
+    if len(text.encode("utf-8")) > _config_ceiling(name):
         raise ValueError(f"provenance config {name!r} exceeds the persisted UTF-8 byte ceiling")
     _write_scalar(grp, name, text)
 

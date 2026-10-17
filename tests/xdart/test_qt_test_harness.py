@@ -53,3 +53,23 @@ def test_qt_harness_refuses_worker_thread_collection(
     assert len(errors) == 1
     assert isinstance(errors[0], RuntimeError)
     assert "main thread" in str(errors[0])
+
+
+def test_qt_harness_delivers_pending_deletions_only_when_asked(
+    _xdart_qt_harness,
+) -> None:
+    """QT-TEST-LIFECYCLE (PRE-P3-BATCH-20261010): a deleteLater() from test code
+    survives ordinary event processing until the harness delivers it, and a live
+    widget is untouched."""
+    import shiboken6
+
+    kept = QtWidgets.QWidget()
+    doomed = QtWidgets.QWidget()
+    doomed.deleteLater()
+    _xdart_qt_harness.app.processEvents()
+    assert shiboken6.isValid(doomed)
+
+    _xdart_qt_harness.deliver_deferred_deletes()
+
+    assert not shiboken6.isValid(doomed)
+    assert shiboken6.isValid(kept)

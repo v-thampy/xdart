@@ -359,8 +359,9 @@ def test_real_browse_load_is_off_thread_exact_and_independently_owned(
     assert len(context.publication_store) == 0
     assert len(context.record_store) == 0
     assert context.calibration_identity
-    assert context.mask_identity == "True"
-    assert context.result_identity == str(path)
+    assert context.requested_path == str(path)
+    assert not hasattr(context, "mask_identity")
+    assert not hasattr(context, "result_identity")
     assert calls == [
         ("open_scan", "scattering-browse"),
         ("read_scalar_catalog", "scattering-browse"),
@@ -568,6 +569,26 @@ def test_cancelled_load_retires_exact_worker_after_inert_completion(
     loader.close()
 
 
+@pytest.mark.parametrize("at_pi", (True, False), ids=("chi_disc_at_pi", "chi_disc_at_zero"))
+def test_tiny_integrator_copies_the_real_chi_discontinuity(tmp_path: Path, at_pi: bool):
+    # Run construction's ring geometry reads the integrator's chi convention;
+    # the shared tiny adapter must carry the calibrated value, never assume pi.
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from xrd_tools.integrate.calibration import (
+        detector_calibration_to_integrator,
+        load_detector_calibration,
+    )
+
+    poni = tmp_path / "tiny.poni"
+    write_poni(poni)
+    calibrated = detector_calibration_to_integrator(load_detector_calibration(poni))
+    if at_pi:
+        calibrated.setChiDiscAtPi()
+    else:
+        calibrated.setChiDiscAtZero()
+    assert _TinyIntegrator(calibrated).chiDiscAtPi is calibrated.chiDiscAtPi is at_pi
+
+
 @pytest.mark.parametrize(
     "gi_enabled",
     (False, True),
@@ -597,20 +618,25 @@ def test_real_executor_pauses_at_durable_store_boundary(
     source_facts = []
     plan_configurations = []
     native_plan = executor_module.native_int_reduction_plan
-    real_integrator = executor_module.poni_to_integrator
+    from xrd_tools.session import readiness as readiness_module
+    native_binding = readiness_module.bind_native_int_source_energy
+
+    def bind_tiny_integrator(scan, calibration, **options):
+        effective = native_binding(scan, calibration, **options)
+        if not gi_enabled:
+            scan.integrator = _TinyIntegrator(scan.integrator)
+        return effective
+
     monkeypatch.setattr(
-        executor_module,
-        "poni_to_integrator",
-        lambda calibration: (real_integrator(calibration) if gi_enabled
-                             else _TinyIntegrator(real_integrator(calibration))),
+        readiness_module, "bind_native_int_source_energy", bind_tiny_integrator,
     )
 
-    def tiny_plan(configuration, **options):
+    def tiny_plan(configuration, *, energy_selection=None, **options):
         assert type(configuration) is FrozenRunConfiguration
         plan_configurations.append(configuration)
         # An ordinary Run asks the translation to declare its companion maps.
         assert options == {"companion_modes_2d": True}
-        plan = native_plan(configuration, **options)
+        plan = native_plan(configuration, energy_selection=energy_selection, **options)
         assert plan.integration_1d is not None
         assert plan.integration_1d.npt == 2
         assert plan.integration_2d is None
@@ -697,7 +723,12 @@ def test_real_executor_pauses_at_durable_store_boundary(
         projection=ContextProjection(),
     )
     controller.adopt_acquisition(launched.run_identity)
-    first_key = context.record_store.catalog_snapshot().entries[-1]
+    entries = context.record_store.catalog_snapshot().entries
+    assert entries, tuple(
+        (event.kind, event.detail, event.primary, event.cleanup_failures)
+        for event in observed + executor.drain_events()
+    )
+    first_key = entries[-1]
     first_payload = controller.project(first_key)
     assert first_payload is not None
     assert first_payload.measurement_mode == (

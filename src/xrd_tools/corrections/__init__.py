@@ -8,7 +8,12 @@ from xrd_tools.corrections.beam import (
     solid_angle_correction,
 )
 from xrd_tools.corrections.detector import (
+    DEFAULT_MIN_FLAT_FRACTION,
+    DetectorImageCheck,
+    check_detector_image,
     apply_flatfield,
+    prepare_dark,
+    prepare_flatfield,
     apply_mask,
     apply_threshold,
     combine_masks,
@@ -16,6 +21,9 @@ from xrd_tools.corrections.detector import (
     subtract_dark,
 )
 from xrd_tools.corrections.normalization import (
+    BeamNormalizationRefused,
+    foil_transmission,
+    frame_divisors,
     normalize_monitor,
     normalize_stack,
     normalize_time,
@@ -50,13 +58,21 @@ __all__ = [
     "polarization_correction",
     "solid_angle_correction",
     # detector
+    "DEFAULT_MIN_FLAT_FRACTION",
+    "DetectorImageCheck",
+    "check_detector_image",
     "apply_flatfield",
+    "prepare_dark",
+    "prepare_flatfield",
     "apply_mask",
     "apply_threshold",
     "combine_masks",
     "correct_image",
     "subtract_dark",
     # normalization
+    "BeamNormalizationRefused",
+    "foil_transmission",
+    "frame_divisors",
     "normalize_monitor",
     "normalize_stack",
     "normalize_time",

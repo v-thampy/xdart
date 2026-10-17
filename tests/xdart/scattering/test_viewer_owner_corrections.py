@@ -347,7 +347,8 @@ def test_intensity_controls_above_status_with_actual_hover_and_entry(viewer_1d):
     assert controls.mapTo(view, QtCore.QPoint()).y() < view.status.mapTo(view, QtCore.QPoint()).y()
     assert abs(controls.mapTo(view, controls.rect().center()).y()
                - view.plot_mode.mapTo(view, view.plot_mode.rect().center()).y()) <= 2
-    QtTest.QTest.mouseDClick(controls.slider, QtCore.Qt.LeftButton)
+    # The exact-range entry opens from the "Intensity" label since 85d4461e.
+    QtTest.QTest.mouseDClick(controls.label, QtCore.Qt.LeftButton)
     app.processEvents()
     assert controls._entry_popup.isVisible()
     low, high = controls._entry_editors()

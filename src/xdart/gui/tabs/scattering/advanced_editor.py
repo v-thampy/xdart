@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -17,6 +18,12 @@ from .controls_editing import (
     advanced_settings_values,
 )
 from xrd_tools.integrate.calibration import PONI_V3_SENSOR_MATERIALS
+from xdart.gui.widgets.controls_panel import PillRow, SubsectionCard
+from xdart.gui.widgets.file_dialogs import CORRECTION_FILTER as _CORRECTION_FILTER
+from .controls_inventory import RECORD_ANGULAR_SUPPORT, recording_control_field
+
+#: Browse titles for the detector-correction images, by role.
+_CORRECTION_TITLES = {"dark": "Choose dark", "flat": "Choose flat field"}
 
 
 @dataclass(slots=True)
@@ -29,21 +36,97 @@ class _DimensionEditors:
     delta_dummy: QtWidgets.QLineEdit
     chi_offset: QtWidgets.QLineEdit
     safe: QtWidgets.QCheckBox
+    error_model: QtWidgets.QComboBox
 
 
-class AdvancedSettingsDialog(QtWidgets.QDialog):
+class AdvancedDialog(QtWidgets.QDialog):
+    """Int's Advanced dialog for any page: the rarely changed settings, in titled groups.
+
+    The canonical owner of a page's Advanced settings (the architecture catalogue; Codex's reuse
+    audits, 2026-10-01). A page builds each group from the shared Controls rows (``FormRow``,
+    ``RangeRow``, the whole-number kind) and adds it with ``add_group``. Its rows commit as they are
+    edited, so the dialog has no values of its own and closes with Close. Int's integration editor
+    (``AdvancedSettingsDialog``) is the modal consumer: it adds its own groups with ``add_section``,
+    and returns its values only on OK.
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        title: str,
+        object_name: str = "advancedDialog",
+        accept_buttons: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName(object_name)
+        self.setWindowTitle(title)
+        self._accept_buttons = accept_buttons
+        layout = QtWidgets.QVBoxLayout(self)
+        self._sections = QtWidgets.QVBoxLayout()
+        layout.addLayout(self._sections)
+        self.buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            if accept_buttons
+            else QtWidgets.QDialogButtonBox.StandardButton.Close
+        )
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def add_group(self, title: str, rows=()) -> SubsectionCard:
+        """A titled group of shared rows, below the groups before it; returns its card, to which
+        more rows can be added."""
+        card = SubsectionCard(title)
+        for row in rows:
+            card.add_row(row)
+        self._sections.addWidget(card)
+        if title == "Corrections" and not self._accept_buttons:
+            from xdart.gui.widgets.context_help import owner_for
+            card.set_help_topic("corrections.existing")
+            self._help_owner = owner_for(self)
+        return card
+
+    def add_section(self, item: QtWidgets.QWidget | QtWidgets.QLayout) -> None:
+        """An owner's own group (a widget or a layout), below the groups before it."""
+        if isinstance(item, QtWidgets.QLayout):
+            self._sections.addLayout(item)
+        else:
+            self._sections.addWidget(item)
+
+    def set_editors_enabled(self, enabled: bool) -> None:
+        """Lock nonmodal group bodies while leaving contextual header help available."""
+        for index in range(self._sections.count()):
+            card = self._sections.itemAt(index).widget()
+            if isinstance(card, SubsectionCard):
+                card.body.setEnabled(enabled)
+        self.buttons.setEnabled(enabled)
+
+
+class AdvancedSettingsDialog(AdvancedDialog):
     """A combined 1D/2D editor containing values, not legacy widgets."""
 
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        path_chooser: Callable[[str, str], str | None] | None = None,
+        correction_inspector: Callable[[str, str, float], object] | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.setObjectName("vnextAdvancedSettingsDialog")
-        self.setWindowTitle("Integration — Advanced Settings")
+        super().__init__(
+            parent,
+            title="Integration — Advanced Settings",
+            object_name="vnextAdvancedSettingsDialog",
+            accept_buttons=True,
+        )
         self.setModal(True)
         self._gi_enabled: object = False
-        layout = QtWidgets.QVBoxLayout(self)
+        self._path_chooser = (
+            path_chooser if path_chooser is not None else self._choose_file
+        )
+        # (role, path, flat cutoff) -> DetectorImageCheck, for the status lines.
+        self._correction_inspector = correction_inspector
         self.gi_group = QtWidgets.QGroupBox(
             "Grazing-incidence Fiber integration"
         )
@@ -75,7 +158,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         )
         gi_form.addRow("Histogram backend", self.gi_method)
         self.gi_group.setVisible(False)
-        layout.addWidget(self.gi_group)
+        self.add_section(self.gi_group)
         self.poni_v3_group = QtWidgets.QGroupBox(
             "Detector sensor / parallax (PONI v3)"
         )
@@ -109,7 +192,40 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             self._set_poni_v3_enabled
         )
         self._set_poni_v3_enabled(False)
-        layout.addWidget(self.poni_v3_group)
+        self.add_section(self.poni_v3_group)
+        self.corrections_group = QtWidgets.QGroupBox("Detector corrections")
+        self.corrections_group.setObjectName("vnextDetectorCorrectionsGroup")
+        corrections_form = QtWidgets.QFormLayout(self.corrections_group)
+        self.dark_file, self.dark_status = self._correction_row(
+            corrections_form, "dark", "Dark",
+            "Dark-current image subtracted from every frame before integration. "
+            "With the Poisson error model its counts add to the variance. "
+            "Background, if set, is subtracted as well, less its own dark.",
+        )
+        self.flat_file, self.flat_status = self._correction_row(
+            corrections_form, "flat", "Flat field",
+            "Flat-field image the integration divides by. Dead pixels and pixels "
+            "below the cutoff are masked.",
+        )
+        self.flat_min_percent = QtWidgets.QDoubleSpinBox()
+        self.flat_min_percent.setObjectName("vnextFlatMinPercent")
+        self.flat_min_percent.setRange(0.0, 99.0)
+        self.flat_min_percent.setDecimals(1)
+        self.flat_min_percent.setSingleStep(1.0)
+        self.flat_min_percent.setSuffix(" % of median")
+        # Re-check on a committed value, not on every keystroke.
+        self.flat_min_percent.setKeyboardTracking(False)
+        self.flat_min_percent.setToolTip(
+            "Flat pixels below this share of the flat's median are treated as dead "
+            "and masked. Raise it to mask a region shadowed in the flat; lower it to "
+            "keep weak but working pixels. 0 masks only zero, negative and "
+            "non-finite pixels."
+        )
+        self.flat_min_percent.valueChanged.connect(
+            lambda _value: self._refresh_status("flat")
+        )
+        corrections_form.addRow("Mask flat pixels below", self.flat_min_percent)
+        self.add_section(self.corrections_group)
         forms = QtWidgets.QHBoxLayout()
         forms.setSpacing(12)
         self.one_d = self._dimension_group(
@@ -117,20 +233,77 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             "Integrate 1D",
             ADVANCED_METHODS_1D,
         )
+        self._recording_field = recording_control_field()
+        self.record_angular_support = PillRow((self._recording_field,))
+        self.one_d.solid_angle.parentWidget().layout().addRow(self.record_angular_support)
         self.two_d = self._dimension_group(
             forms,
             "Integrate 2D",
             ADVANCED_METHODS_2D,
         )
-        layout.addLayout(forms)
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        self.add_section(forms)
+        self.resize(700, 720)
+
+    def _correction_row(
+        self,
+        form: QtWidgets.QFormLayout,
+        role: str,
+        label: str,
+        tooltip: str,
+    ) -> tuple[QtWidgets.QLineEdit, QtWidgets.QLabel]:
+        path = QtWidgets.QLineEdit()
+        path.setObjectName(f"vnext{role.title()}File")
+        path.setPlaceholderText("None")
+        path.setToolTip(tooltip)
+        path.editingFinished.connect(lambda: self._refresh_status(role))
+        browse = QtWidgets.QPushButton("Browse…")
+        browse.setObjectName(f"vnext{role.title()}FileBrowse")
+        browse.clicked.connect(lambda _checked=False: self._browse(role, path))
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(path, 1)
+        row.addWidget(browse)
+        form.addRow(label, row)
+        status = QtWidgets.QLabel()
+        status.setObjectName(f"vnext{role.title()}FileStatus")
+        status.setWordWrap(True)
+        status.setVisible(False)
+        form.addRow("", status)
+        return path, status
+
+    def _browse(self, role: str, editor: QtWidgets.QLineEdit) -> None:
+        selected = self._path_chooser(role, editor.text())
+        if type(selected) is str and selected:
+            editor.setText(selected)
+            self._refresh_status(role)
+
+    def _refresh_status(self, role: str) -> None:
+        """Check the dark or flat file and show what it would do, before a run."""
+        editor, status = ((self.dark_file, self.dark_status) if role == "dark"
+                          else (self.flat_file, self.flat_status))
+        path = editor.text().strip()
+        inspector = self._correction_inspector
+        if not path or inspector is None:
+            status.clear()
+            status.setVisible(False)
+            return
+        try:
+            check = inspector(role, path, self.flat_min_percent.value() / 100.0)
+            text = ("Not usable: " if check.errors else "") + check.summary()
+        except Exception as error:  # noqa: BLE001 - a failed check must not block editing
+            text = f"Could not check the file: {error}"
+        status.setText(text)
+        status.setVisible(True)
+
+    def _choose_file(self, role: str, current: str) -> str | None:
+        from xdart.utils.browse import browse_start_dir, remember_browse_path
+
+        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self, _CORRECTION_TITLES[role], browse_start_dir(current),
+            _CORRECTION_FILTER,
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        self.resize(700, 590)
+        if selected:
+            remember_browse_path(selected)
+        return selected or None
 
     def _set_poni_v3_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -160,6 +333,16 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         delta_dummy = QtWidgets.QLineEdit()
         chi_offset = QtWidgets.QLineEdit()
         safe = QtWidgets.QCheckBox("Safe integration")
+        error_model = QtWidgets.QComboBox()
+        error_model.addItem("None", None)
+        error_model.addItem("Poisson", "poisson")
+        error_model.setToolTip(
+            "Poisson propagates counting uncertainty and saves sigma with the "
+            "result where pyFAI provides it: the q and 2θ profiles, and the "
+            "grazing-incidence total-q profile over the full χ range. The χ "
+            "profile, a χ-restricted total-q profile and the other "
+            "grazing-incidence 1D profiles have none."
+        )
 
         form.addRow(solid_angle)
         form.addRow(apply_polarization)
@@ -168,6 +351,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         form.addRow("Dummy", dummy)
         form.addRow("Dummy tolerance", delta_dummy)
         form.addRow("χ offset (°)", chi_offset)
+        form.addRow("Error model", error_model)
         form.addRow(safe)
         apply_polarization.toggled.connect(
             polarization_factor.setEnabled
@@ -182,6 +366,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             delta_dummy,
             chi_offset,
             safe,
+            error_model,
         )
 
     def edit(
@@ -201,6 +386,8 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             raise TypeError("values must be AdvancedSettingsValues")
         self._load_dimension(self.one_d, values.one_d)
         self._load_dimension(self.two_d, values.two_d)
+        self.record_angular_support.apply_fields({RECORD_ANGULAR_SUPPORT:
+            replace(self._recording_field, value=values.record_angular_support)})
         self._gi_enabled = values.gi_enabled
         gi_enabled = bool(values.gi_enabled)
         blocker = QtCore.QSignalBlocker(self.gi_method)
@@ -239,6 +426,13 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         self._set_poni_v3_enabled(
             bool(values.poni_v3_override_enabled)
         )
+        self.dark_file.setText(str(values.dark_file))
+        self.flat_file.setText(str(values.flat_file))
+        blocker = QtCore.QSignalBlocker(self.flat_min_percent)
+        self.flat_min_percent.setValue(100.0 * float(values.flat_min_fraction))
+        del blocker
+        for role in ("dark", "flat"):
+            self._refresh_status(role)
         standard_method_tooltip = (
             "This standard integration method is not used by "
             "FiberIntegrator in Grazing mode."
@@ -265,6 +459,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
                 editors.delta_dummy,
                 editors.chi_offset,
                 editors.safe,
+                editors.error_model,
             )
         )
         editors.solid_angle.setChecked(bool(values.correct_solid_angle))
@@ -289,6 +484,17 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
         editors.delta_dummy.setText(_optional_text(values.delta_dummy))
         editors.chi_offset.setText(str(values.chi_offset))
         editors.safe.setChecked(bool(values.safe))
+        model = values.error_model
+        index = editors.error_model.findData(model)
+        if index < 0:
+            editors.error_model.addItem(str(model), model)
+            index = editors.error_model.count() - 1
+            editors.error_model.setItemData(
+                index,
+                "Current custom error model.",
+                QtCore.Qt.ItemDataRole.ToolTipRole,
+            )
+        editors.error_model.setCurrentIndex(index)
         editors.polarization_factor.setEnabled(
             bool(values.apply_polarization)
         )
@@ -304,6 +510,10 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             poni_v3_material=self.poni_v3_material.currentData(),
             poni_v3_thickness_m=self.poni_v3_thickness_m.text(),
             poni_v3_parallax=self.poni_v3_parallax.isChecked(),
+            dark_file=self.dark_file.text(),
+            flat_file=self.flat_file.text(),
+            flat_min_fraction=round(self.flat_min_percent.value(), 1) / 100.0,
+            record_angular_support=dict(self.record_angular_support.current_edits())[RECORD_ANGULAR_SUPPORT],
         )
 
     @staticmethod
@@ -319,6 +529,7 @@ class AdvancedSettingsDialog(QtWidgets.QDialog):
             editors.delta_dummy.text(),
             editors.chi_offset.text(),
             editors.safe.isChecked(),
+            editors.error_model.currentData(),
         )
 
 
@@ -326,4 +537,4 @@ def _optional_text(value: object) -> str:
     return "" if value is None else str(value)
 
 
-__all__ = ["AdvancedSettingsDialog"]
+__all__ = ["AdvancedDialog", "AdvancedSettingsDialog"]

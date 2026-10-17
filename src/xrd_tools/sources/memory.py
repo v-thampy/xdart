@@ -45,7 +45,9 @@ class MemoryFrameSource(BaseFrameSource):
     def frame_for(self, index: int) -> ScanFrame:
         return self._frames[int(index)]
 
-    def to_scan(self, *, name: str | None = None, **kwargs: Any) -> Scan:
+    def to_scan(self, *, name: str | None = None, cancelled=None, **kwargs: Any) -> Scan:
+        if cancelled is not None and cancelled():
+            raise RuntimeError("admission cancelled")
         return Scan(name or self.name, [self._frames[i] for i in self.frame_indices], **kwargs)
 
 

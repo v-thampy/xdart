@@ -237,14 +237,16 @@ def test_tiff_series_keeps_duplicate_member_overrides_positional(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ):
+    from xrd_tools.io.metadata import ImageMetadataRead
     from xrd_tools.sources import image as image_module
     from xrd_tools.sources import TiffSeriesSource
 
     path = tmp_path / "same.tif"
+    # The series reads through read_image_metadata_observed since 0d46a239.
     monkeypatch.setattr(
         image_module,
-        "read_image_metadata",
-        lambda *_args, **_kwargs: {"th": 99.0},
+        "read_image_metadata_observed",
+        lambda path, *_args, **_kwargs: ImageMetadataRead({"th": 99.0}, Path(path).with_suffix(".txt")),
     )
     source = TiffSeriesSource(
         [path, path],

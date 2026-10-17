@@ -529,12 +529,22 @@ def test_average_fold_rebuilds_on_replacement_and_bypasses_writable_rows(
             mismatched,
             *changed_traces[2:],
         )
+        # a grid a few ulps away (live integrators publish such grids) is the same grid: folded in the cache
+        rounded_axis = changed_traces[1].axis.values * (1 + 4e-16)
+        rounded_axis.setflags(write=False)
+        assert not np.array_equal(rounded_axis, changed_traces[1].axis.values)
+        rounded_traces = (
+            changed_traces[0],
+            replace(changed_traces[1], axis=replace(changed_traces[1].axis, values=rounded_axis)),
+            *changed_traces[2:],
+        )
         cases = (
             (changed_traces, shell.scientific.plot_options, True),
             (changed_traces, sqrt_options, True),
             (writable_traces, shell.scientific.plot_options, False),
             (infinite_traces, shell.scientific.plot_options, True),
             (mismatched_traces, shell.scientific.plot_options, False),
+            (rounded_traces, shell.scientific.plot_options, True),
         )
         scale_calls = []
         original_scale = scientific_view_module._scaled_intensity

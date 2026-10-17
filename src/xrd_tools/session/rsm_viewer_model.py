@@ -19,6 +19,7 @@ from xrd_tools.rsm.coordinate_frame import (
 
 RSM_HK = PanelKey(PanelRole.SLICE_2D, "HK")
 RSM_HL = PanelKey(PanelRole.SLICE_2D, "HL")
+RSM_LH = PanelKey(PanelRole.SLICE_2D, "LH")
 RSM_KL = PanelKey(PanelRole.SLICE_2D, "KL")
 RSM_H = PanelKey(PanelRole.PROJ_1D, "H")
 RSM_K = PanelKey(PanelRole.PROJ_1D, "K")
@@ -26,20 +27,21 @@ RSM_L = PanelKey(PanelRole.PROJ_1D, "L")
 
 RSM_QX_QY = PanelKey(PanelRole.SLICE_2D, "QxQy")
 RSM_QX_QZ = PanelKey(PanelRole.SLICE_2D, "QxQz")
+RSM_QZ_QX = PanelKey(PanelRole.SLICE_2D, "QzQx")
 RSM_QY_QZ = PanelKey(PanelRole.SLICE_2D, "QyQz")
 RSM_QX = PanelKey(PanelRole.PROJ_1D, "Qx")
 RSM_QY = PanelKey(PanelRole.PROJ_1D, "Qy")
 RSM_QZ = PanelKey(PanelRole.PROJ_1D, "Qz")
 
 RSM_VIEWER_LAYOUT = (
-    (RSM_HK, RSM_HL, RSM_KL),
+    (RSM_HK, RSM_KL, RSM_LH),
     (RSM_H, RSM_K, RSM_L),
 )
 RSM_VIEWER_PANEL_ORDER = tuple(
     panel for row in RSM_VIEWER_LAYOUT for panel in row
 )
 RSM_Q_VIEWER_LAYOUT = (
-    (RSM_QX_QY, RSM_QX_QZ, RSM_QY_QZ),
+    (RSM_QX_QY, RSM_QY_QZ, RSM_QZ_QX),
     (RSM_QX, RSM_QY, RSM_QZ),
 )
 RSM_Q_VIEWER_PANEL_ORDER = tuple(
@@ -57,7 +59,7 @@ _F4 = np.dtype("<f4")
 _F8 = np.dtype("<f8")
 _I8 = np.dtype("<i8")
 
-_ComponentKey = tuple[str, str, str] | tuple[str, str, str, int]
+_ComponentKey = tuple[object, ...]
 _SnapshotKey = tuple[str, str]
 
 
@@ -71,6 +73,25 @@ def rsm_viewer_layout(
     if coordinate_frame is RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU:
         return RSM_Q_VIEWER_LAYOUT
     raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
+
+
+def rsm_axis_bounds(values: object) -> tuple[float, float]:
+    """The outer edges of a slice axis's bins, from their centres: half a bin
+    beyond the first and last centre, where an image of the slice begins and ends
+    so that each pixel sits at its bin's centre (the RSM page's slices)."""
+
+    axis = np.asarray(values, dtype=np.float64)
+    if (
+        axis.ndim != 1
+        or axis.size < 2
+        or not np.all(np.isfinite(axis))
+        or not np.all(np.diff(axis) > 0)
+    ):
+        raise ValueError("strict RSM display axis is invalid")
+    return (
+        float(axis[0] - (axis[1] - axis[0]) / 2),
+        float(axis[-1] + (axis[-1] - axis[-2]) / 2),
+    )
 
 
 def _rsm_viewer_panel_order(
@@ -420,6 +441,8 @@ class RSMViewerState:
     coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
+    projection: bool = False
+    ranges: tuple[tuple[int, int], ...] | None = None
 
     def __post_init__(self, _claim: object) -> None:
         if (
@@ -429,6 +452,12 @@ class RSMViewerState:
             or type(self.l_index) is not int
             or min(self.h_index, self.k_index, self.l_index) < 0
             or type(self.coordinate_frame) is not RSMCoordinateFrame
+            or type(self.projection) is not bool
+            or (self.ranges is not None and (
+                type(self.ranges) is not tuple or len(self.ranges) != 3
+                or any(type(pair) is not tuple or len(pair) != 2
+                       or any(type(x) is not int for x in pair)
+                       or not 0 <= pair[0] < pair[1] for pair in self.ranges)))
         ):
             raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
         _require_digest(self.result_fingerprint)
@@ -453,8 +482,9 @@ class RSMViewerState:
             self,
             "fingerprint",
             analysis_canonical_fingerprint(
-                domain,
-                canonical_value,
+                "rsm-viewer-state-v3" if self.projection or self.ranges is not None else domain,
+                (canonical_value, self.projection, self.ranges)
+                if self.projection or self.ranges is not None else canonical_value,
             ),
         )
 
@@ -563,7 +593,7 @@ class RSMViewerProduct:
                 or self.values.ndim != 2
                 or self.values.shape
                 != (self.y_axis_or_none.size, self.x_axis.size)
-                or sum(value is not None for value in self.source_indices) != 1
+                or sum(value is not None for value in self.source_indices) not in (0, 1)
             ):
                 raise TypeError("RSM viewer slice product is invalid")
         elif (
@@ -769,22 +799,20 @@ def _viewer_finite_mask(intensity: np.ndarray) -> np.ndarray:
 def _projection_values(
     intensity: np.ndarray,
     *,
-    retained_axis: int,
+    retained_axis: int | tuple[int, ...],
 ) -> np.ndarray:
-    output_size = intensity.shape[retained_axis]
+    retained = (retained_axis,) if type(retained_axis) is int else retained_axis
+    output_shape = tuple(intensity.shape[i] for i in retained)
+    output_size = int(np.prod(output_shape))
     charges = _projection_work_bytes(intensity, output_size)
     _require_work_bytes(sum(charges))
     finite = _viewer_finite_mask(intensity)
     zeroed = np.where(finite, intensity, np.float32(0.0))
-    reduction_axes = tuple(axis for axis in range(3) if axis != retained_axis)
+    reduction_axes = tuple(axis for axis in range(3) if axis not in retained)
     sums = np.sum(zeroed, axis=reduction_axes, dtype=np.float64)
     counts = np.sum(finite, axis=reduction_axes, dtype=np.int64)
-    projected = np.empty((output_size,), dtype=_F4)
-    for index in range(output_size):
-        if counts[index] == 0:
-            projected.view(np.uint32)[index] = _QNAN_F4_BITS
-        else:
-            projected[index] = sums[index] / counts[index]
+    projected = np.full(output_shape, np.nan, dtype=_F4)
+    np.divide(sums, counts, out=projected, where=counts > 0)
     if np.isinf(projected).any():
         raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
     del finite, zeroed, sums, counts
@@ -815,29 +843,34 @@ def _build_rsm_viewer_product(
 
     axis0, axis1, axis2 = axes
     panel_order = _rsm_viewer_panel_order(state.coordinate_frame)
+    indices = tuple(index - (state.ranges[i][0] if state.ranges else 0)
+                    for i, index in enumerate(state.axis_indices))
     if panel_key is panel_order[0]:
         return product(
             panel_key,
             axis0,
             axis1,
-            _freeze_float32(intensity[:, :, state.l_index].T),
-            (None, None, state.l_index),
+            _freeze_float32(_projection_values(intensity, retained_axis=(0, 1)).T)
+            if state.projection else _freeze_float32(intensity[:, :, indices[2]].T),
+            (None, None, None) if state.projection else (None, None, state.l_index),
         )
     if panel_key is panel_order[1]:
         return product(
             panel_key,
-            axis0,
+            axis1,
             axis2,
-            _freeze_float32(intensity[:, state.k_index, :].T),
-            (None, state.k_index, None),
+            _freeze_float32(_projection_values(intensity, retained_axis=(1, 2)).T)
+            if state.projection else _freeze_float32(intensity[indices[0], :, :].T),
+            (None, None, None) if state.projection else (state.h_index, None, None),
         )
     if panel_key is panel_order[2]:
         return product(
             panel_key,
-            axis1,
             axis2,
-            _freeze_float32(intensity[state.h_index, :, :].T),
-            (state.h_index, None, None),
+            axis0,
+            _freeze_float32(_projection_values(intensity, retained_axis=(0, 2)))
+            if state.projection else _freeze_float32(intensity[:, indices[1], :]),
+            (None, None, None) if state.projection else (None, state.k_index, None),
         )
     if panel_key is panel_order[3]:
         values = _projection_values(intensity, retained_axis=0)
@@ -872,14 +905,40 @@ def _build_rsm_viewer_product(
 def _component_keys(state: RSMViewerState) -> tuple[_ComponentKey, ...]:
     result = state.result_fingerprint
     axis0, axis1, axis2 = state.coordinate_frame.axis_names
-    return (
+    keys = (
         (result, "slice", axis2, state.l_index),
-        (result, "slice", axis1, state.k_index),
         (result, "slice", axis0, state.h_index),
+        (result, "slice", axis1, state.k_index),
         (result, "projection", axis0),
         (result, "projection", axis1),
         (result, "projection", axis2),
     )
+    if state.projection or state.ranges is not None:
+        return tuple((key[0], "mean-map" if state.projection and i < 3 else key[1],
+                      *key[2:3], state.ranges,
+                      *(() if state.projection and i < 3 else key[3:])) for i, key in enumerate(keys))
+    return keys
+
+
+def _coordinate_crop(axes, bounds):
+    """Inclusive existing bin centres, with no source read or scientific mutation."""
+    if bounds is None:
+        return None
+    if type(bounds) is not tuple or len(bounds) != 3:
+        raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
+    selected = []
+    for axis, pair in zip(axes, bounds, strict=True):
+        if type(pair) is not tuple or len(pair) != 2:
+            raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
+        low, high = (float(x) for x in pair)
+        if not np.isfinite((low, high)).all() or low > high:
+            raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
+        first, stop = int(np.searchsorted(axis, low)), int(np.searchsorted(axis, high, side="right"))
+        if first >= stop:
+            raise RSMViewerRefused("RSM_VIEW_RANGE_EMPTY")
+        selected.append((first, stop))
+    ranges = tuple(selected)
+    return None if ranges == tuple((0, x.size) for x in axes) else ranges
 
 
 def _resident_arrays(
@@ -1071,10 +1130,14 @@ class RSMViewerModel:
         h_index: int | None = None,
         k_index: int | None = None,
         l_index: int | None = None,
+        projection: bool = False,
+        coordinate_ranges: tuple[tuple[float, float], ...] | None = None,
     ) -> RSMViewerSnapshot:
         if values is None:
             values = self._values
         if type(values) is not RSMViewerValues:
+            raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
+        if type(projection) is not bool:
             raise RSMViewerRefused("RSM_VIEW_STATE_INVALID")
         result = values.result_fingerprint
         if (
@@ -1090,6 +1153,11 @@ class RSMViewerModel:
                 k_index=k_index,
                 l_index=l_index,
             )
+            source_axes = None if coordinate_ranges is None else tuple(item[1] for item in values.axes)
+            ranges = None if source_axes is None else _coordinate_crop(source_axes, coordinate_ranges)
+            if ranges is not None:
+                indices = tuple(min(max(x, pair[0]), pair[1] - 1)
+                                for x, pair in zip(indices, ranges, strict=True))
             cached_key: _SnapshotKey | None = None
             cached_snapshot: RSMViewerSnapshot | None = None
             if self._result_fingerprint == result:
@@ -1102,6 +1170,8 @@ class RSMViewerModel:
                         and cached_state.h_index == indices[0]
                         and cached_state.k_index == indices[1]
                         and cached_state.l_index == indices[2]
+                        and cached_state.projection == projection
+                        and cached_state.ranges == ranges
                     ):
                         cached_key = key
                         cached_snapshot = snapshot
@@ -1128,6 +1198,7 @@ class RSMViewerModel:
                 *indices,
                 coordinate_frame=values.coordinate_frame,
                 _claim=_RSM_VIEWER_FACTORY,
+                projection=projection, ranges=ranges,
             )
             required_bytes = _snapshot_shape_bytes(values.shape)
             if required_bytes > _MAX_RSM_VIEWER_CACHE_BYTES:
@@ -1139,9 +1210,17 @@ class RSMViewerModel:
                 > _MAX_RSM_VIEWER_CACHE_BYTES
             ):
                 raise RSMViewerRefused("RSM_VIEW_PRODUCT_TOO_LARGE")
-            source_axes = tuple(item[1] for item in values.axes)
+            if source_axes is None:
+                source_axes = tuple(item[1] for item in values.axes)
             source_intensity = values.intensity
-            for output_size in values.shape:
+            if ranges is not None:
+                crop = tuple(slice(*pair) for pair in ranges)
+                source_intensity = source_intensity[crop]
+            sizes = list(source_intensity.shape)
+            if projection:
+                sizes.extend(source_intensity.shape[x] * source_intensity.shape[y]
+                             for x, y in ((0, 1), (0, 2), (1, 2)))
+            for output_size in sizes:
                 _require_work_bytes(
                     sum(_projection_work_bytes(source_intensity, output_size))
                 )
@@ -1151,6 +1230,8 @@ class RSMViewerModel:
                 values.coordinate_frame,
                 source_axes,
             )
+            if ranges is not None:
+                axis_values = tuple(axis[slice(*pair)] for axis, pair in zip(axis_values, ranges, strict=True))
             staged_products: list[RSMViewerProduct] = []
             panel_order = _rsm_viewer_panel_order(values.coordinate_frame)
             for component_key, panel_key in zip(
@@ -1202,12 +1283,14 @@ __all__ = [
     "RSM_H",
     "RSM_HK",
     "RSM_HL",
+    "RSM_LH",
     "RSM_K",
     "RSM_KL",
     "RSM_L",
     "RSM_QX",
     "RSM_QX_QY",
     "RSM_QX_QZ",
+    "RSM_QZ_QX",
     "RSM_QY",
     "RSM_QY_QZ",
     "RSM_QZ",
@@ -1223,5 +1306,6 @@ __all__ = [
     "RSMViewerValues",
     "make_rsm_viewer_state",
     "make_rsm_viewer_values",
+    "rsm_axis_bounds",
     "rsm_viewer_layout",
 ]

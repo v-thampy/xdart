@@ -216,7 +216,8 @@ class _PhaseModel:
         self.calculate_calls = []
         type(self).instances.append(self)
 
-    def calculate_peaks(self, *, wavelength):
+    def calculate_peaks(self, *, wavelength, two_theta_range=(0, 180), q_range=None,
+                        max_reflections=None):
         assert self.structure is not None
         self.calculate_calls.append(wavelength)
         count = (
@@ -225,7 +226,8 @@ class _PhaseModel:
             else type(self).peak_counts[self.name]
         )
         self.peaks = [
-            SimpleNamespace(q=1.0 + index * 0.001, intensity=100.0, hkl=(1, 0, 0))
+            SimpleNamespace(q=1.0 + index * 0.001, intensity=100.0, hkl=(1, 0, 0),
+                            d_spacing=2 * np.pi / (1.0 + index * 0.001))
             for index in range(count)
         ]
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,19 @@ class BaseFrameSource(ABC):
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         return {}
 
+    @property
+    def metadata_energy_is_eV(self) -> bool:
+        """Whether this source's metadata energy has already been converted."""
+        return False
+
+    @property
+    def metadata_energy_eV(self) -> tuple:
+        """Source-level energy, converted at its raw-reading boundary only once."""
+        from xrd_tools.core.energy import metadata_energy_values
+        return tuple(energy for value in np.atleast_1d(getattr(self, 'motors', {}).get('energy', ()))
+                     for energy in metadata_energy_values({'energy': value},
+                                                         energy_is_eV=getattr(self, 'metadata_energy_is_eV', False)))
+
     def scan_manifest(self) -> list[tuple[int, Mapping[str, Any]]] | None:
         """Cheap METADATA-ONLY pass: ``(frame_index, metadata)`` for every frame
         (ADR-0006).  MUST NOT load detector images.  Returns ``None`` when the
@@ -73,6 +86,7 @@ class BaseFrameSource(ABC):
             metadata=dict(self.metadata_for(index)),
             loader=lambda frame: self.load_frame(frame.index),
             source_identity=self.name,
+            metadata_energy_is_eV=self.metadata_energy_is_eV,
         )
 
     def iter_frames(self) -> Iterator[ScanFrame]:
@@ -87,8 +101,14 @@ class BaseFrameSource(ABC):
             chunk_labels = labels[start:start + chunk_size]
             yield np.stack([self.load_frame(idx) for idx in chunk_labels]), chunk_labels
 
-    def to_scan(self, *, name: str | None = None, **kwargs: Any) -> Scan:
-        return Scan(name or self.name, list(self.iter_frames()), **kwargs)
+    def to_scan(self, *, name: str | None = None, cancelled: Callable[[], bool] | None = None, **kwargs: Any) -> Scan:
+        """Every frame as one Scan; ``cancelled`` (never a Scan keyword) is asked before each frame."""
+        frames = []
+        for frame in self.iter_frames():
+            if cancelled is not None and cancelled():
+                raise RuntimeError("admission cancelled")
+            frames.append(frame)
+        return Scan(name or self.name, frames, **kwargs)
 
 
 def ensure_frame_source(source: FrameSource | Scan | BaseFrameSource) -> FrameSource:
@@ -99,4 +119,10 @@ def ensure_frame_source(source: FrameSource | Scan | BaseFrameSource) -> FrameSo
     raise TypeError(f"object does not implement FrameSource: {type(source)!r}")
 
 
-__all__ = ["BaseFrameSource", "ensure_frame_source"]
+def source_metadata_energy_eV(source) -> tuple:
+    """*source*'s source-level energy in eV; a custom source without the optional fact reads as raw."""
+    canonical = getattr(source, 'metadata_energy_eV', None)
+    return tuple(BaseFrameSource.metadata_energy_eV.fget(source) if canonical is None else canonical)
+
+
+__all__ = ["BaseFrameSource", "ensure_frame_source", "source_metadata_energy_eV"]

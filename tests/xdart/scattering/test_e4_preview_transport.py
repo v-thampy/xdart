@@ -478,7 +478,9 @@ def test_live_thumbnail_carrier_is_exact_complete_and_snapshot_ordered(
     owner = run.display.add_artifact(target, "live", mask=None, mask_saturation=False, measurement_mode="Standard")
     policy, layout, rows, ceiling, _ = dynamic_output._light_policy_layout(
         RunIntent(max_cores=1).freeze(), plan,
-        SimpleNamespace(descriptor=None, source_stamp=SimpleNamespace(frame_count=1)),
+        # the source's options are read for point images since 40ff9574
+        SimpleNamespace(descriptor=None, source_stamp=SimpleNamespace(frame_count=1),
+                        source_spec=SimpleNamespace(options={})),
         scan, (1,),
     )
     lease = dynamic_output.acquire_light_1d_retention(dynamic_output.SessionResourceAuthority.from_allocation(policy.allocation), owner="scattering-light-1d:perf-c5", generation=1, layout=layout, requested_rows=rows, compatibility_byte_ceiling=ceiling, gui_thread_id=run.gui_thread_id, funding_mode=dynamic_output.Light1DFundingMode.REPLACE_PUBLICATION_A1, current_lineage_rows=1)
@@ -783,6 +785,34 @@ def test_full_after_thumbnail_preview_performs_distinct_detector_read(
     assert publication.view.raw is not None
     outcomes = _completion_outcomes(state)
     assert outcomes.count((2, HydrationOutcome.HYDRATED)) == 2
+
+
+def test_full_raw_keeps_accepted_manual_bounds_and_preserves_thumbnail_and_cake(tmp_path):
+    processed, raw_path = _write_processed(tmp_path)
+    state = RunDisplayState(RunIdentity(1, "manual-threshold"), max_payload_items=4)
+    owner = state.add_artifact(processed, "scan", mask=None, mask_saturation=False,
+                               measurement_mode="Standard", threshold_min=3.0, threshold_max=12.0)
+    state.bind_transport(event_sink=lambda event: None)
+    try:
+        keys = _catalog(state, owner, (1, 2, 3))
+        owner_value, gate = _acquisition_identity(state)
+        preview = _typed_request(state, owner_value, gate, processed, 2, HydrationPurpose.PREVIEW, 6)
+        assert state.transport.submit(preview) is not None
+        assert _wait_transport_idle(state)
+        before = owner.publications.get(2).view
+        thumbnail, cake = before.thumbnail.copy(), before.intensity_2d.copy()
+        assert state.request_full(keys[2], 7, owner=owner_value, commit_gate=gate) is not None
+        assert _wait_transport_idle(state)
+        after = owner.publications.get(2).view
+        original = tifffile.imread(raw_path)
+        outside = (original < 3) | (original > 12)
+        assert np.isnan(after.raw[outside]).all()
+        np.testing.assert_array_equal(after.raw[~outside], original[~outside])
+        np.testing.assert_array_equal(after.thumbnail, thumbnail)
+        np.testing.assert_array_equal(after.intensity_2d, cake)
+        np.testing.assert_array_equal(tifffile.imread(raw_path), original)
+    finally:
+        assert state.transport.retire(join_timeout=2)
 
 
 def test_same_read_coalesces_and_every_admitted_token_terminates(

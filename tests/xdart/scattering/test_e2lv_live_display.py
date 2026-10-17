@@ -194,7 +194,7 @@ class _Integrator:
         self.detector = calibrated.detector
         for name in (
             "dist", "poni1", "poni2", "rot1", "rot2", "rot3",
-            "wavelength", "parallax",
+            "wavelength", "parallax", "chiDiscAtPi",
         ):
             setattr(self, name, getattr(calibrated, name))
 
@@ -326,16 +326,21 @@ def _standard_page(
         _write_tiff(member, offset=label)
     selected = members[0]
     poni = tmp_path / "tiny.poni"
-    poni.write_text("accepted through immutable test assets")
+    # The real Run gate parses this file before the immutable test assets are
+    # admitted. Keep that readiness input valid without faking its owner.
+    from tests.xdart.scattering._e2sd_support import write_poni
+    write_poni(poni)
     output = tmp_path / "tiny.nexus"
     monkeypatch.setattr(
         executor_module,
         "build_admission_receipt",
         _accepted_admission(labels, mask=mask),
     )
+    # Since 15250a49 the Int source-energy binder builds the run's integrator.
+    from xrd_tools.integrate import calibration as calibration_module
     monkeypatch.setattr(
-        executor_module,
-        "poni_to_integrator",
+        calibration_module,
+        "detector_calibration_to_integrator",
         _Integrator,
     )
     lifecycle = ScatteringCoordinator()

@@ -27,7 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from pathlib import Path
-from typing import Any, Mapping
+import re
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -133,6 +134,26 @@ def resolve_monitor_norm(metadata: Mapping[str, Any], key: str | None) -> float 
     return norm if np.isfinite(norm) and norm > 0.0 else None
 
 
+#: Beam-monitor-like column names (ion chambers, monitors, beam stops, photodiodes, flux), matched at the
+#: start of the name, ignoring case (maintainer, 2026-09-30: "i0, i1, mon, monitor, bs, beamstop, pd,
+#: photod, etc. if in doubt, list it").
+_LIKELY_MONITOR = re.compile(r"^(i\d|io$|ic\d*$|ion|mon|bs|beam.?stop|pd|photo|diode|flux|norm)", re.IGNORECASE)
+#: Never a beam monitor: the time stamp and the reciprocal-space coordinates.
+_NOT_MONITORS = frozenset({"epoch", "h", "k", "l"})
+
+
+def monitor_candidates(names: Iterable[str], *, keep: Iterable[str] = ()) -> tuple[str, ...]:
+    """``names`` as normalization (beam monitor) choices, each once: the likely monitors first, then the
+    rest, each group in the given order; the time stamp and H, K, L, never a monitor, are left out unless
+    named in ``keep`` (a choice already made). Stitch's Monitor and Int's Norm channel list them so."""
+    keep = set(keep)
+    kept = [name for name in dict.fromkeys(names)
+            if name in keep or name.strip().lower() not in _NOT_MONITORS]
+    likely = [name for name in kept if _LIKELY_MONITOR.match(name.strip())]
+    first = set(likely)
+    return (*likely, *(name for name in kept if name not in first))
+
+
 def numeric_metadata(metadata: Mapping[str, Any] | None) -> dict[str, float]:
     """Return finite scalar numeric values from heterogeneous metadata."""
 
@@ -149,6 +170,32 @@ def numeric_metadata(metadata: Mapping[str, Any] | None) -> dict[str, float]:
             continue
         out[str(key)] = numeric
     return out
+
+
+def finite_motor_metadata(raw: Mapping[str, Any]) -> dict[str, float]:
+    """Project ordered finite image-metadata motors, excluding Boolean/ROI/PD values."""
+    filtered = {key: value for key, value in raw.items()
+                if not isinstance(value, (bool, np.bool_))}
+    return {name: value for name, value in numeric_metadata(filtered).items()
+            if name and "roi" not in name.casefold() and "pd" not in name.casefold()}
+
+
+def ordered_motor_intersection(
+    catalogs: Iterable[tuple[str, ...] | None],
+) -> tuple[str, ...] | None:
+    """Intersect known catalogs in first-catalog order.
+
+    ``None`` means at least one catalog is unknown. ``()`` means every
+    catalog was inspected and there is no common motor.
+    """
+    values = tuple(catalogs)
+    if not values or any(value is None for value in values):
+        return None
+    first = values[0] or ()
+    common = set(first)
+    for catalog in values[1:]:
+        common.intersection_update(catalog or ())
+    return tuple(name for name in first if name and name != "Manual" and name in common)
 
 
 @dataclass(frozen=True, slots=True)

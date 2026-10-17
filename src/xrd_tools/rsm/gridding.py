@@ -25,7 +25,7 @@ import logging
 import math
 import threading
 import weakref
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 
 import numpy as np
 
@@ -578,7 +578,8 @@ def _corner_pixel_q(
         Nch1=s1,
         Nch2=s2,
     )
-    tiny_mapper = PixelQMap(mapper.diff_config, tiny)
+    # the mapper's own mount, offsets and energy offset come along (AUD-9 stage 2b C7b)
+    tiny_mapper = replace(mapper, header=tiny)
     return tiny_mapper.pixel_q(angles, energy, UB=UB)
 
 
@@ -915,13 +916,15 @@ class StreamingGridder:
             elif (
                 type(weight) is not np.ndarray
                 or weight.dtype.kind not in "biuf"
-                or weight.shape != expected_shape[1:]
+                # one detector array for every frame, or one per frame (a weight that varies with the
+                # detector's pose: the polarization; AUD-9 stage 2b)
+                or weight.shape not in {expected_shape[1:], expected_shape}
                 or not weight.flags.c_contiguous
                 or weight.flags.writeable
             ):
                 raise TypeError(
                     "RSM leased weight must be a positive scalar or borrowed "
-                    "read-only detector array"
+                    "read-only detector or per-frame array"
                 )
 
         raw = conditioned = conditioned_view = None
@@ -1064,10 +1067,13 @@ class StreamingGridder:
                 "no chunks processed; call add() at least once before to_volume()."
             )
         with _gridder_runtime(self._runtime_session):
-            axis_values = (
-                np.array(self._grid_raw.xaxis, dtype=float, copy=True),
-                np.array(self._grid_raw.yaxis, dtype=float, copy=True),
-                np.array(self._grid_raw.zaxis, dtype=float, copy=True),
+            # Emit the fixed-grid contract, including exact endpoints. XU's
+            # arange arithmetic can round the last bin away from its bound.
+            axis_values = tuple(
+                np.linspace(lo, hi, count, dtype=np.float64)
+                for count, lo, hi in zip(
+                    self.bins, self._bounds[::2], self._bounds[1::2], strict=True
+                )
             )
             intensity = _pair_intensity(self._grid_raw, self._grid_norm)
         return RSMVolume.from_axes(

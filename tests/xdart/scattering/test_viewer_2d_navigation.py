@@ -394,3 +394,73 @@ def test_completion_after_poll_keeps_the_drain_timer_alive(viewer, monkeypatch):
         diagnostic=controller.viewer_2d_diagnostic, notice=page._notice_text,
     )
     np.testing.assert_array_equal(controller.viewer_2d_frame.array, values[0])
+
+
+def test_scans_row_follows_the_file_intent_while_its_catalog_loads(tmp_path, monkeypatch):
+    """Rapid Down keys: a deferred open retried by the run timer closes the prior file and
+    opens the next, whose catalog is still loading; the Scans row must stay on that file,
+    or the next Down starts again from the top of the list."""
+    import tifffile
+    import xdart.gui.tabs.scattering.hydration_transport as hydration
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    paths = [tmp_path / f"f{index}.tif" for index in range(4)]
+    for index, path in enumerate(paths):
+        tifffile.imwrite(path, np.full((12, 16), index, dtype=np.uint16))
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(processing_mode="2D Viewer", project_root=str(tmp_path),
+                                         save_path=str(tmp_path))),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+    )
+    try:
+        page.resize(1200, 800)
+        page.show()
+        page._set_browser_directory(str(tmp_path), explicit=True)
+        page._open_viewer_2d_path(str(paths[0]))
+        browser, controller = page._shell.browser, page._context_controller
+        _wait(page, app, lambda: controller.viewer_2d_frame is not None and browser.scans.count() == 5)
+        entered, frame_released, catalog_released = Event(), Event(), Event()
+        read, catalog = hydration.read_viewer_2d_frame, hydration.catalog_viewer_2d
+
+        def held_frame(source, label, **values):  # file 1's frame read stays in flight
+            if source.canonical_path == str(paths[1].resolve()):
+                entered.set()
+                assert frame_released.wait(6)
+            return read(source, label, **values)
+
+        def held_catalog(path, **values):  # file 2's catalog cannot beat the timer's refresh
+            if str(path) == str(paths[2]):
+                assert catalog_released.wait(6)
+            return catalog(path, **values)
+
+        monkeypatch.setattr(hydration, "read_viewer_2d_frame", held_frame)
+        monkeypatch.setattr(hydration, "catalog_viewer_2d", held_catalog)
+        current = lambda: (browser.scans.currentItem().data(QtCore.Qt.UserRole)  # noqa: E731
+                           if browser.scans.currentItem() is not None else None)
+        blocker = QtCore.QSignalBlocker(browser.scans)
+        browser.scans.setCurrentRow(_row(browser, paths[0]))
+        del blocker
+        browser.scans.setFocus()
+        QtTest.QTest.keyClick(browser.scans, QtCore.Qt.Key_Down)
+        assert _wait_timer_driven(app, entered.is_set)
+        QtTest.QTest.keyClick(browser.scans, QtCore.Qt.Key_Down)  # file 2 waits for file 1's cleanup
+        assert page._pending_viewer_2d_path == str(paths[2])
+        frame_released.set()
+        assert _wait_timer_driven(app, lambda: page._pending_viewer_2d_path is None
+                                  and controller.viewer_2d_context is not None
+                                  and controller.viewer_2d_context.original_path == str(paths[2]))
+        assert _wait_timer_driven(app, lambda: current() == str(paths[2]), timeout=1.0), current()
+        QtTest.QTest.keyClick(browser.scans, QtCore.Qt.Key_Down)
+        assert _wait_timer_driven(app, lambda: current() == str(paths[3]), timeout=1.0), current()
+        assert str(paths[0]) not in (page._pending_viewer_2d_path,
+                                     controller.viewer_2d_context.original_path)
+        catalog_released.set()
+        assert _wait_timer_driven(app, lambda: controller.viewer_2d_frame is not None
+                                  and controller.viewer_2d_context.original_path == str(paths[3]))
+    finally:
+        frame_released.set()
+        catalog_released.set()
+        page.close_workspace()
+        app.processEvents()
+        page.deleteLater()
+        app.processEvents()

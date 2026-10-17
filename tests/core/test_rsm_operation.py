@@ -298,7 +298,9 @@ def test_foil_and_seconds_divisor_matches_notebook_formula():
         ],
         dtype=float,
     )
-    expected = np.exp(-digits @ np.asarray([1.06, 3.04, 4.65, 9.5])) * seconds
+    # one code at a time, as the notebook computes it
+    lengths = np.asarray([1.06, 3.04, 4.65, 9.5])
+    expected = np.array([np.exp(-np.dot(lengths, row)) for row in digits]) * seconds
     np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
     assert actual.flags.writeable is False
 

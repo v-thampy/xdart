@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from xrd_tools.core.containers import IntegrationResult1D
-from xrd_tools.io.nexus import write_rsm, write_stitched
+from xrd_tools.io.nexus import write_rsm
 from xrd_tools.io.nexus_record import (
     frame_record_key,
     frame_record_labels,
     iter_frame_record_groups,
+    write_contributing_frames,
 )
 from xrd_tools.io.read import get_raw_frame
 from xrd_tools.rsm.volume import RSMVolume
@@ -36,8 +36,6 @@ def _peaked(n: int, where: tuple[int, int]) -> np.ndarray:
 
 def test_stitched_multiscan_frames_no_collision(tmp_path):
     import h5py
-    s1 = IntegrationResult1D(radial=np.linspace(0.5, 5.0, 10),
-                             intensity=np.ones(10), unit="q_A^-1")
     # scan 5 frame 1 → peak top-left; scan 7 frame 1 → peak bottom-right.
     records = [
         {"scan_label": 5, "frame_index": 1, "thumbnail": _peaked(8, (0, 0))},
@@ -47,8 +45,7 @@ def test_stitched_multiscan_frames_no_collision(tmp_path):
     p = tmp_path / "grouped.nexus"
     with h5py.File(p, "w") as f:
         entry = make_v2_entry(f, frame_indices=(1, 2), with_2d=False)
-        write_stitched(entry, stitched_1d=s1,
-                       frame_records=records)
+        write_contributing_frames(entry, records)
 
     img_5_1 = get_raw_frame(p, 1, scan=5)
     img_7_1 = get_raw_frame(p, 1, scan=7)
@@ -63,14 +60,11 @@ def test_stitched_multiscan_frames_no_collision(tmp_path):
 def test_single_scan_stays_flat(tmp_path):
     import h5py
     import pytest
-    s1 = IntegrationResult1D(radial=np.linspace(0.5, 5.0, 10),
-                             intensity=np.ones(10), unit="q_A^-1")
     records = [{"frame_index": 1, "thumbnail": _peaked(8, (3, 3))}]   # no scan_label
     p = tmp_path / "single.nexus"
     with h5py.File(p, "w") as f:
         entry = make_v2_entry(f, frame_indices=(1,), with_2d=False)
-        write_stitched(entry, stitched_1d=s1,
-                       frame_records=records)
+        write_contributing_frames(entry, records)
     # flat addressing (scan=None) resolves
     img = get_raw_frame(p, 1)
     assert np.unravel_index(int(np.argmax(img)), img.shape) == (3, 3)
@@ -99,8 +93,6 @@ def test_write_rsm_carries_frame_records(tmp_path):
 
 def test_iter_frame_record_groups_descends_flat_and_nested(tmp_path):
     import h5py
-    s1 = IntegrationResult1D(radial=np.linspace(0.5, 5.0, 4),
-                             intensity=np.ones(4), unit="q_A^-1")
     records = [
         {"frame_index": 1, "thumbnail": _peaked(8, (0, 0))},            # flat
         {"scan_label": 5, "frame_index": 1, "thumbnail": _peaked(8, (1, 1))},
@@ -109,7 +101,7 @@ def test_iter_frame_record_groups_descends_flat_and_nested(tmp_path):
     ]
     p = tmp_path / "mixed.nxs"
     with h5py.File(p, "w") as f:
-        write_stitched(f.create_group("entry"), stitched_1d=s1, frame_records=records)
+        write_contributing_frames(f.create_group("entry"), records)
 
     with h5py.File(p, "r") as f:
         frames = f["entry/frames"]

@@ -123,3 +123,40 @@ def test_background_edit_and_freeze_refusals(tmp_path: Path) -> None:
     try: FrameBackgroundPlan(mode="Single BG File", locator="/" + "x" * 4096)
     except ValueError: pass
     else: raise AssertionError("Background locator cap+1 was accepted")
+
+
+def test_background_dark_corrected_checkbox(tmp_path: Path) -> None:
+    from xdart.gui.tabs.scattering.controls_inventory import BACKGROUND_DARK_CORRECTED
+    from xrd_tools.session.readiness import ControlFieldKind
+
+    snapshot = _snapshot(tmp_path)
+    fields = {field.path for field in project_controls(snapshot, None, RunPhase.IDLE).fields}
+    assert BACKGROUND_DARK_CORRECTED not in fields  # only with a Background
+    assert isinstance(reduce_control_edit(snapshot, BACKGROUND_DARK_CORRECTED, True), EditRefusal)
+    single = RunIntentStore(reduce_control_edit(snapshot, BACKGROUND_TYPE, "Single BG File")).snapshot()
+    field = next(field for field in project_controls(single, None, RunPhase.IDLE).fields
+                 if field.path == BACKGROUND_DARK_CORRECTED)
+    assert field.kind is ControlFieldKind.BOOL and field.value is False and field.enabled
+    assert isinstance(reduce_control_edit(single, BACKGROUND_DARK_CORRECTED, "yes"), EditRefusal)
+    marked = reduce_control_edit(single, BACKGROUND_DARK_CORRECTED, True)
+    assert marked.background.dark_corrected is True
+    other = reduce_control_edit(RunIntentStore(marked).snapshot(), BACKGROUND_TYPE, "BG Directory")
+    assert other.background.dark_corrected is False  # a new mode starts unmarked
+
+
+def test_background_directory_offers_last_saved_before_frame(tmp_path: Path) -> None:
+    from xdart.gui.tabs.scattering.controls_inventory import (
+        BACKGROUND_MATCH, BACKGROUND_METADATA_KEY,
+    )
+
+    directory = RunIntentStore(reduce_control_edit(_snapshot(tmp_path), BACKGROUND_TYPE,
+                                                   "BG Directory")).snapshot()
+    match = next(field for field in project_controls(directory, None, RunPhase.IDLE).fields
+                 if field.path == BACKGROUND_MATCH)
+    assert "Last Saved Before Frame" in match.choices
+    chosen = reduce_control_edit(directory, BACKGROUND_MATCH, "Last Saved Before Frame")
+    assert chosen.background.match_rule == "Last Saved Before Frame"
+    assert chosen.background.metadata_key is None
+    fields = {field.path for field in project_controls(
+        RunIntentStore(chosen).snapshot(), None, RunPhase.IDLE).fields}
+    assert BACKGROUND_METADATA_KEY not in fields

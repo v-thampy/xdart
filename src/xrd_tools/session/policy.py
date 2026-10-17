@@ -2,6 +2,8 @@
 """The ONE run-policy owner: each run owns one immutable SessionPolicy, so a
 policy built inside the cadence decision is a second owner.  Stdlib only."""
 from __future__ import annotations
+
+from typing import Any
 import os
 import logging
 from dataclasses import dataclass
@@ -52,9 +54,11 @@ class FlushPolicy:
 
 @dataclass(frozen=True, slots=True)
 class SessionPolicy:
-    """One cadence owner plus, for a coordinated run, one resource allocation."""
+    """One cadence owner plus, for a coordinated run, one resource allocation, and the Run's angular support
+    policy (an ``AngularSupportPolicy``; None: the default — COVERAGE-SUPPORT-20261013 decision 6)."""
     flush: FlushPolicy = FlushPolicy()
     allocation: SessionResourceAllocation | None = None
+    angular_support: Any = None
 
     def should_flush(self, *, frames_since_flush: int,
                      unsaved_in_memory: int | None = None,
@@ -89,11 +93,13 @@ class SessionResourceRequirements:
     resolver_background_bytes: int = 0
     worker_background_bytes: int = 0
     background_binding_bytes: int = 0
+    source_auxiliary_bytes: int = 0
     def __post_init__(self) -> None:
         for n in ("height", "width", "native_itemsize"):
             _int(n, getattr(self, n), low=1)
         for n in ("background_bytes", "resolver_background_bytes",
                   "worker_background_bytes", "background_binding_bytes",
+                  "source_auxiliary_bytes",
                   "npt_1d", "npt_rad", "npt_azim"):
             _int(n, getattr(self, n))
         _int("modes_1d", self.modes_1d, high=MAX_MODES_1D)
@@ -119,7 +125,8 @@ class SessionResourceRequirements:
             + self.npt_rad + self.npt_azim)
     @property
     def fingerprint(self) -> tuple:
-        return tuple(getattr(self, name) for name in self.__slots__)
+        values = tuple(getattr(self, name) for name in self.__slots__)
+        return values if self.source_auxiliary_bytes else values[:-1]
 @dataclass(frozen=True, slots=True)
 class SessionResourceAllocation:
     """One immutable grant: requirements, counts, categories, ``M``/``F``."""
@@ -184,6 +191,7 @@ def requirements_from(descriptor, plan, *, background_bytes: int = 0,
                      resolver_background_bytes: int = 0,
                      worker_background_bytes: int = 0,
                      background_binding_bytes: int = 0,
+                     source_auxiliary_bytes: int = 0,
                      ) -> SessionResourceRequirements:
     """Combine a pixel-free descriptor with the plan; duck-typed, stdlib-only."""
     shape = tuple(getattr(descriptor, "frame_shape", None) or ())
@@ -201,6 +209,7 @@ def requirements_from(descriptor, plan, *, background_bytes: int = 0,
         resolver_background_bytes=resolver_background_bytes,
         worker_background_bytes=worker_background_bytes,
         background_binding_bytes=background_binding_bytes,
+        source_auxiliary_bytes=source_auxiliary_bytes,
         modes_1d=modes_1d, modes_2d=modes_2d,
         npt_1d=int(getattr(one_d, "npt", 0) or 0),
         npt_rad=int(getattr(two_d, "npt_rad", 0) or 0),
@@ -211,7 +220,7 @@ def _categories(req: SessionResourceRequirements, counts: dict, *,
                 detector: bool = True) -> dict:
     """The five ratified totals; ``detector=False`` strips only detector terms
     (``F``).  Staging/records/publication are never a union."""
-    P = req.native_frame_bytes if detector else 0
+    P = (req.native_frame_bytes + req.source_auxiliary_bytes) if detector else 0
     G = req.background_bytes if detector else 0
     R = req.resolver_background_bytes if detector else 0
     Bmap = req.background_binding_bytes if detector else 0
@@ -244,7 +253,7 @@ def floor_bytes(req: SessionResourceRequirements) -> int:
     return sum(_categories(req, _minimum_counts(req), detector=False).values())
 def _tunables(req: SessionResourceRequirements) -> dict:
     """``{name: (minimum, unit_bytes)}``; a worker also forces an in-flight slot."""
-    P, G, T = req.native_frame_bytes, req.background_bytes, req.thumbnail_bytes
+    P, G, T = req.native_frame_bytes + req.source_auxiliary_bytes, req.background_bytes, req.thumbnail_bytes
     A1, A2 = req.result_1d_bytes, req.result_2d_bytes
     return {
         "workers": (1, INTEGRATOR_RESERVE_BYTES + 12 * req.pixels

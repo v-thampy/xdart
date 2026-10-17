@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from pathlib import Path
 
-import numpy as np
-
-from xrd_tools.core.metadata import numeric_metadata
+from xrd_tools.core.metadata import (
+    finite_motor_metadata as _finite_motor_mapping,
+    ordered_motor_intersection,
+)
 from xrd_tools.io.metadata import (
     ImageMetadataRead,
     read_image_metadata,
@@ -16,24 +16,6 @@ from xrd_tools.io.metadata import (
 
 
 MotorCatalog = tuple[str, ...] | None
-
-
-def _finite_motor_mapping(raw: dict[str, object]) -> dict[str, float]:
-    filtered = {
-        key: value
-        for key, value in raw.items()
-        if not isinstance(value, (bool, np.bool_))
-    }
-    numeric = numeric_metadata(filtered)
-    return {
-        name: value
-        for name, value in numeric.items()
-        if (
-            name
-            and "roi" not in name.casefold()
-            and "pd" not in name.casefold()
-        )
-    }
 
 
 def image_motor_metadata(
@@ -82,29 +64,6 @@ def image_metadata_motor_names(
     """
 
     return tuple(image_motor_metadata(path, metadata_format))
-
-
-def ordered_motor_intersection(
-    catalogs: Iterable[MotorCatalog],
-) -> MotorCatalog:
-    """Intersect known catalogs in first-catalog order.
-
-    ``None`` means at least one catalog is unknown.  ``()`` means every
-    catalog was inspected and there is no common motor.
-    """
-
-    values = tuple(catalogs)
-    if not values or any(value is None for value in values):
-        return None
-    first = values[0] or ()
-    common = set(first)
-    for catalog in values[1:]:
-        common.intersection_update(catalog or ())
-    return tuple(
-        name
-        for name in first
-        if name and name != "Manual" and name in common
-    )
 
 
 __all__ = [

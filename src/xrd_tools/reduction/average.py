@@ -1,12 +1,12 @@
 from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 import hashlib, json, math, os
 from pathlib import Path
 import re, threading
 import tempfile
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 import numpy as np
 from xrd_tools.core.invalid import detector_value_mask
@@ -17,7 +17,7 @@ from xrd_tools.io.append import AppendIntent, science_fingerprint
 from xrd_tools.io.image import load_mask, read_detector_image_layout
 from xrd_tools.io.nexus_record import _average_count_chunks, _average_count_digest
 from xrd_tools.io.output_transaction import (
-    StreamTerminal, TargetSnapshot, capture_target_snapshot,
+    StreamTerminal, TargetSnapshot, _normalize_target, capture_target_snapshot,
 )
 from xrd_tools.io.finite_artifact import _FinitePublicationSession
 from xrd_tools.io.nexus import open_nexus_writer
@@ -32,13 +32,13 @@ from xrd_tools.io.read import _read_average_lineage, get_average_finite_counts, 
 from xrd_tools.io.record_writer import WriterIncomplete
 from xrd_tools.io.schema import PROCESSED_SCHEMA_VERSION
 from xrd_tools.reduction.background import FrameBackgroundPlan, resolve_frame_background
-from xrd_tools.reduction.core import GIMode, Integration1DPlan, Integration2DPlan, NexusSink, ReductionPlan, run_reduction
-from xrd_tools.session.experiment_state import CalibrationState, FactStatus, MaskState, PoniValues
+from xrd_tools.reduction.core import GIMode, Integration1DPlan, Integration2DPlan, NexusSink, ReductionPlan, _with_variance, run_reduction
+from xrd_tools.session.experiment_state import CalibrationState, DetectorImageState, FactStatus, MaskState, PoniValues
 from xrd_tools.session import policy as _resource_policy
 from xrd_tools.session.policy import SessionResourceAllocation, requirements_from, resolve_session_policy
 from xrd_tools.session.run_configuration import FrozenSourceSpec
 from xrd_tools.session.scan_session import required_result_modes
-from xrd_tools.sources.execution_graph import PreparedSourceExecutionGraph, SourceCleanupFailed, SourceCleanupPending, SourceRevisionChanged, append_source_from_execution_graph, open_source_execution_graph, qualify_source_execution_graph, requalify_source_execution_graph, source_execution_projection, source_graph_digest, source_snapshots_projection, stable_lineage_projection, validate_source_state_sweep
+from xrd_tools.sources.execution_graph import PreparedSourceExecutionGraph, SourceCleanupFailed, SourceCleanupPending, SourceRevisionChanged, append_source_from_execution_graph, graph_saturation, open_source_execution_graph, qualify_source_execution_graph, requalify_source_execution_graph, source_execution_projection, source_graph_digest, source_snapshots_projection, stable_lineage_projection, validate_source_state_sweep
 from xrd_tools.sources.selection import image_series_spec, is_single_image_spec, single_image_spec
 _COUNT_POLICY = 'average_scan_v1'
 _COUNT_DTYPE = np.dtype('<u4')
@@ -101,7 +101,8 @@ def _copy_calibration(value: CalibrationState) -> CalibrationState:
     _reject(type(value) is not CalibrationState, 'Average calibration must be an exact CalibrationState', TypeError); poni = value.values
     copied_values = None if poni is None else PoniValues(*(getattr(poni, item.name) for item in fields(PoniValues)))
     mask = value.mask; copied_mask = MaskState(mask.source_uri, mask.sha256, mask.dtype, tuple(mask.shape), mask.status)
-    return CalibrationState(copied_values, value.detector_id, dict(value.detector_config), value.value_fingerprint, value.source_sha256, value.source_uri, copied_mask, value.status, value.parallax)
+    flat, dark = (DetectorImageState(item.source_uri, item.sha256, tuple(item.shape), item.status, item.min_fraction) for item in (value.flat, value.dark))
+    return CalibrationState(copied_values, value.detector_id, dict(value.detector_config), value.value_fingerprint, value.source_sha256, value.source_uri, copied_mask, value.status, value.parallax, flat, dark)
 def _copy_background(value: FrameBackgroundPlan | None) -> FrameBackgroundPlan | None:
     if value is None: return None
     _reject(type(value) is not FrameBackgroundPlan, 'Average background must be an exact FrameBackgroundPlan', TypeError)
@@ -132,7 +133,7 @@ def _compact_source(value: SourceSpec) -> FrozenSourceSpec:
     if kind is not SourceKind.TIFF_SERIES:
         return FrozenSourceSpec.from_source(value)
     options = dict(value.options)
-    allowed = {'selected_file', 'files', 'pattern', 'scan_name', 'metadata_format', 'selection_mode', 'meta_dir', 'detector_shape', 'detector', 'raw_dtype', 'raw_header_skip', 'admitted_motor_values'}
+    allowed = {'selected_file', 'files', 'pattern', 'scan_name', 'metadata_format', 'selection_mode', 'meta_dir', 'detector_shape', 'detector', 'raw_dtype', 'raw_header_skip', 'admitted_motor_values', 'point_images'}
     _reject(set(options) - allowed, 'Average TIFF source has unsupported options')
     selected = options.get('selected_file')
     _reject(type(selected) is not str or not selected, 'Average TIFF source has no selected member')
@@ -140,7 +141,7 @@ def _compact_source(value: SourceSpec) -> FrozenSourceSpec:
     members = tuple((str(item) for item in expanded.options.get('files', ())))
     _reject(not members or sum((item == selected for item in members)) != 1, 'Average TIFF selection is empty or ambiguous')
     frozen_options = {key: item for key, item in dict(expanded.options).items() if key not in {'files', 'admitted_motor_values'}}
-    for key in ('meta_dir', 'detector_shape', 'detector', 'raw_dtype', 'raw_header_skip'):
+    for key in ('meta_dir', 'detector_shape', 'detector', 'raw_dtype', 'raw_header_skip', 'point_images'):
         if key in options:
             frozen_options[key] = options[key]
     frozen_options['average_compact_series_v1'] = True
@@ -192,7 +193,7 @@ class AverageScanRecipe:
             for name, item in values.items():
                 object.__setattr__(self, name, item)
             return
-        _reject(canonical or type(reduction) is not ReductionPlan or reduction.mask is not None, 'Average recipe requires one exact mask-free ReductionPlan', TypeError)
+        _reject(canonical or type(reduction) is not ReductionPlan or reduction.mask is not None or reduction.flat is not None or reduction.dark is not None, 'Average recipe requires one exact mask-, flat- and dark-free ReductionPlan', TypeError)
         _reject(type(entry) is not str or not entry or '/' in entry or (entry in {'.', '..'}), 'Average entry must be one nonempty component')
         mode = str(output_mode).strip().casefold()
         _reject(mode not in {'append', 'overwrite'}, 'Average output mode is invalid')
@@ -223,6 +224,12 @@ def _calibration_payload(value: CalibrationState) -> dict[str, Any]:
     poni = value.values
     payload = {'values': None if poni is None else {item.name: getattr(poni, item.name) for item in fields(PoniValues)}, 'detector_id': value.detector_id, 'detector_config': _plain_json(value.detector_config), 'value_fingerprint': value.value_fingerprint, 'source_sha256': value.source_sha256, 'source_uri': value.source_uri, 'mask': {item.name: getattr(value.mask, item.name).value if item.name == 'status' else getattr(value.mask, item.name) for item in fields(MaskState)}, 'status': value.status.value}
     if value.parallax is not None: payload['parallax'] = value.parallax
+    for name in ('flat', 'dark'):
+        image = getattr(value, name)
+        if image.status is not FactStatus.ABSENT:
+            payload[name] = {'source_uri': image.source_uri, 'sha256': image.sha256,
+                             'shape': list(image.shape), 'status': image.status.value,
+                             **({} if image.min_fraction is None else {'min_fraction': image.min_fraction})}
     return payload
 def _plain_json(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -244,6 +251,9 @@ class AverageScanPlan:
     numeric_metadata_keys: tuple[str, ...]; invariant_metadata_keys: tuple[str, ...]; allocation: SessionResourceAllocation
     direct_eiger_eligible: bool; science_identity: str; operation_identity: str
     logical_labels: tuple[int, ...] = (1,)
+    #: The source's resolved automatic ceiling when it is not the data type's maximum (decision 39):
+    #: each contributor also leaves out native values at or above it. In the science identity only when set.
+    saturation: int | None = None
     def __post_init__(self) -> None:
         _reject(type(self.recipe) is not AverageScanRecipe or type(self.contributor_extent) is not int or (not 1 <= self.contributor_extent <= _MAX_CONTRIBUTORS) or (type(self.detector_shape) is not tuple) or (len(self.detector_shape) != 2) or any((type(item) is not int or item <= 0 for item in self.detector_shape)) or (type(self.output_artifact) is not str or not os.path.isabs(self.output_artifact)) or _COUNT_DIGEST.fullmatch(self.version_identity) is None or (type(self.expected_target_snapshot) is not TargetSnapshot) or (type(self.allocation) is not SessionResourceAllocation) or type(self.direct_eiger_eligible) is not bool or (self.logical_labels != (1,)), 'Average scan plan is invalid')
 @dataclass(frozen=True, slots=True)
@@ -315,9 +325,19 @@ class AverageScanResult:
 class AverageContributor:
     ordinal: int; logical_index: int; source_path: str; source_frame_index: int
     dataset_path: str | None; source_start: int; source_stop: int; size: int; mtime_ns: int
+    source_constituents: tuple[AverageContributor, ...] = ()
+    point_images: Mapping[str, Any] | None = None
     def __post_init__(self) -> None:
         integers = (self.ordinal, self.logical_index, self.source_frame_index, self.source_start, self.source_stop, self.size, self.mtime_ns)
         _reject(any((type(item) is not int or item < 0 for item in integers)) or self.ordinal != self.logical_index or self.source_stop <= self.source_start or (type(self.source_path) is not str) or (not self.source_path) or (self.dataset_path is not None and (type(self.dataset_path) is not str or not self.dataset_path)), 'Average contributor value is invalid')
+        if self.point_images is not None:
+            from xrd_tools.sources.point_images import PointImagePolicy
+            policy = PointImagePolicy.from_dict(self.point_images)
+            _reject(type(self.source_constituents) is not tuple or len(self.source_constituents) != (1 if policy.operation == 'select' else policy.images_per_point)
+                or any(type(member) is not AverageContributor or member.point_images is not None for member in self.source_constituents), 'Average point constituents are invalid')
+            object.__setattr__(self, 'point_images', MappingProxyType(policy.to_dict()))
+        else:
+            _reject(self.source_constituents != (), 'Average native contributor has point constituents')
 @dataclass(frozen=True, slots=True)
 class AverageFiniteCountsEvidence:
     policy: str; contributor_extent: int; shape: tuple[int, int]; dtype: str; sha256: str
@@ -434,7 +454,9 @@ def _average_allocation(
     owner = _owner_block_bytes(
         shape, native_dtype,
         direct_eiger_eligible=direct_eiger_eligible,
-    ); requests = dict(recipe.resource_requests); requests['owner_block_bytes'] = owner
+    )
+    owner += 48 * math.prod(shape) if _point_policy(recipe) is not None else 0
+    requests = dict(recipe.resource_requests); requests['owner_block_bytes'] = owner
     current = allocation if allocation is not None else resolve_session_policy(requirements, envelope_bytes=recipe.envelope_bytes, requests=requests, env=dict(recipe.resource_env)).allocation
     exact_categories = None if current is None else _resource_policy._categories(requirements, dict(current.counts))
     if current is None or current.requirements.fingerprint != requirements.fingerprint or current.owner_block_bytes != owner or dict(current.categories) != exact_categories:
@@ -473,10 +495,19 @@ def _science_payload(
     recipe: AverageScanRecipe,
     numeric_metadata_keys: tuple[str, ...],
     invariant_metadata_keys: tuple[str, ...],
+    saturation: int | None = None,
 ) -> dict[str, Any]:
     payload = _recipe_payload(recipe)
     modes = required_result_modes(_derived_reduction(recipe))
-    return {'api_version': _COUNT_POLICY, 'integration_1d': payload['integration_1d'], 'integration_2d': payload['integration_2d'], 'integrator_gi': payload['integrator_gi'], 'threshold_min': recipe.threshold_min, 'threshold_max': recipe.threshold_max, 'mask_saturation': recipe.mask_saturation, 'reduction_extra': payload['reduction_extra'], 'calibration': payload['calibration'], 'background': payload['background'], 'pixel_accumulator_policy': 'float64_ordered_inplace_v1', 'finite_count_policy': 'uint32_per_pixel_extent_1000000_v1', 'zero_count_policy': 'nan_and_all_zero_refusal_v1', 'overflow_policy': 'post_add_nonfinite_refusal_v1', 'numeric_metadata_keys': numeric_metadata_keys, 'invariant_metadata_keys': invariant_metadata_keys, 'numeric_metadata_policy': 'binary64_neumaier_per_key_denominator_v1', 'invariant_metadata_policy': 'canonical_json_scalar_exact_all_v1', 'metadata_row_policy': 'graph_bound_complete_scalar_row_256_names_65536_bytes_v1', 'metadata_source_policy': 'container_metadata_inputs_and_tiff_preparse_bounded_v2', 'configured_metadata_lookup_policy': 'exact_first_unique_casefold_single_output_domain_v2', 'default_optional_lookup_policy': 'exact_source_spelling_omit_configured_alias_v2', 'conditioning_order': ['threshold', 'frame_background', 'static_frame_mask', 'detector_value_mask', 'finite_accumulate'], 'result_modes': [f'{mode.kind}:{mode.key}' for mode in modes], 'reduction_strict_policy': {'policy': 'average_reduction_strict_v1', 'missing_normalization': True, 'gi_all_dummy': True, 'thumbnail_fallback': True}}
+    value = {'api_version': _COUNT_POLICY, 'integration_1d': payload['integration_1d'], 'integration_2d': payload['integration_2d'], 'integrator_gi': payload['integrator_gi'], 'threshold_min': recipe.threshold_min, 'threshold_max': recipe.threshold_max, 'mask_saturation': recipe.mask_saturation, 'reduction_extra': payload['reduction_extra'], 'calibration': payload['calibration'], 'background': payload['background'], 'pixel_accumulator_policy': 'float64_ordered_inplace_v1', 'finite_count_policy': 'uint32_per_pixel_extent_1000000_v1', 'zero_count_policy': 'nan_and_all_zero_refusal_v1', 'overflow_policy': 'post_add_nonfinite_refusal_v1', 'numeric_metadata_keys': numeric_metadata_keys, 'invariant_metadata_keys': invariant_metadata_keys, 'numeric_metadata_policy': 'binary64_neumaier_per_key_denominator_v1', 'invariant_metadata_policy': 'canonical_json_scalar_exact_all_v1', 'metadata_row_policy': 'graph_bound_complete_scalar_row_256_names_65536_bytes_v1', 'metadata_source_policy': 'container_metadata_inputs_and_tiff_preparse_bounded_v2', 'configured_metadata_lookup_policy': 'exact_first_unique_casefold_single_output_domain_v2', 'default_optional_lookup_policy': 'exact_source_spelling_omit_configured_alias_v2', 'conditioning_order': ['threshold', 'frame_background', 'static_frame_mask', 'detector_value_mask', 'finite_accumulate'], 'result_modes': [f'{mode.kind}:{mode.key}' for mode in modes], 'reduction_strict_policy': {'policy': 'average_reduction_strict_v1', 'missing_normalization': True, 'gi_all_dummy': True, 'thumbnail_fallback': True}}
+    if saturation is not None:  # decision 39; absent: the data type's rule, as before
+        value['saturation'] = int(saturation)
+    point = _point_policy(recipe)
+    if point is not None:
+        value['point_images'] = point.to_dict()
+        value['point_variance_policy'] = 'independent_native_counts_over_point_coefficients_squared_v1'
+        value['positive_total_screening'] = point.operation != 'difference'
+    return value
 def _allocation_payload(value: SessionResourceAllocation) -> dict[str, Any]:
     return {'requirements': {item.name: getattr(value.requirements, item.name) for item in fields(value.requirements)}, 'envelope_bytes': value.envelope_bytes, 'counts': dict(value.counts), 'categories': dict(value.categories), 'minimum_bytes': value.minimum_bytes, 'floor_bytes': value.floor_bytes, 'assigned_bytes': value.assigned_bytes, 'origin': value.origin, 'oversize_excess_bytes': value.oversize_excess_bytes}
 def _operation_payload(plan: AverageScanPlan) -> dict[str, Any]:
@@ -527,6 +558,10 @@ def _admitted_input_paths(graph, recipe=None) -> tuple[str, ...]:
     mask_uri = getattr(mask, 'source_uri', None)
     if type(mask_uri) is str and mask_uri:
         paths.append(mask_uri)
+    for name in ('flat', 'dark'):
+        uri = getattr(getattr(calibration, name, None), 'source_uri', None)
+        if type(uri) is str and uri:
+            paths.append(uri)
     return tuple(path for path in paths if type(path) is str and path)
 
 
@@ -564,6 +599,12 @@ def _source_from_recipe(recipe: AverageScanRecipe) -> SourceSpec:
     source = recipe.source.thaw()
     _reject(type(source) is not SourceSpec, 'Average frozen source did not thaw to SourceSpec', TypeError)
     return source
+
+
+def _point_policy(recipe: AverageScanRecipe):
+    from xrd_tools.sources.point_images import PointImagePolicy
+    value = _source_from_recipe(recipe).options.get('point_images')
+    return None if value is None else PointImagePolicy.from_dict(value)
 def _source_for_requalification(source: SourceSpec,
                                 graph: PreparedSourceExecutionGraph) -> SourceSpec:
     if (source.kind is SourceKind.NEXUS_STACK
@@ -577,6 +618,10 @@ def _plan_from_prepared_graph(
     first_row: Mapping[str, Any], *, direct_eiger_eligible: bool,
 ) -> AverageScanPlan:
     extent = graph.stamp.frame_count
+    point = _point_policy(recipe)
+    if point is not None:
+        _reject(extent % point.images_per_point != 0, 'AVERAGE_POINT_IMAGES_EXTENT_INVALID')
+        extent //= point.images_per_point
     _reject(type(extent) is not int or not 1 <= extent <= _MAX_CONTRIBUTORS, 'AVERAGE_CONTRIBUTOR_EXTENT_INVALID')
     _reject(graph.detector_shape is None or graph.native_dtype is None, 'AVERAGE_DETECTOR_LAYOUT_UNAVAILABLE')
     dtype = np.dtype(graph.native_dtype)
@@ -589,7 +634,9 @@ def _plan_from_prepared_graph(
         direct_eiger_eligible=direct_eiger_eligible,
     )
     graph_digest = source_graph_digest(graph)
-    science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(recipe, numeric, invariant))).hexdigest()
+    ceiling = graph_saturation(graph, detector=recipe.calibration.detector_id) if recipe.mask_saturation else None
+    saturation = None if ceiling is None or ceiling.source == 'dtype' else ceiling.value
+    science = hashlib.sha256(b'xdart.average-science.v1\x00' + _canonical(_science_payload(recipe, numeric, invariant, saturation))).hexdigest()
     version = _average_version_identity(
         source_graph_digest=graph_digest,
         science_identity=science,
@@ -614,9 +661,9 @@ def _plan_from_prepared_graph(
     # hand.  `snapshot` is still captured: it is the plan-time identity of the
     # public slot, and `_target_sweep` still uses it to refuse if the slot
     # changes underneath a running Average.
-    prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '')
+    prospective = AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, '', saturation=saturation)
     operation = hashlib.sha256(b'xdart.average-operation.v1\x00' + _canonical(_operation_payload(prospective))).hexdigest()
-    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation)
+    return AverageScanPlan(recipe, graph_digest, extent, shape, dtype.str, output, version, snapshot, numeric, invariant, allocation, direct_eiger_eligible, science, operation, saturation=saturation)
 
 
 def _seal_published(path: str, ordinal: int) -> StreamTerminal:
@@ -635,8 +682,10 @@ def _seal_published(path: str, ordinal: int) -> StreamTerminal:
     """
     observed = capture_target_snapshot(path)
     _reject(not observed.exists, 'AVERAGE_PUBLICATION_VANISHED')
+    # The seal names the slot by its canonical identity, as every streamed seal does; the public
+    # file keeps the caller's spelling (on Windows the two differ in case).
     return StreamTerminal(
-        path, int(observed.size), observed.digest, int(ordinal),
+        _normalize_target(path), int(observed.size), observed.digest, int(ordinal),
         int(observed.device), int(observed.inode),
         int(observed.mtime_ns), int(observed.ctime_ns),
     )
@@ -671,7 +720,7 @@ def _committed_average_mismatch(result: AverageScanResult, target: str | Path, e
     except Exception:
         return 'target'
     if result.target != expected or result.entry != entry: return 'target' if result.target != expected else 'entry'
-    if type(commit) is not StreamTerminal or commit.target != expected or type(commit.ordinal) is not int or commit.ordinal <= 0: return 'commit'
+    if type(commit) is not StreamTerminal or commit.target != _normalize_target(expected) or type(commit.ordinal) is not int or commit.ordinal <= 0: return 'commit'
     try: persisted = read_provenance(expected, entry=entry)['config'][_COUNT_POLICY]; snapshot = capture_target_snapshot(expected)
     except Exception: return 'commit'
     if type(persisted) is not dict or persisted.get('operation_identity') != result.operation_identity or persisted.get('science_identity') != result.science_identity: return 'operation' if type(persisted) is not dict or persisted.get('operation_identity') != result.operation_identity else 'science'
@@ -804,6 +853,49 @@ def _load_static_mask(
     result = np.frombuffer(np.ascontiguousarray(value).tobytes(), dtype=bool).reshape(shape)
     result.setflags(write=False)
     return result
+def _load_static_correction(
+    recipe: AverageScanRecipe, shape: tuple[int, int],
+    token: threading.Event | None = None, role: str = 'flat',
+) -> np.ndarray | None:
+    """Read the recipe's flat field or dark, verify its digest, and prepare it."""
+    from xrd_tools.corrections import DEFAULT_MIN_FLAT_FRACTION, prepare_dark, prepare_flatfield
+    from xrd_tools.io.image import read_image
+    state = getattr(recipe.calibration, role)
+    if state.status is not FactStatus.PRESENT:
+        return None
+    code = f'AVERAGE_{role.upper()}'
+    _poll(token)
+    path = Path(state.source_uri)
+    limit = _static_mask_snapshot_limit(shape)
+    with tempfile.TemporaryDirectory(prefix=f"xdart-average-{role}-") as root:
+        snapshot = Path(root) / (role + path.suffix)
+        digest = hashlib.sha256()
+        copied = 0
+        with path.open("rb") as source, snapshot.open("xb") as target:
+            while True:
+                _poll(token)
+                payload = source.read(_STATIC_MASK_COPY_CHUNK_BYTES)
+                if not payload:
+                    break
+                copied += len(payload)
+                _reject(copied > limit, f'{code}_FILE_TOO_LARGE')
+                digest.update(payload)
+                target.write(payload)
+        _reject(digest.hexdigest() != state.sha256, f'{code}_DIGEST_CHANGED')
+        raw = (np.load(snapshot, allow_pickle=False) if snapshot.suffix.casefold() == '.npy'
+               else read_image(snapshot))
+    _reject(tuple(raw.shape) != tuple(shape) or tuple(raw.shape) != tuple(state.shape),
+            f'{code}_SHAPE_INVALID')
+    if role == 'flat':
+        cutoff = DEFAULT_MIN_FLAT_FRACTION if state.min_fraction is None else state.min_fraction
+        prepared = prepare_flatfield(raw, cutoff)
+    else:
+        prepared = prepare_dark(raw)
+    result = np.ascontiguousarray(prepared, dtype=np.float32)
+    result.setflags(write=False)
+    return result
+
+
 def _static_mask_snapshot_limit(shape: tuple[int, int]) -> int:
     pixels = int(shape[0]) * int(shape[1])
     _reject(pixels <= 0, 'AVERAGE_STATIC_MASK_SHAPE_INVALID')
@@ -934,12 +1026,19 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
     invariant_valid = None
     scratch = valid = None
     native_dtype = np.dtype(plan.native_dtype)
-    floating_native = native_dtype.kind == 'f'
+    point = _point_policy(plan.recipe)
+    native_plan = replace(_thaw_reduction(plan.recipe), saturation=plan.saturation)
+    if point is not None:
+        native_plan = replace(native_plan, flat=_load_static_correction(plan.recipe, shape, token, 'flat'))
+    from xrd_tools.reduction.core import _condition_point_operand, _wants_poisson
+    from xrd_tools.sources.point_images import combine_point_statistics
+    point_variance = np.zeros(shape, dtype=np.float64) if point is not None and _wants_poisson(native_plan) else None
+    floating_native = native_dtype.kind == 'f' or point is not None
     threshold_min, threshold_max = _effective_integer_thresholds(
         native_dtype, plan.recipe.threshold_min, plan.recipe.threshold_max,
     )
     invariant_counts = (
-        not floating_native
+        point is None and not floating_native
         and not plan.recipe.mask_saturation
         and threshold_min is None
         and threshold_max is None
@@ -955,11 +1054,33 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
             and external_route[external_cursor].first <= index
             else None
         )
-        _validate_contributor(graph, index, token, external_member)
-        native = np.asarray(window.read_native(index))
-        row = window.complete_metadata_for(index) if needs_metadata else None
-        _validate_contributor(graph, index, token, external_member)
-        _reject(native.ndim != 2 or tuple(native.shape) != shape or native.dtype.str != plan.native_dtype or (native.dtype.kind not in 'iuf') or (native.dtype.itemsize > 8), 'AVERAGE_CONTRIBUTOR_LAYOUT_CHANGED')
+        statistics = None
+        if point is None:
+            _validate_contributor(graph, index, token, external_member)
+            native = np.asarray(window.read_native(index))
+            row = window.complete_metadata_for(index) if needs_metadata else None
+            _validate_contributor(graph, index, token, external_member)
+        else:
+            def load(raw_index):
+                external = next((member for member in external_route if member.first <= raw_index < member.stop), None)
+                _validate_contributor(graph, raw_index, token, external)
+                array = np.asarray(window.read_native(raw_index))
+                _reject(tuple(array.shape) != shape or array.dtype.str != plan.native_dtype, 'AVERAGE_CONTRIBUTOR_LAYOUT_CHANGED')
+                _validate_contributor(graph, raw_index, token, external)
+                return array
+            def condition(array):
+                image = _condition_point_operand(array, native_plan)
+                if invariant_valid is not None:
+                    image[~invariant_valid] = np.nan
+                elif static is not None:
+                    image[static] = np.nan
+                return image
+            statistics = combine_point_statistics(load, point.raw_indices(index), point,
+                poisson=point_variance is not None, native_transform=condition)
+            native = statistics.signal
+            window.finish_native_group((index + 1) * point.images_per_point)
+            row = window.complete_metadata_for(index * point.images_per_point) if needs_metadata else None
+        _reject(native.ndim != 2 or tuple(native.shape) != shape or native.dtype.str != (plan.native_dtype if point is None else np.dtype('float64').str) or (native.dtype.kind not in 'iuf') or (native.dtype.itemsize > 8), 'AVERAGE_CONTRIBUTOR_LAYOUT_CHANGED')
         progress('read', index + 1, extent)
         if index == 0:
             valid = np.empty(shape, dtype=bool)
@@ -970,10 +1091,10 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
         frame_valid = invariant_valid
         if not invariant_counts:
             predicates = 0
-            if threshold_min is not None:
+            if point is None and threshold_min is not None:
                 np.greater_equal(native, threshold_min, out=valid)
                 predicates += 1
-            if threshold_max is not None:
+            if point is None and threshold_max is not None:
                 target = valid if predicates == 0 else scratch
                 np.less_equal(native, threshold_max, out=target)
                 if predicates:
@@ -985,8 +1106,8 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
                 if predicates:
                     np.logical_and(valid, target, out=valid)
                 predicates += 1
-            if plan.recipe.mask_saturation:
-                detector_mask = detector_value_mask(None, native, enabled=True)
+            if point is None and plan.recipe.mask_saturation:
+                detector_mask = detector_value_mask(None, native, enabled=True, saturation=plan.saturation)
                 target = valid if predicates == 0 else scratch
                 if detector_mask is None:
                     target.fill(True)
@@ -1009,10 +1130,15 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
                 np.add(sums, native, out=sums)
             else:
                 np.add(sums, native, out=sums, where=frame_valid)
+            if point_variance is not None:
+                np.add(point_variance, statistics.variance, out=point_variance, where=frame_valid)
         if floating_native:
             scratch.fill(True)
             np.isfinite(sums, out=scratch, where=frame_valid)
             _reject(not bool(scratch.all()), 'AVERAGE_PIXEL_SUM_OVERFLOW')
+            if point_variance is not None:
+                np.isfinite(point_variance, out=scratch, where=frame_valid)
+                _reject(not bool(scratch.all()), 'AVERAGE_VARIANCE_SUM_OVERFLOW')
         if not invariant_counts:
             _increment_finite_counts(counts, frame_valid)
         if needs_metadata:
@@ -1028,6 +1154,10 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
     _reject(bool(zero.all()), 'AVERAGE_ALL_PIXELS_INVALID')
     np.divide(sums, counts, out=sums, where=~zero)
     sums[zero] = np.nan
+    if point_variance is not None:
+        np.divide(point_variance, counts, out=point_variance, where=~zero)
+        np.divide(point_variance, counts, out=point_variance, where=~zero)
+        point_variance[zero] = np.nan
     output_metadata = {}
     denominators = []
     for key in plan.numeric_metadata_keys:
@@ -1045,7 +1175,8 @@ def _average_contributors(plan: AverageScanPlan, graph: PreparedSourceExecutionG
     return {
         'average': sums, 'zero': zero, 'metadata': output_metadata,
         'denominators': tuple(denominators), 'finite': finite,
-        'direct_eiger_execution': _direct_eiger_execution(window, extent),
+        'direct_eiger_execution': _direct_eiger_execution(window, graph.stamp.frame_count),
+        'variance': point_variance,
     }
 def _scan_calibration(recipe: AverageScanRecipe):
     values = recipe.calibration.values
@@ -1054,7 +1185,9 @@ def _scan_calibration(recipe: AverageScanRecipe):
     from xrd_tools.core import PONI
     from xrd_tools.core.geometry import DetectorCalibration
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
-    poni = PONI(values.dist, values.poni1, values.poni2, values.rot1, values.rot2, values.rot3, values.wavelength_m, recipe.calibration.detector_id)
+    selection = _semantic_pairs(recipe.reduction_extra).get('energy_selection')
+    wavelength = values.wavelength_m if selection is None else selection['wavelength_m']
+    poni = PONI(values.dist, values.poni1, values.poni2, values.rot1, values.rot2, values.rot3, wavelength, recipe.calibration.detector_id)
     calibration = DetectorCalibration(poni, dict(recipe.calibration.detector_config), parallax=recipe.calibration.parallax)
     return (poni, detector_calibration_to_integrator(calibration), calibration)
 def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threading.Event | None, progress: Callable[[str, int, int], None]):
@@ -1073,10 +1206,42 @@ def _reduce_average(plan: AverageScanPlan, science: dict[str, Any], token: threa
                 calibration, integrator=integrator,
             )
     frame = ScanFrame(1, image=science['average'], metadata=dict(science['metadata']), source_path=None, source_frame_index=0, background=None, mask=science['zero'])
-    provenance = {**_science_payload(plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
+    point = _point_policy(plan.recipe)
+    if point is not None:
+        frame.metadata['average_point_images'] = point.to_dict()
+    provenance = {**_science_payload(plan.recipe, plan.numeric_metadata_keys, plan.invariant_metadata_keys, plan.saturation), 'science_identity': plan.science_identity, 'operation_identity': plan.operation_identity, 'source_graph_digest': plan.source_graph_digest, 'contributor_extent': plan.contributor_extent, 'metadata_denominators': science['denominators'], 'direct_eiger_eligible': plan.direct_eiger_eligible, 'direct_eiger_execution': science['direct_eiger_execution']}
     scan = Scan('average', [frame], poni=poni, integrator=integrator, output_path=plan.output_artifact, extra={'average_finite_counts': science['finite'], 'average_scan_provenance': provenance, 'detector_shape': plan.detector_shape, **({'detector_calibration': detector_values} if detector_values is not None else {})})
+    selection = _semantic_pairs(plan.recipe.reduction_extra).get('energy_selection')
+    if selection is not None:
+        scan.wavelength = selection['wavelength_m'] * 1e10
+        scan.energy = selection['energy_eV'] / 1000
+        scan.extra = {**scan.extra, 'energy_selection': selection}
     progress('reduce', 0, 1)
-    reduced = run_reduction(_derived_reduction(plan.recipe), scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True))
+    flat, dark = (_load_static_correction(plan.recipe, plan.detector_shape, token, role)
+                  for role in ('flat', 'dark'))
+    reduction = _derived_reduction(plan.recipe)
+    if flat is not None:
+        reduction = replace(reduction, flat=flat)
+        scan.extra = {**scan.extra, 'flatfield': flat}
+    if point is not None and point.operation == 'difference':
+        dark = None
+    if dark is not None:
+        reduction = replace(reduction, dark=dark)
+        scan.extra = {**scan.extra, 'darkcurrent': dark}
+    if any(item is not None and item.error_model == 'poisson' and 'variance' not in item.extra
+           for item in (reduction.integration_1d, reduction.integration_2d)):
+        # The averaged frame is a mean of N counts: its Poisson variance is the
+        # mean over N (pyFAI's floor of one count), not the mean itself. The one
+        # dark subtracted from every frame adds its counts undivided.
+        counts = np.asarray(science['finite'].values)
+        variance = science['variance'] if science.get('variance') is not None else np.divide(np.maximum(science['average'], 1.0), counts,
+                             out=np.zeros(counts.shape), where=counts > 0)
+        if dark is not None:
+            variance += np.clip(dark, 0.0, None)
+        reduction = replace(reduction, integration_1d=_with_variance(reduction.integration_1d, variance),
+                            integration_2d=_with_variance(reduction.integration_2d, variance))
+    # An Average never captures angular support: no single detector footprint (COVERAGE-SUPPORT-20261013)
+    reduced = run_reduction(reduction, scan, cancel_token=token, execution='chunked', retain_products=True, strict=StrictPolicy(True, True, True), angular_support=False)
     progress('reduce', 1, 1)
     if reduced.failed and type(reduced.error) is str and reduced.error.startswith('monitor ') and reduced.error.endswith('Pass StrictPolicy.graceful() to allow it.'): raise MissingNormalizationError(reduced.error)
     _reject(reduced.failed or 1 not in reduced.frames, reduced.error or 'AVERAGE_REDUCTION_FAILED')
@@ -1104,7 +1269,24 @@ def iter_average_contributors(path, *, entry='entry', label=1) -> Iterator[Avera
     _reject(type(average) is not dict or average.get('api_version') != _COUNT_POLICY or average.get('contributor_extent') != counts.evidence.contributor_extent, 'Average lineage provenance or extent is invalid')
     source_base, source = _read_average_lineage(artifact, entry=entry)
     extent = counts.evidence.contributor_extent
-    _reject(source.extent != extent, 'Average lineage source extent does not match counts')
+    from xrd_tools.sources.point_images import PointImagePolicy
+    point = None if 'point_images' not in average else PointImagePolicy.from_dict(average['point_images'])
+    _reject(source.extent != extent * (1 if point is None else point.images_per_point), 'Average lineage source extent does not match counts')
+    native = _iter_native_average_contributors(source, artifact, source_base)
+    if point is None:
+        yield from native
+        return
+    for index in range(extent):
+        members = tuple(next(native) for _ in range(point.images_per_point))
+        used = (members[point.image_index - 1],) if point.operation == 'select' else members
+        first = used[0]
+        yield AverageContributor(index, index, first.source_path, first.source_frame_index,
+            first.dataset_path, members[0].source_start, members[-1].source_stop,
+            first.size, first.mtime_ns, used, point.to_dict())
+
+
+def _iter_native_average_contributors(source, artifact, source_base):
+    extent = source.extent
     if source.image_members:
         for index, member in enumerate(source.image_members):
             yield AverageContributor(index, index, _resolved_lineage_path(member.path, artifact, source_base), 0, None, member.source_start, member.source_stop, member.size, member.mtime_ns)
@@ -1356,6 +1538,21 @@ class AverageScanRunner:
             self._preparation_window = window
             window.__enter__()
             self._preparation_first_row = window.complete_metadata_for(0)
+            if self.recipe.calibration.values is not None:
+                from xrd_tools.core.energy import metadata_energy_values, resolve_acquisition_energy
+                wavelength, unit = window.metadata_wavelength()
+                energy_is_eV = window.metadata_energy_is_eV()
+                def energies():
+                    for index in range(window.extent):
+                        row = (self._preparation_first_row if index == 0
+                               else window.complete_metadata_for(index))
+                        yield from metadata_energy_values(row, energy_is_eV=energy_is_eV, wavelength=wavelength,
+                                                          wavelength_unit=unit)
+                selection = resolve_acquisition_energy(
+                    self.recipe.calibration.values.wavelength_m, energies())
+                extras = {**_semantic_pairs(self.recipe.reduction_extra),
+                          'energy_selection': selection}
+                self.recipe = replace(self.recipe, reduction_extra=_freeze_pairs(extras, [0]))
             if _direct_eiger_candidate(graph):
                 layout, _reason = window.eiger_direct_chunk_layout()
                 self._preparation_direct_eiger_eligible = layout is not None

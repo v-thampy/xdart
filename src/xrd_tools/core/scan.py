@@ -105,6 +105,7 @@ class FrameGeometry:
     poni: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        # Always a fresh copy: a proxy passed in may still view its producer's live dict (P3a residual 7).
         if self.poni is not None:
             object.__setattr__(self, "poni", MappingProxyType(dict(self.poni)))
 
@@ -160,6 +161,17 @@ class ScanFrame:
     source_identity: str | None = None
     background_dependency_bytes: bytes | None = None
     background_dependency_fingerprint: str | None = None
+    #: Poisson variance of ``background`` per unit of it (see FrameBackgroundResult)
+    background_variance_factor: float | np.ndarray | None = None
+    #: The factor ``background`` was scaled by; with a dark, the reducer removes the
+    #: background's own dark (scale · dark). None: the background carries no dark.
+    background_scale: float | None = None
+    #: Grouped sources decode native operands under the consumer's value policy.
+    point_statistics_loader: Callable[..., Any] | None = None
+    point_variance: np.ndarray | None = None
+    point_exposure_multiplier: float = 1.0
+    # Transient source contract; generic NeXus rows already express energy in eV.
+    metadata_energy_is_eV: bool = False
 
     def __post_init__(self) -> None:
         self.metadata = dict(self.metadata or {})

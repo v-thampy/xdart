@@ -105,10 +105,13 @@ def test_registry_is_exactly_two_tools_and_imports_no_gui_dependency() -> None:
         ExternalToolId.NEXPY_SELECTED,
         ExternalToolId.SILX_H5VIEWER,
     )
+    # Plot Metadata left Int's tools column for the shared metadata popup and Scan Plot (2fa82580);
+    # REFERENCE-PHASES-20261011 added the Reference Phases window's launcher, with its tooltip.
+    from xdart.gui.tabs.scattering.tools_view import REFERENCE_PHASES_TOOLTIP
     assert ToolsView._TOOLS == (
         ("∧ Peak Fitting", "peak_fitting"),
         ("≈ Phase Fitting", "phase_fitting"),
-        ("▤ Plot Metadata", "plot_metadata"),
+        ("┆ Reference Phases", "reference_phases", REFERENCE_PHASES_TOOLTIP),
         ("▣ ROI Statistics", "roi_statistics"),
     )
     assert ToolsView._EXTERNAL_VIEWERS == (
@@ -382,8 +385,7 @@ def test_tools_view_reconciles_truthful_external_availability(
         assert all(
             tools.findChild(QtWidgets.QPushButton, f"e3Tool_{name}").isEnabled()
             for name in (
-                "peak_fitting", "phase_fitting", "plot_metadata",
-                "roi_statistics",
+                "peak_fitting", "phase_fitting", "roi_statistics",
             )
         )
 

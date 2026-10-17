@@ -29,7 +29,7 @@ def _function_order(path: Path, name: str, needles: tuple[str, ...]) -> tuple[in
 
 
 def _composition(tmp_path: Path, *, live=False, count=3,
-                 output_mode="Overwrite", processing_mode="Int 1D (XYE)"):
+                 output_mode="Overwrite", processing_mode="Int 1D (XYE)", background=None):
     from xdart.gui.tabs.scattering.contracts import (
         AdmittedOutput, OutputDisposition, OutputFact, PlannedOutput,
         SourceExecutionStamp, SourceFileState)
@@ -57,7 +57,7 @@ def _composition(tmp_path: Path, *, live=False, count=3,
         source_path=path, source_frame_index=0) for index, path in enumerate(paths, 1)]
     configuration = RunIntent(source_spec=spec, processing_mode=processing_mode,
         output_mode=output_mode, live_mode=live, poni_file="/accepted.poni",
-        save_path=str(item.target), background=FrameBackgroundPlan(
+        save_path=str(item.target), background=background or FrameBackgroundPlan(
             mode="Single BG File", locator=str(tmp_path / "background.tif"))).freeze()
     return configuration, Scan("scan", frames), ReductionPlan(
         integration_1d=Integration1DPlan(npt=8)), item, decision
@@ -201,6 +201,59 @@ def test_batch_single_background_capsule_decodes_once_and_releases(
     assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
     assert run.background_capsule is None
 
+
+
+def test_batch_series_background_reads_each_member_once_and_releases(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """BG-SERIES-REREAD (maintainer, 2026-09-30: "Stat check (my recommendation): yes"): a batch qualifies and
+    submits three frames against one Series Average reading each member once (it read every member at every
+    frame, twice: qualification and submission); the bindings agree; the run releases the capsule."""
+    from xdart.gui.tabs.scattering.adapters import dynamic_output, run_executor
+    from xdart.gui.tabs.scattering.events import RunIdentity
+    from xrd_tools.reduction import background as background_module
+
+    series = tuple(tmp_path / f"bg_{index}.tif" for index in (1, 2, 3))
+    for path in series:
+        path.write_bytes(b"background-" + path.name.encode())
+    configuration, scan, plan, item, decision = _composition(tmp_path, background=FrameBackgroundPlan(
+        mode="Series Average", locator=str(series[0])))
+    decoder_calls = []
+
+    def decode(path, **_kwargs):
+        decoder_calls.append(Path(path).resolve())
+        return np.full((2, 2), 1.0 + len(decoder_calls) % 3, np.float32)
+
+    monkeypatch.setattr(background_module, "read_image", decode)
+    owner = SimpleNamespace(background_capsule=None)
+    adapter = dynamic_output.DynamicOutputAdapter(configuration)
+    stop = Event()
+    preparation = adapter.prepare_admission(
+        scan, plan, item, decision, stop,
+        qualify=lambda policy, prior: run_executor._qualify_background_bindings(
+            configuration, scan, item, decision, policy, prior, stop, owner))
+    bindings = preparation.effective.background_bindings
+    assert tuple(value[0] for value in bindings) == (1, 2, 3)
+    assert sorted(decoder_calls) == sorted(path.resolve() for path in series)  # once each
+    assert type(owner.background_capsule).__name__ == "_PreparedSeriesFrameBackground"
+    roots = []
+    for frame, binding in zip(scan.frames, bindings, strict=True):
+        assert run_executor._resolve_background_before_submit(
+            frame, configuration.background, binding, cancelled=stop, capsule_owner=owner)
+        roots.append(frame.background)
+        frame.background = None
+        frame.background_dependency_bytes = None
+        frame.background_dependency_fingerprint = None
+    assert len(decoder_calls) == 3 and all(value is roots[0] for value in roots)
+    class ClosedSource:
+        def close(self) -> None:
+            pass
+
+    run = run_executor._StandardRun(None, RunIdentity(1, "f" * 64), None, ClosedSource(), None, None,
+                                    Path("out.nexus"))
+    run.background_capsule = owner.background_capsule
+    run_executor.StandardRunExecutor()._cleanup(run)
+    assert run.background_capsule is None
 
 def test_live_single_background_capsule_reuses_and_refuses_old_binding(
     monkeypatch, tmp_path: Path,

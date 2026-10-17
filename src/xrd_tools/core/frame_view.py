@@ -20,6 +20,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from xrd_tools.core.metadata import numeric_metadata
+from xrd_tools.core.scan import FrameGeometry
 
 
 class TwoDKind(str, Enum):
@@ -56,21 +57,6 @@ class Axis:
                 values = values.copy()
                 values.setflags(write=False)
         object.__setattr__(self, "values", values)
-
-
-@dataclass(frozen=True, slots=True)
-class FrameGeometry:
-    """Per-frame geometry needed by GI, stitching, and RSM pipelines."""
-
-    rot1: float | None = None
-    rot2: float | None = None
-    rot3: float | None = None
-    incident_angle: float | None = None
-    poni: Mapping[str, Any] | None = None
-
-    def __post_init__(self) -> None:
-        if self.poni is not None:
-            object.__setattr__(self, "poni", MappingProxyType(dict(self.poni)))
 
 
 def _readonly_array(value: Any, *, dtype: Any = float) -> np.ndarray | None:
@@ -120,6 +106,10 @@ class FrameView:
     source_path: str | None = None
     source_frame_index: int | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
+    #: The 1-D profile's angular support (COVERAGE-SUPPORT-20261013): an immutable
+    #: ``AngularSupportProfile`` (run, saved or reconstructed; available or with its reason), or None when
+    #: nothing about it is known. Carried as the object it is: publication never re-derives or serializes it.
+    angular_support: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "intensity_1d", _readonly_array(self.intensity_1d))
@@ -133,6 +123,8 @@ class FrameView:
         object.__setattr__(self, "extra", _readonly_mapping(self.extra))
         if not isinstance(self.two_d_kind, TwoDKind):
             object.__setattr__(self, "two_d_kind", TwoDKind(str(self.two_d_kind)))
+        if self.angular_support is not None and type(self.angular_support).__name__ != "AngularSupportProfile":
+            raise TypeError("FrameView.angular_support must be an AngularSupportProfile or None")
         self._validate_shapes()
 
     @property
@@ -197,6 +189,7 @@ class FrameView:
         source_path: str | None = None,
         source_frame_index: int | None = None,
         extra: Mapping[str, Any] | None = None,
+        angular_support: Any = None,
     ) -> "FrameView":
         axis_1d = intensity_1d = sigma_1d = None
         if result_1d is not None:
@@ -240,6 +233,7 @@ class FrameView:
             source_path=source_path,
             source_frame_index=source_frame_index,
             extra=extra or {},
+            angular_support=angular_support if axis_1d is not None else None,
         )
 
 
@@ -439,7 +433,7 @@ def _view_1d_only(view: FrameView) -> FrameView:
 
 def _view_2d_only(view: FrameView) -> FrameView:
     """Project ``view`` to a dimension-pure 2D view (1D fields dropped)."""
-    return replace(view, axis_1d=None, intensity_1d=None, sigma_1d=None)
+    return replace(view, axis_1d=None, intensity_1d=None, sigma_1d=None, angular_support=None)
 
 
 def _merge_views(v1: FrameView | None, v2: FrameView | None) -> FrameView:
@@ -486,6 +480,7 @@ def _merge_views(v1: FrameView | None, v2: FrameView | None) -> FrameView:
             else v2.source_frame_index
         ),
         extra=v1.extra if v1.extra else v2.extra,
+        angular_support=v1.angular_support,
     )
 
 
@@ -575,6 +570,21 @@ class FrameRecord:
     def active_view(self) -> FrameView:
         """The display view for the currently active 1D + 2D modes."""
         return self.project()
+
+    def merged_with(self, incoming: "FrameRecord") -> "FrameRecord":
+        """Accumulate this frame's modes; incoming values and active selections win.
+
+        An empty incoming dimension retains its existing modes and selection. Arrays
+        remain shared; a publication's latest display view stays separate from this union.
+        """
+        if self.label != incoming.label:
+            raise ValueError(f"cannot merge FrameRecords with labels {self.label!r} and {incoming.label!r}")
+        merged = self
+        for mode, view in incoming.results_1d.items():
+            merged = merged.with_result_1d(mode, view, make_active=(mode == incoming.active_mode_1d))
+        for mode, view in incoming.results_2d.items():
+            merged = merged.with_result_2d(mode, view, make_active=(mode == incoming.active_mode_2d))
+        return merged
 
     def with_result_1d(
         self, mode: str, view: FrameView, *, make_active: bool = True

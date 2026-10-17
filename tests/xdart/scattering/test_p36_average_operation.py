@@ -1200,6 +1200,10 @@ def test_average_page_dispatches_one_revision_checked_canonical_freeze(
     from xrd_tools.sources import selection
 
     source = _source(tmp_path / "source")
+    # Average needs a ready PONI before it freezes, as Run does since a53c324e.
+    poni = tmp_path / "average.poni"
+    poni.write_text("poni_version: 2\nDetector: Pilatus100k\nDetector_config: {}\nDistance: 0.1234\n"
+                    "Poni1: 0.01\nPoni2: 0.03\nRot1: 0\nRot2: 0\nRot3: 0\nWavelength: 1e-10\n")
     intent = RunIntent(
         source_spec=source,
         processing_mode="Int 2D",
@@ -1207,6 +1211,7 @@ def test_average_page_dispatches_one_revision_checked_canonical_freeze(
         max_cores=3,
         project_root=str(tmp_path),
         save_path=str(tmp_path / "processed"),
+        poni_file=str(poni),
         run_options={"series_average": True},
     )
     store = RunIntentStore(intent)
@@ -1707,6 +1712,32 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
     assert len(calls) == 4
 
 
+def test_gui_average_freezes_real_source_energy_before_reduction(tmp_path):
+    from tests.core.test_int_workflow_replay import _fixture
+    from tests.core.test_acquisition_energy import _record_nexus_energy, _replay
+    from xrd_tools.core.provenance import read_provenance
+    from xrd_tools.io import open_scan
+    intent = _fixture(tmp_path / 'project')
+    intent.processing_mode = 'Int 1D'
+    intent.output_mode = 'Overwrite'
+    _record_nexus_energy(intent, [16000., 16000.])
+    expected = open_scan(_replay(intent, 'run'))
+    slot = OperationSlot()
+    try:
+        identity = slot.begin_average(intent.freeze(), tmp_path / 'average.nexus',
+                                      stamp=OperationContextStamp(0))
+        assert identity is not None
+        update = _join(slot, identity)
+        assert update.terminal.status is OperationTerminalStatus.RETURNED
+        result = update.terminal.payload
+        assert result.disposition == 'COMMITTED', result
+        np.testing.assert_array_equal(expected.get_1d(0).q,
+                                      open_scan(result.target).get_1d(1).q)
+        assert read_provenance(result.target)['config']['energy_selection']['energy_eV'] == 16000.
+    finally:
+        assert slot.close().cleanup_status is CleanupStatus.CLEANED
+
+
 def test_average_stop_stale_close_and_single_slot_truth(tmp_path, monkeypatch) -> None:
     entered, release = threading.Event(), threading.Event()
 
@@ -2197,3 +2228,30 @@ def test_a_published_unverified_average_is_not_shown_as_success_or_abort(
     # The operator is told WHICH file is now sitting there, unverified.
     assert result.target in terminal.diagnostic
     assert "could not be verified" in terminal.diagnostic
+
+
+def test_average_calibration_carries_an_admitted_flat_and_refuses_a_missing_one(tmp_path) -> None:
+    import hashlib
+    from xrd_tools.session.experiment_state import FactStatus
+    poni = tmp_path / "flat.poni"
+    poni.write_text(
+        "poni_version: 2.1\nDetector: Detector\n"
+        'Detector_config: {"pixel1": 0.0001, "pixel2": 0.0001, "max_shape": [4, 4], "orientation": 3}\n'
+        "Distance: 0.2\nPoni1: 0.001\nPoni2: 0.001\nRot1: 0.0\nRot2: 0.0\nRot3: 0.0\n"
+        "Wavelength: 1e-10\n"
+    )
+    flat = tmp_path / "flat.npy"
+    np.save(flat, np.full((4, 4), 2.0))
+    state = adapter._average_calibration(SimpleNamespace(
+        poni_file=str(poni), mask_file="", flat_file=str(flat),
+    ))
+    assert state.flat.status is FactStatus.PRESENT
+    assert state.flat.source_uri == str(flat) and state.flat.shape == (4, 4)
+    assert state.flat.sha256 == hashlib.sha256(flat.read_bytes()).hexdigest()
+    assert adapter._average_calibration(SimpleNamespace(
+        poni_file=str(poni), mask_file="",
+    )).flat.status is FactStatus.ABSENT
+    with pytest.raises(ValueError, match="flat field file is unavailable"):
+        adapter._average_calibration(SimpleNamespace(
+            poni_file=str(poni), mask_file="", flat_file=str(tmp_path / "missing.npy"),
+        ))

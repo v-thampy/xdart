@@ -7,8 +7,10 @@ generation without introducing GUI, source, or writer dependencies.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from threading import RLock
+from typing import Any
 
 from .run_configuration import FrozenRunConfiguration, RunIntent
 
@@ -134,6 +136,8 @@ class RunIntentStore:
         *,
         expected_revision: int,
         gi_motor_choices: list[str] | tuple[str, ...] | None = None,
+        saturation: int | None = None,
+        poni_values: Mapping[Any, Any] | None = None,
     ) -> IntentFreezeAccepted | IntentRecaptureRequired:
         """Freeze the owned intent exactly once after a locked revision check."""
 
@@ -143,6 +147,8 @@ class RunIntentStore:
                 return self._recapture_locked(expected_revision)
             configuration = self._intent.freeze(
                 gi_motor_choices=gi_motor_choices,
+                saturation=saturation,
+                poni_values=poni_values,
             )
             return IntentFreezeAccepted(
                 revision=self._revision,

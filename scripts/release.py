@@ -153,7 +153,7 @@ def check_deps() -> bool:
     recipe = (ROOT / "recipe" / "recipe.yaml").read_text()
     uv_lock = (ROOT / "uv.lock").read_text()
     ok = True
-    window = r">=2026\.5,<2026\.6"
+    window = r">=2026\.9,<2026\.10"
     checks = (
         (re.search(rf'"pyFAI{window}"', project), "project pyFAI window"),
         (re.search(rf'^pyfai\s*=\s*"{window}"$', project, re.M),
@@ -162,8 +162,8 @@ def check_deps() -> bool:
          "conda recipe pyFAI window"),
         (re.search(rf'^\s*\{{ name = "pyfai", specifier = "{window}" \}},$',
                    uv_lock, re.M), "uv requirement pyFAI window"),
-        (re.search(r'^name = "pyfai"\nversion = "2026\.5\.0"$',
-                   uv_lock, re.M), "uv resolves pyFAI 2026.5.0"),
+        (re.search(r'^name = "pyfai"\nversion = "2026\.9\.0"$',
+                   uv_lock, re.M), "uv resolves pyFAI 2026.9.0"),
     )
     for matched, label in checks:
         ok &= (_ok if matched else _fail)(label)

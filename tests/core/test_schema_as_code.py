@@ -194,81 +194,71 @@ def test_validator_flags_nx_attr_drift(tmp_path):
     """The nx_attrs pass (Q-C2): the schema-routed writer's group validates
     clean, and the validator flags a mutated NX attr value AND a deleted
     required NX attr — by strict equality, naming the attr."""
-    from xrd_tools.io.nexus import validate_group_against_schema, write_stitched
-    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.io.nexus import validate_group_against_schema, write_rsm
+    from xrd_tools.rsm.volume import RSMVolume
 
-    s1 = IntegrationResult1D(radial=np.linspace(0.5, 5.0, 8),
-                             intensity=np.ones(8, np.float32),
-                             sigma=None, unit="q_A^-1")
-    with h5py.File(tmp_path / "stitch.nxs", "w") as f:
+    volume = RSMVolume(h=np.linspace(-1.0, 1.0, 3), k=np.linspace(0.0, 2.0, 4),
+                       l=np.linspace(-0.5, 0.5, 5), intensity=np.ones((3, 4, 5)))
+    with h5py.File(tmp_path / "rsm.nxs", "w") as f:
         e = f.create_group("entry")
-        write_stitched(e, stitched_1d=s1)
-        g = e["stitched_1d"]
+        write_rsm(e, volume)
+        g = e["rsm"]
 
         # the real (schema-routed) writer's group is conformant
-        assert validate_group_against_schema(g, "stitched_1d") == []
+        assert validate_group_against_schema(g, "rsm") == []
 
         # a mutated NX attr value is flagged, naming the attr
         g.attrs["signal"] = "bogus"
-        probs = validate_group_against_schema(g, "stitched_1d")
+        probs = validate_group_against_schema(g, "rsm")
         assert any("signal" in p for p in probs), probs
         g.attrs["signal"] = "intensity"          # restore to isolate the next
 
         # a deleted required NX attr is flagged as missing
         del g.attrs["NX_class"]
-        probs = validate_group_against_schema(g, "stitched_1d")
+        probs = validate_group_against_schema(g, "rsm")
         assert any("NX_class" in p and "missing" in p for p in probs), probs
 
 
 #: Byte-identity tripwire (Q-C1).  SHA-256 of the canonical h5_content_signature
 #: (group attrs + dataset names/dtypes/shapes/storage/value digests) of a
-#: FIXED-SEED stitched+rsm write.  The schema-as-code routing of
-#: write_stitched/write_rsm was proven byte-identical to the hand-written form
-#: at refactor time (an empty before/after signature diff); this pin keeps every
-#: FUTURE writer change byte-identical too.  Re-pin ONLY for an intentional,
-#: additive format change (see CLAUDE.md — the persisted format is frozen +
-#: additive-only).
-_STITCH_RSM_SIGNATURE_SHA256 = (
-    "207e82b24b951b2c889135aa5de3dbad1d1a11f08618aa52a4445f1b9ddfe08c"
+#: FIXED-SEED rsm write.  The schema-as-code routing of write_rsm was proven
+#: byte-identical to the hand-written form at refactor time (an empty
+#: before/after signature diff); this pin keeps every FUTURE writer change
+#: byte-identical too.  Re-pin ONLY for an intentional, additive format change
+#: (see CLAUDE.md — the persisted format is frozen + additive-only).  It pinned
+#: the old stitched groups too until their writer was removed (2026-09-30, the
+#: maintainer's "Remove old format"); this RSM-only value is the same on the
+#: parent and after the removal.
+_RSM_SIGNATURE_SHA256 = (
+    "9f97b4c4a449ea3ba2d2699b761fde0d418c341f6dd4ba60a3b766e5127d8138"
 )
 
 
-def test_stitched_rsm_write_is_byte_identical(tmp_path):
-    """Pin the stitched+rsm on-disk signature so a writer change that alters the
-    bytes (names/dtypes/shapes/values/attrs) trips loudly."""
+def test_rsm_write_is_byte_identical(tmp_path):
+    """Pin the rsm on-disk signature so a writer change that alters the bytes
+    (names/dtypes/shapes/values/attrs) trips loudly."""
     import hashlib
     import json
 
     from tests.core.h5sig import h5_content_signature
-    from xrd_tools.core.containers import (
-        IntegrationResult1D, IntegrationResult2D)
-    from xrd_tools.io.nexus import write_rsm, write_stitched
+    from xrd_tools.io.nexus import write_rsm
     from xrd_tools.rsm.volume import RSMVolume
 
     rng = np.random.default_rng(20260629)
-    s1 = IntegrationResult1D(radial=np.linspace(0.5, 5.0, 6),
-                             intensity=rng.random(6), sigma=rng.random(6),
-                             unit="q_A^-1")
-    s2 = IntegrationResult2D(radial=np.linspace(0.5, 5.0, 6),
-                             azimuthal=np.linspace(-180, 180, 4, endpoint=False),
-                             intensity=rng.random((6, 4)), sigma=None,
-                             unit="q_A^-1", azimuthal_unit="chi_deg")
     rv = RSMVolume(h=np.linspace(-1.0, 1.0, 3), k=np.linspace(0.0, 2.0, 4),
                    l=np.linspace(-0.5, 0.5, 5), intensity=rng.random((3, 4, 5)))
-    prov = {"plan": "stitch", "corrections": ["solid_angle"]}
+    prov = {"plan": "rsm", "corrections": ["solid_angle"]}
 
-    p = tmp_path / "stitch_rsm.nxs"
+    p = tmp_path / "rsm.nxs"
     with h5py.File(p, "w") as f:
-        e = f.create_group("entry")
-        write_stitched(e, stitched_1d=s1, stitched_2d=s2, provenance=prov)
-        write_rsm(e, rv, provenance=prov)
+        write_rsm(f.create_group("entry"), rv, provenance=prov)
 
     sig = h5_content_signature(p)
     digest = hashlib.sha256(
         json.dumps(sig, sort_keys=True).encode()).hexdigest()
-    assert digest == _STITCH_RSM_SIGNATURE_SHA256, (
-        "byte-identity signature drift in write_stitched/write_rsm — a writer "
-        "changed the on-disk format.  Re-pin ONLY if intentional.\n"
+    assert digest == _RSM_SIGNATURE_SHA256, (
+        "byte-identity signature drift in write_rsm — a writer changed the "
+        "on-disk format.  Re-pin ONLY if intentional.\n"
         f"got: {digest}\n{json.dumps(sig, indent=1, sort_keys=True)}"
     )
 

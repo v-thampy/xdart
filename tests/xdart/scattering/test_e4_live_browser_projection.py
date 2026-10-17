@@ -173,6 +173,7 @@ def test_explicit_heavy_residency_requests_all_three_bounds_without_env_mutation
     item = SimpleNamespace(
         descriptor=descriptor,
         source_stamp=SimpleNamespace(frame_count=1),
+        source_spec=SimpleNamespace(options={}),  # read for point images since 40ff9574
     )
     scan = SimpleNamespace(frames=(SimpleNamespace(index=1, image=None),))
     plan = SimpleNamespace(integration_1d=None, integration_2d=None, gi=None)
@@ -218,6 +219,7 @@ def test_dynamic_policy_widens_only_standard_four_worker_grants(monkeypatch):
     item = SimpleNamespace(
         descriptor=descriptor,
         source_stamp=SimpleNamespace(frame_count=1),
+        source_spec=SimpleNamespace(options={}),  # read for point images since 40ff9574
     )
     scan = SimpleNamespace(frames=(SimpleNamespace(index=1, image=None),))
     plan = ReductionPlan(

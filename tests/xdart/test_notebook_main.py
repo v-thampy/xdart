@@ -1,4 +1,4 @@
-"""``xdart-notebook`` drives this installation's real JupyterLab and ipykernel.
+"""``xdart-notebook`` drives this installation's real notebook frontends and ipykernel.
 
 Every row runs the real command in a child process: the point of the launcher
 is which Python and which JupyterLab it reaches, and a stub would hide that.
@@ -93,3 +93,57 @@ def test_launcher_describes_itself_before_jupyterlab_does():
     done = _run("--help")
     assert done.returncode == 0, done.stdout + done.stderr
     assert "--register-kernel" in done.stdout
+
+
+def test_launcher_reaches_this_installations_marimo_without_starting_a_server(tmp_path):
+    pytest.importorskip("marimo")
+    notebook = tmp_path / "fit 'α'.py"
+    content = b"import marimo\napp = marimo.App()\n"
+    notebook.write_bytes(content)
+    done = _run("--marimo", str(notebook), "--help")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "Usage: marimo edit" in done.stdout and "--no-sandbox" in done.stdout
+    assert notebook.read_bytes() == content
+
+
+@pytest.mark.parametrize("filename", (None, "result.ipynb", "missing.py", "directory.py"))
+def test_marimo_launch_requires_an_explicit_existing_python_notebook(tmp_path, filename):
+    if filename == "result.ipynb":
+        (tmp_path / filename).write_text("{}", encoding="utf-8")
+    elif filename == "directory.py":
+        (tmp_path / filename).mkdir()
+    arguments = [] if filename is None else [str(tmp_path / filename)]
+    done = _run("--marimo", *arguments, "--help")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "existing .py notebook" in done.stderr
+
+
+def test_python_filename_does_not_guess_the_marimo_frontend(tmp_path):
+    notebook = tmp_path / "workflow.py"
+    notebook.write_text("", encoding="utf-8")
+    done = _run(str(notebook), "--version")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip().splitlines()[-1] == metadata.version("jupyterlab")
+
+
+def test_marimo_mode_cannot_register_a_jupyter_kernel(tmp_path):
+    notebook = tmp_path / "workflow.py"
+    notebook.write_text("", encoding="utf-8")
+    done = _run("--marimo", str(notebook), "--register-kernel", "--help")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "--register-kernel" in done.stderr
+
+
+def test_launcher_explains_a_missing_marimo_package(tmp_path):
+    notebook = tmp_path / "workflow.py"
+    notebook.write_text("", encoding="utf-8")
+    driver = (
+        "import sys\n"
+        "sys.modules['marimo'] = None\n"
+        "from xdart.notebook_main import main\n"
+        "raise SystemExit(main(['--marimo', sys.argv[1], '--help']))\n"
+    )
+    done = subprocess.run([sys.executable, "-c", driver, str(notebook)],
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 1
+    assert 'pip install "xdart[notebook]"' in done.stderr

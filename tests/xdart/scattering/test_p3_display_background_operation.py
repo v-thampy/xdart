@@ -14,7 +14,7 @@ from pyqtgraph.Qt import QtWidgets
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.adapters.external_operation import OperationSlot
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
-from xdart.gui.tabs.scattering.context_projection import _apply_presentation_background
+from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
 from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
 from xdart.gui.tabs.scattering.operation_values import (
     OperationContextStamp, OperationTerminalStatus,
@@ -135,7 +135,7 @@ def _seed_page_1d_background(page: ScatteringWorkspace) -> PresentationBackgroun
     receipt = owner.run_and_stage(reservation, lambda: False)
     assert owner.promote(receipt, tuple((*item, 1.0) for item in contributors))
     page._shell.scientific.expect_display_background(key)
-    active = _apply_presentation_background(state, owner.projection())
+    active = apply_presentation_background(state, owner.projection())
     page._shell.scientific.reconcile(
         active, shell.navigation, completed=2, total=2, detail="Ready")
     return owner
@@ -460,7 +460,7 @@ def test_projection_substitutes_only_exact_domain_targets(domain: str) -> None:
     else:
         source = before.heavy.raw if domain == "raw" else before.heavy.cake
         rows = ((id(before.heavy.frame), np.full(source.shape, 42.0)),)
-    after = _apply_presentation_background(
+    after = apply_presentation_background(
         replace(before, processing_mode="Int 1D" if domain == "integrated_1d"
                 else "Int 2D"), (domain, rows, ("active", domain)))
     assert after.background_set
@@ -510,7 +510,7 @@ def test_1d_renderer_uses_reused_d_with_baseline_role_parity(plot_mode: str) -> 
         raw_before = view.raw.canvas.raw_image.copy()
         cake_before = view.cake.canvas.raw_image.copy()
         view.expect_display_background(key)
-        active = _apply_presentation_background(state, projection)
+        active = apply_presentation_background(state, projection)
         view.reconcile(active, shell.navigation, completed=4, total=4, detail="Ready")
         assert _renderer_roles(view) == off_roles
         if plot_mode == "Waterfall":
@@ -630,7 +630,7 @@ def test_image_renderer_uses_d_and_preserves_the_non_target_pane(domain: str) ->
         opposite = view.cake if domain == "raw" else view.raw
         opposite_before = opposite.canvas.raw_image.copy()
         view.expect_display_background(key)
-        active = _apply_presentation_background(state, projection)
+        active = apply_presentation_background(state, projection)
         view.reconcile(active, shell.navigation, completed=3, total=3, detail="Ready")
         assert _renderer_roles(view) == off_roles
         target = view.raw if domain == "raw" else view.cake

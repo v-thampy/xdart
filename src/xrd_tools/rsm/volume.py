@@ -7,6 +7,8 @@ Contains:
 - save_vtk()         — export to VTK rectilinear grid (requires pyevtk)
 - extract_line_cut() — 1D projection / line cut along one axis
 - extract_2d_slice() — 2D projection / slice by integrating over one axis
+
+Line-outs through a point with named axes live in :mod:`xrd_tools.rsm.lineout`.
 """
 
 from __future__ import annotations
@@ -431,6 +433,66 @@ def save_vtk(
     )
 
 
+#: Elements reduced per block by :func:`_box_mean_along`: its float and boolean
+#: temporaries stay near 9 MiB whatever the box size.
+_REDUCTION_BLOCK_ELEMENTS = 1 << 20
+
+
+def _mask_selector(mask: np.ndarray) -> slice | np.ndarray:
+    """A basic slice (a view) when the selected indices are one contiguous run, else the index array."""
+    indices = np.flatnonzero(mask)
+    if indices.size == 0:
+        return slice(0, 0)
+    if int(indices[-1]) - int(indices[0]) + 1 == indices.size:
+        return slice(int(indices[0]), int(indices[-1]) + 1)
+    return indices
+
+
+def _box_view(intensity: np.ndarray, selectors) -> np.ndarray:
+    """``intensity`` restricted by one selector per axis: a view for slices; an index array copies only its block."""
+    view = intensity[tuple(item if isinstance(item, slice) else slice(None) for item in selectors)]
+    for dim, item in enumerate(selectors):
+        if not isinstance(item, slice):
+            view = np.take(view, item, axis=dim)
+    return view
+
+
+class InfiniteVoxelError(ValueError):
+    """An infinite voxel inside a reduced box (raised only when infinities are refused)."""
+
+
+def _box_mean_along(
+    view: np.ndarray,
+    keep_axis: int,
+    *,
+    refuse_infinite: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Unweighted mean over the two other axes of a 3-D ``view``, per index of ``keep_axis``.
+
+    Reduces in blocks along ``keep_axis`` so no temporary approaches the box size. NaN voxels are excluded.
+    With ``refuse_infinite`` an infinite voxel raises :class:`InfiniteVoxelError`; otherwise infinities enter
+    the mean as ``np.nanmean`` keeps them. Returns ``(mean, counts)``: float64 means, NaN where a bin has no
+    voxel (count 0), never zero.
+    """
+    view = np.moveaxis(view, keep_axis, 0)
+    n_bins = view.shape[0]
+    sums = np.zeros(n_bins, dtype=np.float64)
+    counts = np.zeros(n_bins, dtype=np.int64)
+    per_bin = max(1, int(np.prod(view.shape[1:])))
+    step = max(1, _REDUCTION_BLOCK_ELEMENTS // per_bin)
+    for start in range(0, n_bins, step):
+        block = view[start:start + step]
+        if refuse_infinite and np.isinf(block).any():
+            raise InfiniteVoxelError("an infinite voxel lies inside the box")
+        present = ~np.isnan(block)
+        counts[start:start + step] = present.sum(axis=(1, 2))
+        sums[start:start + step] = np.where(present, block, 0.0).sum(axis=(1, 2), dtype=np.float64)
+    means = np.full(n_bins, np.nan, dtype=np.float64)
+    observed = counts > 0
+    means[observed] = sums[observed] / counts[observed]
+    return means, counts
+
+
 def extract_line_cut(
     h: np.ndarray,
     k: np.ndarray,
@@ -441,6 +503,11 @@ def extract_line_cut(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Extract a 1D line cut or projection along one axis.
+
+    The value per bin is ``np.nanmean`` of the voxels whose other two
+    coordinates lie in the inclusive ``fixed_ranges`` (a bin with none is NaN).
+    Contiguous ranges are read as views and reduced in blocks, so even a full
+    projection copies no volume.
 
     Parameters
     ----------
@@ -465,24 +532,20 @@ def extract_line_cut(
         raise ValueError("axis must be 0, 1, or 2")
 
     axes_arr = [h, k, l]
-    slab = intensity
 
     # Copy once upfront — never mutate caller's dict
     ranges = dict(fixed_ranges) if fixed_ranges is not None else {}
+    selectors: list[slice | np.ndarray] = []
     for dim in (0, 1, 2):
-        if dim != axis and dim not in ranges:
-            ranges[dim] = (-np.inf, np.inf)
-
-    for dim in sorted((0, 1, 2), reverse=True):
         if dim == axis:
+            selectors.append(slice(None))
             continue
-        mask = (axes_arr[dim] >= ranges[dim][0]) & (
-            axes_arr[dim] <= ranges[dim][1])
-        slab = np.moveaxis(slab, dim, 0)[mask]
-        slab = np.moveaxis(slab, 0, dim)
+        lower, upper = ranges.get(dim, (-np.inf, np.inf))
+        values = np.asarray(axes_arr[dim])
+        selectors.append(_mask_selector((values >= lower) & (values <= upper)))
 
-    slab = np.moveaxis(slab, axis, -1)
-    intensity_1d = np.nanmean(slab, axis=(0, 1))
+    view = _box_view(np.asarray(intensity), selectors)
+    intensity_1d, _counts = _box_mean_along(view, axis, refuse_infinite=False)
     return axes_arr[axis], intensity_1d
 
 

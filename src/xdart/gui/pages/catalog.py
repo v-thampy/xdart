@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .descriptors import PageDescriptor, ToolDescriptor
+from .descriptors import PageDescriptor
 from .values import (
     PageCapability,
     PageLifecycle,
@@ -20,16 +20,14 @@ def _build_scattering_workspace(services, parent):
     return build_scattering_workspace(services, parent)
 
 
-def _build_stitch_tool(services, parent):
-    from xdart.gui.tools.stitch_tool import build_stitch_tool
+def _build_stitch_page(services, parent):
+    from .stitch_workspace import build_stitch_workspace
+    return build_stitch_workspace(services, parent)
 
-    return build_stitch_tool(services, parent)
 
-
-def _build_rsm_tool(services, parent):
-    from xdart.gui.tools.rsm_tool import build_rsm_tool
-
-    return build_rsm_tool(services, parent)
+def _build_rsm_page(services, parent):
+    from .rsm_workspace import build_rsm_workspace
+    return build_rsm_workspace(services, parent)
 
 
 SCATTERING_WORKSPACE_PAGE = PageDescriptor(
@@ -39,7 +37,7 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
     icon_key="scattering-workspace",
     category="workspace",
     order=0,
-    lifecycle=PageLifecycle.EXIT_ONLY,
+    lifecycle=PageLifecycle.RETAINED,
     capabilities=frozenset({
         PageCapability.OPEN_FOLDER,
         PageCapability.SETTINGS_PERSISTENCE,
@@ -48,33 +46,46 @@ SCATTERING_WORKSPACE_PAGE = PageDescriptor(
         PageCapability.SLICE_PIN,
         PageCapability.RUN_ACTIVITY,
         PageCapability.APP_MENU_HOSTS,
+        PageCapability.PROCESSING_MODE,
     }),
     build=_build_scattering_workspace,
 )
 
-BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE,)
-
-# Processing tools are launched through the workspace mode selector and Run.
-STITCH_TOOL = ToolDescriptor(
+STITCH_PAGE = PageDescriptor(
     key=STITCH_TOOL_KEY,
-    label="Stitching",
-    description="Combine an exact scan selection into one stitched pattern",
+    label="Stitch 1D",
+    description="Native finite Stitch workspace",
     icon_key="stitch",
-    category="analysis",
+    category="workspace",
     order=100,
-    build=_build_stitch_tool,
-    tool_kind="processing",
+    lifecycle=PageLifecycle.RETAINED,
+    capabilities=frozenset({
+        PageCapability.OPEN_FOLDER, PageCapability.SETTINGS_PERSISTENCE,
+        PageCapability.RUN_CONTROL, PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS,
+        PageCapability.PROCESSING_MODE, PageCapability.WRITE_MODE_TOGGLE,
+    }),
+    build=_build_stitch_page,
 )
 
-RSM_TOOL = ToolDescriptor(
+# The native RSM workspace (AUD-9) on the RSM tool's key: Int's and Stitch's mode boxes and the host's
+# open_tool("rsm") reach it unchanged. The classic RSM dialog was retired once the page had its workflows
+# (AUD-9 stage 2b G10), as the Stitching dialog was.
+RSM_PAGE = PageDescriptor(
     key=RSM_TOOL_KEY,
-    label="Reciprocal Space Map",
-    description="Grid one exact psic SPEC scan in reciprocal space",
+    label="RSM",
+    description="Native reciprocal-space map workspace",
     icon_key="rsm",
-    category="analysis",
-    order=110,
-    build=_build_rsm_tool,
-    tool_kind="processing",
+    category="workspace",
+    order=200,
+    lifecycle=PageLifecycle.RETAINED,
+    capabilities=frozenset({
+        PageCapability.OPEN_FOLDER, PageCapability.SETTINGS_PERSISTENCE, PageCapability.RUN_CONTROL,
+        PageCapability.RUN_ACTIVITY, PageCapability.APP_MENU_HOSTS, PageCapability.PROCESSING_MODE,
+        PageCapability.WRITE_MODE_TOGGLE,
+    }),
+    build=_build_rsm_page,
 )
 
-BUILTIN_DESCRIPTORS = (*BUILTIN_PAGES, STITCH_TOOL, RSM_TOOL)
+BUILTIN_PAGES = (SCATTERING_WORKSPACE_PAGE, STITCH_PAGE, RSM_PAGE)
+
+BUILTIN_DESCRIPTORS = BUILTIN_PAGES

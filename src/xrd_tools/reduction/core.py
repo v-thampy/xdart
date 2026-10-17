@@ -58,6 +58,7 @@ from xrd_tools.io.finite_artifact import (
     FiniteSeedBinding,
 )
 from xrd_tools.io.image import read_image
+from xrd_tools.integrate.pyfai_numexpr import PYFAI_NUMEXPR_LOCK
 from xrd_tools.io.nexus import (
     open_nexus_writer,
     open_nexus_image_stack,
@@ -606,7 +607,16 @@ class ReductionPlan:
     # Exclude all native ceiling values per frame. Manual thresholds take
     # precedence; only static masks determine integration geometry.
     mask_saturation: bool = False
+    #: The source's resolved automatic ceiling when it is not the data type's
+    #: maximum (decision 39): Auto also leaves out native values at or above it.
+    saturation: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    #: Flat field applied in pyFAI's normalization; unusable pixels are NaN
+    #: (see ``prepare_flatfield``), which pyFAI masks.
+    flat: np.ndarray | None = field(default=None, repr=False, compare=False)
+    #: Dark current pyFAI subtracts before integration; unusable pixels are NaN
+    #: (see ``prepare_dark``), which pyFAI masks.
+    dark: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.integration_1d is None and self.integration_2d is None:
@@ -615,6 +625,15 @@ class ReductionPlan:
             )
         if self.threshold_min is not None or self.threshold_max is not None:
             self.mask_saturation = False
+        for name in ("flat", "dark"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            value = np.asarray(value)
+            if value.ndim != 2:
+                raise ValueError(f"ReductionPlan.{name} must be a 2-D array.")
+            # pyFAI's compiled kernels refuse a read-only buffer; copy once here.
+            setattr(self, name, value if value.flags.writeable else value.copy())
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,9 +641,15 @@ class _WorkerThumbnailPrep:
     """Transient worker-only thumbnail facts resolved during reduction."""
 
     resolved_mask: np.ndarray | None
+    #: The background the reduction subtracted (``_dark_corrected_background``) and the plan it was
+    #: resolved with: the thumbnail takes it rather than computing it again (AUD-7), only while the frame
+    #: holds it (the prep is released after the worker's thumbnail).
+    background: np.ndarray | None = None
+    plan: object = None
 
 
 _THUMBNAIL_MASK_UNSET = object()
+_THUMBNAIL_BACKGROUND_UNSET = object()
 
 
 @dataclass(slots=True)
@@ -655,6 +680,9 @@ class FrameReduction:
         compare=False,
     )
     write_frame_record: bool = True
+    #: The Run's angular support of ``result_1d`` (COVERAGE-SUPPORT-20261013): an
+    #: ``AngularSupportProfile`` (available or with its reason), or None when the Run captures none.
+    angular_support_1d: Any = field(default=None, repr=False, compare=False)
 
 
 def _plan_mode_keys(plan: ReductionPlan | None) -> tuple[str, str]:
@@ -964,6 +992,21 @@ class CompositeSink:
             bind = getattr(sink, "bind_session", None)
             if callable(bind):
                 bind(facade)
+
+    @property
+    def recorded_angular_support(self) -> str | None:
+        """The children's one recorded coverage choice (an output sink's), or None; two different ones refuse."""
+        recorded = {value for value in (getattr(sink, "recorded_angular_support", None) for sink in self.sinks)
+                    if value is not None}
+        if len(recorded) > 1:
+            raise ValueError("the Run's output sinks recorded different angular coverage choices")
+        return next(iter(recorded), None)
+
+    def bind_angular_support(self, enabled: bool) -> None:
+        for sink in self.sinks:
+            bind = getattr(sink, "bind_angular_support", None)
+            if callable(bind):
+                bind(enabled)
 
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         for sink in self.sinks:
@@ -1643,6 +1686,8 @@ class NexusSink:
     _primary_mode_2d: str = field(default=DEFAULT_MODE_KEY, init=False, repr=False)
     _extension_owner: Any | None = field(default=None, init=False, repr=False)
     _pending_append_decision: Any | None = field(default=None, init=False, repr=False)
+    #: the Run's bound “Record angular coverage” choice, applied to every writer this sink opens
+    _angular_support_enabled: bool | None = field(default=None, init=False, repr=False)
     _epoch_decision: Any | None = field(default=None, init=False, repr=False)
     _source_snapshots: dict[str, dict[str, Any]] = field(
         default_factory=dict, init=False, repr=False,
@@ -2369,6 +2414,18 @@ class NexusSink:
             raise
 
     @property
+    def recorded_angular_support(self) -> str | None:
+        """The output's recorded “Record angular coverage” choice as this sink's writer opened it ("off", "on" or
+        None when it has no 1-D rows yet; COVERAGE-SUPPORT-20261013 contract B)."""
+        return None if self._writer is None else self._writer.recorded_angular_support
+
+    def bind_angular_support(self, enabled: bool) -> None:
+        """The Run's resolved choice, bound to the open writer and to every writer this sink opens later."""
+        self._angular_support_enabled = enabled
+        if self._writer is not None:
+            self._writer.bind_angular_support(enabled)
+
+    @property
     def extension_owner(self):
         if self._extension_owner is None:
             raise RuntimeError("sink has no active same-run extension owner")
@@ -2450,6 +2507,8 @@ class NexusSink:
                 primary_mode_1d=self._primary_mode_1d,
                 primary_mode_2d=self._primary_mode_2d,
             )
+            if self._angular_support_enabled is not None:  # a successor epoch keeps the Run's bound choice
+                writer.bind_angular_support(self._angular_support_enabled)
         except BaseException as primary:
             try:
                 self._abort_composed()
@@ -2608,7 +2667,8 @@ class NexusSink:
         drop_1d = result_1d is not None and not np.isfinite(
             np.asarray(result_1d.intensity, dtype=float)
         ).any()
-        drop_2d = result_2d is not None and self._unusable_2d(result_2d)
+        signed = _signed_point_difference(frame.metadata)
+        drop_2d = result_2d is not None and self._unusable_2d(result_2d, signed=signed)
         dropped = tuple(
             mode for mode, dropped in (
                 (ResultMode.one_d(mode_1d), drop_1d),
@@ -2629,7 +2689,7 @@ class NexusSink:
         if extras:
             companions = []
             for key, extra in extras.items():
-                if self._unusable_2d(extra):
+                if self._unusable_2d(extra, signed=signed):
                     dropped += (ResultMode.two_d(str(key)),)
                     continue
                 companions.append(self._write_frame_record(
@@ -2642,11 +2702,11 @@ class NexusSink:
         return record, dropped
 
     @staticmethod
-    def _unusable_2d(result_2d: IntegrationResult2D) -> bool:
+    def _unusable_2d(result_2d: IntegrationResult2D, *, signed: bool = False) -> bool:
         intensity_2d = np.asarray(result_2d.intensity, dtype=float)
         return bool(
             not np.isfinite(intensity_2d).any()
-            or (intensity_2d == -1.0).mean() >= 0.95
+            or (not signed and (intensity_2d == -1.0).mean() >= 0.95)
             or not np.isfinite(np.asarray(result_2d.radial, dtype=float)).any()
             or not np.isfinite(np.asarray(result_2d.azimuthal, dtype=float)).any()
         )
@@ -2692,6 +2752,10 @@ class NexusSink:
                 if worker_prep is None
                 else worker_prep.resolved_mask
             ),
+            # the background the reduction subtracted, resolved with this sink's plan (AUD-7)
+            **({} if worker_prep is None or worker_prep.background is None
+               or worker_prep.plan is not self._plan
+               else {"background": worker_prep.background}),
         )
         reduction.thumbnail, reduction._thumbnail_mask_baked = prepared
 
@@ -2701,6 +2765,7 @@ class NexusSink:
         *,
         corrected_image: np.ndarray | None = None,
         resolved_mask: np.ndarray | None | object = _THUMBNAIL_MASK_UNSET,
+        background: np.ndarray | None | object = _THUMBNAIL_BACKGROUND_UNSET,
     ) -> tuple[np.ndarray | None, bool]:
         from xrd_tools.io.nexus_record import make_thumbnail_array
 
@@ -2708,12 +2773,24 @@ class NexusSink:
             return None, False
         raw = np.asarray(frame.image)
         if corrected_image is None:
-            background = frame.background
+            # The worker skips the corrected copy for this sink, so apply the
+            # plan's flat and dark here as the reduction does, with the
+            # background the reduction subtracted when it is given (AUD-7).
+            plan = self._plan
+            if plan is not None and _signed_point_difference(frame.metadata):
+                plan = replace(plan, dark=None)
+            if background is _THUMBNAIL_BACKGROUND_UNSET:
+                background = (frame.background if plan is None
+                              else _dark_corrected_background(frame, plan))
             if background is not None:
                 bg = np.asarray(background)
                 if bg.shape != () and bg.shape != raw.shape:
                     background = None
-            image = _thumbnail_corrected_image(raw, background)
+            image = _thumbnail_corrected_image(
+                raw, background,
+                None if plan is None else plan.flat,
+                None if plan is None else plan.dark,
+            )
             owns_image = True
         else:
             image = np.asarray(corrected_image, dtype=np.float32)
@@ -2729,7 +2806,13 @@ class NexusSink:
             resolved_mask = detector_value_mask(
                 static_mask, raw,
                 enabled=bool(plan is not None and plan.mask_saturation),
+                saturation=None if plan is None else plan.saturation,
             )
+            if plan is not None and not isinstance((frame.metadata or {}).get("point_images"), Mapping):
+                threshold_mask = _threshold_mask(raw, plan)
+                if threshold_mask is not None:
+                    resolved_mask = (threshold_mask if resolved_mask is None
+                                     else resolved_mask | threshold_mask)
         return (
             make_thumbnail_array(
                 image,
@@ -2766,6 +2849,17 @@ class NexusSink:
         configuration = self._run_configuration or {}; active = configuration.get("background") if "background" in configuration else None
         if active is not None and (None in dependency or __import__("json").loads(dependency[0])["policy"] != active): raise ValueError("active Background policy requires its exact frame dependency")
         if active is None and any(value is not None for value in dependency): raise ValueError("inactive Background policy forbids a frame dependency")
+        point = (frame.metadata or {}).get("point_images")
+        constituents = ()
+        policy = None
+        if isinstance(point, Mapping):
+            from xrd_tools.sources.point_images import PointImagePolicy
+            policy = PointImagePolicy.from_dict({key: point[key] for key in ("images_per_point", "operation", "image_index", "reverse")}).to_dict()
+            fact = getattr(frame, "source_identity", None)
+            constituents = (tuple({**member, "source_snapshot": {key: value for key, value in member["source_snapshot"].items() if value is not None}} for member in fact.get("source_constituents", ())) if isinstance(fact, Mapping) else ())
+            if not constituents:
+                constituents = tuple({"source_path": locator["path"], "source_frame_index": int(locator["frame"]), "source_snapshot": self._source_snapshots.get(str(locator["path"]), {})} for locator in point["raw_locators"])
+            path, source_snapshot = None, {}
         return RecordWrite(
             label=int(frame.index),
             result_1d=result_1d,
@@ -2776,8 +2870,10 @@ class NexusSink:
             thumbnail_mask_baked=mask_baked,
             mask_baked=mask_baked,
             source_path=path,
-            source_frame_index=int(getattr(frame, "source_frame_index", None) or 0),
+            source_frame_index=0 if constituents else int(getattr(frame, "source_frame_index", None) or 0),
             source_snapshot=source_snapshot,
+            source_constituents=constituents,
+            point_images=policy,
             timestamp=(getattr(frame, "metadata", None) or {}).get("timestamp"),
             metadata=dict(
                 getattr(reduction, "metadata", None)
@@ -2788,6 +2884,9 @@ class NexusSink:
             replace_existing=replace_existing,
             background_dependency_bytes=dependency[0],
             background_dependency_fingerprint=dependency[1],
+            # the Run's support describes the primary 1-D result only; companions and dropped rows carry none
+            angular_support=(getattr(reduction, "angular_support_1d", None)
+                             if result_1d is not None and result_1d is reduction.result_1d else None),
         )
 
     def replace(self, frame: Frame, reduction: FrameReduction):
@@ -2821,10 +2920,13 @@ class NexusSink:
         if not self._perf_nexus_enabled:
             return {}
         with self._perf_nexus_lock:
-            return {
+            values = {
                 "sink_nexus_write": self._perf_nexus_write,
                 "sink_nexus_flush": self._perf_nexus_flush,
             }
+        if self._writer is not None:
+            values.update(self._writer.perf_snapshot())
+        return values
 
     def _writer_finalization(self, writer: NexusRecordWriter) -> WriterFinalization:
         if self._replacement is not None: return WriterFinalization()
@@ -2848,8 +2950,10 @@ class NexusSink:
                 (scan, plan), include_inputs=writer.fresh
             )
             if self._run_configuration is not None:
-                config["run_configuration"] = copy.deepcopy(
-                    self._run_configuration,
+                from xrd_tools.reduction.provenance_config import gi_aligned_run_configuration
+                # a GI Run records the settings it ran: its modes and its freeze's ranges (G1)
+                config["run_configuration"] = gi_aligned_run_configuration(
+                    self._run_configuration, config,
                 )
             if self._source_execution is not None:
                 config["source_execution"] = copy.deepcopy(
@@ -2872,9 +2976,8 @@ class NexusSink:
             detector_calibration=(scan.extra or {}).get("detector_calibration"),
             global_mask=(scan.extra or {}).get("global_mask"),
             detector_shape=(scan.extra or {}).get("detector_shape"),
-            stitched_1d=(scan.extra or {}).get("stitched_1d"),
-            stitched_2d=(scan.extra or {}).get("stitched_2d"),
-            stitched_provenance=(scan.extra or {}).get("stitched_provenance"),
+            flatfield=(scan.extra or {}).get("flatfield"),
+            darkcurrent=(scan.extra or {}).get("darkcurrent"),
             average_finite_counts=(scan.extra or {}).get(
                 "average_finite_counts",
             ),
@@ -3213,7 +3316,13 @@ class ReductionSession:
     only a blocking, no-argument ``result()``.  That is not structurally
     probeable, so an inline executor is unsupported for streaming (use chunked
     execution or an async adapter), not rejected up front.  An ``accept_cb``
-    has shape ``(frame, publisher) -> int`` and publishes that exact attempt."""
+    has shape ``(frame, publisher) -> int`` and publishes that exact attempt.
+
+    The plan's flat and dark are read as they are at each frame (only the mask is
+    snapshotted at construction).  Arrays the session derives from them once (the
+    dark clipped for the Poisson variance, AUD-7) follow them at every ``process()``
+    call and at a ``submit()`` with no frame in flight; changing a correction while
+    frames are in flight is unsupported."""
 
     plan: ReductionPlan
     source: Scan | FrameSource
@@ -3250,6 +3359,13 @@ class ReductionSession:
     # RAISES on missing-normalization / GI-all-dummy instead of writing bad
     # data; the xdart GUI passes StrictPolicy.graceful() (never abort a save).
     strict: StrictPolicy = field(default_factory=StrictPolicy.loud)
+    # COVERAGE-SUPPORT-20261013: angular support capture (an AngularSupportPolicy; None = the default
+    # policy; False = a path that never captures support, such as Average). Support never changes intensity.
+    angular_support: Any = None
+    # Contract B: the output's recorded choice as the sink opened it ("off", "on", None for a new output) and the
+    # policy the Run adopted from it (the request when the Run creates the output), set when the session begins.
+    recorded_angular_support: Any = field(default=None, init=False, repr=False)
+    effective_angular_support: Any = field(default=None, init=False, repr=False)
     # H10-C1: ONE narrow synchronous acceptance-admission hook, invoked on the
     # CALLER thread inside submit() in publication order (§18.2) — Future bound,
     # the same undecided ticket queued, inventory staged, THEN this authority runs
@@ -3288,6 +3404,13 @@ class ReductionSession:
         default_factory=dict, init=False, repr=False,
     )
     _frame_masks: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    # AUD-7: the plan's arrays derived once (the dark clipped for the Poisson
+    # variance), shared with the pool workers as _plan_masks is; cleared at each
+    # process() and at a submit() with nothing in flight, the boundaries where a
+    # caller may change the plan's dark (Codex AUD-7 review F1).
+    _plan_derived: dict[str, tuple[np.ndarray, np.ndarray]] = field(
         default_factory=dict, init=False, repr=False,
     )
     # S8: per-SCAN monitor warn-once state (shared with pool workers like
@@ -3445,6 +3568,7 @@ class ReductionSession:
             ai = self.scan.integrator
             if ai is None and self.scan.poni is None:
                 raise ValueError("Reduction requires scan.integrator or scan.poni.")
+            self.plan = _freeze_energy_scan_q_grid(self.plan, ai, self.scan.poni)
 
         self._integrators = _ReductionIntegratorProvider(
             scan=self.scan,
@@ -3452,6 +3576,7 @@ class ReductionSession:
             ai=ai,
             fi=fi,
             initial_incident_angle=self._initial_incident_angle,
+            support=_support_capture(self.angular_support),
         )
         self.integrator_provider_builds = 1
         # Validate BEFORE acquiring resources: sink.begin() opens an h5 handle
@@ -3476,6 +3601,7 @@ class ReductionSession:
         try:
             self._worker, self._owns_worker = _coerce_executor(self.executor)
             self._sink.begin(self.scan, self.plan)
+            self._bind_angular_support()
             self._started = True
             _emit(self.progress_cb, self.scan.name, "start", None, 0, len(self.scan))
             if self.execution == "streaming":
@@ -3486,6 +3612,24 @@ class ReductionSession:
             except BaseException as cleanup:
                 raise primary from cleanup
             raise
+
+    def _bind_angular_support(self) -> None:
+        """Contract B (COVERAGE-SUPPORT-20261013): an output keeps the “Record angular coverage” choice it was
+        created with. The sink reports the choice its output recorded; the Run adopts it, else its own request,
+        before any frame is reduced, and binds the result to the sink (off: one marker, nothing per frame)."""
+        if self.angular_support is False:  # Average never captures support
+            return
+        from dataclasses import replace as _replace
+        from xrd_tools.analysis.angular_support import AngularSupportPolicy
+        requested = AngularSupportPolicy() if self.angular_support is None else self.angular_support
+        recorded = getattr(self._sink, "recorded_angular_support", None)
+        effective = requested if recorded is None else _replace(requested, enabled=recorded == "on")
+        if effective.enabled is not requested.enabled:
+            self._integrators.support = _support_capture(effective)
+        self.recorded_angular_support, self.effective_angular_support = recorded, effective
+        bind = getattr(self._sink, "bind_angular_support", None)
+        if callable(bind):
+            bind(effective.enabled)
 
     def __enter__(self) -> ReductionSession:
         return self
@@ -3551,6 +3695,8 @@ class ReductionSession:
             )
         if self._finished:
             raise RuntimeError("ReductionSession.process called after finish().")
+        # the plan's dark may have changed since the last call: derive again (AUD-7 F1)
+        self._plan_derived.clear()
         if self._paused:
             raise RuntimeError(
                 "ReductionSession.process called while paused; call resume() first"
@@ -3562,7 +3708,7 @@ class ReductionSession:
         try:
             if frames_or_chunk is None:
                 for chunk, chunk_images in _iter_reduction_chunks(
-                    self.source, self.scan, self.chunk_size,
+                    self.source, self.scan, self.chunk_size, self.plan,
                 ):
                     self._process_chunk(chunk, chunk_images)
                     if self._is_cancelled():
@@ -3665,6 +3811,10 @@ class ReductionSession:
             return False
         label = int(frame.index)
         ticket = _StreamPublication(frame)
+        if self._inflight.idle():
+            # nothing in flight, so no worker reads the derived arrays: the plan's
+            # dark may have changed since the last frame (AUD-7 F1)
+            self._plan_derived.clear()
         try:
             while not self._inflight.try_acquire(ticket, 0.1):
                 if self._is_cancelled():
@@ -3815,6 +3965,7 @@ class ReductionSession:
                 frame, image, self.plan, self._integrators, self._plan_masks,
                 self._frame_masks,
                 self.cancel_token, self._warned_monitor_keys,
+                plan_derived=self._plan_derived,
                 include_corrected_image=(
                     has_worker_process
                     and _worker_process_requires_corrected_image(self._sink)
@@ -3939,7 +4090,7 @@ class ReductionSession:
             elif kind == "failed" or (kind == "prep_failed" and emitted):
                 self._record_failure(error)
             if self.clear_frame_images:
-                frame.image = None
+                frame.image = None; frame.point_variance = None
                 frame.background = None
         finally:
             self._complete_stream_publication(ticket)
@@ -3956,7 +4107,7 @@ class ReductionSession:
                 self._record_failure(exc)
                 outcomes_ok = False
                 if self.clear_frame_images:
-                    frame.image = None
+                    frame.image = None; frame.point_variance = None
                     frame.background = None
         try:
             if not outcomes_ok:
@@ -4000,7 +4151,7 @@ class ReductionSession:
                         _emit(self.progress_cb, self.scan.name, "write",
                               frame.index, self._completed, len(self.scan))
                         if self.clear_frame_images:
-                            frame.image = None
+                            frame.image = None; frame.point_variance = None
                             frame.background = None
                             _clear_source_frame_image(self.source, frame.index)
                     except BaseException as exc:
@@ -4434,6 +4585,7 @@ class ReductionSession:
                         self._frame_masks,
                         cancel_token=self.cancel_token,
                         warned_monitor_keys=self._warned_monitor_keys,
+                        plan_derived=self._plan_derived,
                         strict=self.strict,
                     )
                 except _ReductionCancelled:
@@ -4467,6 +4619,7 @@ class ReductionSession:
                         self._frame_masks,
                         self.cancel_token,
                         self._warned_monitor_keys,
+                        plan_derived=self._plan_derived,
                         strict=self.strict,
                     ),
                 ))
@@ -4512,7 +4665,7 @@ class ReductionSession:
                 self._written_attempts += 1
                 _emit(self.progress_cb, self.scan.name, "write", frame.index, self._completed, len(self.scan))
                 if self.clear_frame_images:
-                    frame.image = None
+                    frame.image = None; frame.point_variance = None
                     frame.background = None
                     _clear_source_frame_image(self.source, frame.index)
                 if _cancel_requested(self.cancel_token):
@@ -4537,7 +4690,7 @@ class ReductionSession:
                 _wait_pending_futures(pending[pos + 1:], worker=self._worker)
                 for _frame, _ in pending:
                     try:
-                        _frame.image = None
+                        _frame.image = None; _frame.point_variance = None
                         _frame.background = None
                     except Exception:
                         pass
@@ -4559,6 +4712,7 @@ def run_reduction(
     inflight_max: int | None = None,
     retain_products: bool | None = None,
     strict: StrictPolicy | None = None,
+    angular_support: Any = None,
 ) -> ReductionResult:
     """Run a headless reduction job over all frames in ``scan`` or a source.
 
@@ -4652,6 +4806,7 @@ def run_reduction(
         inflight_max=inflight_max,
         retain_products=retain_products,
         strict=strict if strict is not None else StrictPolicy.loud(),
+        angular_support=angular_support,
     ) as session:
         if execution == "streaming":
             # Streaming drains via submit() (process() is rejected); feed every
@@ -4672,7 +4827,7 @@ def run_reduction(
             # (in-memory / lazy) load behavior unchanged.
             stop = False
             for chunk_frames, chunk_images in _iter_reduction_chunks(
-                    session.source, session.scan, chunk_size):
+                    session.source, session.scan, chunk_size, plan):
                 for frame, image in zip(chunk_frames, chunk_images):
                     if _cancel_requested(session.cancel_token):
                         stop = True
@@ -4930,11 +5085,11 @@ def _apply_gi_freeze_policy(
         if reduction.result_1d is not None:
             scout_results_1d.append(reduction.result_1d)
         if reduction.result_2d is not None:
-            if _is_all_dummy_2d(reduction.result_2d):
+            if _is_all_dummy_2d(reduction.result_2d, signed=_signed_point_difference(reduction.metadata)):
                 continue
             scout_results_2d.append(reduction.result_2d)
         if was_empty:
-            frame.image = None
+            frame.image = None; frame.point_variance = None
 
     out = plan
     if needs_1d is not None and scout_results_1d:
@@ -4984,7 +5139,12 @@ def _apply_gi_freeze_policy(
     return out
 
 
-def _is_all_dummy_2d(result: IntegrationResult2D, *, dummy: float = -1.0) -> bool:
+def _signed_point_difference(metadata: Mapping[str, Any]) -> bool:
+    point = metadata.get("point_images", metadata.get("average_point_images"))
+    return isinstance(point, Mapping) and point.get("operation") == "difference"
+
+
+def _is_all_dummy_2d(result: IntegrationResult2D, *, dummy: float = -1.0, signed: bool = False) -> bool:
     intensity = getattr(result, "intensity", None)
     if intensity is None:
         return False
@@ -4994,7 +5154,7 @@ def _is_all_dummy_2d(result: IntegrationResult2D, *, dummy: float = -1.0) -> boo
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return True
-    return bool(np.all(finite <= dummy))
+    return not signed and bool(np.all(finite <= dummy))
 
 
 def _gi_freeze_scout_indices(
@@ -5013,10 +5173,17 @@ def _gi_freeze_scout_indices(
                 raise ValueError(f"GI freeze scout frame {idx} is not in scan {scan.name!r}")
             if idx not in out:
                 out.append(idx)
-        return out
-    if freeze_policy == "first_frame" or len(scan.frames) == 1:
-        return [int(scan.frames[0].index)]
-    return [int(scan.frames[0].index), int(scan.frames[-1].index)]
+    elif freeze_policy == "first_frame" or len(scan.frames) == 1:
+        out = [int(scan.frames[0].index)]
+    else:
+        out = [int(scan.frames[0].index), int(scan.frames[-1].index)]
+    # An energy scan's lowest- and highest-energy frames bound its q extents too.
+    wavelengths = _energy_scan_wavelengths(plan)
+    listed = [int(label) for label in scan.frame_indices if int(label) in (wavelengths or {})]
+    for idx in ((min(listed, key=wavelengths.get), max(listed, key=wavelengths.get)) if listed else ()):
+        if idx not in out:
+            out.append(idx)
+    return out
 
 
 def _gi_1d_freeze_key(plan: ReductionPlan) -> str | None:
@@ -5086,7 +5253,90 @@ def _replace_integration_2d_ranges(
     return replace(plan, integration_2d=p2d)
 
 
-_PYFAI_COLD_GEOMETRY_LOCK = threading.Lock()
+# Shared with Stitch's frame workers: one lock for all pyFAI numexpr work in the process.
+_PYFAI_COLD_GEOMETRY_LOCK = PYFAI_NUMEXPR_LOCK
+
+#: Radial units that do not depend on the X-ray energy (maintainer, 2026-10-10: "2θ never needs one energy").
+_ENERGY_FREE_UNITS = frozenset({"2th_deg", "2th_rad", "r_mm", "r_m"})
+_Q_UNITS = frozenset({"q_nm^-1", "q_a^-1"})
+#: plan.extra key: an energy scan's common q range per dimension, applied as each frame is
+#: integrated (as COMPANION_RANGES_2D is), so the recorded integration settings stay the
+#: user's and Reintegrate derives the same grid from the persisted energies.
+ENERGY_SCAN_Q_RANGES = "energy_scan_q_ranges"
+
+
+def _energy_scan_wavelengths(plan: ReductionPlan) -> dict[int, float] | None:
+    """An energy scan's own wavelength (m) for each frame label its energy selection lists, or None.
+
+    None also when nothing the plan integrates depends on the energy: a standard plan in 2θ keeps one
+    integrator for every frame.
+    """
+    selection = (getattr(plan, "extra", None) or {}).get("energy_selection")
+    if not isinstance(selection, Mapping) or "frame_energies_eV" not in selection:
+        return None
+    if plan.gi is None and all(
+        str(item.unit or "").lower() in _ENERGY_FREE_UNITS
+        for item in (plan.integration_1d, plan.integration_2d) if item is not None
+    ):
+        return None
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    return {
+        int(label): energy_eV_to_wavelength_m(float(energy))
+        for label, energy in zip(selection["frame_labels"], selection["frame_energies_eV"], strict=True)
+    }
+
+
+def _freeze_energy_scan_q_grid(plan: ReductionPlan, integrator: Any, poni: Any = None) -> ReductionPlan:
+    """Give a standard energy scan in q one radial range, so that every frame, reduced at its own energy, shares
+    one grid: from the lowest energy's lowest q to the highest energy's highest q over every pixel's extent
+    (centre ± delta). A range the plan sets is kept, 2θ needs none, and the writer's common-axis check is
+    unchanged (maintainer, 2026-10-10: "q needs each frame reduced at its own energy on a common grid").
+    The ranges go to ``plan.extra[ENERGY_SCAN_Q_RANGES]``. Without an accepted integrator, one is built from
+    *poni* only when there is a grid to compute."""
+    wavelengths = _energy_scan_wavelengths(plan)
+    if wavelengths is None or plan.gi is not None:
+        return plan
+    targets = {}
+    for key, item in (("1d", plan.integration_1d), ("2d", plan.integration_2d)):
+        if item is None or key == "1d" and standard_chi_profile(plan):
+            continue  # a chi profile's axis is the azimuth; its q band is the user's
+        unit = str(item.unit or "").lower()
+        if unit in _ENERGY_FREE_UNITS:
+            continue
+        if unit not in _Q_UNITS:
+            raise ValueError(f"an energy scan is reduced in q or 2θ, not {item.unit}")
+        if item.radial_range is None:
+            targets[key] = str(item.unit)  # pyFAI's unit names are case-sensitive
+    if not targets:
+        return plan
+    if integrator is None:
+        integrator = poni_to_integrator(poni)
+    shape = getattr(getattr(integrator, "detector", None), "shape", None)
+    if shape is None:
+        raise ValueError("an energy scan needs its detector's shape to share one q grid")
+    from xrd_tools.integrate.calibration import _clone_integrator_preserving_calibration
+    clone = _clone_integrator_preserving_calibration(integrator)
+    ranges = {}
+    with _PYFAI_COLD_GEOMETRY_LOCK:
+        for unit in sorted(set(targets.values())):
+            lows, highs = [], []
+            for wavelength in (max(wavelengths.values()), min(wavelengths.values())):
+                clone.wavelength = wavelength
+                centre = clone.array_from_unit(shape, "center", unit, scale=True)
+                delta = clone.array_from_unit(shape, "delta", unit, scale=True)
+                lows.append(float(np.min(centre - delta)))
+                highs.append(float(np.max(centre + delta)))
+            ranges[unit] = (max(0.0, min(lows)), max(highs))
+    return replace(plan, extra={
+        **plan.extra, ENERGY_SCAN_Q_RANGES: {key: ranges[unit] for key, unit in targets.items()},
+    })
+
+
+def _on_energy_scan_grid(item: Any, grid: Mapping[str, Any] | None, key: str) -> Any:
+    """One integration on its energy scan's common q range (``_freeze_energy_scan_q_grid``)."""
+    if not grid or item is None or key not in grid:
+        return item
+    return replace(item, radial_range=tuple(map(float, grid[key])))
 
 
 class _ReductionIntegratorProvider:
@@ -5100,14 +5350,24 @@ class _ReductionIntegratorProvider:
         ai: Any,
         fi: Any,
         initial_incident_angle: float | None,
+        support: Any = None,
     ) -> None:
         self.scan = scan
         self.plan = plan
         self.ai = ai
         self.fi = fi
         self.initial_incident_angle = initial_incident_angle
+        #: The Run's angular support capture (one per Run, shared by every worker), or None.
+        self.support = support
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
+        # An energy scan reduces each frame at its own wavelength on a private integrator;
+        # a frame its energies do not list takes the representative (base) wavelength.
+        self._frame_wavelengths = _energy_scan_wavelengths(plan)
+        self._base_wavelength = None
+        if self._frame_wavelengths is not None:
+            base = getattr(ai, "wavelength", None) or getattr(scan.poni, "wavelength", None)
+            self._base_wavelength = None if base is None else float(base)
 
     def _new_standard(self) -> Any:
         """Build one private standard integrator from the accepted calibration."""
@@ -5122,20 +5382,41 @@ class _ReductionIntegratorProvider:
         local_ai = getattr(self._local, "ai", None)
         if local_ai is not None:
             return local_ai
-        if self.scan.poni is None:
-            return self.ai
-        if threading.get_ident() == self._owner_thread and self.ai is not None:
-            return self.ai
-        # Per-worker AI (pyFAI AIs aren't safe to share across threads).
+        if self._frame_wavelengths is None:
+            if self.scan.poni is None:
+                return self.ai
+            if threading.get_ident() == self._owner_thread and self.ai is not None:
+                return self.ai
+        # Per-worker AI (pyFAI AIs aren't safe to share across threads).  An energy
+        # scan's frames each set their own wavelength, so even the owner thread
+        # never shares the accepted base integrator then.
         # Deep-copy the base integrator instead of rebuilding from scan.poni:
         # a PONI cannot recover an unnamed detector's pixel size.
         ai = self._new_standard()
         self._local.ai = ai
         return ai
 
+    def alternate(self, ai: Any, frame: Frame, shape: tuple[int, ...]) -> Any:
+        """``ai`` with its chi discontinuity at zero: one per worker and standard integrator.
+
+        Cloned from the integrator the frame already uses (calibration, bound mask, energy), it
+        then follows each frame's energy as that one does; ``ai`` itself is never changed.
+        """
+        cached = getattr(self._local, "alternate", None)
+        if cached is None or cached[0] is not ai:
+            from xrd_tools.integrate.calibration import _clone_integrator_preserving_calibration
+            with _PYFAI_COLD_GEOMETRY_LOCK:
+                clone = _clone_integrator_preserving_calibration(ai)
+                clone.setChiDiscAtZero()
+                clone.reset_engines(collect_garbage=False)
+                self._warm_standard_centers(clone, (int(shape[0]), int(shape[1])))
+            cached = self._local.alternate = (ai, clone)
+        self.at_frame_energy(cached[1], frame, shape, warm=True)
+        return cached[1]
+
     def _unbound_standard(self) -> Any:
         """Discard an optional bound clone and return the established AI path."""
-        for name in ("ai", "run_mask_binding"):
+        for name in ("ai", "run_mask_binding", "alternate"):
             try:
                 delattr(self._local, name)
             except AttributeError:
@@ -5151,6 +5432,7 @@ class _ReductionIntegratorProvider:
         """Cache a negative admission without rebuilding on every frame."""
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, False)
+        self._local.alternate = None
         return ai, False
 
     def _warm_standard_centers(
@@ -5166,6 +5448,11 @@ class _ReductionIntegratorProvider:
         still provide the scientific isolation; this small process-wide lock
         covers only their one-time geometry construction.
         """
+        for unit in self._standard_units():
+            ai.array_from_unit(shape, "center", unit, scale=False)
+
+    def _standard_units(self) -> tuple[str, ...]:
+        """The radial and azimuthal units the plan's standard integrations use."""
         units: list[str] = []
         one_d = getattr(self.plan, "integration_1d", None)
         if one_d is not None:
@@ -5178,8 +5465,7 @@ class _ReductionIntegratorProvider:
         two_d = getattr(self.plan, "integration_2d", None)
         if two_d is not None:
             units.extend((two_d.unit, "chi_deg"))
-        for unit in dict.fromkeys(units):
-            ai.array_from_unit(shape, "center", unit, scale=False)
+        return tuple(dict.fromkeys(units))
 
     def standard_with_run_mask(
         self,
@@ -5256,12 +5542,43 @@ class _ReductionIntegratorProvider:
 
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, True)
+        self._local.alternate = None  # a new binding retires the previous alternate
         return ai, True
+
+    def at_frame_energy(
+        self, integrator: Any, frame: Frame, shape: tuple[int, ...], *, warm: bool,
+    ) -> None:
+        """Set an energy scan frame's own wavelength on this thread's private integrator.
+
+        A frame the scan's energies do not list (one appended later) takes the
+        representative energy. pyFAI's wavelength setter resets the geometry, so a
+        standard integrator's arrays that pyFAI builds with numexpr (centres, pixel
+        extents and polarization) are rebuilt under the lock, as at its first binding,
+        rather than inside every worker's integration.
+        """
+        wavelengths = self._frame_wavelengths
+        if wavelengths is None or integrator is None:
+            return
+        wavelength = wavelengths.get(int(frame.index), self._base_wavelength)
+        if wavelength is None or float(integrator.wavelength) == wavelength:
+            return
+        with _PYFAI_COLD_GEOMETRY_LOCK:
+            integrator.wavelength = wavelength
+            if warm:
+                frame_shape = (int(shape[0]), int(shape[1]))
+                self._warm_standard_centers(integrator, frame_shape)
+                for unit in self._standard_units():
+                    integrator.array_from_unit(frame_shape, "delta", unit, scale=False)
+                for factor in {item.polarization_factor for item in (self.plan.integration_1d,
+                                                                     self.plan.integration_2d)
+                               if item is not None and item.polarization_factor is not None}:
+                    integrator.polarization(frame_shape, factor, with_checksum=True)
 
     def fiber(self) -> Any:
         if self.scan.poni is None:
             return self.fi
-        if threading.get_ident() == self._owner_thread and self.fi is not None:
+        if (threading.get_ident() == self._owner_thread and self.fi is not None
+                and self._frame_wavelengths is None):
             return self.fi
         fi = getattr(self._local, "fi", None)
         if fi is None:
@@ -5344,6 +5661,10 @@ class _InFlightWindow:
         self._changed.wait(timeout)
         self._changed.clear()
         return False
+
+    def idle(self) -> bool:
+        """No frame in flight (read by the one orchestrating thread before it submits)."""
+        return not self._members
 
     def release(self, ticket: _StreamPublication) -> bool:
         first: BaseException | None = None
@@ -5458,6 +5779,8 @@ def _wait_pending_futures(pending: list[tuple[Frame, Any]], *, worker: Any | Non
             pass
 
 
+#: Env-gated diagnostic: log which 1-D producer ran and whether it returned sigma.
+_DEBUG_UNCERTAINTY = os.environ.get("XDART_DEBUG_UNCERTAINTY") == "1"
 _FLOAT32_CSR_ERROR_MODELS = frozenset((None, "no", "poisson", "azimuthal", "hybrid"))
 _FLOAT32_CSR_EXTRAS = frozenset(("correctSolidAngle", "dummy", "delta_dummy", "safe"))
 
@@ -5575,6 +5898,8 @@ def _can_use_owned_float32_csr(
         and raw_image.flags.c_contiguous
         and plan.gi is None
         and background is None
+        and plan.flat is None
+        and plan.dark is None
         and integrator_input_safe is True
         and bool(enabled)
         and not (
@@ -5583,6 +5908,39 @@ def _can_use_owned_float32_csr(
         )
         and all(_float32_csr_options_are_safe(item) for item in enabled)
     )
+
+
+def standard_chi_profile(plan: ReductionPlan) -> bool:
+    """Whether the 1-D output is the standard (non-GI) χ profile.
+
+    pyFAI integrates that profile without variance, so it carries no sigma
+    even when an error model is set.
+    """
+    p1 = plan.integration_1d
+    return plan.gi is None and p1 is not None and str(p1.unit or "").lower() == "chi_deg"
+
+
+def result_1d_has_sigma(plan: ReductionPlan) -> bool:
+    """Whether the 1-D result carries sigma.
+
+    Uncertainty is requested by an error model other than ``"no"`` or by an
+    explicit ``variance``. Only pyFAI's radial integration propagates it: the
+    standard q/2θ profile and the grazing-incidence total-q profile over the full
+    χ range. The χ profile, a total-q χ wedge (``integrate1d_polar``) and the
+    other grazing-incidence profiles return none. The dispatch uses the same
+    predicates, and a test pins this rule to every producer's actual output.
+    """
+    p1 = plan.integration_1d
+    if p1 is None:
+        return False
+    model = p1.error_model
+    if (model is None or str(model).strip().lower() == "no") and "variance" not in p1.extra:
+        return False
+    if plan.gi is None:
+        return not standard_chi_profile(plan)
+    from xrd_tools.integrate.gid import gi_total_q_uses_radial
+
+    return plan.gi.mode_1d is GI1DMode.Q_TOTAL and gi_total_q_uses_radial(p1.azimuth_range)
 
 
 def _reduce_frame(
@@ -5598,13 +5956,34 @@ def _reduce_frame(
     include_corrected_image: bool = False,
     include_worker_thumbnail_prep: bool = False,
     strict: StrictPolicy | None = None,
+    plan_derived: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> FrameReduction:
     if _cancel_requested(cancel_token):
         raise _ReductionCancelled
+    point_policy = (frame.metadata or {}).get("point_images")
+    grouped = isinstance(point_policy, Mapping)
+    signed_point = _signed_point_difference(frame.metadata)
+    if signed_point and grouped:
+        frame.metadata = {**frame.metadata, "point_images": {
+            **point_policy, "positive_total_screening": False,
+        }}
+    if grouped and frame.point_statistics_loader is not None:
+        statistics = frame.point_statistics_loader(
+            frame.index,
+            poisson=_wants_poisson(plan),
+            native_transform=lambda native: _condition_point_operand(native, plan),
+        )
+        raw_image = statistics.signal
+        frame.point_variance = statistics.variance
+        frame.point_exposure_multiplier = statistics.exposure_multiplier
+    if grouped and float(frame.point_exposure_multiplier) == 0.0:
+        if frame.background is not None:
+            raise ValueError("Difference does not support an external frame background")
+        plan = replace(plan, dark=None)
     if raw_image is not None:
         frame.image = np.asarray(raw_image)
     raw_image_arr = np.asarray(frame.load_image())  # pre-float: integer dtype for the saturation ceiling
-    use_float32_csr = _can_use_owned_float32_csr(
+    use_float32_csr = not grouped and _can_use_owned_float32_csr(
         raw_image_arr,
         frame.background,
         plan,
@@ -5622,8 +6001,9 @@ def _reduce_frame(
     if image.ndim != 2:
         raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")
     _validate_frame_inputs(frame, image.shape, frame_masks)
+    background = _dark_corrected_background(frame, plan)
     corrected_image = (
-        _thumbnail_corrected_image(raw_image_arr, frame.background)
+        _thumbnail_corrected_image(raw_image_arr, background, plan.flat, plan.dark)
         if include_corrected_image
         else None
     )
@@ -5631,18 +6011,26 @@ def _reduce_frame(
     # converted to float32. Explicit bounds already suppress saturation in the
     # plan, and both policies reject into the same owned integration buffer.
     value_mask = _threshold_mask(raw_image_arr, plan) if use_float32_csr else None
-    if value_mask is None:
+    if value_mask is None and not grouped:
         value_mask = detector_value_mask(
             None, raw_image_arr, enabled=bool(plan.mask_saturation),
+            saturation=plan.saturation,
         )
     if value_mask is not None:
         # Like intensity thresholds, reject values in the owned working image.
         # Keep the native dtype for detection and the static geometric mask for
         # integration axes/cache reuse; a recovered pixel is valid next frame.
         image[value_mask] = np.nan
+    variance = None
     if not use_float32_csr:
-        image = _apply_thresholds_owned(image, plan)
-        image = _subtract_background(image, frame.background)
+        if not grouped:
+            image = _apply_thresholds_owned(image, plan)
+        variance = _poisson_variance(image, frame, plan, plan_derived)
+        image = _subtract_background(image, background)
+    # Poisson plans with a dark or background integrate with an explicit variance.
+    grid = (plan.extra or {}).get(ENERGY_SCAN_Q_RANGES)
+    p1_frame = _with_variance(_on_energy_scan_grid(plan.integration_1d, grid, "1d"), variance)
+    p2_frame = _with_variance(_on_energy_scan_grid(plan.integration_2d, grid, "2d"), variance)
     plan_mask = _cached_mask_for_shape(
         plan.mask,
         image.shape,
@@ -5651,6 +6039,8 @@ def _reduce_frame(
     )
     frame_mask = _combined_mask(None, frame.mask, image.shape, frame_masks)
     extra_results_2d: dict[str, IntegrationResult2D] | None = None
+    support_capture = getattr(integrators, "support", None)
+    angular_support_1d = None
 
     if plan.gi is not None:
         mask = (
@@ -5661,30 +6051,40 @@ def _reduce_frame(
             else plan_mask | frame_mask
         )
         fi = integrators.fiber()
+        at_energy = getattr(integrators, "at_frame_energy", None)
+        if at_energy is not None:
+            at_energy(fi, frame, image.shape, warm=False)
         incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
         r1d = (
             _run_gi_1d(
                 image,
                 fi,
-                plan.integration_1d,
+                p1_frame,
                 plan.gi,
                 mask=mask,
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, plan.integration_1d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
+                dark=plan.dark,
             )
             if plan.integration_1d is not None else None
         )
+        if support_capture is not None and r1d is not None:
+            angular_support_1d = _gi_frame_support(
+                support_capture, fi, mask, plan, p1_frame, incident_angle, r1d, grouped, cancel_token)
         r2d = (
             _run_gi_2d(
                 image,
                 fi,
-                plan.integration_2d,
+                p2_frame,
                 plan.gi,
                 mask=mask,
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, plan.integration_2d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
+                dark=plan.dark,
             )
             if plan.integration_2d is not None else None
         )
@@ -5701,10 +6101,12 @@ def _reduce_frame(
                 incident_angle=incident_angle,
                 normalization_factor=_normalization_for(
                     frame, single.integration_2d, warned_monitor_keys, strict=strict),
+                flat=plan.flat,
+                dark=plan.dark,
             )
     else:
-        p1 = plan.integration_1d
-        chi_mode = p1 is not None and str(p1.unit or "").lower() == "chi_deg"
+        p1 = p1_frame
+        chi_mode = standard_chi_profile(plan)
         unsafe_dynamic_mask_cache = any(
             item is not None
             and "safe" in item.extra
@@ -5743,6 +6145,13 @@ def _reduce_frame(
             integration_mask = mask
         if ai is None:
             ai = integrators.standard()
+        at_energy = getattr(integrators, "at_frame_energy", None)
+        if at_energy is not None:
+            at_energy(ai, frame, image.shape, warm=True)
+        # Each dimension takes its own native chi-window call (_native_azimuth_window).
+        ai_1d, range_1d, turn_1d = (
+            (ai, None, 0.0) if p1 is None else _windowed_integrator(
+                integrators, ai, frame, image.shape, p1, radial=not chi_mode))
         if chi_mode:
             # Non-GI azimuthal profile (Mode A): the output axis is chi, while
             # radial_range is the q band to integrate over.  Mirror
@@ -5758,12 +6167,11 @@ def _reduce_frame(
             # off the offset-labeled axes integrates the SAME bins as the 2D.  The
             # output axis is relabeled +offset below.  (Raw range passed straight
             # through would integrate 90deg off the 2D for the default offset.)
-            _chi_azimuth_range = _integration_azimuth_range(p1)
-            if _chi_azimuth_range is not None:
-                chi_extra.setdefault("azimuth_range", _chi_azimuth_range)
+            if range_1d is not None:
+                chi_extra.setdefault("azimuth_range", range_1d)
             r1d = integrate_radial(
                 image,
-                ai,
+                ai_1d,
                 npt=p1.npt,
                 npt_rad=p1.npt_rad,
                 radial_unit="q_A^-1",
@@ -5773,59 +6181,84 @@ def _reduce_frame(
                 polarization_factor=p1.polarization_factor,
                 normalization_factor=_normalization_for(
                     frame, p1, warned_monitor_keys, strict=strict),
+                **_detector_kwargs(plan),
                 **chi_extra,
             )
         else:
             r1d = (
                 integrate_1d(
                     image,
-                    ai,
+                    ai_1d,
                     npt=p1.npt,
                     unit=p1.unit,
                     method=p1.method,
                     mask=integration_mask,
                     radial_range=p1.radial_range,
-                    azimuth_range=_integration_azimuth_range(p1),
+                    azimuth_range=range_1d,
                     error_model=p1.error_model,
                     polarization_factor=p1.polarization_factor,
                     normalization_factor=_normalization_for(
                         frame, p1, warned_monitor_keys, strict=strict),
                     _detector_mask_is_bound=detector_mask_is_bound,
+                    **_detector_kwargs(plan),
                     **p1.extra,
                 )
                 if p1 is not None else None
             )
+        if support_capture is not None and r1d is not None and p1 is not None:
+            angular_support_1d = _standard_frame_support(
+                support_capture, ai_1d, integration_mask, detector_mask_is_bound, p1, r1d, chi_mode, grouped,
+                cancel_token)
         # S-4: re-add chi_offset to the 1D chi OUTPUT axis (mirror the 2D
         # r2d.azimuthal += azimuth_offset below), so the written Mode-A (chi_deg)
         # chi axis matches the 2D cake chi instead of staying in the raw pyFAI
         # frame 90deg out.  Standard mode only (GI keeps azimuth_offset 0).
+        # A window moved by a whole turn returns to the panel interval too.
+        shift_1d = float(getattr(p1, "azimuth_offset", 0.0) or 0.0) - turn_1d
         if (r1d is not None and p1 is not None
                 and str(getattr(p1, "unit", "") or "").lower() == "chi_deg"
-                and getattr(p1, "azimuth_offset", 0.0)):
-            r1d.radial = (np.asarray(r1d.radial, dtype=float)
-                          + float(p1.azimuth_offset))
+                and shift_1d):
+            r1d.radial = np.asarray(r1d.radial, dtype=float) + shift_1d
+        ai_2d, range_2d, turn_2d = (
+            (ai, None, 0.0) if plan.integration_2d is None else _windowed_integrator(
+                integrators, ai, frame, image.shape, p2_frame, radial=False))
         r2d = (
             integrate_2d(
                 image,
-                ai,
-                npt_rad=plan.integration_2d.npt_rad,
-                npt_azim=plan.integration_2d.npt_azim,
-                unit=plan.integration_2d.unit,
-                method=plan.integration_2d.method,
+                ai_2d,
+                npt_rad=p2_frame.npt_rad,
+                npt_azim=p2_frame.npt_azim,
+                unit=p2_frame.unit,
+                method=p2_frame.method,
                 mask=integration_mask,
-                radial_range=plan.integration_2d.radial_range,
-                azimuth_range=_integration_azimuth_range(plan.integration_2d),
-                error_model=plan.integration_2d.error_model,
-                polarization_factor=plan.integration_2d.polarization_factor,
+                radial_range=p2_frame.radial_range,
+                azimuth_range=range_2d,
+                error_model=p2_frame.error_model,
+                polarization_factor=p2_frame.polarization_factor,
                 normalization_factor=_normalization_for(
-                    frame, plan.integration_2d, warned_monitor_keys, strict=strict),
+                    frame, p2_frame, warned_monitor_keys, strict=strict),
                 _detector_mask_is_bound=detector_mask_is_bound,
-                **plan.integration_2d.extra,
+                **_detector_kwargs(plan),
+                **p2_frame.extra,
             )
             if plan.integration_2d is not None else None
         )
-        if r2d is not None and plan.integration_2d.azimuth_offset:
-            r2d.azimuthal = r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
+        if r2d is not None:
+            shift_2d = float(plan.integration_2d.azimuth_offset or 0.0) - turn_2d
+            if shift_2d:
+                r2d.azimuthal = r2d.azimuthal + shift_2d
+
+    if _DEBUG_UNCERTAINTY and r1d is not None:
+        p1 = plan.integration_1d
+        logger.info("xdart-uncertainty %s", {
+            "frame": frame.index,
+            "gi_mode": None if plan.gi is None else plan.gi.mode_1d.value,
+            "gi_method": None if plan.gi is None else plan.gi.method,
+            "unit": str(p1.unit), "method": p1.method,
+            "azimuth_range": p1.azimuth_range is not None,
+            "error_model": p1.error_model, "variance": "variance" in p1.extra,
+            "sigma": r1d.sigma is not None,
+        })
 
     # D7 loud: a 2D integration with no usable data (all-dummy) would persist
     # nothing meaningful.  Under a loud policy RAISE (the streaming writer
@@ -5834,7 +6267,8 @@ def _reduce_frame(
     # dropped per-frame downstream (the publication gate / writer), never
     # aborting a whole-scan save.
     if (strict is not None and strict.gi_all_dummy
-            and r2d is not None and _is_all_dummy_2d(r2d)):
+            and r2d is not None and (_is_all_dummy_2d(r2d, signed=signed_point)
+                                    or signed_point and not np.isfinite(image).any())):
         raise GIAllDummyError(
             f"frame {frame.index}: the 2D integration is entirely dummy "
             "(no usable data); pass StrictPolicy.graceful() to drop it "
@@ -5850,30 +6284,222 @@ def _reduce_frame(
         extra_results_2d=extra_results_2d,
         metadata=dict(frame.metadata),
         corrected_image=corrected_image,
+        angular_support_1d=angular_support_1d,
     )
     if include_worker_thumbnail_prep:
+        # Every execution backend must carry native threshold membership to
+        # the persisted preview. GI/non-CSR integrate a separate float64
+        # buffer; their corrected raw thumbnail has not received those NaNs.
+        # Grouped points were conditioned per operand, before composition.
+        thumbnail_values = (value_mask if value_mask is not None or grouped
+                            else _threshold_mask(raw_image_arr, plan))
         thumbnail_mask = (
-            mask if value_mask is None
-            else value_mask if mask is None
-            else mask | value_mask
+            mask if thumbnail_values is None
+            else thumbnail_values if mask is None
+            else mask | thumbnail_values
         )
-        reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(thumbnail_mask)
+        reduction._worker_thumbnail_prep = _WorkerThumbnailPrep(thumbnail_mask, background, plan)
     return reduction
+
+
+def _support_capture(policy: Any):
+    """The Run's capture owner for ``policy`` (None: the default policy), or None when nothing is captured.
+
+    ``False`` names a path that never captures support (Average): no profile and nothing saved.
+    """
+    from xrd_tools.analysis.angular_support import AngularSupportPolicy, RunSupportCapture
+    if policy is False:
+        return None
+    policy = AngularSupportPolicy() if policy is None else policy
+    if type(policy) is not AngularSupportPolicy:
+        raise TypeError("angular_support must be an AngularSupportPolicy or None")
+    return RunSupportCapture(policy)  # off (decision 6): its frames carry recording_disabled, nothing computed
+
+
+def _support_unavailable(reason: Any, unit: str, detail: str = "") -> Any:
+    from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin
+    return AngularSupportProfile.unavailable(reason, origin=SupportOrigin.RUN, radial_unit=unit, detail=detail)
+
+
+def _guarded_support(build: Callable[[], Any], unit: str) -> Any:
+    """Support never fails a frame: an unexpected kernel error is logged and named, intensity unaffected.
+    The Run's own cancellation, observed inside the kernel, stops the frame as any cancellation does."""
+    from xrd_tools.analysis.angular_support import SupportCancelled
+    from xrd_tools.core.angular_support import SupportReason
+    try:
+        return build()
+    except (_ReductionCancelled, SupportCancelled):
+        raise _ReductionCancelled from None
+    except Exception as error:  # noqa: BLE001 - support is derived, never a reason to lose a frame
+        logger.exception("angular support capture failed")
+        return _support_unavailable(SupportReason.UNQUALIFIED_GEOMETRY, unit,
+                                    f"support capture failed: {type(error).__name__}")
+
+
+def _standard_frame_support(capture: Any, ai: Any, explicit: np.ndarray | None, bound: bool,
+                            p1: Integration1DPlan, r1d: IntegrationResult1D, chi_mode: bool, grouped: bool,
+                            cancel_token: CancelToken | None = None) -> Any:
+    """Support of an Int Standard native radial profile, from the mask and window the reducer applied."""
+    from xrd_tools.analysis.angular_support import admitted_window
+    from xrd_tools.core.angular_support import SupportReason
+    unit = str(getattr(r1d, "unit", "") or getattr(p1, "unit", "") or "")
+    if grouped:  # Average never captures support; its outputs name it from their kind
+        return None
+    if chi_mode:
+        return _support_unavailable(SupportReason.NOT_RADIAL_PROFILE, unit)
+    if not capture.policy.enabled:  # “Record angular coverage” off: no mask or kernel work at all
+        return _support_unavailable(SupportReason.RECORDING_DISABLED, unit)
+
+    def build():
+        mask, digest = capture.applied_mask(ai, explicit, bound=bound)
+        window = admitted_window(p1.azimuth_range, reducer="int_standard",
+                                 offset_deg=float(p1.azimuth_offset or 0.0),
+                                 chi_disc_at_pi=bool(getattr(ai, "chiDiscAtPi", True)))
+        return capture.profile(integrator=ai, mask=mask, mask_digest=digest, convention="detector_chi",
+                               radial_unit=unit, centres=r1d.radial, wavelength_m=getattr(ai, "wavelength", None),
+                               window=window, radial_range=p1.radial_range,
+                               cancel=lambda: _cancel_requested(cancel_token))
+    return _guarded_support(build, unit)
+
+
+def _gi_frame_support(capture: Any, fi: Any, explicit: np.ndarray | None, plan: ReductionPlan,
+                      p1: Integration1DPlan, incident_angle: float, r1d: IntegrationResult1D, grouped: bool,
+                      cancel_token: CancelToken | None = None) -> Any:
+    """Support of Int's GI total-q profile in χ_GI (its fast path admits the full turn, its polar path a window)."""
+    from xrd_tools.analysis.angular_support import admitted_window
+    from xrd_tools.core.angular_support import SupportReason
+    gi = plan.gi
+    unit = "q_A^-1" if "A^-1" in str(getattr(p1, "unit", "") or "") else "q_nm^-1"
+    if grouped:  # Average never captures support; its outputs name it from their kind
+        return None
+    if gi.mode_1d is not GI1DMode.Q_TOTAL:
+        return _support_unavailable(SupportReason.NOT_RADIAL_PROFILE, str(getattr(r1d, "unit", "") or unit))
+    if not capture.policy.enabled:  # “Record angular coverage” off: no mask or kernel work at all
+        return _support_unavailable(SupportReason.RECORDING_DISABLED, unit)
+
+    def build():
+        mask, digest = capture.applied_mask(fi, explicit, bound=False)
+        window = admitted_window(p1.azimuth_range, reducer="int_gi_total_q")
+        angles = (float(incident_angle), float(gi.tilt_angle), int(gi.sample_orientation))
+        return capture.profile(integrator=fi, mask=mask, mask_digest=digest, convention="gi_chi",
+                               radial_unit=unit, centres=r1d.radial, wavelength_m=getattr(fi, "wavelength", None),
+                               window=window, gi=angles, radial_range=p1.radial_range,
+                               cancel=lambda: _cancel_requested(cancel_token))
+    return _guarded_support(build, unit)
+
+
+def _wants_poisson(plan: ReductionPlan) -> bool:
+    return any(item is not None and item.error_model == "poisson" and "variance" not in item.extra
+               for item in (plan.integration_1d, plan.integration_2d))
+
+
+def _condition_point_operand(native, plan: ReductionPlan):
+    native = np.asarray(native)
+    image = native.astype(float)
+    invalid = detector_value_mask(None, native, enabled=bool(plan.mask_saturation), saturation=plan.saturation)
+    if invalid is not None:
+        image[invalid] = np.nan
+    if plan.flat is not None:
+        flat = np.asarray(plan.flat)
+        if flat.shape != native.shape:
+            raise ValueError("flat field shape must match each native detector operand")
+        image[~np.isfinite(flat) | (flat <= 0)] = np.nan
+    return _apply_thresholds_owned(image, plan)
+
+
+def _poisson_variance(image, frame, plan: ReductionPlan, derived=None) -> np.ndarray | None:
+    """Poisson variance of raw − dark − background, for plans that ask for Poisson sigma.
+
+    pyFAI's Poisson model sees only the image it integrates and treats a dark as
+    noiseless. The variance of the difference is pyFAI's max(1, raw), plus the
+    dark's counts (the counting noise of a single-exposure dark; one averaged from
+    many exposures is overstated), plus the background's own (its variance factor
+    times the background). A dark-corrected background (see
+    ``_dark_corrected_background``) returns part of the dark, so the dark's
+    counts are weighted by (1 − scale)². A NaN dark pixel gives NaN, a pixel pyFAI
+    masks. The dark's counts are clipped at 0 once a session (``_clipped_dark``).
+    """
+    factor = getattr(frame, "background_variance_factor", None)
+    background = None if factor is None else frame.background
+    point_variance = getattr(frame, "point_variance", None)
+    if (background is None and plan.dark is None and point_variance is None) or not _wants_poisson(plan):
+        return None
+    variance = np.maximum(image, 1.0) if point_variance is None else np.array(point_variance, dtype=float, copy=True)
+    if plan.dark is not None:
+        # raw − dark − scale·(background − dark) holds the dark with weight 1 − scale.
+        scale = (None if frame.background is None
+                 else getattr(frame, "background_scale", None))
+        multiplier = float(getattr(frame, "point_exposure_multiplier", 1.0))
+        weight = (multiplier - (0.0 if scale is None else float(scale))) ** 2
+        if weight == 1.0:
+            variance += _clipped_dark(plan, derived)
+        elif weight:
+            variance += weight * _clipped_dark(plan, derived)
+    if background is not None:
+        variance += np.clip(np.asarray(factor) * np.asarray(background, dtype=float), 0.0, None)
+    return variance
+
+
+def _clipped_dark(plan: ReductionPlan, derived) -> np.ndarray:
+    """The plan's dark clipped at 0 counts (a negative dark adds no variance), once a session (AUD-7): kept
+    in the session's ``derived`` arrays, which its workers share as they share its mask cache (a concurrent
+    first use computes the same array), for the dark it was clipped from. Without ``derived`` (a direct
+    ``_reduce_frame`` call), clipped each time."""
+    if derived is None:
+        return np.clip(plan.dark, 0.0, None)
+    held = derived.get("dark_clipped")
+    if held is None or held[0] is not plan.dark:
+        clipped = np.clip(plan.dark, 0.0, None)
+        clipped.setflags(write=False)
+        held = derived["dark_clipped"] = (plan.dark, clipped)
+    return held[1]
+
+
+def _dark_corrected_background(frame, plan: ReductionPlan):
+    """The background as subtracted from the frame.
+
+    A background image taken with the same detector holds the dark too, and pyFAI
+    already subtracts the dark from the frame; so with a dark the frame loses
+    scale · (background − dark), where scale is the factor the background image
+    was multiplied by. A background without a recorded scale is taken as it is.
+    """
+    background = frame.background
+    scale = getattr(frame, "background_scale", None)
+    if background is None or plan.dark is None or scale is None:
+        return background
+    return np.asarray(background, dtype=float) - float(scale) * np.asarray(plan.dark, dtype=float)
+
+
+def _with_variance(item, variance):
+    """The integration with an explicit variance in place of its Poisson model."""
+    if variance is None or item is None or item.error_model != "poisson" or "variance" in item.extra:
+        return item
+    return replace(item, error_model=None, extra={**item.extra, "variance": variance})
+
+
+def _detector_kwargs(plan: ReductionPlan) -> dict[str, Any]:
+    """pyFAI's ``flat`` and ``dark`` keywords for those the plan carries."""
+    return {name: value for name, value in (("flat", plan.flat), ("dark", plan.dark))
+            if value is not None}
 
 
 def _thumbnail_corrected_image(
     raw_image: np.ndarray,
     background: np.ndarray | float | None,
+    flat: np.ndarray | None = None,
+    dark: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return a float32 raw-minus-background image for transient thumbnails."""
+    """Return a float32 raw − dark − background image, flat-corrected, for thumbnails."""
     raw = np.asarray(raw_image)
     corrected = np.array(raw, dtype=np.float32, copy=True)
-    if background is None:
-        return corrected
-    bg = np.asarray(background, dtype=np.float32)
-    if bg.ndim == 0 and float(bg) == 0.0:
-        return corrected
-    np.subtract(corrected, bg, out=corrected)
+    if dark is not None:
+        np.subtract(corrected, np.asarray(dark, dtype=np.float32), out=corrected)
+    bg = None if background is None else np.asarray(background, dtype=np.float32)
+    if bg is not None and not (bg.ndim == 0 and float(bg) == 0.0):
+        np.subtract(corrected, bg, out=corrected)
+    if flat is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            np.divide(corrected, np.asarray(flat, dtype=np.float32), out=corrected)
     return corrected
 
 
@@ -5961,6 +6587,41 @@ def _integration_azimuth_range(
     lo, hi = plan.azimuth_range
     offset = float(plan.azimuth_offset)
     return lo - offset, hi - offset
+
+
+def _native_azimuth_window(
+    plan: "Integration1DPlan | Integration2DPlan", *, radial: bool,
+) -> tuple[tuple[float, float] | None, float | None]:
+    """The one native pyFAI call for ``plan``'s chi window: (raw range, whole turn or None).
+
+    pyFAI wraps each endpoint into [-180, 180) and no pixel chi lies beyond, so a raw window
+    past +-180 loses its wrapped part. A radial full turn admits every direction: Auto. A window
+    inside one turn of [0, 360] is moved there by ``turn`` for an integrator whose discontinuity
+    is at zero; the caller removes ``turn`` from a chi axis. Any other window keeps its call.
+    """
+    raw = _integration_azimuth_range(plan)
+    if raw is None:
+        return None, None
+    if radial and plan.azimuth_range[1] - plan.azimuth_range[0] == 360.0:
+        return None, None
+    lo, hi = raw
+    if -180.0 <= lo < hi <= 180.0:
+        return raw, None
+    turn = -360.0 * float(np.floor(lo / 360.0))
+    if not lo < hi <= 360.0 - turn:
+        return raw, None
+    return (lo + turn, hi + turn), turn
+
+
+def _windowed_integrator(
+    integrators: "_ReductionIntegratorProvider", ai: Any, frame: Frame, shape: tuple[int, ...],
+    plan: "Integration1DPlan | Integration2DPlan", *, radial: bool,
+) -> tuple[Any, tuple[float, float] | None, float]:
+    """``plan``'s integrator, raw chi range and the whole turn its chi axis carries."""
+    window, turn = _native_azimuth_window(plan, radial=radial)
+    if turn is None:
+        return ai, window, 0.0
+    return integrators.alternate(ai, frame, shape), window, turn
 
 
 def _coerce_gi_1d_mode(mode: GI1DMode | str) -> GI1DMode:
@@ -6061,8 +6722,13 @@ def _run_gi_1d(
     mask: np.ndarray | None,
     incident_angle: float,
     normalization_factor: float | None,
+    flat: np.ndarray | None = None,
+    dark: np.ndarray | None = None,
 ) -> IntegrationResult1D:
     extra = _gi_plan_extra(plan, normalization_factor)
+    for name, value in (("flat", flat), ("dark", dark)):
+        if value is not None:
+            extra[name] = value
     npt_oop = extra.pop("npt_oop", gi.npt_oop if gi.npt_oop is not None else plan.npt)
     common = dict(
         npt=plan.npt,
@@ -6075,10 +6741,11 @@ def _run_gi_1d(
         sample_orientation=gi.sample_orientation,
     )
     if gi.mode_1d is GI1DMode.Q_IP:
+        # integrate_gi_1d's ``unit`` is the out-of-plane axis (the window, q_oop); its in-plane
+        # axis, the cut's, is q_ip by default
         return integrate_gi_1d(
             image,
             fi,
-            unit="qip_A^-1",
             npt_oop=npt_oop,
             vertical_integration=False,
             **common,
@@ -6131,8 +6798,13 @@ def _run_gi_2d(
     mask: np.ndarray | None,
     incident_angle: float,
     normalization_factor: float | None,
+    flat: np.ndarray | None = None,
+    dark: np.ndarray | None = None,
 ) -> IntegrationResult2D:
     extra = _gi_plan_extra(plan, normalization_factor)
+    for name, value in (("flat", flat), ("dark", dark)):
+        if value is not None:
+            extra[name] = value
     # The qip/qoop output ranges ride in plan.extra as x_range/y_range; they
     # are only meaningful for the QIP_QOOP transform.  Pop them BEFORE
     # branching so they never leak into pyFAI's polar/exit-angle calls as
@@ -6430,6 +7102,7 @@ def _iter_reduction_chunks(
     source: Scan | FrameSource,
     scan: Scan,
     chunk_size: int,
+    plan: ReductionPlan | None = None,
 ) -> Iterator[tuple[list[Frame], list[np.ndarray | None]]]:
     """Yield scan frames paired with optional source-loaded image arrays.
 
@@ -6442,6 +7115,16 @@ def _iter_reduction_chunks(
 
     frame_by_index = {int(frame.index): frame for frame in scan.frames}
     if not isinstance(source, Scan):
+        statistics_iterator = getattr(source, "iter_point_statistics", None)
+        if callable(statistics_iterator) and getattr(source, "point_image_policy", None) is not None and plan is not None:
+            for statistics, labels in statistics_iterator(chunk_size, poisson=_wants_poisson(plan), native_transform=lambda native: _condition_point_operand(native, plan)):
+                frames = [frame_by_index[int(label)] for label in labels]
+                for frame, result in zip(frames, statistics):
+                    frame.point_statistics_loader = None
+                    frame.point_variance = result.variance
+                    frame.point_exposure_multiplier = result.exposure_multiplier
+                yield frames, [result.signal for result in statistics]
+            return
         iter_chunks = getattr(source, "iter_chunks", None)
         if callable(iter_chunks):
             for images, labels in iter_chunks(chunk_size):

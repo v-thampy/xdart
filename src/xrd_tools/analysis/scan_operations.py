@@ -38,7 +38,7 @@ from xrd_tools.analysis.canonical_fingerprint import (
     analysis_canonical_fingerprint,
 )
 from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
-from xrd_tools.core.scan import SourceCapabilities, SourceKind, SourceSpec, coerce_source_kind
+from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.io.metadata import read_image_metadata_observed
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.sources.discover import discover_scans
@@ -51,6 +51,8 @@ __all__ = [
     "MetadataTableRequalificationResult", "ScanPlotPlan", "ScanPlotResult", "RoiPreviewPlan",
     "RoiPreviewResult", "RoiScanPlan", "RoiScanResult", "run_metadata_table",
     "run_metadata_table_requalification", "run_scan_plot", "run_roi_preview", "run_roi_scan",
+    "numeric_scan_columns", "scan_plot_defaults", "scan_frame_rows",
+    "scan_table_columns", "write_scan_table_csv", "metadata_plot_columns",
     "analysis_canonical_fingerprint", "requalified_analysis_source",
 ]
 # SSRL SPEC scans commonly expose roughly 60 point columns plus the complete
@@ -587,6 +589,9 @@ def _metadata_scalar(value: Any) -> Any:
 def _metadata_row(values: Mapping[str, Any]) -> dict[str, Any]:
     row: dict[str, Any] = {}
     for key, value in values.items():
+        if key == "point_images":
+            # Structured source provenance lives in SourceSpec/ScanFrame, not a scalar motor table.
+            continue
         if type(key) is not str:
             raise _Refusal("INVALID_CANONICAL_VALUE")
         row[key] = _metadata_scalar(value)
@@ -712,6 +717,9 @@ class _CursorSource:
         try:
             self.descriptor = cursor.descriptor
             self.provider = cursor.metadata_provider()
+            self.path = self.descriptor.path
+            self.kind = self.descriptor.kind
+            self.name = self.descriptor.scan_name
             self.frame_indices = range(self.descriptor.frame_count)
             self.scanned_axes = tuple(self.provider.motors())
             self.capabilities = SourceCapabilities(supports_random_access=True, supports_chunks=True, has_metadata=True, has_raw_references=True)
@@ -721,6 +729,12 @@ class _CursorSource:
     def metadata_for(self, label, *, max_input_bytes=None):
         return self.provider.complete_metadata_for(label)
     def load_frame(self, label): return self.cursor.read_frame(label)
+    def load_native_frame(self, label): return self.cursor.read_frame(label)
+    def raw_locator_for(self, label): return self.path, int(label)
+    def frame_for(self, label):
+        return ScanFrame(index=int(label), metadata=dict(self.metadata_for(label)),
+                         source_path=self.path, source_frame_index=int(label),
+                         source_identity=self.name, loader=lambda frame: self.load_frame(frame.index))
     def close(self): self.cursor.close()
 def _snapshot(
     spec: SourceSpec, *, cancel_token: threading.Event | None = None,
@@ -776,6 +790,27 @@ def _snapshot(
         discovery_states: list[tuple[Path, FileRevision | None]] = []
         member_states: list[tuple[Path, FileRevision | None]] = []
         member_revisions: dict[Path, FileRevision | None] = {}
+        qualified_raw: set[Path] = set()
+        grouped_aliases: set[Path] = set()
+        container_graph = None
+        from xrd_tools.sources.point_images import PointImageSource
+        if isinstance(source, (_CursorSource, PointImageSource)):
+            from xrd_tools.sources.execution_graph import qualify_source_execution_graph
+            container_graph = qualify_source_execution_graph(
+                SourceSpec(spec.uri, spec.kind, metadata_uri=spec.metadata_uri,
+                    entry=spec.entry, options={key: value for key, value in spec.options.items()
+                        if key not in {"point_images", "scan_point_count", "scan_point_count_path"}}),
+                cancelled=None if cancel_token is None else cancel_token.is_set,
+            )
+            stamp = container_graph.stamp
+            for state in (stamp.file, *stamp.members,
+                          *(member.file for member in stamp.external_members), *stamp.dependency_files):
+                path = Path(state.path)
+                revision = _path_revision(path)
+                if not state.matches_disk():
+                    raise _Refusal("SOURCE_REVISION_CHANGED")
+                member_states.append((path, revision))
+                member_revisions[path.resolve(strict=False)] = revision
         raw_facts: list[tuple[int, str | None, int | None, FileRevision | None]] = []
         options = dict(spec.options)
         metadata_format = getattr(
@@ -891,6 +926,33 @@ def _snapshot(
                     (int(label), None if locator is None else str(locator),
                      source_frame_index, revision)
                 )
+                grouped_locators = getattr(source, "point_raw_locators", None)
+                if callable(grouped_locators) and (getattr(source, "point_image_policy", None) is not None
+                                                  or options.get("nexus_entry")):
+                    for raw_path, _raw_index in grouped_locators(label):
+                        raw_lexical = _lexical_absolute(raw_path)
+                        candidate = raw_lexical.resolve(strict=False)
+                        if candidate not in member_revisions:
+                            member_revision = _path_revision(candidate)
+                            member_revisions[candidate] = member_revision
+                        if raw_lexical not in grouped_aliases:
+                            member_states.append((raw_lexical, member_revisions[candidate]))
+                            grouped_aliases.add(raw_lexical)
+                        # Reuse the raw-container dependency owner for external/VDS shards.
+                        if candidate.suffix.lower() in {".h5", ".hdf5", ".nxs", ".nexus", ".cxi"} and candidate not in qualified_raw:
+                            from xrd_tools.sources.execution_graph import qualify_source_execution_graph
+                            from xrd_tools.sources.descriptor import describe_container
+                            native = describe_container(candidate, entry=options.get("nexus_entry") or
+                                getattr(source, "_read_image_kwargs", {}).get("entry", "entry"))
+                            graph = qualify_source_execution_graph(SourceSpec(raw_lexical, native.kind, entry=native.resolved_entry),
+                                cancelled=None if cancel_token is None else cancel_token.is_set)
+                            stamp = graph.stamp
+                            for state in (stamp.file, *stamp.members,
+                                *(member.file for member in stamp.external_members), *stamp.dependency_files):
+                                if not state.matches_disk():
+                                    raise _Refusal("SOURCE_REVISION_CHANGED")
+                                member_states.append((Path(state.path), _path_revision(Path(state.path))))
+                            qualified_raw.add(candidate)
         else:
             method = source.metadata_for
             try:
@@ -936,6 +998,8 @@ def _snapshot(
             tuple(discovery_states),
             tuple(member_states), tuple(raw_facts), dependency_revisions,
         )
+        if container_graph is not None:
+            source_identity += (container_graph.stamp.as_dict(), container_graph.dataset_paths)
         fingerprint = _digest(source_identity)
         receipt = AnalysisSourceReceipt(
             schema_version="analysis-source-v2", source_spec=spec,
@@ -1078,6 +1142,83 @@ def _columns(
             raise _Refusal("METADATA_TABLE_LIMIT_EXCEEDED")
         result.append(column)
     return tuple(result)
+
+
+def scan_frame_rows(table: Mapping[str, Any]) -> dict[int, int]:
+    """Align streamed ROI labels to rows of an assembled scan table.
+
+    Without frame labels, rows are positional through the longest column.
+    Finite labels round to integers; the last duplicate owns the row.
+    """
+    labels = table.get("frame_index")
+    if labels is None:
+        count = max((len(np.atleast_1d(value)) for value in table.values()), default=0)
+        return {index: index for index in range(count)}
+    return {int(round(value)): row for row, value in enumerate(np.asarray(labels, dtype=float))
+            if np.isfinite(value)}
+
+
+def scan_table_columns(table: Mapping[str, Any]) -> list[str]:
+    """CSV columns in table order, including scalar, text and all-missing values."""
+    return [name for name, values in table.items()
+            if np.atleast_1d(np.asarray(values, dtype=object)).ndim == 1]
+
+
+def write_scan_table_csv(table: Mapping[str, Any], path: str | Path) -> None:
+    """Stream an assembled scan table to CSV, padding ragged rows with blanks.
+
+    Multidimensional values are omitted. File errors propagate to the caller.
+    """
+    import csv
+
+    columns = scan_table_columns(table)
+    arrays = {name: np.atleast_1d(table[name]) for name in columns}
+    count = max((len(values) for values in arrays.values()), default=0)
+    with open(path, "w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(columns)
+        for row in range(count):
+            writer.writerow([arrays[name][row] if row < len(arrays[name]) else ""
+                             for name in columns])
+
+
+def numeric_scan_columns(table: Mapping[str, np.ndarray]) -> list[str]:
+    """Plottable scan columns: one-dimensional numeric, with finite values."""
+    return [name for name, values in table.items()
+            if (array := np.asarray(values)).ndim == 1
+            and array.dtype.kind in "fiu" and np.any(np.isfinite(array))]
+
+
+def scan_plot_defaults(
+    table: Mapping[str, np.ndarray], positioner_names=(), *, x: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Choose a varying declared motor and an intensity-like counter.
+
+    Motor ties retain declaration order; counters are matched case-insensitively.
+    Frame index is the fallback. ROI columns are never selected as default Y.
+    An explicit X retains authority, including the runner's nonnumeric refusal.
+    """
+    columns = numeric_scan_columns(table)
+    if x is None:
+        spread = 0.0
+        for name in positioner_names:
+            if name not in columns:
+                continue
+            values = np.asarray(table[name], dtype=float)
+            values = values[np.isfinite(values)]
+            variation = float(np.max(values) - np.min(values))
+            if variation > spread:
+                spread, x = variation, name
+        if x is None:
+            x = "frame_index" if "frame_index" in columns else next(iter(columns), None)
+    by_lower = {name.lower(): name for name in columns}
+    y = next((by_lower[name] for name in ("photod", "bs", "mon", "i2", "i1", "i0")
+              if name in by_lower and by_lower[name] != x), None)
+    if y is None and "frame_index" in columns and x != "frame_index":
+        y = "frame_index"
+    return x, y
+
+
 def run_metadata_table(
     plan: MetadataTablePlan, *, cancel_token: threading.Event | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -1105,7 +1246,11 @@ def run_metadata_table(
             snapshot.catalog, snapshot.receipt.labels, cancel_token=cancel_token,
         )
         declared = snapshot.scanned[0] if snapshot.scanned else None
-        selected = declared if declared in {column.name for column in columns} else None
+        numeric = {column.name: column.numeric for column in columns
+                   if column.numeric is not None}
+        selected, _ = scan_plot_defaults(numeric, snapshot.scanned)
+        if selected not in snapshot.scanned:
+            selected = None
         policy = _digest(("metadata-table-v1", _MAX_TABLE_ROWS, _MAX_TABLE_COLUMNS,
                           _MAX_TABLE_BYTES))
         table_fp = _digest((snapshot.receipt.source_fingerprint, declared, selected,
@@ -1185,6 +1330,33 @@ def _numeric_column(table: MetadataTableResult, name: str) -> np.ndarray:
     if len(matches) != 1 or matches[0].kind != "numeric" or matches[0].numeric is None:
         raise _Refusal("SCAN_PLOT_NONNUMERIC_COLUMN")
     return matches[0].numeric
+
+
+def metadata_plot_columns(
+    table: MetadataTableResult, selected_labels: tuple[int, ...] | None = None,
+) -> Mapping[str, np.ndarray]:
+    """Detach displayed metadata rows for plotting/CSV without changing source receipts.
+
+    Selection is by original frame label in the requested order, including repeats.
+    Text columns stay available to CSV; numeric selectors retain their existing policy.
+    """
+    if table.disposition is not AnalysisDisposition.COMPLETED:
+        raise ValueError("completed metadata table required")
+    positions = {label: index for index, label in enumerate(table.labels)}
+    labels = table.labels if selected_labels is None else selected_labels
+    rows = [positions[label] for label in labels]
+    columns = {}
+    for column in table.columns:
+        values = column.numeric if column.numeric is not None else column.text
+        if values is None:
+            continue
+        array = np.array([values[index] for index in rows],
+                         dtype=float if column.numeric is not None else object)
+        array.flags.writeable = False
+        columns[column.name] = array
+    return MappingProxyType(columns)
+
+
 def run_scan_plot(
     plan: ScanPlotPlan, table: MetadataTableResult, *, roi_result: RoiScanResult | None = None,
     cancel_token: threading.Event | None = None,
@@ -1200,11 +1372,10 @@ def run_scan_plot(
         names = {column.name for column in table.columns}
         x_name = plan.x or table.selected_scanned_positioner or "frame_index"
         x = _numeric_column(table, x_name)
-        requested = plan.y or next(
-            ((name,) for name in ("Photod", "bs", "mon", "i2", "i1", "i0")
-             if name != x_name and name in names),
-            ("frame_index",) if x_name != "frame_index" else (),
-        )
+        _, default_y = scan_plot_defaults(
+            {column.name: column.numeric for column in table.columns
+             if column.numeric is not None}, x=x_name)
+        requested = plan.y or (() if default_y is None else (default_y,))
         if not requested:
             raise _Refusal("SCAN_PLOT_Y_REQUIRED")
         if len(requested) > _MAX_PLOT_TRACES:

@@ -9,7 +9,6 @@ def test_nonaverage_paths_have_zero_average_reachability_and_allocations(
 ):
     from xrd_tools.io import nexus_record, read as read_module, record_writer
     from xrd_tools.reduction import average
-    from xrd_tools.sources import execution_graph
     from xdart.gui.tabs.scattering.adapters import external_operation
     from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
@@ -27,10 +26,11 @@ def test_nonaverage_paths_have_zero_average_reachability_and_allocations(
     hits = []
     def forbidden(*_a, _name="average", **_k):
         hits.append(_name); raise AssertionError(f"ordinary path reached {_name}")
+    # Decision 39: every run's admission reads its first image's recorded saturation
+    # (execution_graph.graph_saturation), so the image layout is no longer Average's alone.
     for owner, names in (
         (average, ("AverageScanRecipe", "AverageScanRunner",
                    "requirements_from", "resolve_session_policy")),
-        (execution_graph, ("read_detector_image_layout",)),
         (read_module, ("get_average_finite_counts",)),
         (nexus_record, ("write_average_finite_counts",)),
         (record_writer, ("write_average_finite_counts",)),
@@ -152,8 +152,13 @@ def test_average_import_owner_and_alternate_writer_census():
     forbidden = {"AverageScanRecipe", "single_image_spec", "image_series_spec", "qualify_source_execution_graph", "read_image_metadata", "stat", "open", "iterdir"}
     assert forbidden.isdisjoint(name for path, scope, name in edges if
         (path, scope) in {(request_path, "begin_average"), (page_path, page_edges[0][0])})
+    source_reads = {"open_source", "source_for_kind", "NexusStackSource", "metadata_for", "scan_table", "motors", "write_contributing_frames"}
     trees = tuple(ast.parse(path.read_text()) for path in (average_path, graph_path)); imports = {name for tree in trees for node in ast.walk(tree) for name in (([alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module] if isinstance(node, ast.ImportFrom) and node.module else []))}
-    assert not any(name == "xdart" or name.startswith(("xdart.", "qtpy", "pyqtgraph", "PyQt", "PySide")) for name in imports) and not any(name == "h5py" or name.startswith("h5py.") for node in ast.walk(trees[0]) for name in (([alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module] if isinstance(node, ast.ImportFrom) and node.module else []))) and not ({average_path, request_path} & set(calls.get("create_dataset", ()))) and not ({average_path, request_path} & set(calls.get("File", ()))) and not ({"read_image", "openimage", "data"} & {node.attr if isinstance(node, ast.Attribute) else node.id for node in ast.walk(nodes[root / "xrd_tools/io/image.py", "read_detector_image_layout"]) if isinstance(node, (ast.Attribute, ast.Name))}) and all(not ({average_path, graph_path, request_path} & set(calls.get(name, ()))) for name in {"open_source", "source_for_kind", "NexusStackSource", "metadata_for", "scan_table", "motors", "write_contributing_frames"})
+    assert not any(name == "xdart" or name.startswith(("xdart.", "qtpy", "pyqtgraph", "PyQt", "PySide")) for name in imports) and not any(name == "h5py" or name.startswith("h5py.") for node in ast.walk(trees[0]) for name in (([alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module] if isinstance(node, ast.ImportFrom) and node.module else []))) and not ({average_path, request_path} & set(calls.get("create_dataset", ()))) and not ({average_path, request_path} & set(calls.get("File", ()))) and not ({"read_image", "openimage", "data"} & {node.attr if isinstance(node, ast.Attribute) else node.id for node in ast.walk(nodes[root / "xrd_tools/io/image.py", "read_detector_image_layout"]) if isinstance(node, (ast.Attribute, ast.Name))}) and all(not ({average_path, request_path} & set(calls.get(name, ()))) for name in source_reads)
+    # Since 5c17b7f4 the graph's point-image qualifiers read their sources to confirm a TIFF or SPEC mapping; they
+    # alone are exempt in the graph module (maintainer, 2026-10-11). Average and its request keep the full ban.
+    assert all(scope in {"_qualify_tiff", "_qualify_spec", "complete_metadata_for"}
+               for path, scope, name in edges if path == graph_path and name in source_reads)
     for path, scope in ((writer_path, "write"), (writer_path, "write_batch"),
         (root / "xdart/gui/tabs/scattering/adapters/dynamic_output.py", "submit"),
         (run_path, "_execute_current"), (run_path, "_background_ready"), (run_path, "_submit_container_source")):

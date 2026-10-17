@@ -334,10 +334,11 @@ def test_nexus_stack_source_motors_and_metadata(bluesky_file):
 
 
 def test_plain_nexus_stack_has_no_bluesky_columns(plain_nexus_file):
-    """A non-Bluesky stack is untouched: no motors, empty metadata."""
+    """A non-Bluesky stack gets no Bluesky columns and no motors; since CAL-HELD-BATCH-20261009 it serves its
+    supported acquisition metadata, here the monochromator energy (12, no units: keV) in eV."""
     src = NexusStackSource(plain_nexus_file)
     assert src.motors == {}
-    assert src.metadata_for(0) == {}
+    assert dict(src.metadata_for(0)) == {"energy": 12000.0}
 
 
 # ---------------------------------------------------------------------------

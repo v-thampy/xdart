@@ -14,6 +14,7 @@ from xdart.modules.display_context import (
 )
 from xdart.modules.frame_publication import PublicationStore
 from xrd_tools.core import Axis, FrameView
+from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin, SupportReason
 from xrd_tools.io.viewer_2d import (
     Viewer2DArtifactCatalog, Viewer2DFrame, Viewer2DSourceKind,
 )
@@ -44,7 +45,8 @@ from .shell_projection import (
 )
 from .shell_values import (
     AxisProjection, BrowserScanIndex, FrameNavigationProjection, HeavyProjection,
-    ProgressProjection, ScientificProjection, ShellProjection, TraceProjection,
+    KeyedImageProjection, KeyedPanelsProjection, ProgressProjection, ScientificProjection,
+    ShellProjection, TraceProjection,
 )
 from .state_machine import RunPhase
 from .scientific_waterfall_policy import waterfall_should_be_active
@@ -73,9 +75,11 @@ class ProjectionRequest:
             raise TypeError("context projection request is invalid")
 
 
-def _apply_presentation_background(
+def apply_presentation_background(
     state: ScientificProjection, projection,
 ) -> ScientificProjection:
+    """A projection with the presentation background's values in place of its traces' (1-D) or its
+    image's (raw, 2-D), for the frames the background was promoted for; Int's pages and Stitch's."""
     if projection is None:
         return replace(state, background_set=False)
     try:
@@ -106,6 +110,54 @@ def _apply_presentation_background(
           and value.shape == heavy.cake.shape):
         heavy = replace(heavy, cake=value)
     return replace(state, heavy=heavy, background_set=True)
+
+
+def _same_keyed_grid(shown, background) -> bool:
+    """Whether two keyed panels sit on one grid: the same key, axes (values and edges) and, for a slice,
+    the same index of the same count."""
+    if shown.key != background.key or type(shown) is not type(background):
+        return False
+    pairs = ((shown.x_axis, background.x_axis), (shown.y_axis, background.y_axis)) \
+        if type(shown) is KeyedImageProjection else ((shown.axis, background.axis),)
+    for left, right in pairs:
+        if (left.values.shape != right.values.shape or not np.array_equal(left.values, right.values)
+                or (left.edges is None) != (right.edges is None)
+                or left.edges is not None and tuple(left.edges) != tuple(right.edges)):
+            return False
+    return (type(shown) is not KeyedImageProjection
+            or (shown.index == background.index
+                and len(shown.index_captions) == len(background.index_captions)))
+
+
+def apply_keyed_presentation_background(
+    shown: KeyedPanelsProjection, background: KeyedPanelsProjection | None, name: str = "",
+) -> KeyedPanelsProjection:
+    """A keyed layout drawn minus its presentation background, panel by panel (AUD-9 stage 2b G8d): each
+    slice minus the background's slice at the same index, each 1-D panel minus the background's. Display
+    only. ``background`` is the background result's own panels, built by the same projection authority at the
+    indices ``shown`` draws, so a result shown against itself draws zeros. A background on another grid (other
+    keys, axes, edges or index count) is not subtracted: the panels are drawn as they are, and the status and
+    the button's tip say why. None: no background."""
+    if background is None:
+        return replace(shown, background_set=False)
+    label = name or "the background"
+    by_key = {panel.key: panel for panel in background.panels}
+    if set(by_key) != {panel.key for panel in shown.panels} or not all(
+            _same_keyed_grid(panel, by_key[panel.key]) for panel in shown.panels):
+        reason = f"{label} is on another grid: not subtracted (Clear BG to drop it)"
+        return replace(shown, background_set=True, background_note=reason,
+                       status=f"{shown.status} · {reason}" if shown.status else reason)
+    panels = []
+    for panel in shown.panels:
+        other = by_key[panel.key]
+        if type(panel) is KeyedImageProjection:
+            panels.append(replace(panel, image=np.subtract(panel.image, other.image)))
+        else:
+            panels.append(replace(panel, intensity=np.subtract(panel.intensity, other.intensity),
+                                  title=f"{panel.title} − background"))
+    note = f"minus {label}"
+    return replace(shown, panels=tuple(panels), background_set=True, background_note=note,
+                   status=f"{shown.status} · {note}" if shown.status else note)
 
 
 def _terminal_timing_tooltip(progress: ProgressProjection) -> str:
@@ -175,6 +227,10 @@ def _terminal_timing_tooltip(progress: ProgressProjection) -> str:
             "Submit/backpressure is orchestration wait, not pure integration."
         )
     return "\n".join(lines)
+#: A 1D Viewer source is a text or array export with no processing record (COVERAGE-SUPPORT-20261013, D7).
+_VIEWER_1D_SUPPORT = AngularSupportProfile.unavailable(SupportReason.NO_RECORD, origin=SupportOrigin.SAVED)
+
+
 @dataclass(frozen=True, slots=True)
 class _Viewer1DTraceProjection(TraceProjection):
     sigma: np.ndarray | None = None
@@ -291,7 +347,7 @@ def _viewer_1d_scientific(navigation, payloads, resident, preferences, notice,
             axis = AxisProjection(values, view.axis_1d.label, view.axis_1d.unit)
             traces.append(_Viewer1DTraceProjection(
                 frame, axis, intensity, os.path.basename(view.source_path or ""),
-                sigma=sigma))
+                sigma=sigma, wavelength_m=payload.wavelength_m, angular_support=_VIEWER_1D_SUPPORT))
     current = payload_by_id.get(id(navigation.current))
     if ready and current is not None:
         status += f" · {os.path.basename(current.view.source_path or '')}"
@@ -363,6 +419,7 @@ class ContextProjection:
         browser_transient_frame: DisplayFrameKey | None = None,
         viewer_1d_current_path: str = "",
         viewer_1d_selected_paths: tuple[str, ...] = (),
+        viewer_2d_current_path: str = "",
         viewer_waterfall_active: bool = False,
         date_sorted: bool,
         auto_last: bool,
@@ -398,6 +455,9 @@ class ContextProjection:
             source_count=None if viewer_requested else source_count,
             source_count_is_files=source_count_is_files,
             source_count_includes_immediate=source_count_includes_immediate,
+            calibration_ready=(controls_readiness.experiment.ready
+                               if controls_readiness.experiment.detail else None),
+            calibration_reason=controls_readiness.experiment.detail,
         )
         if viewer_requested:
             run = replace(run, mode=("1D Viewer" if tool is Tool.XYE_VIEWER else "2D Viewer"))
@@ -464,8 +524,16 @@ class ContextProjection:
                     intent.processing_mode
                 ),
                 norm_aggregate=norm_aggregate))
-        scientific = _apply_presentation_background(
+        scientific = apply_presentation_background(
             scientific, presentation_background)
+        scientific = replace(scientific, acquisition_selected=(
+            selection is not None and selection.kind is ContextKind.ACQUISITION))
+        if not viewer_selected and selection is not None and selection.kind is ContextKind.BROWSE:
+            browse = next((context for context in contexts
+                           if type(context) is BrowseContext and selection.names(context)), None)
+            if browse is not None and not browse.released:
+                scientific = attach_saved_rings(scientific, browse.ring_basis, navigation.current)
+                scientific = attach_saved_support_source(scientific, browse)
         return ShellProjection(
             revision,
             build_browser_projection(
@@ -481,11 +549,17 @@ class ContextProjection:
                 selected_artifacts=(
                     viewer_1d_selected_paths if viewer_1d_selected else ()
                 ),
+                # The 2D Viewer's file intent leads, as 1-D intent does: while the
+                # next file's catalog loads (or the prior file clears) nothing is
+                # selected, and an empty current row sent the next arrow key to
+                # the list's top.
                 current_artifact=(
-                    next((os.path.abspath(context.original_path)
-                          for context in contexts
-                          if type(context) is Viewer2DContext
-                          and selection.names(context)), "")
+                    viewer_2d_current_path
+                    if tool is Tool.IMAGE_VIEWER and viewer_2d_current_path
+                    else next((os.path.abspath(context.original_path)
+                               for context in contexts
+                               if type(context) is Viewer2DContext
+                               and selection.names(context)), "")
                     if viewer_2d_selected else viewer_1d_current_path
                 ),
                 multi_artifact_selection=viewer_1d_selected or tool is Tool.XYE_VIEWER,
@@ -657,6 +731,51 @@ class ContextProjection:
         return HydrationEligibleMiss(request)
 
 
+def attach_saved_rings(scientific: ScientificProjection, basis, current) -> ScientificProjection:
+    """A Browse Int frame's own saved ring snapshot on its heavy projection (BROWSE-REFERENCE-RINGS-20261013).
+
+    The snapshot and native shape come only from the output's basis. A thumbnail takes the saved detector's shape;
+    a full raw image or recorded native shape that differs refuses. A frame whose image has not arrived keeps
+    ``saved_ring_expected``, so the view says its rings wait for it; a refused frame carries its reason. An Average
+    result or a Reintegrate version is not an Int Run's record and keeps the view's generic reason.
+    """
+    from xrd_tools.geometry_figures import RING_SHAPE_MISMATCH_REASON
+
+    if (basis is None or basis.kind != "run" or current is None
+            or scientific.processing_mode not in {"Int 1D", "Int 2D"}):
+        return scientific
+    label = current.local_frame_label
+    snapshot = basis.frame_snapshot(label)
+    if snapshot is None:
+        return replace(scientific, saved_ring_reason=basis.frame_reason(label))
+    heavy = scientific.heavy
+    if heavy is None or heavy.frame is not current:
+        return replace(scientific, saved_ring_expected=True)
+    if heavy.raw is None:
+        return scientific
+    shape = basis.shape
+    if (heavy.detector_source == "full" and tuple(heavy.raw.shape) != shape
+            or heavy.detector_shape is not None and heavy.detector_shape != shape):
+        return replace(scientific, heavy=replace(heavy, ring_geometry=None, ring_origin=""),
+                       saved_ring_reason=RING_SHAPE_MISMATCH_REASON)
+    return replace(scientific, saved_ring_expected=True, heavy=replace(
+        heavy, ring_geometry=snapshot, detector_shape=shape, ring_origin="saved"))
+
+
+def attach_saved_support_source(scientific: ScientificProjection, browse: BrowseContext) -> ScientificProjection:
+    """A Browse Int output's own facts, from which the strip may rebuild a frame's angular coverage when the output
+    saved none (COVERAGE-SUPPORT-20261013, D5): its frames' name, file, entry, load snapshot and labels."""
+    from .shell_values import SavedSupportSource
+
+    catalog = browse.scalar_catalog
+    if (scientific.processing_mode not in {"Int 1D", "Int 2D"} or browse.target_snapshot is None
+            or catalog is None or not catalog.labels):
+        return scientific
+    return replace(scientific, saved_support_source=SavedSupportSource(
+        browse.requested_path, catalog.artifact_path, browse.target_entry or catalog.entry, browse.target_snapshot,
+        tuple(catalog.labels)))
+
+
 def _browse_payload(
     context: BrowseContext,
     publication,
@@ -766,4 +885,4 @@ def _browse_wavelength(context: BrowseContext) -> float | None:
     return canonical_wavelength_m(value, WavelengthUnit.METRE)
 
 
-__all__ = ["ContextProjection", "ProjectionRequest"]
+__all__ = ["ContextProjection", "ProjectionRequest", "apply_presentation_background", "attach_saved_rings"]

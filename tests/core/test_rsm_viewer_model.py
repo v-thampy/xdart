@@ -30,13 +30,13 @@ from xrd_tools.session.display_logic import PanelKey, PanelRole
 from xrd_tools.session.rsm_viewer_model import (
     RSM_H,
     RSM_HK,
-    RSM_HL,
+    RSM_LH,
     RSM_K,
     RSM_KL,
     RSM_L,
     RSM_QX,
     RSM_QX_QY,
-    RSM_QX_QZ,
+    RSM_QZ_QX,
     RSM_QY,
     RSM_QY_QZ,
     RSM_QZ,
@@ -231,21 +231,21 @@ def test_exact_layout_has_six_repeated_role_keys_in_frozen_order():
     assert module._MAX_RSM_VIEWER_CACHE_BYTES == 64 << 20
     assert module._MAX_RSM_VIEWER_WORK_BYTES == 128 << 20
     assert RSM_VIEWER_LAYOUT == (
-        (RSM_HK, RSM_HL, RSM_KL),
+        (RSM_HK, RSM_KL, RSM_LH),
         (RSM_H, RSM_K, RSM_L),
     )
     assert RSM_VIEWER_PANEL_ORDER == (
         RSM_HK,
-        RSM_HL,
         RSM_KL,
+        RSM_LH,
         RSM_H,
         RSM_K,
         RSM_L,
     )
     assert tuple((key.role, key.instance) for key in RSM_VIEWER_PANEL_ORDER) == (
         (PanelRole.SLICE_2D, "HK"),
-        (PanelRole.SLICE_2D, "HL"),
         (PanelRole.SLICE_2D, "KL"),
+        (PanelRole.SLICE_2D, "LH"),
         (PanelRole.PROJ_1D, "H"),
         (PanelRole.PROJ_1D, "K"),
         (PanelRole.PROJ_1D, "L"),
@@ -255,13 +255,13 @@ def test_exact_layout_has_six_repeated_role_keys_in_frozen_order():
 
 def test_cartesian_q_uses_distinct_six_panel_layout_and_cache_identity():
     assert RSM_Q_VIEWER_LAYOUT == (
-        (RSM_QX_QY, RSM_QX_QZ, RSM_QY_QZ),
+        (RSM_QX_QY, RSM_QY_QZ, RSM_QZ_QX),
         (RSM_QX, RSM_QY, RSM_QZ),
     )
     assert RSM_Q_VIEWER_PANEL_ORDER == (
         RSM_QX_QY,
-        RSM_QX_QZ,
         RSM_QY_QZ,
+        RSM_QZ_QX,
         RSM_QX,
         RSM_QY,
         RSM_QZ,
@@ -282,8 +282,8 @@ def test_cartesian_q_uses_distinct_six_panel_layout_and_cache_identity():
     )
     assert q_model.component_keys == (
         (q_values.result_fingerprint, "slice", "qz", 3),
-        (q_values.result_fingerprint, "slice", "qy", 2),
         (q_values.result_fingerprint, "slice", "qx", 1),
+        (q_values.result_fingerprint, "slice", "qy", 2),
         (q_values.result_fingerprint, "projection", "qx"),
         (q_values.result_fingerprint, "projection", "qy"),
         (q_values.result_fingerprint, "projection", "qz"),
@@ -499,25 +499,25 @@ def test_three_slice_orientation_projection_and_canonical_empty_nan_contracts(
         warnings.simplefilter("always")
         snapshot = RSMViewerModel().snapshot(values, h_index=1, k_index=2, l_index=3)
     assert not captured
-    hk, hl, kl, h, k, l = snapshot.products
+    hk, kl, lh, h, k, l = snapshot.products
     np.testing.assert_array_equal(hk.values, source[:, :, 3].T)
-    np.testing.assert_array_equal(hl.values, source[:, 2, :].T)
     np.testing.assert_array_equal(kl.values, source[1, :, :].T)
+    np.testing.assert_array_equal(lh.values, source[:, 2, :])
     np.testing.assert_array_equal(h.values, _finite_projection(source, 0))
     np.testing.assert_array_equal(k.values, _finite_projection(source, 1))
     np.testing.assert_array_equal(l.values, _finite_projection(source, 2))
     assert tuple(product.values.shape for product in snapshot.products) == (
         (4, 3),
-        (5, 3),
         (5, 4),
+        (3, 5),
         (3,),
         (4,),
         (5,),
     )
     assert tuple(product.source_indices for product in snapshot.products) == (
         (None, None, 3),
-        (None, 2, None),
         (1, None, None),
+        (None, 2, None),
         (None, None, None),
         (None, None, None),
         (None, None, None),
@@ -544,20 +544,20 @@ def test_cartesian_q_slice_values_preserve_axis_order_and_orientation():
         k_index=2,
         l_index=3,
     )
-    qx_qy, qx_qz, qy_qz, qx, qy, qz = snapshot.products
+    qx_qy, qy_qz, qz_qx, qx, qy, qz = snapshot.products
     assert tuple(product.panel_key for product in snapshot.products) == (
         RSM_Q_VIEWER_PANEL_ORDER
     )
     np.testing.assert_array_equal(qx_qy.values, source[:, :, 3].T)
-    np.testing.assert_array_equal(qx_qz.values, source[:, 2, :].T)
     np.testing.assert_array_equal(qy_qz.values, source[1, :, :].T)
+    np.testing.assert_array_equal(qz_qx.values, source[:, 2, :])
     np.testing.assert_array_equal(qx.values, _finite_projection(source, 0))
     np.testing.assert_array_equal(qy.values, _finite_projection(source, 1))
     np.testing.assert_array_equal(qz.values, _finite_projection(source, 2))
     assert tuple(product.values.shape for product in snapshot.products) == (
         (4, 3),
-        (5, 3),
         (5, 4),
+        (3, 5),
         (3,),
         (4,),
         (5,),
@@ -569,17 +569,17 @@ def test_products_are_detached_readonly_c_order_f4_and_share_interned_axes():
     source_axes = tuple(item[1] for item in values.axes)
     source_intensity = values.intensity
     snapshot = RSMViewerModel().snapshot(values)
-    hk, hl, kl, h, k, l = snapshot.products
-    assert hk.x_axis is hl.x_axis is h.x_axis
+    hk, kl, lh, h, k, l = snapshot.products
+    assert hk.x_axis is lh.y_axis_or_none is h.x_axis
     assert hk.y_axis_or_none is kl.x_axis is k.x_axis
-    assert hl.y_axis_or_none is kl.y_axis_or_none is l.x_axis
+    assert lh.x_axis is kl.y_axis_or_none is l.x_axis
     np.testing.assert_array_equal(hk.x_axis, source_axes[0])
-    np.testing.assert_array_equal(hl.x_axis, source_axes[0])
+    np.testing.assert_array_equal(lh.y_axis_or_none, source_axes[0])
     np.testing.assert_array_equal(h.x_axis, source_axes[0])
     np.testing.assert_array_equal(hk.y_axis_or_none, source_axes[1])
     np.testing.assert_array_equal(kl.x_axis, source_axes[1])
     np.testing.assert_array_equal(k.x_axis, source_axes[1])
-    np.testing.assert_array_equal(hl.y_axis_or_none, source_axes[2])
+    np.testing.assert_array_equal(lh.x_axis, source_axes[2])
     np.testing.assert_array_equal(kl.y_axis_or_none, source_axes[2])
     np.testing.assert_array_equal(l.x_axis, source_axes[2])
     for product in snapshot.products:
@@ -666,8 +666,8 @@ def test_state_fingerprint_memory_failure_is_stable_and_nonmutating(monkeypatch)
     "keyword,panel_index,panel_key",
     (
         ("l_index", 0, RSM_HK),
-        ("k_index", 1, RSM_HL),
-        ("h_index", 2, RSM_KL),
+        ("h_index", 1, RSM_KL),
+        ("k_index", 2, RSM_LH),
     ),
 )
 def test_each_single_axis_change_builds_and_counts_only_its_normal_slice(

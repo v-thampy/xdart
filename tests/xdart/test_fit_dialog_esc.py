@@ -22,6 +22,7 @@ def _survives_escape(dlg, qapp):
         return dlg.isVisible()           # still open after Esc
     finally:
         dlg.close()
+        dlg.deleteLater()
 
 
 def test_peak_fit_dialog_swallows_escape(qapp):

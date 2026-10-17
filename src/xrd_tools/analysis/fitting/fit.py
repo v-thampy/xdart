@@ -435,18 +435,29 @@ def fit_2d_slice(
     Parameters
     ----------
     slice_2d : np.ndarray
-        2D intensity.
+        2D intensity in ``(x, y)`` data order: ``slice_2d[i, j]`` is the sample at
+        ``(x_axis[i], y_axis[j])``, so its shape is ``(len(x_axis), len(y_axis))``.
+        A displayed ``(y, x)`` image must be transposed first.
     x_axis, y_axis : np.ndarray
         1D axes (lengths match slice_2d).
     model : str, optional
         'gaussian2d', 'lorentzian2d'/'lor2_2d', or 'pvoigt2d'.
 
+    Only finite samples are guessed from and fitted (non-finite samples are
+    excluded, never treated as zero); the fitted model is then evaluated on the
+    full grid. ``'gaussian2d'`` is lmfit's Gaussian2dModel: ``amplitude`` is the
+    integrated volume and ``height`` the peak height. The custom models take
+    ``amplitude`` as the height; ``fwhmx``/``fwhmy`` are half-height widths
+    (pseudo-Voigt: a common-HWHM mixture, FWHM = 2 sigma).
+
     Returns
     -------
     result : lmfit.model.ModelResult
-        Fit result.
+        Fit result on the finite samples; ``result.eval(x=X, y=Y)`` evaluates the
+        model on any grid.
     residuals : np.ndarray
-        2D residuals.
+        2D residuals ``data - model`` on the full grid, NaN where the data were
+        not finite (the validity mask is ``np.isfinite(residuals)``).
     """
     from lmfit.models import Gaussian2dModel
 
@@ -463,20 +474,26 @@ def fit_2d_slice(
             + ", ".join(f"{k!r}" for k in sorted(_ALL_KEYS))
         )
 
+    data = np.asarray(slice_2d, dtype=float)
+    x_axis = np.asarray(x_axis, dtype=float)
+    y_axis = np.asarray(y_axis, dtype=float)
+    if x_axis.ndim != 1 or y_axis.ndim != 1 or data.shape != (x_axis.size, y_axis.size):
+        raise ValueError(
+            f"slice_2d shape {data.shape} must be (len(x_axis), len(y_axis)) = "
+            f"({x_axis.size}, {y_axis.size}); data order is (x, y)"
+        )
     X, Y = np.meshgrid(x_axis, y_axis, indexing="ij")
-    z_flat = np.asarray(slice_2d, dtype=float).ravel()
-    X_flat, Y_flat = X.ravel(), Y.ravel()
+    valid = np.isfinite(data) & np.isfinite(X) & np.isfinite(Y)
+    z_valid, x_valid, y_valid = data[valid], X[valid], Y[valid]
 
-    if model_key == "gaussian2d":
-        mod = Gaussian2dModel()
-        pars = mod.guess(slice_2d, x=X, y=Y)
-        result = mod.fit(slice_2d, pars, x=X, y=Y, nan_policy="omit")
-        best_fit = np.asarray(result.best_fit)
-    else:
-        mod = _CUSTOM_MAP[model_key]()
-        pars = mod.guess(z_flat, x=X_flat, y=Y_flat)
-        result = mod.fit(z_flat, pars, x=X_flat, y=Y_flat, nan_policy="omit")
-        best_fit = result.best_fit.reshape(slice_2d.shape)
-
-    residuals = np.asarray(slice_2d, dtype=float) - best_fit
+    mod = Gaussian2dModel() if model_key == "gaussian2d" else _CUSTOM_MAP[model_key]()
+    n_free = 6 if model_key == "pvoigt2d" else 5
+    if z_valid.size <= n_free:
+        raise ValueError(
+            f"2D fit needs more than {n_free} finite samples; {z_valid.size} are finite"
+        )
+    pars = mod.guess(z_valid, x=x_valid, y=y_valid)
+    result = mod.fit(z_valid, pars, x=x_valid, y=y_valid)
+    surface = np.asarray(result.eval(x=X, y=Y), dtype=float)
+    residuals = np.where(valid, data - surface, np.nan)
     return result, residuals

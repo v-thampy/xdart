@@ -10,9 +10,11 @@ Masks come from pyFAI's detector registry, not hardcoded arrays.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import fabio
 import h5py
@@ -41,6 +43,31 @@ class DetectorImageLayout:
     shape: tuple[int, int]
     dtype: str
     frame_count: int
+    #: The detector saturation the file's header records (decision 39), or None.
+    saturation: int | None = None
+
+
+_COUNT_CUTOFF = re.compile(r"Count_cutoff\s+(\d+)\s*counts", re.IGNORECASE)
+
+
+def pilatus_count_cutoff(header: object) -> int | None:
+    """The ``Count_cutoff <n> counts`` a PILATUS header records, else None.
+
+    ``header`` is the header text (a TIFF ImageDescription, a CBF
+    ``_array_data.header_contents``) or a mapping of header values, which are
+    searched in order. Two different cutoffs in one header are ambiguous: None.
+    """
+    from xrd_tools.core.invalid import saturation_count
+
+    texts = header.values() if isinstance(header, dict) else (header,)
+    found = set()
+    for text in texts:
+        if isinstance(text, bytes):
+            text = text.decode("latin-1", errors="replace")
+        if isinstance(text, str):
+            found.update(saturation_count(int(match)) for match in _COUNT_CUTOFF.findall(text[:65536]))
+    found.discard(None)
+    return found.pop() if len(found) == 1 else None
 
 # Established detector layouts for headerless binary frames.  This table is a
 # headless I/O capability shared by the GUI and every FrameSource; matching is
@@ -55,9 +82,42 @@ COMMON_RAW_DETECTOR_SHAPES: tuple[tuple[str, tuple[int, int]], ...] = (
 )
 
 
-def _is_eiger_master(path: Path) -> bool:
-    """Return True if *path* looks like an Eiger HDF5 master file."""
-    return path.stem.endswith("_master")
+# Eiger content (CAL-HELD-BATCH-20261009).  Two independent facts of an open
+# NeXus entry decide Eiger handling; the file name and extension never do.
+
+def eiger_vendor_master(entry: Any) -> bool:
+    """Whether an open NeXus *entry* is a DECTRIS Eiger master: its detector holds the
+    vendor configuration (``detectorSpecific/eiger_fw_version``).  This alone makes the
+    EIGER_MASTER kind (direct decode, the Average and discovery lanes)."""
+    try:
+        return (isinstance(entry, h5py.Group)
+                and "instrument/detector/detectorSpecific/eiger_fw_version" in entry)
+    except Exception:
+        return False
+
+
+def eiger_split_layout(entry: Any) -> bool:
+    """Whether an open entry has linked detector segments, excluding counters."""
+    from xrd_tools.io.nexus import _external_detector_segment_names
+
+    try:
+        data = entry.get("data") if isinstance(entry, h5py.Group) else None
+        return isinstance(data, h5py.Group) and bool(_external_detector_segment_names(data))
+    except Exception:
+        return False
+
+
+def eiger_content(path: Path | str) -> tuple[bool, bool]:
+    """Content facts at *path*. Re-read link headers: targets can land without
+    changing the master's stat. A file that cannot be read is neither."""
+    from xrd_tools.io.bluesky_nexus import resolve_nxentry
+
+    try:
+        with h5py.File(path, "r") as handle:
+            entry = resolve_nxentry(handle, "entry")
+            return eiger_vendor_master(entry), eiger_split_layout(entry)
+    except Exception:
+        return False, False
 
 
 def resolve_detector_shape(
@@ -110,22 +170,28 @@ def infer_raw_detector_shape(
     if header_skip < 0:
         raise ValueError("raw_header_skip must be non-negative")
     payload_bytes = path.stat().st_size - header_skip
-    dtype = np.dtype(raw_dtype)
-    if payload_bytes < 0 or payload_bytes % dtype.itemsize:
+    shape = raw_detector_shape_for_payload(payload_bytes, raw_dtype=raw_dtype)
+    if shape is not None:
+        logger.debug(
+            "Inferred headerless RAW shape %sx%s for %s from %d payload bytes",
+            shape[0], shape[1], path, payload_bytes,
+        )
+    return shape
+
+
+def raw_detector_shape_for_payload(
+    payload_bytes: int, *, raw_dtype: str = "int32",
+) -> tuple[int, int] | None:
+    """The one established layout whose frame is exactly ``payload_bytes`` long, else ``None``."""
+    itemsize = np.dtype(raw_dtype).itemsize
+    if payload_bytes < 0 or payload_bytes % itemsize:
         return None
-    pixel_count = payload_bytes // dtype.itemsize
+    pixel_count = payload_bytes // itemsize
     matches = {
         shape for _name, shape in COMMON_RAW_DETECTOR_SHAPES
         if int(shape[0]) * int(shape[1]) == pixel_count
     }
-    if len(matches) != 1:
-        return None
-    shape = matches.pop()
-    logger.debug(
-        "Inferred headerless RAW shape %sx%s for %s from %d payload bytes",
-        shape[0], shape[1], path, payload_bytes,
-    )
-    return shape
+    return matches.pop() if len(matches) == 1 else None
 
 
 def read_detector_image_layout(
@@ -137,21 +203,30 @@ def read_detector_image_layout(
     raw_header_skip: int = 0,
 ) -> DetectorImageLayout:
     """Read only detector header/layout facts, never a pixel allocation."""
+    from xrd_tools.io.nexus import _read_saturation
+
     selected = Path(path)
     suffix = selected.suffix.lower()
+    saturation = None
     if suffix in _HDF5_READ_EXTS:
-        if suffix in {".h5", ".hdf5"} and _is_eiger_master(selected):
+        if eiger_content(selected)[1]:
             from xrd_tools.io.nexus import open_nexus_image_stack
             with open_nexus_image_stack(selected) as stack:
                 shape = tuple(int(value) for value in stack.shape[1:])
                 dtype = np.dtype(stack.dtype)
                 frame_count = int(stack.shape[0])
+            with h5py.File(selected, "r") as handle:
+                saturation = _read_saturation(handle.get("entry"))
         else:
             with h5py.File(selected, "r") as handle:
                 dataset = _find_hdf5_image_dataset(handle)
                 shape = tuple(int(value) for value in dataset.shape[-2:])
                 dtype = np.dtype(dataset.dtype)
                 frame_count = int(dataset.shape[0]) if dataset.ndim == 3 else 1
+                # the saturation the entry holding this image records: /entry, /entry1, ... (an image
+                # at the root: /entry's, as before; Codex terminal review F2)
+                parts = dataset.name.strip("/").split("/")
+                saturation = _read_saturation(handle.get(parts[0] if len(parts) > 1 else "entry"))
     elif suffix in {".tif", ".tiff"}:
         import tifffile
 
@@ -163,6 +238,7 @@ def read_detector_image_layout(
             shape = tuple(int(value) for value in first.shape)
             dtype = np.dtype(first.dtype)
             frame_count = len(pages)
+            saturation = pilatus_count_cutoff(first.description)
     elif suffix == ".raw":
         dtype = np.dtype(raw_dtype)
         shape_value = detector_shape or resolve_detector_shape(detector)
@@ -184,13 +260,14 @@ def read_detector_image_layout(
             shape = tuple(int(value) for value in image.shape)
             dtype = np.dtype(image.dtype)
             frame_count = int(getattr(image, "nframes", 1))
+            saturation = pilatus_count_cutoff(dict(getattr(image, "header", None) or {}))
         finally:
             image.close()
     if len(shape) != 2 or any(value <= 0 for value in shape):
         raise ValueError("detector image layout must be exactly two-dimensional")
     if frame_count <= 0:
         raise ValueError("detector image layout has an invalid frame count")
-    return DetectorImageLayout((shape[0], shape[1]), dtype.str, frame_count)
+    return DetectorImageLayout((shape[0], shape[1]), dtype.str, frame_count, saturation)
 
 
 def get_detector_mask(detector_name: str) -> np.ndarray | None:
@@ -349,7 +426,7 @@ def read_image(
         if not exact_frame:
             _reject_if_processed_xdart(path)
         arr = _read_hdf5_frame(path, frame, dataset_path, exact=exact_frame)
-    elif ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+    elif ext in _HDF5_READ_EXTS and eiger_content(path)[1]:
         from xrd_tools.io.nexus import open_nexus_image_stack
         with open_nexus_image_stack(path) as stack:
             arr = np.asarray(stack[frame])
@@ -412,7 +489,7 @@ def read_image_stack(
         )
 
     if ext in _HDF5_READ_EXTS:
-        if ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+        if eiger_content(path)[1]:
             from xrd_tools.io.nexus import open_nexus_image_stack
             with open_nexus_image_stack(path) as stack:
                 arr = np.asarray(stack[:])
@@ -628,7 +705,7 @@ def count_frames(path: Path | str) -> int:
     path = Path(path)
     ext = path.suffix.lower()
     try:
-        if ext in {".h5", ".hdf5"} and _is_eiger_master(path):
+        if ext in _HDF5_READ_EXTS and eiger_content(path)[1]:
             from xrd_tools.io.nexus import open_nexus_image_stack
             with open_nexus_image_stack(path) as stack:
                 return int(stack.shape[0])

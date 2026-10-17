@@ -407,6 +407,19 @@ class TestImageOrientation:
         o = ImageOrientation(rotation=270, flip_vertical=True, transpose=True)
         assert ImageOrientation.from_dict(o.to_dict()) == o
 
+    @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+    @pytest.mark.parametrize("flip_vertical", [False, True])
+    @pytest.mark.parametrize("flip_horizontal", [False, True])
+    @pytest.mark.parametrize("transpose", [False, True])
+    def test_unapply_inverts_apply(self, rotation, flip_vertical, flip_horizontal, transpose):
+        o = ImageOrientation(rotation, flip_vertical, flip_horizontal, transpose)
+        raw = np.arange(2 * 3 * 5).reshape(2, 3, 5)  # a stack: the trailing two axes
+        turned = o.apply(raw)
+        back = o.unapply(turned)
+        assert back.flags.c_contiguous
+        np.testing.assert_array_equal(back, raw)
+        np.testing.assert_array_equal(o.apply(o.unapply(turned)), turned)
+
 
 # ---------------------------------------------------------------------------
 # DetectorCalibration (PONI + Detector_config + mount)

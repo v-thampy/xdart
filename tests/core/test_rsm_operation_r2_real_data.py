@@ -9,7 +9,8 @@ import shutil
 import numpy as np
 import pytest
 
-from xdart.gui.tools.rsm_values import (
+from xrd_tools.analysis.rsm_operation import RSMFrameCorrections
+from xrd_tools.analysis.rsm_values import (
     RSMFrameSelector,
     RSMScanMemberForm,
     RSMToolFormV2,
@@ -115,6 +116,66 @@ def _data_root() -> Path:
     return root
 
 
+def test_scan18_saved_direct_beam_calibration_runs_on_the_exact_planned_grid(tmp_path):
+    """Native October6 refusal: actual saved calibration, all 81 RAW frames, HKL 40³.
+
+    The producer must emit the frozen NumPy grid exactly; strict validation and
+    publication/readback remain part of this real-interface oracle.
+    """
+    from xrd_tools.analysis.rsm_geometry_asset import (
+        rsm_calibration_geometry_input, rsm_effective_pixel_q_map,
+    )
+    from xrd_tools.analysis.rsm_operation import RSMImageConditioning, RSMNormalizationPolicy
+    from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
+    from xrd_tools.rsm.gridding import StreamingGridder
+
+    source = _data_root()
+    pins = {
+        "STO_align": _SPEC_SHA256,
+        "direct_beam_scan1.json": "a471ae8592daee9bf68431a0aac2b4932df36cd913102286863f0adbadd309d0",
+        "direct_beam_scan1.xu.json": "5abc0726fca454117db9f237fbe2f2595f901e0fed4ddfb31062ae7c48067d67",
+    }
+    for name, digest in pins.items():
+        if not (source / name).exists():
+            pytest.skip("native scan18 saved calibration is unavailable")
+        assert hashlib.sha256((source / name).read_bytes()).hexdigest() == digest
+        shutil.copy2(source / name, tmp_path / name)
+    images = tmp_path / "images"
+    images.mkdir()
+    stem = "b_thampy_STO_align_scan18_"
+    raws = tuple(sorted((source / "images").glob(f"{stem}*.raw")))
+    assert len(raws) == 81 and sum(path.stat().st_size for path in raws) == 30_768_660
+    for path in raws:
+        shutil.copy2(path, images / path.name)
+    preset = rsm_tool_preset()
+    member = RSMScanMemberForm(tmp_path / "STO_align", "18.1", images, stem,
+        RSMFrameSelector(0, 80, 1), preset.detector_shape, preset.raw_dtype,
+        preset.raw_header_skip, preset.motor_selectors)
+    form = RSMToolFormV2(tmp_path, rsm_calibration_geometry_input("direct_beam_scan1.json"),
+        (member,), RSMImageConditioning(0.0, None, None), RSMNormalizationPolicy.identity(),
+        (40, 40, 40), preset.chunk_size, preset.max_frame_bytes, None,
+        tmp_path / "native-scan18.nexus")
+    request = prepare_rsm_tool_v2(form).request
+    # Native kernel diagnostics identify any rounding disagreement before execution.
+    with xu_runtime_session(request.plan.effective_geometry.runtime_requirements) as session:
+        gridder = StreamingGridder(rsm_effective_pixel_q_map(request.plan.effective_geometry),
+            request.plan.bins, runtime_session=session)
+        gridder.set_bounds(*request.plan.common_grid.bounds)
+        for name, axis, bounds in zip("HKL", (gridder._grid_raw.xaxis, gridder._grid_raw.yaxis,
+            gridder._grid_raw.zaxis), request.plan.common_grid.bounds, strict=True):
+            expected = np.linspace(*bounds, 40, dtype=np.float64)
+            print(name, "bounds", bounds, "axis differences", np.flatnonzero(axis != expected),
+                  "max difference", float(np.max(np.abs(axis - expected))))
+    result = run_rsm_operation_v2(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+    assert result.payload.intensity.shape == (40, 40, 40)
+    assert np.isfinite(result.payload.intensity).any()
+    for (_name, axis), bounds in zip(result.payload.axes, request.plan.common_grid.bounds, strict=True):
+        # Publication's existing frozen format is float32; science is validated
+        # against the exact float64 plan before that projection is admitted.
+        np.testing.assert_array_equal(axis, np.linspace(*bounds, 40, dtype=np.float64).astype(np.float32))
+
+
 def _raw_manifest(paths: tuple[Path, ...]) -> str:
     rows = (
         f"{path.name}\0{path.stat().st_size}\0"
@@ -186,6 +247,9 @@ def _form(
         preset.max_frame_bytes,
         preset.max_chunk_bytes,
         project / f"rsm-r2-{'-'.join(str(item) for item in scans)}-{bins}.nexus",
+        # the references were made before the solid angle and polarization (decision 5, on by default in the
+        # form): every correction explicitly off, as row A (test_rsm_frame_corrections)
+        corrections=RSMFrameCorrections(),
     )
 
 
@@ -269,3 +333,25 @@ def test_rsm_v2_matches_independent_authenticated_oracle(
     finally:
         if output.exists():
             output.unlink()
+
+
+@pytest.mark.slow
+def test_the_default_on_scan_43_reference(rsm_r2_project):
+    """Decision 5's corrections (solid angle on, polarization 0.99: the form's default) on scan 43 at 40³, pinned
+    under the canonical asset's psic standard directions: on scan 43 they index the substrate (113) nearest
+    (0.049 from (1 1 3), against 0.171 under the 17-2 record's reversals of mu and chi;
+    test_rsm_calibration_geometry's physical row). The all-off reference (8a88826f…) is kept beside it."""
+    from dataclasses import replace
+
+    default = RSMToolFormV2.__dataclass_fields__["corrections"].default
+    assert default == RSMFrameCorrections(solid_angle=True, polarization_factor=0.99)
+    form = replace(_form(rsm_r2_project, (43,), 40), corrections=default,
+                   output_path=rsm_r2_project / "rsm-r2-43-40-default-on.nexus")
+    try:
+        result = run_rsm_operation_v2(prepare_rsm_tool_v2(form).request)
+        assert result.terminal.disposition is ModuleDisposition.COMMITTED
+        assert int(np.isfinite(result.payload.intensity).sum()) == 5531
+        assert result.payload.result_fingerprint == (
+            "5d72bcaaeb3e923a32037a7117271b866c4f93635c93aeee2071b2b6791b46cc")
+    finally:
+        Path(form.output_path).unlink(missing_ok=True)

@@ -74,7 +74,6 @@ from xrd_tools.io.schema import (
     SCHEMA,
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
-    STITCH_NEUTRAL_GROUPS,
     canonical_gi_mode_key,
     axis_display_metadata,
     local_hard_dataset,
@@ -428,38 +427,37 @@ def find_nexus_image_dataset(
         return find_nexus_image_dataset_in_open_file(f, entry)
 
 
-def _find_eiger_external_link_paths(
-    h5f: h5py.File, entry: str
-) -> list[str]:
-    """Return sorted ``/{entry}/data/data_NNNNNN`` external-link paths.
+def _external_detector_segment_names(data: h5py.Group) -> list[str]:
+    """Sorted linked detector segments, using declarations or dataset headers.
 
-    Eiger master files store the full image stack as a sequence of
-    sibling external links named ``data_000001``, ``data_000002``, ….
-    Each link resolves to a 3D ``(n_in_file, H, W)`` dataset; the full
-    scan is the concatenation along axis 0.
-
-    Returns an empty list if there are no external links under
-    ``/{entry}/data``.
+    Canonical ``data``/``data_NNN`` links remain selected when dangling or
+    malformed so binding refuses the whole stack rather than a landed prefix.
+    Other names must resolve to 2-D/3-D pixels; a dangling NXdata signal remains
+    provisional. Resolved scalar/1-D counters never become image segments.
     """
-    if entry not in h5f:
-        return []
-    grp = h5f[entry]
-    if "data" not in grp or not isinstance(grp["data"], h5py.Group):
-        return []
-    data_grp = grp["data"]
-    ext_keys: list[str] = []
-    for k in data_grp:
-        try:
-            link = data_grp.get(k, getlink=True)
-        except KeyError:
+    signal = data.attrs.get("signal", "")
+    if isinstance(signal, (bytes, np.bytes_)):
+        signal = signal.decode("utf-8", errors="replace")
+    names: list[str] = []
+    for name in sorted(data.keys()):
+        if not isinstance(data.get(name, getlink=True), h5py.ExternalLink):
             continue
-        if link.__class__.__name__ == "ExternalLink":
-            ext_keys.append(k)
-    if not ext_keys:
+        if name == "data" or (name.startswith("data_") and name[5:].isdigit()):
+            names.append(name)
+            continue
+        value = data.get(name)
+        if (isinstance(value, h5py.Dataset) and value.ndim in (2, 3)
+                or value is None and name == signal):
+            names.append(name)
+    return names
+
+
+def _find_eiger_external_link_paths(h5f: h5py.File, entry: str) -> list[str]:
+    """Linked detector selectors, excluding external scalar/1-D counters."""
+    group = h5f.get(f"{entry}/data")
+    if not isinstance(group, h5py.Group):
         return []
-    # Eiger names are zero-padded, so lexical sort = numeric order.
-    ext_keys.sort()
-    return [f"/{entry}/data/{k}" for k in ext_keys]
+    return [f"/{entry}/data/{name}" for name in _external_detector_segment_names(group)]
 
 
 class _NexusDatasetOwnerSlot:
@@ -748,12 +746,8 @@ def _bind_nexus_stack_from_entry(
 
     try:
         data_group = direct("data")
-        external_names: list[str] = []
-        if isinstance(data_group, h5py.Group):
-            for name in sorted(data_group.keys()):
-                link = data_group.get(name, getlink=True)
-                if isinstance(link, h5py.ExternalLink) and name.startswith("data_"):
-                    external_names.append(name)
+        external_names = (_external_detector_segment_names(data_group)
+                          if isinstance(data_group, h5py.Group) else [])
         if external_names:
             for name in external_names:
                 acquire(
@@ -2857,23 +2851,6 @@ def _schema_projected_dataset(
     return group.create_dataset(spec.name, data=data, **kwargs)
 
 
-def _projected_diagnostic_dataset(
-    group: h5py.Group,
-    name: str,
-    data: np.ndarray,
-    *,
-    ck: dict,
-) -> h5py.Dataset:
-    if (
-        type(data) is not np.ndarray
-        or data.dtype != np.dtype("<f4")
-        or not data.flags.c_contiguous
-        or data.flags.writeable
-    ):
-        raise TypeError("stored Stitch diagnostic is not exact frozen <f4")
-    return group.create_dataset(name, data=data, **ck)
-
-
 def _frame_aware_rsm_axis_dataset(
     group: h5py.Group,
     name: str,
@@ -2920,9 +2897,6 @@ def validate_group_against_schema(group: h5py.Group,
     """
     spec = SCHEMA.groups[group_name]
     problems: list[str] = []
-    neutral = STITCH_NEUTRAL_GROUPS.get(group_name)
-    if neutral is not None and _norm_attr(group.attrs.get("axes")) == list(neutral.axes):
-        spec = neutral
     for name, ds_spec in spec.datasets.items():
         if name not in group:
             if ds_spec.required:
@@ -3692,391 +3666,6 @@ def _bound_analysis_nxdata(group: h5py.Group, axes: tuple[str, ...]) -> None:
     _bounded_text_attr(group, "axes", axes)
 
 
-def _uses_neutral_stitch_axes(entry: h5py.Group, *, bounded_artifact: bool) -> bool:
-    version = entry.attrs.get(SCHEMA_VERSION_ATTR)
-    if bounded_artifact:
-        from xrd_tools.io.analysis_artifact import _STITCH_NEUTRAL_CONTRACTS
-
-        return version in _STITCH_NEUTRAL_CONTRACTS
-    marker = entry.attrs.get(SCHEMA_NAME_ATTR)
-    if isinstance(marker, bytes):
-        marker = marker.decode("utf-8")
-    return marker == PROCESSED_SCHEMA_NAME and version == PROCESSED_SCHEMA_VERSION
-
-
-def _finish_stitch_axis_layout(group: h5py.Group, *, bounded: bool) -> None:
-    """Relabel just-created axis links; never read or rewrite scientific arrays."""
-    schema = STITCH_NEUTRAL_GROUPS[group.name.rsplit("/", 1)[1]]
-    for logical, physical in zip(SCHEMA.groups[schema.name].axes, schema.axes, strict=True):
-        group.move(logical, physical)
-        axis = group[physical]
-        unit = axis.attrs["units"]
-        if isinstance(unit, bytes):
-            unit = unit.decode("utf-8")
-        label = axis_display_metadata(unit)["long_name"]
-        if bounded:
-            _bounded_text_attr(axis, "long_name", label)
-        else:
-            axis.attrs["long_name"] = label
-    if bounded:
-        _bound_analysis_nxdata(group, schema.axes)
-    else:
-        group.attrs["axes"] = list(schema.axes)
-
-
-def _stitched_read_axis_names(group: h5py.Group) -> tuple[str, ...]:
-    name = group.name.rsplit("/", 1)[1]
-    legacy = SCHEMA.groups[name].axes
-    neutral = STITCH_NEUTRAL_GROUPS[name].axes
-    declared = tuple(_norm_attr(group.attrs.get("axes", list(legacy))))
-    if declared not in (legacy, neutral):
-        raise ValueError("stitched axis layout is invalid")
-    present = tuple(axis for axis in (*legacy, *neutral) if axis in group)
-    if present != declared:
-        raise ValueError("stitched axis layout is mixed or incomplete")
-    return declared
-
-
-def write_stitched(
-    entry_grp: h5py.Group,
-    *,
-    stitched_1d: IntegrationResult1D | None = None,
-    stitched_2d: IntegrationResult2D | None = None,
-    result_projection: object | None = None,
-    legacy_v1_unit_layout: bool = False,
-    provenance: "Mapping[str, object] | str | None" = None,
-    frame_records=None,
-    source_base=None,
-    coverage: np.ndarray | None = None,
-    normalization: np.ndarray | None = None,
-    compression: str | None = None,
-    bounded_artifact: bool = False,
-) -> None:
-    """Write ``/entry/stitched_1d`` / ``/entry/stitched_2d`` — the symmetric
-    counterpart to :func:`read_stitched`.
-
-    Unlike the per-frame ``integrated_2d`` stack (``frame, y, x``), stitched
-    intensity is stored **as-is** ``(x, y)`` and read with logical dims
-    ``(q, chi)``. Current processed and neutral standalone outputs use
-    ``axis_1``/``axis_2`` tree names; explicit legacy artifacts retain q/chi.
-    Supplied groups replace their predecessors inside the caller's transaction.
-
-    ``provenance`` (the StitchPlan + applied CorrectionStack — typically
-    ``StitchPlan.provenance()``) is stamped into each written group as a
-    ``provenance_json`` blob; ``None`` writes no blob.  A dict is JSON-encoded;
-    a str is written verbatim (assumed already-JSON).  The analysis-artifact
-    boundary passes ``bounded_artifact=True`` so detached readers can reject
-    oversized fixed-width provenance and schema attributes before allocating
-    their contents.  The default retains the historical vlen-UTF8
-    representation for ordinary scan files.
-
-    ``legacy_v1_unit_layout`` is reserved for bounded schema-v1 artifacts.  It
-    reproduces their accepted HDF5 object-header bytes while still writing only
-    the central stored-result projection.  Schema v2 must leave it false.
-    """
-    ck = _comp_kwargs(compression)
-    if type(bounded_artifact) is not bool:
-        raise TypeError("bounded_artifact must be an exact bool")
-    if type(legacy_v1_unit_layout) is not bool:
-        raise TypeError("legacy_v1_unit_layout must be an exact bool")
-    neutral_axes = _uses_neutral_stitch_axes(entry_grp, bounded_artifact=bounded_artifact)
-    if result_projection is not None:
-        from xrd_tools.io.analysis_artifact import (
-            AnalysisArtifactKind,
-            AnalysisArtifactResultProjection,
-        )
-
-        if (
-            type(result_projection) is not AnalysisArtifactResultProjection
-            or result_projection.kind not in {
-                AnalysisArtifactKind.STITCH_1D,
-                AnalysisArtifactKind.STITCH_2D,
-            }
-        ):
-            raise TypeError(
-                "result_projection must be an exact stored Stitch projection"
-            )
-        if (
-            not bounded_artifact
-            or stitched_1d is not None
-            or stitched_2d is not None
-            or coverage is not None
-            or normalization is not None
-            or frame_records is not None
-            or source_base is not None
-        ):
-            raise ValueError(
-                "stored Stitch projection is exclusive to a bounded artifact"
-            )
-        prov_json = _bounded_artifact_provenance(provenance)
-        group_name = result_projection.kind.group
-        if group_name in entry_grp:
-            del entry_grp[group_name]
-        group = _create_group_from_schema(entry_grp, group_name)
-        axis_names = tuple(name for name, _values in result_projection.axes)
-        _bound_analysis_nxdata(group, axis_names)
-        _schema_projected_dataset(
-            group,
-            group_name,
-            "intensity",
-            result_projection.intensity,
-            ck=ck,
-        )
-        for (name, values), (_unit_name, units) in zip(
-            result_projection.axes,
-            result_projection.axis_units,
-            strict=True,
-        ):
-            dataset = _schema_projected_dataset(
-                group,
-                group_name,
-                name,
-                values,
-                ck=ck,
-            )
-            if legacy_v1_unit_layout:
-                # Preserve the historical v1 HDF5 object-header sequence: the
-                # vlen attribute existed briefly before the bounded fixed-width
-                # replacement.  Its tombstone bytes are part of the accepted
-                # v1 terminal-file oracle even though the logical graph agrees.
-                dataset.attrs["units"] = units
-            _bounded_text_attr(dataset, "units", units)
-        if result_projection.sigma is not None:
-            _schema_projected_dataset(
-                group,
-                group_name,
-                "sigma",
-                result_projection.sigma,
-                ck=ck,
-            )
-        if result_projection.coverage is not None:
-            _projected_diagnostic_dataset(
-                group,
-                "coverage",
-                result_projection.coverage,
-                ck=ck,
-            )
-            _projected_diagnostic_dataset(
-                group,
-                "normalization",
-                result_projection.normalization,
-                ck=ck,
-            )
-        group.create_dataset(
-            "provenance_json",
-            data=np.bytes_(prov_json.encode("utf-8")),
-        )
-        if neutral_axes:
-            _finish_stitch_axis_layout(group, bounded=True)
-        return
-    if bounded_artifact:
-        from xrd_tools.io.analysis_artifact import (
-            AnalysisArtifactKind,
-            _project_analysis_artifact_result_v1_compat,
-        )
-
-        if (coverage is None) != (normalization is None):
-            raise ValueError(
-                "stitched coverage and normalization diagnostics must be paired"
-            )
-        if (stitched_1d is None) == (stitched_2d is None):
-            raise ValueError(
-                "bounded analysis artifact requires exactly one stitched result"
-            )
-        if frame_records is not None or source_base is not None:
-            raise ValueError(
-                "bounded analysis artifact does not accept unbound frame records"
-            )
-        value = stitched_1d if stitched_1d is not None else stitched_2d
-        _bounded_artifact_provenance(provenance)
-        if stitched_1d is not None:
-            _bounded_artifact_text(
-                value.unit,
-                "stitched radial units",
-                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
-            )
-            kind = AnalysisArtifactKind.STITCH_1D
-            axes = (("q", value.radial),)
-            axis_units = (("q", value.unit),)
-        else:
-            _bounded_artifact_text(
-                value.unit,
-                "stitched radial units",
-                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
-            )
-            _bounded_artifact_text(
-                value.azimuthal_unit,
-                "stitched azimuthal units",
-                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
-            )
-            kind = AnalysisArtifactKind.STITCH_2D
-            axes = (("q", value.radial), ("chi", value.azimuthal))
-            axis_units = (
-                ("q", value.unit),
-                ("chi", value.azimuthal_unit),
-            )
-        projection = _project_analysis_artifact_result_v1_compat(
-            kind=kind,
-            axes=axes,
-            axis_units=axis_units,
-            intensity=value.intensity,
-            sigma=value.sigma,
-            coverage=coverage,
-            normalization=normalization,
-        )
-        return write_stitched(
-            entry_grp,
-            result_projection=projection,
-            legacy_v1_unit_layout=not neutral_axes,
-            provenance=provenance,
-            compression=compression,
-            bounded_artifact=True,
-        )
-    if legacy_v1_unit_layout:
-        raise ValueError(
-            "legacy v1 unit layout requires a stored Stitch projection"
-        )
-    if (coverage is None) != (normalization is None):
-        raise ValueError(
-            "stitched coverage and normalization diagnostics must be paired"
-        )
-    diagnostics: tuple[np.ndarray, np.ndarray] | None = None
-    if coverage is not None:
-        expected_shape = (
-            None
-            if (stitched_1d is None) == (stitched_2d is None)
-            else (
-                np.asarray(stitched_1d.intensity).shape
-                if stitched_1d is not None
-                else np.asarray(stitched_2d.intensity).shape
-            )
-        )
-        coverage_values = np.asarray(coverage, dtype=np.float32)
-        normalization_values = np.asarray(normalization, dtype=np.float32)
-        if (
-            expected_shape is None
-            or coverage_values.shape != expected_shape
-            or normalization_values.shape != expected_shape
-            or not np.all(np.isfinite(coverage_values))
-            or not np.all(np.isfinite(normalization_values))
-            or np.any(coverage_values < 0)
-            or np.any(normalization_values < 0)
-        ):
-            raise ValueError(
-                "stitched diagnostics must be finite nonnegative result-shaped peers"
-            )
-        diagnostics = coverage_values, normalization_values
-    prov_json: str | None = None
-    if bounded_artifact:
-        if (stitched_1d is None) == (stitched_2d is None):
-            raise ValueError(
-                "bounded analysis artifact requires exactly one stitched result"
-            )
-        if frame_records is not None or source_base is not None:
-            raise ValueError(
-                "bounded analysis artifact does not accept unbound frame records"
-            )
-        prov_json = _bounded_artifact_provenance(provenance)
-        if stitched_1d is not None:
-            _bounded_artifact_text(
-                stitched_1d.unit,
-                "stitched radial units",
-                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
-            )
-        if stitched_2d is not None:
-            _bounded_artifact_text(
-                stitched_2d.unit,
-                "stitched radial units",
-                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
-            )
-            _bounded_artifact_text(
-                stitched_2d.azimuthal_unit,
-                "stitched azimuthal units",
-                max_bytes=_MAX_BOUNDED_ARTIFACT_ATTRIBUTE_BYTES,
-            )
-    elif provenance is not None:
-        prov_json = provenance if isinstance(provenance, str) else json.dumps(
-            provenance, default=str)
-
-    if stitched_1d is not None:
-        if "stitched_1d" in entry_grp:
-            del entry_grp["stitched_1d"]
-        # 2b: group + NX attrs + dataset dtypes/compression derive from SCHEMA
-        # (byte-identical to the hand-written form); only the per-axis units and
-        # the provenance_json blob (an additive extra) are stamped by hand.
-        g = _create_group_from_schema(entry_grp, "stitched_1d")
-        if bounded_artifact:
-            _bound_analysis_nxdata(g, ("q",))
-        _schema_dataset(g, "stitched_1d", "intensity", stitched_1d.intensity, ck=ck)
-        qd = _schema_dataset(g, "stitched_1d", "q", stitched_1d.radial, ck=ck)
-        qd.attrs["units"] = stitched_1d.unit            # units_from="radial_unit"
-        if bounded_artifact:
-            _bounded_text_attr(qd, "units", stitched_1d.unit)
-        if stitched_1d.sigma is not None:
-            _schema_dataset(g, "stitched_1d", "sigma", stitched_1d.sigma, ck=ck)
-        if diagnostics is not None:
-            g.create_dataset("coverage", data=diagnostics[0], **ck)
-            g.create_dataset("normalization", data=diagnostics[1], **ck)
-        if prov_json is not None:
-            if bounded_artifact:
-                g.create_dataset(
-                    "provenance_json",
-                    data=np.bytes_(prov_json.encode("utf-8")),
-                )
-            else:
-                g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
-
-    if stitched_2d is not None:
-        # Fail loud on a transposed cake: read_stitched blindly applies (q, chi)
-        # to the stored array and the stitched validator skips the row-count
-        # block, so a transposed (n_chi, n_q) array round-trips as silently
-        # wrong axes for a square cake.  Enforce the (n_q, n_chi) contract at the
-        # write boundary (complements, never relaxes, the validators).
-        _i2d = np.asarray(stitched_2d.intensity, np.float32)
-        _exp = (len(stitched_2d.radial), len(stitched_2d.azimuthal))
-        if _i2d.shape != _exp:
-            raise ValueError(
-                f"stitched_2d.intensity shape {_i2d.shape} != (len(radial), "
-                f"len(azimuthal)) = {_exp}; the stored cake must be (n_q, n_chi).")
-        if "stitched_2d" in entry_grp:
-            del entry_grp["stitched_2d"]
-        # 2b: schema-routed group + datasets (byte-identical); the (n_q, n_chi)
-        # intensity is stored as-is — see docstring.  Per-axis units + the
-        # provenance_json blob stay hand-stamped.
-        g = _create_group_from_schema(entry_grp, "stitched_2d")
-        if bounded_artifact:
-            _bound_analysis_nxdata(g, ("q", "chi"))
-        _schema_dataset(g, "stitched_2d", "intensity", _i2d, ck=ck)
-        qd = _schema_dataset(g, "stitched_2d", "q", stitched_2d.radial, ck=ck)
-        qd.attrs["units"] = stitched_2d.unit            # units_from="radial_unit"
-        cd = _schema_dataset(g, "stitched_2d", "chi", stitched_2d.azimuthal, ck=ck)
-        cd.attrs["units"] = stitched_2d.azimuthal_unit  # units_from="azimuthal_unit"
-        if stitched_2d.sigma is not None:
-            _schema_dataset(g, "stitched_2d", "sigma", stitched_2d.sigma, ck=ck)
-        if diagnostics is not None:
-            g.create_dataset("coverage", data=diagnostics[0], **ck)
-            g.create_dataset("normalization", data=diagnostics[1], **ck)
-        if bounded_artifact:
-            _bounded_text_attr(qd, "units", stitched_2d.unit)
-            _bounded_text_attr(cd, "units", stitched_2d.azimuthal_unit)
-        if prov_json is not None:
-            if bounded_artifact:
-                g.create_dataset(
-                    "provenance_json",
-                    data=np.bytes_(prov_json.encode("utf-8")),
-                )
-            else:
-                g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
-
-    if frame_records:
-        from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
-        write_contributing_frames(entry_grp, frame_records, source_base=source_base)
-    if neutral_axes:
-        for name, value in (("stitched_1d", stitched_1d), ("stitched_2d", stitched_2d)):
-            if value is not None:
-                _finish_stitch_axis_layout(entry_grp[name], bounded=False)
-
-
 def write_rsm(
     entry_grp: h5py.Group,
     volume: Any | None = None,
@@ -4213,13 +3802,7 @@ def write_rsm(
                 else coordinate_frame
             ),
         )
-    if bounded_artifact:
-        if frame_records is not None or source_base is not None:
-            raise ValueError(
-                "bounded analysis artifact does not accept unbound frame records"
-            )
-        prov = _bounded_artifact_provenance(provenance)
-    elif provenance is not None:
+    if provenance is not None:
         prov = provenance if isinstance(provenance, str) else json.dumps(
             provenance, default=str)
     else:
@@ -4248,19 +3831,11 @@ def write_rsm(
     # 2b: schema-routed group + datasets (byte-identical).  h/k/l carry NO units
     # (no units_from in the schema) — do not add any, it would change the bytes.
     g = _create_group_from_schema(entry_grp, "rsm")
-    if bounded_artifact:
-        _bound_analysis_nxdata(g, ("h", "k", "l"))
     _schema_dataset(g, "rsm", "intensity", intensity, ck=ck)
     for name, axis in (("h", volume.h), ("k", volume.k), ("l", volume.l)):
         _schema_dataset(g, "rsm", name, axis, ck=ck)
     if prov is not None:
-        if bounded_artifact:
-            g.create_dataset(
-                "provenance_json",
-                data=np.bytes_(prov.encode("utf-8")),
-            )
-        else:
-            g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
+        g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
 
     if frame_records:
         from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
@@ -4972,7 +4547,11 @@ def _scalar_or_first(ds: h5py.Dataset) -> float:
 
 
 def _read_energy(grp: h5py.Group) -> float:
-    """Extract beam energy (keV) from the monochromator group."""
+    """Extract beam energy (keV) from the monochromator group.
+
+    A recorded eV value (above 150) is converted: an X-ray energy's scale is
+    decided by its size (:func:`xrd_tools.core.energy.xray_energy_keV`)."""
+    from xrd_tools.core.energy import xray_energy_keV
     from xrd_tools.io.bluesky_nexus import bluesky_energy_kev, is_bluesky_nxwriter
     if is_bluesky_nxwriter(grp):
         # Bluesky/NXWriter: energy lives in the eiger detector config (in eV).
@@ -4982,7 +4561,7 @@ def _read_energy(grp: h5py.Group) -> float:
     path = "instrument/monochromator/energy"
     if path in grp:
         try:
-            return _scalar_or_first(grp[path])
+            return xray_energy_keV(_scalar_or_first(grp[path]))
         except Exception:
             logger.warning("Could not read energy from %s", path, exc_info=True)
     logger.debug(
@@ -5011,6 +4590,36 @@ def _read_wavelength(grp: h5py.Group, energy: float) -> float:
         grp.file.filename,
     )
     return float(np.nan)
+
+
+#: Where a NeXus/Eiger file records its detector's saturation (decision 39): the
+#: standard NXdetector field, then the Eiger's count-rate correction cutoff.
+_SATURATION_PATHS = (
+    "instrument/detector/saturation_value",
+    "instrument/detector/detectorSpecific/countrate_correction_count_cutoff",
+)
+
+
+def _read_saturation(grp: h5py.Group | None) -> int | None:
+    """The detector saturation the entry records, as a positive whole count, else None.
+
+    The first readable path wins; a missing or malformed value falls to the next
+    (``xrd_tools.core.invalid.saturation_count``), never raising.
+    """
+    from xrd_tools.core.invalid import saturation_count
+
+    if grp is None:
+        return None
+    for name in _SATURATION_PATHS:
+        try:
+            item = grp.get(name)
+            value = (saturation_count(item[()])
+                     if isinstance(item, h5py.Dataset) and item.shape == () else None)
+        except Exception:  # noqa: BLE001 - an unreadable value falls to the next rule
+            value = None
+        if value is not None:
+            return value
+    return None
 
 
 def _read_ub_matrix(grp: h5py.Group) -> np.ndarray | None:
@@ -5105,6 +4714,8 @@ def _read_data_group(
             # user-selected foreign file.  ``dtype.kind`` is metadata — no read.
             if getattr(obj.dtype, "kind", "O") not in "fiub":
                 continue
+            if obj.ndim != 1:
+                continue  # Metadata reads must not materialize detector stacks.
             try:
                 arr = np.asarray(obj, dtype=float)
             except (TypeError, ValueError, OSError):
@@ -5127,31 +4738,273 @@ def _read_data_group(
             _harvest(sub)
 
     # NXpositioner ``value`` arrays under sample/positioners — the actual scanned
-    # motor(s).  Each positioner is a GROUP (NXpositioner) with a ``value`` field;
-    # non-group children (e.g. a stray ``frame_index`` dataset) are NOT motors and
-    # are skipped.  These are authoritative motors -> force into angles.
+    # motor(s).  These are authoritative motors -> force into angles.
     sample = grp.get("sample")
-    if isinstance(sample, h5py.Group):
-        positioners = sample.get("positioners")
-        if isinstance(positioners, h5py.Group):
-            for name, obj in positioners.items():
-                if not isinstance(obj, h5py.Group):
-                    continue
-                value = obj.get("value")
-                if not isinstance(value, h5py.Dataset):
-                    continue
-                if getattr(value.dtype, "kind", "O") not in "fiub":
-                    continue
-                try:
-                    arr = np.asarray(value, dtype=float)
-                except (TypeError, ValueError, OSError):
-                    continue
-                if arr.ndim != 1:
-                    continue
-                angles[name] = arr          # authoritative scanned motor
-                counters.pop(name, None)
+    positioners = sample.get("positioners") if isinstance(sample, h5py.Group) else None
+    for name, value in _nxpositioner_values(positioners):
+        if getattr(value.dtype, "kind", "O") not in "fiub":
+            continue
+        try:
+            arr = np.asarray(value, dtype=float)
+        except (TypeError, ValueError, OSError):
+            continue
+        if arr.ndim != 1:
+            continue
+        angles[name] = arr          # authoritative scanned motor
+        counters.pop(name, None)
 
     return angles, counters
+
+
+def _nxpositioner_values(group: Any, *, local_only: bool = False):
+    """``(name, value)`` for each NXpositioner child of *group*: a group whose ``value`` field is a dataset.
+
+    Nothing is read.  A non-group child (e.g. a stray ``frame_index`` dataset) is not a positioner.  With
+    *local_only*, a positioner reached through an external link comes back with ``value=None`` instead of opening
+    the other file."""
+    if not isinstance(group, h5py.Group):
+        return
+    for name in group:
+        if local_only and isinstance(group.get(name, getlink=True), h5py.ExternalLink):
+            yield name, None
+            continue
+        obj = group.get(name)
+        if not isinstance(obj, h5py.Group):
+            continue
+        if local_only and isinstance(obj.get("value", getlink=True), h5py.ExternalLink):
+            yield name, None
+            continue
+        value = obj.get("value")
+        if isinstance(value, h5py.Dataset):
+            yield name, value
+
+
+# ---------------------------------------------------------------------------
+# Supported acquisition metadata of a non-Bluesky NeXus entry (v1)
+# ---------------------------------------------------------------------------
+# CAL-HELD-BATCH-20261009.  A Bluesky/NXWriter entry keeps its own readers.  Any
+# other entry serves only these items, each one value per detector frame or one
+# constant: NXpositioner values under entry/sample (winning a name clash) and
+# entry/instrument, then the NXdata @axes of entry/data, as motors in degrees;
+# counter-named entry/data and scan_data columns, never motors; and the
+# monochromator energy in eV (from its wavelength only when no energy is
+# recorded).  A supported item of another shape or units, or not numeric, is
+# excluded with its reason; nothing is trimmed, padded, interpolated or reduced
+# to its first value.  An energy is eV or keV by its size (core.energy); angles
+# and wavelengths without a declared unit keep the legacy degrees and angstrom.
+
+#: Declared units (casefolded) -> the unit each supported item is read in.
+_ANGLE_UNITS = {"": "deg", "deg": "deg", "degree": "deg", "degrees": "deg",
+                "rad": "rad", "radian": "rad", "radians": "rad"}
+_ENERGY_UNITS = {"": "energy", "kev": "energy", "ev": "energy"}  # the size decides eV or keV
+_WAVELENGTH_UNITS = {unit: f"wavelength:{value}" for unit, value in (
+    ("", "angstrom"), ("a", "angstrom"), ("å", "angstrom"), ("angstrom", "angstrom"), ("angstroms", "angstrom"),
+    ("m", "m"), ("metre", "m"), ("metres", "m"), ("meter", "m"), ("meters", "m"))}
+
+
+class AcquisitionItem(NamedTuple):
+    """One supported item: served *name*, *path* in the entry, *role* (motor, counter or energy), the *unit* it
+    is read in, and whether it holds one value per frame (else one constant)."""
+    name: str
+    path: str
+    role: str
+    unit: str
+    per_frame: bool
+
+
+class AcquisitionMetadata(NamedTuple):
+    """A non-Bluesky entry's supported acquisition metadata, read once.
+
+    ``motor_names`` is the catalog order; ``per_frame`` holds the per-frame motors (degrees), counters and energy
+    (eV), each one value per frame; ``constants`` the one-value motors and energy; ``excluded`` the reasons."""
+    motor_names: tuple[str, ...]
+    per_frame: dict[str, np.ndarray]
+    constants: dict[str, float]
+    excluded: tuple[str, ...]
+
+
+def _units_text(dataset: h5py.Dataset) -> str:
+    raw = dataset.attrs.get("units", "")
+    if isinstance(raw, np.ndarray):
+        raw = raw.ravel()[0] if raw.size == 1 else ""
+    if isinstance(raw, (bytes, np.bytes_)):
+        raw = raw.decode("utf-8", errors="replace")
+    return str(raw).strip().casefold()
+
+
+def _acquisition_alignment(name: str, dataset: h5py.Dataset, frame_count: int,
+                           constant: bool) -> tuple[bool, str | None]:
+    """``(per_frame, reason)``: one value per frame, one constant (when *constant* is allowed), or excluded."""
+    if getattr(dataset.dtype, "kind", "O") not in "fiub" or dataset.shape is None:
+        return False, f"{name}: not numeric"
+    if dataset.is_virtual or dataset.external:
+        return False, f"{name}: stored in another file"
+    shape = tuple(int(extent) for extent in dataset.shape)
+    if shape == (int(frame_count),):
+        return True, None
+    if shape == ():
+        return False, None if constant else f"{name}: one value, not one per frame"
+    if len(shape) == 1:
+        return False, f"{name}: {shape[0]} values for {int(frame_count)} frames"
+    return False, f"{name}: shape {shape} is not one value per frame"
+
+
+def _nxdata_axes(data: h5py.Group) -> tuple[str, ...]:
+    raw = data.attrs.get("axes")
+    if raw is None:
+        return ()
+    names: list[str] = []
+    for value in np.atleast_1d(np.asarray(raw, dtype=object)).ravel():
+        text = value.decode("utf-8", errors="replace") if isinstance(value, (bytes, np.bytes_)) else str(value)
+        names.extend(part.strip() for part in text.replace(",", ":").split(":"))
+    return tuple(dict.fromkeys(name for name in names if name and name != "."))
+
+
+def acquisition_items(entry: h5py.Group, frame_count: int) -> tuple[tuple[AcquisitionItem, ...], tuple[str, ...]]:
+    """The supported items of a non-Bluesky *entry* and the reasons others were excluded, reading no values."""
+    items: list[AcquisitionItem] = []
+    excluded: list[str] = []
+    taken: set[str] = set()
+
+    def resolve(group: h5py.Group, name: str) -> Any:
+        """The local dataset *group*/*name*, or why it is not one; another file is never opened."""
+        if isinstance(group.get(name, getlink=True), h5py.ExternalLink):
+            return "stored in another file"
+        value = group.get(name)
+        return value if isinstance(value, h5py.Dataset) else f"no dataset at {group.name}/{name}"
+
+    def admit(name: str, path: str, dataset: Any, role: str, units: Mapping[str, str] | None, what: str,
+              constant: bool = True) -> None:
+        """Plan *dataset* (or the reason it is unresolved) as *name*; *units* maps its declared units to the
+        unit it is read in, and ``None`` reads it raw."""
+        if isinstance(dataset, str):
+            reason = f"{name}: {dataset}"
+        else:
+            per_frame, reason = _acquisition_alignment(name, dataset, frame_count, constant)
+            text = _units_text(dataset)
+            if reason is None and units is not None and text not in units:
+                reason = f"{name}: units {text!r} are not {what}"
+        if reason is not None:
+            excluded.append(reason)
+            return
+        items.append(AcquisitionItem(name, path, role, "raw" if units is None else units[text], per_frame))
+        taken.add(name)
+
+    for where in ("sample", "instrument"):
+        parent = entry.get(where)
+        positioners = parent.get("positioners") if isinstance(parent, h5py.Group) else None
+        for name, value in _nxpositioner_values(positioners, local_only=True):
+            if name not in taken and name not in _NON_MOTOR_COLUMNS:
+                admit(name, f"{where}/positioners/{name}/value",
+                      "stored in another file" if value is None else value, "motor", _ANGLE_UNITS, "an angle")
+    data = entry.get("data")
+    if isinstance(data, h5py.Group) and _nx_class(data) == "NXdata":
+        for name in _nxdata_axes(data):
+            if (name not in taken and name not in _NON_MOTOR_COLUMNS
+                    and name.casefold() not in _DEFAULT_COUNTER_NAMES):
+                admit(name, f"data/{name}", resolve(data, name), "motor", _ANGLE_UNITS, "an angle", constant=False)
+    for group_name in ("data", "scan_data"):
+        group = entry.get(group_name)
+        if not isinstance(group, h5py.Group):
+            continue
+        for name in group:  # names only: a linked image stack is never resolved here
+            if name.casefold() in _DEFAULT_COUNTER_NAMES and name not in taken:
+                admit(name, f"{group_name}/{name}", resolve(group, name), "counter", None, "",
+                      constant=False)
+    monochromator = entry.get("instrument/monochromator")
+    if isinstance(monochromator, h5py.Group):
+        field = "energy" if "energy" in monochromator else "wavelength" if "wavelength" in monochromator else None
+        if field is not None:
+            admit("energy", f"instrument/monochromator/{field}", resolve(monochromator, field), "energy",
+                  _ENERGY_UNITS if field == "energy" else _WAVELENGTH_UNITS,
+                  "eV or keV" if field == "energy" else "a wavelength unit")
+    return tuple(items), tuple(excluded)
+
+
+def acquisition_motor_names(entry: h5py.Group, frame_count: int) -> tuple[str, ...]:
+    """The motors a non-Bluesky *entry*'s supported metadata resolves, in catalog order, reading no values."""
+    return tuple(item.name for item in acquisition_items(entry, frame_count)[0] if item.role == "motor")
+
+
+def _acquisition_values(
+    entry: h5py.Group, items: tuple[AcquisitionItem, ...],
+    *,
+    motor_names: tuple[str, ...] | None = None,
+    admit: Callable[[str, bool], Any] | None = None,
+    frame_index: int | None = None,
+):
+    """One conversion/admission seam for full tables, indexed rows and scalar energy."""
+    from xrd_tools.core.energy import (
+        WavelengthUnit, canonical_wavelength_m, wavelength_m_to_energy_eV, xray_energy_eV,
+    )
+
+    for item in items:
+        if item.role == "motor" and motor_names is not None and item.name not in motor_names:
+            continue
+        dataset = entry[item.path] if admit is None else admit(item.path, item.per_frame)
+        selection = frame_index if item.per_frame and frame_index is not None else ()
+        values = np.asarray(dataset[selection], dtype=float)
+        if item.unit == "rad":
+            values = np.degrees(values)
+        elif item.unit == "energy":
+            values = np.asarray(xray_energy_eV(values), dtype=float)
+        elif item.unit.startswith("wavelength:"):
+            unit = WavelengthUnit(item.unit.partition(":")[2])
+            values = np.asarray([
+                np.nan if (metres := canonical_wavelength_m(value, unit)) is None
+                else wavelength_m_to_energy_eV(metres)
+                for value in np.atleast_1d(values)
+            ]).reshape(values.shape)
+        yield item, values
+
+
+def acquisition_wavelength(entry: h5py.Group, frame_count: int) -> float | None:
+    """Generic scalar acquisition wavelength in Å, respecting admitted units.
+
+    Per-frame energy belongs to the provider rows, never a first-value descriptor.
+    """
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+
+    items = tuple(item for item in acquisition_items(entry, frame_count)[0]
+                  if item.role == "energy" and not item.per_frame)
+    for _, values in _acquisition_values(entry, items):
+        energy = float(values)
+        if np.isfinite(energy) and energy > 0:
+            return energy_eV_to_wavelength_m(energy) * 1e10
+    return None
+
+
+def read_acquisition_metadata_row(
+    entry: h5py.Group, frame_count: int, frame_index: int, *,
+    motor_names: tuple[str, ...] | None = None,
+    admit: Callable[[str, bool], Any] | None = None,
+) -> dict[str, float]:
+    """Read only one supported row from the held entry, without whole-scan arrays."""
+    if not 0 <= frame_index < frame_count:
+        return {}
+    items, _ = acquisition_items(entry, frame_count)
+    return {item.name: float(value) for item, value in _acquisition_values(
+        entry, items, motor_names=motor_names, admit=admit, frame_index=frame_index)}
+
+
+def read_acquisition_metadata(
+    entry: h5py.Group, frame_count: int, *,
+    motor_names: tuple[str, ...] | None = None,
+    admit: Callable[[str, bool], Any] | None = None,
+) -> AcquisitionMetadata:
+    """Read a supported table once, sharing indexed-row conversion and admission."""
+    items, excluded = acquisition_items(entry, frame_count)
+    names: list[str] = []
+    per_frame: dict[str, np.ndarray] = {}
+    constants: dict[str, float] = {}
+    for item, values in _acquisition_values(entry, items, motor_names=motor_names, admit=admit):
+        if item.per_frame:
+            per_frame[item.name] = values
+        else:
+            constants[item.name] = float(values)
+        if item.role == "motor":
+            names.append(item.name)
+    return AcquisitionMetadata(tuple(names), per_frame, constants, excluded)
 
 
 # ===========================================================================
@@ -5590,73 +5443,6 @@ def read_scan(
     return _read_scan_v2(Path(path), entry, groups, include_thumbnails)
 
 
-def read_stitched(
-    path: Path | str,
-    *,
-    entry: str = "entry",
-):
-    """Read embedded Stitch groups in qualified processed v2/v3 files.
-
-    Neutral and preceding q/chi physical layouts return logical q/chi xarray
-    coordinates. Standalone analysis files use ``read_analysis_artifact``.
-    """
-    import xarray as xr
-
-    path = Path(path)
-    data_vars: dict[str, tuple] = {}
-    coords: dict[str, np.ndarray] = {}
-    attrs: dict[str, object] = {}
-
-    def _read_provenance(g):
-        """The provenance_json blob → a parsed dict (or the raw string if it
-        isn't JSON; absent → None)."""
-        if "provenance_json" not in g:
-            return None
-        raw = g["provenance_json"][()]
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        try:
-            return json.loads(raw)
-        except (ValueError, TypeError):
-            return str(raw)
-
-    with h5py.File(path, "r") as f:
-        e = _current_processed_groups(f, entry, path).entry
-        has_1d = "stitched_1d" in e
-        has_2d = "stitched_2d" in e
-        if not (has_1d or has_2d):
-            raise KeyError(f"No stitched_1d/2d in {path}:{entry}")
-        if has_1d:
-            g = e["stitched_1d"]
-            axis_1 = _stitched_read_axis_names(g)[0]
-            coords["q"] = np.asarray(g[axis_1][()])
-            data_vars["stitched_1d"] = (("q",), np.asarray(g["intensity"][()]))
-            if "sigma" in g:
-                data_vars["stitched_1d_sigma"] = (
-                    ("q",), np.asarray(g["sigma"][()])
-                )
-            prov = _read_provenance(g)
-            if prov is not None:
-                attrs["stitched_1d_provenance"] = prov
-        if has_2d:
-            g = e["stitched_2d"]
-            axis_1, axis_2 = _stitched_read_axis_names(g)
-            coords.setdefault("q", np.asarray(g[axis_1][()]))
-            coords["chi"] = np.asarray(g[axis_2][()])
-            data_vars["stitched_2d"] = (
-                ("q", "chi"), np.asarray(g["intensity"][()])
-            )
-            if "sigma" in g:
-                data_vars["stitched_2d_sigma"] = (
-                    ("q", "chi"), np.asarray(g["sigma"][()])
-                )
-            prov = _read_provenance(g)
-            if prov is not None:
-                attrs["stitched_2d_provenance"] = prov
-
-    return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)
-
-
 __all__ = [
     "PROCESSED_SCHEMA_NAME",
     "PROCESSED_SCHEMA_VERSION",
@@ -5674,7 +5460,6 @@ __all__ = [
     "frame_record_write_parts",
     "write_integrated_stack",
     "write_frame_records",
-    "write_stitched",
     "write_rsm",
     "read_rsm",
     "upsert_scan_metadata",
@@ -5686,5 +5471,4 @@ __all__ = [
     # v2 (xdart 0.37+)
     "read_scan",
     "read_scan_metadata",
-    "read_stitched",
 ]

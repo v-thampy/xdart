@@ -267,8 +267,8 @@ def _validate_destination(dest, *, sources, poni, source_dir, recursive):
 def _measured_nexus_stack_source(path, *, entry, metrics, cursor=None):
     """Build an instrumented public source without retaining detector arrays.
 
-    The harness observes values at the source's real ``metadata_for`` and
-    ``iter_chunks`` seams.  It deliberately wraps no reduction implementation:
+    The harness observes values at the source's real ``metadata_for``,
+    ``frame_for`` and ``iter_chunks`` seams.  It deliberately wraps no reduction implementation:
     production still owns cursor lifetime, planning, decode, submit, and sink
     ordering.
     """
@@ -285,6 +285,13 @@ def _measured_nexus_stack_source(path, *, entry, metrics, cursor=None):
             self._metrics.metadata_reads = (
                 int(self._metrics.metadata_reads or 0) + 1)
             return super().metadata_for(index)
+
+        def frame_for(self, index):
+            # Since 5d2eb8ec a frame reads its complete metadata row here, not
+            # through metadata_for.
+            self._metrics.metadata_reads = (
+                int(self._metrics.metadata_reads or 0) + 1)
+            return super().frame_for(index)
 
         def iter_chunks(self, chunk_size):
             self.cursor_consumptions += 1

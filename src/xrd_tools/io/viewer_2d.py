@@ -586,6 +586,16 @@ def _chain_identities(catalog, chain, shape, dtype):
     return frozenset(identities)
 
 
+def _raw_shape_admitted(policy, catalog):
+    """A RAW catalog's shape: the policy's, or else the one established layout its payload names."""
+    if policy.raw_detector_shape is not None:
+        return policy.raw_detector_shape == catalog.source_shape
+    from xrd_tools.io.image import raw_detector_shape_for_payload
+    return raw_detector_shape_for_payload(
+        catalog.primary_revision.size - policy.raw_header_skip,
+        raw_dtype=catalog.source_dtype) == catalog.source_shape
+
+
 def _validate_catalog_cross_fields(catalog):
     try:
         identity_policy = Viewer2DFormatPolicy(*catalog.policy_identity)
@@ -662,8 +672,8 @@ def _validate_catalog_cross_fields(catalog):
         valid = (kind is Viewer2DSourceKind.RAW_DETECTOR
                  and fmt == suffix_format and catalog.member_name is catalog.dataset_path is None
                  and not dependencies and (fmt != "raw" or len(catalog.source_shape) == 2
-                 and catalog.frame_labels == (0,) and identity_policy.raw_detector_shape ==
-                     catalog.source_shape and np.dtype(identity_policy.raw_dtype).str ==
+                 and catalog.frame_labels == (0,) and _raw_shape_admitted(identity_policy, catalog)
+                 and np.dtype(identity_policy.raw_dtype).str ==
                      catalog.source_dtype and catalog.primary_revision.size ==
                      identity_policy.raw_header_skip + math.prod(catalog.source_shape) *
                      np.dtype(catalog.source_dtype).itemsize))

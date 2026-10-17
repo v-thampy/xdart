@@ -127,8 +127,15 @@ def test_catalog_first_controller_mounts_exact_identity_and_navigation(tmp_path,
     if policy is not None:
         monkeypatch.setattr("xdart.gui.tabs.scattering.context_controller.Viewer2DFormatPolicy", lambda: policy)
     controller = _controller()
+    release, catalog = Event(), viewer_api.catalog_viewer_2d
+    def held(path, **values):
+        assert release.wait(4)
+        return catalog(path, **values)
+    # The transport thread's completion clears loading; hold the read so the flag is observable.
+    monkeypatch.setattr("xdart.gui.tabs.scattering.hydration_transport.catalog_viewer_2d", held)
     request = controller.open_viewer_2d(str(path))
     assert (request.path, controller.viewer_2d_loading) == (str(path), True)
+    release.set()
     _await_viewer(controller)
     owner = controller._viewer_2d
     context = controller.viewer_2d_context
@@ -383,6 +390,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _poll_admission=lambda: False,
         _settle_browse_1d_before_drain=lambda: True,
         _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
+        _dispatch_roi_preview=lambda: None,  # the drain dispatches ROI previews since 495c1380
         _batch_ready_to_paint=lambda: None,
         _advance_authored_asset_confirmation=lambda: None,
         _run_executor=SimpleNamespace(drain_events=lambda: (StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)),

@@ -139,11 +139,6 @@ def _admit_detector_config(
     such as ``pixel1=1`` (integer) becoming ``1.0`` (float).
     """
 
-    from xrd_tools.integrate._pyfai_rayonix import (
-        apply_rayonix_serialization_backport,
-    )
-
-    apply_rayonix_serialization_backport()
     from pyFAI.detectors import ALL_DETECTORS, detector_factory
 
     if type(detector_config) not in _DETECTOR_CONFIG_MAPPING_TYPES:
@@ -376,6 +371,27 @@ def detector_calibration_from_projection(
         thickness_m=sensor.get("thickness"),
         parallax=projection["parallax"],
     )
+
+
+CALIBRANT_NAMES = ('LaB6', 'CeO2', 'Si', 'Al2O3', 'Cr2O3', 'AgBh')
+#: pyFAI registers xdart's "Al2O3" as "alpha_Al2O3"; the other five names match pyFAI's.
+_PYFAI_CALIBRANT_NAMES = MappingProxyType({'Al2O3': 'alpha_Al2O3'})
+
+
+def pyfai_calibrant_name(name: str) -> str:
+    """pyFAI's registered name for a calibrant xdart offers (``CALIBRANT_NAMES``). Any other name, such as one typed
+    into Calibrate's editable list, passes through unchanged."""
+    return _PYFAI_CALIBRANT_NAMES.get(name, name)
+
+
+def pyfai_calibrant(name: str, wavelength_m: float | None = None):
+    """pyFAI's calibrant for ``name`` (through ``pyfai_calibrant_name``), at ``wavelength_m`` when given. Every
+    binding of a calibrant name to pyFAI goes through here."""
+    from pyFAI.calibrant import get_calibrant  # noqa: PLC0415
+    calibrant = get_calibrant(pyfai_calibrant_name(name))
+    if wavelength_m is not None:
+        calibrant.wavelength = float(wavelength_m)
+    return calibrant
 
 
 def detector_calibration_record(
@@ -634,7 +650,8 @@ def poni_to_integrator(poni: PONI) -> AzimuthalIntegrator:
 
 def detector_calibration_to_integrator(
     cal, *, rot1: float | None = None, rot2: float | None = None,
-    rot3: float | None = None,
+    rot3: float | None = None, dist: float | None = None,
+    poni1: float | None = None, poni2: float | None = None,
 ) -> AzimuthalIntegrator:
     """Build a pyFAI integrator from a :class:`DetectorCalibration`, honouring
     its ``Detector_config`` (panel orientation) — unlike :func:`poni_to_integrator`,
@@ -643,6 +660,8 @@ def detector_calibration_to_integrator(
 
     ``rot1``/``rot2``/``rot3`` override the base rotations to build a *per-frame*
     integrator (base calibration ⊕ ``Diffractometer.to_pyfai_per_frame`` rotations).
+    ``dist``/``poni1``/``poni2`` override the base position for a frame whose
+    sample is off the rotation centre (a stacked arm with a sample offset).
 
     Parameters
     ----------
@@ -665,8 +684,21 @@ def detector_calibration_to_integrator(
         )
     else:
         det = None
+    turned = getattr(cal, "turned_from", None)
+    if turned is not None and det is not None:  # a quarter-turned model: its own gaps, turned (AUD-9 item 8)
+        from xrd_tools.core.geometry.diffractometer import ImageOrientation  # noqa: PLC0415
+        from xrd_tools.integrate.turned_detector import turned_frame_shape, turned_model_mask  # noqa: PLC0415
+
+        if tuple(det.shape) != turned_frame_shape(turned["detector"]):
+            raise ValueError("the turned detector's model does not fit the calibration's detector")
+        gaps = turned_model_mask(turned["detector"], ImageOrientation(
+            rotation=turned["image_rotation"], flip_horizontal=turned["image_flip"]))
+        if gaps is not None:
+            det.mask = np.array(gaps, dtype=np.int8)
     integrator = AzimuthalIntegrator(
-        dist=float(p.dist), poni1=float(p.poni1), poni2=float(p.poni2),
+        dist=float(p.dist if dist is None else dist),
+        poni1=float(p.poni1 if poni1 is None else poni1),
+        poni2=float(p.poni2 if poni2 is None else poni2),
         rot1=float(p.rot1 if rot1 is None else rot1),
         rot2=float(p.rot2 if rot2 is None else rot2),
         rot3=float(p.rot3 if rot3 is None else rot3),

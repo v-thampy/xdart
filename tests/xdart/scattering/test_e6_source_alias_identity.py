@@ -437,7 +437,7 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
 
     real_materialize = executor_module.materialize_live_directory_group
     attempts = []
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)
     identity = RunIdentity.from_configuration(configuration)
 
     def capture_pending_attempt(*args, **kwargs):
@@ -480,12 +480,24 @@ def test_sidecar_alias_retarget_is_pending_before_every_output_side_effect(
         run.processed_live_revisions = RejectMap()
         execution_gate.set()
         deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not attempts and not forbidden:
+        while (
+            time.monotonic() < deadline
+            and not any(value.revision_changed for value in attempts)
+            and not forbidden
+        ):
             time.sleep(0.01)
 
         assert retargeted is True
-        assert len(attempts) == 1
-        attempt = attempts[0]
+        # LIVE-QUALIFY-REFUSAL-20261012: under Auto a Live frame first waits one
+        # poll for its metadata to hold still; only then is the group qualified.
+        *waits, attempt = attempts
+        assert waits and all(
+            value.state is ProbeState.IN_PROGRESS
+            and not value.revision_changed
+            and value.decision is None
+            and value.reason.startswith("waiting for the metadata of")
+            for value in waits
+        ), waits
         assert attempt.state is ProbeState.IN_PROGRESS
         assert attempt.revision_changed is True
         assert attempt.decision is None
@@ -562,7 +574,7 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
         capture_attempt,
     )
     monkeypatch.setattr(executor, "_construct", construct)
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)
     identity = RunIdentity.from_configuration(configuration)
     assert type(executor.start(
         configuration,
@@ -690,7 +702,7 @@ def test_hdf_dependency_raw_alias_retarget_is_caught_before_decision(
     try:
         attempt = output_preflight.materialize_live_directory_group(
             receipt,
-            intent.freeze(),
+            intent.freeze(saturation=receipt.saturation),
             session,
             group,
             cancelled=lambda: False,
@@ -878,7 +890,7 @@ def test_nullable_metadata_absence_has_no_binding_and_appearance_is_pending(
     try:
         attempt = output_preflight.materialize_live_directory_group(
             receipt,
-            intent.freeze(),
+            intent.freeze(saturation=receipt.saturation),
             session,
             group,
             cancelled=lambda: False,
@@ -1114,7 +1126,7 @@ def test_stable_semantic_and_schema_failures_are_terminal_not_pending(
         with pytest.raises(ValueError, match="stable output configuration invalid") as error:
             output_preflight.materialize_live_directory_group(
                 receipt,
-                intent.freeze(),
+                intent.freeze(saturation=receipt.saturation),
                 session,
                 group,
                 cancelled=lambda: False,

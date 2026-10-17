@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
+from xrd_tools.analysis.angular_support import DEFAULT_RECORD_ANGULAR_SUPPORT
 from xrd_tools.core.scan import SourceKind, SourceSpec, coerce_source_kind
 from xrd_tools.session.control_labels import (
     range_axis_labels_1d,
@@ -19,6 +20,7 @@ from xrd_tools.session.readiness import (
     SectionId,
     Tool,
     gi_companion_modes_2d,
+    tool_from_mode_text,
 )
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import (
@@ -52,6 +54,9 @@ SOURCE_FILTER = ("Signal", "Filter")
 SOURCE_META = ("Signal", "meta_ext")
 SOURCE_ENERGY = ("Source", "energy_preference")
 AVERAGE_SCAN = ("Signal", "series_average")
+#: Whether a Run records each 1-D profile's angular coverage (COVERAGE-SUPPORT-20261013 decision 6); kept in
+#: ``RunIntent.run_options["record_angular_support"]`` and shared by Int's and Stitch's Advanced editors.
+RECORD_ANGULAR_SUPPORT = ("Int1D", "record_angular_support")
 BACKGROUND_TYPE = ("BG", "bg_type")
 BACKGROUND_FILE = ("BG", "File")
 BACKGROUND_DIRECTORY = ("BG", "Directory")
@@ -60,9 +65,11 @@ BACKGROUND_METADATA_KEY = ("BG", "Metadata Key")
 BACKGROUND_FILTER = ("BG", "Filter")
 BACKGROUND_SCALE = ("BG", "Scale")
 BACKGROUND_NORMALIZE = ("BG", "Normalize")
+BACKGROUND_DARK_CORRECTED = ("BG", "Dark corrected")
 BACKGROUND_EDIT_PATHS = frozenset({BACKGROUND_TYPE, BACKGROUND_FILE,
     BACKGROUND_DIRECTORY, BACKGROUND_MATCH, BACKGROUND_METADATA_KEY,
-    BACKGROUND_FILTER, BACKGROUND_SCALE, BACKGROUND_NORMALIZE})
+    BACKGROUND_FILTER, BACKGROUND_SCALE, BACKGROUND_NORMALIZE,
+    BACKGROUND_DARK_CORRECTED})
 
 INT_1D_AXIS = ("Int1D", "axis")
 INT_1D_POINTS = ("Int1D", "points")
@@ -302,6 +309,12 @@ SOURCE_FORMAT_SUFFIXES = {
 }
 
 
+def recording_control_field(value=DEFAULT_RECORD_ANGULAR_SUPPORT) -> ControlFormField:
+    """The shared Advanced recording pill, with the existing identity, label and bool semantics."""
+    return ControlFormField(SectionId.PROCESSING, "Record angular coverage", RECORD_ANGULAR_SUPPORT,
+                            value=value, kind=ControlFieldKind.BOOL)
+
+
 def project_control_fields(
     values: Mapping[tuple[str, ...], object] | None = None,
     choices: Mapping[tuple[str, ...], Sequence[object]] | None = None,
@@ -449,6 +462,14 @@ def project_control_fields(
             "Normalize",
             BACKGROUND_NORMALIZE,
         )
+        # With a dark set (Advanced), a Background that already has the dark
+        # subtracted is subtracted as it is.
+        add(
+            SectionId.PROCESSING,
+            "BG dark-corrected",
+            BACKGROUND_DARK_CORRECTED,
+            kind=ControlFieldKind.BOOL,
+        )
 
     return tuple(projected)
 
@@ -534,6 +555,7 @@ def bound_values(
         BACKGROUND_FILTER: intent.background.filename_filter,
         BACKGROUND_SCALE: intent.background.scale,
         BACKGROUND_NORMALIZE: intent.background.normalization_key or "None",
+        BACKGROUND_DARK_CORRECTED: intent.background.dark_corrected,
     }
     values.update(source_values(intent.source_spec, source_mode=source_mode))
     average = intent.run_options.get("series_average", False)
@@ -546,6 +568,9 @@ def bound_values(
     ):
         values[AVERAGE_SCAN] = average
     values.update(integration_values(intent))
+    record = intent.run_options.get("record_angular_support", DEFAULT_RECORD_ANGULAR_SUPPORT)
+    if type(record) is bool and tool_from_mode_text(intent.processing_mode) in {Tool.INT_1D, Tool.INT_2D}:
+        values[RECORD_ANGULAR_SUPPORT] = record
     choices: dict[tuple[str, ...], tuple[str, ...]] = {
         SOURCE_TYPE: (
             "Image Series",
@@ -569,7 +594,7 @@ def bound_values(
             "Series Average",
             "BG Directory",
         ),
-        BACKGROUND_MATCH: ("Scan Root + Frame Number", "Metadata Key"),
+        BACKGROUND_MATCH: ("Scan Root + Frame Number", "Metadata Key", "Last Saved Before Frame"),
     }
     if intent.gi.enabled:
         choices.update({

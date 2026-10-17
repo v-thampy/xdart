@@ -20,12 +20,14 @@ from .accent import (
 )
 from .corners import (
     DEFAULT_CONTROLS_CARD_CORNERS,
+    current_controls_card_corners,
     normalize_controls_card_corners,
     rounded_container_radius,
     set_current_controls_card_corners,
 )
 from .spacing import (
     DEFAULT_SPACING,
+    current_spacing,
     normalize_spacing,
     set_current_spacing,
     spacing_tokens,
@@ -34,6 +36,7 @@ from .typography import (
     DEFAULT_FONT_SCALE,
     FONT_SCALE_TOKENS,
     apply_application_font,
+    application_fonts_match,
     calibration_button_font,
     current_font_scale,
     normalize_font_scale,
@@ -1007,6 +1010,11 @@ QComboBox#controlsComboBox:disabled {
     background-color: $panel;
     color: $text_muted;
 }
+/* An integer row's refused text (FormRow kind "int"): kept as typed, outlined, and its tooltip
+   says why; unscoped so a page's Advanced rows outside the panel show it too. */
+QLineEdit#controlsLineEdit[invalid="true"] {
+    border: 1px solid $stop_text;
+}
 QToolButton#controlsBrowseButton,
 QToolButton#controlsMoreButton {
     background-color: #4d6fbd;
@@ -1085,15 +1093,22 @@ QToolButton#controlsAutoButton:disabled {
     color: $text_muted;
     border-color: $field_border;
 }
-/* The complete vNext shell uses one compact square interactive surface.
+/* The complete vNext shell uses one compact square interactive surface; the Stitch page
+   (a page built from the same components) shares it.
    Cards may still use the independent Controls-card corner option; values,
    combos and action/toggle buttons do not. */
 QWidget#scatteringWorkspaceShell QLineEdit,
+QWidget#stitchPage QLineEdit,
 QWidget#scatteringWorkspaceShell QComboBox,
+QWidget#stitchPage QComboBox,
 QWidget#scatteringWorkspaceShell QSpinBox,
+QWidget#stitchPage QSpinBox,
 QWidget#scatteringWorkspaceShell QDoubleSpinBox,
+QWidget#stitchPage QDoubleSpinBox,
 QWidget#scatteringWorkspaceShell QPushButton,
-QWidget#scatteringWorkspaceShell QToolButton#e4FrameNavigationButton {
+QWidget#stitchPage QPushButton,
+QWidget#scatteringWorkspaceShell QToolButton#e4FrameNavigationButton,
+QWidget#stitchPage QToolButton#e4FrameNavigationButton {
     min-height: $control_interactive_height;
     max-height: $control_interactive_height;
     padding-top: 0px;
@@ -1101,22 +1116,33 @@ QWidget#scatteringWorkspaceShell QToolButton#e4FrameNavigationButton {
     border-radius: 0px;
 }
 QWidget#scatteringWorkspaceShell QComboBox::drop-down,
+QWidget#stitchPage QComboBox::drop-down,
 QWidget#scatteringWorkspaceShell QSpinBox::up-button,
+QWidget#stitchPage QSpinBox::up-button,
 QWidget#scatteringWorkspaceShell QSpinBox::down-button,
+QWidget#stitchPage QSpinBox::down-button,
 QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-button,
-QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button {
+QWidget#stitchPage QDoubleSpinBox::up-button,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button,
+QWidget#stitchPage QDoubleSpinBox::down-button {
     border-radius: 0px;
 }
 QWidget#scatteringWorkspaceShell QSpinBox::up-button,
+QWidget#stitchPage QSpinBox::up-button,
 QWidget#scatteringWorkspaceShell QSpinBox::down-button,
+QWidget#stitchPage QSpinBox::down-button,
 QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-button,
-QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button {
+QWidget#stitchPage QDoubleSpinBox::up-button,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-button,
+QWidget#stitchPage QDoubleSpinBox::down-button {
     width: 14px;
     background-color: $field;
     border-left: 1px solid $field_border;
 }
 QWidget#scatteringWorkspaceShell QSpinBox::up-arrow,
-QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-arrow {
+QWidget#stitchPage QSpinBox::up-arrow,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-arrow,
+QWidget#stitchPage QDoubleSpinBox::up-arrow {
     image: none;
     width: 0px;
     height: 0px;
@@ -1125,7 +1151,9 @@ QWidget#scatteringWorkspaceShell QDoubleSpinBox::up-arrow {
     border-bottom: 4px solid $text_muted;
 }
 QWidget#scatteringWorkspaceShell QSpinBox::down-arrow,
-QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-arrow {
+QWidget#stitchPage QSpinBox::down-arrow,
+QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-arrow,
+QWidget#stitchPage QDoubleSpinBox::down-arrow {
     image: none;
     width: 0px;
     height: 0px;
@@ -1133,10 +1161,12 @@ QWidget#scatteringWorkspaceShell QDoubleSpinBox::down-arrow {
     border-right: 3px solid transparent;
     border-top: 4px solid $text_muted;
 }
-QWidget#scatteringWorkspaceShell QComboBox::drop-down {
+QWidget#scatteringWorkspaceShell QComboBox::drop-down,
+QWidget#stitchPage QComboBox::drop-down {
     width: 16px;
 }
-QWidget#scatteringWorkspaceShell QComboBox::down-arrow {
+QWidget#scatteringWorkspaceShell QComboBox::down-arrow,
+QWidget#stitchPage QComboBox::down-arrow {
     image: none;
     width: 0px;
     height: 0px;
@@ -1430,10 +1460,9 @@ def apply_theme(
     1. ``QApplication.setFont`` first.  On its own it does NOT reach widgets
        while an application stylesheet is installed -- Qt's stylesheet style
        caches each widget's resolved font and only re-resolves on a re-polish.
-    2. ``setStyleSheet`` second, which forces exactly that re-polish.  Qt
-       re-polishes even for an identical stylesheet string, so reapplying the
-       same tier stays correct rather than becoming a no-op that strands the
-       new font.
+    2. ``setStyleSheet`` second, which forces exactly that re-polish. A complete
+       appearance already present in the live application skips this pass;
+       changed fonts or stylesheet state still require it.
     3. The platform per-class fonts third -- AFTER the stylesheet, because the
        first ``setStyleSheet`` on the application resets that hash to the
        platform theme's values (measured; see
@@ -1445,11 +1474,8 @@ def apply_theme(
     """
     font_scale = normalize_font_scale(font_scale)
     accent_color = normalize_accent_color(accent_color)
-    spacing = set_current_spacing(normalize_spacing(spacing))
-    controls_card_corners = set_current_controls_card_corners(
-        normalize_controls_card_corners(controls_card_corners)
-    )
-    apply_application_font(app, font_scale)
+    spacing = normalize_spacing(spacing)
+    controls_card_corners = normalize_controls_card_corners(controls_card_corners)
     qss = render_qss(
         name,
         font_scale=font_scale,
@@ -1480,17 +1506,30 @@ def apply_theme(
         # hard-coding 8.5pt here would have frozen them at Extra Large.
         qss += ("\nQPushButton#pyfai_calib, QPushButton#get_mask "
                 f"{{ font-size: {calibration_button_font(font_scale)}; }}\n")
+    try:
+        import pyqtgraph as pg
+    except ImportError:  # pragma: no cover
+        pg = None
+    if (app.styleSheet() == qss and current_font_scale() == font_scale
+            and current_spacing() == spacing
+            and current_controls_card_corners() == controls_card_corners
+            and application_fonts_match(app, font_scale)
+            and (pg is None or (
+                pg.getConfigOption("background") == SEABORN_BG
+                and pg.getConfigOption("foreground") == SEABORN_FG
+                and pg.getConfigOption("antialias") is True))):
+        return
+    set_current_spacing(spacing)
+    set_current_controls_card_corners(controls_card_corners)
+    apply_application_font(app, font_scale)
     app.setStyleSheet(qss)
     # After the stylesheet, never before: the first setStyleSheet on the
     # application resets the per-class font hash to the platform theme's sizes.
     restore_platform_class_fonts(app, font_scale)
-    try:
-        import pyqtgraph as pg
+    if pg is not None:
         pg.setConfigOption("background", SEABORN_BG)
         pg.setConfigOption("foreground", SEABORN_FG)
         pg.setConfigOption("antialias", True)
-    except ImportError:  # pragma: no cover
-        pass
     restyle_live_plots(font_scale)
 
 
@@ -1539,7 +1578,10 @@ def apply_seaborn_plot_style(plot, *, font_pt: int | None = None,
         size.
     grid
         Whether to enable gridlines.  True for 1D / line plots,
-        False for image / heatmap plots.
+        False for image / heatmap plots.  Build a grid plot with
+        ``axisItems={"left": GridAxisItem("left")}`` (``xdart.gui.gui_utils``):
+        it fills the horizontal gridlines as the pixel rows they light, the
+        same pixels at a fraction of the paint cost (LF-012).
     """
     try:
         import pyqtgraph as pg  # noqa: F401

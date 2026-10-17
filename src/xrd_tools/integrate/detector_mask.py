@@ -24,16 +24,20 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["mask_with_detector"]
+__all__ = ["mask_with_detector", "writable_for_pyfai"]
 
 
-def _writable_mask(mask):
-    # pyFAI's x86 SSE checksum requests a writable buffer even though it only
-    # reads it. Preserve the immutable accepted mask and detach at this call
-    # boundary; ordinary writable masks and the bound-detector path need no copy.
-    if isinstance(mask, np.ndarray) and not mask.flags.writeable:
-        return mask.copy(order="C")
-    return mask
+def writable_for_pyfai(array):
+    """*array*, detached when read-only, for a pyFAI call that checksums it.
+
+    pyFAI's x86 SSE checksum (of a mask, or of ``detector.darkcurrent``)
+    requests a writable buffer even though it only reads it. Preserve the
+    immutable accepted array and detach at this call boundary; ordinary
+    writable arrays and the bound-detector path need no copy.
+    """
+    if isinstance(array, np.ndarray) and not array.flags.writeable:
+        return array.copy(order="C")
+    return array
 
 
 def mask_with_detector(ai, mask):
@@ -58,16 +62,16 @@ def mask_with_detector(ai, mask):
     """
     det = getattr(ai, "detector", None)
     if det is None:
-        return _writable_mask(mask)
+        return writable_for_pyfai(mask)
     try:
         det_mask = det.mask
     except Exception:
         det_mask = None
     if det_mask is None:
-        return _writable_mask(mask)
+        return writable_for_pyfai(mask)
     if mask is None:
-        return _writable_mask(det_mask)
+        return writable_for_pyfai(det_mask)
     m = np.asarray(mask)
     if m.shape != np.asarray(det_mask).shape:
-        return _writable_mask(mask)
+        return writable_for_pyfai(mask)
     return np.logical_or(m, det_mask)

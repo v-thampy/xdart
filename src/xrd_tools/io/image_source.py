@@ -154,7 +154,7 @@ def classify_image_source(path) -> ImageSourceInfo:
     raw detector dataset; UNKNOWN when it can't be read or classified.
     """
     import h5py
-    from xrd_tools.io.image import count_frames, _is_eiger_master
+    from xrd_tools.io.image import count_frames, eiger_split_layout
 
     p = Path(path)
 
@@ -205,10 +205,10 @@ def classify_image_source(path) -> ImageSourceInfo:
                     kind=ImageSourceKind.UNKNOWN,
                     path=str(p),
                 )
-            # A marker-free Eiger master remains raw detector data.  Its frames
-            # live in linked data files, and its native ``entry/frames`` group
-            # is not a processed marker.
-            if _is_eiger_master(p):
+            # A marker-free split (Eiger) image layout remains raw detector
+            # data.  Its frames live in linked data files, and its native
+            # ``entry/frames`` group is not a processed marker.
+            if eiger_split_layout(entry):
                 try:
                     n = max(int(count_frames(p)), 1)
                 except ProcessedXdartInputError:

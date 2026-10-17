@@ -393,8 +393,8 @@ def create_fiber_integrator(
     return fi
 
 
-def _nan_empty_1d(result):
-    """Return a 1D result's intensity with EMPTY bins set to NaN.
+def _nan_empty_1d(result, arr=None):
+    """Return a 1D result's intensity (or ``arr``) with EMPTY bins set to NaN.
 
     pyFAI fills bins with no contributing pixels (``count == 0``) with 0, so a
     frozen output range wider than the data (the GI-freeze coverage pad) — and
@@ -402,10 +402,10 @@ def _nan_empty_1d(result):
     (the points-at-negative-Q artifact).  NaN-marking those bins keeps them out
     of the plot; the aggregations are NaN-aware (nanmean/nansum) and the
     equivalence spine compares with equal_nan.  Defensive: if no per-bin
-    ``count`` is exposed (some fiber methods), the intensity is returned
+    ``count`` is exposed (some fiber methods), the array is returned
     unchanged.
     """
-    intensity = np.asarray(result.intensity, dtype=float)
+    intensity = np.asarray(result.intensity if arr is None else arr, dtype=float)
     count = getattr(result, "count", None)
     if count is not None:
         count = np.asarray(count)
@@ -436,6 +436,30 @@ def _nan_empty_2d(arr, result):
         if count.shape == arr.shape:
             arr = np.where(count == 0, np.nan, arr)
     return arr
+
+
+def exact_window_mask(fi, shape, windows, incident_angle, tilt_angle, sample_orientation, mask):
+    """``mask`` with every pixel outside the explicit GI ranges masked: a pixel counts only when each
+    coordinate with a range lies inside it, bounds included (Stitch's GI cuts, ``multi._gi_window_mask``).
+
+    pyFAI's histogram admits pixels up to one bin below an explicit range and a hair above it (it
+    truncates a fractional bin index in (-1, 0) to bin 0 and stretches the top edge). ``windows`` are
+    (fiber unit, range or None) pairs; angles are in radians, as the integration's. The coordinates are
+    computed after ``reset_integrator`` for these angles, which pyFAI's own call then keeps (its
+    center-array cache is keyed by the unit alone). No explicit range: ``mask`` unchanged.
+    """
+    windows = tuple((name, bounds) for name, bounds in windows if bounds is not None)
+    if not windows:
+        return mask
+    from pyFAI.units import get_unit_fiber
+    outside = np.zeros(shape, dtype=bool)
+    for name, (low, high) in windows:
+        unit = get_unit_fiber(str(name), incident_angle=incident_angle, tilt_angle=tilt_angle,
+                              sample_orientation=sample_orientation, angle_unit="rad")
+        fi.reset_integrator(unit.incident_angle, unit.tilt_angle, unit.sample_orientation)
+        values = np.asarray(fi.array_from_unit(shape, "center", unit, scale=True))
+        outside |= ~((values >= low) & (values <= high))
+    return outside if mask is None else np.logical_or(mask, outside)
 
 
 def integrate_gi_1d(
@@ -500,6 +524,9 @@ def integrate_gi_1d(
     _npt_oop = npt_oop if npt_oop is not None else npt
 
     mask = mask_with_detector(fi, mask)   # geometric gaps: always-on
+    # exactly the explicit window, as Stitch's GI cuts (deferred item 8, GI-WIN)
+    mask = exact_window_mask(fi, np.shape(image), ((unit_ip, radial_range), (unit, azimuth_range)),
+                             inc, tilt, orient, mask)
     result = fi.integrate1d_grazing_incidence(
         image,
         npt_ip=npt,
@@ -773,6 +800,15 @@ def integrate_gi_exitangles(
                          azim_unit_fallback="exit_angle_vert_deg")
 
 
+def gi_total_q_uses_radial(azimuth_range) -> bool:
+    """Whether the total-q profile uses pyFAI's radial integration (full χ).
+
+    Only that path propagates an error model or explicit variance into sigma;
+    a χ wedge goes through ``integrate1d_polar``, which returns none.
+    """
+    return azimuth_range is None
+
+
 def integrate_gi_polar_1d(
     image: np.ndarray,
     fi: FiberIntegrator,
@@ -839,7 +875,7 @@ def integrate_gi_polar_1d(
     radial_unit = "A^-1" if "A^-1" in unit else "nm^-1"
 
     # --- fast path: full χ → standard 1D azimuthal integration --------------
-    if azimuth_range is None:
+    if gi_total_q_uses_radial(azimuth_range):
         # Strip kwargs only meaningful to fiber-specific methods so they
         # don't poison the standard integrate1d call.
         _fiber_only = {

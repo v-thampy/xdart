@@ -474,8 +474,13 @@ class StartPipeline:
             return StartRejected(StartRejection.STALE_CAPTURE)
         expected_revision = capture.intent_snapshot.revision
         try:
+            # A v3 calibration's admission signed its PONI projection into the candidate; the
+            # start freezes the same one, or the executor refuses a mismatched configuration.
+            signed = admission.scientific_assets.signed_poni_values
             result = self._intents.freeze(expected_revision=expected_revision,
-                                          gi_motor_choices=admission.gi_motor_choices)
+                                          gi_motor_choices=admission.gi_motor_choices,
+                                          saturation=admission.saturation,
+                                          **({} if signed is None else {"poni_values": signed}))
         except (ValueError, TypeError) as error:
             return self._refuse(capture.request_id, StartRefusal.FREEZE_VALIDATION, error=error)
         except Exception as error:

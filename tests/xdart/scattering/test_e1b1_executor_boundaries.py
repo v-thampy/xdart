@@ -150,6 +150,28 @@ def test_start_cleanup_failure_is_not_reported_as_cleaned(monkeypatch, tmp_path)
     assert opened.close_calls == 1
 
 
+def test_accepted_manual_threshold_reaches_artifact_preview_policy(tmp_path) -> None:
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from tests.xdart.scattering.test_p1b_output_graph import _intent, _write_tiff
+    from tests.xdart.scattering.test_e1b1_terminal_cleanup import _prepared_run
+
+    raw, poni = tmp_path / "raw_0001.tif", tmp_path / "cal.poni"
+    _write_tiff(raw, 1)
+    write_poni(poni)
+    intent = _intent(raw, tmp_path / "processed", poni)
+    intent.threshold = ThresholdIntent(apply_threshold=True, threshold_min=10.0, threshold_max=20.0)
+    executor, run, _admission = _prepared_run(tmp_path, intent=intent)
+    try:
+        executor._run(run)
+        terminal = _terminal(executor)
+        assert terminal.kind is StandardEventKind.FINISHED, terminal.detail
+        artifact = next(iter(run.display.artifacts.values()))
+        assert (artifact.threshold_min, artifact.threshold_max) == (10.0, 20.0)
+        assert not artifact.mask_saturation
+    finally:
+        assert executor.close(run.identity).cleanup_status is CleanupStatus.CLEANED
+
+
 def test_disabled_threshold_does_not_reach_reduction_plan(monkeypatch, tmp_path) -> None:
     from tests.xdart.scattering._e2sd_support import write_poni
     from tests.xdart.scattering.test_p1b_output_graph import _intent, _write_tiff

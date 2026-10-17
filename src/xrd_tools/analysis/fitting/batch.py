@@ -199,6 +199,7 @@ class FitResultStore:
             "success": result.success,
             "redchi": result.redchi,
             "phase_fractions": phase_fractions,
+            "phase_fractions_reason": getattr(result, "phase_fractions_reason", ""),
             "phase_names": phase_names,
             "lattice_params": lattice,
             "width_params": widths,

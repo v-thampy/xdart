@@ -5,12 +5,47 @@ Data export helpers for integrated diffraction results.
 from __future__ import annotations
 
 import logging
+from io import StringIO
+import os
 from pathlib import Path
+import stat
+from uuid import uuid4
 
 import h5py
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def write_exports_atomically(parts) -> None:
+    """Prepare all export files, then replace each destination atomically.
+
+    New files use ordinary 0666-and-umask permissions without changing the process
+    umask; replacements retain the destination's mode. This is not a multi-file
+    transaction. Scientific NeXus publication has its own writer.
+    """
+    prepared = []
+    try:
+        for path, content in parts:
+            path = Path(path)
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+            except FileNotFoundError:
+                mode = None
+            temporary = path.with_name(f'.{path.name}.{uuid4().hex}.tmp')
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o666)
+            prepared.append((temporary, path))
+            with os.fdopen(descriptor, 'wb') as stream:
+                if mode is not None:
+                    os.chmod(temporary, mode)
+                stream.write(content.encode('utf-8') if isinstance(content, str) else content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        for temporary, path in prepared:
+            os.replace(temporary, path)
+    finally:
+        for temporary, _path in prepared:
+            temporary.unlink(missing_ok=True)
 
 
 def _as_path(path: Path | str) -> Path:
@@ -64,6 +99,9 @@ def write_xye(
     xdata: np.ndarray | list[float],
     ydata: np.ndarray | list[float],
     variance: np.ndarray | list[float] | None = None,
+    *,
+    atomic: bool = False,
+    header: str = "",
 ) -> None:
     """
     Write 1D data to ``.xye`` format.
@@ -79,6 +117,11 @@ def write_xye(
     variance : ndarray or list of float, optional
         Error or variance-like column to write as the third column. If omitted,
         ``sqrt(abs(ydata))`` is used for compatibility with existing notebooks.
+    atomic : bool, optional
+        Prepare and atomically replace the companion through the shared export writer.
+    header : str, optional
+        Text written first as ``# ``-prefixed comment lines (one per line of text);
+        the default writes none, so the file holds only the three columns.
     """
     out_path = _as_path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,12 +138,68 @@ def write_xye(
     # beyond any XRD precision.  Formatting is 89% of the XYE write cost and
     # XYE is about a third of a long Run's wall clock, so this is -39% on the
     # format and cuts a 3621-frame run's XYE from roughly 543 MB to 237 MB.
+    stream = StringIO() if atomic else out_path
     np.savetxt(
-        out_path,
+        stream,
         np.column_stack((x, y, sigma)),
         delimiter="\t",
         fmt="%.9g",
+        header=header,
     )
+    if atomic:
+        write_exports_atomically(((out_path, stream.getvalue()),))
+
+
+def write_stitch_xye(payload) -> Path:
+    """Export the strictly admitted Stitch profile beside its scientific artifact, and each saved GI
+    cut (q_ip, q_oop) beside it under its own unit's prefix; return the profile's companion.
+
+    Every companion is checked before any is written. They are then written in that order, each
+    atomically, and the first failure raises, so earlier ones may already be updated: this is not a
+    multi-file transaction. A GI companion's header names its cut and labels its third column, Int's
+    sqrt(abs(I)) compatibility estimate when the cut carries no sigma."""
+    import json
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, AnalysisArtifactPayload
+    from xrd_tools.io.output_safety import check_output_not_source
+    from xrd_tools.io.read import resolve_source_master
+    from xrd_tools.session.display_logic import xye_prefix_for_unit
+
+    if type(payload) is not AnalysisArtifactPayload or payload.kind not in {
+            AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
+        raise TypeError("XYE export requires a saved Stitch result")
+    profile = payload if payload.kind is AnalysisArtifactKind.STITCH_1D else payload.profile
+    if profile is None:
+        raise ValueError("saved Stitch result has no independent 1D profile")
+    nexus = Path(payload.inspection.path)
+    unit = payload.native_unit if profile is payload else dict(profile.axis_units)["q"]
+    companions = [(nexus.with_name(f"{xye_prefix_for_unit(unit)}_{nexus.stem}.xye"), profile, "")]
+    # An ASCII header: readers decode with the system encoding (cp1252 on Windows).
+    source = nexus.name.encode("ascii", "backslashreplace").decode("ascii")
+    for mode, cut in payload.gi:  # the saved cuts, in GI_MODES order
+        cut_unit = dict(cut.axis_units)["q"]
+        sigma = ("estimated as sqrt(abs(intensity)) for compatibility, not a propagated uncertainty"
+                 if cut.sigma is None else "supplied with the saved result")
+        companions.append((nexus.with_name(f"{xye_prefix_for_unit(cut_unit)}_{nexus.stem}.xye"), cut,
+                           f"xdart Stitch GI cut {mode} saved in {source}\n"
+                           f"columns: {mode} ({cut_unit}), intensity, sigma\nsigma: {sigma}"))
+    if len({target for target, _values, _header in companions}) != len(companions):
+        raise ValueError("Stitch XYE companions would overwrite one another")
+    inputs = {nexus}
+    if payload.inspection.frame_manifest_json is not None:
+        manifest = json.loads(payload.inspection.frame_manifest_json)
+        for record in manifest["records"]:
+            for source in record.get("source_constituents", (record,)):
+                path = resolve_source_master(source["source_path"], scan_file=nexus,
+                                             source_base=manifest["source_base"])
+                if path is not None:
+                    inputs.add(path)
+    for target, _values, _header in companions:
+        check_output_not_source(target, input_files=inputs)
+        if target.is_symlink():
+            raise ValueError(f"XYE companion {target.name} cannot replace a symbolic link")
+    for target, values, header in companions:
+        write_xye(target, dict(values.axes)["q"], values.intensity, values.sigma, atomic=True, header=header)
+    return companions[0][0]
 
 
 def write_h5(
@@ -168,4 +267,4 @@ def write_h5(
     logger.debug("Wrote integrated data to %s [frame=%s]", out_path, frame)
 
 
-__all__ = ["write_h5", "write_xye"]
+__all__ = ["write_h5", "write_xye", "write_stitch_xye"]

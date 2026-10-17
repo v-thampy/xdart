@@ -109,11 +109,20 @@ def test_sensor_free_save_stays_legacy(calibration_task):
     assert "Parallax:" not in output.getvalue()
 
 
-def test_gui_patch_is_idempotent_and_version_limited(monkeypatch):
-    apply_calibration_backports()
+@pytest.mark.parametrize("version", ["2026.5.0", "2026.9.1"])
+def test_gui_patch_is_idempotent_and_version_limited(monkeypatch, version):
+    assert apply_calibration_backports() is True
     method = IntegrationTask._IntegrationTask__getPoni
-    apply_calibration_backports()
+    assert apply_calibration_backports() is True
     assert IntegrationTask._IntegrationTask__getPoni is method
-    monkeypatch.setattr(pyFAI, "version", "2026.9.0")
+    monkeypatch.setattr(pyFAI, "version", version)
     assert apply_calibration_backports() is False
     assert IntegrationTask._IntegrationTask__getPoni is method
+
+
+def test_gui_patch_preserves_upstream_save_and_later_serializers():
+    save = IntegrationTask._IntegrationTask__saveAsPoni
+    serializers = _Rayonix.get_config, PyFAIEncoder.default
+    assert apply_calibration_backports() is True
+    assert IntegrationTask._IntegrationTask__saveAsPoni is save
+    assert (_Rayonix.get_config, PyFAIEncoder.default) == serializers

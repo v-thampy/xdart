@@ -24,6 +24,16 @@ def test_parse_scan_groups_combines_ranges():
         parse_scan_groups("1-x")
 
 
+def test_stitch_brackets_define_explicit_outputs_and_preserve_occurrences():
+    from xrd_tools.sources.grouping import parse_stitch_scan_groups
+    assert parse_stitch_scan_groups("1,2,[2-5, 8]") == (("1",), ("2",), ("2", "3", "4", "5", "8"))
+    assert parse_stitch_scan_groups("1-3, 5") == (("1",), ("2",), ("3",), ("5",))
+    assert parse_stitch_scan_groups("[2.1,2.2],2.1") == (("2.1", "2.2"), ("2.1",))
+    for invalid in ("", "[1", "1]", "[[1]]", "[1,,2]", "1,", "3-1", "[1]2", "0", "1-999999"):
+        with pytest.raises(ValueError):
+            parse_stitch_scan_groups(invalid)
+
+
 # ── CompositeFrameSource ──────────────────────────────────────────────────
 
 
@@ -216,13 +226,20 @@ def test_discover_scans_uses_natural_file_order(tmp_path):
 
 
 def test_discover_scans_eiger_filters_master(tmp_path):
-    """Eiger discovery returns only the _master file, not the sibling data files."""
-    (tmp_path / "scan_master.h5").write_bytes(b"")
+    """Eiger discovery returns the DECTRIS masters, known by their vendor detector configuration whatever their
+    name (CAL-HELD-BATCH-20261009), never the sibling data files, which are skipped unopened by their exact names."""
+    import h5py
+    for name, vendor in (("scan_master.h5", True), ("renamed.h5", True), ("plain_master.h5", False)):
+        with h5py.File(tmp_path / name, "w") as handle:
+            handle.create_group("entry").attrs["NX_class"] = "NXentry"
+            if vendor:
+                handle.create_dataset("entry/instrument/detector/detectorSpecific/eiger_fw_version",
+                                      data="release-2022.1.2")
     (tmp_path / "scan_data_000001.h5").write_bytes(b"")
     (tmp_path / "scan_data_000002.h5").write_bytes(b"")
     specs = discover_scans(tmp_path, "eiger_master")
-    assert [s.uri.name for s in specs] == ["scan_master.h5"]
-    assert specs[0].kind is SourceKind.EIGER_MASTER
+    assert sorted(s.uri.name for s in specs) == ["renamed.h5", "scan_master.h5"]
+    assert {s.kind for s in specs} == {SourceKind.EIGER_MASTER}
 
 
 def test_discover_scans_nexus_reuses_exact_eiger_sidecar_policy(tmp_path):

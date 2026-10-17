@@ -34,6 +34,8 @@ __all__ = [
     "plot_waterfall",
     "plot_peak_fit_frame",
     "plot_thermal_history",
+    "plot_analysis_outcome",
+    "convert_analysis_axis",
 ]
 
 
@@ -574,4 +576,121 @@ def plot_peak_fit(
         legend=dict(font=dict(size=10)),
         margin=dict(l=60, r=20, t=50 if title else 30, b=50),
     )
+    return fig
+
+
+def convert_analysis_axis(snapshot, values, axis_unit=None):
+    """Present one admitted trace's coordinates through the public radial conversion owner."""
+    axis = snapshot.axes[0]
+    target_unit = axis.unit if axis_unit is None else axis_unit
+    if target_unit == axis.unit:
+        return values
+    from xrd_tools.core.containers import convert_radial_axis
+    from xrd_tools.analysis.axis_units import canonical_q_unit
+    source_unit = "q_A^-1" if canonical_q_unit(axis.unit) == "q_A^-1" else axis.unit
+    return convert_radial_axis(np.asarray(values), source_unit, target_unit, snapshot.wavelength_angstrom)
+
+
+def plot_analysis_outcome(snapshot, outcome=None, *, overlays=("fit", "background", "residual"),
+                          log_y=False, x_range=None, height=550, axis_unit=None, peak_model="pseudovoigt",
+                          plane_axis=None, plane_index=None, plane_coordinate=None, comparisons=()):
+    """A public analyzer outcome on its admitted native axis; signed residuals stay linear.
+
+    The shared notebook hosts call this model (Jupyter wraps it in FigureWidget, marimo in mo.ui.plotly).
+    Region inputs use the solver's bounded central projection instead of sending a whole volume to a browser.
+    Presentation bounds and log intensity never modify the input or scientific fit bounds.
+    Hosts may lazily supply bounded one-dimensional comparisons; each uses its own admitted coordinate receipt.
+    """
+    go = _import_go()
+    from plotly.subplots import make_subplots
+    if len(snapshot.axes) > 1:
+        data = snapshot.fitted_values()
+        axes = snapshot.axes
+        payload = getattr(getattr(outcome, "result", None), "payload", None)
+        comparison = None
+        if payload is not None and hasattr(payload, "comparison"):
+            indices = [np.flatnonzero(np.isin(original.values, fitted.values)) for original, fitted in zip(axes, payload.axes)]
+            fitted_data = data[np.ix_(*indices)]
+            if data.ndim == 3:
+                held = plane_axis or payload.data_order[2]
+                k = payload.data_order.index(held)
+                index = (int(np.argmin(abs(payload.axes[k].values - plane_coordinate))) if plane_coordinate is not None
+                         else payload.shape[k] // 2 if plane_index is None else min(max(int(plane_index), 0), payload.shape[k]-1))
+                comparison = payload.comparison_slice(fitted_data, held, index)
+            else:
+                comparison = payload.comparison(fitted_data)
+        if comparison is not None:
+            panels = [("data", comparison.data)]
+            if "fit" in overlays:
+                panels.append(("fit", comparison.model))
+            if "residual" in overlays:
+                panels.append(("data − model", comparison.residual))
+            fig = make_subplots(rows=1, cols=len(panels), subplot_titles=[name for name, _ in panels])
+            x, y = comparison.axes
+            for col, (name, values) in enumerate(panels, 1):
+                shown = (np.where(values > 0, np.log10(np.maximum(values, np.finfo(float).tiny)), np.nan)
+                         if log_y and name != "data − model" else values)
+                fig.add_trace(go.Heatmap(x=x.values, y=y.values, z=shown.T, colorscale="Viridis",
+                                         name=name), row=1, col=col)
+                fig.update_xaxes(title_text=f"{x.name} ({x.unit or ''})", row=1, col=col)
+                fig.update_yaxes(title_text=f"{y.name} ({y.unit or ''})", row=1, col=col)
+            fixed_label = f" — {comparison.fixed[0]}={comparison.fixed[2]:.6g}" if comparison.fixed is not None else ""
+            fig.update_layout(height=height, title=snapshot.key.result_identity + fixed_label)
+            return fig
+        if data.ndim == 3:
+            k = [axis.name for axis in axes].index(plane_axis) if plane_axis is not None else 2
+            index = (int(np.argmin(abs(axes[k].values - plane_coordinate))) if plane_coordinate is not None
+                     else data.shape[k] // 2 if plane_index is None else min(max(int(plane_index), 0), data.shape[k]-1))
+            data = np.take(data, index, axis=k)
+            axes = tuple(axis for i, axis in enumerate(axes) if i != k)
+        x, y = axes[:2]
+        shown = np.where(data > 0, np.log10(np.maximum(data, np.finfo(float).tiny)), np.nan) if log_y else data
+        fig = go.Figure(go.Heatmap(x=x.values, y=y.values, z=shown.T, colorscale="Viridis"))
+        fig.update_layout(height=height, title=snapshot.key.result_identity,
+                          xaxis_title=f"{x.name} ({x.unit})", yaxis_title=f"{y.name} ({y.unit})")
+        return fig
+    axis = snapshot.axes[0]
+    target_unit = axis.unit if axis_unit is None else axis_unit
+    def convert(values):
+        return convert_analysis_axis(snapshot, values, target_unit)
+    show_residual = outcome is not None and outcome.overlay is not None and "residual" in overlays
+    fig = make_subplots(rows=2 if show_residual else 1, cols=1, shared_xaxes=True,
+                        row_heights=[.76, .24] if show_residual else [1.], vertical_spacing=.04)
+    fig.add_trace(go.Scattergl(x=convert(axis.values), y=snapshot.fitted_values(), mode="lines", name="data"), row=1, col=1)
+    if outcome is not None and outcome.overlay is not None:
+        overlay = outcome.overlay
+        for name, values in overlay.traces.items():
+            if name not in overlays or values is None:
+                continue
+            fig.add_trace(go.Scattergl(x=convert(overlay.x), y=values, mode="lines", name=name),
+                          row=2 if name == "residual" else 1, col=1)
+        result = outcome.result
+        for i, values in enumerate(getattr(result, "phase_components", ())):
+            if "components" in overlays:
+                fig.add_trace(go.Scattergl(x=convert(overlay.x), y=values, mode="lines", name=f"phase {i}"), row=1, col=1)
+        if "components" in overlays and not getattr(result, "phase_components", ()):
+            from xrd_tools.analysis.fitting.fit import get_peak_model
+            from lmfit import Parameters
+            parameters = Parameters()
+            for name, value in zip(getattr(result, "parameter_names", ()), getattr(result, "parameter_values", ())):
+                parameters.add(name, value=value)
+            prefixes = sorted({name.split("_", 1)[0] + "_" for name in parameters if name.endswith("_center")})
+            for prefix in prefixes:
+                model = get_peak_model(peak_model, prefix=prefix)
+                component = model.eval(params=parameters, x=overlay.x)
+                fig.add_trace(go.Scattergl(x=convert(overlay.x), y=component, name=prefix.rstrip("_"), mode="lines"), row=1, col=1)
+        for center in convert(overlay.markers):
+            fig.add_vline(x=center, line_dash="dot", line_width=1, row=1, col=1)
+    for other in comparisons:
+        fig.add_trace(go.Scattergl(x=convert_analysis_axis(other, other.axes[0].values, target_unit),
+                                   y=other.fitted_values(), mode="lines", name=other.key.result_identity), row=1, col=1)
+    fig.update_yaxes(title_text="Intensity", type="log" if log_y else "linear", row=1, col=1)
+    if show_residual:
+        fig.update_yaxes(title_text="data − model", type="linear", row=2, col=1)
+        fig.add_hline(y=0., line_width=.5, row=2, col=1)
+    axis_name = "2θ" if target_unit.startswith("2th") else "q" if target_unit == "q_A^-1" else axis.name
+    fig.update_xaxes(title_text=f"{axis_name} ({target_unit})", row=2 if show_residual else 1, col=1)
+    if x_range is not None:
+        fig.update_xaxes(range=list(convert(x_range)))
+    fig.update_layout(height=height, title=snapshot.key.result_identity, hovermode="x unified")
     return fig

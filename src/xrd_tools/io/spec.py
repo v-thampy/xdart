@@ -47,6 +47,54 @@ def list_spec_scans(spec_file: Path | str) -> list[str]:
     return list(SpecFile(str(spec_file)).keys())
 
 
+def read_spec_scan_motor_names(
+    spec_file: Path | str, scan_num: str | None = None
+) -> tuple[str, ...]:
+    """One scan's ``#O`` motor names from its header alone (its data table is not
+    read); ``scan_num`` None: the file's first scan. KeyError when there is no such scan."""
+    spec = SpecFile(str(spec_file))
+    keys = spec.keys()
+    if scan_num is None and not len(keys):
+        raise KeyError("the SPEC file has no scans")
+    key = keys[0] if scan_num is None else scan_num
+    return tuple(str(name) for name in spec[key].motor_names)
+
+
+def read_spec_scan_counter_names(
+    spec_file: Path | str, scan_num: str | None = None
+) -> tuple[str, ...]:
+    """One scan's ``#L`` columns that are not its ``#O`` motors (its counters, the beam monitors among
+    them), from its header alone; ``scan_num`` None: the file's first scan. KeyError when there is no
+    such scan."""
+    spec = SpecFile(str(spec_file))
+    keys = spec.keys()
+    if scan_num is None and not len(keys):
+        raise KeyError("the SPEC file has no scans")
+    scan = spec[keys[0] if scan_num is None else scan_num]
+    motors = {str(name) for name in scan.motor_names}
+    return tuple(str(label) for label in scan.labels if str(label) not in motors)
+
+
+def count_spec_scan_points(
+    spec_file: Path | str, scans: tuple[str, ...] | None = None
+) -> dict[str, int | None]:
+    """Each scan's point count (its data lines), keyed as asked: ``scans`` as a Stitch selection names
+    them (``N`` is SPEC's ``N.1`` unless the file has an exact ``N.M`` key), None when the file lacks it;
+    ``scans`` None: every scan by its ``N.M`` key. About half a millisecond a scan (silx's parser)."""
+    spec = SpecFile(str(spec_file))
+    keys = spec.keys()
+    wanted = {key: key for key in keys} if scans is None else {
+        scan: scan if scan in keys else f"{scan}.1" for scan in scans}
+    counts: dict[str, int | None] = {}
+    for scan, key in wanted.items():
+        if key not in keys:
+            counts[scan] = None
+            continue
+        data = np.asarray(spec[key].data)
+        counts[scan] = int(data.shape[1]) if data.ndim == 2 else 0
+    return counts
+
+
 def read_spec_scan_table(
     spec_file: Path | str, scan_num: str
 ) -> tuple[dict[str, np.ndarray], dict[str, float], int]:
@@ -68,6 +116,59 @@ def read_spec_scan_table(
     return columns, dict(motor_positions), npts
 
 
+_SPEC_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def _spec_row_problem(tokens, labels):
+    """The first token of one physical data row that is not a complete number of its ``#L`` column, as (column
+    index, label, token), or None: a missing or an extra token is one too. The selected-row rule every SPEC reader
+    shares (the strict scan validator below and the public metadata reader's bounded point scan)."""
+    for index in range(max(len(tokens), len(labels))):
+        token = tokens[index] if index < len(tokens) else None
+        label = labels[index] if index < len(labels) else "<extra>"
+        if index >= len(labels) or token is None or not _SPEC_NUMBER.fullmatch(token):
+            return index, label, token
+    return None
+
+
+def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
+    """Guard silx's permissive conversion using the selected scan's physical rows.
+
+    silx remains the format/value reader. It can extract digits from malformed
+    tokens (``np.float64(1.0)`` becomes ``0.641``), so validate complete decimal
+    tokens before requesting its array. Header comments and MCA records, including
+    their backslash continuations, are not table rows.
+    """
+    scan_index = -1
+    in_table = False
+    mca_continuation = False
+    with Path(spec_file).open(encoding="utf-8", errors="replace") as stream:
+        for physical_row, raw_line in enumerate(stream, 1):
+            line = raw_line.strip()
+            if raw_line.startswith("#S") and raw_line[2:3].isspace():
+                scan_index += 1
+                if scan_index > scan_data.index:
+                    break
+                in_table = False
+            if scan_index != scan_data.index:
+                continue
+            if line.startswith("#L"):
+                in_table = True
+            if not in_table or not line or line.startswith("#"):
+                continue
+            if mca_continuation or line.startswith("@"):
+                mca_continuation = line.endswith("\\")
+                continue
+            problem = _spec_row_problem(line.split(), labels)
+            if problem is not None:
+                index, label, token = problem
+                raise ValueError(
+                    f"SPEC {spec_file}, scan {scan_data.number}.{scan_data.order}, "
+                    f"physical row {physical_row}, column {index + 1} ({label!r}): "
+                    f"expected a complete decimal/scientific numeric token, got {token!r}"
+                )
+
+
 def read_spec_scan_columns(
     spec_file: Path | str, scan_num: str
 ) -> tuple[
@@ -85,8 +186,9 @@ def read_spec_scan_columns(
     """
 
     scan_data = _get_spec_scan(spec_file, scan_num)
-    data = np.asarray(scan_data.data)
     labels = tuple(str(label) for label in scan_data.labels)
+    _validate_spec_numeric_tokens(spec_file, scan_data, labels)
+    data = np.asarray(scan_data.data)
     if data.ndim != 2 or data.shape[0] != len(labels):
         raise ValueError("SPEC #L labels do not match the physical data table")
     npts = int(data.shape[1])
@@ -123,6 +225,23 @@ def get_energy_and_UB(spec_file: Path | str, scan_num: str) -> tuple[float, np.n
     header_dict = scan_data.scan_header_dict
     UB = np.array(header_dict["G3"].split(), dtype=float).reshape(3, 3)
     return energy, UB
+
+
+def get_UB(spec_file: Path | str, scan_num: str) -> np.ndarray:
+    """Return a scan's ``#G3`` UB matrix (3 x 3) without requiring an energy motor. A scan with no ``#G3``
+    line raises ``KeyError("G3")``; a scan the file does not hold raises silx's own ``KeyError``."""
+
+    header_dict = _get_spec_scan(spec_file, scan_num).scan_header_dict
+    return np.array(header_dict["G3"].split(), dtype=float).reshape(3, 3)
+
+
+def get_orientation_header(spec_file: Path | str, scan_num: str) -> np.ndarray:
+    """Return a scan's ``#G1`` values: the lattice, the reciprocal lattice, and the two orientation reflections
+    (their HKL, angles and wavelengths) SPEC computed its ``#G3`` UB from. A scan with no ``#G1`` line raises
+    ``KeyError("G1")``; a scan the file does not hold raises silx's own ``KeyError``."""
+
+    header_dict = _get_spec_scan(spec_file, scan_num).scan_header_dict
+    return np.array(header_dict["G1"].split(), dtype=float)
 
 
 def get_energy(spec_file: Path | str, scan_num: str) -> float:
@@ -210,16 +329,14 @@ def get_from_spec_file(
     scan_number: str,
     cols: list[str],
 ) -> dict[str, np.ndarray]:
-    scan_data = _get_spec_scan(fname, scan_number)
+    columns, motors, npts = read_spec_scan_table(fname, scan_number)
     spec_data: dict[str, np.ndarray] = {}
 
-    npts = scan_data.data.shape[1]
-
     for col in cols:
-        if col in scan_data.labels:
-            spec_data[col] = np.asarray(scan_data.data_column_by_name(col))
-        elif col in scan_data.motor_names:
-            spec_data[col] = np.full(npts, scan_data.motor_position_by_name(col))
+        if col in columns:
+            spec_data[col] = columns[col]
+        elif col in motors:
+            spec_data[col] = np.full(npts, motors[col])
         else:
             logger.warning(
                 "Column/motor %s does not exist in scan %s",
@@ -235,15 +352,14 @@ def get_angles(
     scan_num: str,
     diff_motors: list[str] | tuple[str, ...],
 ) -> list[list[float]]:
-    scan_data = _get_spec_scan(spec_file, scan_num)
-    npts = scan_data.data.shape[1]
+    columns, motors, npts = read_spec_scan_table(spec_file, scan_num)
     angles: list[list[float]] = []
 
     for motor in diff_motors:
-        if motor in scan_data.labels:
-            vals = scan_data.data_column_by_name(motor)
+        if motor in columns:
+            vals = columns[motor]
         else:
-            vals = np.full(npts, scan_data.motor_position_by_name(motor))
+            vals = np.full(npts, motors[motor])
         angles.append(list(vals))
 
     return angles
