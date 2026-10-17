@@ -125,6 +125,7 @@ def test_the_chosen_gi_axis_survives_reading_a_result_back(qapp, tmp_path, no_re
         _wait(page, qapp)
         paths = _listed(page, qapp)
         assert len(paths) == 2 and len(page._payloads) == 1
+        page._view_command(ShellCommand(ShellCommandKind.SET_SHARE_AXIS, False))  # a shared map holds the plot axis
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "q_oop"))
         _show(page, paths[0])
         assert page._view.plot_axis == "q_oop"  # while it is read back
@@ -158,6 +159,7 @@ def test_a_map_without_the_chosen_cut_shows_i_of_q_and_keeps_the_choice(qapp, tm
         assert len(paths) == 2
         _show(page, paths[0])
         _wait(page, qapp)
+        page._view_command(ShellCommand(ShellCommandKind.SET_SHARE_AXIS, False))  # a shared map holds the plot axis
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "q_oop"))
         gi_payload = page._current_payload()
         assert gi_payload.gi_map is not None and page._last_map_state.plot_axis == "q_oop"

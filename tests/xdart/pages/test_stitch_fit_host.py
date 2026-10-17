@@ -126,6 +126,7 @@ def test_slice_and_matching_pin_are_the_actual_radial_trace(qapp, tmp_path):
         np.testing.assert_array_equal(page._fit_current("peak").load().values,
                                       page._last_map_state.traces[0].intensity)
         radial = page._last_map_state.heavy.cake_x.values
+        _command(page, ShellCommandKind.SET_SHARE_AXIS, False)  # a shared map holds the plot axis (LF-011)
         _command(page, ShellCommandKind.SET_PLOT_AXIS, "chi")
         _command(page, ShellCommandKind.SET_SLICE_CENTER, float(radial[len(radial) // 2]))
         _command(page, ShellCommandKind.SET_SLICE_WIDTH, float(abs(radial[-1] - radial[0]) / 4))
@@ -150,6 +151,7 @@ def test_gi_native_cut_is_peak_only(qapp, tmp_path):
         page.load_form(form)
         page.open_result(path)
         _wait(page, qapp)
+        _command(page, ShellCommandKind.SET_SHARE_AXIS, False)  # a shared map holds the plot axis (LF-011)
         _command(page, ShellCommandKind.SET_PLOT_AXIS, "q_ip")
         cut = page._fit_current("peak").load()
         np.testing.assert_array_equal(cut.values, dict(payload.gi)["q_ip"].intensity)
