@@ -2171,7 +2171,14 @@ def _require_publication_parent(target: Path, descriptor: "int | _NamedParent", 
         raise FiniteArtifactIntegrityError("finite output parent changed")
 
 
-def _reserve_publication_candidate(parent_descriptor: "int | _NamedParent", target: Path, identity: str, *, suffix: str = ".candidate") -> FiniteFileSnapshot:
+def _reserve_publication_candidate(parent_descriptor: "int | _NamedParent", target: Path, identity: str, *, suffix: str = ".candidate") -> tuple[FiniteFileSnapshot, int | None]:
+    """Create the private candidate exclusively and admit it; return its snapshot and its pin.
+
+    On POSIX the pin is the creation descriptor itself, still open: it keeps the inode allocated, so no
+    other file can take the candidate's (st_dev, st_ino) while the identity guards compare it (hosted
+    Linux handed a freed inode number to the next file created, F5). Its owner closes it once, after the
+    last cleanup or observation. Windows keeps its immediate close and returns None.
+    """
     name = f".xdart-finite-{identity}-{secrets.token_hex(16)}{suffix}"
     if type(parent_descriptor) is not int:
         return _reserve_named_candidate(parent_descriptor, name)
@@ -2186,26 +2193,23 @@ def _reserve_publication_candidate(parent_descriptor: "int | _NamedParent", targ
         if not stat.S_ISREG(state.st_mode):
             raise FiniteArtifactIntegrityError("finite candidate reservation is not regular")
         provisional = FiniteFileSnapshot(str(path), int(state.st_size), hashlib.sha256(b"").hexdigest(), int(state.st_dev), int(state.st_ino), int(state.st_mode), int(state.st_mtime_ns), int(state.st_ctime_ns))
-    finally:
+        captured = _snapshot_at(parent_descriptor, name, path)
+        if not _same_object(captured, provisional) or stat.S_IMODE(captured.mode) != 0o600:
+            raise FiniteArtifactIntegrityError("finite candidate changed during reservation")
+    except BaseException as primary:
+        if provisional is not None:  # still pinned, so a recycled identity cannot pass this cleanup
+            try:
+                _unlink_candidate(parent_descriptor, path, provisional)
+            except BaseException:
+                pass
         close_error = _close_descriptor_once(descriptor)
         if close_error is not None:
-            if provisional is not None:
-                try:
-                    _unlink_candidate(parent_descriptor, path, provisional)
-                except BaseException:
-                    pass
-            raise FiniteArtifactIntegrityError("finite candidate reservation close is incomplete") from close_error
-    captured = _snapshot_at(parent_descriptor, name, path)
-    if not _same_object(captured, provisional) or stat.S_IMODE(captured.mode) != 0o600:
-        try:
-            _unlink_candidate(parent_descriptor, path, provisional)
-        except BaseException:
-            pass
-        raise FiniteArtifactIntegrityError("finite candidate changed during reservation")
-    return captured
+            _attach_secondary_close(primary, close_error, "candidate reservation")
+        raise
+    return captured, descriptor
 
 
-def _reserve_named_candidate(parent: _NamedParent, name: str) -> FiniteFileSnapshot:
+def _reserve_named_candidate(parent: _NamedParent, name: str) -> tuple[FiniteFileSnapshot, int | None]:
     """Create the candidate by name, exclusively, and prove where it landed before any byte is written."""
     path = parent.entry(name)
     try:
@@ -2238,7 +2242,8 @@ def _reserve_named_candidate(parent: _NamedParent, name: str) -> FiniteFileSnaps
         if close_error is not None:
             _attach_secondary_close(primary, close_error, "candidate reservation")
         raise
-    close_error = _close_descriptor_once(descriptor)
+    pinned = os.name != "nt"  # a held Windows CRT handle would block the final rename
+    close_error = None if pinned else _close_descriptor_once(descriptor)
     try:
         if close_error is not None:
             raise FiniteArtifactIntegrityError("finite candidate reservation close is incomplete") from close_error
@@ -2252,8 +2257,12 @@ def _reserve_named_candidate(parent: _NamedParent, name: str) -> FiniteFileSnaps
         primary.hidden_orphan = hidden
         if cleanup_error is not None:
             primary.add_note(_bounded_diagnostic(FINITE_CANDIDATE_CLEANUP_WARNING, cleanup_error) + f":{hidden}")
+        if pinned:
+            close_error = _close_descriptor_once(descriptor)
+            if close_error is not None:
+                _attach_secondary_close(primary, close_error, "candidate reservation")
         raise
-    return captured
+    return captured, (descriptor if pinned else None)
 
 
 def _fsync_publication_candidate(parent_descriptor: "int | _NamedParent", path: Path, expected: FiniteFileSnapshot) -> None:
@@ -2324,6 +2333,7 @@ class _FinitePublicationSession:
         self._candidate: Path | None = None
         self._reservation: FiniteFileSnapshot | None = None
         self._document = None
+        self._pin: int | None = None  # POSIX: the candidate's creation descriptor, until _release
         self._published = False
         self._file_synced = False
         self.diagnostics: list[str] = []
@@ -2339,9 +2349,11 @@ class _FinitePublicationSession:
         hold: object,
         candidate: Path,
         reservation: FiniteFileSnapshot,
+        pin: int | None,
     ) -> "_FinitePublicationSession":
-        """Take the already-admitted seeded candidate for its common terminal."""
+        """Take the already-admitted seeded candidate, and its pin, for its common terminal."""
         value = cls(target)
+        value._pin = pin
         value._parent_descriptor = parent_descriptor
         value._parent_state = parent_state
         value._hold = hold
@@ -2406,7 +2418,7 @@ class _FinitePublicationSession:
                 if self._coordinator is None else
                 _acquire_publication_slot(self.target, coordinator=self._coordinator)
             )
-            self._reservation = _reserve_publication_candidate(
+            self._reservation, self._pin = _reserve_publication_candidate(
                 descriptor, self.target, secrets.token_hex(16), suffix=".nexus",
             )
             self._candidate = Path(self._reservation.path)
@@ -2456,6 +2468,9 @@ class _FinitePublicationSession:
             _release_publication_slot(hold, coordinator=self._coordinator)
         )
         self._warning(FINITE_SLOT_LEASE_WARNING, error)
+        pin, self._pin = self._pin, None
+        if pin is not None:
+            self._warning(FINITE_DESCRIPTOR_CLOSE_WARNING, _close_descriptor_once(pin))
         descriptor, self._parent_descriptor = self._parent_descriptor, None
         self._parent_state = None
         if descriptor is not None:
@@ -2683,7 +2698,7 @@ class FiniteArtifactPublisher:
                 available_bytes=available,
             )
 
-    def _reserve_candidate(self, parent_descriptor: int) -> FiniteFileSnapshot:
+    def _reserve_candidate(self, parent_descriptor: int) -> tuple[FiniteFileSnapshot, int | None]:
         return _reserve_publication_candidate(
             parent_descriptor, Path(self.request.output_artifact),
             self.request.version_identity,
@@ -3196,9 +3211,10 @@ class FiniteArtifactPublisher:
             own_link_observed = False
             candidate_consumed = False
             parent_closed = False
+            pin: int | None = None
 
             def close_parent(primary: BaseException | None = None) -> None:
-                nonlocal parent_closed
+                nonlocal parent_closed, pin
                 if parent_closed:
                     return
                 parent_closed = True
@@ -3225,6 +3241,13 @@ class FiniteArtifactPublisher:
                             ))
                         except BaseException:
                             pass
+                held, pin = pin, None  # after every cleanup, which the pin keeps sound
+                if held is not None:
+                    pin_error = _close_descriptor_once(held)
+                    if pin_error is not None:
+                        diagnostics.append(_bounded_diagnostic(FINITE_DESCRIPTOR_CLOSE_WARNING, pin_error))
+                        if primary is not None:
+                            _attach_secondary_close(primary, pin_error, "candidate pin")
                 close_error = _close_descriptor_once(_parent_handle(parent_descriptor))
                 if close_error is None:
                     return
@@ -3286,7 +3309,7 @@ class FiniteArtifactPublisher:
                     parent_descriptor,
                     request_source,
                 )
-                reservation = self._reserve_candidate(parent_descriptor)
+                reservation, pin = self._reserve_candidate(parent_descriptor)
                 candidate = Path(reservation.path)
                 if seed is not None:
                     seed_receipt = self._seed_candidate(
@@ -3404,7 +3427,9 @@ class FiniteArtifactPublisher:
                     hold=self._slot_hold,
                     candidate=candidate,
                     reservation=validated.snapshot,
+                    pin=pin,
                 )
+                pin = None
                 self._slot_hold = None
                 parent_closed = True
 
