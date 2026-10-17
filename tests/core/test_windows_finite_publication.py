@@ -6,7 +6,8 @@ files. On a descriptor host the ``host`` arm keeps the POSIX dir_fd branch; ``na
 replays the CRT text-mode boundary (``test_stream_seed_preserves_binary_bytes``): DIAGNOSTIC ONLY.
 Rows: W01-W08 science; W09-W12 binary bytes; W13-W24 custody; W25-W28 parent state/adoption/capacity;
 W29-W34 calibration pair; W36-W38, W40 retry/flush; W41 Average reload (D1); W42 links (D2); W43-W45
-identity (D3); W46 path length (T5); W47 Windows-width identities, W48 win32 ctime seam (hosted NTFS, 2026-10-16).
+identity (D3); W46 path length (T5); W47 Windows-width identities, W48 win32 ctime seam (hosted NTFS, 2026-10-16);
+W49/W50 distinct-inode controls for W18/W20/W40/W23 (F5: they fail on hosted Linux only, 2026-10-17).
 Applicability (T4): every row applies on NTFS and SMB, except that
 W19 (hard link) and W42's symlink cell report INCOMPLETE (skip) where the link cannot be created, and
 W42's junction cell is N/A on SMB (junctions need local NTFS; W16-W18 and W42's symlink cell cover it).
@@ -356,29 +357,47 @@ def _substitute(path: Path, raw: bytes = b"foreign") -> None:
     path.unlink()
     path.write_bytes(raw)
 
+def _mount_type(path) -> str:
+    """F5 receipt: the filesystem type holding *path* (Linux ``/proc/mounts``), else ``n/a``."""
+    mounts = Path("/proc/mounts")
+    rows = [line.split() for line in mounts.read_text().splitlines()] if mounts.exists() else []
+    return max((row for row in rows if str(path).startswith(row[1])), key=lambda row: len(row[1]),
+               default=("", "", "n/a"))[2]
+
 @pytest.mark.parametrize("moment", ("before-write", "after-close"), ids=("W18-before-write", "W40-before-flush"))
 def test_w18_w40_substituted_candidate_is_refused_and_never_deleted(tmp_path, arm, moment):
     target = tmp_path / "slot.nexus"
     session = _FinitePublicationSession(target)
     session.reserve()
     candidate = session.candidate
+    reserved = finite_module._snapshot_state(session._reservation)  # F5 receipts: (dev, ino, mode, size, mtime, ctime)
     if moment == "before-write":
         _substitute(candidate)
+        print("F5", moment, _mount_type(tmp_path), "reserved", reserved,
+              "replacement", finite_module._state(os.lstat(candidate)), flush=True)
         try:
-            with pytest.raises(FiniteArtifactIntegrityError, match="candidate changed"):
+            with pytest.raises(FiniteArtifactIntegrityError, match="candidate changed") as refused:
                 session.open_document(lambda path: h5py.File(path, "w"))
         finally:
             session.abort()
+        print("F5 refused", repr(refused.value), "exists", candidate.exists(),
+              "bytes", candidate.exists() and candidate.read_bytes(), "orphan", session.hidden_orphan,
+              "diagnostics", session.diagnostics, flush=True)
         assert candidate.read_bytes() == b"foreign" and session.hidden_orphan is None
         return
     document = session.open_document(lambda path: h5py.File(path, "w"))
     document.create_dataset("value", data=[1])
     assert session.close_document()
+    closed = finite_module._state(os.lstat(candidate))
     if moment == "after-close":
         _substitute(candidate)
     foreign = candidate.read_bytes()
+    print("F5", moment, _mount_type(tmp_path), "reserved", reserved, "closed", closed,
+          "replacement", finite_module._state(os.lstat(candidate)), flush=True)
     with pytest.raises(FiniteArtifactIntegrityError, match="candidate changed") as raised:
-        _publish(session, capture_target_snapshot(target))
+        facts = _publish(session, capture_target_snapshot(target))
+        print("F5 returned published", facts.published, "error", repr(facts.error), "terminal", facts.terminal,
+              "target", target.exists() and target.read_bytes()[:16], "orphan", session.hidden_orphan, flush=True)
     assert not target.exists() and candidate.read_bytes() == foreign
     assert session.hidden_orphan is None
     assert any(FINITE_CANDIDATE_CLEANUP_WARNING in note for note in raised.value.__notes__)
@@ -407,8 +426,13 @@ def test_w19_hard_linked_source_alias_is_refused(tmp_path, monkeypatch, arm):
 
 def test_w20_foreign_cleanup_occupant_is_preserved(tmp_path, arm):
     session = _start(tmp_path / "slot.nexus")
+    closed = finite_module._state(os.lstat(session.candidate))
     _substitute(session.candidate)
+    print("F5 W20", _mount_type(tmp_path), "reserved", finite_module._snapshot_state(session._reservation),
+          "closed", closed, "replacement", finite_module._state(os.lstat(session.candidate)), flush=True)
     assert session.abort()
+    print("F5 W20 exists", session.candidate.exists(), "orphan", session.hidden_orphan,
+          "diagnostics", session.diagnostics, flush=True)
     assert session.candidate.read_bytes() == b"foreign" and session.hidden_orphan is None
     assert any(FINITE_CANDIDATE_CLEANUP_WARNING in item for item in session.diagnostics)
     assert not session.slot_held
@@ -441,15 +465,22 @@ def test_w23_ambiguous_foreign_occupant_keeps_its_verdict(tmp_path, monkeypatch,
     real = finite_module.replace_into_place
 
     def foreign_after(*args, **kwargs):
+        print("F5 W23 hook entered", flush=True)
         real(*args, **kwargs)
+        print("F5 W23 renamed", finite_module._state(os.lstat(target)), flush=True)
         target.unlink()
         target.mkdir() if occupant == "directory" else target.write_bytes(b"foreign")
+        print("F5 W23 occupant", finite_module._state(os.lstat(target)), "raising", flush=True)
         raise OSError("ambiguous rename")
     monkeypatch.setattr(finite_module, "replace_into_place", foreign_after)
     session = _start(target)
+    print("F5 W23", occupant, _mount_type(tmp_path), "reserved", finite_module._snapshot_state(session._reservation),
+          flush=True)
     if occupant == "regular":
         with pytest.raises(OSError, match="ambiguous rename"):
-            _publish(session, capture_target_snapshot(target))
+            facts = _publish(session, capture_target_snapshot(target))
+            print("F5 W23 returned published", facts.published, "error", repr(facts.error), "terminal", facts.terminal,
+                  "orphan", session.hidden_orphan, "leftovers", _leftovers(tmp_path), flush=True)
         assert target.read_bytes() == b"foreign"
     else:
         facts = _publish(session, capture_target_snapshot(target))
@@ -871,3 +902,64 @@ def test_w48_win32_ctime_seam_still_seals_analysis_receipts(tmp_path, monkeypatc
     """Synthetic on POSIX: win32 zeroes ctime in comparable revisions, so a receipt must compare like with like."""
     monkeypatch.setattr(stat_identity_module, "IDENTITY_CARRIES_CTIME", False)
     flow(tmp_path, monkeypatch, arm)
+
+@pytest.mark.parametrize("moment", ("before-write", "after-close", "cleanup"), ids=("W18", "W40", "W20"))
+def test_w49_distinct_inode_substitution_is_refused_and_never_deleted(tmp_path, arm, moment):
+    """F5 control beside W18/W40/W20 (kept unchanged): a descriptor holds the original inode across the
+    unlink, so the replacement cannot reuse its (st_dev, st_ino). Windows cannot unlink an open file and
+    needs no hold: an NTFS file ID carries a sequence number."""
+    target = tmp_path / "slot.nexus"
+    session = _FinitePublicationSession(target)
+    session.reserve()
+    candidate = session.candidate
+    if moment != "before-write":
+        document = session.open_document(lambda path: h5py.File(path, "w"))
+        document.create_dataset("value", data=[1])
+        assert session.close_document()
+    held = None if _WINDOWS else os.open(candidate, os.O_RDONLY)
+    try:
+        original = os.lstat(candidate)
+        _substitute(candidate)
+        replacement = os.lstat(candidate)
+        assert (replacement.st_dev, replacement.st_ino) != (original.st_dev, original.st_ino), (
+            finite_module._state(original), finite_module._state(replacement))
+        if moment == "after-close":
+            with pytest.raises(FiniteArtifactIntegrityError, match="candidate changed") as raised:
+                _publish(session, capture_target_snapshot(target))
+            notes = raised.value.__notes__
+        else:
+            if moment == "before-write":
+                with pytest.raises(FiniteArtifactIntegrityError, match="candidate changed"):
+                    session.open_document(lambda path: h5py.File(path, "w"))
+            assert session.abort()
+            notes = session.diagnostics
+        assert not target.exists() and candidate.read_bytes() == b"foreign" and session.hidden_orphan is None
+        assert any(FINITE_CANDIDATE_CLEANUP_WARNING in note for note in notes) and not session.slot_held
+    finally:
+        if held is not None:
+            os.close(held)
+
+def test_w50_distinct_inode_ambiguous_occupant_keeps_its_verdict(tmp_path, monkeypatch, arm):
+    """F5 control beside W23-regular (kept unchanged): the published inode is held across the foreign rewrite."""
+    target = tmp_path / "slot.nexus"
+    real, held, identities = finite_module.replace_into_place, [], []
+
+    def foreign_after(*args, **kwargs):
+        real(*args, **kwargs)
+        held.extend(() if _WINDOWS else (os.open(target, os.O_RDONLY),))
+        ours = finite_module._state(os.lstat(target))
+        target.unlink()
+        target.write_bytes(b"foreign")
+        identities.append((ours, finite_module._state(os.lstat(target))))  # asserted below: publish catches errors
+        raise OSError("ambiguous rename")
+    monkeypatch.setattr(finite_module, "replace_into_place", foreign_after)
+    session = _start(target)
+    try:
+        with pytest.raises(OSError, match="ambiguous rename"):
+            _publish(session, capture_target_snapshot(target))
+        [(ours, occupant)] = identities
+        assert ours[:2] != occupant[:2], identities
+        assert target.read_bytes() == b"foreign" and _leftovers(tmp_path) == [] and session.hidden_orphan is None
+    finally:
+        for descriptor in held:
+            os.close(descriptor)
