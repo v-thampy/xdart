@@ -3856,7 +3856,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._pending_session_resume is not resume:
             return
         if self._owner.busy or self._beam_probe_timer.isActive() or self._pending_source_details is not None:
-            QtCore.QTimer.singleShot(20, lambda: self._restore_session_when_ready(resume))
+            QtCore.QTimer.singleShot(20, self, lambda: self._restore_session_when_ready(resume))
             return
         self._pending_session_resume = None
         def go():
