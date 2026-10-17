@@ -572,6 +572,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         self._source_energy_eV = None
         self._poni_wavelength = (None, None)  # (the calibrated frames' PONI files, the wavelength they agree on)
         self._pending_source_details = None
+        self._source_details_admitted = {}  # each role's ('' calibrant, 'beam_') inputs of its last applied read
         self._calibrant_ready_key = None
         self._calibrant_frame_count = None
         self._calibrant_source_problem = ''
@@ -1238,6 +1239,7 @@ class CalibrationDialog(QtWidgets.QDialog):
         if self._owner.busy:
             self._pending_source_details = prefix
             return
+        self._source_details_admitted.pop(prefix, None)  # the role's shown facts are read again
         self._source_details_orientation_inputs = (self._orientation_key(), self._source_energy_eV)
         if not prefix:
             self._source_energy_eV = None
@@ -1261,6 +1263,13 @@ class CalibrationDialog(QtWidgets.QDialog):
     def _source_details_input_key(self, prefix):
         return tuple(self._text(prefix + key) for key in ('source', 'scan', 'entry', 'images', 'stem')) + (
             self.beam_source_kind.currentData() if prefix else self.source_kind.currentData(),)
+
+    def _commit_source_field(self, prefix, field):
+        """A source field's commit: Return reads its role's metadata, as do inputs other than those of the role's
+        last applied read (an edit since clears it). Focus merely leaving an unchanged field reads nothing again
+        (HOSTED-REDS-20261017 F3); the 📁 pick and Read metadata read through their own routes."""
+        if field.hasFocus() or self._source_details_admitted.get(prefix) != self._source_details_input_key(prefix):
+            self._source_details(prefix)
 
     def _energy_source_key(self):
         return (self._text('source'), self._text('scan'), self._text('entry'),
@@ -1432,7 +1441,10 @@ class CalibrationDialog(QtWidgets.QDialog):
         for key in ('source', 'scan'):
             self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders())
         for key in ('source', 'scan', 'entry', 'images', 'stem'):
-            self._fields[key].editingFinished.connect(lambda: self._source_details())
+            field = self._fields[key]
+            field.editingFinished.connect(lambda field=field: self._commit_source_field('', field))
+            field.textChanged.connect(lambda _text: self._source_details_admitted.pop('', None))
+        self.source_kind.currentIndexChanged.connect(lambda _index: self._source_details_admitted.pop('', None))
         self._sync_source_rows()
         self._auto_placeholders()
         self.list_button = QtWidgets.QPushButton('Read metadata and suggest 5 frames')
@@ -2005,7 +2017,11 @@ class CalibrationDialog(QtWidgets.QDialog):
             self._fields[key].textChanged.connect(lambda _text: self._auto_placeholders('beam_'))
         self._auto_placeholders('beam_')
         for key in ('beam_source', 'beam_scan', 'beam_entry', 'beam_images', 'beam_stem'):
-            self._fields[key].editingFinished.connect(lambda: self._source_details('beam_'))
+            field = self._fields[key]
+            field.editingFinished.connect(lambda field=field: self._commit_source_field('beam_', field))
+            field.textChanged.connect(lambda _text: self._source_details_admitted.pop('beam_', None))
+        self.beam_source_kind.currentIndexChanged.connect(
+            lambda _index: self._source_details_admitted.pop('beam_', None))
         self._edit(form, 'beam_pixel', 'Direct beam pixel (x, y)', '',
                    tip='Column, row of the pixel the direct beam hits with the detector facing it squarely (each '
                        'circle at its motor zero, beside its motor under 1 · Instrument), in the image as '
@@ -4130,6 +4146,7 @@ class CalibrationDialog(QtWidgets.QDialog):
                 elif kind == 'source_details':
                     prefix, energy, automatic, frame_count, source_problem = result
                     if self._source_details_inputs_key == self._source_details_input_key(prefix):
+                        self._source_details_admitted[prefix] = self._source_details_inputs_key
                         if not prefix and self._source_details_key == self._energy_source_key():
                             self._show_source_energy(energy)
                             self._calibrant_ready_key = self._source_details_key if frame_count else None
