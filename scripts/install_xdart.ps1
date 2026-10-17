@@ -56,7 +56,7 @@ platforms = ["win-64"]
 [dependencies]
 # conda-forge fast I/O stack (measured: fastest Eiger bitshuffle/LZ4 decode)
 python = "$PythonPin"
-h5py = "*"
+h5py = "==3.16.0"
 hdf5plugin = "==7.1.0"
 fabio = "==2025.10.0"
 scipy = "==1.18.1"

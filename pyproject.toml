@@ -139,7 +139,7 @@ python = "3.13.*"
 # their PyPI names, so the editable install below sees its requirements as
 # already satisfied and does NOT re-install wheel copies.
 numpy = "==2.5.1"
-h5py = "*"
+h5py = "==3.16.0"
 hdf5plugin = "==7.1.0"
 fabio = "==2025.10.0"
 # Keep the native HDF5/compression stack explicit, matching the installers.

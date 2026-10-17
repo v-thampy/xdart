@@ -72,7 +72,7 @@ requirements:
     - scipy ==1.18.1
     - pandas
     - xarray
-    - h5py
+    - h5py ==3.16.0
     - hdf5plugin ==7.1.0
     - nexusformat ==2.0.3
     # nexusformat 2.0.3 requires this, but its conda-forge recipe omits it.

@@ -71,7 +71,7 @@ platforms = ["$PLAT"]
 [dependencies]
 # conda-forge fast I/O stack (measured: fastest Eiger bitshuffle/LZ4 decode)
 python = "$PYTHON_PIN"
-h5py = "*"
+h5py = "==3.16.0"
 hdf5plugin = "==7.1.0"
 fabio = "==2025.10.0"
 scipy = "==1.18.1"
