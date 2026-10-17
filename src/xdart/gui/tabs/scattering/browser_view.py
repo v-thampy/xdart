@@ -10,6 +10,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from xdart.gui.themes.spacing import current_spacing_tokens
 from xdart.utils.throttle import Coalescer
 
+from .browser_catalog import catalog_order_key
 from .browser_model import FrameListModel
 from .display_values import DisplayFrameKey
 from .shell_values import (
@@ -457,6 +458,8 @@ class ResultDirectoryBrowser(QtCore.QObject):
         entries.extend(BrowserResult(path, os.path.basename(path), path) for path in loaded
                        if path not in known and (not self._active
                        or os.path.dirname(os.path.abspath(path)) == self.directory))
+        if self._active:  # a result the catalog has not read yet sits where it will list it: no row moves when it lands
+            entries.sort(key=lambda entry: catalog_order_key(entry.label, entry.is_directory))
         return tuple(entries)
 
     def _consume(self, wake):
