@@ -77,8 +77,8 @@ results. Preserve raw inputs when moving projects: saved scientific results can
 reopen independently, while full raw-image inspection and processing replay
 still depend on the referenced sources.
 
-SVG plot export is unavailable in this release line until its separate repair
-lands; use PNG. Saved Stitch GI cut XYE companions use `sqrt(abs(I))` as an
+SVG plot export uses a compatibility fix for pyqtgraph 0.14.0 and Qt 6.11.
+Saved Stitch GI cut XYE companions use `sqrt(abs(I))` as an
 estimate in the third column, as their headers state; it is not a propagated
 uncertainty. Exporting an arbitrary displayed cut is a separate operation from
 the automatically written companions.

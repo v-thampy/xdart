@@ -48,6 +48,16 @@ requirements.
   processed once a second directory listing confirms it; network directory
   visibility remains relevant.
 
+### Dependencies and plot exports
+
+- Update silx to 3.1.3, fixing the Python 3.13 HDF5 tree crash in **silx view**;
+  update SciPy to 1.18.1, NumExpr to 2.14.2 and hdf5plugin to 7.1.0.
+- Restore SVG plot export under Qt 6.11 with the upstream close-path correction
+  for the pinned pyqtgraph 0.14.0. PNG and the shared export guards remain available.
+- Keep NumPy 2.5.1, pyFAI 2026.9.x and xrayutilities 1.7.12. The supported native
+  installers also keep FabIO 2025.10.0 and PySide6 6.11.x from conda-forge;
+  the planned FabIO 2026.06 and PySide6 6.12 updates await conda-forge packages.
+
 ### Upgrading and installation
 
 Use the [migration checklist](MIGRATION.md#upgrading-from-115-to-120) before

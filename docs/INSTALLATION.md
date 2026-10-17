@@ -85,16 +85,17 @@ your shell).
 mamba create -n xrd python=3.13 -y
 mamba activate xrd
 
-# 2. the conda-forge fast I/O stack and the GUI's compiled xrayutilities,
+# 2. the qualified conda-forge I/O, Qt and numerical stack,
 #    then the xdart GUI from PyPI
-mamba install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c numpy==2.5.1 xrayutilities==1.7.12
+mamba install -c conda-forge h5py hdf5plugin==7.1.0 fabio==2025.10.0 hdf5 blosc c-blosc2 lz4-c scipy==1.18.1 "numexpr==2.14.2=py*" silx==3.1.3 pyside6==6.11.1 numpy==2.5.1 xrayutilities==1.7.12
 pip install "xdart[gui]"
 ```
 
 then launch with `xdart`. (Already have an environment? Just run step 2 in it.)
 The GUI's Stitch and RSM tools need `xrayutilities` 1.7.12, which is compiled. Take
 it, and the NumPy version it is pinned with, from conda-forge as shown. `pip` then
-finds both already installed.
+finds these already installed. Keep PySide6 from conda-forge too; mixing its
+PyPI wheel with the conda native stack can abort the process.
 
 ## Using pip / uv
 

@@ -34,19 +34,18 @@ if (-not (Test-Path $Pixi)) {
 # --- workspace manifest ----------------------------------------------------------
 # XDART_LOCAL_SOURCE=C:\path\to\checkout installs from a local tree (pre-release
 # testing / development) instead of PyPI -- mirrors install_xdart.sh.
+# Native Qt provenance is unconditional for both published and local GUI/all installs.
+$GuiConda = ""
+$GuiFallback = ""
+if ($ExtrasToml -match '"(gui|all)"') {
+    $GuiConda = 'pyside6 = "==6.11.2"'
+    $GuiFallback = "pyqtgraph = `"==0.14.0`"`nqtawesome = `"*`"`nimagecodecs = `"*`"`nimageio = `"*`"`npackaging = `"*`""
+}
 if ($env:XDART_LOCAL_SOURCE) {
     $SrcPath = ($env:XDART_LOCAL_SOURCE -replace '\\', '/')   # TOML-safe path
     $PypiDep = "xdart = { path = `"$SrcPath`", extras = [$ExtrasToml] }"
-    $GuiFallback = ""
-    if ($ExtrasToml -match '"gui"') {
-        # Belt-and-suspenders: extras on a path dep are the least-exercised
-        # pixi/uv corner; list the gui stack explicitly (keep in sync with
-        # pyproject [gui]).  Harmless duplication -- same versions resolve.
-        $GuiFallback = "pyside6 = `">=6.5`"`npyqtgraph = `">=0.13.7`"`nqtawesome = `"*`"`nimagecodecs = `"*`"`nimageio = `"*`"`npackaging = `"*`""
-    }
 } else {
     $PypiDep = "xdart = { version = `">=1,<2`", extras = [$ExtrasToml] }"
-    $GuiFallback = ""
 }
 @"
 [workspace]
@@ -58,13 +57,17 @@ platforms = ["win-64"]
 # conda-forge fast I/O stack (measured: fastest Eiger bitshuffle/LZ4 decode)
 python = "$PythonPin"
 h5py = "*"
-hdf5plugin = "*"
-fabio = "*"
+hdf5plugin = "==7.1.0"
+fabio = "==2025.10.0"
+scipy = "==1.18.1"
+numexpr = { version = "==2.14.2", build = "py*" }
+silx = "==3.1.3"
 hdf5 = "*"
 blosc = "*"
 c-blosc2 = "*"
 lz4-c = "*"
 $XuConda
+$GuiConda
 
 [pypi-dependencies]
 $PypiDep
@@ -100,7 +103,7 @@ Remove-Item $SanityFile
 
 # Sanity: the GUI stack must actually import (a solve can succeed with the gui
 # extra silently unapplied -> "installed" but xdart won't launch).
-if ($ExtrasToml -match '"gui"') {
+if ($ExtrasToml -match '"(gui|all)"') {
     & $Pixi run --manifest-path "$AppRoot\pixi.toml" python -c "import PySide6, pyqtgraph; print('    GUI stack: PySide6', PySide6.__version__, '+ pyqtgraph', pyqtgraph.__version__, 'OK')"
     if ($LASTEXITCODE -ne 0) { throw "GUI stack verification failed (PySide6/pyqtgraph missing)" }
 }

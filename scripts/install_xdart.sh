@@ -44,23 +44,21 @@ for _e in "${_extras[@]}"; do
     [ -n "$_e" ] && EXTRAS_TOML="${EXTRAS_TOML:+$EXTRAS_TOML, }\"$_e\""
 done
 [ -n "$EXTRAS_TOML" ] || EXTRAS_TOML='"gui"'
-# [rsm]'s xrayutilities is compiled: it has no macOS-arm64 wheel, and its wheels
-# bundle a second OpenMP runtime that aborts beside conda-forge's.  Take it, and
-# [rsm]'s NumPy pin, from conda-forge.  Keep in sync with pyproject [rsm].
+# [rsm]'s pinned xrayutilities wheels bundle a second OpenMP runtime that aborts
+# beside conda-forge's. Take it and [rsm]'s NumPy pin from conda-forge.  Keep in sync with pyproject [rsm].
 XU_CONDA=""
 case "$EXTRAS_TOML" in *'"gui"'*|*'"rsm"'*|*'"all"'*)
     XU_CONDA=$'numpy = "==2.5.1"\nxrayutilities = "==1.7.12"' ;;
 esac
+# Qt must share conda provenance with the compiled stack, for published and local installs alike.
+GUI_CONDA=""
 GUI_FALLBACK=""
+case "$EXTRAS_TOML" in *'"gui"'*|*'"all"'*)
+    GUI_CONDA='pyside6 = "==6.11.1"'
+    GUI_FALLBACK=$'pyqtgraph = "==0.14.0"\nqtawesome = "*"\nimagecodecs = "*"\nimageio = "*"\npackaging = "*"' ;;
+esac
 if [ -n "${XDART_LOCAL_SOURCE:-}" ]; then
     PYPI_DEP="xdart = { path = \"$XDART_LOCAL_SOURCE\", extras = [$EXTRAS_TOML] }"
-    # Belt-and-suspenders: list the gui stack explicitly for local-source
-    # installs (extras on path deps are the least-exercised pixi/uv corner; the
-    # duplication is harmless — same versions resolve).  Keep in sync with
-    # pyproject [gui].
-    case ",${XDART_EXTRAS:-gui}," in *,gui,*)
-        GUI_FALLBACK=$'pyside6 = ">=6.5"\npyqtgraph = ">=0.13.7"\nqtawesome = "*"\nimagecodecs = "*"\nimageio = "*"\npackaging = "*"' ;;
-    esac
 else
     PYPI_DEP="xdart = { version = \">=1,<2\", extras = [$EXTRAS_TOML] }"
 fi
@@ -74,13 +72,17 @@ platforms = ["$PLAT"]
 # conda-forge fast I/O stack (measured: fastest Eiger bitshuffle/LZ4 decode)
 python = "$PYTHON_PIN"
 h5py = "*"
-hdf5plugin = "*"
-fabio = "*"
+hdf5plugin = "==7.1.0"
+fabio = "==2025.10.0"
+scipy = "==1.18.1"
+numexpr = "==2.14.2"
+silx = "==3.1.3"
 hdf5 = "*"
 blosc = "*"
 c-blosc2 = "*"
 lz4-c = "*"
 $XU_CONDA
+$GUI_CONDA
 
 [pypi-dependencies]
 $PYPI_DEP
@@ -111,7 +113,7 @@ EOF
 
 # Sanity: the GUI stack must actually import (observed live: a solve can succeed
 # with the gui extra silently unapplied -> "installed" but xdart won't launch).
-case ",${XDART_EXTRAS:-gui}," in *,gui,*)
+case "$EXTRAS_TOML" in *'"gui"'*|*'"all"'*)
     "$PIXI" run --manifest-path "$APP_ROOT/pixi.toml" python -c \
         "import PySide6, pyqtgraph; print('    GUI stack: PySide6', PySide6.__version__, '+ pyqtgraph', pyqtgraph.__version__, 'OK')" ;;
 esac

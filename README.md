@@ -490,7 +490,7 @@ rejection.
   `iqoop_<result>.xye`. Their third column is the √|I| estimate, because these
   cuts carry no uncertainty; each file's header says so.
 - To save another cut of a displayed plot, such as a cut of a 2D map, use the
-  plot's own export menu. SVG plot export is not available in this release; use PNG.
+  plot's own export menu. Both PNG and SVG are available for visual plot exports.
 - NeXus output carries processing metadata and calibration information for
   subsequent analysis.
 

@@ -10,8 +10,7 @@ arrives, and reports a refusal in the dialog before any file is touched. Its Sav
 :mod:`file_dialogs`, parented to the Export dialog, so deleting the plot's view retires the Export dialog, its Save
 dialogs and its selection box.
 
-pyqtgraph 0.14.0's SVG export raises for every plot under Qt 6.11; that failure is reported here too (maintainer,
-October 14: "Report SVG's error in the dialog (Recommended)").
+pyqtgraph 0.14.0 receives its upstream SVG close-path fix here; unexpected SVG ValueErrors still report a refusal.
 
 Built on pyqtgraph 0.14.0 internals; changing pyqtgraph invalidates the shared-export rows. They are
 GraphicsScene.contextMenu/showExportDialog, ExportDialog.ui (formatList, itemTree, exportBtn, copyBtn, gridLayout),
@@ -21,10 +20,18 @@ Exporter.fileSaveDialog/fileSaveFinished.
 from __future__ import annotations
 
 import functools
+import importlib
+
+import pyqtgraph
 
 from pyqtgraph import ErrorBarItem, PlotItem, exporters
 from pyqtgraph.GraphicsScene.exportDialog import ExportDialog, FormatExportListWidgetItem
 from pyqtgraph.Qt import QtCore, QtWidgets, isQObjectAlive
+
+# Rebind only the qualified dependency version; no installed package is modified.
+if pyqtgraph.__version__ == "0.14.0":
+    from ._pyqtgraph_svg import correctCoordinates
+    importlib.import_module("pyqtgraph.exporters.SVGExporter").correctCoordinates = correctCoordinates
 
 #: Exporters that need a plot as their target: upstream raises for a scene or a bare view box.
 _PLOT_ONLY = frozenset({"CSVExporter", "HDF5Exporter", "MatplotlibExporter"})
@@ -94,7 +101,7 @@ class _OwnedExport:
             return super().export(*args, **kwargs)
         try:
             return super().export(*args, **kwargs)
-        except ValueError as error:  # pyqtgraph 0.14.0 cannot read Qt 6.11's SVG; it raises before writing
+        except ValueError as error:  # retain the owned refusal for unexpected upstream SVG failures
             owner.report_refusal(f"{self.Name} failed in pyqtgraph, so nothing was written ({error}).")
             return None
 

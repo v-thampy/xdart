@@ -29,17 +29,18 @@ classifiers = [
 # friendly "pip install xdart[fitting]" error instead.
 dependencies = [
     "numpy",
-    "scipy",
+    "scipy==1.18.1",
+    "numexpr==2.14.2",
     "pandas",            # core/scan.py + reduction/core.py import it directly
     "xarray",
     "h5py",
     # Registers HDF5 dynamic filters (bitshuffle/lz4): needed by the HEADLESS
     # reader to load Dectris Eiger data and to read/write lz4-compressed
     # integrated stacks.  Lightweight, so kept in the base deps (not just GUI).
-    "hdf5plugin",
+    "hdf5plugin==7.1.0",
     "nexusformat==2.0.3",
-    "fabio",
-    "silx",              # io.spec / io.metadata SPEC parsing
+    "fabio==2025.10.0",
+    "silx==3.1.3",              # io.spec / io.metadata SPEC parsing
     # Keep the audited 2026.9 API/serialization line bounded: PONI v3,
     # MultiGeometry union, and GI convention compatibility are versioned xdart
     # contracts rather than an unconstrained dependency upgrade.
@@ -55,8 +56,8 @@ dependencies = [
 fitting = ["lmfit", "pymatgen"]
 rsm = ["xrayutilities==1.7.12", "numpy==2.5.1", "pyevtk"]
 gui = [
-    "PySide6>=6.5",
-    "pyqtgraph>=0.13.7",
+    "PySide6>=6.11.1,<6.12",
+    "pyqtgraph==0.14.0",
     # silx.gui.plot pulls qtawesome at import time (pyFAI-calib2 /
     # drawmask path) but silx doesn't declare it.
     "qtawesome",
@@ -139,20 +140,22 @@ python = "3.13.*"
 # already satisfied and does NOT re-install wheel copies.
 numpy = "==2.5.1"
 h5py = "*"
-hdf5plugin = "*"
-fabio = "*"
+hdf5plugin = "==7.1.0"
+fabio = "==2025.10.0"
 # Keep the native HDF5/compression stack explicit, matching the installers.
 hdf5 = "*"
 blosc = "*"
 c-blosc2 = "*"
 lz4-c = "*"
 pyfai = ">=2026.9,<2026.10"
-silx = "*"
+scipy = "==1.18.1"
+numexpr = "==2.14.2"
+silx = "==3.1.3"
 # The Qt binding must come from the SAME provenance as the natives above: the
 # PySide6 wheel SIGABRTs when loaded into a process already holding
 # conda-forge libs (caught by pytest tests/core after the switch — pyFAI's
 # import chain reaches PySide6.QtCore).
-pyside6 = "*"
+pyside6 = "==6.11.1"
 # Same rule for xrayutilities: its wheel bundles a second OpenMP runtime,
 # which aborts the process once conda-forge llvm-openmp is already loaded
 # (caught by test_circle_angles' pixel_q -> xrayutilities.area call).
@@ -173,6 +176,8 @@ test-fast = { cmd = "pytest tests/core -n auto -q", description = "run the headl
 gui-test = { cmd = "pytest tests/xdart -q -p no:faulthandler", env = { QT_QPA_PLATFORM = "offscreen" }, description = "run the offscreen GUI tests" }
 
 [tool.pixi.target.win-64.dependencies]
+# Preserve the already-qualified Windows binding; macOS/Linux remain on 6.11.1.
+pyside6 = "==6.11.2"
 # pyFAI 2026.5 calls compiled NumExpr without VML buffering metadata; MKL
 # builds corrupt radial coordinates for strided inputs/scalar broadcasting.
 # conda-forge non-MKL builds start with py; MKL builds start with mkl_py.
