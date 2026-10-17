@@ -15,9 +15,8 @@ dialog, exporter or serialization double; a raise inside a Qt slot lands in sys.
   in that reopened dialog and writes nothing; a changed tree target cannot redirect it; deleting the host while Save is
   open writes nothing and raises nothing.
 - B6: no Export dialog before the first Export click, then one per scene however often and from whichever view box it
-  opens; PNG writes and Cancel writes nothing; SVG, which pyqtgraph 0.14.0 cannot write under Qt 6.11 (upstream),
-  reports that in the dialog instead of raising; deleting the host retires the Export and Save dialogs and the
-  selection box.
+  opens; PNG and SVG write rendered content and Cancel writes nothing; deleting the host retires the Export and
+  Save dialogs and the selection box.
 """
 import sys
 
@@ -324,18 +323,18 @@ def test_b6_one_lazy_dialog_per_scene_visual_exports_and_cleanup_with_the_host(
     _click_format(qapp, dialog, IMAGE)
     _answer(qapp, _export(qapp, dialog), tmp_path, "plot.png")
     assert (tmp_path / "plot.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
-    # pyqtgraph 0.14.0's SVG export raises for every plot under Qt 6.11 (upstream): the dialog reports it (maintainer,
-    # October 14: "Report SVG's error in the dialog (Recommended)"), nothing is written and nothing raises
+    # Exercise the real Save callback; defer the success assertion until after host retirement so the parent red
+    # also completes the lifetime/cancellation checks.
     _click_format(qapp, dialog, SVG)
     _answer(qapp, _export(qapp, dialog), tmp_path, "plot.svg")
     status = _status(dialog)
-    assert status is not None and status.isVisible() and "SVG" in status.text(), "the SVG failure is reported here"
-    assert not (tmp_path / "plot.svg").exists() and hooked == []
+    svg_refusal = status.text() if status is not None and status.isVisible() else ""
+    files_after_svg = sorted(path.name for path in tmp_path.iterdir())
     _click_format(qapp, dialog, CSV)
     cancelled = _export(qapp, dialog)
     QtTest.QTest.keyClick(cancelled, QtCore.Qt.Key.Key_Escape)
     qapp.processEvents()
-    assert not cancelled.isVisible() and sorted(path.name for path in tmp_path.iterdir()) == ["plot.png"]
+    assert not cancelled.isVisible() and sorted(path.name for path in tmp_path.iterdir()) == files_after_svg
     pending, select_box = _export(qapp, dialog), dialog.selectBox
     assert pending is not None
     host.deleteLater()
@@ -344,5 +343,12 @@ def test_b6_one_lazy_dialog_per_scene_visual_exports_and_cleanup_with_the_host(
     added = [widget for widget in QtWidgets.QApplication.topLevelWidgets()
              if shiboken6.getCppPointer(widget)[0] not in windows_before
              and isinstance(widget, (ExportDialog, QtWidgets.QFileDialog))]
-    assert added == [] and sorted(path.name for path in tmp_path.iterdir()) == ["plot.png"]
+    assert added == [] and sorted(path.name for path in tmp_path.iterdir()) == files_after_svg
     assert hooked == []
+    assert (tmp_path / "plot.svg").exists(), svg_refusal
+    assert not svg_refusal and files_after_svg == ["plot.png", "plot.svg"]
+    from xml.etree import ElementTree
+    svg = ElementTree.parse(tmp_path / "plot.svg").getroot()
+    assert svg.tag == "{http://www.w3.org/2000/svg}svg"
+    assert any(node.get("d") or node.get("points") for node in svg.iter()
+               if node.tag.rsplit("}", 1)[-1] in {"path", "polyline"}), "SVG contains rendered geometry"
