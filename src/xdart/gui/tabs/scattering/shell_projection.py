@@ -304,7 +304,14 @@ def build_scientific_projection(
         else maps_by_id.get(id(identity_payload.frame_key), ())
     )
     requested_plot_axis = preferences.plot_axis
-    if preferences.share_axis:
+    # Share Axis follows the map shown: only a complete cake drawn in Int 2D
+    # couples the plot to it (Stitch keeps the preference on for every result).
+    if (
+        preferences.share_axis
+        and processing_mode == "Int 2D"
+        and heavy is not None
+        and heavy.cake is not None
+    ):
         requested_plot_axis = (
             share_plot_axis_for_image(rendered_image_axis)
             or requested_plot_axis
