@@ -4,8 +4,50 @@ The current distribution is **xdart**, with `xdart` and `xrd_tools` as its
 Python import packages. The legacy `ssrl_xrd_tools` import alias has been
 removed; update those imports to `xrd_tools`. See the
 [README installation guide](README.md#install) for current Pixi and pip setup.
-The notes below describe the earlier repository merger, including the
-historical `xrd-tools` distribution name and installation commands.
+The current upgrade checklist comes first; historical merger notes and older
+release records follow, including the former `xrd-tools` distribution name.
+
+## Upgrading from 1.1.5 to 1.2.0
+
+**1.2.0 is being prepared and is not yet published.** See the
+[release notes](RELEASE_NOTES.md) for the current feature summary and
+[limitations](docs/LIMITATIONS.md) for scientific and installation boundaries.
+The older release sections below describe their behavior at the time; the
+current README and installation guide are the starting points for a new install.
+
+1. **Update the environment that actually launches xdart.** Use
+   `pixi global update xdart` for a Pixi global installation, or the
+   [private-workspace update command](docs/INSTALLATION.md#updating-an-installer-workspace)
+   for the one-line installer. Keep the GUI's compiled dependencies on the
+   supported Pixi/conda-forge route; pip-only GUI installs are best-effort.
+   Restart xdart after updating.
+2. **Regenerate affected old seam-window outputs with Replace/Overwrite.**
+   This applies to Standard radial q/2θ data processed before the seam-window
+   correction. Append skips existing frames and can mix old truncated data with
+   corrected new data under the same provenance. There is no automatic data
+   migration. Retain a copy of the old output and reprocess the entire result
+   from raw inputs. See the [seam-q limitation](docs/LIMITATIONS.md#reprocess-outputs-made-before-the-seam-q-correction).
+3. **Use azimuth/χ range Auto for full-turn I(χ) and cakes.** A typed full turn
+   with a nonzero χ offset still has the documented W1 limitation. Exact 360°
+   Standard radial q/2θ windows now use Auto admission; this does not extend to
+   GI or Stitch. Extra seam-window integrators can also increase memory use.
+4. **Choose the new workspace modes explicitly.** **Stitch 1D**, **Stitch 2D**
+   and **RSM** are implemented GUI pages. Follow the README's
+   [Stitch](README.md#stitch-1d-and-stitch-2d) and
+   [RSM](README.md#reciprocal-space-mapping-rsm) instructions for raw inputs and
+   the appropriate calibration. Reopening a saved result does not reconstruct
+   the processing inputs or rerun it.
+5. **Expect stable result-folder name order.** Stitch/RSM rows are naturally
+   sorted from the start. The most recently produced result stays current but
+   may appear above older rows. No-selection fit batches follow the visible
+   order, which can change result-order trends and export order relative to a
+   previously captured arrival order. Select the intended results explicitly
+   when preparing comparisons or a fit batch.
+
+There is no bulk conversion of processed files. Keep the original raw sources
+with a moved project when raw-image inspection or replay is needed. The
+historical API/format changes below remain relevant when upgrading from older
+versions, including the `ssrl_xrd_tools` → `xrd_tools` import rename.
 
 ## Repository merger (June 2026)
 

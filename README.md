@@ -12,9 +12,13 @@ for grazing-incidence processing, and
 [xrayutilities](https://xrayutilities.sourceforge.io/) for stitching and
 reciprocal-space mapping.
 
-The Scattering Workspace brings integration, processed-data browsing, 1D/2D
-viewers, and notebook export into one window. It supports NeXus and XYE output,
-with stitching and reciprocal-space mapping (RSM) coming soon to the GUI.
+The Scattering Workspace brings integration, **Stitch 1D / Stitch 2D**,
+**reciprocal-space mapping (RSM)**, processed-data browsing, fitting, 1D/2D
+viewers, and notebook export into one window. It supports NeXus and XYE output.
+
+**1.2.0 (unreleased):** [Release notes](RELEASE_NOTES.md) ·
+[Upgrading from 1.1.5](MIGRATION.md#upgrading-from-115-to-120) ·
+[Limitations and workarounds](docs/LIMITATIONS.md).
 
 ![xdart Scattering Workspace displaying a detector image, a 2D diffraction map, and an integrated 1D pattern](docs/assets/xdart-workspace.png)
 
@@ -89,6 +93,8 @@ examples for processing, plotting, and analysis.
   - [Key capabilities](#key-capabilities)
   - [GUI quick start](#gui-quick-start)
   - [Usage guide](#usage-guide)
+    - [Stitch 1D and Stitch 2D](#stitch-1d-and-stitch-2d)
+    - [Reciprocal-space mapping (RSM)](#reciprocal-space-mapping-rsm)
   - [Analyze Results notebooks](#analyze-results-notebooks)
   - [Configuration & calibration](#configuration--calibration)
   - [Troubleshooting](#troubleshooting)
@@ -141,6 +147,10 @@ the saved NeXus or XYE output.
 
 - **Real-time 1D/2D azimuthal integration** using pyFAI.
 - **Batch processing** of image series with parallel multicore support.
+- **Stitch 1D and Stitch 2D** from raw scans, using pyFAI MultiGeometry or
+  xrayutilities histogram, with Standard and grazing-incidence modes.
+- **Reciprocal-space mapping** into HKL or Cartesian-Q volumes, with a native
+  six-panel display, 3D viewer, custom slices, and lineout/2D/3D fitting.
 - **Grazing-incidence diffraction (GID)** integration using pyFAI
   `FiberIntegrator`.
 - **Live monitoring** of ongoing experiments with directory-watched file
@@ -174,6 +184,7 @@ the saved NeXus or XYE output.
 3. **Select data**: choose an image file or directory containing images.
 4. **Choose processing mode**: **Int 1D**, **Int 2D**, or **Int 1D (XYE)** in
    the dropdown beside Run. Set the Project folder and Save Path for output.
+   For **Stitch 1D / Stitch 2D** or **RSM**, follow their dedicated workflows below.
 5. **Configure parameters**: choose axes, point counts, background subtraction,
    the global mask, and intensity thresholds as needed. **Batch** suppresses
    intermediate plot updates for faster processing.
@@ -189,7 +200,9 @@ the saved NeXus or XYE output.
 | **Int 1D** | Integrate 1D patterns and save a processed `.nexus` file. |
 | **Int 2D** | Integrate 1D patterns and 2D maps into a processed `.nexus` file. |
 | **Int 1D (XYE)** | Save individual text patterns containing axis, intensity, and uncertainty; browse them with the 1D viewer after completion. |
-| **Stitch 1D**, **Stitch 2D**, **RSM** | Specialized analysis entries; Stitch 2D is currently disabled in the GUI. |
+| **Stitch 1D** | Combine raw detector frames into a saved 1D profile. |
+| **Stitch 2D** | Save a stitched 2D map and an independent 1D profile. |
+| **RSM** | Grid raw scans into an HKL or Cartesian-Q volume and inspect its planes and profiles. |
 | **1D Viewer** | Browse XYE and other supported 1D data without integrating. |
 | **2D Viewer** | Browse raw detector images or the raw images associated with processed NeXus files. |
 
@@ -197,6 +210,114 @@ the saved NeXus or XYE output.
 and displays the saved result after completion. Set **Cores** to control worker
 parallelism. Image Series reads frames from a selected source; Image Directory
 adds file-type, metadata-type, filter, and subdirectory controls.
+
+#### Stitch 1D and Stitch 2D
+
+Stitch uses **raw detector frames and their scan-angle metadata**, not just
+previously integrated curves. Select **Stitch 1D** or **Stitch 2D** in the
+processing-mode menu beside Run.
+
+1. Set **PROJECT → Folder** and optionally **Save Path**. The default output
+   folder is `<Project>/xdart_processed_data`.
+2. Under **Source**, choose **Data format**: **SPEC + Image Series**,
+   **SPEC + Eiger**, or **NeXus**, then select **Files** or a **Folder**.
+   Folder discovery supports **Subdirs** and **Filter**. For SPEC, set
+   **Image Path** and check **Image Stem**; a blank stem uses
+   `<SPEC name>_scan<N>_`. A detector-only Eiger master needs its SPEC or another
+   metadata-bearing scan source; raw pixels alone do not supply the angles.
+3. For SPEC, **Scans → All** creates one output per scan. **Select** accepts
+   groups: `1,2,[2-5,8]` creates separate outputs for scans 1 and 2, plus one
+   combining scans 2–5 and 8. Groups apply to each selected SPEC file.
+   **Files + NeXus combines the selected containers/entries into one output**;
+   Folder discovery makes separate discovered groups. Use **Entry** to restrict
+   NeXus entries when needed.
+4. Choose **EXPERIMENT → Calibration**, or use **Calibrate** to create it. A
+   shared calibration saves the pyFAI goniometer calibration and its
+   xrayutilities `.xu.json` partner. Choose **Backend → pyFAI MultiGeometry**
+   or **xrayutilities histogram**. XU needs its own calibration or the paired
+   `.xu.json`; an arbitrary PONI file is not an XU calibration. For pyFAI's
+   **Advanced → Geometry → PONI + offsets** route, supply the matching angle
+   mappings and reference angles. Calibration, camera orientation and the
+   recorded motor convention must agree.
+5. Set points/ranges, **Normalize**, **Threshold** and **Mask File** as needed;
+   **Make Mask** opens the shared mask editor. Choose **Standard** or
+   **Grazing**; GI incidence/tilt can use metadata motors or manual angles.
+   **Advanced** includes frame bounds/step, geometry and correction settings.
+6. Use **Preview** to inspect membership and warnings, then **Run**. Preview is
+   optional: Run checks the inputs itself. Missing angle/normalization columns
+   or an incompatible calibration must be corrected before processing.
+   **Append** skips already-produced outputs with matching settings;
+   **Replace/Overwrite** recomputes them. **Cores** controls frame parallelism.
+7. Select a saved result under **DATA BROWSER → Results**, or use **Open…** /
+   **Open result…**. Outputs normally end in `_stitch1d.nexus` or
+   `_stitch2d.nexus`, with `_gi` in automatically named GI families. **Full**
+   displays the result; contributor rows inspect its source frames, with
+   **Raw image** and **Metadata** available when those sources remain accessible.
+   Single/Overlay and the footer navigate and compare results. Folder rows use
+   natural name order, so the newest result need not be at the bottom.
+
+Use **Peak Fitting**, **Phase Fitting**, and **Reference Phases** from Tools.
+Return to **Full** and select **Intensity** for fitting; phase fitting also
+needs a radial Q/2θ profile and recorded wavelength. GI cuts support peak fits.
+Fit batches use the selected results, or all listed results when none are
+selected. Fit windows offer CSV, **Export Jupyter…** and **Export marimo…**.
+**Help → Export Run notebook…** instead exports the current processing inputs
+for replay. Opening a saved result is read-only and does not reconstruct those
+inputs or enable a new Run.
+
+Stitch also writes an XYE companion for the saved profile, plus saved Qip/Qoop
+cuts for GI. See [data export](#data-export-and-saving) and the
+[scientific limitations](docs/LIMITATIONS.md) before reusing older outputs.
+
+#### Reciprocal-space mapping (RSM)
+
+Choose **RSM** in the processing-mode menu to open its workspace. RSM grids
+raw frames with recorded motor positions into a volume; its run is finite,
+with **Preview**, **Run**, and **Stop**, rather than Live/Pause/Resume.
+
+1. Set Project **Folder**, **Save Path**, **Data format**, and **Files/Folder**
+   as for Stitch. Supported sources are **SPEC + Image Series**,
+   **SPEC + Eiger**, and metadata-bearing **NeXus**. For SPEC, configure
+   **Image Path**, **Image Stem** and **Scans → All/Select**. `42,43` queues
+   separate maps; `[42-44]` combines those scans into one map.
+2. Select **Calibration**, or create it with **Calibrate**. Current RSM uses
+   **six-circle PSIC geometry** and requires the calibration's `.xu.json`
+   partner within the Project. Single-2θ, four-circle and two-circle partners
+   are refused. **Use the calibration's refinement** applies its detector
+   refinement while retaining each scan's recorded energy and sample offset.
+   Set **Mask File** or use **Make Mask** if needed.
+3. Choose **Coordinates → HKL (crystal reciprocal coordinates)** or
+   **Q Cartesian (Qx, Qy, Qz; Å⁻¹)**. HKL also requires a UB matrix from
+   **The source's**, **Typed**, or **A SPEC scan's** option; Cartesian Q does
+   not. **Advanced → Angle mapping** maps metadata columns to
+   `mu, eta, chi, phi, nu, del`. Detector images without the required scan
+   metadata are insufficient.
+4. Set the three **Grid** counts, initially `40 × 40 × 40`. Bounds are derived
+   from the selected frames and calibration, rather than typed into the GUI.
+   Each count must be at least two and the total cannot exceed 8,000,000 voxels.
+   Choose **Normalize** and **Conditioning → Threshold** for the experiment;
+   **Advanced** contains frame bounds/step, corrections and memory/chunk controls.
+5. Use **Preview** to check the source, geometry and grid, then **Run**.
+   Results normally end in `_rsm.nexus`; queued groups get separate results.
+   **Append** skips an unchanged completed output; **Replace/Overwrite** grids
+   again. **Stop** cancels the current calculation and remaining queue.
+   **Retry**, when offered after a save/verification failure, retries that
+   step without regridding.
+6. Select a result in **Results**, or use **Open… / Open result…** to reopen it.
+   The main view shows three cyclic planes and three mean profiles.
+   **Plot Options → RSM maps** chooses **Mean over range** or **Single plane**;
+   coordinate ranges and plane selectors control the displayed products.
+   **3D Viewer** and **Custom Slice** are native GUI tools. Custom Slice sets
+   directions, a through-point, thickness, ranges and sampling on the saved grid.
+7. Open **Lineout / Peak Fit**, **2-D Peak Fit**, or **3-D Peak Fit** from Tools.
+   The fits use recorded scientific results; main-view Log and Set BG do not
+   rewrite those inputs. Lineout batches use selected results, or all listed
+   results with no selection. Fit windows support CSV and
+   **Export Jupyter… / Export marimo…**. **Help → Export Run notebook…** exports
+   current RSM forms as Jupyter `.ipynb` or marimo `.py` for processing replay.
+
+Reopening a saved map does not regrid it. Preserve the referenced raw data and
+calibration if you need to replay the calculation or inspect original inputs.
 
 #### Append vs Replace
 
@@ -206,6 +327,14 @@ on an already-processed scan is near-instant: frames already in the output are
 skipped. Use Append to continue a stopped NeXus run with compatible settings;
 use Replace to reprocess after changing the integration configuration.
 Append is not available for **Int 1D (XYE)**.
+Some controls label Replace as **Overwrite**. For Stitch and RSM, Append skips
+matching completed results instead of appending frames to their finite result;
+Replace recomputes the whole selected result.
+
+**Upgrading older seam-window data:** use Replace/Overwrite to regenerate
+affected Standard q/2θ outputs in full. Append can mix pre-fix truncated frames
+with corrected frames under the same recorded configuration. See the
+[migration checklist](MIGRATION.md#upgrading-from-115-to-120).
 
 #### Live acquisition
 

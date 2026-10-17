@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xdart"
-version = "1.1.5"
+version = "1.2.0"
 description = "SSRL X-ray diffraction toolkit: headless reduction core (xrd_tools) + Qt GUI (xdart)"
 readme = "README.md"
 # SPDX expression (PEP 639): first-party code is MIT (see LICENSE); the
@@ -87,7 +87,7 @@ xdart-notebook = "xdart.notebook_main:main"
 Homepage = "https://github.com/v-thampy/xdart"
 Repository = "https://github.com/v-thampy/xdart"
 Issues = "https://github.com/v-thampy/xdart/issues"
-Changelog = "https://github.com/v-thampy/xdart/blob/main/MIGRATION.md"
+Changelog = "https://github.com/v-thampy/xdart/blob/main/RELEASE_NOTES.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
