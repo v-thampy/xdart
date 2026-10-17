@@ -7,7 +7,8 @@ replays the CRT text-mode boundary (``test_stream_seed_preserves_binary_bytes``)
 Rows: W01-W08 science; W09-W12 binary bytes; W13-W24 custody; W25-W28 parent state/adoption/capacity;
 W29-W34 calibration pair; W36-W38, W40 retry/flush; W41 Average reload (D1); W42 links (D2); W43-W45
 identity (D3); W46 path length (T5); W47 Windows-width identities, W48 win32 ctime seam (hosted NTFS, 2026-10-16);
-W49/W50 distinct-inode controls for W18/W20/W40/W23 (F5: they fail on hosted Linux only, 2026-10-17).
+W49/W50 distinct-inode controls for W18/W20/W40/W23 (F5: they fail on hosted Linux only, 2026-10-17);
+W51-W53 the POSIX creation-descriptor pin (substitution after reservation, custody, one retirement).
 Applicability (T4): every row applies on NTFS and SMB, except that
 W19 (hard link) and W42's symlink cell report INCOMPLETE (skip) where the link cannot be created, and
 W42's junction cell is N/A on SMB (junctions need local NTFS; W16-W18 and W42's symlink cell cover it).
@@ -37,7 +38,7 @@ import xrd_tools.io.stat_identity as stat_identity_module
 from xrd_tools.io.finite_artifact import (
     FINITE_CANDIDATE_CLEANUP_WARNING, FINITE_PARENT_DIRECTORY_FSYNC_WARNING, FiniteArtifactCapacityError,
     FiniteArtifactCollision, FiniteArtifactDisposition, FiniteArtifactError, FiniteArtifactIntegrityError,
-    FiniteArtifactPublisher, FiniteCandidateValidation, FiniteCommittedInspection,
+    FiniteArtifactPublisher, FiniteCandidateValidation, FiniteCommittedInspection, FiniteDocumentAdapter,
     FiniteSeededDocumentAdapter, _FinitePublicationSession, capture_finite_source,
 )
 from xrd_tools.io.output_transaction import StreamTerminal, capture_target_snapshot, \
@@ -955,3 +956,111 @@ def test_w50_distinct_inode_ambiguous_occupant_keeps_its_verdict(tmp_path, monke
     finally:
         for descriptor in held:
             os.close(descriptor)
+
+@pytest.mark.parametrize("owner", ("session", "publisher"), ids=("W51-session", "W51-publisher"))
+def test_w51_substitution_right_after_reservation_is_refused_and_preserved(tmp_path, monkeypatch, arm, owner):
+    """F5 fix: the candidate is replaced (unlink, recreate) as soon as reservation returns; its first use refuses."""
+    real, replaced, written = finite_module._reserve_publication_candidate, [], []
+
+    def reserve_then_substitute(*args, **kwargs):
+        result = real(*args, **kwargs)
+        replaced.append(Path((result[0] if type(result) is tuple else result).path))
+        _substitute(replaced[0])
+        return result
+    monkeypatch.setattr(finite_module, "_reserve_publication_candidate", reserve_then_substitute)
+    if owner == "session":
+        target = tmp_path / "slot.nexus"
+        session = _FinitePublicationSession(target)
+        with pytest.raises(FiniteArtifactIntegrityError):
+            session.start(lambda path: written.append(path) or h5py.File(path, "w"))
+        assert session.hidden_orphan is None and getattr(session, "_pin", None) is None
+        assert not session.slot_held and session._parent_descriptor is None
+    else:
+        source = tmp_path / "source.nexus"
+        source.write_bytes(b"source")
+        request = _request(tmp_path, source)
+        target = Path(request.output_artifact)
+        adapter = FiniteDocumentAdapter(nullcontext, written.append, nullcontext, written.append)
+        with pytest.raises(FiniteArtifactIntegrityError):
+            FiniteArtifactPublisher(request).publish(adapter, inspect_committed=_raising(AssertionError("inspected")))
+    assert written == [] and replaced[0].read_bytes() == b"foreign" and not target.exists()
+    assert [path.name for path in _leftovers(tmp_path)] == [replaced[0].name]
+    _assert_slot_free(target)
+
+def _pin_spies(monkeypatch, *, fail_pin_close=False):
+    """Call-through spies: the real exclusive creation descriptors, the opened parents and every close. With
+    *fail_pin_close* the first creation descriptor is really closed once, then reported ambiguous through the seam."""
+    created, parents, closes = [], [], []
+    real_open, real_parent, real_close = os.open, finite_module._open_publication_parent, finite_module._close_descriptor_once
+
+    def spy_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL and ".xdart-finite-" in str(path):
+            created.append(descriptor)
+        return descriptor
+
+    def spy_parent(target):
+        opened = real_parent(target)
+        parents.append(opened[0] if type(opened[0]) is int else opened[0].descriptor)
+        return opened
+
+    def spy_close(descriptor):
+        closes.append(descriptor)
+        error = real_close(descriptor)
+        return OSError("injected pin close") if fail_pin_close and descriptor in created[:1] else error
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(finite_module, "_open_publication_parent", spy_parent)
+    monkeypatch.setattr(finite_module, "_close_descriptor_once", spy_close)
+    return created, parents, closes
+
+@pytest.mark.skipif(_WINDOWS, reason="POSIX pin: Windows closes its creation handle during reservation")
+def test_w52_creation_descriptor_pins_the_reserved_inode_until_retirement(tmp_path, monkeypatch, arm):
+    created, parents, closes = _pin_spies(monkeypatch)
+    session = _FinitePublicationSession(tmp_path / "slot.nexus")
+    session.reserve()
+    [pin] = created
+    reserved = finite_module._snapshot_state(session._reservation)[:2]
+    assert pin not in closes and (os.fstat(pin).st_dev, os.fstat(pin).st_ino) == reserved
+    _substitute(session.candidate)
+    held, occupant = os.fstat(pin), os.lstat(session.candidate)
+    assert (held.st_dev, held.st_ino) == reserved and held.st_nlink == 0
+    assert (occupant.st_dev, occupant.st_ino) != reserved
+    assert session.abort() and session.candidate.read_bytes() == b"foreign" and session.hidden_orphan is None
+    assert closes.count(pin) == 1 and closes.count(parents[0]) == 1 and getattr(session, "_pin", None) is None
+
+@pytest.mark.skipif(_WINDOWS, reason="POSIX pin: Windows closes its creation handle during reservation")
+@pytest.mark.parametrize("case", ("abort", "writer", "document-close"), ids=("W53-abort", "W53-writer", "W53-document-close"))
+def test_w53_pin_retires_once_and_its_close_fault_never_replaces_truth(tmp_path, monkeypatch, arm, case):
+    created, parents, closes = _pin_spies(monkeypatch, fail_pin_close=case != "document-close")
+    target = tmp_path / "slot.nexus"
+    if case == "writer":
+        source = tmp_path / "source.nexus"
+        source.write_bytes(b"source")
+        request = _request(tmp_path, source)
+        target = Path(request.output_artifact)
+        adapter = FiniteDocumentAdapter(nullcontext, _raising(LookupError("writer stays primary")), nullcontext,
+                                        _raising(AssertionError("validated")))
+        with pytest.raises(LookupError, match="writer stays primary") as raised:
+            FiniteArtifactPublisher(request).publish(adapter, inspect_committed=_raising(AssertionError("inspected")))
+        assert any("injected pin close" in note for note in raised.value.__notes__)
+        assert len(_leftovers(tmp_path)) == (0 if arm.disposes else 1)
+    else:
+        session = _FinitePublicationSession(target)
+        document = session.start(lambda path: h5py.File(path, "w"))
+        if case == "document-close":
+            real, calls = document.close, []
+
+            def close_fault():
+                calls.append(1)
+                if len(calls) == 1:
+                    raise OSError("injected document close")
+                return real()
+            document.close = close_fault
+            assert session.abort() is False and session._document is document and bool(document)
+            assert session.slot_held and created[0] not in closes and os.fstat(created[0])
+        assert session.abort() and session.abort()  # the second retirement repeats nothing
+        assert session._parent_descriptor is None and getattr(session, "_pin", None) is None
+        assert any("injected pin close" in item for item in session.diagnostics) is (case == "abort")
+        _assert_discarded(session, arm, tmp_path)
+    assert closes.count(created[0]) == 1 and closes.count(parents[0]) == 1 and not target.exists()
+    _assert_slot_free(target)

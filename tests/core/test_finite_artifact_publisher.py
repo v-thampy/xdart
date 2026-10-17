@@ -1910,6 +1910,14 @@ def test_descriptor_close_faults_are_single_attempt_and_never_replace_truth(
     real_close = finite_module._close_descriptor_once
     armed = seam != "writer-primary"
     injected = 0
+    created: list[int] = []
+    real_open = finite_module.os.open
+
+    def spy_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL and ".xdart-finite-" in str(path):
+            created.append(descriptor)
+        return descriptor
 
     def close_once(descriptor: int):
         nonlocal armed, injected
@@ -1921,8 +1929,10 @@ def test_descriptor_close_faults_are_single_attempt_and_never_replace_truth(
             for path in tmp_path.glob(".xdart-finite-*.candidate")
         )
         error = real_close(descriptor)
+        # POSIX: the reservation's creation descriptor pins its inode until retirement (F5).
+        pinned = descriptor in created[:1] if created else is_candidate
         should_fail = armed and (
-            seam == "reservation" and is_candidate
+            seam == "reservation" and pinned
             or seam.startswith("parent-") and is_parent
             or seam == "writer-primary" and is_candidate
         )
@@ -1933,12 +1943,21 @@ def test_descriptor_close_faults_are_single_attempt_and_never_replace_truth(
         return error
 
     monkeypatch.setattr(finite_module, "_close_descriptor_once", close_once)
-    if seam == "reservation":
+    if os.name != "nt":
+        monkeypatch.setattr(finite_module.os, "open", spy_open)
+    if seam == "reservation" and os.name == "nt":
         with pytest.raises(
             FiniteArtifactIntegrityError,
             match="reservation close",
         ):
             _publish(request)
+    elif seam == "reservation":
+        result = _publish(request)
+        assert result.disposition is FiniteArtifactDisposition.COMMITTED
+        assert any(
+            "DESCRIPTOR_CLOSE_INCOMPLETE" in item
+            for item in result.diagnostics
+        )
     elif seam == "writer-primary":
         def writer(_binding):
             nonlocal armed
