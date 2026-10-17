@@ -499,7 +499,9 @@ def test_open_reads_saved_results_off_the_gui_thread_and_keeps_the_newest_five(q
             assert page.reopen(str(tmp_path / f"{name}_rsm.nexus"))
             _wait(page, qapp, lambda: not page.active())
             assert page.shown[0] is shown[name]
-        assert [Path(path).name for path in page.browser.listed_results() if path in page._listed] == [f"{name}_rsm.nexus" for name in shown]
+        # the folder's order (its catalog never lists these stand-ins); residency below keeps arrival order
+        assert [Path(path).name for path in page.browser.listed_results() if path in page._listed] == [
+            f"{name}_rsm.nexus" for name in ("five", "four", "one", "six", "three", "two")]
         page.browser.set_current_result(str(tmp_path / 'two_rsm.nexus'), keep_selection=False)  # kept: shown at once
         assert page.shown[0] is shown["two"] and len(reads) == 6
         page.browser.set_current_result(str(tmp_path / 'one_rsm.nexus'), keep_selection=False)  # the oldest: read again

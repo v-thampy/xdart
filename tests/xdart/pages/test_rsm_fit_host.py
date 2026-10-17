@@ -115,3 +115,27 @@ def test_lineout_batch_is_lazy_project_scoped_and_keeps_scalar_rows(qapp, tmp_pa
         assert window.scope() != before
     finally:
         dispose(page, qapp)
+
+
+def test_listed_order_and_the_lineout_batch_hold_when_the_catalog_lands(qapp, tmp_path, monkeypatch):
+    """Rows listed while the folder catalog is held keep their order once it lands, and the no-selection batch
+    follows them; the page's own bookkeeping keeps arrival order."""
+    from tests.xdart.pages.test_stitch_browser import _held_catalog
+    entered, release = _held_catalog(monkeypatch)
+    page = RSMPage(empty_host_services(_Status()))
+    try:
+        page._rows['project_root'].editor.setText(str(tmp_path))
+        results = [payload(tmp_path, name=f'{name}.nexus') for name in ('two', 'one', 'three')]
+        for result in results:
+            page._add_result(result.inspection.path, result, show=False)
+        assert entered.wait(10)
+        held, current = page.browser.listed_results(), page.browser.current_result()
+        batch = [target.label for target in page._fit_targets(())]
+        release.set()
+        catalog(page, qapp)
+        assert len(held) == 3 and page.browser.listed_results() == held and page.browser.current_result() == current
+        assert batch == [target.label for target in page._fit_targets(())] == list(held)
+        assert page._listed == [result.inspection.path for result in results]
+    finally:
+        release.set()
+        dispose(page, qapp)

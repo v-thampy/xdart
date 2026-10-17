@@ -3,6 +3,8 @@ the page mounts ``BrowserView`` with a results profile (several results for an o
 contributing frames, Open… · Metadata · Raw image) instead of its copied menus, heading and two lists. Each row
 keeps one item of Codex's preservation list, now through the owner."""
 import json
+import os
+import threading
 import time
 from pathlib import Path
 
@@ -197,3 +199,62 @@ def test_a_contributing_frame_opens_in_the_views_own_raw_popup(qapp, tmp_path):
         assert page._raw_frame_view is None and view.raw_popup_image.canvas.raw_image.size == 0
     finally:
         _close(page, qapp)
+
+
+def _held_catalog(monkeypatch):
+    """Hold the real folder read until ``release`` (call before building the page or bridge: the owner captures its
+    reader then). Its thread sets ``entered``, waits, then runs the real enumeration with every original argument."""
+    from xdart.gui.tabs.scattering import processed_browser
+    real, entered, release = processed_browser.enumerate_processed_artifacts, threading.Event(), threading.Event()
+
+    def held(*args, **kwargs):
+        entered.set()
+        release.wait(30)
+        return real(*args, **kwargs)
+    monkeypatch.setattr(processed_browser, "enumerate_processed_artifacts", held)
+    return entered, release
+
+
+def test_results_not_yet_catalogued_take_the_catalogs_place(qapp, tmp_path, monkeypatch):
+    """Stitch's and RSM's shared bridge: a loaded result the folder catalog has not read yet (or never will) is listed
+    where the catalog lists it, so no row moves when the catalog lands; with no folder nothing lands (arrival order)."""
+    from xdart.gui.tabs.scattering.browser_view import ResultDirectoryBrowser
+    folder = tmp_path / "out"
+    (folder / "scan5").mkdir(parents=True)
+    arrival = ("scan10", "scan2", "combined", "scan02", "scan1")  # scan2 before scan02: the exact-name tie-break
+    for name in arrival:
+        (folder / f"{name}.nexus").write_bytes(b"")
+    loaded = [str(folder / f"{name}.nexus") for name in (*arrival, "missing")]
+    folder_order = ["combined", "missing", "scan1", "scan02", "scan2", "scan10"]
+    browser = BrowserView()
+    inactive = ResultDirectoryBrowser(browser)
+    assert [entry.identifier for entry in inactive.entries(loaded)] == loaded
+    entered, release = _held_catalog(monkeypatch)
+    bridge = ResultDirectoryBrowser(browser)
+    try:
+        bridge.set_directory(str(folder))
+        assert entered.wait(10)
+        with monkeypatch.context() as probe:  # placing a result never touches the filesystem on the GUI thread
+            for name in ("stat", "lstat"):
+                probe.setattr(os, name, lambda *a, _name=name, **k: pytest.fail(f"os.{_name} on the GUI thread"))
+            pending = bridge.entries(loaded)
+        assert [Path(entry.identifier).stem for entry in pending] == folder_order
+        release.set()
+        deadline = time.monotonic() + 10
+        while bridge.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        qapp.processEvents()
+        assert not bridge.busy
+        assert [entry.label for entry in bridge.entries(loaded)] == [
+            "..", "combined.nexus", "missing.nexus", "scan1.nexus", "scan02.nexus", "scan2.nexus", "scan5/",
+            "scan10.nexus"]
+    finally:
+        release.set()
+        deadline = time.monotonic() + 10
+        while not (bridge.close() and inactive.close()) and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert bridge.close() and inactive.close()
+        browser.deleteLater()
+        qapp.processEvents()

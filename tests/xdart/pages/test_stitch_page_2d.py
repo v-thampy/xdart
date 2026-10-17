@@ -3,6 +3,8 @@ have pretty much the and layout and buttons as int 2d without the raw 2d panel (
 accessible as in stitch 1d)"): Int 2D's layout without the raw pane, the map as the cake and I(q) below,
 its slices and pins as Int 2D makes them from the same map, and the contributing frames as a Stitch 1D's.
 """
+from pathlib import Path
+
 import numpy as np
 import pytest
 from dataclasses import replace
@@ -36,7 +38,7 @@ def test_saved_stitch_2d_navigation_keeps_the_requested_curves(qapp, tmp_path, p
                                npt_rad_2d=48, npt_azim_2d=32))
         _wait(page, qapp)
         page.run_bar.startButton.click()
-        _wait(page, qapp)
+        _wait(page, qapp, catalog=True)  # the paths below are read once the folder catalog has landed
         paths = page.browser.listed_results()  # directory rows are Browse navigation
         assert len(paths) == 3
         saved = {path: read_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_2D)
@@ -91,6 +93,46 @@ def test_saved_stitch_2d_navigation_keeps_the_requested_curves(qapp, tmp_path, p
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize("plot_mode", ["Single", "Overlay"])
+def test_the_rows_a_run_lists_keep_their_order_when_the_catalog_lands(qapp, tmp_path, plot_mode, monkeypatch):
+    """Nightly 39043642981's two reds: the folder catalog landed between reading the rows and a footer step. The rows
+    listed while it is held keep their order after it lands; the footer and the no-selection fit batch walk them."""
+    from xdart.gui.tabs.stitch import page as module
+    from tests.xdart.pages.test_stitch_browser import _close, _held_catalog
+    monkeypatch.setattr(module, "_RECENT_BYTES", 0)
+    entered, release = _held_catalog(monkeypatch)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(replace(_native_form(tmp_path, "multigeometry"), mode="2d", npt_rad_2d=48, npt_azim_2d=32))
+        _wait(page, qapp)
+        page.run_bar.startButton.click()
+        _wait(page, qapp)
+        assert entered.wait(10)
+        held = page.browser.listed_results()
+        batch = [target.label for target in page._fit_batch("peak")]
+        release.set()
+        _wait(page, qapp, catalog=True)
+        assert len(held) == 3 and page.browser.listed_results() == held
+        assert batch == [target.label for target in page._fit_batch("peak")] == [Path(path).name for path in held]
+        _command(page, ShellCommandKind.SET_PLOT_MODE, plot_mode)
+        page.browser.set_current_result(held[0], keep_selection=False)
+        _wait(page, qapp)
+        page.scientific.next_frame.click()
+        _wait(page, qapp)
+        expected = {held[1]} if plot_mode == "Single" else {held[0], held[1]}
+        assert page.browser.current_result() == held[1] and set(page.browser.selected_results()) == expected
+        traces = page._last_map_state.traces
+        assert len(traces) == len(expected)
+        for trace in traces:
+            path = next(path for path, key in page._result_keys.items() if trace.frame is key)
+            saved = read_analysis_artifact(path, expected_kind=AnalysisArtifactKind.STITCH_2D)
+            assert path in expected
+            np.testing.assert_array_equal(trace.intensity, saved.profile.intensity)
+    finally:
+        release.set()
+        _close(page, qapp)
 
 
 @pytest.mark.parametrize("backend", ["multigeometry", "xu_hist"])
