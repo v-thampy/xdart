@@ -587,7 +587,8 @@ def test_left_drag_zooms_the_1d_plot_into_a_box_and_shift_drag_pans(qapp):
     2-D views, as the retired Static Scan page's 1-D plot also did. The 1-D curve now uses the
     2-D views' RectViewBox: a real left-drag zooms to the box (a pan keeps the width), and
     Shift+left-drag pans (a trackpad has no middle button)."""
-    from pyqtgraph.Qt import QtCore, QtGui
+    from pyqtgraph import getConfigOption
+    from pyqtgraph.Qt import QtCore, QtGui, QtTest
     from xdart.gui.gui_utils import RectViewBox
 
     view = ScientificView()
@@ -624,7 +625,11 @@ def test_left_drag_zooms_the_1d_plot_into_a_box_and_shift_drag_pans(qapp):
             left, none = QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.NoButton
             start, end = at(*start, item=item), at(*end, item=item)
             send(QtCore.QEvent.Type.MouseButtonPress, start, left, left)
+            rate = getConfigOption("mouseRateLimit")
             for step in range(1, 11):
+                # Let the scene's configured rate limiter admit each real move.
+                if rate > 0:
+                    QtTest.QTest.qWait(int(1000 / rate) + 1)
                 send(QtCore.QEvent.Type.MouseMove, start + (end - start) * (step / 10), none, left)
                 qapp.processEvents()
             send(QtCore.QEvent.Type.MouseButtonRelease, end, left, none)
