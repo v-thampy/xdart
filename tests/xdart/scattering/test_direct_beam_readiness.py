@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
+from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
 from xdart.gui.widgets.controls_panel import SectionCard
 from xrd_tools.core.geometry import ImageOrientation
@@ -34,6 +35,19 @@ def settle(dialog, timeout=15):
         QtWidgets.QApplication.processEvents()
         time.sleep(.005)
     assert not dialog.active(), dialog.status.text()
+
+
+def _dispose(dialog, timeout=30):
+    """Retire a test-owned window through its own cleanup receipt, then delete it: a closed but undeleted window
+    keeps every widget it built alive in the test process (QT-TEST-LIFECYCLE)."""
+    end = time.monotonic() + timeout
+    receipt = dialog.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < end:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)
+        receipt = dialog.shutdown()
+    assert receipt.status is PageCleanup.CLEAN, receipt
+    dialog.deleteLater()
 
 
 @pytest.mark.parametrize('outcome', ['complete', 'refused', 'cancelled'])
@@ -86,6 +100,7 @@ def test_job_buttons_wait_for_the_background_probe_and_keep_the_fit(qapp, tmp_pa
     finally:
         release.set()
         dialog.close()
+        _dispose(dialog)
 
 
 def test_save_buttons_wait_for_the_background_probe(qapp, tmp_path, monkeypatch):
@@ -130,6 +145,7 @@ def test_save_buttons_wait_for_the_background_probe(qapp, tmp_path, monkeypatch)
     finally:
         release.set()
         dialog.close()
+        _dispose(dialog)
 
 
 def test_import_waits_for_the_background_probe(qapp, tmp_path, monkeypatch):
@@ -170,6 +186,7 @@ def test_import_waits_for_the_background_probe(qapp, tmp_path, monkeypatch):
     finally:
         release.set()
         dialog.close()
+        _dispose(dialog)
 
 
 def test_the_source_read_keeps_the_tabs_open_and_the_job_buttons_waiting(qapp, tmp_path, monkeypatch):
@@ -204,6 +221,7 @@ def test_the_source_read_keeps_the_tabs_open_and_the_job_buttons_waiting(qapp, t
     finally:
         release.set()
         dialog.close()
+        _dispose(dialog)
 
 
 def test_the_session_buttons_wait_for_a_running_job(qapp, tmp_path, monkeypatch):
@@ -237,6 +255,7 @@ def test_the_session_buttons_wait_for_a_running_job(qapp, tmp_path, monkeypatch)
     finally:
         release.set()
         dialog.close()
+        _dispose(dialog)
 
 
 def test_blank_source_and_rough_tab_use_the_shared_readiness_header(qapp, tmp_path):
@@ -254,6 +273,7 @@ def test_blank_source_and_rough_tab_use_the_shared_readiness_header(qapp, tmp_pa
         assert 'direct-beam' in dialog.status.text()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('tab,context', [('instrument', 'diffractometer'), ('select', 'calibrant scan'),
@@ -273,6 +293,7 @@ def test_background_detection_finishes_with_the_current_tabs_context(qapp, tmp_p
         assert 'beam_detect' not in dialog.status.text().lower()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('command,columns,reason', [
@@ -291,6 +312,7 @@ def test_non_detector_or_ambiguous_scan_disables_fit(qapp, tmp_path, command, co
         assert reason in dialog.beam_readiness.status.text()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('rotation,motion', [(0, 'horizontal'), (90, 'vertical')])
@@ -315,6 +337,7 @@ def test_nexus_motion_comes_from_the_oriented_endpoints_and_ignores_old_settings
         assert dialog._distance_result.distance_m == pytest.approx(.5, rel=1e-3)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('rotation,warning', [
@@ -350,6 +373,7 @@ def test_a_fit_whose_beam_runs_against_the_arm_says_how_the_detector_is_mounted(
             assert all('try 90° CW rather than 270° CW' in text for text in shown), shown
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def _fit_container(dialog, tmp_path, rotation):
@@ -406,6 +430,7 @@ def test_a_sense_edit_after_the_fit_updates_its_advice_everywhere(qapp, tmp_path
         assert dialog._distance_held == {'nu': 4.} and dialog._rough_wavelength_A() == wavelength
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_correcting_the_sense_clears_the_advice_everywhere(qapp, tmp_path):
@@ -419,6 +444,7 @@ def test_correcting_the_sense_clears_the_advice_everywhere(qapp, tmp_path):
         _assert_no_advice(dialog)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_camera_edit_after_the_fit_asks_for_a_new_fit_not_old_advice(qapp, tmp_path):
@@ -438,6 +464,7 @@ def test_a_camera_edit_after_the_fit_asks_for_a_new_fit_not_old_advice(qapp, tmp
         assert not dialog.beam_summary.toPlainText().startswith('⚠')
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_saving_a_geometry_against_its_scan_keeps_the_advice_beside_the_saved_pair(qapp, tmp_path, monkeypatch):
@@ -461,6 +488,7 @@ def test_saving_a_geometry_against_its_scan_keeps_the_advice_beside_the_saved_pa
         assert target.name in saved, saved
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('key,value', [('beam_pixel', '117, 243'), ('beam_strip', '3')])
@@ -478,6 +506,7 @@ def test_an_extraction_edit_after_the_fit_drops_its_advice_everywhere(qapp, tmp_
         assert dialog.beam_summary.toPlainText().startswith('Distance: 500 mm')
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_mount_edit_is_advice_about_the_arm_it_makes(qapp, tmp_path):
@@ -494,6 +523,7 @@ def test_a_mount_edit_is_advice_about_the_arm_it_makes(qapp, tmp_path):
         _assert_advice(dialog, 'try 90° CW rather than 270° CW')
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_typed_rough_geometry_has_no_scan_to_compare(qapp, tmp_path):
@@ -507,6 +537,7 @@ def test_a_typed_rough_geometry_has_no_scan_to_compare(qapp, tmp_path):
         assert not any(text.startswith('⚠') for text in _surfaces(dialog)), _surfaces(dialog)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_every_field_the_fit_identity_and_the_rough_arm_read_refreshes_the_advice(qapp, tmp_path):
@@ -536,6 +567,7 @@ def test_every_field_the_fit_identity_and_the_rough_arm_read_refreshes_the_advic
             read - set(CalibrationDialog._DIRECT_BEAM_ADVICE_FIELDS))
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_motion_check_that_fails_leaves_the_fit_shown(qapp, tmp_path, monkeypatch):
@@ -561,6 +593,7 @@ def test_a_motion_check_that_fails_leaves_the_fit_shown(qapp, tmp_path, monkeypa
         assert dialog._direct_beam_fit_window.summary.text().startswith('Direct-beam distance: 500 mm')
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('fault', ['blank', 'stationary', 'diagonal', 'saturated'])
@@ -609,6 +642,7 @@ def test_background_detection_cannot_adopt_after_source_or_camera_changes(qapp, 
         assert dialog._beam_detection is None and not dialog.beam_button.isEnabled()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.skipif(not os.environ.get('XDART_TEST_DATA'), reason='needs XDART_TEST_DATA')
@@ -635,6 +669,7 @@ def test_real_eiger_scan_fits_after_a_quarter_turn(qapp, tmp_path):
         assert result.used.sum() == 51
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_new_calibrant_spec_resets_source_overrides_and_auto_energy_keeps_manual_choice(qapp, tmp_path):
@@ -667,6 +702,7 @@ def test_new_calibrant_spec_resets_source_overrides_and_auto_energy_keeps_manual
         assert dialog._parts['entry'][0] == 'source_kind'
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_distance_seed_routes_by_verified_source_and_frames_keep_their_recorded_source(qapp, tmp_path):
@@ -707,6 +743,7 @@ def test_distance_seed_routes_by_verified_source_and_frames_keep_their_recorded_
         assert 'valid calibrant source' in dialog.status.text()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_changed_source_cannot_adopt_old_energy_or_stem(qapp, tmp_path):
@@ -725,3 +762,4 @@ def test_changed_source_cannot_adopt_old_energy_or_stem(qapp, tmp_path):
         assert dialog._source_energy_eV == 16000
     finally:
         dialog.close()
+        _dispose(dialog)

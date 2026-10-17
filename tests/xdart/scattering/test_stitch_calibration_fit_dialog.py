@@ -50,6 +50,20 @@ def _wait(dialog, timeout=60):
     assert not dialog.active(), dialog.status.text()
 
 
+def _dispose(owner, timeout=30):
+    """Retire a test-owned window or page through its own cleanup receipt, then delete it (a page takes its
+    calibration window with it): a closed but undeleted one keeps every widget it built alive in the test
+    process (QT-TEST-LIFECYCLE)."""
+    until = time.monotonic() + timeout
+    receipt = owner.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)
+        receipt = owner.shutdown()
+    assert receipt.status is PageCleanup.CLEAN, receipt
+    owner.deleteLater()
+
+
 def _page_with_dialog(tmp_path, spec=None, seed_path=None):
     page = StitchPage(empty_host_services(_Status()))
     page.set_field("project_root", str(tmp_path))
@@ -249,7 +263,7 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
         assert 'extended.xu.json' in dialog.status.text() and 'extended.xu.json' in dialog.fit_summary.toPlainText()
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_path, monkeypatch):
@@ -295,7 +309,7 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         assert partner['acquisition']['source_motors'] == {'del': 'tth', 'nu': None}
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero(qapp, tmp_path, monkeypatch):
@@ -328,7 +342,7 @@ def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero
     finally:
         from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
         _close_with(dialog, qapp, 'Discard')  # answer the real saved-setup close prompt
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_twoc_arms_xrayutilities_file_covers_the_frames_with_nu_at_zero(qapp, tmp_path, monkeypatch):
@@ -362,7 +376,7 @@ def test_a_twoc_arms_xrayutilities_file_covers_the_frames_with_nu_at_zero(qapp, 
     finally:
         from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
         _close_with(dialog, qapp, 'Discard')
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_frames_with_del_at_zero(qapp, tmp_path, monkeypatch):
@@ -391,7 +405,7 @@ def test_a_horizontal_twoc_arms_xrayutilities_file_covers_the_frames_with_del_at
     finally:
         from tests.xdart.scattering.test_calibration_unsaved_setup import _close_with
         _close_with(dialog, qapp, 'Discard')
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_path, monkeypatch):
@@ -447,7 +461,7 @@ def test_a_fit_belongs_to_the_instrument_its_frames_were_staged_with(qapp, tmp_p
         assert page._value("source_motors") == "del_angle=del, nu_angle=nu"
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_the_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
@@ -478,6 +492,7 @@ def test_the_guided_save_equals_the_core_save(qapp, tmp_path, monkeypatch):
         assert (tmp_path / 'calibration' / 'dialog.xu.json').read_bytes() == Path(direct.xu_path).read_bytes()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp, tmp_path, monkeypatch):
@@ -528,7 +543,7 @@ def test_automatic_refinement_from_the_pages_geometry_saves_and_is_adopted(qapp,
         assert saved['automatic_refinement']['validation']['chosen'] == 'stacked_extended'
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_cancelled_refinement_ends_cancelled_and_a_refusal_saves_nothing(qapp, tmp_path):
@@ -560,6 +575,7 @@ def test_cancelled_refinement_ends_cancelled_and_a_refusal_saves_nothing(qapp, t
         assert dialog.fit is None and not dialog.save_button.isEnabled()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_the_arm_note_says_which_model_and_why(qapp, tmp_path):
@@ -580,6 +596,7 @@ def test_the_arm_note_says_which_model_and_why(qapp, tmp_path):
         assert 'at least 3 nu positions (2 so far)' in dialog.arm_note.text()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_cancelled_guided_fit_ends_cancelled_not_failed(tmp_path):
@@ -605,6 +622,7 @@ def test_an_independent_angle_page_geometry_does_not_become_the_refinement_seed(
         assert 'independent angles' in dialog.refine_seed_note.text()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the_pyfai_file(qapp, tmp_path, monkeypatch):
@@ -644,6 +662,7 @@ def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the
         assert 'no xrayutilities file' in dialog.status.text() and 'motor scales' in dialog.status.text()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit(qapp, tmp_path, monkeypatch):
     """CAL-1 (maintainer, 2026-09-29): "a quick multigeometry calibration json file from just the
@@ -682,7 +701,7 @@ def test_a_direct_beam_geometry_saves_as_the_calibration_pair_without_a_ring_fit
         assert dialog.save_rough_button.isHidden()
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_path):
@@ -726,7 +745,7 @@ def test_automatic_refinement_can_start_from_the_direct_beam_geometry(qapp, tmp_
         assert dialog.fit.rms_q < .005, dialog.fit.rms_q
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 @pytest.mark.parametrize('plane,position', [('vertical', 'del_angle'), ('horizontal', 'nu_angle')])
@@ -750,6 +769,7 @@ def test_the_quick_save_builds_the_arm_the_geometry_shows(qapp, tmp_path, plane,
         assert fit.asset['provenance']['instrument_geometry'] == geometry.to_record()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_one(qapp, tmp_path, monkeypatch):
@@ -802,7 +822,7 @@ def test_refine_energy_fits_the_energy_within_the_bound_and_saves_the_recorded_o
         assert dialog.refine_energy.isChecked()
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_fitted_motor_scales_hold_the_default_energy(qapp, tmp_path):
@@ -823,6 +843,7 @@ def test_fitted_motor_scales_hold_the_default_energy(qapp, tmp_path):
         assert dialog.refine_energy.isChecked()  # still the choice for Refine, which holds the scales
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_twoc_arm_refines_the_energy_and_saves_its_xrayutilities_partner(qapp, tmp_path, monkeypatch):
@@ -854,7 +875,7 @@ def test_a_twoc_arm_refines_the_energy_and_saves_its_xrayutilities_partner(qapp,
         assert partner['source_motors'] == {'del': 'tth', 'nu': None}
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp, tmp_path, monkeypatch):
@@ -892,6 +913,7 @@ def test_a_saved_calibration_is_named_after_its_scan_and_never_over_another(qapp
         assert dialog._default_name(False).parent == tmp_path
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_frame_staged_with_another_camera_is_not_calibrated(qapp, tmp_path, monkeypatch):

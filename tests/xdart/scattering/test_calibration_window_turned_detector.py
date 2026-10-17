@@ -8,12 +8,14 @@ handoff). The rows read only what the window writes, so they run on the parent t
 from __future__ import annotations
 
 import json
+import time
 
 import numpy as np
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
 from xdart.gui.pages.services import empty_host_services
+from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
 from xrd_tools.core.geometry import ImageOrientation
 from xrd_tools.core.geometry.camera import stitch_camera
@@ -52,15 +54,31 @@ def _gaps(model):
 
 
 def _window(page_name, tmp_path):
-    """The shared window as the page opens it, and the page's own close."""
+    """The shared window as the page opens it, and the page that owns it."""
     if page_name == "Stitch":
         page, dialog = _page_with_dialog(tmp_path)
-        return dialog, page.shutdown
+        return dialog, page
     from xdart.gui.tabs.rsm.page import RSMPage
     page = RSMPage(empty_host_services(_Status()))
     page.set_field("project_root", str(tmp_path))
     page._calibrate()
-    return page._calibration_dialog, page.close_page
+    return page._calibration_dialog, page
+
+
+def _dispose(owner, timeout=30):
+    """Retire a test-owned window or page through its own cleanup receipt (RSM's ``close_page``, Stitch's and the
+    window's ``shutdown``), then delete it with any window it owns: a closed but undeleted one keeps every widget it
+    built alive in the test process (QT-TEST-LIFECYCLE)."""
+    from xdart.gui.tabs.rsm.page import RSMPage
+    close = owner.close_page if isinstance(owner, RSMPage) else owner.shutdown
+    until = time.monotonic() + timeout
+    receipt = close()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)
+        receipt = close()
+    assert receipt.status is PageCleanup.CLEAN, receipt
+    owner.deleteLater()
 
 
 def _save_rough(dialog, monkeypatch, tmp_path, model, orientation):
@@ -111,6 +129,7 @@ def test_the_image_size_hint_says_the_frame_the_window_works_in(qapp, tmp_path, 
             assert f'turned {QUARTER[turn].rotation}°' in dialog._image_size.toolTip()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize(("page_name", "model", "turn"), [
@@ -135,12 +154,12 @@ def test_a_rough_calibration_saved_for_a_quarter_turned_camera_is_in_the_window_
     rows, columns = native.shape
     gaps = _gaps(model)
     turned_gaps = None if gaps is None else orientation.apply(gaps)
-    dialog, close = _window(page_name, tmp_path)
+    dialog, page = _window(page_name, tmp_path)
     try:
         record, provenance, partner, target = _save_rough(dialog, monkeypatch, tmp_path, model, orientation)
     finally:
         dialog.close()
-        close()
+        _dispose(page)
     # the pyFAI record: the generic detector of the window's image (pyFAI loads it), the model and turn beside it
     assert (record["detector"], record["detector_config"]) == ("Detector", {
         "pixel1": native.pixel2, "pixel2": native.pixel1, "max_shape": [columns, rows], "orientation": 3})
@@ -190,12 +209,12 @@ def test_a_rough_calibration_saved_for_a_quarter_turned_camera_is_in_the_window_
 def test_a_rough_calibration_saved_for_a_camera_keeping_the_axes_names_the_model_itself(
         qapp, tmp_path, monkeypatch, page_name, model, turn):
     orientation, native = KEEPING[turn], _native(model)
-    dialog, close = _window(page_name, tmp_path)
+    dialog, page = _window(page_name, tmp_path)
     try:
         record, provenance, partner, _target = _save_rough(dialog, monkeypatch, tmp_path, model, orientation)
     finally:
         dialog.close()
-        close()
+        _dispose(page)
     assert (record["detector"], record["detector_config"], TURNED_KEY in record) == (model, {}, False)
     assert (partner["detector"]["detector_factory_name"], partner["detector"]["shape"]) == (model, list(native.shape))
     assert (provenance["image_rotation"], provenance.get("image_flip", False)) == (
@@ -212,7 +231,7 @@ def test_the_guided_fit_saved_for_a_quarter_turned_camera_carries_the_turned_mod
     from xrd_tools.integrate.stitch_calibration import xu_partner_path
     from tests.core.test_turned_detector import _TURNED, _turned_guided
     model, config, turned, shape, _controls, frames = _turned_guided(tmp_path)
-    dialog, close = _window(page_name, tmp_path)
+    dialog, page = _window(page_name, tmp_path)
     try:
         dialog.camera.set_value(stitch_camera(_TURNED))
         dialog._set_field_text("beam_detector", model)
@@ -232,7 +251,7 @@ def test_the_guided_fit_saved_for_a_quarter_turned_camera_carries_the_turned_mod
         assert xu_partner_path(target).is_file(), dialog.status.text()
     finally:
         dialog.close()
-        close()
+        _dispose(page)
     record = json.loads(target.read_text(encoding="utf-8"))
     assert (record["detector"], record["detector_config"], record[TURNED_KEY]) == ("Detector", config, turned)
     partner = json.loads(xu_partner_path(target).read_text(encoding="utf-8"))["detector"]
@@ -264,6 +283,7 @@ def test_pyfai_calib2_is_given_the_turned_model_s_gaps_and_never_a_bare_generic_
                                       gaps | _TURNED.apply(drawn.astype(bool)))
     finally:
         dialog.close()
+        _dispose(dialog)
     frame = type("Frame", (), {"energy_eV": 12000.0})()
     assert "-D" not in _pyfai_arguments(frame, {"calibrant": "LaB6", "detector": "Detector"})
     assert _pyfai_arguments(frame, {"calibrant": "LaB6", "detector": "Pilatus100k"})[-2:] == ("-D", "Pilatus100k")
@@ -279,4 +299,4 @@ def test_stitchs_calibration_window_keeps_its_own_starting_detector_and_camera(q
         assert dialog._image_size.text() == "1475 × 195 px (W × H)"
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)

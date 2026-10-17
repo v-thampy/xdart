@@ -3,10 +3,13 @@ freedom about the estimates under Advanced (ARM-ZERO-BOUNDS-20260929; maintainer
 "this is to make sure the sample displacement in particular doesn't go to unrealistic values")."""
 import json
 from pathlib import Path
+import time
 
 import numpy as np
 import pytest
+from pyqtgraph.Qt import QtWidgets
 
+from xdart.gui.pages.values import PageCleanup
 from xrd_tools.core.energy import wavelength_m_to_energy_eV
 
 from xrd_tools.core.geometry import Diffractometer
@@ -19,6 +22,19 @@ from tests.xdart.scattering.test_stitch_calibration_fit_dialog import (  # noqa:
 SOURCES = {'del_angle': 'del', 'nu_angle': 'nu'}
 #: TRUTH's motor zeros (orientation 3: zero = −offset / (π/180))
 TRUTH_ZEROS = {'del': -np.rad2deg(TRUTH['del_offset']), 'nu': -np.rad2deg(TRUTH['nu_offset'])}
+
+
+def _dispose(page, timeout=30):
+    """Retire a test-owned page through its own cleanup receipt, then delete it with its calibration window: a
+    closed but undeleted page keeps every widget it built alive in the test process (QT-TEST-LIFECYCLE)."""
+    until = time.monotonic() + timeout
+    receipt = page.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)
+        receipt = page.shutdown()
+    assert receipt.status is PageCleanup.CLEAN, receipt
+    page.deleteLater()
 
 
 def _type_zeros(dialog, zeros):
@@ -61,7 +77,7 @@ def test_the_direct_beam_and_the_rough_arm_read_the_panels_zeros(qapp, tmp_path)
         assert motor == 'nu' and options['angle_zero_deg'] == -.8 and held == ('del',)
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
     page, dialog = _page_with_dialog(tmp_path / 'older')
     try:
         dialog.apply_settings({'fields': {'beam_zero': '2.3', 'beam_motor': 'del'},
@@ -76,7 +92,7 @@ def test_the_direct_beam_and_the_rough_arm_read_the_panels_zeros(qapp, tmp_path)
         assert dialog.geometry_editor.value().zeros == (('tth', 1.2),)
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_the_advanced_bounds_reach_the_fit_and_its_summary_reports_contact(qapp, tmp_path):
@@ -115,7 +131,7 @@ def test_the_advanced_bounds_reach_the_fit_and_its_summary_reports_contact(qapp,
         assert settings['fields']['displacement_limit'] == '0.05'
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_editing_a_zero_or_a_bound_leaves_the_fit_and_the_prediction_stale(qapp, tmp_path):
@@ -139,7 +155,7 @@ def test_editing_a_zero_or_a_bound_leaves_the_fit_and_the_prediction_stale(qapp,
             assert dialog._seed_options()['prediction'] is None  # the prediction's bounds changed
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 @pytest.mark.parametrize('typed', [False, True])
@@ -171,7 +187,7 @@ def test_refine_starts_from_the_seed_calibrations_zeros_unless_one_is_typed(qapp
         assert 'Fitted values (start → fitted' in dialog.fit_summary.toPlainText()
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def _captured(dialog):
@@ -218,7 +234,7 @@ def test_the_first_opening_keeps_an_older_windows_normal_incidence_zero(qapp, tm
         assert kind == 'fit' and dict(options['bounds'].zeros_deg) == zeros
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_malformed_zero_is_refused_by_every_operation_and_a_typed_zero_is_supplied(qapp, tmp_path):
@@ -255,7 +271,7 @@ def test_a_malformed_zero_is_refused_by_every_operation_and_a_typed_zero_is_supp
         assert dialog._bounds().resolved(['del', 'nu']).zero_sources == (('del', 'default'), ('nu', 'default'))
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_direct_beam_result_is_used_only_with_the_inputs_it_was_fitted_from(qapp, tmp_path):
@@ -304,7 +320,7 @@ def test_a_direct_beam_result_is_used_only_with_the_inputs_it_was_fitted_from(qa
         assert not dialog._distance_fresh()  # another detector: stale too
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_resumed_session_fits_and_predicts_with_its_own_zeros_and_bounds(qapp, tmp_path, monkeypatch):
@@ -362,7 +378,7 @@ def test_a_resumed_session_fits_and_predicts_with_its_own_zeros_and_bounds(qapp,
         assert dialog.geometry_editor.value().arm_zeros() == {'del': 2.3}  # the window's own are kept
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_session_records_the_choices_its_fit_took_and_a_resume_restores_them(qapp, tmp_path, monkeypatch):
@@ -387,8 +403,9 @@ def test_a_session_records_the_choices_its_fit_took_and_a_resume_restores_them(q
         assert dialog.fit is not None, dialog.status.text()
         path = dialog.session_dir / 'calibration-session.json'
         _frames, arm, policy = load_calibration_session(path, with_arm=True, with_policy=True)
-        # version 6: the default threshold (on, maintainer 2026-10-08) is recorded with the session
-        assert json.loads(path.read_text())['version'] == 6 and arm == ('del', 'nu')
+        # version 7: the resumable record (6a7e9f14) upgrades the session that records the default threshold
+        # (on, maintainer 2026-10-08)
+        assert json.loads(path.read_text())['version'] == 7 and arm == ('del', 'nu')
         assert (policy['refine_energy'], policy['energy_bound_eV'], policy['fit_motor_scales']) == (False, 200., False)
         assert policy['bounds']['sample_offset_mm'] == 5.
         assert policy['instrument_geometry'] == dialog.geometry_editor.value().to_record()
@@ -410,7 +427,7 @@ def test_a_session_records_the_choices_its_fit_took_and_a_resume_restores_them(q
         assert dict(options['bounds'].zeros_deg) == pytest.approx(TRUTH_ZEROS)
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)
 
 
 def test_a_horizontal_arm_session_reopens_with_its_nu_zero(qapp, tmp_path, monkeypatch):
@@ -458,4 +475,4 @@ def test_a_horizontal_arm_session_reopens_with_its_nu_zero(qapp, tmp_path, monke
         assert (options['del_motor'], options['nu_motor']) == (None, 'tth')
     finally:
         dialog.close()
-        page.shutdown()
+        _dispose(page)

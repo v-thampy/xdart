@@ -149,8 +149,11 @@ def test_the_window_s_tips_name_the_page_it_serves(tmp_path):
 
     def tips(page):
         dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
-        found = [widget.toolTip() for widget in dialog.findChildren(QtWidgets.QWidget) if widget.toolTip()]
-        dialog.close()
+        try:
+            found = [widget.toolTip() for widget in dialog.findChildren(QtWidgets.QWidget) if widget.toolTip()]
+            dialog.close()
+        finally:
+            _dispose(dialog)
         return found
     rsm = tips('RSM')
     assert not [tip for tip in rsm if 'Stitch' in tip]
@@ -164,46 +167,52 @@ def test_the_window_s_tips_name_the_page_it_serves(tmp_path):
 
 def test_modeless_window_exposes_guided_source_controls_and_preserves_session(tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
-    source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan':'14', 'image_dir':str(tmp_path/'images')})
-    dialog.set_source_context(source, image_rotation=180, del_motor='delta', nu_motor='gamma')
-    assert not dialog.isModal()
-    assert dialog.tabs.count() == 4  # 4 · Calibrate and fit holds the fit (maintainer, 2026-09-29, -30)
-    assert dialog._spec().options['scan'] == '14'
-    assert dialog.camera.value().to_xu() == ('x-', 'z+') and dialog._orientation().rotation == 180  # turned half
-    assert not dialog.scales.isChecked()
-    assert dialog._text('del_motor') == 'delta'
-    _finish(dialog)  # retire the actual metadata job before an idle New session action
-    previous = dialog.session_dir
-    dialog._new_session()
-    assert dialog.session_dir != previous
-    assert not dialog.active()
-    from xdart.gui.pages.values import PageCleanup
-    assert dialog.shutdown().status is PageCleanup.CLEAN
-    dialog.close()
+    try:
+        source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan':'14', 'image_dir':str(tmp_path/'images')})
+        dialog.set_source_context(source, image_rotation=180, del_motor='delta', nu_motor='gamma')
+        assert not dialog.isModal()
+        assert dialog.tabs.count() == 4  # 4 · Calibrate and fit holds the fit (maintainer, 2026-09-29, -30)
+        assert dialog._spec().options['scan'] == '14'
+        assert dialog.camera.value().to_xu() == ('x-', 'z+') and dialog._orientation().rotation == 180  # turned half
+        assert not dialog.scales.isChecked()
+        assert dialog._text('del_motor') == 'delta'
+        _finish(dialog)  # retire the actual metadata job before an idle New session action
+        previous = dialog.session_dir
+        dialog._new_session()
+        assert dialog.session_dir != previous
+        assert not dialog.active()
+        from xdart.gui.pages.values import PageCleanup
+        assert dialog.shutdown().status is PageCleanup.CLEAN
+        dialog.close()
+    finally:
+        _dispose(dialog)
 
 
 def test_calibration_rows_name_their_source_image_and_a_save_selects_the_next_frame(tmp_path):
     from xrd_tools.integrate.stitch_calibration import CalibrationFrame
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    try:
 
-    def frame(index, raw, within=0):
-        return CalibrationFrame(f'frame-{index}', str(tmp_path/'beam'), 'spec', {}, index,
-            str(tmp_path/'images'/raw), within, str(tmp_path/f'frame-{index}'/f'{Path(raw).stem}.edf'),
-            'sha', (8, 10), 0, {'del': 5., 'nu': 0.}, None)
-    done = dict(poni_path='p', npt_path='n', control_image_sha256='c', pairing_policy='pyfai-model-image-v1')
-    dialog.frames = (frame(0, 'scan14_0000.raw'), replace(frame(40, 'scan14_0040.raw'), **done),
-                     frame(143, 'run.h5', 7))
-    dialog._render_frames()
-    assert dialog.frame_table.item(0, 2).text() == 'scan14_0000.raw'  # the source, not the staged copy
-    assert dialog.frame_table.item(2, 2).text() == 'run.h5 #7'
-    assert 'staged for pyFAI' in dialog.frame_table.item(0, 2).toolTip()
-    dialog._select_next_frame(dialog.frames[0])  # 40 is complete: 143 is next
-    assert dialog._selected_frame().index == 143
-    dialog._select_next_frame(dialog.frames[2])  # none after it: the first still pending
-    assert dialog._selected_frame().index == 0
-    from xdart.gui.pages.values import PageCleanup
-    assert dialog.shutdown().status is PageCleanup.CLEAN
-    dialog.close()
+        def frame(index, raw, within=0):
+            return CalibrationFrame(f'frame-{index}', str(tmp_path/'beam'), 'spec', {}, index,
+                str(tmp_path/'images'/raw), within, str(tmp_path/f'frame-{index}'/f'{Path(raw).stem}.edf'),
+                'sha', (8, 10), 0, {'del': 5., 'nu': 0.}, None)
+        done = dict(poni_path='p', npt_path='n', control_image_sha256='c', pairing_policy='pyfai-model-image-v1')
+        dialog.frames = (frame(0, 'scan14_0000.raw'), replace(frame(40, 'scan14_0040.raw'), **done),
+                         frame(143, 'run.h5', 7))
+        dialog._render_frames()
+        assert dialog.frame_table.item(0, 2).text() == 'scan14_0000.raw'  # the source, not the staged copy
+        assert dialog.frame_table.item(2, 2).text() == 'run.h5 #7'
+        assert 'staged for pyFAI' in dialog.frame_table.item(0, 2).toolTip()
+        dialog._select_next_frame(dialog.frames[0])  # 40 is complete: 143 is next
+        assert dialog._selected_frame().index == 143
+        dialog._select_next_frame(dialog.frames[2])  # none after it: the first still pending
+        assert dialog._selected_frame().index == 0
+        from xdart.gui.pages.values import PageCleanup
+        assert dialog.shutdown().status is PageCleanup.CLEAN
+        dialog.close()
+    finally:
+        _dispose(dialog)
 
 
 def test_a_frame_opens_pyfai_with_its_calibrant_energy_and_predicted_geometry(tmp_path):
@@ -246,18 +255,21 @@ def test_the_frame_table_lists_each_frames_expected_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
     from tests.xdart.scattering.test_calibration_ring_scheduling import _close, _settle
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
-    dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
-    dialog.threshold_range._toggle[1].setChecked(False)  # no staged image here: the threshold's mask reads one (test_calibration_threshold)
-    dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20'),)
-    dialog._render_frames()
-    assert dialog.frame_table.item(0, 5).text() == '—'  # nothing to predict from yet
-    assert 'calibrate one frame' in dialog.frame_table.item(0, 5).toolTip()  # it then predicts the rest
-    dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))
-    dialog._render_frames()
-    (text, tip), = _settle(dialog)  # the worker's rings, once they arrive
-    assert text not in ('', '—', 'none', '…') and tip.startswith('Ring ')
-    from xdart.gui.pages.values import PageCleanup
-    assert _close(dialog).status is PageCleanup.CLEAN  # retried while the ring worker returns
+    try:
+        dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
+        dialog.threshold_range._toggle[1].setChecked(False)  # no staged image here: the threshold's mask reads one (test_calibration_threshold)
+        dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20'),)
+        dialog._render_frames()
+        assert dialog.frame_table.item(0, 5).text() == '—'  # nothing to predict from yet
+        assert 'calibrate one frame' in dialog.frame_table.item(0, 5).toolTip()  # it then predicts the rest
+        dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))
+        dialog._render_frames()
+        (text, tip), = _settle(dialog)  # the worker's rings, once they arrive
+        assert text not in ('', '—', 'none', '…') and tip.startswith('Ring ')
+        from xdart.gui.pages.values import PageCleanup
+        assert _close(dialog).status is PageCleanup.CLEAN  # retried while the ring worker returns
+    finally:
+        _dispose(dialog)
 
 
 def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
@@ -266,97 +278,122 @@ def test_a_rough_geometry_comes_first_and_predicts_the_rings(tmp_path):
     from tests.core.test_calibration_seed import _frame, _record
     from tests.xdart.scattering.test_calibration_ring_scheduling import _settle
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
-    dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
-    dialog.threshold_range._toggle[1].setChecked(False)  # no staged image here: the threshold's mask reads one (test_calibration_threshold)
-    assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
-        '1 · Instrument', '2 · Rough geometry', '3 · Calibrant scan', '4 · Calibrate and fit']
-    visible = dialog._row_visible
-    assert visible('beam_source') and not visible('rough_distance')  # a direct-beam scan by default
-    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
-    assert visible('rough_distance') and visible('beam_pixel') and not visible('beam_source')
-    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))  # and back: every scan row returns
-    assert all(visible(key) for key in ('beam_source', 'beam_scan', 'beam_images', 'beam_stem'))
-    assert not dialog._fit_options.isHidden()  # the strip and ROI, under Fit options
-    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
-    assert dialog._fit_options.isHidden()
-    # the Detector panel serves every step: its rows stay, whatever the rough geometry
-    assert all(visible(key) for key in ('beam_detector', 'beam_orientation', 'saturation', 'mask'))
-    assert not dialog.camera.isHidden() and not dialog._image_size.isHidden()
-    assert not visible('raw')  # standard RAW layout is described by the detector picker
-    folder = tmp_path / 'frame-20'
-    folder.mkdir()
-    dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20',
-                             image_path=str(folder / 'scan14_0020.edf')),)
-    dialog._render_frames()
-    assert dialog.frame_table.item(0, 5).text() == '—'  # no distance typed yet
-    for key, value in (('rough_distance', '500'), ('beam_pixel', '737, 97'), ('beam_detector', 'Pilatus300kw')):
-        dialog._set_field_text(key, value)
-    dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))  # a calibration file too
-    dialog._render_frames()
-    (text, tip), = _settle(dialog)
-    assert text not in ('', '—', 'none', '…') and tip.startswith('Ring ')
-    arguments = _pyfai_arguments(dialog.frames[0], dialog._seed_options())
-    seeded = PoniFile(arguments[3])
-    assert seeded.dist == pytest.approx(0.5)  # this session's rough geometry, not the file
-    # the beam pixel is (x, y) = (column, row), as the direct-beam fit reads it
-    assert (seeded.poni2, seeded.poni1) == pytest.approx((737.5 * 172e-6, 97.5 * 172e-6))
-    # a beamline whose del motor is "delta": the zero motor "del" names the circle
-    dialog._frame_motors = ('delta', 'nu')
-    dialog.frames = (replace(dialog.frames[0], motors={'delta': 20., 'nu': 0.}),)
-    assert dialog._rough_record() is not None
-    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
-    assert not visible('beam_pixel') and dialog._seed_options()['rough'] is None
-    assert PoniFile(_pyfai_arguments(dialog.frames[0], dialog._seed_options())[3]).dist == pytest.approx(0.39)
-    from xdart.gui.pages.values import PageCleanup
-    assert dialog.shutdown().status is PageCleanup.CLEAN
-    dialog.close()
+    try:
+        dialog.show()  # a shown window predicts its rings (GUI-PERF-02)
+        dialog.threshold_range._toggle[1].setChecked(False)  # no staged image here: the threshold's mask reads one (test_calibration_threshold)
+        assert [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())] == [
+            '1 · Instrument', '2 · Rough geometry', '3 · Calibrant scan', '4 · Calibrate and fit']
+        visible = dialog._row_visible
+        assert visible('beam_source') and not visible('rough_distance')  # a direct-beam scan by default
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        assert visible('rough_distance') and visible('beam_pixel') and not visible('beam_source')
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))  # and back: every scan row returns
+        assert all(visible(key) for key in ('beam_source', 'beam_scan', 'beam_images', 'beam_stem'))
+        assert not dialog._fit_options.isHidden()  # the strip and ROI, under Fit options
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('manual'))
+        assert dialog._fit_options.isHidden()
+        # the Detector panel serves every step: its rows stay, whatever the rough geometry
+        assert all(visible(key) for key in ('beam_detector', 'beam_orientation', 'saturation', 'mask'))
+        assert not dialog.camera.isHidden() and not dialog._image_size.isHidden()
+        assert not visible('raw')  # standard RAW layout is described by the detector picker
+        folder = tmp_path / 'frame-20'
+        folder.mkdir()
+        dialog.frames = (replace(_frame({'del': 20., 'nu': 0.}), identity='frame-20',
+                                 image_path=str(folder / 'scan14_0020.edf')),)
+        dialog._render_frames()
+        assert dialog.frame_table.item(0, 5).text() == '—'  # no distance typed yet
+        for key, value in (('rough_distance', '500'), ('beam_pixel', '737, 97'), ('beam_detector', 'Pilatus300kw')):
+            dialog._set_field_text(key, value)
+        dialog._fields['refine_seed_path'].setText(str(_record(tmp_path)))  # a calibration file too
+        dialog._render_frames()
+        (text, tip), = _settle(dialog)
+        assert text not in ('', '—', 'none', '…') and tip.startswith('Ring ')
+        arguments = _pyfai_arguments(dialog.frames[0], dialog._seed_options())
+        seeded = PoniFile(arguments[3])
+        assert seeded.dist == pytest.approx(0.5)  # this session's rough geometry, not the file
+        # the beam pixel is (x, y) = (column, row), as the direct-beam fit reads it
+        assert (seeded.poni2, seeded.poni1) == pytest.approx((737.5 * 172e-6, 97.5 * 172e-6))
+        # a beamline whose del motor is "delta": the zero motor "del" names the circle
+        dialog._frame_motors = ('delta', 'nu')
+        dialog.frames = (replace(dialog.frames[0], motors={'delta': 20., 'nu': 0.}),)
+        assert dialog._rough_record() is not None
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        assert not visible('beam_pixel') and dialog._seed_options()['rough'] is None
+        assert PoniFile(_pyfai_arguments(dialog.frames[0], dialog._seed_options())[3]).dist == pytest.approx(0.39)
+        from xdart.gui.pages.values import PageCleanup
+        assert dialog.shutdown().status is PageCleanup.CLEAN
+        dialog.close()
+    finally:
+        _dispose(dialog)
 
 
 def test_the_geometry_comes_first_and_names_the_arm_motors(tmp_path):
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
-    assert dialog.tabs.tabText(0) == '1 · Instrument'
-    assert dialog._tab_pages['instrument'].isAncestorOf(dialog.geometry_editor)
-    source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan': '14'})
-    dialog.set_source_context(source, del_motor='delta', nu_motor='nu')
-    assert dialog.geometry_editor.value().stitch_arm() == ('delta', 'nu')
-    assert dialog.settings()['instrument_geometry']['motors']['del'] == 'delta'
-    dialog.geometry_editor.geometry.setCurrentIndex(dialog.geometry_editor.geometry.findData('twoc'))
-    assert dialog.geometry_editor.value().stitch_arm() == ('tth', None)  # psic's arm, nu held at zero
-    label = dialog.geometry_editor._form.labelForField(dialog.geometry_editor._rows['tth']).text()
-    assert label == 'tth (detector)  ·  used by Stitch'
-    assert dialog.geometry_editor.axis_box('tth').currentText() == 'z-'  # psic's del, vertical plane
-    from xdart.gui.pages.values import PageCleanup
-    assert dialog.shutdown().status is PageCleanup.CLEAN
-    dialog.close()
+    try:
+        assert dialog.tabs.tabText(0) == '1 · Instrument'
+        assert dialog._tab_pages['instrument'].isAncestorOf(dialog.geometry_editor)
+        source = SourceSpec(tmp_path/'beam', SourceKind.SPEC, options={'scan': '14'})
+        dialog.set_source_context(source, del_motor='delta', nu_motor='nu')
+        assert dialog.geometry_editor.value().stitch_arm() == ('delta', 'nu')
+        assert dialog.settings()['instrument_geometry']['motors']['del'] == 'delta'
+        dialog.geometry_editor.geometry.setCurrentIndex(dialog.geometry_editor.geometry.findData('twoc'))
+        assert dialog.geometry_editor.value().stitch_arm() == ('tth', None)  # psic's arm, nu held at zero
+        label = dialog.geometry_editor._form.labelForField(dialog.geometry_editor._rows['tth']).text()
+        assert label == 'tth (detector)  ·  used by Stitch'
+        assert dialog.geometry_editor.axis_box('tth').currentText() == 'z-'  # psic's del, vertical plane
+        from xdart.gui.pages.values import PageCleanup
+        assert dialog.shutdown().status is PageCleanup.CLEAN
+        dialog.close()
+    finally:
+        _dispose(dialog)
 
 
 def test_the_tabs_hold_the_instrument_then_advanced_above_the_fits_and_the_ranges_beside_save(tmp_path):
     """Shared Advanced holds conditioning; scan coverage replaces the manual export ranges."""
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
-    instrument = dialog._tab_pages['instrument'].widget().layout()
-    assert instrument.indexOf(dialog._diffractometer_box) < instrument.indexOf(dialog._detector_box)
-    assert dialog._diffractometer_box.isAncestorOf(dialog.geometry_editor)
-    assert dialog._detector_box.isAncestorOf(dialog._fields['beam_detector'])
-    calibrate = dialog._calibrate_layout
-    assert (calibrate.indexOf(dialog._advanced_card) < calibrate.indexOf(dialog.fit_button)
-            < calibrate.indexOf(dialog._refine_card))
-    assert all(dialog._advanced_card.isAncestorOf(widget)
-               for widget in (dialog.refine_energy, dialog._fields['energy_bound'], dialog.scales,
-                              dialog.threshold_range))
-    assert dialog._advanced_card.body.isHidden() and not dialog._refine_card.body.isHidden()
-    assert not {'del_domain', 'nu_domain'} & dialog._fields.keys()
-    assert dialog.show_calibration_fit_button.parentWidget() is dialog.save_button.parentWidget()
-    buttons = calibrate.itemAt(calibrate.count() - 1).layout()
-    assert buttons.indexOf(dialog.show_calibration_fit_button) == 0
-    assert buttons.indexOf(dialog.save_button) == 1
-    assert dialog._row_of[dialog.refine_seed].isAncestorOf(dialog._fields['refine_frames'])
-    assert dialog.fit_button.text() == 'Global fit of calibrated frames'
-    # Skip keeps the wavelength: a frame whose scan records no energy is calibrated at it
-    dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
-    assert dialog._row_visible('rough_energy') and not dialog._row_visible('beam_pixel')
+    try:
+        instrument = dialog._tab_pages['instrument'].widget().layout()
+        assert instrument.indexOf(dialog._diffractometer_box) < instrument.indexOf(dialog._detector_box)
+        assert dialog._diffractometer_box.isAncestorOf(dialog.geometry_editor)
+        assert dialog._detector_box.isAncestorOf(dialog._fields['beam_detector'])
+        calibrate = dialog._calibrate_layout
+        assert (calibrate.indexOf(dialog._advanced_card) < calibrate.indexOf(dialog.fit_button)
+                < calibrate.indexOf(dialog._refine_card))
+        assert all(dialog._advanced_card.isAncestorOf(widget)
+                   for widget in (dialog.refine_energy, dialog._fields['energy_bound'], dialog.scales,
+                                  dialog.threshold_range))
+        assert dialog._advanced_card.body.isHidden() and not dialog._refine_card.body.isHidden()
+        assert not {'del_domain', 'nu_domain'} & dialog._fields.keys()
+        assert dialog.show_calibration_fit_button.parentWidget() is dialog.save_button.parentWidget()
+        buttons = calibrate.itemAt(calibrate.count() - 1).layout()
+        assert buttons.indexOf(dialog.show_calibration_fit_button) == 0
+        assert buttons.indexOf(dialog.save_button) == 1
+        assert dialog._row_of[dialog.refine_seed].isAncestorOf(dialog._fields['refine_frames'])
+        assert dialog.fit_button.text() == 'Global fit of calibrated frames'
+        # Skip keeps the wavelength: a frame whose scan records no energy is calibrated at it
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('skip'))
+        assert dialog._row_visible('rough_energy') and not dialog._row_visible('beam_pixel')
+        from xdart.gui.pages.values import PageCleanup
+        assert dialog.shutdown().status is PageCleanup.CLEAN
+        dialog.close()
+    finally:
+        _dispose(dialog)
+
+
+def _dispose(dialog, timeout=30):
+    """Retire a test-owned window through its own cleanup receipt, then delete it: a closed but undeleted window
+    keeps every widget it built alive in the test process (QT-TEST-LIFECYCLE)."""
+    import time
+    from pyqtgraph.Qt import QtWidgets
     from xdart.gui.pages.values import PageCleanup
-    assert dialog.shutdown().status is PageCleanup.CLEAN
-    dialog.close()
+    until = time.monotonic() + timeout
+    receipt = dialog.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)
+        receipt = dialog.shutdown()
+    assert receipt.status is PageCleanup.CLEAN, receipt
+    dialog.deleteLater()
 
 
 def _finish(dialog, timeout=30):
@@ -414,6 +451,7 @@ def test_a_twoc_scan_is_read_and_staged_as_one_2theta_arm(tmp_path):
         from xdart.gui.pages.values import PageCleanup
         assert dialog.shutdown().status is PageCleanup.CLEAN
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatch):
@@ -467,6 +505,7 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
         for window in (dialog, other):
             assert window.shutdown().status is PageCleanup.CLEAN
             window.close()
+            _dispose(window)
 
 
 def test_reading_metadata_takes_each_circles_motor_from_the_scan(tmp_path):
@@ -526,35 +565,38 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
         tifffile.imwrite(tmp_path/f'direct_scan1_{index:04d}.tif', array)
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path, detector='Pilatus100k',
                                                  camera=DetectorCamera('x+', 'z-')))
-    dialog.set_instrument(InstrumentGeometry('twoc', motors=(('tth', 'del'),), plane='horizontal',
-                                             zeros=(('tth', 7.),)))
-    for key, value in (('beam_source', spec), ('beam_scan', '1'), ('beam_images', tmp_path)):
-        dialog._set_field_text(key, str(value))
-    from tests.xdart.scattering.test_direct_beam_readiness import detect
-    dialog._set_field_text('beam_pixel', ', '.join(map(str, beam)))
-    dialog._set_field_text('beam_orientation', '3')
-    detect(dialog)  # qualify the actual source before accepting its completed distance fit
-    assert dialog._beam_detection is not None, (dialog._beam_problem, dialog.beam_readiness.status.text())
-    assert dialog._beam_detection[0] == dialog._beam_generation and dialog.beam_button.isEnabled()
-    request = dialog._direct_beam_request()  # expose a qualification exception before key construction
-    key = dialog._direct_beam_key()
-    assert key is not None
-    result, energy, held = _run_job(('distance', request), Event(), lambda *_: None)
-    assert energy is None and held == {}  # the scan records no energy; no other circle is held
-    expected = calibrate_direct_beam(angles, images, detector='Pilatus100k',
-                                     beam_pixel=beam, angle_zero_deg=7.)
-    assert result.distance_m == pytest.approx(expected.distance_m)
-    assert result.point_ids == tuple(('1.1', index) for index in range(7))
-    # The actual completed job and its matching, qualified window inputs (Codex F5).
-    dialog._distance_result, dialog._distance_key = result, key
-    assert dialog._advanced_card.body.isHidden()
-    dialog._apply_distance()  # no confirmation: the result applies
-    assert float(dialog._text('distance_seed')) == pytest.approx(80., rel=2e-5)
-    assert not dialog._advanced_card.body.isHidden()  # opened where the seed landed
-    assert dialog._text('distance_bounds') == ''
-    assert dialog._distance_provenance['regression_std_m'] >= 0
-    assert 'residuals_px' in dialog._distance_provenance
-    dialog.close()
+    try:
+        dialog.set_instrument(InstrumentGeometry('twoc', motors=(('tth', 'del'),), plane='horizontal',
+                                                 zeros=(('tth', 7.),)))
+        for key, value in (('beam_source', spec), ('beam_scan', '1'), ('beam_images', tmp_path)):
+            dialog._set_field_text(key, str(value))
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        dialog._set_field_text('beam_pixel', ', '.join(map(str, beam)))
+        dialog._set_field_text('beam_orientation', '3')
+        detect(dialog)  # qualify the actual source before accepting its completed distance fit
+        assert dialog._beam_detection is not None, (dialog._beam_problem, dialog.beam_readiness.status.text())
+        assert dialog._beam_detection[0] == dialog._beam_generation and dialog.beam_button.isEnabled()
+        request = dialog._direct_beam_request()  # expose a qualification exception before key construction
+        key = dialog._direct_beam_key()
+        assert key is not None
+        result, energy, held = _run_job(('distance', request), Event(), lambda *_: None)
+        assert energy is None and held == {}  # the scan records no energy; no other circle is held
+        expected = calibrate_direct_beam(angles, images, detector='Pilatus100k',
+                                         beam_pixel=beam, angle_zero_deg=7.)
+        assert result.distance_m == pytest.approx(expected.distance_m)
+        assert result.point_ids == tuple(('1.1', index) for index in range(7))
+        # The actual completed job and its matching, qualified window inputs (Codex F5).
+        dialog._distance_result, dialog._distance_key = result, key
+        assert dialog._advanced_card.body.isHidden()
+        dialog._apply_distance()  # no confirmation: the result applies
+        assert float(dialog._text('distance_seed')) == pytest.approx(80., rel=2e-5)
+        assert not dialog._advanced_card.body.isHidden()  # opened where the seed landed
+        assert dialog._text('distance_bounds') == ''
+        assert dialog._distance_provenance['regression_std_m'] >= 0
+        assert 'residuals_px' in dialog._distance_provenance
+        dialog.close()
+    finally:
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('source_kind', ['spec_container', 'nexus'])
@@ -579,44 +621,47 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
         handle['measurement/data/data_000001'] = h5py.ExternalLink(nexus.name, '/measurement/data/image')
         handle['measurement/instrument/detector/detectorSpecific/nimages'] = 1
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
-    dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(source_kind))
-    # the NeXus case leaves the beam pixel blank: it is found on the frame at the zero
-    typed = ', '.join(map(str, beam)) if source_kind == 'spec_container' else ''
-    for key, value in dict(beam_source=spec if source_kind == 'spec_container' else nexus,
-            beam_image_file=master, beam_scan='8.1', beam_entry='measurement',
-            beam_detector='Pilatus100k', beam_pixel=typed).items():
-        dialog._set_field_text(key, value)
-    assert dialog._fields['beam_pixel'].placeholderText().startswith('auto · where the direct beam hits')
-    assert dialog._fields['beam_scan'].isHidden() == (source_kind == 'nexus')
-    assert dialog._row_visible('beam_images') == (source_kind == 'spec_container')
-    from tests.xdart.scattering.test_direct_beam_readiness import detect
-    detect(dialog)
-    dialog.beam_button.click()
-    for _ in range(100):
-        QtWidgets.QApplication.processEvents()
-        if not dialog.active():
-            break
-        QtTest.QTest.qWait(20)
-    assert not dialog.active()
-    result = dialog._distance_result
-    assert result is not None, dialog.status.text()
-    path = master if source_kind == 'spec_container' else nexus
-    assert result.frame_ids == tuple((path, i) for i in range(5))
-    assert result.point_ids == (tuple(('8.1', i) for i in range(5))
-                               if source_kind == 'spec_container' else result.frame_ids)
-    assert result.distance_mm == pytest.approx(500., rel=1e-4)
-    assert result.used.all()
-    assert result.beam_pixel == pytest.approx(beam, abs=.1)
-    if not typed:
-        assert 'found on the frame nearest the zero' in dialog.beam_summary.toPlainText()
-        assert dialog._fields['beam_pixel'].placeholderText().startswith('auto · the direct beam found at 243.0, 32.0')
-    assert dialog._text('distance_seed') == ''
-    dialog.apply_distance_button.click()
-    assert float(dialog._text('distance_seed')) == pytest.approx(500., rel=1e-4)
-    assert dialog._text('distance_bounds') == ''
-    # The saved fit provenance must remain JSON serializable for NeXus path IDs.
-    json.dumps(dialog._distance_provenance)
-    dialog.close()
+    try:
+        dialog.beam_source_kind.setCurrentIndex(dialog.beam_source_kind.findData(source_kind))
+        # the NeXus case leaves the beam pixel blank: it is found on the frame at the zero
+        typed = ', '.join(map(str, beam)) if source_kind == 'spec_container' else ''
+        for key, value in dict(beam_source=spec if source_kind == 'spec_container' else nexus,
+                beam_image_file=master, beam_scan='8.1', beam_entry='measurement',
+                beam_detector='Pilatus100k', beam_pixel=typed).items():
+            dialog._set_field_text(key, value)
+        assert dialog._fields['beam_pixel'].placeholderText().startswith('auto · where the direct beam hits')
+        assert dialog._fields['beam_scan'].isHidden() == (source_kind == 'nexus')
+        assert dialog._row_visible('beam_images') == (source_kind == 'spec_container')
+        from tests.xdart.scattering.test_direct_beam_readiness import detect
+        detect(dialog)
+        dialog.beam_button.click()
+        for _ in range(100):
+            QtWidgets.QApplication.processEvents()
+            if not dialog.active():
+                break
+            QtTest.QTest.qWait(20)
+        assert not dialog.active()
+        result = dialog._distance_result
+        assert result is not None, dialog.status.text()
+        path = master if source_kind == 'spec_container' else nexus
+        assert result.frame_ids == tuple((path, i) for i in range(5))
+        assert result.point_ids == (tuple(('8.1', i) for i in range(5))
+                                   if source_kind == 'spec_container' else result.frame_ids)
+        assert result.distance_mm == pytest.approx(500., rel=1e-4)
+        assert result.used.all()
+        assert result.beam_pixel == pytest.approx(beam, abs=.1)
+        if not typed:
+            assert 'found on the frame nearest the zero' in dialog.beam_summary.toPlainText()
+            assert dialog._fields['beam_pixel'].placeholderText().startswith('auto · the direct beam found at 243.0, 32.0')
+        assert dialog._text('distance_seed') == ''
+        dialog.apply_distance_button.click()
+        assert float(dialog._text('distance_seed')) == pytest.approx(500., rel=1e-4)
+        assert dialog._text('distance_bounds') == ''
+        # The saved fit provenance must remain JSON serializable for NeXus path IDs.
+        json.dumps(dialog._distance_provenance)
+        dialog.close()
+    finally:
+        _dispose(dialog)
 
 
 def _fit_direct_beam(dialog):
@@ -691,6 +736,7 @@ def test_a_direct_beam_fit_shows_its_distance_and_the_scan_supplies_the_waveleng
         assert not window.isVisible()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_return_in_a_box_commits_it_and_presses_no_button(tmp_path):
@@ -715,6 +761,7 @@ def test_return_in_a_box_commits_it_and_presses_no_button(tmp_path):
         assert committed and committed[0] == '280, 97'
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_direct_beam_container_job_refuses_count_mismatch_and_honours_cancel(tmp_path):
@@ -785,7 +832,9 @@ def test_the_detector_and_its_orientation_are_choices_saved_with_the_settings(tm
         assert again._text('beam_detector') == 'SomeFutureDetector'  # kept, not replaced
     finally:
         dialog.close()
+        _dispose(dialog)
         again.close()
+        _dispose(again)
 
 
 def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
@@ -840,6 +889,7 @@ def test_after_one_calibrated_frame_the_others_are_predicted_from_it(tmp_path):
         assert dialog._seed_options()['prediction'] is None
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_a_cancel_during_the_prediction_keeps_the_frame_pyfai_saved(tmp_path):
@@ -893,6 +943,7 @@ def test_the_detector_mask_reaches_pyfai_turned_as_the_frames_are(tmp_path):
             dialog._pyfai_mask()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_the_rough_geometry_puts_the_beam_where_the_fit_says_it_is_at_the_zero(tmp_path):
@@ -936,6 +987,7 @@ def test_the_rough_geometry_puts_the_beam_where_the_fit_says_it_is_at_the_zero(t
         assert float(seed.integrator.tth(np.array([y]), np.array([x]))[0]) == pytest.approx(0, abs=1e-4)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def _beam_container(tmp_path, nu=(4.,) * 5, energy=16000.):
@@ -1059,5 +1111,8 @@ def test_each_page_opens_the_shared_calibration_window_with_its_own_context(tmp_
 def test_shared_calibration_windows_derive_xu_coverage_from_the_scan(tmp_path):
     for page in ('Stitch', 'RSM'):
         dialog = CalibrationDialog(CalibrationContext(page, tmp_path))
-        assert not {'del_domain', 'nu_domain'} & dialog._fields.keys()
-        dialog.close()
+        try:
+            assert not {'del_domain', 'nu_domain'} & dialog._fields.keys()
+            dialog.close()
+        finally:
+            _dispose(dialog)

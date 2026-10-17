@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
+from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
 from xrd_tools.core.energy import energy_eV_to_wavelength_m, wavelength_m_to_energy_eV
 from xrd_tools.core.geometry import ImageOrientation
@@ -31,6 +32,19 @@ def commit(dialog, key, text):
     dialog._set_field_text(key, str(text))
     QtTest.QTest.keyClick(dialog._fields[key], QtCore.Qt.Key.Key_Return)
     settle(dialog)
+
+
+def _dispose(dialog, timeout=30):
+    """Retire a test-owned window through its own cleanup receipt, then delete it: a closed but undeleted window
+    keeps every widget it built alive in the test process (QT-TEST-LIFECYCLE)."""
+    limit = time.monotonic() + timeout
+    receipt = dialog.shutdown()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < limit:
+        QtWidgets.QApplication.processEvents()
+        time.sleep(.005)
+        receipt = dialog.shutdown()
+    assert receipt.status is PageCleanup.CLEAN, receipt
+    dialog.deleteLater()
 
 
 def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path):
@@ -82,8 +96,10 @@ def test_calibrant_spec_container_lists_and_stages_padded_images(qapp, tmp_path)
                 assert again._quick_rows[key].editor.placeholderText() == again._fields[key].placeholderText()
         finally:
             again.close()
+            _dispose(again)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_calibrant_metadata_only_spec_is_not_ready_for_refinement(qapp, tmp_path):
@@ -104,6 +120,7 @@ def test_calibrant_metadata_only_spec_is_not_ready_for_refinement(qapp, tmp_path
         assert 'calibrant source' in dialog.status.text().lower()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_rough_rows_share_existing_controls_and_keep_mode_visibility(qapp, tmp_path):
@@ -128,6 +145,7 @@ def test_rough_rows_share_existing_controls_and_keep_mode_visibility(qapp, tmp_p
         assert dialog._row_visible('beam_entry') and not dialog.beam_readiness.isHidden()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_calibrant_nexus_context_still_selects_the_nexus_choice(qapp, tmp_path):
@@ -139,6 +157,7 @@ def test_calibrant_nexus_context_still_selects_the_nexus_choice(qapp, tmp_path):
         assert not dialog._row_visible('images') and dialog._row_visible('entry')
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_detector_picker_describes_raw_defaults_and_manual_header_reads_pixels(qapp, tmp_path):
@@ -174,7 +193,9 @@ def test_detector_picker_describes_raw_defaults_and_manual_header_reads_pixels(q
         assert again._text('header') == '16'  # byte offset is independent of the detector model
     finally:
         dialog.close()
+        _dispose(dialog)
         again.close()
+        _dispose(again)
 
 
 def test_detector_change_drops_the_previous_detectors_beam_pixel(qapp, tmp_path):
@@ -188,6 +209,7 @@ def test_detector_change_drops_the_previous_detectors_beam_pixel(qapp, tmp_path)
         assert 'found on the frame' in dialog._fields['beam_pixel'].placeholderText()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_camera_names_the_diffractometers_lab_frame(qapp, tmp_path):
@@ -202,6 +224,7 @@ def test_camera_names_the_diffractometers_lab_frame(qapp, tmp_path):
         assert 'does not determine' in dialog.camera.rotation.toolTip()
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('page', ['Stitch', 'RSM'])
@@ -224,6 +247,7 @@ def test_detector_header_tracks_the_model_and_camera_image_correction(qapp, tmp_
         assert dialog._text('beam_orientation') == '1'
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_saturation_shows_the_documented_auto_value_and_keeps_manual_overrides(qapp, tmp_path):
@@ -248,8 +272,10 @@ def test_saturation_shows_the_documented_auto_value_and_keeps_manual_overrides(q
             assert again._fields['saturation'].placeholderText() == field.placeholderText()
         finally:
             again.close()
+            _dispose(again)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('rotation,flip', [(r, f) for r in (0, 90, 180, 270) for f in (False, True)])
@@ -274,6 +300,7 @@ def test_typed_beam_pixel_follows_the_camera_but_not_pyfais_origin(qapp, tmp_pat
         assert dialog._text('beam_orientation') == '1'
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 @pytest.mark.parametrize('key, chooser_kind', [('beam_source', 'spec'), ('source', 'image'), ('images', 'dir')])
@@ -327,8 +354,10 @@ def test_saved_wavelength_migrates_to_energy_with_the_same_physical_value(qapp, 
             assert again._rough_wavelength_A() == dialog._rough_wavelength_A()
         finally:
             again.close()
+            _dispose(again)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_committed_spec_scan_updates_energy_without_reading_images(qapp, tmp_path):
@@ -349,6 +378,7 @@ def test_committed_spec_scan_updates_energy_without_reading_images(qapp, tmp_pat
         assert dialog._text('rough_energy') == ''  # no stale scan energy or first-scan fallback
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_committed_nexus_wavelength_updates_energy(qapp, tmp_path):
@@ -366,6 +396,7 @@ def test_committed_nexus_wavelength_updates_energy(qapp, tmp_path):
         assert dialog._rough_wavelength_A() == pytest.approx(1.1)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 _PONI_HINT = "Auto · 16.0000 keV from the calibrated frames' PONI files"
@@ -416,6 +447,7 @@ def test_a_blank_energy_takes_the_calibrated_frames_poni_wavelength(qapp, tmp_pa
         assert dialog._fields['rough_energy'].placeholderText() == 'Auto · scan energy unavailable'
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_the_real_del_only_scan_7_takes_its_saved_poni_files_energy(qapp, tmp_path):
@@ -452,6 +484,7 @@ def test_the_real_del_only_scan_7_takes_its_saved_poni_files_energy(qapp, tmp_pa
         assert fit.asset['calibration']['wavelength'] == pytest.approx(7.749012402075016e-11, rel=1e-12, abs=0)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_spec_container_uses_auto_folder_and_padded_stem(qapp, tmp_path):
@@ -482,6 +515,7 @@ def test_spec_container_uses_auto_folder_and_padded_stem(qapp, tmp_path):
         assert dialog._distance_result.distance_m == pytest.approx(.5, rel=1e-3)
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_direct_beam_source_does_not_overwrite_the_calibrants_energy(qapp, tmp_path):
@@ -494,6 +528,7 @@ def test_direct_beam_source_does_not_overwrite_the_calibrants_energy(qapp, tmp_p
         assert dialog._text('rough_energy') == '17'
     finally:
         dialog.close()
+        _dispose(dialog)
 
 
 def test_the_real_eiger_del_scan_fits_with_auto_motion_and_no_energy(qapp, tmp_path):
@@ -517,3 +552,4 @@ def test_the_real_eiger_del_scan_fits_with_auto_motion_and_no_energy(qapp, tmp_p
         assert dialog._text('rough_energy') == ''
     finally:
         dialog.close()
+        _dispose(dialog)
