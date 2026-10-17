@@ -399,6 +399,101 @@ def test_committed_nexus_wavelength_updates_energy(qapp, tmp_path):
         _dispose(dialog)
 
 
+_TWO_ENERGIES = ('#O0 energy\n#S 1 ascan del 1 -1 1 1\n#P0 11270\n#N 1\n#L del\n1\n-1\n'
+                 '#S 2 ascan del 1 -1 1 1\n#P0 16000\n#N 1\n#L del\n1\n-1\n')
+
+
+def _record_reads(dialog):
+    """The roles ('' calibrant, 'beam_' direct beam) of each metadata read the window starts; the read runs."""
+    reads, start = [], dialog._start
+
+    def recorded(kind, *args):
+        if kind == 'source_details':
+            reads.append(args[0][0])
+        return start(kind, *args)
+    dialog._start = recorded
+    return reads
+
+
+def _leave(qapp, dialog, key, away, *typed):
+    """Real focus into a source field, each of ``typed`` replacing its text, then focus to ``away``."""
+    dialog.activateWindow()
+    field = dialog._fields[key]
+    field.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+    qapp.processEvents()
+    assert field.hasFocus()
+    for text in typed:
+        field.selectAll()
+        QtTest.QTest.keyClicks(field, text)
+    away.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+    qapp.processEvents()
+    assert not field.hasFocus()
+    settle(dialog)
+
+
+def test_a_calibrant_field_left_unchanged_reads_nothing_again(qapp, tmp_path, monkeypatch):
+    """HOSTED-REDS-20261017 F3: focus leaving a source field its role's last read already used starts no read; a
+    changed value, an edit undone before leaving, Return and choosing the same file again all read."""
+    from xdart.gui.widgets import file_dialogs
+    spec = tmp_path / 'calibrant'
+    spec.write_text('#F calibrant\n' + _TWO_ENERGIES)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    reads = _record_reads(dialog)
+    try:
+        commit(dialog, 'source', spec)
+        assert reads == [''] and dialog._source_energy_eV == 11270
+        dialog._show_tab('select')
+        away = dialog.list_button
+        _leave(qapp, dialog, 'source', away)
+        _leave(qapp, dialog, 'scan', away)
+        assert reads == ['']
+        _leave(qapp, dialog, 'scan', away, '2')
+        assert reads == ['', ''] and dialog._source_energy_eV == 16000
+        _leave(qapp, dialog, 'scan', away, '1', '2')  # undone: the energy it cleared is read again
+        assert reads == ['', '', ''] and dialog._source_energy_eV == 16000
+        dialog._fields['scan'].setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        QtTest.QTest.keyClick(dialog._fields['scan'], QtCore.Qt.Key.Key_Return)
+        settle(dialog)
+        assert reads == ['', '', '', '']
+        monkeypatch.setattr(file_dialogs, 'browse_spec', lambda *args, **kwargs: [str(spec)])
+        dialog._formrows['source'].browse_button.click()
+        settle(dialog)
+        assert reads == ['', '', '', '', ''] and dialog._source_energy_eV == 11270  # a picked file starts at scan 1
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
+def test_a_direct_beam_field_left_unchanged_reads_nothing_again(qapp, tmp_path):
+    """HOSTED-REDS-20261017 F3: the direct beam's source reads on its own inputs, as the calibrant's does, and
+    neither role's read stands for the other's."""
+    calibrant, direct = tmp_path / 'calibrant', tmp_path / 'direct'
+    calibrant.write_text('#F calibrant\n' + _TWO_ENERGIES)
+    direct.write_text('#F direct\n' + _TWO_ENERGIES)
+    dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
+    dialog.show()
+    reads = _record_reads(dialog)
+    try:
+        commit(dialog, 'source', calibrant)
+        dialog.rough_mode.setCurrentIndex(dialog.rough_mode.findData('scan'))
+        commit(dialog, 'beam_source', direct)
+        assert reads == ['', 'beam_']
+        dialog._show_tab('rough')
+        away = dialog.rough_mode
+        _leave(qapp, dialog, 'beam_source', away)
+        _leave(qapp, dialog, 'beam_scan', away)
+        assert reads == ['', 'beam_']
+        _leave(qapp, dialog, 'beam_scan', away, '2')
+        assert reads == ['', 'beam_', 'beam_']
+        dialog._show_tab('select')
+        _leave(qapp, dialog, 'scan', dialog.list_button)
+        assert reads == ['', 'beam_', 'beam_'] and dialog._source_energy_eV == 11270
+    finally:
+        dialog.close()
+        _dispose(dialog)
+
+
 _PONI_HINT = "Auto · 16.0000 keV from the calibrated frames' PONI files"
 
 
