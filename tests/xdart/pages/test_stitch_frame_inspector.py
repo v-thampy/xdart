@@ -224,7 +224,9 @@ def test_frame_inspector_cancels_rapid_frame_file_and_close(qapp, tmp_path):
         _click(page, 1, qapp, settle=False)
         qapp.processEvents()
         _click(page, 2, qapp, settle=False)
-        page.results.setCurrentRow(1)
+        other = next(path for path in page.browser.listed_results() if path != page.browser.current_result())
+        page.results.setCurrentRow(next(row for row in range(page.results.count())
+                                        if page.results.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == other))
         _wait(page, qapp)
         assert page.frames.currentRow() == 0 and page.frames.item(0).text() == "Full"
         assert page._last_map_state.heavy.raw is None

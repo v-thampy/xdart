@@ -1206,8 +1206,9 @@ def test_a_resident_result_shown_again_recomputes_nothing_and_an_evicted_ones_vi
             _wait(page, qapp, lambda: not page.active())
         assert built == list(names) and len(sliced) == 6
         built.clear(), sliced.clear()
-        for row in (1, 2, 1):  # "two", "three", "two": resident
-            page.results.setCurrentRow(row)
+        for name in ("two", "three", "two"):  # resident, found by identity (the folder lists them by name)
+            page.results.setCurrentRow(next(row for row in range(page.results.count()) if page.results.item(row).data(
+                QtCore.Qt.ItemDataRole.UserRole) == str(tmp_path / f"{name}_rsm.nexus")))
         assert built == [] and sliced == [] and page.shown[0] is values["two"]
         assert set(page._viewers) == {str(tmp_path / f"{name}_rsm.nexus") for name in names[1:]}
     finally:

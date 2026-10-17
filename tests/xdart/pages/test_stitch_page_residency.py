@@ -49,27 +49,29 @@ def test_only_the_shown_results_stay_in_memory_and_the_others_reload(qapp, tmp_p
         _wait(page, qapp)
         page.run_bar.startButton.click()
         _wait(page, qapp)
-        paths = _listed(page, qapp)
-        assert len(paths) == 3 and all(Path(path).is_file() for path in paths)
+        paths = _listed(page, qapp)  # the visible order is the folder's
+        first, missing, latest = page._listed  # the order they were stitched
+        assert len(paths) == 3 and set(paths) == {first, missing, latest}
+        assert all(Path(path).is_file() for path in paths)
         # Single: the current result only (the last one stitched)
-        assert set(page._payloads) == {paths[-1]}
-        _show(page, paths[0])
+        assert page.browser.current_result() == latest and set(page._payloads) == {latest}
+        _show(page, first)
         _wait(page, qapp)
-        assert set(page._payloads) == {paths[0]} and page.frames.count() == 3
+        assert first != latest and set(page._payloads) == {first} and page.frames.count() == 3
         # Overlay: the selected results
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
-        _show(page, paths[2], select.ClearAndSelect)
-        _show(page, paths[0], select.Select)
+        _show(page, latest, select.ClearAndSelect)
+        _show(page, first, select.Select)
         _wait(page, qapp)
-        assert set(page._payloads) == {paths[0], paths[2]}
+        assert set(page._payloads) == {first, latest}
         assert len(page.curve.listDataItems()) == 2
-        # a result whose file is gone stays listed, with the reason, and holds nothing
-        Path(paths[1]).unlink()
-        _show(page, paths[1], select.ClearAndSelect)
+        # a result whose file is gone stays listed in its place, with the reason, and holds nothing
+        Path(missing).unlink()
+        _show(page, missing, select.ClearAndSelect)
         _wait(page, qapp)
-        assert page.browser.listed_results() == tuple(paths) and paths[1] not in page._payloads
+        assert page.browser.listed_results() == tuple(paths) and missing not in page._payloads
         status = page.run_bar.readinessLabel.full_text()
-        assert Path(paths[1]).name in status and "No such file" in status, status
+        assert Path(missing).name in status and "No such file" in status, status
         assert not page.run_bar.readinessDot.property("ready")
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
@@ -96,7 +98,8 @@ def test_a_pin_survives_selecting_another_result(qapp, tmp_path):
         command(ShellCommandKind.PIN_SLICE)
         (pinned,) = page._last_map_state.pinned_traces
         pinned_path = page.results.currentItem().data(QtCore.Qt.ItemDataRole.UserRole)
-        _show(page, paths[0], QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        other = next(path for path in paths if path != pinned_path)
+        _show(page, other, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect)
         _wait(page, qapp)
         assert pinned_path in page._payloads and len(page._view.slice_pins) == 1
         (kept,) = page._last_map_state.pinned_traces
@@ -151,25 +154,27 @@ def test_a_map_without_the_chosen_cut_shows_i_of_q_and_keeps_the_choice(qapp, tm
         _wait(page, qapp)  # Start waits for the SPEC source's readiness (71bb665a)
         page.run_bar.startButton.click()  # the GI Stitch 2D
         _wait(page, qapp)
+        gi_path = page._owner.prepared.request.module.output.target
         page.load_form(replace(form, gi=None, output_family="plain"))
         _wait(page, qapp)
         page.run_bar.startButton.click()  # a plain Stitch 2D beside it
         _wait(page, qapp)
         paths = _listed(page, qapp)
-        assert len(paths) == 2
-        _show(page, paths[0])
+        (plain_path,) = [path for path in paths if Path(path).name.startswith("plain_")]
+        assert len(paths) == 2 and gi_path in paths and gi_path != plain_path
+        _show(page, gi_path)
         _wait(page, qapp)
         page._view_command(ShellCommand(ShellCommandKind.SET_SHARE_AXIS, False))  # a shared map holds the plot axis
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "q_oop"))
         gi_payload = page._current_payload()
         assert gi_payload.gi_map is not None and page._last_map_state.plot_axis == "q_oop"
-        _show(page, paths[1])
+        _show(page, plain_path)
         _wait(page, qapp)
         plain = page._current_payload()
         assert plain.gi_map is None and page._view.plot_axis == "q_oop"
         (trace,) = page._last_map_state.traces
         np.testing.assert_array_equal(trace.intensity, plain.profile.intensity)
-        _show(page, paths[0])
+        _show(page, gi_path)
         _wait(page, qapp)
         (trace,) = page._last_map_state.traces
         np.testing.assert_array_equal(trace.intensity, dict(page._current_payload().gi)["q_oop"].intensity)
