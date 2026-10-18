@@ -206,6 +206,37 @@ def test_only_the_exact_bound_session_owner_can_promote_an_epoch():
     assert ledger.snapshot().durable == frozenset(((0, MODE, TARGET),))
 
 
+def test_bound_continuation_guard_is_read_only_and_checks_accounting_owner():
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    boundary = accounting.writer_boundary
+    before = accounting.snapshot()
+
+    assert boundary.require_clean_live_continuation(owner, token) is None
+    assert accounting.snapshot() == before
+
+    with pytest.raises(RuntimeError, match="exact bound live session"):
+        boundary.require_clean_live_continuation(_BoundOwner(), token)
+    with pytest.raises(RuntimeError, match="exact bound live session"):
+        boundary.require_clean_live_continuation(owner, object())
+    assert accounting.snapshot() == before
+
+
+def test_bound_continuation_guard_refuses_latest_provisional_without_mutation():
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    key = _discover(accounting, "continuation-guard", 0)
+    attempt = accounting.begin_attempt(key, source_revision=1)
+    accounting.record_enqueued(attempt)
+    before = accounting.snapshot()
+
+    with pytest.raises(
+        RuntimeError, match="same-run continuation refuses a dirty epoch",
+    ):
+        accounting.writer_boundary.require_clean_live_continuation(owner, token)
+    assert accounting.snapshot() == before
+
+
 def test_completed_attempt_consumes_capacity_until_exact_canonical_receipt():
     _ledger, accounting = _accounting(max_outstanding=1)
     key0 = _discover(accounting, "capacity", 0)
