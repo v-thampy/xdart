@@ -144,7 +144,8 @@ jobs:
               tests/xdart/test_text_selection_contrast.py
               tests/xdart/pages/test_synthetic_page_host.py
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # scattering-other took 49 minutes on hosted CI; leave room for setup/preflight.
+    timeout-minutes: ${{ matrix.group == 'scattering-other' && 75 || 45 }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
