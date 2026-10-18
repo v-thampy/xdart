@@ -222,12 +222,101 @@ def test_bound_continuation_guard_is_read_only_and_checks_accounting_owner():
     assert accounting.snapshot() == before
 
 
-def test_bound_continuation_guard_refuses_latest_provisional_without_mutation():
+@pytest.mark.parametrize(
+    "state",
+    ("provisional", "enqueued", "accepted", "failed_retryable", "failed", "cancelled",
+     "completed_unwritten"),
+)
+def test_bound_continuation_guard_refuses_latest_blocking_attempt_states(state):
     _ledger, accounting = _accounting()
     owner, token = _BOUND_OWNERS[id(accounting)]
-    key = _discover(accounting, "continuation-guard", 0)
+    key = _discover(accounting, f"continuation-{state}", 0)
     attempt = accounting.begin_attempt(key, source_revision=1)
-    accounting.record_enqueued(attempt)
+    if state in {"enqueued", "accepted", "failed_retryable", "failed"}:
+        accounting.record_enqueued(attempt)
+    if state in {"accepted"}:
+        accounting.record_accepted(attempt)
+    elif state == "completed_unwritten":
+        accounting.record_accepted(attempt)
+        accounting.record_completed(attempt, produced=(MODE,))
+    elif state in {"failed_retryable", "failed"}:
+        accounting.record_failed(
+            attempt, error=state, retryable=state == "failed_retryable",
+        )
+    elif state == "cancelled":
+        accounting.record_cancelled(attempt, reason="Stop")
+    before = accounting.snapshot()
+
+    with pytest.raises(
+        RuntimeError, match="same-run continuation refuses a dirty epoch",
+    ):
+        accounting.writer_boundary.require_clean_live_continuation(owner, token)
+    assert accounting.snapshot() == before
+
+
+def test_bound_continuation_guard_allows_failed_retry_followed_by_written_success():
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    key = _discover(accounting, "continuation-retry-success", 0)
+    failed = accounting.begin_attempt(key, source_revision=1)
+    accounting.record_failed(failed, error="transient", retryable=True)
+    _successful_attempt(accounting, key, source_revision=2)
+    before = accounting.snapshot()
+
+    assert accounting.writer_boundary.require_clean_live_continuation(owner, token) is None
+    assert accounting.snapshot() == before
+
+
+@pytest.mark.parametrize("case", ("written_pending", "canonical", "aborted"))
+def test_bound_continuation_guard_allows_written_completed_attempt(case):
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    key = _discover(accounting, f"continuation-written-{case}", 0)
+    attempt = _successful_attempt(accounting, key)
+    if case == "aborted":
+        accounting.writer_boundary.epoch_aborted(owner, token, "rolled back")
+    elif case == "canonical":
+        _stage_writer_durable(accounting, 0)
+        _commit(accounting, "continuation-canonical")
+    before = accounting.snapshot()
+    assert before.attempt_states[attempt] is _api()[1].COMPLETED
+
+    assert accounting.writer_boundary.require_clean_live_continuation(owner, token) is None
+    assert accounting.snapshot() == before
+
+
+def test_bound_continuation_guard_preserves_mixed_current_mode_written_truth():
+    (Limits, _AttemptState, Identity, Accounting, _RunState) = _api()
+    one_d, two_d = ResultMode.one_d(), ResultMode.two_d()
+    ledger = StageLedger(
+        required_modes=(one_d, two_d),
+        targets_by_mode={one_d: (TARGET,), two_d: (TARGET,)},
+    )
+    accounting = Accounting(ledger, run_generation=1, limits=Limits(1, 3, 1))
+    _bind(accounting)
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    key = Identity("continuation-mixed-written", 0)
+    accounting.discover(key, group="g", ordinal=0, output_label=0)
+    first = accounting.begin_attempt(key, source_revision=1)
+    accounting.record_accepted(first)
+    accounting.record_completed(first, produced=(one_d, two_d))
+    accounting.record_written(first, modes=(one_d,))
+    second = accounting.begin_attempt(key, source_revision=2)
+    accounting.record_accepted(second)
+    accounting.record_completed(second, produced=(two_d,))
+    accounting.record_written(second, modes=(two_d,))
+    before = accounting.snapshot()
+    assert before.written == frozenset((key,))
+    assert before.written_attempts == {(key, one_d): first, (key, two_d): second}
+
+    assert accounting.writer_boundary.require_clean_live_continuation(owner, token) is None
+    assert accounting.snapshot() == before
+
+
+def test_bound_continuation_guard_refuses_non_active_accounting_without_mutation():
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    accounting._state = _api()[4].FINISHED
     before = accounting.snapshot()
 
     with pytest.raises(
