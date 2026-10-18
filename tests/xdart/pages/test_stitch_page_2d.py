@@ -110,14 +110,20 @@ def test_the_rows_a_run_lists_keep_their_order_when_the_catalog_lands(qapp, tmp_
         page.run_bar.startButton.click()
         _wait(page, qapp)
         assert entered.wait(10)
-        page.browser.clear_result_selection()  # the run selected its result; the batch below is the no-selection one
-        _wait(page, qapp)
-        held = page.browser.listed_results()
-        batch = [target.label for target in page._fit_batch("peak")]
+        held, keys = page.browser.listed_results(), dict(page._result_keys)
+        current, selected = page.browser.current_result(), page.browser.selected_results()
+        batch = [target.label for target in page._fit_batch("peak")]  # the run selected its result
+        assert current and selected and batch == [Path(path).name for path in selected]
         release.set()
         _wait(page, qapp, catalog=True)
+        assert {entry.artifact for entry in page._result_browser._owner.catalog} >= set(held)  # it landed
         assert len(held) == 3 and page.browser.listed_results() == held
-        assert batch == [target.label for target in page._fit_batch("peak")] == [Path(path).name for path in held]
+        assert (page.browser.current_result(), page.browser.selected_results()) == (current, selected)
+        assert all(page._result_keys[path] is key for path, key in keys.items())
+        assert batch == [target.label for target in page._fit_batch("peak")]
+        page.browser.clear_result_selection()
+        _wait(page, qapp)
+        assert [target.label for target in page._fit_batch("peak")] == [Path(path).name for path in held]
         _command(page, ShellCommandKind.SET_PLOT_MODE, plot_mode)
         page.browser.set_current_result(held[0], keep_selection=False)
         _wait(page, qapp)
@@ -125,6 +131,8 @@ def test_the_rows_a_run_lists_keep_their_order_when_the_catalog_lands(qapp, tmp_
         _wait(page, qapp)
         expected = {held[1]} if plot_mode == "Single" else {held[0], held[1]}
         assert page.browser.current_result() == held[1] and set(page.browser.selected_results()) == expected
+        assert [target.label for target in page._fit_batch("peak")] == [
+            Path(path).name for path in page.browser.selected_results()]  # a selection batches in its own order
         traces = page._last_map_state.traces
         assert len(traces) == len(expected)
         for trace in traces:

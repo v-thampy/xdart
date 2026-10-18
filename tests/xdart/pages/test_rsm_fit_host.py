@@ -129,12 +129,22 @@ def test_listed_order_and_the_lineout_batch_hold_when_the_catalog_lands(qapp, tm
         for result in results:
             page._add_result(result.inspection.path, result, show=False)
         assert entered.wait(10)
-        held, current = page.browser.listed_results(), page.browser.current_result()
+        page.browser.set_current_result(results[1].inspection.path, keep_selection=False)
+        settle(page, qapp)
+        held, current, selected = (page.browser.listed_results(), page.browser.current_result(),
+                                   page.browser.selected_results())
+        resident = dict(page._results)
         batch = [target.label for target in page._fit_targets(())]
+        assert current == results[1].inspection.path and batch == list(selected) == [current]
         release.set()
         catalog(page, qapp)
-        assert len(held) == 3 and page.browser.listed_results() == held and page.browser.current_result() == current
-        assert batch == [target.label for target in page._fit_targets(())] == list(held)
+        assert {entry.artifact for entry in page._result_browser._owner.catalog} >= set(held)  # it landed
+        assert len(held) == 3 and page.browser.listed_results() == held
+        assert (page.browser.current_result(), page.browser.selected_results()) == (current, selected)
+        assert all(page._results[path] is value for path, value in resident.items())
+        assert batch == [target.label for target in page._fit_targets(())]
+        page.browser.clear_result_selection()
+        assert [target.label for target in page._fit_targets(())] == list(held)
         assert page._listed == [result.inspection.path for result in results]
     finally:
         release.set()

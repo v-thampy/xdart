@@ -209,7 +209,8 @@ def _held_catalog(monkeypatch):
 
     def held(*args, **kwargs):
         entered.set()
-        release.wait(30)
+        if not release.wait(30):  # a test that never releases fails loudly instead of reading late
+            raise TimeoutError("held catalog read was never released")
         return real(*args, **kwargs)
     monkeypatch.setattr(processed_browser, "enumerate_processed_artifacts", held)
     return entered, release
