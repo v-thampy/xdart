@@ -299,6 +299,9 @@ class _DynamicWriterBoundary:
     def terminal_boundary_complete(self, state: DynamicRunState) -> bool:
         return self._accounting._terminal_boundary_complete(state)
 
+    def require_clean_live_continuation(self, session, owner_token) -> None:
+        self._accounting._require_clean_live_continuation(session, owner_token)
+
     def recover_external_terminal(
         self, session, owner_token, seal, state, value,
     ) -> BaseException | None:
@@ -1054,6 +1057,46 @@ class DynamicRunAccounting:
         current = self._live_session_ref() if self._live_session_ref else None
         if current is not session or self._live_owner_token is not owner_token:
             raise RuntimeError("epoch transition requires the exact bound live session")
+
+    def _require_clean_live_continuation(self, session, owner_token) -> None:
+        with self._lock:
+            if self._state is not DynamicRunState.ACTIVE:
+                raise RuntimeError("same-run continuation refuses a dirty epoch")
+            self._require_bound(session, owner_token)
+            required_modes = tuple(self._ledger.required_modes)
+            for key, tokens in self._attempts.items():
+                if not tokens:
+                    continue
+                latest = self._records[tokens[-1]]
+                if latest.state in {
+                    DynamicAttemptState.PROVISIONAL,
+                    DynamicAttemptState.ENQUEUED,
+                    DynamicAttemptState.FAILED,
+                    DynamicAttemptState.FAILED_RETRYABLE,
+                    DynamicAttemptState.CANCELLED,
+                }:
+                    raise RuntimeError(
+                        "same-run continuation refuses a dirty epoch",
+                    )
+                if latest.state is DynamicAttemptState.ACCEPTED:
+                    raise RuntimeError(
+                        "same-run continuation refuses a dirty epoch",
+                    )
+                if (
+                    latest.state is not DynamicAttemptState.COMPLETED
+                    or latest.epoch_aborted
+                    or self._key_is_canonical(key)
+                ):
+                    continue
+                written = bool(required_modes) and all(
+                    (supplier := self._current_result_supplier(key, mode)) is not None
+                    and mode in self._records[supplier].written
+                    for mode in required_modes
+                )
+                if not written:
+                    raise RuntimeError(
+                        "same-run continuation refuses a dirty epoch",
+                    )
 
     def _validate_pending_current(self) -> None:
         for _key, (_token, receipt) in {

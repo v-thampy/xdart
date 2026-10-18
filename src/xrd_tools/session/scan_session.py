@@ -1907,28 +1907,9 @@ class ScanSession:
             raise RuntimeError("same-run continuation refuses a failed session")
         if not self._session.drain(timeout=0.0):
             raise RuntimeError("same-run continuation requires a drained writer")
-        snapshot = self._dynamic_accounting.snapshot()
-        latest_states = tuple(
-            snapshot.attempt_states[tokens[-1]]
-            for tokens in snapshot.attempts.values() if tokens
+        self._dynamic_accounting.writer_boundary.require_clean_live_continuation(
+            self, self._dynamic_owner_token,
         )
-        dirty_in_flight = any(
-            key not in snapshot.written
-            or snapshot.attempt_states[snapshot.attempts[key][-1]]
-            is not DynamicAttemptState.COMPLETED
-            for key in snapshot.in_flight
-        )
-        if (
-            snapshot.state is not DynamicRunState.ACTIVE
-            or dirty_in_flight
-            or snapshot.retry_owned
-            or any(state in {
-                DynamicAttemptState.FAILED,
-                DynamicAttemptState.FAILED_RETRYABLE,
-                DynamicAttemptState.CANCELLED,
-            } for state in latest_states)
-        ):
-            raise RuntimeError("same-run continuation refuses a dirty epoch")
         replay = intent == current_intent
         decision = extend_live(owner, intent)
         if not replay:
