@@ -617,6 +617,36 @@ def test_quick_chain_resumes_then_saves_and_uses_geometry(qapp, tmp_path, monkey
         assert started.count('refine') == started.count('distance') == 1, 'resume never reruns either fit'
         window = dialog._calibration_fit_window
         assert window.isVisible() and window.panels.currentWidget() is window.view
+        # Finish refuses an unencodable session before asking for a path or starting the pair writer.
+        from dataclasses import replace
+        retained_fit, retained_dir = dialog.fit, dialog.session_dir
+        retained_identity = dialog.settings()['loaded_calibration']
+        prior_session = session.read_bytes()
+        dialog.session_dir = retained_dir / 'not-created-by-validation'
+        dialog.fit = replace(retained_fit, message='x' * (2 << 20))
+        picks = []
+        monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName',
+                            staticmethod(lambda *args: (picks.append(args) or '', '')))
+        window.save_button.click()
+        assert picks == [] and started.count('save') == 0
+        assert 'calibration session exceeds the size limit' in dialog.status.text()
+        assert dialog.isVisible() and window.isVisible() and not dialog.active()
+        assert not dialog.session_dir.exists() and session.read_bytes() == prior_session
+        assert not saved and _calibration_files(tmp_path / 'project') == []
+        # A selected output path adds its identity to the final session. Check that growth before writing too.
+        dialog.fit = replace(retained_fit, message='')
+        current = dialog._save_session(validate_only=True)
+        dialog.fit = replace(retained_fit, message='x' * ((2 << 20) - len(current) - 16))
+        target = dialog.project_root / ('long-calibration-name-' * 4 + '.json')
+        monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName', staticmethod(lambda *args: (str(target), '')))
+        assert len(dialog._save_session(validate_only=True)) <= 2 << 20
+        window.save_button.click()
+        assert 'calibration session exceeds the size limit' in dialog.status.text()
+        assert started.count('save') == 0 and not target.exists()
+        assert not dialog.session_dir.exists() and session.read_bytes() == prior_session
+        assert dialog.settings()['loaded_calibration'] == retained_identity
+        assert not saved and dialog.isVisible() and window.isVisible() and not dialog.active()
+        dialog.fit, dialog.session_dir = retained_fit, retained_dir
         # Cancel and a real session-write failure keep both windows and the result available.
         monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName', staticmethod(lambda *args: ('', '')))
         window.save_button.click()

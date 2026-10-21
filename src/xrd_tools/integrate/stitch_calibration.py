@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from xrd_tools.integrate.direct_beam import DirectBeamResult
 
 
+CALIBRATION_SESSION_MAX_BYTES = 2 << 20
+
+
 def _sha(path: str | Path, cap: int = 512 << 20) -> str:
     path = Path(path)
     if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= cap:
@@ -517,7 +520,7 @@ def calibration_frame_mask(frame, mask=None, *, conditioning=None, saturation=No
     return bad
 
 
-def save_calibration_session(directory, frames, *, arm=None, fit_policy=None, resume=None):
+def calibration_session_bytes(frames, *, arm=None, fit_policy=None, resume=None) -> bytes:
     """``arm`` (del, nu motors; None for a held circle) makes it version 3: a resumed
     session then knows which circle a single arm's one motor is (vertical or horizontal).
     ``fit_policy`` ({'bounds': ArmFitBounds record, 'distance_seed_m', 'distance_bounds_m'}) makes it
@@ -526,8 +529,8 @@ def save_calibration_session(directory, frames, *, arm=None, fit_policy=None, re
     and the Diffractometer the zeros are read by ('instrument_geometry') it is version 5: a resumed
     session fits with its own choices and circles (combined Stitch review F1, F3).
     With calibration-only ``conditioning`` it is version 6; older policies retain their version.
-    ``resume`` retains canonical setup and current results in version 7, including Quick without staged frames."""
-    path = Path(directory) / 'calibration-session.json'
+    ``resume`` retains canonical setup and current results in version 7, including Quick without staged frames.
+    Return validated, compact JSON bytes without creating or changing a file."""
     payload = {'schema': 'xdart.stitch_calibration_session', 'version': 2,
                'frames': [_session_row(frame) for frame in frames]}
     if arm is not None:
@@ -543,9 +546,17 @@ def save_calibration_session(directory, frames, *, arm=None, fit_policy=None, re
         if not 0 <= len(payload['frames']) <= 32:
             raise ValueError('invalid calibration frame count')
         payload.update(version=7, arm=payload.get('arm'), fit_policy=payload.get('fit_policy'), resume=record)
-    raw = json.dumps(payload, indent=2, allow_nan=False).encode('utf-8')
-    if len(raw) > 1 << 20:
-        raise ValueError('calibration session exceeds the size limit')
+    raw = json.dumps(payload, separators=(',', ':'), allow_nan=False).encode('utf-8')
+    if len(raw) > CALIBRATION_SESSION_MAX_BYTES:
+        raise ValueError(f'calibration session exceeds the size limit ({len(raw)} bytes; '
+                         f'limit {CALIBRATION_SESSION_MAX_BYTES} bytes)')
+    return raw
+
+
+def save_calibration_session(directory, frames, *, arm=None, fit_policy=None, resume=None):
+    """Atomically save the record encoded by :func:`calibration_session_bytes`."""
+    raw = calibration_session_bytes(frames, arm=arm, fit_policy=fit_policy, resume=resume)
+    path = Path(directory) / 'calibration-session.json'
     temporary = path.with_suffix('.tmp')
     temporary.write_bytes(raw)
     temporary.replace(path)
@@ -596,8 +607,10 @@ def load_calibration_session(path, *, with_arm=False, with_policy=False, with_re
     choices from version 5, calibration-only conditioning from version 6).
     ``with_resume`` returns (frames, arm, policy, CalibrationSessionResume or None)."""
     path = Path(path)
-    if path.stat().st_size > 1 << 20:
-        raise ValueError('calibration session exceeds the size limit')
+    size = path.stat().st_size
+    if size > CALIBRATION_SESSION_MAX_BYTES:
+        raise ValueError(f'calibration session exceeds the size limit ({size} bytes; '
+                         f'limit {CALIBRATION_SESSION_MAX_BYTES} bytes)')
     value = json.loads(path.read_text())
     version = value.get('version')
     keys = ({'schema', 'version', 'frames'} | ({'arm'} if version in (3, 4, 5, 6) else set())

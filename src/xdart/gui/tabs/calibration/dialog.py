@@ -39,7 +39,7 @@ from xrd_tools.integrate.stitch_calibration import (
     load_calibration_session, pair_validation_angles, save_calibration_pair, save_calibration_session,
     scan_motor_names, source_frame_choices, suggested_frame_indices, validate_frame_files, xu_partner_path,
     direct_beam_scan_motor, open_calibration_beam_scan,
-    CalibrationSessionResume,
+    CalibrationSessionResume, calibration_session_bytes,
 )
 from .fit_windows import (
     PARAMETER_LABELS, RECORD_LABELS, CalibrationFitWindow, DirectBeamFitWindow, calibration_fit_text, direct_beam_fit_text,
@@ -2784,10 +2784,10 @@ class CalibrationDialog(QtWidgets.QDialog):
                 'instrument_geometry': self.geometry_editor.value().to_record(),
                 **({'conditioning': self._conditioning().to_dict()} if self._conditioning().mode != 'off' else {})}
 
-    def _save_session(self, policy=None):
+    def _save_session(self, policy=None, *, validate_only=False, selected_path=None):
         """Record shared inputs, results and any staged frames with the fit policy: when frames are
         prepared, a row calibrated or imported, a Fit or Refine done (the policy that job took), and
-        at close. A malformed entry leaves the file as it was."""
+        at close. A malformed entry leaves the file as it was. ``validate_only`` encodes without writing."""
         policy = self._fit_policy() if policy is None else policy
         if policy is None:
             return
@@ -2796,10 +2796,17 @@ class CalibrationDialog(QtWidgets.QDialog):
                         energy_eV=self._distance_energy_eV, held=self._distance_held,
                         warning=self._distance_warning, provenance=self._distance_record(beam))
                    if beam is not None else None)
-        resume = CalibrationSessionResume(self.settings(), self.fit,
+        setup = self.settings()
+        if validate_only and selected_path is not None:
+            # Size only: committed identities have a path and two 64-character hashes. These placeholders
+            # are never adopted or written; the post-save session records the actual committed identity.
+            setup['loaded_calibration'] = (str(selected_path), '0' * 64, '0' * 64)
+        resume = CalibrationSessionResume(setup, self.fit,
             self._fit_source if self.fit is not None else None, beam, context)
-        self.session_dir.mkdir(parents=True, exist_ok=True)
         arm = self._frame_motors if self.frames else self.geometry_editor.value().stitch_arm()
+        if validate_only:
+            return calibration_session_bytes(self.frames, arm=arm, fit_policy=policy, resume=resume)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
         return save_calibration_session(self.session_dir, self.frames, arm=arm, fit_policy=policy, resume=resume)
 
     def _apply_fit_policy(self, policy):
@@ -3287,8 +3294,12 @@ class CalibrationDialog(QtWidgets.QDialog):
                 raise ValueError(self._BUSY_WAIT)
             if self.fit is None:
                 raise ValueError('fit the current controls before saving')
+            if self._finish_after_save and self._save_session(validate_only=True) is None:
+                raise ValueError('Record a valid calibration session before closing.')
             selected = self._save_path(beam=False)
             if selected is not None:
+                if self._finish_after_save and self._save_session(validate_only=True, selected_path=selected) is None:
+                    raise ValueError('Record a valid calibration session before closing.')
                 self._saving = self.fit
                 self._start('save', (self.fit, selected, pair_validation_angles(
                     self.fit, scan_angles=self._scan_angles(self.fit))))

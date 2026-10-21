@@ -154,6 +154,34 @@ def test_complete_calibration_session_resumes_settings_fit_and_direct_beam(tmp_p
     assert b'NaN' not in path.read_bytes()
 
 
+@pytest.mark.parametrize('count', (15883, 30000))
+def test_large_calibration_session_retains_every_residual_within_the_size_limit(tmp_path, count):
+    """The real scan-14 fit has 15,883 points: retain that scale without spending the byte cap on whitespace."""
+    from tests.core.test_stitch_operation import _goniometer_record
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit, CalibrationSessionResume
+    residuals = {'q': np.linspace(.123456789, 12.3456789, count),
+                 'dq': np.sin(np.arange(count)) * .001, 'frame': np.arange(count) % 48,
+                 'kept': np.ones(count, dtype=bool),
+                 'frames': tuple((i, {'del': float(i), 'nu': 0.}) for i in range(48))}
+    fit = CalibrationFit('multigeometry', {'calibration': _goniometer_record(), 'provenance': {
+        'source_motors': {'del_angle': 'del', 'nu_angle': 'nu'}}}, .001, 10., count, 'retained', residuals)
+    source = SourceSpec(tmp_path / 'original.nxs', SourceKind.NEXUS_STACK, entry='experiment',
+                        options={'read_image_kwargs': {'detector_shape': (195, 1475)}})
+    resume = CalibrationSessionResume({'fields': {'calibrant': 'LaB6'}, 'camera': ['z-', 'x+']}, fit, source)
+    path = save_calibration_session(tmp_path, (), resume=resume)
+    raw = path.read_bytes()
+    assert len(json.dumps(json.loads(raw), indent=2).encode('utf-8')) > 1 << 20
+    assert len(raw) <= 1 << 20 if count == 15883 else 1 << 20 < len(raw) <= 2 << 20
+    from xrd_tools.integrate.stitch_calibration import calibration_session_bytes
+    assert calibration_session_bytes((), resume=resume) == raw
+    restored = load_calibration_session(path, with_resume=True)[3]
+    assert restored.setup == resume.setup and restored.matches_source(source)
+    assert restored.fit.asset == fit.asset and restored.fit.n_points == count
+    for key in ('q', 'dq', 'frame', 'kept'):
+        np.testing.assert_array_equal(restored.fit.point_residuals[key], residuals[key])
+    assert restored.fit.point_residuals['frames'] == residuals['frames']
+
+
 def test_complete_calibration_session_rejects_invalid_resume_and_preserves_size_limit(tmp_path):
     from xrd_tools.integrate.stitch_calibration import CalibrationSessionResume
     from tests.core.test_stitch_operation import _goniometer_record
@@ -164,11 +192,17 @@ def test_complete_calibration_session_rejects_invalid_resume_and_preserves_size_
     resume = CalibrationSessionResume({'text': {}}, fit, source)
     path = save_calibration_session(tmp_path, (), resume=resume)
     original = path.read_bytes()
-    for bad in (replace(resume, fit_source=None), replace(resume, setup={'large': 'x' * (1 << 20)}),
+    path.write_text(json.dumps(json.loads(original), indent=2))  # existing pretty-printed version 7 remains readable
+    assert load_calibration_session(path, with_resume=True)[3].matches_source(source)
+    original = path.read_bytes()
+    for bad in (replace(resume, fit_source=None), replace(resume, setup={'large': 'x' * (2 << 20)}),
                 replace(resume, fit=replace(fit, asset={'calibration': {}, 'provenance': {}}))):
         with pytest.raises(ValueError):
             save_calibration_session(tmp_path, (), resume=bad)
         assert path.read_bytes() == original
+    with pytest.raises(ValueError, match=r'calibration session exceeds the size limit \(\d+ bytes; limit 2097152 bytes\)'):
+        save_calibration_session(tmp_path, (), resume=replace(resume, setup={'large': 'x' * (2 << 20)}))
+    assert path.read_bytes() == original
     record = json.loads(original)
     record['resume']['fit']['point_residuals'] = {'q': [1.], 'dq': [], 'frame': [0], 'kept': [True],
                                                 'frames': [[0, {'del': 1., 'nu': 2.}]]}
@@ -183,6 +217,9 @@ def test_complete_calibration_session_rejects_invalid_resume_and_preserves_size_
     record = {'schema': 'xdart.stitch_calibration_session', 'version': 2, 'frames': []}
     path.write_text(json.dumps(record))
     with pytest.raises(ValueError, match='frame count'):
+        load_calibration_session(path)
+    path.write_bytes(b' ' * ((2 << 20) + 1))
+    with pytest.raises(ValueError, match='calibration session exceeds the size limit'):
         load_calibration_session(path)
 
 
