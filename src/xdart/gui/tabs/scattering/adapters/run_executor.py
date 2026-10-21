@@ -3147,6 +3147,14 @@ class StandardRunExecutor:
             if run.display.payloads
             else "Standard"
         )
+        if kind is StandardEventKind.FAILED:
+            diagnostic = receipt.primary or next(iter(receipt.cleanup_failures), None)
+            logger.error(
+                "[RUN-FAILED] output=%s error=%s: %s",
+                run.artifact,
+                diagnostic.type_qualname if diagnostic is not None else "ExecutionError",
+                detail,
+            )
         perf: dict[str, float] = {}
         if run.perf_enabled:
             with run.perf_lock:

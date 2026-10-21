@@ -5314,6 +5314,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self, event: StandardRunEvent
     ) -> None:
         identity = event.run_identity
+        failure_already_presented = (
+            self._progress.terminal and self._lifecycle.phase is RunPhase.FAILED
+        )
         self._clear_live_source_refresh()
         stop_was_requested = (
             self._lifecycle.phase is RunPhase.STOPPING
@@ -5365,12 +5368,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             )
             primary = event.primary
-            if failed and primary is not None and (
-                primary.type_module, primary.type_qualname
-            ) == (EnergyScanRefused.__module__, EnergyScanRefused.__qualname__):
-                # Maintainer, 2026-10-10: "there should be a notification for that with
-                # advice to turn it off to allow processing"; the refusal says what to change.
-                self._open_warning("Energy scan not processed", primary.message)
+            if failed and not failure_already_presented:
+                energy_refused = primary is not None and (
+                    primary.type_module, primary.type_qualname
+                ) == (EnergyScanRefused.__module__, EnergyScanRefused.__qualname__)
+                self._open_warning(
+                    "Energy scan not processed" if energy_refused else "Run failed",
+                    primary.message if primary is not None else self._notice_text,
+                )
             return
         ended = self._lifecycle.execution_ended(
             ExecutionEnded(identity)

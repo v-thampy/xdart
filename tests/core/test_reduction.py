@@ -1272,8 +1272,11 @@ def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
         )
 
     scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
-    with pytest.raises(ValueError, match="mask shape"):
+    with pytest.raises(ValueError, match="mask shape") as mismatch:
         run_reduction(ReductionPlan(mask=np.ones((3, 3), dtype=bool)), scan)
+    assert "(3, 3) does not match image shape (2, 2)" in str(mismatch.value)
+    assert "PONI calibration detector" in str(mismatch.value)
+    assert "selected mask" in str(mismatch.value)
 
     scan = Scan(
         "scan",

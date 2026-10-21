@@ -410,6 +410,34 @@ def _eiger1m_ai():
     return ai
 
 
+@pytest.mark.parametrize("dimension", ["1d", "2d"])
+def test_failed_detector_mask_shape_explains_poni_and_preserves_pyfai_cause(dimension):
+    ai = _eiger1m_ai()
+    image = np.ones((32, 32))
+    integrate = integrate_1d if dimension == "1d" else integrate_2d
+    options = ({"npt": 8, "method": "numpy"} if dimension == "1d"
+               else {"npt_rad": 8, "npt_azim": 4, "method": "csr"})
+    with pytest.raises(ValueError) as failure:
+        integrate(image, ai, **options)
+    message = str(failure.value)
+    assert f"mask shape {ai.detector.mask.shape} does not match image shape (32, 32)" in message
+    assert "PONI calibration detector" in message and "selected mask" in message
+    assert isinstance(failure.value.__cause__, (AssertionError, ValueError, RuntimeError))
+    assert str(failure.value.__cause__) in message
+
+
+def test_successful_2d_numpy_detector_mask_cropping_remains_accepted():
+    # pyFAI's numpy 2D path accepts this by cropping the larger mask. The new
+    # diagnostic must observe failed calls only, never preflight this case.
+    ai = _eiger1m_ai()
+    result = integrate_2d(np.ones((32, 32)), ai, npt_rad=8, npt_azim=4,
+                          method="numpy", correctSolidAngle=False)
+    assert result.intensity.shape == (8, 4)
+    finite = result.intensity[np.isfinite(result.intensity)]
+    assert finite.size > 0
+    np.testing.assert_allclose(finite, 1.0)
+
+
 def test_geometric_gap_mask_unioned_into_explicit_mask_1d():
     """pyFAI applies detector.calc_mask() only for mask=None, and xrd-tools
     ALWAYS passes an explicit mask — so ZERO-filled module gaps were averaged

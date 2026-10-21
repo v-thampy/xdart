@@ -6897,6 +6897,8 @@ def _cached_mask_for_shape(
         if resolved.shape != image_shape:
             raise ValueError(
                 f"{name} shape {resolved.shape} does not match image shape {image_shape}"
+                ". Check that the PONI calibration detector and any selected mask "
+                "match the image dimensions."
             )
         # Session plans were detached synchronously; direct/private callers get
         # the same first-resolved immutable ownership at this boundary.
