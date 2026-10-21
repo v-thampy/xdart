@@ -437,10 +437,10 @@ $LASTEXITCODE
 
 Open representative data, process a scan, select frames, and close normally;
 expect exit 0. The four checks establish basic native-library functionality,
-not full application support or release readiness. Average, Stitch, RSM, and
-reintegration have known Windows portability issues that remain separate from
-installing this environment. Record native results before claiming support for
-those workflows.
+not full application support or release readiness. Finite-save paths for
+Average Scan, Stitch 1D/2D, RSM, and reintegration are implemented; their native
+Windows/SMB publication and GUI behavior still require release qualification.
+These install checks do not qualify those workflows.
 
 The Windows workspace selects NumExpr's non-MKL build because pyFAI 2026.5's
 direct NumExpr calls can produce invalid radial coordinates with the MKL build.
