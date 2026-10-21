@@ -298,8 +298,6 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
 
     shell.apply_state = record_apply_state
     heartbeat_timer = QtCore.QTimer(page)
-    lateness, heartbeat_slot = _heartbeat(heartbeat_timer)
-    del heartbeat_slot
     page.show()
     qapp.processEvents()
 
@@ -308,6 +306,9 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
             qapp,
             lambda: shell.run_controls.startButton.isEnabled(),
         )
+        # Exclude page setup, but measure every interval from Run onward.
+        lateness, heartbeat_slot = _heartbeat(heartbeat_timer)
+        del heartbeat_slot
         heartbeat_timer.start()
         started = time.perf_counter()
         shell.run_controls.startButton.click()
