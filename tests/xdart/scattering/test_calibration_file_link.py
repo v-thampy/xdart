@@ -70,3 +70,70 @@ def test_selected_file_updates_new_and_retained_window_and_same_file_keeps_edits
         close()
         page.deleteLater()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize('page_name', ('RSM', 'Stitch'))
+def test_loaded_geometry_inputs_preserve_manual_values_and_explicit_edits_on_restore(qapp, tmp_path, page_name):
+    from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.integrate.stitch_calibration import (
+        CalibrationSessionResume, load_calibration_session, save_calibration_session,
+    )
+    from tests.xdart.scattering.test_calibration_input_defaults import _dispose, settle
+    from tests.xdart.scattering.test_calibration_quick_chain import _type
+    geometry = tmp_path / 'loaded.json'
+    _geometry(geometry, 90, .5)
+    record = json.loads(geometry.read_text())
+    recorded = float(wavelength_m_to_energy_eV(record['wavelength'])) - 40.
+    record['source_energy_eV'] = recorded
+    geometry.write_text(json.dumps(record))
+    dialog = CalibrationDialog(CalibrationContext(page_name, tmp_path))
+    restored = CalibrationDialog(CalibrationContext(page_name, tmp_path))
+    try:
+        dialog.load_calibration(geometry)
+        settle(dialog)
+        assert dialog._text('rough_energy') == ''
+        assert dialog._rough_arm()['wavelength'] == record['wavelength']
+        assert dialog._rough_arm()['source_energy_eV'] == recorded
+        assert dialog._beam_fit_options()['beam_pixel'] is None
+        original = dialog._text('beam_pixel')
+        dialog.camera.set_value(stitch_camera(ImageOrientation(rotation=270)))
+        assert dialog._text('beam_pixel') != original
+        assert dialog._beam_fit_options()['beam_pixel'] is None
+        # Both page settings and the real session codec retain imported provenance, without rereading the file.
+        saved = dialog.settings()
+        (tmp_path / 'session').mkdir()
+        session = save_calibration_session(tmp_path / 'session', (), resume=CalibrationSessionResume(saved))
+        _, _, _, resume = load_calibration_session(session, with_resume=True)
+        restored.apply_settings(resume.setup)
+        settle(restored)
+        assert restored.settings() == saved
+        assert restored._beam_fit_options()['beam_pixel'] is None
+        assert restored._rough_arm()['wavelength'] == record['wavelength']
+        # Calibrated PONI wavelength is already effective: never add the imported offset again.
+        from xrd_tools.core.containers import PONI
+        from xrd_tools.integrate.refine import ControlFrame
+        from tests.core.test_stitch_guided_calibration import _frames
+        (tmp_path / 'poni').mkdir()
+        control = ControlFrame([1, 2], [3, 4], [0, 0], {'del': 10., 'nu': 2.})
+        restored.frames = _frames(tmp_path / 'poni', (control, control),
+                                 PONI(dist=.5, poni1=.01, poni2=.02, wavelength=.8e-10,
+                                      detector='Pilatus100k'))
+        assert restored._rough_wavelength_A() == pytest.approx(.8, rel=1e-12)
+        restored.frames = ()
+        # A same-value user edit is still deliberate; camera transformations and restore must not erase it.
+        _type(dialog._fields['beam_pixel'], dialog._text('beam_pixel'))
+        expected = tuple(map(float, dialog._text('beam_pixel').split(',')))
+        _type(dialog._fields['rough_energy'], repr(recorded / 1000))
+        dialog.load_calibration(geometry)  # same-file reopening keeps both deliberate inputs
+        assert dialog._beam_fit_options()['beam_pixel'] == expected
+        assert dialog._rough_wavelength_A() == pytest.approx(record['wavelength'] * 1e10, rel=1e-12)
+        restored.apply_settings(dialog.settings())
+        assert restored._beam_fit_options()['beam_pixel'] == expected
+        assert restored._text('rough_energy') == dialog._text('rough_energy')
+    finally:
+        # Return the fixture's camera before closing: its unsaved-setup confirmation is unrelated to this row.
+        dialog.camera.set_value(stitch_camera(ImageOrientation(rotation=90)))
+        for window in (dialog, restored):
+            window.close()
+            _dispose(window)

@@ -548,6 +548,53 @@ def test_quick_calibrates_the_real_17_2_pair_with_the_windows_defaults(qapp, tmp
     assert {path.name: path.stat().st_mtime_ns for path in data.iterdir()} == before
 
 
+@pytest.mark.parametrize('clear_imported_beam', (False, True))
+def test_quick_rerun_keeps_loaded_energy_offset_and_finds_the_scan_strip(qapp, tmp_path, clear_imported_beam):
+    """A fitted wavelength is not the recorded energy; the normal-incidence pixel is not a scan strip."""
+    pair = _stitch_pair(tmp_path / 'data')
+    recorded = float(wavelength_m_to_energy_eV(WAVELENGTH)) - 40.
+    for source in (pair.beam, pair.ring):
+        source.write_text(source.read_text().replace('#O0 del nu', '#O0 del  nu  energy').replace(
+            '#P0 0 0', f'#P0 0 0 {recorded!r}'))
+    geometry = tmp_path / 'loaded.json'
+    geometry.write_text(json.dumps(dict(pair.truth, source_energy_eV=recorded)))
+    page, dialog = _page_with_dialog(tmp_path / 'project')
+    try:
+        card = _quick_card(dialog)
+        _configure(dialog, card, pair, camera=UPRIGHT_CAMERA, energy=False)
+        assert dialog._source_energy_eV == pytest.approx(recorded)
+        geometry.with_suffix('.json.provenance.json').write_text(json.dumps({
+            'image_rotation': dialog._orientation().rotation,
+            'image_flip': dialog._orientation().flip_horizontal,
+            'instrument_geometry': dialog.geometry_editor.value().to_record(),
+            'source_motors': {'del_angle': 'del', 'nu_angle': 'nu'},
+        }))
+        dialog.load_calibration(geometry)
+        dialog.refine_energy.setChecked(False)
+        if clear_imported_beam:  # Independently expose the energy defect after the original step-1 refusal.
+            dialog._fields['beam_pixel'].selectAll()
+            QTest.keyClick(dialog._fields['beam_pixel'], QtCore.Qt.Key.Key_Backspace)
+        _wait(dialog)
+        status = _run(dialog, card)
+        assert card.status.text().startswith('Done'), (status, card.status.text())
+        assert dialog._text('rough_energy') == ''
+        assert dialog._source_energy_eV == pytest.approx(recorded)
+        assert dialog._distance_result.used.all()
+        calibration = dialog.fit.asset['calibration']
+        assert calibration['wavelength'] == pytest.approx(WAVELENGTH, rel=1e-12, abs=0)
+        assert calibration['source_energy_eV'] == pytest.approx(recorded)
+        assert 'energy_refinement' not in dialog.fit.asset['provenance']
+        assert dialog.fit.rms_q < .005
+        assert dialog._calibration_fit_window.pattern_view.status.text() == 'Calibrant preview complete.'
+        # A deliberate acquisition override is retained, and genuinely different recorded inputs still refuse.
+        _commit(dialog._fields['rough_energy'], f'{(recorded + 500.) / 1000:.12g}')
+        status = _run(dialog, card)
+        assert card.status.text().startswith('Stopped at 3'), status
+        assert 'source energy and calibration wavelength differ' in card.status.text()
+    finally:
+        _close(qapp, page, dialog)
+
+
 def test_quick_chain_resumes_then_saves_and_uses_geometry(qapp, tmp_path, monkeypatch):
     """Q2: on a matched pair Quick fits the direct-beam scan (no motion warning), reads the calibrant's metadata and
     refines from the rough geometry. Its common session restores the completed fit without rerunning it; the

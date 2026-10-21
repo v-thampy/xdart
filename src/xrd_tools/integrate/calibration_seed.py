@@ -40,7 +40,7 @@ def calibration_seed_inputs(path, *, fallback_instrument):
     """
     from xrd_tools.core.geometry import Diffractometer, ImageOrientation
     from xrd_tools.core.geometry.camera import stitch_camera
-    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.core.energy import calibration_recorded_energy_eV, wavelength_m_to_energy_eV
     from xrd_tools.session.instrument import InstrumentGeometry
     path = Path(path).resolve()
     identity = calibration_file_identity(path)
@@ -56,6 +56,10 @@ def calibration_seed_inputs(path, *, fallback_instrument):
     if arm is None:
         raise ValueError('this older independent-angle geometry has no supported detector arm')
     energy_eV = float(wavelength_m_to_energy_eV(calibration.poni.wavelength))
+    energy_record = {'wavelength': calibration.poni.wavelength}
+    recorded = calibration_recorded_energy_eV(record)
+    if recorded is not None:
+        energy_record['source_energy_eV'] = recorded
     zeros = arm.motor_zeros()
     motors, instrument_zeros = dict(geometry.motors), dict(geometry.zeros)
     for circle in geometry.circles:
@@ -78,7 +82,7 @@ def calibration_seed_inputs(path, *, fallback_instrument):
     return dict(identity=identity, instrument=geometry, calibration_kind=provenance.get('calibration_kind'),
                 camera=stitch_camera(orientation), detector=turned.get('detector', calibration.poni.detector),
                 orientation=int(calibration.detector_config.get('orientation', 3)),
-                distance_m=distance, beam_px=(column, row), energy_eV=energy_eV,
+                distance_m=distance, beam_px=(column, row), energy_eV=energy_eV, energy_record=energy_record,
                 mount_deg=tuple(map(math.degrees, (arm.mount_tilt, arm.mount_roll))))
 
 
