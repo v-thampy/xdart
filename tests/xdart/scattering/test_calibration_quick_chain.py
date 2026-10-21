@@ -633,6 +633,17 @@ def test_quick_chain_resumes_then_saves_and_uses_geometry(qapp, tmp_path, monkey
         assert dialog.isVisible() and window.isVisible() and not dialog.active()
         assert not dialog.session_dir.exists() and session.read_bytes() == prior_session
         assert not saved and _calibration_files(tmp_path / 'project') == []
+        # A long old output identity must not block saving the same data to a shorter new path.
+        dialog.fit = replace(retained_fit, message='')
+        short_target = dialog.project_root / 'x.json'
+        short_size = len(dialog._save_session(validate_only=True, selected_path=short_target))
+        dialog.fit = replace(retained_fit, message='x' * ((2 << 20) - short_size - 8))
+        old_identity = (str(dialog.project_root / ('old-calibration-' * 12 + '.json')), 'a' * 64, 'b' * 64)
+        dialog._loaded_calibration_identity = old_identity
+        assert len(dialog._save_session(validate_only=True)) <= 2 << 20
+        assert len(dialog._save_session(validate_only=True, selected_path=short_target)) <= 2 << 20
+        assert dialog.settings()['loaded_calibration'] == old_identity
+        dialog._loaded_calibration_identity = retained_identity
         # A selected output path adds its identity to the final session. Check that growth before writing too.
         dialog.fit = replace(retained_fit, message='')
         current = dialog._save_session(validate_only=True)

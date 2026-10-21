@@ -2797,10 +2797,12 @@ class CalibrationDialog(QtWidgets.QDialog):
                         warning=self._distance_warning, provenance=self._distance_record(beam))
                    if beam is not None else None)
         setup = self.settings()
-        if validate_only and selected_path is not None:
+        if validate_only:
             # Size only: committed identities have a path and two 64-character hashes. These placeholders
             # are never adopted or written; the post-save session records the actual committed identity.
-            setup['loaded_calibration'] = (str(selected_path), '0' * 64, '0' * 64)
+            # Before the picker, omit the old identity: a shorter new path may fit where it did not.
+            setup['loaded_calibration'] = (None if selected_path is None else
+                                          (str(selected_path), '0' * 64, '0' * 64))
         resume = CalibrationSessionResume(setup, self.fit,
             self._fit_source if self.fit is not None else None, beam, context)
         arm = self._frame_motors if self.frames else self.geometry_editor.value().stitch_arm()
