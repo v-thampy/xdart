@@ -626,8 +626,9 @@ def test_an_independent_angle_page_geometry_does_not_become_the_refinement_seed(
 
 
 def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the_pyfai_file(qapp, tmp_path, monkeypatch):
-    """Was: the window's XU extended fit. Now Save checks the partner on every frame of the scan
-    whose metadata was read; a fit xrayutilities cannot take is saved and adopted without one."""
+    """Was: the window's XU extended fit. Now Save checks the partner on the calibrant frames and a
+    grid over the range of the scan frames whose metadata was read (it checked every one of them until
+    2026-10-21); a fit xrayutilities cannot take is saved and adopted without one."""
     (tmp_path / 'frames').mkdir()
     frames = _guided_frames(tmp_path)
     dialog = CalibrationDialog(CalibrationContext('Stitch', tmp_path))
@@ -647,7 +648,13 @@ def test_the_xrayutilities_file_is_checked_over_the_scan_and_a_refusal_keeps_the
         assert adopted == [(str(target), 'multigeometry')], dialog.status.text()
         provenance = json.loads((tmp_path / 'calibration' / 'arm.xu.json.provenance.json').read_text())
         transfer = provenance['xu_transfer']
-        assert transfer['validation_frames'] == len(ANGLES) and transfer['max_abs_dq_A^-1'] <= 1e-8
+        calibrant = {(frame['motors']['del'], frame['motors']['nu']) for frame in dialog.fit.asset['provenance']['frames']}
+        dels, nus = sorted({d for d, _n in ANGLES}), sorted({n for _d, n in ANGLES})
+        grid = {(d, n) for d in np.linspace(dels[0], dels[-1], 7).tolist() for n in np.linspace(nus[0], nus[-1], 7).tolist()}
+        assert transfer['validation_frames'] == len(calibrant | grid) and transfer['max_abs_dq_A^-1'] <= 1e-8
+        asset = json.loads((tmp_path / 'calibration' / 'arm.xu.json').read_text())
+        assert asset['validation']['validated_scan_domain_source_deg'] == {
+            'del': [dels[0], dels[-1]], 'nu': [nus[0], nus[-1]]}  # the scan's range, as before
         # the partner records its instrument too (Codex round 11 residual)
         assert provenance['instrument_geometry'] == dialog.geometry_editor.value().to_record()
         dialog.scales.setChecked(True)

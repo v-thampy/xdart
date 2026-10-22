@@ -1351,10 +1351,12 @@ def xu_partner_path(path) -> Path:
 def pair_validation_angles(fit: CalibrationFit, *, scan_angles=(), domain=None, grid=7):
     """The (del, nu) circle angles an xrayutilities partner is checked on, a held circle at 0.
 
-    The calibrant frames the fit used, every scan frame whose angles are given (``scan_angles``,
-    (del, nu) pairs) and a ``grid`` × ``grid`` grid over ``domain`` ({'del': [lo, hi], 'nu': [lo, hi]},
-    the range the calibration is to serve; a circle left out spans the other angles). The partner
-    is admitted only where it was checked.
+    The calibrant frames the fit used and a ``grid`` × ``grid`` grid over the range they, the scan's
+    frames (``scan_angles``, (del, nu) pairs) and ``domain`` ({'del': [lo, hi], 'nu': [lo, hi]}, the
+    range the calibration is to serve) span. The partner is admitted on that range, and Stitch takes
+    any frame inside it; both models are smooth in the angles, so the grid checks the range as every
+    scan frame did, in a fraction of the time (maintainer, 2026-10-21: a 287-frame scan took 23-25 s
+    to save on Windows).
     """
     motors = fit.asset['provenance']['source_motors']
     del_motor, nu_motor = motors.get('del_angle'), motors.get('nu_angle')
@@ -1363,20 +1365,20 @@ def pair_validation_angles(fit: CalibrationFit, *, scan_angles=(), domain=None, 
         return 0.0 if motor is None else float(values[motor])
     angles = [(circle(frame['motors'], del_motor), circle(frame['motors'], nu_motor))
               for frame in fit.asset['provenance']['frames']]
-    angles += [(0.0 if del_motor is None else float(d), 0.0 if nu_motor is None else float(n)) for d, n in scan_angles]
-    if not angles and not domain:
+    spanned = angles + [(0.0 if del_motor is None else float(d), 0.0 if nu_motor is None else float(n))
+                        for d, n in scan_angles]
+    if not spanned and not domain:
         # A manually typed rough geometry has no scan coverage. Check its analytical transfer
         # near zero; use the run's explicit extrapolation option for unvalidated poses.
-        angles = [(d, n) for d in ((-1., 0., 1.) if del_motor else (0.,))
-                  for n in ((-1., 0., 1.) if nu_motor else (0.,))]
-    if domain:
-        steps = {}
-        for column, (name, motor) in enumerate((('del', del_motor), ('nu', nu_motor))):
-            # a circle with no range and no frames (a direct-beam calibration with nu at 0) is held at 0
-            limits = domain.get(name) or ([min(a[column] for a in angles), max(a[column] for a in angles)]
-                                          if angles else None)
-            steps[name] = [0.0] if motor is None or limits is None else np.linspace(*map(float, limits), grid).tolist()
-        angles += [(d, n) for d in steps['del'] for n in steps['nu']]
+        return [(d, n) for d in ((-1., 0., 1.) if del_motor else (0.,))
+                for n in ((-1., 0., 1.) if nu_motor else (0.,))]
+    steps = {}
+    for column, (name, motor) in enumerate((('del', del_motor), ('nu', nu_motor))):
+        # a circle with no range and no frames (a direct-beam calibration with nu at 0) is held at 0
+        values = [*map(float, (domain or {}).get(name) or ()), *(a[column] for a in spanned)]
+        steps[name] = ([0.0] if motor is None or not values
+                       else np.linspace(min(values), max(values), grid).tolist())
+    angles += [(d, n) for d in steps['del'] for n in steps['nu']]
     return list(dict.fromkeys(angles))
 
 

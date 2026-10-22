@@ -425,7 +425,8 @@ def test_an_impossible_recorded_energy_is_no_energy(tmp_path, recorded, expected
 
 def test_a_saved_fit_writes_its_xrayutilities_partner_bound_by_hash(tmp_path):
     """Always both (maintainer, 2026-09-29): the pyFAI file, then its xrayutilities partner beside it,
-    checked on the calibrant frames, the scan's frames and the typed range, and bound to the pyFAI bytes."""
+    checked on the calibrant frames and a grid over the range they, the scan's frames and the typed range span,
+    and bound to the pyFAI bytes."""
     from xrd_tools.analysis.xu_stitch_calibration import XuStitchCalibrationInput, capture_xu_stitch_calibration
     from xrd_tools.integrate.stitch_calibration import (
         pair_validation_angles, paired_xu_calibration, save_calibration_pair,
@@ -435,7 +436,7 @@ def test_a_saved_fit_writes_its_xrayutilities_partner_bound_by_hash(tmp_path):
     fit = fit_calibration(frames, distance_bounds_m=(.37, .41))
     domain = {'del': [5., 42.], 'nu': [-11., 17.]}
     angles = pair_validation_angles(fit, scan_angles=[(10., 0.), (30., 12.), (6., -10.)], domain=domain)
-    assert len(angles) == 5 + 2 + 49  # the calibrant frames, two more scan frames (one repeats), the grid
+    assert len(angles) == 5 + 49  # the calibrant frames and the grid; the scan's frames only widen its range
     saved = save_calibration_pair(fit, tmp_path / 'calibration' / 'arm.json', validation_angles=angles)
     assert Path(saved.xu_path).name == 'arm.xu.json' and saved.xu_refusal == ''
     assert saved.xu_transfer['method'] == 'formula' and saved.xu_transfer['validation_frames'] == len(angles)
@@ -531,9 +532,26 @@ def test_a_single_arms_partner_is_checked_with_its_held_circle_at_zero(held):
         'source_motors': motors, 'frames': [{'motors': {moving: 10., 'other': 3.}}, {'motors': {moving: 20.}}]}},
         0., 1., 1, '')
     angles = pair_validation_angles(fit, scan_angles=[(30., 7.)], domain={'del': [0., 40.], 'nu': [0., 40.]}, grid=3)
-    expected = ([(10., 0.), (20., 0.), (30., 0.), (0., 0.), (40., 0.)] if held == 'nu'
-                else [(0., 10.), (0., 20.), (0., 7.), (0., 0.), (0., 40.)])
+    expected = ([(10., 0.), (20., 0.), (0., 0.), (40., 0.)] if held == 'nu'
+                else [(0., 10.), (0., 20.), (0., 0.), (0., 40.)])
     assert angles == expected
+
+
+def test_a_long_scans_partner_is_checked_on_a_grid_over_its_range():
+    """287 scan frames took 23-25 s to save on Windows (maintainer, 2026-10-21): the partner is checked on
+    the calibrant frames and a grid over the range the scan spans, which Stitch admits as before."""
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit, pair_validation_angles
+    calibrant = [(12., 3.), (24., 10.), (36., -3.)]
+    fit = CalibrationFit('multigeometry', {'calibration': {}, 'provenance': {
+        'source_motors': {'del_angle': 'del', 'nu_angle': 'nu'},
+        'frames': [{'motors': {'del': d, 'nu': n}} for d, n in calibrant]}}, 0., 1., 1, '')
+    scan = [(float(d), float(n)) for n in np.linspace(-10., 18., 7) for d in np.linspace(6., 46., 41)]
+    angles = pair_validation_angles(fit, scan_angles=scan)
+    grid = [(float(d), float(n)) for d in np.linspace(6., 46., 7) for n in np.linspace(-10., 18., 7)]
+    assert angles == calibrant + grid
+    for column in (0, 1):  # the range Stitch admits is the scan's, as when every frame was checked
+        assert (min(a[column] for a in angles), max(a[column] for a in angles)) == (
+            min(a[column] for a in scan), max(a[column] for a in scan))
 
 
 def test_the_automatic_arm_model_takes_the_extension_when_it_applies_and_says_why_not(tmp_path):
