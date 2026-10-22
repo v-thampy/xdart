@@ -1,5 +1,21 @@
 # Release notes
 
+## 1.2.1 (unreleased)
+
+### Fixes
+
+- **TIFF scans after a packaged install:** 1.2.0 reads each TIFF's header with
+  `tifffile` before a Run, but declared `tifffile` only for development, so
+  `pixi global install xdart` and `pip install xdart` refused TIFF scans with
+  "No module named 'tifffile'". It is now a runtime dependency. On 1.2.0,
+  `pixi global add --environment xdart tifffile` works around it.
+- **Make Mask on Windows network folders:** after saving and checking the mask,
+  Make Mask reported a failure when Windows kept xdart from deleting its
+  temporary folder, and the mask was not selected. xdart now retries the delete
+  for up to 2 seconds. If the folder still stays behind, the saved mask is
+  selected anyway and a warning names the folder and the Windows error; you can
+  delete that folder.
+
 ## 1.2.0 (2026-10-22)
 
 This release brings Stitch 1D, Stitch 2D and reciprocal-space mapping into the
