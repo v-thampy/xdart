@@ -36,6 +36,7 @@ from xdart.gui.tabs.scattering.experiment_authoring import (
     MaskProof,
     MaskRequest,
     MaskResult,
+    mask_leftover_warning,
 )
 from xdart.gui.tabs.scattering.operation_values import (
     OperationCleanupReceipt,
@@ -289,6 +290,29 @@ def test_process_wins_cancel_but_closing_never_issues_confirmation(
     case.owner.consume_close_receipt(_clean_receipt(identity, terminal))
     assert case.owner.lifecycle is AuthoredAssetOwnerLifecycle.CLOSED
     assert case.store.snapshot() == before
+
+
+def test_a_saved_mask_with_a_leftover_stage_warns_and_still_proceeds_to_adoption(
+    tmp_path: Path,
+) -> None:
+    case, identity = _running(tmp_path, "mask")
+    result = replace(
+        case.result, recovery_path=case.result.cwd,
+        recovery_class="unqualified-private-stage",
+        recovery_reason="cleanup could not remove the private stage: builtins.OSError: busy",
+    )
+    transition = case.owner.consume_operation_update(
+        OperationUpdate(identity, terminal=OperationTerminal(
+            identity, OperationTerminalStatus.RETURNED, payload=result,
+        )),
+        case.stamp,
+    )
+    assert transition.warning == mask_leftover_warning(result)
+    assert case.result.cwd in transition.warning and "builtins.OSError: busy" in transition.warning
+    assert transition.notice == "Mask saved; updating Mask File…" and not transition.error
+    assert case.owner.phase is AuthoredAssetPhase.TERMINAL_READY
+    with pytest.raises(ValueError, match="transition is invalid"):
+        AuthoredAssetTransition(warning="a warning needs a refresh")
 
 
 def test_terminal_evidence_is_separate_exact_and_single_use(tmp_path: Path) -> None:

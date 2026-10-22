@@ -1972,6 +1972,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         elif transition.notice:
             _LOG.info("%s", transition.notice)
             self._notice(transition.notice)
+        if transition.warning:
+            _LOG.warning("Temporary folder left behind: %s", transition.warning)
+            self._open_warning("Mask saved; temporary folder left behind", transition.warning)
         if transition.cancel_identity is not None:
             self._workspace_operations.cancel(transition.cancel_identity)
         issue = transition.issue

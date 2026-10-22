@@ -32,6 +32,7 @@ from .experiment_authoring import (
     CalibrationResult,
     MaskRequest,
     authoring_source_context_current,
+    mask_leftover_warning,
     mask_terminal_result_valid,
 )
 from .operation_values import (
@@ -167,11 +168,13 @@ class AuthoredAssetTransition:
     adoption: AuthoredAssetAdoption | None = None
     error: bool = False
     asset_set: tuple[str, str] | None = None
+    warning: str = ""
 
     def __post_init__(self) -> None:
         valid = (
             type(self.refresh) is AuthoredAssetRefreshEffect
             and type(self.notice) is str
+            and type(self.warning) is str
             and type(self.error) is bool
             and (self.asset_set is None or (
                 type(self.asset_set) is tuple and len(self.asset_set) == 2
@@ -227,6 +230,7 @@ class AuthoredAssetTransition:
         if self.refresh is AuthoredAssetRefreshEffect.NONE:
             valid = valid and (
                 self.notice == ""
+                and self.warning == ""
                 and self.asset_set is None
                 and self.issue is None
                 and self.dialog is None
@@ -615,11 +619,16 @@ class AuthoredAssetOwner:
                 AuthoredAssetRefreshEffect.CONTROLS,
                 f"{label} returned without exact publication proof.",
             )
+        # A saved mask can leave its private stage behind; say so whether or not it is adopted.
+        warning = (
+            mask_leftover_warning(terminal.payload) if state.asset == "mask" else ""
+        )
         if update.stale or not _context_current(state, current_stamp):
             self._state = _OpenState()
             return AuthoredAssetTransition(
                 AuthoredAssetRefreshEffect.CONTROLS,
                 "Authored asset finished but context changed; nothing was adopted.",
+                warning=warning,
             )
         evidence_identity = AuthoredAssetEvidenceIdentity(
             self._next_evidence_serial
@@ -653,7 +662,7 @@ class AuthoredAssetOwner:
             else "Mask saved; updating Mask File…"
         )
         return AuthoredAssetTransition(
-            AuthoredAssetRefreshEffect.CONTROLS, notice
+            AuthoredAssetRefreshEffect.CONTROLS, notice, warning=warning,
         )
 
     def issue_confirmation(

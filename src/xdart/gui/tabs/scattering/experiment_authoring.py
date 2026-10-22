@@ -1307,7 +1307,7 @@ class MaskProof:
 class MaskResult:
     request: MaskRequest; private_path: str; proof: MaskProof | None; final_state: SourceFileState | None
     exit_code: int | None; argv: tuple[str, ...]; cwd: str; published: bool; recovery_path: str = ""
-    recovery_class: str = ""; diagnostic: str = ""
+    recovery_class: str = ""; diagnostic: str = ""; recovery_reason: str = ""
 
     def __post_init__(self) -> None:
         if type(self.request) is not MaskRequest:
@@ -1331,7 +1331,11 @@ class MaskResult:
                 or not _bounded_text(self.diagnostic,
                                      _DIAGNOSTIC_BYTES_LIMIT,
                                      allow_empty=True)
+                or not _bounded_text(self.recovery_reason,
+                                     _DIAGNOSTIC_BYTES_LIMIT,
+                                     allow_empty=True)
                 or bool(self.recovery_path) != bool(self.recovery_class)
+                or self.recovery_reason and not self.recovery_path
                 or not self.argv and self.exit_code is not None
                 or self.argv and (
                     self.argv != (self.request.executable,
@@ -1384,9 +1388,11 @@ def mask_terminal_result_valid(
         if result.diagnostic != terminal.diagnostic:
             return False
         if terminal.status is OperationTerminalStatus.RETURNED:
+            # A verified publication stays adoptable when only its private stage
+            # could not be removed; mask_leftover_warning names that stage.
             return (result.published and result.exit_code == 0
                     and result.proof is not None and result.final_state is not None
-                    and not result.diagnostic and not result.recovery_path)
+                    and not result.diagnostic)
         if terminal.status is OperationTerminalStatus.CANCELLED:
             return (not result.published and result.final_state is None
                     and not result.diagnostic and not result.recovery_path)
@@ -1401,6 +1407,13 @@ def mask_terminal_result_valid(
     except (AttributeError, TypeError, ValueError, OverflowError):
         return False
     return False
+def mask_leftover_warning(result: MaskResult) -> str:
+    """Name the private stage a saved mask left behind, or return ""."""
+    if not result.published or not result.recovery_path:
+        return ""
+    reason = f"\n\nReason: {result.recovery_reason}" if result.recovery_reason else ""
+    return (f"The mask was saved and checked, but xdart could not delete its temporary folder:\n{result.cwd}"
+            f"{reason}\n\nYou can delete that folder; the saved mask does not depend on it.")
 def resolve_mask_executable(fixed: str | None = None) -> str | None:
     return _resolve_authoring_executable("pyFAI-drawmask", fixed)
 
@@ -2100,11 +2113,12 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         recovery = _cleanup_at_admitted_parent(
             stage, stage_identity, names + owned, publication_fd,
         )
-    recovery_class = ""
+    recovery_class = custody = ""
     if recovery:
-        status = OperationTerminalStatus.FAILED; recovery_class = "qualified-private-candidate" if proof is not None and private_mask is not None and _mask_matches(proof, private_mask) is not None else "unqualified-private-stage"
+        recovery_class = "qualified-private-candidate" if proof is not None and private_mask is not None and _mask_matches(proof, private_mask) is not None else "unqualified-private-stage"
         recovery = str(private_mask if recovery_class.startswith("qualified") else stage)
-        diagnostic += ("; " if diagnostic else "") + f"private mask custody relinquished ({recovery_class}): {recovery}" + (f"; {cleanup_reason}" if cleanup_reason else "")
+        custody = f"private mask custody relinquished ({recovery_class}): {recovery}" + (f"; {cleanup_reason}" if cleanup_reason else "")
+    else: cleanup_reason = ""
     if published and proof is not None:
         try:
             reconciled = _publication_state(
@@ -2126,13 +2140,18 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
                 final_state = None
         else:
             final_state = reconciled
+    # A verified publication stays RETURNED, and so adoptable, when only its private
+    # stage remains; the result's recovery fields name it (maintainer, 2026-10-22).
+    if recovery and not published: status = OperationTerminalStatus.FAILED
+    if custody and status is OperationTerminalStatus.FAILED:
+        diagnostic += ("; " if diagnostic else "") + custody
     if publication_fd is not None:
         try:
             os.close(publication_fd)
         except OSError:
             pass
     result = MaskResult(request, "" if private_mask is None else str(private_mask), proof, final_state, code, argv,
-        "" if stage is None else str(stage), published, recovery, recovery_class, diagnostic)
+        "" if stage is None else str(stage), published, recovery, recovery_class, diagnostic, cleanup_reason)
     return OperationTerminal(identity, status, diagnostic, result)
 __all__ = [
     "AssetValidationRequest", "AssetValidationResult",
@@ -2141,7 +2160,7 @@ __all__ = [
     "ExistingMaskProof", "MaskProof", "MaskRequest", "MaskResult",
     "authoring_source_context_current",
     "calibration_candidate_current", "qualify_calibration_candidate",
-    "mask_terminal_result_valid",
+    "mask_leftover_warning", "mask_terminal_result_valid",
     "prepare_calibration_request", "resolve_calibration_executable",
     "prepare_mask_request", "resolve_mask_executable", "run_calibration",
     "run_mask", "validate_authored_asset",

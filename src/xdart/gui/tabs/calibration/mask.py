@@ -1,5 +1,6 @@
 """Mask authoring through the established exact-frame child workflow: the window every page opens to
 draw a detector mask on one of its original frames."""
+import logging
 from pathlib import Path
 
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -7,6 +8,8 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.gui.pages.operation_owner import SingleWorkerOwner, OperationTerminalStatus
 from xdart.gui.pages.values import PageCleanup
 from xdart.gui.widgets.controls_panel import FormRow
+
+_LOG = logging.getLogger(__name__)
 
 
 class MaskDialog(QtWidgets.QDialog):
@@ -80,7 +83,7 @@ class MaskDialog(QtWidgets.QDialog):
     def _run(request, cancelled, publish):
         from xrd_tools.integrate.stitch_calibration import capture_calibration_frames
         from xdart.gui.tabs.scattering.experiment_authoring import (
-            prepare_mask_request, run_mask, mask_terminal_result_valid,
+            prepare_mask_request, run_mask, mask_leftover_warning, mask_terminal_result_valid,
         )
         from xdart.gui.tabs.scattering.operation_values import OperationIdentity
         source, frame, folder, rotation = request
@@ -97,7 +100,7 @@ class MaskDialog(QtWidgets.QDialog):
             return None
         if terminal.status.value != "returned":
             raise ValueError(terminal.diagnostic or "Mask was not saved")
-        return terminal.payload.request.final_path
+        return terminal.payload.request.final_path, mask_leftover_warning(terminal.payload)
 
     def begin(self):
         if self._source is None or not self._project_root:
@@ -133,8 +136,11 @@ class MaskDialog(QtWidgets.QDialog):
             self.frame.setEnabled(not self._closing)
             terminal = update.terminal
             if terminal.status is OperationTerminalStatus.RETURNED and terminal.payload:
-                self.status.setText(f"Saved: {terminal.payload}")
-                self.maskSaved.emit(terminal.payload)
+                path, warning = terminal.payload
+                if warning:
+                    _LOG.warning("Temporary folder left behind: %s", warning)
+                self.status.setText(f"Saved: {path}" + (f"\n\n{warning}" if warning else ""))
+                self.maskSaved.emit(path)
             else:
                 self.status.setText(terminal.failure_message or "Mask editor closed without a saved mask")
             if self._closing:

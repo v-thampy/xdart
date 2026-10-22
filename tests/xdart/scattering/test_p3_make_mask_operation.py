@@ -859,17 +859,29 @@ def test_private_stage_cleanup_names_a_changed_stage_and_keeps_it(tmp_path) -> N
     assert recovery == str(stage) and kept.read_bytes() == b"mask"
     assert reason == f"private stage changed: identity (0, 0) became {(status.st_dev, status.st_ino)}"
 @pytest.mark.parametrize("windows", (False, True))
-def test_published_mask_cleanup_refusal_names_the_blocked_step(tmp_path, monkeypatch, windows) -> None:
+def test_a_held_private_copy_keeps_the_saved_mask_and_names_the_reason(tmp_path, monkeypatch, windows) -> None:
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
     monkeypatch.setattr(authoring, "_WINDOWS", windows); monkeypatch.setattr(authoring.time, "sleep", lambda _seconds: None)
     clock = iter(range(1000)); monkeypatch.setattr(authoring, "_monotonic", lambda: next(clock) * 0.25)
     _refuse(monkeypatch, "unlink", lambda path: path.parent.name.startswith(".xdart-mask-") and path.name.endswith("-mask.edf"), 32)
     terminal, _ = _direct(request); result = terminal.payload
-    assert terminal.status is OperationTerminalStatus.FAILED and result.published
+    assert terminal.status is OperationTerminalStatus.RETURNED and not terminal.diagnostic and result.published
     assert result.recovery_class == "qualified-private-candidate" and Path(result.recovery_path).exists()
-    assert terminal.diagnostic == (
-        f"private mask custody relinquished (qualified-private-candidate): {result.recovery_path}; cleanup could not "
-        f"delete {Path(result.recovery_path).name}: builtins.PermissionError: [Errno 13] held by another process")
+    assert result.recovery_reason == (
+        f"cleanup could not delete {Path(result.recovery_path).name}: builtins.PermissionError: [Errno 13] held by another process")
+    assert authoring.mask_leftover_warning(result) == (
+        f"The mask was saved and checked, but xdart could not delete its temporary folder:\n{result.cwd}\n\n"
+        f"Reason: {result.recovery_reason}\n\nYou can delete that folder; the saved mask does not depend on it.")
+def test_unsaved_mask_with_a_held_stage_still_fails_with_custody_and_reason(tmp_path, monkeypatch) -> None:
+    request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8), code=7)
+    _refuse(monkeypatch, "rmdir", lambda path: path.name.startswith(".xdart-mask-"))
+    terminal, _ = _direct(request); result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.FAILED and not result.published and result.final_state is None
+    assert result.recovery_class == "unqualified-private-stage" and result.recovery_path == result.cwd
+    assert terminal.diagnostic.endswith(
+        f"private mask custody relinquished (unqualified-private-stage): {result.cwd}; cleanup could not remove "
+        "the private stage: builtins.PermissionError: [Errno 13] held by another process")
+    assert authoring.mask_leftover_warning(result) == ""
 def test_windows_publication_outlasts_a_brief_lock_on_the_private_mask(tmp_path, monkeypatch) -> None:
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
     monkeypatch.setattr(authoring, "_WINDOWS", True); monkeypatch.setattr(authoring.time, "sleep", lambda _seconds: None)
@@ -963,6 +975,12 @@ def test_mask_proof_nested_facts_and_terminal_payload_matrix_are_strict(
             terminal, result.request,
         ) is (status is OperationTerminalStatus.RETURNED)
 
+    leftover = replace(result, recovery_path=result.private_path,
+                       recovery_class="qualified-private-candidate",
+                       recovery_reason="cleanup could not delete source-mask.edf: builtins.PermissionError: held")
+    assert authoring.mask_terminal_result_valid(OperationTerminal(
+        identity, OperationTerminalStatus.RETURNED, payload=leftover,
+    ), result.request)
     for changes in (
         {"exit_code": 7},
         {"argv": ()},
@@ -970,6 +988,7 @@ def test_mask_proof_nested_facts_and_terminal_payload_matrix_are_strict(
         {"diagnostic": "unpaired"},
         {"published": False},
         {"recovery_path": str(tmp_path), "recovery_class": ""},
+        {"recovery_reason": "a reason without a stage"},
     ):
         forged = _forge(result, **changes)
         assert not authoring.mask_terminal_result_valid(
@@ -1324,22 +1343,23 @@ def test_busy_delete_later_autonomously_closes_after_worker_join(
             qapp.processEvents()
 
 
-def test_failed_published_mask_terminal_preserves_output_and_recovery_without_adoption(
+def test_saved_mask_with_a_leftover_stage_is_adopted_with_a_warning(
     tmp_path, monkeypatch, qapp,
 ) -> None:
+    """Maintainer, 2026-10-22: a verified, saved mask is selected even when its private stage stays behind."""
     request = _request(tmp_path, monkeypatch)
     _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    reason = "cleanup could not delete chosen-mask.edf: builtins.PermissionError: held"
     monkeypatch.setattr(
-        authoring, "_cleanup", lambda stage, *_args: (str(stage), ""),
+        authoring, "_cleanup", lambda stage, *_args: (str(stage), reason),
     )
     terminal, _progress = _direct(request)
     result = terminal.payload
-    assert terminal.status is OperationTerminalStatus.FAILED
-    assert result.published and result.recovery_path
+    assert terminal.status is OperationTerminalStatus.RETURNED
+    assert not terminal.diagnostic and result.published and result.recovery_reason == reason
     assert result.recovery_class == "qualified-private-candidate"
     assert Path(request.final_path).exists()
     assert Path(result.recovery_path).exists()
-    assert authoring.mask_terminal_result_valid(terminal, request)
 
     prior = str(tmp_path / "prior-mask.edf")
     store = RunIntentStore(RunIntent(mask_file=prior))
@@ -1347,23 +1367,36 @@ def test_failed_published_mask_terminal_preserves_output_and_recovery_without_ad
         intents=store, lifecycle=ScatteringCoordinator(),
         sources=FilesystemSourceAdapter(),
     )
+    warnings = []
+    monkeypatch.setattr(page, "_open_warning", lambda title, detail: warnings.append((title, detail)))
     try:
-        stamp = page._operation_context_stamp(store.revision)
-        page._authored_assets.adopt_operation(
-            "mask", request, stamp, terminal.identity,
-        )
-        assert page._consume_authored_asset_update(OperationUpdate(
-            terminal.identity, terminal=terminal,
-        ))
-        assert page._authored_assets.phase is AuthoredAssetPhase.IDLE
-        assert page._authored_asset_dialog is None
-        assert store.revision == 0
-        assert store.snapshot().thaw().mask_file == prior
-        assert Path(request.final_path).exists()
+        _queue_published_mask(page, store, terminal.identity, result)
+        assert warnings == [("Mask saved; temporary folder left behind",
+                             authoring.mask_leftover_warning(result))]
+        assert result.cwd in warnings[0][1] and reason in warnings[0][1]
+        _begin_mask_validation(page)
+        update = _finish_mask_validation(page)
+        assert update.terminal.status is OperationTerminalStatus.RETURNED
+        assert store.snapshot().thaw().mask_file == request.final_path
         assert Path(result.recovery_path).exists()
-        assert "failed" in page._notice_text.lower()
     finally:
         _close(page, qapp)
+
+
+def test_mask_window_shows_a_leftover_stage_and_still_hands_back_the_saved_mask(qapp, tmp_path) -> None:
+    from xdart.gui.pages.operation_owner import OperationTerminalStatus as WorkerStatus
+    from xdart.gui.tabs.calibration.mask import MaskDialog
+    dialog = MaskDialog(tmp_path); saved = []
+    dialog.maskSaved.connect(saved.append)
+    terminal = SimpleNamespace(status=WorkerStatus.RETURNED, payload=("/data/a-mask.edf", "Leftover warning"))
+    dialog._worker.poll = lambda _identity: SimpleNamespace(progress=None, terminal=terminal)
+    try:
+        dialog._poll()
+        assert saved == ["/data/a-mask.edf"]
+        assert dialog.status.text() == "Saved: /data/a-mask.edf\n\nLeftover warning"
+    finally:
+        dialog.shutdown()
+        dialog.deleteLater()
 
 
 def test_mask_stale_and_context_drift_preserve_field_and_published_file(
