@@ -2579,16 +2579,11 @@ class StitchPage(QtWidgets.QWidget):
     def _publish_results(self, current):
         """The Data Browser's Results: every result listed, ``current`` current (silent, as a blocked list)."""
         previous = self.browser.current_result()
-        selected = self.browser.selected_results()
         self.browser.directory_label.set_path(self._result_browser.directory or "")
         self.browser.reconcile_results(
             self._result_browser.entries(self._listed), current)
         if previous is not None and self.browser.current_result() is None:
-            self._update_residency()
             self._current_result_changed()
-        elif selected != self.browser.selected_results():
-            self._update_residency()
-            self._draw()
 
     def _current_payload(self):
         key = self.browser.current_result()

@@ -657,6 +657,7 @@ def test_viewer_1d_cross_context_switch_and_workspace_close_are_positive(tmp_pat
     phase_view = ScientificView()
     workspace = SimpleNamespace(_context_controller=controller,
         _shell=SimpleNamespace(browser=SimpleNamespace(
+            set_filename_mode=lambda _mode: None,
             reconcile_detector_mode=lambda _projection: None,
             reconcile_heavy_residency=lambda *_args, **_kwargs: None), scientific=SimpleNamespace(
             clear_viewer_1d=clear_viewer,

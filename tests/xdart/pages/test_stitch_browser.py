@@ -140,7 +140,14 @@ def test_stitch_overlay_selection_stepping_and_read_back_live_in_ints_browser(qa
         assert page.browser.current_result() == paths[1]
         assert set(page.browser.selected_results()) == set(paths)
         assert set(page._payloads) == set(paths) and len(page.curve.listDataItems()) == 3
+        # a filter narrows the other rows, never what is shown: the overlay's results all stay
         page.browser.filename_filter.setText(Path(paths[1]).name)
+        assert set(page.browser.listed_results()) == set(paths)
+        assert page.browser.current_result() == paths[1] and set(page.browser.selected_results()) == set(paths)
+        assert len(page.curve.listDataItems()) == 3 and set(page._listed) == set(paths)
+        select_path(paths[1], select.ClearAndSelect)  # the overlay down to the current result
+        _wait(page, qapp)
+        page.browser.set_filename_filter(Path(paths[1]).name)  # the same text, applied again
         assert page.browser.listed_results() == (paths[1],)
         assert page.browser.current_result() == paths[1] and page.browser.selected_results() == (paths[1],)
         assert len(page.curve.listDataItems()) == 1 and set(page._listed) == set(paths)
@@ -274,7 +281,7 @@ def test_results_not_yet_catalogued_take_the_catalogs_place(qapp, tmp_path, monk
 def test_native_browser_filename_filter_refresh_navigation_and_time(qapp, tmp_path, kind):
     from xdart.gui.tabs.rsm.page import RSMPage
     page = (StitchPage if kind == "stitch" else RSMPage)(empty_host_services(_Status()))
-    expected = "_stitch1d" if kind == "stitch" else "_rsm"
+    expected = "_stitch1d, _stitch2d" if kind == "stitch" else "_rsm"  # Stitch 1D shows a 2D record's I(q)
     for index, name in enumerate(("a_stitch1d.nexus", "b_rsm.nexus", "c_int1d.nexus"), 1):
         target = tmp_path / name
         target.write_bytes(b"catalog only; scientific admission remains strict")
@@ -325,3 +332,42 @@ def test_native_browser_filename_filter_refresh_navigation_and_time(qapp, tmp_pa
             close_rsm(page, qapp)
         else:
             _close(page, qapp)
+
+
+def test_a_result_not_yet_catalogued_lists_as_the_newest_in_time_order(qapp, tmp_path):
+    """Time order (newly offered in Stitch and RSM): a result just written but not yet catalogued sorts first, where
+    the catalog will put it, so no row moves when the catalog lands (it listed last, then jumped to the top)."""
+    from xdart.gui.tabs.scattering.browser_view import ResultDirectoryBrowser
+    for index, name in enumerate(("a_stitch1d.nexus", "b_stitch1d.nexus"), 1):
+        (tmp_path / name).write_bytes(b"catalog only")
+        os.utime(tmp_path / name, ns=(index * 1_000_000_000, index * 1_000_000_000))
+    browser = BrowserView()
+    bridge = ResultDirectoryBrowser(browser, processing_mode="Stitch 1D")
+
+    def settle():
+        deadline = time.monotonic() + 10
+        while bridge.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        qapp.processEvents()
+        assert not bridge.busy
+    try:
+        bridge.set_directory(str(tmp_path))
+        settle()
+        bridge.set_date_sorted(True)
+        settle()
+        written = tmp_path / "c_stitch1d.nexus"
+        written.write_bytes(b"catalog only")
+        pending = [entry.label for entry in bridge.entries([str(written)])]
+        bridge.refresh()
+        settle()
+        assert pending == [entry.label for entry in bridge.entries([str(written)])] == [
+            "..", "c_stitch1d.nexus", "b_stitch1d.nexus", "a_stitch1d.nexus"]
+    finally:
+        deadline = time.monotonic() + 10
+        while not bridge.close() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert bridge.close()
+        browser.deleteLater()
+        qapp.processEvents()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, replace
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
@@ -461,9 +462,11 @@ class ResultDirectoryBrowser(QtCore.QObject):
     def entries(self, loaded):
         catalog = self._owner.catalog
         known = {entry.artifact for entry in catalog}
-        # A loaded result not yet catalogued stays visible without a filesystem read.
-        # The next catalog supplies its timestamp through the existing async owner.
-        catalog += tuple(BrowserCatalogEntry(path, os.path.basename(path), 0) for path in loaded
+        # A loaded result not yet catalogued stays visible without a filesystem read. It was just written or
+        # opened, so it sorts as the newest until the next catalog supplies its timestamp: Time order then
+        # moves no row when it lands (it listed last, then jumped to the top).
+        now = time.time_ns()
+        catalog += tuple(BrowserCatalogEntry(path, os.path.basename(path), now) for path in loaded
                          if path not in known and (not self._active
                          or os.path.dirname(os.path.abspath(path)) == self.directory))
         index = build_browser_scan_index(catalog, self._owner.date_sorted)
@@ -852,7 +855,8 @@ class BrowserView(QtWidgets.QFrame):
         self.filename_filter.setToolTip(
             "Filter filenames by literal text, ignoring case. Separate alternatives with commas. "
             "The untouched default matches operation suffixes before the extension; edited text matches "
-            "anywhere in the filename. Clear to show all results. Folders always remain visible.")
+            "anywhere in the filename. Clear to show all results. Folders, and the results being viewed, "
+            "always remain listed.")
         self.filename_filter.setAccessibleName("Filter result filenames")
         self.filename_filter.hide()  # only scientific processing modes opt in
         self.filename_filter.textChanged.connect(self._filename_edited)
@@ -892,7 +896,8 @@ class BrowserView(QtWidgets.QFrame):
         tokens = {
             "Int 1D": ("int-1d", "int-2d", "reintegrate-1d", "average"),
             "Int 2D": ("int-2d", "reintegrate-2d", "average"),
-            "Stitch 1D": ("stitch-1d",), "Stitch 2D": ("stitch-2d",), "RSM": ("rsm",),
+            # Stitch 1D shows a Stitch 2D record's I(q), as Int 1D shows an Int 2D record's
+            "Stitch 1D": ("stitch-1d", "stitch-2d"), "Stitch 2D": ("stitch-2d",), "RSM": ("rsm",),
         }.get(mode, ())
         enabled = bool(tokens) and self.profile.heading
         self.filename_filter.setVisible(enabled)
@@ -904,6 +909,14 @@ class BrowserView(QtWidgets.QFrame):
             self.filename_filter.setText(", ".join(FINITE_OPERATION_SLOTS[token] for token in tokens))
             del blocker
         self._refilter()
+
+    def set_filename_filter(self, text: str) -> None:
+        """The filter as a person types it (empty: All results); mode defaults no longer replace it."""
+        self._filename_custom = True
+        if self.filename_filter.text() != text:
+            self.filename_filter.setText(text)  # textChanged refilters
+        else:
+            self._refilter()
 
     def reveal_filename(self, path: str) -> None:
         """Explicit Open keeps renamed/custom files reachable through the All results escape."""
@@ -955,7 +968,9 @@ class BrowserView(QtWidgets.QFrame):
         self._source_results = entries, current
         terms = self._filename_terms()
         if terms:
-            entries = tuple(entry for entry in entries if entry.is_directory
+            # The results being viewed stay listed: the filter narrows the others, never what is shown.
+            pinned = {current, *(item.data(_USER_ROLE) for item in self.scans.selectedItems())}
+            entries = tuple(entry for entry in entries if entry.is_directory or entry.identifier in pinned
                             or self._filename_matches(entry.label, terms))
         blocker = QtCore.QSignalBlocker(self.scans)
         selected = {item.data(_USER_ROLE) for item in self.scans.selectedItems()}
@@ -1171,11 +1186,14 @@ class BrowserView(QtWidgets.QFrame):
     ) -> None:
         prior = self._source_projection
         terms = self._filename_terms()
-        policy = terms, self._filename_custom
+        # The scans being viewed stay listed: the filter narrows the others, never what is shown, so the
+        # list, its frames and the plot cannot disagree.
+        pinned = frozenset((state.selected_scan, *state.selected_artifacts)) if terms else frozenset()
+        policy = terms, self._filename_custom, pinned
         if prior is not None and prior[0].scans is state.scans and policy == self._projected_filename_terms:
             scans = self._scans
         elif terms:
-            scans = tuple(scan for scan in state.scans if scan.is_directory
+            scans = tuple(scan for scan in state.scans if scan.is_directory or scan.identifier in pinned
                           or self._filename_matches(scan.label, terms))
             if len(scans) == len(state.scans):
                 scans = state.scans
@@ -1184,11 +1202,7 @@ class BrowserView(QtWidgets.QFrame):
         self._source_projection = state, navigation, plot_mode
         self._projected_filename_terms = policy
         if scans != state.scans:
-            visible = {scan.identifier for scan in scans if not scan.is_directory}
-            state = replace(state, scans=scans,
-                            selected_scan=state.selected_scan if state.selected_scan in visible else "",
-                            selected_artifacts=tuple(path for path in state.selected_artifacts if path in visible),
-                            frames=state.frames if state.selected_scan in visible else ())
+            state = replace(state, scans=scans)
         authoritative_changed = (
             self._has_committed_navigation
             and (

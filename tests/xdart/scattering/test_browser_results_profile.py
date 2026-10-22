@@ -252,7 +252,7 @@ def test_a_profile_refuses_an_unknown_selection_and_frames_without_results(qapp)
 @pytest.mark.parametrize("mode,tokens", [
     ("Int 1D", ("int-1d", "int-2d", "reintegrate-1d", "average")),
     ("Int 2D", ("int-2d", "reintegrate-2d", "average")),
-    ("Stitch 1D", ("stitch-1d",)), ("Stitch 2D", ("stitch-2d",)), ("RSM", ("rsm",)),
+    ("Stitch 1D", ("stitch-1d", "stitch-2d")), ("Stitch 2D", ("stitch-2d",)), ("RSM", ("rsm",)),
 ])
 def test_filename_filter_projects_real_catalog_and_keeps_navigation(qapp, tmp_path, monkeypatch, mode, tokens):
     """The filename hint changes resident rows, never catalog admission or scientific reads."""
@@ -307,16 +307,22 @@ def test_filename_filter_projects_real_catalog_and_keeps_navigation(qapp, tmp_pa
 
 
 def test_untouched_filename_default_follows_mode_and_explicit_open_reveals_custom(qapp):
+    """The untouched default follows the mode; the result being viewed stays listed through it (the filter
+    narrows the other rows, never what is shown); an explicit Open of a renamed file shows All results."""
     browser = BrowserView(profile=_STITCH_LIKE)
     commands = []
     browser.commandRequested.connect(commands.append)
     entries = tuple(BrowserResult(name, name) for name in (
         "one_stitch1d.nexus", "two_stitch2d.nexus", "renamed.nexus"))
     try:
-        browser.set_filename_mode("Stitch 1D")
+        browser.set_filename_mode("Stitch 1D")  # a Stitch 2D record's I(q) shows there too
         browser.reconcile_results(entries, entries[0].identifier)
-        assert browser.listed_results() == (entries[0].identifier,)
-        browser.set_filename_mode("Stitch 2D")
+        assert browser.listed_results() == (entries[0].identifier, entries[1].identifier)
+        browser.set_filename_mode("Stitch 2D")  # the Stitch 1D result being viewed stays, current
+        assert browser.listed_results() == (entries[0].identifier, entries[1].identifier)
+        assert browser.current_result() == entries[0].identifier
+        browser.clear_result_selection()
+        browser.reconcile_results(entries, None)  # no longer viewed: the mode's rows only
         assert browser.listed_results() == (entries[1].identifier,)
         assert browser.current_result() is None and browser.selected_results() == ()
         browser.reveal_filename("renamed.nexus")
@@ -327,5 +333,32 @@ def test_untouched_filename_default_follows_mode_and_explicit_open_reveals_custo
         browser.filename_filter.setText("stitch")
         browser.filename_filter.clear()
         assert browser.current_result() is None and browser.selected_results() == ()
+    finally:
+        _close(qapp, browser)
+
+
+def test_the_viewed_scan_and_its_frames_stay_listed_through_the_filter(qapp):
+    """In Int the filter narrows the other rows, never the scan being viewed: its row and its frames stay, as do
+    an overlay's selected scans, so the list, its frames and the plot cannot disagree (a mode switch or typing
+    used to hide the shown scan and empty its frames while the plot kept it)."""
+    from dataclasses import replace
+    from xdart.gui.tabs.scattering.shell_values import BrowserScan, FrameNavigationProjection
+    from tests.xdart.scattering.e3_shell_support import make_shell_projection
+    projection = make_shell_projection(frame_count=4)
+    state = replace(projection.browser, scans=(*projection.browser.scans,
+                                               BrowserScan("x_int2d.nexus", "x_int2d.nexus", "x_int2d.nexus")))
+    names = lambda: [browser.scans.item(i).text() for i in range(browser.scans.count())]
+    browser = BrowserView()
+    try:
+        browser.set_filename_mode("Int 2D")
+        browser.reconcile(state, FrameNavigationProjection(), plot_mode="Single")
+        assert names() == ["scan-a", "x_int2d.nexus"] and browser.scans.currentItem().text() == "scan-a"
+        assert browser.frame_model.rowCount() == len(state.frames) == 4
+        overlay = replace(state, selected_artifacts=("scan-a", "scan-b"), multi_artifact_selection=True)
+        browser.reconcile(overlay, FrameNavigationProjection(), plot_mode="Overlay")
+        assert names() == ["scan-a", "scan-b", "x_int2d.nexus"]
+        moved = replace(state, selected_scan="x_int2d.nexus", frames=())
+        browser.reconcile(moved, FrameNavigationProjection(), plot_mode="Single")
+        assert names() == ["x_int2d.nexus"]
     finally:
         _close(qapp, browser)

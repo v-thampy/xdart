@@ -324,6 +324,7 @@ def _mount(
         sources=FilesystemSourceAdapter(),
         executor=executor,
     )
+    page._shell.browser.set_filename_filter("")  # arbitrary fixture names: All results (the mode defaults are tested in test_browser_results_profile)
     page.show()
     app.processEvents()
     return _MountedRig(

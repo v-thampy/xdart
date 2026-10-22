@@ -21,6 +21,7 @@ def qapp():
 @pytest.fixture
 def burst(tmp_path, monkeypatch, qapp):
     page, _store, seed, original = _loaded_page(tmp_path, monkeypatch, qapp)
+    page._shell.browser.set_filename_filter("")  # arbitrary fixture names: All results (the mode defaults are tested in test_browser_results_profile)
     paths = tuple(
         seed.target.with_name(f"browse-{name}.nexus")
         for name in ("active", "skipped", "latest", "newest")

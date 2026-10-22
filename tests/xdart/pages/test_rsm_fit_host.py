@@ -85,7 +85,8 @@ def test_lineout_batch_is_lazy_project_scoped_and_keeps_scalar_rows(qapp, tmp_pa
     try:
         page._rows['project_root'].editor.setText(str(tmp_path))
         # The results list shows one folder since 063fc88f, so both results share it.
-        first, second = payload(tmp_path, name='one.nexus'), payload(tmp_path, name='two.nexus')
+        # RSM's own results: the RSM page lists `_rsm` names by default (the Data Browser's filename filter)
+        first, second = payload(tmp_path, name='one_rsm.nexus'), payload(tmp_path, name='two_rsm.nexus')
         page._add_result(first.inspection.path, first, show=False)
         page._add_result(second.inspection.path, second)
         catalog(page, qapp)
@@ -125,7 +126,7 @@ def test_listed_order_and_the_lineout_batch_hold_when_the_catalog_lands(qapp, tm
     page = RSMPage(empty_host_services(_Status()))
     try:
         page._rows['project_root'].editor.setText(str(tmp_path))
-        results = [payload(tmp_path, name=f'{name}.nexus') for name in ('two', 'one', 'three')]
+        results = [payload(tmp_path, name=f'{name}_rsm.nexus') for name in ('two', 'one', 'three')]
         for result in results:
             page._add_result(result.inspection.path, result, show=False)
         assert entered.wait(10)

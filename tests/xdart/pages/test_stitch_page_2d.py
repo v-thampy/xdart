@@ -227,7 +227,11 @@ def test_a_stitch_2d_shows_its_map_as_int_2d_without_the_raw_pane(qapp, tmp_path
         # and in Stitch 2D a Stitch 1D result shows in Int 2D's layout, its I(q) below an empty map
         page.apply_settings(document)
         assert page._mode == "Stitch 2D" and not page._map_card.isHidden()
-        page.results.setCurrentRow(rows[page._owner.prepared.request.module.output.target])
+        one_d_target = page._owner.prepared.request.module.output.target
+        assert one_d_target not in page.browser.listed_results()  # Stitch 2D lists its own results by default
+        page.browser.set_filename_filter("")  # All results
+        rows = {page.results.item(row).data(role): row for row in range(page.results.count())}
+        page.results.setCurrentRow(rows[one_d_target])
         _wait(page, qapp)
         assert page._current_payload().kind is AnalysisArtifactKind.STITCH_1D
         state = page._last_map_state
