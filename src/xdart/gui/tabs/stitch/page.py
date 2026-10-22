@@ -547,12 +547,12 @@ class StitchPage(QtWidgets.QWidget):
         self.browser = BrowserView(profile=BrowserProfile(
             menus=(("File", ("Open Folder", "Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
             raw_resolution_menus=False, list_caption="Results", directory=True, frames=True,
-            frames_caption="Frames", actions=("Open…", "Metadata", "Raw image"), date_sort=False, refresh=True,
+            frames_caption="Frames", actions=("Open…", "Metadata", "Raw image"), date_sort=True, refresh=True,
             results=True, result_selection="extended", result_frames=True,
         ))
         self.browser.commandRequested.connect(self._browser_command)
         self._listed = []  # the results listed, in the order they came
-        self._result_browser = ResultDirectoryBrowser(self.browser)
+        self._result_browser = ResultDirectoryBrowser(self.browser, processing_mode=self._mode)
         self._result_browser.changed.connect(lambda: self._publish_results(self.browser.current_result()))
         self._result_browser.notice.connect(lambda text: self._status(text, ready=False))
         self.tools = ToolsView(page_tools=(
@@ -666,6 +666,7 @@ class StitchPage(QtWidgets.QWidget):
         del blocker
         if mode != self._mode:
             self._mode = mode
+            self.browser.set_filename_mode(mode)
             self._map_card.setVisible(mode == "Stitch 2D")
             self.advanced.setWindowTitle(f"Advanced — {mode}")
             self._edited()  # a prepared plan is another mode's; readiness checks this one
@@ -2353,6 +2354,7 @@ class StitchPage(QtWidgets.QWidget):
             path = picks[0] if picks else ""
         if not path:
             return
+        self.browser.reveal_filename(str(path))
         if not completion_message:  # Append follows the existing browser policy when the result is mounted.
             self._result_browser.set_directory(str(Path(path).absolute().parent))
         self._view_revision += 1
@@ -2552,6 +2554,8 @@ class StitchPage(QtWidgets.QWidget):
             self._result_browser.set_directory(value)
         elif kind is ShellCommandKind.REFRESH_BROWSER:
             self._result_browser.refresh()
+        elif kind is ShellCommandKind.SET_DATE_SORT:
+            self._result_browser.set_date_sorted(value)
         elif kind is ShellCommandKind.MENU and value == "File:Open Folder":
             self._result_browser.request()
         elif kind is ShellCommandKind.SELECT_RESULT:
@@ -2575,11 +2579,16 @@ class StitchPage(QtWidgets.QWidget):
     def _publish_results(self, current):
         """The Data Browser's Results: every result listed, ``current`` current (silent, as a blocked list)."""
         previous = self.browser.current_result()
+        selected = self.browser.selected_results()
         self.browser.directory_label.set_path(self._result_browser.directory or "")
         self.browser.reconcile_results(
             self._result_browser.entries(self._listed), current)
         if previous is not None and self.browser.current_result() is None:
+            self._update_residency()
             self._current_result_changed()
+        elif selected != self.browser.selected_results():
+            self._update_residency()
+            self._draw()
 
     def _current_payload(self):
         key = self.browser.current_result()

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.themes.spacing import current_spacing_tokens
 from xdart.utils.throttle import Coalescer
 
-from .browser_catalog import catalog_order_key
+from .browser_catalog import BrowserCatalogEntry
 from .browser_model import FrameListModel
 from .display_values import DisplayFrameKey
 from .shell_values import (
@@ -19,6 +19,7 @@ from .shell_values import (
     FrameNavigationProjection,
     ShellCommand,
     ShellCommandKind,
+    build_browser_scan_index,
 )
 
 
@@ -404,13 +405,15 @@ class ResultDirectoryBrowser(QtCore.QObject):
     notice = QtCore.Signal(str)
     _catalogReady = QtCore.Signal(object)
 
-    def __init__(self, browser):
+    def __init__(self, browser, *, processing_mode=""):
         super().__init__(browser)
         from .processed_browser import ProcessedBrowserOwner
         self.browser = browser
         self._active = False
-        self._owner = ProcessedBrowserOwner(save_path="", processing_mode="Int 2D",
+        self._owner = ProcessedBrowserOwner(save_path="", processing_mode=processing_mode,
                                             deliver=self._catalogReady.emit)
+        browser.set_filename_mode(processing_mode)
+        browser.filenameFilterChanged.connect(self.changed.emit)
         self._catalogReady.connect(self._consume)
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(1500)
@@ -447,20 +450,30 @@ class ResultDirectoryBrowser(QtCore.QObject):
     def refresh(self):
         self._owner.request_catalog()
 
+    def set_date_sorted(self, requested):
+        if self._owner.set_date_sorted(requested):
+            self.changed.emit()
+
     @property
     def busy(self):
         return self._owner.active_request is not None or self._owner.queued_request is not None
 
     def entries(self, loaded):
-        entries = [BrowserResult(entry.artifact, entry.label, entry.artifact,
-                                 is_directory=entry.is_directory) for entry in self._owner.catalog]
-        known = {entry.identifier for entry in entries}
-        entries.extend(BrowserResult(path, os.path.basename(path), path) for path in loaded
-                       if path not in known and (not self._active
-                       or os.path.dirname(os.path.abspath(path)) == self.directory))
-        if self._active:  # a result the catalog has not read yet sits where it will list it: no row moves when it lands
-            entries.sort(key=lambda entry: catalog_order_key(entry.label, entry.is_directory))
-        return tuple(entries)
+        catalog = self._owner.catalog
+        known = {entry.artifact for entry in catalog}
+        # A loaded result not yet catalogued stays visible without a filesystem read.
+        # The next catalog supplies its timestamp through the existing async owner.
+        catalog += tuple(BrowserCatalogEntry(path, os.path.basename(path), 0) for path in loaded
+                         if path not in known and (not self._active
+                         or os.path.dirname(os.path.abspath(path)) == self.directory))
+        index = build_browser_scan_index(catalog, self._owner.date_sorted)
+        if self._active and not self._owner.date_sorted:
+            from .browser_catalog import catalog_order_key
+            scans = sorted(index.scans, key=lambda entry: catalog_order_key(entry.label, entry.is_directory))
+        else:
+            scans = index.scans
+        return tuple(BrowserResult(entry.identifier, entry.label, entry.detail,
+                                   is_directory=entry.is_directory) for entry in scans)
 
     def _consume(self, wake):
         self._apply(self._owner.consume_catalog(wake))
@@ -482,6 +495,7 @@ class ResultDirectoryBrowser(QtCore.QObject):
 
 class BrowserView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
+    filenameFilterChanged = QtCore.Signal()
     #: A user changed independent checks: the checked identities in list order; reconciliation emits nothing.
     checksChanged = QtCore.Signal(object)
     #: A user committed a row's number (a ``result_values`` profile): its identity and value; projection is silent.
@@ -512,6 +526,11 @@ class BrowserView(QtWidgets.QFrame):
         self._row_values: dict[str, tuple[float, bool, str]] = {}
         self._value_editors: dict[str, QtWidgets.QDoubleSpinBox] = {}
         self._results: tuple[BrowserResult, ...] = ()
+        self._filename_mode = ""
+        self._filename_custom = False
+        self._source_results = None
+        self._source_projection = None
+        self._projected_filename_terms = None
         self.setObjectName("e3BrowserView")
         self.setMinimumWidth(255 if self.profile.heading else 0)
         self._scans = ()
@@ -823,6 +842,20 @@ class BrowserView(QtWidgets.QFrame):
         self.date_sort = QtWidgets.QPushButton("Time")
         self.date_sort.setObjectName("e3BrowserCompactButton")
         self.date_sort.setCheckable(True)
+        self.date_sort.setToolTip("Sort by most recently modified time; turn off for name order.")
+        self.date_sort.setAccessibleName("Sort by time")
+        self.filename_filter = QtWidgets.QLineEdit()
+        self.filename_filter.setObjectName("browserFilenameFilter")
+        self.filename_filter.setPlaceholderText("All results")
+        self.filename_filter.setClearButtonEnabled(True)
+        self.filename_filter.setMinimumWidth(60)
+        self.filename_filter.setToolTip(
+            "Filter filenames by literal text, ignoring case. Separate alternatives with commas. "
+            "The untouched default matches operation suffixes before the extension; edited text matches "
+            "anywhere in the filename. Clear to show all results. Folders always remain visible.")
+        self.filename_filter.setAccessibleName("Filter result filenames")
+        self.filename_filter.hide()  # only scientific processing modes opt in
+        self.filename_filter.textChanged.connect(self._filename_edited)
         self.refresh = QtWidgets.QToolButton()
         self.refresh.setObjectName("e3RefreshBrowser")
         self.refresh.setIcon(
@@ -836,6 +869,7 @@ class BrowserView(QtWidgets.QFrame):
             QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly
         )
         row.addWidget(title, 1)
+        row.addWidget(self.filename_filter, 1)
         row.addWidget(self.date_sort)
         row.addWidget(self.refresh)
         if not self.profile.date_sort:
@@ -852,6 +886,62 @@ class BrowserView(QtWidgets.QFrame):
         )
         return row
 
+    def set_filename_mode(self, mode: str) -> None:
+        """Untouched defaults follow the processing mode; an explicit edit (including empty) wins."""
+        from xrd_tools.io.output_path import FINITE_OPERATION_SLOTS
+        tokens = {
+            "Int 1D": ("int-1d", "int-2d", "reintegrate-1d", "average"),
+            "Int 2D": ("int-2d", "reintegrate-2d", "average"),
+            "Stitch 1D": ("stitch-1d",), "Stitch 2D": ("stitch-2d",), "RSM": ("rsm",),
+        }.get(mode, ())
+        enabled = bool(tokens) and self.profile.heading
+        self.filename_filter.setVisible(enabled)
+        if mode == self._filename_mode:
+            return
+        self._filename_mode = mode
+        if not self._filename_custom:
+            blocker = QtCore.QSignalBlocker(self.filename_filter)
+            self.filename_filter.setText(", ".join(FINITE_OPERATION_SLOTS[token] for token in tokens))
+            del blocker
+        self._refilter()
+
+    def reveal_filename(self, path: str) -> None:
+        """Explicit Open keeps renamed/custom files reachable through the All results escape."""
+        if not self._matches_filename(os.path.basename(path)):
+            self.filename_filter.clear()
+
+    def _matches_filename(self, name: str) -> bool:
+        return self._filename_matches(name, self._filename_terms())
+
+    def _filename_matches(self, name: str, terms: tuple[str, ...]) -> bool:
+        if not terms:
+            return True
+        folded = name.casefold()
+        if self._filename_custom:
+            return any(term in folded for term in terms)
+        return os.path.splitext(folded)[0].endswith(terms)
+
+    def _filename_terms(self) -> tuple[str, ...]:
+        return (() if self.filename_filter.isHidden() else tuple(
+            term.strip().casefold() for term in self.filename_filter.text().split(",") if term.strip()))
+
+    def _filename_edited(self, _text) -> None:
+        self._filename_custom = True
+        self._refilter()
+
+    def _refilter(self) -> None:
+        if self._source_results is not None:
+            self._source_results = self._source_results[0], self.current_result()
+        # Native result pages reconcile first so their current-result lifecycle sees
+        # the old selection before a filtered row disappears.
+        self.filenameFilterChanged.emit()
+        if self._source_projection is not None:
+            state, navigation, plot_mode = self._source_projection
+            self.reconcile(state, navigation, plot_mode=plot_mode)
+        if self._source_results is not None:
+            entries, current = self._source_results
+            self.reconcile_results(entries, current)
+
     def reconcile_results(
         self, entries: tuple[BrowserResult, ...], current: str | None,
     ) -> None:
@@ -862,6 +952,11 @@ class BrowserView(QtWidgets.QFrame):
         entries = tuple(entries)
         if any(type(entry) is not BrowserResult for entry in entries):
             raise TypeError("results must be exact BrowserResult entries")
+        self._source_results = entries, current
+        terms = self._filename_terms()
+        if terms:
+            entries = tuple(entry for entry in entries if entry.is_directory
+                            or self._filename_matches(entry.label, terms))
         blocker = QtCore.QSignalBlocker(self.scans)
         selected = {item.data(_USER_ROLE) for item in self.scans.selectedItems()}
         previous = self.current_result()
@@ -886,6 +981,8 @@ class BrowserView(QtWidgets.QFrame):
         del blocker
 
     def _result_selected(self, current, _previous) -> None:
+        if self._source_results is not None:
+            self._source_results = self._source_results[0], self.current_result()
         if current is not None and not current.data(_DIRECTORY_ROLE):
             self._emit(ShellCommandKind.SELECT_RESULT, current.data(_USER_ROLE))
 
@@ -1027,6 +1124,8 @@ class BrowserView(QtWidgets.QFrame):
         """No entry selected or current, as a user clearing the list would (its commands are emitted)."""
         self.scans.clearSelection()
         self.scans.setCurrentRow(-1)
+        if self._source_results is not None:
+            self._source_results = self._source_results[0], None
 
     def reconcile_result_frames(
         self, entries: tuple[BrowserResult, ...], current: str | None,
@@ -1070,6 +1169,26 @@ class BrowserView(QtWidgets.QFrame):
         *,
         plot_mode: str,
     ) -> None:
+        prior = self._source_projection
+        terms = self._filename_terms()
+        policy = terms, self._filename_custom
+        if prior is not None and prior[0].scans is state.scans and policy == self._projected_filename_terms:
+            scans = self._scans
+        elif terms:
+            scans = tuple(scan for scan in state.scans if scan.is_directory
+                          or self._filename_matches(scan.label, terms))
+            if len(scans) == len(state.scans):
+                scans = state.scans
+        else:
+            scans = state.scans
+        self._source_projection = state, navigation, plot_mode
+        self._projected_filename_terms = policy
+        if scans != state.scans:
+            visible = {scan.identifier for scan in scans if not scan.is_directory}
+            state = replace(state, scans=scans,
+                            selected_scan=state.selected_scan if state.selected_scan in visible else "",
+                            selected_artifacts=tuple(path for path in state.selected_artifacts if path in visible),
+                            frames=state.frames if state.selected_scan in visible else ())
         authoritative_changed = (
             self._has_committed_navigation
             and (

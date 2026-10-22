@@ -140,6 +140,13 @@ def test_stitch_overlay_selection_stepping_and_read_back_live_in_ints_browser(qa
         assert page.browser.current_result() == paths[1]
         assert set(page.browser.selected_results()) == set(paths)
         assert set(page._payloads) == set(paths) and len(page.curve.listDataItems()) == 3
+        page.browser.filename_filter.setText(Path(paths[1]).name)
+        assert page.browser.listed_results() == (paths[1],)
+        assert page.browser.current_result() == paths[1] and page.browser.selected_results() == (paths[1],)
+        assert len(page.curve.listDataItems()) == 1 and set(page._listed) == set(paths)
+        page.browser.filename_filter.clear()
+        assert set(page.browser.listed_results()) == set(paths)
+        assert page.browser.current_result() == paths[1] and page.browser.selected_results() == (paths[1],)
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Single"))
         _wait(page, qapp)  # Single: the current result alone, read back if it was let go
         assert page.browser.selected_results() == (paths[1],) and page.browser.current_result() == paths[1]
@@ -161,6 +168,8 @@ def test_a_catalog_result_opens_through_the_native_stitch_reader(qapp, tmp_path)
         while page._result_browser.busy and time.monotonic() < deadline:
             qapp.processEvents()
             time.sleep(.005)
+        assert str(path) not in page.browser.listed_results()  # the fixture has a custom filename
+        page.browser.filename_filter.clear()  # All results retains explicit catalog loading
         assert str(path) in page.browser.listed_results()
         assert page.browser.current_result() is None and not page._payloads
         page.browser.set_current_result(str(path), keep_selection=False)
@@ -259,3 +268,60 @@ def test_results_not_yet_catalogued_take_the_catalogs_place(qapp, tmp_path, monk
         assert bridge.close() and inactive.close()
         browser.deleteLater()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize("kind", ("stitch", "rsm"))
+def test_native_browser_filename_filter_refresh_navigation_and_time(qapp, tmp_path, kind):
+    from xdart.gui.tabs.rsm.page import RSMPage
+    page = (StitchPage if kind == "stitch" else RSMPage)(empty_host_services(_Status()))
+    expected = "_stitch1d" if kind == "stitch" else "_rsm"
+    for index, name in enumerate(("a_stitch1d.nexus", "b_rsm.nexus", "c_int1d.nexus"), 1):
+        target = tmp_path / name
+        target.write_bytes(b"catalog only; scientific admission remains strict")
+        os.utime(target, ns=(index * 1_000_000_000, index * 1_000_000_000))
+    (tmp_path / "folder").mkdir()
+    try:
+        assert not page.browser.date_sort.isHidden()
+        assert page.browser.filename_filter.text() == expected
+        page._result_browser.set_directory(str(tmp_path))
+        deadline = time.monotonic() + 5
+        while page._result_browser.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert [Path(path).name for path in page.browser.listed_results()] == [
+            "a_stitch1d.nexus" if kind == "stitch" else "b_rsm.nexus"]
+        catalog = page._result_browser._owner.catalog
+        page.browser.filename_filter.clear()
+        assert [Path(path).name for path in page.browser.listed_results()] == [
+            "a_stitch1d.nexus", "b_rsm.nexus", "c_int1d.nexus"]
+        page.browser.date_sort.click()
+        deadline = time.monotonic() + 5
+        while page._result_browser.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert [Path(path).name for path in page.browser.listed_results()] == [
+            "c_int1d.nexus", "b_rsm.nexus", "a_stitch1d.nexus"]
+        assert page.browser.scans.item(0).text() == ".."
+        page._result_browser.refresh()
+        deadline = time.monotonic() + 5
+        while page._result_browser.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert page.browser.filename_filter.text() == ""
+        assert {entry.artifact for entry in catalog} == {
+            entry.artifact for entry in page._result_browser._owner.catalog}
+        page.browser.filename_filter.setText("INT1D")
+        assert [Path(path).name for path in page.browser.listed_results()] == ["c_int1d.nexus"]
+        page._result_browser.set_directory(str(tmp_path / "folder"))
+        deadline = time.monotonic() + 5
+        while page._result_browser.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert page.browser.filename_filter.text() == "INT1D"
+        assert page.browser.scans.item(0).text() == ".."
+    finally:
+        if kind == "rsm":
+            from tests.xdart.pages.test_rsm_page import _close as close_rsm
+            close_rsm(page, qapp)
+        else:
+            _close(page, qapp)

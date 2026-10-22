@@ -247,3 +247,81 @@ def test_a_profile_refuses_an_unknown_selection_and_frames_without_results(qapp)
         BrowserView(profile=BrowserProfile(results=True, result_selection="multiple"))
     with pytest.raises(ValueError):
         BrowserView(profile=BrowserProfile(result_frames=True))
+
+
+@pytest.mark.parametrize("mode,tokens", [
+    ("Int 1D", ("int-1d", "int-2d", "reintegrate-1d", "average")),
+    ("Int 2D", ("int-2d", "reintegrate-2d", "average")),
+    ("Stitch 1D", ("stitch-1d",)), ("Stitch 2D", ("stitch-2d",)), ("RSM", ("rsm",)),
+])
+def test_filename_filter_projects_real_catalog_and_keeps_navigation(qapp, tmp_path, monkeypatch, mode, tokens):
+    """The filename hint changes resident rows, never catalog admission or scientific reads."""
+    import h5py
+    from xrd_tools.io.output_path import FINITE_OPERATION_SLOTS
+    from xdart.gui.tabs.scattering.browser_catalog import enumerate_processed_artifacts
+    from xdart.gui.tabs.scattering.shell_values import (
+        BrowserProjection, FrameNavigationProjection, build_browser_scan_index,
+    )
+    for slot in FINITE_OPERATION_SLOTS.values():
+        (tmp_path / f"sample{slot}.nexus").write_bytes(b"not an admitted scientific record")
+    (tmp_path / "CUSTOM[ABC].nexus").write_bytes(b"not HDF5")
+    (tmp_path / "sample_rsm_middle_int2d.nexus").write_bytes(b"catalog only")
+    (tmp_path / "folder").mkdir()
+    catalog = enumerate_processed_artifacts(str(tmp_path))
+    state = BrowserProjection(directory=str(tmp_path), scans=build_browser_scan_index(catalog, False).scans)
+    browser = BrowserView()
+    try:
+        browser.set_filename_mode(mode)
+        assert browser.filename_filter.text() == ", ".join(FINITE_OPERATION_SLOTS[token] for token in tokens)
+        assert browser.filename_filter.isClearButtonEnabled()
+        assert browser.filename_filter.toolTip() and browser.filename_filter.accessibleName()
+        assert browser._root_layout.itemAt(1).layout().indexOf(browser.filename_filter) + 1 == (
+            browser._root_layout.itemAt(1).layout().indexOf(browser.date_sort))
+        browser.reconcile(state, FrameNavigationProjection(), plot_mode="Single")
+        names = lambda: [browser.scans.item(i).text() for i in range(browser.scans.count())]
+        expected = {"..", "folder/", *(f"sample{FINITE_OPERATION_SLOTS[token]}.nexus" for token in tokens)}
+        if "int-2d" in tokens:
+            expected.add("sample_rsm_middle_int2d.nexus")
+        assert set(names()) == expected
+        def forbidden(*args, **kwargs):
+            raise AssertionError("filtering must not read files or HDF5")
+        monkeypatch.setattr(h5py, "File", forbidden)
+        monkeypatch.setattr("os.scandir", forbidden)
+        browser.filename_filter.setText("custom[abc], _RSM")
+        assert set(names()) == {"..", "folder/", "CUSTOM[ABC].nexus", "sample_rsm.nexus",
+                                "sample_rsm_middle_int2d.nexus"}
+        browser.set_filename_mode("Int 2D" if mode != "Int 2D" else "RSM")
+        browser.reconcile(state, FrameNavigationProjection(), plot_mode="Single")
+        assert browser.filename_filter.text() == "custom[abc], _RSM"
+        browser.filename_filter.clear()
+        assert len(names()) == len(catalog)
+        browser.set_filename_mode(mode)
+        browser.reconcile(state, FrameNavigationProjection(), plot_mode="Single")
+        assert browser.filename_filter.text() == "" and len(names()) == len(catalog)
+    finally:
+        _close(qapp, browser)
+
+
+def test_untouched_filename_default_follows_mode_and_explicit_open_reveals_custom(qapp):
+    browser = BrowserView(profile=_STITCH_LIKE)
+    commands = []
+    browser.commandRequested.connect(commands.append)
+    entries = tuple(BrowserResult(name, name) for name in (
+        "one_stitch1d.nexus", "two_stitch2d.nexus", "renamed.nexus"))
+    try:
+        browser.set_filename_mode("Stitch 1D")
+        browser.reconcile_results(entries, entries[0].identifier)
+        assert browser.listed_results() == (entries[0].identifier,)
+        browser.set_filename_mode("Stitch 2D")
+        assert browser.listed_results() == (entries[1].identifier,)
+        assert browser.current_result() is None and browser.selected_results() == ()
+        browser.reveal_filename("renamed.nexus")
+        browser.reconcile_results(entries, "renamed.nexus")
+        assert browser.filename_filter.text() == ""
+        assert browser.current_result() == "renamed.nexus"
+        browser.clear_result_selection()
+        browser.filename_filter.setText("stitch")
+        browser.filename_filter.clear()
+        assert browser.current_result() is None and browser.selected_results() == ()
+    finally:
+        _close(qapp, browser)

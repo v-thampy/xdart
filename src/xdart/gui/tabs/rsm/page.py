@@ -108,7 +108,7 @@ _RSM_MODES = ("RSM",)
 _BROWSER = BrowserProfile(
     menus=(("File", ("Open Folder", "Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
     raw_resolution_menus=False, list_caption="Results", directory=True, frames=False, actions=("Open…", "Metadata"),
-    date_sort=False, refresh=True, results=True,
+    date_sort=True, refresh=True, results=True,
 )
 #: The operation's stages in words (its progress counts frames plus the masks and four steps).
 _STAGE_TEXT = {"revalidate": "Checking the inputs", "static-mask": "Masking hot pixels", "science": "Gridding",
@@ -436,7 +436,7 @@ class RSMPage(QtWidgets.QWidget):
         self.browser = BrowserView(profile=_BROWSER)  # Int's Data Browser (hard rule 14)
         self.browser.metadata.setToolTip("Inspect and plot experimental metadata, including motor positions, "
             "for the displayed RSM's contributors, or the first selected source scan when no result is shown.")
-        self._result_browser = ResultDirectoryBrowser(self.browser)
+        self._result_browser = ResultDirectoryBrowser(self.browser, processing_mode="RSM")
         self._result_browser.changed.connect(self._publish_results)
         self._result_browser.notice.connect(self._notice)
         self.browser.commandRequested.connect(self._browser_command)
@@ -2279,6 +2279,8 @@ class RSMPage(QtWidgets.QWidget):
             self._result_browser.set_directory(command.value)
         elif command.kind is ShellCommandKind.REFRESH_BROWSER:
             self._result_browser.refresh()
+        elif command.kind is ShellCommandKind.SET_DATE_SORT:
+            self._result_browser.set_date_sorted(command.value)
         elif command.kind is ShellCommandKind.MENU and command.value == "File:Open Folder":
             self._result_browser.request()
         elif command.kind is ShellCommandKind.SELECT_RESULT:
@@ -2366,6 +2368,7 @@ class RSMPage(QtWidgets.QWidget):
 
     def reopen(self, path, *, completion_message=""):
         """Read a saved RSM record on the shared single-worker reader, then show it."""
+        self.browser.reveal_filename(str(path))
         identity = self._reader.begin(str(path))
         if identity is None:
             self._notice("A result is still being read")
