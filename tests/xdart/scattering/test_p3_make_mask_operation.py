@@ -823,6 +823,61 @@ def test_stage_first_lstat_failure_reports_recovery_custody(tmp_path, monkeypatc
     monkeypatch.setattr(Path, "lstat", fail_once); terminal, _ = _direct(request)
     assert terminal.status is OperationTerminalStatus.FAILED and terminal.payload.recovery_path == terminal.payload.cwd
     assert failed and Path(terminal.payload.recovery_path).is_dir()
+    assert terminal.diagnostic.endswith("; private stage identity was never captured")
+def _refuse(monkeypatch, method: str, refused, winerror: int | None = None, times: int | None = None) -> list:
+    """Make ``Path.<method>`` refuse paths matching ``refused``, ``times`` times or always."""
+    real, attempts = getattr(Path, method), []
+    def refuse(path, *args, **kwargs):
+        if refused(path) and (times is None or len(attempts) < times):
+            attempts.append(path); error = PermissionError(13, "held by another process")
+            if winerror is not None: error.winerror = winerror
+            raise error
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(Path, method, refuse); return attempts
+@pytest.mark.parametrize(("windows", "method", "winerror", "times", "cleaned"), (
+    (True, "unlink", 32, 2, True), (True, "unlink", 5, 2, True), (True, "rmdir", 145, 2, True),
+    (True, "unlink", 32, None, False), (True, "unlink", 2, 1, False), (False, "unlink", 32, 1, False),
+))
+def test_private_stage_cleanup_outlasts_only_brief_windows_delete_locks(
+    tmp_path, monkeypatch, windows, method, winerror, times, cleaned,
+) -> None:
+    monkeypatch.setattr(authoring, "_WINDOWS", windows); monkeypatch.setattr(authoring.time, "sleep", lambda _seconds: None)
+    clock = iter(range(1000)); monkeypatch.setattr(authoring, "_monotonic", lambda: next(clock) * 0.25)
+    stage = tmp_path / ".xdart-mask-stage"; stage.mkdir(); held = stage / "chosen-mask.edf"; held.write_bytes(b"mask")
+    status = stage.lstat(); target = held if method == "unlink" else stage
+    attempts = _refuse(monkeypatch, method, lambda path: path == target, winerror, times)
+    recovery, reason = authoring._cleanup(stage, (status.st_dev, status.st_ino), (held,))
+    if cleaned:
+        assert (recovery, reason) == ("", "") and not stage.exists() and len(attempts) == times
+        return
+    assert recovery == str(stage) and held.read_bytes() == b"mask"
+    assert reason == "cleanup could not delete chosen-mask.edf: builtins.PermissionError: [Errno 13] held by another process"
+    assert len(attempts) == (1 if times == 1 else 8)  # a lasting lock is retried only until the 2 s bound
+def test_private_stage_cleanup_names_a_changed_stage_and_keeps_it(tmp_path) -> None:
+    stage = tmp_path / ".xdart-mask-stage"; stage.mkdir(); kept = stage / "chosen-mask.edf"; kept.write_bytes(b"mask")
+    recovery, reason = authoring._cleanup(stage, (0, 0), (kept,)); status = stage.lstat()
+    assert recovery == str(stage) and kept.read_bytes() == b"mask"
+    assert reason == f"private stage changed: identity (0, 0) became {(status.st_dev, status.st_ino)}"
+@pytest.mark.parametrize("windows", (False, True))
+def test_published_mask_cleanup_refusal_names_the_blocked_step(tmp_path, monkeypatch, windows) -> None:
+    request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    monkeypatch.setattr(authoring, "_WINDOWS", windows); monkeypatch.setattr(authoring.time, "sleep", lambda _seconds: None)
+    clock = iter(range(1000)); monkeypatch.setattr(authoring, "_monotonic", lambda: next(clock) * 0.25)
+    _refuse(monkeypatch, "unlink", lambda path: path.parent.name.startswith(".xdart-mask-") and path.name.endswith("-mask.edf"), 32)
+    terminal, _ = _direct(request); result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.FAILED and result.published
+    assert result.recovery_class == "qualified-private-candidate" and Path(result.recovery_path).exists()
+    assert terminal.diagnostic == (
+        f"private mask custody relinquished (qualified-private-candidate): {result.recovery_path}; cleanup could not "
+        f"delete {Path(result.recovery_path).name}: builtins.PermissionError: [Errno 13] held by another process")
+def test_windows_publication_outlasts_a_brief_lock_on_the_private_mask(tmp_path, monkeypatch) -> None:
+    request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    monkeypatch.setattr(authoring, "_WINDOWS", True); monkeypatch.setattr(authoring.time, "sleep", lambda _seconds: None)
+    attempts = _refuse(monkeypatch, "unlink", lambda path: path.parent.name.startswith(".xdart-mask-") and path.name.endswith("-mask.edf"), 32, 2)
+    terminal, _ = _direct(request); result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
+    assert result.published and not result.recovery_path and len(attempts) == 2
+    assert result.final_state == SourceFileState.capture(Path(request.final_path)) and not Path(result.cwd).exists()
 def test_cancel_seal_and_platform_child_signals_are_exact(tmp_path, monkeypatch) -> None:
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
     terminal, _ = _direct(request, seal=lambda _identity: False)
@@ -1275,7 +1330,7 @@ def test_failed_published_mask_terminal_preserves_output_and_recovery_without_ad
     request = _request(tmp_path, monkeypatch)
     _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
     monkeypatch.setattr(
-        authoring, "_cleanup", lambda stage, *_args: str(stage),
+        authoring, "_cleanup", lambda stage, *_args: (str(stage), ""),
     )
     terminal, _progress = _direct(request)
     result = terminal.payload

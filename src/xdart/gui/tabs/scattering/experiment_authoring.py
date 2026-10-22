@@ -32,6 +32,10 @@ _CALIBRATION_SUFFIXES = frozenset({
 _HDF5_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs", ".nexus"})
 _POLL_SECONDS, _CANCEL_GRACE_SECONDS = 0.05, 0.25
 _WINDOWS = os.name == "nt"
+# Windows refuses to delete a file that another process has open (32) or that is still pending deletion
+# (5), and a folder that still lists such a file (145). Explorer, antivirus and network clients hold
+# new files briefly, so private-stage cleanup waits up to this long before relinquishing custody.
+_WINDOWS_DELETE_WAIT_SECONDS, _WINDOWS_DELETE_ERRORS = 2.0, frozenset({5, 32, 145})
 _popen, _link = subprocess.Popen, os.link
 _killpg, _monotonic = getattr(os, "killpg", None), time.monotonic
 _DIR_FD_PUBLICATION = all(
@@ -1023,17 +1027,31 @@ def _nonzero_child_error(tool: str, code: int, observed: str) -> RuntimeError:
     return RuntimeError(f"{tool} exited with status {code}{suffix}")
 
 
-def _cleanup(stage: Path | None, identity: tuple[int, int] | None, names: tuple[Path, ...]) -> str:
-    if stage is None or identity is None: return "" if stage is None else str(stage)
+def _delete_waiting(remove: Callable[[], None]) -> None:
+    deadline, pause = _monotonic() + _WINDOWS_DELETE_WAIT_SECONDS, 0.01
+    while True:
+        try: return remove()
+        except OSError as error:
+            if (not _WINDOWS or getattr(error, "winerror", None) not in _WINDOWS_DELETE_ERRORS
+                    or _monotonic() >= deadline): raise
+        time.sleep(pause); pause = min(2 * pause, 0.2)
+def _cleanup(stage: Path | None, identity: tuple[int, int] | None, names: tuple[Path, ...]) -> tuple[str, str]:
+    """Remove the private stage; on refusal return its path and the reason."""
+    if stage is None: return "", ""
+    if identity is None: return str(stage), "private stage identity was never captured"
+    step = "inspect the private stage"
     try:
-        current = stage.lstat()
-        if ((current.st_dev, current.st_ino) != identity
-                or not stat.S_ISDIR(current.st_mode)): return str(stage)
+        current = stage.lstat(); observed = (current.st_dev, current.st_ino)
+        if observed != identity or not stat.S_ISDIR(current.st_mode):
+            return str(stage), f"private stage changed: identity {identity} became {observed}" + ("" if stat.S_ISDIR(current.st_mode) else ", not a directory")
         for path in names:
             if path.parent != stage or not os.path.lexists(path): continue
-            if not stat.S_ISDIR(path.lstat().st_mode): path.unlink()
-        stage.rmdir(); return ""
-    except OSError: return str(stage)
+            step = f"delete {path.name}"
+            if not stat.S_ISDIR(path.lstat().st_mode): _delete_waiting(path.unlink)
+        step = "remove the private stage"; _delete_waiting(stage.rmdir); return "", ""
+    except OSError as error:
+        module, name, message = detached_exception_strings(error)
+        return str(stage), f"cleanup could not {step}: {module}.{name}: {message}"[:4096]
 def _read_calibration_save_report(path: Path, *, points_directory: str | None = None,
                                   source_path: str | None = None):
     if not path.exists():
@@ -2077,7 +2095,7 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         final_state = None
     names = (() if stage is None else tuple(stage / name for name in (".link-probe-source", ".link-probe-linked", ".link-probe-occupied")))
     owned = tuple(path for path in (private_source, private_mask, publication_alias) if path is not None)
-    recovery = _cleanup(stage, stage_identity, names + owned)
+    recovery, cleanup_reason = _cleanup(stage, stage_identity, names + owned)
     if recovery and not authoring_source_context_current(request):
         recovery = _cleanup_at_admitted_parent(
             stage, stage_identity, names + owned, publication_fd,
@@ -2086,7 +2104,7 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
     if recovery:
         status = OperationTerminalStatus.FAILED; recovery_class = "qualified-private-candidate" if proof is not None and private_mask is not None and _mask_matches(proof, private_mask) is not None else "unqualified-private-stage"
         recovery = str(private_mask if recovery_class.startswith("qualified") else stage)
-        diagnostic += ("; " if diagnostic else "") + f"private mask custody relinquished ({recovery_class}): {recovery}"
+        diagnostic += ("; " if diagnostic else "") + f"private mask custody relinquished ({recovery_class}): {recovery}" + (f"; {cleanup_reason}" if cleanup_reason else "")
     if published and proof is not None:
         try:
             reconciled = _publication_state(
