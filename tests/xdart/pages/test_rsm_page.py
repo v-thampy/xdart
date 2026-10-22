@@ -1079,8 +1079,10 @@ def test_append_skips_an_up_to_date_output_and_replace_grids_it_again(qapp, tmp_
         _wait(page, qapp, lambda: page.shown is not None and not page.active())
         revision = (output.stat().st_ino, output.stat().st_mtime_ns, output.read_bytes())
         fingerprint = page.shown[0].result_fingerprint
+        page.browser.set_filename_filter("nothing-matches")
         page.begin_run()
         _wait(page, qapp, lambda: "Up to date" in label.full_text() and not page.active())
+        assert page.browser.filename_filter.text() == "nothing-matches"
         assert (output.stat().st_ino, output.stat().st_mtime_ns, output.read_bytes()) == revision
         assert page.shown[0].result_fingerprint == fingerprint
         assert label.full_text() == (

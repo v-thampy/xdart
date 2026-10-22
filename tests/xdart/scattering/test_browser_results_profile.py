@@ -306,9 +306,9 @@ def test_filename_filter_projects_real_catalog_and_keeps_navigation(qapp, tmp_pa
         _close(qapp, browser)
 
 
-def test_untouched_filename_default_follows_mode_and_explicit_open_reveals_custom(qapp):
+def test_untouched_filename_default_follows_mode_and_open_pins_custom_names(qapp):
     """The untouched default follows the mode; the result being viewed stays listed through it (the filter
-    narrows the other rows, never what is shown); an explicit Open of a renamed file shows All results."""
+    narrows the other rows, never what is shown); opening a renamed file keeps that filter intact."""
     browser = BrowserView(profile=_STITCH_LIKE)
     commands = []
     browser.commandRequested.connect(commands.append)
@@ -325,9 +325,12 @@ def test_untouched_filename_default_follows_mode_and_explicit_open_reveals_custo
         browser.reconcile_results(entries, None)  # no longer viewed: the mode's rows only
         assert browser.listed_results() == (entries[1].identifier,)
         assert browser.current_result() is None and browser.selected_results() == ()
-        browser.reveal_filename("renamed.nexus")
         browser.reconcile_results(entries, "renamed.nexus")
-        assert browser.filename_filter.text() == ""
+        assert browser.filename_filter.text() == "_stitch2d"
+        assert browser.listed_results() == (entries[1].identifier, "renamed.nexus")
+        assert browser.current_result() == "renamed.nexus"
+        browser.set_filename_mode("Stitch 1D")
+        assert browser.filename_filter.text() == "_stitch1d, _stitch2d"
         assert browser.current_result() == "renamed.nexus"
         browser.clear_result_selection()
         browser.filename_filter.setText("stitch")

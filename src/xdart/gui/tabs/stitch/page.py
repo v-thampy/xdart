@@ -2354,7 +2354,6 @@ class StitchPage(QtWidgets.QWidget):
             path = picks[0] if picks else ""
         if not path:
             return
-        self.browser.reveal_filename(str(path))
         if not completion_message:  # Append follows the existing browser policy when the result is mounted.
             self._result_browser.set_directory(str(Path(path).absolute().parent))
         self._view_revision += 1

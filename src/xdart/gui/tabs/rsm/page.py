@@ -2368,7 +2368,6 @@ class RSMPage(QtWidgets.QWidget):
 
     def reopen(self, path, *, completion_message=""):
         """Read a saved RSM record on the shared single-worker reader, then show it."""
-        self.browser.reveal_filename(str(path))
         identity = self._reader.begin(str(path))
         if identity is None:
             self._notice("A result is still being read")

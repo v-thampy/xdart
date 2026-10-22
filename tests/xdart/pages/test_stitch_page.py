@@ -598,8 +598,10 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         (tmp_path / "source").rename(tmp_path / "source-unavailable")
 
         reopened = StitchPage(empty_host_services(_Status()))
+        reopened.browser.set_filename_filter("nothing-matches")
         reopened.open_result(target)
         _wait(reopened, qapp, catalog=True)
+        assert reopened.browser.filename_filter.text() == "nothing-matches"
         assert reopened._owner.form is None
         assert reopened._owner.prepared is None
         assert not reopened.run_bar.startButton.isEnabled()
@@ -1046,8 +1048,10 @@ def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_aga
             path.unlink()
         shown = []
         page.run_bar.set_readiness_summary = lambda text, **k: (shown.append(str(text)), summary(text, **k))[1]
+        page.browser.set_filename_filter("nothing-matches")
         page.run_bar.startButton.click()  # nothing changed: nothing is stitched
         _wait(page, qapp)
+        assert page.browser.filename_filter.text() == "nothing-matches"
         assert revisions() == stitched
         assert all(path.is_file() for path in exports)
         assert page.run_bar.readinessLabel.full_text().startswith(

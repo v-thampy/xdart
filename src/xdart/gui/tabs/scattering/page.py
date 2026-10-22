@@ -4552,7 +4552,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if is_directory:
             self._set_browser_directory(value, explicit=True)
             return
-        self._shell.browser.reveal_filename(value)
         self._retire_batch_presentation()
         normalized = os.path.normcase(os.path.abspath(os.path.expanduser(value)))
         same_terminal_target = (

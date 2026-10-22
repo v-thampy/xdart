@@ -918,14 +918,6 @@ class BrowserView(QtWidgets.QFrame):
         else:
             self._refilter()
 
-    def reveal_filename(self, path: str) -> None:
-        """Explicit Open keeps renamed/custom files reachable through the All results escape."""
-        if not self._matches_filename(os.path.basename(path)):
-            self.filename_filter.clear()
-
-    def _matches_filename(self, name: str) -> bool:
-        return self._filename_matches(name, self._filename_terms())
-
     def _filename_matches(self, name: str, terms: tuple[str, ...]) -> bool:
         if not terms:
             return True
