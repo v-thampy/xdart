@@ -335,6 +335,8 @@ def test_d5_legacy_reconstruction_coalesces_and_cleans_up(qapp, tmp_path):
         # deterministic supersession: ask for every frame quickly; only the last selection is drawn
         for key in keys:
             select(qapp, page, key)
+        _wait(qapp, lambda: REASON_TEXT[SupportReason.PENDING] in view.angular_support_message()
+              or bool(_curves(view)))
         assert REASON_TEXT[SupportReason.PENDING] in view.angular_support_message() or _curves(view)
         _wait(qapp, lambda: bool(_curves(view)) and not owner.computing)
         (data, profile), = _curves(view).values()

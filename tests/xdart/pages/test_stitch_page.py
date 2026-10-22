@@ -540,6 +540,14 @@ def test_average_sum_and_waterfall_show_the_selected_results_as_ints(qapp, tmp_p
         page.deleteLater()
 
 
+def test_frame_progress_text_reports_the_frame_count_and_named_stage():
+    from xdart.gui.tabs.stitch.page import _progress_text
+
+    assert _progress_text("science", 2, 6) == "Stitching · frame 1 of 2"
+    assert _progress_text("science", 3, 6) == "Stitching · frame 2 of 2"
+    assert _progress_text("projection", 4, 6) == "Building the result…"
+
+
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_path, backend):
     from tests.xdart.tools.test_stitch_native_values import _native_form
@@ -563,8 +571,9 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         page.run_bar.startButton.click()
         _wait(page, qapp, catalog=True)
         page.run_bar.set_readiness_summary = summary
-        # the run bar says what it is doing, frames while stitching; never the raw stage names
-        assert any(text.startswith("Stitching · frame ") for text in shown), shown
+        # Latest-only progress can coalesce a fast frame stage before the GUI polls it.
+        assert any(text.startswith("Running · ") for text in shown), shown
+        assert any(text.startswith("Complete · ") for text in shown), shown
         assert not any("science" in text or re.fullmatch(r"[a-z]+ · \d+/\d+", text) for text in shown), shown
         assert page._prepared_revision is None  # a run uses its plan once: the next Run checks again
         payload = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.STITCH_1D)
