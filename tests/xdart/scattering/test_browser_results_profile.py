@@ -264,6 +264,8 @@ def test_filename_filter_projects_real_catalog_and_keeps_navigation(qapp, tmp_pa
     )
     for slot in FINITE_OPERATION_SLOTS.values():
         (tmp_path / f"sample{slot}.nexus").write_bytes(b"not an admitted scientific record")
+    for name in ("sample_int1d_average.nexus", "sample_int2d_average.nexus"):
+        (tmp_path / name).write_bytes(b"catalog only")
     (tmp_path / "CUSTOM[ABC].nexus").write_bytes(b"not HDF5")
     (tmp_path / "sample_rsm_middle_int2d.nexus").write_bytes(b"catalog only")
     (tmp_path / "folder").mkdir()
@@ -282,6 +284,8 @@ def test_filename_filter_projects_real_catalog_and_keeps_navigation(qapp, tmp_pa
         expected = {"..", "folder/", *(f"sample{FINITE_OPERATION_SLOTS[token]}.nexus" for token in tokens)}
         if "int-2d" in tokens:
             expected.add("sample_rsm_middle_int2d.nexus")
+        if "average" in tokens:
+            expected.update(("sample_int1d_average.nexus", "sample_int2d_average.nexus"))
         assert set(names()) == expected
         def forbidden(*args, **kwargs):
             raise AssertionError("filtering must not read files or HDF5")
