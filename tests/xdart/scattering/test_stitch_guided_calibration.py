@@ -603,7 +603,8 @@ def test_direct_beam_window_handoff_uses_actual_api_and_seed_not_bounds(tmp_path
 @pytest.mark.parametrize('source_kind', ['spec_container', 'nexus'])
 def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
     import h5py
-    from pyqtgraph.Qt import QtWidgets, QtTest
+    import time
+    from pyqtgraph.Qt import QtWidgets
     from tests.core.test_direct_beam import beam_images
     angles = np.array([1., .5, 0., -.5, -1.])
     images, _, beam = beam_images(angles, shape=(65, 487),
@@ -640,7 +641,8 @@ def test_direct_beam_fit_button_reads_container_sources(tmp_path, source_kind):
             QtWidgets.QApplication.processEvents()
             if not dialog.active():
                 break
-            QtTest.QTest.qWait(20)
+            # Yield to the Python worker while the GUI polls its result.
+            time.sleep(.02)
         assert not dialog.active()
         result = dialog._distance_result
         assert result is not None, dialog.status.text()

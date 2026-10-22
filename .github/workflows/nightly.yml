@@ -58,7 +58,8 @@ jobs:
               tests/xdart/test_text_selection_contrast.py
               tests/xdart/pages/test_synthetic_page_host.py
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Match PR headroom for the longest GUI group, including environment setup.
+    timeout-minutes: ${{ matrix.group == 'scattering-other' && 75 || 60 }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
