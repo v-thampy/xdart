@@ -534,6 +534,10 @@ class BrowserView(QtWidgets.QFrame):
         self._source_results = None
         self._source_projection = None
         self._projected_filename_terms = None
+        #: a row the filter kept only while it was viewed goes once the view moves on; deferred, so the list is
+        #: never rebuilt inside its own selection signal
+        self._viewed_refilter = Coalescer(0, mode="throttle", parent=self)
+        self._viewed_refilter.triggered.connect(self._refilter_viewed_results)
         self.setObjectName("e3BrowserView")
         self.setMinimumWidth(255 if self.profile.heading else 0)
         self._scans = ()
@@ -694,6 +698,9 @@ class BrowserView(QtWidgets.QFrame):
             self.scans.itemSelectionChanged.connect(self._scan_selected)
             self.scans.itemClicked.connect(self._activate_directory)
             self.scans.itemActivated.connect(self._activate_directory)
+        if self.profile.results:  # after the page has heard of the change
+            self.scans.currentItemChanged.connect(self._viewed_result_changed)
+            self.scans.itemSelectionChanged.connect(self._viewed_result_changed)
         if self.profile.result_checks:
             self.scans.itemChanged.connect(lambda _item: self.checksChanged.emit(self.checked_results()))
         if self.profile.result_values is not None:
@@ -917,6 +924,16 @@ class BrowserView(QtWidgets.QFrame):
             self.filename_filter.setText(text)  # textChanged refilters
         else:
             self._refilter()
+
+    def _viewed_result_changed(self, *_args) -> None:
+        if self._source_results is not None and self._filename_terms():
+            self._viewed_refilter.trigger()
+
+    def _refilter_viewed_results(self) -> None:
+        """Drop a row the filter kept only while it was viewed, once it is not, as Int's re-projection does
+        (a results page rebuilds its list only when its folder, filter or mode changes)."""
+        if self._source_results is not None and self._filename_terms():
+            self.reconcile_results(self._source_results[0], self.current_result())
 
     def _filename_matches(self, name: str, terms: tuple[str, ...]) -> bool:
         if not terms:

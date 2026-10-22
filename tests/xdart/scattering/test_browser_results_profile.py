@@ -2,6 +2,8 @@
 menus, captions and actions instead of copying them (hard rule 14; Codex's RSM reuse audit R1)."""
 from __future__ import annotations
 
+import time
+
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
@@ -336,6 +338,33 @@ def test_untouched_filename_default_follows_mode_and_open_pins_custom_names(qapp
         browser.filename_filter.setText("stitch")
         browser.filename_filter.clear()
         assert browser.current_result() is None and browser.selected_results() == ()
+    finally:
+        _close(qapp, browser)
+
+
+@pytest.mark.parametrize("profile", [_STITCH_LIKE, _RESULTS], ids=["extended", "single"])
+def test_a_row_kept_while_viewed_goes_when_the_view_moves_on(qapp, profile):
+    """A result the filter kept only because it was viewed goes once a click moves the view to another result,
+    as Int's re-projection drops it (it used to stay until the folder next changed, and a no-selection batch
+    would have included it)."""
+    browser = BrowserView(profile=profile)
+    entries = tuple(BrowserResult(name, name) for name in (
+        "one_stitch1d.nexus", "two_stitch1d.nexus", "renamed.nexus"))
+    try:
+        browser.set_filename_mode("Stitch 1D")
+        browser.reconcile_results(entries, "renamed.nexus")  # opened explicitly: listed while viewed
+        assert browser.listed_results() == tuple(entry.identifier for entry in entries)
+        row = next(i for i in range(browser.scans.count())
+                   if browser.scans.item(i).data(QtCore.Qt.ItemDataRole.UserRole) == entries[1].identifier)
+        browser.scans.setCurrentRow(row)  # a click on a result already listed (no page re-publish)
+        deadline = time.monotonic() + 5
+        while "renamed.nexus" in browser.listed_results() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert browser.listed_results() == (entries[0].identifier, entries[1].identifier)
+        assert browser.current_result() == entries[1].identifier
+        browser.filename_filter.clear()  # All results
+        assert browser.listed_results() == tuple(entry.identifier for entry in entries)
     finally:
         _close(qapp, browser)
 
