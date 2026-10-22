@@ -9,7 +9,7 @@ release records follow, including the former `xrd-tools` distribution name.
 
 ## Upgrading from 1.1.5 to 1.2.0
 
-**1.2.0 is being prepared and is not yet published.** See the
+See the
 [release notes](RELEASE_NOTES.md) for the current feature summary and
 [limitations](docs/LIMITATIONS.md) for scientific and installation boundaries.
 The older release sections below describe their behavior at the time; the

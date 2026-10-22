@@ -9,7 +9,7 @@ integration and [xrayutilities](https://xrayutilities.sourceforge.io/) for
 stitching and reciprocal-space mapping. The same processing tools are available
 in Python through **`xrd_tools`**, the headless core included with xdart.
 
-**1.2.0 is unreleased.** This README describes the current source checkout.
+This README describes **xdart 1.2.0**.
 [Release notes](RELEASE_NOTES.md) · [Upgrading from 1.1.5](MIGRATION.md#upgrading-from-115-to-120) ·
 [Limitations and workarounds](docs/LIMITATIONS.md)
 
@@ -34,7 +34,7 @@ in Python through **`xrd_tools`**, the headless core included with xdart.
 3. Launch the xdart app/shortcut, or run `xdart` in a terminal.
 
 To update a global installation, close xdart and run `pixi global update xdart`.
-To use the unreleased code, follow the [source-checkout setup](#development).
+To work from source, follow the [source-checkout setup](#development).
 Global installation and source-checkout installation are separate environments.
 
 Pixi and conda/mamba supply the compiled dependencies needed by the GUI.
@@ -254,15 +254,15 @@ Use the shared Pixi workspace for an editable source installation:
 ```bash
 git clone https://github.com/v-thampy/xdart.git
 cd xdart
-git switch stitch2d
 pixi install --locked
 pixi run --locked xdart
 ```
 
-The `stitch2d` branch contains the current 1.2.0 release candidate.
+The default `main` branch contains the current source. To use the exact 1.2.0
+release, run `git switch --detach v1.2.0` before installing.
 The lockfile covers Apple Silicon macOS, Linux x86-64, and Windows x86-64.
 Each machine installs its own environment; keep the shared lockfile unchanged
-when testing a release candidate.
+when testing on another machine.
 
 To update an existing checkout after saving or committing local work:
 

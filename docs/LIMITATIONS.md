@@ -1,8 +1,7 @@
 # Limitations and workarounds
 
-These notes apply to the 1.2.0 release being prepared. They describe accepted
-behavior and remaining limits; they do not certify a platform or announce a
-published release.
+These notes apply to xdart 1.2.0. They describe accepted behavior and remaining
+limits; they do not certify a platform.
 
 ## Reprocess outputs made before the seam-q correction
 

@@ -1,11 +1,9 @@
 # Release notes
 
-## 1.2.0 (unreleased)
+## 1.2.0 (2026-10-22)
 
 This release brings Stitch 1D, Stitch 2D and reciprocal-space mapping into the
-Scattering Workspace alongside integration and the viewers. This entry describes
-the release being prepared; it is not an announcement that packages have been
-published or that release qualification is complete.
+Scattering Workspace alongside integration and the viewers.
 
 ### Processing and analysis
 
