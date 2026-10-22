@@ -76,6 +76,18 @@ def test_marimo_uses_the_selected_compatible_release_line_in_both_installs():
     assert "0.25.0" in pip.specifier and "0.24.9" not in pip.specifier and "0.26.0" not in pip.specifier
 
 
+def test_the_runtime_tiff_header_reader_is_a_dependency_of_both_installs():
+    """1.2.0 imported tifffile at Run admission but declared it only for development.
+
+    A `pixi global install` on Windows then refused every TIFF scan (maintainer
+    report, 2026-10-22); editable and CI environments hid it through the dev extra.
+    """
+    assert "tifffile" in {_name(item) for item in _project()["dependencies"]}
+    assert "tifffile" in {_name(item) for item in _recipe()["requirements"]["run"]}
+    imports = {name for test in _recipe()["tests"] for name in test.get("python", {}).get("imports", ())}
+    assert "tifffile" in imports
+
+
 def test_conda_recipe_offers_only_the_python_versions_the_project_claims():
     """An open-ended range hands users a Python that no test has ever run.
 

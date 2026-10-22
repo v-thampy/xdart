@@ -286,13 +286,13 @@ modest for batch / pipeline / CI use:
 
 | Extra        | What it enables                                          | Packages                                                    |
 | ------------ | -------------------------------------------------------- | ----------------------------------------------------------- |
-| *(base)*     | `core`, `io`, `integrate`, `viz` — headless / batch      | numpy, scipy, pandas, xarray, h5py, hdf5plugin, nexusformat, fabio, silx, pyFAI, pyyaml, joblib, natsort, matplotlib, plotly |
+| *(base)*     | `core`, `io`, `integrate`, `viz` — headless / batch      | numpy, scipy, pandas, xarray, h5py, hdf5plugin, nexusformat, fabio, tifffile, silx, pyFAI, pyyaml, joblib, natsort, matplotlib, plotly |
 | `[gui]`      | the `xdart` desktop GUI **+ its analysis tools, external viewers, and notebooks** (bundles `[fitting]` + `[rsm]` + `[notebook]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk, nexpy, notebook packages below (silx already in base) |
 | `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting     | lmfit, pymatgen                                             |
 | `[rsm]`      | `rsm.*` — reciprocal-space mapping, VTK export           | xrayutilities, pyevtk                                       |
 | `[notebook]` | Jupyter and marimo environments                           | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab, nbformat, marimo |
 | `[all]`      | everything except dev                                    | `xdart[fitting,rsm,gui,notebook]`                       |
-| `[dev]`      | test / build / release tooling                           | pytest, pytest-timeout, pytest-xdist, build, twine, tifffile, imagecodecs |
+| `[dev]`      | test / build / release tooling                           | pytest, pytest-timeout, pytest-xdist, build, twine, imagecodecs |
 
 Extras compose. `[gui]` already bundles `[fitting]` + `[rsm]` + `[notebook]` — the GUI surfaces
 Peak/Phase Fitting, the Grazing/GI/RSM workflow, and notebook export — so `pip install "xdart[gui]"`
