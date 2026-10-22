@@ -54,8 +54,9 @@ _LOG = logging.getLogger(__name__)
 #: Share of the progress bar per automatic-refinement stage (the owner needs one fixed total).
 _REFINE_STAGES = {'Screening the scan': (0, 250), 'Finding ring points': (250, 700),
                   'Validating models': (700, 980), 'Fitting': (980, 1000)}
-#: Save: the pyFAI file is quick; the xrayutilities transfer and its gates take seconds.
-_TRANSFER_STAGES = {'Transferring to xrayutilities': (0, 500), 'Validating the transfer': (500, 1000)}
+#: Save: the pyFAI file is quick; the xrayutilities transfer is screened on a coarse detector, then the gate
+#: checks every pixel and takes most of the time.
+_TRANSFER_STAGES = {'Transferring to xrayutilities': (0, 100), 'Validating the transfer': (100, 1000)}
 
 
 def _staged_progress(publish, stages):

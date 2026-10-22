@@ -228,6 +228,43 @@ def test_a_five_parameter_arm_transfers_by_formula(tmp_path):
     _receipt(tmp_path, asset)  # the runtime admits it
 
 
+@pytest.mark.parametrize('arm', ['five', 'extended'])
+def test_every_pixel_is_checked_once_and_the_asset_records_that_check(arm, monkeypatch):
+    """pyFAI's q on the full detector is computed once per validation frame, by the gate through Stitch's
+    own XU path (a first full pass duplicated it; candidates are screened on the coarse detector), and
+    the asset and the diagnostics record the gate's |Δq|."""
+    from pyFAI.geometry.core import Geometry
+    record = (StackedDetectorArm(nu_motor='nu', del_motor='del', nu_offset=.02, del_offset=-.05)
+              .to_pyfai_goniometer(_calibration()) if arm == 'five' else _record())
+    full, q_function = [], Geometry.qFunction
+
+    def counted(self, d1, d2, *args, **kwargs):
+        full.append(np.shape(d1) == SHAPE)
+        return q_function(self, d1, d2, *args, **kwargs)
+    monkeypatch.setattr(Geometry, 'qFunction', counted)
+    asset, diagnostics = transfer_arm_to_xu(record, validation_angles=ANGLES)
+    assert sum(full) == len(ANGLES)
+    gated = diagnostics['stitch_path_max_abs_dq_A^-1']
+    assert diagnostics['max_abs_dq_A^-1'] == gated == asset['validation']['transfer_max_abs_dq_A^-1'] <= 1e-8
+    assert asset['validation']['validation_pixel_count'] == len(ANGLES) * SHAPE[0] * SHAPE[1]
+    assert diagnostics['attempts'][-1]['coarse_max_abs_dq_A^-1'] <= 1e-8
+    parse_xu_stitch_calibration_bytes(_canonical_bytes(asset))
+
+
+@pytest.mark.parametrize('arm', ['five', 'extended'])
+def test_the_transfer_reports_every_frame_of_both_checks(arm):
+    """The save's status line moves on every frame of the screen and of the gate, in order (the first check
+    was silent, or said only its fit seed, and the gate moved every 16th frame)."""
+    record = (StackedDetectorArm(nu_motor='nu', del_motor='del', nu_offset=.02, del_offset=-.05)
+              .to_pyfai_goniometer(_calibration()) if arm == 'five' else _record())
+    seen = []
+    _asset, diagnostics = transfer_arm_to_xu(record, validation_angles=ANGLES, progress=lambda *step: seen.append(step))
+    assert len(diagnostics['attempts']) == 1  # one check before the gate: the formula's, or the first seed's
+    frames = range(1, len(ANGLES) + 1)
+    assert seen == ([('Transferring to xrayutilities', done, len(ANGLES)) for done in frames]
+                    + [('Validating the transfer', done, len(ANGLES)) for done in frames])
+
+
 @pytest.mark.parametrize('held', ['nu', 'del'])
 def test_a_single_2theta_arm_transfers_by_formula_and_stitches(tmp_path, held):
     """fourc/twoc: vertical (nu held at zero) or horizontal (del held, the scan's del column

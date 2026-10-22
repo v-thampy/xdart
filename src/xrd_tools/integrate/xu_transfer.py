@@ -15,7 +15,9 @@ along that valley. Held, the mount comes out as the arm's own roll and tilt.
 Every result passes the same gates before it is returned: on every pixel of every
 validation frame, through Stitch's own XU path (the admitted asset, its runtime
 geometry and q provider), |q| within 1e-8 Å⁻¹ and the polarization factor within
-1e-6 (relative, f 0.99) of pyFAI. The sample displacement is in the detector
+1e-6 (relative, f 0.99) of pyFAI. A candidate is first screened on the coarse
+detector's pixels of every validation frame; the gate is the one check made on
+every pixel, and the asset records its |q|. The sample displacement is in the detector
 distance's units (mm here): the fit recovers the arm's offsets exactly as
 ``(s1, s3, −s2)`` in pyFAI's native camera frame.
 """
@@ -82,7 +84,7 @@ def _stitch_path_gate(asset, validation, integrators, shape, cancelled, progress
                         lease.q_magnitude() - integrator.qFunction(rows, cols) / 10.0))))
                     worst_p = max(worst_p, float(np.max(np.abs(
                         lease.polarization(*polarization) - reference) / reference)))
-                if progress is not None and (done + 1) % 16 == 0:
+                if progress is not None:
                     progress('Validating the transfer', done + 1, len(validation))
     return worst_q, worst_p
 
@@ -98,13 +100,14 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     psic's: its XU axis is reversed. Physical circle directions are unchanged.
     ``source_motors`` is (del motor, nu motor), None for the circle a single arm
     holds at zero. ``validation_angles`` are (del, nu) circle angles (a held circle
-    at 0), normally every frame the asset will serve; ``fit_angles`` (an extended
-    arm's fit) default to at most 20 of them spread in order.
+    at 0), normally the calibrant frames and a grid over the angle range the asset
+    will serve (``pair_validation_angles``); ``fit_angles`` (an extended arm's fit)
+    default to at most 20 of them spread in order.
     """
     from scipy.optimize import least_squares
     from pyFAI.detectors import detector_factory
     from xrd_tools.analysis.xu_stitch_calibration import (
-        EXTENDED_TRANSFER_GATE_A, extended_surface_calibration,
+        EXTENDED_TRANSFER_GATE_A, _canonical_bytes, extended_surface_calibration, parse_xu_stitch_calibration_bytes,
     )
     from xrd_tools.core.energy import calibration_recorded_energy_eV, wavelength_m_to_energy_eV
     from xrd_tools.core.geometry import Diffractometer
@@ -171,6 +174,8 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
             raise InterruptedError('XU transfer cancelled')
 
     rows_sub, cols_sub = np.arange(0, shape[0], _SUBGRID[0]), np.arange(0, shape[1], _SUBGRID[1])
+    coarse_rows, coarse_cols = np.meshgrid(rows_sub.astype(float), cols_sub.astype(float), indexing='ij')
+    checked = integrators(validation)
     # the motor zeros, −offset/scale in degrees: a reversed circle's scale is negative (a held circle's offset is
     # its fixed angle, at the nominal scale)
     senses = {circle: 1 if getattr(arm, f'{circle}_scale') > 0 else -1 for circle in ('del', 'nu')}
@@ -198,23 +203,24 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
             qx, qy, qz = hxrd.Ang2Q.area(0., 0., 0., 0., angle[1] - params[4], angle[0] - params[3], **displaced)
             return np.hypot(np.hypot(qx, qy), qz)
 
-        def worst(params):
-            """The candidate's |Δq| on every pixel of every validation frame."""
-            hxrd, value = area(params), 0.0
-            rows, cols = np.indices(shape, dtype=float)
-            for angle, integrator in zip(validation, integrators(validation)):
+        def screen(params):
+            """The candidate's |Δq| on the coarse detector's pixels of every validation frame (the gate
+            then checks every pixel once, through Stitch's own XU path)."""
+            hxrd, value = area(params, coarse=True), 0.0
+            for done, (angle, integrator) in enumerate(zip(validation, checked)):
                 check()
                 value = max(value, float(np.max(np.abs(q_xu(hxrd, params, angle)
-                                                       - integrator.qFunction(rows, cols) / 10.0))))
+                                                       - integrator.qFunction(coarse_rows, coarse_cols) / 10.0))))
+                if progress is not None:
+                    progress('Transferring to xrayutilities', done + 1, len(validation))
             return value
 
         if not arm.extended:
             candidate = formula + [0.] * 6
-            attempts.append({'method': 'formula', 'max_abs_dq_A^-1': worst(candidate)})
-            if attempts[-1]['max_abs_dq_A^-1'] <= gate:
+            attempts.append({'method': 'formula', 'coarse_max_abs_dq_A^-1': screen(candidate)})
+            if attempts[-1]['coarse_max_abs_dq_A^-1'] <= gate:
                 params = candidate
         if params is None:
-            coarse_rows, coarse_cols = np.meshgrid(rows_sub.astype(float), cols_sub.astype(float), indexing='ij')
             targets = [integrator.qFunction(coarse_rows, coarse_cols) / 10.0 for integrator in integrators(fit)]
 
             # The motor offsets stay the arm's: XU's del offset trades exactly against its tilt and
@@ -230,7 +236,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
                                        for angle, target in zip(fit, targets)])
 
             seed = formula[:3] + [math.degrees(arm.mount_roll), abs(math.degrees(arm.mount_tilt))]
-            for done, azimuth in enumerate(_SEED_AZIMUTHS):
+            for azimuth in _SEED_AZIMUTHS:
                 result = least_squares(residual, seed + [azimuth, 0., 0., 0.], method='lm', x_scale='jac',
                                        max_nfev=4000)
                 candidate = [float(v) for v in full(result.x)]
@@ -238,15 +244,13 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
                     candidate[6], candidate[7] = -candidate[6], candidate[7] + 180.0
                 candidate[7] %= 360.0
                 attempts.append({'method': 'coarse_fit', 'tiltazimuth_seed_deg': azimuth, 'evaluations': result.nfev,
-                                 'max_abs_dq_A^-1': worst(candidate)})
-                if progress is not None:
-                    progress('Transferring to xrayutilities', done + 1, len(_SEED_AZIMUTHS))
-                if attempts[-1]['max_abs_dq_A^-1'] <= gate:
+                                 'coarse_max_abs_dq_A^-1': screen(candidate)})
+                if attempts[-1]['coarse_max_abs_dq_A^-1'] <= gate:
                     params = candidate
                     break
         xu_wavelength = float(xu.en2lam(energy))
     if params is None:
-        best = min(attempt['max_abs_dq_A^-1'] for attempt in attempts)
+        best = min(attempt['coarse_max_abs_dq_A^-1'] for attempt in attempts)
         raise XuTransferRefused('XU_TRANSFER_GATE_FAILED',
                                 f'the XU transfer reaches {best:.3g} Å⁻¹ on a validation pixel (gate {gate:.0e})')
     compact = {
@@ -264,7 +268,6 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
         return {'del': [min(a[0] for a in angles), max(a[0] for a in angles)],
                 'nu': [min(a[1] for a in angles), max(a[1] for a in angles)]}
     fitted = attempts[-1]['method'] == 'coarse_fit'
-    worst_dq = attempts[-1]['max_abs_dq_A^-1']
     try:  # the v3 admission and Stitch's own XU path refuse in their own terms: said as the transfer's
         asset = extended_surface_calibration(
             detector=detector,
@@ -277,9 +280,11 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
             source_motors={'del': del_motor, 'nu': nu_motor}, rotation=int(image_rotation), flip=bool(image_flip),
             turned_from=turned, control_domain=domain(fit if fitted else validation), domain=domain(validation),
             fit_frames=len(fit) if fitted else 0, validation_frames=len(validation),
-            validation_pixels=len(validation) * shape[0] * shape[1], max_dq=worst_dq)
-        stitch_dq, polarization = _stitch_path_gate(asset, validation, integrators(validation), shape,
-                                                    cancelled, progress)
+            validation_pixels=len(validation) * shape[0] * shape[1], max_dq=attempts[-1]['coarse_max_abs_dq_A^-1'])
+        stitch_dq, polarization = _stitch_path_gate(asset, validation, checked, shape, cancelled, progress)
+        if stitch_dq <= gate:  # the asset records the |Δq| of the one check made on every pixel
+            asset['validation']['transfer_max_abs_dq_A^-1'] = stitch_dq
+            parse_xu_stitch_calibration_bytes(_canonical_bytes(asset))
     except (ValueError, XuStitchScienceRefused) as error:
         raise XuTransferRefused('XU_TRANSFER_UNSUPPORTED',
                                 f'xrayutilities refuses the transferred calibration: {error}') from error
@@ -289,7 +294,7 @@ def transfer_arm_to_xu(geometry, *, validation_angles, fit_angles=None, source_m
     if not polarization <= POLARIZATION_GATE:
         raise XuTransferRefused('XU_TRANSFER_GATE_FAILED', f"Stitch's XU polarization factor differs from pyFAI's "
                                 f'by {polarization:.3g} (relative) on a validation pixel (gate {POLARIZATION_GATE:.0e})')
-    diagnostics = {'method': attempts[-1]['method'], 'max_abs_dq_A^-1': worst_dq, 'gate_A^-1': gate,
+    diagnostics = {'method': attempts[-1]['method'], 'max_abs_dq_A^-1': stitch_dq, 'gate_A^-1': gate,
                    'stitch_path_max_abs_dq_A^-1': stitch_dq, 'polarization_max_relative': polarization,
                    'polarization_gate': POLARIZATION_GATE, 'polarization_factor': _POLARIZATION_FACTOR,
                    'fit_frames': len(fit) if fitted else 0, 'validation_frames': len(validation),
