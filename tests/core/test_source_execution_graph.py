@@ -1605,7 +1605,7 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
                     **dict(source.options), "metadata_format": "txt",
                 })
         anchor = root / "scan.nexus"
-        target = root / "scan_average.nexus"
+        target = root / "scan_int1d_average.nexus"
         with h5py.File(target, "w") as handle:
             make_v2_entry(handle, frame_indices=(1,), with_2d=False)
         changed = (
@@ -2058,7 +2058,7 @@ def test_average_refuses_raw_external_storage_output_alias(tmp_path):
     )
 
     master = tmp_path / "scan.nexus"
-    storage = tmp_path / "scan_average.nexus"
+    storage = tmp_path / "scan_int1d_average.nexus"
     values = np.arange(48, dtype=np.uint16).reshape(3, 4, 4) + 10
     storage.write_bytes(values.tobytes())
     with h5py.File(master, "w") as handle:
@@ -2101,7 +2101,7 @@ def test_average_refuses_vds_external_link_source_output_alias(tmp_path):
     )
 
     master = tmp_path / "scan.nexus"
-    intermediate = tmp_path / "scan_average.nexus"
+    intermediate = tmp_path / "scan_int1d_average.nexus"
     middle = tmp_path / "middle.nexus"
     raw = tmp_path / "raw.nexus"
     values = np.arange(48, dtype=np.uint16).reshape(3, 4, 4) + 10

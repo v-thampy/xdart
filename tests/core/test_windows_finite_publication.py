@@ -407,7 +407,7 @@ def test_w19_hard_linked_source_alias_is_refused(tmp_path, monkeypatch, arm):
             "data", data=np.arange(12, dtype="u2").reshape(3, 2, 2))
     before = raw.read_bytes()
     try:
-        os.link(raw, tmp_path / "scan_average.nexus")  # the Average slot aliases the raw source
+        os.link(raw, tmp_path / "scan_int1d_average.nexus")  # the Average slot aliases the raw source
     except OSError as error:
         pytest.skip(f"INCOMPLETE: this filesystem cannot create a hard link ({error})")
     _stub_integrators(monkeypatch, [])
@@ -769,11 +769,11 @@ def test_w41_mixed_case_average_reload_keeps_spelling_and_canonical_identity(tmp
     assert result.disposition == "COMMITTED"
     assert Path(result.target).name in os.listdir(folder)  # the public spelling survives publication
     assert result.commit_identity.target == os.path.normcase(os.path.abspath(result.target))
-    assert _committed_average_mismatch(result, anchor, "entry") is None
+    assert _committed_average_mismatch(result, anchor, "entry", dimension="1d") is None
     owner, slot = _owner_with_slot()
     identity = OperationIdentity(41)
     slot._identity = identity
-    owner._average = AverageOperationState(identity, 1, str(anchor), "entry")
+    owner._average = AverageOperationState(identity, 1, str(anchor), "entry", "1d")
     transition = owner.consume_average_update(OperationUpdate(identity, terminal=OperationTerminal(
         identity, OperationTerminalStatus.RETURNED, payload=result)), current_intent_revision=1)
     directive = transition.average_reload

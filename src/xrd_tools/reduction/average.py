@@ -565,26 +565,26 @@ def _admitted_input_paths(graph, recipe=None) -> tuple[str, ...]:
     return tuple(path for path in paths if type(path) is str and path)
 
 
-def _average_output_artifact(anchor: str, *, artifact_family: str | None = None) -> str:
-    """The stable ``<family>_average.nexus`` slot beside *anchor*.
+def _average_dimension(recipe: AverageScanRecipe) -> str:
+    """The selected output dimension; a 2D result may also contain 1D."""
+    return '2d' if recipe.integration_2d is not None else '1d'
+
+
+def _average_output_artifact(anchor: str, *, dimension: str, artifact_family: str | None = None) -> str:
+    """The stable dimension-specific Average slot beside *anchor*.
 
     *anchor* supplies the DIRECTORY and, absent a persisted family, the family.
     It is never written.
 
-    WHY THE ANCHOR CARRIES NO SLOT.  `page.py:2553` builds it from the save
-    FOLDER plus the SCAN NAME, so it is `<scan>.nexus` and the anchor-derived
-    family is `<scan>`.  It must stay that way.  Were the anchor ever given the
-    run's own `_int1d`/`_int2d` slot, the family derived from that stem would be
-    `<scan>_int2d` and this would publish `<scan>_int2d_average.nexus` -- the
-    chained suffix ADR-0010 forbids by name.  Stripping `_int2d` to recover the
-    root is NOT the remedy; parsing a generated suffix is an explicit stop
-    condition.  The remedy is *artifact_family*: pass the family Run persisted.
+    The dimension comes from the frozen reduction, never a parsed filename.
+    The anchor carries no run slot; a persisted family is consumed verbatim.
     """
+    _reject(dimension not in {'1d', '2d'}, 'Average output dimension is invalid')
     requested = Path(anchor)
     return str(resolve_finite_output_target(
         requested.parent,
         artifact_family_from_source(requested, artifact_family),
-        operation_token='average',
+        operation_token=f'average-{dimension}',
     ).resolve())
 def _derived_reduction(recipe: AverageScanRecipe) -> ReductionPlan:
     value = _thaw_reduction(recipe)
@@ -642,7 +642,7 @@ def _plan_from_prepared_graph(
         science_identity=science,
         entry=recipe.entry,
     )
-    output = _average_output_artifact(recipe.target)
+    output = _average_output_artifact(recipe.target, dimension=_average_dimension(recipe))
     # THE SLOT MAY NOT BE AN ADMITTED INPUT.  Codex F1 (P1) on `e06d6123`: with
     # the occupied-slot refusal gone, a raw stack sitting at the derived slot
     # name -- `scan_average.nexus` fed to an Average anchored at `scan.nexus` in
@@ -703,20 +703,20 @@ def _diagnostic(value: BaseException | str) -> str:
 def _result(plan: AverageScanPlan, disposition: str, *, code: str='', diagnostic: str='', denominators=(), evidence=None, h23_phase=None, commit=None) -> AverageScanResult:
     committed = (1,) if disposition == 'COMMITTED' else ()
     return AverageScanResult(disposition, plan.output_artifact, plan.recipe.entry, plan.version_identity, plan.operation_identity, plan.science_identity, plan.contributor_extent, plan.logical_labels, committed, tuple(denominators), evidence if disposition == 'COMMITTED' else None, code, diagnostic, 'committed' if disposition == 'COMMITTED' else h23_phase, commit if disposition == 'COMMITTED' else None)
-def _committed_average_mismatch(result: AverageScanResult, target: str | Path, entry: str) -> str | None:
+def _committed_average_mismatch(result: AverageScanResult, target: str | Path, entry: str, *, dimension: str) -> str | None:
     """Verify a committed Average by RECOMPUTING its deterministic successor.
 
     ``target`` is only the caller's directory/naming anchor: Average never writes
-    it.  Recomputing the successor from that anchor plus the result's own version
-    identity refuses a wrong directory, a wrong artifact family and a wrong
-    version in one equality, and compares two already ``resolve()``d paths so a
+    it. Recomputing from that anchor and the request's frozen dimension refuses
+    a wrong directory, artifact family or output dimension, and compares two
+    already ``resolve()``d paths so a
     symlinked project root cannot make an honest successor look foreign.
     """
     commit = result.commit_identity
     if _COUNT_DIGEST.fullmatch(result.version_identity) is None:
         return 'version'
     try:
-        expected = _average_output_artifact(_average_target(target))
+        expected = _average_output_artifact(_average_target(target), dimension=dimension)
     except Exception:
         return 'target'
     if result.target != expected or result.entry != entry: return 'target' if result.target != expected else 'entry'

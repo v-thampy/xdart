@@ -136,6 +136,68 @@ def _run_average_scan(recipe, **kwargs):
     return result
 
 
+@pytest.mark.parametrize("companion_1d", (False, True))
+def test_average_dimension_slots_coexist_repeat_and_preserve_inputs(tmp_path, companion_1d):
+    """Real reductions share a root family while publishing distinct slots."""
+    from threading import Event
+    from xrd_tools.io import get_1d, get_2d, get_average_finite_counts
+
+    source = _series(tmp_path)
+    original = {path: Path(path).read_bytes() for path in source.options["files"]}
+    calibration = CalibrationState(
+        PoniValues(0.2, 0.001, 0.001, 0., 0., 0., 1e-10), "Detector",
+        {"pixel1": 1e-4, "pixel2": 1e-4, "max_shape": [2, 2]},
+        status=FactStatus.PRESENT,
+    )
+    one = Integration1DPlan(npt=4, method="numpy")
+    two = Integration2DPlan(npt_rad=4, npt_azim=2, method="numpy")
+    anchor = tmp_path / "sample.nexus"
+    recipes = (
+        AverageScanRecipe(source, anchor, ReductionPlan(integration_1d=one), calibration=calibration),
+        AverageScanRecipe(source, anchor, ReductionPlan(integration_1d=one if companion_1d else None, integration_2d=two), calibration=calibration),
+    )
+    first, second = tuple(_run_average_scan(recipe) for recipe in recipes)
+    assert first.disposition == second.disposition == "COMMITTED"
+    assert Path(first.target).name == "sample_int1d_average.nexus"
+    assert Path(second.target).name == "sample_int2d_average.nexus"
+    prior_two = Path(second.target).read_bytes()
+    profile = get_1d(first.target, frame=1)
+    repeated = _run_average_scan(recipes[0])
+    assert repeated.disposition == "COMMITTED" and repeated.target == first.target
+    np.testing.assert_array_equal(get_1d(repeated.target, frame=1).intensity, profile.intensity)
+    if companion_1d:
+        np.testing.assert_array_equal(get_1d(second.target, frame=1).intensity, profile.intensity)
+    assert get_2d(second.target, frame=1).intensity.shape == (2, 4)
+    for result in (repeated, second):
+        np.testing.assert_array_equal(get_average_finite_counts(result.target).values, np.full((2, 2), 3))
+    assert Path(second.target).read_bytes() == prior_two
+    prior_one = Path(first.target).read_bytes()
+    token = Event()
+    def stop():
+        token.set()
+        return False
+    stopped = _run_average_scan(recipes[0], cancel_token=token, publication_gate=stop)
+    assert stopped.disposition == "CANCELLED"
+    assert Path(first.target).read_bytes() == prior_one
+    assert Path(second.target).read_bytes() == prior_two
+    assert {path: Path(path).read_bytes() for path in original} == original
+    assert not anchor.exists() and not tuple(tmp_path.glob(".xdart-finite-*"))
+    assert sorted(path.name for path in tmp_path.glob("*.nexus")) == [
+        "sample_int1d_average.nexus", "sample_int2d_average.nexus",
+    ]
+    # The request's dimension, directory and family determine the expected path.
+    assert module._committed_average_mismatch(repeated, anchor, "entry", dimension="1d") is None
+    assert module._committed_average_mismatch(second, anchor, "entry", dimension="2d") is None
+    assert module._committed_average_mismatch(second, anchor, "entry", dimension="1d") == "target"
+    assert module._committed_average_mismatch(repeated, tmp_path / "other.nexus", "entry", dimension="1d") == "target"
+    assert module._committed_average_mismatch(repeated, tmp_path / "elsewhere" / anchor.name, "entry", dimension="1d") == "target"
+    wrong_seal = replace(repeated.commit_identity, target=second.target)
+    assert module._committed_average_mismatch(replace(repeated, commit_identity=wrong_seal), anchor, "entry", dimension="1d") == "commit"
+    assert Path(module._average_output_artifact(
+        str(tmp_path / "sample_int2d.nexus"), dimension="1d", artifact_family="sample",
+    )).name == "sample_int1d_average.nexus"
+
+
 @pytest.mark.parametrize("mask_saturation", (False, True))
 @pytest.mark.parametrize("thresholds", ("off", "low", "ceiling"))
 def test_real_average_counts_follow_each_frame_saturation(tmp_path, thresholds,
@@ -525,7 +587,7 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
         assert payload["output_artifact"] != payload["target_anchor"]
         artifact = Path(payload["output_artifact"])
         anchor = Path(payload["target_anchor"])
-        assert artifact.name == f"{anchor.stem}_average.nexus"
+        assert artifact.name == f"{anchor.stem}_int1d_average.nexus"
         assert artifact.parent == anchor.parent
         # No version leak: the identity is 64 hex, and none of it may surface.
         assert payload["version_identity"][:32] not in artifact.name
@@ -545,8 +607,8 @@ def test_append_live_xye_refuse_before_source_or_target_effects(tmp_path, monkey
     by_stem = {anchor.stem: anchor for anchor in anchors}
     for result in accepted:
         path = Path(result.target)
-        stem, marker, slot = path.stem.rpartition("_average")
-        assert (marker, slot) == ("_average", "")
+        stem, marker, slot = path.stem.rpartition("_int1d_average")
+        assert (marker, slot) == ("_int1d_average", "")
         assert stem in by_stem and path.parent == by_stem[stem].parent
         # The version identity stays in provenance and out of the public name.
         assert result.version_identity[:32] not in path.name
@@ -1820,7 +1882,7 @@ def test_settlement_retry_revalidates_without_recompute(tmp_path, monkeypatch) -
                 # fail on a botched rollback -- that oracle was vacuous.  The
                 # ARTIFACT is what the route creates and must remove on abort.
                 artifact = Path(module._average_output_artifact(
-                    module._average_target(str(target))
+                    module._average_target(str(target)), dimension="1d"
                 ))
                 if case in {"target", "commit-target"}:
                     # THE TEST put this file at the slot, to simulate something
@@ -2150,7 +2212,7 @@ def test_average_repeat_in_the_same_directory_atomically_replaces(
     hidden same-directory candidate and one atomic replacement publishes it.
 
     This FIXTURE names its scan `average`, so the family is `average` and the
-    slot reads `average_average.nexus`. That doubling is the fixture's own name,
+    slot reads `average_int1d_average.nexus`. The repeated word is the fixture's own name,
     not a product default -- `page.py:2553` builds the anchor from the save
     FOLDER plus the SCAN NAME, so a real scan gives `<scan>_average.nexus`.
     """
@@ -2163,7 +2225,7 @@ def test_average_repeat_in_the_same_directory_atomically_replaces(
     ))
     assert first.disposition == "COMMITTED"
     artifact = Path(first.target)
-    assert artifact.name == "average_average.nexus"
+    assert artifact.name == "average_int1d_average.nexus"
     committed_bytes = artifact.read_bytes()
     first_state = artifact.stat()
 
@@ -2316,7 +2378,7 @@ def test_average_persists_its_root_family_so_the_next_operation_cannot_chain(
     ))
     assert result.disposition == "COMMITTED"
     artifact = Path(result.target)
-    assert artifact.name == "scan12_average.nexus"
+    assert artifact.name == "scan12_int1d_average.nexus"
 
     with h5py.File(artifact, "r") as document:
         stored = document["entry"].attrs[ARTIFACT_FAMILY_ATTR]
@@ -2452,7 +2514,7 @@ def test_a_failure_after_candidate_settlement_strands_nothing(
     assert len(calls) == 2, "the injected failure never fired"
     assert result.disposition != "COMMITTED"
     # No slot was published, and NO private candidate remains.
-    slot = Path(module._average_output_artifact(module._average_target(str(target))))
+    slot = Path(module._average_output_artifact(module._average_target(str(target)), dimension="1d"))
     assert not slot.exists()
     assert not tuple(slot.parent.glob(".xdart-finite-*"))
 
@@ -2472,7 +2534,7 @@ def test_average_refuses_a_slot_that_is_its_own_raw_input(tmp_path, monkeypatch)
     from xrd_tools.core.scan import SourceKind, SourceSpec
     from xrd_tools.reduction.average import AverageScanRunner
 
-    raw = tmp_path / "scan_average.nexus"          # IS the derived slot
+    raw = tmp_path / "scan_int1d_average.nexus"          # IS the derived slot
     with h5py.File(raw, "w") as handle:
         handle.create_group("entry/instrument/detector").create_dataset(
             "data", data=np.arange(12, dtype="u2").reshape(3, 2, 2),
@@ -2512,7 +2574,7 @@ def test_average_refuses_a_slot_that_is_its_own_active_mask(tmp_path, monkeypatc
 
     source = _series(tmp_path)
     # The mask sits exactly where this Average's slot resolves.
-    mask_path = tmp_path / "scan_average.nexus"
+    mask_path = tmp_path / "scan_int1d_average.nexus"
     static_mask = np.zeros((4, 4), dtype=bool)
     static_mask[0, 0] = True
     # Written directly: `np.save` would append `.npy` and defeat the collision.

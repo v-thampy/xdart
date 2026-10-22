@@ -790,6 +790,8 @@ _ADR_SLOTS = {
     "int-1d": "_int1d",
     "int-2d": "_int2d",
     "average": "_average",
+    "average-1d": "_int1d_average",
+    "average-2d": "_int2d_average",
     "reintegrate-1d": "_reintegrate1d",
     "reintegrate-2d": "_reintegrate2d",
     "stitch-1d": "_stitch1d",

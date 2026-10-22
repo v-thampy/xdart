@@ -59,6 +59,7 @@ def _set_average_state(
         revision,
         target,
         entry,
+        "1d",
         pending,
         source_root,
     )
@@ -79,7 +80,7 @@ def _result(disposition: str, target: str = "/detached/average.nxs") -> AverageS
     # `version_identity` below, which is where the identity actually lives now
     # that the public name no longer carries it.
     version = "e" * 64
-    artifact = _average_output_artifact(_average_target(target))
+    artifact = _average_output_artifact(_average_target(target), dimension="1d")
     committed = disposition == "COMMITTED"
     evidence = (AverageFiniteCountsEvidence(
         "average_scan_v1", 2, (1, 1), "<u4", "c" * 64, 1, 2, 0,
@@ -575,7 +576,7 @@ def test_average_page_projects_and_retries_the_exact_pending_token() -> None:
     operations = WorkspaceOperationOwner()
     operations._slot = Slot()
     operations._average = AverageOperationState(
-        identity, 0, "/detached/average.nxs", "entry"
+        identity, 0, "/detached/average.nxs", "entry", "1d"
     )
     page = SimpleNamespace(
         _workspace_operations=operations,
@@ -1621,7 +1622,8 @@ def test_average_publication_gate_linearizes_cancel_wins_and_seal_wins(
     assert result.disposition == "COMMITTED"
 
 
-def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("dimension", ("1d", "2d"))
+def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch, dimension) -> None:
     from xrd_tools.core.provenance import read_provenance
     from xrd_tools.io import get_1d, get_2d, get_average_finite_counts, get_metadata
     from xrd_tools.reduction import average as average_module
@@ -1637,7 +1639,7 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
     })
     reduction = ReductionPlan(
         integration_1d=Integration1DPlan(npt=4, monitor_key="I0"),
-        integration_2d=Integration2DPlan(
+        integration_2d=None if dimension == "1d" else Integration2DPlan(
             npt_rad=3, npt_azim=2, monitor_key="I0",
         ),
     )
@@ -1665,9 +1667,11 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
         _average_output_artifact, _average_target,
     )
     direct_artifact = Path(_average_output_artifact(
-        _average_target(str(direct_target))))
+        _average_target(str(direct_target)), dimension=dimension))
     gui_artifact = Path(_average_output_artifact(
-        _average_target(str(gui_target))))
+        _average_target(str(gui_target)), dimension=dimension))
+    assert direct_artifact.name == f"direct_int{dimension}_average.nexus"
+    assert gui_artifact.name == f"gui_int{dimension}_average.nexus"
     assert Path(direct.target) == direct_artifact
     assert Path(gui.target) == gui_artifact
     assert direct_artifact != direct_target and gui_artifact != gui_target
@@ -1679,6 +1683,8 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
         (get_1d, ("q", "intensity", "sigma", "q_unit", "frames")),
         (get_2d, ("q", "chi", "intensity", "q_unit", "chi_unit", "frames")),
     ):
+        if getter is get_2d and dimension == "1d":
+            continue
         direct_value = getter(direct_artifact, frame=1)
         gui_value = getter(gui_artifact, frame=1)
         for name in fields_to_compare:
@@ -1709,7 +1715,44 @@ def test_direct_and_gui_average_match_after_fresh_reopen(tmp_path, monkeypatch) 
                 and type(commit.ordinal) is int and commit.ordinal > 0)
         assert commit.size == target.stat().st_size and commit.digest == hashlib.sha256(target.read_bytes()).hexdigest()
     assert direct.commit_identity.digest != gui.commit_identity.digest
-    assert len(calls) == 4
+    assert len(calls) == (2 if dimension == "1d" else 4)
+
+
+def test_average_frozen_dimension_refuses_a_real_other_dimension_terminal(tmp_path):
+    """Both adapter verification and reload adoption bind to the request."""
+    from xrd_tools.session.experiment_state import CalibrationState, FactStatus, PoniValues
+    from xrd_tools.reduction.average import _committed_average_mismatch
+    source = _source(tmp_path / "source")
+    target = tmp_path / "sample.nexus"
+    calibration = CalibrationState(
+        PoniValues(0.2, 0.001, 0.001, 0., 0., 0., 1e-10), "Detector",
+        {"pixel1": 1e-4, "pixel2": 1e-4, "max_shape": [2, 2]},
+        status=FactStatus.PRESENT,
+    )
+    reduction = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=4, method="numpy"),
+        integration_2d=Integration2DPlan(npt_rad=4, npt_azim=2, method="numpy"),
+    )
+    committed = _run_terminal_average(AverageScanRecipe(
+        source, target, reduction, calibration=calibration,
+    ))
+    assert committed.disposition == "COMMITTED"
+    assert _committed_average_mismatch(committed, target, "entry", dimension="1d") == "target"
+    for dimension in ("1d", "2d"):
+        owner = WorkspaceOperationOwner()
+        identity = OperationIdentity(78)
+        owner._average = AverageOperationState(identity, 4, str(target), "entry", dimension=dimension)
+        transition = owner.consume_average_update(OperationUpdate(
+            identity, terminal=OperationTerminal(
+                identity, OperationTerminalStatus.RETURNED, payload=committed,
+            ),
+        ), current_intent_revision=4)
+        if dimension == "1d":
+            assert transition.average_reload is None
+            assert "target mismatch" in transition.notice
+        else:
+            assert transition.average_reload is not None
+            assert transition.average_reload.target == committed.commit_identity.target
 
 
 def test_gui_average_freezes_real_source_energy_before_reduction(tmp_path):

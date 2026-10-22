@@ -607,7 +607,7 @@ class OperationSlot:
         publish("prepare", 1, 1)
         from xrd_tools.reduction.average import (
             AverageCommand, AverageScanPending, AverageScanProgress,
-            AverageScanResult, _committed_average_mismatch,
+            AverageScanResult, _average_dimension, _committed_average_mismatch,
         )
         headless_revision = -1; headless_identity = None
         def progress(value):
@@ -632,7 +632,8 @@ class OperationSlot:
         if type(result) is not AverageScanResult or headless_identity is not None and result.operation_identity != headless_identity:
             raise TypeError("Average runner returned an invalid result")
         if result.disposition == "COMMITTED":
-            mismatch = _committed_average_mismatch(result, request.target, request.entry)
+            mismatch = _committed_average_mismatch(result, request.target, request.entry,
+                                                   dimension=_average_dimension(recipe))
             if mismatch is not None:
                 return OperationTerminal(
                     identity, OperationTerminalStatus.FAILED,

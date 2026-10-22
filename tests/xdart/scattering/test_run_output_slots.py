@@ -329,10 +329,11 @@ def test_a_gi_average_anchor_carries_the_marker_and_no_run_slot(tmp_path):
         str(tmp_path), "scan12", grazing_incidence=True,
     )
     assert anchor == tmp_path / "scan12_gi.nexus"
-    assert resolve_finite_output_target(
-        anchor.parent, artifact_family_from_source(anchor),
-        operation_token="average",
-    ) == tmp_path / "scan12_gi_average.nexus"
+    for dimension in ("1d", "2d"):
+        assert resolve_finite_output_target(
+            anchor.parent, artifact_family_from_source(anchor),
+            operation_token=f"average-{dimension}",
+        ) == tmp_path / f"scan12_gi_int{dimension}_average.nexus"
     # An explicit anchor is the operator's name.
     assert _resolved_generated_target(
         str(tmp_path / "chosen.nexus"), "scan12", grazing_incidence=True,
