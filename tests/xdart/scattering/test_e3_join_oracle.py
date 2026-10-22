@@ -1154,6 +1154,14 @@ def test_j0_09_equal_foreign_stale_and_late_values_are_inert(
         _run(rig)
         _wait(rig.app, lambda: rig.lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED})
         assert rig.lifecycle.phase is RunPhase.IDLE, rig.page._notice_text
+        # Terminal status precedes the final Browse presentation. Freeze the
+        # baseline after that legitimate selection change has finished.
+        _wait(
+            rig.app,
+            lambda: rig.page._processed_browser.terminal_request is None
+            and rig.shell.scientific.frame_selector.currentData()
+            is rig.controller.navigation.current,
+        )
         accepted = rig.controller.frame_keys[-1]
         prior = rig.shell.scientific.frame_selector.currentData()
         equal_foreign = replace(accepted)

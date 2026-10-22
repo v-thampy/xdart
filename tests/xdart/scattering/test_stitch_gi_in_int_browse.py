@@ -46,7 +46,12 @@ def test_a_gi_stitch_record_is_a_gi_frame_in_int_browse(tmp_path, monkeypatch, _
         page.resize(1200, 800)
         page.show()
         page._refresh_shell()
-        state = _painted(page)
+        # Sparse traces can arrive before the independently hydrated 2D map.
+        state = _painted(
+            page,
+            lambda value: mode == "1d"
+            or (value.heavy is not None and value.heavy.cake is not None),
+        )
         assert state.measurement_mode == "GI" and state.gi_mode_1d == "q_total"
         np.testing.assert_array_equal(state.traces[0].intensity, (payload.profile if mode == "2d" else payload).intensity)
         if mode == "1d":
