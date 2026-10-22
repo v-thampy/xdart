@@ -258,7 +258,7 @@ SOURCE_BASE_ATTR = "source_base"
 #: (ADR-0010, carried as 491b9413).  Stable public slots are named
 #: `<family><slot>.nexus`, and a later operation must CONSUME this value rather
 #: than derive one from the file's stem -- deriving from `sample_int2d.nexus`
-#: yields `sample_int2d_average.nexus`, the chained name the ADR forbids, and
+#: yields `sample_int2d_reintegrate1d.nexus`, the chained name the ADR forbids, and
 #: stripping the slot to recover the root is an explicit stop condition.
 ARTIFACT_FAMILY_ATTR = "artifact_family_v1"
 #: thumbnail dataset attrs storing the quantization LUT for inversion

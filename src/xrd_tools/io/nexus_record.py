@@ -531,7 +531,7 @@ def stamp_artifact_family(entry_grp: h5py.Group, artifact_family) -> str | None:
     This is what makes the stable-slot policy's anti-chaining rule real. A later
     operation CONSUMES this value; without it, deriving a family from the
     artifact's own stem turns `sample_int2d.nexus` into
-    `sample_int2d_average.nexus`.
+    `sample_int2d_reintegrate1d.nexus`.
     """
     family = validate_artifact_family(entry_grp, artifact_family)
     if family is None:

@@ -54,7 +54,8 @@ Scientific correctness remains independently non-negotiable, and finite
 operations do not gain a general crash-recovery state machine (ADR-0010).
 
 The public slots for one `<family>` are `_int1d.nexus`, `_int2d.nexus`,
-`_average.nexus`, `_reintegrate1d.nexus`, `_reintegrate2d.nexus`,
+`_int1d_average.nexus`, `_int2d_average.nexus` (1.1.5 wrote `_average.nexus`),
+`_reintegrate1d.nexus`, `_reintegrate2d.nexus`,
 `_stitch1d.nexus`, `_stitch2d.nexus`, and `_rsm.nexus`.  Public filenames
 never expose a version or hash; exact identities remain in provenance.  An
 automatically named grazing-incidence result starts the family `<scan>_gi`

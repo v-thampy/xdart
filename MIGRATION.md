@@ -43,6 +43,12 @@ current README and installation guide are the starting points for a new install.
    order, which can change result-order trends and export order relative to a
    previously captured arrival order. Select the intended results explicitly
    when preparing comparisons or a fit batch.
+6. **Clear the Data Browser's filter to find other results.** Each page lists its
+   own mode's results by default; older or hand-named results without an
+   operation suffix appear once the field is cleared. A new Average writes
+   `<family>_int1d_average.nexus` or `<family>_int2d_average.nexus` beside any
+   1.1.5 `<family>_average.nexus`, which it no longer replaces; update scripts
+   that look for `_average.nexus`.
 
 There is no bulk conversion of processed files. Keep the original raw sources
 with a moved project when raw-image inspection or replay is needed. The

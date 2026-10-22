@@ -39,6 +39,17 @@ requirements.
   catalog arrives. The newest result remains current but need not be the last
   row. No-selection fit batches follow the visible order; selected batches use
   the existing selection order.
+- **Each page lists its own results.** The Data Browser's filename filter starts
+  with the current mode's operation suffixes: `_int1d, _int2d, _reintegrate1d,
+  _average` in Int 1D, `_int2d, _reintegrate2d, _average` in Int 2D, `_stitch1d,
+  _stitch2d` in Stitch 1D, `_stitch2d` in Stitch 2D and `_rsm` in RSM. Folders and
+  the results being viewed always stay listed. Typed text matches anywhere in a
+  filename (separate alternatives with commas); clear the field to list every
+  result, including older or hand-named files without an operation suffix. Stitch
+  and RSM also offer Int's Time order.
+- **Average results name their dimension:** a new Average writes
+  `<family>_int1d_average.nexus` or `<family>_int2d_average.nexus`. A 1.1.5
+  `<family>_average.nexus` stays readable, but a new Average does not replace it.
 - On Linux and macOS, Stitch, RSM, Average and Reintegrate saves no longer delete
   or publish a file that another process put in their place.
 - Calibration dialogs release their windows and pending restore callbacks with

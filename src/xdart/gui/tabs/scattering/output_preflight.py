@@ -1893,7 +1893,8 @@ def _resolved_generated_target(
     *slot* is empty for the Average NAMING ANCHOR, which is not a written file:
     it supplies the directory and the root FAMILY, so appending a run slot to it
     would make Average derive `<scan>_int2d` as its family and publish the
-    chained `<scan>_int2d_average.nexus`.  Callers that name a real run target
+    chained `<scan>_int2d_int2d_average.nexus` (a 2-D Average's own slot is
+    `_int2d_average`).  Callers that name a real run target
     pass the slot from :func:`_run_output_slot`.
 
     *grazing_incidence* marks an automatic family exactly as
