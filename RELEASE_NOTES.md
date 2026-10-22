@@ -1,6 +1,6 @@
 # Release notes
 
-## 1.2.1 (unreleased)
+## 1.2.1 (2026-10-22)
 
 ### Fixes
 
@@ -14,7 +14,8 @@
   temporary folder, and the mask was not selected. xdart now retries the delete
   for up to 2 seconds. If the folder still stays behind, the saved mask is
   selected anyway and a warning names the folder and the Windows error; you can
-  delete that folder.
+  review the remaining temporary files. Other save or validation failures still
+  report failure.
 
 ## 1.2.0 (2026-10-22)
 

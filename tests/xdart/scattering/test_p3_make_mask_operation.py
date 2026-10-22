@@ -871,7 +871,25 @@ def test_a_held_private_copy_keeps_the_saved_mask_and_names_the_reason(tmp_path,
         f"cleanup could not delete {Path(result.recovery_path).name}: builtins.PermissionError: [Errno 13] held by another process")
     assert authoring.mask_leftover_warning(result) == (
         f"The mask was saved and checked, but xdart could not delete its temporary folder:\n{result.cwd}\n\n"
-        f"Reason: {result.recovery_reason}\n\nYou can delete that folder; the saved mask does not depend on it.")
+        f"Reason: {result.recovery_reason}\n\nThe saved mask does not depend on those temporary files.")
+def test_saved_mask_with_replaced_stage_does_not_offer_to_delete_foreign_files(tmp_path, monkeypatch) -> None:
+    request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    cleanup = authoring._cleanup
+    def substitute_stage(stage, identity, names):
+        stage.rename(stage.with_name(stage.name + "-original"))
+        stage.mkdir(); (stage / "unrelated.txt").write_text("keep this")
+        return cleanup(stage, identity, names)
+    monkeypatch.setattr(authoring, "_cleanup", substitute_stage)
+    terminal, _ = _direct(request); result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.RETURNED and result.published
+    assert "private stage changed: identity" in result.recovery_reason
+    assert (Path(result.cwd) / "unrelated.txt").read_text() == "keep this"
+    assert Path(request.final_path).is_file()
+    warning = authoring.mask_leftover_warning(result)
+    assert result.cwd in warning and result.recovery_reason in warning
+    assert "You can delete that folder" not in warning
+
+
 def test_unsaved_mask_with_a_held_stage_still_fails_with_custody_and_reason(tmp_path, monkeypatch) -> None:
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8), code=7)
     _refuse(monkeypatch, "rmdir", lambda path: path.name.startswith(".xdart-mask-"))

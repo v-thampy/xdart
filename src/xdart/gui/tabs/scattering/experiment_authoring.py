@@ -1413,7 +1413,7 @@ def mask_leftover_warning(result: MaskResult) -> str:
         return ""
     reason = f"\n\nReason: {result.recovery_reason}" if result.recovery_reason else ""
     return (f"The mask was saved and checked, but xdart could not delete its temporary folder:\n{result.cwd}"
-            f"{reason}\n\nYou can delete that folder; the saved mask does not depend on it.")
+            f"{reason}\n\nThe saved mask does not depend on those temporary files.")
 def resolve_mask_executable(fixed: str | None = None) -> str | None:
     return _resolve_authoring_executable("pyFAI-drawmask", fixed)
 
