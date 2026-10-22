@@ -172,8 +172,22 @@ def _labels(path):
 
 def _show(qapp, page, view, key):
     """Select ``key`` and wait for Int 2D's raw pane (Browse has no Int 1D raw display; see G1)."""
+    def image_ready():
+        state = page._last_scientific_projection
+        heavy = None if state is None else state.heavy
+        return (
+            heavy is not None and heavy.frame is key and heavy.raw is not None
+            and view.raw.render_matches(
+                heavy.raw,
+                detector_shape=heavy.detector_shape,
+                color_map=view.color_map.currentText(),
+                log_scale=state.log_scale,
+            )
+        )
+
     select(qapp, page, key)
-    settle(qapp, view)
+    # A cached thumbnail and an idle phase worker can precede this image's paint.
+    settle(qapp, view, image_ready)
 
 
 def _curves(target, name='LaB6'):
