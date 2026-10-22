@@ -1453,6 +1453,7 @@ class BrowserView(QtWidgets.QFrame):
                 ShellCommandKind.SELECT_RESULT, item.data(_USER_ROLE),
                 artifacts=self.selected_results(), intent=intent,
             ))
+            self._viewed_result_changed()
         elif intent is FrameSelectionIntent.VISIT:
             self._scan_selected(intent)
         else:

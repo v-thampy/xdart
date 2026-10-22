@@ -369,6 +369,44 @@ def test_a_row_kept_while_viewed_goes_when_the_view_moves_on(qapp, profile):
         _close(qapp, browser)
 
 
+@pytest.mark.parametrize("plot_mode", ["Overlay", "Waterfall"])
+def test_overlay_gestures_drop_an_unpinned_row_without_changing_the_remaining_selection(qapp, plot_mode):
+    """The real visit/toggle path blocks Qt's native selection signals, but must still re-filter later."""
+    browser = BrowserView(profile=_STITCH_LIKE)
+    entries = tuple(BrowserResult(name, name) for name in (
+        "one_stitch1d.nexus", "two_stitch1d.nexus", "renamed.nexus"))
+    commands = []
+    browser.commandRequested.connect(commands.append)
+    try:
+        browser.set_filename_mode("Stitch 1D")
+        browser.set_result_plot_mode(plot_mode)
+        browser.reconcile_results(entries, "renamed.nexus")
+        browser.resize(500, 320)
+        browser.show()
+        qapp.processEvents()
+
+        def click(name, modifier=QtCore.Qt.KeyboardModifier.NoModifier):
+            item = next(browser.scans.item(i) for i in range(browser.scans.count())
+                        if browser.scans.item(i).text() == name)
+            QtTest.QTest.mouseClick(browser.scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+                                   modifier, browser.scans.visualItemRect(item).center())
+            qapp.processEvents()
+
+        click(entries[0].label)  # visit keeps the opened result in the overlay
+        click("renamed.nexus", QtCore.Qt.KeyboardModifier.ControlModifier)  # remove its trace
+        click(entries[1].label)  # visit moves current away: the renamed row is no longer pinned
+        deadline = time.monotonic() + 5
+        while "renamed.nexus" in browser.listed_results() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        assert browser.listed_results() == (entries[0].identifier, entries[1].identifier)
+        assert browser.current_result() == entries[1].identifier
+        assert set(browser.selected_results()) == {entries[0].identifier, entries[1].identifier}
+        assert [command.kind for command in commands] == [ShellCommandKind.SELECT_RESULT] * 3
+    finally:
+        _close(qapp, browser)
+
+
 def test_the_viewed_scan_and_its_frames_stay_listed_through_the_filter(qapp):
     """In Int the filter narrows the other rows, never the scan being viewed: its row and its frames stay, as do
     an overlay's selected scans, so the list, its frames and the plot cannot disagree (a mode switch or typing
