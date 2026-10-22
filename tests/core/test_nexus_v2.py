@@ -1,4 +1,4 @@
-"""Tests for the v2 NeXus reader (``read_scan`` / ``read_stitched``).
+"""Tests for the v2 NeXus reader (``read_scan``).
 
 We create a small current record through the production writer — no xdart
 dependency, no captured-file dependency — and round-trip it through the v2
@@ -14,7 +14,7 @@ import pytest
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.geometry import DiffractometerGeometry
 from xrd_tools.core.provenance import write_provenance
-from xrd_tools.io.nexus import read_scan, read_stitched, write_nexus
+from xrd_tools.io.nexus import read_scan, write_nexus
 
 
 N_FRAMES = 5
@@ -148,12 +148,6 @@ def v2_fixture(tmp_path):
             pg.create_dataset("value", data=arr)
             pg["value"].attrs["units"] = "deg"
 
-        # stitched_1d (so read_stitched can be tested too) -------------
-        st = entry.create_group("stitched_1d")
-        st.attrs["NX_class"] = "NXdata"
-        st.create_dataset("intensity", data=rng.random(N_Q, dtype=np.float32))
-        st.create_dataset("q", data=q)
-
         # provenance ---------------------------------------------------
         write_provenance(
             f,
@@ -263,25 +257,6 @@ class TestReadSphere:
         p, _, _ = v2_fixture
         ds = read_scan(p)
         assert "thumbnail" not in ds.data_vars
-
-
-# ---------------------------------------------------------------------------
-# read_stitched
-# ---------------------------------------------------------------------------
-
-class TestReadStitched:
-    def test_reads_stitched_1d(self, v2_fixture):
-        p, _, _ = v2_fixture
-        ds = read_stitched(p)
-        assert "stitched_1d" in ds.data_vars
-        assert ds["stitched_1d"].dims == ("q",)
-        assert ds.sizes["q"] == N_Q
-
-    def test_raises_when_no_stitched_present(self, tmp_path):
-        p = tmp_path / "no_stitch.nexus"
-        _write_current_results(p, [0])
-        with pytest.raises(KeyError):
-            read_stitched(p)
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import struct
+import time
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 import uuid
@@ -34,7 +35,6 @@ from xrd_tools.io.nexus import (
     validate_integrated_stack_write,
     write_diffractometer,
     write_integrated_stack,
-    write_stitched,
 )
 from xrd_tools.io.nexus_record import (
     _PreparedThumbnail,
@@ -166,11 +166,19 @@ class RecordWrite:
     replace_existing: bool = False
     background_dependency_bytes: bytes | None = None
     background_dependency_fingerprint: str | None = None
+    source_constituents: tuple[Mapping[str, Any], ...] = ()
+    point_images: Mapping[str, Any] | None = None
+    #: The primary 1-D profile's angular support (COVERAGE-SUPPORT-20261013): an ``AngularSupportProfile`` saved
+    #: with the row (available or with its reason), or None to save none (Average, older callers).
+    angular_support: Any | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "mode_1d", canonical_gi_mode_key(self.mode_1d, "1d"),
         )
+        if self.angular_support is not None and (
+                type(self.angular_support).__name__ != "AngularSupportProfile" or self.result_1d is None):
+            raise TypeError("RecordWrite.angular_support must be an AngularSupportProfile beside a 1-D result")
         object.__setattr__(
             self, "mode_2d", canonical_gi_mode_key(self.mode_2d, "2d"),
         )
@@ -243,6 +251,22 @@ class RecordWrite:
                     > _MAX_REPLACEMENT_PATH_UTF8_BYTES):
             raise ValueError("source_path exceeds the persisted path byte ceiling")
         object.__setattr__(self, "source_snapshot", MappingProxyType(snapshot))
+        if self.source_constituents:
+            from xrd_tools.sources.point_images import PointImagePolicy
+            policy = PointImagePolicy.from_dict(self.point_images)
+            normalized = []
+            for member in self.source_constituents:
+                if set(member) != {"source_path", "source_frame_index", "source_snapshot"}:
+                    raise ValueError("point source constituent fields are malformed")
+                validated = RecordWrite(0, source_path=member["source_path"], source_frame_index=member["source_frame_index"], source_snapshot=member["source_snapshot"])
+                normalized.append(MappingProxyType({"source_path": str(validated.source_path), "source_frame_index": validated.source_frame_index, "source_snapshot": validated.source_snapshot}))
+            expected = 1 if policy.operation == "select" else policy.images_per_point
+            if len(normalized) != expected:
+                raise ValueError("point source constituents do not match the policy")
+            object.__setattr__(self, "source_constituents", tuple(normalized))
+            object.__setattr__(self, "point_images", MappingProxyType(policy.to_dict()))
+        elif self.point_images is not None:
+            raise ValueError("point image policy requires exact source constituents")
         if self.thumbnail_mask is not None:
             incoming_mask = np.asarray(self.thumbnail_mask)
             if incoming_mask.dtype != np.dtype(bool):
@@ -269,9 +293,10 @@ class WriterFinalization:
     detector_calibration: Mapping[str, Any] | None = None
     global_mask: Any | None = None
     detector_shape: tuple[int, ...] | None = None
-    stitched_1d: Any | None = None
-    stitched_2d: Any | None = None
-    stitched_provenance: Mapping[str, Any] | str | None = None
+    #: The applied flat field (unusable pixels NaN), persisted for Reintegrate.
+    flatfield: Any | None = None
+    #: The subtracted dark current (unusable pixels NaN), persisted for Reintegrate.
+    darkcurrent: Any | None = None
     average_finite_counts: Any | None = None
 
 
@@ -322,6 +347,8 @@ class _ExpectedFrameRow:
     source_snapshot: tuple[tuple[str, Any], ...]
     timestamp: str | None
     background_dependency: tuple[bytes, str] | None
+    source_constituents: tuple[Mapping[str, Any], ...] = ()
+    point_images: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +357,8 @@ class _PersistedSourceFact:
     path: str | None
     frame_index: int | None
     snapshot: tuple[tuple[str, Any | None], ...]
+    source_constituents: tuple[Mapping[str, Any], ...] = ()
+    point_images: Mapping[str, Any] | None = None
 
 
 _SOURCE_SNAPSHOT_ATTRIBUTES = (
@@ -365,7 +394,12 @@ def _replacement_json_node(parent, path, role, *, required=True):
     raw = _replacement_utf8_scalar(node, role); value = json.loads(raw)
     (None if raw == json.dumps(value, sort_keys=True, separators=(",", ":")) else (_ for _ in ()).throw(ValueError(f"{role} is noncanonical"))); return value
 def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "entry", rows: Mapping[str, Mapping[int, int]] | None = None, context: tuple[str, Mapping[str, Any] | None, Mapping[str, Any]] | None = None, metadata_keys: tuple[str, ...] = (), include_geometry: bool = False) -> Mapping[str, Any]:
-    label, group = int(label), _replacement_hard_group(handle, entry); frames = _replacement_hard_group(group, "frames"); frame_name = f"frame_{label:04d}"; frame = _replacement_hard_group(frames, frame_name); source = _replacement_hard_group(frame, "source"); path_node = _replacement_hard_group(source, "path", h5py.Dataset); index_node = _replacement_hard_group(source, "frame_index", h5py.Dataset)
+    label, group = int(label), _replacement_hard_group(handle, entry); frames = _replacement_hard_group(group, "frames"); frame_name = f"frame_{label:04d}"; frame = _replacement_hard_group(frames, frame_name); source = _replacement_hard_group(frame, "source")
+    from xrd_tools.io.nexus_record import read_point_source_ref
+    point = read_point_source_ref(source)
+    if point is not None:
+        source = _replacement_hard_group(source, "constituents/0000")
+    path_node = _replacement_hard_group(source, "path", h5py.Dataset); index_node = _replacement_hard_group(source, "frame_index", h5py.Dataset)
     try: source_class = _replacement_utf8_attribute(source, "NX_class", "replacement source class", max_bytes=_MAX_REPLACEMENT_PATH_UTF8_BYTES)
     except (AttributeError, TypeError, ValueError): source_class = None
     if not isinstance(source, h5py.Group) or set(source) != {"path", "frame_index"} or set(source.attrs) - {"NX_class", *(attr for _key, attr in _SOURCE_SNAPSHOT_ATTRIBUTES)} or source_class != "NXcollection" or type(source.get("path", getlink=True)) is not h5py.HardLink or type(source.get("frame_index", getlink=True)) is not h5py.HardLink or not isinstance(path_node, h5py.Dataset) or path_node.shape != () or path_node.maxshape != () or path_node.chunks is not None or path_node.compression is not None or len(path_node.attrs) != 0 or (encoding := h5py.check_string_dtype(path_node.dtype)) is None or encoding.encoding != "utf-8" or not isinstance(index_node, h5py.Dataset) or index_node.shape != () or index_node.maxshape != () or index_node.chunks is not None or index_node.compression is not None or len(index_node.attrs) != 0 or index_node.dtype.kind not in "iu": raise WriterStateError(f"replacement frame {label} has no exact source fact")
@@ -427,8 +461,9 @@ def _decode_replacement_fact(handle: h5py.File, label: int, *, entry: str = "ent
     return MappingProxyType({"label": label, "path": path, "frame_index": index,
         "snapshot": MappingProxyType(snapshot), "source_base": source_base,
         "source_execution": execution, "append_lineage": lineage,
-        "metadata": indexed("scan_data", metadata_keys), "geometry": indexed("per_frame_geometry", ("rot1", "rot2", "rot3", "incident_angle") if include_geometry else ()),
-        "background_dependency": background})
+        "metadata": MappingProxyType({**indexed("scan_data", metadata_keys), **({"point_images": {**point[0], "raw_locators": [{"path": member["source_path"], "frame": member["source_frame_index"]} for member in point[1]]}} if point is not None else {})}), "geometry": indexed("per_frame_geometry", ("rot1", "rot2", "rot3", "incident_angle") if include_geometry else ()),
+        "background_dependency": background,
+        **({"point_images": point[0], "source_constituents": tuple({**member, "source_snapshot": {key: member["source_snapshot"].get(key) for key, _attr in _SOURCE_SNAPSHOT_ATTRIBUTES}} for member in point[1])} if point is not None else {})})
 
 
 @dataclass(frozen=True, slots=True)
@@ -2010,6 +2045,12 @@ class NexusRecordWriter:
         self.target = require_current_output_path(target)
         self.entry = str(entry)
         self.compression = compression
+        #: one incremental support-table writer for this writer's whole life (COVERAGE-SUPPORT-20261013)
+        self._angular_support_table = None
+        #: the target's recorded “Record angular coverage” choice at open ("off", "on" or None for no 1-D rows yet)
+        #: and the Run's bound choice (None: unbound callers keep per-record support, as Stitch's one profile does)
+        self._recorded_angular_support: str | None = None
+        self._angular_support_enabled: bool | None = None
         self.overwrite = bool(overwrite)
         self.atomic = atomic
         self.flush_every = flush_every
@@ -2192,6 +2233,11 @@ class NexusRecordWriter:
         self._vector = {name: 0 for name in _VECTOR_FIELDS}
         self._pending_owner: str | None = None
         self._finish_step = -1
+        self._perf_enabled = (
+            bool(os.environ.get("XDART_PERF"))
+            or os.environ.get("XDART_PERF_QUARTILES", "").strip() == "1"
+        )
+        self._perf_finish: dict[str, float] = {}
         self._finalization = WriterFinalization()
         self._fresh = False
         self._dirty_modes: dict[tuple[str, int], _ExpectedModeRow] = {}
@@ -2787,6 +2833,8 @@ class NexusRecordWriter:
             timestamp,
             (None if record.background_dependency_bytes is None else
              (record.background_dependency_bytes, record.background_dependency_fingerprint)),
+            tuple({"source_path": member["source_path"] if self._replacement_configuration is not None else relative_source_path(member["source_path"], self.source_base), "source_frame_index": member["source_frame_index"], "source_snapshot": dict(member["source_snapshot"])} for member in record.source_constituents),
+            record.point_images,
         )
 
     def _remember_frame_row(
@@ -2813,6 +2861,8 @@ class NexusRecordWriter:
     def _source_fact_for_expected_frame(
         expected: _ExpectedFrameRow,
     ) -> _PersistedSourceFact:
+        if expected.source_constituents:
+            return _PersistedSourceFact(True, None, None, (), expected.source_constituents, expected.point_images)
         if expected.source_path is None:
             return _PersistedSourceFact(False, None, None, ())
         supplied = dict(expected.source_snapshot)
@@ -2885,6 +2935,10 @@ class NexusRecordWriter:
             return _PersistedSourceFact(False, None, None, ())
         if not isinstance(source, h5py.Group):
             raise WriterStateError(f"existing frame {label} source is not a group")
+        if "constituents" in source:
+            from xrd_tools.io.nexus_record import read_point_source_ref
+            policy, constituents = read_point_source_ref(source)
+            return _PersistedSourceFact(True, None, None, (), constituents, policy)
         try:
             path_node = (_replacement_hard_group(source, "path", h5py.Dataset) if self._replacement_configuration is not None else source["path"])
             index_node = (_replacement_hard_group(source, "frame_index", h5py.Dataset) if self._replacement_configuration is not None else source["frame_index"])
@@ -3110,7 +3164,7 @@ class NexusRecordWriter:
             digest=evidence.observed_hexdigest(),
         )
 
-    def _expected_frame_children(self, expected: _ExpectedFrameRow) -> set[str]: return {name for name, value in (("thumbnail", expected.thumbnail), ("thumbnail_mask", expected.thumbnail_mask), ("source", expected.source_path), ("timestamp", expected.timestamp), ("background_dependency", expected.background_dependency)) if value is not None}
+    def _expected_frame_children(self, expected: _ExpectedFrameRow) -> set[str]: return {name for name, value in (("thumbnail", expected.thumbnail), ("thumbnail_mask", expected.thumbnail_mask), ("source", expected.source_constituents if expected.source_constituents else expected.source_path), ("timestamp", expected.timestamp), ("background_dependency", expected.background_dependency)) if value is not None}
 
     def _verify_frame_row(self, evidence: _EvidenceBuilder, expected: _ExpectedFrameRow) -> None: self._verify_frame_row_with_children(evidence, expected, self._expected_frame_children(expected))
 
@@ -3183,7 +3237,11 @@ class NexusRecordWriter:
                 expected.thumbnail_mask,
                 np.asarray(mask[()]),
             )
-        if expected.source_path is None:
+        if expected.source_constituents:
+            if observed_source_fact != self._source_fact_for_expected_frame(expected):
+                raise WriterStateError(f"durability readback mismatch for {role}/source/constituents")
+            evidence.text(f"{role}/source/constituents", json.dumps({"point_images": dict(expected.point_images), "constituents": expected.source_constituents}, sort_keys=True), json.dumps({"point_images": dict(observed_source_fact.point_images), "constituents": observed_source_fact.source_constituents}, sort_keys=True))
+        elif expected.source_path is None:
             evidence.absent(f"{role}/source", "source" not in frame)
         else:
             source = frame.get("source")
@@ -4210,6 +4268,17 @@ class NexusRecordWriter:
     def operation_vector(self) -> WriterOperationVector:
         return WriterOperationVector(**self._vector)
 
+    def perf_snapshot(self) -> dict[str, float]:
+        """Opt-in finish timings; science readback is included in close."""
+        return dict(self._perf_finish)
+
+    def _record_finish_perf(self, owner: str, started: float) -> None:
+        if self._perf_enabled:
+            key = "writer_finish_" + owner.replace("-", "_")
+            self._perf_finish[key] = self._perf_finish.get(key, 0.0) + max(
+                0.0, time.perf_counter() - started,
+            )
+
     def reset_operation_vector(self) -> None:
         self._vector = {name: 0 for name in _VECTOR_FIELDS}
 
@@ -4558,6 +4627,9 @@ class NexusRecordWriter:
                         "per_frame_geometry",
                     ):
                         self._row_cursors[name] = self._load_cursor(name)
+                # the output's recorded coverage choice, read before a Reintegrate successor resets its rows
+                from xrd_tools.io.angular_support import recorded_choice
+                self._recorded_angular_support = recorded_choice(self._entry_group())
                 if self._replacement_configuration is not None:
                     config = _replacement_hard_group(self._h5, f"{self.entry}/reduction/config"); node = _replacement_hard_group(config, "source_execution", h5py.Dataset)
                     try: execution = json.loads(_replacement_utf8_scalar(node, "source_execution", max_bytes=_MAX_REPLACEMENT_LINEAGE_UTF8_BYTES))
@@ -5196,6 +5268,50 @@ class NexusRecordWriter:
     def write(self, record: RecordWrite) -> None:
         self.write_batch((record,))
 
+    @property
+    def recorded_angular_support(self) -> str | None:
+        """The target's recorded “Record angular coverage” choice when this writer opened it: "off" (its marker),
+        "on" (unmarked with 1-D rows) or None (no 1-D rows yet: the Run that creates them chooses)."""
+        return self._recorded_angular_support
+
+    def bind_angular_support(self, enabled: bool) -> None:
+        """Bind the Run's resolved choice (COVERAGE-SUPPORT-20261013, contract B: an output keeps the choice it was
+        created with). Off marks an output once and then writes no per-frame support; a choice contradicting the
+        output's recorded one is refused here, before any frame."""
+        self._require_active()
+        if type(enabled) is not bool:
+            raise TypeError("the Run's angular coverage choice must be an exact bool")
+        recorded = self._recorded_angular_support
+        if recorded is not None and (recorded == "on") is not enabled:
+            raise WriterStateError(f"the Run's angular coverage choice contradicts the output's recorded {recorded!r}")
+        self._angular_support_enabled = enabled
+        if not enabled and recorded is None:
+            from xrd_tools.io.angular_support import mark_recording_off
+            with self._boundary():
+                self._authorize_transaction_mutation()
+                mark_recording_off(self._entry_group())
+            self._recorded_angular_support = "off"
+
+    def _write_angular_support(self, records: list[RecordWrite]) -> None:
+        """Merge the primary 1-D rows' saved support into their group's table, inside this batch's transaction.
+
+        A row written without support forgets any earlier entry for its label; a batch without support never
+        creates the table. Digests bind each entry to its row exactly as the stack writer stores it (float32).
+        An output recorded off keeps no per-frame support: its one marker names every frame's reason.
+        """
+        if self._angular_support_enabled is False:
+            return
+        from xrd_tools.io.angular_support import SupportTableWriter, has_angular_support
+        from xrd_tools.io.nexus import _comp_kwargs
+        group = self._entry_group().get("integrated_1d")
+        entries = {int(record.label): record.angular_support for record in records}
+        if group is None or (all(value is None for value in entries.values()) and not has_angular_support(group)):
+            return
+        if self._angular_support_table is None:
+            self._angular_support_table = SupportTableWriter(_comp_kwargs(self.compression))
+        self._angular_support_table.write(group, entries, intensity_rows={
+            int(record.label): np.asarray(record.result_1d.intensity, dtype=np.float32) for record in records})
+
     def _write_batch_preserving_average_counts(self, records: Iterable[RecordWrite]) -> None:
         self._require_active(); batch = tuple(records)
         if any(int(record.label) == 1 and record.write_frame_record for record in batch): raise WriterStateError("AVERAGE_FINITE_COUNTS_REPLACEMENT_REQUIRES_AVERAGE_FINALIZATION")
@@ -5316,6 +5432,8 @@ class NexusRecordWriter:
                         },
                         bulk_new_rows=self._fast_regenerable,
                     )
+                if primary_1d:
+                    self._write_angular_support(primary_1d)
                 if prepared_stack is None and (one_d or two_d):
                     self._capture_prepared_stack_authority(batch)
                 if primary_1d:
@@ -5338,6 +5456,8 @@ class NexusRecordWriter:
                             timestamp=record.timestamp,
                             source_base=self.source_base,
                             source_snapshot=record.source_snapshot,
+                            source_constituents=record.source_constituents,
+                            point_images=record.point_images,
                             background_dependency_bytes=record.background_dependency_bytes,
                             background_dependency_fingerprint=record.background_dependency_fingerprint,
                             _prepared_thumbnail=prepared_thumbnails.get(
@@ -5667,6 +5787,7 @@ class NexusRecordWriter:
                     self._h5 = None
                     return
             if self._fast_regenerable and self._stream_close_attempt is not None:
+                started = time.perf_counter() if self._perf_enabled else 0.0
                 try:
                     fast_evidence = self._verify_fast_integrated_results()
                 except BaseException:
@@ -5675,6 +5796,8 @@ class NexusRecordWriter:
                         lease=binding.lease,
                     )
                     raise
+                finally:
+                    self._record_finish_perf("science_readback", started)
         if self._h5 is not None:
             try:
                 self._h5.close()
@@ -5815,6 +5938,13 @@ class NexusRecordWriter:
             )
             cursor.clear()
             cursor.update({value: row for row, value in enumerate(labels)})
+            # the label's saved support goes with its row, in this transaction, through the one table writer
+            from xrd_tools.io.angular_support import SupportTableWriter, has_angular_support
+            if has_angular_support(group):
+                if self._angular_support_table is None:
+                    from xrd_tools.io.nexus import _comp_kwargs
+                    self._angular_support_table = SupportTableWriter(_comp_kwargs(self.compression))
+                self._angular_support_table.write(group, {label: None}, intensity_rows={})
 
             for key, expected in tuple(self._dirty_modes.items()):
                 if expected.group_name != group_name:
@@ -6070,14 +6200,6 @@ class NexusRecordWriter:
             write_average_finite_counts(
                 self._entry_group(), finalization.average_finite_counts,
             )
-        if finalization.stitched_1d is not None or finalization.stitched_2d is not None:
-            write_stitched(
-                self._entry_group(),
-                stitched_1d=finalization.stitched_1d,
-                stitched_2d=finalization.stitched_2d,
-                provenance=finalization.stitched_provenance,
-                compression=self.compression,
-            )
         if finalization.provenance_config is not None:
             inputs = finalization.provenance_inputs
             if inputs is None and self._fresh and self._source_paths:
@@ -6108,7 +6230,9 @@ class NexusRecordWriter:
     def _write_detector_values(self, finalization: WriterFinalization) -> None:
         calibration = dict(finalization.detector_calibration or {})
         if (not calibration and finalization.global_mask is None
-                and finalization.detector_shape is None):
+                and finalization.detector_shape is None
+                and finalization.flatfield is None
+                and finalization.darkcurrent is None):
             return
         instrument = self._entry_group().require_group("instrument")
         instrument.attrs["NX_class"] = "NXinstrument"
@@ -6148,6 +6272,22 @@ class NexusRecordWriter:
             if mask.size:
                 dataset = detector.create_dataset("mask", data=mask)
                 dataset.attrs["description"] = "flat pixel indices, shape (N,)"
+        for name, value, description in (
+            ("flatfield", finalization.flatfield,
+             "flat field applied in the integration normalization; NaN = masked"),
+            ("darkcurrent", finalization.darkcurrent,
+             "dark current subtracted before integration; NaN = masked"),
+        ):
+            if name in detector:
+                del detector[name]
+            if value is None:
+                continue
+            image = np.ascontiguousarray(value, dtype=np.float32)
+            if image.ndim != 2:
+                raise ValueError(f"detector {name} must be 2-D")
+            dataset = detector.create_dataset(name, data=image)
+            dataset.attrs["description"] = description
+            dataset.attrs["sha256"] = hashlib.sha256(image.tobytes()).hexdigest()
         if "detector_shape" in detector:
             del detector["detector_shape"]
         if finalization.detector_shape is not None:
@@ -6369,7 +6509,11 @@ class NexusRecordWriter:
                 while self._finish_step < len(steps):
                     owner, action = steps[self._finish_step]
                     self._pending_owner = owner
-                    action()
+                    started = time.perf_counter() if self._perf_enabled else 0.0
+                    try:
+                        action()
+                    finally:
+                        self._record_finish_perf(owner, started)
                     if owner == "flush":
                         self._bump("flush_boundaries")
                     self._finish_step += 1

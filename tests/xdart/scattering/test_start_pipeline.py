@@ -128,11 +128,12 @@ class TracingStore(RunIntentStore):
         super().__init__(initial)
         self.freeze_inputs: list[tuple[int, tuple[str, ...] | None]] = []
 
-    def freeze(self, *, expected_revision: int, gi_motor_choices=None):
+    def freeze(self, *, expected_revision: int, gi_motor_choices=None, saturation=None):
         self.freeze_inputs.append((expected_revision, gi_motor_choices))
         return super().freeze(
             expected_revision=expected_revision,
             gi_motor_choices=gi_motor_choices,
+            saturation=saturation,
         )
 
 

@@ -239,16 +239,24 @@ class RunControlsBar(QtWidgets.QWidget):
     def set_readiness_summary(self, text='', *, ready=True, tooltip='',
                               live=False):
         text = str(text or '').strip()
+        original = text
+        if text == 'Ready':
+            text = ''
+        elif text.startswith('Ready · '):
+            text = text[len('Ready · '):]
+            mode, _separator, context = text.partition(' · ')
+            if self.modeCombo.findText(mode) >= 0:
+                text = context
         was_hidden = self.readinessRow.isHidden()
-        self.readinessRow.setVisible(bool(text))
-        self.readinessLive.setVisible(bool(text) and bool(live))
+        self.readinessRow.setVisible(bool(original))
+        self.readinessLive.setVisible(bool(original) and bool(live))
         self.readinessDot.setProperty('ready', bool(ready))
         setter = getattr(self.readinessLabel, 'set_full_text', None)
         if callable(setter):
             setter(text)
         else:
             self.readinessLabel.setText(text)
-        self.readinessLabel.setToolTip(tooltip or text)
+        self.readinessLabel.setToolTip(tooltip or original)
         self.readinessDot.style().unpolish(self.readinessDot)
         self.readinessDot.style().polish(self.readinessDot)
         return was_hidden != self.readinessRow.isHidden()
@@ -322,6 +330,17 @@ class RunControlsBar(QtWidgets.QWidget):
         # also un-hides it after swapping away from an image-viewer mode that
         # had hidden it.
         self.set_run_row_visible(True)
+
+    def set_unavailable_modes(self, reasons) -> None:
+        """Grey out the modes a page cannot open, each with its reason as the tooltip."""
+        disabled = dict(reasons)
+        model = self.modeCombo.model()
+        for row in range(self.modeCombo.count()):
+            reason = disabled.get(self.modeCombo.itemText(row), "")
+            item = getattr(model, "item", lambda _row: None)(row)
+            if item is not None:
+                item.setEnabled(not reason)
+            self.modeCombo.setItemData(row, reason or None, QtCore.Qt.ItemDataRole.ToolTipRole)
 
     # ── value getters (read at run-setup) ──
     def get_cores(self):

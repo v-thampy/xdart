@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+from xdart.gui.widgets.scientific_plot import (
+    PlotCursorReadout,
+    scaled_intensity as _scaled_intensity,
+    scaled_intensity_label as _scaled_intensity_label,
+    overlay_step,
+    reference_colors,
+    trace_colors,
+    data_curve_style,
+    segmented_data_curve,
+)
+
 from dataclasses import dataclass, replace
+import functools
+import logging
 import math
 import os
 import time
 
-from matplotlib import colormaps as matplotlib_colormaps
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -15,9 +27,12 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.modules.display_context import (
     Viewer2DRendererClearReceipt, Viewer2DRendererClearRequest,
 )
+from xdart.gui.gui_utils import GridAxisItem, RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.widgets.intensity_controls import IntensityControls
 from xrd_tools.session.display_logic import (
+    PanelKey,
+    PanelRole,
     canonical_axis_key,
     resample_image_axis_to_uniform,
     waterfall_display_rows,
@@ -33,18 +48,29 @@ from .scientific_axes import (
     trace_normalization_scope,
 )
 from .scientific_plot_options import (
-    PLOT_OPTION_COMMAND_PATHS,
+    PLOT_OPTION_BINDINGS,
+    SHARE_AXIS_TOOLTIP,
     PlotOptionsDialog,
     waterfall_should_be_active,
 )
+from .scientific_curves import AngularSupportCurve, add_curve_item, add_text_item, draw_reference_lines
+from xdart.gui.widgets.latest_request import LatestRequestOwner
+from xdart.gui.pages.operation_owner import OperationTerminalStatus
+from xdart.gui.pages.values import PageCleanup
+from xrd_tools.analysis.phase_overlays import PhaseOverlayJob, PhaseOverlayRequest, phase_floor, positions_for_axis
+from xrd_tools.core.angular_support import REASON_TEXT, AngularSupportProfile, SupportOrigin, SupportReason
 from .presentation_background import DisplayBackgroundRendererReleaseReceipt
 from .processed_browser import TerminalRebindAuthorization
 from .shell_widgets import (
     _axis_presentation,
     aggregate_traces,
+    color_map_choices,
+    color_map_combo,
     CompactFrameSelector,
     ContentFitComboBox,
     frame_caption,
+    log_toggle,
+    same_grid,
     ScientificImagePane,
     scrollable_toolbar,
     set_combo,
@@ -56,6 +82,10 @@ from .shell_values import (
     BrowseTraceSnapshot,
     FrameNavigationProjection,
     FrameSelectionIntent,
+    KeyedImageProjection,
+    KeyedFigureProjection,
+    KeyedPanelsProjection,
+    RectRegion,
     ScientificPlotOptions,
     ScientificProjection,
     ShellCommand,
@@ -70,18 +100,25 @@ PLOT_TOOLBAR_MENU_INDICATOR = "▾"
 SCIENTIFIC_TOOLBAR_EDGE_INSET = 4
 SCIENTIFIC_FOOTER_STATUS_LEFT_INSET = 8
 ONE_D_PLOT_BOTTOM_MARGIN = 6
+#: The angular coverage strip below the 1-D plot (COVERAGE-SUPPORT-20261013): its height and what it measures.
+ANGULAR_SUPPORT_STRIP_HEIGHT = 110
+ANGULAR_SUPPORT_STRIP_TOOLTIP = (
+    "Angular coverage of each shown 1-D profile: for every radial bin, the percentage of the profile's χ window "
+    "(360° without one) that unmasked detector pixels reach, averaged over the bin. Value masks such as the "
+    "threshold are not geometry and never reduce it; it is angular reach, not a pixel count, and a full-turn "
+    "window can give small values. Hover a curve for the degrees over a bin.")
+#: The strip's note for a trace whose producer carries no coverage, and for an empty plot.
+_NO_ANGULAR_SUPPORT = "This trace carries no angular coverage."
+_NO_TRACE_SUPPORT = "No 1-D profile is shown."
 MAX_WATERFALL_DISPLAY_ROWS = 256
 MAX_VIEWER_LOADING_SNAPSHOT_PIXELS = 2_000_000
-_PLOT_OPTION_FIELDS = (
-    "waterfall_y_axis",
-    "waterfall_start",
-    "waterfall_stop",
-    "waterfall_step",
-    "overlay_offset",
-    "show_legend",
-    "intensity_scale",
-)
 _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
+#: the top bar's Phases toggle (C6)
+PHASES_TOOLTIP = ("Switch every reference phase listed in the Reference Phases window off or on at once; the list, "
+                  "each phase's include check and every minimum intensity are kept.")
+PHASES_NONE_LISTED = "No reference phase is listed: add one in the Tools panel's Reference Phases window."
+PHASES_OFF_NOTE = ("Reference phases are switched off with the top bar's Phases button; the list, include checks and "
+                   "minimums are kept.")
 _STANDARD_PLOT_AXIS_CHOICES = (
     ("Q (Å⁻¹)", "Q"),
     ("2θ (°)", "2theta"),
@@ -266,13 +303,355 @@ def _pixmap_pixel_count(pixmap) -> int:
     return pixmap.width() * pixmap.height()
 
 
+#: A signed panel's map (a fit's residual: ``KeyedImageProjection.presentation``): diverging about zero.
+SIGNED_COLOR_MAP = "RdBu_r"
+_REGION_PEN = (240, 200, 90)
+
+
+class _KeyedImagePanel:
+    """A keyed layout's image panel: Int's image pane, titled, over the frame navigation's own widgets, which
+    step its slice along its normal (``SET_PANEL_INDEX``); a rectangle region on it (``set_region``)."""
+
+    def __init__(self, view: "ScientificView", key: PanelKey) -> None:
+        self.key = key
+        self.detector_picker = view._detector_picker
+        self._detector_shape = None
+        self.container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(self.container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.pane = ScientificImagePane(lock_aspect=False)
+        self.pane.setObjectName(f"e7KeyedImage_{key.instance}")
+        self.pane.canvas.histogram.sigLevelsChanged.connect(lambda bar: view._keyed_colorbar_changed(key, bar))
+        layout.addWidget(self.pane, 1)
+        navigation = QtWidgets.QHBoxLayout()
+        navigation.setContentsMargins(0, 0, 0, 0)
+        self.previous = QtWidgets.QToolButton()
+        self.previous.setObjectName("e4FrameNavigationButton")
+        self.previous.setText("<")
+        self.selector = CompactFrameSelector()
+        self.selector.setObjectName("e3FrameSelector")
+        self.next = QtWidgets.QToolButton()
+        self.next.setObjectName("e4FrameNavigationButton")
+        self.next.setText(">")
+        self.previous.setToolTip("Show the previous frame or slice, keeping the selected regions.")
+        self.next.setToolTip("Show the next frame or slice, keeping the selected regions.")
+        self.selector.setToolTip("Choose a frame or slice; use arrow keys or the mouse wheel to step.")
+        navigation.addStretch(1)
+        for widget in (self.previous, self.selector, self.next):
+            navigation.addWidget(widget)
+        navigation.addStretch(1)
+        layout.addLayout(navigation)
+        self._captions: tuple[str, ...] = ()
+        #: the panel's presentation and the (label, unit) of its two axes, as last drawn; its rectangle, or None
+        self.presentation = "shared"
+        self.axes: tuple[tuple[str, str], tuple[str, str]] | None = None
+        self.region: pg.RectROI | None = None
+        self.regions: dict[str, pg.RectROI] = {}
+        self.selector.currentIndexChanged.connect(
+            lambda index: index >= 0 and view._emit_panel_index(key, index))
+        self.previous.clicked.connect(lambda: self.step(-1))
+        self.next.clicked.connect(lambda: self.step(1))
+        self.clear()
+
+    def step(self, offset: int) -> None:
+        index = self.selector.currentIndex() + offset
+        if 0 <= index < self.selector.count():
+            self.selector.setCurrentIndex(index)
+
+    def draw(self, panel: KeyedImageProjection, color_map: str, log_scale: bool) -> None:
+        signed = panel.presentation == "signed"
+        if not panel.image.size:
+            self.clear()
+            for side, axis in (("bottom", panel.x_axis), ("left", panel.y_axis)):
+                label, unit = _axis_presentation(axis.label, axis.unit)
+                self.pane.plot.setLabel(side, label, units=unit or None)
+            rendered = False
+        elif self.detector_picker:
+            # Detector selection uses pixel edges 0..N and row zero at the top, without the raw viewer's mirror.
+            rows, columns = panel.image.shape
+            rect = QtCore.QRectF(0, 0, columns, rows)
+            self.pane.canvas.setImage(panel.image.T, rect=rect, scale="Log" if log_scale else "Linear",
+                                      cmap=color_map, linear_percentiles=(2, 98), expand_degenerate_levels=False)
+            box = self.pane.canvas.imageViewBox
+            box.setAspectLocked(True)
+            box.invertY(True)
+            if self._detector_shape != panel.image.shape:
+                box.setRange(rect, padding=0)
+                self._detector_shape = panel.image.shape
+            rendered = True
+        else:
+            rendered = self.pane.render(panel.image, x_axis=panel.x_axis, y_axis=panel.y_axis,
+                            color_map=SIGNED_COLOR_MAP if signed else color_map,
+                            log_scale=False if signed else log_scale)
+        if rendered:  # drawn again (not kept): its own levels and
+            # range, for the view's intensity controls (``_refresh_keyed_intensity``); none for a slice with no finite
+            # value, whose colour bar the pane leaves as it was
+            histogram = self.pane.canvas.histogram
+            finite = np.isfinite(panel.image)
+            if signed:  # its own limits, symmetric about zero, so a sign is never lost to the levels
+                bound = float(np.max(np.abs(panel.image), where=finite, initial=0.0))
+                bound = bound if bound > 0.0 else 1.0
+                histogram.lo_lim, histogram.hi_lim = -bound, bound
+                histogram.setLevels((-bound, bound))
+            self.levels = (((histogram.lo_lim, histogram.hi_lim), tuple(histogram.levels()))
+                           if finite.any() else None)
+        self.presentation = panel.presentation
+        self.pane.canvas.histogram.setToolTip(
+            "Adjust the common color scale of all shared slices; manual limits remain across slice changes."
+            if panel.presentation == "shared" else "Adjust this panel's independent color scale."
+        )
+        axes = ((panel.x_axis.label, panel.x_axis.unit), (panel.y_axis.label, panel.y_axis.unit))
+        if self.region is not None and axes != self.axes:  # its rectangle was in other coordinates: it goes
+            self.set_region(None, None)
+        if axes != self.axes:
+            for name in tuple(self.regions):
+                self.set_named_region(name, None, None)
+        self.axes = axes
+        self.pane.plot.setTitle(panel.title)
+        self.pane.setToolTip(f"{panel.title}. Drag to zoom into this map; right-click for plot controls.")
+        for widget in (self.previous, self.selector, self.next):  # a plane with no index to step has none
+            widget.setVisible(panel.navigation)
+        if not panel.navigation:
+            return
+        blocker = QtCore.QSignalBlocker(self.selector)
+        if panel.index_captions != self._captions:
+            self.selector.clear()
+            for caption in panel.index_captions:
+                QtWidgets.QComboBox.addItem(self.selector, caption)
+            self._captions = panel.index_captions
+        self.selector.setCurrentIndex(panel.index)
+        del blocker
+        self.selector.setEnabled(True)
+        self.previous.setEnabled(panel.index > 0)
+        self.next.setEnabled(panel.index < len(panel.index_captions) - 1)
+
+    def set_region(self, region: RectRegion | None, moved) -> None:
+        """Show ``region`` as a rectangle the user can move and resize (None: none), ``moved()`` called when they
+        have; it must be in the coordinates the panel draws."""
+        self.set_named_region("", region, moved, width=1.5, live=False, corner_handle=False)
+
+    def region_shown(self) -> RectRegion | None:
+        """The rectangle where it is now (moved or not), typed by the panel's axes."""
+        if self.region is None:
+            return None
+        position, size = self.region.pos(), self.region.size()
+        x = tuple(sorted((float(position.x()), float(position.x() + size.x()))))
+        y = tuple(sorted((float(position.y()), float(position.y() + size.y()))))
+        return RectRegion(x, y, *self.axes)
+
+    def set_named_region(self, name, region, moved, *, color=_REGION_PEN, dashed=False, visible=True,
+                         width=2, live=True, corner_handle=True):
+        """Independent signal/background marks, all owned here; programmatic reconciliation is silent."""
+        box = self.pane.canvas.imageViewBox
+        item = self.regions.get(name)
+        if region is None:
+            if item is not None:
+                box.removeItem(item)
+                del self.regions[name]
+            if not name:
+                self.region = None
+            return
+        if self.axes is None or (region.x_axis, region.y_axis) != self.axes:
+            raise TypeError(f"a region on {(region.x_axis, region.y_axis)} cannot be drawn on a panel of {self.axes}")
+        (x0, x1), (y0, y1) = region.x, region.y
+        pen = pg.mkPen(color, width=width, style=(QtCore.Qt.PenStyle.DashLine if dashed
+                                             else QtCore.Qt.PenStyle.SolidLine))
+        if item is None:
+            item = pg.RectROI((x0, y0), (x1 - x0, y1 - y0), pen=pen, movable=True, resizable=True)
+            if corner_handle:
+                item.addScaleHandle([0, 0], [1, 1])
+            item.setZValue(10)
+            self.regions[name] = item
+            signal = item.sigRegionChanged if live else item.sigRegionChangeFinished
+            signal.connect(lambda _roi: moved())
+            box.addItem(item)
+        else:
+            blocker = QtCore.QSignalBlocker(item)
+            item.setPos((x0, y0), update=False, finish=False)
+            item.setSize((x1 - x0, y1 - y0), finish=False)
+            item.setPen(pen)
+            del blocker
+        item.setVisible(bool(visible))
+        if not name:
+            self.region = item
+
+    def named_region_shown(self, name):
+        item = self.regions.get(name)
+        if item is None:
+            return None
+        position, size = item.pos(), item.size()
+        return RectRegion(tuple(sorted((float(position.x()), float(position.x() + size.x())))),
+                          tuple(sorted((float(position.y()), float(position.y() + size.y())))), *self.axes)
+
+    def clear(self) -> None:
+        self.pane.clear_image_buffers()
+        self.pane.plot.setTitle("")
+        #: the slice's own (range, automatic levels) as last drawn, in what the pane draws (log10 with Log)
+        self.levels: tuple[tuple[float, float], tuple[float, float]] | None = None
+        blocker = QtCore.QSignalBlocker(self.selector)
+        self.selector.clear()
+        del blocker
+        self._captions = ()
+        for widget in (self.previous, self.selector, self.next):
+            widget.setEnabled(False)
+
+
+class _KeyedTracePanel:
+    """A keyed layout's 1-D panel: a plot styled as Int's 1-D plot (box zoom, the seaborn style, the cursor
+    readout), one curve."""
+
+    def __init__(self, key: PanelKey) -> None:
+        self.key = key
+        self.container = self.plot = pg.PlotWidget(viewBox=RectViewBox(), axisItems={"left": GridAxisItem("left")})
+        self.plot.setObjectName(f"e7KeyedPlot_{key.instance}")
+        apply_seaborn_plot_style(self.plot.getPlotItem(), grid=True)
+        self.readout = PlotCursorReadout(self.plot)
+        self.curve = segmented_data_curve(self.plot.plot(connect="finite"))
+
+    def draw(self, panel, color, log_scale=False) -> None:
+        scale = "Log" if log_scale else "Linear"
+        self.curve.setData(np.asarray(panel.axis.values, dtype=float),
+                           _scaled_intensity(np.asarray(panel.intensity, dtype=float), scale),
+                           **data_curve_style(color))
+        self.plot.setTitle(panel.title)
+        self.plot.setToolTip(f"{panel.title}. Drag to zoom into this curve; right-click for plot controls.")
+        label, unit = _axis_presentation(panel.axis.label, panel.axis.unit)
+        self.plot.setLabel("bottom", label, units=unit or None)
+        self.plot.setLabel("left", _scaled_intensity_label(panel.y_label, scale))
+
+    def clear(self) -> None:
+        self.curve.setData([], [])
+        self.plot.setTitle("")
+
+
+class _KeyedFigurePanel:
+    """Typed figure rendering inside Int's keyed display owner, with native Export."""
+
+    def __init__(self, key, clicked):
+        self.key = key
+        self._clicked = clicked
+        self._image_shape = None
+        self.container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(self.container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.viewbox = RectViewBox()
+        self.plot = pg.PlotWidget(viewBox=self.viewbox)
+        apply_seaborn_plot_style(self.plot.getPlotItem(), grid=False)
+        self._tick_lengths = {name: self.plot.getAxis(name).style['tickLength'] for name in ('bottom', 'left')}
+        self.viewbox.setAspectLocked(True, ratio=1)
+        self.caption = QtWidgets.QLabel()
+        self.caption.setWordWrap(True)
+        layout.addWidget(self.plot, 1)
+        layout.addWidget(self.caption)
+        self.curves, self.overlay_items = {}, []
+        self.plot.scene().sigMouseClicked.connect(self._image_clicked)
+
+    def _image_clicked(self, event):
+        if self._image_shape is None or event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        if not self.viewbox.sceneBoundingRect().contains(event.scenePos()):
+            return
+        point = self.viewbox.mapSceneToView(event.scenePos())
+        rows, columns = self._image_shape
+        if 0 <= point.x() <= columns-1 and 0 <= point.y() <= rows-1:
+            self._clicked(self.key, float(point.x()), float(point.y()))
+
+    def draw(self, panel, color):
+        self.clear()
+        figure = panel.figure
+        self.plot.setTitle(panel.title or figure.title)
+        self.plot.setToolTip('Computed figure; axes and caption state its coordinate frame. '
+                             'Drag to zoom; right-click for native Export.')
+        self.caption.setText(figure.caption)
+        self.caption.setToolTip(figure.caption)
+        units = figure.units if figure.units == 'px' else None
+        self.plot.setLabel('bottom', figure.x_label, units=units)
+        self.plot.setLabel('left', figure.y_label, units=figure.units or None)
+        schematic = figure.units == 'schematic'  # not to scale: its axes name directions, with no dimensional ticks
+        for name in ('bottom', 'left'):          # (LT-007); any other figure drawn here has them
+            self.plot.getAxis(name).setStyle(showValues=not schematic,
+                                             tickLength=0 if schematic else self._tick_lengths[name])
+        self.viewbox.invertY(figure.units == 'px')
+        if figure.image is not None:
+            self._image_shape = figure.image.shape
+            item = pg.ImageItem(figure.image, axisOrder='row-major')
+            item.setRect(QtCore.QRectF(-.5, -.5, figure.image.shape[1], figure.image.shape[0]))
+            item.setZValue(-10)
+            item.setToolTip('Image in stored pixel coordinates. '+figure.caption)
+            self.plot.addItem(item)
+        for curve in figure.curves:
+            item = add_curve_item(self.plot, curve, color)
+            self.curves[curve.name] = item
+            self.overlay_items.append(item)
+        for marker in figure.markers:
+            item = pg.ScatterPlotItem([marker.xy[0]], [marker.xy[1]],
+                symbol='x' if marker.role == 'rejected' else '+', size=12, pen=pg.mkPen(color, width=2))
+            self._overlay(item, marker.tooltip)
+        for arrow in figure.arrows:
+            dx, dy = np.subtract(arrow.end, arrow.start)
+            item = pg.ArrowItem(pos=arrow.end, angle=180-math.degrees(math.atan2(dy, dx)),
+                headLen=10, tailLen=max(math.hypot(dx, dy)-10, 0), tailWidth=2,
+                pen=pg.mkPen(color), brush=pg.mkBrush(color))
+            self._overlay(item, arrow.tooltip)
+        for text in figure.texts:
+            self.overlay_items.append(add_text_item(self.plot, text, color))
+        if figure.extent is None:
+            self.viewbox.autoRange()
+        else:  # the box a schematic draws in, its labels included (labels do not widen the auto range)
+            self.viewbox.setRange(xRange=figure.extent[0], yRange=figure.extent[1], padding=0)
+
+    def _overlay(self, item, tooltip):
+        item.setToolTip(tooltip)
+        self.plot.addItem(item)
+        self.overlay_items.append(item)
+
+    def clear(self):
+        self.plot.clear()
+        self._image_shape = None
+        self.curves, self.overlay_items = {}, []
+        self.caption.clear()
+
+
 class ScientificView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
+    #: Deliberate left click on a typed Figure image: key, column, row.
+    figureImageClicked = QtCore.Signal(object, float, float)
+    #: The user moved or resized a keyed image panel's rectangle (``set_keyed_region``): its ``PanelKey`` and the
+    #: ``RectRegion`` it now covers.
+    keyedRegionChanged = QtCore.Signal(object, object)
+    #: A named region's live move: panel key, region identity, and typed geometry.
+    keyedNamedRegionChanged = QtCore.Signal(object, str, object)
+    coordinateRangesChanged = QtCore.Signal(object)
+    #: The plot-options dialog was accepted. Emitted after the view has read its own options
+    #: and before it emits their commands, so a host reads the choices it added
+    #: (``plot_options_dialog.add_choice``) before any of its own redraws resets them.
+    plotOptionsAccepted = QtCore.Signal()
+    #: A host page's raw pop-up (``show_raw_popup``) was closed; its image is already cleared.
+    rawPopupClosed = QtCore.Signal()
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(self, parent: QtWidgets.QWidget | None = None, *, detector_picker: bool = False) -> None:
         super().__init__(parent)
+        self._detector_picker = bool(detector_picker)
         self.setObjectName("e3ScientificView")
         self.setMinimumWidth(300)
+        self._hidden_tools: frozenset[str] = frozenset()
+        # the keyed layout (``reconcile_keyed``): built on its first draw, so Int's and Stitch's views never
+        # allocate it
+        self._keyed_area: QtWidgets.QSplitter | None = None
+        self._coordinate_range_bar = None
+        self.coordinate_ranges = []
+        self._keyed_layout: tuple[tuple[PanelKey, ...], ...] = ()
+        self._keyed_panels: dict[PanelKey, _KeyedImagePanel | _KeyedTracePanel] = {}
+        self._keyed_shown: KeyedPanelsProjection | None = None
+        self._keyed_hidden: tuple[QtWidgets.QWidget, ...] = ()
+        self._figure_hidden: tuple[QtWidgets.QWidget, ...] = ()
+        # Share Axis over it: the axes drawing each coordinate shared by two or more, the range links made, and
+        # where Share Axis sits in Int's plot bar while the keyed row borrows it
+        self._keyed_coordinates: dict[tuple[str, str], tuple[tuple[pg.ViewBox, int], ...]] = {}
+        self._keyed_links: list[tuple[object, object]] = []
+        self._keyed_share_on = False
+        self._share_axis_home = -1
         self._heavy_available: frozenset[DisplayFrameKey] = frozenset()
         self._frame_keys: tuple[DisplayFrameKey, ...] = ()
         self._current_key: DisplayFrameKey | None = None
@@ -322,6 +701,8 @@ class ScientificView(QtWidgets.QFrame):
         self._expected_background_key = self._rendered_background_key = None
         self.raw_popup_dialog = None
         self.raw_popup_image = None
+        #: True while a host page (Stitch) owns the raw pop-up; Int's own (its Raw button, Int 1D) when False
+        self._raw_popup_host = False
         self._rendered_image_axis: str | None = None
         self._rendered_cake_axis_key: str | None = None
         self._rendered_cake_x_axis: AxisProjection | None = None
@@ -368,7 +749,9 @@ class ScientificView(QtWidgets.QFrame):
         one_d = QtWidgets.QFrame()
         one_d_layout = QtWidgets.QVBoxLayout(one_d)
         one_d_layout.setContentsMargins(0, 0, 0, 0)
-        self.curve = pg.PlotWidget()
+        # as the 2-D views and the retired Static Scan page: left-drag draws a box to zoom into
+        # (pyqtgraph's default pans), middle-click shows all, right-click keeps pyqtgraph's menu
+        self.curve = pg.PlotWidget(viewBox=RectViewBox(), axisItems={"left": GridAxisItem("left")})
         self.curve.setObjectName("e3OneDPlot")
         apply_seaborn_plot_style(self.curve.getPlotItem(), grid=True)
         self.curve.getPlotItem().layout.setContentsMargins(
@@ -378,18 +761,11 @@ class ScientificView(QtWidgets.QFrame):
             ONE_D_PLOT_BOTTOM_MARGIN,
         )
         self.legend = self.curve.addLegend()
-        self.cursor_position = pg.LabelItem(justify="right")
-        self.cursor_position.setParentItem(self.curve.getPlotItem())
-        self.cursor_position.anchor(
-            itemPos=(1, 0),
-            parentPos=(1, 0),
-            offset=(-14, 8),
-        )
-        self._mouse_proxy = pg.SignalProxy(
-            signal=self.curve.scene().sigMouseMoved,
-            rateLimit=60,
-            slot=self._mouse_moved,
-        )
+        # A phase's legend sample includes or excludes that phase (REFERENCE-PHASES-20261011).
+        self.legend.sigSampleClicked.connect(self._legend_sample_clicked)
+        self._cursor_readout = PlotCursorReadout(self.curve)
+        self.cursor_position = self._cursor_readout.label
+        self._mouse_proxy = self._cursor_readout.proxy
         self.waterfall = ScientificImagePane(lock_aspect=False)
         self.waterfall.setObjectName("e4WaterfallPlot")
         self.bottom_stack = QtWidgets.QStackedWidget()
@@ -398,6 +774,41 @@ class ScientificView(QtWidgets.QFrame):
         self.bottom_stack.addWidget(self.waterfall)
         self.bottom_stack.setCurrentWidget(self.curve)
         one_d_layout.addWidget(self.bottom_stack, 1)
+        # COVERAGE-SUPPORT-20261013: the opt-in angular coverage strip, a passive readout of the shown traces'
+        # profiles. Its plot area takes the 1-D plot's exact horizontal geometry and x range, mirrored one way so
+        # the curve's own autorange is never touched; its percentage axis is fixed at 0–100.
+        self.angular_support_plot = pg.PlotWidget(axisItems={"left": GridAxisItem("left")})
+        self.angular_support_plot.setObjectName("angularSupportStrip")
+        strip = self.angular_support_plot.getPlotItem()
+        apply_seaborn_plot_style(strip, grid=True)
+        strip.layout.setContentsMargins(0, 0, 0, 0)
+        strip.hideAxis("bottom")
+        strip.hideButtons()
+        strip.setMenuEnabled(False)
+        strip.setLabel("left", "Angular (%)")
+        strip_box = strip.getViewBox()
+        strip_box.setMouseEnabled(x=False, y=False)
+        strip_box.enableAutoRange(x=False, y=False)
+        strip_box.setYRange(0.0, 100.0, padding=0.0)
+        self.angular_support_plot.setFixedHeight(ANGULAR_SUPPORT_STRIP_HEIGHT)
+        self.angular_support_plot.setToolTip(ANGULAR_SUPPORT_STRIP_TOOLTIP)
+        self.angular_support_plot.hide()
+        self._support_note = pg.LabelItem("", justify="center")
+        self._support_note.setParentItem(strip)
+        self._support_note.anchor(itemPos=(0.5, 0.5), parentPos=(0.5, 0.5))
+        self._support_readout = PlotCursorReadout(self.angular_support_plot)
+        self._support_contract = None
+        self._support_message = ""
+        self._support_inputs = None
+        #: the one owner of older Int frames' reconstructions (D5); nothing else is computed for the strip
+        from .angular_support_owner import AngularSupportOwner
+        self.angular_support_owner = AngularSupportOwner(self)
+        self.angular_support_owner.reconstructed.connect(self._refresh_angular_support)
+        curve_box = self.curve.getPlotItem().getViewBox()
+        curve_box.sigXRangeChanged.connect(self._mirror_support_x)
+        curve_box.sigResized.connect(self._sync_support_geometry)
+        strip_box.sigResized.connect(self._sync_support_geometry)
+        one_d_layout.addWidget(self.angular_support_plot)
         self.plot_bar = self._make_plot_bar()
         self.plot_toolbar = scrollable_toolbar(
             self.plot_bar,
@@ -410,6 +821,7 @@ class ScientificView(QtWidgets.QFrame):
         self.vertical_splitter.setStretchFactor(1, 1)
         self.vertical_splitter.setSizes([500, 500])
         layout.addWidget(self.vertical_splitter, 1)
+        self._main_layout = layout
 
         self.footer = QtWidgets.QHBoxLayout()
         self.viewer_intensity = IntensityControls(self)
@@ -465,6 +877,49 @@ class ScientificView(QtWidgets.QFrame):
             widget.installEventFilter(self)
         self._viewer_loading_overlay.hide()
         self._install_share_geometry_hooks()
+        if self._detector_picker:
+            self._detector_picker_image = None
+            self._detector_picker_navigation = ((), 0, "")
+            self._main_layout.itemAt(0).widget().hide()
+            scale = QtWidgets.QHBoxLayout()
+            scale.addWidget(QtWidgets.QLabel("Intensity"))
+            self.default_scale = QtWidgets.QPushButton("Default")
+            self.detector_log = QtWidgets.QPushButton("Log")
+            self.default_scale.setToolTip("Show detector image intensity on a linear scale.")
+            self.detector_log.setToolTip("Show detector image intensity on a logarithmic scale; ROI values are unchanged.")
+            group = self._detector_scale_group = QtWidgets.QButtonGroup(self)
+            group.setExclusive(True)
+            for button in (self.default_scale, self.detector_log):
+                button.setCheckable(True)
+                group.addButton(button)
+                scale.addWidget(button)
+            self.default_scale.setChecked(True)
+            scale.addStretch(1)
+            self._main_layout.addLayout(scale)
+            self.detector_log.toggled.connect(lambda _on: self.reconcile_detector_image(
+                self._detector_picker_image, *self._detector_picker_navigation))
+
+    def reconcile_detector_image(self, image, captions=(), index=0, title="") -> PanelKey:
+        """Detector-picker profile: Int's image/scale owners, row-major pixel coordinates, independent ROI marks."""
+        if not self._detector_picker:
+            raise RuntimeError("reconcile_detector_image needs the detector_picker profile")
+        self._detector_picker_image = image
+        self._detector_picker_navigation = (tuple(captions), index, title)
+        key = PanelKey(PanelRole.SLICE_2D, "detector")
+        if image is None:
+            self.clear_keyed()
+            return key
+        rows, columns = np.asarray(image).shape
+        panel = KeyedImageProjection(key, title, np.asarray(image),
+            AxisProjection(np.arange(columns, dtype=float) + 0.5, "column", "px"),
+            AxisProjection(np.arange(rows, dtype=float) + 0.5, "row", "px"), index, tuple(captions),
+            navigation=bool(captions),
+            presentation="own")
+        self.reconcile_keyed(KeyedPanelsProjection(((key,),), (panel,), color_map="viridis",
+                                                  log_scale=self.detector_log.isChecked()))
+        self.viewer_intensity_row.hide()
+        self.status.hide()
+        return key
 
     def reconcile_operation_status(self, status: object) -> bool:
         """Replace only the scalar scientific-footer status text."""
@@ -603,8 +1058,13 @@ class ScientificView(QtWidgets.QFrame):
                 if self.raw_popup_image is not None: self.raw_popup_image.clear_image_buffers()
             elif domain == "integrated_2d":
                 self.cake.clear_image_buffers(); self._rendered_cake_x_axis = self._rendered_cake_y_axis = self._rendered_cake_axis_key = self._rendered_image_axis = None
+            elif domain == "keyed":  # a keyed layout drawn minus its background: every panel let go of
+                for widgets in self._keyed_panels.values():
+                    widgets.clear()
+                self._keyed_shown = None
             else:
                 self.curve.clear(); self.waterfall.clear(); self._trace_history_by_identity.clear(); self._pinned_trace_by_id.clear()
+                self._clear_angular_support()
                 self._rendered_trace_keys = self._trace_history_keys = self._waterfall_source_keys = ()
                 self._curve_mounted_keys = ()
                 self._curve_items_by_key.clear(); self._curve_item_contracts.clear()
@@ -621,20 +1081,26 @@ class ScientificView(QtWidgets.QFrame):
         self.norm = ContentFitComboBox()
         self.norm.setObjectName("e3NormChannel")
         self.background = QtWidgets.QPushButton("Set BG")
+        #: switches every listed reference phase off or on at once (C6); it never takes input focus
+        self.phases = QtWidgets.QPushButton("Phases")
+        self.phases.setObjectName("e3PhasesToggle")
+        self.phases.setCheckable(True)
+        self.phases.setChecked(True)
+        self.phases.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.phases.setEnabled(False)
+        self.phases.setToolTip(PHASES_TOOLTIP + ' ' + PHASES_NONE_LISTED)
         self.title = QtWidgets.QLabel("Current")
         self.title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.color_map = ContentFitComboBox()
-        self._color_map_choices = (
-            "Default",
-            *tuple(matplotlib_colormaps),
-        )
-        self.color_map.addItems(self._color_map_choices)
-        self.log_scale = QtWidgets.QPushButton("Log")
-        self.log_scale.setCheckable(True)
+        self.color_map = color_map_combo()  # Int's list, shared with the 3D Viewer (shell_widgets)
+        self._color_map_choices = color_map_choices()
+        self.log_scale = log_toggle()
         self.raw_popup_button = QtWidgets.QPushButton("Raw")
         row.addWidget(self.norm)
         row.addWidget(self.background)
+        row.addWidget(self.phases)
         row.addWidget(self.raw_popup_button)
+        self._top_bar_row = row
+        self._page_tool_buttons: dict[str, QtWidgets.QPushButton] = {}
         row.addWidget(self.title, 1)
         row.addWidget(self.color_map)
         row.addWidget(self.log_scale)
@@ -646,6 +1112,8 @@ class ScientificView(QtWidgets.QFrame):
         self.background.clicked.connect(
             lambda: self._emit(ShellCommandKind.SET_BACKGROUND)
         )
+        self.phases.clicked.connect(lambda on: self._emit(
+            ShellCommandKind.SET_PLOT_OPTION, bool(on), ("other", "phase_references_shown")))
         self.color_map.currentTextChanged.connect(
             lambda value: self._emit(ShellCommandKind.SET_COLOR_MAP, value)
         )
@@ -667,6 +1135,10 @@ class ScientificView(QtWidgets.QFrame):
         controls = QtWidgets.QHBoxLayout()
         self.raw_popup_thumbnail = QtWidgets.QPushButton("Thumbnail")
         self.raw_popup_full = QtWidgets.QPushButton("Full Raw")
+        self.raw_popup_full.setToolTip(
+            "Read the full-resolution detector image with the saved reduction's value masking. "
+            "The original file is unchanged; unavailable originals fall back to the saved thumbnail.")
+        self.raw_popup_thumbnail.setToolTip("Show the saved detector thumbnail without reading the original image.")
         self.raw_popup_mode_group = QtWidgets.QButtonGroup(dialog)
         self.raw_popup_mode_group.setExclusive(True)
         for button in (self.raw_popup_thumbnail, self.raw_popup_full):
@@ -674,6 +1146,10 @@ class ScientificView(QtWidgets.QFrame):
             self.raw_popup_mode_group.addButton(button)
             controls.addWidget(button)
         controls.addStretch(1)
+        self.raw_popup_intensity = IntensityControls(dialog, percentiles=(2, 98))
+        controls.addWidget(self.raw_popup_intensity)
+        self.raw_popup_intensity.rangeChanged.connect(lambda _lo, _hi: self._refresh_raw_popup_intensity())
+        self.raw_popup_intensity.autoToggled.connect(lambda _on: self._refresh_raw_popup_intensity())
         layout.addLayout(controls)
         self.raw_popup_image = ScientificImagePane(lock_aspect=True)
         layout.addWidget(self.raw_popup_image, 1)
@@ -690,6 +1166,8 @@ class ScientificView(QtWidgets.QFrame):
         if not self.raw_popup_button.isEnabled():
             return
         self._ensure_raw_popup()
+        self._raw_popup_host = False
+        self.raw_popup_dialog.setWindowTitle("Raw Image")
         self.raw_popup_dialog.show(); self.raw_popup_dialog.raise_()
         self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail", ("popup",))
         self.raw_popup_full.setChecked(True)
@@ -698,11 +1176,82 @@ class ScientificView(QtWidgets.QFrame):
     def _release_raw_popup(self, *_args) -> None:
         if self.raw_popup_image is not None:
             self.raw_popup_image.clear_image_buffers()
+        if self._processing_mode == 'Int 1D':
+            self._clear_phase_popup()
+            self._clear_grid_overlay()
         if hasattr(self, "raw_popup_status"): self.raw_popup_status.setText("")
-        if self._processing_mode == "Int 1D":
+        self.raw_popup_intensity.sync(None, None, reset=True)
+        if self._raw_popup_host:
+            self.rawPopupClosed.emit()
+        elif self._processing_mode == "Int 1D":
             self._emit(ShellCommandKind.SET_DETECTOR_MODE, "thumbnail", ("popup",))
 
+    # -- the raw pop-up for a host page's image (Codex's Stitch/Int reuse audit R2: Stitch's contributing
+    # frame opens here, not in a page-built dialog). Int's own pop-up path above is unchanged.
+    def show_raw_popup(self, title: str, *, mode: str = "thumbnail") -> None:
+        """Open the view's raw pop-up for a host page's image, which the host then fills with
+        ``show_raw_image`` and ``show_raw_status``. Its Thumbnail / Full Raw buttons emit
+        ``SET_DETECTOR_MODE`` (path ``("popup",)``) for the host to read its image again in that
+        mode; closing it clears the image and emits ``rawPopupClosed``. The host's image stays through
+        the view's own reconciles and layout changes (Int's pop-up follows Int 1D only)."""
+        if mode not in {"thumbnail", "full"}:
+            raise ValueError("the raw pop-up mode is 'thumbnail' or 'full'")
+        self._ensure_raw_popup()
+        self._raw_popup_host = True
+        self.raw_popup_dialog.setWindowTitle(title)
+        (self.raw_popup_full if mode == "full" else self.raw_popup_thumbnail).setChecked(True)
+        self.raw_popup_full.setEnabled(True)
+        self.raw_popup_dialog.show(); self.raw_popup_dialog.raise_()
+
+    def raw_popup_shown(self) -> bool:
+        """Whether a host page's raw pop-up is open."""
+        return (self._raw_popup_host and self.raw_popup_dialog is not None
+                and self.raw_popup_dialog.isVisible())
+
+    def raw_popup_mode(self) -> str:
+        """The raw pop-up's mode: 'full' when Full Raw is checked, else 'thumbnail'."""
+        return ("full" if self.raw_popup_dialog is not None and self.raw_popup_full.isChecked()
+                else "thumbnail")
+
+    def show_raw_image(self, image, *, status: str, color_map: str, log_scale: bool,
+                       detector_shape: tuple[int, int] | None = None) -> None:
+        """A host page's image in its open raw pop-up, with the line below it."""
+        if not self.raw_popup_shown():
+            return
+        self._clear_phase_popup()  # a host's own image carries no ring geometry
+        self.raw_popup_image.render(image, detector_shape=detector_shape, color_map=color_map,
+                                    log_scale=log_scale)
+        self.raw_popup_intensity.set_percentile_defaults((0.1, 99.9) if log_scale else (2, 98))
+        self._refresh_raw_popup_intensity()
+        self.raw_popup_status.setText(status)
+
+    def _refresh_raw_popup_intensity(self) -> None:
+        """The shared intensity owner maps the popup's already-displayed detector pixels."""
+        pane, controls = self.raw_popup_image, self.raw_popup_intensity
+        if pane.image.image is None or not np.isfinite(pane.canvas.displayed_image).any():
+            controls.sync(None, None)
+            return
+        percentile = controls.percentile_values()
+        levels = pane.canvas.percentile_levels(percentile) if percentile is not None else (
+            pane.canvas.percentile_levels() if controls.autoscale.isChecked()
+            else controls.values())
+        domain = pane.canvas._display_domain
+        pane.canvas.histogram.lo_lim = min(domain[0], levels[0])
+        pane.canvas.histogram.hi_lim = max(domain[1], levels[1])
+        pane.canvas.histogram.setLevels(levels)
+        controls.sync(domain, levels)
+
+    def show_raw_status(self, status: str, *, clear_image: bool = False) -> None:
+        """The line below a host page's open raw pop-up; ``clear_image`` empties the image too."""
+        if not self.raw_popup_shown():
+            return
+        if clear_image:
+            self.raw_popup_image.clear_image_buffers()
+        self.raw_popup_status.setText(status)
+
     def _reconcile_raw_popup(self, state: ScientificProjection) -> None:
+        if self._raw_popup_host:  # a host page's image: Int's frame does not replace it
+            return
         heavy = state.heavy
         dialog = self.raw_popup_dialog
         if dialog is None or not dialog.isVisible():
@@ -710,13 +1259,18 @@ class ScientificView(QtWidgets.QFrame):
         if heavy is None or heavy.raw is None:
             self.raw_popup_image.clear_image_buffers()
             return
-        if heavy.detector_source != "full":
+        if heavy.detector_source != "full" and not self.raw_popup_image.render_matches(
+            heavy.raw, detector_shape=heavy.detector_shape,
+            color_map=state.color_map, log_scale=state.log_scale,
+        ):
             self.raw_popup_image.clear_image_buffers()
         self.raw_popup_image.render(
             heavy.raw, detector_shape=heavy.detector_shape,
             color_map=state.color_map, log_scale=state.log_scale,
             level_scan_token=(id(heavy.frame), id(heavy.raw)),
         )
+        self.raw_popup_intensity.set_percentile_defaults((0.1, 99.9) if state.log_scale else (2, 98))
+        self._refresh_raw_popup_intensity()
         self.raw_popup_thumbnail.setChecked(state.detector_mode == "thumbnail")
         self.raw_popup_full.setChecked(state.detector_mode == "full")
         self.raw_popup_full.setEnabled(state.detector_available)
@@ -748,15 +1302,40 @@ class ScientificView(QtWidgets.QFrame):
         self.slice_width = spin(0.0, 360.0, 10.0)
         self.pin = QtWidgets.QPushButton("Pin")
         self.plot_mode = ContentFitComboBox()
-        self.plot_mode.addItems(
-            ["Single", "Overlay", "Average", "Sum", "Waterfall"]
-        )
+        self.plot_mode.addItems(list(self._PLOT_MODES))
         self.options = _CompactMenuButton("Options")
+        self.options.setToolTip("Edit plot options and display limits. Display limit changes apply immediately.")
         self.plot_options_dialog = PlotOptionsDialog(self)
+        from .reference_phases import ReferencePhasesWindow
+        self.reference_phases = ReferencePhasesWindow(self)
+        self.reference_phases.optionEdited.connect(
+            lambda path, value: self._emit(ShellCommandKind.SET_PLOT_OPTION, value, path))
+        self._grid_cache = self._grid_prediction = self._grid_frame = None
+        self._phase_job = PhaseOverlayJob()
+        self._phase_requests = LatestRequestOwner(self._phase_job, self._phase_done,
+                                                  same=lambda a, b: a == b, parent=self)
+        self.phase_worker = self._phase_requests.worker
+        self.phase_families = {}
+        self._phase_markers, self._phase_legends, self._phase_colors = {}, {}, {}
+        self._phase_drawings = {}
+        self._phase_line_context = None
+        self._phase_wavelengths = ()
+        self._phase_display_contract = None
+        #: the last accepted detector-ring context (frame, snapshot, shape), kept across a retained display
+        self._phase_ring_context = None
+        #: the run whose frames carry ring geometry (the last one shown with it): its frames still loading wait
+        self._phase_ring_run = None
+        #: closed tools' phase workers a host retired here (a deleted Phase Fitter's Add CIF…), until each is CLEAN
+        self._retired_phase_workers = []
+        #: every listed phase with its include flag, as the window resolved it (legend entries and colours)
+        self._phase_listed = ()
+        #: each listed phase's colour slot, kept from when it joined the list until it leaves it
+        self._phase_color_slots = {}
         self.clear = QtWidgets.QPushButton("Clear")
         self.share_axis = QtWidgets.QPushButton("Share Axis")
         self.share_axis.setCheckable(True)
         self.share_axis.setMinimumWidth(90)
+        self.share_axis.setToolTip(SHARE_AXIS_TOOLTIP)
         self.previous_frame = QtWidgets.QToolButton()
         self.previous_frame.setObjectName("e4FrameNavigationButton")
         self.previous_frame.setText("<")
@@ -830,6 +1409,7 @@ class ScientificView(QtWidgets.QFrame):
         self.plot_options_dialog.accepted.connect(
             self._accept_plot_options
         )
+        self.plot_options_dialog.rejected.connect(self._sync_share_axis_options)
         self.clear.clicked.connect(
             lambda: self._emit(ShellCommandKind.CLEAR_1D)
         )
@@ -838,6 +1418,7 @@ class ScientificView(QtWidgets.QFrame):
                 ShellCommandKind.SET_SHARE_AXIS, bool(value)
             )
         )
+        self.share_axis.toggled.connect(self._sync_share_axis_options)
         self.frame_selector.currentIndexChanged.connect(
             self._frame_selected
         )
@@ -845,8 +1426,15 @@ class ScientificView(QtWidgets.QFrame):
         self.next_frame.clicked.connect(lambda: self._navigate(1))
         return row
 
+    def show_reference_phases(self) -> None:
+        """The Tools panel's Reference Phases window (REFERENCE-PHASES-20261011)."""
+        self.reference_phases.show()
+        self.reference_phases.raise_()
+        self.reference_phases.activateWindow()
+
     def _show_plot_options(self) -> None:
         self._emit(ShellCommandKind.SHOW_WATERFALL_OPTIONS)
+        self._sync_share_axis_options()
         self.plot_options_dialog.show()
         self.plot_options_dialog.raise_()
         self.plot_options_dialog.activateWindow()
@@ -854,11 +1442,10 @@ class ScientificView(QtWidgets.QFrame):
     def _accept_plot_options(self) -> None:
         prior = self.plot_options_dialog.projection
         edited = self.plot_options_dialog.edited_options()
-        for field, path in zip(
-            _PLOT_OPTION_FIELDS,
-            PLOT_OPTION_COMMAND_PATHS,
-            strict=True,
-        ):
+        share_axis = (self.plot_options_dialog.share_axis.isChecked()
+                      if self.plot_options_dialog.share_axis.isEnabled() else self.share_axis.isChecked())
+        self.plotOptionsAccepted.emit()
+        for path, field in PLOT_OPTION_BINDINGS:
             old_value = getattr(prior, field)
             new_value = getattr(edited, field)
             if new_value != old_value:
@@ -867,6 +1454,349 @@ class ScientificView(QtWidgets.QFrame):
                     new_value,
                     path,
                 )
+        self.share_axis.setChecked(share_axis)  # the existing SET_SHARE_AXIS route, with no second preference
+
+    def _sync_share_axis_options(self, *_args) -> None:
+        self.plot_options_dialog.reconcile_share_axis(self.share_axis.isChecked(), self.share_axis.isEnabled())
+
+    def _remove_phase_drawings(self, identifier):
+        family = 'phase:' + identifier
+        self._phase_drawings.pop(identifier, None)
+        for pane in (self.raw, self.cake, self.raw_popup_image):
+            if pane is not None:
+                pane.render_overlay_family(family, ())
+        marker = self._phase_markers.pop(identifier, None)
+        if marker is not None:
+            self.curve.removeItem(marker)
+            self._cursor_readout.clear_hover()
+        self.phase_families.pop(identifier, None)
+
+    def _remove_phase_family(self, identifier):
+        self._remove_phase_drawings(identifier)
+        legend = self._phase_legends.pop(identifier, None)
+        if legend is not None:
+            self.legend.removeItem(legend)
+
+    def _clear_phase_popup(self):
+        if self.raw_popup_image is not None:
+            for family in tuple(self.raw_popup_image.overlay_families):
+                if family.startswith('phase:'):
+                    self.raw_popup_image.render_overlay_family(family, ())
+
+    def _clear_phase_overlays(self):
+        self._phase_requests.release()
+        self._phase_job.clear_cache()
+        for identifier in set(self.phase_families) | set(self._phase_legends) | set(self._phase_markers):
+            self._remove_phase_family(identifier)
+        self._phase_drawings.clear()
+        self._phase_colors.clear()
+        self._phase_line_context = None
+        self._phase_wavelengths = ()
+        self._phase_display_contract = None
+        self._phase_ring_context = None
+        self._phase_ring_run = None
+        self._phase_listed = ()
+        self._phase_color_slots = {}
+
+    def retire_phase_worker(self, worker):
+        """Keep a closed tool's phase worker (a deleted Phase Fitter's Add CIF…) until it closes CLEAN; this view's
+        shutdown waits for it."""
+        if worker.close().status is not PageCleanup.CLEAN:
+            self._retired_phase_workers.append(worker)
+
+    def shutdown_phase_overlays(self):
+        """Close the phase worker, the window's Add CIF… worker, any retired one and the angular coverage strip's
+        reconstruction owner: CLEAN, or PENDING while one runs (the host asks again)."""
+        self.reference_phases.close()  # the view's window does not outlive its overlays
+        self._clear_phase_overlays()
+        retired = [(worker, worker.close()) for worker in self._retired_phase_workers]
+        self._retired_phase_workers = [worker for worker, receipt in retired if receipt.status is not PageCleanup.CLEAN]
+        receipts = (self._phase_requests.shutdown(), self.reference_phases.phase_source.shutdown(),
+                    self.angular_support_owner.shutdown(),  # the strip's reconstructions retire with the view
+                    *(receipt for _worker, receipt in retired))
+        return next((receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN), receipts[0])
+
+    @staticmethod
+    def _phase_axis(axis):
+        if axis is None:
+            return None
+        key = ScientificView._axis_key(axis)
+        values = np.asarray(axis.values)
+        values = values[np.isfinite(values)]
+        return (key, (float(values.min()), float(values.max()))) if values.size else None
+
+    def _sync_phases_button(self, options, available):
+        """The Phases toggle (C6): its state follows the option; it switches something only while a phase is
+        listed, and says so."""
+        listed = available and bool(options.phase_references)
+        blocker = QtCore.QSignalBlocker(self.phases)
+        self.phases.setChecked(options.phase_references_shown)
+        del blocker
+        self.phases.setEnabled(listed)
+        self.phases.setToolTip(PHASES_TOOLTIP + (' Now on.' if options.phase_references_shown else ' Now off.')
+                               + ('' if listed else ' ' + PHASES_NONE_LISTED))
+
+    def _reconcile_phase_overlay(self, state, navigation):
+        from xrd_tools import geometry_figures as gf
+        # a closed tool's Add CIF… worker that has finished lets its parse go at the next refresh, not only at this
+        # view's shutdown (HELP-RETIRED-ADD-PAYLOAD); one still reading stays, and its close does not wait
+        self._retired_phase_workers = [worker for worker in self._retired_phase_workers
+                                       if worker.close().status is not PageCleanup.CLEAN]
+        options, window = state.plot_options, self.reference_phases
+        visible = state.processing_mode != '2D Viewer'
+        window.set_available(visible, '' if visible else 'Reference phases are unavailable in the 2D Viewer.')
+        window.reconcile(options)
+        self._sync_phases_button(options, visible)
+        listed = window.phase_source.listed_entries() if visible else ()
+        listed_ids = {entry.id for entry, _shown in listed}
+        # Switched off (C6): nothing draws, while the list, each include flag, every minimum and the colour slots stay.
+        switched_off = not options.phase_references_shown
+        entries = () if switched_off else tuple(entry for entry, shown in listed if shown)
+        shown_ids = {entry.id for entry in entries}
+        for identifier in set(self.phase_families) | set(self._phase_legends) | set(self._phase_markers):
+            if identifier not in listed_ids or switched_off:
+                self._remove_phase_family(identifier)
+            elif identifier not in shown_ids:
+                self._remove_phase_drawings(identifier)  # a hidden phase keeps its greyed legend entry
+        # Each phase keeps the colour slot it joined with, so hiding or removing a phase recolours no other.
+        slots = {identifier: slot for identifier, slot in self._phase_color_slots.items() if identifier in listed_ids}
+        for entry, _shown in listed:
+            if entry.id not in slots:
+                slots[entry.id] = min(set(range(len(listed) + len(slots))) - set(slots.values()))
+        self._phase_color_slots = slots
+        palette = reference_colors(max(slots.values(), default=-1) + 1)
+        self._phase_colors = {identifier: palette[slot] for identifier, slot in slots.items()}
+        self._phase_listed = () if switched_off else listed
+        if not entries:
+            self._phase_requests.release()
+            window.set_rings_reason(PHASES_OFF_NOTE if switched_off and listed else '')
+            self._draw_phase_legends()
+            return
+        wavelengths = self._phase_wavelengths
+        wavelength = wavelengths[0]*1e10 if len(wavelengths) == 1 and wavelengths[0] is not None else None
+        context = self._phase_line_context
+        cake = self._phase_axis(self._rendered_cake_x_axis)
+        if context is None or context[0] not in _CONVERTIBLE_RADIAL_AXIS_KEYS:
+            context = cake
+        key, bounds = context if context is not None else ('', (0., 1.))
+        unit = {'q_A^-1': 'q', '2th_deg': '2theta'}.get(key, '')
+        reason = ''
+        if state.measurement_mode == 'Grazing':
+            reason = 'Reference lines and maps require Standard q or 2θ coordinates; GI detector rings remain detector-frame references.'
+        elif not unit:
+            reason = 'Reference phases require a q or 2θ axis.'
+        elif unit == '2theta' and wavelength is None:
+            reason = '2θ reference lines require one displayed energy; mixed or missing energies cannot share reference lines.'
+        heavy = state.heavy
+        is_int = (state.processing_mode == 'Int 1D' and 'raw' not in self._hidden_tools
+                  or state.processing_mode == 'Int 2D' and 'raw_pane' not in self._hidden_tools)
+        raw_shown = is_int or state.processing_mode in ('Average', 'Reintegrate')
+        snapshot, shape, retained = (), None, self._phase_ring_context
+        if (heavy is None and state.retain_display and is_int and retained is not None
+                and retained[0] is navigation.current):
+            snapshot, shape = retained[1], retained[2]  # the accepted image+geometry pair (R10)
+            ring_reason = ''
+        else:
+            current = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
+            geometry = heavy.ring_geometry if current else None
+            if geometry is not None and heavy.ring_origin != 'saved':
+                self._phase_ring_run = navigation.current.run_identity
+            # A frame of that run whose image has not arrived yet waits for it (P3a residual 9). A Browse frame's
+            # rings come from its saved output (BROWSE-REFERENCE-RINGS-20261013): they wait for its image, or its
+            # record's own reason says why there are none; an Average or Reintegrate result keeps the Run reason.
+            loading = (is_int and state.acquisition_selected and not current and navigation.current is not None
+                       and (heavy is None or heavy.frame is not navigation.current)
+                       and navigation.current.run_identity is self._phase_ring_run)
+            ring_reason = (gf.LOADING_RING_REASON if loading else
+                           gf.BROWSE_LOADING_RING_REASON if is_int and not current and state.saved_ring_expected else
+                           state.saved_ring_reason if is_int and geometry is None and state.saved_ring_reason else
+                           gf.detector_ring_unavailable(geometry, heavy.detector_shape if current else None))
+            if current and not ring_reason:
+                snapshot, shape = tuple(geometry.items()), heavy.detector_shape
+                self._phase_ring_context = (navigation.current, snapshot, shape)
+            else:
+                self._phase_ring_context = None
+        window.set_rings_reason(ring_reason if raw_shown else '')
+        self._phase_display_contract = (state.measurement_mode, self._phase_line_context, cake,
+            self._phase_axis(self._rendered_cake_y_axis), wavelength, shape, bool(snapshot), state.processing_mode)
+        floors = () if options.phase_global_floor else tuple(
+            pair for pair in options.phase_floors if pair[0] in shown_ids)
+        request = PhaseOverlayRequest(entries, options.phase_min_intensity, unit, bounds, wavelength,
+                                      snapshot, shape, line_reason=reason, floors=floors)
+        shown = self._phase_requests.shown
+        if shown is not None and request != shown:
+            def context(value):
+                return (value.line_unit, value.line_range, value.wavelength_angstrom, value.ring_snapshot,
+                        value.ring_shape, value.step_px, value.line_reason)
+            if context(shown) != context(request):
+                for identifier in tuple(self.phase_families):
+                    self._remove_phase_drawings(identifier)
+            else:
+                before = {entry.id: (entry, phase_floor(shown, entry)) for entry in shown.entries}
+                for entry in entries:
+                    if before.get(entry.id) != (entry, phase_floor(request, entry)):
+                        self._remove_phase_drawings(entry.id)  # only the phase that changed waits for its lines
+            # What is drawn is no longer the shown request's result, so asking for it again (a Browse frame
+            # re-selected through a transient state) must compute it again rather than count as unchanged.
+            self._phase_requests.forget()
+        self._phase_requests.ask(request)
+        self._draw_phase_overlays()
+
+    def _phase_done(self, request, terminal):
+        if terminal.status is OperationTerminalStatus.RETURNED:
+            self.phase_families = {family.id: family for family in terminal.payload}
+        else:
+            from xrd_tools.analysis.phase_overlays import PhaseOverlayFamily
+            self.phase_families = {entry.id: PhaseOverlayFamily(entry.id, entry.name, entry.source_kind,
+                reason=str(terminal.failure_message or 'Reference phase computation failed.')) for entry in request.entries}
+        self._draw_phase_overlays()
+        return True
+
+    @staticmethod
+    def _phase_tip(family):
+        from xrd_tools.analysis.phase_overlays import RING_CAVEAT
+        if family.source_kind == 'calibrant':
+            tip = f'{family.name} (built-in calibrant): reference positions from pyFAI d-spacings. {RING_CAVEAT}'
+        else:
+            tip = f'{family.name}: {family.omitted_count} reflections omitted below the floor. Display reference only.'
+            if family.source_kind == 'cif':  # C8: what a stick's height means
+                tip += (" Stick heights are relative reference intensities within this phase's reachable range, "
+                        "not measured counts or phase fractions.")
+        return tip + (' ' + family.reason if family.reason else '')
+
+    def _draw_phase_legends(self):
+        for entry, shown in self._phase_listed:
+            identifier = entry.id
+            color = self._phase_colors.get(identifier, (240, 200, 90))
+            family = self.phase_families.get(identifier)
+            tip = (self._phase_tip(family) if family is not None and shown else
+                   f'{entry.name}: hidden. Click to show it again. Display reference only.' if not shown else
+                   f'{entry.name}: computing reference positions. Display reference only.')
+            legend = self._phase_legends.get(identifier)
+            pen = pg.mkPen(color, width=2, style=QtCore.Qt.PenStyle.DashLine)  # the lines' dash (D4)
+            if legend is None:
+                legend = pg.PlotDataItem(pen=pen)
+                self._phase_legends[identifier] = legend
+            if not any(item.item is legend for item, _label in self.legend.items):
+                self.legend.addItem(legend, entry.name)
+            legend.setPen(pen)
+            legend.setVisible(bool(shown))  # pyqtgraph greys a hidden sample
+            legend.setToolTip(tip)
+            for sample, label in self.legend.items:
+                if sample.item is legend:  # the entry the legend shows, not only its proxy
+                    sample.setToolTip(tip)
+                    label.setToolTip(tip)
+                    sample.update()
+
+    def _legend_sample_clicked(self, item):
+        identifier = next((key for key, legend in self._phase_legends.items() if legend is item), None)
+        if identifier is None:
+            return  # a trace's own entry: pyqtgraph shows or hides the trace itself
+        shown = bool(item.isVisible())  # the sample toggled its proxy before this signal
+        options = self.reference_phases.projection
+        references = tuple((key, shown if key == identifier else flag) for key, flag in options.phase_references)
+        if references != options.phase_references:
+            self._emit(ShellCommandKind.SET_PLOT_OPTION, references, ('other', 'phase_references'))
+
+    def _draw_phase_overlays(self):
+        self._draw_phase_legends()
+        if self._phase_display_contract is None:
+            return
+        measurement, line, cake, cake_y, wavelength, shape, raw_allowed, mode = self._phase_display_contract
+        line_key = line[0] if line else ''
+        for identifier, family in self.phase_families.items():
+            name = 'phase:' + identifier
+            color = self._phase_colors.get(identifier, (240, 200, 90))
+            tip = self._phase_tip(family)
+            positions = positions_for_axis(family.q_lines,
+                {'q_A^-1': 'q', '2th_deg': '2theta'}.get(line_key, ''), wavelength)
+            values = positions.values if measurement != 'Grazing' else ()
+            # Each drawn line's reflection (C7): a 2θ axis draws the reachable prefix of ``q_lines``.
+            line_values = family.line_values[:len(values)]
+            # One joined 1D item per phase (maintainer, October 11), not one item per reflection.
+            marker = self._phase_markers.get(identifier)
+            if (marker is None or marker.reference_positions != tuple(values)
+                    or marker.line_values != line_values
+                    or marker not in self.curve.getPlotItem().items
+                    or marker.lines.opts['pen'].color().getRgb()[:3] != color[:3]):
+                if marker is not None:
+                    self.curve.removeItem(marker)
+                    self._cursor_readout.clear_hover()
+                marker = draw_reference_lines(self.curve, values, color=color, family=name,
+                                              tooltip=tip, values=line_values) if values else None
+                if marker is None:
+                    self._phase_markers.pop(identifier, None)
+                else:
+                    self._phase_markers[identifier] = marker
+            if marker is not None:
+                marker.set_tooltip(tip)
+            # The family object, unchanged by another phase's edit, keeps its curves and so every pane's items.
+            scalars = (measurement, cake, cake_y, wavelength, color, tip)
+            drawing = self._phase_drawings.get(identifier)
+            if drawing is None or drawing[0] is not family or drawing[1] != scalars:
+                rings = tuple(replace(curve, tooltip=tip) for curve in family.rings)
+                cuts = ()
+                if measurement != 'Grazing' and cake is not None and cake_y is not None:
+                    cake_values = positions_for_axis(family.q_lines,
+                        {'q_A^-1': 'q', '2th_deg': '2theta'}.get(cake[0], ''), wavelength).values
+                    cuts = self._reference_cuts(family, cake_values, cake_y[1], tip)
+                drawing = (family, scalars, rings, cuts)
+                self._phase_drawings[identifier] = drawing
+            self.cake.render_overlay_family(name, drawing[3], color=color, joined=True)
+            raw_curves = drawing[2] if raw_allowed else ()
+            self.raw.render_overlay_family(name, raw_curves if mode == 'Int 2D' else (),
+                                           native_shape=shape, color=color, joined=True)
+            if self.raw_popup_image is not None:
+                own_popup = mode == 'Int 1D' and not self._raw_popup_host and self.raw_popup_dialog.isVisible()
+                self.raw_popup_image.render_overlay_family(name, raw_curves if own_popup else (),
+                                                           native_shape=shape, color=color, joined=True)
+
+    def _clear_grid_overlay(self, *, retain_cache=False):
+        self._grid_frame = None
+        if not retain_cache:
+            self._grid_cache = self._grid_prediction = None
+        self.raw.render_overlay_family('grid', ())
+        if self.raw_popup_image is not None:
+            self.raw_popup_image.render_overlay_family('grid', ())
+
+    def _reconcile_grid_overlay(self, state, navigation):
+        from xrd_tools import geometry_figures as gf
+        heavy, mode = state.heavy, state.processing_mode
+        shown = (mode in ('Average', 'Reintegrate')
+                 or mode == 'Int 1D' and 'raw' not in self._hidden_tools
+                 or mode == 'Int 2D' and 'raw_pane' not in self._hidden_tools)
+        is_int = shown and mode in ('Int 1D', 'Int 2D')
+        if (heavy is None and state.retain_display and is_int
+                and self._grid_frame is navigation.current):
+            return
+        matches = is_int and heavy is not None and heavy.frame is navigation.current and heavy.raw is not None
+        snapshot, shape = ((heavy.ring_geometry, heavy.detector_shape) if matches else (None, None))
+        # A saved output's frame draws q contours and withholds χ, and its note says so (D4(c)).
+        saved = matches and heavy.ring_origin == 'saved'
+        reason = gf.detector_grid_unavailable(snapshot, shape)
+        choice = state.plot_options.coordinate_grid
+        self.plot_options_dialog.set_grid_available(
+            not reason, reason, note='' if reason else gf.detector_grid_note(choice, saved=saved), visible=shown)
+        if reason or choice == 'Off':
+            self._clear_grid_overlay(retain_cache=True)
+            return
+        dimension = '1d' if mode == 'Int 1D' else '2d'
+        key = (tuple(snapshot.items()), shape, choice, dimension, saved)
+        if self._grid_cache != key:
+            self._clear_grid_overlay()
+            try:
+                self._grid_prediction = gf.predict_detector_grid(snapshot, shape=shape, choice=choice,
+                                                                  mode=dimension, saved=saved)
+            except ValueError as error:
+                self.plot_options_dialog.set_grid_available(False, str(error))
+                return
+            self._grid_cache = key
+        self._grid_frame = navigation.current
+        target = self.raw if mode == 'Int 2D' else self.raw_popup_image
+        if target is not None and (mode == 'Int 2D' or
+                                  self.raw_popup_dialog.isVisible() and not self._raw_popup_host):
+            target.render_overlay_family('grid', self._grid_prediction.curves,
+                                         texts=self._grid_prediction.texts, native_shape=shape)
 
     def reconcile(
         self,
@@ -878,6 +1808,24 @@ class ScientificView(QtWidgets.QFrame):
         detail: str,
     ) -> None:
         self.reconcile_action_availability(state)
+        if state.processing_mode == '2D Viewer':
+            self._clear_grid_overlay()
+            self.plot_options_dialog.set_grid_available(False, visible=False)
+            self._clear_phase_overlays()
+            self.reference_phases.set_available(False, 'Reference phases are unavailable in the 2D Viewer.')
+            self._clear_angular_support()  # no 1-D profile in the 2D Viewer: no strip and no option
+            self.plot_options_dialog.set_angular_support_mounted(False)
+        coverage = (
+            state.heavy.cake_coverage
+            if state.heavy is not None
+            and state.processing_mode == "Int 2D"
+            and state.image_axis in {"Q-Chi", "q_chi"}
+            and not state.derived_2d
+            else None
+        )
+        self.plot_options_dialog.set_coverage_available(coverage is not None)
+        if coverage is None or not state.plot_options.show_coverage_holes:
+            self.cake.render_coverage(None)
         self.background.setText(("Clear" if state.background_set else "Set") + " " + {"Int 1D": "1D", "1D Viewer": "1D", "Int 2D": "2D", "2D Viewer": "Raw"}.get(state.processing_mode, "BG") + " BG")
         self._rendered_background_key = self._expected_background_key if state.background_set else None
         if state.processing_mode == "2D Viewer":
@@ -1074,6 +2022,9 @@ class ScientificView(QtWidgets.QFrame):
                             id(state.heavy.cake),
                         ),
                     )
+                    self.cake.render_coverage(
+                        coverage if state.plot_options.show_coverage_holes else None
+                    )
                     self._rendered_cake_axis_key = self._axis_key(
                         state.heavy.cake_x
                     )
@@ -1111,6 +2062,8 @@ class ScientificView(QtWidgets.QFrame):
                 )
             if state.processing_mode == "Int 1D":
                 self._reconcile_raw_popup(state)
+            self._reconcile_grid_overlay(state, navigation)
+            self._reconcile_phase_overlay(state, navigation)
         finally:
             self._share_axis_syncing = prior_syncing
         if replace_presentation:
@@ -1249,6 +2202,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def _clear_viewer_payloads(self, *, keep_chrome=False, failure=False):
         """Release scientific buffers; navigation need not dismantle the layout."""
+        self._clear_phase_overlays()
         cleared, canonical = True, self._viewer_2d_payload
         def scrub(target, name, value=None, *, read=False):
             nonlocal cleared
@@ -1295,6 +2249,7 @@ class ScientificView(QtWidgets.QFrame):
                 verify_released(target, name)
         for root in (self.curve, self.waterfall):
             scrub(root, "clear")
+        scrub(self, "_clear_angular_support")
         try:
             blocker = QtCore.QSignalBlocker(self.frame_selector)
         except Exception:
@@ -1387,6 +2342,8 @@ class ScientificView(QtWidgets.QFrame):
 
     def clear_workspace(self) -> bool:
         """Drop every mounted scientific payload before owner retirement."""
+        self._clear_phase_overlays()
+        self._clear_grid_overlay()
         self.drop_viewer_loading_snapshot()
         cleared = ScientificView.clear_viewer_1d(
             self, None, failure=True
@@ -1771,8 +2728,8 @@ class ScientificView(QtWidgets.QFrame):
         return all(
             _is_readonly_array(trace.axis.values)
             and _is_readonly_array(trace.intensity)
-            and trace.axis.values.shape == reference.shape
-            and np.array_equal(trace.axis.values, reference)
+            # a grid equal to rounding is the same grid, as aggregate_traces folds it
+            and same_grid(trace.axis.values, reference)
             for _key, trace in rows
         )
 
@@ -1896,6 +2853,7 @@ class ScientificView(QtWidgets.QFrame):
     ) -> None:
         browse_snapshot = state.browse_trace_snapshot
         if browse_snapshot is not None:
+            owned_by_id = {id(frame): frame for frame in navigation.frames}
             if (
                 type(browse_snapshot) is not BrowseTraceSnapshot
                 or not browse_snapshot.science_contract
@@ -1908,7 +2866,7 @@ class ScientificView(QtWidgets.QFrame):
                 or tuple(trace.frame for trace in state.traces)
                 != browse_snapshot.display_frames
                 or any(
-                    not any(owned is frame for owned in navigation.frames)
+                    owned_by_id.get(id(frame)) is not frame
                     for frame in browse_snapshot.logical_frames
                 )
             ):
@@ -2006,6 +2964,8 @@ class ScientificView(QtWidgets.QFrame):
                 return
             if browse_snapshot is None:
                 rows = self._bounded_waterfall_rows(rows)
+        self._phase_wavelengths = tuple(sorted({getattr(trace, "wavelength_m", None)
+            for _, trace in rows}, key=lambda value: -1. if value is None else value))
         if state.plot_mode in {"Average", "Sum"}:
             traces = self._aggregate_trace_rows(
                 rows,
@@ -2033,6 +2993,11 @@ class ScientificView(QtWidgets.QFrame):
             self._axis_key(trace.axis)
             for trace in traces
         }
+        self._phase_line_context = None
+        if len(axis_keys) == 1 and traces:
+            finite = np.concatenate([np.asarray(t.axis.values)[np.isfinite(t.axis.values)] for t in traces])
+            if finite.size:
+                self._phase_line_context = (next(iter(axis_keys)), (float(finite.min()), float(finite.max())))
         prior_trace_axis_key = self._rendered_trace_axis_key
         self._rendered_trace_axis_key = (
             next(iter(axis_keys))
@@ -2081,6 +3046,7 @@ class ScientificView(QtWidgets.QFrame):
         ):
             self.bottom_stack.setCurrentWidget(self.waterfall)
             self.legend.setVisible(False)
+            self._reconcile_angular_support(state, (), aggregate=True)
             self._rendered_trace_keys = keys
             self._rendered_plot_mode = state.plot_mode
             self._rendered_plot_options = state.plot_options
@@ -2144,6 +3110,7 @@ class ScientificView(QtWidgets.QFrame):
         # curve during the synchronous rebuild.
         self.bottom_stack.setCurrentWidget(self.curve)
         self.legend.setVisible(state.plot_options.show_legend)
+        self._reconcile_angular_support(state, traces)
         self._rendered_trace_keys = keys
         self._rendered_plot_mode = state.plot_mode
         self._rendered_plot_options = state.plot_options
@@ -2202,10 +3169,7 @@ class ScientificView(QtWidgets.QFrame):
             if prior_contract is not None:
                 self._curve_item_contracts[keys[0]] = prior_contract
 
-        colors = None
-        if color_map != "Default" and color_map in matplotlib_colormaps:
-            positions = [.65] if len(traces) == 1 else np.linspace(.15, .85, len(traces))
-            colors = matplotlib_colormaps[color_map](positions, bytes=True)
+        colors = trace_colors(color_map, len(traces))
         desired_items = []
         for index, (key, trace) in enumerate(
             zip(keys, traces, strict=True)
@@ -2218,11 +3182,7 @@ class ScientificView(QtWidgets.QFrame):
                 offset,
                 title,
             )
-            style_contract = (
-                _TRACE_COLORS[index % len(_TRACE_COLORS)]
-                if colors is None
-                else tuple(int(channel) for channel in colors[index])
-            )
+            style_contract = colors[index]
             item = self._curve_items_by_key.get(key)
             prior_contract = self._curve_item_contracts.get(key)
             clip_eligible = (
@@ -2248,12 +3208,7 @@ class ScientificView(QtWidgets.QFrame):
                     measured = slice(valid[0], valid[-1] + 1) if valid.size else slice(0, 0)
                     plot_x, plot_y = plot_x[measured], plot_y[measured]
             if item is None:
-                pen = pg.mkPen(
-                    color=style_contract,
-                    width=1.4,
-                    style=QtCore.Qt.PenStyle.SolidLine,
-                )
-                item = self.curve.plot(
+                item = segmented_data_curve(self.curve.plot(
                     plot_x,
                     _offset_intensity(
                         plot_y,
@@ -2261,13 +3216,8 @@ class ScientificView(QtWidgets.QFrame):
                         overlay_step,
                     ),
                     name=title,
-                    pen=pen,
-                    symbol="o",
-                    symbolBrush=style_contract,
-                    symbolPen=style_contract,
-                    symbolSize=4,
-                    connect="finite",
-                )
+                    **data_curve_style(style_contract),
+                ))
                 self._curve_items_by_key[key] = item
             else:
                 if data_changed:
@@ -2285,15 +3235,10 @@ class ScientificView(QtWidgets.QFrame):
                     prior_contract is None
                     or prior_contract[1] != style_contract
                 ):
-                    item.setPen(
-                        pg.mkPen(
-                            color=style_contract,
-                            width=1.4,
-                            style=QtCore.Qt.PenStyle.SolidLine,
-                        )
-                    )
-                    item.setSymbolBrush(style_contract)
-                    item.setSymbolPen(style_contract)
+                    style = data_curve_style(style_contract)
+                    item.setPen(style['pen'])
+                    item.setSymbolBrush(style['symbolBrush'])
+                    item.setSymbolPen(style['symbolPen'])
                 if (
                     prior_contract is None
                     or prior_contract[0][-1] != title
@@ -2334,6 +3279,135 @@ class ScientificView(QtWidgets.QFrame):
                 continue
             self._curve_items_by_key.pop(key, None)
             self._curve_item_contracts.pop(key, None)
+
+    def angular_support_message(self) -> str:
+        """The strip's note (COVERAGE-SUPPORT-20261013): why the shown traces, or some of them, have no angular
+        coverage; empty while every shown profile is drawn or the strip is off."""
+        return self._support_message
+
+    def _reconcile_angular_support(self, state, traces, *, aggregate=False) -> None:
+        """Each shown native profile in its trace's colour on the strip, or the reasons there is none. An unavailable
+        trace never unchecks the option: while it is on the strip stays shown, with its note."""
+        # only what the strip reads, kept for a reconstruction's redraw: never the projection's images
+        self._draw_angular_support((tuple(traces), state.plot_mode, state.plot_options.show_angular_support,
+                                    state.color_map, state.saved_support_source, bool(aggregate)))
+
+    def _draw_angular_support(self, inputs) -> None:
+        traces, plot_mode, on, color_map, source, aggregate = inputs
+        self._support_inputs = inputs
+        self.plot_options_dialog.set_angular_support_mounted(True)
+        drawn, reasons = [], []
+        if aggregate or plot_mode in {"Average", "Sum", "Waterfall"}:  # a waterfall drawn as image or offsets
+            reasons.append(REASON_TEXT[SupportReason.AGGREGATE_TRACE])
+        elif not traces:
+            reasons.append(_NO_TRACE_SUPPORT)
+        else:
+            rebuilt = self._rebuilt_profiles(source, traces) if on else {}
+            for trace, color in zip(traces, trace_colors(color_map, len(traces)), strict=True):
+                profile = self._strip_profile(source, trace, rebuilt) if on else trace.angular_support
+                if profile is not None and profile.available:
+                    drawn.append((trace, profile, color))
+                    continue
+                text = _NO_ANGULAR_SUPPORT if profile is None else profile.text
+                if text not in reasons:
+                    reasons.append(text)
+        message = " ".join(reasons)
+        if drawn and reasons:
+            message = f"{len(traces) - len(drawn)} of {len(traces)} profiles: {message}"
+        contract = (on, message, tuple((trace.title, id(trace.axis.values), id(profile), color)
+                                       for trace, profile, color in drawn))
+        if contract == self._support_contract:
+            return
+        self._support_contract = contract
+        self._support_message = message if on else ""
+        self.plot_options_dialog.set_angular_support_available(bool(drawn), message)
+        plot = self.angular_support_plot.getPlotItem()
+        for item in plot.listDataItems():
+            plot.removeItem(item)
+        self._support_readout.clear_hover()
+        if not on:
+            self.angular_support_owner.clear()  # the strip off: nothing kept, nothing computing
+            self._support_note.setText("")
+            self.angular_support_plot.hide()
+            return
+        for trace, profile, color in drawn:
+            plot.addItem(AngularSupportCurve(trace.axis.values, profile, color=color,
+                                             name=trace.title or str(trace.frame.local_frame_label)))
+        self._support_note.setText("" if drawn else message)
+        self.angular_support_plot.setToolTip(ANGULAR_SUPPORT_STRIP_TOOLTIP + (f" {message}" if message else ""))
+        self.angular_support_plot.show()
+        self._sync_support_geometry()
+
+    @staticmethod
+    def _rebuildable(source, trace) -> bool:
+        """Whether the shown Int output saved no coverage; the headless owner qualifies its saved facts."""
+        profile = trace.angular_support
+        return (profile is not None and profile.reason in {SupportReason.NO_SAVED_SUPPORT, SupportReason.RECORDING_DISABLED}
+                and source is not None
+                and trace.frame.artifact == source.artifact)
+
+    def _rebuilt_profiles(self, source, traces) -> dict:
+        """The shown output's rebuilt profiles: one ask of the owner for all its shown frames, which keeps
+        exactly those and rebuilds only the missing; with none shown, the owner lets go of what it kept."""
+        labels = [int(trace.frame.local_frame_label) for trace in traces if self._rebuildable(source, trace)]
+        if not labels:
+            self.angular_support_owner.clear()
+            return {}
+        return self.angular_support_owner.profiles(source, labels)
+
+    def _strip_profile(self, source, trace, rebuilt):
+        """The saved profile, or requested reconstruction from the shown Int output's own record, pending meanwhile.
+        Recording Off still skips Run-time work; Show may compute qualifying saved Standard Int frames on demand."""
+        profile = trace.angular_support
+        if not self._rebuildable(source, trace):
+            return profile
+        rebuilt = rebuilt.get(int(trace.frame.local_frame_label))
+        if rebuilt is None:
+            return AngularSupportProfile.unavailable(SupportReason.PENDING, origin=SupportOrigin.RECONSTRUCTED)
+        if rebuilt.available and rebuilt.supported_deg.shape != trace.intensity.shape:
+            return AngularSupportProfile.unavailable(SupportReason.LEGACY_INSUFFICIENT, origin=SupportOrigin.RECONSTRUCTED,
+                                                     detail="the rebuilt bins are not the shown profile's")
+        return rebuilt
+
+    def _refresh_angular_support(self) -> None:
+        """A reconstruction completed: the strip draws what it now has for the traces it shows."""
+        if self._support_inputs is not None:
+            self._draw_angular_support(self._support_inputs)
+
+    def _clear_angular_support(self) -> None:
+        """The strip lets go of its drawn profiles with the 1-D payloads they describe."""
+        self.angular_support_owner.clear()
+        self._support_inputs = None
+        plot = self.angular_support_plot.getPlotItem()
+        for item in plot.listDataItems():
+            plot.removeItem(item)
+        self._support_readout.clear_hover()
+        self._support_note.setText("")
+        self._support_contract = None
+        self._support_message = ""
+        self.angular_support_plot.hide()
+
+    def _sync_support_geometry(self, *_args) -> None:
+        """The strip's plot area takes the 1-D plot's: its left axis as wide as the curve's (an AxisItem sizes itself
+        lazily, so this follows both view boxes' resizes), then the curve's x range."""
+        if not self.angular_support_plot.isVisible():
+            return
+        width = float(self.curve.getPlotItem().getAxis("left").width())
+        strip = self.angular_support_plot.getPlotItem()
+        axis = strip.getAxis("left")
+        if width > 0 and axis.fixedWidth != width:
+            axis.setWidth(width)
+            strip.layout.activate()
+        self._mirror_support_x()
+
+    def _mirror_support_x(self, *_args) -> None:
+        """The strip shows exactly the curve's x range (pan, zoom, drawable extent), whatever Share Axis does."""
+        if not self.angular_support_plot.isVisible():
+            return
+        low, high = self.curve.getPlotItem().getViewBox().viewRange()[0]
+        box = self.angular_support_plot.getPlotItem().getViewBox()
+        if box.viewRange()[0] != [low, high]:
+            box.setXRange(low, high, padding=0.0)
 
     def _update_curve_axis_labels(
         self,
@@ -2428,6 +3502,7 @@ class ScientificView(QtWidgets.QFrame):
                             )
                             and retained.title == trace.title
                             and retained.epoch == trace.epoch
+                            and getattr(retained, "wavelength_m", None) == getattr(trace, "wavelength_m", None)
                         )
                     )
                 ):
@@ -2634,23 +3709,7 @@ class ScientificView(QtWidgets.QFrame):
         return values, y_axis_choice
 
     def _mouse_moved(self, positions: object) -> None:
-        position = positions
-        if type(positions) is tuple:
-            if not positions:
-                return
-            position = positions[0]
-        if not isinstance(position, QtCore.QPointF):
-            return
-        plot = self.curve.getPlotItem()
-        if not plot.sceneBoundingRect().contains(position):
-            self.cursor_position.setText("")
-            self.curve.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
-            return
-        point = plot.vb.mapSceneToView(position)
-        self.cursor_position.setText(
-            f"x={point.x():.2f}, y={point.y():.2e}"
-        )
-        self.curve.setCursor(QtCore.Qt.CursorShape.CrossCursor)
+        self._cursor_readout.mouse_moved(positions)
 
     @staticmethod
     def _set_data_combo(combo: QtWidgets.QComboBox, value: str) -> None:
@@ -2692,7 +3751,9 @@ class ScientificView(QtWidgets.QFrame):
         native_key: str | None,
     ) -> tuple[tuple[str, str], ...]:
         if state.measurement_mode == "GI":
-            native_choices = _GI_PLOT_AXIS_CHOICES.get(
+            native_choices = self._merged_axis_choices(*(
+                _GI_PLOT_AXIS_CHOICES.get(mode, ()) for mode in state.gi_modes_1d
+            )) if state.gi_modes_1d else _GI_PLOT_AXIS_CHOICES.get(
                 state.gi_mode_1d,
                 _GI_PLOT_AXIS_CHOICES["q_total"],
             )
@@ -2828,8 +3889,529 @@ class ScientificView(QtWidgets.QFrame):
             # a fresh re-flow follow epoch like the scheduled ones do.
             self._reflow_follows = 0
             self._align_curve_under_cake()
+        self._sync_share_axis_options()
+
+    # -- the keyed layout: display_logic's repeated PanelKey roles (the H11/WS-X2 seam) -----------------------
+    def reconcile_keyed(self, state: KeyedPanelsProjection) -> None:
+        """Draw a keyed layout: ``state.layout``'s rows of ``PanelKey``s, a SLICE_2D key on Int's image pane
+        over the frame navigation's own widgets (stepping its slice along its normal: ``SET_PANEL_INDEX``),
+        a PROJ_1D key on a 1-D plot styled as Int's. The top bar's colour map, Log and Set BG drive every
+        panel; below the panels, Int's intensity controls set one set of levels for every slice
+        (``_refresh_keyed_intensity``) and Share Axis (``state.share_axis``) links the panels drawing one
+        coordinate (``_link_keyed_axes``). Int's own layout is hidden while it is shown, and
+        ``_apply_mode_layout`` brings it back for Int's modes. All or nothing: on a failure the prior panels are
+        drawn again (or cleared) and the error raised."""
+        if type(state) is not KeyedPanelsProjection:
+            raise TypeError("a keyed layout is drawn from a KeyedPanelsProjection")
+        self._clear_phase_overlays()
+        self.reference_phases.set_available(False, "Reference phases are unavailable in keyed views.", visible=False)
+        self._clear_angular_support()  # RSM's keyed panels: no strip and no option
+        self.plot_options_dialog.set_angular_support_mounted(False)
+        prior = self._keyed_shown
+        try:
+            self._paint_keyed(state)
+        except BaseException:
+            try:
+                if prior is None:
+                    self.clear_keyed()
+                else:
+                    self._paint_keyed(prior)
+            except BaseException:  # the primary failure is the one reported
+                pass
+            raise
+        self._keyed_shown = state
+
+    def set_coordinate_ranges(self, axes, labels, bounds=None):
+        """Mount Int's coordinate editors/handles; synchronization emits no edits."""
+        from xdart.gui.widgets.controls_panel import CoordinateRangeControl
+        if not axes:
+            if self._coordinate_range_bar is not None:
+                self._coordinate_range_bar.hide()
+            return
+        if self._coordinate_range_bar is None:
+            self._coordinate_range_bar = QtWidgets.QWidget(self)
+            layout = QtWidgets.QHBoxLayout(self._coordinate_range_bar)
+            layout.setContentsMargins(4, 0, 4, 0)
+            for label in labels:
+                control = CoordinateRangeControl(label)
+                control.rangeChanged.connect(lambda _low, _high: self.coordinateRangesChanged.emit(
+                    tuple(row._bounds for row in self.coordinate_ranges)))
+                layout.addWidget(control, 1)
+                self.coordinate_ranges.append(control)
+            self._main_layout.insertWidget(self._main_layout.indexOf(self.viewer_intensity_row),
+                                           self._coordinate_range_bar)
+        if len(axes) != len(self.coordinate_ranges):
+            raise ValueError("coordinate ranges must match their mounted axes")
+        for i, (row, axis, label) in enumerate(zip(self.coordinate_ranges, axes, labels, strict=True)):
+            row.reconcile(label, axis, None if bounds is None else bounds[i])
+        self._coordinate_range_bar.show()
+
+    @property
+    def coordinate_range_bounds(self):
+        """Detached operator bounds; the scientific projection remains the page's authority."""
+        return tuple(row._bounds for row in self.coordinate_ranges)
+
+    @property
+    def keyed_projection(self) -> KeyedPanelsProjection | None:
+        """The keyed layout drawn now, or None."""
+        return self._keyed_shown
+
+    def prepare_keyed_layout(self, layout: tuple[tuple[PanelKey, ...], ...]) -> None:
+        """Mount empty keyed panels while their worker is pending, without inventing a scientific projection."""
+        if (type(layout) is not tuple or not layout
+                or any(type(row) is not tuple or not row for row in layout)):
+            raise TypeError("a keyed layout is nonempty rows of PanelKeys")
+        keys = tuple(key for row in layout for key in row)
+        if (any(type(key) is not PanelKey or key.role not in {
+                PanelRole.SLICE_2D, PanelRole.PROJ_1D, PanelRole.FIGURE} for key in keys)
+                or len(set(keys)) != len(keys)):
+            raise TypeError("a keyed layout has distinct supported PanelKeys")
+        self._enter_keyed_layout()
+        self._link_keyed_axes(False)
+        if layout != self._keyed_layout:
+            self._build_keyed(layout)
+        self._keyed_coordinates = {}
+        self.clear_keyed()
+        self.share_axis.setEnabled(False)
+        self._sync_share_axis_options()
+        self._apply_hidden_tools()
+
+    def keyed_panel(self, key: PanelKey):
+        """A keyed panel's widgets (an image panel's ``pane``, ``previous``, ``selector`` and ``next``; a 1-D
+        panel's ``plot`` and ``curve``), for its host's checks."""
+        return self._keyed_panels[key]
+
+    @staticmethod
+    def _reference_cuts(family, positions, y_bounds, tooltip):
+        from xrd_tools.geometry_figures import Curve
+        return tuple(Curve(family.name, np.asarray(((value, y_bounds[0]), (value, y_bounds[1]))),
+                           'predicted', tooltip, value=line_value)
+                     for value, line_value in zip(positions, family.line_values))
+
+    def set_keyed_calibrant_reference(self, key: PanelKey, name: str | None, wavelength_m: float) -> str:
+        """Draw one calibrant's expected Q lines with the shared phase provider/painter; return an unavailable reason.
+
+        Lines survive presentation redraws and leave with clear_keyed(). No phase-library entry is created.
+        """
+        from xrd_tools.analysis.phase_references import calibrant_entry
+        widgets = self._keyed_panels.get(key)
+        if type(widgets) is not _KeyedImagePanel or self._keyed_shown is None:
+            raise KeyError(f'no shown keyed image panel {key!r}')
+        widgets.pane.render_overlay_family('calibrant-reference', ())
+        if not name:
+            return 'This fit does not record a calibrant identity; no reference positions are inferred.'
+        panel = self._keyed_shown.panel(key)
+        x, y = self._phase_axis(panel.x_axis), self._phase_axis(panel.y_axis)
+        if x is None or x[0] != 'q_A^-1' or y is None:
+            return 'Calibrant reference positions require a Q map.'
+        if not np.isfinite(wavelength_m) or wavelength_m <= 0:
+            return 'Calibrant reference positions require the fitted wavelength.'
+        try:
+            entry = calibrant_entry(name)
+        except ValueError as error:
+            return str(error)
+        family, = self._phase_job(PhaseOverlayRequest((entry,), 0., 'q', x[1], wavelength_m * 1e10), None, None)
+        cuts = self._reference_cuts(family, family.q_lines, panel.y_axis.edges or y[1], self._phase_tip(family))
+        widgets.pane.render_overlay_family('calibrant-reference', cuts, color=reference_colors(1)[0], joined=True)
+        return family.reason
+
+    def set_keyed_region(self, key: PanelKey, region: RectRegion | None) -> None:
+        """Show ``region`` as a rectangle the user can move and resize on the keyed image panel ``key`` (None: no
+        rectangle there), drawn in the panel's coordinates: a region in other coordinates than the panel draws is
+        refused (``TypeError``). It stays over the panel's redraws in the same coordinates; a redraw in other ones
+        or a new layout drops it. Setting it emits nothing; the user's moves emit ``keyedRegionChanged``."""
+        widgets = self._keyed_panels.get(key)
+        if type(widgets) is not _KeyedImagePanel:
+            raise KeyError(f"no keyed image panel {key!r}")
+        widgets.set_region(region, lambda: self.keyedRegionChanged.emit(key, widgets.region_shown()))
+
+    def keyed_region(self, key: PanelKey) -> RectRegion | None:
+        """The keyed image panel's rectangle where it is now, or None."""
+        widgets = self._keyed_panels.get(key)
+        return widgets.region_shown() if type(widgets) is _KeyedImagePanel else None
+
+    def set_keyed_named_region(self, key: PanelKey, name: str, region: RectRegion | None, *,
+                               color=_REGION_PEN, dashed: bool = False, visible: bool = True) -> None:
+        """Reconcile one independent mark by identity. Other marks stay; live gestures emit typed geometry.
+        None removes it; hidden backgrounds keep their geometry. Axes changes drop every mark."""
+        widgets = self._keyed_panels.get(key)
+        if type(widgets) is not _KeyedImagePanel:
+            raise KeyError(f"no keyed image panel {key!r}")
+        widgets.set_named_region(str(name), region,
+            lambda: self.keyedNamedRegionChanged.emit(key, str(name), widgets.named_region_shown(str(name))),
+            color=color, dashed=dashed, visible=visible)
+
+    def keyed_named_region(self, key: PanelKey, name: str) -> RectRegion | None:
+        widgets = self._keyed_panels.get(key)
+        return widgets.named_region_shown(str(name)) if type(widgets) is _KeyedImagePanel else None
+
+    def keyed_region_item(self, key: PanelKey, name: str = ""):
+        """Borrowed interaction handle for compatibility and gesture checks; lifetime stays with the view."""
+        widgets = self._keyed_panels[key]
+        return widgets.regions.get(str(name)) if name else widgets.region
+
+    def clear_keyed(self, detail: str = "") -> None:
+        """Empty every keyed panel, keeping the layout."""
+        for widgets in self._keyed_panels.values():
+            widgets.clear()
+        if self._layout_mode == "keyed":
+            self.title.setText("")
+            self.status.setText(str(detail))
+            self._refresh_keyed_intensity()
+        self._keyed_shown = None
+
+    def _paint_keyed(self, state: KeyedPanelsProjection) -> None:
+        self._enter_keyed_layout()
+        self._unlink_keyed_axes()  # linked again below, on this draw's axes
+        if state.layout != self._keyed_layout:
+            self._build_keyed(state.layout)
+        color = trace_colors(state.color_map, 1)[0]
+        for panel in state.panels:
+            widgets = self._keyed_panels[panel.key]
+            if type(panel) is KeyedImageProjection:
+                widgets.draw(panel, state.color_map, state.log_scale)
+            elif type(widgets) is _KeyedTracePanel:
+                widgets.draw(panel, color, state.log_scale)
+            else:
+                widgets.draw(panel, color)
+        blockers = [QtCore.QSignalBlocker(widget) for widget in (self.color_map, self.log_scale, self.share_axis)]
+        set_combo_value(self.color_map, state.color_map, fallback="Default")
+        self.log_scale.setChecked(state.log_scale)
+        self.share_axis.setChecked(state.share_axis)
+        del blockers
+        self.background.setEnabled(state.background_enabled)
+        self.background.setText(("Clear" if state.background_set else "Set") + " BG")
+        self.background.setToolTip(state.background_note)
+        # the background drawn now, which ``release_display_background`` lets go of (as ``reconcile`` does)
+        self._rendered_background_key = self._expected_background_key if state.background_set else None
+        self.title.setText(state.title)
+        self.status.setText(state.status)
+        self._keyed_coordinates = self._keyed_axes(state)
+        self.share_axis.setEnabled(bool(self._keyed_coordinates))
+        self._set_share_link(state.share_axis)
+        self._sync_share_axis_options()
+        self._refresh_keyed_intensity()
+
+        if all(type(panel) is KeyedFigureProjection for panel in state.panels):
+            if not self._figure_hidden:
+                self._figure_hidden = tuple(w for w in (self.norm, self.background, self.color_map,
+                    self.log_scale, self.title, self.status, self.viewer_intensity_row) if not w.isHidden())
+                for widget in self._figure_hidden:
+                    widget.hide()
+        else:
+            self._restore_figure_chrome()
+        self._apply_hidden_tools()
+
+    def _keyed_axes(self, state: KeyedPanelsProjection) -> dict[tuple[str, str], tuple[tuple[pg.ViewBox, int], ...]]:
+        """The keyed panels' axes (view box, 0 for x or 1 for y) by the coordinate each draws, its label and unit,
+        in the layout's order: those drawn by two or more, which Share Axis links. Not ``_axis_key``: Int's
+        canonical key takes the Q frame's Qx, Qy and Qz alike as Q."""
+        coordinates: dict[tuple[str, str], list[tuple[pg.ViewBox, int]]] = {}
+        for row in state.layout:
+            for key in row:
+                panel, widgets = state.panel(key), self._keyed_panels[key]
+                if type(panel) is KeyedImageProjection:
+                    box = widgets.pane.canvas.imageViewBox
+                    drawn = ((box, 0, panel.x_axis), (box, 1, panel.y_axis))
+                elif type(panel) is KeyedFigureProjection:
+                    continue  # figure axes are declared locally, not linked as scientific slices
+                else:
+                    drawn = ((widgets.plot.getViewBox(), 0, panel.axis),)
+                for box, axis, projection in drawn:
+                    coordinates.setdefault((projection.label, projection.unit), []).append((box, axis))
+        return {coordinate: tuple(axes) for coordinate, axes in coordinates.items() if len(axes) > 1}
+
+    def _link_keyed_axes(self, on: bool) -> None:
+        """Share Axis over a keyed layout (``_set_share_link``'s keyed side; Int's own links stay off): the axes
+        drawing one coordinate (RSM's H on the HK and HL slices and the H projection) take the first one's range,
+        then follow each other's pan and zoom along it. Off, they are independent, and the 1-D panels follow their
+        data again, as Int's 1-D plot does when Share Axis goes off."""
+        self._unlink_keyed_axes()
+        stacked = self._keyed_stacked_pair()
+        if on and stacked is not None:
+            # An image above its profile shares screen columns, as Int's cake and curve do. Other keyed
+            # layouts (RSM's several coordinates, including x/y links) keep their coordinate-range links.
+            _, image_box, _, trace_box = stacked
+            for signal, slot in ((image_box.sigXRangeChanged, self._on_cake_xrange_changed),
+                                 (trace_box.sigXRangeChanged, self._on_curve_xrange_changed)):
+                signal.connect(slot)
+                self._keyed_links.append((signal, slot))
+        elif on:
+            for axes in self._keyed_coordinates.values():
+                first, axis = axes[0]
+                self._sync_keyed_axis(axes, tuple(first.viewRange()[axis]), axes[0])
+                for member in axes:
+                    signal = member[0].sigXRangeChanged if member[1] == 0 else member[0].sigYRangeChanged
+                    slot = functools.partial(self._on_keyed_range_changed, axes, member)
+                    signal.connect(slot)
+                    self._keyed_links.append((signal, slot))
+        elif self._keyed_share_on:
+            for widgets in self._keyed_panels.values():
+                if type(widgets) is _KeyedTracePanel:
+                    widgets.plot.getViewBox().enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
+        self._keyed_share_on = bool(on and self._keyed_coordinates)
+        if self._keyed_share_on and stacked is not None:
+            self._schedule_curve_under_cake()
+
+    def _keyed_stacked_pair(self):
+        """A single image above its profile on the same x coordinate, eligible for Int's pixel alignment."""
+        if len(self._keyed_layout) != 2 or any(len(row) != 1 for row in self._keyed_layout):
+            return None
+        image, trace = (self._keyed_panels[row[0]] for row in self._keyed_layout)
+        if type(image) is not _KeyedImagePanel or type(trace) is not _KeyedTracePanel:
+            return None
+        image_box, trace_box = image.pane.canvas.imageViewBox, trace.plot.getViewBox()
+        if ((image_box, 0), (trace_box, 0)) not in self._keyed_coordinates.values():
+            return None
+        return image.pane.canvas.image_win, image_box, trace.plot, trace_box
+
+    def _unlink_keyed_axes(self) -> None:
+        for signal, slot in self._keyed_links:
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        self._keyed_links = []
+
+    def _on_keyed_range_changed(self, axes, source, _box, view_range) -> None:
+        if not self._keyed_share_on or self._share_axis_syncing:
+            return
+        self._sync_keyed_axis(axes, tuple(view_range), source)
+
+    def _sync_keyed_axis(self, axes, view_range, source) -> None:
+        """Every axis of ``axes`` but ``source`` to ``view_range``, under Int's share guard."""
+        prior = self._share_axis_syncing
+        self._share_axis_syncing = True
+        try:
+            for box, axis in axes:
+                if box is not source[0] or axis != source[1]:
+                    (box.setXRange if axis == 0 else box.setYRange)(*view_range, padding=0)
+        finally:
+            self._share_axis_syncing = prior
+
+    def _refresh_keyed_intensity(self, *, source=None) -> None:
+        """Int's intensity controls over a keyed layout's slices: one set of levels for them all, in what each
+        pane draws (log10 with Log, as Int's viewer's). Autoscale spans the slices' own automatic levels (each
+        Int's rule over its finite values), and the controls' range their values; typed or dragged levels are
+        kept across draws. A shared slice's colour bar edits this same manual range. A panel
+        presented on its own ("own", "signed": ``KeyedImageProjection.presentation``) keeps its own levels."""
+        controls = self.viewer_intensity
+        controls.set_percentile_defaults((0.1, 99.9) if self.log_scale.isChecked() else (0.5, 99.5))
+        drawn = [widgets.levels for widgets in self._keyed_panels.values()
+                 if type(widgets) is _KeyedImagePanel and widgets.levels is not None
+                 and widgets.presentation == "shared"]
+        if not drawn:
+            self._viewer_intensity_domain = self._viewer_auto_levels = None
+            controls.sync(None, None)
+            return
+        self._viewer_intensity_domain = (min(found[0] for found, _levels in drawn),
+                                         max(found[1] for found, _levels in drawn))
+        percentile = controls.percentile_values()
+        mapped = [widgets.pane.canvas.percentile_levels(percentile)
+                  for widgets in self._keyed_panels.values()
+                  if type(widgets) is _KeyedImagePanel and widgets.levels is not None
+                  and widgets.presentation == "shared"] if percentile is not None else [levels for _found, levels in drawn]
+        self._viewer_auto_levels = (min(levels[0] for levels in mapped), max(levels[1] for levels in mapped))
+        controls.sync(self._viewer_intensity_domain, self._viewer_auto_levels)
+        chosen = self._viewer_auto_levels if percentile is not None or controls.autoscale.isChecked() else controls.values()
+        self._set_keyed_levels(chosen, source=source)
+        controls.sync(self._viewer_intensity_domain, chosen)
+
+    def _set_keyed_levels(self, levels, *, source=None) -> None:
+        """Every drawn slice's colour bar to ``levels``, its limits widened to take them."""
+        if levels is None or not np.isfinite(levels).all() or levels[1] <= levels[0]:
+            return
+        low, high = levels
+        for widgets in self._keyed_panels.values():
+            if (type(widgets) is _KeyedImagePanel and widgets.levels is not None
+                    and widgets.presentation == "shared"):
+                histogram = widgets.pane.canvas.histogram
+                (own_low, own_high), _automatic = widgets.levels
+                histogram.lo_lim, histogram.hi_lim = min(own_low, low), max(own_high, high)
+                if histogram is not source:  # Keep the active drag's original anchor until release.
+                    histogram.setLevels((low, high))
+
+    def _keyed_colorbar_changed(self, key, bar) -> None:
+        """An operator's shared-slice colorbar edit drives the existing common scale."""
+        widgets = self._keyed_panels.get(key)
+        if (self._layout_mode == "keyed" and type(widgets) is _KeyedImagePanel
+                and widgets.presentation == "shared" and widgets.levels is not None
+                and bar is widgets.pane.canvas.histogram):
+            self.viewer_intensity.set_absolute_limits(*bar.levels(), emit=False)
+            self._refresh_keyed_intensity(source=bar)
+
+    def _build_keyed(self, layout: tuple[tuple[PanelKey, ...], ...]) -> None:
+        for widgets in self._keyed_panels.values():
+            widgets.container.setParent(None)
+            widgets.container.deleteLater()
+        self._keyed_panels, self._keyed_layout = {}, ()
+        while self._keyed_area.count():
+            old_row = self._keyed_area.widget(0)
+            old_row.setParent(None)
+            old_row.deleteLater()
+        for row_index, row in enumerate(layout):
+            container = QtWidgets.QWidget()
+            across = QtWidgets.QHBoxLayout(container)
+            across.setContentsMargins(0, 0, 0, 0)
+            across.setSpacing(4)
+            for key in row:
+                if key.role is PanelRole.SLICE_2D:
+                    widgets = _KeyedImagePanel(self, key)
+                elif key.role is PanelRole.PROJ_1D:
+                    widgets = _KeyedTracePanel(key)
+                elif key.role is PanelRole.FIGURE:
+                    widgets = _KeyedFigurePanel(key, self.figureImageClicked.emit)
+                else:
+                    raise ValueError(f"a keyed layout draws SLICE_2D and PROJ_1D panels, not {key.role.value}")
+                if type(widgets) in {_KeyedImagePanel, _KeyedTracePanel}:
+                    widget, box = ((widgets.pane.canvas.image_win, widgets.pane.canvas.imageViewBox)
+                                   if type(widgets) is _KeyedImagePanel
+                                   else (widgets.plot, widgets.plot.getViewBox()))
+                    widget.installEventFilter(self)
+                    box.sigResized.connect(self._on_share_view_resized)
+                across.addWidget(widgets.container, 1)
+                self._keyed_panels[key] = widgets
+            self._keyed_area.addWidget(container)
+            self._keyed_area.setStretchFactor(row_index, 1)
+        self._keyed_area.setSizes([500] * len(layout))
+        self._keyed_layout = layout
+
+    def _enter_keyed_layout(self) -> None:
+        if self._layout_mode == "keyed":
+            return
+        if self._keyed_area is None:
+            self._keyed_area = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical, self)
+            self._keyed_area.setObjectName("e7KeyedPanels")
+            self._keyed_area.setChildrenCollapsible(False)
+            self._keyed_area.setHandleWidth(8)
+            self._keyed_area.splitterMoved.connect(self._on_share_geometry_changed)
+            self._main_layout.insertWidget(self._main_layout.indexOf(self.vertical_splitter) + 1,
+                                           self._keyed_area, 1)
+        self.drop_viewer_loading_snapshot()
+        self._set_share_link(False)
+        if self.raw_popup_dialog is not None and not self._raw_popup_host:
+            self.raw_popup_dialog.close()
+        hidden = tuple(widget for widget in (
+            self.vertical_splitter, self.previous_frame, self.frame_selector,
+            self.next_frame, self.progress, self.raw_popup_button, self.phases,
+        ) if not widget.isHidden())
+        for widget in hidden:
+            widget.setVisible(False)
+        self._keyed_hidden = hidden
+        # Share Axis and the intensity controls on the 2D Viewer's intensity row, below the panels; an Int mode
+        # gives them back (``_leave_keyed_layout``, ``_apply_mode_layout``)
+        self._share_axis_home = self.plot_bar.indexOf(self.share_axis)
+        options_layout = self.options.parentWidget().layout()
+        self._options_home = options_layout, options_layout.indexOf(self.options)
+        self.viewer_intensity_row_layout.addWidget(self.share_axis)
+        self.viewer_intensity_row_layout.addWidget(self.options)
+        self.viewer_intensity_row_layout.addWidget(self.viewer_intensity)
+        self.viewer_intensity.sync(None, None, reset=True)
+        self._viewer_intensity_contract = None
+        self._viewer_intensity_domain = self._viewer_auto_levels = None
+        for widget in (self.share_axis, self.viewer_intensity, self.viewer_intensity_row, self._keyed_area):
+            widget.setVisible(True)
+        self.options.show()
+        self._layout_mode = self._processing_mode = "keyed"
+        self._apply_hidden_tools()
+
+    def _leave_keyed_layout(self) -> None:
+        self._restore_figure_chrome()
+        self._link_keyed_axes(False)
+        if self._keyed_area is not None:
+            self._keyed_area.setVisible(False)
+        if self._coordinate_range_bar is not None:
+            self._coordinate_range_bar.hide()
+        for widget in self._keyed_hidden:
+            widget.setVisible(True)
+        self._keyed_hidden = ()
+        if self._share_axis_home >= 0:  # back where Int's plot bar keeps it; the controls go where the mode does
+            self.plot_bar.insertWidget(self._share_axis_home, self.share_axis)
+        options_layout, options_index = self._options_home
+        options_layout.insertWidget(options_index, self.options)
+        self.viewer_intensity_row.setVisible(False)
+
+    def _restore_figure_chrome(self):
+        for widget in self._figure_hidden:
+            widget.show()
+        self._figure_hidden = ()
+
+    def _emit_panel_index(self, key: PanelKey, index: int) -> None:
+        self.commandRequested.emit(ShellCommand(ShellCommandKind.SET_PANEL_INDEX, int(index), (key.instance,)))
+
+    def set_page_tools(self, *tools: tuple[str, str, str]) -> None:
+        """A host page's own tools, as (name, label, tooltip): buttons in the top bar where Int's Raw pop-up
+        button sits, each emitting ``PAGE_TOOL`` with its name (RSM's "3D Viewer" and "Custom Slice", whose
+        windows the page opens). Calling it again replaces them."""
+        if any(type(tool) is not tuple or len(tool) != 3 or any(type(part) is not str or not part
+                                                                for part in tool) for tool in tools):
+            raise TypeError("a page tool is (name, label, tooltip), all non-empty text")
+        if len({tool[0] for tool in tools}) != len(tools):
+            raise ValueError("page tools are named uniquely")
+        for button in self._page_tool_buttons.values():
+            self._top_bar_row.removeWidget(button)
+            button.deleteLater()
+        self._page_tool_buttons = {}
+        at = self._top_bar_row.indexOf(self.raw_popup_button) + 1
+        for offset, (name, label, tooltip) in enumerate(tools):
+            button = QtWidgets.QPushButton(label)
+            button.setObjectName(f"e7PageTool_{name}")
+            button.setToolTip(tooltip)
+            button.clicked.connect(lambda _checked=False, name=name: self._emit(ShellCommandKind.PAGE_TOOL, name))
+            self._top_bar_row.insertWidget(at + offset, button)
+            self._page_tool_buttons[name] = button
+
+    def page_tool(self, name: str) -> QtWidgets.QPushButton:
+        """A host page's tool button, by name."""
+        return self._page_tool_buttons[name]
+
+    #: Top-bar tools a host page may leave out, by name (some name several widgets).
+    _HOST_TOOLS = {"norm": "norm", "background": "background", "raw": "raw_popup_button",
+                   "raw_pane": "raw", "slice": ("slice", "slice_center", "slice_width", "pin"),
+                   "phases": "phases", "viewer_controls": "viewer_intensity_row", "share_axis": "share_axis"}
+    _PLOT_MODES = ("Single", "Overlay", "Average", "Sum", "Waterfall")
+
+    def set_plot_modes(self, *names: str) -> None:
+        """Offer only the plot modes the host can show (Int and Stitch offer all). Without Waterfall,
+        the options dialog leaves out its Waterfall section."""
+        unknown = set(names) - set(self._PLOT_MODES)
+        if not names or unknown:
+            raise ValueError(f"unknown plot modes: {sorted(unknown) or 'none given'}")
+        current = self.plot_mode.currentText()
+        blocker = QtCore.QSignalBlocker(self.plot_mode)
+        self.plot_mode.clear()
+        self.plot_mode.addItems([mode for mode in self._PLOT_MODES if mode in names])
+        self.plot_mode.setCurrentIndex(max(0, self.plot_mode.findText(current)))
+        del blocker
+        self.plot_options_dialog.set_waterfall_visible("Waterfall" in names)
+
+    def set_hidden_tools(self, *names: str) -> None:
+        """Leave out top-bar tools the host page has no operation for (Stitch: no
+        normalization channel, 1-D Background or raw popup), the raw detector pane
+        ('raw_pane': Stitch's map has no one detector image; Int 2D's layout keeps its cake),
+        and the χ (c/w) slice with its Pin ('slice': RSM's keyed layout has no cake to cut).
+        'viewer_controls' leaves out the keyed/viewer bottom Share Axis, Options and intensity row.
+        'share_axis' leaves its main button out while keeping its mirror in Options.
+        Int shows them all."""
+        unknown = set(names) - set(self._HOST_TOOLS)
+        if unknown:
+            raise ValueError(f"unknown scientific-view tools: {sorted(unknown)}")
+        self._hidden_tools = frozenset(names)
+        self._apply_hidden_tools()
+
+    def _apply_hidden_tools(self) -> None:
+        for name in self._hidden_tools:
+            widgets = self._HOST_TOOLS[name]
+            for widget in (widgets if type(widgets) is tuple else (widgets,)):
+                getattr(self, widget).setVisible(False)
 
     def _apply_processing_layout(self, mode: str) -> None:
+        self._apply_mode_layout(mode)
+        self._apply_hidden_tools()
+
+    def _apply_mode_layout(self, mode: str) -> None:
+        if self._layout_mode == "keyed":
+            self._leave_keyed_layout()
         normalized = str(mode or "")
         if (
             self._viewer_loading_mode is not None
@@ -2841,11 +4423,13 @@ class ScientificView(QtWidgets.QFrame):
         self._layout_mode = normalized
         viewer = normalized in {"1D Viewer", "2D Viewer"}
         if changed:
-            host = (self.viewer_intensity_row_layout if normalized == "2D Viewer"
-                    else self.plot_bar)
-            host.addWidget(self.viewer_intensity)
+            if viewer:
+                host = self.viewer_intensity_row_layout if normalized == "2D Viewer" else self.plot_bar
+                host.addWidget(self.viewer_intensity)
+            else:
+                self.plot_options_dialog.mount_display_scale(self.viewer_intensity)
         self.viewer_intensity_row.setVisible(normalized == "2D Viewer")
-        self.viewer_intensity.setVisible(viewer)
+        self.viewer_intensity.setVisible(True)
         self.axis_display_group.setVisible(not viewer)
         self.plot_axis.setVisible(not viewer)
         if changed:
@@ -2858,7 +4442,10 @@ class ScientificView(QtWidgets.QFrame):
             self._viewer_intensity_domain = self._viewer_auto_levels = None
             self.curve.getViewBox().enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self.raw_popup_button.setVisible(normalized == "Int 1D")
-        if normalized != "Int 1D" and self.raw_popup_dialog is not None:
+        # Reference phases are unavailable in the 2D Viewer, so is their switch (keyed layouts hide it too).
+        self.phases.setVisible(normalized != "2D Viewer" and "phases" not in self._hidden_tools)
+        if (normalized != "Int 1D" and self.raw_popup_dialog is not None
+                and not self._raw_popup_host):
             self.raw_popup_dialog.close()
         aggregate_enabled = normalized != "1D Viewer"
         combo = getattr(self, "plot_mode", None)
@@ -2926,16 +4513,24 @@ class ScientificView(QtWidgets.QFrame):
             return self.raw
         if self._processing_mode == "1D Viewer" and self._bottom_waterfall_active:
             return self.waterfall
+        if self._processing_mode == "Int 2D":
+            return self.cake
         return None
 
     def _refresh_viewer_intensity(self) -> None:
         """Synchronize scalar display limits, never retain another pixel buffer."""
-        if self._processing_mode not in {"1D Viewer", "2D Viewer"}:
+        if self._layout_mode == "keyed":
+            self._refresh_keyed_intensity()
             return
         controls = self.viewer_intensity
+        if self._processing_mode in {"1D Viewer", "Int 1D"}:
+            controls.set_percentile_defaults(None)
+        else:
+            defaults = (0.5, 99.5) if self._processing_mode == "Int 2D" else (2, 98)
+            controls.set_percentile_defaults((0.1, 99.9) if self.log_scale.isChecked() else defaults)
         pane = self._viewer_intensity_image()
         if pane is not None:
-            if pane.image.image is None:
+            if pane.image.image is None or not np.isfinite(pane.canvas.displayed_image).any():
                 controls.sync(None, None)
                 return
             contract = (self._processing_mode, pane._render_contract)
@@ -2944,9 +4539,11 @@ class ScientificView(QtWidgets.QFrame):
                 histogram = pane.canvas.histogram
                 self._viewer_intensity_domain = (histogram.lo_lim, histogram.hi_lim)
                 self._viewer_auto_levels = tuple(histogram.levels())
-            controls.sync(self._viewer_intensity_domain, pane.canvas.histogram.levels())
-            if not controls.autoscale.isChecked():
-                self._set_viewer_intensity(*controls.values())
+            percentile = controls.percentile_values()
+            levels = pane.canvas.percentile_levels(percentile) if percentile is not None else (
+                self._viewer_auto_levels if controls.autoscale.isChecked() else controls.values())
+            controls.sync(self._viewer_intensity_domain, levels)
+            self._set_viewer_intensity(*controls.values())
             return
         ranges = []
         for item in self.curve.listDataItems():
@@ -2968,20 +4565,29 @@ class ScientificView(QtWidgets.QFrame):
         controls.sync(domain, plot.viewRange()[1])
 
     def _set_viewer_intensity(self, lo, hi) -> None:
-        if (self._processing_mode not in {"1D Viewer", "2D Viewer"}
-                or not np.isfinite((lo, hi)).all() or hi <= lo):
+        if self._layout_mode == "keyed":  # the keyed slices' one set of levels
+            self._refresh_keyed_intensity()
+            return
+        if (not np.isfinite((lo, hi)).all() or hi <= lo):
             return
         pane = self._viewer_intensity_image()
         if pane is None:
             self.curve.getViewBox().setYRange(lo, hi, padding=0)
         elif pane.image.image is not None:
+            percentile = self.viewer_intensity.percentile_values()
+            if percentile is not None:
+                lo, hi = pane.canvas.percentile_levels(percentile)
             histogram = pane.canvas.histogram
             domain = self._viewer_intensity_domain or (lo, hi)
             histogram.lo_lim = min(domain[0], lo)
             histogram.hi_lim = max(domain[1], hi)
             histogram.setLevels((lo, hi))
+            self.viewer_intensity.sync(domain, (lo, hi))
 
     def _toggle_viewer_autoscale(self, enabled) -> None:
+        if self._layout_mode == "keyed":  # Autoscale's span of the keyed slices, or the levels shown, kept
+            self._refresh_keyed_intensity()
+            return
         if not enabled:
             self._set_viewer_intensity(*self.viewer_intensity.values())
             return
@@ -2993,6 +4599,9 @@ class ScientificView(QtWidgets.QFrame):
         self._refresh_viewer_intensity()
 
     def _set_share_link(self, on: bool) -> None:
+        if self._layout_mode == "keyed":  # the keyed panels' coordinates (``_link_keyed_axes``)
+            self._link_keyed_axes(on)
+            return
         cake_view = self.cake.canvas.imageViewBox
         curve_view = self.curve.getPlotItem().getViewBox()
         waterfall_view = self.waterfall.canvas.imageViewBox
@@ -3035,12 +4644,12 @@ class ScientificView(QtWidgets.QFrame):
                 self._cake_x_pinned_by_share = False
 
     def _on_cake_xrange_changed(self, *_args) -> None:
-        if not self._share_link_on or self._share_axis_syncing:
+        if not self._pixel_share_active() or self._share_axis_syncing:
             return
         self._schedule_curve_under_cake()
 
     def _on_curve_xrange_changed(self, *_args) -> None:
-        if not self._share_link_on or self._share_axis_syncing:
+        if not self._pixel_share_active() or self._share_axis_syncing:
             return
         self._schedule_cake_under_curve()
 
@@ -3067,11 +4676,11 @@ class ScientificView(QtWidgets.QFrame):
 
     def _on_share_geometry_changed(self, *_args) -> None:
         self._layout_viewer_loading_snapshot()
-        if self._share_link_on:
+        if self._pixel_share_active():
             self._schedule_curve_under_cake()
 
     def _on_share_view_resized(self, *_args) -> None:
-        if self._share_link_on:
+        if self._pixel_share_active():
             self._schedule_curve_under_cake(from_reflow=True)
 
     def eventFilter(self, watched, event) -> bool:
@@ -3100,18 +4709,18 @@ class ScientificView(QtWidgets.QFrame):
             }
         ):
             self._layout_viewer_loading_snapshot()
+        stacked = self._keyed_stacked_pair()
         if (
-            watched
-            in {
+            (watched in {
                 self.cake.canvas.image_win,
                 self.curve,
                 self.waterfall.canvas.image_win,
-            }
+            } or (stacked is not None and watched in (stacked[0], stacked[2])))
             and event.type() in {
                 QtCore.QEvent.Type.Resize,
                 QtCore.QEvent.Type.Show,
             }
-            and self._share_link_on
+            and self._pixel_share_active()
         ):
             self._schedule_curve_under_cake()
         return super().eventFilter(watched, event)
@@ -3119,8 +4728,12 @@ class ScientificView(QtWidgets.QFrame):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._layout_viewer_loading_snapshot()
-        if self._share_link_on:
+        if self._pixel_share_active():
             self._schedule_curve_under_cake()
+
+    def _pixel_share_active(self) -> bool:
+        return self._share_link_on or (self._layout_mode == "keyed" and self._keyed_share_on
+                                      and self._keyed_stacked_pair() is not None)
 
     def _schedule_curve_under_cake(self, *, from_reflow: bool = False) -> None:
         # Coalesce onto the first pending pair instead of restarting a
@@ -3205,18 +4818,19 @@ class ScientificView(QtWidgets.QFrame):
         return float(left), float(right)
 
     def _share_geometry(self):
-        cake_widget = self.cake.canvas.image_win
-        curve_widget, curve_view = self._active_bottom_plot()
-        if not (
-            self._share_link_on
-            and cake_widget.isVisible()
-            and curve_widget.isVisible()
-            and self._rendered_cake_axis_key is not None
-            and self._rendered_cake_axis_key
-            == self._rendered_trace_axis_key
-        ):
+        if self._layout_mode == "keyed":
+            stacked = self._keyed_stacked_pair()
+            if not self._keyed_share_on or stacked is None:
+                return None
+            cake_widget, cake_view, curve_widget, curve_view = stacked
+        else:
+            cake_widget, cake_view = self.cake.canvas.image_win, self.cake.canvas.imageViewBox
+            curve_widget, curve_view = self._active_bottom_plot()
+            if not (self._share_link_on and self._rendered_cake_axis_key is not None
+                    and self._rendered_cake_axis_key == self._rendered_trace_axis_key):
+                return None
+        if not cake_widget.isVisible() or not curve_widget.isVisible():
             return None
-        cake_view = self.cake.canvas.imageViewBox
         cake_span = self._global_xspan(cake_widget, cake_view)
         curve_span = self._global_xspan(curve_widget, curve_view)
         if (
@@ -3296,7 +4910,8 @@ class ScientificView(QtWidgets.QFrame):
                 enable=False,
             )
             cake_view.setXRange(*desired, padding=0.0)
-            self._cake_x_pinned_by_share = True
+            if self._layout_mode != "keyed":
+                self._cake_x_pinned_by_share = True
         finally:
             self._share_axis_syncing = prior_syncing
 
@@ -3351,31 +4966,6 @@ class ScientificView(QtWidgets.QFrame):
         self.commandRequested.emit(ShellCommand(kind, value, path))
 
 
-def _scaled_intensity(values: np.ndarray, scale: str) -> np.ndarray:
-    if scale == "Linear":
-        return values
-    result = np.asarray(values, dtype=float).copy()
-    finite = result[np.isfinite(result)]
-    if not finite.size:
-        return result
-    if scale == "Log":
-        minimum = float(np.min(finite))
-        if minimum < 1.0:
-            result -= minimum - 1.0
-        return np.log10(result)
-    if scale == "Sqrt":
-        return np.sign(result) * np.sqrt(np.abs(result))
-    raise ValueError(f"unsupported intensity scale: {scale}")
-
-
-def _scaled_intensity_label(label: str, scale: str) -> str:
-    if scale == "Log":
-        return f"Log {label}"
-    if scale == "Sqrt":
-        return f"√{label}"
-    return label
-
-
 def _offset_intensity(
     values: np.ndarray,
     index: int,
@@ -3405,30 +4995,7 @@ def _overlay_step(
     traces,
     offset_percent: float,
 ) -> float:
-    minimum = np.inf
-    maximum = -np.inf
-    for trace in traces:
-        finite = trace.intensity[np.isfinite(trace.intensity)]
-        if finite.size:
-            minimum = min(minimum, float(np.min(finite)))
-            maximum = max(maximum, float(np.max(finite)))
-    if not np.isfinite(minimum) or not np.isfinite(maximum):
-        return 0.0
-    return float(offset_percent) * (maximum - minimum) / 100.0
-
-
-_TRACE_COLORS = (
-    (31, 119, 180),
-    (255, 127, 14),
-    (44, 160, 44),
-    (214, 39, 40),
-    (148, 103, 189),
-    (140, 86, 75),
-    (227, 119, 194),
-    (127, 127, 127),
-    (188, 189, 34),
-    (23, 190, 207),
-)
+    return overlay_step((trace.intensity for trace in traces), offset_percent)
 _MAX_RETAINED_CURVE_ITEMS = 32
 # Axis-re-flow-driven share-link follows allowed between real triggers: a
 # legitimate chain is two (the follow's own Y autorange may re-flow once).

@@ -205,13 +205,18 @@ class NexusStackSource(BaseFrameSource):
     _canonical_iter_cursor_chunks = _iter_cursor_chunks
 
     def frame_for(self, index: int) -> ScanFrame:
+        # A frame carries its complete row, its per-frame motors included: GI
+        # resolves the incident angle from these frames (CAL-HELD-BATCH-20261009).
+        provider = self._metadata_provider()
         return ScanFrame(
             index=int(index),
-            metadata=dict(self.metadata_for(index)),
+            metadata=({} if provider is None
+                      else dict(provider.complete_metadata_for(int(index)))),
             source_path=self.path,
             source_frame_index=int(index),
             loader=lambda frame: self.load_frame(frame.source_frame_index or 0),
             source_identity=str(self.path),
+            metadata_energy_is_eV=provider.metadata_energy_is_eV if provider is not None else False,
         )
 
     # -- Bluesky / apstools NXWriter per-frame metadata --------------------
@@ -224,6 +229,15 @@ class NexusStackSource(BaseFrameSource):
     # with identical column semantics.  Built once through a short-lived cursor
     # and MATERIALIZED before the cursor closes, so repeated metadata reads touch
     # only memory and reopen no master.
+    @property
+    def metadata_energy_is_eV(self) -> bool:
+        provider = self._metadata_provider()
+        return provider.metadata_energy_is_eV if provider is not None else False
+
+    def bind_metadata_provider(self, provider: MetadataProvider) -> None:
+        """Serve every frame's metadata from ``provider`` (a Live SPEC container's admitted rows)."""
+        self._provider_cache = provider
+
     def _metadata_provider(self) -> MetadataProvider | None:
         cache = self.__dict__.get("_provider_cache", _UNSET)
         if cache is not _UNSET:

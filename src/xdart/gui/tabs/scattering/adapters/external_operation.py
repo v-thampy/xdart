@@ -62,13 +62,17 @@ class _ScanPlotRequest:
     roi_result: object | None
 def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
     from .. import output_preflight
-    from xrd_tools.session.experiment_state import CalibrationState, FactStatus, MaskState, PoniValues
+    from xrd_tools.session.experiment_state import CalibrationState, DetectorImageState, FactStatus, MaskState, PoniValues
     assets = output_preflight._load_scientific_assets(
         configuration,
         cancelled=(lambda: False) if cancelled is None else cancelled.is_set,
     )
     if configuration.poni_file and assets.poni_values is None: raise ValueError("AVERAGE_CALIBRATION_UNAVAILABLE")
     if configuration.mask_file and assets.mask_bytes is None: raise ValueError("AVERAGE_MASK_UNAVAILABLE")
+    flat_file = getattr(configuration, "flat_file", "")
+    if flat_file and assets.flat_bytes is None: raise ValueError("AVERAGE_FLAT_UNAVAILABLE")
+    dark_file = getattr(configuration, "dark_file", "")
+    if dark_file and assets.dark_bytes is None: raise ValueError("AVERAGE_DARK_UNAVAILABLE")
     config = None
     if assets.poni_values is not None:
         text = assets.poni_detector_config_json
@@ -99,10 +103,19 @@ def _average_calibration(configuration: FrozenRunConfiguration, cancelled=None):
             np.frombuffer(assets.mask_bytes, dtype=dtype).reshape(shape)
             mask_state = MaskState(configuration.mask_file, assets.mask_sha256 or "", dtype.str, shape, FactStatus.PRESENT)
         except (TypeError, ValueError, OverflowError) as error: raise ValueError("AVERAGE_MASK_UNREPRESENTABLE") from error
-    state = (CalibrationState(mask=mask_state) if values is None else
+    from xrd_tools.corrections import DEFAULT_MIN_FLAT_FRACTION
+    cutoff = float(getattr(configuration, "flat_min_fraction", DEFAULT_MIN_FLAT_FRACTION))
+    flat_state, dark_state = (
+        DetectorImageState.absent() if payload is None
+        else DetectorImageState(path, digest or "", shape, FactStatus.PRESENT, fraction)
+        for path, payload, digest, shape, fraction in (
+            (flat_file, assets.flat_bytes, assets.flat_sha256, assets.flat_shape,
+             None if cutoff == DEFAULT_MIN_FLAT_FRACTION else cutoff),
+            (dark_file, assets.dark_bytes, assets.dark_sha256, assets.dark_shape, None)))
+    state = (CalibrationState(mask=mask_state, flat=flat_state, dark=dark_state) if values is None else
         CalibrationState(values, assets.poni_values[7], config, "",
             assets.poni_sha256 or "", configuration.poni_file, mask_state,
-            FactStatus.PRESENT, assets.poni_parallax))
+            FactStatus.PRESENT, assets.poni_parallax, flat_state, dark_state))
     if values is None: return state
     try:
         from xrd_tools.core import PONI
@@ -594,7 +607,7 @@ class OperationSlot:
         publish("prepare", 1, 1)
         from xrd_tools.reduction.average import (
             AverageCommand, AverageScanPending, AverageScanProgress,
-            AverageScanResult, _committed_average_mismatch,
+            AverageScanResult, _average_dimension, _committed_average_mismatch,
         )
         headless_revision = -1; headless_identity = None
         def progress(value):
@@ -619,7 +632,8 @@ class OperationSlot:
         if type(result) is not AverageScanResult or headless_identity is not None and result.operation_identity != headless_identity:
             raise TypeError("Average runner returned an invalid result")
         if result.disposition == "COMMITTED":
-            mismatch = _committed_average_mismatch(result, request.target, request.entry)
+            mismatch = _committed_average_mismatch(result, request.target, request.entry,
+                                                   dimension=_average_dimension(recipe))
             if mismatch is not None:
                 return OperationTerminal(
                     identity, OperationTerminalStatus.FAILED,

@@ -84,7 +84,10 @@ def build_reduction_config(
     run_configuration = getattr(scan, "run_configuration_provenance", None) \
         if scan is not None else None
     if isinstance(run_configuration, Mapping) and run_configuration:
-        config["run_configuration"] = dict(run_configuration)
+        config["run_configuration"] = gi_aligned_run_configuration(dict(run_configuration), config)
+    energy_selection = _plan_extra(plan).get('energy_selection')
+    if energy_selection is not None:
+        config['energy_selection'] = dict(energy_selection)
 
     return config, (_inputs_from_scan(scan) if include_inputs else {})
 
@@ -133,6 +136,38 @@ def _config_from_plan(plan: Any) -> dict[str, Any]:
             getattr(plan, "gi", None),
         ),
     }
+
+
+#: per dimension: its arguments, its GI mode and the ranges a GI freeze fixes when the Run left them automatic
+_GI_RUN_FREEZE = (("bai_1d_args", "1d", ("radial_range", "azimuth_range")),
+                  ("bai_2d_args", "2d", ("x_range", "y_range", "radial_range", "azimuth_range")))
+
+
+def gi_aligned_run_configuration(run_configuration: Any, config: Mapping[str, Any]) -> Any:
+    """A GI Run's recorded settings as it ran them (LT-SMALL-FIXES-20261014 G1; maintainer, October 14: "New
+    outputs only"), so Reintegrate finds them equal to the arguments ``config`` records: each dimension's
+    arguments gain the Run's GI mode and, where the request left a range automatic, the range its GI freeze
+    fixed. A requested value stays as requested, and the signed duplicate changes with it, so it still equals the
+    record. Any other record (a Standard run's, an Average recipe) is returned unchanged, as a copy."""
+    import copy
+    run = copy.deepcopy(run_configuration)
+    gi = run.get("gi") if isinstance(run, dict) else None
+    if not isinstance(gi, Mapping) or gi.get("enabled") is not True:
+        return run
+    signed = run.get("scientific_signature")
+    for record in (run, signed) if isinstance(signed, dict) else (run,):
+        for args_key, dimension, ranges in _GI_RUN_FREEZE:
+            args, used = record.get(args_key), config.get(args_key)
+            if not isinstance(args, dict) or not isinstance(used, Mapping):
+                continue
+            args = dict(args)
+            if gi.get(f"mode_{dimension}") is not None:
+                args.setdefault(f"gi_mode_{dimension}", gi[f"mode_{dimension}"])
+            for key in ranges:
+                if args.get(key) is None and used.get(key) is not None:
+                    args[key] = copy.deepcopy(used[key])
+            record[args_key] = args
+    return run
 
 
 def _integration_1d_args(plan: Any, gi: Any) -> dict[str, Any]:

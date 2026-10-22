@@ -157,8 +157,15 @@ class FramePublication:
             object.__setattr__(self, "record", FrameRecord.from_view(self.view))
         raw = self.metadata_raw or self.view.metadata_raw
         numeric = self.metadata_numeric or self.view.metadata_numeric or numeric_metadata(raw)
-        object.__setattr__(self, "metadata_raw", _readonly_mapping(raw))
-        object.__setattr__(self, "metadata_numeric", _readonly_mapping(numeric))
+        # FrameView already snapshots these mappings. Explicit overrides still
+        # need their own snapshot; only the exact owning view can supply one.
+        frozen_view = type(self.view) is FrameView
+        object.__setattr__(self, "metadata_raw", (
+            raw if frozen_view and raw is self.view.metadata_raw else _readonly_mapping(raw)
+        ))
+        object.__setattr__(self, "metadata_numeric", (
+            numeric if frozen_view and numeric is self.view.metadata_numeric else _readonly_mapping(numeric)
+        ))
 
     @property
     def label(self) -> int | str:
@@ -769,35 +776,6 @@ def _without_1d_arrays(publication: FramePublication) -> FramePublication:
         ),
         raw_ref=None,
     )
-
-
-def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
-    """Accumulate the incoming record's modes into the existing one (ADR-0003
-    fork B): the store keeps ONE FrameRecord per frame that grows as GI modes
-    are recomputed.
-
-    Each incoming 1D/2D mode is folded in via ``with_result_1d/2d`` (immutable
-    upsert-by-key — an incoming mode already present is overwritten with the
-    fresher view).  The INCOMING active modes win (the merged ``active_mode_1d/2d``
-    equal the incoming ones), and the caller keeps the publication's ``.view``
-    unchanged, so display consumers (which read ``.view`` today) are unaffected.
-
-    NOTE the merged record may be a SUPERSET of ``.view``: for a same-dimension
-    re-publish ``record.active_view()`` equals ``.view``, but a cross-dimension
-    accumulation (e.g. a 1D-only publish then a 2D-only publish for one frame)
-    leaves ``.view`` as the latest single projection while ``record.active_view()``
-    carries BOTH dimensions — that richer union is the whole point (the record is
-    what a future multi-mode consumer reads; ``.view`` is the current display
-    surface).  An incoming record with empty result maps folds as a no-op.
-    """
-    acc = existing
-    for mode, view in incoming.results_1d.items():
-        acc = acc.with_result_1d(
-            mode, view, make_active=(mode == incoming.active_mode_1d))
-    for mode, view in incoming.results_2d.items():
-        acc = acc.with_result_2d(
-            mode, view, make_active=(mode == incoming.active_mode_2d))
-    return acc
 
 
 def canonical_frame_source_path(
@@ -1847,7 +1825,7 @@ class PublicationStore:
                 ):
                     publication = replace(
                         publication,
-                        record=_merge_records(existing.record, publication.record),
+                        record=existing.record.merged_with(publication.record),
                         # Exact ownership classes already matched above; the
                         # current publication retains its own identical owner.
                         scan_key=publication.scan_key,
@@ -1873,7 +1851,7 @@ class PublicationStore:
                     ):
                         publication = replace(
                             publication,
-                            record=_merge_records(carried_record, publication.record),
+                            record=carried_record.merged_with(publication.record),
                             # Exact ownership classes already matched above.
                             scan_key=publication.scan_key,
                         )

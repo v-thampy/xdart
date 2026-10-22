@@ -98,6 +98,7 @@ _INPUT_FACTORY = object()
 _RECEIPT_FACTORY = object()
 _EFFECTIVE_FACTORY = object()
 _MEMBER_BINDING_FACTORY = object()
+_CALIBRATION_FACTORY = object()
 _PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
 _MAX_RSM_MEMBERS = 16
 
@@ -399,6 +400,48 @@ def rsm_geometry_asset_input(locator: str | Path) -> RSMGeometryAssetInput:
     """Create one immutable, factory-owned RSM geometry locator request."""
 
     return RSMGeometryAssetInput(locator, _INPUT_FACTORY)
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMCalibrationGeometryInput:
+    """The Calibration row's file (a calibration window's pyFAI file, or its xrayutilities partner), Project
+    relative: RSM's geometry from the reused calibration (AUD-9 stage 2b C7b)."""
+
+    locator: str | Path
+    #: Use the calibration's refinement (offsets, mount, energy offset): on by default, optional.
+    refinement: bool = True
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        if _claim is not _INPUT_FACTORY or type(self.refinement) is not bool:
+            raise TypeError("RSM calibration input is not factory-owned")
+        try:
+            shown = os.fspath(self.locator)
+        except TypeError as error:
+            raise TypeError("RSM calibration locator must be path-like") from error
+        _validate_exact_relative(shown)
+        object.__setattr__(self, "locator", shown)
+
+    def __copy__(self):
+        raise TypeError("RSM calibration input is not copyable")
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("RSM calibration input is not copyable")
+
+    def __reduce__(self):
+        raise TypeError("RSM calibration input is not serializable")
+
+    def __reduce_ex__(self, _protocol):
+        raise TypeError("RSM calibration input is not serializable")
+
+    def __replace__(self, /, **_changes):
+        raise TypeError("RSM calibration input is not replaceable")
+
+
+def rsm_calibration_geometry_input(locator: str | Path, *, refinement: bool = True) -> RSMCalibrationGeometryInput:
+    """Create one immutable, factory-owned Calibration-row locator request."""
+
+    return RSMCalibrationGeometryInput(locator, refinement, _INPUT_FACTORY)
 
 
 def _project_path(project_root: str | Path) -> str:
@@ -805,6 +848,24 @@ class RSMEffectiveGeometry:
     roi: tuple[int, int, int, int]
     runtime_requirements: object
     fingerprint: str
+    #: "asset": the canonical geometry asset; "calibration": a calibration window's xrayutilities partner
+    #: (``RSMCalibrationGeometryReceipt``, AUD-9 stage 2b C7b), whose semantic fingerprint is its own.
+    source: str = "asset"
+    #: A calibration's refinement, applied (AUD-9 stage 2b C7b; the maintainer: "when the refinement is done it
+    #: should be used, but it should remain optional"): xrayutilities' mount (detrot, tilt, tiltazimuth in the
+    #: raw frame), each circle's zero offset (mu, eta, chi, phi, nu, del) and the energy offset; zeros otherwise.
+    area_mount: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    angle_offsets: tuple[float, ...] = ()
+    energy_offset_eV: float = 0.0
+    refinement: bool = False
+    #: The calibration's recorded energy (its source energy where it refined one), for the Preview's 2 % warning.
+    calibration_energy_eV: float | None = None
+    #: Where the circle directions came from, for Preview (decision 2); the directions themselves are in the
+    #: diffractometer and the fingerprint.
+    circle_directions: str | None = None
+    #: The instrument record is psic's mirror image (``InstrumentGeometry.is_mirror``): RSM maps through the mirror
+    #: into SPEC's handedness (``PixelQMap.mirror``). In the fingerprint only when set.
+    mirror: bool = False
     _claim: InitVar[object] = None
 
     def __post_init__(self, _claim: object) -> None:
@@ -812,8 +873,13 @@ class RSMEffectiveGeometry:
             _claim is not _EFFECTIVE_FACTORY
             or type(self.asset_receipt_fingerprint) is not str
             or len(self.asset_receipt_fingerprint) != 64
-            or self.asset_semantic_fingerprint
-            != _RESOURCE_SEMANTIC_FINGERPRINT
+            or self.source not in {"asset", "calibration"}
+            or type(self.mirror) is not bool
+            or (self.mirror and self.source != "calibration")
+            or (self.source == "asset"
+                and self.asset_semantic_fingerprint != _RESOURCE_SEMANTIC_FINGERPRINT)
+            or type(self.asset_semantic_fingerprint) is not str
+            or len(self.asset_semantic_fingerprint) != 64
             or type(self.roi) is not tuple
             or self.roi != (0, -1, 0, -1)
             or type(self.fingerprint) is not str
@@ -894,8 +960,11 @@ def _effective_diffractometer_value(diffractometer: object) -> tuple[object, ...
 def lower_rsm_effective_geometry(
     receipt: RSMGeometryAssetReceipt,
 ) -> RSMEffectiveGeometry:
-    """Revalidate and lower one exact asset to the pinned psic geometry."""
+    """Revalidate and lower one exact asset to the pinned psic geometry, or a calibration window's xrayutilities
+    partner (``RSMCalibrationGeometryReceipt``) to the same raw-frame psic description."""
 
+    if type(receipt) is RSMCalibrationGeometryReceipt:
+        return _lower_calibration_geometry(receipt)
     if type(receipt) is not RSMGeometryAssetReceipt:
         raise TypeError("RSM effective geometry requires an exact asset receipt")
     revalidate_rsm_geometry_asset(receipt)
@@ -1030,7 +1099,7 @@ def lower_rsm_effective_geometry(
         roi,
         requirements,
         fingerprint,
-        _EFFECTIVE_FACTORY,
+        _claim=_EFFECTIVE_FACTORY,
     )
 
 
@@ -1094,6 +1163,478 @@ def rsm_effective_pixel_q_map(effective_geometry: RSMEffectiveGeometry):
     return PixelQMap(
         effective_geometry.diffractometer_projection,
         effective_geometry.detector_header,
+        area_mount=effective_geometry.area_mount,
+        angle_offsets=effective_geometry.angle_offsets,
+        energy_offset_eV=effective_geometry.energy_offset_eV,
+        mirror=effective_geometry.mirror,
+    )
+
+
+@dataclass(eq=False, frozen=True, slots=True)
+class RSMCalibrationGeometryReceipt:
+    """RSM's instrument geometry from a calibration made in the calibration window (AUD-9 stage 2b C7b; the
+    maintainer: "the idea is to reuse what was developed for stitch, not use the calibration that was done in
+    stitch"). It is the window's xrayutilities partner (``<name>.xu.json``, beside the pyFAI file on the
+    Calibration row), captured by the same authenticated reader Stitch's xrayutilities backend uses. It names the
+    same custody facts as an asset receipt, so the operation's provenance keeps its form."""
+
+    calibration: object = field(repr=False)
+    project_root: str = field(repr=False)
+    lexical_relative_path: str
+    resolved_relative_path: str
+    byte_count: int
+    raw_sha256: str
+    semantic_fingerprint: str
+    receipt_fingerprint: str
+    refinement: bool = True
+    #: The calibration's instrument record (``InstrumentGeometry.to_record()`` as canonical JSON) from the
+    #: partner's provenance, which gives every circle's direction (decision 2); None when it records none.
+    instrument_record: str | None = None
+    _claim: InitVar[object] = None
+
+    def __post_init__(self, _claim: object) -> None:
+        from xrd_tools.analysis.xu_stitch_calibration import XuStitchCalibrationReceipt
+        if (
+            _claim is not _CALIBRATION_FACTORY
+            or type(self.refinement) is not bool
+            or not (self.instrument_record is None or type(self.instrument_record) is str)
+            or type(self.calibration) is not XuStitchCalibrationReceipt
+            or self.project_root != self.calibration.project_root
+            or self.byte_count != self.calibration.byte_count
+            or self.raw_sha256 != self.calibration.raw_sha256
+            or self.semantic_fingerprint != self.calibration.semantic_fingerprint
+            or type(self.receipt_fingerprint) is not str
+            or len(self.receipt_fingerprint) != 64
+        ):
+            raise TypeError("RSM calibration geometry receipt is not factory-owned")
+
+    @property
+    def fingerprint(self) -> str:
+        return self.receipt_fingerprint
+
+    (
+        __copy__,
+        __deepcopy__,
+        __reduce__,
+        __reduce_ex__,
+        __replace__,
+    ) = _uncopyable_geometry_value("RSM calibration geometry receipt")
+
+
+def capture_rsm_calibration_geometry(
+    locator: str | Path,
+    *,
+    project_root: str | Path,
+    refinement: bool = True,
+) -> RSMCalibrationGeometryReceipt:
+    """Capture the calibration on RSM's Calibration row: the pyFAI file's xrayutilities partner
+    (``xu_partner_path``), or the partner named directly. Refused (``RSM_CALIBRATION_UNSUPPORTED``): a pyFAI file
+    with no partner, a partner the reader refuses, a single 2θ arm (a fourc or twoc: one detector circle held at
+    zero, not psic). Parallax and sensor models never reach a partner (the window's transfer refuses them)."""
+
+    from xrd_tools.analysis.xu_stitch_calibration import (
+        XuStitchCalibrationInput,
+        XuStitchCalibrationRefused,
+        capture_xu_stitch_calibration,
+    )
+    from xrd_tools.integrate.stitch_calibration import xu_partner_path
+
+    root = Path(project_root)
+    given = Path(os.fspath(locator))
+    named = given if given.is_absolute() else root / given
+    partner = named if named.stem.endswith(".xu") else xu_partner_path(named)
+    if not partner.is_file():
+        _refuse(
+            "RSM_CALIBRATION_UNSUPPORTED",
+            f"{named.name} has no xrayutilities partner ({partner.name}): save the calibration again from "
+            "the calibration window",
+        )
+    try:
+        calibration = capture_xu_stitch_calibration(
+            XuStitchCalibrationInput(partner), project_root=root,
+        )
+    except XuStitchCalibrationRefused as error:
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", f"{partner.name}: {error.code}: {error}")
+    motors = calibration.projection.value["acquisition"]["source_motors"]
+    if any(motor is None for motor in motors.values()):
+        _refuse(
+            "RSM_CALIBRATION_UNSUPPORTED",
+            f"{partner.name} is a single 2θ arm (one detector circle held at zero); RSM needs psic's two",
+        )
+    if type(refinement) is not bool:
+        raise TypeError("RSM calibration refinement must be an exact bool")
+    record = _calibration_instrument_record(partner)
+    fingerprint = analysis_canonical_fingerprint(
+        "rsm-calibration-geometry-receipt-v1",
+        (calibration.fingerprint, calibration.semantic_fingerprint, calibration.raw_sha256, refinement)
+        + (() if record is None else (record,)),
+    )
+    return RSMCalibrationGeometryReceipt(
+        calibration,
+        calibration.project_root,
+        calibration.lexical_relative_path,
+        calibration.resolved_relative_path,
+        calibration.byte_count,
+        calibration.raw_sha256,
+        calibration.semantic_fingerprint,
+        fingerprint,
+        refinement,
+        record,
+        _claim=_CALIBRATION_FACTORY,
+    )
+
+
+def _calibration_instrument_record(partner: Path) -> str | None:
+    """The instrument record a calibration carries (the calibration window saves its ``InstrumentGeometry``
+    in the partner's provenance, ``<name>.xu.json.provenance.json``) as canonical JSON; None when the calibration
+    records none (an older save). A record that is not a psic instrument, or a provenance that cannot be read, is
+    refused: RSM's circle directions come from it (decision 2)."""
+    from xrd_tools.session.instrument import InstrumentGeometry
+
+    provenance = partner.with_suffix(partner.suffix + ".provenance.json")
+    if not provenance.exists():
+        return None
+    try:
+        value = json.loads(provenance.read_text(encoding="utf-8"))
+        record = value.get("instrument_geometry") if isinstance(value, dict) else None
+        if record is None:
+            return None
+        geometry = InstrumentGeometry.from_record(dict(record))
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", f"{provenance.name}: its instrument record cannot be read ({error})")
+    if geometry.geometry != "psic":
+        _refuse("RSM_CALIBRATION_UNSUPPORTED",
+                f"{provenance.name} records a {geometry.geometry} instrument; RSM needs psic's six circles")
+    return json.dumps(geometry.to_record(), sort_keys=True, separators=(",", ":"))
+
+
+def revalidate_rsm_geometry_source(receipt) -> bytes:
+    """Revalidate whichever geometry source a request binds (asset or calibration partner, with the instrument
+    record its provenance carries)."""
+
+    if type(receipt) is RSMCalibrationGeometryReceipt:
+        from xrd_tools.analysis.xu_stitch_calibration import revalidate_xu_stitch_calibration
+        content = revalidate_xu_stitch_calibration(receipt.calibration)
+        partner = Path(receipt.project_root) / receipt.resolved_relative_path
+        if _calibration_instrument_record(partner) != receipt.instrument_record:
+            _refuse("RSM_GEOMETRY_ASSET_IDENTITY_MISMATCH",
+                    "the calibration's instrument record no longer matches its receipt")
+        return content
+    return revalidate_rsm_geometry_asset(receipt)
+
+
+def _raw_frame_pixel(orientation, raw_shape: tuple[int, int], point: tuple[float, float]) -> tuple[float, float]:
+    """A turned-frame pixel coordinate in the raw frame. ``orientation`` turns a raw array into the partner's
+    frame; it permutes and reverses indices, so the map is affine with coefficients 0 and ±1 (exact for whole
+    pixels, within an ulp otherwise)."""
+
+    import numpy as np
+
+    rows, columns = (np.indices(raw_shape).astype(np.float64))
+    turned_rows, turned_columns = orientation.apply(rows), orientation.apply(columns)
+    i, j = float(point[0]), float(point[1])
+    raw = []
+    for grid in (turned_rows, turned_columns):
+        origin = float(grid[0, 0])
+        raw.append(origin + float(grid[1, 0] - origin) * i + float(grid[0, 1] - origin) * j)
+    return raw[0], raw[1]
+
+
+_CAMERA_VECTORS = {"x+": (1.0, 0.0, 0.0), "x-": (-1.0, 0.0, 0.0), "z+": (0.0, 0.0, 1.0), "z-": (0.0, 0.0, -1.0)}
+
+
+def _raw_tiltazimuth(turned_camera, raw_camera, azimuth_deg: float, beam) -> float:
+    """xrayutilities' ``tiltazimuth`` for the raw camera, given the turned camera's. The tilt vector lies in the
+    detector plane at ``azimuth`` from the rows' direction toward the columns'; re-expressed in the raw camera's
+    directions, plus 180° when the raw camera is mirrored against the turned one. ``detrot`` and ``tilt`` carry
+    over unchanged. Found and pinned for all 8 cameras against xrayutilities itself (S3b probe 1: within 2.7e-13
+    Å⁻¹; row E)."""
+
+    import numpy as np
+
+    if tuple(raw_camera) == tuple(turned_camera):
+        return float(azimuth_deg)
+    rows_t, columns_t = (np.array(_CAMERA_VECTORS[axis]) for axis in turned_camera)
+    rows_r, columns_r = (np.array(_CAMERA_VECTORS[axis]) for axis in raw_camera)
+    angle = math.radians(float(azimuth_deg))
+    vector = math.cos(angle) * rows_t + math.sin(angle) * columns_t
+    raw = math.degrees(math.atan2(float(vector @ columns_r), float(vector @ rows_r)))
+    beam = np.asarray(beam, dtype=np.float64)
+    handed = lambda first, second: np.sign(np.linalg.det(np.array([first, second, beam])))
+    if handed(rows_r, columns_r) != handed(rows_t, columns_t):
+        raw += 180.0
+    return raw % 360.0
+
+
+def rsm_calibration_detector(receipt) -> str | None:
+    """The validated calibration's pyFAI detector name; unknown for the canonical asset."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt:
+        return None
+    return receipt.calibration.projection.value["detector"].get("detector_factory_name")
+
+
+def rsm_calibration_detector_mask(receipt) -> np.ndarray | None:
+    """The calibrated detector's own mask (module gaps) in the raw frame RSM reads, read-only: Stitch's rebuild
+    (``calibration_detector_mask``: pyFAI's detector from the partner, its count and digest checked), mapped back
+    by the inverse turn. None for the canonical asset, which names no detector, or a detector without one."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt:
+        return None
+    from xrd_tools.analysis.stitch_native import calibration_detector_mask
+
+    value = receipt.calibration.projection.value
+    try:
+        turned = calibration_detector_mask(value)
+    except ValueError as error:
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", str(error))
+    if turned is None:
+        return None
+    raw = _partner_orientation(value["acquisition"]).unapply(turned)
+    raw.setflags(write=False)
+    return raw
+
+
+def _partner_orientation(acquisition):
+    """The turn from the raw frame to the partner's (``image_rotation_quarter_turns``, ``image_flip``)."""
+    from xrd_tools.core.geometry.diffractometer import ImageOrientation
+
+    return ImageOrientation(rotation=90 * int(acquisition["image_rotation_quarter_turns"]),
+                            flip_horizontal=bool(acquisition.get("image_flip", False)))
+
+
+def _calibration_arm_corrections(receipt):
+    """A refined version-3 calibration's corrections, whose attested pyFAI arm gives RSM's solid angle
+    (``EXTENDED_SOLID_ANGLE_POLICY``); None where the untilted formula about the beam pixel applies (the canonical
+    asset, the refinement off, or a version-2 partner, which records no arm)."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt or not receipt.refinement:
+        return None
+    from xrd_tools.analysis.xu_stitch_calibration import EXTENDED_SOLID_ANGLE_POLICY
+    from xrd_tools.integrate.xu_stitch import _thaw
+
+    corrections = _thaw(receipt.calibration.projection.value["corrections"])
+    return corrections if corrections.get("solid_angle_policy") == EXTENDED_SOLID_ANGLE_POLICY else None
+
+
+def rsm_calibration_solid_angle_source(receipt) -> str:
+    """Where RSM's solid angle comes from, in words, for the Preview (``rsm_calibration_solid_angle``'s own rule):
+    the refined calibration's arm, or the untilted formula about the beam pixel."""
+    if _calibration_arm_corrections(receipt) is not None:
+        return "the refined calibration's arm (its mount, as Stitch's weight), the same at every pose"
+    return "the untilted formula about the beam pixel"
+
+
+def rsm_calibration_kind(receipt) -> str | None:
+    """What kind of calibration the Calibration row's pair is, in words, for the Preview only (item 7; it enters
+    no identity): from the pair's provenance (``<name>.xu.json.provenance.json``), the calibration window's
+    ``calibration_kind`` (``direct_beam_not_ring_fitted``: 2 · Rough geometry's distance and beam pixel), else the
+    calibrant frames a ring fit used. None for the canonical asset; a pair without a readable provenance says so."""
+    if type(receipt) is not RSMCalibrationGeometryReceipt:
+        return None
+    partner = Path(receipt.project_root) / receipt.resolved_relative_path
+    provenance = partner.with_suffix(partner.suffix + ".provenance.json")
+    try:
+        value = json.loads(provenance.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "its kind is not recorded (no provenance beside the pair)"
+    except (OSError, ValueError):
+        return "its kind is not recorded (its provenance cannot be read)"
+    kind = value.get("calibration_kind") if isinstance(value, dict) else None
+    if kind == "direct_beam_not_ring_fitted":
+        return "direct-beam (rough): the distance and beam pixel, rotations held; not ring-fitted"
+    if isinstance(kind, str) and kind:
+        return "recorded as " + kind.replace("_", " ")
+    frames = value.get("frames") if isinstance(value, dict) else None
+    if isinstance(frames, list) and frames:
+        rms = value.get("rms_q_A^-1")
+        return (f"ring-fitted on {len(frames)} calibrant frame{'s' if len(frames) != 1 else ''}"
+                + (f" (RMS |q| {rms:.3g} Å⁻¹)" if isinstance(rms, (int, float)) and not isinstance(rms, bool)
+                   else ""))
+    return "its kind is not recorded"
+
+
+def rsm_calibration_solid_angle(receipt) -> np.ndarray | None:
+    """The solid-angle weight of a refined version-3 calibration, in the raw frame RSM reads, read-only: Stitch's
+    own per-frame weight from the attested pyFAI arm (``_extended_solid_angle``), with the calibrant's sample
+    offset at zero as RSM's q takes it, so it is the same at every pose and computed once; then the inverse turn.
+
+    The mount enters through the arm's PONI and distance: pyFAI's relative solid angle is (dist / r)³ about the
+    PONI, the perpendicular foot from the sample, and a tilted mount moves that foot off xrayutilities' beam pixel,
+    about which the untilted formula is centred (the arm's tilt and roll themselves leave the weight unchanged;
+    measured, ``logs/s3c-solid-angle-arm.log``). None (the untilted formula applies): the canonical asset, the
+    refinement off, or a version-2 partner, which records no arm."""
+    corrections = _calibration_arm_corrections(receipt)
+    if corrections is None:
+        return None
+    from xrd_tools.integrate.xu_stitch import XuStitchScienceRefused, _extended_solid_angle
+
+    value = receipt.calibration.projection.value
+    shape = tuple(int(item) for item in value["detector"]["shape"])
+    try:
+        turned = _extended_solid_angle(corrections, shape, sample_offset=False)(0.0, 0.0)
+    except XuStitchScienceRefused as error:
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", f"the calibration's solid angle: {error}")
+    raw = _partner_orientation(value["acquisition"]).unapply(turned)
+    raw.setflags(write=False)
+    return raw
+
+
+def _lower_calibration_geometry(receipt: RSMCalibrationGeometryReceipt) -> RSMEffectiveGeometry:
+    """The calibration partner as RSM's raw-frame geometry. The partner describes the image Stitch turns into
+    its camera (``STITCH_CAMERA``, by ``image_rotation_quarter_turns`` and ``image_flip``); RSM reads raw images,
+    so the raw camera is ``stitch_camera(orientation)`` and the beam pixel, pixel pitch and shape are mapped back
+    by the inverse turn. The circles, beam and HXRD references are the partner's own (its detector circles carry
+    the window's senses). The distance and pitch are taken as Stitch's xrayutilities backend takes them
+    (metres × 1e3), so its q and RSM's agree at the same physical pixel (row E)."""
+
+    from dataclasses import replace
+
+    from xrd_tools.core.geometry.camera import DetectorCamera, stitch_camera, stitch_orientation
+    from xrd_tools.core.geometry.diffractometer import Diffractometer, ImageOrientation
+    from xrd_tools.core.geometry.pixel_q import DetectorHeader
+    from xrd_tools.core.geometry.xu_runtime import (
+        XuRuntimeRequirements,
+        xu_runtime_requirements_projection,
+    )
+
+    revalidate_rsm_geometry_source(receipt)
+    value = receipt.calibration.projection.value
+    xu_value, detector, acquisition = value["xrayutilities"], value["detector"], value["acquisition"]
+    frame = DetectorCamera(*xu_value["camera"])
+    orientation = ImageOrientation(
+        rotation=90 * int(acquisition["image_rotation_quarter_turns"]),
+        flip_horizontal=bool(acquisition.get("image_flip", False)),
+    )
+    camera = stitch_camera(orientation, frame=frame)
+    check = stitch_orientation(camera, frame=frame)  # the turn must be the partner's own
+    if (check.rotation, check.flip_horizontal) != (orientation.rotation, orientation.flip_horizontal):
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", "the calibration's image turn has no camera")
+    turned_shape = tuple(int(item) for item in detector["shape"])
+    raw_shape = (turned_shape[1], turned_shape[0]) if orientation.swaps_axes else turned_shape
+    if min(raw_shape) < 2:
+        _refuse("RSM_CALIBRATION_UNSUPPORTED", "RSM needs a detector at least 2 pixels each way")
+    cch1, cch2 = _raw_frame_pixel(
+        orientation, raw_shape, (float(detector["cch1_px"]), float(detector["cch2_px"])),
+    )
+    pitch = (float(detector["pixel1_m"]) * 1e3, float(detector["pixel2_m"]) * 1e3)
+    if orientation.swaps_axes:
+        pitch = (pitch[1], pitch[0])
+    detector_header = DetectorHeader(
+        cch1=cch1,
+        cch2=cch2,
+        pwidth1=pitch[0],
+        pwidth2=pitch[1],
+        distance=float(detector["distance_m"]) * 1e3,
+        Nch1=raw_shape[0],
+        Nch2=raw_shape[1],
+    )
+    diffractometer = replace(
+        Diffractometer.psic(
+            mu=_PSIC_ROLES[0], eta=_PSIC_ROLES[1], chi=_PSIC_ROLES[2], phi=_PSIC_ROLES[3],
+            nu=_PSIC_ROLES[4], del_=_PSIC_ROLES[5],
+        ),
+        sample_circles=tuple(xu_value["sample_axes"]),
+        detector_circles=tuple(xu_value["detector_axes"]),
+        r_i=tuple(float(item) for item in xu_value["incident_beam"]),
+        camera=camera.to_xu(),
+        hxrd_n=tuple(float(item) for item in xu_value["inplane_reference"]),
+        hxrd_q=tuple(float(item) for item in xu_value["surface_normal_reference"]),
+        hxrd_geometry=xu_value["geometry"],
+    )
+    # Decision 2 (the maintainer, 2026-10-01: "Xu provides a way to specify the actual circle directions on the
+    # instrument. Shouldn't that be used?"): every circle's direction is the calibration's instrument record's,
+    # sample and detector circles alike; the partner's detector circles must already be the record's (its fit was
+    # made in them). Without a record, psic's standard directions, as the partner carries them.
+    directions = "psic's standard (the calibration records no instrument)"
+    mirror = False
+    if receipt.instrument_record is not None:
+        from xrd_tools.session.instrument import InstrumentGeometry
+
+        record = InstrumentGeometry.from_record(json.loads(receipt.instrument_record))
+        axes = dict(record.circle_axes())
+        sample = tuple(axes[role] for role in _PSIC_ROLES[:4])
+        detector_axes = tuple(axes[role] for role in _PSIC_ROLES[4:])
+        if detector_axes != tuple(xu_value["detector_axes"]):
+            _refuse(
+                "RSM_CALIBRATION_UNSUPPORTED",
+                f"the calibration's xrayutilities file turns nu and del as {list(xu_value['detector_axes'])} but its "
+                f"instrument record as {list(detector_axes)}: save the calibration again with the record",
+            )
+        diffractometer = replace(diffractometer, sample_circles=sample, detector_circles=detector_axes)
+        reversed_roles = [role for role in _PSIC_ROLES if role in record.reversed_circles]
+        directions = ("the calibration's instrument record: psic, "
+                      + ("every circle as psic's standard" if not reversed_roles
+                         else "reversed " + ", ".join(reversed_roles)))
+        # A record reversing mu, chi and nu is psic's mirror image (17-2): SPEC's psic model, its orientation
+        # reflections' labels and its UB are that image's, so RSM maps through the mirror into SPEC's handedness
+        # (the maintainer approved 2026-10-01), with whatever else the record reverses (17-2's phi, for now).
+        mirror = record.is_mirror()
+        if mirror:
+            residual = [role for role in _PSIC_ROLES if role in record.mirror_residual()]
+            directions += ("; mapped through the mirror into SPEC's handedness: psic's standard"
+                           if not residual else
+                           "; mapped through the mirror into SPEC's handedness: psic with "
+                           + ", ".join(residual) + " reversed")
+    for name in ("qconv_kwargs", "hxrd_kwargs", "ang2q_kwargs"):
+        object.__setattr__(
+            diffractometer, name, MappingProxyType(dict(getattr(diffractometer, name))),
+        )
+    # The refinement (the maintainer's decision: used when the fit has one, optional): del/nu zero offsets, as
+    # Stitch subtracts them; the mount of a version-3 transfer, its azimuth carried to the raw camera; the energy
+    # OFFSET (refined minus recorded), never the energy itself. The calibrant's sample offset is never taken.
+    calibration_energy = float(acquisition.get("source_energy_eV", acquisition["energy_eV"]))
+    area_mount, angle_offsets, energy_offset = (0.0, 0.0, 0.0), (), 0.0
+    if receipt.refinement:
+        offsets = acquisition["detector_offsets_deg"]
+        angle_offsets = (0.0, 0.0, 0.0, 0.0, float(offsets["nu"]), float(offsets["del"]))
+        if "detrot_deg" in detector:
+            area_mount = (
+                float(detector["detrot_deg"]),
+                float(detector["tilt_deg"]),
+                _raw_tiltazimuth(frame.to_xu(), camera.to_xu(), float(detector["tiltazimuth_deg"]),
+                                 xu_value["incident_beam"]),
+            )
+        if "source_energy_eV" in acquisition:
+            energy_offset = float(acquisition["energy_eV"]) - float(acquisition["source_energy_eV"])
+    image_orientation = ImageOrientation()
+    roi = (0, -1, 0, -1)
+    requirements = XuRuntimeRequirements()
+    identity = (
+        receipt.receipt_fingerprint,
+        receipt.semantic_fingerprint,
+        (receipt.refinement, area_mount, angle_offsets, energy_offset, calibration_energy),
+        _effective_diffractometer_value(diffractometer),
+        (
+            detector_header.cch1,
+            detector_header.cch2,
+            detector_header.pwidth1,
+            detector_header.pwidth2,
+            detector_header.distance,
+            detector_header.Nch1,
+            detector_header.Nch2,
+        ),
+        roi,
+        xu_runtime_requirements_projection(requirements),
+    ) + ((("mirror", True),) if mirror else ())  # every other geometry keeps its identity
+    fingerprint = analysis_canonical_fingerprint(
+        "rsm-effective-geometry-calibration-v1", identity
+    )
+    return RSMEffectiveGeometry(
+        receipt.receipt_fingerprint,
+        receipt.semantic_fingerprint,
+        diffractometer,
+        detector_header,
+        image_orientation,
+        roi,
+        requirements,
+        fingerprint,
+        source="calibration",
+        area_mount=area_mount,
+        angle_offsets=angle_offsets,
+        energy_offset_eV=energy_offset,
+        refinement=receipt.refinement,
+        calibration_energy_eV=calibration_energy,
+        circle_directions=directions,
+        mirror=mirror,
+        _claim=_EFFECTIVE_FACTORY,
     )
 
 

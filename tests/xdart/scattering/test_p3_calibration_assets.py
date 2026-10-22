@@ -82,13 +82,25 @@ def _intent(tmp_path: Path, text: str, name: str = "cal") -> tuple[RunIntent, Pa
     raw.write_bytes(b"raw")
     return RunIntent(source_spec=image_series_spec(raw), poni_file=str(path),
         save_path=str(tmp_path / f"{name}.nxs"), output_mode="Overwrite"), path
+from xrd_tools.session.readiness import bind_native_int_source_energy as _BIND_SOURCE_ENERGY  # noqa: E402
+
+
 def _execute(intent: RunIntent, assets, monkeypatch, request: int = 1):
+    """Standard execution as far as the real energy binder: the PONI and integrator it binds to the scan from the
+    admitted (or loaded) calibration. The executor makes the scan with to_scan(output_path=...) and binds after."""
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.session import readiness
     configuration, observed = intent.freeze(), []
     class ProbeSource:
-        def to_scan(self, *, poni, integrator, output_path):
-            observed.append((poni, integrator)); raise _ProbeComplete
+        def to_scan(self, *, output_path, cancelled=None):
+            return Scan(name="probe", frames=[], output_path=output_path)
         def close(self): return None
+
+    def observe(scan, calibration, **kwargs):
+        _BIND_SOURCE_ENERGY(scan, calibration, **kwargs)  # the real binder, not an earlier call's wrapper
+        observed.append((scan.poni, scan.integrator)); raise _ProbeComplete
     monkeypatch.setattr(executor_module, "open_source", lambda _source: ProbeSource())
+    monkeypatch.setattr(readiness, "bind_native_int_source_energy", observe)
     resources = None if assets is None else SimpleNamespace(
         admission=SimpleNamespace(scientific_assets=assets))
     capture = SourceCapture(RequestId(request), 1, configuration.thaw_source_spec())
@@ -637,18 +649,19 @@ def test_p3_1a_no_calibration_mask_crosses_legacy_floor_without_promotion(
     assert len(accepted.mask_bytes) == np.prod(shape)
     assert accepted.mask_bytes[0] == 1
 
+    from xrd_tools.session import scientific_assets as asset_module
     tiny = tmp_path / "declared-too-large.edf"
     tiny.write_bytes(b"header")
     intent.mask_file = str(tiny)
     monkeypatch.setattr(
-        preflight_module,
+        asset_module,
         "read_detector_image_layout",
         lambda _path: DetectorImageLayout(
             (16385, 16385), np.dtype(np.uint8).str, 1,
         ),
     )
     monkeypatch.setattr(
-        preflight_module,
+        asset_module,
         "load_mask",
         lambda *_args, **_kwargs: pytest.fail(
             "oversize declared layout reached pixel decode"

@@ -189,7 +189,9 @@ def test_each_frame_matches_local_value_exclusions(tmp_path, execution, gi):
     for index, image in enumerate(raw):
         # Independently reject the native sentinel in this frame's working
         # values, keeping the accepted static geometry and thresholds.
-        local_mask = static  # Thresholds override the separate raw saturation mask.
+        # Thresholds override the separate raw saturation mask. Since 70d9b91b the
+        # saved thumbnail also carries this frame's own threshold exclusions.
+        local_mask = static | (image < 1) | (image > 1000)
         working = image.astype(float)
         working[image >= np.iinfo(np.uint32).max] = np.nan
         reference = run_reduction(

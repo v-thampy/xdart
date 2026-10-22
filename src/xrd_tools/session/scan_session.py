@@ -92,6 +92,7 @@ from .dynamic_accounting import (
     DynamicRunState,
 )
 from .frame_record_store import FrameRecordStore
+from .readiness import frame_ring_wavelengths
 from .policy import (SessionPolicy, _int, requirements_from,
                      resolve_session_policy)
 from .stage_accounting import (
@@ -215,6 +216,16 @@ class _EventSink:
     def begin(self, scan, plan) -> None:
         if self._inner is not None:
             self._inner.begin(scan, plan)
+
+    @property
+    def recorded_angular_support(self):
+        """The wrapped output's recorded coverage choice (COVERAGE-SUPPORT-20261013 contract B)."""
+        return getattr(self._inner, "recorded_angular_support", None)
+
+    def bind_angular_support(self, enabled: bool) -> None:
+        bind = getattr(self._inner, "bind_angular_support", None)
+        if callable(bind):
+            bind(enabled)
 
     def write(self, frame, reduction) -> None:
         if self._inner is not None:
@@ -410,6 +421,7 @@ class ScanSession:
         cancel_token: Any | None = None,
         clear_frame_images: bool = False,
         record_store: FrameRecordStore | None = None,
+        ring_geometry: Mapping | None = None,
         record_store_persisted_on_write: bool = False,
         strict: StrictPolicy | None = None,
         obligations: Iterable[str] = (),
@@ -468,6 +480,10 @@ class ScanSession:
         self._dynamic_batch_settlement_authority_cb = (
             _dynamic_batch_settlement_authority_cb
         )
+        self._ring_geometry = ring_geometry
+        # The one per-label rule a saved output's rings also use (BROWSE-REFERENCE-RINGS-20261013).
+        self._ring_wavelengths = frame_ring_wavelengths(
+            source.extra.get('energy_selection', {}) if ring_geometry is not None else {})
         if dynamic_accounting is not None and record_store_persisted_on_write:
             raise RuntimeError(
                 "dynamic durable truth is owned only by the writer boundary"
@@ -668,6 +684,8 @@ class ScanSession:
                 # the streaming path's per-frame contract (B-1 regression fix).
                 strict=strict if strict is not None else StrictPolicy.loud(),
                 retain_products=False,
+                # COVERAGE-SUPPORT-20261013 decision 6: the Run's frozen “Record angular coverage” policy
+                angular_support=None if self._policy is None else self._policy.angular_support,
                 # The writer nulls frame.image after each write so the source-array
                 # reference doesn't pin ~18 MB/frame for the session's life (xdart's
                 # PERF-3); a later consumer reloads via Frame.load_image.  Default
@@ -790,7 +808,8 @@ class ScanSession:
         terms = ({name: getattr(descriptor, name) for name in names}
                  if all(background_declared) else {name: 0 for name in names})
         if any(type(value) is not int or value < 0 for value in terms.values()): raise ValueError("source Background resource declarations must be exact nonnegative integers")
-        requirements = requirements_from(descriptor, plan, **terms)
+        requirements = requirements_from(descriptor, plan, **terms,
+            source_auxiliary_bytes=getattr(descriptor, 'source_auxiliary_bytes', 0))
         prior = self._policy
         # A cadence-only SessionPolicy(allocation=None) is NOT explicit.
         explicit = None if prior is None else prior.allocation
@@ -811,6 +830,9 @@ class ScanSession:
             if inflight_max is not None and int(inflight_max) != alloc.reduction_inflight:
                 raise ValueError(f"inflight_max {int(inflight_max)} != explicit "
                                  f"grant {alloc.reduction_inflight}")
+        if prior is not None and prior.angular_support is not None:  # the Run's frozen support policy survives
+            from dataclasses import replace as _replace
+            policy = _replace(policy, angular_support=prior.angular_support)
         self._policy = policy
         bind(alloc)
         return alloc
@@ -1885,28 +1907,9 @@ class ScanSession:
             raise RuntimeError("same-run continuation refuses a failed session")
         if not self._session.drain(timeout=0.0):
             raise RuntimeError("same-run continuation requires a drained writer")
-        snapshot = self._dynamic_accounting.snapshot()
-        latest_states = tuple(
-            snapshot.attempt_states[tokens[-1]]
-            for tokens in snapshot.attempts.values() if tokens
+        self._dynamic_accounting.writer_boundary.require_clean_live_continuation(
+            self, self._dynamic_owner_token,
         )
-        dirty_in_flight = any(
-            key not in snapshot.written
-            or snapshot.attempt_states[snapshot.attempts[key][-1]]
-            is not DynamicAttemptState.COMPLETED
-            for key in snapshot.in_flight
-        )
-        if (
-            snapshot.state is not DynamicRunState.ACTIVE
-            or dirty_in_flight
-            or snapshot.retry_owned
-            or any(state in {
-                DynamicAttemptState.FAILED,
-                DynamicAttemptState.FAILED_RETRYABLE,
-                DynamicAttemptState.CANCELLED,
-            } for state in latest_states)
-        ):
-            raise RuntimeError("same-run continuation refuses a dirty epoch")
         replay = intent == current_intent
         decision = extend_live(owner, intent)
         if not replay:
@@ -2370,6 +2373,12 @@ class ScanSession:
             0.0, time.perf_counter() - started,
         )
 
+    @property
+    def recorded_angular_support(self) -> str | None:
+        """The output's recorded “Record angular coverage” choice as this Run opened it ("off", "on"; None when the
+        Run creates its 1-D rows): an appending Run keeps it whatever it asked (COVERAGE-SUPPORT-20261013)."""
+        return getattr(getattr(self, "_session", None), "recorded_angular_support", None)
+
     def perf_snapshot(self) -> dict[str, float]:
         """Return writer-side timings without exposing mutable state."""
         values = dict(self._perf_values)
@@ -2391,6 +2400,17 @@ class ScanSession:
                     if self._accounting.current_revision(label, mode) >= 1]
         if receipts:
             self._accounting.record_durable(receipts)
+    def _published_ring_geometry(self, frame, label):
+        if self._ring_geometry is None:
+            return None
+        from xrd_tools.core.scan import FrameGeometry
+        snapshot = self._ring_geometry
+        wavelength = self._ring_wavelengths.get(int(label), snapshot['wavelength'])
+        if wavelength != snapshot['wavelength']:
+            snapshot = MappingProxyType({**snapshot, 'wavelength': wavelength})
+        return FrameGeometry(rot1=snapshot['rot1'], rot2=snapshot['rot2'], rot3=snapshot['rot3'],
+            incident_angle=getattr(getattr(frame, 'geometry', None), 'incident_angle', None), poni=snapshot)
+
     def _upsert_record_store(self, frame: Frame, reduction: Any,
                              event: FrameEvent) -> None:
         if self._record_store is None:
@@ -2399,6 +2419,7 @@ class ScanSession:
         try:
             facts = dict(
                 label=event.frame_index,
+                geometry=self._published_ring_geometry(frame, event.frame_index),
                 metadata_raw=event.metadata,
                 metadata_numeric=getattr(frame, "metadata_numeric", None),
                 incident_angle=getattr(getattr(frame, "geometry", None), "incident_angle", None),
@@ -2411,6 +2432,9 @@ class ScanSession:
             )
             view = FrameView.from_results(
                 result_1d=event.result_1d, result_2d=event.result_2d, **facts,
+                angular_support=(getattr(reduction, "angular_support_1d", None)
+                                 if event.result_1d is not None
+                                 and event.result_1d is getattr(reduction, "result_1d", None) else None),
             )
             record = FrameRecord.from_view(view, mode_1d=mode_1d, mode_2d=mode_2d)
             for key, extra in (event.extra_results_2d or {}).items():

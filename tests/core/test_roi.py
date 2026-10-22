@@ -247,3 +247,33 @@ def test_run_roi_signals_streams_and_cancels():
         should_cancel=stop_after_one).payload
     assert list(res2.frames) == [0]
     assert res2.diagnostics["cancelled"] is True
+
+
+def test_roi_leaves_out_counts_at_an_eiger_masters_recorded_saturation(monkeypatch):
+    """Decision 39: with Mask Saturated, an ROI leaves out the counts at or above the saturation the
+    frame's file records. eiger_w2s3_test_2 records 299,963; its first five frames hold 8/9/9/9/8 such
+    counts below the uint32 sentinel, which the data type's rule kept (Round 29)."""
+    import os
+    from pathlib import Path
+    from xrd_tools.analysis import plans
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import open_source
+    master = Path(os.environ.get("XDART_TEST_DATA", "")) / "eiger" / "eiger_w2s3_test_2_scan001_master.h5"
+    if not master.is_file():
+        pytest.skip("XDART_TEST_DATA Eiger master unavailable")
+
+    def valid_counts():
+        source = open_source(str(master))
+        try:
+            labels = list(source.frame_indices)[:5]
+            result = run_roi_signals((RoiSignal(RoiSpec.full_frame(), name="all"),), source,
+                                     mask_saturation=True, frame_indices=labels)
+            return np.asarray(result.payload.valid_counts["all"])
+        finally:
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
+    recorded = valid_counts()
+    monkeypatch.setattr(plans, "_recorded_saturation", lambda *_args: None)  # the data type's rule
+    np.testing.assert_array_equal(valid_counts() - recorded, [8, 9, 9, 9, 8])

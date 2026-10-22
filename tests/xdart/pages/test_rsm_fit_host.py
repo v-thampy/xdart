@@ -1,0 +1,152 @@
+"""The native page supplies admitted artifacts to the shared fit windows."""
+from pathlib import Path
+import time
+
+import numpy as np
+
+from xdart.gui.pages.services import empty_host_services
+from xdart.gui.pages.values import PageCleanup
+from xdart.gui.tabs.rsm.page import RSMPage
+from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+from xrd_tools.notebooks import load_snapshot
+from tests.xdart.pages.test_rsm_page import _Status
+from tests.xdart.scattering.test_rsm_fit_windows import payload, qapp  # noqa: F401
+
+
+def settle(page, qapp):
+    end = time.monotonic() + 30
+    while page.active() and time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(.01)
+    qapp.processEvents()
+    assert not page.active()
+
+
+def catalog(page, qapp):
+    """Wait for the results folder's catalog, which the browser lists since 063fc88f."""
+    end = time.monotonic() + 30
+    while page._result_browser.busy and time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(.01)
+    qapp.processEvents()
+    assert not page._result_browser.busy
+
+
+def dispose(page, qapp):
+    end = time.monotonic() + 30
+    receipt = page.close_page()
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(.01)
+        receipt = page.close_page()
+    assert receipt.status is PageCleanup.CLEAN
+    page.deleteLater()
+    qapp.processEvents()
+
+
+def test_page_mounts_native_lineout_plane_and_volume_fits(qapp, tmp_path):
+    page = RSMPage(empty_host_services(_Status()))
+    admitted = payload(tmp_path)
+    path = admitted.inspection.path
+    try:
+        page._rows['project_root'].editor.setText(str(tmp_path))
+        page._add_result(path, admitted)
+        for name in ('lineout', 'fit2d', 'fit3d'):
+            page.tools.page_tool(name).click()
+            settle(page, qapp)
+            window = page._tool_windows[name]
+            assert window.current().reference.path == path
+            captured = window.current().load()
+            replay = load_snapshot(window.current().reference, bundle_root=tmp_path)
+            np.testing.assert_array_equal(captured.values, replay.values)
+            if name == 'lineout':
+                assert window.host.source_root == str(tmp_path)
+                assert window.fit_dialog.batch_btn.isEnabled()
+                window.fit_dialog.fit_btn.click()
+                settle(page, qapp)
+                assert window.host.outcomes[-1].ok, window.fit_dialog.status.text()
+            else:
+                assert window.source_root == str(tmp_path)
+                window.fit_button.click()
+                settle(page, qapp)
+                assert window.outcome is not None, window.status.text()
+        outcome = page._tool_windows['fit3d'].outcome
+        page._view_command(ShellCommand(ShellCommandKind.SET_LOG_SCALE, True))
+        settle(page, qapp)
+        assert page._tool_windows['fit3d'].outcome is outcome
+        page._follow_tools()
+        assert page._tool_windows['fit3d'].outcome is outcome
+    finally:
+        dispose(page, qapp)
+
+
+def test_lineout_batch_is_lazy_project_scoped_and_keeps_scalar_rows(qapp, tmp_path):
+    page = RSMPage(empty_host_services(_Status()))
+    try:
+        page._rows['project_root'].editor.setText(str(tmp_path))
+        # The results list shows one folder since 063fc88f, so both results share it.
+        # RSM's own results: the RSM page lists `_rsm` names by default (the Data Browser's filename filter)
+        first, second = payload(tmp_path, name='one_rsm.nexus'), payload(tmp_path, name='two_rsm.nexus')
+        page._add_result(first.inspection.path, first, show=False)
+        page._add_result(second.inspection.path, second)
+        catalog(page, qapp)
+        page.tools.page_tool('lineout').click()
+        settle(page, qapp)
+        window = page._tool_windows['lineout']
+        # No selection: Batch uses all listed results, including one that is no longer resident.
+        page._results[first.inspection.path] = None
+        page.browser.clear_result_selection()
+        targets = window.batch()
+        assert [target.label for target in targets] == [first.inspection.path, second.inspection.path]
+        np.testing.assert_array_equal(targets[0].load().values, window.current().load().values)
+        missing = targets[0].trend('unavailable_column')
+        assert not missing.available
+        window.fit_dialog.batch_btn.click()
+        settle(page, qapp)
+        assert len(window.host.outcomes) == 2
+        assert all(outcome.ok for outcome in window.host.outcomes)
+        assert window.host.outcomes[0].overlay is None
+        assert window.host.outcomes[-1].overlay is not None
+        before = window.scope()
+        # A result leaving the listed folder changes the batch scope.
+        page._listed.pop(0)
+        Path(first.inspection.path).unlink()
+        page._result_browser.refresh()
+        catalog(page, qapp)
+        assert window.scope() != before
+    finally:
+        dispose(page, qapp)
+
+
+def test_listed_order_and_the_lineout_batch_hold_when_the_catalog_lands(qapp, tmp_path, monkeypatch):
+    """Rows listed while the folder catalog is held keep their order once it lands, and the no-selection batch
+    follows them; the page's own bookkeeping keeps arrival order."""
+    from tests.xdart.pages.test_stitch_browser import _held_catalog
+    entered, release = _held_catalog(monkeypatch)
+    page = RSMPage(empty_host_services(_Status()))
+    try:
+        page._rows['project_root'].editor.setText(str(tmp_path))
+        results = [payload(tmp_path, name=f'{name}_rsm.nexus') for name in ('two', 'one', 'three')]
+        for result in results:
+            page._add_result(result.inspection.path, result, show=False)
+        assert entered.wait(10)
+        page.browser.set_current_result(results[1].inspection.path, keep_selection=False)
+        settle(page, qapp)
+        held, current, selected = (page.browser.listed_results(), page.browser.current_result(),
+                                   page.browser.selected_results())
+        resident = dict(page._results)
+        batch = [target.label for target in page._fit_targets(())]
+        assert current == results[1].inspection.path and batch == list(selected) == [current]
+        release.set()
+        catalog(page, qapp)
+        assert {entry.artifact for entry in page._result_browser._owner.catalog} >= set(held)  # it landed
+        assert len(held) == 3 and page.browser.listed_results() == held
+        assert (page.browser.current_result(), page.browser.selected_results()) == (current, selected)
+        assert all(page._results[path] is value for path, value in resident.items())
+        assert batch == [target.label for target in page._fit_targets(())]
+        page.browser.clear_result_selection()
+        assert [target.label for target in page._fit_targets(())] == list(held)
+        assert page._listed == [result.inspection.path for result in results]
+    finally:
+        release.set()
+        dispose(page, qapp)

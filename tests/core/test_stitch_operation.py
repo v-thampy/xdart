@@ -146,7 +146,7 @@ def _source_receipt(tmp_path: Path, *, selected=(1, 3)) -> ModuleSourceReceipt:
             "# Motors\n"
             f"del = {5 * index}, nu = {index}\n"
             "User: stitch, time: Mon Jan 15 10:30:00 2024  # Temp\n",
-            encoding="utf-8",
+            encoding="utf-8", newline="\n",
         )
     table = run_metadata_table(
         MetadataTablePlan(
@@ -221,6 +221,7 @@ def _xu_prepared(
     del_value: float = 14.0,
     nu_value: float = -10.0,
     energy_eV: float | None = 17000.018,
+    allow_extrapolation: bool = False,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     root = tmp_path / "xu-source"
@@ -238,7 +239,7 @@ def _xu_prepared(
         "# Motors\n"
         f"del = {del_value}, nu = {nu_value}\n"
         "User: stitch, time: Mon Jan 15 10:30:00 2024  # Temp\n",
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     table = run_metadata_table(
         MetadataTablePlan(
@@ -277,10 +278,11 @@ def _xu_prepared(
         calibration,
         effective,
         1.0,
-        5.2,
+        9.0 if allow_extrapolation else 5.2,
         npt_1d=64,
         monitor_selector=MetadataColumnSelector("I0"),
         max_frame_bytes=4 * 1024 * 1024,
+        **({"allow_extrapolation": True} if allow_extrapolation else {}),
     )
     output_root = tmp_path / "xu-output"
     output_root.mkdir()
@@ -426,6 +428,7 @@ def test_json_geometry_requires_exact_declared_position_mapping(
             )
         )
     assert refused.value.code == "GEOMETRY_MOTOR_MAPPING_MISMATCH"
+    assert "(declared: " in str(refused.value) and "; bound: " in str(refused.value)
 
 
 @pytest.mark.parametrize(
@@ -607,6 +610,34 @@ def test_xu_prepare_refuses_energy_and_domain_before_operation_request(tmp_path)
     assert domain.value.code == "XU_CALIBRATION_DOMAIN_EXCEEDED"
 
 
+def test_xu_extrapolation_opt_in_commits_with_coverage_warning_and_immutable_asset(tmp_path):
+    request = _xu_prepared(tmp_path, del_value=46.0, allow_extrapolation=True)
+    asset = Path(request.plan.calibration.project_root, request.plan.calibration.lexical_relative_path)
+    before = asset.read_bytes()
+    assert request.provenance["plan"]["allow_extrapolation"] is True
+    assert request.provenance["observations"]["validated_domain_extrapolation_frame_count"] == 1
+    assert request.provenance["observations"]["warnings"] == ["XU_CALIBRATION_DOMAIN_EXCEEDED_ALLOWED"]
+    strict = replace(request.plan, allow_extrapolation=False)
+    assert strict.fingerprint != request.plan.fingerprint
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED
+    persisted = json.loads(result.payload.provenance_json)
+    assert persisted["plan"]["allow_extrapolation"] is True
+    assert persisted["observations"]["validated_domain_extrapolation_frame_count"] == 1
+    assert asset.read_bytes() == before
+
+
+def test_xu_extrapolation_opt_in_keeps_energy_refusal_and_default_observations(tmp_path):
+    with pytest.raises(StitchOperationRefused) as energy:
+        _xu_prepared(tmp_path / "energy", energy_eV=18000.0, allow_extrapolation=True)
+    assert energy.value.code == "XU_SOURCE_ENERGY_CONFLICT"
+    request = _xu_prepared(tmp_path / "default")
+    assert replace(request.plan, allow_extrapolation=False).fingerprint == request.plan.fingerprint
+    assert "allow_extrapolation" not in request.provenance["plan"]
+    assert "validated_domain_extrapolation_frame_count" not in request.provenance["observations"]
+    assert request.provenance["observations"]["warnings"] == []
+
+
 def test_xu_asset_drift_after_prepare_refuses_before_science_or_output(tmp_path):
     request = _xu_prepared(tmp_path)
     Path(
@@ -642,10 +673,10 @@ def test_xu_effective_geometry_drift_at_prepublish_refuses_commit(
     real_resolve = stitch_operation.resolve_xu_stitch_effective_geometry
     calls = []
 
-    def mutate_before_prepublish(receipt, session):
+    def mutate_before_prepublish(receipt, session, **kwargs):
         calls.append("resolve")
         asset.touch()
-        return real_resolve(receipt, session)
+        return real_resolve(receipt, session, **kwargs)
 
     monkeypatch.setattr(
         stitch_operation,
@@ -665,7 +696,7 @@ def test_xu_transient_reload_retry_never_replays_science_or_writer(
 ):
     request = _xu_prepared(tmp_path)
     real_read = stitch_operation.read_analysis_artifact
-    real_write = stitch_operation.write_stitched
+    real_write = stitch_operation.write_stitch_projection
     real_science = stitch_operation.run_xu_hist_stitch_1d
     reads = []
     writes = []
@@ -679,7 +710,6 @@ def test_xu_transient_reload_retry_never_replays_science_or_writer(
 
     def write_once(*args, **kwargs):
         writes.append("write")
-        assert kwargs.get("legacy_v1_unit_layout", False) is False
         return real_write(*args, **kwargs)
 
     def science_once(*args, **kwargs):
@@ -687,7 +717,7 @@ def test_xu_transient_reload_retry_never_replays_science_or_writer(
         return real_science(*args, **kwargs)
 
     monkeypatch.setattr(stitch_operation, "read_analysis_artifact", fail_read_once)
-    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
+    monkeypatch.setattr(stitch_operation, "write_stitch_projection", write_once)
     monkeypatch.setattr(
         stitch_operation,
         "run_xu_hist_stitch_1d",
@@ -802,8 +832,8 @@ def test_poni_v3_stitch_persists_and_cross_checks_effective_calibration(
 
     runtime_geometry = stitch_operation._runtime_geometry
 
-    def lose_effective_parallax(receipt, raw):
-        diffractometer, orientation = runtime_geometry(receipt, raw)
+    def lose_effective_parallax(receipt, raw, **kwargs):
+        diffractometer, orientation = runtime_geometry(receipt, raw, **kwargs)
         calibration = replace(diffractometer.calibration, parallax=False)
         return replace(diffractometer, calibration=calibration), orientation
 
@@ -1097,9 +1127,10 @@ def test_frame_bound_covers_float64_processing_representation(tmp_path):
     assert not Path(request.module.output.target).exists()
 
 
-@pytest.mark.parametrize("mode", ("1d", "2d"))
-def test_operation_commits_and_strictly_reloads_detached_payload(tmp_path, mode):
-    request = _prepared(tmp_path, mode=mode)
+def test_operation_commits_and_strictly_reloads_detached_payload(tmp_path):
+    """A Stitch 1D; a native Stitch 2D's commit and reload are test_native_stitch_2d's (the old Stitch 2D
+    layout was removed, 2026-09-30)."""
+    request = _prepared(tmp_path)
     progress = []
     result = run_stitch_operation(
         request,
@@ -1123,9 +1154,7 @@ def test_operation_commits_and_strictly_reloads_detached_payload(tmp_path, mode)
     assert result.payload.normalization.shape == result.payload.intensity.shape
     assert np.any(result.payload.coverage > 0)
     assert np.any(result.payload.normalization > 0)
-    assert result.payload.intensity.shape == (
-        (96,) if mode == "1d" else (48, 32)
-    )
+    assert result.payload.intensity.shape == (96,)
     totals = {item.total for item in progress}
     assert totals == {len(request.module.source.selected_labels) + 4}
     assert [item.completed for item in progress] == sorted(
@@ -1180,7 +1209,7 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
 ):
     request = _prepared(tmp_path)
     real_read = stitch_operation.read_analysis_artifact
-    real_write = stitch_operation.write_stitched
+    real_write = stitch_operation.write_stitch_projection
     real_science = stitch_operation.run_stitch
     reads = []
     writes = []
@@ -1194,7 +1223,6 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
 
     def write_once(*args, **kwargs):
         writes.append("write")
-        assert kwargs["legacy_v1_unit_layout"] is False
         return real_write(*args, **kwargs)
 
     def science_once(*args, **kwargs):
@@ -1202,7 +1230,7 @@ def test_transient_strict_reload_retry_does_not_replay_science_or_writer(
         return real_science(*args, **kwargs)
 
     monkeypatch.setattr(stitch_operation, "read_analysis_artifact", fail_read_once)
-    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
+    monkeypatch.setattr(stitch_operation, "write_stitch_projection", write_once)
     monkeypatch.setattr(stitch_operation, "run_stitch", science_once)
     with pytest.raises(StitchOperationVerificationError) as failed:
         run_stitch_operation(request)
@@ -1253,7 +1281,7 @@ def test_published_inspection_retry_does_not_replay_science_or_writer(
     coordinator = OutputTransactionCoordinator()
     from xrd_tools.io import analysis_artifact as artifact_api
     real_inspect = artifact_api.inspect_analysis_artifact
-    real_write = stitch_operation.write_stitched
+    real_write = stitch_operation.write_stitch_projection
     real_science = stitch_operation.run_stitch
     failures = []
     writes = []
@@ -1274,7 +1302,7 @@ def test_published_inspection_retry_does_not_replay_science_or_writer(
         return real_science(*args, **kwargs)
 
     monkeypatch.setattr(artifact_api, "inspect_analysis_artifact", fail_published_inspection_once)
-    monkeypatch.setattr(stitch_operation, "write_stitched", write_once)
+    monkeypatch.setattr(stitch_operation, "write_stitch_projection", write_once)
     monkeypatch.setattr(stitch_operation, "run_stitch", science_once)
     with pytest.raises(StitchOperationCleanupPending) as pending:
         run_stitch_operation(request, coordinator=coordinator)
@@ -1317,3 +1345,62 @@ def test_plan_rejects_unbounded_or_unsupported_science(tmp_path):
             radial_range=(0.1, 1.0),
             azimuth_range=(-1.0, 1.0),
         )
+    # the old Stitch 2D layout was removed (maintainer, 2026-09-30: "Remove old format")
+    with pytest.raises(ValueError, match="a Stitch 2D is a native record"):
+        StitchOperationPlan(geometry, mode="2d", radial_range=(0.1, 1.0), azimuth_range=(-1.0, 1.0))
+
+
+def _form(tmp_path, backend):
+    from xrd_tools.analysis.stitch_values import StitchFrameSelector, StitchToolForm
+    source = tmp_path / "source"
+    source.mkdir()
+    spec = source / "sample"
+    spec.write_text(
+        "#F sample\n#E 1\n#D today\n#O0 del  nu  energy\n\n"
+        "#S 1 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
+        "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n"
+    )
+    images = source / "images"
+    images.mkdir()
+    shape = (195, 1475) if backend == "xu_hist" else (195, 487)
+    for i in range(2):
+        array = np.full(shape, i + 10, dtype=np.int32) if backend == "xu_hist" else _ring(i).astype(np.int32)
+        array.tofile(images / f"sample_scan1_{i:04d}.raw")
+    geometry = source / "geometry.json"
+    if backend == "xu_hist":
+        geometry.write_bytes(canonical_surface_resource_bytes())
+    else:
+        geometry.write_text(json.dumps(_goniometer_record()))
+    (tmp_path / "output").mkdir()
+    return StitchToolForm(
+        project_root=tmp_path, spec_path=spec, scan="1", image_dir=images,
+        image_stem="sample_scan1_", frame_selector=StitchFrameSelector(),
+        detector_shape=shape, raw_dtype="int32", threshold=800000,
+        geometry_path=geometry, geometry_kind=StitchGeometryKind.PYFAI_GONIOMETER_JSON,
+        source_motors=(("del", "del"), ("nu", "nu")) if backend == "xu_hist"
+            else (("del_angle", "del"), ("nu_angle", "nu")),
+        q_range=(1., 5.2), npt_1d=64, output_path=tmp_path / "output" / "sample_stitch1d.nexus",
+        backend=backend,
+    )
+
+
+def _native_form(tmp_path, backend, *, scans="1,2,[1,2]", unit="q_A^-1"):
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection
+    from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+    form = _form(tmp_path, backend)
+    path = Path(form.spec_path)
+    text = path.read_text()
+    # The MG test calibration is 1 Angstrom; no independent energy was measured
+    # for this synthetic source. XU uses its canonical recorded energy.
+    if backend == "multigeometry":
+        text = text.replace("  energy", "").replace(" 17000.018", "").replace("#N 3", "#N 2")
+    second = text[text.index("#S 1"):].replace("#S 1", "#S 2", 1)
+    empty = second.replace("#S 2", "#S 3", 1)
+    path.write_text(text + "\n" + second + "\n" + empty)
+    for source in Path(form.image_dir).glob("*scan1_*"):
+        destination = source.with_name(source.name.replace("scan1_", "scan2_"))
+        destination.write_bytes(source.read_bytes())
+    return replace(form, source_selection=StitchSourceSelection(
+        "Spec", (str(path),), scans=scans, image_dir=str(form.image_dir)),
+        unit=unit, q_range=None, conditioning=StitchConditioning("auto"),
+        output_family="combined" if "[" in scans and "," in scans else None)

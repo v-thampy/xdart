@@ -10,6 +10,7 @@ import numpy as np
 from pyqtgraph.Qt import QtWidgets
 
 from tests.xdart.scattering._admission import ImmediateAdmission
+from tests.xdart.scattering._e2sd_support import write_poni
 from xdart.gui.tabs.scattering.contracts import (
     SourceCapture,
     SourceObservation,
@@ -252,7 +253,8 @@ def _active_page(
     selected = tmp_path / "frame.tif"
     selected.write_bytes(b"frame")
     poni = tmp_path / "tiny.poni"
-    poni.write_text("poni")
+    # Since a53c324e Run parses the PONI before admission, so the active page needs a real one.
+    write_poni(poni)
     coordinator = lifecycle or ScatteringCoordinator()
     page = ScatteringWorkspace(
         intents=RunIntentStore(

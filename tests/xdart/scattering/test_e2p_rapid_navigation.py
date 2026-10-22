@@ -84,7 +84,7 @@ class _TinyIntegrator:
         self.detector = calibrated.detector
         for name in (
             "dist", "poni1", "poni2", "rot1", "rot2", "rot3",
-            "wavelength", "parallax",
+            "wavelength", "parallax", "chiDiscAtPi",
         ):
             setattr(self, name, getattr(calibrated, name))
 
@@ -226,8 +226,10 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
         raising=False,
     )
     real_integrator = executor_module.poni_to_integrator
+    # Since 15250a49 the Int source-energy binder builds the run's integrator.
+    from xrd_tools.integrate import calibration as calibration_module
     monkeypatch.setattr(
-        executor_module, "poni_to_integrator",
+        calibration_module, "detector_calibration_to_integrator",
         lambda calibration: _TinyIntegrator(real_integrator(calibration)),
     )
     native_plan = executor_module.native_int_reduction_plan
@@ -235,8 +237,10 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
     def observed_plan(configuration, **options):
         assert type(configuration) is FrozenRunConfiguration
         plan_configurations.append(configuration)
-        # An ordinary Run asks the translation to declare its companion maps.
-        assert options == {"companion_modes_2d": True}
+        # An ordinary Run asks the translation to declare its companion maps, and (since 15250a49)
+        # passes the run's energy selection.
+        assert options["companion_modes_2d"] is True
+        assert set(options) == {"companion_modes_2d", "energy_selection"}
         plan = native_plan(configuration, **options)
         assert plan.integration_1d is not None
         assert plan.integration_1d.npt == 2
@@ -294,8 +298,6 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
 
     shell.apply_state = record_apply_state
     heartbeat_timer = QtCore.QTimer(page)
-    lateness, heartbeat_slot = _heartbeat(heartbeat_timer)
-    del heartbeat_slot
     page.show()
     qapp.processEvents()
 
@@ -304,6 +306,9 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
             qapp,
             lambda: shell.run_controls.startButton.isEnabled(),
         )
+        # Exclude page setup, but measure every interval from Run onward.
+        lateness, heartbeat_slot = _heartbeat(heartbeat_timer)
+        del heartbeat_slot
         heartbeat_timer.start()
         started = time.perf_counter()
         shell.run_controls.startButton.click()

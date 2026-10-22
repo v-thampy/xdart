@@ -334,12 +334,15 @@ def test_eiger_data_with_native_frames_group_is_raw_master(tmp_path):
 
 
 def test_eiger_master_is_raw_master(tmp_path):
-    """A ``*_master.h5`` (data in linked files + a native frames group) is
-    raw detector data, classified by the eiger-master name."""
+    """An Eiger master (data in linked files + a native frames group) is raw
+    detector data, classified by its linked image segments, not its name
+    (CAL-HELD-BATCH-20261009)."""
     p = tmp_path / "eiger_w2s3_scan001_master.h5"
     with h5py.File(p, "w") as f:
         f.create_group("entry/frames")
         f.create_group("entry/instrument/detector")
+        f["entry/data/data_000001"] = h5py.ExternalLink(
+            "eiger_w2s3_scan001_data_000001.h5", "/entry/data/data")
     info = classify_image_source(p)
     assert info.kind is ImageSourceKind.RAW_MASTER
 

@@ -134,7 +134,7 @@ def _average_result(target: str) -> AverageScanResult:
     # The public slot no longer carries the version, so the derivation takes
     # only the anchor.  `version` still populates `version_identity` below,
     # which is where the identity actually lives.
-    artifact = _average_output_artifact(_average_target(target))
+    artifact = _average_output_artifact(_average_target(target), dimension="1d")
     return AverageScanResult(
         disposition="COMMITTED",
         target=artifact,
@@ -463,7 +463,7 @@ def test_average_pending_retry_cancel_and_stamp_remain_exact() -> None:
     identity = OperationIdentity(21)
     slot._identity = identity
     owner._average = AverageOperationState(
-        identity, 5, "/detached/average.nexus", "entry"
+        identity, 5, "/detached/average.nexus", "entry", "1d"
     )
     pending = OperationPending(
         identity, 2, "source-cleanup", "source close retained"
@@ -515,7 +515,7 @@ def test_average_stale_terminal_never_reloads_and_lost_owner_retires_state(
     identity = OperationIdentity(31)
     target = "/detached/average.nxs"
     slot._identity = identity
-    owner._average = AverageOperationState(identity, 4, target, "entry")
+    owner._average = AverageOperationState(identity, 4, target, "entry", "1d")
     result = _average_result(target)
     transition = owner.consume_average_update(
         OperationUpdate(
@@ -532,7 +532,7 @@ def test_average_stale_terminal_never_reloads_and_lost_owner_retires_state(
     assert transition.request_catalog
     assert owner.average_state is None
 
-    owner._average = AverageOperationState(identity, 4, target, "entry")
+    owner._average = AverageOperationState(identity, 4, target, "entry", "1d")
     lost = owner.consume_lost_owner(identity)
     assert lost.effect is WorkspaceRefreshEffect.CONTROLS
     assert owner.average_state is None
@@ -544,7 +544,7 @@ def test_committed_average_reload_transfers_without_dual_operation_ownership(
     identity = OperationIdentity(33)
     target = "/detached/average.nxs"
     slot._identity = identity
-    state = AverageOperationState(identity, 4, target, "entry")
+    state = AverageOperationState(identity, 4, target, "entry", "1d")
     owner._average = state
     result = _average_result(target)
     transition = owner.consume_average_update(
@@ -591,7 +591,7 @@ def test_non_science_average_terminals_are_controls_only(
     identity = OperationIdentity(34)
     target = "/detached/average.nxs"
     slot._identity = identity
-    owner._average = AverageOperationState(identity, 4, target, "entry")
+    owner._average = AverageOperationState(identity, 4, target, "entry", "1d")
     transition = owner.consume_average_update(
         OperationUpdate(
             identity,
@@ -611,7 +611,7 @@ def test_close_preserves_active_state_until_exact_slot_cleanup() -> None:
     identity = OperationIdentity(41)
     slot._identity = identity
     owner._average = AverageOperationState(
-        identity, 1, "/detached/average.nexus", "entry"
+        identity, 1, "/detached/average.nexus", "entry", "1d"
     )
     slot.close_receipts = [
         OperationCleanupReceipt(
@@ -654,7 +654,7 @@ def test_committed_average_naming_a_foreign_artifact_never_reloads() -> None:
     identity = OperationIdentity(77)
     anchor = "/detached/average.nxs"
     slot._identity = identity
-    owner._average = AverageOperationState(identity, 4, anchor, "entry")
+    owner._average = AverageOperationState(identity, 4, anchor, "entry", "1d")
 
     # A well-formed COMMITTED result in every respect EXCEPT the path it names.
     foreign = replace(
@@ -688,7 +688,7 @@ def test_committed_average_naming_the_recomputed_slot_is_adopted() -> None:
     identity = OperationIdentity(78)
     anchor = "/detached/average.nxs"
     slot._identity = identity
-    owner._average = AverageOperationState(identity, 4, anchor, "entry")
+    owner._average = AverageOperationState(identity, 4, anchor, "entry", "1d")
 
     transition = owner.consume_average_update(
         OperationUpdate(
@@ -723,7 +723,7 @@ def test_a_published_unverified_average_refreshes_the_folder_not_just_controls(
     identity = OperationIdentity(71)
     target = "/detached/average.nxs"
     slot._identity = identity
-    owner._average = AverageOperationState(identity, 4, target, "entry")
+    owner._average = AverageOperationState(identity, 4, target, "entry", "1d")
     result = _replace(
         _average_result(target),
         disposition="PUBLISHED_UNVERIFIED",
@@ -751,7 +751,7 @@ def test_a_published_unverified_average_refreshes_the_folder_not_just_controls(
 
     assert transition.effect is WorkspaceRefreshEffect.FULL
     # ...and an ordinary abort still gets the cheaper refresh.
-    owner._average = AverageOperationState(identity, 4, target, "entry")
+    owner._average = AverageOperationState(identity, 4, target, "entry", "1d")
     aborted = owner.consume_average_update(
         OperationUpdate(
             identity,

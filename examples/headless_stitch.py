@@ -13,10 +13,11 @@ script.  A reader should be able to see, one-to-one, that:
     backend / corrections — is the ``StitchPlan`` cell.
 
 It then RUNS the plan (``run_stitch`` → an ``AnalysisResult`` whose ``.payload``
-is an ``IntegrationResult1D``), PERSISTS it to a temp ``.nexus``
-(``write_stitched`` + ``StitchPlan.provenance()``), READS it back
-(``read_stitched``), and proves the section-3 RELOAD path
-(``StitchPlan.from_provenance``) reconstructs the processing options.
+is an ``IntegrationResult1D``), PERSISTS it to a temp ``.nexus`` as a processed
+record (``write_nexus``), READS it back (``read_scan``), and proves the section-3
+RELOAD path (``StitchPlan.from_provenance``) reconstructs the processing options.
+(The Stitch page persists its results as Stitch records, with the plan's
+provenance, through its operation.)
 
 No external data files (synthetic ring frames are generated in-script) and no Qt
 / xdart GUI imports — it must run in a headless environment::
@@ -38,7 +39,7 @@ from xrd_tools.core.geometry import DetectorCalibration, Diffractometer
 from xrd_tools.core.scan import ScanFrame
 from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
 from xrd_tools.corrections.stack import CorrectionStack
-from xrd_tools.io.nexus import read_stitched, write_nexus, write_stitched
+from xrd_tools.io.nexus import read_scan, write_nexus
 from xrd_tools.sources import MemoryFrameSource
 
 # A small Pilatus-100k-shaped detector for the whole demo.
@@ -211,35 +212,22 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         nxs = Path(tmp) / "stitched_demo.nexus"
 
-        # --- PERSIST: write the pyfai_hist result + its plan provenance ----
-        import h5py
-
-        prov = plan_hist.provenance()
-        # Seed the container through the public processed-record writer so the
-        # file carries the current schema identity and a genuine result graph.
+        # --- PERSIST: the pyfai_hist result as a processed record ----------
         write_nexus(
             nxs,
             results_1d={0: stitched_hist},
             overwrite=True,
             compression=None,
         )
-        with h5py.File(nxs, "r+") as f:
-            entry = f["entry"]
-            write_stitched(entry, stitched_1d=stitched_hist, provenance=prov)
 
-        # --- READ BACK: intensity + provenance round-trip ------------------
-        ds = read_stitched(nxs)
+        # --- READ BACK: the intensity round-trips --------------------------
+        ds = read_scan(nxs)
         np.testing.assert_allclose(
-            ds["stitched_1d"].values, stitched_hist.intensity, rtol=1e-4
+            ds["intensity_1d"].values[0], stitched_hist.intensity, rtol=1e-4
         )
-        read_prov = ds.attrs["stitched_1d_provenance"]
-        assert read_prov["backend"] == "pyfai_hist", read_prov["backend"]
-        assert read_prov["npt_1d"] == NPT_1D, read_prov["npt_1d"]
-        assert read_prov["corrections"]["polarization_factor"] == 0.99
         print(
-            f"PERSIST -> {nxs.name}: read_stitched 1d shape="
-            f"{tuple(ds['stitched_1d'].shape)}, intensity round-trips; "
-            f"provenance backend={read_prov['backend']!r} present"
+            f"PERSIST -> {nxs.name}: read_scan 1d shape="
+            f"{tuple(ds['intensity_1d'].shape)}, intensity round-trips"
         )
 
     # --- RELOAD ROUND-TRIP: rebuild the Section-3 plan from provenance ------

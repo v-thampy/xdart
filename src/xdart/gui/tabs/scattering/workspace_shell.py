@@ -22,7 +22,7 @@ from .shell_values import (
     ShellPhase,
     ShellProjection,
 )
-from .tools_view import ToolsView
+from .tools_view import BrowserToolsColumn, ToolsView
 
 
 class _HugWidthScrollArea(QtWidgets.QScrollArea):
@@ -98,17 +98,9 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         self._connect_controls()
 
     def _make_left_column(self) -> QtWidgets.QFrame:
-        column = QtWidgets.QFrame()
-        column.setObjectName("e3BrowserColumn")
-        column.setMinimumWidth(255)
-        layout = QtWidgets.QVBoxLayout(column)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
         self.browser = BrowserView()
         self.tools = ToolsView()
-        layout.addWidget(self.browser, 1)
-        layout.addWidget(self.tools, 0)
-        return column
+        return BrowserToolsColumn(self.browser, self.tools)
 
     def _make_right_column(self) -> QtWidgets.QFrame:
         column = QtWidgets.QFrame()
@@ -353,19 +345,7 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
             )
         ]
         self.run_controls.apply_profile(modes=state.modes)
-        disabled = dict(state.disabled_modes)
-        model = self.run_controls.modeCombo.model()
-        for row in range(self.run_controls.modeCombo.count()):
-            label = self.run_controls.modeCombo.itemText(row)
-            reason = disabled.get(label, "")
-            item = getattr(model, "item", lambda _row: None)(row)
-            if item is not None:
-                item.setEnabled(not reason)
-            self.run_controls.modeCombo.setItemData(
-                row,
-                reason or None,
-                QtCore.Qt.ItemDataRole.ToolTipRole,
-            )
+        self.run_controls.set_unavailable_modes(state.disabled_modes)
         index = self.run_controls.modeCombo.findText(state.mode)
         if index >= 0:
             self.run_controls.modeCombo.setCurrentIndex(index)

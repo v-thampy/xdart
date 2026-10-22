@@ -23,6 +23,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _explain_failed_mask_shape(error: Exception, mask, image_shape) -> None:
+    """Add mask context only after pyFAI has refused the actual integration."""
+    if mask is not None and np.shape(mask) != image_shape:
+        raise ValueError(
+            f"Detector or selected mask shape {np.shape(mask)} does not match "
+            f"image shape {image_shape}. Check that the PONI calibration detector "
+            f"and any selected mask match the image dimensions. pyFAI: {error}"
+        ) from error
+
+
 def integrate_1d(
     image: np.ndarray,
     ai: AzimuthalIntegrator,
@@ -93,17 +103,21 @@ def integrate_1d(
             raise ValueError("a bound detector mask requires mask=None")
     else:
         mask = mask_with_detector(ai, mask)
-    result = ai.integrate1d(
-        image,
-        npt,
-        unit=unit,
-        method=method,
-        mask=mask,
-        radial_range=radial_range,
-        azimuth_range=azimuth_range,
-        error_model=error_model,
-        **extra,
-    )
+    try:
+        result = ai.integrate1d(
+            image,
+            npt,
+            unit=unit,
+            method=method,
+            mask=mask,
+            radial_range=radial_range,
+            azimuth_range=azimuth_range,
+            error_model=error_model,
+            **extra,
+        )
+    except (AssertionError, ValueError, RuntimeError) as error:
+        _explain_failed_mask_shape(error, mask, image.shape)
+        raise
     sigma = result.sigma if result.sigma is not None else None
     unit_str = str(result.unit) if result.unit is not None else unit
     return IntegrationResult1D(
@@ -264,18 +278,22 @@ def integrate_2d(
             raise ValueError("a bound detector mask requires mask=None")
     else:
         mask = mask_with_detector(ai, mask)
-    result = ai.integrate2d(
-        image,
-        npt_rad,
-        npt_azim,
-        unit=unit,
-        method=method,
-        mask=mask,
-        radial_range=radial_range,
-        azimuth_range=azimuth_range,
-        error_model=error_model,
-        **extra,
-    )
+    try:
+        result = ai.integrate2d(
+            image,
+            npt_rad,
+            npt_azim,
+            unit=unit,
+            method=method,
+            mask=mask,
+            radial_range=radial_range,
+            azimuth_range=azimuth_range,
+            error_model=error_model,
+            **extra,
+        )
+    except (AssertionError, ValueError, RuntimeError) as error:
+        _explain_failed_mask_shape(error, mask, image.shape)
+        raise
     # pyFAI intensity shape is (npt_azim, npt_rad); transpose to (npt_rad, npt_azim).
     # NaN-mask empty (count==0) bins BEFORE the transpose (arr must match
     # result.count's pyFAI orientation) so the q-chi->1D projection and the 2D

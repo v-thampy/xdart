@@ -88,11 +88,11 @@ def test_project_fiber_resets_engines_without_eager_global_gc(
 ):
     """Geometry changes stay exact but never serialize workers through GC."""
 
-    from pyFAI.integrator import common as pyfai_common
+    import gc
 
     collections = []
     monkeypatch.setattr(
-        pyfai_common.gc,
+        gc,
         "collect",
         lambda: collections.append("collected"),
     )

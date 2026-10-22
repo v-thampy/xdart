@@ -16,6 +16,7 @@ from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources.descriptor import ContainerDescriptor
 from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.selection import DirectorySourceSpec
+from xrd_tools.sources.point_images import PointImageDetection
 
 from .events import (
     CleanupStatus,
@@ -196,110 +197,7 @@ class AdmittedOutput:
                 and tuple(value[0] for value in bindings) == tuple(sorted(set(value[0] for value in bindings)))):
             raise TypeError("admitted output is invalid")
 
-@dataclass(frozen=True, slots=True)
-class AcceptedScientificAssets:
-    poni_values: tuple[float, float, float, float, float, float, float, str] | None
-    mask_dtype: str | None
-    mask_shape: tuple[int, ...] | None
-    mask_bytes: bytes | None
-    poni_sha256: str | None
-    mask_sha256: str | None
-    poni_detector_config_json: str | None = None
-    poni_parallax: bool | None = None
-
-    def __post_init__(self) -> None:
-        values = self.poni_values
-        if values is not None and not (
-                type(values) is tuple and len(values) == 8
-                and all(type(value) is float and math.isfinite(value) for value in values[:7])
-                and values[0] > 0 and values[6] >= 0 and type(values[7]) is str):
-            raise TypeError("accepted PONI is invalid")
-        parts = self.mask_dtype, self.mask_shape, self.mask_bytes
-        if any(value is not None for value in parts) and not (
-                type(self.mask_dtype) is str and type(self.mask_shape) is tuple
-                and all(type(value) is int and value >= 0 for value in self.mask_shape)
-                and type(self.mask_bytes) is bytes):
-            raise TypeError("accepted detector mask is invalid")
-        if not all(value is None or type(value) is str
-                   for value in (self.poni_sha256, self.mask_sha256)):
-            raise TypeError("accepted scientific assets are invalid")
-        config_text = self.poni_detector_config_json
-        if (values is None) != (config_text is None):
-            raise TypeError("accepted PONI and detector config must be paired")
-        if self.poni_parallax is not None and type(self.poni_parallax) is not bool:
-            raise TypeError("accepted PONI parallax is invalid")
-        if values is None and self.poni_parallax is not None:
-            raise TypeError("accepted PONI parallax has no calibration")
-        if config_text is not None:
-            try:
-                config = json.loads(config_text)
-                canonical = json.dumps(
-                    config, sort_keys=True, separators=(",", ":"), allow_nan=False,
-                )
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise TypeError("accepted detector config is invalid") from exc
-            orientation = config.get("orientation") if type(config) is dict else None
-            if (canonical != config_text or type(orientation) is not int
-                    or orientation not in range(1, 5)):
-                raise TypeError("accepted detector config is not canonical")
-            sensor = config.get("sensor")
-            if self.poni_parallax is None:
-                if sensor is not None:
-                    raise TypeError("legacy accepted PONI cannot contain a sensor")
-            else:
-                try:
-                    from xrd_tools.integrate.calibration import (
-                        validate_sensor_parallax,
-                    )
-                    validate_sensor_parallax(
-                        sensor.get("material") if type(sensor) is dict else None,
-                        sensor.get("thickness") if type(sensor) is dict else None,
-                        self.poni_parallax,
-                        wavelength_m=values[6],
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise TypeError(
-                        "accepted PONI sensor/parallax is invalid"
-                    ) from exc
-
-    @property
-    def poni(self) -> object | None:
-        from xrd_tools.core.containers import PONI
-        return None if self.poni_values is None else PONI(*self.poni_values)
-
-    @property
-    def detector_calibration(self) -> object | None:
-        if self.poni_values is None:
-            return None
-        from xrd_tools.integrate.calibration import (
-            detector_calibration_from_projection,
-        )
-
-        projection = dict(self.poni.to_dict())
-        config = json.loads(self.poni_detector_config_json)
-        if self.poni_parallax is not None:
-            projection["detector_config"] = config
-            projection["parallax"] = self.poni_parallax
-        return detector_calibration_from_projection(
-            projection,
-            detector_config=config,
-        )
-
-    @property
-    def poni_projection(self) -> dict[str, object] | None:
-        if self.poni_values is None:
-            return None
-        from xrd_tools.integrate.calibration import (
-            detector_calibration_projection,
-        )
-        return detector_calibration_projection(self.detector_calibration)
-
-    @property
-    def mask(self) -> np.ndarray | None:
-        return None if self.mask_bytes is None else np.frombuffer(
-            self.mask_bytes, dtype=np.dtype(self.mask_dtype)).reshape(
-                self.mask_shape).copy()
-
+from xrd_tools.session.scientific_assets import AcceptedScientificAssets
 def _copy_source(value: SourceSelection) -> SourceSelection:
     if type(value) is SourceSpec:
         return SourceSpec(
@@ -361,10 +259,12 @@ class AdmissionFailure:
     token: AdmissionToken
     reason: str
     append_refused: bool = False
+    point_images: PointImageDetection | None = None
 
     def __post_init__(self) -> None:
         if (type(self.token) is not AdmissionToken or type(self.reason) is not str
-                or type(self.append_refused) is not bool):
+                or type(self.append_refused) is not bool
+                or (self.point_images is not None and type(self.point_images) is not PointImageDetection)):
             raise TypeError("admission failure values are invalid")
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +303,9 @@ class AdmissionReceipt:
     deferred_directory: object | None = None
     directory_discovered_file_count: int = 0
     directory_discovered_paths: tuple[Path, ...] = ()
+    #: The resolved automatic ceiling admission bound into the candidate
+    #: (decision 39); the run's own freeze takes the same value.
+    saturation: int | None = None
 
     def __post_init__(self) -> None:
         from .output_preflight import (
@@ -437,6 +340,11 @@ class AdmissionReceipt:
                  == len(self.directory_discovered_paths)
                  and (choices is None or type(choices) is tuple
                       and all(type(value) is str for value in choices))
+                 and (self.saturation is None or type(self.saturation) is int
+                      and self.saturation > 0)
+                 and self.saturation == (
+                     None if self.candidate._configuration is None
+                     else self.candidate._configuration.threshold.saturation)
                  and type(self.display_retirement)
                  is DisplayRetirementReceipt
                  and self.display_retirement.cleanup_status
@@ -514,7 +422,10 @@ class SourceObservation:
     candidate_fingerprint: str = ""
     one_level_file_count: int | None = None
     file_count_scope: SourceCountScope = SourceCountScope.DIRECT_ONLY
-    default_threshold_max: float | None = None
+    #: The selected input's native data type and the detector saturation it
+    #: records (decision 39): header facts for the automatic ceiling's hint.
+    raw_dtype: str | None = None
+    recorded_saturation: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.observation_id) is not int or self.observation_id <= 0:
@@ -525,12 +436,12 @@ class SourceObservation:
             raise TypeError("status must be SourceObservationStatus")
         if type(self.file_count_scope) is not SourceCountScope:
             raise TypeError("file_count_scope must be SourceCountScope")
-        if self.default_threshold_max is not None and (
-            type(self.default_threshold_max) not in (float, int)
-            or not math.isfinite(self.default_threshold_max)
-            or self.default_threshold_max < 0
+        if self.raw_dtype is not None and type(self.raw_dtype) is not str:
+            raise TypeError("observed raw dtype must be a string")
+        if self.recorded_saturation is not None and (
+            type(self.recorded_saturation) is not int or self.recorded_saturation <= 0
         ):
-            raise ValueError("default threshold maximum must be finite and non-negative")
+            raise ValueError("observed saturation must be a positive whole count")
         for value in (self.exists, self.is_directory, self.subdirectories_deferred):
             if type(value) is not bool:
                 raise TypeError("observation flags must be booleans")

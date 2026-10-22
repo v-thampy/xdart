@@ -51,8 +51,9 @@ from xrd_tools.io.analysis_artifact import (
 )
 from xrd_tools.io.output_transaction import StreamTerminal, TargetChanged
 from xrd_tools.io.output_transaction import OutputTransactionCoordinator
-from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from xrd_tools.io.nexus import write_rsm, write_stitched
+from xrd_tools.core.containers import IntegrationResult1D
+from xrd_tools.io.nexus import write_rsm
+from xrd_tools.io.stitch_record import StitchedPattern, write_stitch_record
 from xrd_tools.rsm.volume import RSMVolume
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
 from xrd_tools.sources.selection import image_series_spec
@@ -301,6 +302,18 @@ def _rsm_attestation(
             "restore_passed": True,
         },
     }
+
+
+def _write_stitched_record(entry, target, projection=None):
+    """A Stitch 1D test result, written as the stitched Int record the owner admits."""
+    if projection is None:
+        pattern = StitchedPattern(np.linspace(0.1, 1.0, 8), "q_A^-1", np.linspace(2.0, 3.0, 8), None,
+                                  np.ones(8), np.ones(8))
+    else:
+        ((_name, axis),), ((_axis, unit),) = projection.axes, projection.axis_units
+        pattern = StitchedPattern(axis, unit, projection.intensity, projection.sigma, projection.coverage,
+                                  projection.normalization)
+    write_stitch_record(entry, target, pattern)
 
 
 def test_public_canonical_fingerprint_is_type_framed_and_domain_separated():
@@ -854,12 +867,7 @@ def test_module_artifact_admission_and_commit_keep_exact_request(tmp_path):
         unit="q_A^-1",
     )
     result = output.publish(
-        lambda entry: write_stitched(
-            entry,
-            stitched_1d=value,
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        ),
+        lambda entry: _write_stitched_record(entry, request.output.target),
     )
     assert result.disposition is ModuleDisposition.COMMITTED
     assert result.request is request
@@ -908,12 +916,7 @@ def test_module_neutral_stitch_commit_binds_separate_attestation_and_same_reques
         coordinator=OutputTransactionCoordinator(),
     )
     result = output.publish(
-        lambda entry: write_stitched(
-            entry,
-            result_projection=projection,
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        lambda entry: _write_stitched_record(entry, request.output.target, projection)
     )
     assert result.disposition is ModuleDisposition.COMMITTED
     assert result.request is request
@@ -1010,7 +1013,7 @@ def test_rsm_v2_module_commit_binds_group_and_exact_attestation(
     monkeypatch,
 ):
     from tests.core.test_rsm_operation_r2 import _form, _write_member
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
     import xrd_tools.analysis.rsm_operation as rsm_operation
 
     monkeypatch.setattr(
@@ -1280,7 +1283,7 @@ def test_rsm_v2_mask_facts_require_the_factory_execution_receipts(
     monkeypatch,
 ):
     from tests.core.test_rsm_operation_r2 import _form, _write_member
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
     import xrd_tools.analysis.rsm_operation as rsm_operation
     from xrd_tools.analysis.rsm_operation import RSMImageConditioning
 
@@ -1374,7 +1377,7 @@ def test_rsm_v2_factory_owner_refuses_retagged_nested_provenance(
     monkeypatch,
 ):
     from tests.core.test_rsm_operation_r2 import _form, _write_member
-    from xdart.gui.tools.rsm_values import prepare_rsm_tool_v2
+    from xrd_tools.analysis.rsm_values import prepare_rsm_tool_v2
     import xrd_tools.analysis.rsm_operation as rsm_operation
 
     monkeypatch.setattr(
@@ -1497,12 +1500,7 @@ def test_candidate_cleanup_warning_keeps_primary_outcome_and_names_orphan(tmp_pa
     def writer(entry):
         if outcome == "writer":
             raise ValueError("primary writer failure")
-        write_stitched(
-            entry, stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8), unit="q_A^-1",
-            ), provenance=bound.provenance_json, bounded_artifact=True,
-        )
+        _write_stitched_record(entry, request.output.target)
         if outcome == "cancel":
             cancel.set()
 
@@ -1550,16 +1548,7 @@ def test_module_commit_receipt_is_built_before_lower_lease_release(
         classmethod(inspect_before_release),
     )
     result = output.publish(
-        lambda entry: write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        lambda entry: _write_stitched_record(entry, request.output.target)
     )
     assert result.disposition is ModuleDisposition.COMMITTED
     assert observed == [True]
@@ -1569,11 +1558,11 @@ def test_module_commit_receipt_is_built_before_lower_lease_release(
 @pytest.mark.parametrize(
     ("module_kind", "artifact_kind"),
     (
-        (ModuleKind.STITCH, AnalysisArtifactKind.STITCH_2D),
+        (ModuleKind.STITCH, AnalysisArtifactKind.STITCH_1D),
         (ModuleKind.RSM, AnalysisArtifactKind.RSM),
     ),
 )
-def test_shared_module_commit_covers_stitch_2d_and_rsm(
+def test_shared_module_commit_covers_stitch_and_rsm(
     tmp_path,
     module_kind,
     artifact_kind,
@@ -1586,21 +1575,8 @@ def test_shared_module_commit_covers_stitch_2d_and_rsm(
         provenance,
         coordinator=OutputTransactionCoordinator(),
     )
-    if artifact_kind is AnalysisArtifactKind.STITCH_2D:
-        value = IntegrationResult2D(
-            radial=np.linspace(0.1, 1.0, 8),
-            azimuthal=np.linspace(-5.0, 5.0, 4),
-            intensity=np.arange(32, dtype=float).reshape(8, 4),
-            sigma=np.full((8, 4), 0.25),
-            unit="q_A^-1",
-            azimuthal_unit="chi_deg",
-        )
-        writer = lambda entry: write_stitched(
-            entry,
-            stitched_2d=value,
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+    if artifact_kind is AnalysisArtifactKind.STITCH_1D:  # a Stitch result is an Int record
+        writer = lambda entry: _write_stitched_record(entry, request.output.target)
     else:
         volume = RSMVolume(
             h=np.linspace(-1.0, 1.0, 3),
@@ -1638,16 +1614,7 @@ def test_invalid_writer_does_not_consume_module_publication(tmp_path):
     assert output.snapshot.slot_held and not output.snapshot.writer_started
     assert output.snapshot.writer_started is False
     result = output.publish(
-        lambda entry: write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        lambda entry: _write_stitched_record(entry, request.output.target)
     )
     assert result.disposition is ModuleDisposition.COMMITTED
 
@@ -1708,16 +1675,7 @@ def test_module_prepublish_check_runs_after_writer_and_can_refuse_commit(tmp_pat
 
     def write(entry):
         order.append("writer")
-        write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        _write_stitched_record(entry, request.output.target)
 
     def refuse():
         order.append("prepublish")
@@ -1784,16 +1742,7 @@ def test_prepublish_check_cannot_impersonate_module_control_outcome(
     exception_type = getattr(module_api, control_exception)
 
     def write(entry):
-        write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        _write_stitched_record(entry, request.output.target)
 
     def impersonate():
         raise exception_type("FORGED_REFUSAL")
@@ -1831,16 +1780,7 @@ def test_prepublish_check_rejects_malformed_or_subclass_refusal(
     )
 
     def write(entry):
-        write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        _write_stitched_record(entry, request.output.target)
 
     if hostile_kind == "malformed":
         refusal = ModuleArtifactRefused("VALID_AT_CONSTRUCTION")
@@ -1874,16 +1814,7 @@ def test_module_commit_revalidates_the_factory_artifact(tmp_path):
         bound,
         coordinator=OutputTransactionCoordinator(),
     ).publish(
-        lambda entry: write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        lambda entry: _write_stitched_record(entry, request.output.target)
     )
     target = Path(request.output.target)
     payload = target.read_bytes()
@@ -1900,16 +1831,7 @@ def test_module_commit_refuses_byte_identical_replacement_inode(tmp_path):
         bound,
         coordinator=OutputTransactionCoordinator(),
     ).publish(
-        lambda entry: write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        lambda entry: _write_stitched_record(entry, request.output.target)
     )
     target = Path(request.output.target)
     state = target.stat()
@@ -1937,16 +1859,7 @@ def test_module_commit_refuses_genuine_artifact_with_foreign_provenance(tmp_path
         foreign,
         coordinator=OutputTransactionCoordinator(),
     ).publish(
-        lambda entry: write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=foreign.provenance_json,
-            bounded_artifact=True,
-        )
+        lambda entry: _write_stitched_record(entry, request.output.target)
     )
     with pytest.raises(TypeError, match="exact module request"):
         ModuleCommitReceipt.from_artifact(request, artifact)
@@ -2018,16 +1931,7 @@ def test_repeated_module_postcommit_readback_retry_does_not_replay_writer(
 
     def write_once(entry):
         writes.append("writer")
-        write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        _write_stitched_record(entry, request.output.target)
 
     monkeypatch.setattr(module_api, "inspect_analysis_artifact", fail_module_readback_twice)
     with pytest.raises(AnalysisArtifactCleanupPending):
@@ -2136,12 +2040,7 @@ def test_stale_source_refuses_before_output_and_drift_rolls_back_candidate(tmp_p
     )
 
     def write_then_drift(entry):
-        write_stitched(
-            entry,
-            stitched_1d=value,
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        _write_stitched_record(entry, request.output.target)
         state = fresh_source.stat()
         raw = fresh_source.read_bytes()
         fresh_source.write_bytes(raw[:-1] + bytes((raw[-1] ^ 1,)))
@@ -2188,16 +2087,7 @@ def test_foreign_completed_source_requalification_refuses_after_writer(
 
     def write_once(entry):
         writes.append("writer")
-        write_stitched(
-            entry,
-            stitched_1d=IntegrationResult1D(
-                radial=np.linspace(0.1, 1.0, 8),
-                intensity=np.linspace(2.0, 3.0, 8),
-                unit="q_A^-1",
-            ),
-            provenance=bound.provenance_json,
-            bounded_artifact=True,
-        )
+        _write_stitched_record(entry, request.output.target)
 
     result = output.publish(write_once)
     assert result.disposition is ModuleDisposition.REFUSED
@@ -2219,3 +2109,18 @@ def test_mismatched_provenance_is_refused_before_output_admission(tmp_path):
         )
     assert raised.value.code == "PROVENANCE_MISMATCH"
     assert not Path(request.output.target).exists()
+
+
+def test_an_rsm_family_names_its_stable_slot_also_where_paths_fold_case(tmp_path, monkeypatch):
+    """AUD-9 stage 2: an RSM output carries the family of its stable slot ``<family>_rsm.nexus``, as Stitch's
+    outputs carry theirs. Windows folds a target's case and not the family's: the slot is compared folded."""
+    output = ModuleOutputRequest(
+        tmp_path / "STO_43_rsm.nexus", AnalysisArtifactKind.RSM, AnalysisArtifactOverwrite.REPLACE, "STO_43")
+    assert output.artifact_family == "STO_43"
+    with pytest.raises(ValueError, match="stable slot"):
+        ModuleOutputRequest(
+            tmp_path / "STO_43.nexus", AnalysisArtifactKind.RSM, AnalysisArtifactOverwrite.REPLACE, "STO_43")
+    monkeypatch.setattr(os.path, "normcase", str.lower)  # as ntpath.normcase folds
+    folded = ModuleOutputRequest(
+        tmp_path / "STO_43_rsm.nexus", AnalysisArtifactKind.RSM, AnalysisArtifactOverwrite.REPLACE, "STO_43")
+    assert folded.target == str(tmp_path / "STO_43_rsm.nexus").lower()

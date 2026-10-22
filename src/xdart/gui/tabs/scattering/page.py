@@ -5,11 +5,9 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 import logging
-import math
 import os
 from pathlib import Path
 import stat
-import tempfile
 import time
 from typing import Any, Callable
 import weakref
@@ -49,14 +47,16 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.io.viewer_2d import Viewer2DArtifactCatalog, _stable_revision
 from .results_notebook import results_notebook_text
-from xrd_tools.session.readiness import Tool, tool_from_mode_text
+from xrd_tools.session.readiness import EnergyScanRefused, Tool, tool_from_mode_text
 from xrd_tools.session.display_logic import xye_prefix_for_unit
 from xrd_tools.sources.selection import (
     DirectorySourceSpec,
     is_single_image_spec,
 )
 from xdart.utils.browse import browse_start_dir, remember_browse_path
+from xdart.gui.widgets.file_dialogs import MASK_FILTER, PONI_FILTER
 from .advanced_editor import AdvancedSettingsDialog
+from .point_images_editor import PointImagesSettings
 from .adapters.browse_loader import BrowseLoader
 from .adapters.external_operation import OperationSlot
 from .batch_terminal_presentation import (
@@ -130,7 +130,7 @@ from .controls_readiness import (
     SectionHeaderProjection,
 )
 from .coordinator import ScatteringCoordinator
-from .detector_projection import detector_summary
+from .detector_projection import detector_calibration_ready, detector_summary, poni_detector
 from .display_values import (
     DisplayFrameKey,
     StandardDisplayPayload,
@@ -172,10 +172,11 @@ from .scientific_axes import (
     native_1d_plot_axis,
     resolve_gi_display_axes,
     resolve_norm_presentation,
-    slice_recipe_axes_compatible,
-    slice_region_orientation,
+    shown_slice_pin,
+    slice_pins_for_plot_axis as _slice_pins_for_plot_axis,
 )
 from .scientific_plot_options import waterfall_should_be_active
+from .scientific_preferences import scientific_preference_updates
 from .shell_values import (
     ArtifactProgress,
     DirectoryFileProgress,
@@ -184,7 +185,6 @@ from .shell_values import (
     ProgressProjection,
     ShellCommand,
     ShellCommandKind,
-    SlicePin,
 )
 from .shell_widgets import (
     experiment_header_projection,
@@ -329,23 +329,6 @@ def _drop_nexus_only_performance_options(intent: object) -> None:
         raise TypeError("run options must be one mutable mapping")
     for key in _NEXUS_ONLY_PERFORMANCE_KEYS:
         run_options.pop(key, None)
-
-
-def _slice_pins_for_plot_axis(
-    pins: tuple[SlicePin, ...],
-    prior_axis: str,
-    requested_axis: str,
-) -> tuple[SlicePin, ...]:
-    """Retarget compatible slice recipes and retire incompatible ones."""
-
-    if requested_axis == prior_axis:
-        return pins
-    if not slice_recipe_axes_compatible(prior_axis, requested_axis):
-        return ()
-    return tuple(
-        replace(pin, plot_axis=requested_axis)
-        for pin in pins
-    )
 
 
 def _linearized_frame_selection(navigation, command: ShellCommand):
@@ -537,6 +520,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     sourceSelectionRequested = QtCore.Signal(object)
     browseRequested = QtCore.Signal(object)
     toolRequested = QtCore.Signal(str)
+    #: (page key, processing mode): open that page in that mode (Stitch 1D or 2D on the Stitch page)
+    modeRequested = QtCore.Signal(str, str)
     noticeChanged = QtCore.Signal(str)
     _observationFinished = QtCore.Signal(object)
     _browserCatalogFinished = QtCore.Signal(object)
@@ -658,6 +643,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else self._choose_results_notebook_dialog
         )
         self._advanced_dialog: AdvancedSettingsDialog | None = None
+        self.point_images = PointImagesSettings(self)
+        self.point_images.restore_intent(intents.snapshot().thaw())
+        # Decoded dark/flat images for the open Advanced dialog's checks.
+        self._correction_inspections: dict = {}
         self._advanced_settings_editor = (
             advanced_settings_editor
             if advanced_settings_editor is not None
@@ -713,8 +702,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._detector_demand_frame = None
         self._last_scientific_projection = None
         self._rendered_image_axis = self._preferences.image_axis
-        self._detector_summary_key: tuple[str, str] | None = None
         self._detector_summary_text = "not configured"
+        self._poni_detector_name = ""
+        self._poni_ready = False
         self._authoring_dependency_availability: tuple[bool, bool] | None = None
         self._project_readiness_key: tuple[str, str] | None = None
         self._project_readiness = SectionHeaderProjection("")
@@ -724,6 +714,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._artifact_progress: dict[str, ArtifactProgress] = {}
         self._progress = ProgressProjection()
         self._notice_text = ""
+        self._launch_notice_identity: RunIdentity | None = None
+        self._launch_auto_motor: str | None = None
+        self._launch_energy_announced = False
 
         self._context_projection = ContextProjection()
         self._browse_loader = BrowseLoader()
@@ -744,6 +737,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._background_owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
         self._background_identity: OperationIdentity | None = None
         self._metadata_dialog = self._scan_roi_dialog = None
+        self._metadata_plot_dialog = None
         self._peak_dialog = self._phase_dialog = None
         self._scan_roi_generation = 0
         self._peak_generation = self._phase_generation = 0
@@ -759,6 +753,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self._shell = ScatteringWorkspaceShell(self)
         layout.addWidget(self._shell)
+        from xdart.gui.analysis.workflow_export import WorkflowExportActions
+        self._workflow_export_actions = WorkflowExportActions(self, capture=self._capture_workflow_recipe,
+            source_root=lambda: self._intents.snapshot().thaw().project_root, status=self._notice)
+        self._workflow_export_actions.mount_help_menu(self._shell.browser.menus["Help"])
         self._source_status = SourceStatusView(self._shell.controls)
         self._shell.controls.set_source_widget(
             self._source_status,
@@ -808,6 +806,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._poll_browser_catalog,
         )
 
+        self._refresh_poni_fact(initial)
         self._refresh_shell()
         self._request_observation(initial)
         self._request_browser_catalog()
@@ -967,8 +966,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if kind == "roi_preview":
                     if not table.labels: return None
                     from xrd_tools.analysis.scan_operations import RoiPreviewPlan
+                    label = dialog._roi_preview_label
+                    if label not in table.labels: return None
                     return analysis_request_facts(RoiPreviewPlan.from_table(
-                        table, label=table.labels[0]))
+                        table, label=label))
                 picker = dialog._roi_dialog
                 binding = self._roi_preview_binding
                 if (picker is None or binding is None or binding[0] is not table
@@ -1069,8 +1070,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_anchor, self._analysis_fingerprint = anchor, fingerprint
         self._analysis_request = request
         self._ensure_timer()
+        if target == "scan_roi" and self._scan_roi_dialog is not None:
+            self._scan_roi_dialog.set_analysis_busy(kind)
         message = f"Running {kind.replace('_', ' ')}…"
         self._notice(message)
+        if target == "scan_roi" and self._scan_roi_dialog is not None:
+            self._scan_roi_dialog.status.setText(message)
         self._refresh_shell(
             preserve_display=True,
             preserve_scientific=True,
@@ -1242,15 +1247,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if target == "scan_roi":
             self._roi_preview_binding = self._scan_roi_result = None
         elif target == "peak": self._peak_result = None
-        elif target == "phase": self._phase_result = None
+        elif target == "phase":
+            self._phase_result = None
+            # Nothing a CIF still being read returns reaches this Fitter (it deletes on close); the view keeps its
+            # Add CIF… worker until it stops, and the page's close waits for it through the view's.
+            dialog.phase_source.shutdown()
+            self._shell.scientific.retire_phase_worker(dialog.phase_source.add_worker)
 
     def _open_analysis_mount(self, target, *, focus_roi=False):
         field = f"_{target}_dialog"; dialog = getattr(self, field)
         created = dialog is None
         if created:
             if target == "metadata":
-                from .analysis_mount import MetadataResultDialog
+                from .analysis_mount import MetadataResultDialog, open_metadata_plot
                 dialog = MetadataResultDialog(self)
+                dialog.plotRequested.connect(lambda source: open_metadata_plot(self, source))
             elif target == "scan_roi":
                 from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
                 dialog = ScanPlotDialog(parent=self, vnext_submit=self._scan_analysis_action)
@@ -1262,6 +1273,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
             dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
             setattr(self, field, dialog)
+            if target in {"peak", "phase"}:
+                dialog._export_snapshot_provider = lambda t=target: self._fit_export_snapshot(t)
             if target in {"metadata", "scan_roi"}:
                 if self._metadata_operations.open_dialog(target) is None:
                     dialog.close()
@@ -1310,7 +1323,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _scan_analysis_action(self, action, value):
         if action == "close":
             self._analysis_dialog_closed("scan_roi", self._scan_roi_dialog); return
+        if action == "roi_cancel":
+            from .analysis_mount import cancel_owned
+            if self._analysis_kind == "roi_scan":
+                cancel_owned(self._analysis_slot, self._analysis_identity)
+                self._scan_roi_dialog.status.setText("Cancelling ROI computation; waiting for cleanup…")
+            return
         if action == "metadata":
+            from .analysis_mount import cancel_owned
+            self._scan_roi_generation += 1
+            self._roi_preview_binding = self._scan_roi_result = None
+            if self._analysis_target == "scan_roi": cancel_owned(self._analysis_slot, self._analysis_identity)
+            if self._scan_roi_dialog is not None: self._scan_roi_dialog.clear_vnext_metadata()
             from .analysis_mount import analysis_request_facts, metadata_plan_from_syntax
             plan = metadata_plan_from_syntax(value)
             if plan is not None:
@@ -1328,11 +1352,45 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._begin_analysis("scan_plot", plan, self._scan_roi_generation,
                 target="scan_roi", request=request, table=table, roi=roi); return
         if action == "roi_preview" and value is not None and value.labels:
-            from .analysis_mount import analysis_request_facts
-            from xrd_tools.analysis.scan_operations import RoiPreviewPlan
-            plan = RoiPreviewPlan.from_table(value, label=value.labels[0])
-            self._begin_analysis("roi_preview", plan, self._scan_roi_generation,
-                target="scan_roi", request=analysis_request_facts(plan))
+            dialog = self._scan_roi_dialog
+            if dialog is None or value is not dialog._vnext_table_result: return
+            dialog._roi_preview_label = value.labels[0]
+            dialog._roi_preview_waiting = True
+            self._dispatch_roi_preview()
+
+    def _request_roi_preview_frame(self, table, picker, label):
+        dialog = self._scan_roi_dialog
+        if (dialog is None or dialog._vnext_table_result is not table
+                or dialog._roi_dialog is not picker or label not in table.labels): return
+        if self._analysis_identity is not None and self._analysis_kind not in {"roi_preview", "scan_plot"}:
+            picker.set_preview_pending(message="ROI computation is running; wait before selecting another frame.")
+            return
+        dialog._roi_preview_label = label
+        dialog._roi_preview_waiting = True
+        picker.set_preview_pending(label)
+        if self._analysis_identity is not None and self._analysis_kind == "roi_preview":
+            from .analysis_mount import cancel_owned
+            cancel_owned(self._analysis_slot, self._analysis_identity)
+        self._dispatch_roi_preview()
+        self._ensure_timer()
+
+    def _dispatch_roi_preview(self):
+        dialog = self._scan_roi_dialog
+        if (dialog is None or not dialog._roi_preview_waiting
+                or self._closing or self._closed or self._analysis_identity is not None): return
+        table, label = dialog._vnext_table_result, dialog._roi_preview_label
+        if table is None or label not in table.labels: return
+        picker, binding = dialog._roi_dialog, self._roi_preview_binding
+        if (picker is not None and binding is not None and binding[0] is table
+                and binding[-1] is picker and binding[4] == label):
+            dialog._roi_preview_waiting = False
+            picker.set_preview_pending()
+            return
+        from .analysis_mount import analysis_request_facts
+        from xrd_tools.analysis.scan_operations import RoiPreviewPlan
+        plan = RoiPreviewPlan.from_table(table, label=label)
+        self._begin_analysis("roi_preview", plan, self._scan_roi_generation,
+            target="scan_roi", request=analysis_request_facts(plan))
 
     def _refresh_fit_trace(self, kind):
         trace, _anchor = self._capture_analysis_trace(kind)
@@ -1340,6 +1398,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if trace is None or dialog is None:
             self._notice("Select one displayed 1-D trace first."); return None
         dialog.set_vnext_trace(trace); return trace
+
+    def _fit_export_snapshot(self, kind):
+        """Detach the current displayed trace and controls, never an earlier fit's input."""
+        trace, anchor = self._capture_analysis_trace(kind)
+        dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
+        if trace is None or anchor is None or dialog is None:
+            return None
+        from .analysis_mount import phase_wavelength_angstrom
+        from xdart.gui.analysis.fit_export import snapshot_from_trace, plain_settings
+        return snapshot_from_trace(trace,
+            wavelength=phase_wavelength_angstrom(self._context_controller, anchor.frame),
+            settings=plain_settings(dialog.vnext_fit_values()))
 
     def _peak_analysis_action(self, action, values):
         if action == "close":
@@ -1373,6 +1443,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _roi_analysis_signals(self, table, picker, signals):
         binding = self._roi_preview_binding
         if (not signals or self._scan_roi_dialog is None
+                or self._scan_roi_dialog._roi_preview_waiting
                 or self._scan_roi_dialog._vnext_table_result is not table
                 or self._scan_roi_dialog._roi_dialog is not picker
                 or binding is None or binding[0] is not table
@@ -1539,6 +1610,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     f"{update.progress.completed}/{update.progress.total}"
                 )
                 self._notice(message)
+                if self._analysis_target == "scan_roi" and self._scan_roi_dialog is not None:
+                    self._scan_roi_dialog.status.setText(message)
             return WorkspaceRefreshEffect.FULL
 
         kind, target = self._analysis_kind, self._analysis_target
@@ -1572,7 +1645,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_generation = self._analysis_anchor = None
         self._analysis_request = None
         self._analysis_fingerprint = ""
+        if target == "scan_roi" and self._scan_roi_dialog is not None:
+            self._scan_roi_dialog.set_analysis_busy()
         if payload is None:
+            if target == "scan_roi" and self._scan_roi_dialog is not None:
+                self._scan_roi_dialog.status.setText(diagnostic)
+                terminal_payload = None if update.terminal is None else update.terminal.payload
+                details = tuple(getattr(terminal_payload, "diagnostics", ())) if current and not update.stale else ()
+                self._scan_roi_dialog.set_help_diagnostic(diagnostic, details)
+            if kind == "roi_preview" and current and self._scan_roi_dialog is not None:
+                dialog = self._scan_roi_dialog
+                dialog._roi_preview_waiting = False
+                picker = dialog._roi_dialog
+                dialog._roi_preview_label = None if picker is None else picker._frame_label
+                if picker is not None: picker.set_preview_pending(message=diagnostic)
+                dialog.refresh_roi_cursor("raw preview unavailable: " + diagnostic)
             self._notice(diagnostic)
             return WorkspaceRefreshEffect.FULL
 
@@ -1587,33 +1674,54 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if kind in {"scan_plot", "roi_preview", "roi_scan"}
             else kind
         )
+        dialog = self._scan_roi_dialog
+        if dialog is not None:
+            retained.pop("scan_roi")
+            retained.update(scan_plot=dialog._vnext_scan_result, roi_scan=dialog._vnext_roi_result,
+                            roi_preview=dialog._vnext_preview_result)
+            if replacing == "scan_roi": replacing = kind
         admitted, reason = retention_admission(retained, replacing, payload)
         if not admitted:
+            if target == "scan_roi" and self._scan_roi_dialog is not None:
+                self._scan_roi_dialog.status.setText(reason)
+                self._scan_roi_dialog.set_help_diagnostic(reason)
+            if kind == "roi_preview" and self._scan_roi_dialog is not None:
+                self._scan_roi_dialog._roi_preview_waiting = False
+                picker = self._scan_roi_dialog._roi_dialog
+                if picker is not None: picker.set_preview_pending(message=reason)
             self._notice(reason)
             return WorkspaceRefreshEffect.FULL
-        if kind in {"scan_plot", "roi_preview", "roi_scan"}:
-            self._roi_preview_binding = None
-            if self._scan_roi_dialog is not None:
-                self._scan_roi_dialog._retire_vnext_result()
+        if kind == "roi_preview" and self._scan_roi_dialog is not None:
+            picker = self._scan_roi_dialog._roi_dialog
+            if picker is not None and not picker.adopt_preview(payload.image, payload.label):
+                self._scan_roi_dialog._roi_preview_waiting = False
+                self._scan_roi_dialog._roi_preview_label = picker._frame_label
+                return WorkspaceRefreshEffect.FULL
         if kind == "scan_plot":
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None: self._scan_roi_dialog.set_vnext_scan_result(payload, request[2])
         elif kind == "roi_preview":
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None and payload.image is not None:
-                from xdart.gui.analysis.roi_select_dialog import RoiSelectDialog
-                old = self._scan_roi_dialog._roi_dialog
-                if old is not None: old.close(); old.deleteLater()
+                self._scan_roi_dialog._vnext_preview_result = payload
+                self._scan_roi_dialog.set_help_diagnostic(payload.code, payload.diagnostics)
                 table = self._scan_roi_dialog._vnext_table_result
-                picker = RoiSelectDialog(payload.image, parent=self._scan_roi_dialog)
-                picker.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
-                self._scan_roi_dialog._roi_dialog = picker
+                created = self._scan_roi_dialog._roi_dialog is None
+                picker = self._scan_roi_dialog.mount_roi_view(payload)
+                picker._frame_labels = tuple(payload.labels)
+                picker.set_preview_pending()
+                if created:
+                    picker.sigCompute.connect(lambda signals, p=picker:
+                        self._roi_analysis_signals(self._scan_roi_dialog._vnext_table_result, p, signals))
+                    picker.sigPreviewFrame.connect(lambda label, p=picker:
+                        self._request_roi_preview_frame(self._scan_roi_dialog._vnext_table_result, p, label))
+                self._scan_roi_dialog._roi_preview_label = payload.label
+                self._scan_roi_dialog._roi_preview_waiting = False
                 self._roi_preview_binding = (table, payload.receipt,
                     payload.table_fingerprint, payload.result_fingerprint,
                     payload.label, tuple(payload.labels), picker)
-                picker.sigCompute.connect(lambda signals, t=table, p=picker:
-                                          self._roi_analysis_signals(t, p, signals))
-                picker.show(); picker.raise_(); picker.activateWindow()
+                picker.show()
+                self._scan_roi_dialog.refresh_roi_cursor()
         elif kind == "roi_scan":
             self._scan_roi_result = payload
             if self._scan_roi_dialog is not None:
@@ -1823,9 +1931,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._apply_authored_asset_transition(transition)
         self._notice(f"Making {os.path.basename(request.final_path)}…")
 
-    def _authoring_error(self, title: str, detail: str) -> None:
-        _LOG.warning("%s: %s", title, detail)
-        self._notice(f"{title}: {detail}")
+    def _open_warning(self, title: str, detail: str) -> None:
+        """The page's warning notification: a window-modal box with *title* as its text, *detail* below it."""
         if self._closing or self._closed:
             return
         dialog = QtWidgets.QMessageBox(
@@ -1835,6 +1942,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         dialog.setInformativeText(detail)
         dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dialog.open()
+
+    def _authoring_error(self, title: str, detail: str) -> None:
+        _LOG.warning("%s: %s", title, detail)
+        self._notice(f"{title}: {detail}")
+        if self._closing or self._closed:
+            return
+        self._open_warning(title, detail)
         self._refresh_shell(preserve_display=True, preserve_scientific=True)
 
     def _apply_authored_asset_transition(
@@ -2027,9 +2141,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                             "Choose existing PONI" if asset == "poni"
                             else "Choose existing detector mask",
                             directory,
-                            "PONI files (*.poni);;All files (*)"
-                            if asset == "poni" else
-                            "Detector masks (*.edf *.npy)",
+                            PONI_FILTER if asset == "poni" else MASK_FILTER,
                         )[0])
         except Exception as error:
             self._error_notice("Asset chooser failed", error); return
@@ -2651,6 +2763,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or tool_from_mode_text(intent.processing_mode)
                 not in {Tool.INT_1D, Tool.INT_2D}):
             self._notice("Average requires one finite image source, Overwrite NeXus output, non-Live execution, an integration mode, and an idle workspace."); self._refresh_shell(); return
+        self._refresh_poni_fact(snapshot)
+        if not self._poni_ready:
+            self._refresh_shell()
+            return
         try:
             from pathlib import Path
             from .output_preflight import _resolved_generated_target
@@ -2747,7 +2863,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             self._metadata_operations.begin_close()
             self._processed_browser.retire_terminal(force=True)
-            for dialog in (self._metadata_dialog, self._scan_roi_dialog,
+            for dialog in (self._metadata_dialog, self._metadata_plot_dialog, self._scan_roi_dialog,
                            self._peak_dialog, self._phase_dialog):
                 if dialog is not None: dialog.close()
             ScatteringWorkspace._clear_presentation_targets(self)
@@ -2865,7 +2981,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         except Exception:
             analysis_clean = False
 
-        if (not self._release_browse_1d_debt()
+        from xdart.gui.pages.values import PageCleanup
+        phase_close = self._shell.scientific.shutdown_phase_overlays()
+        if (phase_close.status is not PageCleanup.CLEAN
+                or not self._release_browse_1d_debt()
                 or not self._clear_viewer_1d_renderer(close=True)
                 or not self._clear_viewer_2d_renderer(close=True)
                 or not self._shell.scientific.clear_workspace()):
@@ -3087,6 +3206,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             )
             return
+        if kind is ShellCommandKind.LAUNCH_TOOL and command.value == "reference_phases":
+            self._shell.scientific.show_reference_phases()  # a view-owned window, not an analysis mount
+            return
         if kind in {ShellCommandKind.SHOW_METADATA, ShellCommandKind.LAUNCH_TOOL,
                     ShellCommandKind.ANALYSIS_ACTION}:
             from .analysis_mount import mount_target
@@ -3161,6 +3283,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if kind is ShellCommandKind.RUN_ACTION:
             self._run_action()
+            return
+        if kind is ShellCommandKind.PAGE_TOOL and command.value == "export-run":
+            self._workflow_export_actions.choose()
             return
         if kind is ShellCommandKind.STOP:
             average = self._workspace_operations.average_identity
@@ -3640,6 +3765,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             selected_paths.append(path)
         return "xye", tuple(selected_paths), ""
 
+    def _capture_workflow_recipe(self):
+        """Capture the committed intent through its public profile codec without allocating a run generation."""
+        import json
+        from xrd_tools.notebooks.workflow import WorkflowRecipe
+        if not self._profile_action_permitted():
+            raise ValueError("WORKFLOW_IDLE_REQUIRED: wait for the current operation to finish")
+        if not self._commit_focused_control_edit_for_run():
+            raise ValueError("WORKFLOW_SETTINGS_REQUIRED: finish the current control edit")
+        return WorkflowRecipe("int", json.loads(dump_run_intent_profile(self._intents.snapshot().thaw())))
+
     def _export_results_notebook(self) -> None:
         kind, paths, reason = self._selected_results_notebook_sources()
         if not paths:
@@ -3685,24 +3820,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     @staticmethod
     def _write_profile_atomically(path: Path, text: str) -> None:
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(text)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        except Exception:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        from xrd_tools.io.export import write_exports_atomically
+        write_exports_atomically(((path, text),))
 
     def _save_run_intent_profile(self) -> None:
         if not self._profile_action_permitted():
@@ -3772,6 +3891,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._reconcile_snapshot(prior, result.snapshot)
 
     def _begin_run(self) -> None:
+        self.point_images.finish_run()
         pipeline = self._pipeline
         if self._closing or self._closed or pipeline is None:
             self._notice("Standard execution is unavailable.")
@@ -3788,6 +3908,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice("Standard cleanup remains pending.")
                 self._refresh_shell()
                 return
+        self._refresh_poni_fact()
         if not self._start_permitted()[0]:
             self._refresh_shell()
             return
@@ -3862,17 +3983,26 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(f"Output admission failed: {result.reason}")
             if released.cleanup_status is not CleanupStatus.CLEANED:
                 self._notice("Output cleanup remains pending.")
+            elif result.point_images is not None:
+                prior = self._intents.snapshot()
+                if prior.revision != token.revision:
+                    self._notice('The Source changed; press Run again to confirm the current scan.')
+                elif self.point_images.confirm((result.point_images,), self):
+                    candidate = self.point_images.apply_intent(prior.thaw())
+                    committed = self._intents.commit(candidate, expected_revision=prior.revision)
+                    if type(committed) is IntentCommitAccepted:
+                        self._reconcile_snapshot(prior, committed.snapshot)
+                        self._begin_run()
+                    else:
+                        self.point_images.restore_intent(self._intents.snapshot().thaw())
+                        self._notice('The Source changed; press Run again to confirm the current scan.')
+                else:
+                    self._notice('Grouping not confirmed; scan unprocessed.')
+                self.point_images.finish_run()
             elif result.append_refused:
                 self._confirm_append_overwrite(result)
             else:
-                dialog = QtWidgets.QMessageBox(
-                    QtWidgets.QMessageBox.Icon.Warning,
-                    "Run not started", "Run not started",
-                    QtWidgets.QMessageBox.StandardButton.Ok, self,
-                )
-                dialog.setInformativeText(result.reason)
-                dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
-                dialog.open()
+                self._open_warning("Run not started", result.reason)
             return True
         if type(result) is not AdmissionReceipt:
             self._release_admission(token)
@@ -3973,9 +4103,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         pipeline = self._pipeline
         if pipeline is None:
             return False
+        # Start validates this final intent revision and owns normalization of
+        # the captured source; normalization is not a new user source choice.
+        auto_motor = self._source_selection.automatic_motor_for(self._intents.snapshot())
         outcome = pipeline.start(receipt)
         if isinstance(outcome, StartLaunched):
             self._admission = None
+            self._launch_notice_identity = outcome.run_identity
+            self._launch_auto_motor = (
+                auto_motor if outcome.configuration.gi.enabled
+                and auto_motor == outcome.configuration.gi.incidence_motor
+                else None
+            )
+            self._launch_energy_announced = False
             self._bind_native_plot_axis_to_run(
                 outcome.run_identity,
                 outcome.configuration,
@@ -4012,7 +4152,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._progress = ProgressProjection(
                 detail="Run started"
             )
-            self._notice("")
+            # A usable but suspicious flat or dark (median far from 1, many
+            # masked pixels) runs; say so where the run starts.
+            warnings = getattr(receipt.scientific_assets, "correction_warnings", ())
+            self._notice("; ".join(item[:1].upper() + item[1:] for item in warnings))
             self._refresh_shell(preserve_display=True)
             self._ensure_timer()
             return True
@@ -4108,9 +4251,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _stop_run(self) -> None:
         if self._closing or self._closed:
             return
-        self._release_native_plot_axis_transition_for_retry()
         token = self._admission
         if token is not None:
+            self._release_native_plot_axis_transition_for_retry()
             released = self._release_admission(token)
             self._refuse_preparing(token)
             if released.cleanup_status is not CleanupStatus.CLEANED:
@@ -4119,6 +4262,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refresh_shell()
             return
         try:
+            # A launched Stop can still publish and paint a saved partial.
+            # Terminal Browse owns consumption or release of its axis receipt.
             ScatteringWorkspace._flush_presentation_target(self)
             self._context_controller.stop()
         except Exception as error:
@@ -4211,6 +4356,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             FULL_REFUSED,
             "Batch terminal Full Raw request was refused; prior display retained.",
         )
+
+    def _show_launch_notice(self, event: StandardRunEvent) -> None:
+        """Render only fresh launch clauses, without retaining scientific status."""
+        if (event.run_identity is not self._launch_notice_identity
+                or self._progress.terminal
+                or self._lifecycle.phase is not RunPhase.RUNNING):
+            return
+        clauses = []
+        if event.detail and not self._launch_energy_announced:
+            clauses.append(event.detail)
+            self._launch_energy_announced = True
+        if self._launch_auto_motor is not None:
+            clauses.append(f"GI Auto selected incidence motor {self._launch_auto_motor}.")
+            self._launch_auto_motor = None
+        if clauses:
+            text = " ".join(clauses)
+            self._progress = replace(self._progress, detail=text, directory_files=None)
+            self._refresh_shell(preserve_scientific=True)
+            self.noticeChanged.emit(text)
 
     def _advance_batch_terminal(self, event: StandardRunEvent) -> BatchTerminalDecision:
         controller = self._batch_terminal
@@ -4636,7 +4800,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 changed = True
                 if not successor_settled:
                     detail = getattr(outcome, "detail", "")
-                    self._notice(detail)
+                    if detail or not self._progress.terminal or not self._notice_text:
+                        self._notice(detail)
                 current = self._context_controller.navigation.current
                 if current is not None:
                     self._follow_processed_artifact(current)
@@ -4729,6 +4894,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._context_controller.adopt_acquisition(
                         event.run_identity
                     )
+                    self._show_launch_notice(event)
                     changed = True
                     force_scientific = True
                 except Exception as error:
@@ -4841,17 +5007,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     ScatteringWorkspace._flush_presentation_target(self)
                     self._retain_outgoing_display = False
                 batch_owner = self._batch_terminal.presentation
-                if (
-                    not was_batch
-                    or event.kind is not StandardEventKind.FINISHED
-                    or event.cleanup_status is not CleanupStatus.CLEANED
-                    or batch_owner is None
-                    or batch_owner.run_identity is not event.run_identity
-                    or batch_owner.frame is None
-                ):
-                    self._release_native_plot_axis_transition_for_retry(
-                        event.run_identity
-                    )
                 terminal_navigation = self._context_controller.navigation
                 batch_notice = (
                     self._notice_text
@@ -4872,6 +5027,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         selected=terminal_navigation.selected,
                     )
                 )
+                # A terminal Browse is still this run's first possible paint.
+                # Keep its axis receipt bound until that exact read settles.
+                if not defer_terminal_science and (
+                    not was_batch
+                    or event.kind is not StandardEventKind.FINISHED
+                    or event.cleanup_status is not CleanupStatus.CLEANED
+                    or batch_owner is None
+                    or batch_owner.run_identity is not event.run_identity
+                    or batch_owner.frame is None
+                ):
+                    self._release_native_plot_axis_transition_for_retry(
+                        event.run_identity
+                    )
                 handoff = self._processed_browser.terminal_handoff
                 terminal_science_complete = (
                     defer_terminal_science
@@ -4988,12 +5156,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._analysis_anchor = None
                 self._analysis_request = None
                 self._analysis_fingerprint = ""
+                if self._scan_roi_dialog is not None: self._scan_roi_dialog.set_analysis_busy()
                 message = "Analysis failed before terminal publication."
                 self._notice(message)
                 changed = True
                 force_scientific = True
 
         deferred_refresh = self._dispatch_deferred_metadata()
+        self._dispatch_roi_preview()
         if deferred_refresh is WorkspaceRefreshEffect.CONTROLS:
             controls_refresh = True
         elif deferred_refresh is WorkspaceRefreshEffect.FULL:
@@ -5144,6 +5314,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self, event: StandardRunEvent
     ) -> None:
         identity = event.run_identity
+        failure_already_presented = (
+            self._progress.terminal and self._lifecycle.phase is RunPhase.FAILED
+        )
         self._clear_live_source_refresh()
         stop_was_requested = (
             self._lifecycle.phase is RunPhase.STOPPING
@@ -5194,6 +5367,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     else "Standard cleanup remains pending."
                 )
             )
+            primary = event.primary
+            if failed and not failure_already_presented:
+                energy_refused = primary is not None and (
+                    primary.type_module, primary.type_qualname
+                ) == (EnergyScanRefused.__module__, EnergyScanRefused.__qualname__)
+                self._open_warning(
+                    "Energy scan not processed" if energy_refused else "Run failed",
+                    primary.message if primary is not None else self._notice_text,
+                )
             return
         ended = self._lifecycle.execution_ended(
             ExecutionEnded(identity)
@@ -5629,6 +5811,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             outcome, captured
         )
         if settlement is None:
+            self._release_native_plot_axis_transition_for_retry(handoff.run_identity)
             return False
         handoff = settlement.handoff
         navigation = self._context_controller.navigation
@@ -5647,6 +5830,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         elif current is not None:
             self._context_controller.select_navigation(current, selected)
+        self._consume_native_plot_axis_transition(handoff.run_identity)
         if not settlement.reuse_seal_authorized:
             # An ordinary terminal Browse may preserve its exact frame-label
             # choice, but only a writer-authenticated seal can authorize
@@ -5851,6 +6035,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return True
         if (
             self._metadata_operations.polling_needed
+            or (self._scan_roi_dialog is not None and self._scan_roi_dialog._roi_preview_waiting)
             or self._admission is not None
             or getattr(self._context_controller, "viewer_1d_loading", False)
             or getattr(self._context_controller, "viewer_1d_cleanup_pending", False)
@@ -6409,6 +6594,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         viewer_current, viewer_paths = (
             self._context_controller.viewer_1d_artifact_selection
             if viewer_1d else ("", ()))
+        # The 2D file intent: a deferred open, else the open context's file
+        # (still loading its catalog, or clearing).
+        context_2d = self._context_controller.viewer_2d_context
+        viewer_2d_current = (self._pending_viewer_2d_path
+                             or getattr(context_2d, "original_path", "") or ""
+                             ) if tool is Tool.IMAGE_VIEWER else ""
         projection = self._context_projection.build_shell(
             revision=self._shell_revision,
             controls=controls,
@@ -6426,6 +6617,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browser_catalog_index=browser.scan_index,
             browser_transient_frame=browser.transient_frame,
             viewer_1d_current_path=viewer_current,
+            viewer_2d_current_path=(os.path.abspath(viewer_2d_current)
+                                    if viewer_2d_current else ""),
             viewer_1d_selected_paths=viewer_paths,
             viewer_waterfall_active=self._shell.scientific.bottom_waterfall_active,
             date_sorted=browser.date_sorted,
@@ -6592,6 +6785,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._ensure_timer()
             return
         try:
+            self._shell.browser.set_filename_mode(intent.processing_mode)
             if not preserve_display:
                 self._shell.browser.reconcile_detector_mode(projection.scientific)
                 choice, _ = heavy_residency_choice(intent.run_options)
@@ -6714,17 +6908,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and not self._context_controller.viewer_2d_cleanup_pending
         )
 
+    def _refresh_poni_fact(self, snapshot: RunIntentSnapshot | None = None) -> bool:
+        """Refresh only at explicit edits, idle activation and actual Run entry."""
+        prior = (self._detector_summary_text, self._poni_ready, self._poni_detector_name)
+        intent = (snapshot or self._intents.snapshot()).thaw()
+        self._detector_summary_text = detector_summary(intent.poni_file, intent.mask_file)
+        self._poni_ready = detector_calibration_ready(intent.poni_file)
+        self._poni_detector_name = poni_detector(intent.poni_file)
+        changed = prior != (self._detector_summary_text, self._poni_ready, self._poni_detector_name)
+        if changed:
+            self._experiment_readiness_key = None
+        return changed
+
     def _project_controls(
         self, snapshot: RunIntentSnapshot
     ):
         intent = snapshot.thaw()
-        detector_key = (
-            str(intent.poni_file or ""),
-            str(intent.mask_file or ""),
-        )
-        if detector_key != self._detector_summary_key:
-            self._detector_summary_text = detector_summary(*detector_key)
-            self._detector_summary_key = detector_key
         observation = self._source_selection.project_observation(snapshot)
         operation_identity = self._workspace_operations.current_identity
         operation_active = (operation_identity is not None and not self._closing and not self._closed)
@@ -6774,6 +6973,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ),
             source_mode_override=self._source_selection.mode,
             detector_summary_override=self._detector_summary_text,
+            detector_name_override=self._poni_detector_name,
             calibrate_available=calibrate_available,
             calibrate_dependency_available=calibrate_dependency_available,
             operation_busy=operation_busy,
@@ -6841,7 +7041,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if experiment_key != self._experiment_readiness_key:
             self._experiment_readiness = experiment_header_projection(
-                controls
+                controls, calibration_ready=self._poni_ready,
             )
             self._experiment_readiness_key = experiment_key
         self._controls_readiness = ControlsReadinessProjection(
@@ -6896,6 +7096,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             return False, "Loading finalized Browse context…"
         phase = self._lifecycle.phase
+        intent = self._intents.snapshot().thaw()
+        if (phase in {RunPhase.IDLE, RunPhase.FAILED}
+                and tool_from_mode_text(intent.processing_mode) in {Tool.INT_1D, Tool.INT_2D}
+                and not self._poni_ready):
+            return False, ("Needs PONI" if not intent.poni_file else
+                           "Needs PONI · Choose a readable, parseable PONI calibration.")
         if phase is RunPhase.IDLE:
             return True, ""
         if phase is RunPhase.FAILED and self._lifecycle.reset_permitted:
@@ -6919,6 +7125,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         browse_source = None
         if kind is ShellCommandKind.SET_PROCESSING_MODE:
             if type(value) is not str or not value:
+                return
+            if value in {"Stitch 1D", "Stitch 2D", "RSM"}:
+                # This selection navigates to its retained page, in that mode (the native
+                # RSM page too, AUD-9). Keep the integration intent intact for return
+                # navigation; the host owns the active-operation and pending-cleanup fences.
+                self._refresh_shell()
+                self.modeRequested.emit("rsm" if value == "RSM" else "stitch", value)
                 return
             controller = self._context_controller
             target_tool = tool_from_mode_text(value)
@@ -7242,67 +7455,23 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and type(value) is str and value in {"Average", "Sum"}):
             return False
         updates: dict[str, object] = {}
-        if kind is ShellCommandKind.SET_NORM_CHANNEL:
-            updates["norm_channel"] = str(value)
-        elif kind is ShellCommandKind.SET_COLOR_MAP:
-            updates["color_map"] = str(value)
-        elif kind is ShellCommandKind.SET_LOG_SCALE:
-            updates["log_scale"] = bool(value)
-            updates["plot_options"] = replace(
-                self._preferences.plot_options,
-                intensity_scale="Log" if value else "Linear",
-            )
-        elif kind is ShellCommandKind.SET_DETECTOR_MODE:
+        # The preference fields a plot command changes are the shared reducer's (Int's rules, the Stitch
+        # page's too); the workspace adds its own side effects.
+        shared = scientific_preference_updates(
+            self._preferences, command,
+            shown_image_axis=getattr(self, "_rendered_image_axis", self._preferences.image_axis),
+        )
+        if kind is ShellCommandKind.SET_DETECTOR_MODE:
             return self._set_detector_mode(str(value))
-        elif kind is ShellCommandKind.SET_IMAGE_AXIS:
-            if type(value) is not str or value not in {
-                "Q-Chi",
-                "2Th-Chi",
-                "qip_qoop",
-                "q_chi",
-                "q_chi_derived",
-                "exit_angles",
-            }:
-                return False
-            # A display preference only: choosing which available 2-D map the
-            # pane shows never edits the run intent or starts an integration.
-            updates["image_axis"] = value
-            if self._preferences.share_axis:
-                matching_plot_axis = share_plot_axis_for_image(value)
-                if matching_plot_axis is None:
-                    updates["share_axis"] = False
-                else:
-                    updates["plot_axis"] = matching_plot_axis
-                    updates["slice_pins"] = _slice_pins_for_plot_axis(
-                        self._preferences.slice_pins,
-                        self._preferences.plot_axis,
-                        matching_plot_axis,
-                    )
-        elif kind is ShellCommandKind.SET_PLOT_AXIS:
-            requested_axis = str(value)
-            updates["plot_axis"] = requested_axis
-            updates["slice_pins"] = _slice_pins_for_plot_axis(
-                self._preferences.slice_pins,
-                self._preferences.plot_axis,
-                requested_axis,
-            )
         elif kind is ShellCommandKind.SET_PLOT_MODE:
-            if type(value) is not str or value not in {
-                "Single",
-                "Overlay",
-                "Average",
-                "Sum",
-                "Waterfall",
-            }:
+            if shared is None:
                 return False
             prior_mode = self._preferences.plot_mode
             if value != prior_mode:
                 self._retire_batch_presentation()
             if not viewer_1d:
                 ScatteringWorkspace._clear_presentation_targets(self)
-            updates["plot_mode"] = value
-            if value not in {"Overlay", "Waterfall"}:
-                updates["slice_pins"] = ()
+            updates.update(shared)
             if value == "Single" and prior_mode != "Single" and not viewer_1d:
                 self._shell.browser.cancel_pending_frame_selection()
                 current = self._context_controller.navigation.current
@@ -7310,129 +7479,31 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._context_controller.select_navigation(
                         current, (current,),
                     )
-        elif kind is ShellCommandKind.SET_SHARE_AXIS:
-            if type(value) is not bool:
-                return False
-            matching_plot_axis = share_plot_axis_for_image(
-                getattr(
-                    self,
-                    "_rendered_image_axis",
-                    self._preferences.image_axis,
-                )
-            )
-            updates["share_axis"] = bool(
-                value and matching_plot_axis is not None
-            )
-            if value:
-                if matching_plot_axis is not None:
-                    updates["plot_axis"] = matching_plot_axis
-                    updates["slice_pins"] = _slice_pins_for_plot_axis(
-                        self._preferences.slice_pins,
-                        self._preferences.plot_axis,
-                        matching_plot_axis,
-                    )
-        elif kind is ShellCommandKind.SET_SLICE_ENABLED:
-            updates["slice_enabled"] = bool(value)
-        elif kind is ShellCommandKind.SET_SLICE_CENTER:
-            updates["slice_center"] = float(value)
-        elif kind is ShellCommandKind.SET_SLICE_WIDTH:
-            updates["slice_width"] = float(value)
         elif kind is ShellCommandKind.PIN_SLICE:
-            state = self._last_scientific_projection
+            pin = shown_slice_pin(self._last_scientific_projection)
             navigation = self._context_controller.navigation
-            heavy = None if state is None else state.heavy
             if (
-                state is None
-                or state.plot_mode not in {"Overlay", "Waterfall"}
-                or not state.slice_enabled
-                or heavy is None
-                or heavy.cake is None
-                or slice_region_orientation(
-                    state.plot_axis,
-                    heavy.cake_x,
-                    heavy.cake_y,
-                ) is None
-            ):
-                return False
-            frame = heavy.frame
-            if (
-                navigation.current is not frame
-                or not self._context_controller.owns_frame(frame)
+                pin is None
+                or navigation.current is not pin.frame
+                or not self._context_controller.owns_frame(pin.frame)
             ):
                 return False
             existing = self._preferences.slice_pins
             existing_ids = {pin.projection_id for pin in existing}
-            pin = SlicePin(
-                frame,
-                state.plot_axis,
-                float(state.slice_center),
-                float(state.slice_width),
-            )
             if pin.projection_id in existing_ids:
                 return False
             updates["slice_pins"] = (*existing, pin)
-        elif kind is ShellCommandKind.SET_RANGE:
-            if type(value) not in {int, float}:
+        elif kind in {
+            ShellCommandKind.SET_NORM_CHANNEL, ShellCommandKind.SET_COLOR_MAP,
+            ShellCommandKind.SET_LOG_SCALE, ShellCommandKind.SET_IMAGE_AXIS,
+            ShellCommandKind.SET_PLOT_AXIS, ShellCommandKind.SET_SHARE_AXIS,
+            ShellCommandKind.SET_SLICE_ENABLED, ShellCommandKind.SET_SLICE_CENTER,
+            ShellCommandKind.SET_SLICE_WIDTH, ShellCommandKind.SET_RANGE,
+            ShellCommandKind.SET_PLOT_OPTION,
+        }:
+            if shared is None:
                 return False
-            if command.path == ("q", "low"):
-                updates["q_range"] = (
-                    float(value), self._preferences.q_range[1]
-                )
-            elif command.path == ("q", "high"):
-                updates["q_range"] = (
-                    self._preferences.q_range[0], float(value)
-                )
-            elif command.path == ("chi", "low"):
-                updates["chi_range"] = (
-                    float(value), self._preferences.chi_range[1]
-                )
-            elif command.path == ("chi", "high"):
-                updates["chi_range"] = (
-                    self._preferences.chi_range[0], float(value)
-                )
-            else:
-                return False
-        elif kind is ShellCommandKind.SET_PLOT_OPTION:
-            options = self._preferences.plot_options
-            option_updates: dict[str, object] = {}
-            if command.path == ("waterfall", "y_axis"):
-                if type(value) is not str or not value:
-                    return False
-                option_updates["waterfall_y_axis"] = value
-            elif command.path == ("waterfall", "start"):
-                if type(value) is not int or value < 1:
-                    return False
-                option_updates["waterfall_start"] = value
-            elif command.path == ("waterfall", "stop"):
-                if type(value) is not int or value < 0:
-                    return False
-                option_updates["waterfall_stop"] = value
-            elif command.path == ("waterfall", "step"):
-                if type(value) is not int or value < 1:
-                    return False
-                option_updates["waterfall_step"] = value
-            elif command.path == ("overlay", "offset"):
-                if (
-                    type(value) not in {int, float}
-                    or not math.isfinite(float(value))
-                ):
-                    return False
-                option_updates["overlay_offset"] = float(value)
-            elif command.path == ("other", "legend"):
-                if type(value) is not bool:
-                    return False
-                option_updates["show_legend"] = value
-            elif command.path == ("other", "intensity_scale"):
-                if type(value) is not str or value not in {
-                    "Linear",
-                    "Sqrt",
-                    "Log",
-                }:
-                    return False
-                option_updates["intensity_scale"] = value
-            else:
-                return False
-            updates["plot_options"] = replace(options, **option_updates)
+            updates.update(shared)
         elif kind is ShellCommandKind.SET_DATE_SORT:
             requested = bool(value)
             self._processed_browser.set_date_sorted(requested)
@@ -7529,6 +7600,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
 
     def event(self, event: QtCore.QEvent) -> bool:
+        if (event.type() == QtCore.QEvent.WindowActivate
+                and hasattr(self, "_poni_ready")
+                and not self._closing and not self._closed
+                and self._lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED}):
+            # Replacing focused controls can activate the window again during
+            # reconciliation. Unchanged PONI facts need no nested shell paint.
+            if self._refresh_poni_fact():
+                self._refresh_shell()
         if event.type() == QtCore.QEvent.DeferredDelete:
             if self._deferred_delete_pending:
                 self._schedule_deferred_delete_retry()
@@ -7575,9 +7654,31 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> AdvancedSettingsValues | None:
         dialog = self._advanced_dialog
         if dialog is None:
-            dialog = AdvancedSettingsDialog(self)
+            dialog = AdvancedSettingsDialog(
+                self, correction_inspector=self._inspect_detector_correction,
+            )
             self._advanced_dialog = dialog
-        return dialog.edit(snapshot)
+            dialog.add_section(self.point_images)
+        self._correction_inspections = {}
+        original = self.point_images.document()
+        try:
+            result = dialog.edit(snapshot)
+            if result is None:
+                self.point_images.restore(original)
+            return result
+        finally:
+            self._correction_inspections = {}
+
+    def _inspect_detector_correction(
+        self, role: str, path: str, min_fraction: float,
+    ) -> object:
+        """Check a dark or flat file against the current PONI's detector."""
+        from .output_preflight import inspect_detector_correction
+
+        poni_file = str(self._intents.snapshot().thaw().poni_file or "")
+        return inspect_detector_correction(
+            poni_file, path, role, min_fraction, cache=self._correction_inspections,
+        )
 
     def _show_performance_diagnostics_dialog(
         self,
@@ -7712,13 +7813,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice(reduced.reason)
             self._refresh_shell()
             return
-        if isinstance(reduced, EditNoChange):
+        candidate = self.point_images.apply_intent(snapshot.thaw() if isinstance(reduced, EditNoChange) else reduced)
+        if (isinstance(reduced, EditNoChange)
+                and candidate.run_options == snapshot.thaw().run_options
+                and candidate.source_spec == snapshot.thaw().source_spec):
             self._notice("")
             self._refresh_shell()
             return
         try:
             result = self._intents.commit(
-                reduced,
+                candidate,
                 expected_revision=snapshot.revision,
             )
         except Exception as error:
@@ -8033,6 +8137,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._refuse_preparing(token)
         prior_intent = prior.thaw()
         current_intent = current.thaw()
+        if (self._lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED}
+                and (prior_intent.poni_file != current_intent.poni_file
+                     or prior_intent.source_spec != current_intent.source_spec
+                     or prior_intent.processing_mode != current_intent.processing_mode)):
+            self._refresh_poni_fact(current)
         if (
             _native_plot_axis_for_run(prior_intent)
             != _native_plot_axis_for_run(current_intent)
@@ -8064,6 +8173,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         *,
         preserve_terminal: bool = False,
     ) -> None:
+        self.point_images.restore_intent(current.thaw())
         source_transition = self._apply_snapshot_effects(
             prior,
             current,

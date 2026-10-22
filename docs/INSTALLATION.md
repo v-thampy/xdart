@@ -37,12 +37,15 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
   (`%LOCALAPPDATA%\xdart` on Windows) and never edits your shell config or an
   existing conda install.
 - **Fast by construction** — it uses the conda-forge builds of the HDF5/compression
-  stack (the fastest Eiger bitshuffle/LZ4 decode) plus `xdart[gui]` from PyPI,
-  resolved in one solve with a lockfile. This is the same layering the manual
-  conda steps below do — only assembled for you.
+  stack (the fastest Eiger bitshuffle/LZ4 decode) and of the GUI's compiled
+  xrayutilities (with its NumPy pin), plus `xdart[gui]` from PyPI, resolved in one
+  solve with a lockfile. This is the same layering the manual conda steps below
+  do — only assembled for you.
 - **Launch** with `xdart`. **Upgrade** using the [private-workspace instructions below](#updating-an-installer-workspace).
 - **Extras**: set `XDART_EXTRAS` before the command, e.g.
   `curl -fsSL … | XDART_EXTRAS="gui,notebook" bash` on macOS/Linux.
+- **Folders**: `XDART_INSTALL_ROOT` chooses the workspace folder. On macOS/Linux,
+  `XDART_BIN_DIR` chooses where the `xdart` launcher goes (default `~/.local/bin`).
 - If `xdart` launches an old version, run `hash -r` (or open a new terminal) — the
   installer prints the specifics when it detects a shadowing install.
 
@@ -82,12 +85,17 @@ your shell).
 mamba create -n xrd python=3.13 -y
 mamba activate xrd
 
-# 2. the conda-forge fast I/O stack, then the xdart GUI from PyPI
-mamba install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
+# 2. the qualified conda-forge I/O, Qt and numerical stack,
+#    then the xdart GUI from PyPI
+mamba install -c conda-forge h5py hdf5plugin==7.1.0 fabio==2025.10.0 hdf5 blosc c-blosc2 lz4-c scipy==1.18.1 "numexpr==2.14.2=py*" silx==3.1.3 pyside6==6.11.1 numpy==2.5.1 xrayutilities==1.7.12
 pip install "xdart[gui]"
 ```
 
 then launch with `xdart`. (Already have an environment? Just run step 2 in it.)
+The GUI's Stitch and RSM tools need `xrayutilities` 1.7.12, which is compiled. Take
+it, and the NumPy version it is pinned with, from conda-forge as shown. `pip` then
+finds these already installed. Keep PySide6 from conda-forge too; mixing its
+PyPI wheel with the conda native stack can abort the process.
 
 ## Using pip / uv
 
@@ -103,6 +111,14 @@ then launch with `xdart`. Note the Eiger bitshuffle/LZ4 decode is measurably slo
 with the pure-pip HDF5 wheels than the conda-forge builds
 ([see below](#performance-install-the-hdf5-stack-from-conda-forge)), and
 lz4-compressed outputs need `hdf5plugin` (a base dep) to read outside xdart.
+
+A pip GUI install is **best-effort**. The supported GUI installations are the
+[Pixi global installation](../README.md#quick-start), the one-line installer and
+the conda route above. `xdart[gui]` includes `xrayutilities==1.7.12`, which has no
+macOS Apple Silicon wheel, so pip builds it from source there, which needs
+compilers. Its wheels also bundle an OpenMP runtime that can abort beside
+conda-forge libraries in a mixed environment. The headless `pip install xdart`
+below is unaffected.
 
 The GUI installation includes **[NeXpy](https://nexpy.github.io/nexpy/)** for opening
 the selected processed NeXus file and
@@ -158,6 +174,21 @@ cd /shared/xrd-env && pixi run python -m ipykernel install --prefix /usr/local \
 
 Admins update the shared env with `pixi update` in that directory; the lockfile
 rebuilds it identically on a new machine (`pixi install`).
+
+## Marimo notebooks
+
+The GUI installation (conda or `pip install "xdart[gui]"`) includes both Jupyter
+and marimo. For a headless installation, add `pip install "xdart[notebook]"`.
+Open an exported marimo notebook with the explicit route:
+
+```bash
+xdart-notebook --marimo results.py
+```
+
+This edits an existing `.py` notebook in xdart's Python environment without
+creating a separate sandbox. Append marimo edit options as needed. Ordinary
+`xdart-notebook` arguments still open JupyterLab; a filename does not select
+the frontend automatically.
 
 ## Jupyter and VS Code kernel setup
 
@@ -256,15 +287,15 @@ modest for batch / pipeline / CI use:
 | Extra        | What it enables                                          | Packages                                                    |
 | ------------ | -------------------------------------------------------- | ----------------------------------------------------------- |
 | *(base)*     | `core`, `io`, `integrate`, `viz` — headless / batch      | numpy, scipy, pandas, xarray, h5py, hdf5plugin, nexusformat, fabio, silx, pyFAI, pyyaml, joblib, natsort, matplotlib, plotly |
-| `[gui]`      | the `xdart` desktop GUI **+ its analysis tools and external viewers** (bundles `[fitting]` + `[rsm]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk, nexpy (silx already in base) |
+| `[gui]`      | the `xdart` desktop GUI **+ its analysis tools, external viewers, and notebooks** (bundles `[fitting]` + `[rsm]` + `[notebook]`) | PySide6, pyqtgraph, qtawesome, imagecodecs, imageio, lmfit, pymatgen, xrayutilities, pyevtk, nexpy, notebook packages below (silx already in base) |
 | `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting     | lmfit, pymatgen                                             |
 | `[rsm]`      | `rsm.*` — reciprocal-space mapping, VTK export           | xrayutilities, pyevtk                                       |
-| `[notebook]` | self-contained Jupyter environment                       | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab, nbformat |
+| `[notebook]` | Jupyter and marimo environments                           | ipywidgets, anywidget, ipyfilechooser, ipykernel, ipympl, jupyterlab, nbformat, marimo |
 | `[all]`      | everything except dev                                    | `xdart[fitting,rsm,gui,notebook]`                       |
 | `[dev]`      | test / build / release tooling                           | pytest, pytest-timeout, pytest-xdist, build, twine, tifffile, imagecodecs |
 
-Extras compose. `[gui]` already bundles `[fitting]` + `[rsm]` — the GUI surfaces
-Peak/Phase Fitting and the Grazing/GI/RSM workflow — so `pip install "xdart[gui]"`
+Extras compose. `[gui]` already bundles `[fitting]` + `[rsm]` + `[notebook]` — the GUI surfaces
+Peak/Phase Fitting, the Grazing/GI/RSM workflow, and notebook export — so `pip install "xdart[gui]"`
 (and the conda package) give you the **complete** GUI with no missing-dependency prompts.
 
 > **Tip — use [`uv`](https://docs.astral.sh/uv/) if you have it.** It is a
@@ -406,10 +437,10 @@ $LASTEXITCODE
 
 Open representative data, process a scan, select frames, and close normally;
 expect exit 0. The four checks establish basic native-library functionality,
-not full application support or release readiness. Average, Stitch, RSM, and
-reintegration have known Windows portability issues that remain separate from
-installing this environment. Record native results before claiming support for
-those workflows.
+not full application support or release readiness. Finite-save paths for
+Average Scan, Stitch 1D/2D, RSM, and reintegration are implemented; their native
+Windows/SMB publication and GUI behavior still require release qualification.
+These install checks do not qualify those workflows.
 
 The Windows workspace selects NumExpr's non-MKL build because pyFAI 2026.5's
 direct NumExpr calls can produce invalid radial coordinates with the MKL build.

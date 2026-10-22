@@ -22,10 +22,12 @@ class PageCapability(str, Enum):
     RUN_ACTIVITY = "run-activity"
     APP_MENU_HOSTS = "app-menu-hosts"
     LAYOUT_DIAGNOSTICS = "layout-diagnostics"
+    PROCESSING_MODE = "processing-mode"
 
 
 class PageLifecycle(str, Enum):
     SWITCHABLE = "switchable"
+    RETAINED = "retained"
     EXIT_ONLY = "exit-only"
 
 
@@ -68,3 +70,4 @@ EXIT_ONLY_PAGE = "exit-only-page"
 PAGE_ACTIVE = "page-active"
 CLEANUP_PENDING = "cleanup-pending"
 UNKNOWN_PAGE = "unknown-page"
+MODE_REFUSED = "mode-refused"

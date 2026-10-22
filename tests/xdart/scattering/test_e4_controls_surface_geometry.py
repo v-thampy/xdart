@@ -107,6 +107,7 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
         theme,
         font_scale=font_scale,
         spacing=spacing,
+        controls_card_corners=True,
     )
     panel = ControlsPanel()
     run_controls = RunControlsBar()
@@ -225,7 +226,7 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
         plain_toggle.close()
         menu_button.close()
 
-        # Enclosing workflow cards remain subtly rounded.
+        # Opt-in rounded workflow cards remain subtly rounded.
         subsection = panel.findChild(SubsectionCard)
         assert subsection is not None
         card_image = subsection.grab().toImage()
@@ -255,7 +256,7 @@ def test_controls_interactive_surfaces_share_square_scaled_geometry(
             "dark",
             font_scale="default",
             spacing="normal",
-            controls_card_corners=True,
+            controls_card_corners=False,
         )
 
 

@@ -11,7 +11,7 @@ import math
 import sys
 from threading import RLock
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from weakref import ReferenceType, ref
 
 import h5py
@@ -416,6 +416,9 @@ class Frame1DModeRows:
     labels: tuple[int, ...]
     intensity_rows: tuple[np.ndarray, ...]
     sigma_rows: tuple[np.ndarray, ...] | None = None
+    #: Each label's saved angular support (COVERAGE-SUPPORT-20261013), aligned with ``labels``: the primary mode
+    #: carries one AngularSupportProfile per label (values or the reason), every other mode None.
+    support_rows: tuple[Any, ...] | None = None
 
     def __post_init__(self) -> None:
         if type(self.mode) is not str or not self.mode:
@@ -470,9 +473,28 @@ class Frame1DModeRows:
                 for row in sigma_rows
             )
 
+        support_rows = self.support_rows
+        if support_rows is not None:
+            from xrd_tools.core.angular_support import AngularSupportProfile
+            if (type(support_rows) is not tuple or len(support_rows) != len(labels)
+                    or any(type(item) is not AngularSupportProfile for item in support_rows)):
+                raise ValueError("support_rows must align exactly with labels")
+            for item in support_rows:
+                if item.available:
+                    _exact_readonly_float64_vector(item.supported_deg, role="angular support row", points=points)
+
         object.__setattr__(self, "labels", tuple(labels))
         object.__setattr__(self, "intensity_rows", intensity_rows)
         object.__setattr__(self, "sigma_rows", sigma_rows)
+
+    def support(self, label: int):
+        """``label``'s saved angular support profile, or None (another mode, or not a selected label)."""
+        if self.support_rows is None or type(label) is not int or label < 0:
+            return None
+        index = bisect_left(self.labels, label)
+        if index == len(self.labels) or self.labels[index] != label:
+            return None
+        return self.support_rows[index]
 
     def row(
         self, label: int,
@@ -2108,6 +2130,7 @@ class FrameViewReader:
         self._map_geom, self._map_scan_data = map_geom, map_scan_data
         self._scan_data_items = scan_data_items
         self._g1_modes, self._g2_modes = g1_modes, g2_modes
+        self._support_tables = {}  # group name → SupportTableReader or its format error
         self._map_1d_modes, self._map_2d_modes = (
             map_1d_modes, map_2d_modes,
         )
@@ -2515,6 +2538,15 @@ class FrameViewReader:
                 return tuple(addresses)
 
             addresses = bundle._callback(dataset_addresses)
+            # the primary mode's saved support rows are read beside intensity: one root per distinct table row
+            support_table, support_address = None, None
+            if mode == self._primary_mode_1d:
+                support_table = bundle._callback(self._support_table, group)
+                if isinstance(support_table, Exception) or support_table.table is None:
+                    support_table = None
+                else:
+                    support_address = bundle._callback(
+                        lambda: int(h5py.h5o.get_info(support_table.table.id).addr))
             mode_rows: list[tuple[int, int]] = []
             mode_map = self._map_1d_modes[mode]
             for label in labels:
@@ -2533,8 +2565,11 @@ class FrameViewReader:
                         projected_bytes=axis_bytes + row_bytes_total,
                     )
                 mode_rows.append((label, row))
-                for address in addresses:
-                    key = (address, row)
+                support_row = None if support_table is None else support_table.table_row(label)
+                roots = tuple((address, row) for address in addresses)
+                if support_row is not None:
+                    roots += ((support_address, support_row),)
+                for key in roots:
                     prior_bytes = row_roots.get(key)
                     row_bytes = points * int(np.dtype(np.float64).itemsize)
                     if prior_bytes is None:
@@ -2629,6 +2664,12 @@ class FrameViewReader:
                 sigmas: list[np.ndarray] | None = (
                     [] if plan.has_sigma else None
                 )
+                # the primary mode's saved angular support, decoded as read() decodes it (one strict reader),
+                # its values reserved in this bundle and a table row's profile shared only within this read
+                supports: list[object] | None = (
+                    [] if mode == self._primary_mode_1d else None
+                )
+                support_memo: dict = {}
                 for label, row in plan.rows:
                     checkpoint()
                     intensity = _read_1d_row(
@@ -2655,6 +2696,10 @@ class FrameViewReader:
                         if sigma is None:
                             raise AssertionError("qualified sigma row is unavailable")
                         sigmas.append(sigma)
+                    if supports is not None:
+                        supports.append(self._saved_support(group, label, intensity, bundle=bundle,
+                                                            memo=support_memo))
+                        checkpoint()
                 mode_results.append(bundle._callback(
                     Frame1DModeRows,
                     mode=mode,
@@ -2662,6 +2707,7 @@ class FrameViewReader:
                     labels=tuple(mode_labels),
                     intensity_rows=tuple(intensities),
                     sigma_rows=None if sigmas is None else tuple(sigmas),
+                    support_rows=None if supports is None else tuple(supports),
                 ))
                 checkpoint()
 
@@ -2982,6 +3028,10 @@ class FrameViewReader:
                         bundle=bundle,
                     )
 
+            support = (
+                self._saved_support(g1, frame, intensity_1d)
+                if intensity_1d is not None and m1 == self._primary_mode_1d else None
+            )
             view = FrameView(
                 label=frame,
                 axis_1d=(
@@ -3002,9 +3052,66 @@ class FrameViewReader:
                 sigma_2d=sigma_2d,
                 two_d_kind=self._two_d_kind_modes.get(m2, TwoDKind.Q_CHI),
                 **self._common_fields(frame, bundle=bundle),
+                angular_support=support,
             )
             bundle.finish()
             return view
+
+    def _support_table(self, group):
+        """The primary group's validated support index (an index, never values), cached per group, or its error.
+
+        The table is bounded by the group's own stored row count (its qualified ``frame_index`` shape, metadata
+        only), never by this reader's frame map: a target reader maps one label (ANGULAR-SUPPORT-TARGET-FRAME-BOUND).
+        """
+        from xrd_tools.io.angular_support import AngularSupportFormatError, SupportTableReader, recorded_off
+        table = self._support_tables.get(group.name)
+        if table is None:
+            inventory = _required_direct_dataset(group, "frame_index", role=f"{group.name}/frame_index")
+            rows = 0 if inventory is None else int(_qualify_frame_index(group, inventory).shape[0])
+            try:
+                table = SupportTableReader(group, frame_count=rows, recording_off=recorded_off(self._entry))
+            except AngularSupportFormatError as error:
+                table = error
+            self._support_tables[group.name] = table
+        return table
+
+    @staticmethod
+    def _read_support_row(table, row: int, bundle: "_ReaderArrayBundle") -> np.ndarray:
+        """One table row's float64 values, reserved and read in ``bundle`` like the intensity row beside it: a
+        transient caller payload, shared within the bundle by the row's physical identity."""
+        deg = table.table
+
+        def qualify(value):
+            if not isinstance(value, h5py.Dataset) or value.ndim != 2 or value.dtype != np.dtype("<f4"):
+                raise ValueError(f"{deg.name} is not a bounded support table")
+            return value
+
+        return bundle.read_hdf(deg, role=deg.name, validator=qualify, selection=int(row),
+                               final_dtype=np.dtype(np.float64), transform="numeric-float64", retain=False)
+
+    def _saved_support(self, group, label: int, intensity_row, *, bundle: "_ReaderArrayBundle | None" = None,
+                       memo: dict | None = None):
+        """``label``'s saved angular support in its primary 1-D group (format v1), or the reason it has none.
+
+        Values are read in the caller's ``bundle``; ``memo`` shares a table row's profile within that one read.
+        A malformed table is reported per frame as ``malformed_saved_support``: intensity stays readable.
+        """
+        from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin, SupportReason
+        from xrd_tools.io.angular_support import AngularSupportFormatError
+        table = self._support_table(group)
+        try:
+            if isinstance(table, AngularSupportFormatError):
+                raise table
+            read_values = None if bundle is None else (lambda row: self._read_support_row(table, row, bundle))
+            profile = table.profile(label, intensity_row, read_values=read_values, memo=memo)
+        except AngularSupportFormatError as error:
+            return AngularSupportProfile.unavailable(SupportReason.MALFORMED_SAVED_SUPPORT,
+                                                     origin=SupportOrigin.SAVED, detail=str(error))
+        if profile.reason is SupportReason.NO_SAVED_SUPPORT and self._entry is not None:
+            from xrd_tools.io.stitch_record import STITCH_GROUP
+            if STITCH_GROUP in self._entry:  # an older Stitch result opened in Int Browse: never rebuilt (D6)
+                return AngularSupportProfile.unavailable(SupportReason.LEGACY_STITCH, origin=SupportOrigin.SAVED)
+        return profile
 
     def _view_for(
         self,
@@ -3035,11 +3142,12 @@ class FrameViewReader:
                 )
                 if sigma_node is not None else None
             )
+            intensity = _read_1d_row(g, "intensity", row, points=points, bundle=bundle)
             return FrameView(
                 label=frame, axis_1d=self._axis_1d_modes.get(mode),
-                intensity_1d=_read_1d_row(
-                    g, "intensity", row, points=points, bundle=bundle,
-                ), sigma_1d=sig,
+                intensity_1d=intensity, sigma_1d=sig,
+                angular_support=(self._saved_support(g, frame, intensity, bundle=bundle)
+                                 if mode == self._primary_mode_1d else None),
                 **(
                     common
                     if common is not None
@@ -3401,6 +3509,7 @@ class FrameViewReader:
         self._axis_1d = self._axis_2d_x = self._axis_2d_y = None
         self._two_d_kind = TwoDKind.Q_CHI
         self._g1_modes = self._g2_modes = {}
+        self._support_tables = {}
         self._map_1d_modes = self._map_2d_modes = {}
         self._axis_1d_modes = self._axis_2d_x_modes = self._axis_2d_y_modes = {}
         self._two_d_kind_modes = {}
@@ -3515,6 +3624,132 @@ class FrameViewReader:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self._clear_open_state()
+
+
+def read_contributing_frame_view(
+    scan_file: str | Path,
+    frame: int,
+    *,
+    scan: str | None = None,
+    source_root: str | Path | None = None,
+    full_raw: bool = False,
+    artifact_payload=None,
+) -> FrameView:
+    """Read a strictly admitted Stitch source record through shared raw owners.
+
+    An unavailable or changed original leaves ``raw`` absent and the stored
+    ``thumbnail`` intact, with the reason in ``extra["raw_unavailable_reason"]``,
+    allowing the presenter to label fallback honestly. No integrated-frame rows
+    or display identities are fabricated for this scan-level result.
+    """
+    from xrd_tools.io.analysis_artifact import (
+        AnalysisArtifactKind, AnalysisArtifactInvalid, AnalysisArtifactPayload,
+        inspect_analysis_artifact,
+        _stat_revision, _opened_hdf_revision,
+    )
+    from xrd_tools.io.nexus_record import frame_record_key, read_point_source_ref
+    from xrd_tools.io.stitch_record import STITCH_GROUP
+    from xrd_tools.io.read import (
+        _raw_frame_parts_from_entry, _frame_group_for_label,
+        _frame_source_read_options, _raw_frame_or_thumbnail, resolve_source_master,
+        _point_raw_frame,
+    )
+    from xrd_tools.sources.execution_graph import SourceFileState
+    import json
+    import os
+
+    if type(frame) is not int or frame < 0 or type(full_raw) is not bool:
+        raise TypeError("contributing frame selector is invalid")
+    path = Path(scan_file)
+    stitched = {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}
+    if artifact_payload is None:
+        inspection = inspect_analysis_artifact(path)
+        if inspection.kind not in stitched:
+            raise ValueError("contributing frames belong to a Stitch result")
+    else:
+        if type(artifact_payload) is not AnalysisArtifactPayload:
+            raise TypeError("contributing frame payload must be strictly admitted")
+        inspection = artifact_payload.inspection
+        if inspection.path != str(path.expanduser().absolute()) or inspection.kind not in stitched:
+            raise ValueError("contributing frame payload belongs to another artifact")
+        if _stat_revision(os.stat(path)) != inspection.storage_revision:
+            raise AnalysisArtifactInvalid("artifact changed since detached admission")
+    if inspection.frame_manifest_json is None:
+        raise KeyError("this artifact has no contributing frame records")
+    key = frame_record_key(scan, frame)
+    frame_manifest = json.loads(inspection.frame_manifest_json)
+    rows = frame_manifest["records"]
+    selected = next((row for row in rows if row["key"] == key), None)
+    if selected is None:
+        raise KeyError(f"unknown contributing frame {key}")
+    with h5py.File(path, "r") as handle:
+        if _opened_hdf_revision(handle) != inspection.storage_revision:
+            raise AnalysisArtifactInvalid("artifact changed before frame hydration")
+        # a stitched record keeps its contributors (and their source base) under entry/stitch
+        container = handle["entry"][STITCH_GROUP]
+        master, index, thumbnail = _raw_frame_parts_from_entry(
+            path, container, frame, scan=scan, source_root=source_root,
+        )
+        group = _frame_group_for_label(container, frame, scan=scan)
+        options = _frame_source_read_options(group)
+        point = read_point_source_ref(group.get("source"))
+    raw = None
+    raw_reason = ""
+    if full_raw:
+        operands = selected["source_constituents"] if point is not None else (selected,)
+        expected = [(resolve_source_master(operand["source_path"], scan_file=path,
+            source_base=frame_manifest["source_base"], source_root=source_root) if point is not None else master,
+            operand["source_snapshot"].get("size"), operand["source_snapshot"].get("mtime_ns"))
+            for operand in operands]
+        if any(operand["source_snapshot"].get("self_contained") is False for operand in operands):
+            # The primary NeXus file can stay unchanged while its linked detector
+            # data changes. Reuse this exact member's existing dependency stamps
+            # and the same relocatable Project resolver as its raw link.
+            manifest = json.loads(inspection.provenance_json).get("source", {}).get("input_manifest", {})
+            member = next((item for item in manifest.get("members", (manifest,))
+                if item.get("source", {}).get("module_source_fingerprint") == selected["identity"]["source_id"]), None)
+            if member is None:
+                expected.append((None, None, None))
+            else:
+                expected.extend((resolve_source_master(item["relative_path"], scan_file=path,
+                    source_base=frame_manifest["source_base"], source_root=source_root),
+                    item["revision"][3], item["revision"][4])
+                    for item in member["files"] if item["revision"] is not None)
+        try:
+            states = []
+            for source_path, size, mtime_ns in expected:
+                if size is None or mtime_ns is None:
+                    raw_reason = "saved raw source identity unavailable"
+                    break
+                if source_path is None:
+                    raise FileNotFoundError("raw source unavailable")
+                state = SourceFileState.capture(Path(source_path))
+                if (state.size, state.mtime_ns) != (size, mtime_ns):
+                    raw_reason = "raw source changed since processing"
+                    break
+                states.append(state)
+            if not raw_reason:
+                raw = (_point_raw_frame(path, point, source_base=frame_manifest["source_base"],
+                    source_root=source_root) if point is not None else
+                    _raw_frame_or_thumbnail(path, frame, master, index, thumbnail,
+                        allow_thumbnail=False, preserve_dtype=True, raw_options=options))
+                if not all(state.matches_disk() for state in states):
+                    raw, raw_reason = None, "raw source changed during reading"
+                elif point is not None:
+                    raw.setflags(write=False)
+        except (KeyError, OSError):
+            raw, raw_reason = None, "raw source unavailable"
+        except ValueError:
+            if point is None:
+                raise
+            raw, raw_reason = None, "raw source unavailable"
+    if _stat_revision(os.stat(path)) != inspection.storage_revision:
+        raise AnalysisArtifactInvalid("artifact changed during frame hydration")
+    return FrameView(label=frame, raw=raw, thumbnail=thumbnail,
+        mask_baked=selected["mask_baked"], metadata_raw=(dict(selected["identity"],
+            point_images=selected["point_images"]) if point is not None else selected["identity"]),
+        source_path=None if master is None else str(master), source_frame_index=None if point is not None else index,
+        extra={"raw_unavailable_reason": raw_reason} if raw_reason else {})
 
 
 def read_frame_view(

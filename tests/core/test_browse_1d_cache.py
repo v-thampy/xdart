@@ -518,25 +518,121 @@ def test_evicted_array_dies_before_replacement_capacity_is_reserved(monkeypatch)
     cache.close()
 
 
+def _fail_release_once(monkeypatch, authority):
+    """Fail the authority's actual release transition once, before it publishes, and keep the original for every
+    later call (INT-PERF-DIRECT-20261015 CR3): the batch transition where it exists, which every release goes through,
+    else the parent's one-token release."""
+    name = "_release_tokens" if hasattr(authority, "_release_tokens") else "_release"
+    real = getattr(authority, name)
+    failures = []
+
+    def fail_once(argument):
+        if not failures:
+            failures.append(argument)
+            raise OSError("lease release failed")
+        return real(argument)
+
+    monkeypatch.setattr(authority, name, fail_once)
+    return failures
+
+
+def _transitions(monkeypatch):
+    """Count the authority's real state transitions (full rebuilds and validated deltas); each call runs the
+    original."""
+    from xrd_tools.core import physical_memory
+    count = [0]
+    for name in ("_indexed_state", "_replacement_state"):
+        def counted(*args, _real=getattr(physical_memory, name), **kwargs):
+            count[0] += 1
+            return _real(*args, **kwargs)
+        monkeypatch.setattr(physical_memory, name, counted)
+    return count
+
+
 def test_close_retries_failed_eviction_and_releases_surviving_rows(monkeypatch):
     cache = Browse1DCache(64)
     cache.store_rows(1, 1, (("first", _readonly(range(4))), ("second", _readonly(range(4)))))
-    release = cache._authority._release
-    failures = []
-
-    def fail_once(token):
-        if not failures:
-            failures.append(token)
-            raise OSError("lease release failed")
-        return release(token)
-
-    monkeypatch.setattr(cache._authority, "_release", fail_once)
+    assert _fail_release_once(monkeypatch, cache._authority) == []
     with pytest.raises(OSError, match="lease release failed"):
         cache.store_rows(2, 2, (("new", _readonly(range(4))),))
     assert cache._authority.retained_bytes == 64
     cache.close()
     assert cache.phase is Browse1DCachePhase.CLOSED
     assert cache._authority.retained_bytes == 0
+
+
+def test_o1_closing_a_cache_releases_its_rows_in_one_transition(monkeypatch):
+    """INT-PERF-DIRECT-20261015 O1: close() makes a fixed number of authority transitions, however many rows it
+    releases (the parent made one full rebuild per row)."""
+    counts = {}
+    for size in (64, 1024):
+        cache = Browse1DCache(1 << 30)
+        cache.store_rows(1, 1, tuple((f"r{index}", _readonly([index])) for index in range(size)))
+        count = _transitions(monkeypatch)
+        cache.close()
+        counts[size] = count[0]
+        monkeypatch.undo()
+        assert cache.phase is Browse1DCachePhase.CLOSED
+        assert (cache._authority.retained_bytes, cache._authority.retained_root_count) == (0, 0)
+    assert counts[1024] - counts[64] <= 1 and counts[64] <= 3, counts
+
+
+def test_o2_an_evicting_store_makes_at_most_two_transitions(monkeypatch):
+    """INT-PERF-DIRECT-20261015 O2: a store that evicts four rows releases them in one batch, then commits, keeping
+    the least-recently-used order and exact accounting."""
+    cache = Browse1DCache(8 * 8)  # eight one-value float64 rows
+    for index in range(8):
+        cache.store_rows(index, index, (("v", _readonly([index])),))
+    count = _transitions(monkeypatch)
+    cache.store_rows(9, 9, tuple((f"n{index}", _readonly([10 + index])) for index in range(4)))
+    assert count[0] <= 2, count[0]
+    monkeypatch.undo()
+    resident = {(key.frame, key.name) for key in cache.resident_keys}
+    assert resident == {(index, "v") for index in range(4, 8)} | {(9, f"n{index}") for index in range(4)}
+    assert cache._authority.retained_bytes == 8 * 8
+    cache.close()
+
+
+def test_o3a_a_failed_eviction_keeps_its_leases_owned_and_the_cache_open(monkeypatch):
+    """INT-PERF-DIRECT-20261015 O3a: victims are detached before release; after a failed release the survivors stay,
+    nothing incoming is published, exactly the pending leases stay charged, and retry_cleanup() settles them while
+    the cache stays open and usable."""
+    cache = Browse1DCache(4 * 8)
+    for index in range(4):
+        cache.store_rows(index, index, (("v", _readonly([index])),))
+    charges = {id(row.lease): row.fact.nbytes for row in cache._snapshot_state().rows}
+    assert _fail_release_once(monkeypatch, cache._authority) == []
+    with pytest.raises(OSError, match="lease release failed"):
+        cache.store_rows(9, 9, (("a", _readonly([9])), ("b", _readonly([10]))))
+    assert cache.phase is Browse1DCachePhase.OPEN
+    assert {row.key.frame for row in cache._snapshot_state().rows} == {2, 3}
+    pending = cache._pending
+    assert pending and all(not lease.released for lease in pending)
+    assert cache._authority.retained_bytes == 2 * 8 + sum(charges[id(lease)] for lease in pending)
+    cache.retry_cleanup()
+    assert (cache.phase, cache._pending, cache._authority.retained_bytes) == (Browse1DCachePhase.OPEN, None, 2 * 8)
+    cache.store_rows(9, 9, (("a", _readonly([9])),))
+    assert cache._authority.retained_bytes == 3 * 8
+    cache.close()
+
+
+def test_o3b_a_failed_close_release_stays_closing_until_retried(monkeypatch):
+    """INT-PERF-DIRECT-20261015 O3b: close() detaches every row before releasing; a failed release leaves the cache
+    closing with empty membership and exactly the pending leases charged, and retry_cleanup() completes the close."""
+    cache = Browse1DCache(1 << 20)
+    for index in range(3):
+        cache.store_rows(index, index, (("v", _readonly([index])),))
+    charges = {id(row.lease): row.fact.nbytes for row in cache._snapshot_state().rows}
+    assert _fail_release_once(monkeypatch, cache._authority) == []
+    with pytest.raises(OSError, match="lease release failed"):
+        cache.close()
+    assert cache.phase is Browse1DCachePhase.CLOSING and cache._snapshot_state().rows == ()
+    pending = cache._pending
+    assert pending and all(not lease.released for lease in pending)
+    assert cache._authority.retained_bytes == sum(charges[id(lease)] for lease in pending)
+    cache.retry_cleanup()
+    assert cache.phase is Browse1DCachePhase.CLOSED
+    assert (cache._authority.retained_bytes, cache._authority.retained_root_count) == (0, 0)
 
 
 def test_late_cancel_discards_whole_bundle_and_allows_reread_without_locked_callback():

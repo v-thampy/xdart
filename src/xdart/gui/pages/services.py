@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, TYPE_CHECKING
+from typing import Protocol
 
 from .values import PageKey
-
-if TYPE_CHECKING:
-    from xrd_tools.session.experiment_state import ExperimentEditorPort
 
 
 class StatusPresenter(Protocol):
@@ -26,10 +23,6 @@ class ExecutionProvider(Protocol):
 
 class SourceProvider(Protocol):
     def source_port_for(self, key: PageKey) -> object | None: ...
-
-
-class _ExperimentProvider(Protocol):
-    def experiment_for(self, key: PageKey) -> ExperimentEditorPort | None: ...
 
 
 class ExecutionProfile(str, Enum):
@@ -80,22 +73,6 @@ class _SelectedSources:
 
 
 @dataclass(frozen=True, slots=True)
-class _SelectedExperiments:
-    selected: PageKey
-    provider: _ExperimentProvider
-
-    def experiment_for(self, key: PageKey) -> ExperimentEditorPort | None:
-        if key != self.selected:
-            return None
-        return self.provider.experiment_for(self.selected)
-
-
-class _NullExperiments:
-    def experiment_for(self, _key: PageKey) -> None:
-        return None
-
-
-@dataclass(frozen=True, slots=True)
 class HostServices:
     status: StatusPresenter
     run_intents: RunIntentProvider
@@ -103,14 +80,6 @@ class HostServices:
     sources: SourceProvider
     execution_profile: ExecutionProfile
     diagnostics: DiagnosticIdentity
-    _experiments: _ExperimentProvider = field(
-        default_factory=_NullExperiments,
-        repr=False,
-    )
-
-    def experiment_for(self, key: PageKey) -> ExperimentEditorPort | None:
-        """Return the borrowed experiment editor for that exact key, or None."""
-        return self._experiments.experiment_for(key)
 
     def for_page(self, key: PageKey) -> "HostServices":
         """Return providers that refuse every key except the selected one."""
@@ -121,7 +90,6 @@ class HostServices:
             sources=_SelectedSources(key, self.sources),
             execution_profile=self.execution_profile,
             diagnostics=self.diagnostics,
-            _experiments=_SelectedExperiments(key, self._experiments),
         )
 
 

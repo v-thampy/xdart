@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from threading import Event
 import time
 
+import numpy as np
 import pytest
+import tifffile
 
 from xdart.gui.pages.operation_owner import OperationTerminalStatus
 from xdart.gui.pages.values import PageCleanup
@@ -14,19 +17,106 @@ from xdart.gui.tools.rsm_owner import (
     RSMOwnerOutcomeKind,
     RSMToolOwner,
 )
-from xdart.gui.tools.rsm_values import RSMToolPreflightRefused
+from xdart.gui.tools.rsm_values import (
+    RSMFrameSelector,
+    RSMScanMemberForm,
+    RSMToolFormV2,
+    RSMToolPreflightRefused,
+    prepare_rsm_tool_v2,
+)
 from xrd_tools.analysis.module_transaction import (
+    MetadataColumnSelector,
     ModuleDisposition,
     ModuleProgress,
     ModuleSourceReceipt,
     ModuleTerminalResult,
 )
-from xrd_tools.analysis.rsm_operation import (
-    RSMOperationCleanupPending,
-    RSMOperationExecution,
-    RSMOperationResult,
-    RSMOperationVerificationError,
+from xrd_tools.analysis.rsm_geometry_asset import (
+    CANONICAL_RSM_GEOMETRY_LOCATOR,
+    install_canonical_rsm_geometry_asset,
+    rsm_geometry_asset_input,
 )
+from xrd_tools.analysis.rsm_operation import (
+    RSMImageConditioning,
+    RSMNormalizationPolicy,
+    RSMOperationCleanupPending,
+    RSMOperationCleanupPendingV2,
+    RSMOperationExecution,
+    RSMOperationExecutionV2,
+    RSMOperationResult,
+    RSMOperationResultV2,
+    RSMOperationVerificationError,
+    RSMOperationVerificationErrorV2,
+)
+from xrd_tools.io.analysis_artifact import AnalysisArtifactOverwrite
+from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+
+
+# The RSM v2 owner's helpers and rows, moved from the classic RSM dialog's test file when the dialog was
+# retired (AUD-9 stage 2b G10): they never touched the dialog. `_prepared_v2` installs the canonical RSM
+# geometry asset, so a later retirement of that asset must replace it here too.
+_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
+
+
+def _write_member(root: Path, ordinal: int):
+    source = root / f"source-{ordinal}"
+    images = source / "images"
+    images.mkdir(parents=True)
+    spec = source / f"RSM_synth_{ordinal}"
+    spec.write_text(
+        f"""#F RSM_synth_{ordinal}
+#E 1
+#D Mon Jan 15 10:30:00 2024
+#O0 energy  mu  chi  phi  nu  del
+
+#S 1 ascan eta {ordinal} {ordinal + 1} 1 1
+#D Mon Jan 15 10:30:00 2024
+#P0 13000.007 {10 + ordinal} 20 30 40 50
+#G3 1 0 0 0 1 0 0 0 1
+#N 4
+#L eta  Seconds  Seconds  foil status
+{ordinal}.0 1 10 101
+{ordinal + 1}.0 2 20 110
+""",
+        encoding="utf-8",
+    )
+    for label in range(2):
+        tifffile.imwrite(
+            images / f"member{ordinal}_{label:04d}.tif",
+            np.arange(20, dtype=np.uint16).reshape(4, 5) + ordinal + label,
+        )
+    return RSMScanMemberForm(
+        spec,
+        "1.1",
+        images,
+        f"member{ordinal}_",
+        RSMFrameSelector(0, 1, 1),
+        (195, 487),
+        "uint16",
+        0,
+        tuple((role, MetadataColumnSelector(role, 0)) for role in _ROLES),
+    )
+
+
+def _prepared_v2(root, coordinate_frame=RSMCoordinateFrame.HKL):
+    install_canonical_rsm_geometry_asset(project_root=root)
+    output = root / "output"
+    output.mkdir(exist_ok=True)
+    form = RSMToolFormV2(
+        root,
+        rsm_geometry_asset_input(CANONICAL_RSM_GEOMETRY_LOCATOR),
+        (_write_member(root, 0), _write_member(root, 1)),
+        RSMImageConditioning(0.0, None, None),
+        RSMNormalizationPolicy.identity(),
+        (4, 5, 6),
+        1,
+        16 * 1024 * 1024,
+        16 * 1024 * 1024,
+        output / "rsm-v2.nexus",
+        AnalysisArtifactOverwrite.CREATE_NEW,
+        coordinate_frame,
+    )
+    return prepare_rsm_tool_v2(form)
 
 
 def _poll_terminal(owner: RSMToolOwner, *, timeout: float = 3.0):
@@ -372,3 +462,113 @@ def test_close_drains_and_retries_exact_verification(
         "retry-verification",
     ]
     assert calls[0][1] is calls[1][1]
+
+
+def test_v2_owner_profile_adopts_only_exact_v2_preflight(tmp_path):
+    prepared = _prepared_v2(tmp_path)
+    owner = RSMToolOwner.v2(
+        preflight_runner=lambda _form, *, cancel_token=None: prepared
+    )
+    try:
+        assert owner.set_form(prepared.form) is False
+        assert owner.begin_preflight() is not None
+        update = _poll_terminal(owner)
+        assert update.outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_READY
+        assert owner.prepared is prepared
+    finally:
+        assert owner.close().status is PageCleanup.CLEAN
+
+
+@pytest.mark.parametrize(
+    ("pending_error", "pending_kind", "retry_name", "begin_name"),
+    (
+        (
+            RSMOperationCleanupPendingV2,
+            RSMOwnerOutcomeKind.CLEANUP_PENDING,
+            "retry_cleanup",
+            "begin_retry_cleanup",
+        ),
+        (
+            RSMOperationVerificationErrorV2,
+            RSMOwnerOutcomeKind.VERIFICATION_PENDING,
+            "retry_verification",
+            "begin_retry_verification",
+        ),
+    ),
+)
+def test_v2_owner_retains_exact_execution_for_finalization_retry(
+    tmp_path,
+    monkeypatch,
+    pending_error,
+    pending_kind,
+    retry_name,
+    begin_name,
+):
+    prepared = _prepared_v2(tmp_path)
+
+    def run(self, *, cancel_token=None, progress_callback=None):
+        if pending_error is RSMOperationVerificationErrorV2:
+            raise pending_error(self, "held reload")
+        raise pending_error(self)
+
+    def retry(self):
+        return RSMOperationResultV2(
+            self.request,
+            ModuleTerminalResult(
+                self.request.module,
+                ModuleDisposition.REFUSED,
+                "TEST_RESULT",
+            ),
+        )
+
+    monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
+    monkeypatch.setattr(RSMOperationExecutionV2, retry_name, retry)
+    owner = RSMToolOwner.v2(
+        preflight_runner=lambda _form, *, cancel_token=None: prepared
+    )
+    try:
+        owner.set_form(prepared.form)
+        assert owner.begin_preflight() is not None
+        assert _poll_terminal(owner).outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_READY
+        assert owner.begin_run() is not None
+        assert _poll_terminal(owner).outcome.kind is pending_kind
+        assert getattr(owner, begin_name)() is not None
+        assert _poll_terminal(owner).outcome.kind is RSMOwnerOutcomeKind.RESULT
+    finally:
+        assert owner.close().status is PageCleanup.CLEAN
+
+
+@pytest.mark.parametrize(
+    "foreign_error",
+    (RSMOperationCleanupPending, RSMOperationVerificationError),
+)
+def test_v2_owner_rejects_wrong_generation_finalization_exception(
+    tmp_path,
+    monkeypatch,
+    foreign_error,
+):
+    prepared = _prepared_v2(tmp_path)
+
+    def run(self, *, cancel_token=None, progress_callback=None):
+        if foreign_error is RSMOperationVerificationError:
+            raise foreign_error(self, "foreign R1 verification")
+        raise foreign_error(self)
+
+    monkeypatch.setattr(RSMOperationExecutionV2, "run", run)
+    owner = RSMToolOwner.v2(
+        preflight_runner=lambda _form, *, cancel_token=None: prepared
+    )
+    try:
+        owner.set_form(prepared.form)
+        assert owner.begin_preflight() is not None
+        assert _poll_terminal(owner).outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_READY
+        assert owner.begin_run() is not None
+        failed = _poll_terminal(owner)
+        assert failed.terminal_status is OperationTerminalStatus.FAILED
+        assert failed.failure_type == "TypeError"
+        assert "generation" in failed.failure_message
+        assert owner.finalization is RSMOwnerFinalization.NONE
+        assert owner.begin_retry_cleanup() is None
+        assert owner.begin_retry_verification() is None
+    finally:
+        assert owner.close().status is PageCleanup.CLEAN

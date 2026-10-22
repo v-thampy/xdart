@@ -17,7 +17,7 @@ import numpy as np
 
 from xrd_tools.core.physical_memory import (
     PhysicalRootAuthority, PhysicalRootFact, PhysicalRootLease,
-    PhysicalRootReservation, physical_root_fact,
+    PhysicalRootReservation, physical_root_fact, release_leases,
 )
 
 if TYPE_CHECKING:
@@ -27,7 +27,9 @@ _GIB = 1 << 30
 _MAX_ROW_NAME_BYTES = 1 << 10
 _MAX_BROWSE_1D_RESIDENT_ROWS = 4096
 _ROW_NAME_PREFIX = "browse-1d-row-v1:"
-_ROW_COMPONENTS = frozenset({"axis", "intensity", "sigma"})
+#: A label's rows by role; "angular_support" is the primary mode's saved angular coverage (COVERAGE-SUPPORT-20261013),
+#: resident, leased and evicted like the intensity beside it (one more row per label under the same row bound).
+_ROW_COMPONENTS = frozenset({"axis", "intensity", "sigma", "angular_support"})
 
 def browse_1d_row_name(mode: str, component: str) -> str:
     """Return one collision-free versioned cache name for a 1-D row role.
@@ -44,7 +46,7 @@ def browse_1d_row_name(mode: str, component: str) -> str:
         raise TypeError("Browse 1-D row component must be an exact string")
     if component not in _ROW_COMPONENTS:
         raise ValueError(
-            "Browse 1-D row component must be axis, intensity, or sigma"
+            "Browse 1-D row component must be axis, intensity, sigma, or angular_support"
         )
     mode_bytes = mode.encode("utf-8")
     name = f"{_ROW_NAME_PREFIX}{len(mode_bytes)}:{mode}:{component}"
@@ -620,6 +622,9 @@ class Browse1DCache(_LinearObject):
             components = (("intensity", intensity),)
             if sigma is not None:
                 components += (("sigma", sigma),)
+            support = mode_rows.support(label)
+            if support is not None and support.available:
+                components += (("angular support", support.supported_deg),)
             for component, array in components:
                 if (
                     type(array) is not np.ndarray
@@ -636,6 +641,8 @@ class Browse1DCache(_LinearObject):
             named.append((browse_1d_row_name(mode, "intensity"), intensity))
             if sigma is not None:
                 named.append((browse_1d_row_name(mode, "sigma"), sigma))
+            if support is not None and support.available:
+                named.append((browse_1d_row_name(mode, "angular_support"), support.supported_deg))
         return tuple(named)
 
 
@@ -669,18 +676,9 @@ class Browse1DCache(_LinearObject):
         if type(pending) is PhysicalRootReservation:
             pending.rollback()
         else:
-            failed = []
-            first_error = None
-            for lease in pending:
-                try:
-                    lease.release()
-                except BaseException as error:
-                    failed.append(lease)
-                    if first_error is None:
-                        first_error = error
-            self._pending = tuple(failed) or None
-            if first_error is not None:
-                raise first_error
+            # one authority transition for the whole tuple, however many rows an eviction or close detached
+            # (INT-PERF-DIRECT-20261015); if it raises, every lease stays pending and owned for retry_cleanup()
+            release_leases(pending)
         self._pending = None
 
     def _store_rows(self, frame: int, label: int,

@@ -393,3 +393,36 @@ class RunCandidatePlan:
 
 
 __all__ = ["RunCandidatePlan", "RunReconcile", "SupersededPlanError"]
+
+
+def directory_candidate_groups(
+    plan: RunCandidatePlan,
+) -> tuple[tuple[Candidate, ...], ...]:
+    from xrd_tools.sources.adapters import get_adapter
+    from xrd_tools.core.scan import SourceKind
+    groups: list[tuple[Candidate, ...]] = []
+    consumed: set[Path] = set()
+    for candidate in plan.candidates:
+        if candidate.path in consumed:
+            continue
+        adapter = get_adapter(candidate.adapter_id)
+        if adapter is None:
+            raise ValueError(
+                f"directory candidate lost adapter {candidate.adapter_id!r}"
+            )
+        if SourceKind.IMAGE_FILE in adapter.kinds:
+            name = adapter.scan_name(candidate.path)
+            members = tuple(
+                value
+                for value in plan.candidates
+                if (
+                    value.adapter_id == candidate.adapter_id
+                    and value.path.parent == candidate.path.parent
+                    and adapter.scan_name(value.path) == name
+                )
+            )
+        else:
+            members = (candidate,)
+        consumed.update(value.path for value in members)
+        groups.append(members)
+    return tuple(groups)

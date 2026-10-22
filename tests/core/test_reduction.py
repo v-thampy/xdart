@@ -1272,8 +1272,11 @@ def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
         )
 
     scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
-    with pytest.raises(ValueError, match="mask shape"):
+    with pytest.raises(ValueError, match="mask shape") as mismatch:
         run_reduction(ReductionPlan(mask=np.ones((3, 3), dtype=bool)), scan)
+    assert "(3, 3) does not match image shape (2, 2)" in str(mismatch.value)
+    assert "PONI calibration detector" in str(mismatch.value)
+    assert "selected mask" in str(mismatch.value)
 
     scan = Scan(
         "scan",
@@ -1543,6 +1546,49 @@ def test_composite_nexus_sink_prepares_thumbnails_off_writer_thread(
         for index in range(4):
             assert f"entry/frames/frame_{index:04d}/thumbnail" in h5
 
+
+
+def test_a_frames_dark_corrected_background_is_computed_once_for_its_reduction_and_thumbnail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AUD-7 (maintainer, 2026-09-30: "fix", measured first): the background a frame's reduction subtracts,
+    raw − dark − (background − scale·dark), is computed once and given to the worker's thumbnail, which
+    computed it again; the thumbnail is the same, 30 + i − 2 − (10 − 0.5·2) = 19 + i (a uniform frame's
+    stored thumbnail: its value in ``vmin``)."""
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(np.nansum(image))),
+    )
+    calls: list[int] = []
+    original = reduction_core._dark_corrected_background
+
+    def counted(frame, plan):
+        calls.append(int(frame.index))
+        return original(frame, plan)
+
+    monkeypatch.setattr(reduction_core, "_dark_corrected_background", counted)
+    shape = (32, 24)
+    frames = []
+    for index in range(4):
+        frame = Frame(index, image=np.full(shape, 30.0 + index))
+        frame.background = np.full(shape, 10.0)
+        frame.background_scale = 0.5
+        frames.append(frame)
+    out = tmp_path / "shared-background.nexus"
+    result = run_reduction(
+        ReductionPlan(integration_2d=None, dark=np.full(shape, 2.0)),
+        Scan("scan", frames, integrator=object()),
+        (NexusSink(out, overwrite=True), MemorySink()),
+        executor=2,
+    )
+    assert result.n_processed == 4
+    assert sorted(calls) == [0, 1, 2, 3]  # once a frame
+    with h5py.File(out, "r") as h5:
+        for index in range(4):
+            thumbnail = h5[f"entry/frames/frame_{index:04d}/thumbnail"]
+            assert float(thumbnail.attrs["vmin"]) == 19.0 + index
 
 def test_nexus_disabled_thumbnails_allocate_no_corrected_copy(
     tmp_path: Path,

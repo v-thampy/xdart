@@ -27,7 +27,7 @@ context:
   # convenience value for a local `rattler-build build`; keep it == pyproject.
   # (load_from_file would auto-read it, but that needs rattler-build
   # --experimental, so we sync in CI instead.)
-  version: "1.1.5"
+  version: "1.2.0"
   python_min: "3.13"
 
 package:
@@ -39,7 +39,7 @@ source:
   path: ../
 
 build:
-  number: 1
+  number: 0
   noarch: python
   script:
     - python -m pip install . -vv --no-deps --no-build-isolation
@@ -69,20 +69,20 @@ requirements:
     - python >=${{ python_min }},<3.14
     # headless core — conda-forge fast I/O stack
     - numpy ==2.5.1               # match the XU numerical runtime contract
-    - scipy
+    - scipy ==1.18.1
     - pandas
     - xarray
-    - h5py
-    - hdf5plugin
-    - nexusformat
+    - h5py ==3.16.0
+    - hdf5plugin ==7.1.0
+    - nexusformat ==2.0.3
     # nexusformat 2.0.3 requires this, but its conda-forge recipe omits it.
     - chardet
-    - fabio
-    - silx
-    - pyfai >=2026.5,<2026.6     # conda-forge lowercase; audited 2026.5 line
+    - fabio ==2025.10.0
+    - silx ==3.1.3
+    - pyfai >=2026.9,<2026.10    # conda-forge lowercase; audited 2026.9 line
     # pyFAI's bare NumExpr calls omit VML buffering metadata. Use the non-MKL
     # build (py*, not mkl_py*) to keep strided/broadcast geometry correct.
-    - numexpr * py*
+    - numexpr ==2.14.2 py*
     - pyyaml
     - joblib
     - natsort
@@ -90,10 +90,10 @@ requirements:
     - plotly
     # xdart GUI ([gui] extra, carried unconditionally — this package IS the GUI
     # one-liner; a separate GUI-less headless-core noarch can come later)
-    - pyside6 >=6.5
-    - pyqtgraph >=0.13.7
+    - pyside6 >=6.11.1,<6.12
+    - pyqtgraph ==0.14.0
     - qtawesome
-    - nexpy ==2.0.1               # external NeXus browser; silx view is already included
+    - nexpy ==2.0.3               # external NeXus browser; silx view is already included
     - imagecodecs
     - imageio
     - packaging
@@ -115,6 +115,7 @@ requirements:
     - ipyfilechooser
     - jupyterlab
     - nbformat
+    - marimo >=0.25,<0.26
 
 tests:
   - python:
@@ -128,6 +129,7 @@ tests:
         - ipyfilechooser
         - jupyterlab
         - nbformat
+        - marimo
       pip_check: true             # every declared dep resolves in the solved env
   # NB: `xdart --help` is intentionally NOT tested — xdart_main launches the GUI
   # (no arg parsing), which would hang a headless build.  A real launch is the

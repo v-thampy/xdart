@@ -26,7 +26,7 @@ from .controls_editing import (
     reduce_advanced_settings,
     reduce_control_edit,
     reduce_source_selection,
-    observed_threshold_max,
+    observed_saturation,
 )
 from .controls_inventory import (
     AVERAGE_SCAN,
@@ -37,6 +37,7 @@ from .controls_inventory import (
     BACKGROUND_METADATA_KEY,
     BACKGROUND_NORMALIZE,
     BACKGROUND_SCALE,
+    BACKGROUND_DARK_CORRECTED,
     BACKGROUND_TYPE,
     GI_ENABLED,
     GI_MOTOR,
@@ -96,6 +97,7 @@ def project_controls(
     advanced_editor_available: bool = False,
     source_mode_override: str | None = None,
     detector_summary_override: str | None = None,
+    detector_name_override: str | None = None,
     calibrate_available: bool = False,
     calibrate_dependency_available: bool = False,
     operation_busy: bool = False,
@@ -234,7 +236,8 @@ def project_controls(
         2,
     )
     fields.insert(insertion, output)
-    fields = _threshold_fields(fields, intent, observation, unlocked=unlocked)
+    fields = _threshold_fields(fields, intent, observation, unlocked=unlocked,
+                               detector=detector_name_override)
     fields = [truthful_field(candidate) for candidate in fields]
     if viewer:
         fields = [candidate if candidate.path == PROJECT_ROOT else
@@ -358,7 +361,9 @@ def project_controls(
 #: Detector-scope hover guard: rides every disabled reason for the manual
 #: max bound AND its enabled-state tooltip, so it is visible whichever state
 #: the row renders in.
-_MAX_BOUND_SCOPE_CAVEAT = " Automatic upper limit: native integer type maximum minus one. Clear this bound to restore the default 0-to-limit band."
+_MAX_BOUND_SCOPE_CAVEAT = (" Automatic upper limit: the detector's saturation (the value the input records, else the"
+                           " calibration detector's counter limit, else the data type's maximum); values at or above it"
+                           " are left out. Clear this bound to restore the automatic band.")
 
 
 def _threshold_fields(
@@ -367,6 +372,7 @@ def _threshold_fields(
     observation: SourceObservation | None,
     *,
     unlocked: bool,
+    detector: str | None = None,
 ) -> list:
     """One enable owns the automatic native band or an explicit edited band."""
     manual_on = bool(intent.threshold.apply_threshold)
@@ -378,12 +384,15 @@ def _threshold_fields(
             continue
         if candidate.path in {THRESHOLD_MIN, THRESHOLD_MAX}:
             value = candidate.value if manual_on or not enabled else None
-            if value is None:
-                value = (
-                    0.0
-                    if candidate.path == THRESHOLD_MIN
-                    else None if manual_on else observed_threshold_max(intent, observation)
-                )
+            if value is None and candidate.path == THRESHOLD_MIN:
+                value = 0.0
+            placeholder = None
+            if candidate.path == THRESHOLD_MAX:
+                # the automatic ceiling is a grey hint, never the field's value (decision 39)
+                ceiling = observed_saturation(intent, observation, detector=detector)
+                placeholder = "Auto" if ceiling is None else (
+                    f"Auto · {ceiling.value} "
+                    + ("(data type maximum)" if ceiling.source == "dtype" else "(saturation)"))
             # The disabled reason takes tooltip precedence, so the max
             # bound's detector-scope caveat must ride EVERY disabled reason
             # — Auto-on AND run-locked — or the hover guard silently
@@ -406,6 +415,7 @@ def _threshold_fields(
                 value=value,
                 enabled=unlocked and enabled,
                 reason=reason,
+                placeholder=placeholder,
             ))
             continue
         out.append(candidate)
@@ -421,6 +431,7 @@ __all__ = [
     "BACKGROUND_METADATA_KEY",
     "BACKGROUND_NORMALIZE",
     "BACKGROUND_SCALE",
+    "BACKGROUND_DARK_CORRECTED",
     "AdvancedSettingsValues",
     "BACKGROUND_TYPE",
     "EditNoChange",

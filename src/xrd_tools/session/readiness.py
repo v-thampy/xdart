@@ -9,7 +9,10 @@ from enum import Enum
 import logging
 import math
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from xrd_tools.session.run_configuration import FrozenRunConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +519,15 @@ class ControlAction(str, Enum):
     REINTEGRATE_1D = "reintegrate_1d"
     REINTEGRATE_2D = "reintegrate_2d"
     ADVANCED_PROCESSING = "advanced_processing"
+    SOURCE_OPTIONS = "source_options"
+    #: Another page's own Processing actions on the same row (Stitch: check the
+    #: inputs and list the outputs; retry a finalization that did not complete).
+    PREVIEW = "preview"
+    RETRY = "retry"
+    PLOT_METADATA = "plot_metadata"
+    #: Presentation only: shared help buttons route directly to their context
+    #: owner, never through ControlsProjection or a scientific command.
+    HELP = "help"
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,6 +587,31 @@ class ControlFieldKind(str, Enum):
     LINE = "line"
     BOOL = "bool"
     COMBO = "combo"
+    #: A whole number typed into a line: the text is kept as typed and refused, never reverted, when it is
+    #: no whole number within the field's bounds (:func:`integer_field_refusal`).
+    INT = "int"
+
+
+def integer_field_refusal(text, *, minimum: int | None = None, maximum: int | None = None,
+                          allow_blank: bool = False) -> str:
+    """Why ``text`` is not a whole number within the bounds, in a few words ("" when it is one).
+
+    The one rule an integer field's row shows and a page's readiness names. It never replaces the
+    typed value (Codex's RSM stage-1 review F1: a refused value must not leave an older one in force).
+    ``allow_blank``: an empty field is valid (the field's automatic value, as a blank Last frame).
+    """
+    value = "" if text is None else str(text).strip()
+    if not value:
+        return "" if allow_blank else "a whole number is needed"
+    try:
+        number = int(value)
+    except ValueError:
+        return f"{value!r} is not a whole number"
+    if minimum is not None and number < minimum:
+        return f"must be at least {minimum}"
+    if maximum is not None and number > maximum:
+        return f"must be at most {maximum}"
+    return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -595,6 +632,16 @@ class ControlFormField:
     enabled: bool = True
     reason: str = ""
     parameter_group: str = ""
+    #: The grey hint an empty range bound shows (None leaves the renderer's own), e.g. the
+    #: automatic threshold ceiling, which is never the field's value (decision 39).
+    placeholder: str | None = None
+    #: INT fields only: the bounds, and whether a blank (automatic) value is valid
+    #: (:func:`integer_field_refusal`).
+    minimum: int | None = None
+    maximum: int | None = None
+    allow_blank: bool = False
+    #: COMBO fields only: (stored choice, shown label) pairs; the stored choices stay the field's value
+    choice_labels: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -766,6 +813,7 @@ def build_native_int_reduction_plan_from_args(
     threshold_min: Any = None,
     threshold_max: Any = None,
     mask_saturation: bool = False,
+    saturation: int | None = None,
     detector_mask: Any = None,
     detector_shape: tuple[int, int] | None = None,
 ):
@@ -922,6 +970,7 @@ def build_native_int_reduction_plan_from_args(
         threshold_min=threshold_min,
         threshold_max=threshold_max,
         mask_saturation=bool(mask_saturation),
+        saturation=saturation,
         extra=modes,
     )
 
@@ -990,3 +1039,345 @@ def build_native_int_reduction_plan_from_scan(
         detector_mask=getattr(scan, "global_mask", None),
         detector_shape=detector_shape,
     )
+
+
+def execution_plan_shape(
+    bai_1d_args: Mapping[str, Any],
+    bai_2d_args: Mapping[str, Any],
+    gi: Any,
+    processing_mode: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """The plan arguments a Run's controls imply: its argument copies, GI and dimensions.
+
+    One rule for the Run's frozen configuration and for a saved output's ``run_configuration``
+    (BROWSE-REFERENCE-RINGS-20261013), whose rings must rebuild the plan facts the Run published.
+    """
+    one, two = dict(bai_1d_args), dict(bai_2d_args)
+    if gi.enabled:
+        one["gi_mode_1d"], two["gi_mode_2d"] = gi.mode_1d, gi.mode_2d
+    manual = gi.enabled and gi.effective_motor == "Manual"
+    return one, two, {
+        "gi_enabled": gi.enabled,
+        "gi_incident_angle": gi.th_val if manual else None,
+        "incidence_motor": gi.effective_motor if gi.enabled and not manual else None,
+        "tilt_angle": gi.tilt_angle, "sample_orientation": gi.sample_orientation,
+        "integrate_1d": True,
+        "integrate_2d": not (
+            "Viewer" not in processing_mode
+            and "1D" in processing_mode
+            and "2D" not in processing_mode
+        ),
+    }
+
+
+def execution_plan_values(
+    configuration: FrozenRunConfiguration,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    threshold = configuration.threshold
+    one, two, shape = execution_plan_shape(
+        configuration.bai_1d_args, configuration.bai_2d_args,
+        configuration.gi, configuration.processing_mode,
+    )
+    return one, two, {
+        **shape,
+        "threshold_min": (
+            threshold.threshold_min if threshold.apply_threshold else None
+        ),
+        "threshold_max": (
+            threshold.threshold_max if threshold.apply_threshold else None
+        ),
+        "mask_saturation": threshold.mask_saturation,
+        # the source's resolved ceiling (decision 39); absent: the data type's rule
+        "saturation": threshold.saturation,
+    }
+
+
+class EnergyScanRefused(ValueError):
+    """An Int energy scan that cannot be reduced as recorded.
+
+    Raised when the scan is bound, before any frame is reduced or anything is written; its
+    message says what to change, and the page shows it in a notification.
+    """
+
+
+def effective_ring_geometry(calibration, *, integrator, plan=None):
+    """One immutable, transient snapshot of geometry already bound for Run.
+
+    Construct once, before publication. JSON owns the nested detector config;
+    no integrator, array, source or RSM-only image transform is retained.
+    """
+    import json
+    detector = integrator.detector
+    return MappingProxyType({
+        **{name: float(getattr(integrator, name)) for name in
+           ('dist', 'poni1', 'poni2', 'rot1', 'rot2', 'rot3')},
+        'wavelength': integrator.wavelength,
+        'detector': detector.name,
+        'detector_config_json': json.dumps(dict(calibration.detector_config), sort_keys=True),
+        'parallax': calibration.parallax,
+        'is_flat': bool(detector.IS_FLAT),
+        'uniform_pixel': bool(detector.uniform_pixel),
+        'has_spline': detector.spline is not None,
+        'domain': 'Grazing' if plan is not None and plan.gi is not None else 'Standard',
+        'chiDiscAtPi': bool(integrator.chiDiscAtPi),
+        'azimuth_offset_1d': float(getattr(getattr(plan, 'integration_1d', None), 'azimuth_offset', 0.)),
+        'azimuth_offset_2d': float(getattr(getattr(plan, 'integration_2d', None), 'azimuth_offset', 0.)),
+    })
+
+
+def frame_ring_wavelengths(selection: Mapping[str, Any] | None) -> dict[int, float]:
+    """Each listed frame's effective wavelength (m) from an energy selection's per-frame energies.
+
+    The one per-label rule the Run's ring publication and a saved output's rings share: a label in
+    ``frame_labels`` takes its own ``frame_energies_eV`` entry; any other keeps the snapshot's wavelength.
+    """
+    from xrd_tools.core.energy import energy_eV_to_wavelength_m
+    selection = selection or {}
+    return dict(zip(selection.get('frame_labels', ()),
+                    map(energy_eV_to_wavelength_m, selection.get('frame_energies_eV', ()))))
+
+
+@dataclass(frozen=True, slots=True)
+class RingRefusal:
+    """A saved output whose frames get no predicted rings, with the reason for each of them.
+
+    ``kind`` is the record's: an Average result or a Reintegrate version is not an Int Run's record, so a
+    display keeps its own generic reason for it rather than this one.
+    """
+
+    reason: str
+    kind: str = 'run'
+
+    @property
+    def shape(self) -> None:
+        return None
+
+    def frame_snapshot(self, label: int) -> None:
+        return None
+
+    def frame_reason(self, label: int) -> str:
+        return self.reason
+
+
+@dataclass(frozen=True, slots=True)
+class RingBasis:
+    """Detached per-frame ring snapshots rebuilt from one saved Int output (BROWSE-REFERENCE-RINGS-20261013).
+
+    ``base`` is the output's 17-field snapshot; an eligible label's own wavelength replaces its ``wavelength``,
+    as the Run published it. ``shape`` is the saved detector's native shape. Labels outside the output, and an
+    energy scan's earlier Append epochs (D5), refuse with their own reasons. No handle, integrator or array is held.
+    """
+
+    base: Mapping[str, Any]
+    wavelengths: Mapping[int, float]
+    labels: frozenset[int]
+    eligible: frozenset[int]
+    shape: tuple[int, int]
+    #: The record's own accepted calibration and plan, as the basis resolved them (COVERAGE-SUPPORT-20261013's saved
+    #: support basis extends this one rather than reading the record again); None only for a hand-built basis.
+    calibration: Any = None
+    plan: Any = None
+
+    @property
+    def kind(self) -> str:
+        return 'run'
+
+    def frame_snapshot(self, label: int) -> Mapping[str, Any] | None:
+        if self.frame_reason(label):
+            return None
+        wavelength = self.wavelengths.get(label, self.base['wavelength'])
+        return (self.base if wavelength == self.base['wavelength']
+                else MappingProxyType({**self.base, 'wavelength': wavelength}))
+
+    def frame_reason(self, label: int) -> str:
+        from xrd_tools import geometry_figures as gf
+        if label not in self.labels:
+            return gf.SAVED_LABEL_ABSENT_REASON
+        return '' if label in self.eligible else gf.SAVED_HISTORY_REASON
+
+
+def _valid_energy_selection(selection: Any) -> bool:
+    """A saved energy selection the Run's rule can trust: a finite positive or absent representative wavelength,
+    and equal-length lists of unique nonnegative integer labels and finite positive energies, or neither list."""
+    def positive(value):
+        return type(value) in (int, float) and math.isfinite(value) and value > 0
+    if not isinstance(selection, Mapping) or 'wavelength_m' not in selection:
+        return False
+    wavelength = selection.get('wavelength_m')
+    if wavelength is not None and not positive(wavelength):
+        return False
+    labels, energies = selection.get('frame_labels'), selection.get('frame_energies_eV')
+    if labels is None and energies is None:
+        return True
+    return (type(labels) is list and type(energies) is list and len(labels) == len(energies)
+            and all(type(label) is int and label >= 0 for label in labels) and len(set(labels)) == len(labels)
+            and all(positive(energy) for energy in energies))
+
+
+def ring_basis_from_saved(run_configuration, energy_selection, *, labels, monochromator_wavelength_m=None,
+                          epochs=None, kind='run', unreadable=()):
+    """One saved Int output's ring basis, or a typed refusal; malformed content refuses rather than raises.
+
+    Geometry comes only from the output's own record: its accepted PONI values and detector configuration, its
+    saved plan arguments through the Run's own plan route (:func:`execution_plan_shape`), and its effective
+    energy — the energy selection, or for an older output without one its recorded monochromator wavelength (D2).
+    When the selection lists per-frame energies, only the last Append epoch's labels are eligible (D5).
+    ``unreadable`` names the record nodes that exist but could not be read.
+    """
+    import json
+    from dataclasses import replace
+    from xrd_tools import geometry_figures as gf
+    from xrd_tools.integrate.calibration import (
+        detector_calibration_from_projection, detector_calibration_to_integrator)
+    from xrd_tools.session.run_configuration import FrozenGIConfiguration
+    if kind == 'average':
+        return RingRefusal(gf.SAVED_AVERAGE_REASON, kind)
+    if kind == 'reintegrate':
+        return RingRefusal(gf.SAVED_REINTEGRATE_REASON, kind)
+    if 'run_configuration' in unreadable or (run_configuration is not None
+                                             and not isinstance(run_configuration, Mapping)):
+        return RingRefusal(gf.SAVED_RECORD_MALFORMED_REASON)
+    signature = (run_configuration or {}).get('scientific_signature')
+    assets = signature.get('accepted_scientific_assets') if isinstance(signature, Mapping) else None
+    if not isinstance(assets, Mapping) or not isinstance(assets.get('poni_values'), Mapping):
+        return RingRefusal(gf.SAVED_NO_CALIBRATION_REASON)
+    if assets.get('poni_detector_config_json') is None:
+        return RingRefusal(gf.SAVED_NO_DETECTOR_CONFIG_REASON)
+    if 'energy_selection' in unreadable or (energy_selection is not None
+                                            and not _valid_energy_selection(energy_selection)):
+        return RingRefusal(gf.SAVED_ENERGY_MALFORMED_REASON)
+    if energy_selection is None and 'monochromator' in unreadable:
+        return RingRefusal(gf.SAVED_ENERGY_MALFORMED_REASON)
+    if energy_selection is not None and energy_selection['wavelength_m'] is None:
+        return RingRefusal(gf.SAVED_NO_ENERGY_REASON)
+    if energy_selection is None and monochromator_wavelength_m is None:
+        return RingRefusal(gf.SAVED_NO_ENERGY_REASON)
+    per_frame = energy_selection is not None and 'frame_energies_eV' in energy_selection
+    if per_frame and (epochs is None or 'append_lineage' in unreadable):
+        return RingRefusal(gf.SAVED_HISTORY_UNREADABLE_REASON)
+    wavelength = monochromator_wavelength_m if energy_selection is None else energy_selection.get('wavelength_m')
+    try:
+        calibration = detector_calibration_from_projection(
+            dict(assets['poni_values']), detector_config=json.loads(assets['poni_detector_config_json']))
+        if wavelength is not None:
+            calibration = replace(calibration, poni=replace(calibration.poni, wavelength=wavelength))
+        integrator = detector_calibration_to_integrator(calibration)
+        one, two, values = execution_plan_shape(
+            run_configuration['bai_1d_args'], run_configuration['bai_2d_args'],
+            FrozenGIConfiguration.from_dict(run_configuration['gi']), run_configuration['processing_mode'])
+        plan = build_native_int_reduction_plan_from_args(one, two, **values)
+        base = effective_ring_geometry(calibration, integrator=integrator, plan=plan)
+        shape = tuple(int(size) for size in integrator.detector.shape)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return RingRefusal(gf.SAVED_RECORD_MALFORMED_REASON)
+    reason = gf.detector_ring_unavailable(base, shape)
+    if reason:
+        return RingRefusal(reason)
+    held = frozenset(labels)
+    return RingBasis(base, MappingProxyType(frame_ring_wavelengths(energy_selection)), held,
+                     held & frozenset(epochs[-1] if epochs else ()) if per_frame else held, shape, calibration, plan)
+
+
+def ring_basis_for_record(path, *, entry='entry', labels):
+    """Read one processed output's ring facts (bounded, local, once) and return its basis or refusal."""
+    from xrd_tools.io.browse_presentation import read_ring_record
+    record = read_ring_record(path, entry=entry)
+    return ring_basis_from_saved(
+        record.run_configuration, record.energy_selection, labels=labels,
+        monochromator_wavelength_m=record.monochromator_wavelength_m, epochs=record.epochs, kind=record.kind,
+        unreadable=record.unreadable)
+
+
+def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=None,
+                                  metadata_energy_eV=()):
+    """Bind already-read source metadata to a new Int scan, without loading pixels.
+
+    Explicitly called by new Run/replay only; persisted and Reintegrate scans retain
+    their existing interpretation. The returned calibration is an effective copy.
+
+    Each frame's own recorded energy decides (eV or keV by its size; an impossible one
+    counts as none). Only when no frame records one does the source's energy or wavelength
+    apply. A varying series is an energy scan, which Int reduces frame by frame at each
+    frame's own energy (``frame_labels`` and ``frame_energies_eV``); an enabled sensor parallax
+    correction, computed at one energy, cannot follow it. Such a scan, and one whose per-frame
+    energies would not fit the run's saved settings, raise :class:`EnergyScanRefused`.
+    """
+    from dataclasses import replace
+    from xrd_tools.core.energy import resolve_acquisition_energy, metadata_energy_values, WavelengthUnit
+    from xrd_tools.integrate.calibration import detector_calibration_to_integrator
+    labels, recorded = [], []
+    for frame in scan.frames:
+        values = metadata_energy_values(frame.metadata, energy_is_eV=frame.metadata_energy_is_eV)
+        if len(values) > 1:
+            resolve_acquisition_energy(None, values)  # a row's energy and wavelengths must agree
+        labels.append(int(frame.index))
+        recorded.append(values[0] if values else None)
+    per_frame = any(value is not None for value in recorded)
+    if per_frame:
+        energies = recorded
+    else:
+        energies = list(metadata_energy_eV)
+        if metadata_wavelength_A is not None:
+            energies.extend(metadata_energy_values({}, wavelength=metadata_wavelength_A,
+                                                  wavelength_unit=WavelengthUnit.ANGSTROM))
+    selection = resolve_acquisition_energy(calibration.poni.wavelength, energies, allow_energy_scan=per_frame)
+    if 'frame_energies_eV' in selection:
+        # enabled parallax only, as the conversion owner applies it: an explicit False (a sensor-equipped PONI v3, or
+        # Advanced's override with Enable parallax cleared) reduces each frame at its energy (LT-SMALL-FIXES S1)
+        if calibration.parallax is True:
+            raise EnergyScanRefused(
+                'an energy scan cannot use the sensor parallax correction, which is computed at one energy. To '
+                'reduce each frame at its own energy, turn parallax off: in Advanced, "Detector sensor / parallax '
+                '(PONI v3)", check "Override selected PONI sensor settings" and clear "Enable parallax"')
+        selection = {**selection, 'frame_labels': labels,
+                     'frame_energies_eV': [float(value) for value in selection['frame_energies_eV']]}
+        from xrd_tools.core.provenance import config_entry_overflow
+        overflow = config_entry_overflow('energy_selection', selection)  # as the run saves it at its end
+        if overflow is not None:
+            size, ceiling = overflow
+            raise EnergyScanRefused(
+                f"an energy scan of {len(labels):,} frames cannot be saved: Int saves each frame's energy with the "
+                f"run's settings, which hold at most {ceiling:,} bytes, and these energies need {size:,}. Reduce at "
+                f"most about {len(labels) * ceiling // size:,} frames per run")
+    if selection['disagreement']:
+        logger.warning('X-ray energy mismatch: metadata=%.1f eV, PONI=%.1f eV; using metadata',
+                       selection['source_energy_eV'], selection['calibration_energy_eV'])
+    wavelength = selection['wavelength_m']
+    if wavelength is not None:
+        calibration = replace(calibration, poni=replace(calibration.poni, wavelength=wavelength))
+    scan.poni = calibration.poni
+    scan.integrator = detector_calibration_to_integrator(calibration)
+    scan.wavelength = None if wavelength is None else wavelength * 1e10
+    scan.energy = None if selection['energy_eV'] is None else selection['energy_eV'] / 1000
+    scan.extra = {**scan.extra, 'energy_selection': selection}
+    return calibration
+
+
+def native_int_reduction_plan(
+    configuration: FrozenRunConfiguration, *, companion_modes_2d: bool = False,
+    energy_selection: Mapping[str, Any] | None = None,
+):
+    """Translate one frozen Controls configuration into its mask-free plan.
+
+    *companion_modes_2d* is set only by an ordinary Run: it alone integrates the
+    GI companion map the "Q-χ + Qip-Qoop" choice selects.  Average and the XYE
+    naming lookup stay single-mode.
+
+    Scientific assets are admitted independently of control intent. The
+    ordinary run path attaches its already-authenticated detector mask after
+    this pure translation; Average keeps the mask in its calibration state so
+    it can apply the accepted static mask while accumulating detector pixels.
+    """
+
+    from xrd_tools.session.readiness import (
+        build_native_int_reduction_plan_from_args,
+    )
+
+    one, two, values = execution_plan_values(configuration)
+    plan = build_native_int_reduction_plan_from_args(
+        one, two, declare_companion_modes_2d=companion_modes_2d, **values,
+    )
+    if energy_selection is not None:
+        from dataclasses import replace
+        plan = replace(plan, extra={**plan.extra, 'energy_selection': dict(energy_selection)})
+    return plan

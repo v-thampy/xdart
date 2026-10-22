@@ -11,7 +11,6 @@ from typing import Callable
 import numpy as np
 from natsort import os_sorted
 from xrd_tools.core.filters import compile_filter
-from xrd_tools.core.invalid import integer_saturation_ceiling
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.adapters import candidate_owner, get_adapter
 from xrd_tools.sources.probe import ProbeState
@@ -39,14 +38,12 @@ class FilesystemSourceAdapter:
     _MOTOR_PREVIEW_LIMIT = 32
 
     @staticmethod
-    def _threshold_max_for_dtype(dtype) -> float | None:
-        ceiling = integer_saturation_ceiling(np.empty(0, dtype=dtype))
-        return None if ceiling is None else ceiling - 1.0
+    def _image_layout_facts(path, options) -> tuple[str | None, int | None]:
+        """The first image's native dtype and recorded saturation (decision 39).
 
-    @classmethod
-    def _image_threshold_max(cls, path, options) -> float | None:
-        # One header on the observation worker. No pixels, per-frame maxima,
-        # or detector-family guesses; admission still qualifies the source.
+        One header on the observation worker. No pixels, per-frame maxima,
+        or detector-family guesses; admission still qualifies the source.
+        """
         from xrd_tools.io.image import read_detector_image_layout
 
         try:
@@ -56,11 +53,11 @@ class FilesystemSourceAdapter:
                 detector_shape=options.get("detector_shape"),
                 detector=options.get("detector"),
             )
-            return cls._threshold_max_for_dtype(layout.dtype)
+            return layout.dtype, layout.saturation
         except Exception:
             # Passive presence/count readiness is independent of optional
             # layout availability. Unknown limits stay automatic in the UI.
-            return None
+            return None, None
 
     def __init__(self) -> None:
         self._lock = Lock()
@@ -575,7 +572,8 @@ class FilesystemSourceAdapter:
                 max(fact.mtime_ns for fact in facts),
                 len(facts),
                 candidate_fingerprint=self._fingerprint(facts),
-                default_threshold_max=self._image_threshold_max(members[0], source.options),
+                **dict(zip(("raw_dtype", "recorded_saturation"),
+                           self._image_layout_facts(members[0], source.options))),
             )
         path = Path(source.uri).expanduser()
         try:
@@ -589,7 +587,7 @@ class FilesystemSourceAdapter:
         except OSError:
             return self._unavailable(request, "Source metadata is unavailable.", path.name)
         frame_count = None
-        default_threshold_max = None
+        raw_dtype = recorded_saturation = None
         gi_motor_choices = None
         if source.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
             # An explicitly selected container is one bounded observation, so
@@ -607,7 +605,8 @@ class FilesystemSourceAdapter:
                     and descriptor.frame_count > 0
                 ):
                     frame_count = int(descriptor.frame_count)
-                    default_threshold_max = self._threshold_max_for_dtype(descriptor.dtype)
+                    raw_dtype = None if descriptor.dtype is None else np.dtype(descriptor.dtype).str
+                    recorded_saturation = descriptor.saturation
                     gi_motor_choices = descriptor.motor_names
             except Exception:
                 frame_count = None
@@ -616,7 +615,8 @@ class FilesystemSourceAdapter:
             SourceObservationStatus.AVAILABLE, path.name, True, is_directory,
             state.size, state.mtime_ns, frame_count,
             candidate_fingerprint=self._fingerprint((state,)),
-            default_threshold_max=default_threshold_max,
+            raw_dtype=raw_dtype,
+            recorded_saturation=recorded_saturation,
             gi_motor_choices=gi_motor_choices,
         )
 

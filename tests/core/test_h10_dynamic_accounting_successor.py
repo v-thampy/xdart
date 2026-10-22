@@ -206,6 +206,100 @@ def test_only_the_exact_bound_session_owner_can_promote_an_epoch():
     assert ledger.snapshot().durable == frozenset(((0, MODE, TARGET),))
 
 
+def test_bound_continuation_guard_is_read_only_and_checks_accounting_owner():
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    boundary = accounting.writer_boundary
+    before = accounting.snapshot()
+
+    assert boundary.require_clean_live_continuation(owner, token) is None
+    assert accounting.snapshot() == before
+
+    with pytest.raises(RuntimeError, match="exact bound live session"):
+        boundary.require_clean_live_continuation(_BoundOwner(), token)
+    with pytest.raises(RuntimeError, match="exact bound live session"):
+        boundary.require_clean_live_continuation(owner, object())
+    assert accounting.snapshot() == before
+
+
+@pytest.mark.parametrize(
+    "state",
+    ("provisional", "enqueued", "accepted", "failed_retryable", "failed", "cancelled",
+     "completed_unwritten"),
+)
+def test_bound_continuation_guard_refuses_latest_blocking_attempt_states(state):
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    key = _discover(accounting, f"continuation-{state}", 0)
+    attempt = accounting.begin_attempt(key, source_revision=1)
+    if state in {"enqueued", "accepted", "failed_retryable", "failed"}:
+        accounting.record_enqueued(attempt)
+    if state in {"accepted"}:
+        accounting.record_accepted(attempt)
+    elif state == "completed_unwritten":
+        accounting.record_accepted(attempt)
+        accounting.record_completed(attempt, produced=(MODE,))
+    elif state in {"failed_retryable", "failed"}:
+        accounting.record_failed(
+            attempt, error=state, retryable=state == "failed_retryable",
+        )
+    elif state == "cancelled":
+        accounting.record_cancelled(attempt, reason="Stop")
+    before = accounting.snapshot()
+
+    with pytest.raises(
+        RuntimeError, match="same-run continuation refuses a dirty epoch",
+    ):
+        accounting.writer_boundary.require_clean_live_continuation(owner, token)
+    assert accounting.snapshot() == before
+
+
+def test_bound_continuation_guard_allows_failed_retry_followed_by_written_success():
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    key = _discover(accounting, "continuation-retry-success", 0)
+    failed = accounting.begin_attempt(key, source_revision=1)
+    accounting.record_failed(failed, error="transient", retryable=True)
+    _successful_attempt(accounting, key, source_revision=2)
+    before = accounting.snapshot()
+
+    assert accounting.writer_boundary.require_clean_live_continuation(owner, token) is None
+    assert accounting.snapshot() == before
+
+
+@pytest.mark.parametrize("case", ("written_pending", "canonical"))
+def test_bound_continuation_guard_allows_written_completed_attempt(case):
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    key = _discover(accounting, f"continuation-written-{case}", 0)
+    attempt = _successful_attempt(accounting, key)
+    if case == "canonical":
+        _stage_writer_durable(accounting, 0)
+        _commit(accounting, "continuation-canonical")
+    before = accounting.snapshot()
+    assert before.attempt_states[attempt] is _api()[1].COMPLETED
+
+    assert accounting.writer_boundary.require_clean_live_continuation(owner, token) is None
+    assert accounting.snapshot() == before
+
+
+def test_bound_continuation_guard_refuses_non_active_accounting_without_mutation():
+    _ledger, accounting = _accounting()
+    owner, token = _BOUND_OWNERS[id(accounting)]
+    key = _discover(accounting, "continuation-aborted", 0)
+    attempt = _successful_attempt(accounting, key)
+    accounting.writer_boundary.epoch_aborted(owner, token, "rolled back")
+    before = accounting.snapshot()
+    assert before.state is _api()[4].ABORTED
+    assert before.attempt_states[attempt] is _api()[1].COMPLETED
+
+    with pytest.raises(
+        RuntimeError, match="same-run continuation refuses a dirty epoch",
+    ):
+        accounting.writer_boundary.require_clean_live_continuation(owner, token)
+    assert accounting.snapshot() == before
+
+
 def test_completed_attempt_consumes_capacity_until_exact_canonical_receipt():
     _ledger, accounting = _accounting(max_outstanding=1)
     key0 = _discover(accounting, "capacity", 0)
@@ -975,6 +1069,11 @@ def test_written_frame_high_water_waits_for_every_current_required_mode():
         (key, one_d): first,
         (key, two_d): second,
     }
+    owner, owner_token = _BOUND_OWNERS[id(accounting)]
+    assert accounting.writer_boundary.require_clean_live_continuation(
+        owner, owner_token,
+    ) is None
+    assert accounting.snapshot() == complete
 
 
 def test_mode_composite_durable_truth_and_finish_use_one_canonical_rule():

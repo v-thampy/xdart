@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from xdart.gui.tabs.scattering.display_values import StandardDisplayPayload
 from xdart.gui.tabs.scattering.shell_projection import (
@@ -293,3 +294,46 @@ def test_share_uses_the_truthfully_rendered_radial_identity():
     assert state.heavy.cake_x is not None
     assert state.heavy.cake_x.unit == "q_A^-1"
     assert state.traces[0].axis.unit == "q_A^-1"
+
+
+@pytest.mark.parametrize("processing_mode", ["Int 1D", "Int 2D"])
+@pytest.mark.parametrize("with_cake", [False, True])
+def test_share_follows_only_an_int_2d_cake_that_is_drawn(with_cake, processing_mode):
+    """Share Axis follows the map shown (HOSTED-REDS-20261017 F1): a native 2θ pattern keeps its 2θ with Share on
+    unless Int 2D draws a complete cake, whose Q it then shares. Stitch keeps Share on for every result."""
+    base = make_shell_projection(frame_count=1, selected_index=0, plot_mode="Single")
+    frame = base.navigation.current
+    two_theta = np.linspace(5.0, 40.0, 4)
+    cake = dict(axis_2d_x=Axis("Q", "q_A^-1", values=np.linspace(0.5, 3.0, 4)),
+                axis_2d_y=Axis("chi", "chi_deg", values=np.linspace(-90.0, 90.0, 3)),
+                intensity_2d=np.arange(12, dtype=float).reshape(3, 4), two_d_kind=TwoDKind.Q_CHI)
+    payload = StandardDisplayPayload(0, frame, "frame", FrameView(
+        frame.local_frame_label, axis_1d=Axis("2theta", "2th_deg", values=two_theta),
+        intensity_1d=np.linspace(1.0, 2.0, two_theta.size), thumbnail=np.ones((2, 2)),
+        **(cake if with_cake else {})), wavelength_m=1.0e-10)
+    preferences = ScientificPreferences(image_axis="Q-Chi", plot_axis="2theta", plot_mode="Single", share_axis=True)
+    state = build_scientific_projection((payload,), base.navigation, frozenset({frame}), preferences, "",
+                                        processing_mode=processing_mode)
+    shared = with_cake and processing_mode == "Int 2D"
+    assert state.heavy is not None and (state.heavy.cake is not None) is with_cake
+    assert state.plot_axis == ("Q" if shared else "2theta")
+    assert state.traces[0].axis.unit == ("q_A^-1" if shared else "2th_deg")
+    assert state.share_axis, "the preference itself is never rewritten"
+
+def test_int_1d_shows_the_pattern_with_a_slice_left_on_from_int_2d():
+    """Int 1D has no cake, so a slice (Int 2D's, still on after the mode changed) cannot apply: the frame's
+    I(q) shows, where the slice's rule (never the full row for a cut) left the plot empty."""
+    base = make_shell_projection(frame_count=1, selected_index=0, plot_mode="Single")
+    frame = base.navigation.current
+    q = np.linspace(0.5, 5.0, 4)
+    payload = StandardDisplayPayload(0, frame, "frame", FrameView(
+        frame.local_frame_label, axis_1d=Axis("radial", "q_A^-1", values=q),
+        intensity_1d=np.linspace(1.0, 2.0, q.size), raw=np.ones((2, 2))))
+    preferences = ScientificPreferences(plot_axis="Q", plot_mode="Single", slice_enabled=True)
+    state = build_scientific_projection((payload,), base.navigation, frozenset({frame}), preferences, "",
+                                        processing_mode="Int 1D")
+    (trace,) = state.traces
+    np.testing.assert_array_equal(trace.intensity, payload.view.intensity_1d)
+    # Int 2D keeps the rule: a slice of a frame without a cake shows nothing
+    assert build_scientific_projection((payload,), base.navigation, frozenset({frame}), preferences, "",
+                                       processing_mode="Int 2D").traces == ()

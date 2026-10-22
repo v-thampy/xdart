@@ -1,25 +1,33 @@
 # -*- coding: utf-8 -*-
 """Self-contained Peak Fitting popup (Direction-A Tools).
 
-Opens from the bottom-left Tools card.  Grabs the currently displayed 1-D
-integrated pattern, fits it with the headless ``xrd_tools.analysis.fitting``
-API over a user-chosen range (auto-detecting peaks by default), and shows
-data + fit + residual in its own pyqtgraph plots plus a results table — all
-isolated from the main display (no change to the main plot render path).
-Non-modal so the user can change the selected frame and re-fit.
+Opens from the bottom-left Tools card. Fits the currently displayed 1-D integrated pattern over a user-chosen range
+(auto-detecting peaks by default) and shows data, fit and residual, a parameter trend and a results table, isolated
+from the main display. Non-modal so the user can change the selected frame and re-fit.
 
-The fitting backend is headless/Qt-free; this module is the thin Qt front-end.
-``lmfit`` (the ``xrd-tools[fitting]`` extra) is imported lazily so xdart still
-launches without it — the dialog shows a friendly install hint instead.
+It builds no display or editor widget of its own (hard rule 14; FIT-TOOLS-2026-10 phase 0): its rows are the shared
+Controls rows (``FormRow``, ``RangeRow``) in a ``SectionCard``, its rarely changed values the shared
+``AdvancedDialog``, its plots ``FitView`` (whose fit range is the dragged range), its trend ``TrendView`` and its table
+``ResultsTable``. Int's page drives it through ``vnext_submit`` (its analysis slot runs the headless displayed-fit
+operation); without it, the dialog's own path fits through the headless analyzer. ``lmfit`` (the ``xrd-tools[fitting]``
+extra) is imported lazily so xdart still launches without it.
 """
 
 import logging
 
+from xrd_tools.help_topics import diagnostic_text
+
 import numpy as np
-import pyqtgraph as pg
+from dataclasses import replace
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from .param_trend import ParamTrendMixin
+from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView, fit_result_series
+from xdart.gui.tabs.scattering.results_table import (
+    PEAK_OUTCOME_HEADERS, ResultsTable, peak_outcome_rows, peak_parameter_rows,
+)
+from xdart.gui.tabs.scattering.trend_view import TrendView
+from xdart.gui.widgets.controls_panel import FormRow, RangeRow, SectionCard
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +56,11 @@ _BACKGROUNDS = [
 ]
 
 
-class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
+def _path(name):
+    return ("peak_fit", name)
+
+
+class PeakFitDialog(QtWidgets.QDialog):
     """Peak-fit the active 1-D pattern.
 
     Parameters
@@ -61,11 +73,13 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
     """
 
     def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None,
-                 vnext_submit=None):
+                 vnext_submit=None, allow_batch=False):
         super().__init__(parent)
         self._vnext = callable(vnext_submit)
         self._vnext_submit = vnext_submit
-        self._analysis_context = analysis_context
+        self._allow_batch = bool(allow_batch)
+        self._export_trace = None
+        self._export_snapshot_provider = None
         self._provider = (
             analysis_context.current_pattern_tuple
             if analysis_context is not None else pattern_provider)
@@ -78,22 +92,19 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         # Reload so stepping through frames keeps the chosen window.
         self._fit_lo = None
         self._fit_hi = None
-        self._sync_guard = False
-        # Parameter-vs-frame trend (analyzer framework Step: unified 3-row plot).
-        # frame_index -> flat params dict; written by BOTH live (per fit) and
-        # batch (per frame).  Keyed by index so live drops / out-of-order re-fits
-        # update-not-duplicate.  Reset only on a fresh run, never per frame.
-        self._param_accumulator = {}
-        self._param_family_keys = ()      # cached families currently in the combo
         self.setObjectName("peakFitDialog")
         self.setWindowTitle("Peak Fitting")
-        self.resize(560, 820)
+        self.resize(560, 860)
         self._build_ui()
         if self._vnext:
             self.live_check.setChecked(False); self.live_check.setEnabled(False)
-            self.live_check.setToolTip("P3_7_LIVE_FITTING_UNAVAILABLE")
-            self.batch_btn.setEnabled(False)
-            self.batch_btn.setToolTip("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+            self.live_check.setToolTip(diagnostic_text("P3_7_LIVE_FITTING_UNAVAILABLE"))
+            self.batch_btn.setEnabled(bool(allow_batch))
+            if not allow_batch:
+                self.batch_btn.setToolTip(diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE"))
+        from .fit_export import FitExportActions
+        self.export_actions = FitExportActions(self, tool='peak', snapshot=self.export_snapshot,
+                                               settings=self.vnext_fit_values)
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
@@ -101,26 +112,40 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
 
-        # Row 1: model / background / peak count
-        controls = QtWidgets.QHBoxLayout()
-        controls.setSpacing(7)
-        self.model_combo = QtWidgets.QComboBox()
-        for label, _ in _MODELS:
-            self.model_combo.addItem(label)
-        self.bkg_combo = QtWidgets.QComboBox()
-        for label, _ in _BACKGROUNDS:
-            self.bkg_combo.addItem(label)
-        self.auto_check = QtWidgets.QCheckBox("Auto")
-        self.auto_check.setToolTip(
-            "Detect peaks automatically (scipy find_peaks) over the fit range")
-        self.auto_check.setChecked(True)
-        self.npeaks_spin = QtWidgets.QSpinBox()
-        self.npeaks_spin.setRange(1, _MAX_PEAKS)
-        self.npeaks_spin.setValue(1)
+        # The fit's rows: model, background, peaks (Auto or a count) and the fit range, on the shared rows.
+        card = SectionCard("Peak fit", collapsible=False)
+        models, backgrounds = [label for label, _ in _MODELS], [label for label, _ in _BACKGROUNDS]
+        self.model_row = FormRow(label="Model", path=_path("model"), value=models[0], kind="combo", choices=models)
+        self.bkg_row = FormRow(label="Background", path=_path("background"), value=backgrounds[0], kind="combo",
+                               choices=backgrounds)
+        self.auto_row = FormRow(label="Auto", path=_path("auto"), value=True, kind="bool")
+        self.count_row = FormRow(label="Peaks", path=_path("n_peaks"), value="1", kind="int", minimum=1,
+                                 maximum=_MAX_PEAKS)
+        self.range_row = RangeRow(label="Range", low={"path": _path("range_low"), "value": "", "placeholder": "—"},
+                                  high={"path": _path("range_high"), "value": "", "placeholder": "—"})
+        self.model_combo, self.bkg_combo = self.model_row.editor, self.bkg_row.editor
+        self.auto_check, self.npeaks_spin = self.auto_row.editor, self.count_row.editor
+        self.range_lo, self.range_hi = self.range_row.editors
+        self.auto_check.setToolTip("Detect peaks automatically (scipy find_peaks) over the fit range")
         self.npeaks_spin.setEnabled(False)        # auto on by default
+        for edit in (self.range_lo, self.range_hi):
+            edit.setValidator(QtGui.QDoubleValidator(self))
+        self.full_btn = QtWidgets.QPushButton("Full")
+        self.full_btn.setToolTip("Reset the fit range to the whole pattern")
+        self.range_row.add_trailing_widget(self.full_btn)
+        for row in (self.model_row, self.bkg_row, self.auto_row, self.count_row, self.range_row):
+            card.add_row(row)
+        lay.addWidget(card)
+
+        # Actions: Advanced, Reload, Live, Fit and Batch.
+        actions = QtWidgets.QHBoxLayout()
+        actions.setSpacing(7)
+        self.advanced_btn = QtWidgets.QPushButton("Advanced…")
+        self.advanced_btn.setObjectName("peakFitAdvancedToggle")
         self.refresh_btn = QtWidgets.QPushButton("Reload")
         self.refresh_btn.setToolTip("Re-grab the currently selected frame's pattern")
-        self.live_check = QtWidgets.QCheckBox("Live")
+        self.live_row = FormRow(label="Live", path=_path("live"), value=False, kind="bool")
+        self.live_check = self.live_row.editor
         self.live_check.setToolTip(
             "Re-fit automatically as new frames arrive during a scan "
             "(latest-wins — the fit tracks the newest frame).")
@@ -130,155 +155,98 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.batch_btn.setToolTip(
             "Fit every frame in the scan with these settings, then plot the "
             "parameters vs frame number.")
-        controls.addWidget(QtWidgets.QLabel("Model"))
-        controls.addWidget(self.model_combo)
-        controls.addWidget(QtWidgets.QLabel("Background"))
-        controls.addWidget(self.bkg_combo)
-        controls.addWidget(self.auto_check)
-        controls.addWidget(QtWidgets.QLabel("Peaks"))
-        controls.addWidget(self.npeaks_spin)
-        controls.addStretch(1)
-        controls.addWidget(self.refresh_btn)
-        controls.addWidget(self.live_check)
-        controls.addWidget(self.fit_btn)
-        controls.addWidget(self.batch_btn)
-        lay.addLayout(controls)
+        actions.addWidget(self.advanced_btn)
+        actions.addStretch(1)
+        actions.addWidget(self.refresh_btn)
+        actions.addWidget(self.live_row)
+        actions.addWidget(self.fit_btn)
+        actions.addWidget(self.batch_btn)
+        lay.addLayout(actions)
 
-        # Row 2: fit range (current x-unit) — synced with a draggable region
-        range_row = QtWidgets.QHBoxLayout()
-        range_row.setSpacing(7)
-        self.range_lo = QtWidgets.QLineEdit()
-        self.range_hi = QtWidgets.QLineEdit()
-        for e in (self.range_lo, self.range_hi):
-            e.setValidator(QtGui.QDoubleValidator(self))
-            e.setMaximumWidth(90)
-            e.setPlaceholderText("—")
-        self.full_btn = QtWidgets.QPushButton("Full")
-        self.full_btn.setToolTip("Reset the fit range to the whole pattern")
-        range_row.addWidget(QtWidgets.QLabel("Range"))
-        range_row.addWidget(self.range_lo)
-        range_row.addWidget(QtWidgets.QLabel("to"))
-        range_row.addWidget(self.range_hi)
-        range_row.addWidget(self.full_btn)
-        range_row.addStretch(1)
-        lay.addLayout(range_row)
-
-        # Advanced options (collapsible) — all backed by fit_peaks / PeakFitPlan
-        # today, so they apply identically to manual Fit, Live, and Batch.
-        self.advanced_btn = QtWidgets.QPushButton("Advanced ▾")
-        self.advanced_btn.setCheckable(True)
-        self.advanced_btn.setObjectName("peakFitAdvancedToggle")
-        adv_row = QtWidgets.QHBoxLayout()
-        adv_row.addWidget(self.advanced_btn)
-        adv_row.addStretch(1)
-        lay.addLayout(adv_row)
-
-        self.advanced_box = QtWidgets.QWidget()
-        self.advanced_box.setVisible(False)
-        adv = QtWidgets.QGridLayout(self.advanced_box)
-        adv.setContentsMargins(2, 2, 2, 2)
-        adv.setHorizontalSpacing(8)
-        adv.setVerticalSpacing(5)
-
-        def _num():
-            e = QtWidgets.QLineEdit()
-            e.setValidator(QtGui.QDoubleValidator(self))
-            e.setMaximumWidth(90)
-            e.setPlaceholderText("auto")
-            return e
-
-        self.adv_centers = QtWidgets.QLineEdit()
-        self.adv_centers.setPlaceholderText("auto-detect — e.g. 2.1, 3.5, 4.8")
-        self.adv_centers.setToolTip(
-            "Manual peak centers (current x-unit), comma-separated.  When set, "
-            "these seed the fit and override Auto-detect — for shoulders / weak "
-            "peaks find_peaks misses.")
-        self.adv_sigma_init = _num()
-        self.adv_sigma_init.setToolTip("Initial peak width σ (blank = auto)")
-        self.adv_sigma_min = _num()
-        self.adv_sigma_max = _num()
-        self.adv_center_delta = _num()
-        self.adv_center_delta.setToolTip(
-            "Constrain each center to ± this much around its start (blank = free)")
-        self.adv_fraction = _num()
-        self.adv_fraction.setPlaceholderText("0.5")
-        self.adv_fraction.setToolTip(
-            "Pseudo-Voigt Gaussian/Lorentzian mix, 0–1 (Pseudo-Voigt only)")
-        self.adv_maxfev = QtWidgets.QSpinBox()
-        self.adv_maxfev.setRange(0, 1000000)
-        self.adv_maxfev.setSingleStep(500)
-        self.adv_maxfev.setSpecialValueText("auto")
-        self.adv_maxfev.setMaximumWidth(110)
-        self.adv_maxfev.setToolTip("Max solver iterations (max_nfev); 0 = lmfit default")
-
-        adv.addWidget(QtWidgets.QLabel("Peak centers"), 0, 0)
-        adv.addWidget(self.adv_centers, 0, 1, 1, 3)
-        adv.addWidget(QtWidgets.QLabel("σ initial"), 1, 0)
-        adv.addWidget(self.adv_sigma_init, 1, 1)
-        adv.addWidget(QtWidgets.QLabel("σ min / max"), 1, 2)
-        sig_row = QtWidgets.QHBoxLayout()
-        sig_row.setSpacing(4)
-        sig_row.addWidget(self.adv_sigma_min)
-        sig_row.addWidget(self.adv_sigma_max)
-        adv.addLayout(sig_row, 1, 3)
-        adv.addWidget(QtWidgets.QLabel("Center ± delta"), 2, 0)
-        adv.addWidget(self.adv_center_delta, 2, 1)
-        adv.addWidget(QtWidgets.QLabel("PV fraction"), 2, 2)
-        adv.addWidget(self.adv_fraction, 2, 3)
-        adv.addWidget(QtWidgets.QLabel("Max iterations"), 3, 0)
-        adv.addWidget(self.adv_maxfev, 3, 1)
-        adv.setColumnStretch(3, 1)
-        lay.addWidget(self.advanced_box)
+        self._build_advanced()
 
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("peakFitStatus")
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
-        # Plots: data+fit on top (with a draggable fit-range region), residual below
-        self.plot = pg.PlotWidget()
-        self.plot.setMinimumHeight(240)
-        self.plot.addLegend(offset=(-10, 10))
-        self.region = pg.LinearRegionItem(brush=(189, 147, 249, 30))
-        self.region.setZValue(-10)
-        self.plot.addItem(self.region)
-        self.region.hide()
-        self.resid_plot = pg.PlotWidget()
-        self.resid_plot.setMaximumHeight(120)
-        self.resid_plot.setXLink(self.plot)
-        self.resid_plot.addLine(y=0, pen=pg.mkPen((130, 130, 140), width=1))
-        lay.addWidget(self.plot, 3)
-        lay.addWidget(self.resid_plot, 1)
+        # Data and fit above (the fit range dragged on it), the residual below: the shared fit display.
+        self.fit_view = FitView(self, name="peakFitView", summary=False, stretch=(3, 1), upper_min_height=240,
+                                lower_max_height=120, link_x=True)
+        self.plot, self.resid_plot = self.fit_view.plot, self.fit_view.residuals
+        self.fit_view.reconcile(FitProjection(lower=FitPanel(zero_line=True)))
+        lay.addWidget(self.fit_view, 4)
 
-        # Row 3: parameter(s) vs frame number — fills as frames are fit (live or
-        # batch).  Shared with the Phase Fitter via ParamTrendMixin.  X-axis is
-        # FRAME INDEX (not q), so it is NOT x-linked to the data plot.
-        self._build_param_trend_row(lay)
+        # Parameters vs frame (live or batch), on the shared trend; its x is the frame, not q.
+        self.trend = TrendView(self, name="peakFitTrend")
+        self.trend.messageChanged.connect(self.status.setText)
+        lay.addWidget(self.trend, 2)
 
-        # Results table
-        self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["#", "Center", "Center ±", "FWHM", "Amplitude"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QtWidgets.QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setMaximumHeight(130)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table = ResultsTable(PEAK_OUTCOME_HEADERS, self, name="peakFitTable", max_height=130)
         lay.addWidget(self.table)
 
         self.fit_btn.clicked.connect(self._do_fit)
         self.refresh_btn.clicked.connect(self.refresh_pattern)
         self.full_btn.clicked.connect(self._on_full)
-        self.auto_check.toggled.connect(
-            lambda on: self.npeaks_spin.setEnabled(not on))
-        self.region.sigRegionChanged.connect(self._region_to_fields)
-        self.range_lo.editingFinished.connect(self._fields_to_region)
-        self.range_hi.editingFinished.connect(self._fields_to_region)
-        self._connect_param_trend()
-        self.advanced_btn.toggled.connect(self._on_advanced_toggled)
+        self.advanced_btn.clicked.connect(self._show_advanced)
+        self.auto_check.toggled.connect(lambda on: self.npeaks_spin.setEnabled(not on))
+        self.fit_view.rangeChanged.connect(self._region_to_fields)
+        self.range_row.valueChanged.connect(lambda _path, _value: self._fields_to_region())
 
-    def _on_advanced_toggled(self, on):
-        self.advanced_box.setVisible(on)
-        self.advanced_btn.setText("Advanced ▴" if on else "Advanced ▾")
+    def _build_advanced(self):
+        """The rarely changed fit values, on the shared Advanced dialog's rows: they apply identically to Fit, Live
+        and Batch (all backed by fit_peaks / PeakFitPlan)."""
+        self.advanced = AdvancedDialog(self, title="Advanced — Peak Fitting", object_name="peakFitAdvancedDialog")
+        rows = {
+            "centers": FormRow(label="Peak centers", path=_path("centers"), value=""),
+            "sigma_init": FormRow(label="σ initial", path=_path("sigma_init"), value=""),
+            "sigma_bounds": RangeRow(label="σ min / max",
+                                     low={"path": _path("sigma_min"), "value": "", "placeholder": "auto"},
+                                     high={"path": _path("sigma_max"), "value": "", "placeholder": "auto"}),
+            "center_delta": FormRow(label="Center ± delta", path=_path("center_delta"), value=""),
+            "fraction": FormRow(label="PV fraction", path=_path("fraction"), value=""),
+            "max_nfev": FormRow(label="Max iterations", path=_path("max_nfev"), value="", kind="int", minimum=0,
+                                maximum=1_000_000, allow_blank=True),
+        }
+        self.advanced.add_group("Peaks", tuple(rows.values()))
+        uncertainty = FormRow(label="Use uncertainties", path=_path("use_uncertainties"), value=False, kind="bool")
+        self.advanced.add_group("Weighting", (uncertainty,))
+        self.use_uncertainties = uncertainty.editor
+        self.use_uncertainties.setEnabled(False)
+        self.use_uncertainties.setToolTip("Use admitted measured sigma; no uncertainties are inferred")
+        self._maxfev_row = rows["max_nfev"]
+        self.adv_centers = rows["centers"].editor
+        self.adv_sigma_init = rows["sigma_init"].editor
+        self.adv_sigma_min, self.adv_sigma_max = rows["sigma_bounds"].editors
+        self.adv_center_delta = rows["center_delta"].editor
+        self.adv_fraction = rows["fraction"].editor
+        self.adv_maxfev = rows["max_nfev"].editor
+        self.adv_centers.setPlaceholderText("auto-detect — e.g. 2.1, 3.5, 4.8")
+        self.adv_centers.setToolTip(
+            "Manual peak centers (current x-unit), comma-separated.  When set, "
+            "these seed the fit and override Auto-detect — for shoulders / weak "
+            "peaks find_peaks misses.")
+        for edit in (self.adv_sigma_init, self.adv_sigma_min, self.adv_sigma_max, self.adv_center_delta,
+                     self.adv_fraction):
+            edit.setValidator(QtGui.QDoubleValidator(self))
+        for edit in (self.adv_sigma_init, self.adv_center_delta):
+            edit.setPlaceholderText("auto")
+        self.adv_sigma_init.setToolTip("Initial peak width σ (blank = auto)")
+        self.adv_center_delta.setToolTip("Constrain each center to ± this much around its start (blank = free)")
+        self.adv_fraction.setPlaceholderText("0.5")
+        self.adv_fraction.setToolTip("Pseudo-Voigt Gaussian/Lorentzian mix, 0–1 (Pseudo-Voigt only)")
+        self.adv_maxfev.setPlaceholderText("auto")
+        self.adv_maxfev.setToolTip("Max solver iterations (max_nfev); blank or 0 = lmfit default")
+
+    def _show_advanced(self):
+        self.advanced.show(); self.advanced.raise_(); self.advanced.activateWindow()
+
+    def _refusal(self):
+        """The first whole-number row whose text is refused, named as the rows name it ("" when none)."""
+        for row in (self.count_row, self._maxfev_row):
+            if row.refusal():
+                return f"{row.label.text()}: {row.refusal()}"
+        return ""
 
     # ---- range sync -----------------------------------------------------
     def _data_extent(self):
@@ -286,21 +254,14 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             return (0.0, 1.0)
         return (float(np.nanmin(self._x)), float(np.nanmax(self._x)))
 
-    def _region_to_fields(self):
-        if self._sync_guard:
-            return
-        lo, hi = sorted(self.region.getRegion())
+    def _region_to_fields(self, lo, hi):
+        """The fit range dragged on the plot: kept, and written into the Range row."""
         self._fit_lo, self._fit_hi = lo, hi
-        self._sync_guard = True
-        try:
-            self.range_lo.setText(f"{lo:.4g}")
-            self.range_hi.setText(f"{hi:.4g}")
-        finally:
-            self._sync_guard = False
+        self.range_lo.setText(f"{lo:.4g}")
+        self.range_hi.setText(f"{hi:.4g}")
 
     def _fields_to_region(self):
-        if self._sync_guard:
-            return
+        """The Range row's values: kept, and shown as the plot's fit range."""
         ext = self._data_extent()
         try:
             lo = float(self.range_lo.text()) if self.range_lo.text() else ext[0]
@@ -309,22 +270,15 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             return
         lo, hi = sorted((lo, hi))
         self._fit_lo, self._fit_hi = lo, hi
-        self._sync_guard = True
-        try:
-            self.region.setRegion((lo, hi))
-        finally:
-            self._sync_guard = False
+        if self._x is not None:
+            self.fit_view.set_fit_range((lo, hi), limits=ext)
 
     def _on_full(self):
         self._fit_lo = self._fit_hi = None
-        lo, hi = self._data_extent()
-        self._sync_guard = True
-        try:
-            self.region.setRegion((lo, hi))
-            self.range_lo.setText("")
-            self.range_hi.setText("")
-        finally:
-            self._sync_guard = False
+        if self._x is not None:
+            self.fit_view.set_fit_range(self._data_extent(), limits=self._data_extent())
+        self.range_lo.setText("")
+        self.range_hi.setText("")
 
     def batch_x_range(self):
         """The (lo, hi) x-window to clip each frame to in a batch run — for the
@@ -369,9 +323,8 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         if not data:
             self._x = self._y = None
             self.status.setText("No frame selected — pick a frame, then Reload.")
-            self.plot.clear()
-            self.plot.addItem(self.region)
-            self.region.hide()
+            self.fit_view.reconcile(replace(self.fit_view.projection, upper=FitPanel()))
+            self.fit_view.set_fit_range(None)
             return
         x, y, x_label = data
         self._show_pattern(x, y, x_label)
@@ -382,48 +335,42 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         """Show a pattern pushed by the live runner — the data appears at once;
         the fit overlay arrives later via :meth:`_draw_outcome` on the worker
         result. Called by the workspace live controller per frame."""
-        self._clear_fit()
-        self._show_pattern(x, y, x_label)
+        self._show_pattern(x, y, x_label, clear_fit=True)
 
     def set_batch_running(self, running):
         """Reflect a batch run in flight: the Batch button becomes Cancel and
         the single-frame controls are disabled (the workspace owns the run)."""
         self.batch_btn.setText("Cancel" if running else "Batch")
         self.fit_btn.setEnabled(not running)
-        self.live_check.setEnabled(not running)
+        self.live_check.setEnabled(not running and not self._vnext)
+        self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
 
     def set_batch_progress(self, done, total):
         self.status.setText(f"Batch fitting… {done}/{total}")
 
-    def _show_pattern(self, x, y, x_label):
-        """Draw the raw pattern + the fit-range region and set self._x / self._y."""
+    def _pattern_panel(self, *series, markers=()):
+        """The upper panel: the pattern's points ("data", the 1-D plot's markers), then ``series`` (fit,
+        background) and the peak ``markers``."""
+        return FitPanel((FitSeries(self._x, self._y, "data", "data"), *series), self._x_label, "Intensity",
+                        markers=markers)
+
+    def _show_pattern(self, x, y, x_label, *, clear_fit=False):
+        """Draw the raw pattern and the fit range (kept across reloads, clamped to the data); set _x / _y.
+        ``clear_fit``: the last fit goes too (its residual and rows), in the same one redraw."""
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
         self._x_label = x_label or "q"
-        self.plot.clear()
-        self.plot.addItem(self.region)
-        self.plot.setLabel("bottom", self._x_label)
-        self.plot.setLabel("left", "Intensity")
-        # UI-5: DATA is markers only (no connecting line), marker size 4 to match
-        # the display widget's 1D plots.
-        self.plot.plot(self._x, self._y, pen=None, symbol='o', symbolSize=4,
-                       symbolBrush=(210, 210, 220), symbolPen=(210, 210, 220),
-                       name="data")
-        # Region bounds = data extent; keep the chosen window across reloads.
-        lo_ext, hi_ext = self._data_extent()
-        self.region.setBounds([lo_ext, hi_ext])
-        self._sync_guard = True
-        try:
-            self.region.setRegion(self._fit_range())
-        finally:
-            self._sync_guard = False
-        self.region.show()
-        self._region_to_fields()
+        self.trend.set_value_unit(self._x_label)
+        lower = FitPanel(zero_line=True) if clear_fit else self.fit_view.projection.lower
+        self.fit_view.reconcile(FitProjection(self._pattern_panel(), lower))
+        if clear_fit:
+            self.table.clear_rows()
+        self.fit_view.set_fit_range(self._fit_range(), limits=self._data_extent())
+        self._region_to_fields(*self.fit_view.fit_range)
 
     def _clear_fit(self):
-        self.resid_plot.clear()
-        self.resid_plot.addLine(y=0, pen=pg.mkPen((130, 130, 140), width=1))
-        self.table.setRowCount(0)
+        self.fit_view.reconcile(replace(self.fit_view.projection, lower=FitPanel(zero_line=True)))
+        self.table.clear_rows()
 
     def _detect_peaks(self, x, y):
         """Auto-detect peak centers in (x, y) via scipy.signal.find_peaks.
@@ -476,6 +423,10 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         (background), so live + manual fit identically — the dialog is just one
         consumer of the agnostic Analyzer contract."""
         if self._x is None or self._y is None:
+            return None
+        refusal = self._refusal()
+        if refusal:
+            self.status.setText(refusal)
             return None
         try:
             from xrd_tools.analysis.fitting import fit_peaks  # noqa: F401  lmfit probe
@@ -574,7 +525,7 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         if frac is not None:
             out["fraction_init"] = min(max(frac, 0.0), 1.0)
         nfev = self.adv_maxfev.value()
-        if nfev > 0:
+        if nfev:
             out["fit_kwargs"] = {"max_nfev": int(nfev)}
         return out
 
@@ -583,7 +534,8 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         centers = tuple(self._manual_centers(*bounds) or ()) if bounds else ()
         smin, smax = self._line_float(self.adv_sigma_min), self._line_float(self.adv_sigma_max)
         fraction = self._line_float(self.adv_fraction)
-        return {
+        nfev = self.adv_maxfev.value()
+        values = {
             "selection_mode": "auto" if self.auto_check.isChecked() else "count",
             "n_peaks": len(centers) or int(self.npeaks_spin.value()),
             "model": _MODELS[self.model_combo.currentIndex()][1],
@@ -593,12 +545,22 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             "sigma_bounds": ((smin, smax) if smin is not None and smax is not None else None),
             "center_bounds_delta": self._line_float(self.adv_center_delta),
             "fraction_init": 0.5 if fraction is None else fraction,
-            "max_nfev": (int(self.adv_maxfev.value())
-                          if self.adv_maxfev.value() > 0 else None),
+            "max_nfev": int(nfev) if nfev else None,
         }
+        if self.use_uncertainties.isChecked():
+            values['use_uncertainties'] = True
+        return values
 
     def _do_fit(self):
+        refusal = self._refusal()
+        if refusal:
+            self.status.setText(refusal)
+            return
         if self._vnext:
+            if self._x is None:  # nothing shown yet: the displayed trace first, as Reload, so its fit can be drawn
+                self._vnext_submit("reload", None)
+                if self._x is None:
+                    return
             self._vnext_submit("fit", self.vnext_fit_values())
             return
         if self._x is None or self._y is None:
@@ -617,24 +579,37 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self._draw_outcome(outcome, auto=self.auto_check.isChecked())
 
     def set_vnext_trace(self, trace):
-        self._clear_fit(); self._show_pattern(
-            trace.axis, trace.intensity, trace.axis_unit or trace.label)
+        self._export_trace = trace
+        self.use_uncertainties.setEnabled(trace.sigma is not None)
+        if trace.sigma is None:
+            self.use_uncertainties.setChecked(False)
+        self._show_pattern(trace.axis, trace.intensity, trace.axis_unit or trace.label, clear_fit=True)
         self.status.setText("Displayed trace captured. Click Fit.")
 
+    def clear_input(self):
+        """Release a detached displayed input when its host changes scope or closes."""
+        self._x = self._y = self._export_trace = None
+        self.fit_view.reconcile(FitProjection(FitPanel(), FitPanel(zero_line=True)))
+        self.table.clear_rows()
+        self.fit_btn.setEnabled(False)
+        self.use_uncertainties.setChecked(False)
+        self.use_uncertainties.setEnabled(False)
+
+    def export_snapshot(self):
+        if self._export_snapshot_provider is not None:
+            return self._export_snapshot_provider()
+        if self._export_trace is None:
+            return None
+        from .fit_export import snapshot_from_trace, plain_settings
+        return snapshot_from_trace(self._export_trace, settings=plain_settings(self.vnext_fit_values()))
+
     def set_vnext_result(self, result):
-        self.plot.clear()
-        self.plot.plot(self._x, self._y, pen=None, symbol="o", symbolSize=4,
-                       symbolBrush=(210, 210, 220), name="data")
-        mask = np.isfinite(self._x) & np.isfinite(self._y)
-        bounds = self.vnext_fit_values()["fit_bounds"]
-        if bounds is not None: mask &= (self._x >= bounds[0]) & (self._x <= bounds[1])
-        fit_x = self._x[mask]
-        from xdart.gui.tabs.scattering.analysis_mount import (
-            render_fit_projection, render_table_rows)
-        render_fit_projection(self.plot, self.resid_plot, fit_x, result)
-        render_table_rows(self.table, ["Parameter", "Value", "StdErr"],
-            tuple(zip(result.parameter_names, result.parameter_values,
-                      result.parameter_stderr, strict=True)))
+        lo, hi = self._fit_range()
+        mask = np.isfinite(self._x) & np.isfinite(self._y) & (self._x >= lo) & (self._x <= hi)
+        upper, markers, lower = fit_result_series(self._x[mask], result)
+        self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper, markers=markers),
+                                              FitPanel(lower, zero_line=True)))
+        self.table.show_rows(*peak_parameter_rows(result))
         detail = "; ".join(result.diagnostics)
         self.status.setText(result.code if result.fit_success is None else
                             (result.message or result.code) + (f"; {detail}" if detail else ""))
@@ -648,63 +623,23 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
 
     def _draw_outcome(self, outcome, auto=False):
         # data over the FULL pattern (context); the analyzer's Overlay traces
-        # (fit / background / residual) over the fitted range.
+        # (fit / background / residual) over the fitted range: the total fit solid, the background dashed
         overlay = outcome.overlay
         payload = outcome.result.payload
-        self.plot.clear()
-        self.plot.addItem(self.region)
-        self.plot.setLabel("bottom", self._x_label)
-        self.plot.setLabel("left", "Intensity")
-        # UI-5: DATA is markers only (no connecting line) so the fit curve reads
-        # ON TOP of the points, not under a coincident line; marker size matches
-        # the display widget's 1D plots (4).
-        self.plot.plot(self._x, self._y, pen=None, symbol='o', symbolSize=4,
-                       symbolBrush=(210, 210, 220), symbolPen=(210, 210, 220),
-                       name="data")
         ox = overlay.x
-        if "fit" in overlay.traces:
-            # UI-5: the TOTAL fit stays SOLID.
-            self.plot.plot(ox, overlay.traces["fit"],
-                           pen=pg.mkPen((189, 147, 249), width=2), name="fit")
-        if "background" in overlay.traces:
-            # UI-5: every component except the total fit is DASHED; background
-            # line width +30% (was near-invisible).
-            self.plot.plot(ox, overlay.traces["background"],
-                           pen=pg.mkPen((130, 200, 160), width=1.3,
-                                        style=QtCore.Qt.PenStyle.DashLine),
-                           name="background")
-        self._clear_fit()
-        if "residual" in overlay.traces:
-            self.resid_plot.plot(ox, overlay.traces["residual"],
-                                 pen=pg.mkPen((230, 133, 151), width=1))
-            self.resid_plot.setLabel("left", "resid")
-
-        centers = list(payload.peak_centers or [])
-        cerrs = list(getattr(payload, "peak_centers_err", []) or [])
-        sigmas = list(payload.peak_sigmas or [])
-        amps = list(payload.peak_amplitudes or [])
-        params = getattr(payload, "params", None)
-        self.table.setRowCount(len(centers))
-        for i, c in enumerate(centers):
-            fwhm = None
-            if params is not None:
-                p = params.get(f"p{i}_fwhm")
-                if p is not None:
-                    fwhm = p.value
-            if fwhm is None and i < len(sigmas):
-                fwhm = 2.3548 * sigmas[i]
-            cerr = cerrs[i] if i < len(cerrs) and cerrs[i] is not None else float("nan")
-            amp = amps[i] if i < len(amps) else float("nan")
-            vals = [str(i + 1), f"{c:.5g}", f"{cerr:.2g}",
-                    f"{fwhm:.4g}" if fwhm is not None else "—", f"{amp:.4g}"]
-            for col, v in enumerate(vals):
-                self.table.setItem(i, col, QtWidgets.QTableWidgetItem(v))
+        upper = [FitSeries(ox, overlay.traces[name], name, name) for name in ("fit", "background")
+                 if name in overlay.traces]
+        residual = (FitSeries(ox, overlay.traces["residual"], "residual"),) if "residual" in overlay.traces else ()
+        self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper), FitPanel(
+            residual, y_label="resid" if residual else "", zero_line=True)))
+        headers, rows = peak_outcome_rows(payload)
+        self.table.show_rows(headers, rows)
 
         ok = bool(getattr(payload, "success", True))
         how = "auto-detected" if auto else "fixed-count"
         self.status.setText(
             ("Fit converged." if ok else "Fit did NOT converge (best effort).")
-            + f"  {len(centers)} {how} peak(s), "
+            + f"  {len(rows)} {how} peak(s), "
             + f"{payload.model_name} + {payload.background_name}.")
 
         # Feed the vs-frame trend when this outcome is for a real frame (live /
@@ -715,3 +650,12 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
             frame_idx = None
         if frame_idx is not None:
             self._accumulate_frame_params(frame_idx, outcome.params)
+
+    # ---- the parameter trend ---------------------------------------------
+    def reset_param_trend(self):
+        """A fresh vs-frame trend (Reload, a new live or batch run)."""
+        self.trend.clear()
+
+    def _accumulate_frame_params(self, frame_idx, params):
+        """One frame's parameters on the trend (a re-fit of the frame replaces its row)."""
+        self.trend.set_row(str(int(frame_idx)), int(frame_idx), params)

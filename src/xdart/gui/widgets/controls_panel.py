@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import PurePath
+import logging
+import os
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
@@ -19,6 +21,7 @@ from xrd_tools.session.readiness import (
     ControlsProjection,
     ProcessingPage,
     SectionId,
+    integer_field_refusal,
 )
 
 
@@ -68,16 +71,41 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
     # Processing / conditioning
     ("Signal", "series_average"): (
         "Average all frames in the series into one frame before integration."),
+    ("Int1D", "record_angular_support"): (
+        "Record angular coverage (On or Off): with each new 1-D profile (Int 2D writes them too), compute and save "
+        "how many degrees of its χ window the detector's unmasked pixels reach in every radial bin. Plot Options' "
+        "“Show angular coverage” only displays it. This is angular reach, not a pixel count, and it never changes "
+        "intensity. Off by default; turn On to compute and save it. When it is off, the result records that it was "
+        "off. Show can compute coverage on demand for qualifying saved Standard Int results; Stitch needs it recorded. "
+        "The recording choice belongs to the output: Append (and Reintegrate) keep "
+        "the one an output was created with, and the Run says so when that differs from this setting; a new output "
+        "or Overwrite takes this setting."),
     ("Mask", "Threshold"): (
         "Exclude values outside the inclusive [min, max] band per frame. "
-        "Default: 0 to native integer maximum minus one. Off keeps all finite "
-        "values. The global mask always applies."),
+        "Automatic: values at or above the detector's saturation are left out. "
+        "Off keeps all finite values. The global mask always applies."),
     ("Mask", "min"): (
         "Manual threshold lower bound (pixels below are masked). Default 0."),
     ("Mask", "max"): (
-        "Upper threshold (pixels above are masked). The automatic default is "
-        "the native integer type maximum minus one, not the frame maximum. "
-        "Clear this bound to restore the default 0-to-limit band."),
+        "Upper threshold (pixels above are masked). Automatic upper limit: the "
+        "detector's saturation (the value the input records, else the "
+        "calibration detector's counter limit, else the data type's maximum), "
+        "never the frame maximum. Clear this bound to restore the automatic band."),
+    # The calibration window's own threshold (and its Quick card's view of it), Int's rule
+    ("Calibration", "enabled"): (
+        "Calibration's threshold for calibrant ring finding and the automatic refinement, by "
+        "Int's Threshold rule; on by default. Auto leaves out pixels at or above the detector's "
+        "saturation; typed bounds tighten the band. Off keeps saturated pixels (strong grains). "
+        "Ring finding (the automatic refinement, pyFAI-calib2) leaves out the detector's "
+        "invalid-pixel value (4294967295) either way. Raw images and the page's own processing "
+        "threshold stay unchanged."),
+    ("Calibration", "min"): (
+        "Calibration threshold lower bound: pixels below it are left out of ring finding. "
+        "Default 0."),
+    ("Calibration", "max"): (
+        "Calibration threshold upper bound: pixels above it are left out of ring finding. "
+        "Blank: Auto, the detector's saturation (the Saturation field, else its documented "
+        "counter limit, else the image type's maximum)."),
     # Source
     ("Signal", "inp_type"): (
         "Source kind: a numbered image series, a directory of images, or a "
@@ -98,6 +126,7 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
 
 # Descriptive hover tooltips for the producer/inspector action buttons.
 _ACTION_TOOLTIPS: dict[ControlAction, str] = {
+    ControlAction.HELP: "Open offline scientific help for this control; no settings or data change.",
     ControlAction.CALIBRATE: "Run pyFAI calibration to produce a PONI (detector geometry) file.",
     ControlAction.MAKE_MASK: "Build a detector mask from a chosen TIFF image.",
     ControlAction.ADVANCED_PROCESSING: "Open the advanced integration settings (full parameter tree).",
@@ -110,6 +139,16 @@ def _field_tooltip(path, reason: str = "") -> str:
     """Resolve a control's hover tooltip: the disabled `reason` takes precedence
     (so a locked control explains WHY), else the descriptive help text."""
     return (reason or "") or _FIELD_TOOLTIPS.get(tuple(path), "")
+
+
+#: Toggles whose text says their state after the label ("Record angular coverage: On"); the accessible name
+#: stays the label (COVERAGE-EXPORT-FOLLOWUP-20261014, the maintainer's approved wording).
+_STATE_TEXT_PATHS = frozenset({("Int1D", "record_angular_support")})
+
+
+def _toggle_text(path, label: str, checked: bool) -> str:
+    """A toggle's text: its label, followed by On or Off for the toggles that say their state."""
+    return f"{label}: {'On' if checked else 'Off'}" if tuple(path) in _STATE_TEXT_PATHS else label
 
 
 _SOURCE_ENERGY_PATH = ("Source", "energy_preference")
@@ -135,12 +174,29 @@ class ActionButton(QtWidgets.QPushButton):
         super().__init__(spec.label, parent)
         self.setObjectName("controlsActionButton")
         self._spec = spec
+        self._purpose_tooltip = ""
         self.clicked.connect(lambda: self.actionRequested.emit(self._spec.action))
         self.apply_spec(spec)
 
     @property
     def spec(self) -> ControlActionSpec:
         return self._spec
+
+    def set_purpose_tooltip(self, text: str) -> None:
+        """Describe an action separately from its temporary refusal reason."""
+        self._purpose_tooltip = str(text)
+        self.apply_spec(self._spec)
+
+    @classmethod
+    def for_help(cls, context, topic_id: str):
+        """A presentation action: its current top-level owner opens this context directly."""
+        from .context_help import bind_topic, owner_for
+        bind_topic(context, topic_id)
+        button = cls(ControlActionSpec(ControlAction.HELP, "?", SectionId.EXPERIMENT))
+        button.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        button.set_purpose_tooltip(f"Open offline help: {topic_id}. F1 opens help for the focused control.")
+        button.clicked.connect(lambda: owner_for(context).show_context(context))
+        return button
 
     def apply_spec(self, spec: ControlActionSpec) -> None:
         label = (
@@ -149,7 +205,7 @@ class ActionButton(QtWidgets.QPushButton):
             else _ACTION_LABELS.get(spec.action, spec.label)
         )
         enabled = bool(spec.enabled)
-        tooltip = spec.reason or _ACTION_TOOLTIPS.get(spec.action, "")
+        tooltip = spec.reason or self._purpose_tooltip or _ACTION_TOOLTIPS.get(spec.action, "")
         production_ready = bool(spec.production_ready)
         # Role drives a subtle tint: Reintegrate = green (run-like), Advanced =
         # red (the destructive/expert escape hatch); producers stay neutral.
@@ -188,6 +244,15 @@ class ActionButton(QtWidgets.QPushButton):
             self.style().polish(self)
 
 
+def _card_help(card, topic_id: str) -> None:
+    from .context_help import bind_topic
+    bind_topic(card, topic_id)
+    if not hasattr(card, "help_button"):
+        card.help_button = ActionButton.for_help(card, topic_id)
+        card._header_layout.addWidget(card.help_button)
+    card.help_button.set_purpose_tooltip(f"Open offline help: {topic_id}; available while editors are locked.")
+
+
 class SectionCard(QtWidgets.QFrame):
     """Colour-coded collapsible workflow section."""
 
@@ -199,12 +264,14 @@ class SectionCard(QtWidgets.QFrame):
         number: str = "",
         accent: str = "neutral",
         collapsible: bool = True,
+        compact: bool = False,
     ):
         super().__init__(parent)
         self.setObjectName("controlsSectionCard")
         self.setProperty("accent", accent)
         self._collapsed = False
         self._collapsible = bool(collapsible)
+        self._compact = bool(compact)
         outer = QtWidgets.QVBoxLayout(self)
         self._outer_layout = outer
         outer.setContentsMargins(0, 0, 0, 0)
@@ -229,16 +296,21 @@ class SectionCard(QtWidgets.QFrame):
         self.chip.setObjectName("controlsSectionChip")
         self.chip.setProperty("accent", accent)
         self.chip.setAlignment(QtCore.Qt.AlignCenter)
-        self.chip.setVisible(bool(number))
+        # Parented first: a parentless label made visible opens as its own window for an instant, and on macOS
+        # that steals and returns the activation (live 2026-10-08: the Int page re-rendered on it, endlessly).
         header_lay.addWidget(self.chip)
+        self.chip.setVisible(bool(number))
         self.title = QtWidgets.QLabel(title.upper())
         self.title.setObjectName("controlsSectionTitle")
         header_lay.addWidget(self.title, 1)
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("controlsSectionStatus")
+        # Status detail uses the available header space, never the column's width floor.
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                  QtWidgets.QSizePolicy.Policy.Preferred)
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.status.hide()
-        header_lay.addWidget(self.status)
+        header_lay.addWidget(self.status, 1)
         self.valid_marker = QtWidgets.QLabel("✓")
         self.valid_marker.setObjectName("controlsSectionTick")
         self.valid_marker.setProperty("accent", accent)
@@ -262,7 +334,23 @@ class SectionCard(QtWidgets.QFrame):
         self.embedded_layout.setSpacing(0)
         self.embedded.hide()
         self.body_layout.addWidget(self.embedded)
+        if self._compact:
+            self.setObjectName("controlsInlineReadiness")
+            self.header.setObjectName("controlsInlineReadinessHeader")
+            for widget in (self.toggle, self.chip, self.title, self.body):
+                widget.hide()
+            header_lay.setStretchFactor(self.status, 1)
+            self.status.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self._apply_spacing(current_spacing_tokens())
+
+    def set_purpose_tooltip(self, text: str) -> None:
+        """Explain the section on the card and on its title."""
+        self.setToolTip(text)
+        self.title.setToolTip(text)
+
+    def set_help_topic(self, topic_id: str) -> None:
+        """Keep contextual help in the header, outside editor/body locks."""
+        _card_help(self, topic_id)
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -274,10 +362,10 @@ class SectionCard(QtWidgets.QFrame):
 
     def _apply_spacing(self, tokens: SpacingTokens) -> None:
         self._header_layout.setContentsMargins(
-            _spaced(7, tokens),
-            _spaced(5, tokens),
-            _spaced(8, tokens),
-            _spaced(5, tokens),
+            0 if self._compact else _spaced(7, tokens),
+            0 if self._compact else _spaced(5, tokens),
+            0 if self._compact else _spaced(8, tokens),
+            0 if self._compact else _spaced(5, tokens),
         )
         self._header_layout.setSpacing(_spaced(7, tokens))
         self.body_layout.setContentsMargins(
@@ -328,6 +416,16 @@ class SectionCard(QtWidgets.QFrame):
         self.valid_marker.setVisible(visible)
         self.valid_marker.setToolTip(tooltip)
 
+    def set_readiness(self, ready: bool, text: str) -> None:
+        """A passive readiness header, using the shared green/red section accents."""
+        self.status.setWordWrap(True)
+        self.set_status_text(text)
+        self.valid_marker.setText("✓" if ready else "!")
+        self.valid_marker.setProperty("accent", "source" if ready else "processing")
+        self.set_valid_marker(True, text)
+        self.valid_marker.style().unpolish(self.valid_marker)
+        self.valid_marker.style().polish(self.valid_marker)
+
     def clear_rows(self) -> None:
         while self.body_layout.count():
             item = self.body_layout.takeAt(0)
@@ -345,10 +443,12 @@ class SectionCard(QtWidgets.QFrame):
     def add_row(self, widget: QtWidgets.QWidget) -> None:
         self.body_layout.addWidget(widget)
 
-    def add_group_header(self, text: str) -> None:
+    def add_group_header(self, text: str, *, tooltip: str = "") -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
         label.setObjectName("controlsGroupHeader")
+        label.setToolTip(tooltip)
         self.add_row(label)
+        return label
 
     def embedded_visible(self) -> bool:
         """The embedded widget's EXPLICIT projection state (§21.5 req 2).
@@ -388,6 +488,10 @@ class SectionCard(QtWidgets.QFrame):
 class SubsectionCard(QtWidgets.QFrame):
     """Compact collapsible subsection inside a workflow section."""
 
+    def set_help_topic(self, topic_id: str) -> None:
+        """Use the same header help action as the outer section."""
+        _card_help(self, topic_id)
+
     def __init__(
         self,
         title: str,
@@ -400,6 +504,7 @@ class SubsectionCard(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("controlsSubsectionCard")
         self._collapsed = False
+        self._trigger = None  # (button, text) when a host row shows and hides the body (external_trigger)
         outer = QtWidgets.QVBoxLayout(self)
         self._outer_layout = outer
         outer.setContentsMargins(0, 0, 0, 0)
@@ -433,8 +538,8 @@ class SubsectionCard(QtWidgets.QFrame):
         # When a numbered/chip prefix already names the group (e.g. the "1-D"
         # chip), an identical title text duplicates it ("1-D 1-D").  Hide the
         # title label when empty so the chip alone names the group.
+        h_lay.addWidget(self.title)  # parented before it is shown (see SectionCard's chip)
         self.title.setVisible(bool(title))
-        h_lay.addWidget(self.title)
         # Explicit stretch (not the title's) so trailing header widgets (the
         # "Pts" cluster, the status) right-align even when the title is hidden —
         # a hidden title item would otherwise swallow its own stretch.
@@ -450,9 +555,11 @@ class SubsectionCard(QtWidgets.QFrame):
         h_lay.addWidget(self.header_extra)
         self.status = QtWidgets.QLabel(status)
         self.status.setObjectName("controlsSubsectionStatus")
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                  QtWidgets.QSizePolicy.Policy.Preferred)
         self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        h_lay.addWidget(self.status, 1)
         self.status.setVisible(bool(status))
-        h_lay.addWidget(self.status)
         self.header.mousePressEvent = self._header_mouse_press
         outer.addWidget(self.header)
         self.body = QtWidgets.QFrame()
@@ -502,6 +609,22 @@ class SubsectionCard(QtWidgets.QFrame):
         self._collapsed = bool(collapsed)
         self.body.setVisible(not self._collapsed)
         self.toggle.setText("▸" if self._collapsed else "▾")
+        if self._trigger is not None:
+            button, text = self._trigger
+            button.setText(f"{text} {'▸' if self._collapsed else '▾'}")
+
+    def external_trigger(self, text: str, tooltip: str) -> QtWidgets.QToolButton:
+        """A button that shows and hides the body from a host row beside the controls it configures (LT-009's
+        inline Config, maintainer, 2026-10-14: "Inline expansion"); the card's own header hides. Collapsed at first.
+        Showing or hiding changes only what is shown: the body's editors, their values and drafts stay."""
+        button = QtWidgets.QToolButton()
+        button.setAutoRaise(True)
+        button.setToolTip(tooltip)
+        button.clicked.connect(self.toggle_collapsed)
+        self._trigger = (button, text)
+        self.header.hide()
+        self.set_collapsed(True)
+        return button
 
     def add_row(self, widget: QtWidgets.QWidget) -> None:
         self.body_layout.addWidget(widget)
@@ -544,8 +667,16 @@ class _ControlsComboBox(QtWidgets.QComboBox):
     only authoritative boundary -- immediately before the popup is shown.
     """
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup_resume = QtCore.QTimer(self)
+        self._popup_resume.setSingleShot(True)
+        self._popup_resume.timeout.connect(self._return_popup_focus)
+
     def showPopup(self) -> None:
         view = self.view()
+        self._popup_resume.stop()
+        view.window().installEventFilter(self)
         view.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
         view.doItemsLayout()
         popup_width = (
@@ -567,6 +698,76 @@ class _ControlsComboBox(QtWidgets.QComboBox):
         view.updateGeometry()
         super().showPopup()
 
+    def hidePopup(self) -> None:
+        popup = self.view().window()
+        was_visible = popup.isVisible()
+        super().hidePopup()
+        if os.environ.get('XDART_DEBUG_HELP_FOCUS'):
+            logging.getLogger(__name__).warning('controls_popup %s', dict(was_visible=was_visible,
+                popup=popup, visible=popup.isVisible(), active=QtWidgets.QApplication.activeWindow(),
+                focus=QtWidgets.QApplication.focusWidget(), root=self.window()))
+        if was_visible:
+            self._popup_resume.start(0)
+
+    def eventFilter(self, watched, event):
+        if (watched is self.view().window() and event.type() == QtCore.QEvent.Type.WindowActivate
+                and not watched.isVisible()):
+            self._popup_resume.start(0)
+        return super().eventFilter(watched, event)
+
+    def _return_popup_focus(self):
+        # Qt may activate the popup *after* hidePopup returns. Only recover
+        # an empty focus owned by this exact hidden popup; a later user choice
+        # in another control/window wins without any deferred focus override.
+        popup, root = self.view().window(), self.window()
+        if (not popup.isVisible() and QtWidgets.QApplication.activeWindow() is popup
+                and QtWidgets.QApplication.focusWidget() is None and root.focusWidget() is self
+                and root.isVisible() and self.isEnabled()):
+            root.activateWindow()
+            self.setFocus(QtCore.Qt.FocusReason.PopupFocusReason)
+
+
+class ControlsComboBox(_ControlsComboBox):
+    """The Controls combo for any host: popup rows at the closed control's height, never elided.
+
+    Qt's native popup ignores the QSS item-height floor on some platforms; the
+    parented delegate keeps a Tight live-theme change from compressing choices.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("controlsComboBox")
+        self.setItemDelegate(_ComboPopupItemDelegate(self))
+
+
+def browse_button(label: str) -> QtWidgets.QToolButton:
+    """The Controls 📁 browse button; the host connects ``clicked``."""
+    button = QtWidgets.QToolButton()
+    button.setText("📁")
+    button.setObjectName("controlsBrowseButton")
+    button.setToolTip(f"Browse {label}")
+    button.setMinimumWidth(31)
+    button.setMaximumWidth(36)
+    return button
+
+
+class IntegerLineEdit(QtWidgets.QLineEdit):
+    """A whole-number row's editor (``FormRow`` with ``kind="int"``): a line edit whose text is kept as typed and
+    shown refused, never reverted, with a spin box's ``value``/``setValue`` for a window that drives the row itself
+    (FIT-TOOLS-2026-10: Int's Peak Fit sets its peak count to the peaks it found)."""
+
+    def value(self) -> int | None:
+        """The text as a whole number (``integer_field_refusal``'s reading), None when it is blank or none (the row
+        says why: ``FormRow.refusal``)."""
+        try:
+            return int(self.text().strip())
+        except ValueError:
+            return None
+
+    def setValue(self, value: int | None) -> None:  # noqa: N802 (a spin box's name, which its callers use)
+        """Show ``value`` (None: blank), as code sets text: no draft and no commit."""
+        self.setText("" if value is None else str(int(value)))
+
 
 class FormRow(QtWidgets.QWidget):
     """One editable row in the Controls form."""
@@ -586,16 +787,28 @@ class FormRow(QtWidgets.QWidget):
         value,
         kind: str = "line",
         choices: Sequence[str] = (),
+        choice_labels: Mapping[str, str] | None = None,
         browse: bool = False,
         enabled: bool = True,
         reason: str = "",
+        minimum: int | float | None = None,
+        maximum: int | float | None = None,
+        allow_blank: bool = False,
+        decimals: int = 2,
+        suffix: str = "",
         parent=None,
     ):
         super().__init__(parent)
         self.setObjectName("controlsFormRow")
         self._path = tuple(path)
         self._kind = kind
+        self._choice_labels = dict(choice_labels or {})
         self._enabled = bool(enabled)
+        #: "int" rows: the bounds their text is checked against (``integer_field_refusal``)
+        self._bounds = (minimum, maximum, bool(allow_blank))
+        self._reason = reason
+        self._purpose_tooltip = ""
+        self._browse = bool(browse)
         self._file_name_only = (
             kind == "line"
             and browse
@@ -603,6 +816,7 @@ class FormRow(QtWidgets.QWidget):
         )
         self._model_value = "" if value is None else str(value)
         self._editor_dirty = False
+        self._help_focus_transfer = False
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
@@ -616,10 +830,12 @@ class FormRow(QtWidgets.QWidget):
             # GI/threshold/saturation toggles.  Mirroring that behavior keeps
             # checked-but-disabled controls visibly checked during active runs.
             self.label.hide()
-            editor = QtWidgets.QPushButton(label)
+            editor = QtWidgets.QPushButton(_toggle_text(self._path, label, bool(value)))
+            editor.setAccessibleName(label)
             editor.setObjectName("controlsToggleButton")
             editor.setCheckable(True)
             editor.setChecked(bool(value))
+            editor.toggled.connect(lambda checked: editor.setText(_toggle_text(self._path, label, checked)))
             editor.toggled.connect(
                 lambda checked: self._emit_edit(bool(checked))
             )
@@ -628,26 +844,42 @@ class FormRow(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Preferred,
             )
             lay.addWidget(editor, 1)
+        elif kind == "float":
+            # A decimal number with arrows (REFERENCE-PHASES-20261011): it commits once per changed value, on
+            # Return, focus-out or a step, and ``set_number`` projects it silently.
+            lay.addWidget(self.label)
+            editor = QtWidgets.QDoubleSpinBox()
+            editor.setObjectName("controlsDoubleSpin")
+            editor.setKeyboardTracking(False)
+            editor.setDecimals(int(decimals))
+            editor.setRange(float(-1e12 if minimum is None else minimum), float(1e12 if maximum is None else maximum))
+            editor.setSuffix(str(suffix))
+            editor.setValue(float(value))
+            self._number = float(editor.value())
+            editor.valueChanged.connect(self._number_edited)
+            lay.addWidget(editor, 1)
         elif kind == "combo":
             lay.addWidget(self.label)
-            editor = _ControlsComboBox()
-            editor.setObjectName("controlsComboBox")
-            # Qt's native popup ignores the QSS item-height floor on some
-            # platforms.  Keep this parented delegate alive with the row so a
-            # Tight live-theme change cannot compress choices into one line.
-            self._combo_popup_delegate = _ComboPopupItemDelegate(editor)
-            editor.setItemDelegate(self._combo_popup_delegate)
+            editor = ControlsComboBox()
+            self._combo_popup_delegate = editor.itemDelegate()
             values = [str(choice) for choice in choices]
             if not values and value not in (None, ""):
                 values = [str(value)]
-            editor.addItems(values)
+            if self._choice_labels:
+                for item in values:
+                    editor.addItem(self._choice_labels.get(item, item), item)
+            else:
+                editor.addItems(values)
             text = "" if value is None else str(value)
-            idx = editor.findText(text)
+            idx = editor.findData(text) if self._choice_labels else editor.findText(text)
             if idx >= 0:
                 editor.setCurrentIndex(idx)
             elif text:
-                editor.addItem(text)
-                editor.setCurrentText(text)
+                if self._choice_labels:
+                    editor.addItem(text, text)
+                else:
+                    editor.addItem(text)
+                editor.setCurrentIndex(editor.count() - 1)
             # ``currentTextChanged`` also fires for programmatic reconciliation,
             # and rebuilding the passive Controls form synchronously from that
             # signal can destroy a native popup while it is still open.  Accept
@@ -656,64 +888,163 @@ class FormRow(QtWidgets.QWidget):
             editor.textActivated.connect(
                 lambda text: QtCore.QTimer.singleShot(
                     0,
-                    lambda selected=str(text): self._emit_edit(selected),
+                    lambda selected=str(editor.currentData() if self._choice_labels else text): self._emit_edit(selected),
                 )
             )
             lay.addWidget(editor, 1)
         else:
             lay.addWidget(self.label)
-            editor = QtWidgets.QLineEdit(self._line_display_value(value))
+            editor = (IntegerLineEdit if kind == "int" else QtWidgets.QLineEdit)(self._line_display_value(value))
             editor.setObjectName("controlsLineEdit")
             editor.editingFinished.connect(self._emit_editor_edit)
             # A focused draft (user typing, NOT programmatic setText) is
             # revisioned at action time so it survives a rebuild and wins by
             # revision (§12.4); it commits (and applies) on editingFinished.
             editor.textEdited.connect(self._draft_edited)
+            if kind == "int":  # the typed text is kept and shown refused, never reverted
+                editor.textChanged.connect(lambda _text: self._show_validity())
             lay.addWidget(editor, 1)
 
         self.editor = editor
+        self.editor.installEventFilter(self)
         self.editor.setEnabled(self._enabled)
         if self._file_name_only:
-            self.editor.installEventFilter(self)
+            # connected first, so a host's own ``textChanged`` slot reads the adopted value
+            self.editor.textChanged.connect(self._adopt_set_text)
         # Path/browse fields should show the root of long paths by default; the
         # full value is still available on hover via the row tooltip.
         if browse and isinstance(self.editor, QtWidgets.QLineEdit):
             self.editor.setCursorPosition(0)
         self.browse_button = None
         if browse:
-            btn = QtWidgets.QToolButton()
-            btn.setText("📁")
-            btn.setObjectName("controlsBrowseButton")
-            btn.setToolTip(f"Browse {label}")
+            btn = browse_button(label)
             btn.clicked.connect(lambda _=False, p=self._path: self.browseRequested.emit(p))
-            btn.setMinimumWidth(31)
-            btn.setMaximumWidth(36)
             btn.setEnabled(self._enabled)
             lay.addWidget(btn)
             self.browse_button = btn
-        tip = (
-            self._model_value
-            if browse and self._model_value and not reason
-            else _field_tooltip(self._path, reason)
-        )
-        for widget in (self, self.editor, self.label):
-            widget.setToolTip(tip)
+        self._refresh_tooltip()
+        if kind == "int":
+            self._show_validity()
 
     @property
     def path(self) -> tuple[str, ...]:
         return self._path
 
-    def add_trailing_widget(self, widget: QtWidgets.QWidget) -> None:
+    def set_purpose_tooltip(self, text: str) -> None:
+        """Keep descriptive help separate from temporary refusal/disabled reasons."""
+        self._purpose_tooltip = str(text)
+        if self._kind == "int":
+            self._show_validity()
+        else:
+            self._refresh_tooltip()
+
+    def set_help_topic(self, topic_id: str, *, button: bool = False) -> None:
+        """Bind F1 without changing purpose/refusal/path tips; opt in to a trailing action."""
+        from .context_help import bind_topic
+        bind_topic(self, topic_id)
+        if button and not hasattr(self, "help_button"):
+            self.help_button = ActionButton.for_help(self, topic_id)
+            self.add_trailing_widget(self.help_button)
+
+    def preserve_help_draft(self) -> None:
+        """Keep this draft across a read-only help visit; returning restores normal commits."""
+        from .context_help import owner_for
+        self._help_focus_transfer = True
+        owner_for(self).hold_draft(self)
+
+    def resolve_help_draft(self) -> bool:
+        """Release a help hold through this row's normal commit or visible refusal.
+
+        The caller selects a different focus destination. A repeated release
+        has no effect; an invalid integer keeps its text and refusal cue.
+        """
+        held = self._help_focus_transfer
+        self._help_focus_transfer = False
+        if not held or not self._editor_dirty:
+            return True
+        if self.refusal():
+            self._show_validity()
+            return False
+        self.editor.editingFinished.emit()
+        self._editor_dirty = False
+        self.editor.setModified(False)
+        self._collapse_path_editor()
+        return True
+
+    def _refresh_tooltip(self, refusal: str = "") -> None:
+        tip = (f"{self.label.text()}: {refusal}" if refusal else
+               self._reason or (self._model_value if self._browse and self._model_value else
+                                self._purpose_tooltip or _field_tooltip(self._path)))
+        widgets = (self, self.editor, self.label)
+        if self._kind == "float":
+            widgets += (self.editor.lineEdit(),)
+        for widget in widgets:
+            if widget.toolTip() != tip:
+                widget.setToolTip(tip)
+
+    def refusal(self) -> str:
+        """Why an ``int`` row's text is no whole number within its bounds ("" when it is, and for
+        every other kind): the rule a page's readiness names (``integer_field_refusal``)."""
+        if self._kind != "int":
+            return ""
+        minimum, maximum, allow_blank = self._bounds
+        return integer_field_refusal(self.editor.text(), minimum=minimum, maximum=maximum,
+                                     allow_blank=allow_blank)
+
+    def set_integer_bounds(self, minimum: int | None, maximum: int | None) -> None:
+        """Change a whole-number row's bounds without changing its entered text."""
+        if self._kind != "int":
+            raise TypeError("integer bounds require a whole-number row")
+        self._bounds = (minimum, maximum, self._bounds[2])
+        self._show_validity()
+
+    def _show_validity(self) -> None:
+        """An ``int`` row marks refused text (the theme's ``invalid`` property) and says why in its
+        tooltip; the text itself stays as typed."""
+        refusal = self.refusal()
+        if bool(self.editor.property("invalid")) != bool(refusal):
+            self.editor.setProperty("invalid", bool(refusal))
+            style = self.editor.style()
+            style.unpolish(self.editor)
+            style.polish(self.editor)
+        self._refresh_tooltip(refusal)
+
+    def add_trailing_widget(self, widget: QtWidgets.QWidget, stretch: int = 0) -> None:
         """Append a widget to the right of the row (after the editor).  Used to
         park the compact 'Pts' cluster on the Axis row — the editor stretches, so
-        trailing widgets pin to the right."""
-        self.layout().addWidget(widget)
+        trailing widgets pin to the right; a ``stretch`` shares the width instead
+        (a second field on a file row, e.g. the calibration window's image stem)."""
+        self.layout().addWidget(widget, stretch)
+
+    def set_number(self, value) -> None:
+        """A float row's projection: silent; a changed value is authoritative, an equal one keeps a draft being
+        typed (REFERENCE-PHASES-20261011)."""
+        if self._kind != "float":
+            raise TypeError("set_number needs a float row")
+        value = float(value)
+        if value == self._number:
+            return
+        self._number = value
+        blocked = self.editor.blockSignals(True)
+        try:
+            self.editor.setValue(value)
+        finally:
+            self.editor.blockSignals(blocked)
+
+    def _number_edited(self, value) -> None:
+        value = float(value)
+        if value == self._number:
+            return
+        self._number = value
+        self._emit_edit(value)
 
     def current_value(self):
+        if self._kind == "float":
+            return float(self.editor.value())
         if self._kind == "bool":
             return bool(self.editor.isChecked())
         if self._kind == "combo":
-            return self.editor.currentText()
+            return self.editor.currentData() if self._choice_labels else self.editor.currentText()
         if self._file_name_only and not self._editor_dirty:
             return self._model_value
         return self.editor.text()
@@ -737,6 +1068,7 @@ class FormRow(QtWidgets.QWidget):
                 checked = bool(field.value)
                 if self.editor.isChecked() != checked:
                     self.editor.setChecked(checked)
+                self.editor.setText(_toggle_text(self._path, self.label.text(), checked))
             elif self._kind == "combo":
                 # The projected ``field.choices`` are the authoritative combo
                 # vocabulary; construction-time items must not outlive them.
@@ -747,18 +1079,27 @@ class FormRow(QtWidgets.QWidget):
                 if value and value not in desired:
                     desired.append(value)
                 current_items = [
-                    self.editor.itemText(index)
+                    self.editor.itemData(index) if self._choice_labels else self.editor.itemText(index)
                     for index in range(self.editor.count())
                 ]
                 if current_items != desired:
                     self.editor.clear()
-                    self.editor.addItems(desired)
-                if self.editor.currentText() != value:
-                    idx = self.editor.findText(value)
+                    if self._choice_labels:
+                        for item in desired:
+                            self.editor.addItem(self._choice_labels.get(item, item), item)
+                    else:
+                        self.editor.addItems(desired)
+                if self.current_value() != value:
+                    idx = self.editor.findData(value) if self._choice_labels else self.editor.findText(value)
                     if idx >= 0:
                         self.editor.setCurrentIndex(idx)
             else:
-                focused = self.editor.hasFocus()
+                # A changed model value is authoritative, including a load
+                # during help. An unchanged projection preserves typed text.
+                replaced = value != self._model_value
+                if replaced:
+                    self._help_focus_transfer = False
+                focused = (self.editor.hasFocus() or self._help_focus_transfer) and not replaced
                 if not focused:
                     shown = self._line_display_value(value)
                     if self.editor.text() != shown:
@@ -776,13 +1117,13 @@ class FormRow(QtWidgets.QWidget):
         finally:
             self.editor.blockSignals(was_blocked)
 
-        if field.browse and field.value and not field.reason:
-            tip = str(field.value)
+        self._reason = field.reason
+        self._browse = bool(field.browse)
+        if self._kind == "int":
+            self._bounds = (field.minimum, field.maximum, bool(field.allow_blank))
+            self._show_validity()
         else:
-            tip = _field_tooltip(field.path, field.reason)
-        for widget in (self, self.editor, self.label):
-            if widget is not None and widget.toolTip() != tip:
-                widget.setToolTip(tip)
+            self._refresh_tooltip()
         return True
 
     def _line_display_value(self, value) -> str:
@@ -792,6 +1133,16 @@ class FormRow(QtWidgets.QWidget):
         return text
 
     def eventFilter(self, watched, event) -> bool:
+        if (watched is self.editor and os.environ.get("XDART_DEBUG_HELP_FOCUS")
+                and event.type() in (QtCore.QEvent.Type.FocusIn, QtCore.QEvent.Type.FocusOut)):
+            logging.getLogger(__name__).warning("help_focus event=%s reason=%s path=%s hold=%s destination=%s",
+                event.type(), event.reason(), self._path, self._help_focus_transfer, QtWidgets.QApplication.focusWidget())
+        if watched is self.editor and event.type() == QtCore.QEvent.Type.FocusOut:
+            destination = QtWidgets.QApplication.focusWidget()
+            if isinstance(destination, ActionButton) and destination.spec.action is ControlAction.HELP:
+                self.preserve_help_draft()  # before QLineEdit's focus-out handler can commit
+        if watched is self.editor and event.type() == QtCore.QEvent.Type.FocusIn:
+            self._help_focus_transfer = False
         if watched is self.editor and self._file_name_only:
             event_type = event.type()
             if event_type == QtCore.QEvent.Type.FocusIn:
@@ -811,8 +1162,24 @@ class FormRow(QtWidgets.QWidget):
                 QtCore.QTimer.singleShot(0, self._collapse_path_editor)
         return super().eventFilter(watched, event)
 
+    def _adopt_set_text(self, text: str) -> None:
+        """A file row's text set by code while it is unfocused is the row's value: a window that drives
+        its rows directly rather than through a projection (the calibration window) reads back what it
+        set. It is shown collapsed, with the full path as the tooltip, and makes no draft and no commit
+        (§19.9: a programmatic set is a projection, never user intent). ``apply_field`` and this row's
+        own display swaps block signals, so they never arrive here."""
+        if self.editor.hasFocus() or self._editor_dirty:
+            return
+        self._model_value = text
+        tip = text if text and not self._reason else _field_tooltip(self._path, self._reason)
+        for widget in (self, self.editor, self.label):
+            if widget.toolTip() != tip:
+                widget.setToolTip(tip)
+        # the row as the context: the collapse is dropped if the row is destroyed first
+        QtCore.QTimer.singleShot(0, self, self._collapse_path_editor)
+
     def _collapse_path_editor(self) -> None:
-        if not self._file_name_only or self.editor.hasFocus():
+        if not self._file_name_only or self.editor.hasFocus() or self._help_focus_transfer:
             return
         blocked = self.editor.blockSignals(True)
         try:
@@ -826,6 +1193,8 @@ class FormRow(QtWidgets.QWidget):
         self.draftChanged.emit(self._path, text)
 
     def _emit_editor_edit(self) -> None:
+        if self._help_focus_transfer:
+            return
         value = self.current_value()
         if self._file_name_only:
             # A focused Return commit can precede any owner reconciliation,
@@ -843,6 +1212,71 @@ class FormRow(QtWidgets.QWidget):
     def _emit_edit(self, value) -> None:
         edit = ControlFormEdit(path=self._path, value=value)
         self.valueChanged.emit(edit.path, edit.value)
+
+
+class CoordinateRangeControl(QtWidgets.QWidget):
+    """Int range editors and canonical two-handle slider for a display coordinate."""
+    rangeChanged = QtCore.Signal(float, float)
+
+    def __init__(self, label, parent=None):
+        super().__init__(parent)
+        from xdart.gui.widgets.intensity_controls import IntensityRangeSlider
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.row = RangeRow(label=label, display_decimals=3,
+            low={"path": ("display_range", "low"), "value": ""},
+            high={"path": ("display_range", "high"), "value": ""})
+        self.label, self.editors = self.row.label, self.row.editors
+        self.label.setMinimumWidth(24)
+        self.slider = IntensityRangeSlider(self, range_label=label, continuous=False,
+            range_hint="Release a handle to choose the included bin centres. This changes display projections only; saved science is unchanged.")
+        layout.addWidget(self.row)
+        layout.addWidget(self.slider)
+        self._bounds = None
+        self.row.valueChanged.connect(self._edited)
+        self.slider.sigRangeChanged.connect(self._slid)
+
+    def reconcile(self, label, axis, bounds=None):
+        self.label.setText(label)
+        self.slider._range_label = label
+        low, high = float(axis[0]), float(axis[-1])
+        bounds = (low, high) if bounds is None else bounds
+        self._bounds = tuple(float(x) for x in bounds)
+        self.slider.setDomain(low, high, lower=bounds[0], upper=bounds[1])
+        self._sync_editors()
+        tip = (f"{label} bin centres included in all displayed maps and curves. "
+               "Edit bounds or drag the handles; saved science is unchanged.")
+        for widget in (self, self.label, self.row, *self.editors):
+            widget.setToolTip(tip)
+
+    def _sync_editors(self):
+        for editor, path, value in zip(self.editors, (self.row._low_path, self.row._high_path), self._bounds, strict=True):
+            self.row._model_text_by_path[path] = str(value)
+            editor.setText(format(value, '.3f'))
+            editor.setModified(False)
+
+    def _edited(self, path, value):
+        try:
+            low, high = self._bounds
+            if path[-1] == "low":
+                low = float(value)
+            else:
+                high = float(value)
+            from math import isfinite
+            if not isfinite(low) or not isfinite(high) or low > high:
+                raise ValueError
+        except ValueError:
+            self._sync_editors()
+            return
+        self._bounds = low, high
+        self.slider.setValues(low, high, emit=False)
+        self.rangeChanged.emit(low, high)
+
+    def _slid(self, low, high):
+        self._bounds = low, high
+        self._sync_editors()
+        self.rangeChanged.emit(low, high)
 
 
 class RangeRow(QtWidgets.QWidget):
@@ -939,6 +1373,8 @@ class RangeRow(QtWidgets.QWidget):
         # Same tooltip rule as _apply_edit: a full render must not leave the
         # bounds without their hover text until the first state UPDATE.
         edit.setToolTip(_field_tooltip(path, spec.get("reason", "")))
+        if spec.get("placeholder") is not None:
+            edit.setPlaceholderText(spec["placeholder"])
         edit.editingFinished.connect(
             lambda e=edit, p=path: self.valueChanged.emit(
                 p, self._current_edit_value(e, p)
@@ -949,6 +1385,15 @@ class RangeRow(QtWidgets.QWidget):
         )
         lay.addWidget(edit, 1)
         return edit, path
+
+    @property
+    def editors(self) -> tuple[QtWidgets.QLineEdit, QtWidgets.QLineEdit]:
+        """The low and high editors, for a window that drives the row itself (a fit range dragged on its plot)."""
+        return self._low, self._high
+
+    def add_trailing_widget(self, widget: QtWidgets.QWidget, stretch: int = 0) -> None:
+        """Append a widget to the right of the row (a fit range's Full button), as ``FormRow`` does."""
+        self.layout().addWidget(widget, stretch)
 
     @staticmethod
     def _model_text(value) -> str:
@@ -1050,6 +1495,8 @@ class RangeRow(QtWidgets.QWidget):
     ) -> None:
         edit.setEnabled(bool(field.enabled))
         edit.setToolTip(_field_tooltip(field.path, field.reason))
+        if field.placeholder is not None:
+            edit.setPlaceholderText(field.placeholder)
         path = tuple(field.path)
         self._model_text_by_path[path] = self._model_text(field.value)
         value = self._display_text(field.value)
@@ -1088,7 +1535,8 @@ class PillRow(QtWidgets.QWidget):
         lay.setSpacing(6)
         self._pills: list[tuple[tuple[str, ...], QtWidgets.QPushButton]] = []
         for field in fields:
-            btn = QtWidgets.QPushButton(field.label)
+            btn = QtWidgets.QPushButton(_toggle_text(field.path, field.label, bool(field.value)))
+            btn.setAccessibleName(field.label)
             # Reuse the accent-when-checked toggle styling, but content-sized and
             # fully rounded, via a DEDICATED object name (grouped with
             # controlsToggleButton in the theme).  The fully-rounded radius
@@ -1104,6 +1552,8 @@ class PillRow(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed
             )
             path = tuple(field.path)
+            btn.toggled.connect(
+                lambda checked, p=path, b=btn, text=field.label: b.setText(_toggle_text(p, text, checked)))
             btn.toggled.connect(
                 lambda checked, p=path: self.valueChanged.emit(p, bool(checked))
             )
@@ -1132,6 +1582,7 @@ class PillRow(QtWidgets.QWidget):
                     btn.setChecked(checked)
             finally:
                 btn.blockSignals(was_blocked)
+            btn.setText(_toggle_text(path, field.label, checked))
             btn.setEnabled(bool(field.enabled))
             btn.setToolTip(_field_tooltip(field.path, field.reason))
         return True
@@ -1259,6 +1710,8 @@ class ControlsPanel(QtWidgets.QWidget):
         self.source_card = self._make_section(SectionId.SOURCE)
         self.experiment_card = self._make_section(SectionId.EXPERIMENT)
         self.processing_card = self._make_section(SectionId.PROCESSING)
+        self.experiment_card.set_help_topic("geometry.orientation")
+        self.processing_card.set_help_topic("corrections.existing")
         lay.addWidget(self.project_card)
         lay.addWidget(self.experiment_card)
         lay.addWidget(self.source_card)
@@ -1419,6 +1872,8 @@ class ControlsPanel(QtWidgets.QWidget):
             tuple[SectionId, ControlAction], ActionButton
         ] = {}
         for button in self.findChildren(ActionButton):
+            if button.spec.action is ControlAction.HELP:
+                continue  # header presentation actions never belong to the Controls projection
             key = (button.spec.section, button.spec.action)
             if key in mounted_actions:
                 return False
@@ -1645,19 +2100,29 @@ class ControlsPanel(QtWidgets.QWidget):
         self._apply_card_visibility(state)
 
     def _apply_card_visibility(self, state: ControlsProjection) -> None:
-        viewer_mode = state.processing_page is ProcessingPage.VIEWER
-        project_root = state.value_for(_PROJECT_ROOT_PATH, None)
+        self.apply_card_visibility(
+            state.value_for(_PROJECT_ROOT_PATH, None),
+            viewer_mode=state.processing_page is ProcessingPage.VIEWER,
+            experiment=bool(state.fields_for(SectionId.EXPERIMENT)),
+        )
+
+    def apply_card_visibility(
+        self,
+        project_root: object,
+        *,
+        viewer_mode: bool = False,
+        experiment: bool = True,
+    ) -> None:
+        """The section gate: Source, Experiment and Processing show once a
+        Project folder is named (None: no Project field), never in a viewer.
+        Public for another page's own Project value (Stitch)."""
         project_ready = (
             project_root is None
             or type(project_root) is str and bool(project_root.strip())
         )
         self.project_card.show()
         self.source_card.setVisible(not viewer_mode and project_ready)
-        self.experiment_card.setVisible(
-            bool(state.fields_for(SectionId.EXPERIMENT))
-            and not viewer_mode
-            and project_ready
-        )
+        self.experiment_card.setVisible(experiment and not viewer_mode and project_ready)
         self.processing_card.setVisible(not viewer_mode and project_ready)
 
     def _render_plain_bound_section(
@@ -1672,12 +2137,34 @@ class ControlsPanel(QtWidgets.QWidget):
         self,
         fields: Iterable[ControlFormField],
     ) -> None:
+        self.render_source_rows(self.source_card, fields)
+
+    def render_source_rows(
+        self,
+        card: SectionCard,
+        fields: Iterable[ControlFormField],
+        *,
+        groups: Iterable[tuple[tuple[str, ...], ...]] = (),
+    ) -> dict[tuple[str, ...], FormRow]:
         """SOURCE layout with a few coalesced rows (Vivek): the mode combo + the
         directory-only Subdirs toggle share a row, and File Type + Meta Type share
-        a row.  Everything else renders one field per row, in field order."""
+        a row.  Everything else renders one field per row, in field order.
+
+        Public for another page's own source values (Stitch): returns each field's
+        row by path. Edits emit ``fieldValueChanged`` with the fields' paths.
+
+        ``groups`` (opt-in; Stitch's and RSM's Source, LT-SMALL-FIXES-20261014) lays each group of paths out on
+        one row, under its first field's label: a menu sized to its text, a text box taking the remaining width, a
+        toggle with its own short label; another text box's label is hidden and kept as its editor's accessible
+        name. Every other field then has a row of its own, in field order. Without groups, Int's layout above is
+        unchanged."""
         fields = tuple(fields)
+        groups = tuple(tuple(group) for group in groups)
+        if groups:
+            return self._render_grouped_rows(card, fields, groups)
         by_path = {field.path: field for field in fields}
         rendered: set[tuple[str, ...]] = set()
+        built: dict[tuple[str, ...], FormRow] = {}
 
         def row_for(
                 *paths: tuple[str, ...],
@@ -1697,18 +2184,19 @@ class ControlsPanel(QtWidgets.QWidget):
                     lay.setSpacing(8)
                     lay.addStretch(1)
                     lay.addWidget(self._make_source_energy_button(energy_field))
-                    self.source_card.add_row(container)
+                    card.add_row(container)
                 return
             rendered.update(field.path for field in present)
             if len(present) == 1 and not tight and energy_field is None:
-                self._add_bound_row(self.source_card, present[0])
+                built[present[0].path] = row = self._make_bound_row(present[0])
+                card.add_row(row)
                 return
             container = QtWidgets.QWidget()
             lay = QtWidgets.QHBoxLayout(container)
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(8)
             for field in present:
-                sub = self._make_bound_row(field)
+                built[field.path] = sub = self._make_bound_row(field)
                 if field.path in tight:
                     # Paired labels use their text width instead of the full
                     # form's aligned label column.
@@ -1727,7 +2215,7 @@ class ControlsPanel(QtWidgets.QWidget):
                 lay.addWidget(sub, st)
             if energy_field is not None:
                 lay.addWidget(self._make_source_energy_button(energy_field), 0)
-            self.source_card.add_row(container)
+            card.add_row(container)
 
         # Mode combo + (directory-only) Subdirs toggle on one row.
         row_for(("Signal", "inp_type"), ("Signal", "include_subdir"))
@@ -1747,7 +2235,42 @@ class ControlsPanel(QtWidgets.QWidget):
         # Anything else (e.g. NeXus File / Entry) one per row, in order.
         for field in fields:
             if field.path not in rendered:
-                self._add_bound_row(self.source_card, field)
+                built[field.path] = row = self._make_bound_row(field)
+                card.add_row(row)
+        return built
+
+    def _render_grouped_rows(self, card, fields, groups):
+        """``render_source_rows`` with ``groups``: see there."""
+        by_path = {field.path: field for field in fields}
+        group_of = {path: group for group in groups for path in group}
+        built: dict[tuple[str, ...], FormRow] = {}
+        for field in fields:
+            if field.path in built:
+                continue
+            group = group_of.get(field.path)
+            if group is None:
+                built[field.path] = row = self._make_bound_row(field)
+                card.add_row(row)
+                continue
+            container = QtWidgets.QWidget()
+            lay = QtWidgets.QHBoxLayout(container)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(8)
+            for index, path in enumerate(path for path in group if path in by_path):
+                member = by_path[path]
+                built[path] = sub = self._make_bound_row(member)
+                kind = getattr(member.kind, "value", member.kind)
+                if kind == "bool" and index:  # a toggle keeps its short label beside it
+                    sub.label.setMinimumWidth(0)
+                    sub.label.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
+                elif index:
+                    sub.label.hide()
+                    sub.editor.setAccessibleName(member.label)
+                if kind == "combo":
+                    sub.editor.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+                lay.addWidget(sub, 1 if kind == "line" else 0)
+            card.add_row(container)
+        return built
 
     def _make_source_energy_button(
             self, field: ControlFormField) -> QtWidgets.QToolButton:
@@ -1803,9 +2326,28 @@ class ControlsPanel(QtWidgets.QWidget):
     ) -> None:
         if not fields:
             return
+        self.render_experiment_rows(
+            self.experiment_card, fields, self._experiment_producers(state),
+            detector_summary=state.detector_summary,
+        )
+
+    def render_experiment_rows(
+        self,
+        card: SectionCard,
+        fields: tuple[ControlFormField, ...],
+        producers: Sequence[ControlActionSpec] = (),
+        *,
+        detector_summary: str = "",
+    ) -> dict[object, QtWidgets.QWidget]:
+        """EXPERIMENT layout: the producer actions on top, then the Detector
+        subsection (calibration and mask) and the Sample & measurement one (GI).
+
+        Public for another page's own values (Stitch): returns each Detector
+        field's row by path and each producer's button by action. Edits emit
+        ``fieldValueChanged``; a button ``controlActionRequested``."""
+        built: dict[object, QtWidgets.QWidget] = {}
         # Producer actions (Calibrate / Refine / Make Mask) sit at the top of the
         # section they write into — co-located with §3 state, not a top bar.
-        producers = self._experiment_producers(state)
         if producers:
             row = QtWidgets.QWidget()
             row.setObjectName("controlsActionRow")
@@ -1813,10 +2355,10 @@ class ControlsPanel(QtWidgets.QWidget):
             prow.setContentsMargins(0, 0, 0, 3)
             prow.setSpacing(5)
             for spec in producers:
-                btn = ActionButton(spec)
+                built[spec.action] = btn = ActionButton(spec)
                 btn.actionRequested.connect(self.controlActionRequested)
                 prow.addWidget(btn, 1)
-            self.experiment_card.add_row(row)
+            card.add_row(row)
         detector_paths = {
             ("Signal", "poni_file"),
             ("Calibration", "poni_file"),
@@ -1839,7 +2381,7 @@ class ControlsPanel(QtWidgets.QWidget):
             (
                 "Detector",
                 tuple(field for field in fields if field.path in detector_paths),
-                self._detector_status(fields, state.detector_summary),
+                self._detector_status(fields, detector_summary),
             ),
             (
                 self._experiment_title,
@@ -1857,8 +2399,25 @@ class ControlsPanel(QtWidgets.QWidget):
                 self._render_sample_measurement_rows(group, group_fields)
             else:
                 for field in group_fields:
-                    self._add_bound_row(group, field)
-            self.experiment_card.add_row(group)
+                    built[field.path] = row = self._make_bound_row(field)
+                    group.add_row(row)
+            card.add_row(group)
+        return built
+
+    @property
+    def experiment_title(self) -> str:
+        """The Sample & measurement subsection's title, for another page's GI rows."""
+        return self._experiment_title
+
+    def render_gi_rows(
+        self,
+        group: "SubsectionCard",
+        fields: tuple[ControlFormField, ...],
+    ) -> None:
+        """Int's grazing-incidence rows for another page's own GI values (Stitch): the
+        Standard|Grazing control, the incidence motor and Manual angle, and '…' for the
+        orientation and tilt. Edits emit ``fieldValueChanged`` with Int's GI paths."""
+        self._render_sample_measurement_rows(group, fields)
 
     def _render_sample_measurement_rows(
         self,
@@ -1993,15 +2552,65 @@ class ControlsPanel(QtWidgets.QWidget):
             expand=True,
         )
 
+    def render_processing_rows(
+        self,
+        sub: SubsectionCard,
+        fields: Sequence[ControlFormField],
+    ) -> dict[tuple[str, ...], QtWidgets.QWidget]:
+        """Int's rows of one Processing group (1-D, 2-D, Conditioning) for another page's own
+        values (Stitch): the Axis row with its Pts, a RangeRow per low/high/auto triple and the
+        Threshold, pills for toggles. Returns each field's row by path (a range's three paths
+        its RangeRow). Edits emit ``fieldValueChanged`` with the fields' paths."""
+        return self._render_processing_group_rows(sub, fields)
+
+    def render_count_row(
+        self,
+        section: SectionCard | SubsectionCard,
+        label: str,
+        fields: Sequence[ControlFormField],
+    ) -> dict[tuple[str, ...], FormRow]:
+        """Mount labeled numeric fields on one processing-aligned row.
+
+        Each field's label names its axis; the existing FormRow owns its
+        validation, drafts and committed edits.
+        """
+        container = QtWidgets.QWidget()
+        container.setToolTip("Number of points along each labeled axis.")
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(PROCESSING_ROW_GAP)
+        heading = QtWidgets.QLabel(label)
+        heading.setObjectName("controlsFieldLabel")
+        heading.setFixedWidth(PROCESSING_ROW_LABEL_WIDTH)
+        heading.setWordWrap(True)
+        heading.setToolTip(container.toolTip())
+        layout.addWidget(heading)
+        built = {}
+        for field in fields:
+            row = self._make_bound_row(field)
+            row.label.setMinimumWidth(0)
+            row.layout().setSpacing(PROCESSING_ROW_GAP)
+            layout.addWidget(row, 1)
+            built[field.path] = row
+        section.add_row(container)
+        return built
+
+    @staticmethod
+    def _align_processing_row(row: FormRow) -> None:
+        row.label.setFixedWidth(PROCESSING_ROW_LABEL_WIDTH)
+        row.label.setWordWrap(True)
+        row.layout().setSpacing(PROCESSING_ROW_GAP)
+
     def _render_processing_group_rows(
         self,
         sub: SubsectionCard,
         fields: Sequence[ControlFormField],
-    ) -> None:
+    ) -> dict[tuple[str, ...], QtWidgets.QWidget]:
         """Render a Processing group, coalescing low/high(/auto) triples and the
         Threshold min/max into one compact :class:`RangeRow` each (mockup)."""
         by_path = {field.path: field for field in fields}
         consumed: set[tuple[str, ...]] = set()
+        built: dict[tuple[str, ...], QtWidgets.QWidget] = {}
         # The point-count field(s) park on the Axis row, right of the dropdown —
         # NOT their own body row, and no longer in the subsection header (which
         # stays clear for a status line).  Collected here; attached when the Axis
@@ -2020,6 +2629,7 @@ class ControlsPanel(QtWidgets.QWidget):
         def flush_pills() -> None:
             if pending_pills:
                 row = PillRow(list(pending_pills))
+                built.update(dict.fromkeys((field.path for field in pending_pills), row))
                 if any(
                     field.path in {
                         ("Signal", "series_average"),
@@ -2049,7 +2659,9 @@ class ControlsPanel(QtWidgets.QWidget):
                 low_f, high_f = by_path.get(low_p), by_path.get(high_p)
                 if low_f is not None and high_f is not None:
                     flush_pills()
-                    sub.add_row(self._make_range_row(low_f, high_f, by_path.get(auto_p)))
+                    row = self._make_range_row(low_f, high_f, by_path.get(auto_p))
+                    sub.add_row(row)
+                    built.update(dict.fromkeys((p for p in (low_p, high_p, auto_p) if p in by_path), row))
                     consumed.update({low_p, high_p, auto_p})
                     continue
             # A bare _high / _auto whose _low partner is in this group is folded
@@ -2062,9 +2674,12 @@ class ControlsPanel(QtWidgets.QWidget):
             if path == ("Mask", "min") and ("Mask", "max") in by_path:
                 flush_pills()
                 toggle_field = by_path.get(("Mask", "Threshold"))
-                sub.add_row(self._make_range_row(
+                row = self._make_range_row(
                     field, by_path[("Mask", "max")], toggle_field,
-                    label="Threshold", display_decimals=0))
+                    label="Threshold", display_decimals=0)
+                sub.add_row(row)
+                built.update(dict.fromkeys((p for p in (("Mask", "min"), ("Mask", "max"), ("Mask", "Threshold"))
+                                            if p in by_path), row))
                 consumed.update({("Mask", "min"), ("Mask", "max"), ("Mask", "Threshold")})
                 continue
             if path in {("Mask", "max"), ("Mask", "Threshold")} and ("Mask", "min") in by_path:
@@ -2081,25 +2696,28 @@ class ControlsPanel(QtWidgets.QWidget):
                 # RangeRow is the alignment owner for the bounds directly
                 # below.  Match its label width and gap so the Axis combo and
                 # both range editors share one exact left edge.
-                row.label.setMinimumWidth(PROCESSING_ROW_LABEL_WIDTH)
-                row.layout().setSpacing(PROCESSING_ROW_GAP)
+                self._align_processing_row(row)
                 if point_fields:
-                    self._attach_points_to_row(row, point_fields)
+                    built.update(self._attach_points_to_row(row, point_fields))
                     points_attached = True
                 sub.add_row(row)
+                built[path] = row
                 continue
-            self._add_bound_row(sub, field)
+            built[path] = row = self._make_bound_row(field)
+            self._align_processing_row(row)
+            sub.add_row(row)
         flush_pills()
         # Safety net: never drop the point fields if a group has them but no
         # Axis row to host them.
         if point_fields and not points_attached:
-            self._add_points_header(sub, point_fields)
+            built.update(self._add_points_header(sub, point_fields))
+        return built
 
     def _add_points_header(
         self,
         sub: SubsectionCard,
         point_fields: Sequence[ControlFormField],
-    ) -> None:
+    ) -> dict[tuple[str, ...], FormRow]:
         """Put the point-count field(s) on the subsection header as ``Pts [n] …``.
 
         Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
@@ -2107,6 +2725,7 @@ class ControlsPanel(QtWidgets.QWidget):
         label = QtWidgets.QLabel("Pts")
         label.setObjectName("controlsHeaderLabel")
         sub.add_header_widget(label)
+        built = {}
         for field in point_fields:
             row = FormRow(
                 label="",
@@ -2121,6 +2740,8 @@ class ControlsPanel(QtWidgets.QWidget):
             row.valueChanged.connect(self.fieldValueChanged)
             row.draftChanged.connect(self.fieldDraftChanged)
             sub.add_header_widget(row)
+            built[field.path] = row
+        return built
 
     @staticmethod
     def _range_low_path(path: tuple[str, ...]) -> tuple[str, ...]:
@@ -2169,9 +2790,11 @@ class ControlsPanel(QtWidgets.QWidget):
         row = RangeRow(
             label=label,
             low={"path": low_field.path, "value": low_field.value,
-                 "enabled": low_field.enabled, "reason": low_field.reason},
+                 "enabled": low_field.enabled, "reason": low_field.reason,
+                 "placeholder": low_field.placeholder},
             high={"path": high_field.path, "value": high_field.value,
-                  "enabled": high_field.enabled, "reason": high_field.reason},
+                  "enabled": high_field.enabled, "reason": high_field.reason,
+                  "placeholder": high_field.placeholder},
             toggle=toggle,
             display_decimals=display_decimals,
         )
@@ -2238,6 +2861,10 @@ class ControlsPanel(QtWidgets.QWidget):
             browse=field.browse,
             enabled=field.enabled,
             reason=field.reason,
+            minimum=field.minimum,
+            maximum=field.maximum,
+            allow_blank=field.allow_blank,
+            choice_labels=dict(field.choice_labels) or None,
         )
         row.valueChanged.connect(self.fieldValueChanged)
         row.draftChanged.connect(self.fieldDraftChanged)
@@ -2270,7 +2897,7 @@ class ControlsPanel(QtWidgets.QWidget):
         self,
         row: FormRow,
         point_fields: Sequence[ControlFormField],
-    ) -> None:
+    ) -> dict[tuple[str, ...], FormRow]:
         """Park the compact ``Pts [n] …`` cluster on the right of an Axis row.
 
         Reuses :class:`FormRow` (label hidden) so the editors stay harvestable by
@@ -2278,6 +2905,7 @@ class ControlsPanel(QtWidgets.QWidget):
         label = QtWidgets.QLabel("Pts")
         label.setObjectName("controlsHeaderLabel")
         row.add_trailing_widget(label)
+        built = {}
         for field in point_fields:
             pr = FormRow(
                 label="",
@@ -2292,6 +2920,8 @@ class ControlsPanel(QtWidgets.QWidget):
             pr.valueChanged.connect(self.fieldValueChanged)
             pr.draftChanged.connect(self.fieldDraftChanged)
             row.add_trailing_widget(pr)
+            built[field.path] = pr
+        return built
 
     @staticmethod
     def _processing_group_for_path(path: tuple[str, ...]) -> str:
@@ -2312,15 +2942,45 @@ class ControlsPanel(QtWidgets.QWidget):
             return "Background"
         return ""
 
+    def render_actions(
+        self,
+        card: SectionCard,
+        actions: tuple[ControlActionSpec, ...],
+        *,
+        expand: bool = False,
+    ) -> dict[object, ActionButton]:
+        """A section's action row (Int's Reintegrate · Advanced) for another page's
+        own actions (Stitch's Preview · Retry · Advanced): each button by action;
+        a click emits ``controlActionRequested``."""
+        return self._add_actions(card, actions, expand=expand)
+
+    def set_editors_enabled(self, enabled: bool) -> None:
+        """Lock or unlock every row of the four sections except their action rows,
+        whose buttons keep their own availability: Int locks its rows field by field
+        through its projection; a page that renders its own rows and actions (Stitch,
+        RSM) locks them here, not by disabling the panel, whose disabled ancestry
+        would also disable an action that must stay usable (a pending result's Retry,
+        Codex's RSM stage-1 review F2)."""
+        for card in (
+            self.project_card,
+            self.experiment_card,
+            self.source_card,
+            self.processing_card,
+        ):
+            for index in range(card.body_layout.count()):
+                row = card.body_layout.itemAt(index).widget()
+                if row is not None and row.objectName() != "controlsActionRow":
+                    row.setEnabled(bool(enabled))
+
     def _add_actions(
         self,
         card: SectionCard,
         actions: tuple[ControlActionSpec, ...],
         *,
         expand: bool = False,
-    ) -> None:
+    ) -> dict[object, ActionButton]:
         if not actions:
-            return
+            return {}
         row = QtWidgets.QWidget()
         row.setObjectName("controlsActionRow")
         lay = QtWidgets.QHBoxLayout(row)
@@ -2328,8 +2988,10 @@ class ControlsPanel(QtWidgets.QWidget):
         lay.setSpacing(5)
         if not expand:
             lay.addStretch(1)
+        built = {}
         for spec in actions:
-            btn = ActionButton(spec)
+            built[spec.action] = btn = ActionButton(spec)
             btn.actionRequested.connect(self.controlActionRequested)
             lay.addWidget(btn, 1 if expand else 0)
         card.add_row(row)
+        return built

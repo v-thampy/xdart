@@ -506,11 +506,17 @@ def _two_d_kind(scalar_row, heavy: _QualifiedHeavy | None) -> TwoDKind:
     return TwoDKind.Q_CHI
 
 
+#: The record modes only a grazing-incidence reduction writes (a standard one's are "default").
+_GI_MODE_KEYS = frozenset({"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi", "qip_qoop", "q_chi", "exit_angles"})
+
+
 def _is_gi(scalar_row, kind: TwoDKind) -> bool:
     geometry = scalar_row.geometry
     return bool(
         kind is not TwoDKind.Q_CHI
         or geometry is not None and geometry.incident_angle is not None
+        # a record of GI modes without one incidence (a GI Stitch, merged from many frames)
+        or not _GI_MODE_KEYS.isdisjoint((*scalar_row.modes_1d, *scalar_row.modes_2d))
     )
 
 
@@ -529,6 +535,7 @@ def _payload(
     axis = None
     intensity = None
     sigma = None
+    support = None
     if mode_inventory is not None:
         mode, label, unit, log = _axis_descriptor(
             scope.catalog, mode_inventory.mode,
@@ -552,6 +559,16 @@ def _payload(
         sigma = None if sigma_borrow is None else sigma_borrow.array
         if axis.values is not axis_borrow.array:
             raise _Refused("Browse 1-D axis construction copied its borrow")
+        # the label's saved angular support: the profile stored with its borrowed row, or its reason
+        support_borrow = (None if mode_inventory.angular_support is None
+                          else borrowed.get(mode_inventory.angular_support.name))
+        if mode_inventory.angular_support is not None and type(support_borrow) is not Browse1DBorrow:
+            raise _Refused("Browse 1-D borrow set is incomplete")
+        support = scope.hydration.angular_support(
+            frame.work_ordinal, frame.local_frame_label, None if support_borrow is None else support_borrow.array)
+        if mode_inventory.angular_support is not None and (
+                support is None or support.supported_deg is not support_borrow.array):
+            raise _Refused("Browse 1-D angular support lost its resident row")
     heavy = _current_heavy(scope, frame, scalar_row)
     kind = _two_d_kind(scalar_row, heavy)
     geometry = scalar_row.geometry
@@ -574,6 +591,7 @@ def _payload(
         geometry=geometry,
         source_path=scalar_row.source_path,
         source_frame_index=scalar_row.source_frame_index,
+        angular_support=support,
     )
     if intensity is not None and view.intensity_1d is not intensity:
         raise _Refused("Browse 1-D view copied its intensity borrow")

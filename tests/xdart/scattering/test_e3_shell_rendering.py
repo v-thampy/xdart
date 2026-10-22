@@ -35,6 +35,114 @@ def qapp() -> QtWidgets.QApplication:
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+def test_dense_nan_slice_render_retains_at_most_one_mask_byte_per_pixel(qapp):
+    """A maximum-size CustomSlice plane must not retain two indices per empty pixel."""
+    import time
+    import tracemalloc
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+
+    data = np.arange(4_000_000, dtype=np.float32).reshape(2000, 2000)
+    data[data % 10 != 0] = np.nan
+    data.flags.writeable = False
+    pane = ScientificImagePane(lock_aspect=False)
+    try:
+        pane.render(data, x_axis=AxisProjection(np.arange(2000), "H", ""),
+                    y_axis=AxisProjection(np.arange(2000), "L", ""))
+        tracemalloc.start()
+        start = time.perf_counter()
+        pane.image.render()  # Force the actual upstream QImage conversion, beyond setImage.
+        elapsed = time.perf_counter() - start
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        locations = pane.image._imageNanLocations
+        retained = (locations.nbytes if isinstance(locations, np.ndarray)
+                    else sum(array.nbytes for array in locations))
+        print(f"render={elapsed:.6f}s traced_peak={peak}B retained_nan_locations={retained}B")
+        assert retained <= data.size
+        assert isinstance(locations, np.ndarray) and locations.dtype == np.bool_
+        assert locations.shape == data.shape
+        pane.image.setLevels((100, 3_000_000))
+        pane.image.render()
+        assert pane.image._imageNanLocations is locations
+        np.testing.assert_array_equal(pane.canvas.raw_image.T, data)
+        pane.clear_image_buffers()
+        assert pane.image._imageNanLocations is None
+        assert pane.image.qimage is None
+    finally:
+        tracemalloc.stop()
+        pane.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize("axis_order", ("col-major", "row-major"))
+@pytest.mark.parametrize("dense", (True, False))
+def test_nan_transparency_matches_upstream_pixels_and_preserves_source(qapp, axis_order, dense):
+    from xdart.gui.widgets.image_widget import pgXDImageItem
+
+    data = np.arange(120, dtype=np.float32).reshape(10, 12)
+    data[::2 if dense else 10, ::2 if dense else 12] = np.nan
+    original = data.copy()
+    item = pgXDImageItem()
+    reference = pg.ImageItem()
+    for target in (item, reference):
+        target.setOpts(axisOrder=axis_order)
+        target.setLookupTable(pg.colormap.get("viridis", source="matplotlib").getLookupTable(nPts=256))
+        target.setImage(data, autoLevels=False, levels=(0, 119), autoDownsample=False)
+    for levels in ((0, 119), (20, 80)):
+        for target in (item, reference):
+            target.setLevels(levels)
+            target.render()
+        np.testing.assert_array_equal(pg.functions.ndarray_from_qimage(item.qimage),
+                                      pg.functions.ndarray_from_qimage(reference.qimage))
+    assert isinstance(item._imageNanLocations, np.ndarray if dense else tuple)
+    np.testing.assert_array_equal(data, original)
+    assert np.shares_memory(item.image, data)
+
+
+@pytest.mark.parametrize("mode", ("Int 1D", "Int 2D"))
+def test_main_and_popup_images_use_shared_manual_percentile_controls(qapp, mode):
+    shell = ScatteringWorkspaceShell()
+    state = make_shell_projection()
+    state = replace(state, scientific=replace(state.scientific, processing_mode=mode))
+    try:
+        shell.show()
+        shell.apply_state(state)
+        view = shell.scientific
+        controls = view.viewer_intensity
+        pane = view.cake if mode == "Int 2D" else None
+        assert not controls.isHidden()
+        assert not controls.isVisible()
+        view.options.click()
+        qapp.processEvents()
+        assert controls.isVisible() and view.plot_options_dialog.isAncestorOf(controls)
+        assert controls.percentile_values() == ((0.5, 99.5) if mode == "Int 2D" else None)
+        pixels = pane.image.image if pane is not None else None
+        controls._open_entry()
+        for editor, value in zip(controls._entry_editors(), (10, 90)):
+            editor.setText(str(value))
+        controls._entry_popup.findChild(QtWidgets.QPushButton, "intensityApply").click()
+        if pane is not None:
+            expected = np.nanpercentile(pane.canvas.displayed_image, (10, 90))
+            np.testing.assert_allclose(pane.canvas.histogram.levels(), expected)
+            assert pane.image.image is pixels
+        else:
+            np.testing.assert_allclose(view.curve.getViewBox().viewRange()[1], (10, 90))
+        view.show_raw_popup("Contributing raw")
+        raw = np.array([[-5., 0., 10.], [20., np.nan, 65535.]])
+        view.show_raw_image(raw, status="source", color_map="Default", log_scale=False)
+        popup_controls = view.raw_popup_intensity
+        popup_controls._open_entry()
+        for editor, value in zip(popup_controls._entry_editors(), (0, 100)):
+            editor.setText(str(value))
+        popup_controls._entry_popup.findChild(QtWidgets.QPushButton, "intensityApply").click()
+        np.testing.assert_allclose(view.raw_popup_image.canvas.histogram.levels(), (-5, 20))
+        assert "Absolute display limits: -5 to 20" in popup_controls.label.toolTip()
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
 def test_e3_ui2_renders_raw_cake_axes_and_all_retained_overlay_rows(
     qapp: QtWidgets.QApplication,
 ) -> None:
@@ -626,13 +734,13 @@ def test_e3_ui2_restores_control_inventory_and_ranges(
             "Auto Last",
             "Peak Fitting",
             "Phase Fitting",
-            "Plot Metadata",
+            "ROI Statistics",  # Metadata plotting moved into the Metadata popup at 2fa82580.
             "Run",
         } <= {
             text.removeprefix("▶ ")
             .removeprefix("∧ ")
             .removeprefix("≈ ")
-            .removeprefix("▤ ")
+            .removeprefix("▣ ")
             for text in buttons
         }
         options = shell.scientific.plot_options_dialog
@@ -1499,3 +1607,63 @@ def test_e3_ui2_status_fallback_and_non_string_rejection_are_exact(
         shell.close()
         shell.deleteLater()
         qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize('descending', [False, True])
+def test_int_cake_projection_places_pixels_at_q_chi_bin_centres(qapp, descending) -> None:
+    """Int's FrameView adapter supplies bin edges to the mounted scientific view."""
+    state = make_shell_projection(frame_count=1, selected_index=0, plot_mode='Single')
+    frame = state.navigation.current
+    q = np.array([1., 2., 3.])
+    chi = np.array([-3., -1., 1., 3.])
+    if descending:
+        q, chi = q[::-1], chi[::-1]
+    cake = np.arange(12, dtype=float).reshape(4, 3)
+    payload = StandardDisplayPayload(0, frame, 'calibrant', FrameView(
+        frame.local_frame_label, axis_2d_x=Axis('Q', 'q_A^-1', values=q),
+        axis_2d_y=Axis('chi', 'chi_deg', values=chi), intensity_2d=cake,
+        two_d_kind=TwoDKind.Q_CHI), wavelength_m=1e-10)
+    scientific = build_scientific_projection(
+        (payload,), state.navigation, frozenset({frame}),
+        ScientificPreferences(image_axis='Q-Chi', plot_mode='Single'), '')
+    shell = ScatteringWorkspaceShell()
+    try:
+        shell.apply_state(replace(state, scientific=scientific))
+        item = shell.scientific.cake.image
+        np.testing.assert_array_equal(item.image, cake.T)
+        assert scientific.heavy.cake_x.unit == 'q_A^-1'
+        assert scientific.heavy.cake_y.unit == 'chi_deg'
+        np.testing.assert_array_equal(scientific.heavy.cake_x.values, q)
+        np.testing.assert_array_equal(scientific.heavy.cake_y.values, chi)
+        for column, row in ((0, 0), (2, 3)):
+            position = item.mapToParent(QtCore.QPointF(column + .5, row + .5))
+            assert (position.x(), position.y()) == pytest.approx((q[column], chi[row]), abs=1e-9)
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+
+def test_an_image_spans_its_axes_edges_so_each_pixel_sits_at_its_bin_centre(qapp) -> None:
+    """``AxisProjection.edges`` (Codex's RSM stage-1 review F3, now in Int's pane): an axis of bin centres
+    with its bins' outer edges draws each pixel at its bin's centre; without them the image spans the first
+    to last centre, as Int's cake always has."""
+    from xdart.gui.tabs.scattering.shell_widgets import ScientificImagePane
+    x = np.array([10.0, 20.0, 30.0])
+    y = np.array([100.0, 102.0, 104.0, 106.0])
+    data = np.arange(12, dtype=float).reshape(4, 3)  # (y, x), as Int's cake
+    pane = ScientificImagePane(lock_aspect=False)
+    try:
+        pane.render(data, x_axis=AxisProjection(x, "H", "", edges=(5.0, 35.0)),
+                    y_axis=AxisProjection(y, "K", "", edges=(99.0, 107.0)))
+        first = pane.image.mapToParent(QtCore.QPointF(0.5, 0.5))
+        last = pane.image.mapToParent(QtCore.QPointF(2.5, 3.5))
+        assert (first.x(), first.y()) == pytest.approx((10.0, 100.0), abs=1e-9)
+        assert (last.x(), last.y()) == pytest.approx((30.0, 106.0), abs=1e-9)
+        pane.render(data, x_axis=AxisProjection(x, "H", ""), y_axis=AxisProjection(y, "K", ""))
+        first = pane.image.mapToParent(QtCore.QPointF(0.5, 0.5))
+        assert (first.x(), first.y()) == pytest.approx((10 + 20 / 3 / 2, 100 + 6 / 4 / 2), abs=1e-9)
+    finally:
+        pane.deleteLater()
+    with pytest.raises(TypeError):
+        AxisProjection(x, "H", "", edges=(35.0, 5.0))

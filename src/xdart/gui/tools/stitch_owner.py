@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 from threading import Lock
+from typing import Any
 
 from xdart.gui.pages.operation_owner import (
     OperationIdentity,
@@ -19,7 +21,20 @@ from xrd_tools.analysis.stitch_operation import (
     StitchOperationExecution,
     StitchOperationResult,
     StitchOperationVerificationError,
+    read_stitch_contributor_view,
+    stitch_contributor_raw_preview,
 )
+from xrd_tools.io.analysis_artifact import (
+    AnalysisArtifactKind,
+    AnalysisArtifactPayload,
+    read_analysis_artifact,
+)
+
+from xrd_tools.core.frame_view import FrameView
+from xrd_tools.io.frame_view import read_contributing_frame_view
+from xrd_tools.analysis.stitch_metadata import StitchMetadataTable, read_stitch_metadata
+from xrd_tools.analysis.module_transaction import ModuleDisposition
+from xrd_tools.io.export import write_stitch_xye
 
 from .stitch_values import (
     StitchToolForm,
@@ -29,6 +44,9 @@ from .stitch_values import (
 
 
 class StitchOwnerAction(str, Enum):
+    REOPEN = "reopen"
+    FRAME_READ = "frame-read"
+    METADATA = "metadata"
     PREFLIGHT = "preflight"
     RUN = "run"
     RETRY_CLEANUP = "retry-cleanup"
@@ -36,6 +54,9 @@ class StitchOwnerAction(str, Enum):
 
 
 class StitchOwnerOutcomeKind(str, Enum):
+    REOPENED = "reopened"
+    FRAME_READ = "frame-read"
+    METADATA = "metadata"
     PREFLIGHT_READY = "preflight-ready"
     RESULT = "result"
     CLEANUP_PENDING = "cleanup-pending"
@@ -56,11 +77,41 @@ class StitchOwnerOutcome:
     preflight: StitchToolPreflight | None = None
     result: StitchOperationResult | None = None
     finalization_message: str = ""
+    payload: AnalysisArtifactPayload | None = None
+    artifact_path: str = ""
+    frame_view: FrameView | None = None
+    metadata: tuple[StitchMetadataTable, ...] | None = None
 
     def __post_init__(self) -> None:
+        if self.kind is StitchOwnerOutcomeKind.METADATA:
+            if (type(self.metadata) is not tuple or not self.artifact_path
+                or any(type(row) is not StitchMetadataTable for row in self.metadata)
+                or any(value is not None for value in (self.frame_view, self.payload, self.preflight, self.result))):
+                raise TypeError("Stitch metadata outcome is invalid")
+            return
+        if self.metadata is not None:
+            raise TypeError("metadata belongs only to a metadata outcome")
+        if self.kind is StitchOwnerOutcomeKind.FRAME_READ:
+            if (type(self.frame_view) is not FrameView or not self.artifact_path
+                or self.payload is not None or self.preflight is not None or self.result is not None):
+                raise TypeError("Stitch frame read outcome is invalid")
+            return
         if (
+            self.frame_view is not None
+            or
             type(self.kind) is not StitchOwnerOutcomeKind
             or type(self.finalization_message) is not str
+            or type(self.artifact_path) is not str
+            or (self.payload is not None and type(self.payload) is not AnalysisArtifactPayload)
+            or (
+                self.kind is StitchOwnerOutcomeKind.REOPENED
+                and (self.payload is None or not self.artifact_path
+                     or self.preflight is not None or self.result is not None)
+            )
+            or (
+                self.kind is not StitchOwnerOutcomeKind.REOPENED
+                and (self.payload is not None or self.artifact_path)
+            )
             or (self.preflight is not None and type(self.preflight) is not StitchToolPreflight)
             or (self.result is not None and type(self.result) is not StitchOperationResult)
             or (
@@ -155,6 +206,24 @@ class StitchOwnerUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrameReadRequest:
+    payload: AnalysisArtifactPayload
+    frame_index: int
+    scan: str | None = None
+    source_root: str | None = None
+    full_raw: bool = False
+    scientific: bool = False
+
+    def __post_init__(self):
+        if (type(self.payload) is not AnalysisArtifactPayload
+            or type(self.frame_index) is not int or self.frame_index < 0
+            or (self.scan is not None and type(self.scan) is not str)
+            or (self.source_root is not None and type(self.source_root) is not str)
+            or type(self.full_raw) is not bool or type(self.scientific) is not bool):
+            raise TypeError("Stitch frame read request is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class _WorkerCommand:
     action: StitchOwnerAction
     form_fingerprint: str
@@ -162,14 +231,28 @@ class _WorkerCommand:
     form: StitchToolForm | None = None
     preflight: StitchToolPreflight | None = None
     execution: StitchOperationExecution | None = None
+    artifact_path: str = ""
+    frame_request: _FrameReadRequest | None = None
+    metadata_payload: AnalysisArtifactPayload | None = None
+    source_root: str | None = None
+    #: a Run's frame workers (the run bar's Cores): the result is the same for any count
+    workers: int = 1
+    export_paths: tuple[str, ...] = ()
+    #: a Run's frozen “Record angular coverage” policy (an AngularSupportPolicy; None: the default)
+    angular_support: Any = None
 
     def __post_init__(self) -> None:
         if (
             type(self.action) is not StitchOwnerAction
+            or type(self.workers) is not int
+            or self.workers < 1
             or type(self.form_fingerprint) is not str
             or not self.form_fingerprint
             or type(self.form_revision) is not int
             or self.form_revision < 1
+            or type(self.artifact_path) is not str
+            or type(self.export_paths) is not tuple
+            or any(type(path) is not str or not path or "\0" in path for path in self.export_paths)
             or (self.form is not None and type(self.form) is not StitchToolForm)
             or (
                 self.preflight is not None
@@ -181,18 +264,40 @@ class _WorkerCommand:
             )
         ):
             raise TypeError("Stitch worker command is invalid")
-        if self.action is StitchOwnerAction.PREFLIGHT:
+        if self.action is StitchOwnerAction.METADATA:
+            valid = (type(self.metadata_payload) is AnalysisArtifactPayload and bool(self.artifact_path)
+                     and (self.source_root is None or type(self.source_root) is str)
+                     and all(value is None for value in (self.form, self.preflight, self.execution)))
+        elif self.action is StitchOwnerAction.FRAME_READ:
+            valid = (type(self.frame_request) is _FrameReadRequest and bool(self.artifact_path)
+                     and all(value is None for value in (self.form, self.preflight, self.execution)))
+        elif self.action is StitchOwnerAction.REOPEN:
+            valid = bool(self.artifact_path) and all(
+                value is None for value in (self.form, self.preflight, self.execution)
+            )
+        elif self.action is StitchOwnerAction.PREFLIGHT:
             valid = self.form is not None and self.preflight is None and self.execution is None
         else:
             valid = (
                 self.form is None
                 and self.preflight is not None
                 and self.execution is not None
-                and self.execution.request is self.preflight.request
+                and any(self.execution.request is item for item in self.preflight.requests)
                 and self.form_fingerprint == self.preflight.form.fingerprint
             )
-        if not valid:
+        if (not valid or (self.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.FRAME_READ, StitchOwnerAction.METADATA} and self.artifact_path)
+            or (self.action is not StitchOwnerAction.FRAME_READ and self.frame_request is not None)
+            or (self.action is not StitchOwnerAction.METADATA and (self.metadata_payload is not None or self.source_root is not None))
+            or (self.action is not StitchOwnerAction.RUN and self.workers != 1)
+            or (self.action is not StitchOwnerAction.RUN and self.angular_support is not None)):
             raise TypeError("Stitch worker command fields disagree")
+        if self.angular_support is not None:
+            from xrd_tools.analysis.angular_support import AngularSupportPolicy
+            if type(self.angular_support) is not AngularSupportPolicy:
+                raise TypeError("a Run's angular support policy must be an AngularSupportPolicy")
+        if self.export_paths and self.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.RUN,
+                StitchOwnerAction.RETRY_CLEANUP, StitchOwnerAction.RETRY_VERIFICATION}:
+            raise TypeError("only Run or explicit Append may publish XYE companions")
 
 
 PreflightRunner = Callable[[StitchToolForm], StitchToolPreflight]
@@ -231,6 +336,7 @@ class StitchToolOwner:
         self._execution: StitchOperationExecution | None = None
         self._execution_preflight: StitchToolPreflight | None = None
         self._execution_form_revision: int | None = None
+        self._execution_export_paths: tuple[str, ...] = ()
         self._last_result: StitchOperationResult | None = None
         self._finalization = StitchOwnerFinalization.NONE
         self._active_identity: OperationIdentity | None = None
@@ -344,7 +450,56 @@ class StitchToolOwner:
                 self._prepared_revision = None
             return identity
 
-    def begin_run(self) -> OperationIdentity | None:
+    def begin_reopen(self, path: str | Path, *, export_paths: tuple[str, ...] = ()) -> OperationIdentity | None:
+        """Read one saved result on this owner's worker without run authority.
+
+        The strict reader detaches arrays and closes its handles. Reopening does
+        not reconstruct a source, preflight, execution or output transaction.
+        Explicit Append may additionally request XYE companions from saved profiles.
+        """
+        shown = str(Path(path).expanduser().absolute())
+        if not str(path).strip() or "\0" in shown:
+            raise ValueError("a saved Stitch result path is required")
+        with self._lock:
+            if self._finalization is not StitchOwnerFinalization.NONE:
+                return None
+            return self._begin_locked(_WorkerCommand(
+                StitchOwnerAction.REOPEN, shown, max(1, self._form_revision),
+                artifact_path=shown,
+                export_paths=export_paths,
+            ))
+
+    def begin_frame_read(self, payload, frame_index, *, scan=None, source_root=None, full_raw=False, scientific=False):
+        """Hydrate only a selected contributor on the existing serial worker."""
+        request = _FrameReadRequest(payload, frame_index, scan,
+                                    None if source_root is None else str(source_root), full_raw, scientific)
+        path = payload.inspection.path
+        with self._lock:
+            if self._finalization is not StitchOwnerFinalization.NONE:
+                return None
+            return self._begin_locked(_WorkerCommand(
+                StitchOwnerAction.FRAME_READ, path, max(1, self._form_revision),
+                artifact_path=path, frame_request=request,
+            ))
+
+    def begin_metadata(self, payload, *, source_root=None):
+        """Read contributing-source tables on the same serial, closeable worker."""
+        path = payload.inspection.path
+        with self._lock:
+            if self._finalization is not StitchOwnerFinalization.NONE:
+                return None
+            return self._begin_locked(_WorkerCommand(
+                StitchOwnerAction.METADATA, path, max(1, self._form_revision),
+                artifact_path=path, metadata_payload=payload,
+                source_root=None if source_root is None else str(source_root),
+            ))
+
+    def begin_run(self, job_index: int = 0, workers: int = 1, *, export_paths: tuple[str, ...] = (),
+                  angular_support: Any = None) -> OperationIdentity | None:
+        """Run the prepared output ``job_index`` with ``workers`` frame workers (the run bar's Cores) and the
+        page's frozen “Record angular coverage” policy (``angular_support``; None: the default)."""
+        if type(workers) is not int or workers < 1:
+            raise TypeError("Stitch workers must be a positive int")
         with self._lock:
             preflight = self._prepared
             if (
@@ -352,14 +507,16 @@ class StitchToolOwner:
                 or not preflight.is_current(self._form)
                 or self._prepared_revision != self._form_revision
                 or self._finalization is not StitchOwnerFinalization.NONE
+                or type(job_index) is not int or not 0 <= job_index < len(preflight.requests)
             ):
                 return None
+            request = preflight.requests[job_index]
             execution = self._execution_factory(
-                preflight.request, coordinator=self._coordinator
+                request, coordinator=self._coordinator
             )
             if (
                 type(execution) is not StitchOperationExecution
-                or execution.request is not preflight.request
+                or execution.request is not request
             ):
                 raise TypeError(
                     "execution factory must return the exact prepared Stitch execution"
@@ -370,6 +527,9 @@ class StitchToolOwner:
                 self._prepared_revision,
                 preflight=preflight,
                 execution=execution,
+                workers=workers,
+                export_paths=export_paths,
+                angular_support=angular_support,
             )
             identity = self._begin_locked(command)
             if identity is not None:
@@ -378,6 +538,7 @@ class StitchToolOwner:
                 self._execution = execution
                 self._execution_preflight = preflight
                 self._execution_form_revision = self._prepared_revision
+                self._execution_export_paths = export_paths
                 self._last_result = None
             return identity
 
@@ -396,7 +557,7 @@ class StitchToolOwner:
             or preflight is None
             or execution is None
             or form_revision is None
-            or execution.request is not preflight.request
+            or not any(execution.request is item for item in preflight.requests)
         ):
             return None
         command = _WorkerCommand(
@@ -405,6 +566,7 @@ class StitchToolOwner:
             form_revision,
             preflight=preflight,
             execution=execution,
+            export_paths=self._execution_export_paths,
         )
         return self._begin_locked(command, allow_closing=allow_closing)
 
@@ -427,13 +589,47 @@ class StitchToolOwner:
 
         with self._lock:
             identity = self._active_identity
-            if self._active_action is not StitchOwnerAction.RUN:
+            if self._active_action not in {StitchOwnerAction.RUN, StitchOwnerAction.METADATA}:
                 return False
         return identity is not None and self._worker.cancel(identity)
 
     def _run_command(self, request, cancel, publish):
         if type(request) is not _WorkerCommand:
             raise TypeError("Stitch worker requires one exact command")
+        if request.action is StitchOwnerAction.METADATA:
+            publish("metadata", 0, 1)
+            metadata = read_stitch_metadata(request.metadata_payload,
+                source_root=request.source_root, cancel_token=cancel)
+            publish("metadata", 1, 1)
+            return StitchOwnerOutcome(StitchOwnerOutcomeKind.METADATA,
+                metadata=metadata, artifact_path=request.artifact_path)
+        if request.action is StitchOwnerAction.FRAME_READ:
+            selected = request.frame_request
+            publish("raw-frame", 0, 1)
+            view = (read_stitch_contributor_view(selected.payload, selected.frame_index,
+                scan=selected.scan, source_root=selected.source_root, cancel_token=cancel)
+                if selected.scientific else read_contributing_frame_view(request.artifact_path, selected.frame_index,
+                scan=selected.scan, source_root=selected.source_root, full_raw=selected.full_raw,
+                artifact_payload=selected.payload))
+            if not selected.scientific and view.raw is not None:
+                view = replace(view, raw=stitch_contributor_raw_preview(selected.payload, view.raw,
+                    selected.frame_index, scan=selected.scan, source_root=selected.source_root))
+            publish("raw-frame", 1, 1)
+            return StitchOwnerOutcome(StitchOwnerOutcomeKind.FRAME_READ,
+                frame_view=view, artifact_path=request.artifact_path)
+        if request.action is StitchOwnerAction.REOPEN:
+            publish("reopen", 0, 1)
+            payload = read_analysis_artifact(request.artifact_path)
+            if payload.kind not in {AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
+                raise ValueError("not a Stitch result")
+            if payload.kind is AnalysisArtifactKind.STITCH_2D and payload.profile is None:
+                raise ValueError("an older Stitch 2D file, without I(q) beside its map: stitch it again")
+            publish("reopen", 1, 1)
+            return StitchOwnerOutcome(
+                StitchOwnerOutcomeKind.REOPENED,
+                payload=payload, artifact_path=request.artifact_path,
+                finalization_message=self._export_xyes(payload, request.export_paths) if request.export_paths else "",
+            )
         if request.action is StitchOwnerAction.PREFLIGHT:
             publish("preflight", 0, 1)
             preflight = self._preflight_runner(request.form)
@@ -451,11 +647,18 @@ class StitchToolOwner:
             raise TypeError("Stitch execution command lost its owner")
         try:
             if request.action is StitchOwnerAction.RUN:
+                if request.preflight.form.source_selection is not None:
+                    from .stitch_native_values import create_native_output_directory
+                    create_native_output_directory(execution.request)
+                # the page's frozen “Record angular coverage” policy, when it gave one (None: the run's default)
+                support = {} if request.angular_support is None else {"angular_support": request.angular_support}
                 result = execution.run(
                     cancel_token=cancel,
                     progress_callback=lambda progress: publish(
                         progress.stage, progress.completed, progress.total
                     ),
+                    workers=request.workers,
+                    **support,
                 )
             elif request.action is StitchOwnerAction.RETRY_CLEANUP:
                 publish("cleanup", 0, 1)
@@ -482,7 +685,21 @@ class StitchToolOwner:
             return StitchOwnerOutcome(StitchOwnerOutcomeKind.VERIFICATION_PENDING)
         if type(result) is not StitchOperationResult or result.request is not execution.request:
             raise TypeError("Stitch execution returned an invalid result")
-        return StitchOwnerOutcome(StitchOwnerOutcomeKind.RESULT, result=result)
+        warning = (self._export_xyes(result.payload, request.export_paths)
+                   if result.terminal.disposition is ModuleDisposition.COMMITTED else "")
+        return StitchOwnerOutcome(StitchOwnerOutcomeKind.RESULT, result=result, finalization_message=warning)
+
+    @staticmethod
+    def _export_xyes(payload, paths):
+        """Companion errors do not revoke the already committed scientific result."""
+        warnings = []
+        for path in dict.fromkeys((payload.inspection.path, *paths)):
+            try:
+                selected = payload if path == payload.inspection.path else read_analysis_artifact(path)
+                write_stitch_xye(selected)
+            except Exception as error:
+                warnings.append(f"XYE_EXPORT_FAILED: {Path(path).name}: {error}")
+        return " · ".join(warnings)
 
     def _adopt(self, raw_update) -> StitchOwnerUpdate:
         identity = raw_update.identity
@@ -490,7 +707,7 @@ class StitchToolOwner:
         if type(command) is not _WorkerCommand:
             raise RuntimeError("Stitch worker identity lost its exact command")
         with self._lock:
-            stale = (
+            stale = command.action not in {StitchOwnerAction.REOPEN, StitchOwnerAction.FRAME_READ, StitchOwnerAction.METADATA} and (
                 self._form is None
                 or self._form.fingerprint != command.form_fingerprint
                 or self._form_revision != command.form_revision
@@ -518,6 +735,7 @@ class StitchToolOwner:
                     self._execution = None
                     self._execution_preflight = None
                     self._execution_form_revision = None
+                    self._execution_export_paths = ()
                     self._finalization = StitchOwnerFinalization.NONE
                 elif outcome.kind is StitchOwnerOutcomeKind.CLEANUP_PENDING:
                     self._finalization = StitchOwnerFinalization.CLEANUP_PENDING
@@ -534,6 +752,7 @@ class StitchToolOwner:
                 self._execution = None
                 self._execution_preflight = None
                 self._execution_form_revision = None
+                self._execution_export_paths = ()
                 self._finalization = StitchOwnerFinalization.NONE
             self._active_identity = None
             self._active_action = None
@@ -579,7 +798,7 @@ class StitchToolOwner:
             self._closing = True
             identity = self._active_identity
             action = self._active_action
-        if identity is not None and action is StitchOwnerAction.RUN:
+        if identity is not None and action in {StitchOwnerAction.RUN, StitchOwnerAction.METADATA}:
             self._worker.cancel(identity)
         # Crucially poll before SingleWorkerOwner.close().  Its close seals
         # polling and retires terminal payloads; doing that first could discard

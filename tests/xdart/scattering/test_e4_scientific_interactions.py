@@ -5,7 +5,7 @@ from dataclasses import replace
 import numpy as np
 import pyqtgraph as pg
 import pytest
-from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtTest, QtWidgets
 
 from xdart.gui.tabs.scattering.scientific_view import (
     _MAX_REFLOW_FOLLOWS,
@@ -787,6 +787,53 @@ def test_viewer_single_steady_scope_reuses_exact_curve_through_axis_change(
         assert view.curve.listDataItems()[0] is item
         assert view.trace_history_projections == (changed_trace,)
         assert view._trace_history_keys == (frames[1],)
+    finally:
+        _dispose(view)
+
+
+def test_continuous_wheel_zoom_progresses_without_shared_axes() -> None:
+    """Real trackpad-shaped events zoom a saved 1,500-point profile without changing its data or linking panels."""
+    from xdart.gui.tabs.scattering.shell_values import AxisProjection
+    from xdart.gui.themes import apply_dark_theme
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    apply_dark_theme(app)
+    view = ScientificView()
+    projection = make_shell_projection(frame_count=1, selected_index=0, heavy_indices=(), plot_mode="Single")
+    q = np.linspace(.1, 8., 1500)
+    intensity = 20. + np.sin(q * 2.) ** 2 * 30. + 100. * np.exp(-((q - 3.) / .07) ** 2)
+    q.setflags(write=False)
+    intensity.setflags(write=False)
+    trace = replace(projection.scientific.traces[0], axis=AxisProjection(q, "Q", "Å⁻¹"), intensity=intensity)
+    state = replace(projection.scientific, processing_mode="Int 1D", traces=(trace,), share_axis=False)
+    frame = projection.navigation.current
+    snapshot = BrowseTraceSnapshot((frame,), (frame,), (1,), plot_mode="Single",
+                                   science_contract=state.browse_science_contract)
+    state = replace(state, browse_trace_snapshot=snapshot)
+    view.resize(1200, 800)
+    view.show()
+    try:
+        _reconcile(view, state, projection.navigation)
+        QtTest.QTest.qWait(100)
+        assert not view._share_link_on
+        item = view.curve.listDataItems()[0]
+        box = view.curve.getViewBox()
+        point = view.curve.mapFromScene(box.sceneBoundingRect().center())
+        global_point = view.curve.viewport().mapToGlobal(point)
+        before = _x_range(box)
+        widths = []
+        for _ in range(24):
+            event = QtGui.QWheelEvent(QtCore.QPointF(point), QtCore.QPointF(global_point),
+                QtCore.QPoint(0, 2), QtCore.QPoint(0, 8), QtCore.Qt.MouseButton.NoButton,
+                QtCore.Qt.KeyboardModifier.NoModifier, QtCore.Qt.ScrollPhase.ScrollUpdate, False)
+            app.sendEvent(view.curve.viewport(), event)
+            app.processEvents()
+            widths.append(_x_range(box)[1] - _x_range(box)[0])
+            QtTest.QTest.qWait(8)
+        assert widths[0] < before[1] - before[0]
+        assert all(later < earlier for earlier, later in zip(widths, widths[1:]))
+        assert not view._share_link_on
+        np.testing.assert_array_equal(item.getOriginalDataset()[1], intensity)
     finally:
         _dispose(view)
 

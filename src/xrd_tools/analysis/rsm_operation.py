@@ -27,6 +27,7 @@ import weakref
 
 import numpy as np
 
+from xrd_tools.corrections.normalization import BeamNormalizationRefused, frame_divisors
 from xrd_tools.analysis.module_transaction import (
     MetadataColumnSelector,
     ModuleArtifactOutput,
@@ -40,12 +41,14 @@ from xrd_tools.analysis.module_transaction import (
     ModuleSourceReceipt,
     ModuleTerminalResult,
     admit_module_artifact,
+    refusal_diagnostic,
     module_artifact_request,
     module_plan_fingerprint,
     module_provenance_digest,
     _rsm_v2_module_request,
 )
 from xrd_tools.analysis.rsm_geometry_asset import (
+    RSMCalibrationGeometryReceipt,
     RSMEffectiveGeometry,
     RSMGeometryAssetRefused,
     RSMGeometryAssetReceipt,
@@ -53,8 +56,16 @@ from xrd_tools.analysis.rsm_geometry_asset import (
     bind_rsm_member_geometry,
     lower_rsm_effective_geometry,
     revalidate_rsm_geometry_asset,
+    revalidate_rsm_geometry_source,
+    rsm_calibration_detector as _rsm_calibration_detector,
+    rsm_calibration_detector_mask,
+    rsm_calibration_solid_angle,
     rsm_effective_pixel_q_map,
 )
+
+#: RSM v2's geometry sources: the canonical asset, or a calibration window's xrayutilities partner
+#: (AUD-9 stage 2b C7b). Both name the same custody facts (project root, paths, digests, receipt fingerprint).
+_RSM_GEOMETRY_RECEIPTS = (RSMGeometryAssetReceipt, RSMCalibrationGeometryReceipt)
 from xrd_tools.analysis.plans import RSMPlan, run_rsm
 from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
@@ -87,10 +98,11 @@ from xrd_tools.io.analysis_artifact import (
     canonical_analysis_provenance,
     project_analysis_artifact_result,
     read_analysis_artifact,
+    rsm_record_identity,
 )
 from xrd_tools.io.nexus import write_rsm
 from xrd_tools.io.stat_identity import identity_ctime_ns
-from xrd_tools.io.spec import get_energy, get_energy_and_UB
+from xrd_tools.io.spec import get_UB, get_energy, get_energy_and_UB, get_orientation_header
 from xrd_tools.rsm.gridding import (
     RSMGridChunkLease,
     RSMGridChunkReleaseError,
@@ -102,6 +114,7 @@ from xrd_tools.rsm.coordinate_frame import (
     rsm_coordinate_matrix,
 )
 from xrd_tools.rsm.volume import RSMVolume
+from xrd_tools.sources.point_images import PointImagePolicy
 
 
 _MAX_RSM_VOXELS = 8_000_000
@@ -116,6 +129,8 @@ _MAX_PROVENANCE_BYTES = 1024 * 1024
 _MAX_JSON_DEPTH = 32
 _MAX_RSM_RESIDENT_BYTES = 1024 * 1024 * 1024
 _PSIC_ROLES = ("mu", "eta", "chi", "phi", "nu", "del")
+#: The raw NeXus stacks an RSM member may be (AUD-9 stage 2b C5c); processed xdart members stay held.
+_RSM_NEXUS_KINDS = frozenset({SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER})
 _REQUEST_FACTORY = object()
 _RSM_V2_FACTORY = object()
 _RSM_V2_HOLDS = (
@@ -126,8 +141,7 @@ _RSM_V2_HOLDS = (
     "volume-rendering-isosurfaces-vtk-ui-and-gpu-opencl",
     "non-psic-custom-fourc-two-circle-and-sixc-geometry-assets",
     "non-identity-raw-image-orientation",
-    "authored-arbitrary-detector-masks-and-mask-editing-ui",
-    "nexus-tiled-and-processed-scan-members",
+    "tiled-and-processed-xdart-scan-members",
     "heterogeneous-detector-geometry-or-roi",
     "windows-smb-unc-linux-and-intel-macos-validation",
     "broad-test-battery-launcher-replacement-canonical-merge-push-tag-and-release",
@@ -135,8 +149,15 @@ _RSM_V2_HOLDS = (
 
 
 class RSMNormalizationMode(str, Enum):
+    """Decision 4 (the maintainer, 2026-10-01: "There are monitors both before and after the foil. So add the
+    4th choice"): a monitor after the foils already counts their attenuation (``MONITOR``); one before them does
+    not, so its counts are multiplied by the foils' transmission (``MONITOR_FOIL_TRANSMISSION``). An exposure is
+    never combined with a monitor, which already counts over it."""
+
     IDENTITY = "identity"
     FOIL_TRANSMISSION_EXPOSURE = "foil-transmission-exposure"
+    MONITOR = "monitor"
+    MONITOR_FOIL_TRANSMISSION = "monitor-foil-transmission"
 
 
 def _rsm_coordinate_matrix(
@@ -258,12 +279,15 @@ def _canonical_roi(
 
 @dataclass(frozen=True, slots=True)
 class RSMNormalizationPolicy:
-    """Mandatory per-frame numerator normalization for one RSM plan."""
+    """Mandatory per-frame numerator normalization for one RSM plan: the shared beam divisor
+    (``corrections.normalization.frame_divisors``) of the mode's columns. ``monitor_selector`` is set only for
+    the two monitor modes, so the two original modes keep their canonical value and every fingerprint over it."""
 
     mode: RSMNormalizationMode
     foil_selector: MetadataColumnSelector | None
     exposure_selector: MetadataColumnSelector | None
     absorption_lengths: tuple[float, float, float, float]
+    monitor_selector: MetadataColumnSelector | None = None
 
     def __post_init__(self) -> None:
         if type(self.mode) is not RSMNormalizationMode:
@@ -279,28 +303,31 @@ class RSMNormalizationPolicy:
         )
         if any(value < 0 for value in lengths):
             raise ValueError("RSM absorption lengths must be non-negative")
-        if self.mode is RSMNormalizationMode.IDENTITY:
-            if (
-                self.foil_selector is not None
-                or self.exposure_selector is not None
-                or lengths != (0.0, 0.0, 0.0, 0.0)
-            ):
-                raise ValueError(
-                    "identity RSM normalization requires no selectors and zero lengths"
-                )
-        else:
-            if (
-                type(self.foil_selector) is not MetadataColumnSelector
-                or type(self.exposure_selector) is not MetadataColumnSelector
-            ):
-                raise TypeError(
-                    "foil/exposure RSM normalization requires exact selectors"
-                )
-            if self.foil_selector == self.exposure_selector:
-                raise ValueError("foil and exposure selectors must be distinct")
-            if not any(value > 0 for value in lengths):
-                raise ValueError("foil absorption lengths cannot all be zero")
+        mode = self.mode
+        foil = mode in {RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE,
+                        RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION}
+        exposure = mode is RSMNormalizationMode.FOIL_TRANSMISSION_EXPOSURE
+        monitor = mode in {RSMNormalizationMode.MONITOR, RSMNormalizationMode.MONITOR_FOIL_TRANSMISSION}
+        for name, value, wanted in (("foil", self.foil_selector, foil),
+                                    ("exposure", self.exposure_selector, exposure),
+                                    ("monitor", self.monitor_selector, monitor)):
+            if wanted and type(value) is not MetadataColumnSelector:
+                raise TypeError(f"{mode.value} RSM normalization requires an exact {name} selector")
+            if not wanted and value is not None:
+                raise ValueError(f"{mode.value} RSM normalization takes no {name} selector")
+        if foil and not any(value > 0 for value in lengths):
+            raise ValueError("foil absorption lengths cannot all be zero")
+        if not foil and lengths != (0.0, 0.0, 0.0, 0.0):
+            raise ValueError(f"{mode.value} RSM normalization requires zero absorption lengths")
+        if len(set(self.selectors)) != len(self.selectors):
+            raise ValueError("RSM normalization selectors must be distinct")
         object.__setattr__(self, "absorption_lengths", lengths)
+
+    @property
+    def selectors(self) -> tuple[MetadataColumnSelector, ...]:
+        """The metadata columns this normalization reads: foil, exposure, monitor (those set)."""
+        return tuple(selector for selector in (self.foil_selector, self.exposure_selector, self.monitor_selector)
+                     if selector is not None)
 
     @classmethod
     def identity(cls) -> "RSMNormalizationPolicy":
@@ -312,12 +339,215 @@ class RSMNormalizationPolicy:
         )
 
     def _canonical_value(self) -> tuple[object, ...]:
-        return (
+        value = (
             self.mode,
             _selector_value(self.foil_selector),
             _selector_value(self.exposure_selector),
             self.absorption_lengths,
         )
+        return value if self.monitor_selector is None else value + (_selector_value(self.monitor_selector),)
+
+
+@dataclass(frozen=True, slots=True)
+class RSMFrameCorrections:
+    """The per-frame corrections RSM shares with Stitch (design §4; the maintainer, 2026-10-01: "masks should
+    be applied when specified. Other processing options like thresholding, monitor etc should also apply";
+    decision 5: solid angle and polarization on by default, which the form sets).
+
+    ``mask_path``: a Mask File (with the detector's own mask). ``threshold``: Int's threshold policy on the
+    native values. ``dark_path`` and ``flat_path`` (with ``flat_min_fraction``): admitted by Int's owners.
+    ``solid_angle`` and ``polarization_factor``: the normalization weight, as pyFAI's. Every field at its
+    default is no correction, and a plan without corrections keeps the identity it had."""
+
+    mask_path: str | None = None
+    threshold: object = None
+    dark_path: str | None = None
+    flat_path: str | None = None
+    flat_min_fraction: float = 0.1
+    solid_angle: bool = False
+    polarization_factor: float | None = None
+
+    def __post_init__(self) -> None:
+        from xrd_tools.integrate.stitch_conditioning import StitchConditioning
+        for name in ("mask_path", "dark_path", "flat_path"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not str or not value):
+                raise TypeError(f"RSM {name} must be a non-empty path string")
+        if self.threshold is not None and type(self.threshold) is not StitchConditioning:
+            raise TypeError("RSM threshold must be Int's exact StitchConditioning")
+        if type(self.solid_angle) is not bool:
+            raise TypeError("RSM solid angle must be an exact bool")
+        fraction = _finite_float(self.flat_min_fraction, "RSM flat cutoff")
+        if not 0 <= fraction < 1:
+            raise ValueError("RSM flat cutoff must be a fraction of the flat's median")
+        object.__setattr__(self, "flat_min_fraction", fraction)
+        if self.polarization_factor is not None:
+            factor = _finite_float(self.polarization_factor, "RSM polarization factor")
+            if not -1 <= factor <= 1:
+                raise ValueError("RSM polarization factor must lie in [-1, 1]")
+            object.__setattr__(self, "polarization_factor", factor)
+
+
+@dataclass(frozen=True, slots=True)
+class RSMBoundCorrections:
+    """``RSMFrameCorrections`` bound at Preview: the mask, dark and flat receipts (Stitch's own captures), and
+    ``saturation``, each member's automatic ceiling from the calibrated detector (decision 39, Stitch's
+    ``member_saturation``): None for the data type's rule, and None when every member takes it. ``detector_mask``:
+    the calibrated detector's own mask in the raw frame, which the dark and flat captures leave out of their
+    counts at Preview and again at the run (so the run's capture is Preview's); not identity, the geometry's."""
+
+    corrections: RSMFrameCorrections
+    mask_receipt: object
+    dark_receipt: object
+    flat_receipt: object
+    saturation: tuple[int | None, ...] | None = None
+    detector_mask: np.ndarray | None = field(default=None, compare=False, repr=False)
+
+    def identity(self) -> tuple[object, ...]:
+        value = self.corrections
+        identity = ("frame-corrections-v1",
+                None if self.mask_receipt is None else (self.mask_receipt.sha256, self.mask_receipt.shape),
+                None if value.threshold is None else (value.threshold.mode, value.threshold.threshold_min,
+                                                      value.threshold.threshold_max),
+                None if self.dark_receipt is None else self.dark_receipt.fingerprint,
+                None if self.flat_receipt is None else (self.flat_receipt.fingerprint, value.flat_min_fraction),
+                value.solid_angle, value.polarization_factor)
+        # a resolved ceiling only when one applies: an identity without it is the one it was
+        return identity if self.saturation is None else (*identity, ("saturation", self.saturation))
+
+    def to_provenance(self) -> dict[str, object]:
+        value = self.corrections
+        return {
+            "mask": None if self.mask_receipt is None else {
+                "name": Path(self.mask_receipt.lexical_path).name, "sha256": self.mask_receipt.sha256,
+                "shape": list(self.mask_receipt.shape)},
+            "threshold": None if value.threshold is None else {
+                "mode": value.threshold.mode, "threshold_min": value.threshold.threshold_min,
+                "threshold_max": value.threshold.threshold_max,
+                **({} if self.saturation is None else {"saturation": list(self.saturation)})},
+            "dark": None if self.dark_receipt is None else {
+                "name": Path(self.dark_receipt.lexical_path).name, "fingerprint": self.dark_receipt.fingerprint},
+            "flat": None if self.flat_receipt is None else {
+                "name": Path(self.flat_receipt.lexical_path).name, "fingerprint": self.flat_receipt.fingerprint,
+                "min_fraction": value.flat_min_fraction},
+            "solid_angle": value.solid_angle,
+            "polarization_factor": value.polarization_factor,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RSMUBOverride:
+    """A UB matrix for an RSM in HKL, replacing the source's (the maintainer, 2026-10-01: "For files with no ub
+    matrix, a warning with a chance to enter the ub matrix manually or through a spec file can be offered").
+
+    Exactly one of ``matrix``, nine numbers row by row in SPEC's ``#G3`` convention (as SPEC writes the line), or
+    ``spec_path`` with ``scan``, that SPEC scan's own ``#G3``. The numbers are checked when bound
+    (``RSM_UB_INVALID``)."""
+
+    matrix: tuple[float, ...] | None = None
+    spec_path: str | None = None
+    scan: str | None = None
+
+    def __post_init__(self) -> None:
+        manual = self.matrix is not None
+        if manual == (self.spec_path is not None or self.scan is not None):
+            raise TypeError("an RSM UB is nine numbers or a SPEC file and scan, not both")
+        if manual:
+            if type(self.matrix) is not tuple or len(self.matrix) != 9 or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float)) for value in self.matrix):
+                raise TypeError("an RSM UB matrix is nine numbers, row by row")
+            object.__setattr__(self, "matrix", tuple(float(value) for value in self.matrix))
+        elif (type(self.spec_path) is not str or not self.spec_path or type(self.scan) is not str
+              or not self.scan.strip()):
+            raise TypeError("an RSM UB from SPEC needs a SPEC file and a scan")
+
+
+@dataclass(frozen=True, slots=True)
+class RSMBoundUB:
+    """``RSMUBOverride`` bound at Preview: the nine numbers used, and for a SPEC source its file's revision."""
+
+    override: RSMUBOverride
+    matrix: tuple[float, ...]
+    #: (name, resolved path, SHA-256, stat state, scan key) of the SPEC file; None for a typed matrix
+    spec_receipt: tuple | None
+
+    def array(self) -> np.ndarray:
+        return np.asarray(self.matrix, dtype=np.float64).reshape(3, 3)
+
+    def identity(self) -> tuple[object, ...]:
+        return ("ub-override-v1", self.matrix,
+                None if self.spec_receipt is None else (self.spec_receipt[4], self.spec_receipt[2]))
+
+    def to_provenance(self) -> dict[str, object]:
+        if self.spec_receipt is None:
+            return {"kind": "manual", "matrix": list(self.matrix)}
+        return {"kind": "spec", "name": self.spec_receipt[0], "scan": self.spec_receipt[4],
+                "sha256": self.spec_receipt[2], "matrix": list(self.matrix)}
+
+
+def _rsm_spec_scan_key(scan: str) -> str:
+    """A SPEC scan as silx keys it: ``43`` is its first occurrence, ``43.1``; ``43.2`` as given."""
+    value = scan.strip()
+    return f"{value}.1" if value.isdigit() else value
+
+
+def _rsm_ub_file_state(path: Path) -> tuple[int, ...]:
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _bind_rsm_ub(override, coordinate_frame) -> RSMBoundUB | None:
+    """Bind a UB override at Preview: typed numbers as given, or a SPEC scan's ``#G3`` with its file's revision.
+    Only an HKL map uses a UB (``RSM_UB_OVERRIDE_UNUSED`` in Q); a non-finite or singular matrix is
+    ``RSM_UB_INVALID``, a SPEC scan without a ``#G3`` line ``RSM_UB_MISSING``."""
+    if override is None:
+        return None
+    if type(override) is not RSMUBOverride:
+        raise TypeError("RSM UB override must be exact RSMUBOverride")
+    if coordinate_frame is not RSMCoordinateFrame.HKL:
+        raise RSMOperationRefused("RSM_UB_OVERRIDE_UNUSED", "a UB applies to an HKL map; Q coordinates use none")
+    receipt = None
+    if override.matrix is not None:
+        values = override.matrix
+    else:
+        scan = _rsm_spec_scan_key(override.scan)
+        try:
+            resolved = Path(override.spec_path).expanduser().resolve(strict=True)
+            before = _rsm_ub_file_state(resolved)
+            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            ub = get_UB(str(resolved), scan)
+            if _rsm_ub_file_state(resolved) != before:
+                raise RSMOperationRefused("RSM_UB_INVALID", "the UB's SPEC file changed while read")
+        except KeyError as error:
+            if error.args and error.args[0] == "G3":
+                raise RSMOperationRefused("RSM_UB_MISSING",
+                                          f"SPEC scan {scan} records no UB matrix (#G3)") from error
+            raise RSMOperationRefused("RSM_UB_INVALID", f"that SPEC file has no scan {scan}") from error
+        except (OSError, ValueError, TypeError) as error:
+            if isinstance(error, RSMOperationRefused):
+                raise
+            raise RSMOperationRefused("RSM_UB_INVALID", f"the UB's SPEC scan is unreadable: {error}") from error
+        values = tuple(float(value) for value in np.asarray(ub, dtype=np.float64).ravel())
+        receipt = (resolved.name, str(resolved), digest, before, scan)
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (9,) or not np.all(np.isfinite(array)):
+        raise RSMOperationRefused("RSM_UB_INVALID", "a UB matrix is nine finite numbers")
+    _rsm_coordinate_matrix(RSMCoordinateFrame.HKL, array.reshape(3, 3), invalid_ub_code="RSM_UB_INVALID")
+    return RSMBoundUB(override, tuple(float(value) for value in array), receipt)
+
+
+def _revalidate_rsm_ub(bound) -> None:
+    """At the run: a SPEC file the UB came from is unchanged since Preview."""
+    if bound is None or bound.spec_receipt is None:
+        return
+    path = Path(bound.spec_receipt[1])
+    try:
+        unchanged = (_rsm_ub_file_state(path) == bound.spec_receipt[3]
+                     and hashlib.sha256(path.read_bytes()).hexdigest() == bound.spec_receipt[2])
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        raise RSMOperationRefused("SOURCE_IDENTITY_MISMATCH", "the UB's SPEC file changed since Preview")
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,10 +779,7 @@ def required_rsm_selectors(
     if type(plan) is not RSMOperationPlan:
         raise TypeError("RSM selector projection requires exact plan")
     requested = [selector for _role, selector in plan.geometry.motor_selectors]
-    if plan.normalization.foil_selector is not None:
-        requested.append(plan.normalization.foil_selector)
-    if plan.normalization.exposure_selector is not None:
-        requested.append(plan.normalization.exposure_selector)
+    requested.extend(plan.normalization.selectors)
     unique = {
         (selector.name, selector.occurrence): selector for selector in requested
     }
@@ -651,15 +878,24 @@ def _bind_project_output(
         raise RSMOperationRefused(
             "OUTPUT_PATH_INVALID", "RSM output has no bounded Project path"
         )
-    return ModuleOutputRequest(resolved, output.kind, output.overwrite)
+    return ModuleOutputRequest(
+        resolved, output.kind, output.overwrite, output.artifact_family
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class RSMOutputAuthorityReceipt:
-    """Preview-time identity of the canonical directory owning RSM output."""
+    """Preview-time identity of the canonical directory owning RSM output.
+
+    ``created_relative_path`` (RSM v2 only) is set when the output's folder did
+    not exist at Preview: the identity is then the deepest existing directory on
+    its path, and the run creates the folders below it (as Stitch's run creates
+    its output folder, AUD-9 stage 2), so Preview creates nothing.
+    """
 
     parent_relative_path: str
     parent_identity: tuple[int, int, int]
+    created_relative_path: str | None = None
 
     def __post_init__(self) -> None:
         relative = self.parent_relative_path
@@ -668,9 +904,13 @@ class RSMOutputAuthorityReceipt:
                 relative,
                 "RSM output parent path",
             )
+        created = self.created_relative_path
+        if created is not None:
+            created = _manifest_relative_path(created, "RSM output folder path")
         if (
             type(self.parent_relative_path) is not str
             or relative != self.parent_relative_path
+            or created != self.created_relative_path
             or type(self.parent_identity) is not tuple
             or len(self.parent_identity) != 3
             or any(type(item) is not int for item in self.parent_identity)
@@ -680,7 +920,7 @@ class RSMOutputAuthorityReceipt:
 
     def to_provenance(self) -> dict[str, object]:
         mode, device, inode = self.parent_identity
-        return {
+        value: dict[str, object] = {
             "parent_relative_path": self.parent_relative_path,
             "parent_identity": {
                 "mode": mode,
@@ -688,17 +928,26 @@ class RSMOutputAuthorityReceipt:
                 "inode": inode,
             },
         }
+        if self.created_relative_path is not None:
+            value["created_relative_path"] = self.created_relative_path
+        return value
 
 
 def _capture_output_authority(
     output: ModuleOutputRequest,
     project_root: str | Path,
+    *,
+    allow_absent_parent: bool = False,
 ) -> RSMOutputAuthorityReceipt:
     root = _project_root(project_root)
     parent = Path(output.target).parent
+    authority, created = parent, ()
+    if allow_absent_parent:  # the deepest existing directory on the folder's path
+        while authority != root and not os.path.lexists(authority):
+            authority, created = authority.parent, (authority.name, *created)
     try:
-        relative = parent.relative_to(root)
-        observed = os.stat(parent, follow_symlinks=False)
+        relative = authority.relative_to(root)
+        observed = os.stat(authority, follow_symlinks=False)
     except (OSError, ValueError) as error:
         raise RSMOperationRefused(
             "OUTPUT_PARENT_UNAVAILABLE",
@@ -713,25 +962,112 @@ def _capture_output_authority(
     return RSMOutputAuthorityReceipt(
         relative_path,
         (int(observed.st_mode), int(observed.st_dev), int(observed.st_ino)),
+        "/".join(created) if created else None,
     )
+
+
+def _created_output_folders(
+    output: ModuleOutputRequest,
+    root: Path,
+    authority: RSMOutputAuthorityReceipt,
+) -> tuple[Path, ...]:
+    """The folders below a Preview-time authority that the run creates, from the
+    outermost; the authority must be the directory Preview qualified."""
+
+    anchor = (
+        root
+        if authority.parent_relative_path == "."
+        else root / authority.parent_relative_path
+    )
+    folders = []
+    for part in Path(authority.created_relative_path).parts:
+        folders.append((folders[-1] if folders else anchor) / part)
+    observed = os.stat(anchor, follow_symlinks=False)
+    if (
+        folders[-1] != Path(output.target).parent
+        or not stat.S_ISDIR(observed.st_mode)
+        or (int(observed.st_mode), int(observed.st_dev), int(observed.st_ino))
+        != authority.parent_identity
+    ):
+        raise RSMOperationRefused(
+            "OUTPUT_IDENTITY_MISMATCH",
+            "RSM output path authority changed after Preview",
+        )
+    return tuple(folders)
+
+
+def _create_rsm_v2_output_folder(request: RSMOperationRequestV2) -> None:
+    """Make the output's folder Preview qualified without creating it (at the
+    start of a run, as Stitch's run makes its output folder): each folder below
+    the unchanged authority is made, or must already be, one ordinary directory."""
+
+    authority = request.output_authority
+    if authority.created_relative_path is None:
+        return
+    root = _project_root(request.preflight.project_root)
+    try:
+        folders = _created_output_folders(request.module.output, root, authority)
+    except OSError as error:
+        raise RSMOperationRefused(
+            "OUTPUT_IDENTITY_MISMATCH",
+            "RSM output path authority changed after Preview",
+        ) from error
+    for folder in folders:
+        try:
+            os.mkdir(folder)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise RSMOperationRefused(
+                "OUTPUT_PARENT_UNAVAILABLE",
+                f"RSM output folder could not be made: {error}",
+            ) from error
+        try:
+            ordinary = stat.S_ISDIR(os.lstat(folder).st_mode)
+        except OSError:
+            ordinary = False
+        if not ordinary:
+            raise RSMOperationRefused(
+                "OUTPUT_IDENTITY_MISMATCH",
+                "RSM output path authority changed after Preview",
+            )
 
 
 def _requalify_project_output(
     output: ModuleOutputRequest,
     project_root: str | Path,
     authority: RSMOutputAuthorityReceipt,
+    *,
+    folders_made: bool = True,
 ) -> None:
     """Refuse completed namespace changes under the trusted-Project boundary.
 
     This is deliberately not a descriptor-bound publication claim.  Concurrent
     mutation by an untrusted actor in a shared-writable Project remains held for
     the common Stitch/RSM output namespace owner.
+
+    Below an authority captured without the output's folder, each folder must be
+    one ordinary directory once the run has made them (``folders_made``), and
+    absent or one before.
     """
 
     try:
         current = _bind_project_output(output, project_root)
-        current_authority = _capture_output_authority(current, project_root)
-    except RSMOperationRefused as error:
+        if (
+            type(authority) is RSMOutputAuthorityReceipt
+            and authority.created_relative_path is not None
+        ):
+            for folder in _created_output_folders(
+                current, _project_root(project_root), authority
+            ):
+                if not folders_made and not os.path.lexists(folder):
+                    break
+                if not stat.S_ISDIR(os.lstat(folder).st_mode):
+                    raise RSMOperationRefused("OUTPUT_IDENTITY_MISMATCH")
+            current_authority = authority
+        else:
+            current_authority = _capture_output_authority(current, project_root)
+    except (RSMOperationRefused, OSError) as error:
         raise RSMOperationRefused(
             "OUTPUT_IDENTITY_MISMATCH",
             "RSM output path authority changed after Preview",
@@ -812,6 +1148,7 @@ class RSMContribution:
     source_frame_index: int
     values: tuple[tuple[str, int, float], ...]
     normalization_divisor: float
+    point_raw_locators: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -821,6 +1158,13 @@ class RSMContribution:
             or type(self.source_frame_index) is not int
             or self.source_frame_index < 0
             or type(self.values) is not tuple
+            or type(self.point_raw_locators) is not tuple
+            or any(type(item) is not tuple or len(item) != 2 or
+                   any(type(value) is not int or value < 0 for value in item)
+                   for item in self.point_raw_locators)
+            or len(set(self.point_raw_locators)) != len(self.point_raw_locators)
+            or (self.point_raw_locators and self.point_raw_locators[0] !=
+                (self.file_ordinal, self.source_frame_index))
         ):
             raise TypeError("RSM contribution is invalid")
         parsed: list[tuple[str, int, float]] = []
@@ -853,6 +1197,23 @@ class RSMContribution:
             "RSM normalization divisor",
             positive=True,
         )
+
+    def _canonical_value(self):
+        value = (self.label, self.file_ordinal, self.source_frame_index,
+                 self.values, self.normalization_divisor)
+        return value if not self.point_raw_locators else value + (self.point_raw_locators,)
+
+    def to_provenance(self):
+        value = {"label": self.label, "file_ordinal": self.file_ordinal,
+                 "source_frame_index": self.source_frame_index,
+                 "values": [{"name": name, "occurrence": occurrence, "value": number}
+                            for name, occurrence, number in self.values],
+                 "normalization_divisor": self.normalization_divisor}
+        if self.point_raw_locators:
+            value["point_raw_locators"] = [
+                {"file_ordinal": file, "source_frame_index": frame}
+                for file, frame in self.point_raw_locators]
+        return value
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -903,6 +1264,8 @@ class RSMPreflightReceipt:
             or len(self.contributions) > _MAX_CONTRIBUTIONS
             or any(type(item) is not RSMContribution for item in self.contributions)
             or any(item.file_ordinal >= len(self.files) for item in self.contributions)
+            or any(file >= len(self.files) for item in self.contributions
+                   for file, _ in item.point_raw_locators)
             or len({item.label for item in self.contributions})
             != len(self.contributions)
         ):
@@ -994,14 +1357,7 @@ class RSMPreflightReceipt:
             self.primary_revision,
             tuple((item.relative_path, item.revision) for item in self.files),
             tuple(
-                (
-                    item.label,
-                    item.file_ordinal,
-                    item.source_frame_index,
-                    item.values,
-                    item.normalization_divisor,
-                )
-                for item in self.contributions
+                item._canonical_value() for item in self.contributions
             ),
             self.energy_eV,
             self.ub,
@@ -1037,21 +1393,7 @@ class RSMPreflightReceipt:
                 for item in self.files
             ],
             "contributions": [
-                {
-                    "label": item.label,
-                    "file_ordinal": item.file_ordinal,
-                    "source_frame_index": item.source_frame_index,
-                    "values": [
-                        {
-                            "name": name,
-                            "occurrence": occurrence,
-                            "value": value,
-                        }
-                        for name, occurrence, value in item.values
-                    ],
-                    "normalization_divisor": item.normalization_divisor,
-                }
-                for item in self.contributions
+                item.to_provenance() for item in self.contributions
             ],
             "energy_eV": self.energy_eV,
             "ub": [list(row) for row in self.ub],
@@ -1111,6 +1453,27 @@ def _project_source_options(
             "SOURCE_SPEC_UNSUPPORTED",
             "R1 RSM does not accept SourceSpec.metadata_uri",
         )
+    if analysis.resolved_kind in _RSM_NEXUS_KINDS:
+        # a raw NeXus stack (AUD-9 stage 2b C5c): one exact entry, no scan and no reader overrides, as Stitch
+        # admits it; its frames, energy, motors and UB come from the entry, the UB read in SPEC's #G3
+        # convention (2π included), which xdart's own NeXus writer stores there
+        options = dict(analysis.source_spec.options)
+        if (
+            set(options) - {"point_images"}
+            or not analysis.resolved_entry
+            or analysis.resolved_scan
+        ):
+            raise RSMOperationRefused(
+                "SOURCE_SPEC_UNSUPPORTED",
+                "a NeXus member needs one exact entry and no reader overrides",
+            )
+        if "point_images" in options:
+            options["point_images"] = PointImagePolicy.from_dict(options["point_images"]).to_dict()
+        return json.dumps(
+            {"entry": analysis.resolved_entry, "kind": analysis.resolved_kind.value,
+             "ub_convention": "spec-g3", **options},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
     if analysis.resolved_kind is not SourceKind.SPEC:
         raise RSMOperationRefused("SOURCE_KIND_UNSUPPORTED")
     options = dict(analysis.source_spec.options)
@@ -1120,6 +1483,9 @@ def _project_source_options(
         "image_stem",
         "read_image_kwargs",
         "metadata_column_projection",
+        "point_images",
+        "require_complete_images",
+        "nexus_entry",
     }
     if (
         analysis.resolved_entry is not None
@@ -1147,6 +1513,10 @@ def _project_source_options(
             "R1 source projection must exactly match the RSM selectors",
         )
     projected = dict(options)
+    if "require_complete_images" in projected and type(projected["require_complete_images"]) is not bool:
+        raise RSMOperationRefused("SOURCE_SPEC_UNSUPPORTED", "complete-image intent must be an exact bool")
+    if "point_images" in projected:
+        projected["point_images"] = PointImagePolicy.from_dict(projected["point_images"]).to_dict()
     projected["image_dir"] = _relative_locator(
         options["image_dir"], root, "SPEC image directory"
     )
@@ -1186,6 +1556,27 @@ def _project_source_options(
         separators=(",", ":"),
         ensure_ascii=False,
     )
+
+
+def _rsm_nexus_energy_and_ub(analysis, coordinate_frame, ub_override):
+    """A raw NeXus member's energy (eV) and UB, from its entry through xdart's NeXus reader (AUD-9 stage 2b
+    C5c): the energy in keV there; the UB from ``sample/ub_matrix`` or ``orientation_matrix``, read in SPEC's
+    #G3 convention (2π included, as xdart's writer stores it), else a UB given at Preview, else, in HKL,
+    ``RSM_UB_MISSING``. Q coordinates need no UB."""
+    from xrd_tools.io.nexus import read_nexus
+    metadata = read_nexus(analysis.resolved_root, entry=analysis.resolved_entry)
+    energy = float(metadata.energy) * 1000.0
+    if coordinate_frame is not RSMCoordinateFrame.HKL:
+        return energy, None
+    if ub_override is not None:
+        return energy, ub_override.array()
+    if metadata.ub_matrix is None:
+        raise RSMOperationRefused(
+            "RSM_UB_MISSING",
+            "this NeXus entry records no UB matrix (sample/ub_matrix or orientation_matrix); enter one, take it "
+            "from a SPEC scan, or choose Q coordinates",
+        )
+    return energy, np.asarray(metadata.ub_matrix, dtype=np.float64)
 
 
 def _numeric_lookup(
@@ -1245,6 +1636,99 @@ class _RSMCapturedMemberFacts:
     source_fingerprint: str
     module_source_fingerprint: str
     table_fingerprint: str
+    #: where the UB came from, for Preview only (decision 2): never part of an identity
+    ub_origin: str | None = None
+    #: Pixel-free NeXus facts used to bind Auto before conditioning changes the frame dtype.
+    detector_dtype: np.dtype | None = None
+    detector_saturation: int | None = None
+
+
+_STANDARD_PSIC_AXES = ("x+", "z-", "y+", "z-", "x+", "z-")  # mu, eta, chi, phi, nu, del
+
+
+def _rsm_reversed_circles(mapper: PixelQMap) -> tuple[str, ...]:
+    """The psic circles a map turns other than psic's standard way (by role). A mirror's map
+    (``PixelQMap.mirror``) is read through the mirror, where it maps: the circles still reversed there (17-2's
+    phi, for now)."""
+    from xrd_tools.rsm.orientation import ROLE_ORDER
+    from xrd_tools.session.instrument import mirrored_axis
+    axes = tuple(mapper.diff_config.sample_circles) + tuple(mapper.diff_config.detector_circles)
+    if len(axes) != len(_STANDARD_PSIC_AXES):
+        return ()
+    if mapper.mirror:
+        axes = tuple(mirrored_axis(axis) for axis in axes)
+    return tuple(role for role, axis, plain in zip(ROLE_ORDER, axes, _STANDARD_PSIC_AXES) if axis != plain)
+
+
+def _rsm_orientation_ub(analysis, g3, mapper: PixelQMap, runtime_session) -> tuple[np.ndarray, str]:
+    """A SPEC member's UB in the model RSM maps with (AUD-9 stage 2b decision 2; the maintainer: "Xu provides a
+    way to specify the actual circle directions on the instrument. Shouldn't that be used?"). SPEC stores no circle
+    directions, and ``#G3`` was computed in its own psic convention from the header's two orientation reflections
+    (``#G1``); the UB is recomputed from them in the map's directions and zero offsets.
+
+    ``#G3`` is the cross-check, twice. The header's reflections must reproduce ``#G3`` in psic's standard model to
+    its rounding, or they cannot be trusted in another: psic's standard model then keeps ``#G3`` (with a warning),
+    any other refuses. And a recompute within the rounding of ``#G3`` is ``#G3`` itself, so its bytes and every
+    identity are unchanged. A model other than psic's standard needs the reflections
+    (``RSM_ORIENTATION_REFLECTIONS_MISSING``).
+
+    A mirror's map (``PixelQMap.mirror``, 17-2) recomputes through the mirror: SPEC's labels are its psic model's,
+    which is the mirror image's, so a pure mirror's recompute is ``#G3`` and only what stays reversed there (17-2's
+    phi, for now) can move it. The standard self-check is always made without the mirror."""
+    from dataclasses import replace
+
+    from xrd_tools.rsm.orientation import ROLE_ORDER, ROUNDING, relative_difference, spec_orientation
+
+    g3 = np.asarray(g3, dtype=np.float64)
+    reversed_roles = _rsm_reversed_circles(mapper)
+    plain = not reversed_roles and not any(mapper.angle_offsets)
+    try:
+        orientation = spec_orientation(
+            get_orientation_header(analysis.resolved_root, analysis.resolved_scan))
+    except KeyError:
+        orientation = None
+    if orientation is None:
+        if plain:
+            return g3, "#G3 (the header holds no orientation reflections to recompute it from)"
+        raise RSMOperationRefused(
+            "RSM_ORIENTATION_REFLECTIONS_MISSING",
+            "this scan's header holds no orientation reflections (#G1) to recompute its UB in the instrument's "
+            "directions; give a UB, or map in Q coordinates",
+        )
+    named = " and ".join(
+        "(" + " ".join(f"{value:g}" for value in item.hkl) + ")" for item in orientation.reflections)
+    model = "the instrument's directions" + (" through the mirror" if mapper.mirror else "")
+    standard = mapper if plain and not mapper.mirror else replace(
+        mapper,
+        diff_config=replace(
+            mapper.diff_config,
+            sample_circles=_STANDARD_PSIC_AXES[:4],
+            detector_circles=_STANDARD_PSIC_AXES[4:],
+        ),
+        angle_offsets=(),
+        mirror=False,
+    )
+    self_check = relative_difference(standard.orientation_ub(orientation, runtime_session=runtime_session), g3)
+    if self_check > ROUNDING:
+        if plain:
+            return g3, (f"#G3, kept; ⚠ its own reflections {named} give it only to {self_check:.3g} (relative) in "
+                        "psic's standard directions, so they are not a psic #G1 this RSM can check it by")
+        raise RSMOperationRefused(
+            "RSM_ORIENTATION_REFLECTIONS_MISSING",
+            f"this scan's reflections {named} do not reproduce its own #G3 in psic's standard directions "
+            f"({self_check:.3g}, relative), so its UB cannot be recomputed in the instrument's; give a UB",
+        )
+    if plain and not mapper.mirror:
+        return g3, f"#G3; recomputed from {named} in the instrument's directions it agrees to {self_check:.2g}"
+    recomputed = mapper.orientation_ub(orientation, runtime_session=runtime_session)
+    difference = relative_difference(recomputed, g3)
+    if difference <= ROUNDING:
+        return g3, f"#G3; recomputed from {named} in {model} it agrees to {difference:.2g}"
+    moved = sorted({role for role in reversed_roles for item in orientation.reflections
+                    if abs(math.remainder(item.angles[ROLE_ORDER.index(role)], 180.0)) > 1e-6})
+    note = "" if not moved else "; reversed circles away from 0° or 180° there: " + ", ".join(moved)
+    return recomputed, (f"recomputed from {named} in {model}; #G3 differs by "
+                        f"{difference:.3g} (relative){note}")
 
 
 def _capture_preflight_facts(
@@ -1271,6 +1755,7 @@ def _capture_preflight_facts(
     allow_single_static_hot: bool = False,
     cancel_token: threading.Event | None = None,
     coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
+    ub_override: RSMBoundUB | None = None,
 ) -> _RSMCapturedMemberFacts:
     if type(coordinate_frame) is not RSMCoordinateFrame:
         raise TypeError("RSM coordinate frame must be exact")
@@ -1287,7 +1772,8 @@ def _capture_preflight_facts(
         )
     source_relative = _relative_locator(analysis.resolved_root, root, "source")
     source_options_json = _project_source_options(analysis, root, selectors)
-    if expected_detector_shape is not None:
+    nexus = analysis.resolved_kind in _RSM_NEXUS_KINDS
+    if expected_detector_shape is not None and not nexus:
         try:
             read_options = json.loads(source_options_json)["read_image_kwargs"]
         except (KeyError, TypeError, json.JSONDecodeError) as error:
@@ -1301,10 +1787,12 @@ def _capture_preflight_facts(
                 "RSM_MEMBER_IDENTITY_MISMATCH",
                 "member detector shape differs from effective geometry",
             )
-    if analysis.primary_post_state is None or not analysis.resolved_scan:
+    if analysis.primary_post_state is None or not (
+        analysis.resolved_entry if nexus else analysis.resolved_scan
+    ):
         raise RSMOperationRefused(
             "SOURCE_IDENTITY_MISMATCH",
-            "SPEC source has no exact primary revision or scan",
+            "source has no exact primary revision, scan or entry",
         )
     dependency_rows = (
         (analysis.lexical_root, analysis.resolved_root, analysis.primary_post_state),
@@ -1377,18 +1865,16 @@ def _capture_preflight_facts(
             "SOURCE_IDENTITY_MISMATCH",
             "selected RSM label is outside the exact metadata table",
         ) from error
-    foil = exposure = None
-    if normalization.foil_selector is not None:
-        selector = normalization.foil_selector
-        foil = selected_by_key[(selector.name, selector.occurrence)][rows]
-    if normalization.exposure_selector is not None:
-        selector = normalization.exposure_selector
-        exposure = selected_by_key[(selector.name, selector.occurrence)][rows]
+    foil, exposure, monitor = (
+        None if selector is None else selected_by_key[(selector.name, selector.occurrence)][rows]
+        for selector in (normalization.foil_selector, normalization.exposure_selector,
+                         normalization.monitor_selector))
     divisors = rsm_normalization_divisors(
         normalization,
         len(source.selected_labels),
         foil_status=foil,
         exposure_seconds=exposure,
+        monitor_counts=monitor,
     )
     angles = tuple(
         np.asarray(
@@ -1398,36 +1884,69 @@ def _capture_preflight_facts(
         for _role, selector in motor_selectors
     )
     contributions: list[RSMContribution] = []
+    detector_dtype = detector_saturation = None
     try:
         with requalified_analysis_source(
             analysis,
             cancel_token=cancel_token,
         ) as opened:
+            if nexus and expected_detector_shape is not None:
+                # the open entry's pixel-free descriptor (the lease's cursor source, or the source's own)
+                descriptor = getattr(opened, "descriptor", None)
+                if descriptor is None and callable(getattr(opened, "container_descriptor", None)):
+                    descriptor = opened.container_descriptor()
+                frame_shape = None if descriptor is None else descriptor.frame_shape
+                if tuple(frame_shape or ()) != tuple(expected_detector_shape):
+                    raise RSMOperationRefused(
+                        "RSM_MEMBER_IDENTITY_MISMATCH",
+                        "member detector shape differs from effective geometry",
+                    )
+                detector_dtype = descriptor.dtype
+                detector_saturation = descriptor.saturation
+            ub_origin = None
             try:
-                if coordinate_frame is RSMCoordinateFrame.HKL:
+                if nexus:
+                    energy, ub_value = _rsm_nexus_energy_and_ub(
+                        analysis, coordinate_frame, ub_override)
+                elif coordinate_frame is RSMCoordinateFrame.HKL and ub_override is not None:
+                    # a UB given at Preview replaces the source's (AUD-9 stage 2b C5); the energy is the source's
+                    energy = get_energy(
+                        analysis.resolved_root,
+                        analysis.resolved_scan,
+                    )
+                    ub_value = ub_override.array()
+                    ub_origin = "given (typed, or from a named SPEC scan), used as given"
+                elif coordinate_frame is RSMCoordinateFrame.HKL:
                     energy, ub_value = get_energy_and_UB(
                         analysis.resolved_root,
                         analysis.resolved_scan,
                     )
+                    if mapper is not None:  # decision 2: the UB in the model RSM maps with
+                        ub_value, ub_origin = _rsm_orientation_ub(
+                            analysis, ub_value, mapper, active_runtime_session)
                 else:
                     energy = get_energy(
                         analysis.resolved_root,
                         analysis.resolved_scan,
                     )
                     ub_value = None
+            except RSMOperationRefused:  # already named (a NeXus member's RSM_UB_MISSING, C5c)
+                raise
             except KeyError as error:
                 if normalize_source_fact_errors:
-                    code = (
-                        invalid_ub_code
-                        if (
-                            coordinate_frame is RSMCoordinateFrame.HKL
-                            and error.args
-                            and error.args[0] == "G3"
-                        )
-                        else invalid_energy_code
+                    missing_ub = (
+                        coordinate_frame is RSMCoordinateFrame.HKL
+                        and error.args
+                        and error.args[0] == "G3"
                     )
+                    if missing_ub:  # no #G3 line: give a UB, or map in Q (AUD-9 stage 2b C5)
+                        raise RSMOperationRefused(
+                            "RSM_UB_MISSING",
+                            "this source records no UB matrix (#G3); enter one, take it from a SPEC "
+                            "scan, or choose Q coordinates",
+                        ) from error
                     raise RSMOperationRefused(
-                        code or "RSM_MEMBER_ENERGY_INVALID"
+                        invalid_energy_code or "RSM_MEMBER_ENERGY_INVALID"
                     ) from error
                 raise
             except ValueError as error:
@@ -1465,35 +1984,37 @@ def _capture_preflight_facts(
                         "PREFLIGHT_CONTRIBUTION_LIMIT_EXCEEDED",
                         "RSM selection exceeds 4096 contributions",
                     )
+                policy = getattr(opened, "point_image_policy", None)
                 raw_locator = getattr(opened, "raw_locator_for", None)
-                if callable(raw_locator):
-                    path, frame_index = raw_locator(label)
+                if policy is not None:
+                    locators = opened.point_raw_locators(label)
+                elif callable(raw_locator):
+                    locators = (raw_locator(label),)
                 else:
                     frame = opened.frame_for(label)
-                    path, frame_index = frame.source_path, frame.source_frame_index
-                if path is None or type(frame_index) is not int or frame_index < 0:
-                    raise RSMOperationRefused(
-                        "RAW_LOCATOR_MISSING",
-                        f"selected frame {label} has no exact raw source locator",
-                    )
+                    locators = ((frame.source_path, frame.source_frame_index),)
+                raw_members = []
+                for path, frame_index in locators:
+                    if path is None or type(frame_index) is not int or frame_index < 0:
+                        raise RSMOperationRefused(
+                            "RAW_LOCATOR_MISSING",
+                            f"selected frame {label} has no exact raw source locator")
+                    try:
+                        resolved = Path(path).expanduser().resolve(strict=True)
+                        state = _file_state(os.stat(resolved, follow_symlinks=False))
+                    except OSError as error:
+                        raise RSMOperationRefused(
+                            "RAW_SOURCE_UNAVAILABLE",
+                            f"selected frame {label} raw source is unavailable") from error
+                    if not stat.S_ISREG(state[0]) or dependency_by_resolved.get(resolved) != state:
+                        raise RSMOperationRefused(
+                            "SOURCE_IDENTITY_MISMATCH",
+                            f"selected frame {label} raw source is outside its receipt")
+                    raw_members.append((file_ordinals[resolved], frame_index))
+                if not raw_members:
+                    raise RSMOperationRefused("RAW_LOCATOR_MISSING")
+                ordinal, frame_index = raw_members[0]
                 try:
-                    resolved = Path(path).expanduser().resolve(strict=True)
-                    state = _file_state(os.stat(resolved, follow_symlinks=False))
-                except OSError as error:
-                    raise RSMOperationRefused(
-                        "RAW_SOURCE_UNAVAILABLE",
-                        f"selected frame {label} raw source is unavailable",
-                    ) from error
-                if (
-                    not stat.S_ISREG(state[0])
-                    or dependency_by_resolved.get(resolved) != state
-                ):
-                    raise RSMOperationRefused(
-                        "SOURCE_IDENTITY_MISMATCH",
-                        f"selected frame {label} raw source is outside its receipt",
-                    )
-                try:
-                    ordinal = file_ordinals[resolved]
                     position = label_positions[label]
                 except KeyError as error:
                     raise RSMOperationRefused(
@@ -1516,16 +2037,14 @@ def _capture_preflight_facts(
                     frame_index,
                     tuple(sorted(values_list)),
                     float(divisors[contribution_index]),
+                    tuple(raw_members) if policy is not None else (),
                 )
-                charge_piece(
-                    {
-                        "label": contribution.label,
-                        "file_ordinal": contribution.file_ordinal,
-                        "source_frame_index": contribution.source_frame_index,
-                        "values": contribution.values,
-                        "normalization_divisor": contribution.normalization_divisor,
-                    }
-                )
+                charge_piece({"label": contribution.label, "file_ordinal": contribution.file_ordinal,
+                              "source_frame_index": contribution.source_frame_index,
+                              "values": contribution.values,
+                              "normalization_divisor": contribution.normalization_divisor,
+                              **({} if not contribution.point_raw_locators else
+                                 {"point_raw_locators": contribution.point_raw_locators})})
                 contributions.append(contribution)
             selected_mapper = (
                 PixelQMap(Diffractometer.psic(), detector_header)
@@ -1564,7 +2083,7 @@ def _capture_preflight_facts(
     return _RSMCapturedMemberFacts(
         str(root),
         source_relative,
-        analysis.resolved_scan,
+        "" if nexus else analysis.resolved_scan,
         source_options_json,
         analysis.primary_post_state,
         tuple(files),
@@ -1578,6 +2097,9 @@ def _capture_preflight_facts(
         analysis.source_fingerprint,
         source.fingerprint,
         source.table_fingerprint,
+        ub_origin=ub_origin,
+        detector_dtype=detector_dtype,
+        detector_saturation=detector_saturation,
     )
 
 
@@ -1694,6 +2216,9 @@ def _normalization_provenance(
         ),
         "absorption_lengths": list(normalization.absorption_lengths),
         "placement": "conditioned-numerator-before-grid",
+        **({} if normalization.monitor_selector is None else {"monitor_selector": {
+            "name": normalization.monitor_selector.name,
+            "occurrence": normalization.monitor_selector.occurrence}}),
     }
 
 
@@ -1854,6 +2379,8 @@ class RSMPreflightMemberV2:
     mask_policy_intent: tuple[object, ...]
     fingerprint: str
     _claim: InitVar[object] = None
+    #: where the UB came from, for Preview only (decision 2): outside the fingerprint
+    ub_origin: str | None = field(default=None, repr=False)
 
     def __post_init__(self, _claim: object) -> None:
         try:
@@ -1887,7 +2414,7 @@ class RSMPreflightMemberV2:
             or canonical_options != self.source_options_json
             or type(options) is not dict
             or type(self.source_scan) is not str
-            or not self.source_scan
+            or bool(self.source_scan) == ("entry" in options)  # a SPEC scan, or a NeXus entry (C5c)
             or type(self.dependency_files) is not tuple
             or not self.dependency_files
             or len(self.dependency_files) > _MAX_MANIFEST_FILES
@@ -1902,6 +2429,8 @@ class RSMPreflightMemberV2:
                 item.file_ordinal >= len(self.dependency_files)
                 for item in self.contributions
             )
+            or any(file >= len(self.dependency_files) for item in self.contributions
+                   for file, _ in item.point_raw_locators)
             or len({item.label for item in self.contributions})
             != len(self.contributions)
             or type(self.coordinate_frame) is not RSMCoordinateFrame
@@ -1991,14 +2520,7 @@ class RSMPreflightMemberV2:
                 for item in self.dependency_files
             ),
             tuple(
-                (
-                    item.label,
-                    item.file_ordinal,
-                    item.source_frame_index,
-                    item.values,
-                    item.normalization_divisor,
-                )
-                for item in self.contributions
+                item._canonical_value() for item in self.contributions
             ),
             self.coordinate_frame,
             self.coordinate_frame.matrix_policy,
@@ -2031,21 +2553,7 @@ class RSMPreflightMemberV2:
                 for item in self.dependency_files
             ],
             "contributions": [
-                {
-                    "label": item.label,
-                    "file_ordinal": item.file_ordinal,
-                    "source_frame_index": item.source_frame_index,
-                    "values": [
-                        {
-                            "name": name,
-                            "occurrence": occurrence,
-                            "value": value,
-                        }
-                        for name, occurrence, value in item.values
-                    ],
-                    "normalization_divisor": item.normalization_divisor,
-                }
-                for item in self.contributions
+                item.to_provenance() for item in self.contributions
             ],
             "coordinate_frame": self.coordinate_frame.value,
             "axis_names": list(self.coordinate_frame.axis_names),
@@ -2121,14 +2629,7 @@ def _make_rsm_preflight_member_v2(
         facts.primary_revision,
         tuple((item.relative_path, item.revision) for item in facts.files),
         tuple(
-            (
-                item.label,
-                item.file_ordinal,
-                item.source_frame_index,
-                item.values,
-                item.normalization_divisor,
-            )
-            for item in facts.contributions
+            item._canonical_value() for item in facts.contributions
         ),
         facts.coordinate_frame,
         facts.coordinate_frame.matrix_policy,
@@ -2167,6 +2668,7 @@ def _make_rsm_preflight_member_v2(
         mask_intent,
         fingerprint,
         _RSM_V2_FACTORY,
+        ub_origin=facts.ub_origin,
     )
 
 
@@ -2176,19 +2678,17 @@ def _require_unique_rsm_physical_contributions_v2(
     physical: set[tuple[tuple[int, int, int, int, int, int], int]] = set()
     for member in members:
         for contribution in member.contributions:
-            revision = member.dependency_files[contribution.file_ordinal].revision
-            if revision is None:
-                raise RSMOperationRefused(
-                    "RSM_MEMBER_IDENTITY_MISMATCH",
-                    "selected contribution has no exact file revision",
-                )
-            identity = (revision, contribution.source_frame_index)
-            if identity in physical:
-                raise RSMOperationRefused(
-                    "RSM_SOURCE_GROUP_INVALID",
-                    "two members select the same physical contribution",
-                )
-            physical.add(identity)
+            for file, frame in contribution.point_raw_locators or ((contribution.file_ordinal,
+                                                                    contribution.source_frame_index),):
+                revision = member.dependency_files[file].revision
+                if revision is None:
+                    raise RSMOperationRefused(
+                        "RSM_MEMBER_IDENTITY_MISMATCH", "selected contribution has no exact file revision")
+                identity = (revision, frame)
+                if identity in physical:
+                    raise RSMOperationRefused(
+                        "RSM_SOURCE_GROUP_INVALID", "two members select the same physical contribution")
+                physical.add(identity)
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -2206,10 +2706,25 @@ class RSMOperationPlanV2:
     max_chunk_bytes: int
     fingerprint: str
     _claim: InitVar[object] = None
+    #: The per-frame corrections bound at Preview (``RSMBoundCorrections``); None: none, as before.
+    corrections: object = None
+    #: A UB given at Preview (``RSMBoundUB``), replacing every member's source UB; None: the sources' own.
+    ub_override: object = None
+    #: The calibrated detector's own mask (module gaps) in the raw frame, read-only (``rsm_calibration_detector_mask``),
+    #: masked in every frame whatever the corrections (S3c unit 4b); None: the canonical asset, or no gaps. Not
+    #: identity: the geometry receipt carries its digest.
+    detector_mask: object = None
 
     def __post_init__(self, _claim: object) -> None:
+        header = getattr(self.effective_geometry, "detector_header", None)
         if (
             _claim is not _RSM_V2_FACTORY
+            or (self.corrections is not None and type(self.corrections) is not RSMBoundCorrections)
+            or (self.ub_override is not None and type(self.ub_override) is not RSMBoundUB)
+            or (self.detector_mask is not None and (
+                type(self.detector_mask) is not np.ndarray or self.detector_mask.dtype != np.dtype(bool)
+                or self.detector_mask.flags.writeable or header is None
+                or self.detector_mask.shape != (int(header.Nch1), int(header.Nch2))))
             or type(self.effective_geometry) is not RSMEffectiveGeometry
             or type(self.ordered_geometry_bindings) is not tuple
             or not 1 <= len(self.ordered_geometry_bindings) <= 16
@@ -2284,7 +2799,8 @@ class RSMOperationPlanV2:
             "bounded-chunk-working-set-v1",
             None,
             None,
-        )
+        ) + (() if self.corrections is None else (self.corrections.identity(),)) + (
+            () if self.ub_override is None else (self.ub_override.identity(),))
 
     def to_provenance(self) -> dict[str, object]:
         return {
@@ -2302,6 +2818,10 @@ class RSMOperationPlanV2:
             "working_set_policy": "bounded-chunk-working-set-v1",
             "gi_q_correction": None,
             "gi_intensity_correction": None,
+            # the per-frame corrections, only when the plan has them
+            **({} if self.corrections is None else {"frame_corrections": self.corrections.to_provenance()}),
+            # where the UB came from, only when given at Preview (the sources' own otherwise)
+            **({} if self.ub_override is None else {"ub_source": self.ub_override.to_provenance()}),
             "fingerprint": self.fingerprint,
         }
 
@@ -2325,6 +2845,9 @@ def _make_rsm_operation_plan_v2(
     chunk_size: int,
     max_frame_bytes: int,
     max_chunk_bytes: int,
+    corrections: RSMBoundCorrections | None = None,
+    ub_override: RSMBoundUB | None = None,
+    detector_mask: np.ndarray | None = None,
 ) -> RSMOperationPlanV2:
     canonical = (
         "rsm-operation-plan-v2",
@@ -2347,7 +2870,8 @@ def _make_rsm_operation_plan_v2(
         "bounded-chunk-working-set-v1",
         None,
         None,
-    )
+    ) + (() if corrections is None else (corrections.identity(),)) + (
+        () if ub_override is None else (ub_override.identity(),))
     fingerprint = module_plan_fingerprint(ModuleKind.RSM, canonical)
     return RSMOperationPlanV2(
         effective_geometry,
@@ -2361,6 +2885,9 @@ def _make_rsm_operation_plan_v2(
         max_chunk_bytes,
         fingerprint,
         _RSM_V2_FACTORY,
+        corrections,
+        ub_override,
+        detector_mask,
     )
 
 
@@ -2369,7 +2896,7 @@ class RSMGroupPreflightReceiptV2:
     """Ordered group preflight with exact contribution and grid identity."""
 
     project_root: str
-    geometry_asset_receipt: RSMGeometryAssetReceipt
+    geometry_asset_receipt: RSMGeometryAssetReceipt | RSMCalibrationGeometryReceipt
     effective_geometry: RSMEffectiveGeometry
     ordered_geometry_bindings: tuple[RSMMemberGeometryBinding, ...]
     ordered_members: tuple[RSMPreflightMemberV2, ...]
@@ -2384,7 +2911,7 @@ class RSMGroupPreflightReceiptV2:
             _claim is not _RSM_V2_FACTORY
             or type(self.project_root) is not str
             or not Path(self.project_root).is_absolute()
-            or type(self.geometry_asset_receipt) is not RSMGeometryAssetReceipt
+            or type(self.geometry_asset_receipt) not in _RSM_GEOMETRY_RECEIPTS
             or self.geometry_asset_receipt.project_root != self.project_root
             or type(self.effective_geometry) is not RSMEffectiveGeometry
             or self.effective_geometry.asset_receipt_fingerprint
@@ -2482,7 +3009,7 @@ class RSMGroupPreflightReceiptV2:
 def _make_rsm_group_preflight_v2(
     *,
     project_root: Path,
-    asset: RSMGeometryAssetReceipt,
+    asset: RSMGeometryAssetReceipt | RSMCalibrationGeometryReceipt,
     effective: RSMEffectiveGeometry,
     bindings: tuple[RSMMemberGeometryBinding, ...],
     members: tuple[RSMPreflightMemberV2, ...],
@@ -2620,6 +3147,18 @@ def _effective_geometry_provenance(
         "runtime_requirements": list(
             xu_runtime_requirements_projection(effective.runtime_requirements)
         ),
+        **({} if effective.source == "asset" else {
+            "source": effective.source,
+            "refinement": {
+                "applied": bool(effective.refinement),
+                "angle_offsets_deg": list(effective.angle_offsets),
+                "mount_deg": dict(zip(("detrot", "tilt", "tiltazimuth"), effective.area_mount)),
+                "energy_offset_eV": effective.energy_offset_eV,
+                "calibration_energy_eV": effective.calibration_energy_eV,
+            },
+            # the record is psic's mirror image: the sample frame's q is mirrored (z → −z) into SPEC's handedness
+            **({"mirror": True} if effective.mirror else {}),
+        }),
         "fingerprint": effective.fingerprint,
     }
 
@@ -2628,7 +3167,7 @@ def _rsm_v2_provenance(
     group: ModuleSourceGroupReceipt,
     output: ModuleOutputRequest,
     output_authority: RSMOutputAuthorityReceipt,
-    asset: RSMGeometryAssetReceipt,
+    asset: RSMGeometryAssetReceipt | RSMCalibrationGeometryReceipt,
     effective: RSMEffectiveGeometry,
     plan: RSMOperationPlanV2,
     preflight: RSMGroupPreflightReceiptV2,
@@ -2674,6 +3213,12 @@ def _rsm_v2_provenance(
             "overwrite": output.overwrite.value,
             "output_fingerprint": output.fingerprint,
             **output_authority.to_provenance(),
+            # the stable slot's family, persisted as native Stitch persists its own
+            **(
+                {}
+                if output.artifact_family is None
+                else {"artifact_family": output.artifact_family}
+            ),
         },
         "holds": list(_RSM_V2_HOLDS),
     }
@@ -3089,6 +3634,133 @@ def _rsm_v2_chunk_owned_bytes(
     return 2 * raw_bytes + float_bytes + mask_state_bytes
 
 
+def _rsm_v2_correction_bytes(plan, frame_count: int, member) -> int:
+    """A plan's per-frame corrections, charged with each science chunk (AUD-9 stage 2b S2).
+
+    Measured 2026-10-01 with tracemalloc, every correction on: 72.7 B per detector pixel at Pilatus 100K, one
+    pose (S2.2, ``logs/s2-2-weights-peak.log``: the polarization's lab-frame q and terms over the whole crop, and
+    the weights). S2.3 bands the polarization (``_rsm_weight_band_rows``), so its working set is one band:
+    charged 80 B per band pixel, or Int's threshold's 9 B per detector pixel (a float64 frame and its mask)
+    when larger (they run at different moments). Also charged: one weight array of 8 B per cropped pixel (one
+    per frame when the polarization follows the pose), and the run's decoded mask, dark, flat and solid angle.
+    S2.3 measured (``logs/s23-weights-peak.log``): Pilatus 100K 80.6 B/px at one pose (one band covers that
+    crop); a 2167 x 2070 detector 12.3 B/px with its weight array. None: 0, the charge unchanged."""
+    bound = plan.corrections
+    if bound is None:
+        return 0
+    return _rsm_v2_correction_charge(bound.corrections, bound.dark_receipt is not None,
+                                     bound.flat_receipt is not None, member.detector_shape,
+                                     member.cropped_shape, frame_count)
+
+
+def _rsm_v2_correction_charge(value, dark: bool, flat: bool, detector_shape, cropped_shape,
+                              frame_count: int) -> int:
+    """``_rsm_v2_correction_bytes`` in shapes and flags, so the Preview charges a form before its plan exists
+    (AUD-9 stage 2b S3a): ``value`` the ``RSMFrameCorrections``, ``dark``/``flat`` whether each is bound."""
+    full = math.prod(detector_shape)
+    cropped = math.prod(cropped_shape)
+    resident = full * (1 + 8 * (bool(dark) + bool(flat) + int(value.solid_angle)))
+    polarized = value.polarization_factor is not None
+    # S2.3: the polarization's working set is one band of rows (``_rsm_weight_band_rows``), not the detector;
+    # Int's threshold works on whole frames at another moment, so the larger of the two is charged
+    rows, columns = cropped_shape
+    band = min(int(rows), _rsm_weight_band_rows(columns)) * int(columns)
+    working = max(80 * band if polarized else 0, 9 * full if value.threshold is not None else 0)
+    weighted = value.solid_angle or polarized or bool(flat)
+    # the weights: one detector array, or one per frame when the polarization follows the pose
+    return resident + working + (8 * cropped * (frame_count if polarized else 1) if weighted else 0)
+
+
+def rsm_v2_chunk_bytes(detector_shape, cropped_shape, frame_count: int, *, static_hot: bool,
+                       corrections=None, dark: bool = False, flat: bool = False, detector_mask: bool = False,
+                       point_images: bool = False) -> int:
+    """The bytes a run charges one chunk of ``frame_count`` frames of one member against Max chunk MiB, in
+    shapes and flags (AUD-9 stage 2b S3a): the larger of the science pass (decoded and conditioned frames, q,
+    the feed and the per-frame corrections) and, with all-frame hot masking, the mask pass. The memory plan
+    (``_require_rsm_v2_memory_plan``) and the Preview's Auto cap both charge through it. ``detector_mask``: the
+    plan holds the calibrated detector's own mask (one bool a detector pixel) through both passes (S3c)."""
+    full = math.prod(detector_shape)
+    cropped = math.prod(cropped_shape)
+    held = full * np.dtype(bool).itemsize if detector_mask else 0
+    pixels = frame_count * full
+    raw_bytes = pixels * np.dtype(np.float64).itemsize
+    float_bytes = pixels * np.dtype(np.float64).itemsize
+    # Native image, Int/RSM conditioned copies, the returned point operand, combination and mask.
+    # Grouping is serial within a point, so this transient does not grow with group size.
+    point_bytes = 41 * full if point_images else 0
+    science = point_bytes + _rsm_v2_chunk_owned_bytes(
+        raw_bytes=raw_bytes,
+        float_bytes=float_bytes,
+        pixel_count=pixels,
+        mask_state_bytes=(cropped * np.dtype(bool).itemsize if static_hot else 0) + held,
+        science=True,
+    ) + (0 if corrections is None
+         else _rsm_v2_correction_charge(corrections, dark, flat, detector_shape, cropped_shape, frame_count))
+    if not static_hot:
+        return science
+    mask_state_bytes = max(
+        full * (np.dtype(np.float64).itemsize + 3 * np.dtype(bool).itemsize),
+        full * np.dtype(bool).itemsize + cropped * np.dtype(bool).itemsize,
+    ) + held
+    return max(science, point_bytes + _rsm_v2_chunk_owned_bytes(
+        raw_bytes=raw_bytes,
+        float_bytes=float_bytes,
+        pixel_count=pixels,
+        mask_state_bytes=mask_state_bytes,
+        science=False,
+    ))
+
+
+def _rsm_v2_correction_state_bytes(plan, members) -> int:
+    """The run's one-off correction state, before the chunks (``_rsm_correction_state``, with the grid
+    resident): the decoded mask, dark and flat, and pyFAI's solid angle with its transient, which is not a
+    chunk's but bounds the run's peak too (AUD-9 stage 2b S3a). 0 with no corrections."""
+    bound = plan.corrections
+    if bound is None:
+        return 0
+    full = max(math.prod(member.detector_shape) for member in members)
+    held = full * (1 + 8 * ((bound.dark_receipt is not None) + (bound.flat_receipt is not None)))
+    return held + (full * _RSM_SOLID_ANGLE_TRANSIENT_BYTES_PER_PIXEL if bound.corrections.solid_angle else 0)
+
+
+#: Auto Max chunk MiB's floor: the preset's 256 MiB (AUD-9 stage 2b S3a).
+_RSM_AUTO_CHUNK_FLOOR_BYTES = 256 * 1024 * 1024
+
+
+def rsm_v2_auto_chunking(detector_shape, cropped_shape, chunk_size: int, *, static_hot: bool,
+                         corrections=None, detector_mask: bool = False,
+                         point_images: bool = False) -> tuple[int, int]:
+    """Auto Max chunk MiB (AUD-9 stage 2b S3a): the preset's 256 MiB, or one frame's charge rounded up to the
+    next MiB when that is larger, so a default run never refuses for memory on a large detector (an Eiger 4M's
+    plain frame alone charges 282.3 MiB); and the chunk holds as many frames as that cap fits, at most
+    ``chunk_size`` and at least one. ``corrections``: the form's ``RSMFrameCorrections`` (its dark and flat
+    charged when their paths are set); ``detector_mask``: the calibration's detector has its own mask, which the plan
+    holds. Returns (chunk_size, max_chunk_bytes)."""
+    flags = {
+        "static_hot": static_hot,
+        "corrections": corrections,
+        "dark": corrections is not None and corrections.dark_path is not None,
+        "flat": corrections is not None and corrections.flat_path is not None,
+        "detector_mask": detector_mask,
+        "point_images": point_images,
+    }
+    mib = 1024 * 1024
+    one = rsm_v2_chunk_bytes(detector_shape, cropped_shape, 1, **flags)
+    cap = max(_RSM_AUTO_CHUNK_FLOOR_BYTES, -(-one // mib) * mib)
+    frames = int(chunk_size)
+    while frames > 1 and rsm_v2_chunk_bytes(detector_shape, cropped_shape, frames, **flags) > cap:
+        frames -= 1
+    return frames, cap
+
+
+#: pyFAI's solid angle, computed once a run before the chunks (``_rsm_correction_state``) and not banded,
+#: since banding would change its weights: its traced peak, output included, measured 2026-10-01
+#: (``logs/s3a-solid-angle-transient.log``): 48.1 B/px at Pilatus 100K, 48.0 B/px at 2167 x 2070. Charged at 49.
+#: A refined version-3 calibration's (``rsm_calibration_solid_angle``, Stitch's arm then the inverse turn) peaks
+#: the same: 48.0 B/px at 195 x 1475, turned and not (``logs/s3c-solid-angle-transient.log``).
+_RSM_SOLID_ANGLE_TRANSIENT_BYTES_PER_PIXEL = 49
+
+
 def _load_rsm_v2_raw_chunk(
     source: object,
     labels: tuple[int, ...],
@@ -3104,6 +3776,22 @@ def _load_rsm_v2_raw_chunk(
     # SpecSource's admitted decoder contract returns owned float64 frames even
     # when the authenticated on-disk raw encoding is an integer dtype.
     expected_decoded_dtype = np.dtype(np.float64)
+    try:
+        nexus = "entry" in json.loads(member.source_options_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
+    native_dtype = None
+    policy = _rsm_member_point_policy(member)
+    if getattr(source, "point_image_policy", None) != policy:
+        raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH", "source point-image policy changed")
+    bound = plan.corrections
+    threshold = None if bound is None else bound.corrections.threshold
+    saturation = None if bound is None or bound.saturation is None else bound.saturation[member.ordinal]
+
+    def native_transform(raw):
+        from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+        value = condition_stitch_frame(raw, threshold, saturation)
+        return condition_rsm_images(value, plan.conditioning)[0].copy(order="C")
     frames: list[np.ndarray] = []
     raw_bytes = 0
     pixels_per_frame = math.prod(member.detector_shape)
@@ -3111,16 +3799,26 @@ def _load_rsm_v2_raw_chunk(
         for label in labels:
             if cancel_token is not None and cancel_token.is_set():
                 raise RSMOperationRefused("CANCELLED")
-            observed = np.asarray(source.load_frame(label))
+            observed = np.asarray(source.load_frame(label) if policy is None else
+                                  source.load_point_frame(label, native_transform=native_transform))
             if (
                 observed.dtype.kind not in "biuf"
                 or observed.shape != member.detector_shape
             ):
                 raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
-            owned = np.array(observed, copy=True, order="C")
+            if nexus:
+                # Keep native values until Int's threshold policy runs. Conditioning owns the float64
+                # copy; converting here first would lose native integer saturation sentinels.
+                if native_dtype is None:
+                    native_dtype = observed.dtype
+                elif observed.dtype != native_dtype:
+                    raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
+                owned = np.array(observed, copy=True, order="C")
+            else:
+                owned = np.array(observed, copy=True, order="C")
+                if owned.dtype != expected_decoded_dtype:  # SPEC's decoder contract: float64 every frame
+                    raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
             observed = None
-            if owned.dtype != expected_decoded_dtype:
-                raise RSMOperationRefused("FRAME_LAYOUT_INVALID")
             float_frame_bytes = pixels_per_frame * np.dtype(np.float64).itemsize
             if (
                 owned.nbytes > plan.max_frame_bytes
@@ -3130,13 +3828,13 @@ def _load_rsm_v2_raw_chunk(
             frames.append(owned)
             raw_bytes += owned.nbytes
             float_bytes = len(frames) * float_frame_bytes
-            required = _rsm_v2_chunk_owned_bytes(
+            required = (41 * pixels_per_frame if policy is not None else 0) + _rsm_v2_chunk_owned_bytes(
                 raw_bytes=raw_bytes,
                 float_bytes=float_bytes,
                 pixel_count=len(frames) * pixels_per_frame,
                 mask_state_bytes=mask_state_bytes,
                 science=science,
-            )
+            ) + (_rsm_v2_correction_bytes(plan, len(frames), member) if science else 0)
             if required > plan.max_chunk_bytes:
                 raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
         if cancel_token is not None and cancel_token.is_set():
@@ -3182,6 +3880,271 @@ def _rsm_v2_contribution_angles(
     return tuple(values)
 
 
+def _rsm_member_saturation(threshold, members, detector):
+    """Each member's automatic ceiling (decision 39), through Stitch's shared resolver: a recorded value,
+    then the calibrated detector's documented counter limit, then the native dtype's ceiling (None in the
+    recorded plan; ``member_saturation``). NeXus members supply the descriptor's recorded saturation and
+    native dtype, captured in the existing pixel-free preflight open. The resolved cutoff belongs to the
+    bound corrections, hence the plan fingerprint and provenance. SPEC's decoded-frame contract is unchanged."""
+    if threshold is None or threshold.mode != "auto":
+        return None
+    from xrd_tools.analysis.stitch_native import member_saturation
+    from xrd_tools.core.invalid import resolve_detector_saturation
+    ceilings = []
+    for member in members:
+        try:
+            options = json.loads(member.source_options_json)
+            dtype = (getattr(member, "detector_dtype", None) if "entry" in options
+                     else None if detector is None else np.dtype(options["read_image_kwargs"]["raw_dtype"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            dtype = None
+        ceilings.append(resolve_detector_saturation(recorded=getattr(member, "detector_saturation", None),
+                                                    detector=detector, dtype=dtype))
+    return member_saturation(ceilings)
+
+
+def _bind_rsm_corrections(corrections, members, max_frame_bytes, *, detector=None, detector_mask=None):
+    """Bind a plan's corrections at Preview: Stitch's mask capture and Int-admitted dark and flat
+    (``capture_detector_image``), each the members' full detector shape, and an Auto threshold's ceilings
+    from ``detector``, the calibrated detector's name (``_rsm_member_saturation``). ``detector_mask``, its own
+    mask in the raw frame, is left out of the dark's and flat's usability counts, as Int passes it. None: None."""
+    if type(corrections) not in {RSMFrameCorrections, type(None)}:
+        raise TypeError("RSM corrections must be exact RSMFrameCorrections")
+    if corrections is None or corrections == RSMFrameCorrections():  # every field at its default: none
+        return None
+    from xrd_tools.analysis.stitch_native import capture_detector_image, capture_mask
+    shapes = {tuple(member.detector_shape) for member in members}
+    if len(shapes) != 1:
+        raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", "the members' detectors differ")
+    shape, = shapes
+    if detector_mask is not None and tuple(detector_mask.shape) != shape:
+        raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID",
+                                  f"the calibration's detector is {detector_mask.shape}, the members' {shape}")
+    mask = dark = flat = None
+    try:
+        if corrections.mask_path is not None:
+            mask = capture_mask(corrections.mask_path)
+            if tuple(mask.shape) != shape:
+                raise RSMOperationRefused("RSM_MASK_INVALID", f"the mask is {mask.shape}, the detector {shape}")
+    except ValueError as error:
+        if type(error) is RSMOperationRefused:
+            raise
+        raise RSMOperationRefused("RSM_MASK_INVALID", str(error)) from None
+    for role in ("dark", "flat"):
+        path = getattr(corrections, f"{role}_path")
+        if path is None:
+            continue
+        try:
+            receipt, pixels = capture_detector_image(path, role, max_frame_bytes, corrections.flat_min_fraction,
+                                                     detector_mask=detector_mask)
+        except ValueError as error:
+            raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", str(error)) from None
+        if tuple(pixels.shape) != shape:
+            raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID",
+                                      f"the {role} is {pixels.shape}, the detector {shape}")
+        if role == "dark":
+            dark = receipt
+        else:
+            flat = receipt
+    return RSMBoundCorrections(corrections, mask, dark, flat,
+                               _rsm_member_saturation(corrections.threshold, members, detector),
+                               None if dark is None and flat is None else detector_mask)
+
+
+@dataclass(frozen=True, slots=True)
+class _RSMCorrectionState:
+    """A run's corrections, decoded once: the static invalid pixels (Mask File, unusable dark or flat
+    pixels), the neutral-filled dark and flat, the solid angle, the polarization axes."""
+
+    bound: RSMBoundCorrections
+    invalid: np.ndarray | None
+    dark: np.ndarray | None
+    flat: np.ndarray | None
+    solid: np.ndarray | None
+    axes: tuple | None
+
+
+def _rsm_correction_state(plan, header, diffractometer, asset=None, *,
+                          separate_dark_invalid=False) -> _RSMCorrectionState | None:
+    """Decode a plan's corrections for its run (each image verified against its Preview receipt). The solid
+    angle: a refined version-3 calibration's (``asset``; its mount, as Stitch's arm), else the untilted formula
+    about the beam pixel."""
+    bound = plan.corrections
+    if bound is None:
+        return None
+    from xrd_tools.analysis.stitch_native import capture_detector_image, revalidate_mask
+    from xrd_tools.corrections.frame_preparation import (
+        correction_image, flat_detector_solid_angle, polarization_axes,
+    )
+    shape = (int(header.Nch1), int(header.Nch2))
+    invalid = None
+    if bound.mask_receipt is not None:
+        revalidate_mask(bound.mask_receipt)
+        invalid = np.frombuffer(bound.mask_receipt.pixels, dtype=bool).reshape(shape).copy()
+        if separate_dark_invalid:
+            invalid = invalid.astype(np.uint8)
+    images = {}
+    for role in ("dark", "flat"):
+        receipt = getattr(bound, f"{role}_receipt")
+        if receipt is None:
+            images[role] = None
+            continue
+        current, pixels = capture_detector_image(receipt.lexical_path, role, plan.max_frame_bytes,
+                                                 bound.corrections.flat_min_fraction,
+                                                 detector_mask=bound.detector_mask)
+        if current != receipt:
+            raise RSMOperationRefused("RSM_CORRECTION_IMAGE_INVALID", f"the {role} no longer matches Preview")
+        values, unusable = correction_image(pixels, role, min_fraction=bound.corrections.flat_min_fraction)
+        images[role] = values
+        if unusable is not None:
+            if separate_dark_invalid:
+                # One byte keeps independent invalidity (bit 1) separate from the common dark
+                # (bit 2), without another resident detector mask for mixed member operations.
+                marked = unusable.astype(np.uint8) * (2 if role == "dark" else 1)
+                invalid = marked if invalid is None else np.bitwise_or(invalid, marked)
+            else:
+                invalid = unusable if invalid is None else np.logical_or(invalid, unusable)
+    solid = None
+    if bound.corrections.solid_angle:
+        try:
+            solid = rsm_calibration_solid_angle(asset)
+        except RSMGeometryAssetRefused as error:
+            raise RSMOperationRefused(error.code, str(error)) from None
+        if solid is None:
+            solid = flat_detector_solid_angle(shape, distance=float(header.distance),
+                                              cch=(float(header.cch1), float(header.cch2)),
+                                              pixel_size=(float(header.pwidth1), float(header.pwidth2)))
+        elif tuple(solid.shape) != shape:
+            raise RSMOperationRefused("RSM_CALIBRATION_UNSUPPORTED",
+                                      f"the calibration's solid angle is {solid.shape}, the detector {shape}")
+    axes = None
+    if bound.corrections.polarization_factor is not None:
+        # the outer detector circle (nu) is the vertical; the Diffractometer's or a legacy config's stack
+        circles = getattr(diffractometer, "detector_circles", None) or diffractometer.detector_rot
+        axes = polarization_axes(diffractometer.r_i, circles[0])
+    return _RSMCorrectionState(bound, invalid, images["dark"], images["flat"], solid, axes)
+
+
+#: The rows of one band of the polarization's lab-frame q and terms, in detector pixels: its working set (about
+#: 64 B a pixel, measured) is bounded by this whatever the detector, where an unbanded Eiger 4M needed 359 MB
+#: (AUD-9 stage 2b S2.3).
+_RSM_WEIGHT_BAND_PIXELS = 1 << 18
+
+
+def _rsm_weight_band_rows(cropped_columns: int) -> int:
+    return max(1, _RSM_WEIGHT_BAND_PIXELS // max(1, int(cropped_columns)))
+
+
+def _rsm_chunk_weights(state, mapper, session, angles, energy, roi):
+    """One chunk's normalization weights (solid angle × polarization × flat), cropped to the ROI: one detector
+    array for every frame when they do not depend on the detector pose (no polarization, or one pose), one per
+    frame otherwise; None: no weight (1, as before).
+
+    The polarization is computed in bands of rows (``_rsm_weight_band_rows``), each through ``pixel_q``'s
+    ``rows`` with the crop's own beam centre, so every weight is bit-identical to one whole-detector call;
+    ``frame_weights``' order (solid × polarization, then × flat) is kept band by band, and each distinct pose
+    is computed once."""
+    from xrd_tools.corrections.frame_preparation import frame_weights, polarization_weight
+    if state is None or (state.solid is None and state.axes is None and state.flat is None):
+        return None
+    rows, columns = int(mapper.header.Nch1), int(mapper.header.Nch2)
+    r0, r1, c0, c1 = roi if roi is not None else (0, rows, 0, columns)
+    r1, c1 = rows + r1 if r1 < 0 else r1, columns + c1 if c1 < 0 else c1  # as DetectorHeader.with_roi
+    shape = (r1 - r0, c1 - c0)
+    base = None if state.solid is None else state.solid[r0:r1, c0:c1]
+    flat = None if state.flat is None else state.flat[r0:r1, c0:c1]
+    if state.axes is None:  # no polarization: the same weights at every pose
+        weights = frame_weights(np.ones(shape) if base is None else base, flat=flat)
+        if weights is base or weights.base is not None or weights is state.solid:
+            weights = np.array(weights, copy=True)
+        weights = np.ascontiguousarray(weights, dtype=np.float64)
+        weights.setflags(write=False)
+        return weights
+    nu, delta = (np.asarray(angles[index], dtype=np.float64) for index in (4, 5))
+    poses = [(float(a), float(b)) for a, b in zip(nu, delta)]
+    weights = np.empty(shape if len(set(poses)) == 1 else (len(poses), *shape), dtype=np.float64)
+    xu_module, _numpy = session.active_modules()
+    # the energy q is mapped with: a refined calibration's offset included (C7b), so the scatter is elastic
+    wavelength = float(xu_module.en2lam(float(mapper.mapped_energy(energy))))
+    if mapper.mirror:
+        from dataclasses import replace
+        lab_mapper = replace(mapper, mirror=False)
+    else:
+        lab_mapper = mapper
+    factor = state.bound.corrections.polarization_factor
+    band = _rsm_weight_band_rows(shape[1])
+    first = {}
+    for index, pose in enumerate(poses):
+        target = weights if weights.ndim == 2 else weights[index]
+        if pose in first:
+            if weights.ndim == 3:
+                target[...] = weights[first[pose]]
+            continue
+        first[pose] = index
+        # the detector pose alone, in the lab frame (the sample circles at zero, an identity UB): the elastic
+        # scattered direction of each pixel, as the circles turn (a mirror's map unmirrored: the beam's
+        # polarization is physical, and a left-right mirror leaves its weight unchanged anyway)
+        lab = tuple(np.zeros(1) for _ in range(4)) + (np.array([pose[0]]), np.array([pose[1]]))
+        for start in range(0, shape[0], band):
+            stop = min(start + band, shape[0])
+            qx, qy, qz = lab_mapper.pixel_q(lab, float(energy), UB=np.eye(3), roi=roi, runtime_session=session,
+                                            rows=(start, stop))
+            polarization = polarization_weight(
+                np.asarray(qx)[0], np.asarray(qy)[0], np.asarray(qz)[0], factor=factor,
+                wavelength_A=wavelength, beam=state.axes[0], vertical=state.axes[1])
+            qx = qy = qz = None
+            block = target[start:stop]
+            if base is None:
+                block[...] = polarization  # frame_weights' 1 × polarization
+            else:
+                np.multiply(base[start:stop], polarization, out=block)
+            if flat is not None:
+                np.multiply(block, flat[start:stop], out=block)
+            polarization = None
+    weights.setflags(write=False)
+    return weights
+
+
+def _rsm_member_point_policy(member):
+    value = json.loads(member.source_options_json).get("point_images")
+    return None if value is None else PointImagePolicy.from_dict(value)
+
+
+def _rsm_point_conditioning(member, conditioning):
+    policy = _rsm_member_point_policy(member)
+    if policy is None:
+        return conditioning
+    # Every used native image already received offset/high before grouping. Only the logical
+    # point result participates in static-hot; unused Select operands never reach that pass.
+    return RSMImageConditioning(0., None, conditioning.static_hot_threshold)
+
+
+def _apply_rsm_frame_corrections(raw, conditioned, state, divisors, saturation=None, point_images=None):
+    """A chunk's per-frame corrections, in place on its conditioned float64 frames: Int's threshold on the
+    native values (Auto with the member's resolved ``saturation``, as Stitch passes it), the static invalid
+    pixels, then the dark and the frame's divisor (the shared ``prepare_frame_signal``, Stitch's)."""
+    from xrd_tools.corrections.frame_preparation import FramePreparationRefused, prepare_frame_signal
+    from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
+    threshold = state.bound.corrections.threshold
+    difference = point_images is not None and point_images.operation == "difference"
+    for index in range(conditioned.shape[0]):
+        frame = conditioned[index]
+        if threshold is not None and point_images is None:
+            frame[np.isnan(condition_stitch_frame(raw[index], threshold, saturation))] = np.nan
+        if state.invalid is not None:
+            invalid = state.invalid
+            if invalid.dtype == np.dtype(np.uint8):
+                invalid = (invalid & 1 != 0) if difference else invalid != 0
+            frame[invalid] = np.nan
+        try:
+            prepare_frame_signal(frame, dark=None if difference else state.dark,
+                                 divisor=float(divisors[index]))
+        except FramePreparationRefused:
+            raise RSMOperationRefused("NORMALIZATION_RESULT_INVALID") from None
+    if np.any(np.isinf(conditioned)):
+        raise RSMOperationRefused("NORMALIZATION_RESULT_INVALID")
+
+
 def _make_rsm_v2_chunk_lease(
     source: object,
     member: RSMPreflightMemberV2,
@@ -3190,6 +4153,7 @@ def _make_rsm_v2_chunk_lease(
     *,
     cropped_static_mask: np.ndarray | None,
     cancel_token: threading.Event | None,
+    corrections: _RSMCorrectionState | None = None,
 ) -> RSMGridChunkLease:
     """Build one non-generator chunk whose image roots are owned by its lease."""
 
@@ -3202,10 +4166,12 @@ def _make_rsm_v2_chunk_lease(
         science=True,
         mask_state_bytes=(
             0 if cropped_static_mask is None else cropped_static_mask.nbytes
-        ),
+        ) + (0 if plan.detector_mask is None else plan.detector_mask.nbytes),
         cancel_token=cancel_token,
     )
-    conditioned = condition_rsm_images(raw, plan.conditioning)
+    conditioned = condition_rsm_images(raw, _rsm_point_conditioning(member, plan.conditioning))
+    if plan.detector_mask is not None:  # the calibrated detector's own gaps, whatever the corrections (S3c)
+        np.copyto(conditioned, np.nan, where=plan.detector_mask)
     if cropped_static_mask is not None:
         roi = plan.effective_geometry.roi
         if (
@@ -3227,8 +4193,14 @@ def _make_rsm_v2_chunk_lease(
         [item.normalization_divisor for item in contributions],
         dtype=np.float64,
     )
-    with np.errstate(over="ignore", invalid="ignore"):
-        conditioned /= divisors[:, None, None]
+    if corrections is not None:  # the shared per-frame corrections (AUD-9 stage 2b)
+        saturation = corrections.bound.saturation
+        _apply_rsm_frame_corrections(raw, conditioned, corrections, divisors,
+                                     None if saturation is None else saturation[member.ordinal],
+                                     _rsm_member_point_policy(member))
+    else:
+        with np.errstate(over="ignore", invalid="ignore"):
+            conditioned /= divisors[:, None, None]
     divisors = None
     if np.any(np.isinf(conditioned)):
         raise RSMOperationRefused("NORMALIZATION_RESULT_INVALID")
@@ -3268,7 +4240,7 @@ def _derive_rsm_v2_static_mask(
         ),
         full_pixels * np.dtype(bool).itemsize
         + cropped_pixels * np.dtype(bool).itemsize,
-    )
+    ) + (0 if plan.detector_mask is None else plan.detector_mask.nbytes)
     contributions = member.contributions
     for start in range(0, len(contributions), plan.chunk_size):
         if cancel_token is not None and cancel_token.is_set():
@@ -3283,7 +4255,7 @@ def _derive_rsm_v2_static_mask(
             mask_state_bytes=mask_state_bytes,
             cancel_token=cancel_token,
         )
-        conditioned = condition_rsm_images(raw, plan.conditioning)
+        conditioned = condition_rsm_images(raw, _rsm_point_conditioning(member, plan.conditioning))
         raw = None
         for frame in conditioned:
             if cancel_token is not None and cancel_token.is_set():
@@ -3349,8 +4321,9 @@ def _require_rsm_v2_memory_plan(request: RSMOperationRequestV2) -> None:
     for member in request.preflight.members:
         try:
             options = json.loads(member.source_options_json)
-            declared_raw_dtype = np.dtype(
-                options["read_image_kwargs"]["raw_dtype"]
+            declared_raw_dtype = (
+                np.dtype(np.float64) if "entry" in options  # a NeXus member (C5c)
+                else np.dtype(options["read_image_kwargs"]["raw_dtype"])
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
@@ -3365,46 +4338,33 @@ def _require_rsm_v2_memory_plan(request: RSMOperationRequestV2) -> None:
             or float_bytes // frame_count > plan.max_frame_bytes
         ):
             raise RSMOperationRefused("FRAME_MEMORY_LIMIT_EXCEEDED")
-        full_pixels = math.prod(member.detector_shape)
-        cropped_pixels = math.prod(member.cropped_shape)
-        cropped_mask_bytes = (
-            cropped_pixels * np.dtype(bool).itemsize
-            if plan.conditioning.static_hot_threshold is not None
-            else 0
-        )
-        science_bytes = _rsm_v2_chunk_owned_bytes(
-            raw_bytes=raw_bytes,
-            float_bytes=float_bytes,
-            pixel_count=pixels,
-            mask_state_bytes=cropped_mask_bytes,
-            science=True,
-        )
-        mask_state_bytes = max(
-            full_pixels
-            * (
-                np.dtype(np.float64).itemsize
-                + 3 * np.dtype(bool).itemsize
-            ),
-            full_pixels * np.dtype(bool).itemsize
-            + cropped_pixels * np.dtype(bool).itemsize,
-        )
-        mask_bytes = _rsm_v2_chunk_owned_bytes(
-            raw_bytes=raw_bytes,
-            float_bytes=float_bytes,
-            pixel_count=pixels,
-            mask_state_bytes=mask_state_bytes,
-            science=False,
-        )
-        required = max(
-            science_bytes,
-            mask_bytes if plan.conditioning.static_hot_threshold is not None else 0,
+        bound = plan.corrections
+        required = rsm_v2_chunk_bytes(
+            member.detector_shape,
+            member.cropped_shape,
+            frame_count,
+            static_hot=plan.conditioning.static_hot_threshold is not None,
+            corrections=None if bound is None else bound.corrections,
+            dark=bound is not None and bound.dark_receipt is not None,
+            flat=bound is not None and bound.flat_receipt is not None,
+            detector_mask=plan.detector_mask is not None,
+            point_images="point_images" in options,
         )
         if required > plan.max_chunk_bytes:
-            raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
+            mib = 1024 * 1024
+            raise RSMOperationRefused(
+                "Q_MEMORY_LIMIT_EXCEEDED",
+                f"one chunk of {frame_count} frame{'s' if frame_count != 1 else ''} needs "
+                f"{-(-required // mib)} MiB; Max chunk MiB is {plan.max_chunk_bytes // mib}: raise it, lower "
+                "Chunk, or leave Max chunk MiB on Auto",
+            )
         peak_chunk_bytes = max(peak_chunk_bytes, required)
+    transient_bytes = (fixed_grid_bytes + _rsm_v2_correction_state_bytes(plan, request.preflight.members)
+                       + (0 if plan.detector_mask is None else plan.detector_mask.nbytes))
     resident_bytes = max(
         fixed_grid_bytes + peak_chunk_bytes,
         finalization_bytes,
+        transient_bytes,
     )
     if resident_bytes >= _MAX_RSM_RESIDENT_BYTES:
         raise RSMOperationRefused("Q_MEMORY_LIMIT_EXCEEDED")
@@ -3417,10 +4377,7 @@ def required_rsm_selectors_v2(
     if type(motor_selectors) is not tuple or type(normalization) is not RSMNormalizationPolicy:
         raise TypeError("RSM v2 selector projection requires exact values")
     requested = [selector for _role, selector in motor_selectors]
-    if normalization.foil_selector is not None:
-        requested.append(normalization.foil_selector)
-    if normalization.exposure_selector is not None:
-        requested.append(normalization.exposure_selector)
+    requested.extend(normalization.selectors)
     unique = {
         (selector.name, selector.occurrence): selector for selector in requested
     }
@@ -3499,7 +4456,8 @@ def _resolve_exact_rsm_q_bounds_active(
         )
     session.require_active()
     try:
-        hxrd = mapper.diff_config.make_hxrd(energy)
+        # a refined calibration's energy offset, mount and zero offsets (AUD-9 stage 2b C7b), as pixel_q takes them
+        hxrd = mapper.diff_config.make_hxrd(mapper.mapped_energy(energy))
     except (RSMOperationRefused, XuRuntimeUnsupported):
         raise
     except Exception:
@@ -3516,6 +4474,7 @@ def _resolve_exact_rsm_q_bounds_active(
             distance=float(header.distance),
             Nch1=int(header.Nch1),
             Nch2=int(header.Nch2),
+            **mapper.init_area_extra(),
         )
     except (RSMOperationRefused, XuRuntimeUnsupported):
         raise
@@ -3523,6 +4482,7 @@ def _resolve_exact_rsm_q_bounds_active(
         raise RSMOperationRefused("RSM_MEMBER_Q_BOUNDS_INVALID") from None
     lows = np.full(3, np.inf, dtype=np.float64)
     highs = np.full(3, -np.inf, dtype=np.float64)
+    values = mapper.area_angles(values)
     for start in range(0, frame_count, chunk_size):
         if cancel_token is not None and cancel_token.is_set():
             raise RSMOperationRefused("CANCELLED")
@@ -3531,7 +4491,7 @@ def _resolve_exact_rsm_q_bounds_active(
         try:
             q_values = hxrd.Ang2Q.area(
                 *(item[start:stop] for item in values),
-                UB=matrix,
+                UB=mapper.frame_ub(matrix),  # a mirror's map: through the mirror, as pixel_q
                 **mapper.diff_config.ang2q_kwargs,
             )
             expected = (stop - start, header.Nch1, header.Nch2)
@@ -3567,7 +4527,7 @@ def _resolve_exact_rsm_q_bounds_active(
 def prepare_rsm_operation_v2(
     source_group: ModuleSourceGroupReceipt,
     output: ModuleOutputRequest,
-    geometry_asset_receipt: RSMGeometryAssetReceipt,
+    geometry_asset_receipt: RSMGeometryAssetReceipt | RSMCalibrationGeometryReceipt,
     member_form_fingerprints: tuple[str, ...],
     member_motor_selectors: tuple[
         tuple[tuple[str, MetadataColumnSelector], ...], ...
@@ -3582,15 +4542,19 @@ def prepare_rsm_operation_v2(
     project_root: str | Path,
     coordinate_frame: RSMCoordinateFrame = RSMCoordinateFrame.HKL,
     cancel_token: threading.Event | None = None,
+    corrections: RSMFrameCorrections | None = None,
+    ub_override: RSMUBOverride | None = None,
 ) -> RSMOperationRequestV2:
-    """Build one ordered, image-free RSM v2 Preview transaction."""
+    """Build one ordered, image-free RSM v2 Preview transaction. ``corrections`` (``RSMFrameCorrections``)
+    binds the Mask File, dark and flat here, as Stitch's Preview does. ``ub_override`` (``RSMUBOverride``, HKL
+    only) replaces every member's source UB, typed or from a named SPEC scan."""
 
     if (
         type(source_group) is not ModuleSourceGroupReceipt
         or source_group.kind is not ModuleKind.RSM
         or type(output) is not ModuleOutputRequest
         or output.kind is not AnalysisArtifactKind.RSM
-        or type(geometry_asset_receipt) is not RSMGeometryAssetReceipt
+        or type(geometry_asset_receipt) not in _RSM_GEOMETRY_RECEIPTS
         or type(member_form_fingerprints) is not tuple
         or type(member_motor_selectors) is not tuple
         or len(member_form_fingerprints) != len(source_group.members)
@@ -3606,15 +4570,12 @@ def prepare_rsm_operation_v2(
         or type(bins) is not tuple
         or type(chunk_size) is not int
         or type(max_frame_bytes) is not int
-        or type(max_chunk_bytes) is not int
+        or (max_chunk_bytes is not None and type(max_chunk_bytes) is not int)
         or type(coordinate_frame) is not RSMCoordinateFrame
     ):
         raise TypeError("RSM v2 preparation requires exact grouped values")
-    if output.overwrite is not AnalysisArtifactOverwrite.CREATE_NEW:
-        raise RSMOperationRefused(
-            "RSM_OUTPUT_POLICY_UNSUPPORTED",
-            "RSM v2 must create one new immutable artifact",
-        )
+    # REPLACE regenerates a same-kind RSM result in place; the publisher refuses a
+    # foreign or other-kind file at the target (AUD-9 stage 2, Stitch's Replace).
     if len(set(member_form_fingerprints)) != len(member_form_fingerprints):
         raise RSMOperationRefused(
             "RSM_SOURCE_GROUP_INVALID",
@@ -3642,13 +4603,15 @@ def prepare_rsm_operation_v2(
             "FRAME_MEMORY_LIMIT_EXCEEDED",
             "RSM v2 frame byte limit is outside the absolute bound",
         )
-    if not 1 <= max_chunk_bytes <= _MAX_CHUNK_BYTES:
+    if max_chunk_bytes is not None and not 1 <= max_chunk_bytes <= _MAX_CHUNK_BYTES:
         raise RSMOperationRefused(
             "Q_MEMORY_LIMIT_EXCEEDED",
             "RSM v2 chunk byte limit is outside the absolute bound",
         )
     if cancel_token is not None and type(cancel_token) is not threading.Event:
         raise TypeError("RSM cancellation token must be exact threading.Event")
+    grouped_points = any("point_images" in member.analysis.source_spec.options
+                         for member in source_group.members)
     root = _project_root(project_root)
     if geometry_asset_receipt.project_root != str(root):
         raise RSMOperationRefused(
@@ -3656,12 +4619,48 @@ def prepare_rsm_operation_v2(
             "geometry asset is not bound to the selected Project",
         )
     output = _bind_project_output(output, root)
-    output_authority = _capture_output_authority(output, root)
+    # Preview creates no folder: the run makes it (_create_rsm_v2_output_folder)
+    output_authority = _capture_output_authority(output, root, allow_absent_parent=True)
+    bound_ub = _bind_rsm_ub(ub_override, coordinate_frame)  # after the cheap checks: it reads a file
 
     from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 
+    # the corrections the plan will bind (every field at its default is none, as _bind_rsm_corrections says),
+    # so the Preview charges a chunk exactly as the run's memory plan will
+    charged = None if corrections is None or corrections == RSMFrameCorrections() else corrections
     with xu_runtime_session() as runtime_session:
         effective = lower_rsm_effective_geometry(geometry_asset_receipt)
+        # the calibrated detector's own mask (module gaps), built once (S3c unit 4b): every frame's mask whatever
+        # the corrections, the dark and flat checks' exclusion, and memory the plan holds and charges
+        detector_mask = rsm_calibration_detector_mask(geometry_asset_receipt)
+        if max_chunk_bytes is None:  # Auto: sized from the detector before any member is charged (S3a)
+            header = effective.detector_header
+            cropped = header if effective.roi is None else header.with_roi(effective.roi)
+            chunk_size, max_chunk_bytes = rsm_v2_auto_chunking(
+                (int(header.Nch1), int(header.Nch2)), (int(cropped.Nch1), int(cropped.Nch2)), chunk_size,
+                static_hot=conditioning.static_hot_threshold is not None, corrections=charged,
+                detector_mask=detector_mask is not None, point_images=grouped_points)
+            if max_chunk_bytes > _MAX_CHUNK_BYTES:
+                raise RSMOperationRefused(
+                    "Q_MEMORY_LIMIT_EXCEEDED",
+                    "one frame of this detector exceeds the absolute chunk bound",
+                )
+        else:  # the user's cap: one frame must fit it, said with what it needs before any member is read (S3a)
+            header = effective.detector_header
+            cropped = header if effective.roi is None else header.with_roi(effective.roi)
+            one = rsm_v2_chunk_bytes(
+                (int(header.Nch1), int(header.Nch2)), (int(cropped.Nch1), int(cropped.Nch2)), 1,
+                static_hot=conditioning.static_hot_threshold is not None, corrections=charged,
+                dark=charged is not None and charged.dark_path is not None,
+                flat=charged is not None and charged.flat_path is not None,
+                detector_mask=detector_mask is not None, point_images=grouped_points)
+            if one > max_chunk_bytes:
+                mib = 1024 * 1024
+                raise RSMOperationRefused(
+                    "Q_MEMORY_LIMIT_EXCEEDED",
+                    f"one frame needs {-(-one // mib)} MiB; Max chunk MiB is {max_chunk_bytes // mib}: raise it, "
+                    "or leave Max chunk MiB on Auto",
+                )
         mapper = rsm_effective_pixel_q_map(effective)
         bindings = tuple(
             bind_rsm_member_geometry(
@@ -3672,6 +4671,7 @@ def prepare_rsm_operation_v2(
             for ordinal, motor_selectors in enumerate(member_motor_selectors)
         )
         members: list[RSMPreflightMemberV2] = []
+        captured: list[_RSMCapturedMemberFacts] = []
         for ordinal, (source, binding, form_fingerprint) in enumerate(
             zip(
                 source_group.members,
@@ -3718,11 +4718,14 @@ def prepare_rsm_operation_v2(
                 allow_single_static_hot=True,
                 cancel_token=cancel_token,
                 coordinate_frame=coordinate_frame,
+                ub_override=bound_ub,
             )
             try:
-                read_options = json.loads(facts.source_options_json)[
-                    "read_image_kwargs"
-                ]
+                projected = json.loads(facts.source_options_json)
+                read_options = (
+                    {"detector_shape": facts.detector_shape} if "entry" in projected  # NeXus (C5c)
+                    else projected["read_image_kwargs"]
+                )
             except (KeyError, TypeError, json.JSONDecodeError) as error:
                 raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH") from error
             if (
@@ -3744,6 +4747,7 @@ def prepare_rsm_operation_v2(
                     conditioning=conditioning,
                 )
             )
+            captured.append(facts)
         member_tuple = tuple(members)
         _require_unique_rsm_physical_contributions_v2(member_tuple)
         common_grid = make_rsm_common_grid(
@@ -3761,6 +4765,11 @@ def prepare_rsm_operation_v2(
             chunk_size=chunk_size,
             max_frame_bytes=max_frame_bytes,
             max_chunk_bytes=max_chunk_bytes,
+            corrections=_bind_rsm_corrections(
+                corrections, captured, max_frame_bytes,
+                detector=_rsm_calibration_detector(geometry_asset_receipt), detector_mask=detector_mask),
+            ub_override=bound_ub,
+            detector_mask=detector_mask,
         )
         preflight = _make_rsm_group_preflight_v2(
             project_root=root,
@@ -3773,10 +4782,10 @@ def prepare_rsm_operation_v2(
             plan=plan,
         )
 
-    revalidate_rsm_geometry_asset(geometry_asset_receipt)
+    revalidate_rsm_geometry_source(geometry_asset_receipt)
     for source in source_group.members:
         _fresh_table(source, cancel_token=cancel_token)
-    _requalify_project_output(output, root, output_authority)
+    _requalify_project_output(output, root, output_authority, folders_made=False)
     provenance = _rsm_v2_provenance(
         source_group,
         output,
@@ -3801,7 +4810,7 @@ def prepare_rsm_operation_v2(
         preflight_owner=preflight,
         output_authority_owner=output_authority,
     )
-    return RSMOperationRequestV2(
+    request = RSMOperationRequestV2(
         module,
         plan,
         preflight,
@@ -3809,6 +4818,10 @@ def prepare_rsm_operation_v2(
         canonical,
         _RSM_V2_FACTORY,
     )
+    # the run's memory plan, at Preview too: a chunk its cap cannot hold is refused here, naming what it needs,
+    # not after the sources are opened (AUD-9 stage 2b S3a)
+    _require_rsm_v2_memory_plan(request)
+    return request
 
 
 def _engine_version() -> str:
@@ -3895,6 +4908,9 @@ def _provenance(
             ),
             "absorption_lengths": list(normalization.absorption_lengths),
             "placement": "conditioned-numerator-before-grid",
+            **({} if normalization.monitor_selector is None else {"monitor_selector": {
+                "name": normalization.monitor_selector.name,
+                "occurrence": normalization.monitor_selector.occurrence}}),
         },
         "plan": {
             "bins": list(plan.bins),
@@ -4099,73 +5115,42 @@ def rsm_normalization_divisors(
     *,
     foil_status: np.ndarray | None = None,
     exposure_seconds: np.ndarray | None = None,
+    monitor_counts: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Compute finite positive per-frame divisors for numerator normalization."""
+    """Compute finite positive per-frame divisors for numerator normalization: the shared beam divisor
+    (Stitch's too) of the mode's columns, byte for byte as before for foil transmission × exposure."""
 
     if type(policy) is not RSMNormalizationPolicy:
         raise TypeError("RSM normalization policy must be exact")
     if type(frame_count) is not int or frame_count < 1:
         raise ValueError("RSM normalization frame count must be positive")
+    given = {"foil": foil_status, "exposure": exposure_seconds, "monitor": monitor_counts}
+    wanted = {name for name, selector in (("foil", policy.foil_selector), ("exposure", policy.exposure_selector),
+                                          ("monitor", policy.monitor_selector)) if selector is not None}
     if policy.mode is RSMNormalizationMode.IDENTITY:
-        if foil_status is not None or exposure_seconds is not None:
+        if any(value is not None for value in given.values()):
             raise ValueError("identity normalization does not accept metadata arrays")
         result = np.ones(frame_count, dtype=np.float64)
         result.setflags(write=False)
         return result
-    if foil_status is None or exposure_seconds is None:
+    if any(given[name] is None for name in wanted):
         raise RSMOperationRefused(
             "NORMALIZATION_METADATA_MISSING",
-            "foil and exposure metadata are required",
+            f"{policy.mode.value} normalization requires its "
+            + " and ".join(sorted(wanted)) + " metadata",
         )
-    foil = np.asarray(foil_status, dtype=np.float64)
-    exposure = np.asarray(exposure_seconds, dtype=np.float64)
-    expected = (frame_count,)
-    if foil.shape != expected or exposure.shape != expected:
-        raise RSMOperationRefused(
-            "NORMALIZATION_METADATA_SHAPE_INVALID",
-            "normalization metadata does not match frame membership",
+    if any(value is not None for name, value in given.items() if name not in wanted):
+        raise ValueError(f"{policy.mode.value} normalization takes only its own metadata arrays")
+    try:
+        return frame_divisors(
+            frame_count,
+            monitor=monitor_counts,
+            foil=foil_status,
+            exposure=exposure_seconds,
+            absorption_lengths=None if foil_status is None else policy.absorption_lengths,
         )
-    if not np.all(np.isfinite(foil)) or not np.all(foil == np.floor(foil)):
-        raise RSMOperationRefused(
-            "FOIL_STATUS_INVALID",
-            "foil status must be finite integral values",
-        )
-    if np.any((foil < 0) | (foil > 9999)):
-        raise RSMOperationRefused(
-            "FOIL_STATUS_INVALID",
-            "foil status must be between 0 and 9999",
-        )
-    if not np.all(np.isfinite(exposure)) or np.any(exposure <= 0):
-        raise RSMOperationRefused(
-            "EXPOSURE_INVALID",
-            "exposure seconds must be finite and strictly positive",
-        )
-    codes = foil.astype(np.int64)
-    digits = np.column_stack(
-        (
-            codes // 1000,
-            (codes // 100) % 10,
-            (codes // 10) % 10,
-            codes % 10,
-        )
-    )
-    transmission = np.exp(
-        -(digits @ np.asarray(policy.absorption_lengths, dtype=np.float64))
-    )
-    divisors = transmission * exposure
-    if not np.all(np.isfinite(transmission)) or np.any(transmission <= 0):
-        raise RSMOperationRefused(
-            "TRANSMISSION_INVALID",
-            "foil transmission is non-finite or non-positive",
-        )
-    if not np.all(np.isfinite(divisors)) or np.any(divisors <= 0):
-        raise RSMOperationRefused(
-            "NORMALIZATION_DIVISOR_INVALID",
-            "foil/exposure divisor is non-finite or non-positive",
-        )
-    result = np.array(divisors, dtype=np.float64, copy=True, order="C")
-    result.setflags(write=False)
-    return result
+    except BeamNormalizationRefused as error:
+        raise RSMOperationRefused(error.code, str(error)) from None
 
 
 def condition_rsm_images(
@@ -4803,7 +5788,7 @@ class RSMOperationExecution:
                 self.request.output_authority,
             )
         except RSMOperationRefused as error:
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         try:
             with requalified_analysis_source(
                 self.request.module.source.analysis,
@@ -4852,14 +5837,14 @@ class RSMOperationExecution:
         except AnalysisSourceLeaseRefused as error:
             if error.code == "CANCELLED":
                 return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         except RSMOperationRefused as error:
             disposition = (
                 ModuleDisposition.CANCELLED
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -4894,7 +5879,7 @@ class RSMOperationExecution:
                 self.request.output_authority,
             )
         except RSMOperationRefused as error:
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         provenance = self.request.provenance
         bound = module_artifact_request(self.request.module, provenance)
         try:
@@ -4910,9 +5895,9 @@ class RSMOperationExecution:
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
-        except FileExistsError:
-            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
+        except FileExistsError as error:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS", str(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -4936,7 +5921,7 @@ class RSMOperationExecution:
                     self.request.output_authority,
                 )
             except RSMOperationRefused as error:
-                raise ModuleArtifactRefused(error.code) from error
+                raise ModuleArtifactRefused(error.code, refusal_diagnostic(error)) from error
 
         try:
             terminal = self._output.publish(
@@ -5005,7 +5990,7 @@ def _revalidate_rsm_v2_geometry(request: RSMOperationRequestV2) -> None:
     if type(request) is not RSMOperationRequestV2:
         raise TypeError("RSM v2 revalidation requires an exact request")
     try:
-        revalidate_rsm_geometry_asset(request.preflight.geometry_asset_receipt)
+        revalidate_rsm_geometry_source(request.preflight.geometry_asset_receipt)
         current_effective = lower_rsm_effective_geometry(
             request.preflight.geometry_asset_receipt
         )
@@ -5026,6 +6011,7 @@ def _revalidate_rsm_v2_authorities(
     cancel_token: threading.Event | None,
 ) -> None:
     _revalidate_rsm_v2_geometry(request)
+    _revalidate_rsm_ub(request.plan.ub_override)  # a UB taken from a SPEC file: that file unchanged
     for source, member in zip(
         request.module.source.members,
         request.preflight.members,
@@ -5391,6 +6377,7 @@ class RSMOperationExecutionV2:
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         try:
             _require_rsm_v2_memory_plan(self.request)
+            _create_rsm_v2_output_folder(self.request)
             _revalidate_rsm_v2_authorities(
                 self.request,
                 cancel_token=cancel_token,
@@ -5401,7 +6388,7 @@ class RSMOperationExecutionV2:
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
         self._emit("revalidate", 1)
 
         from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
@@ -5432,6 +6419,15 @@ class RSMOperationExecutionV2:
                     coordinate_frame=self.request.plan.coordinate_frame,
                 )
                 gridder.set_bounds(*self.request.plan.common_grid.bounds)
+                correction_state = _rsm_correction_state(
+                    self.request.plan,
+                    self.request.plan.effective_geometry.detector_header,
+                    self.request.plan.effective_geometry.diffractometer_projection,
+                    self.request.preflight.geometry_asset_receipt,
+                    separate_dark_invalid=any(
+                        policy is not None and policy.operation == "difference"
+                        for policy in map(_rsm_member_point_policy, self.request.preflight.members)),
+                )
                 for source_receipt, member in zip(
                     self.request.module.source.members,
                     self.request.preflight.members,
@@ -5487,6 +6483,11 @@ class RSMOperationExecutionV2:
                                 contributions,
                                 cropped_static_mask=cropped_mask,
                                 cancel_token=cancel_token,
+                                **({} if correction_state is None else {"corrections": correction_state}),
+                            )
+                            weights = _rsm_chunk_weights(
+                                correction_state, mapper, session, angles, member.energy_eV,
+                                self.request.plan.effective_geometry.roi,
                             )
                             release = gridder.add_leased(
                                 lease,
@@ -5497,8 +6498,9 @@ class RSMOperationExecutionV2:
                                     dtype=np.float64,
                                 ),
                                 roi=self.request.plan.effective_geometry.roi,
-                                weight=1.0,
+                                weight=1.0 if weights is None else weights,
                             )
+                            weights = None
                             release_facts = _rsm_grid_chunk_release_facts(
                                 release,
                                 expected_frame_count=len(contributions),
@@ -5534,18 +6536,20 @@ class RSMOperationExecutionV2:
         except AnalysisSourceLeaseRefused as error:
             if error.code == "CANCELLED":
                 return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
-        except RSMGridChunkReleaseError:
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
+        except RSMGridChunkReleaseError as error:
             return self._terminal(
                 ModuleDisposition.REFUSED,
                 "RSM_CHUNK_RELEASE_FAILED",
+                refusal_diagnostic(error),
             )
         except XuRuntimeUnsupported as error:
-            return self._terminal(ModuleDisposition.REFUSED, error.code)
-        except AllocatorPressureUnavailable:
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
+        except AllocatorPressureUnavailable as error:
             return self._terminal(
                 ModuleDisposition.REFUSED,
                 "RSM_ALLOCATOR_PRESSURE_UNAVAILABLE",
+                refusal_diagnostic(error),
             )
         except AllocatorPressureCallFailed:
             return self._terminal(
@@ -5558,7 +6562,7 @@ class RSMOperationExecutionV2:
                 if error.code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, error.code)
+            return self._terminal(disposition, error.code, refusal_diagnostic(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -5597,10 +6601,11 @@ class RSMOperationExecutionV2:
             # with HDF5 validation and strict detached reload.
             if allocator_pressure is not None:
                 allocator_pressure.relieve()
-        except AllocatorPressureUnavailable:
+        except AllocatorPressureUnavailable as error:
             return self._terminal(
                 ModuleDisposition.REFUSED,
                 "RSM_ALLOCATOR_PRESSURE_UNAVAILABLE",
+                refusal_diagnostic(error),
             )
         except AllocatorPressureCallFailed:
             return self._terminal(
@@ -5653,9 +6658,9 @@ class RSMOperationExecutionV2:
                 if code == "CANCELLED"
                 else ModuleDisposition.REFUSED
             )
-            return self._terminal(disposition, code)
-        except FileExistsError:
-            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS")
+            return self._terminal(disposition, code, refusal_diagnostic(error))
+        except FileExistsError as error:
+            return self._terminal(ModuleDisposition.REFUSED, "OUTPUT_EXISTS", str(error))
         except BaseException as error:
             return self._terminal(
                 ModuleDisposition.FAILED,
@@ -5684,7 +6689,7 @@ class RSMOperationExecutionV2:
                     cancel_token=cancel_token,
                 )
             except RSMOperationRefused as error:
-                raise ModuleArtifactRefused(error.code) from error
+                raise ModuleArtifactRefused(error.code, refusal_diagnostic(error)) from error
 
         try:
             terminal = self._output.publish(
@@ -5741,10 +6746,45 @@ def run_rsm_operation_v2(
     )
 
 
+def rsm_output_current(request: RSMOperationRequestV2) -> bool:
+    """Whether ``request``'s output already holds its RSM: the same plan (geometry,
+    grid, conditioning, normalization, frame) over the same members and frames
+    (sources, scans, images and motor readings). A Run in Append mode skips such an
+    output, as Stitch's skips one (``stitch_output_current``, AUD-9 stage 2).
+
+    File revisions are left out as Stitch leaves them out, and with them the
+    metadata table's fingerprint, which carries its SPEC file's revision (probe 2:
+    a SPEC file grown by a later scan changes it and nothing else of the member):
+    an earlier scan's RSM stays standing. The file's envelope alone is read
+    (``rsm_record_identity``); a missing, unreadable or foreign file is not current.
+    """
+
+    from xrd_tools.analysis.stitch_operation import _REVISION_KEYS, _without_revisions
+
+    if type(request) is not RSMOperationRequestV2:
+        raise TypeError("RSM v2 output currency requires an exact request")
+    target = Path(request.module.output.target)
+    identity = rsm_record_identity(target) if target.is_file() else None
+    if identity is None:
+        return False
+    plan_fingerprint, provenance = identity
+    keys = _REVISION_KEYS | {"table_fingerprint"}
+    try:
+        stored = json.loads(provenance)["members"]
+        planned = json.loads(json.dumps(request.provenance["members"]))
+    except (ValueError, KeyError, TypeError):
+        return False
+    return plan_fingerprint == request.plan.fingerprint and _without_revisions(
+        stored, keys
+    ) == _without_revisions(planned, keys)
+
+
 __all__ = [
+    "RSMBoundCorrections",
     "RSMCommonGrid",
     "RSMContribution",
     "RSMDetectorGeometry",
+    "RSMFrameCorrections",
     "RSMImageConditioning",
     "RSMManifestFile",
     "RSMNormalizationMode",
@@ -5777,5 +6817,6 @@ __all__ = [
     "run_rsm_operation",
     "run_rsm_operation_v2",
     "rsm_normalization_divisors",
+    "rsm_output_current",
     "rsm_static_hot_mask",
 ]

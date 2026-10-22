@@ -137,24 +137,6 @@ def _thin_modes(record: FrameRecord, modes: set[_ModeKey]) -> FrameRecord:
     )
 
 
-def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
-    if existing.label != incoming.label:
-        raise ValueError(
-            f"cannot merge FrameRecords with labels {existing.label!r} and "
-            f"{incoming.label!r}"
-        )
-    merged = existing
-    for mode, view in incoming.results_1d.items():
-        merged = merged.with_result_1d(
-            mode, view, make_active=(mode == incoming.active_mode_1d)
-        )
-    for mode, view in incoming.results_2d.items():
-        merged = merged.with_result_2d(
-            mode, view, make_active=(mode == incoming.active_mode_2d)
-        )
-    return merged
-
-
 def _source_identity_from_record(record: FrameRecord) -> str:
     ids: set[str] = set()
     for view in _record_views(record):
@@ -286,7 +268,7 @@ class FrameRecordStore:
         with self._lock:
             existing = self._records.get(label)
             if existing is not None and _same_source_id(self._source_ids.get(label, ""), source_id):
-                record = _merge_records(existing, record)
+                record = existing.merged_with(record)
                 persisted_set = set(self._persisted_modes.get(label, set()))
                 persisted_set.difference_update(incoming_mode_keys)
                 for registry in (self._durable_modes, self._dropped_modes):

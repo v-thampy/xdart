@@ -46,7 +46,8 @@ an artifact family named `<family>`, the operation result slots are:
 
 - `<family>_int1d.nexus`;
 - `<family>_int2d.nexus`;
-- `<family>_average.nexus`;
+- `<family>_int1d_average.nexus` for a 1-D Average;
+- `<family>_int2d_average.nexus` for a 2-D Average (including its 1-D profile);
 - `<family>_reintegrate1d.nexus`;
 - `<family>_reintegrate2d.nexus`;
 - `<family>_stitch1d.nexus`;
@@ -58,6 +59,11 @@ timestamp, or random token.  Full science, source, operation, and publication
 identities remain recorded inside provenance.  Repeating an operation for the
 same family replaces that operation's processed result slot; it does not create
 an accumulating public sequence of version-named files.
+
+Average names were amended on 2026-10-21 to show the selected output dimension.
+The compound slot is generated from the persisted root family; filenames are
+never parsed to recover lineage. Existing outputs remain readable and are not
+renamed. Reintegrate retains its existing separate slots.
 
 For ordinary streamed Run, this decision changes only target naming to the
 `_int1d.nexus` and `_int2d.nexus` slots.  Run's hot integration, writer, and

@@ -62,6 +62,8 @@ def _eiger_master(root: Path, extents=(2, 3)) -> tuple[Path, tuple[Path, ...]]:
     master = root / "scan_master.h5"
     with h5py.File(master, "w") as handle:
         entry = handle.create_group("entry"); entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/detectorSpecific/eiger_fw_version",
+                             data=np.bytes_("release-2022.1.2"))  # the DECTRIS vendor block
         data = entry.create_group("data"); data.attrs["NX_class"] = "NXdata"
         for ordinal, path in enumerate(members, 1):
             data[f"data_{ordinal:06d}"] = h5py.ExternalLink(path.name, "/entry/data/data")
@@ -1603,7 +1605,7 @@ def test_average_promoted_stack_close_pending_retains_owner_and_revalidates(
                     **dict(source.options), "metadata_format": "txt",
                 })
         anchor = root / "scan.nexus"
-        target = root / "scan_average.nexus"
+        target = root / "scan_int1d_average.nexus"
         with h5py.File(target, "w") as handle:
             make_v2_entry(handle, frame_indices=(1,), with_2d=False)
         changed = (
@@ -2056,7 +2058,7 @@ def test_average_refuses_raw_external_storage_output_alias(tmp_path):
     )
 
     master = tmp_path / "scan.nexus"
-    storage = tmp_path / "scan_average.nexus"
+    storage = tmp_path / "scan_int1d_average.nexus"
     values = np.arange(48, dtype=np.uint16).reshape(3, 4, 4) + 10
     storage.write_bytes(values.tobytes())
     with h5py.File(master, "w") as handle:
@@ -2099,7 +2101,7 @@ def test_average_refuses_vds_external_link_source_output_alias(tmp_path):
     )
 
     master = tmp_path / "scan.nexus"
-    intermediate = tmp_path / "scan_average.nexus"
+    intermediate = tmp_path / "scan_int1d_average.nexus"
     middle = tmp_path / "middle.nexus"
     raw = tmp_path / "raw.nexus"
     values = np.arange(48, dtype=np.uint16).reshape(3, 4, 4) + 10
@@ -2529,16 +2531,12 @@ def test_tiff_metadata_cap_precedes_auto_txt_pdi_generic_and_spec_parsers(
     assert unrestricted.source_path == ordinary and unrestricted.values["I0"] == 1.0
     ordinary.unlink()
 
-    class Scan:
-        data = np.array([[1.0]])
-        labels = ("I0",)
-        motor_names = ("theta",)
-        def data_column_by_name(self, _name): return np.array([1.0])
-        def motor_position_by_name(self, _name): return 2.0
-    class Spec:
-        def __init__(self, path): parser_calls.append(("spec", Path(path)))
-        def __getitem__(self, _key): return Scan()
-        def close(self): pass
+    real_spec_file = silx_spec.SpecFile
+    class Spec:  # silx's real parser; each admission recorded
+        def __init__(self, path):
+            parser_calls.append(("spec", Path(path))); self._parser = real_spec_file(path)
+        def __getitem__(self, key): return self._parser[key]
+        def close(self): self._parser.close()
 
     monkeypatch.setattr(silx_spec, "SpecFile", Spec)
     parsers = {
@@ -2574,7 +2572,10 @@ def test_tiff_metadata_cap_precedes_auto_txt_pdi_generic_and_spec_parsers(
         sidecar.unlink()
 
     spec_source = tmp_path / "experiment"
-    spec_source.write_bytes(exact_bytes)
+    spec_scan = b"#F experiment\n#E 1\n#O0 theta\n\n#S 1 ascan theta 0 1 1 1\n#P0 2\n#N 1\n#L I0\n1\n"
+    spec_exact = spec_scan + b"\n" * ((1 << 16) - len(spec_scan))
+    assert len(spec_exact) == 1 << 16
+    spec_source.write_bytes(spec_exact)
     parser_calls.clear()
     observed = metadata_io.read_image_metadata_observed(
         image, meta_format="spec", max_input_bytes=1 << 16,
@@ -2582,7 +2583,7 @@ def test_tiff_metadata_cap_precedes_auto_txt_pdi_generic_and_spec_parsers(
     assert observed.values == {"I0": 1.0, "theta": 2.0}
     assert observed.source_path == spec_source
     assert len(parser_calls) == 1 and parser_calls[0][0] == "spec"
-    spec_source.write_bytes(exact_bytes + b"x")
+    spec_source.write_bytes(spec_exact + b"x")
     parser_calls.clear()
     with pytest.raises(metadata_io.MetadataInputTooLarge):
         metadata_io.read_image_metadata_observed(
@@ -2657,16 +2658,12 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
 
     image = tmp_path / "experiment_scan1_0.tif"
     tifffile.imwrite(image, np.ones((2, 2), dtype="u1"))
-    source = tmp_path / "experiment"; source.write_text("#F experiment\n")
+    source = tmp_path / "experiment"
+    source.write_text("#F experiment\n#E 1\n#O0 theta\n\n#S 1 ascan theta 0 1 1 1\n#P0 4\n#N 1\n#L I0\n3\n")
     scratch = []; events = []
+    real_spec_file = silx_spec.SpecFile
 
-    class Scan:
-        data = np.array([[3.0]])
-        labels = ("I0",)
-        motor_names = ("theta",)
-        def data_column_by_name(self, _name): return np.array([3.0])
-        def motor_position_by_name(self, _name): return 4.0
-    class Parser:
+    class Parser:  # silx's real parser behind a recorder that injects the original faults
         bounded = True
         fail_body = False
         fail_close = False
@@ -2674,15 +2671,17 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
             self.path = Path(path); scratch.append(self.path); events.append("open")
             assert ((self.path != source and self.path.read_bytes() == source.read_bytes())
                     if self.bounded else self.path == source)
-        def __getitem__(self, _key):
+            self._parser = real_spec_file(path)
+        def __getitem__(self, key):
             events.append("body")
             if self.fail_body:
                 if isinstance(self.fail_body, BaseException): raise self.fail_body
                 raise ValueError("parser body")
-            return Scan()
+            return self._parser[key]
         def close(self):
             events.append("close")
             assert self.path.exists()
+            self._parser.close()
             if self.fail_close:
                 raise OSError("parser close")
 
@@ -2767,7 +2766,8 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
                 image, meta_format="spec", max_input_bytes=1 << 16,
             )
     assert events == ["open", "body", "close", "unlink"]
-    assert len(scratch) == 1 and scratch.pop().exists()
+    assert len(scratch) == 1 and scratch[0].exists()
+    scratch.pop().unlink()  # the injected unlink failure left it behind
 
     events.clear(); Parser.fail_body = True
     observed = metadata_io.read_image_metadata_observed(
@@ -2784,3 +2784,86 @@ def test_spec_snapshot_closes_parser_before_unlink_on_every_path(
         )
     assert events == ["open", "body", "close"]
     assert len(scratch) == 1 and not scratch.pop().exists()
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_int_reads_a_generic_nexus_containers_motors_on_every_frame(tmp_path, external) -> None:
+    """CAL-HELD-BATCH-20261009 (maintainer: "I want these things to be addressed in this batch"): Int's run path
+    (run_executor: the qualified cursor's NexusStackSource, then to_scan, whose frame metadata GI reads) carries a
+    non-Bluesky acquisition container's supported motors on frame 0 and later frames, its images self-contained or
+    split, even when it is called scan_master."""
+    from tests.core.test_metadata_provider import _acquisition
+    from xrd_tools.sources.cursor import open_container_cursor
+    from xrd_tools.sources.nexus import NexusStackSource
+    path = tmp_path / "scan_master.h5"
+    _acquisition(path, external=external)
+    value = graph.qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta")
+    entry = value.execution_source.entry or "entry"
+    source = NexusStackSource(path, entry=entry, cursor=open_container_cursor(path, entry=entry))
+    try:
+        frames = source.to_scan().frames
+        assert frames[0].metadata["eta"] == pytest.approx(0.11, rel=0, abs=1e-12)
+        row = frames[2].metadata
+        assert (row["eta"], row["phi"], row["chi"]) == pytest.approx((0.37, 30.0, 12.5), rel=0, abs=1e-9)
+    finally:
+        source.close()
+
+
+def test_a_container_without_the_selected_motor_refuses_naming_its_supported_metadata(tmp_path) -> None:
+    """CAL-HELD-BATCH-20261009: a GI motor a container's supported metadata does not record is refused with the
+    reason and the way on (Manual, or a SPEC/NeXus metadata source), not a bare absence."""
+    path = tmp_path / "plain.nxs"
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/data", data=np.ones((2, 2, 3), dtype=np.uint16))
+    with pytest.raises(ValueError, match=r"'eta' is not in plain\.nxs's supported scan metadata.*Manual"):
+        graph.qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta")
+
+
+def test_average_reads_a_generic_nexus_containers_motors(tmp_path) -> None:
+    """CAL-HELD-BATCH-20261009: the prevalidated Average route reads the same container's motor per frame. Average's
+    own bounded catalog (unchanged) admits only 1-D instrument positioner values and a scalar monochromator energy,
+    so the 0-d constant and the per-frame energy are left out here."""
+    from tests.core.test_metadata_provider import _acquisition
+    path = tmp_path / "acquisition.nxs"
+    _acquisition(path)
+    with h5py.File(path, "a") as handle:
+        del handle["entry/instrument/positioners/chi"]
+        del handle["entry/instrument/monochromator/energy"]
+    value = graph.qualify_source_execution_graph(
+        SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta", reader_binding="average_closed_v1",
+    )
+    with graph.open_source_execution_graph(value) as window:
+        assert window.complete_metadata_for(1)["eta"] == pytest.approx(0.25, rel=0, abs=1e-12)
+
+
+def test_average_reads_generic_metadata_only_through_its_own_bounds(tmp_path) -> None:
+    """CAL-HELD-BATCH-20261009 (added after implementation): on the prevalidated Average route the generic provider
+    reads each metadata dataset through Average's unchanged bounded admission, so a soft-linked sample positioner
+    value (Int resolves it) refuses there with Average's reason before it is read."""
+    from tests.core.test_metadata_provider import _acquisition
+    path = tmp_path / "acquisition.nxs"
+    _acquisition(path)
+    with h5py.File(path, "a") as handle:
+        del handle["entry/instrument/positioners/chi"]
+        del handle["entry/instrument/monochromator/energy"]
+        del handle["entry/sample/positioners/eta/value"]
+        handle["entry/sample/positioners/eta/value"] = h5py.SoftLink("/entry/instrument/positioners/omega/value")
+    value = graph.qualify_source_execution_graph(
+        SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="eta", reader_binding="average_closed_v1",
+    )
+    with graph.open_source_execution_graph(value) as window:
+        with pytest.raises(ValueError, match="AVERAGE_METADATA_INDIRECTION_UNSUPPORTED"):
+            window.complete_metadata_for(0)
+
+
+def test_a_selected_motor_recorded_unsupported_is_refused_with_its_reason(tmp_path) -> None:
+    """CAL-HELD-BATCH-20261009 (added after implementation): a motor the container records but its supported metadata
+    excludes is refused with the named exclusion, not only the supported locations."""
+    from tests.core.test_metadata_provider import _acquisition
+    path = tmp_path / "acquisition.nxs"
+    _acquisition(path)
+    with pytest.raises(ValueError, match=r"'x' is not in acquisition\.nxs's supported scan metadata "
+                                         r"\(x: units 'mm' are not an angle\); choose Manual"):
+        graph.qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="x")

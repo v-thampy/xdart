@@ -15,13 +15,15 @@ from xrd_tools.core import (
     axis_from_unit,
     convert_radial_axis,
 )
-from xrd_tools.core.metadata import resolve_monitor_norm
+from xrd_tools.core.angular_support import AngularSupportProfile, SupportReason
+from xrd_tools.core.metadata import monitor_candidates, resolve_monitor_norm
 from xrd_tools.io import is_readable_output_path
 from xrd_tools.session.display_logic import (
     canonical_axis_key,
     nanmean_slice,
 )
 from xrd_tools.session.gi_derived_view import derive_q_chi
+from xrd_tools.session.rsm_viewer_model import rsm_axis_bounds
 from xrd_tools.session.scan_norm import (
     ScanNormAggregate,
     channel_is_partial,
@@ -36,6 +38,8 @@ from .shell_values import (
     AxisProjection,
     FrameNavigationProjection,
     HeavyProjection,
+    ScientificProjection,
+    SlicePin,
     TraceProjection,
 )
 
@@ -345,9 +349,30 @@ def trace_projection(
             intensity,
             title,
             _finite_metadata_value(view.metadata_numeric, "epoch"),
+            wavelength_m=payload.wavelength_m,
+            angular_support=_trace_angular_support(view, intensity, from_cake=selected_from_cake),
         )
     except Exception:
         return None
+
+
+def _trace_angular_support(view, intensity: np.ndarray, *, from_cake: bool) -> AngularSupportProfile | None:
+    """The trace's angular coverage (COVERAGE-SUPPORT-20261013): its frame's own profile, the very object, when the
+    trace is that native radial row (a display conversion between Q and 2θ keeps each bin's result); a cake-derived
+    slice, a χ or GI-cut row, or a profile of other bins is not that profile."""
+    profile = view.angular_support
+    if profile is None:
+        return None
+    native = view.axis_1d
+    key = None if native is None else canonical_axis_key(f"{native.label} ({native.unit})")
+    if from_cake or key not in _CONVERTIBLE_RADIAL_AXIS_KEYS:
+        return AngularSupportProfile.unavailable(SupportReason.NOT_RADIAL_PROFILE, origin=profile.origin)
+    if not profile.available:
+        return profile
+    if (profile.supported_deg.shape != intensity.shape
+            or profile.radial_unit.startswith("q") != key.startswith("q")):
+        return AngularSupportProfile.unavailable(SupportReason.NOT_RADIAL_PROFILE, origin=profile.origin)
+    return profile
 
 
 def _native_trace_values(
@@ -509,6 +534,50 @@ def slice_recipe_axes_compatible(first: str, second: str) -> bool:
     )
 
 
+def slice_pins_for_plot_axis(
+    pins: tuple[SlicePin, ...],
+    prior_axis: str,
+    requested_axis: str,
+) -> tuple[SlicePin, ...]:
+    """Retarget compatible slice recipes and retire incompatible ones."""
+
+    if requested_axis == prior_axis:
+        return pins
+    if not slice_recipe_axes_compatible(prior_axis, requested_axis):
+        return ()
+    return tuple(
+        replace(pin, plot_axis=requested_axis)
+        for pin in pins
+    )
+
+
+def shown_slice_pin(state: ScientificProjection | None) -> SlicePin | None:
+    """The slice ``state`` shows, as a pin recipe on its current cake; None where there is none to
+    pin (not Overlay or Waterfall, no slice, no cake, or a plot axis the cake cannot cut). The host
+    page still decides whether it owns the frame."""
+
+    heavy = None if state is None else state.heavy
+    if (
+        state is None
+        or state.plot_mode not in {"Overlay", "Waterfall"}
+        or not state.slice_enabled
+        or heavy is None
+        or heavy.cake is None
+        or slice_region_orientation(
+            state.plot_axis,
+            heavy.cake_x,
+            heavy.cake_y,
+        ) is None
+    ):
+        return None
+    return SlicePin(
+        heavy.frame,
+        state.plot_axis,
+        float(state.slice_center),
+        float(state.slice_width),
+    )
+
+
 def _legend_axis_label(axis: AxisProjection) -> str:
     return _LEGEND_AXIS_LABELS.get(
         _axis_key(axis),
@@ -585,6 +654,7 @@ def heavy_projection(
                 requested_axis=requested_axis,
                 wavelength_m=payload.wavelength_m,
             )
+        x_axis, y_axis = (_cake_bin_axis(axis) for axis in (x_axis, y_axis))
         complete_cake = (
             cake is not None
             and x_axis is not None
@@ -602,9 +672,22 @@ def heavy_projection(
             frame, raw, cake, x_axis, y_axis,
             detector_shape=detector_shape,
             detector_source=detector_source,
+            ring_geometry=None if view.geometry is None else view.geometry.poni,
         )
     except Exception:
         return None
+
+
+def _cake_bin_axis(axis: AxisProjection | None) -> AxisProjection | None:
+    """Cake axes are bin centres; share RSM's outer-edge calculation."""
+    if axis is None or axis.values.size < 2:
+        return axis
+    values = axis.values
+    increasing = values[::-1] if values[0] > values[-1] else values
+    try:
+        return replace(axis, edges=rsm_axis_bounds(increasing))
+    except ValueError:
+        return axis  # Keep the existing presentation of non-monotonic axes.
 
 
 def _present_radial_axis(
@@ -679,7 +762,9 @@ def resolve_norm_presentation(
     normalization cannot disagree.  :func:`trace_normalization_scope` derives
     the narrower trace-cache regime from that result.  Exact type and revision
     are validated here; choices carry only complete channels outside the
-    reserved sentinel; the effective channel is empty unless the one accepted
+    reserved sentinel, likely beam monitors first and the time stamp and H, K,
+    L left out unless saved (Stitch's Monitor ordering: ``monitor_candidates``;
+    maintainer 2026-09-30); the effective channel is empty unless the one accepted
     aggregate covers EVERY selected frame and the saved selection
     case-insensitively names a complete, non-reserved channel.
     """
@@ -691,11 +776,14 @@ def resolve_norm_presentation(
         return None, 0, "", ("Norm Channel",)
     choices = (
         "Norm Channel",
-        *(
-            key
-            for key in accepted.channels
-            if key.lower() != _RESERVED_NORM_SENTINEL
-            and not channel_is_partial(accepted, key)
+        *monitor_candidates(
+            (
+                key
+                for key in accepted.channels
+                if key.lower() != _RESERVED_NORM_SENTINEL
+                and not channel_is_partial(accepted, key)
+            ),
+            keep=(saved_channel.lower(),) if type(saved_channel) is str else (),
         ),
     )
     effective = ""

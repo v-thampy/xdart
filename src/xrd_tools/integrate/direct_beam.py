@@ -6,8 +6,11 @@ No integration, plotting, GUI, file writes or calibration-asset construction.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import copy
+import logging
+import os
 from pathlib import Path
 import warnings
 
@@ -15,6 +18,7 @@ import numpy as np
 from scipy.optimize import OptimizeWarning, curve_fit
 
 from xrd_tools.core.geometry.diffractometer import ImageOrientation
+from xrd_tools.core.scan import FrameSource, ScanFrame
 from xrd_tools.integrate.calibration import get_detector
 from xrd_tools.io.image import read_image
 
@@ -46,14 +50,45 @@ class DirectBeamResult:
     image_shape: tuple[int, int]
     slope_deg_per_pixel: float
     intercept_px: float
+    #: The (x, y) beam pixel the strips were placed by: as given, or found (``find_beam_spot``).
+    beam_pixel: tuple[float, float] | None = None
+    #: The direction the spot moves ('horizontal': along x, 'vertical': along y).
+    motion: str | None = None
 
     @property
     def distance_mm(self) -> float:
         return self.distance_m * 1000.0
 
     @property
+    def zero_beam_pixel(self) -> tuple[float, float] | None:
+        """The (x, y) pixel the direct beam hits at the zero angle: the fitted centre along the
+        motion (at ``angle_zero_deg``; the linear model's intercept is at angle 0) and the strips'
+        position across it. ``beam_pixel`` only placed the strips; found on the frame nearest the
+        zero, it is off the zero-angle beam along the motion whenever that frame is not at it."""
+        if self.beam_pixel is None or self.motion not in ('horizontal', 'vertical'):
+            return None
+        centre = (self.intercept_px if self.model == 'tangent'
+                  else self.intercept_px + (self.angle_zero_deg or 0.) / self.slope_deg_per_pixel)
+        x, y = self.beam_pixel
+        return (float(centre), float(y)) if self.motion == 'horizontal' else (float(x), float(centre))
+
+    @property
     def motion_sign(self) -> int:
         return int(np.sign(self.slope_deg_per_pixel))
+
+
+@dataclass(frozen=True)
+class DirectBeamScanInput:
+    """Source inputs valid inside :func:`open_direct_beam_scan`'s context.
+
+    Images are lazy; the caller still supplies detector, beam pixel and fit
+    settings. ``frame_ids=None`` lets the fitter retain explicit image references.
+    """
+
+    angles_deg: np.ndarray
+    images: Iterable
+    frame_ids: tuple | None
+    point_ids: tuple
 
 
 def _uniform_flat(detector):
@@ -98,7 +133,8 @@ def _gaussian_line(x, background, gradient, amplitude, centre, sigma):
     return background + gradient*x + amplitude*np.exp(-.5*((x-centre)/sigma)**2)
 
 
-def _peak(image, invalid, beam, motion, half_width, roi, saturation):
+def _peak(image, invalid, beam, motion, half_width, roi, saturation, *,
+          native_saturated=None, signed=False):
     h,w = image.shape
     x0,y0,x1,y1 = (0,0,w,h) if roi is None else roi
     if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
@@ -107,18 +143,24 @@ def _peak(image, invalid, beam, motion, half_width, roi, saturation):
         raise ValueError('beam_pixel must be inside the oriented image/ROI')
     if motion == 'vertical':
         image, invalid = image.T, invalid.T
+        if native_saturated is not None:
+            native_saturated = native_saturated.T
         x0,y0,x1,y1 = y0,x0,y1,x1
         beam = beam[::-1]
     row = int(np.floor(beam[1]+.5))
     lo,hi = max(y0,row-half_width), min(y1,row+half_width+1)
     strip = image[lo:hi,x0:x1]
-    bad = invalid[lo:hi,x0:x1] | ~np.isfinite(strip) | (strip < 0)
-    # Do not mask out saturation and then fit the remaining wings as a valid beam.
+    bad = invalid[lo:hi,x0:x1] | ~np.isfinite(strip)
+    if not signed:
+        bad |= strip < 0
+    # Static invalid pixels are not measurements. Still reject unmasked saturation
+    # rather than masking it and fitting the remaining wings as a valid beam.
     limit = saturation
     if np.issubdtype(image.dtype,np.integer):
         native_limit = np.iinfo(image.dtype).max
         limit = native_limit if limit is None else min(limit,native_limit)
-    if limit is not None and np.any(strip >= limit):
+    if ((native_saturated is not None and native_saturated[lo:hi,x0:x1].any())
+            or limit is not None and np.any((strip >= limit) & ~bad)):
         raise ValueError('saturated pixels in beam strip/ROI')
     valid = ~bad.any(axis=0)
     x = np.arange(x0,x1,dtype=float)
@@ -153,9 +195,178 @@ def _peak(image, invalid, beam, motion, half_width, roi, saturation):
     return float(centre),error
 
 
+def find_beam_spot(image, invalid=None, *, box: int = 5) -> tuple[float, float]:
+    """Where the direct beam hits an oriented frame, as (x, y) = (column, row).
+
+    The brightest ``box`` × ``box`` sum (a lone hot pixel is diluted ``box``² times),
+    refined as the background-subtracted intensity centroid of the 11 × 11 pixels around
+    it (a narrower window biases it toward the brightest pixel). Invalid pixels (``invalid``, negative or nonfinite) count as zero. A frame with no
+    spot clear of its background is refused.
+    """
+    from scipy.ndimage import uniform_filter
+    values = np.asarray(image, dtype=float)
+    bad = ~np.isfinite(values) | (values < 0)
+    if invalid is not None:
+        bad |= np.asarray(invalid, dtype=bool)
+    if values.ndim != 2 or bad.all():
+        raise ValueError('no valid pixels to find the direct beam on')
+    clean = np.where(bad, 0.0, values)
+    summed = uniform_filter(clean, size=box, mode='constant')
+    row, col = np.unravel_index(int(np.argmax(summed)), summed.shape)
+    level = float(np.median(summed[~bad]))
+    spread = 1.4826 * float(np.median(np.abs(summed[~bad] - level)))
+    if not summed[row, col] - level > max(10 * spread, .5 * abs(level), 1e-12):
+        raise ValueError('no direct-beam spot stands clear of the background')
+    rows, cols = slice(max(row - 5, 0), row + 6), slice(max(col - 5, 0), col + 6)
+    weights = np.where(bad[rows, cols], 0., np.clip(clean[rows, cols] - float(np.median(clean[~bad])), 0., None))
+    grid_rows, grid_cols = np.mgrid[rows, cols][:, :weights.shape[0], :weights.shape[1]]
+    total = float(weights.sum())
+    return float((weights * grid_cols).sum() / total), float((weights * grid_rows).sum() / total)
+
+
+def _load_beam_image(item, options, *, native_transform=None):
+    if item is None:
+        raise ValueError('missing frame')
+    if isinstance(item,np.ndarray):
+        return item
+    if isinstance(item, ScanFrame):
+        if native_transform is not None:
+            if not callable(item.point_statistics_loader):
+                raise ValueError('grouped direct-beam frame has no native point loader')
+            return item.point_statistics_loader(native_transform=native_transform).signal
+        return item.load_image()
+    opts = options.copy()
+    path = item
+    if isinstance(item,tuple):
+        if len(item) not in (2,3):
+            raise ValueError('frame reference must be (path,frame[,dataset])')
+        path,opts['frame'] = item[:2]
+        if len(item) == 3:
+            opts['dataset_path'] = item[2]
+    return read_image(path,preserve_dtype=True,exact_frame=True,**opts)
+
+
+def _prepare_beam_image(image, det, orient, mask, state, *, native_values=True):
+    if image.ndim != 2 or not all(image.shape):
+        raise ValueError('image shape must be nonempty 2-D')
+    if not state:
+        effective,pitches = _effective_detector(det,image.shape)
+        detector_mask = effective.mask
+        if detector_mask is not None:
+            if detector_mask.shape != image.shape:
+                raise ValueError('detector mask shape differs from image shape')
+            detector_mask = orient.apply(detector_mask).astype(bool)
+        if orient.swaps_axes:
+            pitches = pitches[::-1]
+        state.update(raw_shape=image.shape, effective=effective, detector_mask=detector_mask,
+                     pitches=pitches)
+    if image.shape != state['raw_shape']:
+        raise ValueError(f"image shape {image.shape} differs from {state['raw_shape']}")
+    oriented = orient.apply(image)
+    invalid = (np.zeros(oriented.shape,bool) if state['detector_mask'] is None
+               else state['detector_mask'].copy())
+    if native_values:
+        dummy, tolerance = state['effective'].get_dummies(image)
+        if dummy is not None:
+            invalid |= np.abs(oriented.astype(np.float32)-dummy) <= tolerance
+    if mask is not None:
+        if np.shape(mask) != oriented.shape:
+            raise ValueError('mask shape must match the oriented image')
+        invalid |= np.asarray(mask,dtype=bool)
+    return oriented, invalid
+
+
+def _prepared_beam_image(item, options, det, orient, mask, state, saturation):
+    """Prepare used native operands, retaining saturation independently of their sum.
+
+    A saturated strip is refused even when averaging hides its native count.
+    Invalid native pixels propagate through the point combiner; detector dummy
+    values and a positive-count cutoff do not reinterpret a signed Difference.
+    """
+    policy = item.metadata.get('point_images') if isinstance(item, ScanFrame) else None
+    grouped = isinstance(policy, Mapping)
+    saturated = None
+
+    def native_transform(native):
+        nonlocal saturated
+        oriented, invalid = _prepare_beam_image(native, det, orient, mask, state)
+        bad = invalid | ~np.isfinite(oriented) | (oriented < 0)
+        limit = saturation
+        if np.issubdtype(native.dtype, np.integer):
+            native_limit = np.iinfo(native.dtype).max
+            limit = native_limit if limit is None else min(limit, native_limit)
+        if limit is not None:
+            hits = (oriented >= limit) & ~bad
+            saturated = hits if saturated is None else np.logical_or(saturated, hits)
+        image = np.array(native, dtype=np.float64, copy=True)
+        image[orient.unapply(bad)] = np.nan
+        return image
+
+    image = _load_beam_image(item, options, native_transform=native_transform if grouped else None)
+    oriented, invalid = _prepare_beam_image(image, det, orient, mask, state, native_values=not grouped)
+    return oriented, invalid, saturated, grouped and policy.get('operation') == 'difference'
+
+
+def infer_direct_beam_motion(images: Sequence, *, detector, detector_config=None,
+        orientation=None, mask=None, saturation=None, roi=None, reader_options=None,
+        cancelled=None, return_details=False):
+    """Measure the dominant displacement between the first and last usable frames.
+
+    Items are lazy references, as in the fitter. Only endpoint candidates are decoded,
+    one at a time. Beam extraction shares the fitter's detector mask, orientation,
+    Gaussian peak checks and inclusive saturation rejection. A stationary or diagonal
+    trajectory cannot select a strip axis safely and is refused.
+    """
+    orient = orientation or ImageOrientation()
+    if detector_config is None:
+        det = get_detector(detector)
+    else:
+        from pyFAI.detectors import detector_factory
+        det = detector_factory(detector, config=dict(detector_config))
+    _uniform_flat(det)
+    state = {}
+
+    def endpoint(indices, excluded=None):
+        reason = 'no direct-beam spot'
+        for index in indices:
+            if index == excluded:
+                continue
+            if cancelled is not None and cancelled.is_set():
+                raise ValueError('direct-beam detection cancelled')
+            try:
+                image, invalid, native_saturated, signed = _prepared_beam_image(
+                    images[index], dict(reader_options or {}), det, orient, mask, state, saturation)
+                if roi is not None:
+                    x0, y0, x1, y1 = roi
+                    outside = np.ones(image.shape, dtype=bool)
+                    outside[y0:y1, x0:x1] = False
+                    invalid |= outside
+                spot = find_beam_spot(image, invalid)
+                x, _ = _peak(image, invalid, spot, 'horizontal', 2, roi,
+                    None if signed else saturation, native_saturated=native_saturated, signed=signed)
+                y, _ = _peak(image, invalid, spot, 'vertical', 2, roi,
+                    None if signed else saturation, native_saturated=native_saturated, signed=signed)
+                return index, np.array((x, y))
+            except (ValueError, OSError, RuntimeError) as error:
+                reason = str(error)
+        raise ValueError('No usable direct-beam endpoint: ' + reason)
+
+    first, start = endpoint(range(len(images)))
+    last, stop = endpoint(range(len(images) - 1, -1, -1), first)
+    delta = stop - start
+    dx, dy = np.abs(delta)
+    if os.environ.get('XDART_DEBUG_DIRECT_BEAM'):
+        logging.getLogger(__name__).warning('direct_beam endpoints=%s,%s pixels=%s,%s '
+            'displacement=%g,%g orientation=%s', first, last, start, stop, dx, dy, orient)
+    if max(dx, dy) < 2 or max(dx, dy) < 3 * min(dx, dy):
+        raise ValueError('Ambiguous or insignificant direct-beam endpoint motion')
+    motion = 'horizontal' if dx > dy else 'vertical'
+    return (motion, tuple(float(value) for value in delta), (first, last)) if return_details else motion
+
+
 def calibrate_direct_beam(
     angles_deg: Sequence[float], images: Iterable, *, detector,
-    beam_pixel: tuple[float, float], detector_config: Mapping | None = None,
+    beam_pixel: tuple[float, float] | None = None, detector_config: Mapping | None = None,
     motion: str = 'horizontal', strip_half_width: int = 2,
     model: str = 'tangent', angle_zero_deg: float | None = None,
     orientation: ImageOrientation | None = None, roi: tuple[int,int,int,int] | None = None,
@@ -165,7 +376,8 @@ def calibrate_direct_beam(
 ) -> DirectBeamResult:
     """Fit distance from explicit degree angles and ordered images/references.
 
-    An item is a 2-D array, path, ``(path, frame)`` or ``(path, frame, dataset)``;
+    An item is a 2-D array, lazy ``ScanFrame``, path, ``(path, frame)`` or
+    ``(path, frame, dataset)``;
     ``None`` denotes a missing frame. References use ``read_image`` with exact
     frame selection. ``reader_options`` accepts raw dtype/header/shape and HDF
     dataset/frame options, never image transforms or masking.
@@ -186,11 +398,16 @@ def calibrate_direct_beam(
     perpendicular sample-to-plane separation for a sample-centred detector arm.
     ``model='linear'`` uses the notebook's inverse regression and local distance
     approximation, without needing a known zero. No tilt/wavelength/PONI is fit.
-    The beam pixel selects the strip only, not the fitted intercept.
+    The beam pixel selects the strip only, not the fitted intercept. Without one
+    (``beam_pixel=None``) it is found (:func:`find_beam_spot`) on the frame nearest
+    ``angle_zero_deg`` (the middle angle without a zero), a missing or unreadable
+    frame passing to the next nearest; the result's ``beam_pixel`` says which.
 
-    Negative/nonfinite pixels and masks exclude whole strip-profile bins; invalid
+    Negative/nonfinite native pixels and masks exclude whole strip-profile bins; invalid
     beam cores and saturation reject a frame. Set ``saturation`` to the detector's
     acquisition limit (inclusive); integer dtype maximum is also rejected.
+    Confirmed grouped frames check used native operands before combination;
+    finite negative Difference values remain valid background for a positive peak.
     Unknown clipping/count-rate effects cannot be inferred from intensity alone.
     At least three usable rows at distinct angles and significant motion are required.
     """
@@ -212,8 +429,8 @@ def calibrate_direct_beam(
         raise ValueError("motion must be 'horizontal' or 'vertical'")
     if not isinstance(strip_half_width,(int,np.integer)) or strip_half_width < 0:
         raise ValueError('strip_half_width must be a nonnegative integer')
-    beam = np.asarray(beam_pixel,dtype=float)
-    if beam.shape != (2,) or not np.isfinite(beam).all():
+    beam = None if beam_pixel is None else np.asarray(beam_pixel,dtype=float)
+    if beam is not None and (beam.shape != (2,) or not np.isfinite(beam).all()):
         raise ValueError('beam_pixel must be finite (x,y)')
     if roi is not None and (len(roi) != 4 or any(not isinstance(v,(int,np.integer)) for v in roi)):
         raise ValueError('ROI must contain four integer bounds')
@@ -241,66 +458,62 @@ def calibrate_direct_beam(
     centres = np.full(len(angles),np.nan)
     errors = centres.copy()
     reasons, references = [],[]
-    raw_shape = None
-    pitch = effective_shape = detector_mask = None
-    iterator = iter(images)
+    state = {}  # the first readable image's layout: raw shape, effective detector, its mask, the pitch
+
+    def prepared(item):
+        result = _prepared_beam_image(item, options, det, orient, mask, state, saturation)
+        state['pitch'] = float(state['pitches'][1 if motion == 'horizontal' else 0])
+        return result
+
+    iterator = iter(images)  # streamed: no frame is kept past its row
+    if beam is None:  # the zero frame first: the rows' items are gathered (lazy references stay undecoded)
+        items = list(iterator)
+        if len(items) != len(angles):
+            raise ValueError('image and angle lengths differ')
+        zero = np.median(angles) if angle_zero_deg is None else angle_zero_deg
+        problems = []
+        for index in np.argsort(np.abs(angles-zero), kind='stable'):
+            try:
+                oriented, invalid, _saturated, _signed = prepared(items[index])
+                beam = np.asarray(find_beam_spot(oriented, invalid), dtype=float)
+                oriented = invalid = _saturated = None
+                break
+            except (OSError,ValueError,IndexError,KeyError,RuntimeError) as exc:
+                problems.append(f'row {int(index)}: {exc}')
+        else:
+            raise ValueError('no frame shows the direct beam; enter the beam pixel ('
+                             + '; '.join(problems[:3]) + ')')
+
+        def released():
+            for index in range(len(items)):
+                item, items[index] = items[index], None
+                yield item
+        iterator = released()
     for index in range(len(angles)):
         try:
             item = next(iterator)
         except StopIteration as exc:
             raise ValueError('image and angle lengths differ') from exc
-        references.append(index if isinstance(item,np.ndarray) or item is None else item)
+        reference = ((item.source_identity, item.index) if isinstance(item, ScanFrame)
+                     else index if isinstance(item, np.ndarray) or item is None else item)
+        references.append(reference)
         try:
-            if item is None:
-                raise ValueError('missing frame')
-            if isinstance(item,np.ndarray):
-                image = item
-            else:
-                opts = options.copy()
-                path = item
-                if isinstance(item,tuple):
-                    if len(item) not in (2,3):
-                        raise ValueError('frame reference must be (path,frame[,dataset])')
-                    path,opts['frame'] = item[:2]
-                    if len(item) == 3:
-                        opts['dataset_path'] = item[2]
-                image = read_image(path,preserve_dtype=True,exact_frame=True,**opts)
-            if image.ndim != 2 or not all(image.shape):
-                raise ValueError('image shape must be nonempty 2-D')
-            if raw_shape is None:
-                effective,pitches = _effective_detector(det,image.shape)
-                raw_shape = image.shape
-                detector_mask = effective.mask
-                if detector_mask is not None:
-                    if detector_mask.shape != raw_shape:
-                        raise ValueError('detector mask shape differs from image shape')
-                    detector_mask = orient.apply(detector_mask).astype(bool)
-                if orient.swaps_axes:
-                    pitches = pitches[::-1]
-                pitch = float(pitches[1 if motion == 'horizontal' else 0])
-            if image.shape != raw_shape:
-                raise ValueError(f'image shape {image.shape} differs from {raw_shape}')
-            oriented = orient.apply(image)
-            effective_shape = oriented.shape
-            invalid = np.zeros(effective_shape,bool) if detector_mask is None else detector_mask.copy()
-            dummy, tolerance = effective.get_dummies(image)
-            if dummy is not None:
-                invalid |= np.abs(oriented.astype(np.float32)-dummy) <= tolerance
-            if mask is not None:
-                if np.shape(mask) != effective_shape:
-                    raise ValueError('mask shape must match the oriented image')
-                invalid |= np.asarray(mask,dtype=bool)
+            oriented, invalid, native_saturated, signed = prepared(item)
             centres[index],errors[index] = _peak(oriented,invalid,beam,motion,
-                strip_half_width,roi,saturation)
+                strip_half_width,roi,None if signed else saturation,
+                native_saturated=native_saturated,signed=signed)
         except (OSError,ValueError,IndexError,KeyError,RuntimeError,OptimizeWarning) as exc:
             reasons.append(f'{type(exc).__name__}: {exc}')
         else:
             reasons.append(None)
         # No scan stack or array-valued frame identifiers are retained.
-        item = image = oriented = None
+        item = oriented = invalid = native_saturated = None
     sentinel = object()
     if next(iterator,sentinel) is not sentinel:
         raise ValueError('image and angle lengths differ')
+    pitch = state.get('pitch')
+    effective_shape = None if not state else tuple(state['raw_shape'][::-1] if orient.swaps_axes
+                                                   else state['raw_shape'])
     used = np.isfinite(centres)
     if used.sum() < 3 or np.unique(angles[used]).size < 3:
         detail = '; '.join(f'row {i}: {r}' for i,r in enumerate(reasons) if r)
@@ -320,6 +533,10 @@ def calibrate_direct_beam(
     intercept = float(y.mean()-slope*x.mean())
     regression_residual = y-(intercept+slope*x)
     slope_std = float(np.sqrt((regression_residual@regression_residual)/(len(x)-2)/ss))
+    if os.environ.get('XDART_DEBUG_DIRECT_BEAM'):
+        logging.getLogger(__name__).warning('direct_beam motion=%s orientation=%s shape=%s '
+            'used=%s centre_span_px=%g slope=%g slope_std=%g', motion, orient,
+            state['raw_shape'], int(used.sum()), float(np.ptp(centres[used])), slope, slope_std)
     if abs(slope) <= max(1e-12,3*slope_std) or np.ptp(centres[used]) < 1e-6:
         raise ValueError('degenerate or insignificant beam motion')
     if model == 'tangent':
@@ -340,40 +557,174 @@ def calibrate_direct_beam(
     return DirectBeamResult(float(distance),float(uncertainty),angles,
         tuple(references) if ids is None else ids,points,centres,errors,used,
         tuple(reasons),predictions,centres-predictions,model,angle_zero_deg,pitch,
-        effective_shape,slope_deg,float(intercept_px))
+        effective_shape,slope_deg,float(intercept_px),(float(beam[0]),float(beam[1])),motion)
+
+
+@contextmanager
+def open_direct_beam_scan(
+    scan_file: str | Path | FrameSource, scan: str | int | None = None, *,
+    images: Iterable | None = None, image_file: str | Path | None = None,
+    image_dir: str | Path | None = None, filename_template: str | None = None,
+    point_index_origin: int = 0, motor: str = 'del',
+    angles_deg: Sequence[float] | None = None,
+    frame_indices: Sequence[int] | None = None, entry: str = 'entry',
+):
+    """Load paired angles and lazy images from SPEC, raw NeXus or FrameSource.
+
+    SPEC requires an exact scan number/repetition and either ``image_file``
+    (an Eiger/NeXus container), ordered ``images``, or ``image_dir`` plus a
+    filename template. Raw NeXus needs no scan selector; the existing metadata
+    reader supplies ``motor``, or ``angles_deg`` supplies explicit degree angles.
+    Beam pixel, mask, detector and acquisition cutoff are never inferred here.
+
+    ``frame_indices`` selects ordered original labels (zero-based for files),
+    and their corresponding metadata rows. Automatic whole-container pairing
+    requires equal counts; an explicit subset requires only its paired rows.
+    For an arbitrary different angle/frame association use the numerical API.
+    Explicit ``images`` already defines its own order and cannot be reselected.
+
+    A caller-owned FrameSource supplies raw frames and either ``motors`` arrays,
+    per-frame ``metadata_for`` values, or explicit ``angles_deg`` aligned with
+    its full ``frame_indices`` order. Its name/path labels provenance; callers
+    can override IDs in the fitter. It is never closed here. Container handles
+    opened here close on context exit, including errors. Consume images inside
+    the context. Units and detector-arm motor meaning remain caller choices.
+    """
+    from xrd_tools.io.spec import is_spec_file, read_spec_scan_table
+    from xrd_tools.io.nexus import read_nexus
+    from xrd_tools.sources.cursor import ContainerCursor
+
+    if not isinstance(point_index_origin, int):
+        raise ValueError('point_index_origin must be an integer')
+    template_input = image_dir is not None or filename_template is not None
+    if sum((images is not None, image_file is not None, template_input)) > 1:
+        raise ValueError('supply only one of images, image_file, or image_dir/filename_template')
+    with ExitStack() as resources:
+        key = None
+        references = False
+        frame_source = None
+        if isinstance(scan_file, FrameSource):
+            if scan is not None or images is not None or image_file is not None or template_input:
+                raise ValueError('FrameSource already supplies images; no scan or image options allowed')
+            labels = tuple(scan_file.frame_indices)
+            identity = getattr(scan_file, 'path', getattr(scan_file, 'name', 'source'))
+            load = scan_file.load_frame
+            frame_source = scan_file
+            if angles_deg is None:
+                motors = getattr(scan_file, 'motors', {})
+                if motor in motors:
+                    angles_deg = motors[motor]
+                else:
+                    metadata = getattr(scan_file, 'metadata_for', None)
+                    if metadata is None:
+                        raise ValueError(f'source has no {motor!r} metadata; supply angles_deg')
+                    try:
+                        angles_deg = [metadata(label)[motor] for label in labels]
+                    except KeyError as exc:
+                        raise ValueError(f'source has no {motor!r} angle column') from exc
+        else:
+            path = Path(scan_file)
+            if scan is not None or is_spec_file(path):
+                if scan is None:
+                    raise ValueError('SPEC input requires an explicit scan number/repetition')
+                if angles_deg is not None:
+                    raise ValueError('SPEC supplies angles; use the numerical API for explicit angles')
+                key = str(scan)
+                if '.' not in key:
+                    key += '.1'
+                columns, _, count = read_spec_scan_table(path, key)
+                if motor not in columns:
+                    raise ValueError(f'{motor!r} is not a scanned column in SPEC {key}')
+                angles_deg = columns[motor]
+                if images is not None:
+                    if frame_indices is not None:
+                        raise ValueError('explicit images already select their rows; omit frame_indices')
+                    yield DirectBeamScanInput(np.array(angles_deg, dtype=float), images, None,
+                        tuple((key, i + point_index_origin) for i in range(count)))
+                    return
+                if image_file is None:
+                    if image_dir is None or filename_template is None or '{point' not in filename_template:
+                        raise ValueError('supply image_file, images, or image_dir/template with {point}')
+                    number, repetition = key.split('.')
+                    labels = tuple(range(count))
+                    identity = path
+                    def load(index):
+                        return Path(image_dir) / filename_template.format(
+                            point=index + point_index_origin, scan=int(number), repetition=int(repetition))
+                    references = True
+                else:
+                    path = Path(image_file)
+            else:
+                if images is not None or image_file is not None or template_input:
+                    raise ValueError('NeXus input already supplies images; omit image options')
+                if angles_deg is None:
+                    metadata = read_nexus(path, entry, motor_names=[motor], counter_names=[])
+                    if motor not in metadata.angles:
+                        raise ValueError(f'NeXus has no {motor!r} angle column; supply angles_deg')
+                    angles_deg = metadata.angles[motor]
+            if not references:
+                cursor = resources.enter_context(ContainerCursor(path, entry=entry))
+                labels = tuple(range(cursor.frame_count))
+                identity, load = path, cursor.read_frame
+
+        angles = np.array(angles_deg, dtype=float, copy=True)
+        if angles.ndim != 1 or not np.isfinite(angles).all():
+            raise ValueError('angles_deg must be a finite one-dimensional array')
+        if frame_indices is None and len(angles) != len(labels):
+            raise ValueError(f'angle/image count mismatch: {len(angles)} angles, {len(labels)} frames')
+        selected = labels if frame_indices is None else tuple(frame_indices)
+        if (any(isinstance(i, (bool, np.bool_)) or not isinstance(i, (int, np.integer)) for i in selected)
+                or len(set(selected)) != len(selected)):
+            raise ValueError('frame_indices must contain unique integer labels')
+        positions = {label: i for i, label in enumerate(labels)}
+        if any(label not in positions for label in selected):
+            raise ValueError('selected frame label is absent from source')
+        rows = [positions[label] for label in selected]
+        if any(row >= len(angles) for row in rows):
+            raise ValueError('selected frame has no corresponding angle row')
+        points = (tuple((key, row + point_index_origin) for row in rows) if key is not None
+                  else tuple((identity, label) for label in selected))
+        if references:
+            image_items = (load(label) for label in selected)
+            ids = None
+        else:
+            def frame_item(label):
+                metadata = {} if frame_source is None else dict(frame_source.metadata_for(label))
+                statistics = None
+                if isinstance(metadata.get('point_images'), Mapping):
+                    point_loader = getattr(frame_source, 'load_point_statistics', None)
+                    statistics = (lambda **kwargs: point_loader(label, **kwargs)) if callable(point_loader) else (
+                        frame_source.frame_for(label).point_statistics_loader)
+                return ScanFrame(index=label, source_identity=str(identity), metadata=metadata,
+                    loader=lambda frame: load(frame.index), point_statistics_loader=statistics)
+            image_items = (frame_item(label) for label in selected)
+            ids = tuple((identity, label) for label in selected)
+        yield DirectBeamScanInput(angles[rows], image_items, ids, points)
 
 
 def calibrate_direct_beam_scan(
-    scan_file: str | Path, scan: str | int, *, images: Iterable | None = None,
+    scan_file: str | Path | FrameSource, scan: str | int | None = None, *,
+    images: Iterable | None = None, image_file: str | Path | None = None,
     image_dir: str | Path | None = None, filename_template: str | None = None,
-    point_index_origin: int = 0, motor: str = 'del', **calibration_options,
+    point_index_origin: int = 0, motor: str = 'del',
+    angles_deg: Sequence[float] | None = None,
+    frame_indices: Sequence[int] | None = None, entry: str = 'entry',
+    **calibration_options,
 ) -> DirectBeamResult:
-    """Thin SPEC adapter; ``scan=23`` means key ``'23.1'``, never list index.
+    """One-call wrapper around source loading and the numerical distance fit.
 
-    Supply ordered ``images`` OR ``image_dir`` and an explicit filename template
-    with ``{point}`` (and optionally ``{scan}``, ``{repetition}``). Row numbers
-    start at ``point_index_origin``; no missing-path discovery or renumbering.
-    All numerical/reader options pass to :func:`calibrate_direct_beam`.
+    See :func:`open_direct_beam_scan` for sources/selection and
+    :func:`calibrate_direct_beam` for detector, explicit beam pixel and fit options.
+    Existing SPEC calls retain their scan-number/repetition and image semantics.
     """
-    from xrd_tools.io.spec import read_spec_scan_table
-    key = str(scan)
-    if '.' not in key:
-        key += '.1'
-    columns,_,count = read_spec_scan_table(scan_file,key)
-    if motor not in columns:
-        raise ValueError(f'{motor!r} is not a scanned column in SPEC {key}')
-    if not isinstance(point_index_origin,int):
-        raise ValueError('point_index_origin must be an integer')
-    points = tuple((key,i+point_index_origin) for i in range(count))
-    if images is None:
-        if image_dir is None or filename_template is None or '{point' not in filename_template:
-            raise ValueError('supply images or image_dir and filename_template with {point}')
-        number,repetition = key.split('.')
-        images = (Path(image_dir)/filename_template.format(point=point,scan=int(number),
-                   repetition=int(repetition)) for _,point in points)
-    elif image_dir is not None or filename_template is not None:
-        raise ValueError('supply either images or image_dir/filename_template')
-    return calibrate_direct_beam(columns[motor],images,point_ids=points,**calibration_options)
+    with open_direct_beam_scan(scan_file, scan, images=images, image_file=image_file,
+            image_dir=image_dir, filename_template=filename_template,
+            point_index_origin=point_index_origin, motor=motor, angles_deg=angles_deg,
+            frame_indices=frame_indices, entry=entry) as inputs:
+        calibration_options.setdefault('frame_ids', inputs.frame_ids)
+        calibration_options.setdefault('point_ids', inputs.point_ids)
+        return calibrate_direct_beam(inputs.angles_deg, inputs.images, **calibration_options)
 
 
-__all__ = ['DirectBeamResult','calibrate_direct_beam','calibrate_direct_beam_scan']
+__all__ = ['DirectBeamResult', 'DirectBeamScanInput', 'open_direct_beam_scan',
+           'calibrate_direct_beam', 'calibrate_direct_beam_scan']

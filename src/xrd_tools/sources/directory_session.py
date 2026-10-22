@@ -8,13 +8,16 @@ may share this session without racing directory polls or probe bookkeeping.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import logging
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from xrd_tools.sources import directory_index
 from xrd_tools.sources.directory_index import (
     DirectoryIndex,
     IndexDelta,
@@ -23,6 +26,7 @@ from xrd_tools.sources.directory_index import (
 )
 from xrd_tools.sources.discover import Candidate
 from xrd_tools.sources.probe import ProbeResult, ProbeState
+from xrd_tools.sources.selection import SeriesBound
 from xrd_tools.core.filters import compile_filter
 
 
@@ -35,13 +39,14 @@ class DirectorySessionConfig:
     recursive: bool = False
     name_filter: str | None = None
     suffixes: tuple[str, ...] = ()
+    series: SeriesBound | None = None  # a Live Image Series: only its members
 
     @classmethod
-    def build(cls, root, *, recursive=False, name_filter=None, suffixes=()):
+    def build(cls, root, *, recursive=False, name_filter=None, suffixes=(), series=None):
         normalized = tuple(str(item).lower() for item in suffixes if item)
         return cls(
             Path(root).expanduser(), bool(recursive), name_filter or None,
-            normalized)
+            normalized, series)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +158,21 @@ class DirectoryIndexSession:
         self._probe_time_budget_s = float(probe_time_budget_s)
         self._probe_candidates = bool(probe_candidates)
         self._probe_excluded: set[Candidate] = set()
+        # A lazy (non-probing) session returns its last observation again while
+        # the index returns the same Snapshot and no probe result moved.
+        self._results_version = 0
+        self._last: tuple[Snapshot, int, DirectoryObservation] | None = None
+        self._paths: tuple[Snapshot, Mapping[Path, Candidate]] | None = None
+        # D1: the paths a Live Run watches (None: off), a forced listing, and
+        # the last real listing's start with what a deferral must find unchanged.
+        self._watched: tuple[Path, ...] | None = None
+        self._force = False
+        self._listed: tuple[float, tuple, tuple] | None = None
+        self.listing_deferred = False
+        # The paths the last refreshing observation saw first: a listing concurrent with
+        # writes can show a newer file and miss an older one, so a Live Run admits a
+        # file only once a later listing has seen it again.
+        self.fresh: frozenset[Path] = frozenset()
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xdart-directory-index")
         self._closed = False
@@ -168,11 +188,11 @@ class DirectoryIndexSession:
             return self._desired
 
     def configure(
-        self, root, *, recursive=False, name_filter=None, suffixes=(),
+        self, root, *, recursive=False, name_filter=None, suffixes=(), series=None,
     ) -> int:
         config = DirectorySessionConfig.build(
             root, recursive=recursive, name_filter=name_filter,
-            suffixes=suffixes)
+            suffixes=suffixes, series=series)
         with self._lock:
             if self._closed:
                 raise RuntimeError("directory index session is closed")
@@ -289,18 +309,34 @@ class DirectoryIndexSession:
             )
             self._active = config
             self._results.clear()
+            self._results_version += 1
             self._visible_candidates = ()
+            self._last = None
 
         index = self._index
-        snapshot = (
-            index.poll()
-            if refresh or reconfigured or index.snapshot.generation == 0
-            else index.snapshot
-        )
+        deferred = refresh and self._defers(index, reconfigured)
+        if (refresh and not deferred) or reconfigured or index.snapshot.generation == 0:
+            if self._watched is not None:
+                directories = self._directories(index)
+                self._listed = (time.monotonic(), directories, self._watch(directories))
+            snapshot = index.poll()
+        else:
+            snapshot = index.snapshot
+        last = self._last
+        if (last is not None and not self._probe_candidates and last[0] is snapshot
+                and last[1] == self._results_version and last[2].request_generation == generation):
+            # Same Snapshot object, no probe result moved and nothing to probe:
+            # exactly the observation a rebuild would make, with an empty delta.
+            self.fresh = frozenset() if refresh else self.fresh
+            return replace(last[2], delta=IndexDelta(), content_opens=0, stale_drops=0,
+                           elapsed_s=time.perf_counter() - started)
+        raw_snapshot = snapshot
         name_ok = compile_filter(config.name_filter)
 
         def included(candidate: Candidate) -> bool:
             name = candidate.path.name
+            if config.series is not None and config.series.key(name) is None:
+                return False
             low = name.lower()
             suffix = next(
                 (item for item in config.suffixes if low.endswith(item)), "")
@@ -314,11 +350,7 @@ class DirectoryIndexSession:
             snapshot.generation, candidates, snapshot.root,
             snapshot.recursive, config.name_filter)
         current = snapshot.by_path()
-        self._results = {
-            path: stored
-            for path, stored in self._results.items()
-            if current.get(path) == stored[0]
-        }
+        self._prune_results(current)
 
         content_opens = 0
         stale_drops = 0
@@ -372,21 +404,18 @@ class DirectoryIndexSession:
                         reason=f"{type(exc).__name__}: {exc}",
                     )
                 self._results[candidate.path] = (candidate, result)
+                self._results_version += 1
 
         # A probe can race a file mutation or owner flip.  Re-poll before
         # publishing so no stale candidate identity reaches the GUI or Run.
         if stale_drops:
-            snapshot = index.poll()
+            snapshot = raw_snapshot = index.poll()
             candidates = tuple(filter(included, snapshot.candidates))
             snapshot = Snapshot(
                 snapshot.generation, candidates, snapshot.root,
                 snapshot.recursive, config.name_filter)
             current = snapshot.by_path()
-            self._results = {
-                path: stored
-                for path, stored in self._results.items()
-                if current.get(path) == stored[0]
-            }
+            self._prune_results(current)
 
         prior_by_path = {
             candidate.path: candidate for candidate in self._visible_candidates
@@ -405,6 +434,7 @@ class DirectoryIndexSession:
                 if candidate.path not in current_by_path),
         )
         self._visible_candidates = snapshot.candidates
+        self.fresh = frozenset(candidate.path for candidate in delta.added) if refresh else self.fresh
 
         queued_result = ProbeResult(
             ProbeState.IN_PROGRESS,
@@ -435,7 +465,7 @@ class DirectoryIndexSession:
             snapshot.recursive,
             snapshot.name_filter,
         )
-        return DirectoryObservation(
+        observation = DirectoryObservation(
             request_generation=generation,
             discovered_snapshot=snapshot,
             ready_snapshot=ready_snapshot,
@@ -446,6 +476,14 @@ class DirectoryIndexSession:
             elapsed_s=time.perf_counter() - started,
             unprobed_count=unprobed_count,
         )
+        self._last = (raw_snapshot, self._results_version, observation)
+        return observation
+
+    def _prune_results(self, current: Mapping[Path, Candidate]) -> None:
+        kept = {path: stored for path, stored in self._results.items() if current.get(path) == stored[0]}
+        if len(kept) != len(self._results):
+            self._results_version += 1
+        self._results = kept
 
     def _probe_candidate_on_owner(
         self,
@@ -463,7 +501,14 @@ class DirectoryIndexSession:
             config,
             refresh,
         )
-        current = observation.discovered_snapshot.by_path().get(candidate.path)
+        return self._probe_exact(observation, candidate, force_reprobe)
+
+    def _probe_exact(self, observation: DirectoryObservation, candidate: Candidate,
+                     force_reprobe: bool) -> CandidateObservation:
+        snapshot = observation.discovered_snapshot
+        if self._paths is None or self._paths[0] is not snapshot:
+            self._paths = (snapshot, snapshot.by_path())
+        current = self._paths[1].get(candidate.path)
         if current != candidate:
             raise StaleCandidateError(
                 f"{candidate.path} changed before its deferred probe"
@@ -473,14 +518,87 @@ class DirectoryIndexSession:
             raise RuntimeError("directory index session has no active index")
         if force_reprobe:
             index.discard_probe_resolution(current)
-            self._results.pop(current.path, None)
+            if self._results.pop(current.path, None) is not None:
+                self._results_version += 1
         stored = self._results.get(candidate.path)
         retrying = index.retry_state(candidate.path) is not None
         if stored is not None and stored[0] == current and not retrying:
             return CandidateObservation(current, stored[1])
         result = index.probe_candidate(current)
         self._results[current.path] = (current, result)
+        self._results_version += 1
         return CandidateObservation(current, result)
+
+    def probe_candidates(self, candidates, *, refresh: bool = False, reprobe: bool = False,
+                         stop_unready: bool = True, cancelled=None) -> tuple[CandidateObservation, ...]:
+        """:meth:`probe_candidate` (with ``reprobe``, :meth:`reprobe_candidate`) for each candidate in
+        order, against one observation in one owner call; ``stop_unready`` ends after the first that is
+        not READY, a stale one raises once the earlier are recorded, and ``cancelled`` is asked before each."""
+        candidates = tuple(candidates)
+        if any(type(candidate) is not Candidate for candidate in candidates):
+            raise TypeError("candidate probe requires an exact Candidate")
+        generation, config = self._request()
+        return self._executor.submit(self._probe_candidates_on_owner, generation, config, candidates,
+                                     bool(refresh), bool(reprobe), bool(stop_unready), cancelled).result()
+
+    def _probe_candidates_on_owner(self, generation, config, candidates, refresh, reprobe, stop_unready,
+                                   cancelled) -> tuple[CandidateObservation, ...]:
+        observation = self._observe_on_owner(generation, config, refresh)
+        observed: list[CandidateObservation] = []
+        for candidate in candidates:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("admission cancelled")
+            value = self._probe_exact(observation, candidate, reprobe)
+            observed.append(value)
+            if stop_unready and value.result.state is not ProbeState.READY:
+                break
+        return tuple(observed)
+
+    #: A deferred listing (D1) is younger than this, so a real one follows
+    #: within a poll and its work more: inside 1 s.
+    LISTING_AGE_S = 0.75
+
+    def defer_listing(self, watched) -> None:
+        """D1, a Live Run's session: a refreshing observation keeps the last real listing while it is
+        under LISTING_AGE_S old and the registrations, the watched directories and ``watched`` files
+        (pending or growing in place) are unchanged; ``None`` turns it off."""
+        self._watched = None if watched is None else tuple(watched)
+
+    def force_listing(self) -> None:
+        self._force = True
+
+    @staticmethod
+    def _directories(index) -> tuple:
+        """The watched directories: the root, and with Subdirs its immediate subfolders (the bounded plan)."""
+        if not index.snapshot.recursive:
+            return (index.root,)
+        try:
+            with os.scandir(index.root) as entries:
+                return (index.root, *sorted(entry.path for entry in entries if entry.is_dir()))
+        except OSError:
+            return (index.root,)
+
+    def _watch(self, directories) -> tuple:
+        from xrd_tools.sources.adapters import registry_identity
+        return (registry_identity(), *map(directory_index.directory_identity, directories),
+                *((path, directory_index.directory_identity(path)) for path in self._watched or ()))
+
+    def _defers(self, index, reconfigured: bool) -> bool:
+        from xrd_tools.sources.registry import name_pure_registry  # only name-pure owners may skip a listing
+        forced, self._force, listed = self._force, False, self._listed
+        self.listing_deferred = not (forced or reconfigured) and self._watched is not None and (
+            listed is not None and index.snapshot.generation != 0 and name_pure_registry()
+            and time.monotonic() - listed[0] < self.LISTING_AGE_S and listed[2] == self._watch(listed[1]))
+        return self.listing_deferred
+
+    def reuse_records(self) -> tuple[tuple, ...]:
+        """One record per path kept between polls for reuse (discovery's memo, the path map)."""
+        def records():
+            memo = {} if self._index is None else self._index._discovery
+            paths = () if self._paths is None else self._paths[1]
+            return tuple((None, str(path)) for path in (
+                *memo.get("candidates", ()), *memo.get("owners", ()), *paths))
+        return self._executor.submit(records).result()
 
     def close(self) -> None:
         with self._lock:

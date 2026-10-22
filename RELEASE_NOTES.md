@@ -1,0 +1,86 @@
+# Release notes
+
+## 1.2.0 (2026-10-22)
+
+This release brings Stitch 1D, Stitch 2D and reciprocal-space mapping into the
+Scattering Workspace alongside integration and the viewers.
+
+### Processing and analysis
+
+- **Stitch 1D and Stitch 2D:** process raw detector frames with scan-angle
+  metadata using pyFAI MultiGeometry or xrayutilities histogram. Standard and
+  grazing-incidence workflows share calibration, masking, result browsing and
+  analysis tools. Stitch 2D saves both a map and an independent 1D profile.
+- **RSM:** build HKL or Cartesian-Q volumes from raw scans with a six-circle
+  PSIC calibration. Browse saved volumes, open the 3D viewer, make custom slices,
+  and use the native lineout, 2D and 3D fitting tools.
+- **Saved results and notebooks:** reopen Stitch/RSM `.nexus` results without
+  reprocessing. Export processing inputs through **Help → Export Run notebook…**
+  and export supported fit workflows from their fit windows to Jupyter or
+  marimo. Raw-image inspection and processing replay still need their sources.
+- **Stitch text companions:** saved profiles have `iq_` or `itth_` XYE companions;
+  saved grazing-incidence cuts also have `iqip_` and `iqoop_` companions. The GI
+  cut header identifies its third column as an estimated uncertainty.
+
+See the README's [Stitch](README.md#stitch-1d-and-stitch-2d) and
+[RSM](README.md#reciprocal-space-mapping-rsm) workflows for input and calibration
+requirements.
+
+### Corrections and behavior changes
+
+- Standard radial q/2θ integration preserves the requested detector directions
+  for the corrected seam-crossing azimuth windows. Exact 360° Standard radial
+  ranges use Auto admission. **Regenerate affected older outputs with
+  Replace/Overwrite; Append does not repair old frames.**
+- Active Stitch/RSM result folders use natural name order immediately, including
+  results not yet read by the folder catalog. Rows keep that order when the
+  catalog arrives. The newest result remains current but need not be the last
+  row. No-selection fit batches follow the visible order; selected batches use
+  the existing selection order.
+- **Each page lists its own results.** The Data Browser's filename filter starts
+  with the current mode's operation suffixes: `_int1d, _int2d, _reintegrate1d,
+  _average` in Int 1D, `_int2d, _reintegrate2d, _average` in Int 2D, `_stitch1d,
+  _stitch2d` in Stitch 1D, `_stitch2d` in Stitch 2D and `_rsm` in RSM. Folders and
+  the results being viewed always stay listed. Typed text matches anywhere in a
+  filename (separate alternatives with commas); clear the field to list every
+  result, including older or hand-named files without an operation suffix. Stitch
+  and RSM also offer Int's Time order.
+- **Average results name their dimension:** a new Average writes
+  `<family>_int1d_average.nexus` or `<family>_int2d_average.nexus`. A 1.1.5
+  `<family>_average.nexus` stays readable, but a new Average does not replace it.
+- On Linux and macOS, Stitch, RSM, Average and Reintegrate saves no longer delete
+  or publish a file that another process put in their place.
+- Calibration dialogs release their windows and pending restore callbacks with
+  their owners, reducing retained GUI memory.
+- Live input discovery reuses unchanged identities and avoids repeated checks
+  while retaining strict admission and publication checks. A newly seen file is
+  processed once a second directory listing confirms it; network directory
+  visibility remains relevant.
+
+### Dependencies and plot exports
+
+- Update silx to 3.1.3, fixing the Python 3.13 HDF5 tree crash in **silx view**;
+  update SciPy to 1.18.1, NumExpr to 2.14.2 and hdf5plugin to 7.1.0.
+- Restore SVG plot export under Qt 6.11 with the upstream close-path correction
+  for the pinned pyqtgraph 0.14.0. PNG and the shared export guards remain available.
+- Keep NumPy 2.5.1, pyFAI 2026.9.x and xrayutilities 1.7.12. The supported native
+  installers also keep FabIO 2025.10.0 and PySide6 6.11.x from conda-forge;
+  the planned FabIO 2026.06 and PySide6 6.12 updates await conda-forge packages.
+
+### Upgrading and installation
+
+Use the [migration checklist](MIGRATION.md#upgrading-from-115-to-120) before
+continuing existing outputs. The processed-file format is not bulk-migrated, and
+installing the update does not recalculate saved data.
+
+**Pixi and conda environments using conda-forge's compiled dependencies are the
+supported GUI installation routes.** A pip-only GUI install is best-effort;
+headless `pip install xdart` remains available. See
+[installation instructions](docs/INSTALLATION.md).
+
+### Known limitations
+
+Read the [limitations and workarounds](docs/LIMITATIONS.md), especially the
+explicit full-turn I(χ)/cake limitation, the Auto workaround, additional memory
+for seam-window integrators, and the scope of full-turn Auto behavior. Release
+qualification, native operation and package publication remain separate steps.

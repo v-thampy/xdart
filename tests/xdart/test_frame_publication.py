@@ -667,6 +667,52 @@ def test_live_publication_carries_record_and_view_is_active_projection():
     assert_frameview_equivalent(pub.view, pub.record.active_view())
 
 
+def test_publication_reuses_only_its_exact_views_frozen_metadata():
+    view = FrameView(
+        label=3, metadata_raw={"sample": "LaB6", "monitor": 100.0},
+        metadata_numeric={"monitor": 100.0}, source_path="/raw/raw_0003.tif",
+        source_frame_index=3,
+    )
+    for publication in (
+        FramePublication(view),
+        FramePublication(view, metadata_raw=view.metadata_raw,
+                         metadata_numeric=view.metadata_numeric),
+        publication_from_frame_view(view),
+    ):
+        assert publication.metadata_raw is view.metadata_raw
+        assert publication.metadata_numeric is view.metadata_numeric
+        revised = replace(publication, generation=1)
+        assert revised.metadata_raw is view.metadata_raw
+        assert revised.metadata_numeric is view.metadata_numeric
+        with pytest.raises(TypeError):
+            revised.metadata_raw["sample"] = "changed"
+        with pytest.raises(TypeError):
+            revised.metadata_numeric["monitor"] = 1.0
+
+
+def test_publication_still_snapshots_explicit_metadata_overrides():
+    view = FrameView(label=3, metadata_raw={"sample": "LaB6"},
+                     metadata_numeric={"monitor": 100.0})
+    raw = {"sample": "Si", "nested": [1]}
+    numeric = {"monitor": 200.0}
+    publication = FramePublication(view, metadata_raw=raw, metadata_numeric=numeric)
+    raw["sample"] = "changed"
+    numeric["monitor"] = 1.0
+    assert publication.metadata_raw["sample"] == "Si"
+    assert publication.metadata_raw["nested"] is raw["nested"]
+    assert publication.metadata_numeric == {"monitor": 200.0}
+    assert publication.metadata_raw is not view.metadata_raw
+    assert publication.metadata_numeric is not view.metadata_numeric
+
+
+def test_publication_metadata_fallback_and_numeric_derivation_are_unchanged():
+    view = FrameView(label=3, metadata_raw={"sample": "LaB6", "monitor": 100.0})
+    publication = FramePublication(view, metadata_raw={}, metadata_numeric={})
+    assert publication.metadata_raw == view.metadata_raw
+    assert publication.metadata_numeric == {"monitor": 100.0}
+    assert FramePublication(FrameView(label=4)).metadata_numeric == {}
+
+
 def test_non_gi_record_is_single_default_mode():
     rec = publication_from_live_frame(DuckFrame(idx=4)).record
     assert len(rec.results_1d) == 1 and len(rec.results_2d) == 1

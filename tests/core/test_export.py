@@ -9,12 +9,36 @@ import pytest
 from xrd_tools.io.export import read_xye, write_h5, write_xye
 
 
+def test_export_prepares_all_parts_before_replacing_any_destination(tmp_path):
+    from xrd_tools.io.export import write_exports_atomically
+    notebook = tmp_path / 'prior.ipynb'
+    notebook.write_bytes(b'prior notebook')
+    with pytest.raises(FileNotFoundError):
+        write_exports_atomically(((notebook, 'replacement'),
+                                  (tmp_path / 'missing-folder' / 'input.npz', b'input')))
+    assert notebook.read_bytes() == b'prior notebook'
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['prior.ipynb']
+
+
 # XYE is written at "%.9g" (io/export.py), so a round trip is lossy in the 9th
 # significant digit.  The tolerance below IS the accepted contract: values are
 # preserved to better than 5e-9 relative, far beyond any XRD measurement.  The
 # whole-number fixtures used elsewhere in this file cannot distinguish "%.9g"
 # from the old "%.18e" and so pin nothing -- these values can.
 XYE_ROUND_TRIP_RTOL = 5e-9
+
+
+def test_atomic_xye_preserves_formatter_and_replacement_mode(tmp_path):
+    import stat
+    ordinary, atomic = tmp_path / "ordinary.xye", tmp_path / "atomic.xye"
+    values = [0, np.nan, 1.0000000049]
+    write_xye(ordinary, [1, 2, 3], values, [0, np.nan, 0.25])
+    atomic.write_bytes(b"prior")
+    atomic.chmod(0o640)
+    write_xye(atomic, [1, 2, 3], values, [0, np.nan, 0.25], atomic=True)
+    assert atomic.read_bytes() == ordinary.read_bytes()
+    assert stat.S_IMODE(atomic.stat().st_mode) == 0o640
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_write_xye(tmp_path):

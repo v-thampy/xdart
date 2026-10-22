@@ -35,6 +35,7 @@ from xdart.gui.tabs.scattering.shell_values import (
 )
 from xdart.gui.tabs.scattering.state_machine import RunPhase
 from tests.xdart.scattering._admission import ImmediateAdmission
+from tests.xdart.scattering._e2sd_support import write_poni
 
 
 @pytest.fixture
@@ -218,6 +219,8 @@ def _page(
     live: bool = True,
 ) -> tuple[ScatteringWorkspace, _Executor]:
     root.mkdir(parents=True, exist_ok=True)
+    # Since a53c324e Run refuses an absent PONI before admission, so the live run has a real one.
+    write_poni(root.parent / "calibration.poni")
     source = DirectorySourceSpec(root, suffixes=(".tif",))
     executor = _Executor()
     page = ScatteringWorkspace(

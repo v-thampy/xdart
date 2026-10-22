@@ -223,6 +223,12 @@ class DetectorHeader:
 # PixelQMap
 # ---------------------------------------------------------------------------
 
+#: psic's left-right mirror (z → −z in its lab frame, x up and y along the beam), applied to a mirrored
+#: instrument's sample-frame Q (``PixelQMap.mirror``).
+MIRROR = np.diag((1.0, 1.0, -1.0))
+MIRROR.setflags(write=False)
+
+
 @dataclass(frozen=True, slots=True)
 class PixelQMap:
     """Map per-frame angle arrays to per-pixel ``(qx, qy, qz)`` arrays.
@@ -243,6 +249,79 @@ class PixelQMap:
     #: ``make_hxrd`` + ``init_area_detrot``/``init_area_tiltazimuth``.
     diff_config: "Diffractometer | DiffractometerConfig"
     header: DetectorHeader
+    #: A refined calibration's detector mount (AUD-9 stage 2b C7b): xrayutilities' ``detrot``, ``tilt`` and
+    #: ``tiltazimuth`` (degrees), passed to ``init_area`` only when not all zero.
+    area_mount: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #: One zero offset per circle, in the angles' order (sample circles, then detector circles): each angle is
+    #: taken minus its offset, as Stitch's xrayutilities path takes its arm's. Empty: none.
+    angle_offsets: tuple[float, ...] = ()
+    #: Added to the energy a caller passes (a refined calibration's energy offset, eV).
+    energy_offset_eV: float = 0.0
+    #: The instrument is psic's left-right mirror image (``InstrumentGeometry.is_mirror``, 17-2): the sample
+    #: frame's Q is mirrored (z → −z, ``MIRROR``) into SPEC's handedness, where its psic model, orientation
+    #: reflections and UB live; the pixels are computed with the circles as they turn. Only RSM's lowering sets it.
+    mirror: bool = False
+
+    def frame_ub(self, UB: np.ndarray) -> np.ndarray:
+        """The matrix xrayutilities applies (it returns ``inv(UB) @ Q``): ``UB`` itself, or ``MIRROR @ UB`` for a
+        mirror, so its H, K, L (or, with the identity, its Q) are SPEC's handedness'."""
+        return UB if not self.mirror else MIRROR @ UB
+
+    def init_area_extra(self) -> dict[str, float]:
+        """``init_area``'s mount keywords: none for an unmounted detector, so its call is unchanged."""
+        if not any(self.area_mount):
+            return {}
+        detrot, tilt, azimuth = self.area_mount
+        return {"detrot": float(detrot), "tilt": float(tilt), "tiltazimuth": float(azimuth)}
+
+    def area_angles(self, angles):
+        """The angles ``Ang2Q.area`` takes: each minus its circle's zero offset (unchanged without offsets)."""
+        if not any(self.angle_offsets):
+            return angles
+        if len(angles) != len(self.angle_offsets):
+            raise ValueError("pixel_q angle offsets must name every circle")
+        return tuple(np.asarray(angle, dtype=np.float64) - float(offset) if offset else angle
+                     for angle, offset in zip(angles, self.angle_offsets))
+
+    def mapped_energy(self, energy: float) -> float:
+        """The energy mapped: the caller's plus the calibration's energy offset (unchanged without one)."""
+        return energy if not self.energy_offset_eV else float(energy) + float(self.energy_offset_eV)
+
+    def orientation_ub(self, orientation, *, runtime_session: object | None = None) -> np.ndarray:
+        """A SPEC source's UB recomputed from its ``#G1`` orientation reflections in this map's own model (its
+        circle directions; the calibration's zero offsets subtracted from the reflections' angles as from every
+        frame's), by Busing and Levy (``xrd_tools.rsm.orientation``; AUD-9 stage 2b decision 2). The energy offset
+        and the mount do not enter: U uses only the reflections' directions, and a reflection is centred on the
+        beam pixel. A mirror's reflections are mirrored too (``frame_ub``), as its pixels are, so SPEC's labels
+        keep their handedness."""
+        from xrd_tools.core.geometry.xu_runtime import (
+            XuRuntimeSession,
+            require_active_xu_runtime_session,
+            xu_runtime_session,
+        )
+        from xrd_tools.rsm.orientation import busing_levy_ub
+
+        offsets = tuple(self.angle_offsets)
+
+        def compute(active_session):
+            require_active_xu_runtime_session(active_session)
+            hxrd = self.diff_config.make_hxrd(12398.419843320026 / orientation.reflections[0].wavelength_A)
+
+            def point(angles, wavelength):
+                values = (angles if not any(offsets)
+                          else tuple(angle - offset for angle, offset in zip(angles, offsets, strict=True)))
+                require_active_xu_runtime_session(active_session)
+                return np.asarray(hxrd.Ang2Q.point(*values, UB=self.frame_ub(np.identity(3)),
+                                                   wl=float(wavelength)), dtype=np.float64)
+
+            return busing_levy_ub(point, orientation)
+
+        if runtime_session is None:
+            with xu_runtime_session() as active_session:
+                return compute(active_session)
+        if type(runtime_session) is not XuRuntimeSession:
+            raise TypeError("orientation_ub runtime session must be exact")
+        return compute(runtime_session)
 
     def pixel_q(
         self,
@@ -253,6 +332,7 @@ class PixelQMap:
         roi: tuple[int, int, int, int] | None = None,
         image_shape: tuple[int, ...] | None = None,
         runtime_session: object | None = None,
+        rows: tuple[int, int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute per-pixel ``(qx, qy, qz)`` arrays for a frame stack.
 
@@ -279,11 +359,17 @@ class PixelQMap:
         runtime_session : XuRuntimeSession, optional
             Exact already-active shared XU owner.  When omitted, this call
             creates and restores its own one-shot owner as before.
+        rows : (start, stop), optional
+            Only these rows of the (``roi``-cropped) detector, through
+            xrayutilities' own per-call ``roi`` with the header's beam centre
+            unchanged, so each pixel's q is bit-identical to the whole call's.
+            A caller bounds its memory with bands (AUD-9 stage 2b S2.3).
 
         Returns
         -------
         qx, qy, qz : ndarray
-            Each shaped ``(N_frame, Nch1, Nch2)``.
+            Each shaped ``(N_frame, Nch1, Nch2)``; ``(N_frame, stop - start,
+            Nch2)`` with ``rows``.
         """
         # NOTE: ``xrayutilities`` is imported lazily inside
         # ``DiffractometerConfig.make_hxrd``; we don't import it here so
@@ -299,6 +385,20 @@ class PixelQMap:
                 f"Nch2={header.Nch2}); pass image_shape= or fill in "
                 f"DetectorHeader.Nch1/Nch2 explicitly."
             )
+        area_kwargs = dict(self.diff_config.ang2q_kwargs)
+        band_rows = int(header.Nch1)
+        if rows is not None:
+            start, stop = rows
+            if (
+                type(start) is not int
+                or type(stop) is not int
+                or not 0 <= start < stop <= int(header.Nch1)
+                or "roi" in area_kwargs
+                or "Nav" in area_kwargs  # a binned detector's roi counts binned rows
+            ):
+                raise ValueError("pixel_q rows must be one band of the detector's rows")
+            area_kwargs["roi"] = [start, stop, 0, int(header.Nch2)]
+            band_rows = stop - start
 
         from xrd_tools.core.geometry.xu_runtime import (
             XuRuntimeSession,
@@ -312,7 +412,7 @@ class PixelQMap:
         # NTHREADS=1/restore lifecycle.
         def map_active(active_session):
             require_active_xu_runtime_session(active_session)
-            hxrd = self.diff_config.make_hxrd(energy)
+            hxrd = self.diff_config.make_hxrd(self.mapped_energy(energy))
             require_active_xu_runtime_session(active_session)
             hxrd.Ang2Q.init_area(
                 self.diff_config.init_area_detrot,
@@ -324,6 +424,7 @@ class PixelQMap:
                 distance=float(header.distance),
                 Nch1=int(header.Nch1),
                 Nch2=int(header.Nch2),
+                **self.init_area_extra(),
             )
             require_active_xu_runtime_session(active_session)
             matrix = (
@@ -334,9 +435,9 @@ class PixelQMap:
             if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
                 raise ValueError("pixel_q UB must be one finite 3x3 matrix")
             qx, qy, qz = hxrd.Ang2Q.area(
-                *angles,
-                UB=matrix,
-                **self.diff_config.ang2q_kwargs,
+                *self.area_angles(angles),
+                UB=self.frame_ub(matrix),
+                **area_kwargs,
             )
             require_active_xu_runtime_session(active_session)
             if not angles:
@@ -344,7 +445,7 @@ class PixelQMap:
                     "pixel_q requires at least one per-frame angle array"
                 )
             frame_count = len(np.asarray(angles[0]))
-            expected = (frame_count, int(header.Nch1), int(header.Nch2))
+            expected = (frame_count, band_rows, int(header.Nch2))
             values: list[np.ndarray] = []
             for value in (qx, qy, qz):
                 array = np.asarray(value)
@@ -371,5 +472,6 @@ class PixelQMap:
 
 __all__ = [
     "DetectorHeader",
+    "MIRROR",
     "PixelQMap",
 ]

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
-from tests.xdart.scattering._e2sd_support import Sources, store
+from tests.xdart.scattering._e2sd_support import Sources, store, write_poni
 from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.contracts import SourceCapture, StartCapture
@@ -56,6 +56,8 @@ def test_append_refusal_returns_idle_then_overwrite_can_admit(
     lifecycle = ScatteringCoordinator()
     executor = StandardRunExecutor()
     run_store = store(tmp_path, output_mode="Append")
+    # Since a53c324e Run refuses an absent PONI before admission, so the Overwrite run has a real one.
+    write_poni(tmp_path / "cal.poni")
     snapshot = run_store.snapshot()
     intent = snapshot.thaw()
     intent.processing_mode = "Int 1D (XYE)"

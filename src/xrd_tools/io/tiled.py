@@ -227,18 +227,19 @@ def _iter_client(client: Any, limit: int):
 
 def _extract_energy(run: Any, start: dict[str, Any], stream: str) -> float:
     """
-    Attempt to read beam energy (keV).
+    Attempt to read beam energy (keV), eV or keV by its size (``xray_energy_keV``).
 
     Checks (in order):
     1. ``start["energy"]``
     2. ``run[stream]["energy"]`` scalar column (first value)
     """
+    from xrd_tools.core.energy import xray_energy_keV
     raw = start.get("energy")
     if raw is not None:
         try:
             val = float(np.asarray(raw).ravel()[0])
             if np.isfinite(val):
-                return val
+                return xray_energy_keV(val)
         except Exception:
             pass
 
@@ -248,7 +249,7 @@ def _extract_energy(run: Any, start: dict[str, Any], stream: str) -> float:
         if "energy" in ds:
             arr = np.asarray(ds["energy"].values, dtype=float).ravel()
             if len(arr) > 0 and np.isfinite(arr[0]):
-                return float(arr[0])
+                return xray_energy_keV(float(arr[0]))
     except Exception:
         logger.debug("Could not read energy from stream %r", stream, exc_info=True)
 

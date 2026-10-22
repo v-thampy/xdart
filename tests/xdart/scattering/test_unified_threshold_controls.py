@@ -44,7 +44,9 @@ def test_single_threshold_toggle_default_manual_and_off(observed_input):
     assert MASK_SATURATION not in fields
     assert fields[THRESHOLD_ENABLED].value is True
     assert fields[THRESHOLD_MIN].value == 0
-    assert fields[THRESHOLD_MAX].value == limit
+    # decision 39: the automatic ceiling is a hint, never the field's value (no calibration: the dtype's)
+    assert fields[THRESHOLD_MAX].value is None
+    assert fields[THRESHOLD_MAX].placeholder == f"Auto · {int(limit) + 1} (data type maximum)"
     assert type(reduce_control_edit(snapshot, THRESHOLD_ENABLED, True)) is EditNoChange
 
     off = reduce_control_edit(snapshot, THRESHOLD_ENABLED, False)
@@ -94,7 +96,7 @@ def test_rendered_threshold_has_no_independent_saturation_switch(qapp, observed_
         row = next(r for r in panel.findChildren(RangeRow) if tuple(r._low_path) == THRESHOLD_MIN)
         assert row._toggle[1].isChecked()
         assert row._low.isEnabled() and row._high.isEnabled()
-        assert float(row._high.text()) == limit
+        assert row._high.text() == "" and row._high.placeholderText() == f"Auto · {int(limit) + 1} (data type maximum)"
         assert not any(tuple(path) == MASK_SATURATION for r in panel.findChildren(PillRow) for path, _ in r._pills)
         emitted = []
         panel.fieldValueChanged.connect(lambda path, value: emitted.append((tuple(path), value)))

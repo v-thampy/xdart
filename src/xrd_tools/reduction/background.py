@@ -1,5 +1,7 @@
 """Bounded, Qt-free display-background aggregation."""
 from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -222,7 +224,7 @@ def run_display_background(
         (f"contributors={len(contributors)}", f"finite={int(counts.sum())}"))
 
 _FRAME_MODES = frozenset({"None", "Single BG File", "Series Average", "BG Directory"}); _NONCONTAINER_SUFFIXES = frozenset({".cbf", ".edf", ".img", ".mar3450", ".raw", ".tif", ".tiff"})
-_CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs"}); _MATCH_RULES = frozenset({"Scan Root + Frame Number", "Metadata Key"})
+_CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs"}); _LAST_SAVED = "Last Saved Before Frame"; _MATCH_RULES = frozenset({"Scan Root + Frame Number", "Metadata Key", _LAST_SAVED})
 _STABLE_POLICY = "stat-sha256-decode-stat-v1"; _MEMBER = re.compile(r"^(.*?)[_-](\d+)$")
 _MAX_FILE = 256 * 1024 ** 2; _MAX_PIXELS = 67_108_864
 _MAX_MEMBERS = 10_000; _MAX_PATH_BYTES = 4 * 1024 ** 2
@@ -253,9 +255,15 @@ class FrameBackgroundPlan:
     normalization_key: str | None = None
     metadata_format: str = "Auto"
     stable_read_policy: str = _STABLE_POLICY
+    #: The Background images already have the dark subtracted: with a dark set, the
+    #: reducer subtracts them as they are instead of removing the dark from them.
+    #: Recorded only when set, so existing records keep their mappings.
+    dark_corrected: bool = False
     def __post_init__(self) -> None:
         if type(self.version) is not int or self.version != 1 or type(self.mode) is not str or self.mode not in _FRAME_MODES:
             raise ValueError("frame-background policy version/mode is invalid")
+        if type(self.dark_corrected) is not bool:
+            raise ValueError("frame-background dark-corrected flag must be a boolean")
         if type(self.scale) is bool or not isinstance(self.scale, (int, float)) \
                 or isinstance(self.scale, int) and abs(self.scale) > float.fromhex("0x1.fffffffffffffp+1023") \
                 or not math.isfinite(float(self.scale)):
@@ -309,16 +317,19 @@ class FrameBackgroundPlan:
     def to_mapping(self) -> dict[str, object]:
         self._complete()
         if self.mode == "None": return {"version": 1, "mode": "None"}
-        return {name: getattr(self, name) for name in self.__slots__}
+        values = {name: getattr(self, name) for name in self.__slots__ if name != "dark_corrected"}
+        if self.dark_corrected: values["dark_corrected"] = True
+        return values
     @classmethod
     def from_mapping(cls, value: Mapping[str, object] | None) -> "FrameBackgroundPlan":
         if value is None: return cls()
         if not isinstance(value, Mapping): raise ValueError("background provenance must be a mapping")
         if set(value) == {"version", "mode"} and type(value["version"]) is int and type(value["mode"]) is str and dict(value) == {"version": 1, "mode": "None"}: return cls()
-        if set(value) != set(cls.__slots__): raise ValueError("background provenance has an invalid keyset")
+        if set(value) - {"dark_corrected"} != set(cls.__slots__) - {"dark_corrected"}:
+            raise ValueError("background provenance has an invalid keyset")
         raw = dict(value); plan = cls(**{**raw, "locator": None})
         if type(raw["scale"]) is not float or plan.scale != raw["scale"]: raise ValueError("background provenance is not canonical")
-        for name in cls.__slots__: object.__setattr__(plan, name, raw[name])
+        for name in raw: object.__setattr__(plan, name, raw[name])
         plan._complete()
         if plan.to_mapping() != raw: raise ValueError("background provenance is not canonical")
         return plan
@@ -334,6 +345,14 @@ class FrameBackgroundResult:
     descriptor_bytes: bytes | None
     fingerprint: str | None
     diagnostics: tuple[str, ...] = ()
+    #: Poisson variance of ``background`` per unit of it: var = factor · background
+    #: (scale × normalization ratio, divided by each pixel's member count for a
+    #: series). A float, or a per-pixel array only for a series with uneven counts.
+    variance_factor: float | np.ndarray | None = None
+    #: The factor the background image was multiplied by (scale × normalization
+    #: ratio). With a dark, the reducer removes the background's own dark first;
+    #: None when the plan marks the Background as already dark-corrected.
+    scale: float | None = None
     def __post_init__(self) -> None:
         active = self.disposition == "RESOLVED" and self.background is not None
         pair = self.descriptor_bytes is not None or self.fingerprint is not None
@@ -347,6 +366,15 @@ class FrameBackgroundResult:
                              or _json(json.loads(self.descriptor_bytes.decode("utf-8", "strict"))) != self.descriptor_bytes or hashlib.sha256(self.descriptor_bytes).hexdigest() != self.fingerprint) \
                 or not active and any(v is not None for v in (self.background, self.descriptor_bytes, self.fingerprint)):
             raise ValueError("frame-background result is invalid")
+        factor = self.variance_factor
+        if factor is not None and (not active or (
+                type(factor) is not float or not math.isfinite(factor)) and (
+                type(factor) is not np.ndarray or factor.dtype != np.dtype(np.float64)
+                or factor.shape != self.background.shape or not _is_bytes_backed(factor))):
+            raise ValueError("frame-background variance factor is invalid")
+        if self.scale is not None and (
+                not active or type(self.scale) is not float or not math.isfinite(self.scale)):
+            raise ValueError("frame-background scale is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +388,123 @@ class _PreparedSingleFrameBackground:
     source_receipt: bytes
     metadata_items_receipt: bytes
     metadata_source_receipt: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSeriesFrameBackground:
+    """A Series Average resolved once a run (BG-SERIES-REREAD; maintainer, 2026-09-30, on the per-frame proof:
+    "Stat check ... yes"): its members' mean before any scale (read-only, NaN where none covers), their counts
+    where uneven (read-only, else None: one count everywhere covered), the manifest and normalization
+    denominator, and the state of every member and metadata file read. A later frame rebinds it after a stat
+    proof (the member set listed again, each file's ``_source_state`` unchanged) instead of reading, decoding
+    and hashing every member again; its own normalization scales the mean as the full resolution does
+    (``_series_result``), and the same normalization as the last frame's reuses that result. None is kept
+    where a stat cannot prove an input: a metadata file reached through a link, or an EDF whose pixels live
+    in another file, whatever its name (Codex BG-SERIES F1, F2 and the re-review's F1)."""
+
+    plan: FrameBackgroundPlan
+    frame_shape: tuple[int, int]
+    members: tuple[str, ...]
+    states: tuple[tuple[str, tuple[int, ...]], ...]
+    mean: np.ndarray
+    counts: np.ndarray | None
+    most: int
+    denominator: float
+    manifest: tuple[int, int, str]
+    selected: str
+    #: [(the last frame's normalization tag, its result)]: one slot, used on the run's one resolving thread.
+    last: list
+
+
+#: Set by the run executor around a resolution (``series_capsule_requested``): a resolved Series Average then
+#: also leaves its capsule in the holder. Any other caller resolves as before.
+_SERIES_CAPSULE: ContextVar[dict | None] = ContextVar("xdart_series_capsule", default=None)
+
+
+@contextmanager
+def series_capsule_requested(holder: dict):
+    """Within it, a resolved Series Average also leaves its ``_PreparedSeriesFrameBackground`` in
+    ``holder["series"]`` for later frames (``_rebind_series_frame_background``)."""
+    token = _SERIES_CAPSULE.set(holder)
+    try:
+        yield holder
+    finally:
+        _SERIES_CAPSULE.reset(token)
+
+
+def _series_result(series: _PreparedSeriesFrameBackground, frame_fact, target_norm: float, cancelled, *,
+                   in_place: bool = False) -> FrameBackgroundResult:
+    """One frame's Series Average from its unscaled mean: the full resolution's and a rebind's one
+    computation, so their background, variance factor and descriptor agree byte for byte. ``in_place``
+    scales the mean itself (a resolution that keeps no capsule)."""
+    plan = series.plan
+    factor = float(plan.scale * target_norm / series.denominator)
+    if in_place:
+        background = series.mean
+        background *= factor
+    else:
+        background = series.mean * factor
+    # var(f · mean of n counts) = f · (f · mean) / n: one scalar when every covered pixel has all
+    # members, else per pixel (AUD-7: checked once, without a compacted copy of the covered counts).
+    variance_factor = (factor / float(series.most) if series.counts is None
+                       else np.divide(factor, series.counts, out=np.zeros(series.frame_shape),
+                                      where=series.counts > 0))
+    count, receipt_bytes, manifest = series.manifest
+    return _result(plan, frame_fact, background, {"version": 1, "mode": plan.mode,
+        "policy": plan.to_mapping(), "frame_fact": frame_fact, "manifest": {
+            "version": 1, "count": count, "receipt_bytes": receipt_bytes, "sha256": manifest},
+        "selected": series.selected,
+        "normalization": {"target": _tag(target_norm), "denominator": _tag(series.denominator)}},
+        cancelled, variance_factor, factor)
+
+
+def _rebind_series_frame_background(
+    prepared: _PreparedSeriesFrameBackground,
+    plan: FrameBackgroundPlan,
+    frame_fact: tuple[object, ...],
+    *,
+    cancelled: Event | Callable[[], bool] | None = None,
+) -> FrameBackgroundResult | None:
+    """Reuse one Series Average for another frame after a stat proof: the same members (listed again: a
+    member added or removed resolves in full) and every member and metadata file's state unchanged. None:
+    resolve in full."""
+    if type(prepared) is not _PreparedSeriesFrameBackground:
+        raise TypeError("prepared Series capsule must be exact")
+    if type(plan) is not FrameBackgroundPlan:
+        raise TypeError("frame-background plan must be exact")
+    if plan != prepared.plan or plan.mode != "Series Average":
+        return None
+    try:
+        _poll(cancelled)
+        _label, _target, _selector, _index, shape, target_items = _frame(frame_fact)
+        active_keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
+        if shape != prepared.frame_shape or tuple(name for name, _tagged in target_items) != active_keys:
+            return None
+        if tuple(str(member) for member in _series_paths(plan.locator or "", cancelled)) != prepared.members:
+            return None
+        for path, state in prepared.states:
+            if _source_state(Path(path), cancelled) != state:
+                return None
+        target_norm = _target_metadata(target_items, plan.normalization_key)
+        tag = _tag(target_norm)
+        if prepared.last and prepared.last[0][0] == tag:  # the last frame's normalization: its result
+            previous = prepared.last[0][1]
+            body = json.loads(previous.descriptor_bytes.decode("utf-8", "strict"))
+            body["frame_fact"] = frame_fact
+            raw = _json(body)
+            if len(raw) > _MAX_RECEIPT:
+                return None
+            return FrameBackgroundResult("RESOLVED", previous.background, raw, hashlib.sha256(raw).hexdigest(),
+                                         previous.diagnostics, previous.variance_factor, previous.scale)
+        result = _series_result(prepared, frame_fact, target_norm, cancelled)
+        prepared.last[:] = [(tag, result)]
+        return result
+    except InterruptedError:
+        return FrameBackgroundResult("CANCELLED", None, None, None, ("cancelled",))
+    except (FileNotFoundError, PermissionError, OSError, RuntimeError, TypeError, ValueError, KeyError,
+            IndexError, AttributeError, json.JSONDecodeError):
+        return None
+
 
 def _cancelled(value: Event | Callable[[], bool] | None) -> bool:
     if value is None: return False
@@ -444,13 +589,38 @@ def _frame(value: tuple[object, ...], *, persisted=False) -> tuple[int, str, str
     if len(_json(value)) > _MAX_FRAME_FACT or len(_json(metadata)) > 12_288:
         raise ValueError("frame_fact exceeds its bounded encoding")
     return label, locator, selector, index, shape, metadata
-def _metadata(path: Path, plan: FrameBackgroundPlan, keys: tuple[str, ...], cancelled):
+def _holds_its_pixels(path: Path) -> bool:
+    """Whether a Background member provably stores its own pixels, by its content, not its name. ``read_image``
+    decodes every non-container member through fabio, which detects EDF by content, so an EDF named ``.img``
+    or ``.tif`` also reads its pixels from the file its header names in ``EDF_BinaryFileName``, and no stat
+    of the member proves that file (Codex BG-SERIES F2 and its re-review F1). Header only (about 0.3 ms). A
+    multi-frame EDF counts as not proven. A header fabio cannot read is not an EDF's: the member decoded, so
+    fabio read it as another, self-contained format, or ``read_image`` decoded it as raw binary (``.raw``),
+    whose bytes are its pixels."""
+    import fabio
+    try:
+        with fabio.openheader(str(path)) as image:
+            if not isinstance(image, fabio.edfimage.EdfImage):
+                return True
+            return int(image.nframes) == 1 and "EDF_BinaryFileName" not in image.header
+    except Exception:
+        return True
+
+
+def _metadata(path: Path, plan: FrameBackgroundPlan, keys: tuple[str, ...], cancelled, *,
+              aliased: list | None = None):
+    """``aliased`` (a Series capsule's request) records whether the metadata file was reached through a
+    symbolic link: the receipt names the resolved file only, so a link retargeted later is invisible to a
+    stat of it (Codex BG-SERIES F1)."""
     keys = tuple(sorted(set(keys)))
     if not keys: return (), None
     if _cancelled(cancelled): raise InterruptedError
     discovery = read_image_metadata_observed(path, meta_format=plan.metadata_format); _poll(cancelled)
     if discovery.source_path is None: raise ValueError("required Background metadata is absent")
-    source = Path(discovery.source_path).resolve(strict=True); del discovery
+    source = Path(discovery.source_path).resolve(strict=True)
+    if aliased is not None:
+        aliased.append(Path(os.path.abspath(discovery.source_path)) != source)
+    del discovery
     if len(str(source).encode()) > 4096: raise ValueError("Background metadata path exceeds cap")
     before = _digest(source, cancelled)
     if _cancelled(cancelled): raise InterruptedError
@@ -524,6 +694,12 @@ def _prepare_single_frame_background(
         source_receipt = _json(source)
         metadata_items_receipt = _json(metadata_items)
         metadata_source_receipt = _json(metadata_source)
+        # The normal container read already proved a self-contained dataset.
+        # Other formats use Series' content check: an EDF can live behind any
+        # suffix and keep its pixels elsewhere, so neither hash nor stat of its
+        # header proves those pixels. Resolve it afresh for every frame.
+        if not source.get("hdf") and not _holds_its_pixels(Path(source["locator"])):
+            return None
     except (
         TypeError,
         ValueError,
@@ -551,7 +727,7 @@ def _rebind_single_frame_background(
     *,
     cancelled: Event | Callable[[], bool] | None = None,
 ) -> FrameBackgroundResult | None:
-    """Reuse one decoded Single-BG result after a full content proof."""
+    """Rebind by stat for a self-contained unnormalized source; normalized sources retain full proof."""
 
     if type(prepared) is not _PreparedSingleFrameBackground:
         raise TypeError("prepared frame-background capsule must be exact")
@@ -583,7 +759,10 @@ def _rebind_single_frame_background(
             return None
         source = json.loads(prepared.source_receipt.decode("utf-8", "strict"))
         path = Path(source["locator"])
-        state, digest = _digest(path, cancelled)
+        if plan.normalization_key is None:
+            state, digest = _source_state(path, cancelled), source["sha256"]
+        else:
+            state, digest = _digest(path, cancelled)
         if (
             list(state) != source["state"]
             or digest != source["sha256"]
@@ -614,6 +793,8 @@ def _rebind_single_frame_background(
             raw,
             hashlib.sha256(raw).hexdigest(),
             prepared.result.diagnostics,
+            prepared.result.variance_factor,
+            prepared.result.scale,
         )
     except InterruptedError:
         return FrameBackgroundResult(
@@ -758,14 +939,30 @@ def _series_paths(value: str, cancelled) -> tuple[Path, ...]:
     members = tuple(value[-1] for value in sorted(values))
     if members.count(anchor) != 1: raise ValueError("Background Series anchor is absent or ambiguous")
     return members
+def _saved_times(candidates, cancelled) -> dict[Path, int]:
+    times = {}
+    for candidate in candidates:
+        _poll(cancelled); times[candidate] = candidate.stat().st_mtime_ns
+    return times
+def _saved_by(candidates, before_ns: int, cancelled) -> tuple[Path, ...]:
+    """Only files saved by the frame can be chosen, so only they are recorded: darks
+    saved later in the scan leave the frame's dependency unchanged."""
+    return tuple(path for path, when in _saved_times(candidates, cancelled).items() if when <= before_ns)
+def _last_saved(times: dict[Path, int], before_ns: int) -> Path | None:
+    """The Background file saved last, not after the frame; the later name breaks a tie."""
+    saved = [path for path, when in times.items() if when <= before_ns]
+    return max(saved, key=lambda path: (times[path], path.name.casefold(), path.name)) if saved else None
 def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
-                        selected_facts, shape, cancelled):
+                        selected_facts, shape, cancelled, saved_before=None):
     matches = 0
+    times = _saved_times(candidates, cancelled) if plan.match_rule == _LAST_SAVED else None
+    pick = None if times is None else _last_saved(times, saved_before)
     for ordinal, candidate in enumerate(candidates):
         if _cancelled(cancelled): raise InterruptedError
         keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
         projected, metadata_source = _metadata(candidate, plan, keys, cancelled) if keys else ((), None)
         if plan.match_rule == "Metadata Key": match = dict(projected).get(plan.metadata_key) == target_tag
+        elif times is not None: match = candidate == pick
         else:
             parsed = _MEMBER.match(candidate.stem)
             match = bool(target_match and parsed and int(parsed.group(2)) == int(target_match.group(2)) and
@@ -775,6 +972,7 @@ def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
         if match != (candidate == chosen): raise RuntimeError("Background Directory match changed")
         receipt = {"ordinal": ordinal, "candidate": str(candidate), "match": match,
                    "metadata_items": projected, "metadata_source": metadata_source}
+        if times is not None: receipt["saved_ns"] = times[candidate]
         if candidate == chosen:
             if (projected, metadata_source) != selected_facts[:2]:
                 raise RuntimeError("Background Directory selected metadata changed")
@@ -783,7 +981,7 @@ def _directory_receipts(candidates, plan, target_tag, target_match, chosen,
             receipt["source"] = source; del image
         yield receipt
     if matches != 1: raise RuntimeError("Background Directory match changed")
-def _result(plan, frame_fact, background, body, cancelled) -> FrameBackgroundResult:
+def _result(plan, frame_fact, background, body, cancelled, variance_factor=None, scale=None) -> FrameBackgroundResult:
     _poll(cancelled)
     if not np.isfinite(background).any(): raise ValueError("Background contains no finite pixels")
     _poll(cancelled); body["result_sha256"] = _array_digest(background, cancelled, np.float64)
@@ -791,8 +989,11 @@ def _result(plan, frame_fact, background, body, cancelled) -> FrameBackgroundRes
     cap = _MAX_RECEIPT if plan.mode in {"Series Average", "BG Directory"} else _MAX_DESCRIPTOR
     if len(raw) > cap: raise ValueError("Background descriptor exceeds cap")
     frozen = _bytes_array(background); _poll(cancelled)
+    if type(variance_factor) is np.ndarray:
+        variance_factor = _bytes_array(variance_factor)
     return FrameBackgroundResult("RESOLVED", frozen, raw,
-                                 hashlib.sha256(raw).hexdigest())
+                                 hashlib.sha256(raw).hexdigest(), (), variance_factor,
+                                 None if plan.dark_corrected else scale)
 def resolve_frame_background(
     plan: FrameBackgroundPlan, frame_fact: tuple[object, ...], *,
     cancelled: Event | Callable[[], bool] | None = None,
@@ -813,16 +1014,23 @@ def resolve_frame_background(
             metadata, metadata_source = _metadata(Path(source["locator"]), plan,
                 tuple(key for key in (plan.normalization_key,) if key), cancelled)
             denominator = _target_metadata(metadata, plan.normalization_key)
-            image *= plan.scale * target_norm / denominator
+            factor = float(plan.scale * target_norm / denominator)
+            image *= factor
             return _result(plan, frame_fact, image, {"version": 1, "mode": plan.mode,
                 "policy": policy, "frame_fact": frame_fact, "source": source,
                 "metadata_items": metadata, "metadata_source": metadata_source,
-                "decoded": source["decoded"]}, cancelled)
+                "decoded": source["decoded"]}, cancelled, factor, factor)
         if plan.mode == "Series Average":
             members = _series_paths(plan.locator or "", cancelled)
             sums = np.zeros(shape, np.float64); counts = np.zeros(shape, np.uint64)
             manifest = hashlib.sha256(b"XDART-FRAME-BG-SERIES-MANIFEST-V1\0")
             receipt_bytes = 0; norm_sum = 0.0; itemsize = None
+            states = {}  # every file read and its state: a later frame's stat proof (BG-SERIES-REREAD)
+            # a capsule only when those states prove every input (Codex BG-SERIES F1, F2): no metadata file
+            # reached through a link, no member whose pixels live in another file (an EDF, by its content);
+            # else each frame resolves in full
+            requested = _SERIES_CAPSULE.get()
+            aliased = None if requested is None else []
             for ordinal, member in enumerate(members):
                 if _cancelled(cancelled): raise InterruptedError
                 member = member.resolve(strict=True)
@@ -831,7 +1039,12 @@ def resolve_frame_background(
                 if itemsize not in {None, observed_itemsize}: raise ValueError("Background Series native itemsize differs")
                 itemsize = observed_itemsize
                 metadata, metadata_source = _metadata(member, plan,
-                    tuple(key for key in (plan.normalization_key,) if key), cancelled)
+                    tuple(key for key in (plan.normalization_key,) if key), cancelled, aliased=aliased)
+                if aliased is not None and (any(aliased) or not _holds_its_pixels(member)):
+                    aliased = requested = None
+                states[source["locator"]] = tuple(source["state"])
+                if metadata_source is not None:
+                    states[metadata_source["locator"]] = tuple(metadata_source["state"])
                 norm_sum += _target_metadata(metadata, plan.normalization_key)
                 finite = np.isfinite(image); np.add(sums, image, out=sums, where=finite); np.add(counts, finite, out=counts)
                 raw = _json({"ordinal": ordinal, "source": source,
@@ -840,13 +1053,28 @@ def resolve_frame_background(
                     raise ValueError("Background Series receipt stream exceeds cap")
                 manifest.update(struct.pack(">Q", len(raw))); manifest.update(raw); receipt_bytes += len(raw)
                 del image, finite, source, metadata, metadata_source, raw
-            np.divide(sums, counts, out=sums, where=counts > 0); sums[counts == 0] = np.nan
-            denominator = norm_sum / len(members); sums *= plan.scale * target_norm / denominator
-            return _result(plan, frame_fact, sums, {"version": 1, "mode": plan.mode,
-                "policy": policy, "frame_fact": frame_fact, "manifest": {
-                    "version": 1, "count": len(members), "receipt_bytes": receipt_bytes,
-                    "sha256": manifest.hexdigest()}, "selected": str(Path(plan.locator or "").resolve()),
-                "normalization": {"target": _tag(target_norm), "denominator": _tag(denominator)}}, cancelled)
+            covered = counts > 0  # one mask for the mean, the empty pixels and the uniform check
+            np.divide(sums, counts, out=sums, where=covered); sums[~covered] = np.nan
+            # uniform: every covered pixel's count is the largest (AUD-7: no compacted copy)
+            most = int(counts.max())
+            uniform = most and np.count_nonzero(counts == most) == np.count_nonzero(covered)
+            del covered
+            # uneven counts: without a capsule this resolution's own, used once (no copy); a capsule keeps a
+            # read-only uint16 copy (at most _MAX_MEMBERS a pixel)
+            uneven = None if uniform else counts if requested is None else counts.astype(np.uint16)
+            series = _PreparedSeriesFrameBackground(
+                plan, shape, tuple(str(member) for member in members), tuple(states.items()), sums,
+                uneven, most, norm_sum / len(members),
+                (len(members), receipt_bytes, manifest.hexdigest()), str(Path(plan.locator or "").resolve()), [])
+            if requested is None:  # no capsule kept: the mean is scaled in place, as before
+                return _series_result(series, frame_fact, target_norm, cancelled, in_place=True)
+            sums.setflags(write=False)
+            if series.counts is not None:
+                series.counts.setflags(write=False)
+            result = _series_result(series, frame_fact, target_norm, cancelled)
+            series.last[:] = [(_tag(target_norm), result)]
+            requested["series"] = series
+            return result
         root = Path(plan.locator or "").resolve(strict=True)
         if not root.is_dir(): raise ValueError("Background Directory is not a directory")
         predicate = compile_filter(plan.filename_filter)
@@ -855,10 +1083,23 @@ def resolve_frame_background(
         chosen = None
         target_tag = dict(target_items).get(plan.metadata_key) if plan.metadata_key else None
         target_match = _MEMBER.match(target_path.stem)
+        saved_before = None
+        if plan.match_rule == _LAST_SAVED:
+            # Each frame needs its own file time; frames in one container share one.
+            if target_selector is not None or target_path.suffix.casefold() in _CONTAINER_SUFFIXES:
+                raise ValueError("Last Saved Before Frame needs one image file per frame")
+            if root == target_path.parent and not plan.filename_filter.strip():
+                raise ValueError("Last Saved Before Frame: the Background folder holds the frames; "
+                                 "set a Filename Filter that selects only the Background files")
+            saved_before = target_path.stat().st_mtime_ns
+            candidates = _saved_by(candidates, saved_before, cancelled)
+            pick = _last_saved(_saved_times(candidates, cancelled), saved_before)
+            if pick is None: raise ValueError("no Background file was saved before this frame")
         for candidate in candidates:
             if _cancelled(cancelled): raise InterruptedError
             projected = (); metadata_source = None; match = False
-            if plan.match_rule == "Metadata Key":
+            if plan.match_rule == _LAST_SAVED: match = candidate == pick
+            elif plan.match_rule == "Metadata Key":
                 projected, metadata_source = _metadata(candidate, plan,
                     tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key))), cancelled)
                 match = dict(projected).get(plan.metadata_key) == target_tag
@@ -875,23 +1116,26 @@ def resolve_frame_background(
         image, source = _read(str(chosen), plan, shape, cancelled)
         if plan.normalization_key and not projected:
             projected, metadata_source = _metadata(chosen, plan, (plan.normalization_key,), cancelled)
-        image *= plan.scale * target_norm / _target_metadata(projected, plan.normalization_key)
+        factor = float(plan.scale * target_norm / _target_metadata(projected, plan.normalization_key))
+        image *= factor
         prefix = b"XDART-FRAME-BG-DIRECTORY-MANIFEST-V1\0"
         selected_facts = (projected, metadata_source, source)
         first = _manifest(prefix, _directory_receipts(
             candidates, plan, target_tag, target_match, chosen, selected_facts,
-            shape, cancelled), cancelled); del candidates
+            shape, cancelled, saved_before), cancelled); del candidates
         fresh = _directory_paths(root, target_path, predicate, cancelled)
+        if saved_before is not None: fresh = _saved_by(fresh, saved_before, cancelled)
         second = _manifest(prefix, _directory_receipts(
             fresh, plan, target_tag, target_match, chosen, selected_facts,
-            shape, cancelled), cancelled); del fresh
+            shape, cancelled, saved_before), cancelled); del fresh
         if first != second: raise RuntimeError("Background Directory membership changed")
         count, receipt_bytes, digest = first
         return _result(plan, frame_fact, image, {"version": 1, "mode": plan.mode,
             "policy": policy, "frame_fact": frame_fact, "manifest": {"version": 1,
                 "count": count, "receipt_bytes": receipt_bytes, "sha256": digest},
             "selected": str(chosen), "metadata_items": projected,
-            "metadata_source": metadata_source, "decoded": source["decoded"]}, cancelled)
+            "metadata_source": metadata_source, "decoded": source["decoded"],
+            **({} if saved_before is None else {"frame_saved_ns": saved_before})}, cancelled, factor, factor)
     except InterruptedError:
         return FrameBackgroundResult("CANCELLED", None, None, None, ("cancelled",))
     except (FileNotFoundError, PermissionError, OSError, RuntimeError) as error:
@@ -901,3 +1145,95 @@ def resolve_frame_background(
 __all__ = ["DisplayBackgroundPlan", "DisplayBackgroundResult",
            "run_display_background"]
 __all__ += ["FrameBackgroundPlan", "FrameBackgroundResult", "resolve_frame_background"]
+
+
+def background_frame_fact(frame, plan, shape, selector=None) -> tuple[object, ...]:
+    """Freeze one bounded, array-free target fact for Background qualification."""
+    path = str(Path(frame.source_path).resolve(strict=False))
+    keys = tuple(sorted(set(key for key in (plan.metadata_key, plan.normalization_key) if key)))
+    items = []
+    for key in keys:
+        matches = (value for name, value in frame.metadata.items() if type(name) is str and name.casefold() == key.casefold())
+        value = next(matches, items)
+        if value is items or next(matches, items) is not items: raise ValueError("target Background metadata is absent or ambiguous")
+        value = value.item() if isinstance(value, np.generic) else value
+        if type(value) is bool: tagged = ("bool", value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and (not isinstance(value, int) or abs(value) <= float.fromhex("0x1.fffffffffffffp+1023")) and np.isfinite(numeric := float(value)):
+            tagged = ("number", numeric.hex())
+        elif type(value) is str and len(value) <= 4085 and len(value.encode("utf-8")) <= 4085: tagged = ("text", value)
+        elif type(value) is bytes and len(value) <= 2042: tagged = ("bytes", value.hex())
+        else: raise ValueError("target Background metadata scalar is unsupported")
+        if len(json.dumps(tagged, separators=(",", ":")).encode()) > 4096: raise ValueError("target Background scalar exceeds cap")
+        items.append((key, tagged))
+    fact = (int(frame.index), path, selector, int(frame.source_frame_index or 0), tuple(shape), tuple(items))
+    if len(json.dumps(fact, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()) > 24_576:
+        raise ValueError("target Background frame fact exceeds cap")
+    return fact
+
+
+
+def resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
+                                      *, cancelled, retryable=False,
+                                      frame_fact=None, capsule_owner=None, resolver=None) -> bool:
+    """The sole immediate-pre-submit Background array insertion seam."""
+    from xrd_tools.sources.execution_graph import SourceRevisionChanged
+    resolve = resolve_frame_background if resolver is None else resolver
+    if type(plan) is not FrameBackgroundPlan: raise TypeError("Background plan must be exact")
+    frame.background = None; frame.background_dependency_bytes = None
+    frame.background_dependency_fingerprint = None
+    if plan.mode == "None": return True
+    fact = binding[1] if binding is not None else frame_fact
+    if fact is None: raise RuntimeError("Background resolution lost its frame fact")
+    prepared = (
+        None
+        if capsule_owner is None
+        else getattr(capsule_owner, "background_capsule", None)
+    )
+    result = (
+        _rebind_single_frame_background(
+            prepared, plan, fact, cancelled=cancelled,
+        )
+        if type(prepared) is _PreparedSingleFrameBackground
+        else _rebind_series_frame_background(
+            prepared, plan, fact, cancelled=cancelled,
+        )
+        if type(prepared) is _PreparedSeriesFrameBackground
+        else None
+    )
+    candidate = None
+    if result is None:
+        if capsule_owner is not None:
+            capsule_owner.background_capsule = None
+        if capsule_owner is not None and plan.mode == "Series Average":
+            # resolved once a run: later frames rebind it after a stat proof (BG-SERIES-REREAD)
+            with series_capsule_requested({}) as requested:
+                result = resolve(plan, fact, cancelled=cancelled)
+            candidate = requested.get("series")
+        else:
+            result = resolve(plan, fact, cancelled=cancelled)
+            candidate = _prepare_single_frame_background(plan, fact, result)
+    if result.disposition == "RETRYABLE" and retryable: return False
+    if result.disposition == "CANCELLED": raise RuntimeError("admission cancelled")
+    if result.disposition != "RESOLVED" or result.background is None:
+        raise SourceRevisionChanged("Background dependency is not presently resolvable")
+    pair = result.descriptor_bytes, result.fingerprint
+    if binding is not None:
+        if pair != binding[2:]: raise SourceRevisionChanged("Background dependency changed after qualification")
+        pair = binding[2], binding[3]
+    if candidate is not None and capsule_owner is not None:
+        capsule_owner.background_capsule = candidate
+    frame.background = result.background
+    frame.background_variance_factor = result.variance_factor
+    frame.background_scale = result.scale
+    frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
+    return True
+
+
+
+def background_resource_terms(plan, pixels: int) -> tuple[int, int, int, int]:
+    from xrd_tools.reduction import FrameBackgroundPlan
+    if type(plan) is not FrameBackgroundPlan or type(pixels) is not int or pixels <= 0:
+        raise TypeError("Background resource inputs are not exact")
+    if plan.mode == "None": return 0, 0, 0, 0
+    return 8 * pixels, (25 if plan.mode == "Series Average" else 8) * pixels, \
+        8 * pixels, 64 * 1024 ** 2

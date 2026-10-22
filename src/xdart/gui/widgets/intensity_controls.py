@@ -19,21 +19,23 @@ def _interval(values):
 
 
 class IntensityRangeSlider(QtWidgets.QWidget):
-    """Canonical two-handle horizontal slider, with exact-entry activation."""
+    """Canonical two-handle horizontal slider."""
 
     sigRangeChanged = QtCore.Signal(float, float)
-    sigEditRequested = QtCore.Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, range_label="Intensity", range_hint=None, continuous=True):
         super().__init__(parent)
         self._vmin, self._vmax = 0.0, 1.0
         self._lo, self._hi = 0.0, 1.0
         self._drag = None
+        self._range_label = range_label
+        self._range_hint = range_hint
+        self._continuous = continuous
         self.setMinimumSize(150, 24)
         self.setMaximumHeight(28)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.setToolTip(
-            "Manual intensity range — drag the handles, or double-click "
+            "Manual intensity range — drag the handles, or click Intensity "
             "to type exact min/max values."
         )
 
@@ -71,8 +73,8 @@ class IntensityRangeSlider(QtWidgets.QWidget):
         if changed:
             self._lo, self._hi = lo, hi
         self.setToolTip(
-            f"Intensity: {lo:.8g} to {hi:.8g}\n"
-            "Drag handles or double-click to enter exact minimum and maximum."
+            f"{self._range_label}: {lo:.8g} to {hi:.8g}\n"
+            + (self._range_hint or "Drag handles or click Intensity to enter exact minimum and maximum.")
         )
         if changed:
             self.update()
@@ -125,41 +127,45 @@ class IntensityRangeSlider(QtWidgets.QWidget):
             self._move_handle(event.position().x())
 
     def mouseReleaseEvent(self, event):
+        changed = self._drag is not None
         self._drag = None
-
-    def mouseDoubleClickEvent(self, event):
-        if self.isEnabled():
-            self._drag = None
-            self.sigEditRequested.emit()
+        if changed and not self._continuous:
+            self.sigRangeChanged.emit(*self.values())
 
     def _move_handle(self, x):
         value = self._value_for_x(x)
         if self._drag == "lo":
-            self.setValues(min(value, self._hi), self._hi)
+            self.setValues(min(value, self._hi), self._hi, emit=self._continuous)
         elif self._drag == "hi":
-            self.setValues(self._lo, max(value, self._lo))
+            self.setValues(self._lo, max(value, self._lo), emit=self._continuous)
 
 
 class IntensityControls(QtWidgets.QFrame):
     """Intensity slider, Autoscale toggle, and exact displayed-value entry.
 
     ``sync(domain, current, reset=False)`` accepts finite increasing pairs or
-    ``None`` for unavailable data.  Manual limits remain absolute across every
-    domain change; the host may explicitly reset after a mode/unit transition.
+    ``None`` for unavailable data. Optional percentiles make the selected pair
+    relative to each image's population; sync still receives absolute display
+    limits for the tooltip. Absolute manual limits remain literal across data
+    changes; the host may explicitly reset after a mode/unit transition.
     The public ``autoscale`` button and ``values()`` expose the current choice.
     """
 
     rangeChanged = QtCore.Signal(float, float)
     autoToggled = QtCore.Signal(bool)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, percentiles=None):
         super().__init__(parent)
         self.setObjectName("viewerIntensityControls")
         self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(8)
-        layout.addWidget(QtWidgets.QLabel("Intensity", self))
+        self.label = QtWidgets.QLabel("Intensity", self)
+        self.label.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.label.setToolTip("Double-click to enter intensity minimum and maximum.")
+        self.label.installEventFilter(self)
+        layout.addWidget(self.label)
         self.slider = IntensityRangeSlider(self)
         self.slider.setEnabled(False)
         layout.addWidget(self.slider)
@@ -170,13 +176,70 @@ class IntensityControls(QtWidgets.QFrame):
         self.autoscale.setMinimumWidth(112)
         layout.addWidget(self.autoscale)
         self._domain = self._current = None
+        self._percentile_defaults = self._percentiles = None
+        self._mode = "Absolute"
         self._entry_popup = None
         self.slider.sigRangeChanged.connect(self._range_changed)
-        self.slider.sigEditRequested.connect(self._open_entry)
         self.autoscale.toggled.connect(self._auto_toggled)
+        self.autoscale.setToolTip("Use the automatic intensity limits for the current display.")
+        self.set_percentile_defaults(percentiles)
+
+    def eventFilter(self, watched, event):
+        if (watched is getattr(self, "_entry_popup", None) and event.type() == QtCore.QEvent.Type.MouseButtonPress
+                and not watched.rect().contains(event.position().toPoint())):
+            watched.hide()
+            return True
+        if (watched is self.label
+                and event.type() == QtCore.QEvent.Type.MouseButtonDblClick
+                and event.button() == QtCore.Qt.MouseButton.LeftButton
+                and self.label.rect().contains(event.position().toPoint())):
+            self._open_entry()
+            return True
+        return super().eventFilter(watched, event)
 
     def values(self):
-        return self.slider.values()
+        return self._percentiles if self._mode == "Percentile" else self.slider.values()
+
+    def percentile_values(self):
+        """Selected percentile pair, or None for the existing absolute display units."""
+        return self.values() if self._mode == "Percentile" else None
+
+    def set_absolute_limits(self, low, high, *, emit=True):
+        """Commit a colorbar's displayed limits through the same manual range owner."""
+        pair = _interval((low, high))
+        if pair is None or self._domain is None:
+            return
+        self._mode = "Absolute"
+        self._current = pair
+        blocker = QtCore.QSignalBlocker(self.autoscale)
+        self.autoscale.setChecked(False)
+        del blocker
+        self._set_window(pair)
+        if self._entry_popup is not None:
+            self._entry_popup.hide()
+        if emit:
+            self.rangeChanged.emit(*pair)
+
+    def set_percentile_defaults(self, pair):
+        """Enable percentile entry; update automatic defaults while retaining manual choices.
+
+        None restores absolute-only controls for a 1-D host.
+        """
+        enabled = self._percentile_defaults is not None
+        if pair is None:
+            self._percentile_defaults = None
+            self._mode = "Absolute"
+            return
+        pair = _interval(pair)
+        if pair is None or pair[0] < 0 or pair[1] > 100:
+            raise ValueError("percentile limits need 0 <= minimum < maximum <= 100")
+        self._percentile_defaults = pair
+        if not enabled:
+            self._mode = "Percentile"
+        if self.autoscale.isChecked() or self._percentiles is None:
+            self._percentiles = pair
+        if self._mode == "Percentile" and self._domain is not None:
+            self._set_window(self._percentiles)
 
     def sync(self, domain, current, *, reset=False):
         domain, current = _interval(domain), _interval(current)
@@ -186,29 +249,54 @@ class IntensityControls(QtWidgets.QFrame):
             blocker = QtCore.QSignalBlocker(self.autoscale)
             self.autoscale.setChecked(True)
             del blocker
+            self._percentiles = self._percentile_defaults
         if domain is None:
             self.slider.setEnabled(False)
             return
-        self._set_window(current if self.autoscale.isChecked() else self.values())
+        if self._mode == "Percentile":
+            self._set_window(self._percentiles)
+        else:
+            self._set_window(current if self.autoscale.isChecked() else self.values())
 
     def _set_window(self, values):
         if self._domain is None:
             self.slider.setEnabled(False)
             return
         lo, hi = values
+        # Auto shows the active display interval, not the detector/data span.
+        # Manual editing keeps that span and can widen it for absolute limits.
+        domain = (0.0, 100.0) if self._mode == "Percentile" else values if self.autoscale.isChecked() else (
+            min(self._domain[0], lo), max(self._domain[1], hi))
         self.slider.setDomain(
-            min(self._domain[0], lo), max(self._domain[1], hi),
+            *domain,
             lower=lo, upper=hi, emit=False,
         )
+        absolute = self._current
+        tip = (f"Absolute display limits: {absolute[0]:.8g} to {absolute[1]:.8g}\n"
+               if absolute is not None else "")
+        tip += "Double-click Intensity to edit limits."
+        self.label.setToolTip(tip)
+        self.slider.setToolTip(self.slider.toolTip() + "\n" + tip)
 
     def _auto_toggled(self, checked):
         if self._current is not None and self._domain is not None:
-            self._set_window(self._current)
+            if self._mode == "Percentile":
+                if checked:
+                    self._percentiles = self._percentile_defaults
+                self._set_window(self._percentiles)
+            else:
+                self._set_window(self._current)
         self.autoToggled.emit(checked)
 
     def _range_changed(self, lo, hi):
-        if not self.autoscale.isChecked():
-            self.rangeChanged.emit(lo, hi)
+        if self._mode == "Percentile":
+            self._percentiles = (lo, hi)
+        if self.autoscale.isChecked():
+            blocker = QtCore.QSignalBlocker(self.autoscale)
+            self.autoscale.setChecked(False)
+            del blocker
+            self.autoToggled.emit(False)
+        self.rangeChanged.emit(lo, hi)
 
     def _open_entry(self):
         if not self.slider.isEnabled():
@@ -216,24 +304,40 @@ class IntensityControls(QtWidgets.QFrame):
         if self._entry_popup is None:
             popup = QtWidgets.QFrame(self, QtCore.Qt.WindowType.Popup)
             popup.setObjectName("intensityEntryPopup")
+            popup.installEventFilter(self)
             popup.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
             layout = QtWidgets.QHBoxLayout(popup)
             layout.setContentsMargins(8, 6, 8, 6)
             layout.setSpacing(6)
+            mode = QtWidgets.QComboBox(popup)
+            mode.setObjectName("intensityMode")
+            mode.addItems(("Percentile", "Absolute"))
+            mode.setToolTip("Percentile follows each image's intensity population; Absolute keeps literal display limits.")
+            mode.currentTextChanged.connect(self._change_mode)
+            layout.addWidget(mode)
             for label, name in (("Min", "intensityMinimum"), ("Max", "intensityMaximum")):
                 edit = QtWidgets.QLineEdit(popup)
                 edit.setObjectName(name)
                 edit.setFixedWidth(92)
+                edit.setToolTip(f"{label}imum intensity limit in the selected Percentile or Absolute display units.")
                 edit.returnPressed.connect(self._apply_entry)
-                layout.addWidget(QtWidgets.QLabel(label, popup))
+                caption = QtWidgets.QLabel(label, popup)
+                caption.setToolTip(edit.toolTip())
+                layout.addWidget(caption)
                 layout.addWidget(edit)
             button = QtWidgets.QPushButton("Apply", popup)
             button.setObjectName("intensityApply")
             button.setDefault(True)
+            button.setToolTip("Apply these display limits; keep this popup open for further edits. Esc closes it.")
             button.clicked.connect(self._apply_entry)
             layout.addWidget(button)
             self._entry_popup = popup
         popup = self._entry_popup
+        mode = popup.findChild(QtWidgets.QComboBox, "intensityMode")
+        blocker = QtCore.QSignalBlocker(mode)
+        mode.setCurrentText(self._mode)
+        mode.setVisible(self._percentile_defaults is not None)
+        del blocker
         low, high = self._entry_editors()
         lo, hi = self.values()
         low.setText(f"{lo:g}")
@@ -242,6 +346,23 @@ class IntensityControls(QtWidgets.QFrame):
         popup.show()
         low.setFocus()
         low.selectAll()
+
+    def _change_mode(self, mode):
+        if mode == self._mode or self._percentile_defaults is None:
+            return
+        if self._mode == "Percentile":
+            self._percentiles = self.values()
+        self._mode = mode
+        values = self._percentiles if mode == "Percentile" else self._current
+        if values is None:
+            return
+        blocker = QtCore.QSignalBlocker(self.autoscale)
+        self.autoscale.setChecked(False)
+        del blocker
+        self._set_window(values)
+        for editor, value in zip(self._entry_editors(), values):
+            editor.setText(f"{value:g}")
+        self.rangeChanged.emit(*values)
 
     def _entry_editors(self):
         return tuple(self._entry_popup.findChild(QtWidgets.QLineEdit, name) for name in (
@@ -256,7 +377,10 @@ class IntensityControls(QtWidgets.QFrame):
             return
         if values is None or self._domain is None:
             return
-        self._entry_popup.hide()
+        if self._mode == "Percentile" and (values[0] < 0 or values[1] > 100):
+            return
+        if self._mode == "Percentile":
+            self._percentiles = values
         self.autoscale.setChecked(False)
         self._set_window(values)
         self.rangeChanged.emit(*values)

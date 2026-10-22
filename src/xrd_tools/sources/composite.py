@@ -20,8 +20,8 @@ from typing import Any
 
 import numpy as np
 
-from xrd_tools.core.scan import SourceCapabilities, SourceKind
-from xrd_tools.sources.base import BaseFrameSource
+from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind
+from xrd_tools.sources.base import BaseFrameSource, source_metadata_energy_eV
 
 
 class CompositeFrameSource(BaseFrameSource):
@@ -73,6 +73,43 @@ class CompositeFrameSource(BaseFrameSource):
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         mi, label = self._map[int(index)]
         return self._members[mi].metadata_for(label)
+
+    def load_native_frame(self, index: int) -> np.ndarray:
+        mi, label = self._map[int(index)]
+        member = self._members[mi]
+        return getattr(member, "load_native_frame", member.load_frame)(label)
+
+    def load_point_statistics(self, index, conditioning=None, saturation=None, *,
+                              poisson=False, native_transform=None):
+        from xrd_tools.sources.point_images import combine_point_statistics, PointImagePolicy
+        mi, label = self._map[int(index)]
+        member = self._members[mi]
+        method = getattr(member, 'load_point_statistics', None)
+        if callable(method):
+            return method(label, conditioning, saturation, poisson=poisson,
+                          native_transform=native_transform)
+        loader = getattr(member, 'load_native_frame', member.load_frame)
+        return combine_point_statistics(loader, (label,), PointImagePolicy(1, 'select'),
+            conditioning, saturation, poisson=poisson, native_transform=native_transform)
+
+    def load_point_frame(self, index, conditioning=None, saturation=None, *, native_transform=None):
+        return self.load_point_statistics(index, conditioning, saturation,
+                                         native_transform=native_transform).signal
+
+    def frame_for(self, index: int) -> ScanFrame:
+        mi, label = self._map[int(index)]
+        frame = self._members[mi].frame_for(label)
+        return ScanFrame(index=int(index), metadata=dict(frame.metadata),
+                         source_path=frame.source_path,
+                         source_frame_index=frame.source_frame_index,
+                         source_identity=frame.source_identity,
+                         metadata_energy_is_eV=frame.metadata_energy_is_eV,
+                         loader=lambda value: self.load_frame(value.index),
+                         point_statistics_loader=(self.load_point_statistics if frame.point_statistics_loader is not None else None))
+
+    @property
+    def metadata_energy_eV(self) -> tuple:
+        return tuple(value for member in self._members for value in source_metadata_energy_eV(member))
 
     @property
     def motors(self) -> dict[str, np.ndarray]:

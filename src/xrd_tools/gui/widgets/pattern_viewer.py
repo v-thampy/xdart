@@ -178,3 +178,12 @@ class PatternViewer:
 
     def _ipython_display_(self) -> None:
         display(self.widget)
+
+    def dispose(self) -> None:
+        """Disconnect a notebook cell's old viewer before creating its replacement."""
+        for control in (self._log_toggle, self._offset, self._show_phases):
+            control.unobserve(self._on_change, names="value")
+        self._patterns.clear()
+        self._phase_models.clear()
+        from .fit_controls import _close_widgets
+        _close_widgets(self.widget)

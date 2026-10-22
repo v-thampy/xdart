@@ -208,7 +208,7 @@ def test_prestamp_inventory_schema_failure_with_hardlink_retarget_is_pending(
     errors: list[BaseException] = []
     outcome = Event()
     execution_gate = Event()
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)
     identity = RunIdentity.from_configuration(configuration)
     real_execute_live = executor._execute_live_directory
     real_materialize = executor_module.materialize_live_directory_group
@@ -352,7 +352,7 @@ def test_prestamp_unchanged_inventory_schema_failure_remains_terminal(
         with pytest.raises(ValueError, match=_SCHEMA_SENTINEL):
             output_preflight.materialize_live_directory_group(
                 receipt,
-                intent.freeze(),
+                intent.freeze(saturation=receipt.saturation),
                 session,
                 group,
                 cancelled=lambda: False,
@@ -456,13 +456,13 @@ def test_prestamp_inventory_failure_two_sweep_order_and_cancellation(
         if cancel_at is None:
             with pytest.raises(ValueError, match=_SCHEMA_SENTINEL):
                 output_preflight.materialize_live_directory_group(
-                    receipt, intent.freeze(), session, group, cancelled=cancelled,
+                    receipt, intent.freeze(saturation=receipt.saturation), session, group, cancelled=cancelled,
                 )
             assert traces == expected
         else:
             with pytest.raises(RuntimeError, match="admission cancelled"):
                 output_preflight.materialize_live_directory_group(
-                    receipt, intent.freeze(), session, group, cancelled=cancelled,
+                    receipt, intent.freeze(saturation=receipt.saturation), session, group, cancelled=cancelled,
                 )
             cancellation_positions = [index for index, value in enumerate(expected)
                                       if value == "cancel"]
@@ -501,7 +501,7 @@ def test_prestamp_exact_cancellation_skips_failure_classification(
         with pytest.raises(RuntimeError, match="admission cancelled") as caught:
             output_preflight.materialize_live_directory_group(
                 receipt,
-                intent.freeze(),
+                intent.freeze(saturation=receipt.saturation),
                 session,
                 group,
                 cancelled=lambda: False,

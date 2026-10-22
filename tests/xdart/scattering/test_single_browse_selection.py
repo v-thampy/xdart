@@ -125,3 +125,34 @@ def test_standard_page_rejects_stale_qz_qxy_image_command(
         assert page._preferences is before
     finally:
         _close(page, qapp)
+
+
+def test_visiting_a_pinned_scan_keeps_the_custom_filename_filter(tmp_path, monkeypatch, qapp):
+    """The real Browser command must not turn a pinned scan visit into All results."""
+    from shutil import copyfile
+
+    seeded = _seed_existing(tmp_path, labels=(2, 5))
+    unrelated = seeded.target.with_name("unrelated_int1d.nexus")
+    copyfile(seeded.target, unrelated)
+    page, _store, _seeded, _context = _loaded_page(tmp_path, monkeypatch, qapp, seed=seeded)
+    browser = page._shell.browser
+    try:
+        browser.set_filename_filter("")  # fixture names do not choose the processing mode
+        page._set_browser_directory(str(seeded.target.parent), explicit=True)
+        page._refresh_shell()
+
+        def catalogued():
+            page._drain_executor()
+            return True if str(unrelated) in browser.listed_results() else None
+
+        _wait(catalogued)
+        browser.set_filename_filter("nothing-matches")
+        assert browser.listed_results() == (str(seeded.target),)
+        assert browser.frame_model.rowCount() == len(seeded.labels)
+        browser._scan_selected()  # the shared list's actual SELECT_SCAN signal reaches the real page
+        qapp.processEvents()
+        assert browser.filename_filter.text() == "nothing-matches"
+        assert browser.listed_results() == (str(seeded.target),)
+        assert browser.frame_model.rowCount() == len(seeded.labels)
+    finally:
+        _close(page, qapp)

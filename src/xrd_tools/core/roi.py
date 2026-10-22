@@ -57,11 +57,12 @@ class RoiSpec:
         return slice(r0, r1), slice(c0, c1)
 
 
-def invalid_pixel_mask(image, *, mask_saturation: bool = False) -> np.ndarray:
-    """Exclude non-finite values and the operator-selected detector values."""
+def invalid_pixel_mask(image, *, mask_saturation: bool = False, saturation: int | None = None) -> np.ndarray:
+    """Exclude non-finite values and the operator-selected detector values; ``saturation`` is the frame's
+    recorded detector saturation (decision 39), left out at and above when the values are masked."""
     a = np.asarray(image)
     bad = ~np.isfinite(a)
-    selected = detector_value_mask(None, a, enabled=mask_saturation)
+    selected = detector_value_mask(None, a, enabled=mask_saturation, saturation=saturation)
     if selected is not None:
         bad |= selected
     return bad

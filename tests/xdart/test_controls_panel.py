@@ -2,6 +2,7 @@
 
 import gc
 import os
+from dataclasses import replace
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -87,6 +88,41 @@ def _drain_qt_events_after_test(qapp):
     gc.collect()
     for _ in range(2):
         qapp.processEvents()
+
+
+def test_grouped_counts_use_shared_integer_rows_and_axis_labels(qapp):
+    panel = ControlsPanel()
+    fields = tuple(ControlFormField(
+        SectionId.PROCESSING, axis, ("RSM", axis), "40", ControlFieldKind.INT,
+        minimum=1, maximum=1000) for axis in ("H", "K", "L"))
+    emitted = []
+    panel.fieldValueChanged.connect(lambda *args: emitted.append(args))
+    rows = panel.render_count_row(panel.processing_card, "Grid", fields)
+    try:
+        panel.resize(380, 900)
+        panel.processing_card.show()
+        panel.show()
+        qapp.processEvents()
+        editors = [rows[field.path].editor for field in fields]
+        assert all(editor.isVisible() for editor in editors)
+        assert [rows[field.path].label.text() for field in fields] == ["H", "K", "L"]
+        assert len({editor.mapTo(panel, QtCore.QPoint()).y() for editor in editors}) == 1
+        assert all(editors[index].mapTo(panel, QtCore.QPoint()).x() + editors[index].width()
+                   < editors[index + 1].mapTo(panel, QtCore.QPoint()).x() for index in (0, 1))
+        row = rows[fields[1].path]
+        _user_types(qapp, panel, row.editor, "64")
+        row.editor.editingFinished.emit()
+        assert emitted[-1] == (fields[1].path, "64")
+        _user_types(qapp, panel, row.editor, "0")
+        assert row.refusal()
+        updated = replace(fields[1], value="80")
+        row.editor.clearFocus()
+        qapp.processEvents()
+        row.apply_field(updated)
+        assert row.label.text() == "K" and row.current_value() == "80"
+    finally:
+        panel.close()
+        panel.deleteLater()
 
 
 def test_controls_panel_renders_bound_render_state_directly(qapp):
@@ -286,6 +322,40 @@ def test_run_readiness_label_elides_without_widening_controls(qapp):
     finally:
         controls.close()
         controls.deleteLater()
+
+
+@pytest.mark.parametrize("kind", ["section", "subsection", "compact"])
+def test_shared_header_status_does_not_set_card_minimum_width(qapp, kind):
+    from xdart.gui.widgets.controls_panel import SectionCard
+
+    card = (SubsectionCard("Detector") if kind == "subsection" else
+            SectionCard("Processing", compact=kind == "compact"))
+    try:
+        if kind == "compact":
+            card.set_readiness(True, "ready")
+        else:
+            card.status.setText("ready")
+            card.status.show()
+        card.resize(360, 100)
+        card.show()
+        qapp.processEvents()
+        before = card.minimumSizeHint().width()
+        message = "Calibration, coordinate and grid details " * 40
+        if kind == "compact":
+            card.set_readiness(True, message)
+        else:
+            card.status.setText(message)
+        card.status.setToolTip(message)
+        qapp.processEvents()
+        assert card.minimumSizeHint().width() == before
+        assert card.status.text() == message
+        assert card.status.toolTip() == message
+        assert 0 < card.status.width() < card.width()
+        assert card.status.wordWrap() is (kind == "compact")
+    finally:
+        card.close()
+        card.deleteLater()
+        qapp.processEvents()
 
 
 @pytest.mark.parametrize(
@@ -944,17 +1014,17 @@ def test_max_bound_scope_caveat_survives_run_lock(qapp):
         locked = _row(panel)
         assert not locked._high.isEnabled()
         assert "locked" in locked._high.toolTip()
-        assert "native integer type maximum minus one" in locked._high.toolTip()
+        assert "Automatic upper limit: the detector's saturation" in locked._high.toolTip()
 
         # In-place unlock, then re-lock, through the update path.
         panel.reconcile(project_controls(
             store.snapshot(), None, RunPhase.IDLE))
-        assert "native integer type maximum minus one" in _row(panel)._high.toolTip()
+        assert "Automatic upper limit: the detector's saturation" in _row(panel)._high.toolTip()
         panel.reconcile(project_controls(
             store.snapshot(), None, RunPhase.RUNNING))
         relocked = _row(panel)
         assert "locked" in relocked._high.toolTip()
-        assert "native integer type maximum minus one" in relocked._high.toolTip()
+        assert "Automatic upper limit: the detector's saturation" in relocked._high.toolTip()
     finally:
         panel.close()
         panel.deleteLater()
@@ -1216,3 +1286,222 @@ def test_form_row_combo_restores_a_previously_blocked_signal_state(qapp):
     finally:
         row.close()
         row.deleteLater()
+
+
+def test_form_row_mounting_captions_commit_and_restore_signed_axis_values(qapp):
+    from xdart.gui.widgets.camera_editor import CAMERA_LABELS
+    path = ('Stitch', 'camera')
+    row = FormRow(label='Camera orientation', path=path, value='x-, z+', kind='combo',
+                  choices=tuple(CAMERA_LABELS), choice_labels=CAMERA_LABELS)
+    emitted = []
+    row.valueChanged.connect(lambda *values: emitted.append(values))
+    try:
+        assert row.editor.currentText() == 'upright'
+        assert row.current_value() == 'x-, z+'
+        row.editor.setCurrentIndex(row.editor.findData('z+, x+'))
+        row.editor.textActivated.emit(row.editor.currentText())
+        qapp.processEvents()
+        assert emitted == [(path, 'z+, x+')]
+        field = ControlFormField(SectionId.SOURCE, 'Camera orientation', path, 'x+, z-',
+                                 ControlFieldKind.COMBO, tuple(CAMERA_LABELS))
+        assert row.apply_field(field)
+        assert row.editor.currentText() == '180° CW' and row.current_value() == 'x+, z-'
+        assert row.apply_field(replace(field, value='invalid'))
+        assert row.current_value() == row.editor.currentText() == 'invalid'
+        assert emitted == [(path, 'z+, x+')]
+    finally:
+        row.close()
+        row.deleteLater()
+
+
+def test_set_editors_enabled_locks_every_row_but_the_action_rows(qapp):
+    """A page that renders its own rows and actions (Stitch, RSM) locks the editors through the panel and
+    keeps its action row usable, each button with its own availability: disabling the panel itself also
+    disabled a pending result's Retry (Codex's RSM stage-1 review F2)."""
+    from xrd_tools.session.readiness import ControlActionSpec
+    panel = ControlsPanel(show_section_numbers=False)
+    rows = {}
+    for section, card in ((SectionId.PROJECT, panel.project_card), (SectionId.PROCESSING, panel.processing_card)):
+        rows[section] = FormRow(label="Folder", path=("Project", str(section)), value="", kind="line")
+        card.add_row(rows[section])
+    loose = QtWidgets.QPushButton("Install")
+    panel.experiment_card.add_row(loose)
+    buttons = panel.render_actions(panel.processing_card, tuple(
+        ControlActionSpec(action, label, SectionId.PROCESSING)
+        for action, label in ((ControlAction.PREVIEW, "Preview"), (ControlAction.RETRY, "Retry"))))
+    buttons[ControlAction.PREVIEW].setEnabled(False)  # its own availability, kept
+    panel.set_editors_enabled(False)
+    assert not any(row.isEnabled() for row in rows.values()) and not loose.isEnabled()
+    assert buttons[ControlAction.RETRY].isEnabled() and not buttons[ControlAction.PREVIEW].isEnabled()
+    assert panel.isEnabled()
+    panel.set_editors_enabled(True)
+    assert all(row.isEnabled() for row in rows.values()) and loose.isEnabled()
+    assert buttons[ControlAction.RETRY].isEnabled() and not buttons[ControlAction.PREVIEW].isEnabled()
+    panel.deleteLater()
+
+
+def test_an_integer_row_keeps_refused_text_marks_it_and_names_why(qapp):
+    """The whole-number kind (Codex's RSM stage-1 review F1, on the shared row): text that is no whole number
+    within the field's bounds stays as typed (a refused value never leaves an older one in force), the row is
+    outlined (the theme's ``invalid`` property) and its tooltip says why, and ``refusal()`` gives a page's
+    readiness the same rule (``integer_field_refusal``). The value emitted is the typed text, as a line's."""
+    from xrd_tools.session.readiness import integer_field_refusal
+    assert integer_field_refusal("3", minimum=1) == ""
+    assert integer_field_refusal("0", minimum=1) == "must be at least 1"
+    assert integer_field_refusal("9", maximum=8) == "must be at most 8"
+    assert integer_field_refusal("1.5") == "'1.5' is not a whole number"
+    assert integer_field_refusal(" ", allow_blank=True) == "" and integer_field_refusal("") == "a whole number is needed"
+    row = FormRow(label="Frame step", path=("Stitch", "frame_step"), value="1", kind="int", minimum=1)
+    emitted = []
+    row.valueChanged.connect(lambda path, value: emitted.append(value))
+    try:
+        assert row.refusal() == "" and not row.editor.property("invalid")
+        row.editor.setText("0")
+        row.editor.editingFinished.emit()
+        assert emitted == ["0"] and row.editor.text() == "0"  # kept and emitted as typed
+        assert row.refusal() == "must be at least 1" and row.editor.property("invalid") is True
+        assert row.toolTip() == "Frame step: must be at least 1" == row.editor.toolTip()
+        field = ControlFormField(SectionId.SOURCE, "Frame step", ("Stitch", "frame_step"), "0",
+                                 ControlFieldKind.INT, minimum=0)
+        assert row.apply_field(field) and row.refusal() == "" and not row.editor.property("invalid")
+        assert row.toolTip() != "Frame step: must be at least 1"
+        assert not FormRow(label="Last", path=("Stitch", "frame_stop"), value="", kind="int", minimum=0,
+                           allow_blank=True).refusal()
+        line = FormRow(label="Name", path=("Stitch", "name"), value="x", kind="line")
+        assert line.refusal() == ""  # every other kind refuses nothing here
+        line.deleteLater()
+    finally:
+        row.deleteLater()
+
+
+def test_form_purpose_tip_survives_reconcile_and_recovers_after_a_refusal(qapp):
+    row = FormRow(label="Bins", path=("RSM", "grid_h"), value="12", kind="int", minimum=2)
+    field = ControlFormField(SectionId.PROCESSING, "Bins", row.path, "12", ControlFieldKind.INT, minimum=2)
+    try:
+        row.set_purpose_tooltip("Number of H grid points.")
+        row.apply_field(field)
+        assert all(widget.toolTip() == "Number of H grid points." for widget in (row, row.editor, row.label))
+        row.apply_field(replace(field, enabled=False, reason="Unavailable while running"))
+        assert row.toolTip() == "Unavailable while running"
+        row.apply_field(field)
+        assert row.editor.toolTip() == "Number of H grid points."
+        row.editor.setText("0")
+        assert row.editor.toolTip() == "Bins: must be at least 2"
+        row.editor.setText("12")
+        assert row.editor.toolTip() == "Number of H grid points."
+    finally:
+        row.deleteLater()
+
+
+def test_a_file_row_set_by_code_while_unfocused_takes_the_value_without_a_draft_or_commit(qapp):
+    """A window that drives its rows directly rather than through a projection (the shared calibration window,
+    AUD-9 stage 2b G6) sets a file row's text in code and reads the value back: the row adopts it, shows it
+    collapsed with the full path as the tooltip, and makes no draft and no commit (§19.9: a programmatic
+    set is a projection, never user intent). A projected field (``apply_field``) is still exactly the
+    projected value."""
+    path = ("Calibration", "mask")
+    row = FormRow(label="Mask file", path=path, value="/data/old/mask.edf", browse=True)
+    row.show()
+    qapp.processEvents()
+    row.editor.clearFocus()
+    qapp.processEvents()
+    drafts, edits = [], []
+    row.draftChanged.connect(lambda changed, text: drafts.append(text))
+    row.valueChanged.connect(lambda changed, text: edits.append(text))
+    try:
+        row.editor.setText("/data/new/other_mask.npy")
+        assert row.current_value() == "/data/new/other_mask.npy"
+        qapp.processEvents()
+        assert row.editor.text() == "other_mask.npy" and row.editor.toolTip() == "/data/new/other_mask.npy"
+        assert row.current_value() == "/data/new/other_mask.npy" and drafts == [] and edits == []
+        row.apply_field(ControlFormField(SectionId.SOURCE, "Mask file", path, "/data/projected/mask.tif",
+                                         browse=True))
+        qapp.processEvents()
+        assert row.current_value() == "/data/projected/mask.tif" and row.editor.text() == "mask.tif"
+        assert drafts == [] and edits == []
+    finally:
+        row.close()
+        row.deleteLater()
+
+
+
+def test_an_integer_row_is_driven_as_a_spin_box_by_a_window_that_sets_it(qapp):
+    """FIT-TOOLS-2026-10: a window driving its whole-number row (Int's Peak Fit setting its peak count to the peaks it
+    found) uses the editor's ``setValue``/``value``: it is still the themed line edit, the value set as code sets
+    text (no draft, no commit) and still checked against the row's bounds."""
+    from xdart.gui.widgets.controls_panel import IntegerLineEdit
+    row = FormRow(label="Peaks", path=("peak_fit", "n_peaks"), value="1", kind="int", minimum=1, maximum=12)
+    edits = []
+    row.valueChanged.connect(lambda path, value: edits.append(value))
+    row.draftChanged.connect(lambda path, value: edits.append(value))
+    try:
+        editor = row.editor
+        assert isinstance(editor, IntegerLineEdit) and isinstance(editor, QtWidgets.QLineEdit)
+        assert editor.objectName() == "controlsLineEdit" and editor.value() == 1
+        editor.setValue(2)
+        assert editor.text() == "2" and editor.value() == 2 and row.current_value() == "2" and not edits
+        editor.setValue(13)
+        assert row.refusal() == "must be at most 12" and editor.property("invalid") is True
+        editor.setValue(None)
+        assert editor.text() == "" and editor.value() is None and row.refusal() == "a whole number is needed"
+        editor.setText("2.5")
+        assert editor.value() is None
+        line = FormRow(label="Name", path=("x", "name"), value="a", kind="line")
+        assert type(line.editor) is QtWidgets.QLineEdit  # only the whole-number kind
+        line.deleteLater()
+    finally:
+        row.deleteLater()
+
+
+def test_a_range_rows_editors_and_trailing_widget(qapp):
+    from xdart.gui.widgets.controls_panel import RangeRow
+    row = RangeRow(label="Range", low={"path": ("fit", "low"), "value": ""}, high={"path": ("fit", "high"), "value": ""})
+    try:
+        low, high = row.editors
+        assert (low.objectName(), high.objectName()) == ("controlsLineEdit", "controlsLineEdit")
+        assert row.layout().indexOf(low) < row.layout().indexOf(high)
+        button = QtWidgets.QPushButton("Full")
+        row.add_trailing_widget(button)
+        assert row.layout().indexOf(button) == row.layout().count() - 1
+    finally:
+        row.deleteLater()
+
+
+@pytest.mark.parametrize("card_kind", ("section", "subsection"))
+def test_a_card_never_shows_its_header_labels_as_windows(qapp, card_kind):
+    """Live 2026-10-08: a header label made visible before it had a parent opened as its own window for an
+    instant. On macOS that window took the activation and handing it back reactivated the main window, inside
+    the Int page's render, which rendered again (an endless recursion). A card shows its chip, title and status
+    only once they are parented; which of them end up visible is unchanged."""
+    from xdart.gui.widgets.controls_panel import SectionCard, SubsectionCard
+    shown = []
+
+    class WindowsShown(QtCore.QObject):
+        def eventFilter(self, watched, event):
+            if (event.type() == QtCore.QEvent.Type.Show and isinstance(watched, QtWidgets.QWidget)
+                    and watched.isWindow()):
+                shown.append(type(watched).__name__)
+            return False
+
+    def build(full):
+        if card_kind == "section":
+            return SectionCard("Experiment", number="1" if full else "", accent="experiment")
+        return SubsectionCard("Sample & measurement" if full else "", status="Auto" if full else "",
+                              accent="experiment")
+
+    spy = WindowsShown()
+    qapp.installEventFilter(spy)
+    try:
+        full, empty = build(True), build(False)
+    finally:
+        qapp.removeEventFilter(spy)
+    try:
+        assert shown == []
+        if card_kind == "section":
+            assert not full.chip.isHidden() and empty.chip.isHidden()
+        else:
+            assert not full.title.isHidden() and not full.status.isHidden()
+            assert empty.title.isHidden() and empty.status.isHidden()
+    finally:
+        full.deleteLater()
+        empty.deleteLater()

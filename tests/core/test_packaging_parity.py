@@ -14,6 +14,7 @@ import tomllib
 from pathlib import Path
 
 import yaml
+from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -54,7 +55,25 @@ def test_conda_recipe_tests_import_the_notebook_stack():
         for test in _recipe()["tests"]
         for name in test.get("python", {}).get("imports", ())
     }
-    assert {"ipykernel", "ipympl", "ipywidgets", "jupyterlab"} <= imports
+    assert {"ipykernel", "ipympl", "ipywidgets", "jupyterlab", "marimo"} <= imports
+
+
+def test_gui_extra_includes_the_complete_notebook_stack():
+    extras = _project()["optional-dependencies"]
+    bundled = set().union(*(Requirement(item).extras for item in extras["gui"]
+                            if _name(item) == "xdart"))
+    assert {"fitting", "rsm", "notebook"} <= bundled
+    assert {"ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab", "nbformat", "marimo"} <= {
+        _name(item) for item in extras["notebook"]
+    }
+
+
+def test_marimo_uses_the_selected_compatible_release_line_in_both_installs():
+    pip = next(Requirement(item) for item in _project()["optional-dependencies"]["notebook"]
+               if _name(item) == "marimo")
+    conda = next(item for item in _recipe()["requirements"]["run"] if _name(item) == "marimo")
+    assert str(pip.specifier) == str(Requirement(conda).specifier)
+    assert "0.25.0" in pip.specifier and "0.24.9" not in pip.specifier and "0.26.0" not in pip.specifier
 
 
 def test_conda_recipe_offers_only_the_python_versions_the_project_claims():

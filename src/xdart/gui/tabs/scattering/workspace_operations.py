@@ -133,6 +133,7 @@ class AverageOperationState:
     revision: int
     target: str
     entry: str
+    dimension: str
     pending: OperationPending | None = None
     source_root: str | None = None
 
@@ -145,6 +146,7 @@ class AverageOperationState:
             or not self.target
             or type(self.entry) is not str
             or not self.entry
+            or self.dimension not in {"1d", "2d"}
             or (
                 self.source_root is not None
                 and (
@@ -344,6 +346,8 @@ class WorkspaceOperationOwner:
             or os.path.normcase(os.path.normpath(source_root)) != source_root
         ):
             return None
+        from .output_preflight import native_int_reduction_plan
+        reduction = native_int_reduction_plan(configuration)
         identity = self._slot.begin_average(
             configuration,
             target,
@@ -357,6 +361,7 @@ class WorkspaceOperationOwner:
             revision,
             str(target),
             entry,
+            "2d" if reduction.integration_2d is not None else "1d",
             source_root=source_root,
         )
         return identity
@@ -723,7 +728,7 @@ class WorkspaceOperationOwner:
             )
         # Average never writes `target`: it is only this operation's directory
         # and naming anchor.  Recompute the stable slot from that anchor so a
-        # terminal naming a different directory, family or operation cannot be
+        # terminal naming a different directory, family or dimension cannot be
         # adopted.  Path math only -- the worker already did the full
         # provenance verification.
         #
@@ -744,7 +749,7 @@ class WorkspaceOperationOwner:
         )
 
         try:
-            successor = _average_output_artifact(_average_target(target))
+            successor = _average_output_artifact(_average_target(target), dimension=state.dimension)
         except Exception:
             successor = None
         if successor is None or result.target != successor or result.entry != entry:
@@ -770,7 +775,9 @@ class WorkspaceOperationOwner:
                 request_catalog=True,
             )
         directive = AverageReloadDirective(
-            successor,
+            # The seal's canonical spelling of the same slot (it differs from `successor` in case on
+            # Windows); Browse reopens exactly what the writer sealed.
+            commit_identity.target,
             entry,
             commit_identity,
             state.source_root,

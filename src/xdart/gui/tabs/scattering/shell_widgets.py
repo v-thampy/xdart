@@ -33,6 +33,8 @@ from .controls_readiness import (
 from .detector_projection import detector_calibration_ready
 from .display_values import DisplayFrameKey
 from .shell_values import AxisProjection, TraceProjection
+from .scientific_curves import add_curve_item, add_text_item, reference_entry
+from xdart.gui.widgets.scientific_plot import HOVER_PX, HoverTooltip
 
 
 def _axis_text(text: str) -> str:
@@ -104,6 +106,73 @@ class _ScientificImageWidget(pgImageWidget):
             self.raw_image = raw
 
 
+class _OverlayHitIndex:
+    """One joined overlay family's drawn points (the item's own array, not a copy) bucketed in a uniform grid over
+    their view-coordinate extent, so a hover finds the curves within ``HOVER_PX`` without scanning every point (C7,
+    CR7). Built once per drawing (a radix sort of 16-bit cell ids); a zoom changes only the query's reach. A segment
+    longer than one cell is kept in a short exact list instead of widening every query. Memory: about eight bytes per
+    drawn point."""
+
+    CELLS = 255  # (CELLS + 1)² cell ids fit 16 bits
+
+    def __init__(self, points, values, color):
+        self.points, self.values, self.color = points, values, color
+        finite = np.isfinite(points).all(axis=1)
+        #: the separator rows: curve k ends before ``breaks[k]`` (one separator follows each joined curve)
+        self.breaks = np.flatnonzero(~finite)
+        index = np.flatnonzero(finite)
+        self.empty = index.size == 0
+        if self.empty:
+            return
+        xy = points[index]
+        self.origin = xy.min(axis=0)
+        self.cell = np.maximum((xy.max(axis=0) - self.origin) / self.CELLS, 1e-12)
+        joined = np.diff(index) == 1  # consecutive drawn points of one curve
+        starts = index[:-1][joined]
+        long = (np.abs(points[starts + 1] - points[starts]) > self.cell).any(axis=1)
+        #: segments longer than one cell, checked exactly at every hover (few: arcs are sampled finely)
+        self.long = starts[long].astype(np.int32)
+        cells = self._cells(xy)
+        order = np.argsort(cells, kind='stable')
+        self.cells, self.order = cells[order], index[order].astype(np.int32)
+
+    def _cells(self, xy):
+        ij = np.clip(np.floor((xy - self.origin) / self.cell), 0, self.CELLS).astype(np.uint16)
+        return (ij[..., 1].astype(np.uint32) * (self.CELLS + 1) + ij[..., 0]).astype(np.uint16)
+
+    def hits(self, x, y, pixel):
+        """The curves (indices into ``values``) passing within ``HOVER_PX`` screen pixels of view (x, y)."""
+        if self.empty:
+            return ()
+        scale = np.abs(np.asarray(pixel, dtype=float))
+        cursor_view = np.array((x, y))
+        reach = HOVER_PX * scale + self.cell
+        low = (cursor_view - reach - self.origin) / self.cell
+        high = (cursor_view + reach - self.origin) / self.cell
+        near = np.zeros(0, dtype=np.int32)
+        if not ((high < 0).any() or (low > self.CELLS).any()):
+            (i0, j0) = np.clip(np.floor(low), 0, self.CELLS).astype(int)
+            (i1, j1) = np.clip(np.floor(high), 0, self.CELLS).astype(int)
+            width = self.CELLS + 1
+            rows = [self.order[np.searchsorted(self.cells, j * width + i0):
+                               np.searchsorted(self.cells, j * width + i1, side='right')]
+                    for j in range(j0, j1 + 1)]
+            near = np.concatenate(rows) if rows else near
+        points, last = self.points, len(self.points) - 1
+        starts = np.unique(np.concatenate((near, near - 1, self.long)))
+        starts = starts[(starts >= 0) & (starts < last)]
+        segments = starts[np.isfinite(points[starts]).all(axis=1) & np.isfinite(points[starts + 1]).all(axis=1)]
+        cursor = cursor_view / scale
+        a, b = points[segments] / scale, points[segments + 1] / scale
+        d = b - a
+        t = np.clip(((cursor - a) * d).sum(axis=1) / np.maximum((d * d).sum(axis=1), 1e-300), 0., 1.)
+        hit = np.hypot(*(a + t[:, None] * d - cursor).T) <= HOVER_PX
+        single = near[~np.isin(near, np.concatenate((segments, segments + 1)))]
+        alone = single[np.hypot(*((points[single] / scale) - cursor).T) <= HOVER_PX] if single.size else single
+        curves = np.searchsorted(self.breaks, np.concatenate((segments[hit], alone)))
+        return tuple(int(curve) for curve in np.unique(curves) if curve < len(self.values))
+
+
 class ScientificImagePane(QtWidgets.QWidget):
     def __init__(
         self,
@@ -126,12 +195,27 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.plot = self.canvas.image_plot
         self.image = self.canvas.imageItem
         self.color_scale = self.canvas.histogram
+        self.coverage_overlay = pg.ImageItem(axisOrder="col-major")
+        self.coverage_overlay.setZValue(1)
+        self.coverage_overlay.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+        self.coverage_overlay.setAcceptHoverEvents(False)
+        self.plot.addItem(self.coverage_overlay)
+        self.coverage_overlay.hide()
         self._render_contract: tuple[object, ...] | None = None
         self._geometry_contract: tuple[object, ...] | None = None
         self._axis_presentation_contract: tuple[object, ...] | None = None
+        self.overlay_families = {}
+        self._overlay_contracts = {}
+        #: hoverable families (curves carrying values: reference phases' rings and lines, C7): their drawn points,
+        #: the curves' values and colour; each index is built on the first hover after its drawing
+        self._hover_data, self._hover_indexes = {}, {}
+        self.hover = HoverTooltip(self.canvas.image_win)
+        self._hover_proxy = pg.SignalProxy(signal=self.canvas.image_win.scene().sigMouseMoved, rateLimit=60,
+                                           slot=self._hover_moved)
         layout.addWidget(self.canvas, 1)
 
     def clear(self) -> None:
+        self.clear_overlay_families()
         self._render_contract = None
         self._geometry_contract = None
         self._axis_presentation_contract = None
@@ -140,6 +224,100 @@ class ScientificImagePane(QtWidgets.QWidget):
         self.canvas._level_cache = None
         self.canvas._level_scan_token = None
         self.image.clear()
+        self.render_coverage(None)
+
+    def clear_overlay_families(self):
+        for family in tuple(self.overlay_families):
+            self.render_overlay_family(family, ())
+
+    def _map_overlay_points(self, points, native_shape):
+        if native_shape is None:
+            return np.asarray(points)
+        c, r = self.image.image.shape[:2]
+        rows, columns = native_shape
+        native = np.asarray(points)
+        x = native[:, 0]*(c-1)/(columns-1)+.5 if columns > 1 else np.full(len(native), .5)
+        y = r-.5-native[:, 1]*(r-1)/(rows-1) if rows > 1 else np.full(len(native), .5)
+        transform, pos = self.image.transform(), self.image.pos()
+        return np.column_stack((
+            transform.m11()*x+transform.m21()*y+transform.dx()+pos.x(),
+            transform.m12()*x+transform.m22()*y+transform.dy()+pos.y()))
+
+    def render_overlay_family(self, family, curves, *, texts=(), native_shape=None,
+                              color=None, joined=False):
+        """Independent passive family using one native-pixel display mapper."""
+        contract = None
+        if curves and (native_shape is None or self.image.image is not None):
+            transform, pos = self.image.transform(), self.image.pos()
+            contract = (tuple(id(curve) for curve in curves), tuple(id(text) for text in texts),
+                        native_shape, None if self.image.image is None else self.image.image.shape,
+                        transform.m11(), transform.m12(), transform.m21(), transform.m22(),
+                        transform.dx(), transform.dy(), pos.x(), pos.y(), color, joined)
+        if contract == self._overlay_contracts.get(family):
+            return
+        for item in self.overlay_families.pop(family, ()):
+            self.plot.removeItem(item)
+        self._overlay_contracts.pop(family, None)
+        self._hover_data.pop(family, None)
+        self._hover_indexes.pop(family, None)
+        self.hover.hide()  # what it named may be gone or moved
+        if contract is None:
+            return
+        self._overlay_contracts[family] = contract
+        color = color or '#8dd3ec'
+        mapped = [self._map_overlay_points(curve.xy, native_shape) for curve in curves]
+        pairs = [(curves[0], np.vstack([np.vstack((points, (np.nan, np.nan))) for points in mapped]))]
+        values = tuple(getattr(curve, 'value', None) for curve in curves)
+        if joined and any(value is not None for value in values):
+            self._hover_data[family] = (pairs[0][1], values, pg.mkColor(color).getRgb()[:3])
+        if not joined:
+            pairs = zip(curves, mapped)
+        items = [add_curve_item(self.plot, curve, color, xy=points) for curve, points in pairs]
+        items.extend(add_text_item(self.plot, text, color,
+                     xy=self._map_overlay_points([text.xy], native_shape)[0]) for text in texts)
+        for item in items:
+            item.setZValue(2)
+        self.overlay_families[family] = tuple(items)
+
+    def _hover_moved(self, positions):
+        """The overlay curves within ``HOVER_PX`` of the cursor name their reflections in one tooltip (C7)."""
+        position = positions[0] if type(positions) is tuple and positions else positions
+        box = self.canvas.imageViewBox
+        if (not isinstance(position, QtCore.QPointF) or not self._hover_data
+                or not box.sceneBoundingRect().contains(position)):
+            self.hover.hide()
+            return
+        point, pixel = box.mapSceneToView(position), box.viewPixelSize()
+        entries = []
+        for family, (points, values, color) in self._hover_data.items():
+            index = self._hover_indexes.get(family)
+            if index is None:
+                index = self._hover_indexes[family] = _OverlayHitIndex(points, values, color)
+            entries.extend(reference_entry(values[curve], color) for curve in index.hits(point.x(), point.y(), pixel)
+                           if values[curve] is not None)
+        if entries:
+            self.hover.show(position, "<br>".join(entries))
+        else:
+            self.hover.hide()
+
+    def render_coverage(self, coverage: np.ndarray | None) -> None:
+        """Shade zero-support bins separately from the scientific image and its color scale."""
+        if coverage is None:
+            self.coverage_overlay.clear()
+            # ImageItem.clear drops pixels, but its rendered QImage/buffers can still own them.
+            for name in ("qimage", "_displayBuffer", "_processingBuffer", "_imageNanLocations", "_imageHasNans"):
+                setattr(self.coverage_overlay, name, None)
+            self.coverage_overlay.hide()
+            return
+        if self.image.image is None or coverage.T.shape != self.image.image.shape[:2]:
+            raise ValueError("coverage must match the rendered image")
+        rgba = np.zeros((*coverage.T.shape, 4), dtype=np.uint8)
+        rgba[..., :3] = 128
+        rgba[..., 3] = (coverage.T == 0) * 180
+        self.coverage_overlay.setImage(rgba, autoLevels=False)
+        self.coverage_overlay.setTransform(self.image.transform())
+        self.coverage_overlay.setPos(self.image.pos())
+        self.coverage_overlay.show()
 
     def clear_image_buffers(self, *, keep_chrome: bool = True) -> None:
         """Release pyqtgraph image state while leaving failures observable."""
@@ -224,7 +402,7 @@ class ScientificImagePane(QtWidgets.QWidget):
             None
             if axis is None
             else (
-                id(axis.values), axis.label, axis.unit, axis.values.shape,
+                id(axis.values), axis.label, axis.unit, axis.values.shape, axis.edges,
             )
         )
 
@@ -257,8 +435,8 @@ class ScientificImagePane(QtWidgets.QWidget):
     ) -> tuple[object, ...]:
         source = np.asarray(data)
         if x_axis is not None and y_axis is not None:
-            x0, x1 = axis_extent(x_axis.values)
-            y0, y1 = axis_extent(y_axis.values)
+            x0, x1 = axis_span(x_axis)
+            y0, y1 = axis_span(y_axis)
             return (
                 "axes", source.shape, x_axis.values.shape, y_axis.values.shape,
                 x0, x1, y0, y1,
@@ -307,7 +485,14 @@ class ScientificImagePane(QtWidgets.QWidget):
             autorange_finite_y=autorange_finite_y,
         )
 
-    def render(
+    def render(self, *args, **kwargs) -> bool:
+        try:
+            return self._render_image(*args, **kwargs)
+        except Exception:
+            self.clear_overlay_families()
+            raise
+
+    def _render_image(
         self,
         data: np.ndarray,
         *,
@@ -319,7 +504,10 @@ class ScientificImagePane(QtWidgets.QWidget):
         level_scan_token: object | None = None,
         view_range: QtCore.QRectF | None = None,
         autorange_finite_y: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Draw ``data``; False when the identical immutable image is already drawn (only ``view_range`` is
+        applied), True when it is drawn again: its colour bar's levels and limits are then the image's own, unless
+        it has no finite value (the canvas leaves the colour bar as it was)."""
         source = np.asarray(data)
         render_contract = ScientificImagePane._image_render_contract(
             source,
@@ -354,7 +542,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         if immutable and getattr(self, "_render_contract", None) == render_contract:
             if view_range is not None:
                 self.canvas.imageViewBox.setRange(view_range, padding=0.0)
-            return
+            return False
         # A failed repaint may already have changed pixels, range, or labels.
         # Retire the prior identity contract before the first mutation so a
         # later request for the old immutable source cannot incorrectly fast
@@ -367,8 +555,13 @@ class ScientificImagePane(QtWidgets.QWidget):
         self._axis_presentation_contract = None
         image = source.T
         if x_axis is not None and y_axis is not None:
-            x0, x1 = axis_extent(x_axis.values)
-            y0, y1 = axis_extent(y_axis.values)
+            x0, x1 = axis_span(x_axis)
+            y0, y1 = axis_span(y_axis)
+            # Explicit bin edges retain the centres' direction without reordering pixels.
+            if x_axis.edges is not None and x_axis.values[0] > x_axis.values[-1]:
+                x0, x1 = x1, x0
+            if y_axis.edges is not None and y_axis.values[0] > y_axis.values[-1]:
+                y0, y1 = y1, y0
             rect = QtCore.QRectF(x0, y0, x1 - x0, y1 - y0)
             linear_percentiles = (0.5, 99.5)
             expand_degenerate = True
@@ -450,6 +643,7 @@ class ScientificImagePane(QtWidgets.QWidget):
         self._render_contract = render_contract if immutable else None
         self._geometry_contract = geometry_contract
         self._axis_presentation_contract = axis_presentation
+        return True
 
 
 class CompactFrameSelector(QtWidgets.QComboBox):
@@ -664,6 +858,8 @@ def project_header_projection(
 
 def experiment_header_projection(
     state: ControlsProjection,
+    *,
+    calibration_ready: bool | None = None,
 ) -> SectionHeaderProjection:
     """Qualify EXPERIMENT from the production parsed-PONI fact."""
 
@@ -671,7 +867,8 @@ def experiment_header_projection(
     text = "grazing" if values.get(("GI", "Grazing")) is True else "standard"
     raw_poni = values.get(("Signal", "poni_file"))
     poni_file = raw_poni if type(raw_poni) is str else ""
-    ready = detector_calibration_ready(poni_file)
+    ready = (detector_calibration_ready(poni_file)
+             if calibration_ready is None else calibration_ready)
     return SectionHeaderProjection(
         text,
         ready,
@@ -959,6 +1156,21 @@ def _threshold_is_configured(
     return low is not None and (upper is None or (high is not None and low <= high))
 
 
+class _ToolbarContent(QtWidgets.QWidget):
+    """A scrollable toolbar's row: at least ``minimum_width`` wide and never
+    narrower than its controls need.  An explicit minimum width would replace
+    the row's own minimum, so controls added later (the Phases toggle, a
+    page's tools) would overlap instead of scrolling."""
+
+    def __init__(self, minimum_width: int) -> None:
+        super().__init__()
+        self._minimum_width = int(minimum_width)
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        hint = super().minimumSizeHint()
+        return QtCore.QSize(max(self._minimum_width, hint.width()), hint.height())
+
+
 def scrollable_toolbar(
     row: QtWidgets.QLayout,
     *,
@@ -977,9 +1189,8 @@ def scrollable_toolbar(
         horizontal_inset,
         0,
     )
-    content = QtWidgets.QWidget()
+    content = _ToolbarContent(minimum_width)
     content.setLayout(row)
-    content.setMinimumWidth(minimum_width)
     area = QtWidgets.QScrollArea()
     area.setObjectName("e3ScrollableToolbar")
     area.setWidgetResizable(True)
@@ -1037,6 +1248,11 @@ def axis_extent(values: np.ndarray) -> tuple[float, float]:
     return min(first, last), max(first, last)
 
 
+def axis_span(axis: AxisProjection) -> tuple[float, float]:
+    """Where an image spans along ``axis``: its ``edges`` when given, else its first and last values."""
+    return axis.edges if axis.edges is not None else axis_extent(axis.values)
+
+
 def repeated_labels(
     frames: tuple[DisplayFrameKey, ...],
 ) -> frozenset[int]:
@@ -1059,40 +1275,137 @@ def frame_caption(
     return str(frame.local_frame_label)
 
 
+#: Curves on different grids are folded on one grid of at most this many points (display only), and at most
+#: _FOLD_WORK interpolated values in all; never fewer points than the longest curve's.
+_FOLD_GRID_POINTS = 50_000
+_FOLD_WORK = 20_000_000
+
+
+def same_grid(values: np.ndarray, reference: np.ndarray) -> bool:
+    """One grid: equal, or equal to rounding (a billionth of each value; live integrators can publish
+    numerically equivalent grids a few ulps apart)."""
+    return values.shape == reference.shape and (
+        np.array_equal(values, reference) or np.allclose(values, reference, rtol=1e-9, atol=0.0))
+
+
+def _on_one_grid(traces: tuple[TraceProjection, ...]) -> bool:
+    """The traces share the first's grid (``same_grid``)."""
+    first = traces[0].axis.values
+    return all(same_grid(trace.axis.values, first) for trace in traces)
+
+
+def _fold_grid(traces: tuple[TraceProjection, ...]) -> np.ndarray | None:
+    """One grid for curves on different grids of one axis: from the lowest point of any to the highest, as
+    fine as the finest (its mean spacing), within ``_FOLD_GRID_POINTS`` and ``_FOLD_WORK``; None when the
+    axes differ (Q and 2θ) or one is not finite and strictly monotonic with two points or more."""
+    first = traces[0].axis
+    lows, highs, steps, sizes = [], [], [], []
+    for trace in traces:
+        if (trace.axis.label, trace.axis.unit) != (first.label, first.unit):
+            return None
+        values = np.asarray(trace.axis.values, dtype=float)
+        if values.size < 2 or not np.all(np.isfinite(values)):
+            return None
+        step = np.diff(values)
+        if not (np.all(step > 0.0) or np.all(step < 0.0)):
+            return None
+        lows.append(float(values.min()))
+        highs.append(float(values.max()))
+        steps.append((highs[-1] - lows[-1]) / (values.size - 1))
+        sizes.append(values.size)
+    low, high = min(lows), max(highs)
+    points = int(math.ceil((high - low) / min(steps))) + 1
+    points = max(max(sizes), min(points, _FOLD_GRID_POINTS, _FOLD_WORK // len(traces)))
+    return np.linspace(low, high, points)
+
+
+def foldable(traces: tuple[TraceProjection, ...]) -> bool:
+    """Whether Average and Sum fold these traces (one grid, or grids of one axis), else they show the first."""
+    return not traces or _on_one_grid(traces) or _fold_grid(traces) is not None
+
+
 def aggregate_traces(
     traces: tuple[TraceProjection, ...], mode: str
 ) -> tuple[TraceProjection, ...]:
+    """The traces' Average or Sum, for display. On one grid, point by point. On different grids of one axis
+    (maintainer, 2026-09-30: "can this be changed and made more flexible, at least for sum? This is only for
+    display" -- "bin them together on a common grid"), each is interpolated linearly onto ``_fold_grid``'s
+    and every point takes the curves that reach it (none: no value); a curve that alone reaches a stretch
+    is shown there as it is. On different axes the first is shown."""
     if not traces:
         return ()
     first = traces[0]
-    if not all(
-        trace.axis.values.shape == first.axis.values.shape
-        and np.array_equal(trace.axis.values, first.axis.values)
-        for trace in traces
-    ):
+    if _on_one_grid(traces):
+        values = np.stack([trace.intensity for trace in traces])
+        intensity = (
+            np.nanmean(values, axis=0)
+            if mode == "Average"
+            else np.nansum(values, axis=0)
+        )
+        return (
+            TraceProjection(first.frame, first.axis, intensity, mode),
+        )
+    grid = _fold_grid(traces)
+    if grid is None:
         return (first,)
-    values = np.stack([trace.intensity for trace in traces])
-    intensity = (
-        np.nanmean(values, axis=0)
-        if mode == "Average"
-        else np.nansum(values, axis=0)
-    )
+    total = np.zeros(grid.shape)
+    count = np.zeros(grid.shape, dtype=np.int64)
+    for trace in traces:  # one curve at a time: the fold holds the grid's arrays only
+        values = np.asarray(trace.axis.values, dtype=float)
+        intensity = np.asarray(trace.intensity, dtype=float)
+        if values[0] > values[-1]:
+            values, intensity = values[::-1], intensity[::-1]
+        row = np.interp(grid, values, intensity, left=np.nan, right=np.nan)
+        reached = ~np.isnan(row)
+        total[reached] += row[reached]
+        count += reached
+    intensity = np.full(grid.shape, np.nan)
+    reached = count > 0
+    intensity[reached] = total[reached] / count[reached] if mode == "Average" else total[reached]
     return (
-        TraceProjection(first.frame, first.axis, intensity, mode),
+        TraceProjection(first.frame, AxisProjection(grid, first.axis.label, first.axis.unit), intensity, mode),
     )
+
+
+def color_map_choices() -> tuple[str, ...]:
+    """Int's colour-map list: "Default" (viridis) first, then every matplotlib map."""
+    from matplotlib import colormaps  # lazy: importing this module loads no plotting library
+
+    return ("Default", *tuple(colormaps))
+
+
+def color_map_combo() -> ContentFitComboBox:
+    """Int's colour-map selector, the one its scientific view's top bar shows: built here once for every view
+    that draws an intensity (``ScientificView``, the 3D Viewer's ``VolumeView``)."""
+    combo = ContentFitComboBox()
+    combo.addItems(color_map_choices())
+    return combo
+
+
+def log_toggle() -> QtWidgets.QPushButton:
+    """Int's Log toggle, shared as ``color_map_combo`` is."""
+    button = QtWidgets.QPushButton("Log")
+    button.setCheckable(True)
+    return button
 
 
 __all__ = [
     "apply_section_header",
     "apply_vnext_controls_readiness",
     "axis_extent",
+    "axis_span",
     "aggregate_traces",
+    "color_map_choices",
+    "color_map_combo",
+    "foldable",
     "ContentFitComboBox",
     "experiment_header_projection",
     "frame_caption",
+    "log_toggle",
     "processing_header_projection",
     "project_header_projection",
     "repeated_labels",
+    "same_grid",
     "ScientificImagePane",
     "SectionHeaderProjection",
     "scrollable_toolbar",

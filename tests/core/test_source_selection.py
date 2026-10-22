@@ -1,5 +1,7 @@
 """Typed mode-specific source-selection contracts."""
 
+import os
+
 import pytest
 
 from xrd_tools.core.scan import SourceKind
@@ -23,6 +25,57 @@ def test_image_series_spec_freezes_all_members_from_selected_fourth(tmp_path):
     assert spec.options["selected_file"] == str(paths[3])
     assert tuple(spec.options["files"]) == tuple(str(path) for path in paths)
     assert spec.options["metadata_format"] == "auto"
+
+
+def test_image_series_spec_checks_file_type_only_for_series_names(
+    tmp_path, monkeypatch,
+):
+    """A shared acquisition folder: an unrelated name gets no metadata call."""
+
+    for name in (
+        "series_2.tif", "series_02.tif", "SERIES_0003.TIF", "series_0004.tif",
+        "series-0005.tif", "series_10.tif",
+        "other_0001.tif", "series_0001.cbf", "series_0001.tif.bak",
+        "series.tif", "series_x.tif", "seriesB_0001.tif", "notes.txt",
+    ):
+        (tmp_path / name).write_bytes(b"x")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "frame.tif").write_bytes(b"x")
+    (tmp_path / "series_0011.tif").symlink_to(elsewhere / "frame.tif")
+    (tmp_path / "series_0012.tif").mkdir()
+    (tmp_path / "series_0013.tif").symlink_to(tmp_path / "missing.tif")
+    (tmp_path / "series_0014.tif").symlink_to(elsewhere)
+    (tmp_path / "other_link").symlink_to(tmp_path / "nowhere")
+    checked = []
+    for name in ("stat", "lstat"):
+        call = getattr(os, name)
+
+        def observed(path, *args, _call=call, **kwargs):
+            checked.append(path)
+            return _call(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, name, observed)
+
+    spec = image_series_spec(tmp_path / "series_0004.tif")
+    monkeypatch.undo()
+
+    assert tuple(spec.options["files"]) == tuple(
+        str(tmp_path / name)
+        for name in (
+            "series_02.tif", "series_2.tif", "SERIES_0003.TIF",
+            "series_0004.tif", "series-0005.tif", "series_10.tif",
+            "series_0011.tif",
+        )
+    )
+    assert spec.options["pattern"] == "series_*.tif"
+    assert spec.options["scan_name"] == "series"
+    assert checked
+    assert {os.path.basename(path) for path in checked} <= {
+        "series_2.tif", "series_02.tif", "SERIES_0003.TIF", "series_0004.tif",
+        "series-0005.tif", "series_10.tif", "series_0011.tif",
+        "series_0012.tif", "series_0013.tif", "series_0014.tif",
+    }
 
 
 def test_container_image_selection_carries_actual_auto_metadata_policy(tmp_path):

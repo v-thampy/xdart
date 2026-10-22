@@ -16,11 +16,15 @@ from xdart.modules.frame_publication import (
 )
 from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.append import AppendRefused
+from xrd_tools.io.metadata import MetadataSourceChanged
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.background import (
+    _PreparedSeriesFrameBackground,
     _PreparedSingleFrameBackground,
     _prepare_single_frame_background,
+    _rebind_series_frame_background,
     _rebind_single_frame_background,
+    series_capsule_requested,
 )
 from xrd_tools.integrate.calibration import (
     apply_sensor_parallax,
@@ -35,9 +39,18 @@ from xrd_tools.io.output_transaction import (
 )
 from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources import open_source
+from xrd_tools.sources.adapters import registry_identity
+from xrd_tools.sources.base import source_metadata_energy_eV
+from xrd_tools.sources.point_images import PointImagesRequired
 from xrd_tools.sources.cursor import open_container_cursor
+from xrd_tools.sources.execution_graph import (
+    LivePrefixProof, published_metadata_drift, validate_consumed_metadata,
+)
 from xrd_tools.sources.nexus import NexusStackSource
+from xrd_tools.sources.metadata_provider import RowsMetadataProvider
+from xrd_tools.sources.point_images import PointImageSource
 from xrd_tools.sources.probe import ProbeState
+from xrd_tools.sources.selection import DirectorySourceSpec, live_metadata_format
 from ..contracts import (
     AdmittedOutput, AdmissionFailure, AdmissionReceipt, AdmissionReleased,
     AdmissionToken,
@@ -72,7 +85,7 @@ from ..output_preflight import (
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     native_int_reduction_plan, materialize_deferred_output,
-    live_directory_groups, materialize_live_directory_group,
+    live_directory_groups, materialize_live_directory_group, observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
 )
@@ -96,47 +109,12 @@ _LIVE_DIRECTORY_POLL_S = 0.1
 _SOURCE_SUBMISSION_END = object()
 
 
-def _resolve_background_before_submit(frame, plan: FrameBackgroundPlan, binding,
-                                      *, cancelled, retryable=False,
-                                      frame_fact=None, capsule_owner=None) -> bool:
-    """The sole immediate-pre-submit Background array insertion seam."""
-    if type(plan) is not FrameBackgroundPlan: raise TypeError("Background plan must be exact")
-    frame.background = None; frame.background_dependency_bytes = None
-    frame.background_dependency_fingerprint = None
-    if plan.mode == "None": return True
-    fact = binding[1] if binding is not None else frame_fact
-    if fact is None: raise RuntimeError("Background resolution lost its frame fact")
-    prepared = (
-        None
-        if capsule_owner is None
-        else getattr(capsule_owner, "background_capsule", None)
-    )
-    result = (
-        _rebind_single_frame_background(
-            prepared, plan, fact, cancelled=cancelled,
-        )
-        if type(prepared) is _PreparedSingleFrameBackground
-        else None
-    )
-    candidate = None
-    if result is None:
-        if capsule_owner is not None:
-            capsule_owner.background_capsule = None
-        result = resolve_frame_background(plan, fact, cancelled=cancelled)
-        candidate = _prepare_single_frame_background(plan, fact, result)
-    if result.disposition == "RETRYABLE" and retryable: return False
-    if result.disposition == "CANCELLED": raise RuntimeError("admission cancelled")
-    if result.disposition != "RESOLVED" or result.background is None:
-        raise SourceRevisionChanged("Background dependency is not presently resolvable")
-    pair = result.descriptor_bytes, result.fingerprint
-    if binding is not None:
-        if pair != binding[2:]: raise SourceRevisionChanged("Background dependency changed after qualification")
-        pair = binding[2], binding[3]
-    if candidate is not None and capsule_owner is not None:
-        capsule_owner.background_capsule = candidate
-    frame.background = result.background
-    frame.background_dependency_bytes, frame.background_dependency_fingerprint = pair
-    return True
+def _resolve_background_before_submit(frame, plan, binding, *, cancelled,
+                                      retryable=False, frame_fact=None, capsule_owner=None):
+    from xrd_tools.reduction.background import resolve_background_before_submit
+    return resolve_background_before_submit(frame, plan, binding, cancelled=cancelled,
+        retryable=retryable, frame_fact=frame_fact, capsule_owner=capsule_owner,
+        resolver=resolve_frame_background)
 
 
 def _qualify_background_bindings(configuration, scan, item, decision, policy,
@@ -147,8 +125,7 @@ def _qualify_background_bindings(configuration, scan, item, decision, policy,
     shape = requirements.height, requirements.width
     selector = None if item.descriptor is None else item.descriptor.dataset_path
     if not prior and configuration.output_mode == "Append":
-        labels = tuple(range(item.source_stamp.first_label,
-            item.source_stamp.first_label + item.source_stamp.frame_count))
+        labels = tuple(int(frame.index) for frame in scan.frames)
         skipped = tuple(label for label in labels if label not in decision.labels)
         if skipped:
             from xrd_tools.io.record_writer import _read_persisted_background_bindings
@@ -429,6 +406,24 @@ def _session_terminal_commit_identity(
         return None
     return commit_identity
 
+
+def _coverage_notice(run) -> str:
+    """The Run-start notice when the output this Run appends to keeps a “Record angular coverage” choice that the
+    pill did not ask for (COVERAGE-SUPPORT-20261013 contract B: an output keeps the choice it was created with)."""
+    recorded = getattr(run.session, "recorded_angular_support", None)
+    if recorded is None or run.configuration is None:
+        return ""
+    from xrd_tools.analysis.angular_support import DEFAULT_RECORD_ANGULAR_SUPPORT
+    requested = run.configuration.run_options.get("record_angular_support", DEFAULT_RECORD_ANGULAR_SUPPORT)
+    if type(requested) is not bool or (recorded == "on") is requested:
+        return ""
+    if recorded == "off":
+        return (f"{run.artifact.name} was created with angular coverage off, and Append keeps that: this Run "
+                "records none. Overwrite or a new output records it.")
+    return (f"{run.artifact.name} was created recording angular coverage, and Append keeps that: this Run "
+            "records it. Overwrite or a new output can turn it off.")
+
+
 @dataclass(slots=True)
 class _StandardRun:
     configuration: FrozenRunConfiguration | None
@@ -442,6 +437,7 @@ class _StandardRun:
     capture: SourceCapture | None = None
     sink: Any | None = None
     output: DynamicOutputAdapter | None = None
+    point_plan: Any | None = None
     worker: Thread | None = None
     stop_requested: bool = False
     stop_signal: Event = field(default_factory=Event)
@@ -465,6 +461,15 @@ class _StandardRun:
         default_factory=dict
     )
     live_revision_lock: Lock = field(default_factory=Lock)
+    # Live reuse: physical target key -> the proof of its published prefix,
+    # and SPEC readiness by (SPEC file, scan).  Run-owned; cleared with the loop.
+    live_proofs: dict[str, Any] = field(default_factory=dict)
+    live_spec_cache: dict[Any, Any] = field(default_factory=dict)
+    # The proof of what the Live poll admitted, for the construction it calls.
+    live_admission_proof: Any = None
+    # Live outputs that stopped growing because a published frame's metadata
+    # changed: physical target key -> the reason every later status carries.
+    live_blocked: dict[str, str] = field(default_factory=dict)
     current_file_total: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
@@ -491,7 +496,9 @@ class _StandardRun:
     resource_facts: list[Any] = field(default_factory=list)
     pending_partition_count: int = 1
     terminal_commit_identity: StreamTerminal | None = None
-    background_capsule: _PreparedSingleFrameBackground | None = None
+    background_capsule: _PreparedSingleFrameBackground | _PreparedSeriesFrameBackground | None = None
+    energy_notice_sent: bool = False
+    coverage_notice_sent: bool = False
 
     def __post_init__(self) -> None:
         self.perf_quartiles_enabled = (
@@ -567,6 +574,12 @@ def _observe_quartile_completion(run: _StandardRun) -> None:
         logger.exception("[PERF-QUARTILE] telemetry disabled after snapshot failure")
 
 
+def _live_proof(configuration, graph, record, registry) -> LivePrefixProof:
+    """A published Live output's proof, with its members' sidecar observations from ``record``."""
+    return LivePrefixProof(graph, metadata_format=live_metadata_format(configuration.thaw_source_spec()),
+                           record=record, registry=registry)
+
+
 def _directory_status(
     run: _StandardRun,
     *,
@@ -581,7 +594,7 @@ def _directory_status(
         f"{state} · {processed} processed · {skipped} skipped · "
         f"{pending} pending · {discovered} discovered"
     )
-    return status
+    return " · ".join((status, *run.live_blocked.values()))
 
 
 def _directory_counts(
@@ -952,10 +965,14 @@ class StandardRunExecutor:
                     display_retirement=proof,
                 )
         except Exception as error:
+            point_images = error.detection if isinstance(error, PointImagesRequired) else None
+            live_point_images = point_images is not None and operation.capture.intent_snapshot.thaw().live_mode
             result = AdmissionFailure(
                 operation.token,
-                detach_exception(error, 'admission').message,
+                ('Multiple images per point are unavailable in Live; choose a finite run.'
+                 if live_point_images else detach_exception(error, 'admission').message),
                 append_refused=isinstance(error, AppendRefused),
+                point_images=None if live_point_images else point_images,
             )
         finally:
             operation.finish_worker(result)
@@ -1343,6 +1360,27 @@ class StandardRunExecutor:
         with run.live_revision_lock:
             return tuple(run.processed_live_revisions.values())
 
+    def live_reuse_records(self, run_identity: RunIdentity) -> tuple[tuple, ...]:
+        """What a Live Run keeps between polls for reuse, as records of primitive values whose
+        first is the frame label served, or ``None`` for an output's or the Run's own state."""
+        run = self._exact_run(run_identity)
+        session = None if run is None or run.resources is None else run.resources.directory_session
+        records = [] if session is None else list(session.reuse_records())
+        for (path, scan), (revision, count, read) in tuple(() if run is None else run.live_spec_cache.items()):
+            records.append((None, str(path), scan, *revision, count,
+                            *(() if read is None else (line.decode('latin-1') for line in read.lines))))
+        for target, proof in tuple(() if run is None else run.live_proofs.items()):
+            stamp = proof.graph.stamp
+            records.append((None, target, proof.verified_at, *(value for entry in proof.registry for value in entry),
+                            *(value for key, seen in tuple(proof.spec_revisions.items()) for value in (key, *seen))))
+            for label, (path, seen) in enumerate(proof.observations, stamp.first_label + proof.start):
+                records.append((label, path, *(value for sidecar, revision in seen or () for value in
+                                               (sidecar, *(revision or (None,))))))
+            for label, source in enumerate(stamp.metadata_sources, stamp.first_label):
+                if source.read_values is not None:
+                    records.append((label, *source.read_values, *source.read_values.values()))
+        return tuple(records)
+
     def acquisition_context(self, run_identity: RunIdentity):
         run = self._exact_run(run_identity)
         runtime = None if run is None else run.context_runtime
@@ -1371,6 +1409,26 @@ class StandardRunExecutor:
             return
         self._settle_predecessor(run, output, predecessor)
 
+    def _block_live_target(
+        self, run: _StandardRun, target: Path, target_key: str,
+        drift: tuple[str, ...],
+    ) -> None:
+        """Stop extending one Live output whose published frames' metadata changed.
+
+        Its published frames, their metadata and lineage stay as written; its
+        open writer is finished through the output owner, and a failure there
+        still fails the Run.  The reason stays in every later status.
+        """
+
+        self._release_predecessor_before_target(run, target)
+        names = ", ".join(sorted({Path(path).name for path in drift}))
+        reason = (
+            f"{Path(target).name} stopped growing: {names} changed after "
+            "its frame was reduced; published frames kept"
+        )
+        run.live_blocked[target_key] = reason
+        logger.warning("[LIVE] %s", reason)
+
     def _settle_predecessor(self, run, output, predecessor) -> None:
         result = output.finish_predecessor(predecessor)
         self._finish_display_projection(run)
@@ -1385,6 +1443,10 @@ class StandardRunExecutor:
         output.drop_released_predecessor(predecessor)
 
     def _construct(self, run: _StandardRun, *, item: PlannedOutput | None=None, labels: tuple[int, ...] | None=None, decision: AdmittedOutput | None=None) -> _StandardRun:
+        proof = getattr(run, 'live_admission_proof', None)
+        if proof is not None:
+            run.live_admission_proof = None
+            proof = proof if item is not None and proof.graph is item.graph else None
         configuration, capture = (run.configuration, run.capture)
         if configuration is None or capture is None:
             raise RuntimeError('run construction shell is incomplete')
@@ -1415,17 +1477,29 @@ class StandardRunExecutor:
             run.scan = None
 
         try:
-            if item is not None:
+            # A Live item re-checks the proof of what its poll admitted; only a
+            # failed proof validates the whole graph again.
+            if item is not None and (proof is None or not proof.holds(cancelled=cancelled)):
                 validate_planned_source(item, cancelled=cancelled)
             if item is not None and item.candidate is not None and (item.descriptor is not None) and (item.descriptor.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
                 cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
                 try:
                     run.source = NexusStackSource(item.source_path, entry=item.source_spec.entry or 'entry', cursor=cursor)
+                    if (rows := item.graph.stamp.metadata_sources):  # a Live SPEC container: each frame's admitted row (R5b)
+                        run.source.bind_metadata_provider(RowsMetadataProvider(
+                            (value.spec_values for value in rows), rows[0].spec_columns or ()))
+                    if source_spec.options.get('point_images') is not None:
+                        run.source = PointImageSource(run.source, source_spec)
                 except Exception:
                     cursor.close()
                     raise
             else:
                 run.source = open_source(source_spec)
+            if proof is not None and hasattr(run.source, 'retain_metadata'):
+                # The proved prefix's frames keep the values their admission read.
+                run.source.retain_metadata({label: values for label, source in enumerate(
+                    item.graph.stamp.metadata_sources[:proof.start], item.graph.stamp.first_label)
+                    if (values := source.read_values if source.spec_values is None else source.spec_values) is not None})
             admission = None if run.resources is None else run.resources.admission
             assets = None if admission is None else admission.scientific_assets
             calibration = (
@@ -1442,18 +1516,40 @@ class StandardRunExecutor:
                     thickness_m=override.thickness_m,
                     parallax=override.parallax,
                 )
-            poni = getattr(calibration, "poni", calibration)
-            integrator = poni_to_integrator(calibration)
-            run.scan = run.source.to_scan(
-                poni=poni,
-                integrator=integrator,
-                output_path=artifact,
-            )
+            from xrd_tools.session.readiness import bind_native_int_source_energy, effective_ring_geometry
+            run.scan = run.source.to_scan(output_path=artifact, cancelled=cancelled)
+            if item is not None:
+                # A live Run reduces only the SPEC values its admission read.
+                validate_consumed_metadata(
+                    item.graph,
+                    {int(frame.index): frame.metadata for frame in run.scan.frames},
+                    start=0 if proof is None else proof.start,
+                )
+            calibration = bind_native_int_source_energy(run.scan, calibration,
+                metadata_wavelength_A=(None if item is None or item.descriptor is None
+                                       else item.descriptor.wavelength),
+                metadata_energy_eV=source_metadata_energy_eV(run.source))
+            integrator = run.scan.integrator
+            poni = run.scan.poni
             if calibration.parallax is not None:
                 extra = dict(getattr(run.scan, "extra", None) or {})
                 extra["detector_calibration"] = detector_calibration_record(
                     calibration, integrator=integrator,
                 )
+                run.scan.extra = extra
+            mask = None if assets is None else assets.mask
+            flat = None if assets is None else assets.flat
+            dark = None if assets is None else assets.dark
+            if mask is not None or flat is not None or dark is not None:
+                # Persist the applied mask, flat and dark: Reintegrate reuses only
+                # the output's own copies, never the source files.
+                extra = dict(getattr(run.scan, "extra", None) or {})
+                if mask is not None:
+                    extra["global_mask"] = np.flatnonzero(np.asarray(mask, dtype=bool))
+                if flat is not None:
+                    extra["flatfield"] = flat
+                if dark is not None:
+                    extra["darkcurrent"] = dark
                 run.scan.extra = extra
         except SourceRevisionChanged:
             discard_source()
@@ -1465,6 +1561,15 @@ class StandardRunExecutor:
             ):
                 discard_source()
                 raise
+            if (
+                isinstance(error, MetadataSourceChanged)
+                and item is not None
+                and not item.graph.infers_point_images
+            ):
+                # A live Run's reduction read met a metadata file changing under
+                # it (a SPEC file still being appended): read again next poll.
+                discard_source()
+                raise SourceRevisionChanged(str(error)) from error
             if item is not None:
                 try:
                     validate_planned_source(item, cancelled=cancelled)
@@ -1479,14 +1584,21 @@ class StandardRunExecutor:
             raise
         run.scan.gi_config = configuration.gi.scan_config().copy()
         run.current_total = (
-            item.source_stamp.frame_count
-            if item is not None
-            else len(run.scan.frames)
+            len(run.scan.frames)
         )
+        for key, name in (("flat", "flat field"), ("dark", "dark")):
+            if getattr(configuration, f"{key}_file", "") and (
+                    assets is None or getattr(assets, f"{key}_bytes") is None):
+                raise ValueError(f"the configured {name} was not admitted")
         plan = replace(
-            native_int_reduction_plan(configuration, companion_modes_2d=True),
+            native_int_reduction_plan(configuration, companion_modes_2d=True,
+                energy_selection=run.scan.extra['energy_selection']),
             mask=None if assets is None else assets.mask,
+            flat=None if assets is None else assets.flat,
+            dark=None if assets is None else assets.dark,
         )
+        ring_geometry = effective_ring_geometry(calibration, integrator=integrator, plan=plan)
+        run.point_plan = plan if isinstance(run.source, PointImageSource) else None
         try:
             npt = int(configuration.bai_1d_args.get("npt", 0))
         except (TypeError, ValueError):
@@ -1544,6 +1656,9 @@ class StandardRunExecutor:
                 mask_saturation=bool(
                     getattr(plan, "mask_saturation", False)
                 ),
+                saturation=getattr(plan, "saturation", None),
+                threshold_min=plan.threshold_min,
+                threshold_max=plan.threshold_max,
                 measurement_mode=(
                     "GI" if configuration.gi.enabled else "Standard"
                 ),
@@ -1579,6 +1694,7 @@ class StandardRunExecutor:
             raise RuntimeError("admission cancelled")
         run.session, created = output.activate(
             preparation,
+            ring_geometry=ring_geometry,
             record_store=run.records,
             run_provenance=run_provenance,
             cancelled=cancelled,
@@ -1662,10 +1778,24 @@ class StandardRunExecutor:
             else runtime.context.hydration_owner
         )
         context = runtime.adopt(run, owner, source_path)
-        if created or context.hydration_owner != previous:
+        # The native binder already resolved these values for this output.
+        # Announce only after its acquisition context has actually been adopted.
+        selection = getattr(run.scan, "extra", {}).get("energy_selection", {})
+        energy = ""
+        if selection.get("disagreement") and not run.energy_notice_sent:
+            energy = (f"Using the scan energy, {selection['source_energy_eV'] / 1000:.3f} keV; "
+                      f"the PONI says {selection['calibration_energy_eV'] / 1000:.3f} keV.")
+            if isinstance(run.capture.source, DirectorySourceSpec):
+                energy = f"{run.artifact.name}: {energy}"
+        coverage = "" if run.coverage_notice_sent else _coverage_notice(run)
+        detail = " ".join(part for part in (energy, coverage) if part)
+        if created or context.hydration_owner != previous or detail:
             self._events.put(StandardRunEvent(
-                run.identity, StandardEventKind.CONTEXT_READY
+                run.identity, StandardEventKind.CONTEXT_READY,
+                artifact=str(run.artifact), detail=detail,
             ))
+            run.energy_notice_sent |= bool(energy)
+            run.coverage_notice_sent |= bool(coverage)
         return context
 
     def _run(self, run: _StandardRun) -> None:
@@ -1879,10 +2009,16 @@ class StandardRunExecutor:
             tuple[tuple[object, ...], SourceExecutionIdentityV1 | None],
         ] = {}
         retry_revisions: dict[str, tuple[object, ...]] = {}
+        # SPEC readiness by SPEC file revision: no read while it is unchanged.
+        spec_cache = run.live_spec_cache
+        spec_cache.clear()
+        run.live_proofs.clear()
+        # Each image's sidecar as last seen; admission waits until it holds still.
+        sidecar_observations: dict[str, tuple[tuple[str, object], ...]] = {}
         discovered_paths: set[Path] = set(deferred.discovered_paths)
         processed_paths: set[Path] = set()
         skipped_paths: set[Path] = set()
-        last_projection: tuple[int, int, int, int, int] | None = None
+        last_projection: tuple[object, ...] | None = None
 
         def publish(*, force: bool = False) -> None:
             nonlocal last_projection
@@ -1899,6 +2035,8 @@ class StandardRunExecutor:
                     - run.files_skipped,
                 ),
                 run.files_discovered,
+                # A newly stopped output is news even when no count moved.
+                tuple(run.live_blocked.values()),
             )
             if not force and projection == last_projection:
                 return
@@ -1917,19 +2055,34 @@ class StandardRunExecutor:
 
         with _run_effect(run):
             publish(force=True)
+        # The last poll's groups, reused while the session returns the same
+        # Snapshot object under the same adapter registrations.
+        grouped: tuple[object, tuple[object, ...], tuple[object, ...]] | None = None
         while not run.stop_requested:
             with _run_effect(run):
                 observation = session.observe(refresh=True)
-                groups = live_directory_groups(receipt, observation)
+                registry = registry_identity()
+                if grouped is None or grouped[0] is not observation.discovered_snapshot or grouped[1] != registry:
+                    grouped = (observation.discovered_snapshot, registry, live_directory_groups(receipt, observation))
+                groups = grouped[2]
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
                 publish()
 
+            watched: list[Path] = []  # files the next poll must see change at once (D1)
             for group in groups:
                 if run.stop_requested:
                     return True
                 revision = tuple(group.revision)
                 target_key = _physical_file_key(group.target)
+                if target_key in run.live_blocked:
+                    # This output stopped growing; later frames are skipped.
+                    skipped_paths.update(
+                        path for path in group.physical_paths
+                        if path not in processed_paths
+                    )
+                    publish()
+                    continue
                 settled = settled_revisions.get(target_key)
                 if settled is not None and settled[0] == revision:
                     settled_identity = settled[1]
@@ -1946,7 +2099,22 @@ class StandardRunExecutor:
                         raise RuntimeError(
                             "settled Live source identity lost its exact attempt"
                         )
+                    proof = run.live_proofs.get(target_key)
                     with _run_effect(run):
+                        # The drift sweep: each settled output's proof is
+                        # re-checked within the sweep period (a container,
+                        # which grows in place, every poll); only a change
+                        # reaches the strict validator below.
+                        if proof is not None and proof.graph is retained.decision.item.graph and (
+                                proof.current if retained.decision.item.descriptor is None
+                                else proof.holds)(cancelled=lambda: run.stop_requested):
+                            continue
+                        run.live_proofs.pop(target_key, None)
+                        # Discovery and registrations as they are before the
+                        # strict check: a proof rebuilt on its pass holds both.
+                        registry = registry_identity()
+                        seen = observe_live_members(configuration, [
+                            member.path for member in retained.decision.item.source_stamp.members])
                         try:
                             validate_planned_source(
                                 retained.decision.item,
@@ -1955,15 +2123,28 @@ class StandardRunExecutor:
                         except SourceRevisionChanged:
                             settled_revisions.pop(target_key, None)
                         else:
+                            run.live_proofs[target_key] = _live_proof(
+                                configuration, retained.decision.item.graph, seen, registry)
                             continue
                 try:
                     with _run_effect(run):
                         reprobe = (
                             retry_revisions.pop(target_key, None) == revision
                         )
+                        with run.live_revision_lock:
+                            retained = run.processed_live_revisions.get(
+                                target_key
+                            )
+                        published = (
+                            0 if retained is None or retained.decision is None
+                            else len(retained.decision.item.source_stamp.members)
+                        )
+                        watched.extend(group.physical_paths[published:])
                         self._release_predecessor_before_target(
                             run, group.target,
                         )
+                        # The registrations this attempt is qualified under.
+                        registry = registry_identity()
                         attempt = materialize_live_directory_group(
                             receipt,
                             configuration,
@@ -1971,6 +2152,14 @@ class StandardRunExecutor:
                             group,
                             cancelled=lambda: run.stop_requested,
                             reprobe=reprobe,
+                            sidecar_observations=sidecar_observations,
+                            published_members=published,
+                            published_graph=(
+                                None if retained is None or retained.decision is None
+                                else retained.decision.item.graph
+                            ),
+                            proof=run.live_proofs.get(target_key),
+                            spec_cache=spec_cache,
                         )
                         if attempt.state is ProbeState.IN_PROGRESS:
                             if attempt.revision_changed:
@@ -1991,12 +2180,42 @@ class StandardRunExecutor:
                             raise RuntimeError(
                                 "Live output target changed after JIT"
                             )
+                        drift = (
+                            () if retained is None or retained.decision is None
+                            else published_metadata_drift(
+                                retained.decision.item.graph,
+                                decision.item.graph,
+                            )
+                        )
+                        if drift:
+                            self._block_live_target(
+                                run, group.target, target_key, drift,
+                            )
+                            skipped_paths.update(
+                                path for path in group.physical_paths
+                                if path not in processed_paths
+                            )
+                            publish(force=True)
+                            continue
+                        if attempt.partial and len(
+                            decision.item.source_stamp.members
+                        ) <= published and (
+                            retained is not None and retained.decision is not None
+                            and decision.item.source_stamp.members
+                            == retained.decision.item.source_stamp.members[
+                                :len(decision.item.source_stamp.members)
+                            ]
+                        ):
+                            # Nothing beyond the published frames is ready yet.
+                            # A raw rewrite must still reach the Append guard.
+                            continue
                         item = decision.item
                         run.current_file_total = len(group.physical_paths)
                         run.current_files_incremental = (
                             item.source_spec.kind is SourceKind.TIFF_SERIES
                         )
                         try:
+                            run.live_admission_proof = attempt.proof
                             self._construct(
                                 run,
                                 item=item,
@@ -2049,10 +2268,15 @@ class StandardRunExecutor:
                     ):
                         with run.live_revision_lock:
                             run.processed_live_revisions[target_key] = attempt
-                        settled_revisions[target_key] = (
-                            revision,
-                            decision.item.source_stamp.execution_identity_v1,
-                        )
+                        run.live_proofs[target_key] = _live_proof(
+                            configuration, decision.item.graph, sidecar_observations, registry)
+                        if not attempt.partial:
+                            # A partial attempt leaves members still waiting
+                            # for their metadata: retry them next poll.
+                            settled_revisions[target_key] = (
+                                revision,
+                                decision.item.source_stamp.execution_identity_v1,
+                            )
                     run.current_file_total = 0
                     run.current_files_incremental = False
                     publish(force=True)
@@ -2066,6 +2290,12 @@ class StandardRunExecutor:
                 if stopped or run.stop_requested:
                     return True
 
+            with run.live_revision_lock:
+                containers = tuple(value.decision.item.source_stamp for value in run.processed_live_revisions.values()
+                                   if value.decision is not None and value.decision.item.descriptor is not None)
+            # Containers grow in place and their external chunks are never listed.
+            session.defer_listing((*watched, *(Path(state.path) for stamp in containers for state in (
+                stamp.file, *(member.file for member in stamp.external_members), *stamp.dependency_files))))
             run.stop_signal.wait(_LIVE_DIRECTORY_POLL_S)
         return True
 
@@ -2249,7 +2479,7 @@ class StandardRunExecutor:
         }
         with _run_effect(run):
             session.start()
-        if isinstance(run.source, NexusStackSource) and write_labels:
+        if isinstance(run.source, (NexusStackSource, PointImageSource)) and write_labels:
             self._submit_container_source(run, output)
         else:
             for frame in scan.frames:
@@ -2281,7 +2511,7 @@ class StandardRunExecutor:
                 if not finished_current:
                     result = output.commit_epoch()
                 else:
-                    result = output.finish_current()
+                    result = output.finish_current(stopped=run.stop_requested)
             except BaseException as error:
                 session_error = error
             _perf_add(run, "finish_writer_seal", monotonic() - seal_started)
@@ -2388,7 +2618,7 @@ class StandardRunExecutor:
         queue; no h5py object crosses threads.
         """
         source = run.source
-        if not isinstance(source, NexusStackSource):
+        if not isinstance(source, (NexusStackSource, PointImageSource)):
             raise TypeError("container submission requires NexusStackSource")
 
         def publish_direct_fact() -> None:
@@ -2489,17 +2719,24 @@ class StandardRunExecutor:
                     continue
             return False
 
-        vnext_chunks = getattr(source, "_iter_vnext_chunks", None)
-        public_chunks = source.iter_chunks
-        canonical = getattr(type(source), "_canonical_iter_chunks", None)
         cancelled = lambda: (run.stop_requested or run.stop_signal.is_set()
                              or not accepting.is_set())
-        chunks = iter(
-            vnext_chunks(_CONTAINER_READ_CHUNK_FRAMES, cancelled)
-            if (callable(vnext_chunks)
-                and getattr(public_chunks, "__func__", None) is canonical)
-            else public_chunks(_CONTAINER_READ_CHUNK_FRAMES)
-        )
+        grouped = isinstance(source, PointImageSource)
+        if grouped:
+            from xrd_tools.reduction.core import _condition_point_operand, _wants_poisson
+            plan = run.point_plan
+            if plan is None:
+                raise RuntimeError('grouped container lost its frozen reduction plan')
+            chunks = iter(source.iter_point_statistics(1,
+                poisson=_wants_poisson(plan), native_transform=lambda native: _condition_point_operand(native, plan),
+                cancelled=cancelled))
+        else:
+            vnext_chunks = getattr(source, "_iter_vnext_chunks", None)
+            public_chunks = source.iter_chunks
+            canonical = getattr(type(source), "_canonical_iter_chunks", None)
+            chunks = iter(vnext_chunks(_CONTAINER_READ_CHUNK_FRAMES, cancelled)
+                if (callable(vnext_chunks) and getattr(public_chunks, "__func__", None) is canonical)
+                else public_chunks(_CONTAINER_READ_CHUNK_FRAMES))
         producer_error: BaseException | None = None
         try:
             while accepting.is_set() and not run.stop_requested:
@@ -2518,7 +2755,15 @@ class StandardRunExecutor:
                     frame = run.frames_by_label.get(int(label))
                     if frame is None:
                         continue
-                    if not enqueue((frame, np.asarray(block[offset]))):
+                    if grouped:
+                        statistics = block[offset]
+                        frame.point_statistics_loader = None
+                        frame.point_variance = statistics.variance
+                        frame.point_exposure_multiplier = statistics.exposure_multiplier
+                        image = statistics.signal
+                    else:
+                        image = np.asarray(block[offset])
+                    if not enqueue((frame, image)):
                         break
         except BaseException as error:
             producer_error = error
@@ -2742,6 +2987,7 @@ class StandardRunExecutor:
         ))
 
     def _cleanup(self, run: _StandardRun, primary: DetachedDiagnostic | None=None) -> ExecutorClosed:
+        run.live_proofs.clear(); run.live_spec_cache.clear()
         with run.cleanup_lock:
             if primary is not None and run.primary is None:
                 run.primary = primary
@@ -2844,6 +3090,7 @@ class StandardRunExecutor:
             if cleaned:
                 run.closed = True
                 run.configuration = None
+                run.point_plan = None
                 run.capture = None
                 run.scan = None
                 run.records = None
@@ -2900,6 +3147,14 @@ class StandardRunExecutor:
             if run.display.payloads
             else "Standard"
         )
+        if kind is StandardEventKind.FAILED:
+            diagnostic = receipt.primary or next(iter(receipt.cleanup_failures), None)
+            logger.error(
+                "[RUN-FAILED] output=%s error=%s: %s",
+                run.artifact,
+                diagnostic.type_qualname if diagnostic is not None else "ExecutionError",
+                detail,
+            )
         perf: dict[str, float] = {}
         if run.perf_enabled:
             with run.perf_lock:
@@ -2911,12 +3166,22 @@ class StandardRunExecutor:
             ("writer_batch", "sink_nexus_write"),
             ("writer_flush", "sink_nexus_flush"),
             ("xye", "sink_xye_write"),
+            ("xye_worker_format", "sink_xye_worker_format"),
+            ("xye_enqueue_wait", "sink_xye_enqueue_wait"),
+            ("xye_queue_high_water", "sink_xye_queue_high_water"),
+            ("xye_drain", "sink_xye_drain"),
+            ("xye_promotion", "sink_xye_promotion"),
+            ("xye_generated", "sink_xye_generated"),
             ("finish_wait", "finish_wait"),
             ("finish_writer_seal", "finish_writer_seal"),
             ("finish_display_drain", "finish_display_drain"),
         ):
             if key in perf:
                 timing_details.append((name, float(perf[key])))
+        timing_details.extend(
+            (key, float(value)) for key, value in perf.items()
+            if key.startswith("writer_finish_")
+        )
         display_keys = ("display_callback", "display_projection")
         if any(key in perf for key in display_keys):
             timing_details.append((
@@ -3042,6 +3307,25 @@ class StandardRunExecutor:
                 perf.get("session_frame_listeners", 0.0),
                 perf.get("session_progress_listeners", 0.0),
             )
+            if "sink_xye_generated" in perf:
+                logger.info(
+                    "[PERF-XYE] worker-format=%.3fs enqueue-wait=%.3fs "
+                    "queue-high-water=%d drain=%.3fs promotion=%.3fs "
+                    "files=%d (parallel timers may overlap)",
+                    perf.get("sink_xye_worker_format", 0.0),
+                    perf.get("sink_xye_enqueue_wait", 0.0),
+                    perf.get("sink_xye_queue_high_water", 0),
+                    perf.get("sink_xye_drain", 0.0),
+                    perf.get("sink_xye_promotion", 0.0),
+                    perf["sink_xye_generated"],
+                )
+            if "writer_finish_close" in perf:
+                logger.info(
+                    "[PERF-WRITER-FINISH] %s (science-readback is included in close)",
+                    " ".join(f"{key.removeprefix('writer_finish_')}={value:.3f}s"
+                             for key, value in perf.items()
+                             if key.startswith("writer_finish_")),
+                )
         if quartile_timing is not None:
             logger.info(
                 "[PERF-QUARTILES] frames=%s",

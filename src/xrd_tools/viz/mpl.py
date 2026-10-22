@@ -277,18 +277,3 @@ def plot_scan_1d(
         kwargs.pop("color", None)
     return handles
 
-
-def plot_stitched_1d(ax: Axes, ds, **kwargs):
-    """Plot a stitched 1-D pattern from :func:`read_stitched` output."""
-    if "stitched_1d" not in ds.data_vars:
-        raise ValueError("Dataset has no 'stitched_1d' — was the scan stitched?")
-    q = ds["q"].values
-    I = ds["stitched_1d"].values
-    sigma = ds.get("stitched_1d_sigma")
-    sigma = sigma.values if sigma is not None else None
-    return plot_1d(
-        ax, q, I, yerr=sigma,
-        attrs=dict(xlabel=r"Q (Å$^{-1}$)", ylabel="Intensity",
-                   yscale="log", title="Stitched"),
-        **kwargs,
-    )

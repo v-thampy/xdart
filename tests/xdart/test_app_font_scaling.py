@@ -43,7 +43,7 @@ import pytest
 
 pytest.importorskip("pyqtgraph")
 import pyqtgraph as pg
-from pyqtgraph import QtGui, QtWidgets
+from pyqtgraph import QtCore, QtGui, QtWidgets
 
 from xdart.gui.themes import apply_theme, render_qss
 from xdart.gui.themes import typography as typo
@@ -458,6 +458,72 @@ def test_reapplying_the_same_tier_is_idempotent(qapp):
     for _ in range(4):
         apply_theme(qapp, "dark", font_scale="large")
     assert _probe_metrics(qapp) == once
+
+
+def test_unchanged_complete_appearance_does_not_repolish(qapp):
+    """A repeated complete appearance causes no native style/font event."""
+    class Events(QtCore.QObject):
+        def __init__(self):
+            super().__init__()
+            self.changes = []
+
+        def eventFilter(self, obj, event):
+            if event.type() in (QtCore.QEvent.Type.StyleChange,
+                                QtCore.QEvent.Type.FontChange):
+                self.changes.append(event.type())
+            return False
+
+    appearance = dict(font_scale="large", spacing="spacious",
+                      accent_color="mauve_grey", controls_card_corners=True)
+    apply_theme(qapp, "light", **appearance)
+    editor = QtWidgets.QLineEdit("selected value")
+    editor.setProperty("invalid", True)
+    editor.setProperty("productionReady", False)
+    editor.setSelection(0, 8)
+    widget, plot, legend = _styled_plot()
+    widget.show()
+    qapp.processEvents()
+    events = Events()
+    editor.installEventFilter(events)
+    bottom = plot.getAxis("bottom")
+    picture = bottom.picture
+    assert picture is not None
+    metrics = _plot_font_metrics(plot, legend)
+    qss = qapp.styleSheet()
+    try:
+        apply_theme(qapp, "light", **appearance)
+        assert events.changes == []
+        assert bottom.picture is picture
+        assert _plot_font_metrics(plot, legend) == metrics
+        assert qapp.styleSheet() == qss
+        assert editor.text() == "selected value"
+        assert editor.selectedText() == "selected"
+        assert editor.property("invalid") is True
+        assert editor.property("productionReady") is False
+    finally:
+        editor.removeEventFilter(events)
+        editor.close()
+        widget.close()
+
+
+@pytest.mark.parametrize("changed", ["stylesheet", "font", "plot_config"])
+def test_same_appearance_repairs_external_state(qapp, changed):
+    """An argument cache must not strand restored fixture/application state."""
+    apply_theme(qapp, "dark", font_scale="large")
+    qss = qapp.styleSheet()
+    font = QtGui.QFont(qapp.font())
+    if changed == "stylesheet":
+        qapp.setStyleSheet("")
+    elif changed == "font":
+        altered = QtGui.QFont(font)
+        altered.setPointSize(font.pointSize() + 1)
+        qapp.setFont(altered)
+    else:
+        pg.setConfigOption("antialias", False)
+    apply_theme(qapp, "dark", font_scale="large")
+    assert qapp.styleSheet() == qss
+    assert qapp.font() == font
+    assert pg.getConfigOption("antialias") is True
 
 
 def test_tiers_are_derived_from_the_captured_baseline(qapp):

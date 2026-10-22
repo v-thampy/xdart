@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 import struct
 from typing import Mapping
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 from .operation_values import OperationTerminalStatus, OperationUpdate
 from .shell_values import ShellCommandKind
 MOUNT_TARGETS = {
@@ -241,49 +241,116 @@ def analysis_result_matches(payload: object, facts: object) -> bool:
         DisplayedPhaseFitResult if kind == "phase" else None)
     return bool(expected is not None and type(payload) is expected
                 and (payload.trace_fingerprint, payload.trace_receipt) == echo)
-def render_fit_projection(plot, residual_plot, x, result, components=()):
-    import pyqtgraph as pg; from pyqtgraph.Qt import QtCore
-    if result.fit is not None:
-        plot.plot(x, result.fit, pen=pg.mkPen((189, 147, 249), width=2), name="fit")
-    if result.background is not None:
-        plot.plot(x, result.background, pen=pg.mkPen((130, 200, 160), width=1.3,
-            style=QtCore.Qt.PenStyle.DashLine), name="background")
-    for name, values in components: plot.plot(x, values, pen=pg.mkPen(
-        width=1, style=QtCore.Qt.PenStyle.DashLine), name=name)
-    for position in (() if result.marker_positions is None else result.marker_positions):
-        plot.addItem(pg.InfiniteLine(float(position), angle=90,
-            pen=pg.mkPen((240, 200, 90), width=1)))
-    residual_plot.clear(); residual_plot.addLine(
-        y=0, pen=pg.mkPen((130, 130, 140), width=1))
-    if result.residual is not None:
-        residual_plot.plot(x, result.residual,
-                           pen=pg.mkPen((230, 133, 151), width=1))
-def render_table_rows(table, headers, rows):
-    table.setColumnCount(len(headers)); table.setHorizontalHeaderLabels(headers)
-    table.setRowCount(len(rows))
-    for row, values in enumerate(rows):
-        for column, value in enumerate(values):
-            table.setItem(row, column, QtWidgets.QTableWidgetItem(str(value)))
+@dataclass(frozen=True, slots=True)
+class MetadataSource:
+    """One source of a result's metadata table, for ``MetadataResultDialog.adopt_sources`` (a grouped
+    Stitch result's member scans): its label, its table (a ``MetadataTableResult``), the rows it shows and
+    their labels, and the status shown when its table is complete."""
+
+    label: str
+    table: object
+    selected_labels: tuple | None = None
+    row_labels: tuple | None = None
+    note: str = ""
+
+
+def open_metadata_plot(parent, source: MetadataSource) -> None:
+    """One shared detached plot per page, independently owned from its metadata reader."""
+    from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
+    dialog = parent._metadata_plot_dialog
+    if dialog is None:
+        dialog = ScanPlotDialog(parent=parent)
+        dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        parent._metadata_plot_dialog = dialog
+
+        def closed(_value):
+            if parent._metadata_plot_dialog is dialog:
+                parent._metadata_plot_dialog = None
+        dialog.finished.connect(closed)
+    dialog.set_metadata_rows(source)
+    dialog.show(); dialog.raise_(); dialog.activateWindow()
+
+
 class MetadataResultDialog(QtWidgets.QDialog):
+    plotRequested = QtCore.Signal(object)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Metadata"); self.setObjectName("p37MetadataDialog")
         layout = QtWidgets.QVBoxLayout(self)
         self.table = QtWidgets.QTableWidget(0, 0, self); self.status = QtWidgets.QLabel("")
         layout.addWidget(self.table); layout.addWidget(self.status)
+        from xdart.gui.widgets.controls_panel import ActionButton
+        from xrd_tools.session.readiness import ControlAction, ControlActionSpec, SectionId
+        self.plot_button = ActionButton(ControlActionSpec(
+            ControlAction.PLOT_METADATA, "Plot Metadata…", SectionId.PROCESSING,
+            enabled=False, reason="Plot exactly the experimental metadata rows shown above; "
+            "the detached plot remains available after this popup closes."), self)
+        layout.addWidget(self.plot_button)
+        self._adopted_source = None
+        self.plot_button.actionRequested.connect(self._plot)
+        #: Built by ``adopt_sources`` only, for a result read from several sources.
+        self.source_selector = None
+        self._sources: tuple[MetadataSource, ...] = ()
+    def adopt_sources(self, sources) -> None:
+        """Several sources of one result (Codex's Stitch/Int reuse audit R3): a selector above the table
+        shows one source's table at a time, the first at once; a source whose table is not complete shows
+        its code."""
+        if self.source_selector is None:
+            self.source_selector = QtWidgets.QComboBox(self)
+            self.source_selector.setObjectName("p37MetadataSourceSelector")
+            self.source_selector.setToolTip("Choose the member scan whose contributing metadata rows are shown and plotted.")
+            self.source_selector.currentIndexChanged.connect(self._select_source)
+            self.layout().insertWidget(0, self.source_selector)
+        self._sources = tuple(sources)
+        self.source_selector.clear()
+        self.source_selector.addItems([source.label for source in self._sources])
+    def _select_source(self, index: int) -> None:
+        from xrd_tools.analysis.scan_operations import AnalysisDisposition
+        self.clear_result()
+        if not 0 <= index < len(self._sources):
+            return
+        source = self._sources[index]
+        if source.table.disposition is AnalysisDisposition.COMPLETED:
+            self.adopt_result(source.table, selected_labels=source.selected_labels,
+                              row_labels=source.row_labels)
+            self._adopted_source = source
+            if source.note:
+                self.status.setText(source.note)
+        else:
+            self.status.setText(source.table.code)
     def clear_result(self) -> None:
+        self._adopted_source = None
+        self.plot_button.setEnabled(False)
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self.status.clear()
-    def adopt_result(self, result: object) -> None:
+    def _plot(self, _action) -> None:
+        if self._adopted_source is not None:
+            self.plotRequested.emit(self._adopted_source)
+    def adopt_result(self, result: object, *, selected_labels=None, row_labels=None) -> None:
+        from xrd_tools.analysis.scan_operations import AnalysisDisposition
+        self._adopted_source = None
+        self.plot_button.setEnabled(False)
         columns = tuple(getattr(result, "columns", ()))
         labels = tuple(getattr(result, "labels", ()))
-        self.table.setColumnCount(len(columns)); self.table.setRowCount(len(labels))
+        selected = labels if selected_labels is None else tuple(selected_labels)
+        positions = {label: index for index, label in enumerate(labels)}
+        rows = [positions[label] for label in selected]
+        self.table.setColumnCount(len(columns)); self.table.setRowCount(len(rows))
         self.table.setHorizontalHeaderLabels([column.name for column in columns])
+        if selected_labels is not None or row_labels is not None:
+            self.table.setVerticalHeaderLabels([str(label) for label in (selected if row_labels is None else row_labels)])
         for col, column in enumerate(columns):
             values = column.numeric if column.numeric is not None else column.text
-            for row, value in enumerate(() if values is None else values):
+            for row, index in enumerate(() if values is None else rows):
+                value = values[index]
                 self.table.setItem(row, col, QtWidgets.QTableWidgetItem(
                     "" if value is None else str(value)))
         self.status.setText(getattr(result, "code", ""))
+        if result.disposition is AnalysisDisposition.COMPLETED and rows:
+            self._adopted_source = MetadataSource("Experimental metadata", result,
+                None if selected_labels is None else tuple(selected_labels),
+                None if row_labels is None else tuple(row_labels))
+            self.plot_button.setEnabled(True)

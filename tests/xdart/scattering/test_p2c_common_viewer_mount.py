@@ -54,6 +54,12 @@ class _Renderer:
     def drop_viewer_loading_snapshot(self):
         pass
 
+    def shutdown_phase_overlays(self):
+        # LT-SMALL-FIXES-20261014 V2: the scientific view's phase-overlay shutdown, as the page's close asks for it
+        from xdart.gui.pages.values import CloseReceipt, PageCleanup
+        self.events.append("phase_overlays")
+        return CloseReceipt(PageCleanup.CLEAN)
+
 
 class _Mount:
     def __init__(self, tmp_path, monkeypatch):

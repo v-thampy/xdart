@@ -407,7 +407,7 @@ def test_trial_verification_uses_exact_callback_before_filesystem_work(
         with pytest.raises(RuntimeError, match="admission cancelled"):
             output_preflight.materialize_live_directory_group(
                 receipt,
-                intent.freeze(),
+                intent.freeze(saturation=receipt.saturation),
                 session,
                 group,
                 cancelled=cancelled,
@@ -434,7 +434,7 @@ def _assert_live_pending_fence(
     errors: list[BaseException] = []
     outcome = Event()
     execution_gate = Event()
-    configuration = intent.freeze()
+    configuration = intent.freeze(saturation=receipt.saturation)
     identity = RunIdentity.from_configuration(configuration)
     real_execute_live = executor._execute_live_directory
     real_materialize = executor_module.materialize_live_directory_group
@@ -673,7 +673,7 @@ def test_stop_before_external_storage_capture_has_no_later_side_effect(
         with pytest.raises(RuntimeError, match="admission cancelled"):
             output_preflight.materialize_live_directory_group(
                 receipt,
-                intent.freeze(),
+                intent.freeze(saturation=receipt.saturation),
                 session,
                 group,
                 cancelled=stopped.is_set,

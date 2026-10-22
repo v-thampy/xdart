@@ -270,3 +270,66 @@ def test_form_rejects_extension_and_unsafe_decoder(rsm_tool_form):
         replace(rsm_tool_form, spec_path=rsm_tool_form.spec_path + ".spec")
     with pytest.raises(ValueError, match="scalar real numeric"):
         replace(rsm_tool_form, raw_dtype="complex64")
+
+
+def test_a_members_own_ub_and_a_typed_ub_are_read_as_the_run_reads_them(tmp_path):
+    """G8b: ``rsm_member_source_ub`` reads a SPEC member's #G3 (None when the scan has no #G3 line; () when the
+    line does not parse, which counts as recorded and is the run's to refuse), and ``parse_rsm_ub_rows`` reads a
+    typed UB as nine numbers, naming a row that is not three numbers or a matrix an HKL map cannot invert."""
+    from dataclasses import replace
+    from tests.core.test_rsm_operation_r2 import _write_member
+    from xdart.gui.tools.rsm_values import parse_rsm_ub_rows, rsm_member_source_ub
+    member = _write_member(tmp_path, 0, ub=(2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0))
+    assert rsm_member_source_ub(member) == (2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0)
+    spec = Path(member.spec_path)
+    text = spec.read_text(encoding="utf-8")
+    spec.write_text(text.replace("#G3 2.0 0.0 0.0 0.0 2.0 0.0 0.0 0.0 2.0\n", ""), encoding="utf-8")
+    assert rsm_member_source_ub(member) is None
+    spec.write_text(text.replace("#G3 2.0 0.0", "#G3 two 0.0"), encoding="utf-8")
+    assert rsm_member_source_ub(member) == ()
+    with pytest.raises(KeyError):  # a scan the file does not hold is not "no UB"
+        rsm_member_source_ub(replace(member, scan="7.1"))
+    assert parse_rsm_ub_rows(("1, 0, 0", "0 1 0", " 0  0 1 ")) == (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    for rows, reason in ((("1 0 0", "0 1", "0 0 1"), "row 2 needs three numbers"),
+                         (("1 0 0", "0 1 0", "0 0 nan"), "row 3 needs three numbers"),
+                         (("1 0 0", "2 0 0", "0 0 1"), "the matrix is singular")):
+        with pytest.raises(ValueError, match=reason):
+            parse_rsm_ub_rows(rows)
+
+
+@pytest.mark.parametrize("frame", ("hkl", "q"))
+def test_the_shared_preview_text_lists_every_identity_member_and_dependency(tmp_path, frame):
+    """The RSM v2 Preview text (``rsm_preflight_summary_lines``, the page's Preview) names every exact identity,
+    each ordered member's fingerprints, energy and raw dependencies, and the frame's own axes and UB authority.
+    Moved from the classic RSM dialog's presentation rows when the dialog was retired (AUD-9 stage 2b G10): the
+    dialog only rendered these shared lines; the labels are the current function's output, unchanged since."""
+    from tests.xdart.tools.test_rsm_owner import _prepared_v2
+    from xdart.gui.tools.rsm_values import rsm_preflight_summary_lines
+    from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame
+
+    coordinate_frame = RSMCoordinateFrame.HKL if frame == "hkl" else RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU
+    prepared = _prepared_v2(tmp_path, coordinate_frame)
+    shown = "\n".join(rsm_preflight_summary_lines(prepared.summary))
+    for label in ("Asset semantic:", "Asset receipt:", "Effective geometry:", "Common grid:", "Group source:",
+                  "Group preflight:", "Plan:", "Request:", "Output identity:", "Holds:"):
+        assert label in shown
+    assert f"Asset raw: {prepared.summary.geometry_asset_raw_sha256}" in shown
+    for member in prepared.summary.members:
+        assert f"Member {member.ordinal + 1}:" in shown
+        for fingerprint in (member.source_fingerprint, member.table_fingerprint,
+                            member.member_preflight_fingerprint):
+            assert fingerprint in shown
+        assert f"energy: {member.energy_eV:.12g} eV" in shown
+        for dependency in member.dependency_files:
+            assert dependency in shown
+    if frame == "hkl":
+        assert "Union q bounds:" in shown
+        assert "Source UB authority: authenticated source UB drives H/K/L conversion" in shown
+    else:
+        assert "Coordinate frame: Q Cartesian" in shown
+        assert "Stored axes: Qx [q_A^-1], Qy [q_A^-1], Qz [q_A^-1]" in shown
+        assert "xrayutilities matrix policy: explicit-identity-ub-f8-v1" in shown
+        assert ("Source UB authority: source UB is unused and non-driving; explicit identity drives Cartesian Q"
+                in shown)
+        assert "Union coordinate bounds: Qx " in shown
+        assert "xrayutilities matrix: 1 0 0; 0 1 0; 0 0 1" in shown

@@ -14,7 +14,7 @@ launcher.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -22,8 +22,10 @@ from typing import TYPE_CHECKING
 from .handle import AppMenuHosts, PageHandle
 from .services import HostServices
 from .values import (
+    MODE_REFUSED,
     ActionAccepted,
     ActionCompleted,
+    ActionRefused,
     CloseReceipt,
     PageCleanup,
     SCATTERING_PAGE_KEY,
@@ -35,16 +37,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _SESSION_PROFILE_KEY = "scattering_run_profile"
-
-
-def _tool_button_menu(widget, object_name: str):
-    """The page-owned QMenu behind one named toolbutton, fail-loud."""
-    from pyqtgraph.Qt import QtWidgets
-
-    button = widget.findChild(QtWidgets.QToolButton, object_name)
-    if button is None or button.menu() is None:
-        raise RuntimeError(f"vNext menu host {object_name!r} is missing")
-    return button.menu()
+_SESSION_PHASE_KEY = "scattering_phase_references"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +46,10 @@ class _WorkspaceMenus:
 
     def mount_points(self) -> AppMenuHosts:
         return AppMenuHosts(
-            _tool_button_menu(self.widget, "configMenuButton"),
-            _tool_button_menu(self.widget, "helpMenuButton"),
+            self.widget._shell.browser.menus["Config"],
+            self.widget._shell.browser.menus["Help"],
             tool_requested=self.widget.toolRequested,
+            mode_requested=self.widget.modeRequested,
         )
 
 
@@ -117,12 +111,15 @@ class _WorkspaceCloser:
             )
         if closed.cleanup_status is CleanupStatus.CLEANED:
             if self.persist_session and not self._session_saved:
+                from xdart.gui.tabs.scattering.shell_values import phase_reference_document
                 from xdart.utils.session import save_session
                 from xrd_tools.session.run_intent_profile import dump_run_intent_profile
 
                 try:
                     profile = dump_run_intent_profile(self.widget._intents.snapshot().thaw())
-                    save_session({_SESSION_PROFILE_KEY: profile})
+                    options = self.widget._preferences.plot_options
+                    save_session({_SESSION_PROFILE_KEY: profile,
+                                  _SESSION_PHASE_KEY: phase_reference_document(options)})
                 except Exception:
                     logger.warning("Could not save the last run configuration", exc_info=True)
                 self._session_saved = True
@@ -148,6 +145,35 @@ class _WorkspaceOpenFolder:
     def request(self):
         _dispatch(self.widget, "MENU", "File:Open Folder")
         return ActionCompleted("browser-directory")
+
+    @property
+    def directory(self):
+        return self.widget._processed_browser.directory
+
+    def set_directory(self, path):
+        if path != self.directory:
+            self.widget._set_browser_directory(path, explicit=True)
+        return ActionCompleted("browser-directory")
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceProjectDefaults:
+    widget: "ScatteringWorkspace"
+
+    def location(self):
+        from pathlib import Path
+        intent = self.widget._intents.snapshot().thaw()
+        output = intent.save_path
+        if output and not Path(output).is_absolute():
+            output = str(Path(intent.project_root).expanduser() / output)
+        return intent.project_root, output
+
+    def inherit(self, location):
+        from xdart.gui.tabs.scattering.controls_inventory import PROJECT_ROOT, SAVE_PATH
+        if not self.location()[0] and location[0]:
+            self.widget._on_field_value(PROJECT_ROOT, location[0])
+            if location[1]:
+                self.widget._on_field_value(SAVE_PATH, location[1])
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +216,20 @@ class _WorkspaceSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class _WorkspaceProcessingMode:
+    """Another page's request for a mode by name (Stitch's mode box, Codex audit G-F3), through the
+    page's own mode command; completed only when the page took it."""
+
+    widget: "ScatteringWorkspace"
+
+    def select(self, mode):
+        _dispatch(self.widget, "SET_PROCESSING_MODE", str(mode))
+        if self.widget._intents.snapshot().thaw().processing_mode == mode:
+            return ActionCompleted(f"processing-mode-{mode}")
+        return ActionRefused(MODE_REFUSED)
+
+
+@dataclass(frozen=True, slots=True)
 class _WorkspaceSlicePin:
     widget: "ScatteringWorkspace"
 
@@ -200,8 +240,10 @@ class _WorkspaceSlicePin:
 
 def _control_path_chooser(widget):
     """File-dialog chooser for Controls path fields (from the live launcher)."""
-    from pyqtgraph.Qt import QtWidgets
-
+    from xdart.gui.widgets import file_dialogs as dialogs
+    from xdart.gui.widgets.file_dialogs import (
+        BACKGROUND_IMAGE_FILTER, MASK_FILTER, PONI_FILTER,
+    )
     from xdart.gui.tabs.scattering.controls_projection import (
         BACKGROUND_DIRECTORY,
         BACKGROUND_FILE,
@@ -212,28 +254,22 @@ def _control_path_chooser(widget):
     )
 
     def choose(path, current, start_directory):
+        # the shared dialog owner, with the page's own start (the page keeps the Browse rule itself)
         if path in {PROJECT_ROOT, SOURCE_DIRECTORY, BACKGROUND_DIRECTORY}:
-            selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose folder", start_directory)
-            return selected or None
+            return (dialogs.ask(widget, "Choose folder", start=start_directory, folder=True)
+                    or [None])[0]
         if path == SAVE_PATH:
-            selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose processed-data folder", start_directory)
-            return selected or None
+            return (dialogs.ask(widget, "Choose processed-data folder", start=start_directory,
+                                folder=True) or [None])[0]
         title, file_filter = (
-            ("Choose Background detector image",
-             "Detector images (*.tif *.tiff *.cbf *.edf *.img *.mar3450 *.raw)")
+            ("Choose Background detector image", BACKGROUND_IMAGE_FILTER)
             if path == BACKGROUND_FILE
             else
-            ("Choose PONI calibration", "PONI files (*.poni);;All files (*)")
+            ("Choose PONI calibration", PONI_FILTER)
             if path == PONI_FILE
-            else (
-                "Choose detector mask",
-                "Detector masks (*.edf *.npy)",
-            ))
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            widget, title, start_directory, file_filter)
-        return selected or None
+            else ("Choose detector mask", MASK_FILTER))
+        return (dialogs.ask(widget, title, start=start_directory, file_filter=file_filter)
+                or [None])[0]
 
     return choose
 
@@ -262,6 +298,7 @@ def _qualify_mask_hdf_dialog_selection(
 def _mask_hdf_dialog_type():
     """Build the xdart-owned, metadata-only HDF frame selector type."""
     from pyqtgraph.Qt import QtCore, QtWidgets
+    from xdart.gui.widgets.controls_panel import FormRow
 
     class _MaskHdfFrameDialog(QtWidgets.QDialog):
         def __init__(self, parent, source: str):
@@ -280,22 +317,22 @@ def _mask_hdf_dialog_type():
             source_label.setWordWrap(True)
             layout.addWidget(source_label)
 
-            form = QtWidgets.QFormLayout()
-            self.dataset_path = QtWidgets.QLineEdit(
-                "/entry/data/data_000001", self)
+            self.dataset_row = FormRow(label="Dataset path", path=("mask", "dataset"),
+                                       value="/entry/data/data_000001", parent=self)
+            self.dataset_path = self.dataset_row.editor
             self.dataset_path.setObjectName("maskHdfDatasetPath")
             self.dataset_path.setMaxLength(4096)
-            form.addRow("Dataset path", self.dataset_path)
-            self.no_frame = QtWidgets.QCheckBox(
-                "Dataset is one 2-D image (no frame index)", self)
+            layout.addWidget(self.dataset_row)
+            self.no_frame_row = FormRow(label="Dataset is one 2-D image (no frame index)",
+                                        path=("mask", "no_frame"), value=False, kind="bool", parent=self)
+            self.no_frame = self.no_frame_row.editor
             self.no_frame.setObjectName("maskHdfNoFrame")
-            form.addRow("", self.no_frame)
-            self.frame_index = QtWidgets.QSpinBox(self)
+            layout.addWidget(self.no_frame_row)
+            self.frame_row = FormRow(label="Frame index", path=("mask", "frame"), value=0, kind="int",
+                                     minimum=0, maximum=2_147_483_647, parent=self)
+            self.frame_index = self.frame_row.editor
             self.frame_index.setObjectName("maskHdfFrameIndex")
-            self.frame_index.setRange(0, 2_147_483_647)
-            self.frame_index.setValue(0)
-            form.addRow("Frame index", self.frame_index)
-            layout.addLayout(form)
+            layout.addWidget(self.frame_row)
             self.no_frame.toggled.connect(
                 lambda checked: self.frame_index.setEnabled(not checked))
 
@@ -318,9 +355,10 @@ def _mask_hdf_dialog_type():
 
         def accept(self):
             data_path = self.dataset_path.text().strip()
-            frame = None if self.no_frame.isChecked() \
-                else int(self.frame_index.value())
             try:
+                if not self.no_frame.isChecked() and self.frame_row.refusal():
+                    raise ValueError(self.frame_row.refusal())
+                frame = None if self.no_frame.isChecked() else int(self.frame_index.value())
                 selected = _qualify_mask_hdf_dialog_selection(
                     self._source, data_path, frame)
             except Exception as exc:
@@ -340,6 +378,8 @@ def _authoring_source_chooser(widget):
     """Dedicated source chooser for standalone Calibrate and Make Mask."""
     from pyqtgraph.Qt import QtWidgets
 
+    from xdart.gui.widgets import file_dialogs as dialogs
+
     def choose(asset, start_directory):
         if asset == "poni":
             title = "Choose calibration source image"
@@ -348,11 +388,11 @@ def _authoring_source_chooser(widget):
                 "*.nexus *.edf *.cbf *.img *.mar3450 *.raw);;All files (*)"
             )
         elif asset == "mask":
-            selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            selected = (dialogs.ask(
                 widget, "Choose TIFF or HDF5/NeXus source for mask",
-                start_directory,
-                "Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)",
-            )
+                start=start_directory,
+                file_filter="Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)",
+            ) or [None])[0]
             if not selected:
                 return None
             suffix = os.path.splitext(selected)[1].casefold()
@@ -372,10 +412,8 @@ def _authoring_source_chooser(widget):
             return exact
         else:
             return None
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            widget, title, start_directory, file_filter,
-        )
-        return selected or None
+        return (dialogs.ask(widget, title, start=start_directory, file_filter=file_filter)
+                or [None])[0]
 
     return choose
 
@@ -384,8 +422,7 @@ def _source_selection_chooser(widget):
     """Source chooser (directory/single/series) from the live launcher."""
     from pathlib import Path
 
-    from pyqtgraph.Qt import QtWidgets
-
+    from xdart.gui.widgets import file_dialogs as dialogs
     from xrd_tools.core.scan import SourceSpec
     from xrd_tools.sources.selection import (
         DirectorySourceSpec,
@@ -424,8 +461,8 @@ def _source_selection_chooser(widget):
                     metadata_format=metadata_format(current),
                 )
             )
-            selected = QtWidgets.QFileDialog.getExistingDirectory(
-                widget, "Choose image directory", start_directory)
+            selected = (dialogs.ask(widget, "Choose image directory", start=start_directory,
+                                    folder=True) or [None])[0]
             if not selected:
                 return None
             return DirectorySourceSpec(
@@ -436,15 +473,15 @@ def _source_selection_chooser(widget):
                 generation=prior.generation + 1,
                 metadata_format=prior.metadata_format,
             )
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+        selected = (dialogs.ask(
             widget,
             (
                 "Choose one detector image"
                 if mode == "Single Image"
                 else "Choose an image-series member"
             ),
-            start_directory,
-            (
+            start=start_directory,
+            file_filter=(
                 "Detector image files (*.tif *.tiff *.cbf *.edf *.img "
                 "*.mar3450 *.raw)"
                 if mode == "Single Image"
@@ -452,7 +489,7 @@ def _source_selection_chooser(widget):
                 "Detector images (*.tif *.tiff *.h5 *.hdf5 *.nxs *.cxi "
                 "*.cbf *.edf *.img *.mar3450 *.raw);;All files (*)"
             ),
-        )
+        ) or [None])[0]
         if not selected:
             return None
         if mode == "Single Image":
@@ -482,7 +519,11 @@ def build_scattering_workspace(
     key = SCATTERING_PAGE_KEY
     intents = services.run_intents.store_for(key)
     persist_session = intents is None
+    phase_preferences = None
     if intents is None:
+        from xdart.gui.tabs.scattering.controls_editing import (
+            DEFAULT_POLARIZATION_FACTOR,
+        )
         from xdart.utils.session import load_session
         from xrd_tools.core.staging import reduction_worker_cap
         from xrd_tools.session.run_intent_profile import load_run_intent_profile
@@ -491,14 +532,22 @@ def build_scattering_workspace(
         # small-RAM worker cap never trims.  This value is one nobody chose, so
         # it takes the cap's own default (two workers below 16 GiB); a Cores
         # edit or a restored session still wins.  One core stays with the GUI.
+        # SSRL beams are strongly horizontally polarized, so a fresh session
+        # corrects for it (POL-1); unticking it stores None, and a restored
+        # session keeps its own choice.
+        polarization = {"polarization_factor": DEFAULT_POLARIZATION_FACTOR}
         intent = RunIntent(
             output_mode="Overwrite",
             max_cores=min(
                 max(1, (os.cpu_count() or 1) - 1), reduction_worker_cap(None),
             ),
+            bai_1d_args=dict(polarization),
+            bai_2d_args=dict(polarization),
         )
         try:
-            profile = load_session().get(_SESSION_PROFILE_KEY)
+            saved_session = load_session()
+            profile = saved_session.get(_SESSION_PROFILE_KEY)
+            phase_preferences = saved_session.get(_SESSION_PHASE_KEY)
             if profile is not None:
                 intent = load_run_intent_profile(profile)
         except Exception:
@@ -524,6 +573,14 @@ def build_scattering_workspace(
         source_selection_chooser=_source_selection_chooser(parent),
         parent=parent,
     )
+    if phase_preferences is not None:
+        try:
+            from xdart.gui.tabs.scattering.shell_values import restore_phase_references
+            options = restore_phase_references(widget._preferences.plot_options, phase_preferences)
+            widget._preferences = replace(widget._preferences, plot_options=options)
+            widget._refresh_shell()
+        except (AttributeError, TypeError, ValueError):
+            logger.warning("Could not restore the last reference phases", exc_info=True)
 
     # Operation/analysis refusal paths emit a notice and return without a
     # projection refresh; bridge them to the host status presenter so the
@@ -536,10 +593,13 @@ def build_scattering_workspace(
         widget=widget,
         close=_WorkspaceCloser(widget, persist_session=persist_session),
         open_folder=_WorkspaceOpenFolder(widget),
+        browser_directory=_WorkspaceOpenFolder(widget),
+        project_location=_WorkspaceProjectDefaults(widget),
         settings_io=_WorkspaceSettings(widget),
         run_control=_WorkspaceRunControl(widget),
         write_mode=_WorkspaceWriteMode(widget),
         slice_pin=_WorkspaceSlicePin(widget),
+        processing_mode=_WorkspaceProcessingMode(widget),
         activity=_WorkspaceActivity(
             lifecycle, widget._workspace_operations,
             widget._experiment_operation_busy,

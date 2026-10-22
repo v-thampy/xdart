@@ -44,9 +44,16 @@ _DARWIN_MAXPATHLEN = 1024
 
 _GENERIC_WRITE = 0x40000000
 _DELETE = 0x00010000
+_FILE_LIST_DIRECTORY = 0x00000001
+_FILE_READ_ATTRIBUTES = 0x00000080
+_SYNCHRONIZE = 0x00100000
 _FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_FILE_SHARE_DELETE = 0x00000004
 _CREATE_NEW = 1
+_OPEN_EXISTING = 3
 _FILE_ATTRIBUTE_NORMAL = 0x00000080
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _ERROR_FILE_EXISTS = 80
 _ERROR_ALREADY_EXISTS = 183
@@ -107,14 +114,15 @@ def _win32_final_path(descriptor: int) -> str:
         size = length + 1
 
 
-def create_exclusive_leaf(path: str) -> int:
+def create_exclusive_leaf(path: str, *, mode: int = 0o644) -> int:
     """Create the regular file *path* by name, exclusively, for writing.
 
     Returns a descriptor the caller writes through and closes.  A name
     that already exists -- a symbolic link included -- raises
     ``FileExistsError``.  On Windows the handle is opened with ``DELETE``
     access as well, so :func:`dispose_created_leaf` can remove the object
-    through it; the CRT ``os.open`` never asks for that right.
+    through it; the CRT ``os.open`` never asks for that right.  *mode* is
+    the POSIX permission of the new file; Windows inherits the parent ACL.
     """
     if sys.platform == "win32":
         return _win32_create_exclusive(path)
@@ -125,7 +133,71 @@ def create_exclusive_leaf(path: str) -> int:
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
-    return os.open(path, flags, 0o644)
+    return os.open(path, flags, mode)
+
+
+def open_directory(path: str) -> int:
+    """A descriptor of the directory *path* itself, never through a link.
+
+    POSIX opens it ``O_DIRECTORY | O_NOFOLLOW``.  Windows has no directory
+    descriptors in the CRT, so the handle comes from ``CreateFileW`` with
+    backup semantics on the reparse point itself, shared for reading and
+    writing but not for deletion: while it is held the directory cannot be
+    renamed or removed, and entries inside it remain usable.  The caller
+    still proves the descriptor's identity and kind.
+    """
+    if sys.platform == "win32":
+        return _win32_open_existing(
+            path,
+            _FILE_LIST_DIRECTORY | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    return os.open(path, flags)
+
+
+def open_leaf_for_disposal(path: str) -> int:
+    """A descriptor of the existing entry *path* that can delete it.
+
+    The caller proves the object's identity and placement before handing
+    the descriptor to :func:`dispose_created_leaf`, so a name never decides
+    what is removed.  Windows asks for ``DELETE`` access, which fails while
+    another handle refuses delete sharing; POSIX opens it read-only, where
+    disposal through the descriptor is unavailable and the caller reports
+    the leaf it leaves.
+    """
+    if sys.platform == "win32":
+        return _win32_open_existing(
+            path,
+            _DELETE | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            _FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    return os.open(path, flags | getattr(os, "O_CLOEXEC", 0))
+
+
+def _win32_open_existing(path: str, access: int, share: int, flags: int) -> int:
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    kernel32 = _win32_kernel32()
+    function = kernel32.CreateFileW
+    function.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    function.restype = wintypes.HANDLE
+    handle = function(os.fspath(path), access, share, None, _OPEN_EXISTING, flags, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_NOINHERIT)
+    except OSError:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
 
 
 def _win32_create_exclusive(path: str) -> int:

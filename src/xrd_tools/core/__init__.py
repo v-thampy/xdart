@@ -1,9 +1,9 @@
 """Headless core contracts and containers for ``xrd_tools``.
 
 The public ``core`` namespace intentionally exposes one canonical input-side
-``FrameGeometry`` from :mod:`xrd_tools.core.scan`.  The display/round-trip
-geometry type used by :class:`FrameView` remains available as
-``ViewFrameGeometry`` so callers never depend on import-order shadowing.
+``FrameGeometry`` from :mod:`xrd_tools.core.scan` for both input and display/
+round-trip records. ``ViewFrameGeometry`` remains an alias for callers using
+the earlier display spelling.
 """
 
 from __future__ import annotations

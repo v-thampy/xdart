@@ -38,6 +38,7 @@ array([1, 2, 3, 4, 5])
 from __future__ import annotations
 
 import logging
+import json
 import hashlib
 import os
 import struct
@@ -706,12 +707,18 @@ def observe_resolved_raw_source(
                 frame_group = _frame_group_for_label(entry_grp, int(frame))
             if frame_group is None:
                 return RawSourceObservation(None, True, "no source frame")
-            master, _idx, _thumb = _raw_frame_parts_from_group(
-                scan_file,
-                entry_grp,
-                frame_group,
-                source_root=source_root,
-            )
+            from xrd_tools.io.nexus_record import read_point_source_ref
+            point = read_point_source_ref(frame_group.get("source"))
+            if point is not None:
+                master = resolve_source_master(point[1][0]["source_path"], scan_file=scan_file,
+                    source_base=_decode(entry_grp.attrs.get("source_base", "")), source_root=source_root)
+            else:
+                master, _idx, _thumb = _raw_frame_parts_from_group(
+                    scan_file,
+                    entry_grp,
+                    frame_group,
+                    source_root=source_root,
+                )
     except TRANSIENT_PROBE_ERRORS as exc:
         return RawSourceObservation(
             None, False, f"transient provenance read error: {exc}")
@@ -811,13 +818,23 @@ def get_raw_frame(
     """
     scan_file = Path(scan_file)
     with h5py.File(scan_file, "r") as f:
+        entry_group = _entry(f, entry)
         master, src_frame_idx, thumb = _raw_frame_parts_from_entry(
             scan_file,
-            _entry(f, entry),
+            entry_group,
             int(frame),
             scan=scan,
             source_root=source_root,
         )
+        frame_group = _frame_group_for_label(entry_group, frame, scan=scan)
+        raw_options = _frame_source_read_options(frame_group)
+        from xrd_tools.io.nexus_record import read_point_source_ref
+        point = read_point_source_ref(frame_group.get("source"))
+        source_base = _decode(entry_group.attrs.get("source_base", ""))
+        execution_node = entry_group.get("reduction/config/source_execution")
+        execution = None if execution_node is None else json.loads(_decode(execution_node[()]))
+    if point is not None:
+        return _point_raw_frame(scan_file, point, source_base=source_base, source_root=source_root, execution=execution)
     return _raw_frame_or_thumbnail(
         scan_file,
         int(frame),
@@ -826,7 +843,69 @@ def get_raw_frame(
         thumb,
         allow_thumbnail=allow_thumbnail,
         preserve_dtype=preserve_dtype,
+        raw_options=raw_options,
     )
+
+
+def _point_raw_frame(scan_file, point, *, source_base=None, source_root=None, execution=None, native_transform=None, poisson=False):
+    """Replay exact native constituents through the same bounded combiner."""
+    from xrd_tools.io.image import read_image
+    from xrd_tools.sources.point_images import PointImagePolicy, combine_point_statistics
+    policy, constituents = point
+    if execution is not None:
+        states = list(execution.get("dependency_files", ()))
+        states += [member["file"] for member in execution.get("external_members", ())]
+        for state in states:
+            path = Path(state["path"])
+            if source_root is not None and source_base:
+                try:
+                    path = Path(source_root) / path.relative_to(source_base)
+                except ValueError:
+                    pass
+            _require_point_source_revision(path, state)
+    def native(ordinal):
+        member = constituents[ordinal]
+        path = resolve_source_master(member["source_path"], scan_file=scan_file, source_base=source_base, source_root=source_root)
+        if path is None:
+            raise FileNotFoundError("point raw constituent source unavailable")
+        snapshot = member["source_snapshot"]
+        _require_point_source_revision(path, snapshot)
+        options = {key: snapshot[key] for key in ("dataset_path", "raw_dtype", "rotation") if key in snapshot}
+        if "raw_shape" in snapshot:
+            options["detector_shape"] = tuple(snapshot["raw_shape"])
+        if "raw_header_bytes" in snapshot:
+            options["raw_header_skip"] = snapshot["raw_header_bytes"]
+        return read_image(path, frame=member["source_frame_index"], preserve_dtype=True, exact_frame=True, **options)
+    result = combine_point_statistics(native, range(len(constituents)), PointImagePolicy.from_dict(policy), poisson=poisson, native_transform=native_transform)
+    return result if poisson else result.signal
+
+
+def _require_point_source_revision(path, snapshot):
+    try:
+        stat = Path(path).stat()
+    except OSError as error:
+        raise FileNotFoundError(f"point raw constituent source unavailable: {path}") from error
+    if any(key in snapshot and getattr(stat, attr) != int(snapshot[key]) for key, attr in (("size", "st_size"), ("mtime_ns", "st_mtime_ns"))):
+        raise ValueError(f"point raw constituent source changed: {path}")
+
+
+def _frame_source_read_options(frame_group) -> dict:
+    """Forward the persisted exact decoder/selector to the shared image reader."""
+    source = None if frame_group is None else frame_group.get("source")
+    if not isinstance(source, h5py.Group):
+        return {}
+    options = {}
+    for attr, option in (("dataset_path", "dataset_path"), ("raw_dtype", "raw_dtype")):
+        if attr in source.attrs:
+            options[option] = _decode(source.attrs[attr])
+    if "raw_shape" in source.attrs:
+        options["detector_shape"] = tuple(int(n) for n in source.attrs["raw_shape"])
+    for attr, option in (("raw_header_bytes", "raw_header_skip"), ("rotation", "rotation")):
+        if attr in source.attrs:
+            options[option] = int(source.attrs[attr])
+    if options:
+        options["exact_frame"] = True
+    return options
 
 
 def _raw_frame_from_entry(
@@ -842,6 +921,12 @@ def _raw_frame_from_entry(
     ``ProcessedScan.iter_chunks`` uses this to avoid reopening the processed
     NeXus file for every frame while preserving the public reader behavior.
     """
+    from xrd_tools.io.nexus_record import read_point_source_ref
+    frame_group = _frame_group_for_label(entry_group, frame)
+    point = read_point_source_ref(None if frame_group is None else frame_group.get("source"))
+    if point is not None:
+        node = entry_group.get("reduction/config/source_execution")
+        return _point_raw_frame(scan_file, point, source_base=_decode(entry_group.attrs.get("source_base", "")), source_root=source_root, execution=None if node is None else json.loads(_decode(node[()])))
     master, src_frame_idx, thumb = _raw_frame_parts_from_entry(
         scan_file,
         entry_group,
@@ -987,6 +1072,7 @@ def _raw_frame_or_thumbnail(
     *,
     allow_thumbnail: bool = True,
     preserve_dtype: bool = False,
+    raw_options: dict | None = None,
 ) -> np.ndarray:
     from xrd_tools.io.image import read_image
 
@@ -996,6 +1082,7 @@ def _raw_frame_or_thumbnail(
                 master,
                 frame=src_frame_idx,
                 preserve_dtype=preserve_dtype,
+                **(raw_options or {}),
             )
             return (
                 np.asarray(image)

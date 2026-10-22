@@ -114,8 +114,8 @@ class Mode(Enum):
     IMAGE_VIEWER = "image_viewer"
     XYE_VIEWER = "xye_viewer"
     NEXUS_VIEWER = "nexus_viewer"
-    STITCH_1D = "stitch_1d"      # whole-scan merged 1D pattern (scan.stitched_1d)
-    STITCH_2D = "stitch_2d"      # whole-scan merged 2D cake (scan.stitched_2d)
+    STITCH_1D = "stitch_1d"      # whole-scan merged 1D pattern (a Stitch 1D record)
+    STITCH_2D = "stitch_2d"      # whole-scan merged 2D map (a Stitch 2D record)
 
 
 # ── Panel layout table (Stage 4/5 step 1) ────────────────────────────
@@ -280,6 +280,7 @@ class PanelRole(Enum):
     STITCH_2D = "stitch_2d"      # reserved: stitched 2D image
     SLICE_2D = "slice_2d"        # reserved: RSM reciprocal-space 2D slice (repeats)
     PROJ_1D = "proj_1d"          # reserved: RSM 1D projection (repeats)
+    FIGURE = "figure"            # computed geometry with typed overlays
     RESULTS = "results"          # reserved: tables/scalars (non-array)
 
 

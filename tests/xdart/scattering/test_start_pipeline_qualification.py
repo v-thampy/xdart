@@ -56,8 +56,9 @@ class MismatchedCommitStore(RunIntentStore):
 
 
 class MismatchedFreezeStore(RunIntentStore):
-    def freeze(self, *, expected_revision, gi_motor_choices=None):
-        result = super().freeze(expected_revision=expected_revision, gi_motor_choices=gi_motor_choices)
+    def freeze(self, *, expected_revision, gi_motor_choices=None, saturation=None):
+        result = super().freeze(expected_revision=expected_revision, gi_motor_choices=gi_motor_choices,
+                                saturation=saturation)
         assert isinstance(result, IntentFreezeAccepted)
         return IntentFreezeAccepted(result.revision + 1, result.configuration)
 
@@ -78,7 +79,7 @@ class EditAfterAcceptedCommitStore(RunIntentStore):
 
 
 class UnexpectedFreezeStore(RunIntentStore):
-    def freeze(self, *, expected_revision, gi_motor_choices=None):
+    def freeze(self, *, expected_revision, gi_motor_choices=None, saturation=None):
         raise RuntimeError("unexpected freeze fault")
 
 

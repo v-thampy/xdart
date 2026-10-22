@@ -29,7 +29,7 @@ from xrd_tools.io.append import (
 )
 from xrd_tools.io.nexus import (
     open_nexus_writer,
-    read_stitched,
+    read_scan,
     validate_integrated_stack_write,
     write_nexus,
     write_nexus_frame,
@@ -151,7 +151,7 @@ def test_new_gi_record_persists_exact_current_identity_and_reloads(tmp_path):
 
 
 @pytest.mark.parametrize("corruption", ["unknown", "malformed"])
-def test_read_stitched_rejects_every_malformed_unrequested_gi_sibling(
+def test_read_scan_rejects_every_malformed_unrequested_gi_sibling(
     tmp_path,
     corruption,
 ):
@@ -163,7 +163,7 @@ def test_read_stitched_rejects_every_malformed_unrequested_gi_sibling(
         else:
             del parent["q_oop/intensity"]
     with pytest.raises(ValueError, match="not a current xdart"):
-        read_stitched(target)
+        read_scan(target)
 
 
 def test_nested_soft_link_is_refused_by_admission_and_writer_preflight(tmp_path):

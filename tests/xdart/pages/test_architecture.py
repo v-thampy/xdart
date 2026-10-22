@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 
@@ -11,22 +10,6 @@ import sys
 ROOT = Path(__file__).resolve().parents[3]
 PAGES = ROOT / "src" / "xdart" / "gui" / "pages"
 GUI_MAIN = ROOT / "src" / "xdart" / "_gui_main.py"
-_SANCTIONED_J1_EXPERIMENT_IDENTIFIERS = (
-    "ExperimentEditorPort",
-    "_ExperimentProvider",
-    "_SelectedExperiments",
-    "_NullExperiments",
-)
-
-
-def _strip_sanctioned_j1_experiment_identifiers(text: str) -> str:
-    for identifier in _SANCTIONED_J1_EXPERIMENT_IDENTIFIERS:
-        text = re.sub(
-            rf"(?<!\w){re.escape(identifier)}(?!\w)",
-            "",
-            text,
-        )
-    return text
 
 
 def test_pages_contract_import_is_lazy_and_constructs_no_qt_or_page_package():
@@ -37,9 +20,7 @@ import xdart.gui.pages.services
 for name in (
     'xdart.gui.tabs.scattering',
     'xdart.gui.tabs.scattering.page',
-    'xdart.gui.tools.stitch_tool',
     'xdart.gui.tools.stitch_owner',
-    'xdart.gui.tools.rsm_tool',
     'xdart.gui.tools.rsm_owner',
     'xrd_tools.analysis.stitch_operation',
     'xrd_tools.analysis.rsm_operation',
@@ -58,26 +39,14 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
     forbidden_import_roots = (
         "xdart.gui.tabs", "xrd_tools", "xdart.modules", "xdart._gui_main",
     )
-    # The one ratified J1 exemption: services.py may name the Q3 editor port
-    # for annotations only, inside ``if TYPE_CHECKING:``; every runtime
-    # science import and every other spelling stays forbidden.
     for path in sorted(PAGES.glob("*.py")):
         # The vNext lazy adapter is a sanctioned science bridge, but only for
         # imports deferred inside build-time function bodies: its MODULE level
         # stays subject to the same prohibition as every contract module, and
         # only the import census is narrowed (the token census below is
         # skipped for it — the adapter names its own page by design).
-        adapter_lazy = path.name == "scattering_workspace.py"
+        adapter_lazy = path.name in {"scattering_workspace.py", "stitch_workspace.py", "rsm_workspace.py"}
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        type_checking_imports = {
-            child
-            for node in ast.walk(tree)
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Name)
-            and node.test.id == "TYPE_CHECKING"
-            for child in node.body
-            if isinstance(child, ast.ImportFrom)
-        }
         import_nodes = (
             [node for node in tree.body
              if isinstance(node, (ast.Import, ast.ImportFrom))]
@@ -89,14 +58,6 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
             else:
-                if (
-                    path.name == "services.py"
-                    and node in type_checking_imports
-                    and node.module == "xrd_tools.session.experiment_state"
-                    and [alias.name for alias in node.names]
-                    == ["ExperimentEditorPort"]
-                ):
-                    continue
                 names = [node.module or ""]
             for name in names:
                 if name.startswith(forbidden_import_roots):
@@ -104,8 +65,6 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
         if adapter_lazy:
             continue
         text = path.read_text(encoding="utf-8")
-        if path.name == "services.py":
-            text = _strip_sanctioned_j1_experiment_identifiers(text)
         if path.name == "catalog.py":
             # The catalog is the one module that NAMES pages; strip the exact
             # registered vNext label — exactly one occurrence, so a second
@@ -117,14 +76,6 @@ def test_contract_modules_have_no_science_settings_or_main_imports():
             if token in text:
                 offenders.append(f"{path.name}: contains {token}")
     assert offenders == []
-
-
-def test_j1_experiment_identifier_allowlist_is_exact():
-    text = " ".join((*_SANCTIONED_J1_EXPERIMENT_IDENTIFIERS,
-                     "_ExperimentProviderBundle"))
-    assert _strip_sanctioned_j1_experiment_identifiers(text).split() == [
-        "_ExperimentProviderBundle"
-    ]
 
 
 def test_main_host_has_no_page_name_branch_or_retired_widget_reach_in():
@@ -149,8 +100,8 @@ def test_catalog_is_the_only_builtin_registration_point():
     assert "LEGACY_STATIC_PAGE" not in catalog
     assert "STATIC_SCAN_PAGE_KEY" not in catalog
     assert "build_legacy_static" not in catalog
-    assert catalog.count("PageDescriptor(") == 1
-    assert catalog.count("ToolDescriptor(") == 2
+    assert catalog.count("PageDescriptor(") == 3  # Int, Stitch and RSM (AUD-9)
+    assert "ToolDescriptor" not in catalog  # the Stitch and RSM dialogs gave way to their pages
     assert "BUILTIN_PAGES" in catalog
     assert "BUILTIN_DESCRIPTORS" in catalog
     assert "BUILTIN_DESCRIPTORS" in main

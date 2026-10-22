@@ -22,7 +22,7 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,7 @@ from xrd_tools.corrections.grazing import (
     validate_gi_exit_angle_convention,
 )
 from xrd_tools.core.scan import SourceSpec
+from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.reduction.provenance_config import jsonable_run_value
 from xrd_tools.session.gi_motor import pick_default_gi_motor
 from xrd_tools.sources.selection import (
@@ -83,6 +84,18 @@ class PoniV3OverrideIntent:
             value["thickness_m"],
             value["parallax"],
         )
+
+
+def background_dark_rule(background) -> str:
+    """How a run with both a Background and a dark combines them.
+
+    ``"subtracted"``: the reducer removes the dark from the Background images
+    (frame − dark − scale·(Background − dark)); ``"as_is"``: they are already
+    dark-corrected (frame − dark − scale·Background). Recorded with every run that
+    has both, so outputs from before the rule was recorded (which used "as_is")
+    are told apart.
+    """
+    return "as_is" if background.dark_corrected else "subtracted"
 
 
 def _default_background():
@@ -490,7 +503,9 @@ class ThresholdIntent:
     threshold_max: float | None = None
     mask_saturation: bool = True
 
-    def freeze(self) -> "FrozenThresholdPolicy":
+    def freeze(self, *, saturation: int | None = None) -> "FrozenThresholdPolicy":
+        """``saturation`` is the admitted source's resolved automatic ceiling
+        (decision 39), never user intent; Auto keeps it, manual and off drop it."""
         return FrozenThresholdPolicy(
             apply_threshold=bool(self.apply_threshold),
             threshold_min=(
@@ -500,6 +515,7 @@ class ThresholdIntent:
                 None if self.threshold_max is None else float(self.threshold_max)
             ),
             mask_saturation=bool(self.mask_saturation),
+            saturation=saturation,
         )
 
     @classmethod
@@ -518,16 +534,30 @@ class ThresholdIntent:
 
 @dataclass(frozen=True, slots=True)
 class FrozenThresholdPolicy:
-    """Deeply immutable threshold/saturation policy for one run."""
+    """Deeply immutable threshold/saturation policy for one run.
+
+    ``saturation`` is the source's resolved automatic ceiling (decision 39)
+    when it is not the data type's maximum: Auto also leaves out native values
+    at or above it. Absent is the data type's rule, the rule of every earlier
+    run; it is recorded only when present, so their provenance and
+    fingerprints keep their bytes, and it is never re-resolved from them.
+    """
 
     apply_threshold: bool = False
     threshold_min: float | None = None
     threshold_max: float | None = None
     mask_saturation: bool = True
+    saturation: int | None = None
 
     def __post_init__(self) -> None:
         if self.apply_threshold:
             object.__setattr__(self, "mask_saturation", False)
+        if not self.mask_saturation:  # only Auto has a ceiling
+            object.__setattr__(self, "saturation", None)
+        if self.saturation is not None and (
+            type(self.saturation) is not int or self.saturation <= 0
+        ):
+            raise ValueError("saturation must be a positive whole count or None")
         for name in ("threshold_min", "threshold_max"):
             value = getattr(self, name)
             if value is not None and not math.isfinite(float(value)):
@@ -540,12 +570,15 @@ class FrozenThresholdPolicy:
             raise ValueError("threshold_min cannot exceed threshold_max")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "apply_threshold": bool(self.apply_threshold),
             "threshold_min": self.threshold_min,
             "threshold_max": self.threshold_max,
             "mask_saturation": bool(self.mask_saturation),
         }
+        if self.saturation is not None:
+            value["saturation"] = int(self.saturation)
+        return value
 
 
 def _detached_value(value: Any) -> Any:
@@ -888,6 +921,12 @@ class FrozenRunConfiguration:
     threshold: FrozenThresholdPolicy
     poni_file: str = ""
     mask_file: str = ""
+    #: Flat-field image applied in the integration normalization ("" = none).
+    flat_file: str = ""
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
+    #: Dark-current image subtracted before integration ("" = none).
+    dark_file: str = ""
     poni_v3_override: PoniV3OverrideIntent | None = None
     background: Any = field(default_factory=_default_background)
     project_root: str = ""
@@ -995,6 +1034,10 @@ class FrozenRunConfiguration:
                     else _float_token(self.threshold.threshold_max)
                 ),
                 bool(self.threshold.mask_saturation),
+            ) + (
+                ()
+                if self.threshold.saturation is None
+                else (("saturation", int(self.threshold.saturation)),)
             ),
             str(self.poni_file),
             str(self.mask_file),
@@ -1007,6 +1050,14 @@ class FrozenRunConfiguration:
         )
         if self.background.mode != "None":
             value += (("background", _freeze_value(self.background.to_mapping())),)
+        if self.flat_file:
+            value += (("flat_file", str(self.flat_file)),)
+            if self.flat_min_fraction != DEFAULT_MIN_FLAT_FRACTION:
+                value += (("flat_min_fraction", float(self.flat_min_fraction)),)
+        if self.dark_file:
+            value += (("dark_file", str(self.dark_file)),)
+            if self.background.mode != "None":
+                value += (("background_dark", background_dark_rule(self.background)),)
         if self.poni_v3_override is not None:
             value += ((
                 "poni_v3_override",
@@ -1124,6 +1175,18 @@ class FrozenRunConfiguration:
         }
         if self.background.mode != "None":
             values["background"] = self.background.to_mapping()
+        source = self.thaw_source_spec()
+        if type(source) is SourceSpec and "point_images" in source.options:
+            from xrd_tools.sources.point_images import PointImagePolicy
+            values["point_images"] = PointImagePolicy.from_dict(source.options["point_images"]).to_dict()
+        if self.flat_file:
+            values["flat_file"] = self.flat_file
+            if self.flat_min_fraction != DEFAULT_MIN_FLAT_FRACTION:
+                values["flat_min_fraction"] = float(self.flat_min_fraction)
+        if self.dark_file:
+            values["dark_file"] = self.dark_file
+            if self.background.mode != "None":
+                values["background_dark"] = background_dark_rule(self.background)
         if self.poni_v3_override is not None:
             values["poni_v3_override"] = self.poni_v3_override.as_dict()
         return values
@@ -1148,6 +1211,16 @@ class FrozenRunConfiguration:
         return values
 
 
+def _flat_min_fraction(value: object) -> float:
+    """The flat cutoff as a float from 0 to below 1."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("the flat cutoff must be a number")
+    fraction = float(value)
+    if not math.isfinite(fraction) or not 0.0 <= fraction < 1.0:
+        raise ValueError("the flat cutoff must be from 0 to below 1")
+    return fraction
+
+
 @dataclass(slots=True)
 class RunIntent:
     """Mutable Controls-owned intent that freezes into one run generation."""
@@ -1165,6 +1238,12 @@ class RunIntent:
     poni_file: str = ""
     poni_values: Mapping[Any, Any] | None = None
     mask_file: str = ""
+    #: Flat-field image applied in the integration normalization ("" = none).
+    flat_file: str = ""
+    #: Flat pixels below this fraction of the flat's median are masked as dead.
+    flat_min_fraction: float = DEFAULT_MIN_FLAT_FRACTION
+    #: Dark-current image subtracted before integration ("" = none).
+    dark_file: str = ""
     poni_v3_override: PoniV3OverrideIntent | None = None
     background: Any = field(default_factory=_default_background)
     project_root: str = ""
@@ -1213,12 +1292,19 @@ class RunIntent:
         *,
         generation: int | None = None,
         gi_motor_choices: "list[str] | tuple[str, ...] | None" = None,
+        saturation: int | None = None,
+        poni_values: Mapping[Any, Any] | None = None,
     ) -> FrozenRunConfiguration:
         """Freeze the current values and advance the monotonic run generation.
 
         ``gi_motor_choices`` is the source's real motor list, supplied by the
         caller (the GUI) so the effective GI motor is resolved ONCE here (R4B-8)
-        rather than independently by each run consumer.
+        rather than independently by each run consumer. ``saturation`` is the
+        admitted source's resolved automatic ceiling (decision 39), likewise
+        resolved once at admission. ``poni_values``, when given, is the PONI
+        projection admission signed for a v3 calibration
+        (``AcceptedScientificAssets.signed_poni_values``) and replaces the
+        intent's own, as admission's candidate does.
         """
 
         heavy_residency_choice(self.run_options)
@@ -1238,6 +1324,7 @@ class RunIntent:
             if source_spec is None
             else FrozenSourceSpec.from_source(source_spec)
         )
+        signed_poni = self.poni_values if poni_values is None else poni_values
         frozen = FrozenRunConfiguration(
             generation=next_generation,
             source=source,
@@ -1247,17 +1334,23 @@ class RunIntent:
             batch_mode=bool(self.batch_mode),
             max_cores=int(self.max_cores),
             gi=self.gi.freeze(choices=gi_motor_choices),
-            threshold=self.threshold.freeze(),
+            threshold=self.threshold.freeze(saturation=saturation),
             poni_file=str(self.poni_file or ""),
             mask_file=str(self.mask_file or ""),
+            flat_file=str(self.flat_file or ""),
+            flat_min_fraction=_flat_min_fraction(self.flat_min_fraction),
+            dark_file=str(self.dark_file or ""),
             poni_v3_override=self.poni_v3_override,
-            background=self.background,
+            # "Already dark-corrected" matters only with a dark; without one it is
+            # not recorded, so it cannot set two runs apart.
+            background=(self.background if self.dark_file or not self.background.dark_corrected
+                        else replace(self.background, dark_corrected=False)),
             project_root=str(self.project_root or ""),
             save_path=str(self.save_path or ""),
             _bai_1d_args=_mapping_value(self.bai_1d_args),
             _bai_2d_args=_mapping_value(self.bai_2d_args),
             _poni_values=_freeze_value(
-                None if self.poni_values is None else dict(self.poni_values)
+                None if signed_poni is None else dict(signed_poni)
             ),
             _run_options=_mapping_value(self.run_options),
         )
@@ -1342,6 +1435,9 @@ class RunIntent:
                 else _detached_value(dict(self.poni_values))
             ),
             mask_file=self.mask_file,
+            flat_file=self.flat_file,
+            flat_min_fraction=self.flat_min_fraction,
+            dark_file=self.dark_file,
             poni_v3_override=self.poni_v3_override,
             background=self.background,
             project_root=self.project_root,
@@ -1372,6 +1468,9 @@ class RunIntent:
             poni_file=value.poni_file,
             poni_values=value.poni_values,
             mask_file=value.mask_file,
+            flat_file=value.flat_file,
+            flat_min_fraction=value.flat_min_fraction,
+            dark_file=value.dark_file,
             poni_v3_override=value.poni_v3_override,
             background=value.background,
             project_root=value.project_root,

@@ -564,6 +564,18 @@ def test_choices_selection_divisor_label_identity_and_revision_are_one_call():
     np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 4.0)
 
 
+def test_choices_offer_likely_monitors_first_and_leave_out_the_time_stamp_and_hkl_unless_saved():
+    # Maintainer 2026-09-30: Int's Norm channel takes Stitch's Monitor ordering ("the same can be used
+    # for populating the Norm channel in int"); a choice already made stays offered and effective.
+    row = {"del": 5.0, "epoch": 100.0, "h": 1.0, "i0": 2.0, "mon": 3.0, "seconds": 1.0, "pd1": 4.0}
+    parts = _fabricated([(1, 1.0, row), (2, 2.0, row)])
+    state = _build(parts.payloads, parts.navigation, _prefs(), parts.aggregate)
+    assert state.norm_channels == (PLACEHOLDER, "i0", "mon", "pd1", "del", "seconds")
+    state = _build(parts.payloads, parts.navigation, _prefs(norm_channel="Epoch"), parts.aggregate)
+    assert state.norm_channel == "epoch"
+    assert state.norm_channels == (PLACEHOLDER, "i0", "mon", "pd1", "del", "epoch", "seconds")
+
+
 def test_producer_swap_after_capture_stays_on_r_until_next_refresh():
     parts = _acquisition_parts(
         [(1, 1.0, {"mon": 2.0}), (2, 2.0, {"mon": 4.0})]

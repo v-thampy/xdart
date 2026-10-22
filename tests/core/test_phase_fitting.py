@@ -389,3 +389,33 @@ class TestMultiPhaseResult:
         result = fitter.fit(caglioti=False)
         assert result.redchi > 0
         assert np.isfinite(result.redchi)
+
+
+@pytest.mark.parametrize("kind", ("cif", "lattice"))
+def test_cell_lengths_refine_from_starts_that_round_off_the_bounded_midpoint(kind):
+    """A free cell length must start at lmfit's bounded internal 0, or leastsq never moves it.
+
+    Bounds v0(1-pct), v0(1+pct) leave a -1.1e-15 residue for some starts (4.15 Å, about 5% of cells);
+    leastsq's forward step then vanishes and the fit returns the start (CIF phases too, before P3b).
+    """
+    lmfit = pytest.importorskip("lmfit")
+    pymatgen = pytest.importorskip("pymatgen.core")
+    a_true, a0 = 4.1569, 4.15
+    assert lmfit.Parameter("a", value=a0, min=a0 * .95, max=a0 * 1.05).setup_bounds() != 0.
+
+    def phase(name, a):
+        if kind == "lattice":
+            return PhaseModel.from_lattice(name, a=a, space_group="Pm-3m")
+        return PhaseModel(name, pymatgen.Structure(pymatgen.Lattice.cubic(a), ["Cs", "Cl"],
+                                                   [[0, 0, 0], [.5, .5, .5]]))
+
+    truth = phase("truth", a_true)
+    q = np.linspace(1., 6., 5001)
+    y = 20. + sum(1000. * peak.intensity / 100. * np.exp(-(q - peak.q) ** 2 / (2 * .02 ** 2))
+                  for peak in truth.peaks if 1.05 <= peak.q <= 5.95)
+    fitter = PhaseFitter(q, y)
+    fitter.add_phase(phase("start", a0), q_range=(1., 6.), min_intensity=0.)
+    params = fitter.build_parameters(phase_profile="gaussian")
+    assert params["p0_a"].vary and params["p0_a"].setup_bounds() == 0.
+    result = fitter.fit(params=params, phase_profile="gaussian")
+    assert abs(result.params["p0_a"].value - a_true) < 1e-4, result.params["p0_a"].value
