@@ -445,6 +445,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         calls.append("render-failed")
         raise RuntimeError("render")
     page._shell = SimpleNamespace(scientific=scientific, browser=SimpleNamespace(
+        set_filename_mode=lambda mode: calls.append(("filename-mode", mode)),
         reconcile_detector_mode=lambda _projection: None,
         reconcile_heavy_residency=lambda *_args, **_kwargs: None), apply_state=fail_render)
     page._notice = lambda text: setattr(page, "_notice_text", text)
@@ -452,6 +453,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     owner_state = (controller.viewer_2d_frame, controller.viewer_2d_context)
     assert retained.heavy.raw is canonical
     ScatteringWorkspace._refresh_shell(page)
+    assert ("filename-mode", "2D Viewer") in calls
     assert calls[-2:] == ["render-failed", "drop-snapshot"]
     assert page._notice_text == "Passive shell render failed: render"
     assert page._last_scientific_projection is None and owner_state == (controller.viewer_2d_frame, controller.viewer_2d_context)
