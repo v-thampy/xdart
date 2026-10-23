@@ -95,6 +95,7 @@ def test_stopped_deferred_skip_counts_known_unowned_sidecar(
     sidecar = tmp_path / "master_data.h5"
     first = SimpleNamespace(
         target=tmp_path / "master.nexus",
+        completed=None,
         physical_paths=(master,),
         protected_states=(
             SimpleNamespace(path=str(master)),
@@ -103,6 +104,7 @@ def test_stopped_deferred_skip_counts_known_unowned_sidecar(
     )
     second = SimpleNamespace(
         target=tmp_path / "linked.nexus",
+        completed=None,
         physical_paths=(linked_candidate,),
         protected_states=(SimpleNamespace(path=str(linked_candidate)),),
     )

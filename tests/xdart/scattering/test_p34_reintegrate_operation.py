@@ -233,7 +233,7 @@ def test_ordinary_output_routes_group_target_through_one_borrowed_lock(tmp_path)
     target = tmp_path / "canonical.nxs"; target.write_bytes(b"x")
     alias = tmp_path / "alias.nxs"; alias.symlink_to(target)
     assert dynamic_output._target_key(alias) == dynamic_output._target_key(target)
-    adapter = dynamic_output.DynamicOutputAdapter(SimpleNamespace())
+    adapter = dynamic_output.DynamicOutputAdapter(SimpleNamespace(max_cores=1))
     def prepared(shown):
         item = SimpleNamespace(target=shown, group=SimpleNamespace(target=target))
         value = dynamic_output._PreparedAdmission(adapter, object(), object(), item, object(), object(), threading.Event(), (None,) * 5, (None,) * 5, None)
