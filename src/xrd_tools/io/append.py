@@ -1124,8 +1124,9 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
         )
 
 def _refusal_reason(target: Path, entry: str, error: BaseException) -> str:
-    """The refusal, with its remedy when an interrupted in-place Append left the output pending (Replace) or
-    unreadable (Replace's raw-target gate refuses a file it cannot recognize, so: move or delete it)."""
+    """The refusal, with its remedy when an interrupted in-place Append left the output pending (Replace) or torn
+    (Replace's raw-target gate refuses a file it cannot recognize, so: move or delete it), or when another program
+    holds it (close that program)."""
     reason = str(error)
     try:
         with open(target, "rb"):
@@ -1135,11 +1136,16 @@ def _refusal_reason(target: Path, entry: str, error: BaseException) -> str:
     try:
         with h5py.File(target, "r") as handle:
             state = _read_lineage(handle[entry]).get("state")
-    except OSError:
-        return (
-            "the output is not a readable HDF5 file, possibly left by an interrupted Append; "
-            f"move or delete it, then run again ({reason})"
-        )
+    except OSError as opened:
+        text = str(opened)
+        if "unable to lock file" in text:
+            return f"another program has the output open; close it, then run again ({reason})"
+        if "truncated file" in text or "file signature not found" in text:
+            return (
+                "the output is not a readable HDF5 file, possibly left by an interrupted Append; "
+                f"move or delete it, then run again ({reason})"
+            )
+        return reason
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return reason
     if state == "pending":

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import errno
 import hashlib
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -24,6 +25,7 @@ from typing import Callable, Mapping, Protocol, TypeVar, runtime_checkable
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.session import get_pool
 
+logger = logging.getLogger(__name__)
 
 _BACKUP_SUFFIX = ".xdart-replacing"
 _HASH_CHUNK_BYTES = 1024 * 1024
@@ -2957,6 +2959,10 @@ class OutputTransaction:
                 base,
                 "stream-in-place",
             )
+            logger.debug(
+                "[APPEND-INPLACE] output=%s %s size=%d", target,
+                "reopened epoch" if sealed is not None else "first stream", int(state.st_size),
+            )
             checkpoint = _descriptor_stream_stat_receipt(
                 descriptor,
                 target,
@@ -3469,7 +3475,9 @@ class OutputTransaction:
                     or _descriptor_identity(flushed)
                     != _stream_receipt_revision(checkpoint)
                 ):
-                    raise TargetChanged("fast stream terminal lost its close checkpoint")
+                    raise TargetChanged(
+                        "held stream terminal (fast or in-place) lost its close checkpoint"
+                    )
                 receipt = _descriptor_content_receipt(
                     descriptor, Path(self._admission.target), "stream-terminal",
                     durable_fsync=False,

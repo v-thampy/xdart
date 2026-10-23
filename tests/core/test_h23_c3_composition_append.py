@@ -5239,3 +5239,25 @@ def test_in_place_pending_lineage_stays_deferred_until_it_is_staged(tmp_path, mo
     assert writer._deferred_lineage is not None
     writer._authorize_transaction_mutation()
     assert writer._deferred_lineage is None and writer._lineage_dirty
+
+
+def test_an_output_another_program_holds_is_refused_naming_that_program(tmp_path):
+    """HDF5 locks a file another process writes; that refusal must not advise deleting it."""
+    import subprocess
+    import sys
+    from xrd_tools.io import AppendDisposition, qualify_append
+    target = tmp_path / "in-place-held.nexus"
+    _finite_seed(target, tmp_path, 1)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "import h5py, sys; f = h5py.File(sys.argv[1], 'a'); print('held', flush=True); "
+         "sys.stdin.readline(); f.close()", str(target)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        refused = qualify_append(target, _labels_intent(tmp_path, 2, generation=1))
+    finally:
+        holder.communicate("\n", timeout=60)
+    assert refused.disposition is AppendDisposition.REFUSE
+    assert refused.reason.startswith("another program has the output open; close it, then run again (")
+    assert "delete" not in refused.reason
