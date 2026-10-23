@@ -4847,3 +4847,23 @@ def test_existing_append_integrity_hold_abort_never_reports_settled(
             sink.abort(None)
         assert sink.append_preflight is owner
         assert owner.snapshot.state is AppendPreflightState.INTEGRITY_HOLD
+
+
+def test_same_extent_append_refusal_names_what_changed() -> None:
+    """Windows report, 2026-10-22: a directory Append refused "same-extent source identity changed" with no field."""
+    from xrd_tools.io.append import _source_extends
+
+    member = {"path": "/raw/a_0001.tif", "size": 10, "mtime_ns": 1_000_000_000,
+              "source_start": 0, "source_stop": 1, "ordinal": 0}
+    prior = {"path": "/raw/a_0001.tif", "adapter_id": "tiff", "size": 10, "mtime_ns": 1_000_000_000,
+             "extent": 1, "digest": None, "dataset_paths": [], "image_members": [member],
+             "external_members": [], "generation": 1}
+    current = {**prior, "mtime_ns": 3_500_000_000, "digest": "ab", "generation": 2}
+    with pytest.raises(ValueError) as caught:
+        _source_extends(prior, current)
+    message = str(caught.value)
+    assert message.startswith("same-extent source identity changed: ")
+    assert "digest None → 'ab'" in message
+    assert "mtime_ns 1000000000 → 3500000000 (+2.500 s)" in message
+    assert "generation" not in message
+    _source_extends(prior, {**prior, "generation": 2})  # generation alone is not a change

@@ -740,6 +740,21 @@ def _member_extends(
             return False
     return True
 
+def _identity_changes(prior: Any, current: Any, at: str = "") -> list[str]:
+    """Name each differing leaf of two source identities (generation aside); the refusal stays exact."""
+    if isinstance(prior, Mapping) and isinstance(current, Mapping):
+        return [change for key in sorted(set(prior) | set(current), key=str) if at or key != "generation"
+                for change in _identity_changes(prior.get(key), current.get(key), f"{at}.{key}" if at else str(key))]
+    if isinstance(prior, list) and isinstance(current, list) and len(prior) == len(current):
+        return [change for index, (old, new) in enumerate(zip(prior, current))
+                for change in _identity_changes(old, new, f"{at}[{index}]")]
+    if prior == current:
+        return []
+    delta = (f" ({(current - prior) / 1e9:+.3f} s)" if at.endswith("mtime_ns")
+             and type(prior) is int and type(current) is int else "")
+    return [f"{at} {repr(prior)[:160]} → {repr(current)[:160]}{delta}"]
+
+
 def _source_extends(
     prior: Mapping[str, Any],
     current: Mapping[str, Any],
@@ -772,7 +787,10 @@ def _source_extends(
         }
         if ({key: value for key, value in current.items() if key != "generation"}
                 != comparable_prior):
-            raise ValueError("same-extent source identity changed")
+            changes = _identity_changes(prior, current)
+            more = f" (and {len(changes) - 6} more)" if len(changes) > 6 else ""
+            raise ValueError("same-extent source identity changed: "
+                             + ("; ".join(changes[:6]) or "no single field differs") + more)
 
 def _extend_pending_decision(
     prior_decision: AppendDecision,

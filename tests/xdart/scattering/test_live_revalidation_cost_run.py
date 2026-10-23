@@ -780,8 +780,12 @@ def test_r3d_a_published_raw_member_change_keeps_its_exact_outcome(tmp_path, mon
         _settle(executor, events, .5)
     finally:
         terminal = _stop(executor, identity, events)
+    # The same-extent refusal now names what changed (1.2.4); the frozen outcome keeps its stem.
+    stem = 'same-extent source identity changed: '
+    named = [detail[len(stem):] for _kind, detail in terminal if detail.startswith(stem)]
+    assert all(change.strip() for change in named), terminal
     outcome = ([kind for kind, _detail in terminal], _counted(tmp_path, 'scan')[0], _said(events, 'stopped growing'),
-               [detail for _kind, detail in terminal])
+               [stem[:-2] if detail.startswith(stem) else detail for _kind, detail in terminal])
     assert outcome == R3D_PARENT[case], outcome
 
 
