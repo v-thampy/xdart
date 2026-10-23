@@ -4903,3 +4903,103 @@ def test_a_seed_that_changes_size_at_its_close_is_refused_and_the_prior_kept(tmp
         )
     monkeypatch.undo()
     assert target.read_bytes() == b"prior" and not transaction.backup.exists()
+
+
+# In-place Append (maintainer, 2026-10-23: "Append in place": "No copy and no hashes: open the existing output and add
+# only the new frames ... a crash mid-append can leave that output partly written or unreadable, and that scan then
+# needs Replace."). Codex's design review REVIEW-DESIGN-125: the policy binds at admission, keeps lease and checkpoint
+# evidence, and an abort retains the existing file without restoring, deleting or hashing it.
+
+def _prepared_in_place(tmp_path: Path, *, prior: bytes | None = b"prior"):
+    api = _api()
+    target = tmp_path / "result.nexus"
+    if prior is not None:
+        target.write_bytes(prior)
+    coordinator = api.OutputTransactionCoordinator()
+    transaction_owner, target_owner = api.OwnerToken("transaction"), api.OwnerToken("target")
+    transaction = coordinator.admit(
+        target, transaction_owner=transaction_owner, target_owner=target_owner, in_place=True,
+    )
+    owners = _owners(api)
+    lease = transaction.acquire_lease(
+        admission=transaction.admission, transaction_owner=transaction_owner, target_owner=target_owner,
+        owners=owners,
+    )
+    return api, target, coordinator, transaction, transaction_owner, target_owner, owners, lease
+
+
+def _counted_hashes(api, monkeypatch) -> list[int]:
+    calls: list[int] = []
+    real_hash = api._sha256_handle
+
+    def counted(handle):
+        calls.append(1)
+        return real_hash(handle)
+
+    monkeypatch.setattr(api, "_sha256_handle", counted)
+    return calls
+
+
+def _begin_in_place(prepared, seed: str = "IN_PLACE"):
+    api, _target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, lease = prepared
+    return transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=_DepthPool(), file_lock=threading.RLock(), seed_mode=getattr(api.StreamSeedMode, seed),
+    )
+
+
+def test_in_place_append_writes_the_existing_file_without_copy_backup_or_hash(tmp_path, monkeypatch):
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    hashes = _counted_hashes(api, monkeypatch)
+    before = os.stat(target)
+    assert transaction.in_place and transaction.admission.snapshot.digest is None
+    attempt = _begin_in_place(prepared)
+    assert os.stat(target).st_ino == before.st_ino
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["result.nexus"]
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(b"-new")
+    _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    assert transaction.commit_stream(attempt, lease=lease).phase is api.TransactionPhase.COMMITTED
+    assert target.read_bytes() == b"prior-new" and os.stat(target).st_ino == before.st_ino
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["result.nexus"] and hashes == []
+
+
+@pytest.mark.parametrize("stage", ("before-mutation", "after-mutation", "after-durable-floor"))
+def test_in_place_abort_retains_the_existing_file_without_restoring_or_hashing(tmp_path, monkeypatch, stage):
+    """No backup exists to restore: the canonical file stays as it stands, reported as retained and incomplete."""
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    hashes = _counted_hashes(api, monkeypatch)
+    attempt = _begin_in_place(prepared)
+    expected = b"prior"
+    if stage != "before-mutation":
+        transaction.authorize_stream_mutation(attempt, lease=lease)
+        with open(target, "ab") as stream:
+            stream.write(b"-partial")
+        expected = b"prior-partial"
+    if stage == "after-durable-floor":
+        checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+        transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    snapshot = transaction.abort_stream(attempt, lease=lease)
+    assert snapshot.phase is api.TransactionPhase.ABORTED and not snapshot.pending_actions
+    assert snapshot.partial_path == transaction.admission.target
+    assert target.read_bytes() == expected and hashes == []
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["result.nexus"]
+
+
+def test_in_place_policy_binds_at_admission_and_needs_an_existing_output(tmp_path, monkeypatch):
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    with pytest.raises(api.TransactionStateError, match="in-place"):
+        _begin_in_place(prepared, "PRESERVE_BASE")
+    (tmp_path / "copy").mkdir()
+    ordinary = _prepared(tmp_path / "copy")
+    with pytest.raises(api.TransactionStateError, match="in-place"):
+        _begin_in_place(ordinary)
+    (tmp_path / "absent").mkdir()
+    missing = _prepared_in_place(tmp_path / "absent", prior=None)
+    with pytest.raises(api.TransactionStateError, match="existing output"):
+        _begin_in_place(missing)
