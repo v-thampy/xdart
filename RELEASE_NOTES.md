@@ -1,6 +1,6 @@
 # Release notes
 
-## 1.2.4 (unreleased)
+## 1.2.4 (2026-10-22)
 
 ### Fixes
 
