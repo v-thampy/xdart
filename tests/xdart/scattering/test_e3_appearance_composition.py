@@ -156,3 +156,35 @@ def test_config_spacing_drives_the_real_shell_without_changing_selection(
         shell.deleteLater()
         window.deleteLater()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize(("width", "height"), [(1440, 900), (1024, 900)])
+def test_themed_controls_fit_their_column_with_the_log_hidden_or_shown(
+    qapp: QtWidgets.QApplication,
+    monkeypatch,
+    tmp_path,
+    width: int,
+    height: int,
+) -> None:
+    """UI7 under the theme: the card border every QFrame gets must not reach
+    the Show log split, whose minimum width ignores its own border (1.2.4
+    clipped the controls by two pixels at the column's narrowest)."""
+    monkeypatch.setenv("XDART_SETTINGS_FILE", str(tmp_path / "appearance.ini"))
+    apply_theme(qapp, "dark", spacing="normal")
+    shell = ScatteringWorkspaceShell()
+    shell.apply_state(make_shell_projection())
+    shell.resize(width, height)
+    shell.show()
+    try:
+        qapp.processEvents()
+        assert shell.control_scroll.horizontalScrollBar().maximum() == 0
+        assert shell.log_panel.split.frameWidth() == 0
+        shell.log_panel.toggle.setChecked(True)
+        qapp.processEvents()
+        qapp.processEvents()
+        assert shell.log_panel.isVisible()
+        assert shell.control_scroll.horizontalScrollBar().maximum() == 0
+    finally:
+        shell.close()
+        shell.deleteLater()
+        qapp.processEvents()

@@ -28,6 +28,10 @@
   final write time when the program closes it, and the reported failure fits that;
   xdart now records the file's state after that close. Not yet confirmed on the
   beamline share.
+- **The controls are no longer cut off at their right edge:** since 1.2.4's Show
+  log, a window narrow enough to leave the controls column at its minimum width
+  cut two pixels off the controls' right edge (Int, Stitch and RSM), and Int showed
+  a thin horizontal scrollbar under them.
 
 ## 1.2.4 (2026-10-22)
 

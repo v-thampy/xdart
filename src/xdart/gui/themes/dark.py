@@ -260,8 +260,11 @@ QFrame, QGroupBox {
 }
 /* QSplitter inherits QFrame.  The mounted three-column shell owns its column
    separation through splitter handles, so inheriting the generic card border
-   would inset every column by one pixel and silently consume two layout pixels. */
-QSplitter#e3MainSplitter {
+   would inset every column by one pixel and silently consume two layout pixels.
+   Every page's Show log split (the controls over the log) is the same case: a
+   splitter's minimum width ignores its own border, so the border clipped the
+   controls by two pixels at the column's narrowest. */
+QSplitter#e3MainSplitter, QSplitter#logPanelSplit {
     border: none;
     border-radius: 0px;
     background: transparent;
