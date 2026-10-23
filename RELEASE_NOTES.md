@@ -9,6 +9,10 @@
   to its network path, or a symlinked folder resolves to another path. Browse now
   uses the same normalized path throughout loading and adoption. Adoption failures
   also log their reason and traceback instead of disappearing silently.
+- **Overlay across processed files in Int:** keep compatible selected curves when
+  opening another processed file, while its raw image and 2D map follow the current
+  selection. Incompatible sampled axes or the detached display memory limit start
+  a new overlay with a clear notice. Clear and Single remove earlier comparisons.
 
 ## 1.2.1 (2026-10-22)
 
