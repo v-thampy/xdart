@@ -292,3 +292,41 @@ def test_an_already_processed_scan_after_another_scan_is_shown_from_its_saved_fr
     assert seams.materialized == ["scana_int1d.nexus", "scanc_int1d.nexus"][(0 if first_new else 1):]
     assert _labels(tmp_path, "scana") == (1, 2, 3) and _labels(tmp_path, "scanb") == (1, 2)
     assert _labels(tmp_path, "scanc") == (1,)
+
+
+def test_an_in_place_append_seals_its_close_after_its_writing_handle_closes(tmp_path, monkeypatch):
+    """Beamline 2026-10-23 (dev d28d0716, Windows share): a growing scan's in-place Append failed, "held stream
+    terminal (fast or in-place) lost its close checkpoint". Its close was sealed while the writer's duplicate of its
+    writing handle was still open, and Windows finalizes a written file's timestamps when that handle closes; here
+    that close moves mtime 86.5 ms, as the share did for the stream seed (48a7ee5d)."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _scan(raw, "scana", 3)
+    events, _catalog = _run(tmp_path, raw, 9301)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+    _scan(raw, "scana", 1, start=3)
+    output = tmp_path / "processed" / "scana_int1d.nexus"
+    duplicates = set()
+
+    class _ClosingFinalizesTimestamps:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def dup(descriptor):
+            duplicate = os.dup(descriptor)
+            duplicates.add(duplicate)
+            return duplicate
+
+        @staticmethod
+        def close(descriptor):
+            os.close(descriptor)
+            if descriptor in duplicates:
+                duplicates.discard(descriptor)
+                state = output.stat()
+                os.utime(output, ns=(state.st_atime_ns, state.st_mtime_ns + 86_500_000))
+
+    monkeypatch.setattr(record_writer, "os", _ClosingFinalizesTimestamps())
+    events, _catalog = _run(tmp_path, raw, 9302)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"], events[-1].detail
+    assert duplicates == set() and _labels(tmp_path, "scana") == (1, 2, 3, 4)

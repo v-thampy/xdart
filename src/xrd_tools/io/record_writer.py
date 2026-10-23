@@ -3954,7 +3954,7 @@ class NexusRecordWriter:
                     raise WriterStateError(
                         "durable rows changed during post-close verification"
                     )
-                if seal_transaction:
+                if seal_transaction and verification_descriptor is None:
                     binding.transaction.seal_stream_close(
                         binding.attempt,
                         self._stream_close_attempt,
@@ -3964,6 +3964,36 @@ class NexusRecordWriter:
                         evidence_digest=aggregate.hexdigest(),
                         evidence_bytes=read_bytes,
                     )
+            if seal_transaction and verification_descriptor is not None:
+                # The duplicate is the file's last writing handle. Windows finalizes a written file's timestamps when
+                # that handle closes, on a share a moment later (beamline 2026-10-23, in-place Append: "held stream
+                # terminal (fast or in-place) lost its close checkpoint"), so flush through it, close it, and seal
+                # through a read-only descriptor bound to the verified file and size (as _seal_closed_stream_seed).
+                os.fsync(verification_descriptor)
+                verification_stream.close()
+                verification_stream = None
+                os.close(verification_descriptor)
+                verification_descriptor = None
+                self._close_verification_descriptor = None
+                closed = os.open(self._active_path or self.target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                try:
+                    sealed = self._descriptor_stat_tuple(closed)
+                    if sealed[:3] != after[:3]:
+                        raise WriterStateError(
+                            "durable rows changed when the writing handle closed"
+                        )
+                    binding.transaction.seal_stream_close(
+                        binding.attempt,
+                        self._stream_close_attempt,
+                        lease=binding.lease,
+                        descriptor=closed,
+                        expected_stat=sealed,
+                        evidence_digest=aggregate.hexdigest(),
+                        evidence_bytes=read_bytes,
+                        flushed=True,
+                    )
+                finally:
+                    os.close(closed)
         except BaseException:
             if seal_transaction:
                 binding.transaction.hold_stream_close(

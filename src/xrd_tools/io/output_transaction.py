@@ -3300,8 +3300,13 @@ class OutputTransaction:
         expected_stat: tuple[int, int, int, int, int] | None = None,
         evidence_digest: str | None = None,
         evidence_bytes: int | None = None,
+        flushed: bool = False,
     ) -> StreamCheckpoint:
-        """Resolve a successful controlled close to a new exact durable floor."""
+        """Resolve a successful controlled close to a new exact durable floor.
+
+        ``flushed``: the writer flushed the file through its own writing handle before closing it, so the seal
+        requests no flush (on Windows a read-only descriptor's flush reopens the file writable).
+        """
         with self._lock:
             self._require_stream(attempt, lease)
             owner = self._stream_close_owner
@@ -3348,7 +3353,7 @@ class OutputTransaction:
                         ordinal=self._coordinator._next_ordinal(),
                         role="stream-close",
                         expected_stat=expected_stat,
-                        durable_fsync=self._durable_fsync,
+                        durable_fsync=self._durable_fsync and not flushed,
                     )
                 except TargetChanged:
                     self._phase = TransactionPhase.INTEGRITY_HOLD
