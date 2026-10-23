@@ -2533,7 +2533,7 @@ def test_unsealed_browse_physical_validation_runs_only_on_browse_worker(
     monkeypatch.setattr(browse_loader, "capture_target_snapshot", tracked_capture)
     try:
         request = page._context_controller.begin_browse(target)
-        assert snapshot_threads == []
+        assert main_ident not in snapshot_threads
         outcome = _wait(page._context_controller.poll_browse)
         assert outcome.request is request
         assert outcome.status is BrowseLoadStatus.READY

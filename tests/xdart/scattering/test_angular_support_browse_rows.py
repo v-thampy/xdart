@@ -25,6 +25,7 @@ def test_g5_overlay_rows_carry_each_outputs_own_support(qapp, tmp_path):
         _enable(qapp, view)
         _command(qapp, page, ShellCommandKind.SET_PLOT_MODE, 'Overlay')
         bands = {}
+        expected_keys = []
         for output, band in outputs:
             assert _pump(qapp, lambda: not page._context_controller.browse_preview_polling_needed, 30.)
             _reopen(qapp, page, output)
@@ -32,22 +33,26 @@ def test_g5_overlay_rows_carry_each_outputs_own_support(qapp, tmp_path):
             assert page._context_controller.select_navigation(keys[0], tuple(keys))
             page._refresh_shell()
             bands[os.path.normcase(os.path.abspath(output))] = band
+            expected_keys.extend(keys)
 
             def drawn():
-                return [item.angular_support for item in view.angular_support_plot.getPlotItem().listDataItems()
+                return [item for item in view.angular_support_plot.getPlotItem().listDataItems()
                         if item.getData()[0] is not None]
 
             def settled():
                 # Overlay retains the earlier output's compatible curves (1.2.2): wait until this output's own
                 # frames are among the rows and every row's strip curve is drawn.
-                rows = view.trace_history_projections
-                return (len(keys) == 2 and all(any(row.frame is key for row in rows) for key in keys)
-                        and len(drawn()) == len(rows)
-                        and all(any(profile is row.angular_support for row in rows) for profile in drawn()))
+                rows, items = view.trace_history_projections, drawn()
+                return (len(keys) == 2 and len(rows) == len(expected_keys)
+                        and all(row.frame is key for row, key in zip(rows, expected_keys, strict=True))
+                        and len(items) == len(rows)
+                        and all(item.angular_support is row.angular_support
+                                for item, row in zip(items, rows, strict=True)))
 
             _wait(qapp, settled)
-            for row in view.trace_history_projections:
-                profile = row.angular_support
+            for item, row in zip(drawn(), view.trace_history_projections, strict=True):
+                profile = item.angular_support
+                assert profile is row.angular_support
                 assert profile.origin is SupportOrigin.SAVED and profile.available
                 np.testing.assert_allclose(profile.supported_deg, _analytic(profile, bands[row.frame.artifact]),
                                            atol=TOL * 360, err_msg=f"{row.frame.artifact}: another output's support is shown")
