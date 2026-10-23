@@ -1754,7 +1754,15 @@ class StandardRunExecutor:
             raise TypeError("persisted prefix labels must be exact integers")
         capacity = run.display.navigation_capacity
         retained = labels[-capacity:]
-        absolute_base = run.completed + len(labels) - len(retained)
+        # Live progress counts only new frames, so run.completed omits earlier
+        # outputs' persisted prefixes that the catalog already holds; a second
+        # Append output then reused a spent ordinal (Windows report, 2026-10-22).
+        # A prefix the catalog already represents (cross-run Append) keeps its
+        # ordinals; a new one starts after every ordinal already issued.
+        issued = run.completed
+        if not run.display.navigation_represents(str(owner.artifact), retained):
+            issued = max(issued, run.display.navigation_work_high_water)
+        absolute_base = issued + len(labels) - len(retained)
         rows = tuple(
             (
                 owner.source_scan,

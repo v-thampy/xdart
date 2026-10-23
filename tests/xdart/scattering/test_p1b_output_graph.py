@@ -920,6 +920,41 @@ def test_executor_persisted_prefix_seeds_absolute_run_ordinals(
     assert appended.work_ordinal == 13
 
 
+def test_live_second_append_output_seeds_after_the_catalog_high_water() -> None:
+    """Live counts only new frames in run.completed, so earlier outputs' persisted prefixes are not in it.
+
+    Windows report, 2026-10-22: a Live directory run Appending to two existing outputs failed with "persisted work
+    ordinal must advance high-water" after the first output's prefix and two new frames moved the catalog past
+    run.completed.
+    """
+    from xdart.gui.tabs.scattering.display_runtime import RunDisplayState
+
+    display = RunDisplayState(
+        RunIdentity(1, "live-two-append-outputs"),
+        max_payload_items=1,
+        catalog_max_items=16,
+    )
+    first = SimpleNamespace(source_scan="first", artifact=Path("/processed/first_int2d.nexus"))
+    second = SimpleNamespace(source_scan="second", artifact=Path("/processed/second_int2d.nexus"))
+    run = SimpleNamespace(display=display, completed=0, current_completed=1)
+    StandardRunExecutor._seed_persisted_prefix_navigation(
+        run, first, (1,), newly_adopted=True,
+    )
+    for label in (2, 3):  # two new Live frames; only these reach run.completed
+        display.append_navigation(first.source_scan, str(first.artifact), label)
+    run.completed, run.current_completed = 2, 1
+    StandardRunExecutor._seed_persisted_prefix_navigation(
+        run, second, (1,), newly_adopted=True,
+    )
+    entries = display.catalog_snapshot().entries
+    assert [(key.source_scan, key.local_frame_label, key.work_ordinal) for key in entries] == [
+        ("first", 1, 1), ("first", 2, 2), ("first", 3, 3), ("second", 1, 4),
+    ]
+    assert display.append_navigation(
+        second.source_scan, str(second.artifact), 2,
+    ).appended.work_ordinal == 5
+
+
 @pytest.mark.parametrize(
     "same_run_labels",
     ((), (101, 102, 103, 104, 105)),

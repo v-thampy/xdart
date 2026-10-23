@@ -39,6 +39,11 @@ class DisplayCatalogIndex:
     def entries(self) -> tuple[DisplayFrameKey, ...]:
         return tuple(self._entries)
 
+    @property
+    def work_high_water(self) -> int:
+        """The last work ordinal issued; retirement never lowers it."""
+        return self._work_ordinal
+
     def resize(self, max_items: int) -> tuple[DisplayFrameKey, ...]:
         if type(max_items) is not int or max_items < 1:
             raise ValueError("display catalog max_items must be positive")

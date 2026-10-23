@@ -1,5 +1,16 @@
 # Release notes
 
+## 1.2.4 (unreleased)
+
+### Fixes
+
+- **Live runs that Append to several existing results:** a Live directory run
+  stopped with "persisted work ordinal must advance high-water" when a second
+  scan's output already held frames. Live counts only new frames in its progress,
+  so that output's saved frames were numbered after the new frames rather than
+  after every frame already shown. They now take the next free numbers; frames
+  already shown keep theirs.
+
 ## 1.2.3 (2026-10-22)
 
 ### Fixes

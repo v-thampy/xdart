@@ -699,6 +699,16 @@ class RunDisplayState:
     def navigation_capacity(self) -> int:
         return self.catalog.max_items
 
+    @property
+    def navigation_work_high_water(self) -> int:
+        with self._lock:
+            return self.catalog.work_high_water
+
+    def navigation_represents(self, artifact: str, labels: tuple[int, ...]) -> bool:
+        """Whether any of ``artifact``'s ``labels`` already has a navigation key."""
+        with self._lock:
+            return any(self.catalog.resolve_exact(artifact, label) is not None for label in labels)
+
     def publish_light_1d(self, owner: DisplayArtifact, record: FrameRecord, *, source_identity: str) -> FramePublication:
         with self._light_admission_lock, self._lock:
             lease = owner.light_lease
