@@ -4552,6 +4552,9 @@ class ReductionSession:
     def _apply_gi_freeze(self, freeze_policy: str) -> None:
         if self._gi_freeze_applied or self.plan.gi is None:
             return
+        reuse = self.integrator_reuse if _owns_its_pool(self.executor, self.execution) else None
+        if reuse is not None:
+            reuse.fit(_planned_workers(self.executor))  # the grant bounds the store before the scout borrows
         self.plan = _apply_gi_freeze_policy(
             self.plan,
             self.scan,
@@ -4559,6 +4562,7 @@ class ReductionSession:
             fi=_accepted_reintegrate_fi(self.scan),
             initial_incident_angle=self._initial_incident_angle,
             warned_monitor_keys=self._warned_monitor_keys,
+            reuse=reuse,
         )
         self._gi_freeze_applied = True
 
@@ -5086,6 +5090,7 @@ def _apply_gi_freeze_policy(
     fi: Any,
     initial_incident_angle: float | None,
     warned_monitor_keys: set[str] | None = None,
+    reuse: WarmIntegrators | None = None,
 ) -> ReductionPlan:
     """Return a copy of *plan* with missing GI output ranges frozen.
 
@@ -5110,14 +5115,14 @@ def _apply_gi_freeze_policy(
                                  if k != "enabled_modes_2d"}),
             scan, freeze_policy=freeze_policy, fi=fi,
             initial_incident_angle=initial_incident_angle,
-            warned_monitor_keys=warned_monitor_keys,
+            warned_monitor_keys=warned_monitor_keys, reuse=reuse,
         )
         frozen = dict(plan.extra.get(COMPANION_RANGES_2D) or {})
         for mode in companions:
             single = _apply_gi_freeze_policy(
                 _companion_plan(plan, mode), scan, freeze_policy=freeze_policy,
                 fi=fi, initial_incident_angle=initial_incident_angle,
-                warned_monitor_keys=warned_monitor_keys,
+                warned_monitor_keys=warned_monitor_keys, reuse=reuse,
             ).integration_2d
             keys = (("x_range", "y_range") if mode == GI2DMode.QIP_QOOP.value
                     else ("radial_range", "azimuth_range"))
@@ -5147,72 +5152,77 @@ def _apply_gi_freeze_policy(
         ai=scan.integrator,
         fi=fi,
         initial_incident_angle=initial_incident_angle,
+        reuse=reuse,
+        role="scout",
     )
-    scout_results_1d: list[IntegrationResult1D] = []
-    scout_results_2d: list[IntegrationResult2D] = []
-    masks: dict[tuple[int, int], np.ndarray | None] = {}
-    for idx in scout_indices:
-        frame = scan._frame_by_index[int(idx)]
-        was_empty = frame.image is None
-        reduction = _reduce_frame(frame, None, plan, scout_integrators, masks,
-                                  warned_monitor_keys=warned_monitor_keys)
-        if reduction.result_1d is not None:
-            scout_results_1d.append(reduction.result_1d)
-        if reduction.result_2d is not None:
-            if _is_all_dummy_2d(reduction.result_2d, signed=_signed_point_difference(reduction.metadata)):
-                continue
-            scout_results_2d.append(reduction.result_2d)
-        if was_empty:
-            frame.image = None; frame.point_variance = None
+    try:
+        scout_results_1d: list[IntegrationResult1D] = []
+        scout_results_2d: list[IntegrationResult2D] = []
+        masks: dict[tuple[int, int], np.ndarray | None] = {}
+        for idx in scout_indices:
+            frame = scan._frame_by_index[int(idx)]
+            was_empty = frame.image is None
+            reduction = _reduce_frame(frame, None, plan, scout_integrators, masks,
+                                      warned_monitor_keys=warned_monitor_keys)
+            if reduction.result_1d is not None:
+                scout_results_1d.append(reduction.result_1d)
+            if reduction.result_2d is not None:
+                if _is_all_dummy_2d(reduction.result_2d, signed=_signed_point_difference(reduction.metadata)):
+                    continue
+                scout_results_2d.append(reduction.result_2d)
+            if was_empty:
+                frame.image = None; frame.point_variance = None
 
-    out = plan
-    if needs_1d is not None and scout_results_1d:
-        from xrd_tools.integrate.gid import freeze_common_axis
+        out = plan
+        if needs_1d is not None and scout_results_1d:
+            from xrd_tools.integrate.gid import freeze_common_axis
 
-        key, rng = freeze_common_axis(
-            scout_results_1d,
-            gi_mode_1d=out.gi.mode_1d.value,
-        )
-        if rng is not None and key == needs_1d:
-            out = _replace_integration_1d_range(out, key, rng)
-        elif key == needs_1d:
-            # Mirror the 2D branch's fail-loud: a degenerate scout (blank /
-            # all-masked / collapsed span -> rng None) silently skipped the
-            # 1D freeze, leaving per-frame auto axes that the writer's
-            # uniform-axes validator rejects MID-RUN, frames already on disk
-            # and far from the root cause.
-            raise GIFreezeError(
-                "GI 1D freeze scout produced a degenerate axis range; "
-                "check the incident angle / mask / threshold."
+            key, rng = freeze_common_axis(
+                scout_results_1d,
+                gi_mode_1d=out.gi.mode_1d.value,
             )
-    elif needs_1d is not None:
-        raise GIFreezeError(
-            "GI 1D freeze scout produced no usable 1D results; "
-            "check the incident angle / incidence motor."
-        )
-    if needs_2d and scout_results_2d:
-        from xrd_tools.integrate.gid import freeze_common_axes_2d
+            if rng is not None and key == needs_1d:
+                out = _replace_integration_1d_range(out, key, rng)
+            elif key == needs_1d:
+                # Mirror the 2D branch's fail-loud: a degenerate scout (blank /
+                # all-masked / collapsed span -> rng None) silently skipped the
+                # 1D freeze, leaving per-frame auto axes that the writer's
+                # uniform-axes validator rejects MID-RUN, frames already on disk
+                # and far from the root cause.
+                raise GIFreezeError(
+                    "GI 1D freeze scout produced a degenerate axis range; "
+                    "check the incident angle / mask / threshold."
+                )
+        elif needs_1d is not None:
+            raise GIFreezeError(
+                "GI 1D freeze scout produced no usable 1D results; "
+                "check the incident angle / incidence motor."
+            )
+        if needs_2d and scout_results_2d:
+            from xrd_tools.integrate.gid import freeze_common_axes_2d
 
-        ranges = freeze_common_axes_2d(
-            scout_results_2d,
-            gi_mode_2d=out.gi.mode_2d.value,
-        )
-        out = _replace_integration_2d_ranges(
-            out,
-            {
-                key: value
-                for key, value in ranges.items()
-                if key in needs_2d
-            },
-        )
-    elif needs_2d:
-        raise GIFreezeError(
-            "GI 2D freeze scout produced no non-dummy 2D results; "
-            "check the incident angle / incidence motor."
-        )
+            ranges = freeze_common_axes_2d(
+                scout_results_2d,
+                gi_mode_2d=out.gi.mode_2d.value,
+            )
+            out = _replace_integration_2d_ranges(
+                out,
+                {
+                    key: value
+                    for key, value in ranges.items()
+                    if key in needs_2d
+                },
+            )
+        elif needs_2d:
+            raise GIFreezeError(
+                "GI 2D freeze scout produced no non-dummy 2D results; "
+                "check the incident angle / incidence motor."
+            )
+    except BaseException:
+        scout_integrators.discard()  # a failed scout or freeze: nothing it built goes back
+        raise
+    scout_integrators.give_back()  # reduction and freeze both succeeded
     return out
-
-
 def _signed_point_difference(metadata: Mapping[str, Any]) -> bool:
     point = metadata.get("point_images", metadata.get("average_point_images"))
     return isinstance(point, Mapping) and point.get("operation") == "difference"
@@ -5414,50 +5424,153 @@ def _on_energy_scan_grid(item: Any, grid: Mapping[str, Any] | None, key: str) ->
 
 
 class WarmIntegrators:
-    """A Run's store of worker integrators whose Run mask is bound and whose pyFAI tables are built.
+    """A Run's store of worker integrators whose pyFAI tables are built.
 
     Each series builds a new integrator and each worker deep-copies it, and pyFAI's deepcopy drops the tables, so
     without this store every worker of every series rebuilds them (seconds for a large detector, against a fraction
-    of a second to integrate a frame). A session lends one to a worker at a time and gives them back once its workers
-    have all stopped; the next series with the same key borrows them. It holds integrators for one key, at most
-    ``capacity`` (the Run's worker count).
+    of a second to integrate a frame). A worker borrows one under an exact key and gives it back once its session's
+    workers have all stopped, or (GI) as soon as its next frame needs another incident angle; a borrowed integrator is
+    never in the store, so no two workers share one.
+
+    A key is (role, size family, exact state, incident angle): the role is "standard", "fiber", or "scout" for the GI
+    freeze; the size family (detector, image shape, methods and point counts, but no ranges or angle) prices a build
+    by the largest tables measured for it; the angle is None outside GI. Least recently used first, the store drops
+    idle integrators beyond
+    ``KEYS_PER_ROLE`` keys per role, ``limit`` (the granted workers) per key, and table bytes, idle and in use, beyond
+    ``allowance`` (from the Run's memory plan, ``warm_integrator_allowance``). It keeps each role's most recently
+    returned key even so: one series' own integrators, whose memory the plan already funded while they worked. A
+    build of a family whose size is still unknown first drops every idle integrator.
     """
 
-    def __init__(self, limit: int) -> None:
-        self._limit = max(1, int(limit))
-        self._lock = threading.Lock()
-        self._key: Any = None
-        self._free: list[Any] = []
+    KEYS_PER_ROLE = 8
 
-    def fit(self, limit: int) -> None:
-        """Keep at most ``limit`` (the current session's granted workers) idle integrators."""
+    def __init__(self, limit: int, allowance: int = 0) -> None:
+        self._limit = max(1, int(limit))
+        self._allowance = max(0, int(allowance))
+        self._lock = threading.Lock()
+        self._idle: dict[Any, list[tuple[Any, int]]] = {}  # key -> [(integrator, table bytes)], least recent first
+        self._recent: dict[Any, Any] = {}  # role -> its most recently returned key
+        self._sizes: dict[Any, int] = {}  # family -> the largest table bytes measured for it
+        self._lent: dict[Any, int] = {}  # family -> integrators lent or being built
+
+    def fit(self, limit: int, allowance: int | None = None) -> None:
+        """Bound the store by the current session's granted workers and, from the Run's memory plan, its bytes."""
         with self._lock:
             self._limit = max(1, int(limit))
-            del self._free[self._limit:]
+            if allowance is not None:
+                self._allowance = max(0, int(allowance))
+            for entries in self._idle.values():
+                del entries[: max(0, len(entries) - self._limit)]
+            self._trim()
 
     def borrow(self, key: Any) -> Any:
-        """One integrator built under ``key`` (no longer in the store), or None. A different key first drops the
-        idle integrators, so they never coexist with the ones about to be built."""
+        """One integrator built under ``key``, no longer in the store, or None to build one: idle integrators then
+        make room for its family's measured size, or all go when that size is not yet known."""
+        family = key[:2]
         with self._lock:
-            if self._key != key:
-                self._key, self._free = key, []
-            return self._free.pop() if self._free else None
+            self._lent[family] = self._lent.get(family, 0) + 1
+            entries = self._idle.get(key)
+            if entries:
+                integrator, _size = entries.pop()
+                if not entries:
+                    del self._idle[key]
+                return integrator
+            if family in self._sizes:
+                self._trim(spare=True)
+            else:
+                self._idle.clear()
+            return None
 
     def give_back(self, key: Any, integrator: Any) -> None:
-        """Keep ``integrator`` for the next borrower of ``key``; integrators of another key are dropped."""
+        """Keep ``integrator``, borrowed or built under ``key``, for its next borrower, within the store's bounds."""
+        size = _table_bytes(integrator)
+        family = key[:2]
         with self._lock:
-            if self._key != key:
-                self._key, self._free = key, []
-            if len(self._free) < self._limit:
-                self._free.append(integrator)
+            self._release(family)
+            if size:  # a size of 0 says nothing: the family stays unknown, so its builds still clear idle ones
+                self._sizes[family] = max(size, self._sizes.get(family, 0))
+            entries = self._idle.pop(key, [])
+            if len(entries) < self._limit:
+                entries.append((integrator, size))
+            self._idle[key] = entries  # now the most recently used key
+            self._recent[key[0]] = key
+            keys = [item for item in self._idle if item[0] == key[0]]
+            for stale in keys[: max(0, len(keys) - self.KEYS_PER_ROLE)]:
+                del self._idle[stale]
+            self._trim()
+
+    def release(self, key: Any) -> None:
+        """An integrator borrowed or built under ``key`` will not come back (its session failed or stopped early)."""
+        with self._lock:
+            self._release(key[:2])
 
     def clear(self) -> None:
         with self._lock:
-            self._key, self._free = None, []
+            self._idle.clear()
+            self._recent.clear()
 
     def __len__(self) -> int:
         with self._lock:
-            return len(self._free)
+            return sum(len(entries) for entries in self._idle.values())
+
+    def _release(self, family: Any) -> None:
+        count = self._lent.get(family, 0) - 1
+        if count > 0:
+            self._lent[family] = count
+        else:
+            self._lent.pop(family, None)
+
+    def _trim(self, *, spare: bool = False) -> None:
+        """Drop least recently used idle integrators while idle and lent table bytes exceed the allowance; each
+        role's most recent key stays unless ``spare`` (a build is about to need the room)."""
+        unknown = any(family not in self._sizes for family in self._lent)
+        lent = sum(self._sizes.get(family, 0) * count for family, count in self._lent.items())
+        idle = sum(size for entries in self._idle.values() for _, size in entries)
+        for key in list(self._idle):
+            if self._allowance and not unknown and idle + lent <= self._allowance:
+                return  # (with no allowance, only the most recent keys stay, and nothing stays for a build)
+            if not spare and self._recent.get(key[0]) == key:
+                continue
+            idle -= sum(size for _, size in self._idle.pop(key))
+
+
+def _table_bytes(integrator: Any) -> int:
+    """Bytes of the arrays a pyFAI integrator holds in its engines (CSR data, indices and pointers included) and in
+    its geometry caches, each backing buffer counted once. Measured against RSS: a GI histogram integrator within 7%,
+    a CSR one about 17% over."""
+    seen: set[int] = set()
+    total = 0
+
+    def walk(value: Any, depth: int) -> None:
+        nonlocal total
+        if depth > 6 or id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, np.ndarray):
+            base = value
+            while isinstance(base.base, np.ndarray):
+                base = base.base
+            if id(base) not in seen or base is value:
+                seen.add(id(base))
+                total += base.nbytes
+            return
+        if isinstance(value, Mapping):
+            items = value.values()
+        elif isinstance(value, (list, tuple)):
+            items = value
+        else:
+            items = list(getattr(value, "__dict__", {}).values())
+            for name in ("data", "indices", "indptr", "lut", "_data", "_indices", "_indptr", "_lut"):
+                try:
+                    items.append(getattr(value, name))
+                except Exception:
+                    pass
+        for item in items:
+            walk(item, depth + 1)
+
+    walk(getattr(integrator, "engines", {}), 0)
+    walk(getattr(integrator, "_cached_array", {}), 0)
+    return total
 
 
 def _bound_detector_mask(detector_mask: Any, run_mask: np.ndarray | None) -> np.ndarray | None:
@@ -5481,36 +5594,48 @@ def _plain(value: Any) -> Any:
     raise TypeError(f"no exact key part for {type(value).__name__}")
 
 
+def _plain_fields(item: Any, *, skip: frozenset[str] = frozenset()) -> tuple[Any, ...] | None:
+    return None if item is None else tuple((part.name, _plain(getattr(item, part.name)))
+                                           for part in dataclasses.fields(item) if part.name not in skip)
+
+
+#: Settings that change which bins a table maps to, not how large it is: a build's size family leaves them out.
+_RANGE_SETTINGS = frozenset(("radial_range", "azimuth_range", "azimuth_offset", "extra", "incident_angle"))
+
+
 def _warm_integrator_key(
-    ai: Any, bound_mask: np.ndarray | None, shape: tuple[int, int], plan: ReductionPlan,
+    role: str, ai: Any, bound_mask: np.ndarray | None, shape: tuple[int, ...], plan: ReductionPlan,
+    *, angle: float | None = None,
 ) -> tuple[Any, ...] | None:
-    """What makes a bound worker integrator's tables reusable, all exact: the integrator's and its detector's own
-    state (pyFAI's ``_IMMUTABLE_ATTRS``: geometry, wavelength, chi discontinuity, solid-angle and transmission
-    settings; pixel size, binning, orientation, mask and correction checksums) and detector configuration, the image
-    shape, the mask bound into its detector, and the plan's integration settings. None (no reuse) for what the key
-    cannot hold: the sensor parallax correction, a spline, the detector's own flat field, dark current or pixel
-    corners, or a setting that is not a plain value."""
+    """What makes a worker integrator's tables reusable, all exact: its role, the integrator's and its detector's
+    own state (pyFAI's ``_IMMUTABLE_ATTRS``: geometry, wavelength, chi discontinuity, solid-angle and transmission
+    settings; pixel size, binning, orientation, mask and correction checksums), the detector configuration (its sensor
+    included) and the sensor parallax configuration, the image shape, the run-constant mask, the plan's integration
+    and GI settings, and last the GI incident angle. None (no reuse) for what the key cannot hold: a spline, the
+    detector's own flat field, dark current or pixel corners, or a setting that is not a plain value."""
     try:
         detector = ai.detector
-        if (getattr(ai, "parallax", None) is not None or detector.spline is not None
-                or detector.flatfield is not None or detector.darkcurrent is not None
+        if (detector.spline is not None or detector.flatfield is not None or detector.darkcurrent is not None
                 or detector._pixel_corners is not None):
             return None
+        parallax = getattr(ai, "parallax", None)
         state = (
+            role,
             type(ai).__qualname__,
             tuple((name, _plain(getattr(ai, name))) for name in type(ai)._IMMUTABLE_ATTRS),
             type(detector).__qualname__,
             tuple((name, _plain(getattr(detector, name))) for name in type(detector)._IMMUTABLE_ATTRS),
             _plain(detector.get_config()),
-            tuple(None if item is None else tuple((part.name, _plain(getattr(item, part.name)))
-                                                   for part in dataclasses.fields(item))
-                  for item in (plan.integration_1d, plan.integration_2d)),
+            None if parallax is None else _plain(parallax.get_config()),
+            tuple(_plain_fields(item) for item in (plan.integration_1d, plan.integration_2d, plan.gi)),
         )
+        size_family = (type(detector).__qualname__, shape, tuple(
+            _plain_fields(item, skip=_RANGE_SETTINGS) for item in (plan.integration_1d, plan.integration_2d, plan.gi)))
     except (AttributeError, TypeError, ValueError):
         return None
     mask = None if bound_mask is None else hashlib.blake2b(
         np.packbits(bound_mask).tobytes(), digest_size=16).hexdigest()
-    return (*state, shape, mask)
+    return (role, size_family, (*state, shape, mask), None if angle is None else float(angle))
 
 
 class _ReductionIntegratorProvider:
@@ -5526,6 +5651,7 @@ class _ReductionIntegratorProvider:
         initial_incident_angle: float | None,
         support: Any = None,
         reuse: WarmIntegrators | None = None,
+        role: str = "fiber",
     ) -> None:
         self.scan = scan
         self.plan = plan
@@ -5540,6 +5666,8 @@ class _ReductionIntegratorProvider:
         self._bound_lock = threading.Lock()
         self._reuse_closed = False
         self._reuse_keys: dict[tuple[int, int], tuple[Any, Any]] = {}  # shape -> (Run mask, key)
+        self._fiber_role = role  # "fiber" for a session's workers, "scout" for the GI freeze's own integrators
+        self._fiber_keys: dict[tuple[int, ...], tuple[Any, Any]] = {}  # shape -> (Run mask, key without its angle)
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
         # An energy scan reduces each frame at its own wavelength on a private integrator;
@@ -5549,7 +5677,7 @@ class _ReductionIntegratorProvider:
         if self._frame_wavelengths is not None:
             base = getattr(ai, "wavelength", None) or getattr(scan.poni, "wavelength", None)
             self._base_wavelength = None if base is None else float(base)
-        if reuse is not None and (plan.gi is not None or self._frame_wavelengths is not None or ai is None):
+        if reuse is not None and (self._frame_wavelengths is not None or ai is None):
             reuse.clear()
 
     def _new_standard(self) -> Any:
@@ -5665,20 +5793,54 @@ class _ReductionIntegratorProvider:
         except (AttributeError, TypeError, ValueError):
             key = None
         else:
-            key = _warm_integrator_key(self.ai, bound_mask, shape, self.plan)
+            key = _warm_integrator_key("standard", self.ai, bound_mask, shape, self.plan)
         self._reuse_keys[shape] = (run_mask, key)
         if key is None:
             self.reuse.clear()
         return key
 
     def discard(self) -> None:
-        """Drop failed-session references, including any worker finishing after a timeout."""
+        """Drop failed-session references, including any worker finishing after a timeout; their reservations in the
+        Run's store end with them."""
+        self._forget_thread()
         with self._bound_lock:
             self._reuse_closed = True
-            self._bound.clear()
+            bound, self._bound = self._bound, []
+        if self.reuse is not None:
+            for key, _ai in bound:
+                self.reuse.release(key)
+
+    def _track(self, key: Any, ai: Any) -> bool:
+        """Record ``ai``, borrowed or built under ``key``, for give-back; False (its reservation released) once this
+        session was discarded."""
+        with self._bound_lock:
+            if not self._reuse_closed:
+                self._bound.append((key, ai))
+                return True
+        self.reuse.release(key)
+        return False
+
+    def _settle_early(self, key: Any, ai: Any, *, done: bool) -> None:
+        """One worker's GI integrator before it takes another angle's: back to the store if its frame succeeded,
+        else dropped. Nothing if this session was discarded meanwhile (its reservation already released)."""
+        with self._bound_lock:
+            index = next((at for at, (_key, held) in enumerate(self._bound) if held is ai), None)
+            if index is None:
+                return
+            del self._bound[index]
+        if done:
+            self.reuse.give_back(key, ai)
+        else:
+            self.reuse.release(key)
+
+    def _forget_thread(self) -> None:
+        """Drop the calling thread's own references (the GI scout's setup thread) before its integrators move."""
+        for name in ("ai", "fi", "fi_key", "fi_done", "run_mask_binding", "alternate"):
+            self._local.__dict__.pop(name, None)
 
     def give_back(self) -> None:
         """Hand this session's bound worker integrators to the Run's store, once its workers have all stopped."""
+        self._forget_thread()
         with self._bound_lock:
             bound, self._bound = self._bound, []
         if self.reuse is not None:
@@ -5725,6 +5887,7 @@ class _ReductionIntegratorProvider:
             key = self._reuse_key(run_mask, shape)
             # one the Run already built (mask bound, tables in place) under this exact key, else a new one
             ai = None if key is None else self.reuse.borrow(key)
+            settled = ai is not None or key is None  # a borrowed integrator, or no reservation to return
             try:
                 if ai is None:
                     ai = self._new_standard()
@@ -5749,14 +5912,16 @@ class _ReductionIntegratorProvider:
                                 shape,
                             )
                     self._warm_standard_centers(ai, shape)
+                settled = True
             except (AttributeError, TypeError, ValueError):
                 unbound = self._unbound_standard()
                 return self._retain_unbound_standard(unbound, run_mask, shape)
+            finally:
+                if not settled:
+                    self.reuse.release(key)  # the build failed or fell back to the unbound path
 
         if key is not None:
-            with self._bound_lock:
-                if not self._reuse_closed:
-                    self._bound.append((key, ai))
+            self._track(key, ai)
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, True)
         self._local.alternate = None  # a new binding retires the previous alternate
@@ -5791,39 +5956,106 @@ class _ReductionIntegratorProvider:
                                if item is not None and item.polarization_factor is not None}:
                     integrator.polarization(frame_shape, factor, with_checksum=True)
 
-    def fiber(self) -> Any:
+    def _fiber_key(self, angle: float, run_mask: np.ndarray | None, shape: tuple[int, ...]) -> tuple[Any, ...] | None:
+        """The key of this thread's GI integrator for a frame at ``angle``, or None (no reuse): an energy scan, a
+        caller's accepted fiber integrator, or what the key cannot hold. All but the angle is computed once per shape,
+        under ``_PYFAI_COLD_GEOMETRY_LOCK`` (it reads the accepted integrator's detector mask)."""
+        if (self.reuse is None or self._reuse_closed or self._frame_wavelengths is not None or self.fi is not None
+                or self.ai is None):
+            return None
+        cached = self._fiber_keys.get(shape)
+        if cached is None or cached[0] is not run_mask:
+            with _PYFAI_COLD_GEOMETRY_LOCK:
+                try:
+                    bound_mask = _bound_detector_mask(self.ai.detector.mask, run_mask)
+                except (AttributeError, TypeError, ValueError):
+                    base = None
+                else:
+                    base = _warm_integrator_key(self._fiber_role, self.ai, bound_mask, shape, self.plan)
+            cached = self._fiber_keys[shape] = (run_mask, base)
+            if base is None:
+                self.reuse.clear()  # a build whose size the store cannot know: nothing idle stays beside it
+        return None if cached[1] is None else (*cached[1][:-1], float(angle))
+
+    def fiber_done(self) -> None:
+        """This thread's frame finished every GI integration: its integrator may go back to the store."""
+        self._local.fi_done = True
+
+    def fiber(
+        self,
+        incident_angle: float | None = None,
+        run_mask: np.ndarray | None = None,
+        shape: tuple[int, ...] | None = None,
+        *,
+        static_mask: bool = True,
+    ) -> Any:
+        """This thread's GI integrator for a frame at ``incident_angle``. With the Run's store, each angle keeps its
+        own: a worker whose next frame needs another angle gives its current one back (if that frame succeeded,
+        ``fiber_done``) and borrows that angle's. Without it, one per thread, and pyFAI rebuilds on an angle change."""
         if self.scan.poni is None:
             return self.fi
         if (threading.get_ident() == self._owner_thread and self.fi is not None
                 and self._frame_wavelengths is None):
-            return self.fi
+            return self.fi  # the scan's own accepted integrator: never lent to the store
+        key = (self._fiber_key(incident_angle, run_mask, shape)
+               if static_mask and incident_angle is not None and shape is not None else None)
         fi = getattr(self._local, "fi", None)
+        held = getattr(self._local, "fi_key", None)
+        if fi is not None:
+            if key == held:
+                self._local.fi_done = False
+                return fi
+            self._local.fi = self._local.fi_key = None  # no longer this thread's before another worker can borrow it
+            if held is not None:
+                self._settle_early(held, fi, done=getattr(self._local, "fi_done", False))
+        fi = None if key is None else self.reuse.borrow(key)
         if fi is None:
             gi = self.plan.gi
             if gi is None:
+                if key is not None:
+                    self.reuse.release(key)
                 return None
-            accepted = self.fi if self.fi is not None else self.ai
-            if accepted is not None:
-                # pyFAI Geometry.promote/deepcopy does not copy _parallax.
-                # Use the checked project promotion so each worker preserves
-                # the accepted detector config, sensor, wavelength, and exact
-                # enabled/disabled parallax state.
-                from xrd_tools.integrate.gid import _fiber_from_integrator
-                fi = _fiber_from_integrator(
-                    accepted,
-                    incident_angle=float(self.initial_incident_angle or 0.0),
-                    tilt_angle=float(gi.tilt_angle),
-                    sample_orientation=int(gi.sample_orientation),
-                )
-            else:
-                fi = poni_to_fiber_integrator(
-                    self.scan.poni,
-                    incident_angle=float(self.initial_incident_angle or 0.0),
-                    tilt_angle=float(gi.tilt_angle),
-                    sample_orientation=int(gi.sample_orientation),
-                )
-            self._local.fi = fi
+            try:
+                fi = self._new_fiber(gi)
+            except BaseException:
+                if key is not None:
+                    self.reuse.release(key)  # the build failed: its reservation goes with it
+                raise
+        if key is not None and not self._track(key, fi):
+            key = None
+        self._local.fi, self._local.fi_key, self._local.fi_done = fi, key, False
         return fi
+
+    def _new_fiber(self, gi: Any) -> Any:
+        """Build one private GI integrator from the accepted calibration."""
+        accepted = self.fi if self.fi is not None else self.ai
+        if accepted is not None:
+            # pyFAI Geometry.promote/deepcopy does not copy _parallax.
+            # Use the checked project promotion so each worker preserves
+            # the accepted detector config, sensor, wavelength, and exact
+            # enabled/disabled parallax state.
+            from xrd_tools.integrate.gid import _fiber_from_integrator
+            return _fiber_from_integrator(
+                accepted,
+                incident_angle=float(self.initial_incident_angle or 0.0),
+                tilt_angle=float(gi.tilt_angle),
+                sample_orientation=int(gi.sample_orientation),
+            )
+        return poni_to_fiber_integrator(
+            self.scan.poni,
+            incident_angle=float(self.initial_incident_angle or 0.0),
+            tilt_angle=float(gi.tilt_angle),
+            sample_orientation=int(gi.sample_orientation),
+        )
+
+
+def _planned_workers(executor: Any | None) -> int:
+    """The worker count of the pool a session that owns it will build (``_coerce_executor``, streaming default)."""
+    if isinstance(executor, int) and not isinstance(executor, bool):
+        return max(1, executor)
+    from xrd_tools.core import reduction_worker_cap
+    return reduction_worker_cap()
+
 
 def _owns_its_pool(executor: Any | None, execution: str) -> bool:
     """Whether a session with this ``executor`` builds (and so shuts down and joins) its own worker pool: a worker
@@ -6275,11 +6507,12 @@ def _reduce_frame(
             if frame_mask is None
             else plan_mask | frame_mask
         )
-        fi = integrators.fiber()
+        # the frame's own angle first: with the Run's store, each angle keeps its own integrator
+        incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
+        fi = integrators.fiber(incident_angle, plan_mask, image.shape, static_mask=frame_mask is None)
         at_energy = getattr(integrators, "at_frame_energy", None)
         if at_energy is not None:
             at_energy(fi, frame, image.shape, warm=False)
-        incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
         r1d = (
             _run_gi_1d(
                 image,
@@ -6329,6 +6562,9 @@ def _reduce_frame(
                 flat=plan.flat,
                 dark=plan.dark,
             )
+        done = getattr(integrators, "fiber_done", None)
+        if done is not None:
+            done()  # every GI integration of this frame succeeded: its integrator may go back to the store
     else:
         p1 = p1_frame
         chi_mode = standard_chi_profile(plan)

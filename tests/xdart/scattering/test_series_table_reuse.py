@@ -51,8 +51,8 @@ def _series(raw, stems):
         _Sidecar(raw, TINY, stem).frame(number)  # each series one frame, each frame its own values
 
 
-def _outputs(tmp_path, stem):
-    with h5py.File(tmp_path / "processed" / f"{stem}_int2d.nexus", "r") as handle:
+def _outputs(tmp_path, stem, name="int2d"):
+    with h5py.File(tmp_path / "processed" / f"{stem}_{name}.nexus", "r") as handle:
         return [handle[name][()] for name in _DATASETS]
 
 
@@ -109,3 +109,60 @@ def test_a_live_run_reuses_the_tables_from_one_series_to_the_next(tmp_path, buil
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
     assert len(builds) == 1, builds  # on the parent: one per series
+
+
+@pytest.fixture
+def promotions(monkeypatch):
+    """GI integrators the Run promotes (each starts with no tables)."""
+    import xrd_tools.integrate.gid as gid
+    made = []
+    real = gid._fiber_from_integrator
+
+    def counting(*args, **kwargs):
+        made.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(gid, "_fiber_from_integrator", counting)
+    return made
+
+
+def _gi_intent(tmp_path, raw, *, live=False, processing="Int 2D"):
+    from xrd_tools.session.run_configuration import GIIntent
+    intent = _intent(tmp_path, raw, live=live, processing=processing)
+    intent.gi = GIIntent(enabled=True, incidence_motor="Manual", th_val=0.2)
+    return intent
+
+
+def test_a_gi_directory_run_at_one_angle_reuses_its_scout_and_worker_integrators(tmp_path, promotions):
+    together = tmp_path / "together"
+    _series(together / "raw", _STEMS)
+    executor, identity, events = _run_to_terminal(_gi_intent(together, together / "raw"), request_value=9540)
+    executor.close(identity)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+    assert len(promotions) <= 3, promotions  # on the parent: a scout and a worker per series (6)
+    for number, stem in enumerate(_STEMS):
+        alone = tmp_path / f"alone-{stem}"
+        raw = alone / "raw"
+        raw.mkdir(parents=True)
+        _Sidecar(raw, TINY, stem).frame(number + 1)
+        executor, identity, events = _run_to_terminal(_gi_intent(alone, raw), request_value=9550 + number)
+        executor.close(identity)
+        assert all(np.array_equal(left, right, equal_nan=True)
+                   for left, right in zip(_outputs(together, stem, "gi_int2d"), _outputs(alone, stem, "gi_int2d"))), stem
+
+
+def test_a_gi_live_run_reuses_its_integrators_from_one_series_to_the_next(tmp_path, promotions):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    executor = StandardRunExecutor(join_timeout=2.0)
+    identity = _start(executor, _gi_intent(tmp_path, raw, live=True, processing="Int 1D"), request_value=9560)
+    events = []
+    try:
+        for number, stem in enumerate(_STEMS, 1):
+            _Sidecar(raw, TINY, stem).frame(number)
+            _wait(executor, events, _count_labels(f"{stem}_gi", 1), 60.0)
+            time.sleep(0.2)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert len(promotions) <= 3, promotions  # on the parent: one or two per series

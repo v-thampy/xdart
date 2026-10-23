@@ -124,11 +124,13 @@ def test_state_the_key_cannot_hold_is_never_reused(builds):
     sensor = detector_factory("Pilatus100k", {"orientation": 3, "sensor": {"material": "Si", "thickness": 0.00045}})
     parallax = AzimuthalIntegrator(dist=0.1, poni1=0.010013, poni2=0.040007, detector=sensor, wavelength=1e-10)
     parallax.enable_parallax(True)
-    assert _warm_integrator_key(parallax, None, tuple(sensor.shape), _plan(shape=tuple(sensor.shape))) is None
+    # the sensor parallax correction is keyed exactly (its sensor and beam configuration), so it is reused now
+    assert _warm_integrator_key("standard", parallax, None, tuple(sensor.shape),
+                                _plan(shape=tuple(sensor.shape))) is not None
     plain = _scan("plain").integrator
     odd = ReductionPlan(integration_1d=Integration1DPlan(npt=100, extra={"weights": np.ones(3)}))
-    assert _warm_integrator_key(plain, None, SHAPE, _plan()) is not None
-    assert _warm_integrator_key(plain, None, SHAPE, odd) is None
+    assert _warm_integrator_key("standard", plain, None, SHAPE, _plan()) is not None
+    assert _warm_integrator_key("standard", plain, None, SHAPE, odd) is None
 
 
 def test_a_session_that_does_not_own_its_pool_never_borrows_or_gives_back(builds):
@@ -203,17 +205,18 @@ def test_a_failed_series_gives_nothing_back_and_a_clean_one_gives_back_once():
 
 
 def test_the_store_keeps_one_key_within_the_grant():
-    store = WarmIntegrators(4)
+    store = WarmIntegrators(4)  # no byte allowance: one key per role
+    a, b = ("standard", "a", None), ("standard", "b", None)
     first, second, third = object(), object(), object()
     for integrator in (first, second, third):
-        store.give_back("a", integrator)
+        store.give_back(a, integrator)
     store.fit(2)  # a session granted two workers
     assert len(store) == 2
-    assert store.borrow("b") is None and len(store) == 0  # another key drops the idle set before anything is built
-    store.give_back("b", third)
-    store.give_back("a", first)  # and giving back under another key drops the other key's
-    assert len(store) == 1 and store.borrow("a") is first and len(store) == 0
-    store.give_back("a", second)
+    assert store.borrow(b) is None and len(store) == 0  # another key drops the idle set before anything is built
+    store.give_back(b, third)
+    store.give_back(a, first)  # and giving back under another key of the role drops the other key's
+    assert len(store) == 1 and store.borrow(a) is first and len(store) == 0
+    store.give_back(a, second)
     store.clear()
     assert len(store) == 0
 

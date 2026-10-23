@@ -18,9 +18,12 @@
   and Live runs alike. Each series used to rebuild them, which for a large
   detector took far longer than integrating the frame itself (a 4096 x 4096
   Rayonix frame: 2.7 s to build, 0.13 s to integrate, on a fast Mac). Results
-  are identical. This covers standard integration only: grazing-incidence runs,
-  energy scans, and calibrations with the sensor parallax correction, a spline
-  or a detector flat field still build them for each series.
+  are identical. Grazing incidence keeps a set per incident angle, so positions
+  measured at a few repeated angles build each angle once per Run (Rayonix, three
+  angles: 1.8 s per series before, 0.7 s once every angle is cached); the sensor
+  parallax correction is reused too. Kept sets stay within the memory the Run is
+  planned for, and at most 8 per kind. Energy scans and calibrations with a
+  spline or a detector flat field still build them for each series.
 
 ### Fixes
 

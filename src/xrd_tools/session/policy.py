@@ -13,7 +13,7 @@ from typing import Mapping
 __all__ = ["FlushPolicy", "SessionPolicy", "SessionResourceRequirements",
            "SessionResourceAllocation", "SessionEnvelopeError", "floor_bytes",
            "resolve_session_policy", "requirements_from", "minimum_bytes",
-           "default_envelope_bytes"]
+           "default_envelope_bytes", "warm_integrator_allowance"]
 
 INTEGRATOR_RESERVE_BYTES = _GIB = 1024 ** 3   #: one worker's integrator copy
 MAX_MODES_1D, MAX_MODES_2D = 5, 3      #: the finite schema maxima
@@ -323,6 +323,22 @@ def default_envelope_bytes(env=None) -> int:
     except (ValueError, OSError, AttributeError):
         total = 0
     return int(total * DEFAULT_ENVELOPE_FRACTION) if total > 0 else 16 * _GIB
+
+
+#: The share of physical RAM a Run's warm integrators may reach above their funded reserve.
+WARM_INTEGRATOR_RAM_FRACTION = 0.25
+
+
+def warm_integrator_allowance(allocation: "SessionResourceAllocation | None", workers: int,
+                              total_ram_bytes: int | None) -> int:
+    """Bytes a Run's warm integrators (``WarmIntegrators``) may hold, in use and idle: the integrator reserve this
+    plan funds for its granted workers, plus envelope headroom no category was granted, up to a quarter of physical
+    RAM. With RAM unknown (Windows today) the envelope is only a fallback, so the funded reserve alone."""
+    funded = max(1, int(workers)) * INTEGRATOR_RESERVE_BYTES
+    if allocation is None or not total_ram_bytes:
+        return funded
+    headroom = max(0, int(allocation.envelope_bytes) - int(allocation.assigned_bytes))
+    return funded + min(headroom, max(0, int(total_ram_bytes * WARM_INTEGRATOR_RAM_FRACTION) - funded))
 def _default_requests(req: SessionResourceRequirements, requested_workers,
                       env) -> dict:
     """These requests feed this ONE resolution; consumers receive grants."""

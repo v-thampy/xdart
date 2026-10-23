@@ -50,7 +50,7 @@ from xrd_tools.session import (
     required_result_modes,
     resolve_session_policy,
 )
-from xrd_tools.session.policy import requirements_from
+from xrd_tools.session.policy import requirements_from, warm_integrator_allowance
 from xrd_tools.session.readiness import gi_companion_modes_2d
 from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.core.scan import SourceKind
@@ -1419,13 +1419,17 @@ class DynamicOutputAdapter:
                 and xye_lineage.disposition is not AppendDisposition.WRITE
             ):
                 raise AppendRefused(xye_lineage)
+            workers = (self.configuration.max_cores if policy is None
+                       else policy.allocation.workers)
+            # this series' memory plan bounds the Run's built integrators, before its scout or workers borrow
+            self._integrator_reuse.fit(workers, warm_integrator_allowance(
+                None if policy is None else policy.allocation, workers, total_physical_ram_bytes()))
             session = open_headless_scan_session(
                 session_scan,
                 plan,
                 ring_geometry=ring_geometry,
                 sink=sink,
-                executor=(self.configuration.max_cores if policy is None
-                          else policy.allocation.workers),
+                executor=workers,
                 inflight_max=inflight_max,
                 gi_freeze_mode=(
                     "scout_union" if self.configuration.gi.enabled else None
