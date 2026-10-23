@@ -5401,7 +5401,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._open_warning(
                 "Scans skipped",
                 "\n\n".join(event.warnings)
-                + "\n\nThe other scans were processed. Use Replace for a skipped scan to reprocess it.",
+                + "\n\nThe listed scans were skipped; their existing results were left unchanged. "
+                  "Use Replace to reprocess them.",
             )
 
     def _processed_terminal_presentation_is_current(

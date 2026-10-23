@@ -987,6 +987,63 @@ def test_live_restart_appends_two_saved_outputs_and_preserves_their_prefixes(tmp
             np.testing.assert_array_equal(frame.intensity_2d, profiles[target][1])
 
 
+def test_directory_append_skips_a_changed_scan_and_runs_the_next_with_a_summary(tmp_path):
+    """Real Run click, strict refusal, later output and actual nonblocking summary."""
+    from pyqtgraph.Qt import QtWidgets
+    from tests.xdart.scattering.test_browse_reference_rings_run import _page, _pump, _run
+    from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
+
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    source, output = tmp_path / "raw", tmp_path / "output"
+    source.mkdir()
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    first = source / "first_0001.tif"
+    _write_tiff(first, 1)
+    intent = _live_directory_intent(source, output, poni, processing_mode="Int 2D")
+    intent.live_mode = False
+    seeded, seed_id, events = _run_to_terminal(intent, request_value=1812)
+    try:
+        assert next(event for event in events if event.kind in _TERMINAL).kind is StandardEventKind.FINISHED
+    finally:
+        assert seeded.close(seed_id).cleanup_status is CleanupStatus.CLEANED
+    targets = tuple(output.glob("*.nexus"))
+    assert len(targets) == 1
+    protected = targets + tuple(output.rglob("*.xye"))
+    assert len(protected) == 2
+    before = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+              for path in protected}
+    _write_tiff(first, 2)
+    _write_tiff(source / "second_0001.tif", 3)
+    intent.output_mode = "Append"
+    with _page(qapp, intent) as (page, _view, observed):
+        controls = page.findChild(ScatteringWorkspaceShell).run_controls
+        assert _pump(qapp, controls.startButton.isEnabled), page._notice_text
+        terminal = _run(qapp, page, observed)
+        assert (terminal.files_processed, terminal.files_skipped,
+                terminal.files_discovered, terminal.files_pending) == (1, 1, 2, 0)
+        assert terminal.cleanup_status is CleanupStatus.CLEANED
+        assert len(terminal.warnings) == 1
+        assert targets[0].name in terminal.warnings[0]
+        assert "source does not extend exact image-member history" in terminal.warnings[0]
+        assert {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+                for path in protected} == before
+        second = next(path for path in output.glob("*.nexus") if path != targets[0])
+        assert _nexus_rows(second) == (1,)
+        assert _pump(qapp, lambda: bool(page.findChildren(QtWidgets.QMessageBox)))
+        dialogs = page.findChildren(QtWidgets.QMessageBox)
+        assert len(dialogs) == 1
+        dialog = dialogs[0]
+        try:
+            assert dialog.text() == "Scans skipped"
+            assert terminal.warnings[0] in dialog.informativeText()
+            assert "existing results were left unchanged" in dialog.informativeText()
+            qapp.processEvents()
+            assert len(page.findChildren(QtWidgets.QMessageBox)) == 1
+        finally:
+            dialog.accept()
+
+
 def test_live_second_append_output_seeds_after_the_catalog_high_water() -> None:
     """Live counts only new frames in run.completed, so earlier outputs' persisted prefixes are not in it.
 
