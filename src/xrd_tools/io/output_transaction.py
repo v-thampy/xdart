@@ -2841,6 +2841,8 @@ class OutputTransaction:
                     target,
                     "stream-seed",
                 )
+                if self._durable_fsync:
+                    _fsync_descriptor(destination, target)
             else:
                 receipt = _descriptor_content_receipt(
                     destination,
@@ -2848,20 +2850,46 @@ class OutputTransaction:
                     "stream-seed",
                     durable_fsync=self._durable_fsync,
                 )
-            checkpoint = _descriptor_stream_stat_receipt(
-                destination,
+        finally:
+            if source_descriptor is not None:
+                os.close(source_descriptor)
+            os.close(destination)
+        return receipt, self._seal_closed_stream_seed(target, receipt)
+
+    def _seal_closed_stream_seed(
+        self, target: Path, receipt: _ObjectReceipt,
+    ) -> _StreamStatReceipt:
+        """The seed's checkpoint, taken after its writing handle closed.
+
+        Windows finalizes a written file's timestamps when that handle
+        closes, on a network share a moment later (beamline 1.2.4: mtime
+        86.5 ms past a checkpoint sealed before the close).  A read-only
+        descriptor bound to the reserved file and its sealed size gives the
+        baseline; the seed was flushed before the close, and a read-only
+        fsync would reopen it writable on Windows, so none is requested.
+        """
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            state = os.fstat(descriptor)
+            if (
+                _FileIdentity(int(state.st_dev), int(state.st_ino))
+                != receipt.identity
+                or int(state.st_size) != int(receipt.snapshot.size or 0)
+            ):
+                raise TargetChanged(
+                    f"stream seed changed when its writing handle closed: {target}"
+                )
+            return _descriptor_stream_stat_receipt(
+                descriptor,
                 target,
                 evidence_digest=str(receipt.snapshot.digest),
                 evidence_bytes=int(receipt.snapshot.size or 0),
                 ordinal=self._coordinator._next_ordinal(),
                 role="stream-seed",
-                durable_fsync=self._durable_fsync,
+                durable_fsync=False,
             )
         finally:
-            if source_descriptor is not None:
-                os.close(source_descriptor)
-            os.close(destination)
-        return receipt, checkpoint
+            os.close(descriptor)
 
     def _require_stream(
         self,

@@ -4798,3 +4798,77 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
             and node.module == "xrd_tools.io.output_transaction"
             for alias in node.names} == {"TargetChanged",
                                          "revalidate_target_snapshot"}
+
+
+def _close_finalizes_seed_timestamps(monkeypatch, target: Path) -> list[int]:
+    """Windows finalizes a written file's timestamps when its writing handle closes (on a network share, a moment
+    later): each close of a descriptor that created ``target`` moves its mtime 86.5 ms on, size unchanged. Returns the
+    number of fsync calls made through ``os.fsync`` so a row can bound the durability work."""
+    real_open, real_close, real_fsync = os.open, os.close, os.fsync
+    creators: set[int] = set()
+    fsyncs = [0]
+
+    def opening(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_CREAT and flags & os.O_EXCL and Path(path) == target:
+            creators.add(descriptor)
+        return descriptor
+
+    def closing(descriptor):
+        real_close(descriptor)
+        if descriptor in creators:
+            creators.discard(descriptor)
+            state = os.stat(target)
+            os.utime(target, ns=(state.st_atime_ns, state.st_mtime_ns + 86_500_000))
+
+    def flushing(descriptor):
+        fsyncs[0] += 1
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "close", closing)
+    monkeypatch.setattr(os, "fsync", flushing)
+    return fsyncs
+
+
+@pytest.mark.parametrize(("prior", "seed"), (
+    (b"prior", "PRESERVE_BASE"), (None, "PRESERVE_BASE"), (b"prior", "EMPTY_REPLACEMENT"),
+))
+def test_stream_seed_baseline_is_taken_after_its_own_handle_closes(tmp_path, monkeypatch, prior, seed):
+    """Beamline 1.2.4, 2026-10-23 (Windows share): "stream checkpoint failed identity verification" with device,
+    file ID and size equal and mtime 86.5 ms later. The seed sealed its baseline while its writing handle was still
+    open; the close then finalized the timestamp. The baseline is taken after that close, with no extra flush; a
+    later change of timestamp, size or file still refuses."""
+    api, target, _, transaction, tx_owner, target_owner, _, lease = _prepared(tmp_path, prior=prior)
+    fsyncs = _close_finalizes_seed_timestamps(monkeypatch, target)
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=_DepthPool(), file_lock=threading.RLock(), seed_mode=getattr(api.StreamSeedMode, seed),
+    )
+    # one flush per written object, before its close: the staged prior (when copied) and the seed
+    assert fsyncs[0] == (2 if prior is not None and seed == "PRESERVE_BASE" else 1)
+    transaction.authorize_stream_mutation(attempt, lease=lease)  # the beamline refusal
+    state = os.stat(target)
+    os.utime(target, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))  # a later change of the open stream
+    transaction._stream_checkpoint_fresh = True
+    with pytest.raises(api.TargetChanged, match="stream checkpoint failed identity verification"):
+        transaction.authorize_stream_mutation(attempt, lease=lease)
+
+
+def test_stream_epoch_seed_baseline_is_taken_after_its_own_handle_closes(tmp_path, monkeypatch):
+    """The owned epoch extension seeds through the same copy: its baseline also follows the seed's own close."""
+    api, target, _, transaction, tx_owner, target_owner, _, lease = _prepared(tmp_path, prior=b"prior")
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=_DepthPool(), file_lock=threading.RLock(),
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    target.write_bytes(b"epoch-a")
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    assert transaction.commit_stream_epoch(attempt, lease=lease).phase is api.TransactionPhase.EPOCH_COMMITTED
+    _close_finalizes_seed_timestamps(monkeypatch, target)
+    following = transaction.begin_stream_epoch(
+        attempt, admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+    )
+    transaction.authorize_stream_mutation(following, lease=lease)
+    assert target.read_bytes() == b"epoch-a"

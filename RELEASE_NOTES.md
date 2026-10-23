@@ -1,5 +1,15 @@
 # Release notes
 
+## 1.2.5 (unreleased)
+
+### Fixes
+
+- **Append to an output on a network folder:** a run could stop with "writer begin
+  incomplete: stream checkpoint failed identity verification" when the output's
+  modification time moved a moment after xdart wrote it. Windows sets a file's
+  final write time when the program closes it, on a network share slightly later;
+  xdart now records the file's state after that close.
+
 ## 1.2.4 (2026-10-22)
 
 ### Added
