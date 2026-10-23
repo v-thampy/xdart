@@ -236,6 +236,7 @@ class LogPanel(QtWidgets.QFrame):
 
     def show_latest(self) -> None:
         """Scroll to the newest line and follow new ones again."""
+        self._at_end = True  # all text may fit already, so setValue need not emit valueChanged
         bar = self.pane.verticalScrollBar()
         bar.setValue(bar.maximum())
         self.refresh()

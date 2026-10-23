@@ -301,6 +301,19 @@ def test_the_panel_follows_the_newest_line_and_holds_a_scrolled_back_view(qapp):
         assert pane.blockCount() == 60 and bar.value() == bar.maximum()
         assert pane.document().lastBlock().text().endswith("second 9") and not panel.latest.isEnabled()
 
+        # A paused view can be enlarged until all text fits: the scroll value
+        # stays zero, so Latest must resume following without a valueChanged.
+        bar.setValue(0)
+        panel.refresh()
+        assert panel.latest.isEnabled()
+        panel.split.resize(320, 4000)
+        _settle(qapp)
+        assert bar.value() == bar.maximum() == 0
+        panel.latest.click()
+        assert not panel.latest.isEnabled()
+        panel.split.resize(320, 400)
+        _settle(qapp)
+
         for index in range(250):  # more at once than an append should trim: the pane is rebuilt, still bounded
             log.info("third %d", index)
         panel.refresh()
