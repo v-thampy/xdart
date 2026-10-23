@@ -186,3 +186,31 @@ def test_vnext_edit_commits_to_store_and_freezes_same_revision(tmp_path):
     assert frozen.configuration.save_path == str(
         edited_root / "xdart_processed_data"
     )
+
+
+@pytest.mark.parametrize("spelling", ("trailing-separator", "windows-dialog"))
+def test_the_save_path_follows_the_project_folder_however_its_default_is_spelled(tmp_path, monkeypatch, spelling):
+    """Beamline 2026-10-23 (Windows): "when i change the project folder, the save path doesn't change to follow it".
+    The Save Path follows only while it is the old Project's default, which was compared as exact text; a folder
+    dialog's forward slashes, a trailing separator or another case made the default look like a chosen folder."""
+    import ntpath
+    import os
+    from types import SimpleNamespace
+
+    from xdart.gui.tabs.scattering import controls_editing
+    from xdart.gui.tabs.scattering.controls_inventory import PROJECT_ROOT
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+
+    old, new = tmp_path / "Nordlund", tmp_path / "Baniecki"
+    default = str(old / "xdart_processed_data")
+    if spelling == "windows-dialog":  # Windows' rules: either separator, any case
+        monkeypatch.setattr(controls_editing, "os", SimpleNamespace(path=ntpath))
+        default = default.replace(os.sep, "\\").upper() if os.sep == "/" else default.replace(os.sep, "/").upper()
+    else:
+        default += os.sep
+    store = RunIntentStore(RunIntent(project_root=str(old), save_path=default))
+    candidate = reduce_control_edit(store.snapshot(), PROJECT_ROOT, str(new))
+    assert candidate.save_path == str(new / "xdart_processed_data")
+    chosen = RunIntentStore(RunIntent(project_root=str(old), save_path=str(tmp_path / "elsewhere")))
+    assert reduce_control_edit(chosen.snapshot(), PROJECT_ROOT, str(new)).save_path == str(tmp_path / "elsewhere")
