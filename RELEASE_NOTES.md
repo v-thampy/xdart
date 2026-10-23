@@ -4,12 +4,11 @@
 
 ### Fixes
 
-- **Opening processed results on a mapped network drive:** on Windows, opening a
-  processed `.nexus` file through a mapped drive (for example `X:`) left the Data
-  Browser stuck at "Browse cleanup remains pending", while a local copy opened.
-  Browse resolved the drive to its network path for reading but compared it with
-  the path you chose, so the loaded result was refused. Browse now reads it under
-  the path you chose. A symlinked folder had the same effect on macOS and Linux.
+- **Opening processed results through an alias:** avoid a path-identity mismatch
+  that could refuse Browse adoption when a mapped drive (for example `X:`) resolves
+  to its network path, or a symlinked folder resolves to another path. Browse now
+  uses the same normalized path throughout loading and adoption. Adoption failures
+  also log their reason and traceback instead of disappearing silently.
 
 ## 1.2.1 (2026-10-22)
 

@@ -275,9 +275,8 @@ def test_processed_scan_from_another_os_browses_without_a_project_folder(tmp_pat
 def test_a_result_opened_through_a_rewritten_path_still_browses(tmp_path, monkeypatch):
     """A mapped drive (X: -> its UNC share) or a symlinked folder makes resolve() differ from the path clicked.
 
-    Windows report, 2026-10-22: the loader built its scalar catalog under resolve(), the 1-D lane compared it
-    with the clicked path, refused the context, and Browse stayed pending. A directory symlink gives the same
-    split on every host that can create one.
+    Model the path-identity split implicated by the Windows report without needing a network share:
+    a directory symlink makes the resolved catalog path differ from the requested path.
     """
     import os
 

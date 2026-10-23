@@ -974,9 +974,9 @@ class BrowseLoader:
 
         # The request already holds the normcase/abspath identity that every
         # Browse consumer compares: the catalog, the hydration lanes and the
-        # writer seal. Path.resolve() rewrote a mapped network drive to its UNC
-        # path (or followed a symlink), so the 1-D lane refused the context and
-        # Browse never settled (Windows report, 2026-10-22).
+        # writer seal. Path.resolve() can rewrite a mapped drive to its UNC path
+        # or follow a symlink, making the catalog disagree with the request and
+        # causing the 1-D lane to refuse the context.
         canonical_path = request.source_path
         path = Path(canonical_path)
         if _timing is not None:
