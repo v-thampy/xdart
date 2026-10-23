@@ -31,7 +31,15 @@ from __future__ import annotations
 
 from typing import Callable
 
-__all__ = ["compile_filter"]
+__all__ = ["GRAMMAR_HELP", "compile_filter"]
+
+#: The grammar in one sentence each, for every Filter field's tooltip (the control panel's and the Data Browser's).
+GRAMMAR_HELP = (
+    "Space-separated terms must ALL match "
+    "(case-insensitive substrings, any order): 'lab6 cal'. "
+    "Alternatives with | or OR: 'scan1 | scan2'. "
+    "Exclude with -term or NOT term: 'scan -bg'."
+)
 
 
 def _parse(expr: str | None) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:

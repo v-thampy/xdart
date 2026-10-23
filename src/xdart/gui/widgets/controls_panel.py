@@ -11,6 +11,7 @@ import os
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.themes.spacing import SpacingTokens, current_spacing_tokens
+from xrd_tools.core.filters import GRAMMAR_HELP
 
 from xrd_tools.session.readiness import (
     ControlAction,
@@ -111,12 +112,7 @@ _FIELD_TOOLTIPS: dict[tuple[str, ...], str] = {
         "Source kind: a numbered image series, a directory of images, or a "
         "single image."),
     ("Signal", "include_subdir"): "Also search sub-directories for matching images.",
-    ("Signal", "Filter"): (
-        "Filename filter. Space-separated terms must ALL match "
-        "(case-insensitive substrings, any order): 'lab6 cal'. "
-        "Alternatives with | or OR: 'scan1 | scan2'. "
-        "Exclude with -term or NOT term: 'scan -bg'. "
-        "Empty matches every file."),
+    ("Signal", "Filter"): f"Filename filter. {GRAMMAR_HELP} Empty matches every file.",
     ("Signal", "img_ext"): "Image file type (extension).",
     ("Signal", "meta_ext"): "Per-frame metadata format (auto, none, txt, metadata, spec, pdi).",
     ("Signal", "meta_dir"): (

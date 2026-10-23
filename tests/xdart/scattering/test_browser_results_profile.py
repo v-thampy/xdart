@@ -252,12 +252,14 @@ def test_a_profile_refuses_an_unknown_selection_and_frames_without_results(qapp)
 
 
 @pytest.mark.parametrize("mode,tokens", [
-    ("Int 1D", ("int-1d", "int-2d", "reintegrate-1d", "average")),
-    ("Int 2D", ("int-2d", "reintegrate-2d", "average")),
+    ("Int 1D", ("int-1d", "int-2d")), ("Int 2D", ("int-2d",)),
     ("Stitch 1D", ("stitch-1d", "stitch-2d")), ("Stitch 2D", ("stitch-2d",)), ("RSM", ("rsm",)),
 ])
 def test_filename_filter_projects_real_catalog_and_keeps_navigation(qapp, tmp_path, monkeypatch, mode, tokens):
-    """The filename hint changes resident rows, never catalog admission or scientific reads."""
+    """The filename hint changes resident rows, never catalog admission or scientific reads. Maintainer,
+    2026-10-23: an empty filter is Auto, the mode's own results, shown faded like the threshold fields' Auto (no
+    Reintegrate or Average results); typed text uses the control panel's Filter grammar and tooltip; * lists every
+    result; Dirs hides folders."""
     import h5py
     from xrd_tools.io.output_path import FINITE_OPERATION_SLOTS
     from xdart.gui.tabs.scattering.browser_catalog import enumerate_processed_artifacts
@@ -273,37 +275,53 @@ def test_filename_filter_projects_real_catalog_and_keeps_navigation(qapp, tmp_pa
     (tmp_path / "folder").mkdir()
     catalog = enumerate_processed_artifacts(str(tmp_path))
     state = BrowserProjection(directory=str(tmp_path), scans=build_browser_scan_index(catalog, False).scans)
+    from xrd_tools.core.filters import GRAMMAR_HELP
     browser = BrowserView()
     try:
         browser.set_filename_mode(mode)
-        assert browser.filename_filter.text() == ", ".join(FINITE_OPERATION_SLOTS[token] for token in tokens)
+        assert browser.filename_filter.text() == ""
+        assert browser.filename_filter.placeholderText() == (
+            "Auto: " + ", ".join(FINITE_OPERATION_SLOTS[token] for token in tokens))
+        assert GRAMMAR_HELP in browser.filename_filter.toolTip()
         assert browser.filename_filter.isClearButtonEnabled()
         assert browser.filename_filter.toolTip() and browser.filename_filter.accessibleName()
-        assert browser._root_layout.itemAt(1).layout().indexOf(browser.filename_filter) + 1 == (
-            browser._root_layout.itemAt(1).layout().indexOf(browser.date_sort))
+        heading = browser._root_layout.itemAt(1).layout()  # the filter, then Dirs, then Time
+        assert heading.indexOf(browser.filename_filter) + 1 == heading.indexOf(browser.show_dirs)
+        assert heading.indexOf(browser.show_dirs) + 1 == heading.indexOf(browser.date_sort)
         browser.reconcile(state, FrameNavigationProjection(), plot_mode="Single")
         names = lambda: [browser.scans.item(i).text() for i in range(browser.scans.count())]
         expected = {"..", "folder/", *(f"sample{FINITE_OPERATION_SLOTS[token]}.nexus" for token in tokens)}
         if "int-2d" in tokens:
             expected.add("sample_rsm_middle_int2d.nexus")
-        if "average" in tokens:
-            expected.update(("sample_int1d_average.nexus", "sample_int2d_average.nexus"))
         assert set(names()) == expected
         def forbidden(*args, **kwargs):
             raise AssertionError("filtering must not read files or HDF5")
         monkeypatch.setattr(h5py, "File", forbidden)
         monkeypatch.setattr("os.scandir", forbidden)
-        browser.filename_filter.setText("custom[abc], _RSM")
+        files = {name for name in names() if not name.endswith("/") and name != ".."} | {
+            entry.label for entry in catalog if not entry.label.endswith("/")}
+        browser.filename_filter.setText("custom[abc] | _RSM")  # the control panel's OR
         assert set(names()) == {"..", "folder/", "CUSTOM[ABC].nexus", "sample_rsm.nexus",
                                 "sample_rsm_middle_int2d.nexus"}
+        browser.filename_filter.setText("sample int2d")  # a space is AND
+        assert set(names()) == {"..", "folder/", *(name for name in files
+                                                    if "sample" in name and "int2d" in name)}
+        browser.filename_filter.setText("sample -int")  # -term excludes
+        assert set(names()) == {"..", "folder/", *(name for name in files
+                                                    if "sample" in name and "int" not in name)}
+        browser.show_dirs.setChecked(False)  # Dirs off: folders go, .. stays to go up
+        assert set(names()) == {"..", *(name for name in files if "sample" in name and "int" not in name)}
+        browser.show_dirs.setChecked(True)
+        browser.filename_filter.setText("custom[abc] | _RSM")
         browser.set_filename_mode("Int 2D" if mode != "Int 2D" else "RSM")
         browser.reconcile(state, FrameNavigationProjection(), plot_mode="Single")
-        assert browser.filename_filter.text() == "custom[abc], _RSM"
-        browser.filename_filter.clear()
+        assert browser.filename_filter.text() == "custom[abc] | _RSM"
+        browser.filename_filter.setText("*")  # every result
         assert len(names()) == len(catalog)
+        browser.filename_filter.clear()  # back to Auto, as the threshold fields return to Auto
         browser.set_filename_mode(mode)
         browser.reconcile(state, FrameNavigationProjection(), plot_mode="Single")
-        assert browser.filename_filter.text() == "" and len(names()) == len(catalog)
+        assert browser.filename_filter.text() == "" and set(names()) == expected
     finally:
         _close(qapp, browser)
 
@@ -328,11 +346,12 @@ def test_untouched_filename_default_follows_mode_and_open_pins_custom_names(qapp
         assert browser.listed_results() == (entries[1].identifier,)
         assert browser.current_result() is None and browser.selected_results() == ()
         browser.reconcile_results(entries, "renamed.nexus")
-        assert browser.filename_filter.text() == "_stitch2d"
+        assert browser.filename_filter.text() == ""
+        assert browser.filename_filter.placeholderText() == "Auto: _stitch2d"
         assert browser.listed_results() == (entries[1].identifier, "renamed.nexus")
         assert browser.current_result() == "renamed.nexus"
         browser.set_filename_mode("Stitch 1D")
-        assert browser.filename_filter.text() == "_stitch1d, _stitch2d"
+        assert browser.filename_filter.placeholderText() == "Auto: _stitch1d, _stitch2d"
         assert browser.current_result() == "renamed.nexus"
         browser.clear_result_selection()
         browser.filename_filter.setText("stitch")
@@ -363,7 +382,7 @@ def test_a_row_kept_while_viewed_goes_when_the_view_moves_on(qapp, profile):
             time.sleep(.005)
         assert browser.listed_results() == (entries[0].identifier, entries[1].identifier)
         assert browser.current_result() == entries[1].identifier
-        browser.filename_filter.clear()  # All results
+        browser.filename_filter.setText("*")  # every result
         assert browser.listed_results() == tuple(entry.identifier for entry in entries)
     finally:
         _close(qapp, browser)

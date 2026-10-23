@@ -926,7 +926,7 @@ def test_a_catalog_result_opens_through_the_native_rsm_reader(qapp, tmp_path):
         page._result_browser.set_directory(str(tmp_path))
         _wait(page, qapp, lambda: not page._result_browser.busy)
         assert path not in page.browser.listed_results()  # this fixture has a custom filename
-        page.browser.filename_filter.clear()
+        page.browser.filename_filter.setText("*")
         assert path in page.browser.listed_results()
         assert page.browser.current_result() is None and page.shown is None
         page.browser.set_current_result(path, keep_selection=False)
