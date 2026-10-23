@@ -73,3 +73,36 @@ def test_install_survives_an_unwritable_target(monkeypatch, tmp_path):
     finally:
         _clear_file_handlers(_gui_main)
         monkeypatch.setattr(_gui_main, "LOG_FILE_PATH", None, raising=False)
+
+
+def test_debug_logging_switch_writes_debug_records_mid_session(monkeypatch, tmp_path):
+    """Config ▸ Debug ▸ Debug Logging (1.2.4): DEBUG reaches the log file at once and off restores INFO."""
+    import os
+
+    from xdart import _gui_main
+    monkeypatch.delenv("XDART_LOG_FILE", raising=False)
+    monkeypatch.setenv("XDART_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(_gui_main, "LOG_FILE_PATH", None)
+    monkeypatch.setattr(_gui_main, "_FILE_LOG_HANDLER", None)
+    for flag in _gui_main.DEBUG_LOGGING_FLAGS:
+        monkeypatch.delenv(flag, raising=False)
+    for name in ("xdart", "xrd_tools"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.getLogger(name).level)
+    _clear_file_handlers(_gui_main)
+    try:
+        path = _gui_main._install_file_log_handler()
+        probe = logging.getLogger("xrd_tools.io.metadata")
+        probe.debug("before the switch")
+        _gui_main.set_debug_logging(True)
+        assert all(os.environ.get(flag) == "1" for flag in _gui_main.DEBUG_LOGGING_FLAGS)
+        probe.debug("while debugging")
+        _gui_main.set_debug_logging(False)
+        assert not any(flag in os.environ for flag in _gui_main.DEBUG_LOGGING_FLAGS)
+        probe.debug("after the switch")
+        _gui_main._FILE_LOG_HANDLER.flush()
+        text = path.read_text(encoding="utf-8")
+        assert "while debugging" in text
+        assert "before the switch" not in text and "after the switch" not in text
+        assert "Debug logging on" in text and "Debug logging off" in text
+    finally:
+        _clear_file_handlers(_gui_main)

@@ -2,6 +2,12 @@
 
 ## 1.2.4 (2026-10-22)
 
+### Added
+
+- **Config ▸ Debug ▸ Debug Logging:** writes detailed diagnostics to the log file
+  (Help ▸ Open Log Location) from the moment you tick it, with no restart, and is
+  remembered between sessions. Turn it on while reproducing a problem.
+
 ### Fixes
 
 - **Live runs that Append to several existing results:** a Live directory run

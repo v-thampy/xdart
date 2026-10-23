@@ -78,6 +78,27 @@ def _resolve_log_file():
 #: :func:`_install_file_log_handler` (None if it could not be created).  The
 #: Help ▸ Open Log Location action and the startup banner read this.
 LOG_FILE_PATH = None
+_FILE_LOG_HANDLER = None
+
+#: Diagnostic switches that xdart reads at each use, so Config ▸ Debug ▸
+#: Debug Logging takes effect mid-session without a restart.
+DEBUG_LOGGING_FLAGS = ("XDART_VIEWER_DEBUG", "XDART_METADATA_DEBUG", "XDART_DEBUG_PRERUN")
+
+
+def set_debug_logging(enabled: bool) -> None:
+    """Write DEBUG records from xdart and xrd_tools, plus the per-use debug
+    switches, to the log file; off restores INFO."""
+    level = logging.DEBUG if enabled else logging.INFO
+    for name in ("xdart", "xrd_tools"):
+        logging.getLogger(name).setLevel(logging.DEBUG if enabled else logging.NOTSET)
+    if _FILE_LOG_HANDLER is not None:
+        _FILE_LOG_HANDLER.setLevel(level)
+    for flag in DEBUG_LOGGING_FLAGS:
+        if enabled:
+            os.environ[flag] = "1"
+        else:
+            os.environ.pop(flag, None)
+    logging.getLogger(__name__).warning("Debug logging %s", "on" if enabled else "off")
 
 
 def _install_file_log_handler():
@@ -85,7 +106,7 @@ def _install_file_log_handler():
     launch (``pixi global`` / the menuinst shortcut have no attached terminal,
     so the stderr StreamHandler goes nowhere).  Best-effort: any failure here
     must never stop the GUI from starting."""
-    global LOG_FILE_PATH
+    global LOG_FILE_PATH, _FILE_LOG_HANDLER
     if LOG_FILE_PATH is not None:                 # idempotent
         return LOG_FILE_PATH
     try:
@@ -97,6 +118,7 @@ def _install_file_log_handler():
         handler.setFormatter(logging.Formatter(
             '%(asctime)s %(levelname)s %(name)s: %(message)s'))
         logging.getLogger().addHandler(handler)
+        _FILE_LOG_HANDLER = handler
         LOG_FILE_PATH = path
     except Exception:
         logging.getLogger(__name__).warning(
@@ -494,6 +516,17 @@ class Main(QMainWindow):
         self.actionDebugWindowState = QtGui.QAction("Window State", self)
         self.actionDebugWindowState.triggered.connect(self._log_window_state)
         self.debugMenu.addAction(self.actionDebugWindowState)
+        self.actionDebugLogging = QtGui.QAction("Debug Logging", self)
+        self.actionDebugLogging.setCheckable(True)
+        self.actionDebugLogging.setToolTip(
+            "Write detailed diagnostics to the log file (Help ▸ Open Log Location). "
+            "Takes effect at once and is remembered; turn it off when done.")
+        debug_logging = _app_settings().value("debug.logging", False, type=bool)
+        self.actionDebugLogging.setChecked(bool(debug_logging))
+        if debug_logging:
+            set_debug_logging(True)
+        self.actionDebugLogging.toggled.connect(self._set_debug_logging)
+        self.debugMenu.addAction(self.actionDebugLogging)
         self.actionCheckForUpdates = QtGui.QAction("Check for Updates…", self)
         self.actionCheckForUpdates.triggered.connect(self._check_for_updates)
         self.actionOpenLogLocation = QtGui.QAction("Open Log Location", self)
@@ -574,6 +607,10 @@ class Main(QMainWindow):
         if mode_requested is not None:
             mode_requested.connect(self.open_page_mode)
         self._attached_mode_requested = mode_requested
+
+    def _set_debug_logging(self, enabled):
+        set_debug_logging(bool(enabled))
+        _app_settings().setValue("debug.logging", bool(enabled))
 
     def _open_log_location(self):
         """Help ▸ Open Log Location — reveal the rotating log file in the OS file
