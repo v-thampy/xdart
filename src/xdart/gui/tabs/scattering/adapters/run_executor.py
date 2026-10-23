@@ -86,7 +86,7 @@ from ..output_preflight import (
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     native_int_reduction_plan, materialize_deferred_output,
-    live_directory_groups, materialize_live_directory_group, observe_live_members,
+    live_directory_groups, live_group_already_processed, materialize_live_directory_group, observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
 )
@@ -2060,6 +2060,9 @@ class StandardRunExecutor:
             tuple[tuple[object, ...], SourceExecutionIdentityV1 | None],
         ] = {}
         retry_revisions: dict[str, tuple[object, ...]] = {}
+        # Outputs this Run has already settled once (admitted, presented or published): only these take the
+        # already-processed census below; a first sight is admitted as before.
+        seen_targets: set[str] = set()
         # SPEC readiness by SPEC file revision: no read while it is unchanged.
         spec_cache = run.live_spec_cache
         spec_cache.clear()
@@ -2135,6 +2138,8 @@ class StandardRunExecutor:
                     publish()
                     continue
                 settled = settled_revisions.get(target_key)
+                if settled is not None:
+                    seen_targets.add(target_key)
                 if settled is not None and settled[0] == revision:
                     settled_identity = settled[1]
                     if settled_identity is None:
@@ -2177,6 +2182,17 @@ class StandardRunExecutor:
                             run.live_proofs[target_key] = _live_proof(
                                 configuration, retained.decision.item.graph, seen, registry)
                             continue
+                if (target_key in seen_targets or target_key in run.processed_live_revisions) and not (
+                        run.output is not None and run.output.owns_target(group.target)) and (
+                        live_group_already_processed(receipt, group)):
+                    # A scan this Run settled before whose output still holds it image for image: a quiet no-op until
+                    # its images change, with nothing read, released or refused (beamline 2026-10-23: files the
+                    # beamline touched after a scan were refused one by one, and settling the scan still growing to
+                    # look at them failed it at its next frame, "cannot bind an allocation to a populated store").
+                    settled_revisions[target_key] = (revision, None)
+                    processed_paths.update(group.physical_paths)
+                    publish()
+                    continue
                 constructing = False
                 try:
                     with _run_effect(run):

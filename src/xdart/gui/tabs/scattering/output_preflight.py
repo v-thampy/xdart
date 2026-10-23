@@ -831,18 +831,21 @@ def _already_processed(
     configuration: OutputCandidate,
     group: tuple[Candidate, ...],
     target: Path,
+    *,
+    live: bool = False,
 ) -> CommittedAppendCoverage | None:
     """A finite directory Append's scan that its output already holds, recognized from this census (each image's
     name, size and time) and the output's committed record, before any source capture: its coverage, or None to admit
     it the full way. The maintainer, 2026-10-23: "If a frame has already been processed that means the image data as
     well as the metadata if any were already verified. It seems wasteful to recheck that" (Codex's design review
     DESIGN-append-smb-125). TIFF images without Background only; Live, other formats, new or renamed files, a file
-    whose size or time changed, and another identity all go the full way."""
+    whose size or time changed, and another identity all go the full way. ``live``: a Live poll's census
+    (:func:`live_group_already_processed`)."""
     frozen = configuration._configuration
     if (
         frozen is None
         or frozen.output_mode != "Append"
-        or frozen.live_mode
+        or frozen.live_mode and not live
         or frozen.background.mode != "None"
         or any(candidate.adapter_id != "image_file" for candidate in group)
     ):
@@ -1128,6 +1131,15 @@ def _validate_deferred_targets(
             recursive=source.recursive,
             container_directory_mode=source.series is None,  # a series' bound already keeps outputs out
         )
+
+
+def live_group_already_processed(receipt: AdmissionReceipt, group: "LiveDirectoryGroup") -> bool:
+    """Whether a Live group's output already holds exactly its images, each name, size and time as the output's
+    committed record has them: a quiet no-op until its files change. The census and the committed record only; no
+    image or sidecar is read (maintainer, 2026-10-23: "If something has already been processed, it should be skipped
+    anyway"; Codex, DESIGN-append-image-reprocess-125: a watch, never a permanent skip, and never for the output a
+    Live epoch owns)."""
+    return _already_processed(receipt.candidate, group.plan.candidates, group.target, live=True) is not None
 
 
 def live_directory_groups(

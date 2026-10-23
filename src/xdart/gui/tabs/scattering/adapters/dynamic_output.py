@@ -929,6 +929,11 @@ class DynamicOutputAdapter:
             return None
         return graph["display_owner"]
 
+    def owns_target(self, target: Path) -> bool:
+        """Whether the Run's current output graph (open, pending or dormant) is ``target``'s."""
+        graph = self._current
+        return graph is not None and graph.get("target") == _target_key(target)
+
     def predecessor_owner_for_target(self, target: Path):
         graph = self._current
         return (None if graph is None or graph.get("target") == _target_key(target)
