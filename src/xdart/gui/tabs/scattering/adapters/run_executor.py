@@ -1757,8 +1757,9 @@ class StandardRunExecutor:
         # Live progress counts only new frames, so run.completed omits earlier
         # outputs' persisted prefixes that the catalog already holds; a second
         # Append output then reused a spent ordinal (Windows report, 2026-10-22).
-        # A prefix the catalog already represents (cross-run Append) keeps its
-        # ordinals; a new one starts after every ordinal already issued.
+        # New output owners start after every ordinal already issued. Retain
+        # the caller's absolute base when it supplies an already represented
+        # prefix; ordinary same-owner growth returned above without reseeding.
         issued = run.completed
         if not run.display.navigation_represents(str(owner.artifact), retained):
             issued = max(issued, run.display.navigation_work_high_water)

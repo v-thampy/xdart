@@ -920,6 +920,73 @@ def test_executor_persisted_prefix_seeds_absolute_run_ordinals(
     assert appended.work_ordinal == 13
 
 
+def test_live_restart_appends_two_saved_outputs_and_preserves_their_prefixes(tmp_path):
+    """Real Int2D restart: saved/new first output, dormant second, then second-owner growth."""
+    from xrd_tools.io import FrameViewReader
+
+    source, output = tmp_path / "raw", tmp_path / "output"
+    source.mkdir()
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    for family in ("first", "second"):
+        _write_tiff(source / f"{family}_0001.tif", 1)
+    intent = _live_directory_intent(source, output, poni, processing_mode="Int 2D")
+    intent.live_mode = False
+    seeded, seed_id, seed_events = _run_to_terminal(intent, request_value=1810)
+    try:
+        assert next(event for event in seed_events if event.kind in _TERMINAL).kind is StandardEventKind.FINISHED
+    finally:
+        assert seeded.close(seed_id).cleanup_status is CleanupStatus.CLEANED
+    targets = tuple(sorted(output.glob("*.nexus")))
+    assert len(targets) == 2
+    profiles = {}
+    for target in targets:
+        with FrameViewReader(target) as reader:
+            frame = reader.read(1)
+            profiles[target] = (frame.intensity_1d.copy(), frame.intensity_2d.copy())
+    second = targets[1]
+    second_before = (second.read_bytes(), second.stat().st_ino, second.stat().st_mtime_ns)
+    xye_before = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+                  for path in output.rglob("*.xye")}
+    assert len(xye_before) == 2
+    for label in (2, 3):
+        _write_tiff(source / f"first_{label:04d}.tif", label)
+
+    executor = StandardRunExecutor(join_timeout=2.0)
+    identity = _start(executor, _live_directory_intent(
+        source, output, poni, processing_mode="Int 2D", output_mode="Append"), request_value=1811)
+    try:
+        def settled(count):
+            events = _drain_until(executor, lambda values: any(
+                event.kind in _TERMINAL or (event.kind is StandardEventKind.DISCOVERY
+                and event.files_processed == count and event.files_pending == 0) for event in values))
+            assert not any(event.kind in _TERMINAL for event in events), events
+
+        settled(4)
+        entries = executor.frame_catalog(identity).entries
+        assert [(Path(key.artifact).name, key.local_frame_label, key.work_ordinal) for key in entries] == [
+            (targets[0].name, 1, 1), (targets[0].name, 2, 2), (targets[0].name, 3, 3), (second.name, 1, 4)]
+        assert (second.read_bytes(), second.stat().st_ino, second.stat().st_mtime_ns) == second_before
+        _write_tiff(source / "second_0002.tif", 2)
+        settled(5)
+        grown = executor.frame_catalog(identity).entries
+        assert all(prior is current for prior, current in zip(entries, grown[:4], strict=True))
+        assert (grown[-1].artifact, grown[-1].local_frame_label, grown[-1].work_ordinal) == (str(second), 2, 5)
+        executor.stop(identity)
+        terminal = _drain_until(executor, lambda values: any(event.kind in _TERMINAL for event in values))
+        assert next(event for event in terminal if event.kind in _TERMINAL).kind is StandardEventKind.STOPPED
+    finally:
+        executor.stop(identity)
+        assert executor.close(identity).cleanup_status is CleanupStatus.CLEANED
+    assert {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+            for path in xye_before} == xye_before
+    for target in targets:
+        with FrameViewReader(target) as reader:
+            frame = reader.read(1)
+            np.testing.assert_array_equal(frame.intensity_1d, profiles[target][0])
+            np.testing.assert_array_equal(frame.intensity_2d, profiles[target][1])
+
+
 def test_live_second_append_output_seeds_after_the_catalog_high_water() -> None:
     """Live counts only new frames in run.completed, so earlier outputs' persisted prefixes are not in it.
 
