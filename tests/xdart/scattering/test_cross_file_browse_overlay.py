@@ -45,12 +45,14 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
             and not controller.browse_pending
             and not page._scientific_repaint_pending
             and not shell.browser.frame_selection_pending
-            and state is not None and state.heavy is not None
-            and state.heavy.frame is frame
+            and state is not None
             and any(trace.frame is frame for trace in state.traces)
             and frame in view.trace_history_keys
-            and view.raw.canvas.displayed_image.size
-            and (mode == "Int 1D" or view.cake.canvas.displayed_image.size)
+            and (mode == "Int 1D" or (
+                state.heavy is not None and state.heavy.frame is frame
+                and view.raw.canvas.displayed_image.size
+                and view.cake.canvas.displayed_image.size
+            ))
         ) else None
 
     def open_file(path):
@@ -93,9 +95,24 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
 
 
 @pytest.fixture
-def comparison(tmp_path, monkeypatch, qapp):
+def comparison(tmp_path, monkeypatch, qapp, request):
     paths = tuple(_write_processed(tmp_path / name, labels=(1, 2))[0]
                   for name in ("left", "right"))
+    if getattr(request, "param", False):
+        import h5py
+        from xrd_tools.core.angular_support import AngularSupportProfile, SupportOrigin
+        from xrd_tools.io.angular_support import write_angular_support
+
+        profile = AngularSupportProfile(
+            origin=SupportOrigin.RUN, supported_deg=np.array([90., 180., 270.]),
+            window_deg=360., convention="detector_chi", radial_unit="q_A^-1",
+            bin_edges=(0.05, 0.35),
+        )
+        for path in paths:
+            with h5py.File(path, "r+") as handle:
+                group = handle["entry/integrated_1d"]
+                write_angular_support(group, {1: profile, 2: profile},
+                                      intensity_rows=dict(zip((1, 2), group["intensity"][()], strict=True)))
     store = RunIntentStore(RunIntent(project_root=str(tmp_path), processing_mode="Int 2D"))
     page, _ = _page(tmp_path, monkeypatch, store=store)
     controller, view = page._context_controller, page._shell.scientific
@@ -190,7 +207,10 @@ def test_cross_file_overlay_counts_shared_roots_against_one_global_budget(compar
     def root_bytes():
         roots = {}
         for trace in view._trace_history_by_identity.values():
-            for array in (trace.axis.values, trace.intensity):
+            arrays = [trace.axis.values, trace.intensity]
+            if trace.angular_support is not None and trace.angular_support.supported_deg is not None:
+                arrays.append(trace.angular_support.supported_deg)
+            for array in arrays:
                 while isinstance(array.base, np.ndarray):
                     array = array.base
                 roots[id(array)] = array
@@ -202,4 +222,32 @@ def test_cross_file_overlay_counts_shared_roots_against_one_global_budget(compar
     assert root_bytes() <= limit
     assert view.trace_history_keys == (second,)
     assert "new overlay" in page._notice_text.lower()
+    assert "budget" in page._notice_text.lower()
+
+
+@pytest.mark.parametrize("comparison", [True], indirect=True)
+def test_cross_file_overlay_detaches_and_budgets_saved_angular_support(comparison, monkeypatch):
+    from xdart.gui.tabs.scattering import browse_1d_display
+
+    page, paths, first, open_file, ready = comparison
+    view = page._shell.scientific
+    admitted = page._last_scientific_projection.traces[0].angular_support
+    retained = view._trace_history_by_identity[id(first)].angular_support
+    assert admitted.available and retained.available
+    assert retained.supported_deg is not admitted.supported_deg
+    assert not np.shares_memory(retained.supported_deg, admitted.supported_deg)
+    assert not retained.supported_deg.flags.writeable
+    np.testing.assert_array_equal(retained.supported_deg, admitted.supported_deg)
+
+    roots = {}
+    for array in (view._trace_history_by_identity[id(first)].axis.values,
+                  view._trace_history_by_identity[id(first)].intensity):
+        while isinstance(array.base, np.ndarray):
+            array = array.base
+        roots[id(array)] = array
+    # Two x/y allocations fit; adding both support roots exceeds the same budget.
+    limit = 2 * sum(array.nbytes for array in roots.values()) + retained.supported_deg.nbytes
+    monkeypatch.setattr(browse_1d_display, "MAX_BROWSE_1D_DETACHED_BYTES", limit)
+    second = open_file(paths[1])
+    assert view.trace_history_keys == (second,)
     assert "budget" in page._notice_text.lower()

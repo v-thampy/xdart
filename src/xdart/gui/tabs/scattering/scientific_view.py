@@ -3488,7 +3488,15 @@ class ScientificView(QtWidgets.QFrame):
             foreign = ()
         retained = tuple(self._trace_history_by_identity[id(frame)] for frame in foreign
                          if id(frame) in self._trace_history_by_identity)
-        incoming = state.traces
+        incoming = []
+        for trace in state.traces:
+            support = trace.angular_support
+            if support is not None and support.supported_deg is not None:
+                values = np.array(support.supported_deg, dtype=np.float64, copy=True)
+                values.setflags(write=False)
+                trace = replace(trace, angular_support=replace(support, supported_deg=values))
+            incoming.append(trace)
+        incoming = tuple(incoming)
         self.browse_comparison_notice = ""
         if retained:
             first = retained[0]
@@ -3502,7 +3510,10 @@ class ScientificView(QtWidgets.QFrame):
         def root_bytes(traces):
             roots = {}
             for trace in traces:
-                for array in (trace.axis.values, trace.intensity):
+                arrays = [trace.axis.values, trace.intensity]
+                if trace.angular_support is not None and trace.angular_support.supported_deg is not None:
+                    arrays.append(trace.angular_support.supported_deg)
+                for array in arrays:
                     while isinstance(array.base, np.ndarray):
                         array = array.base
                     roots[id(array)] = array
