@@ -1696,6 +1696,7 @@ class NexusSink:
         default=None, init=False, repr=False,
     )
     _fast_regenerable: bool = field(default=False, init=False, repr=False)
+    _in_place_append: bool = field(default=False, init=False, repr=False)
     _source_execution: dict[str, Any] | None = field(
         default=None, init=False, repr=False,
     )
@@ -1940,6 +1941,9 @@ class NexusSink:
             )
         if self.overwrite and self.append_preflight is not None:
             raise ValueError("Overwrite cannot consume an Append preflight")
+        if (self.rollback_until_commit and self.append_preflight is not None
+                and self.append_preflight._transaction.in_place):
+            raise ValueError("an explicit full-rollback sink cannot write its Append in place")
         if self.same_run_intent is not None and self.append_preflight is not None:
             raise ValueError("same-run creation and cross-run Append are distinct policies")
         if self.allow_unbound_same_run and (
@@ -1961,6 +1965,11 @@ class NexusSink:
         self._fast_regenerable = bool(
             self.overwrite and config.get("output_mode") == "Overwrite"
             and config.get("live_mode") is False and not self.rollback_until_commit)
+        # A finite Append writes its existing output in place (maintainer,
+        # 2026-10-23); an explicit full-rollback request keeps the preserved copy.
+        self._in_place_append = bool(
+            not self.overwrite and config.get("live_mode") is False
+            and not self.rollback_until_commit)
         if self.source_execution_provenance is not None:
             self._source_execution = jsonable_run_value(
                 self.source_execution_provenance,
@@ -2095,6 +2104,7 @@ class NexusSink:
                     committed_prefix=self._existing_append_prefix,
                     file_lock=self.file_lock,
                     before_admit=self._require_current_append_target,
+                    in_place=self._in_place_append,
                 )
             except AppendPreflightCleanupError as error:
                 self.append_preflight = error.owner
@@ -2124,7 +2134,11 @@ class NexusSink:
                     target_owner=binding.target_owner,
                     lease=binding.lease,
                     file_lock=self.file_lock,
-                    seed_mode=StreamSeedMode.PRESERVE_BASE,
+                    seed_mode=(
+                        StreamSeedMode.IN_PLACE
+                        if binding.transaction.in_place
+                        else StreamSeedMode.PRESERVE_BASE
+                    ),
                 )
             except BaseException as primary:
                 try:
@@ -2466,6 +2480,34 @@ class NexusSink:
         if self._pending_append_decision is decision:
             self._pending_append_decision = None
 
+    @property
+    def _reopens_in_place(self) -> bool:
+        """Whether a reopened epoch writes the committed output in place: every
+        ordinary reopen (maintainer, 2026-10-23); an explicit full-rollback
+        request keeps its preserved copy."""
+        return self._transaction.in_place or not self.rollback_until_commit
+
+    def _discard_unopened_in_place_epoch(self) -> None:
+        """A Stop that arrives before a queued epoch opens keeps the committed
+        epochs exactly as they stand.
+
+        Opening an in-place epoch writes into the committed output itself (its
+        metadata at once), and there is no copy to restore; opening one only to
+        abort it would change that output and report the run aborted although
+        nothing was added.  A cancelled finish therefore drops the unopened
+        epoch, and the committed one is terminalized as usual.
+        """
+        writer = self._writer
+        if (
+            self._pending_append_decision is not None
+            and not self._pending_record_writes
+            and writer is not None and writer.phase.value == "finished"
+            and self._transaction is not None
+            and self._transaction.snapshot().phase is TransactionPhase.EPOCH_COMMITTED
+            and self._reopens_in_place
+        ):
+            self._pending_append_decision = None
+
     def _open_owned_epoch(self, decision) -> None:
         transaction_owner, target_owner, _owners = self._transaction_owners
         try:
@@ -2475,6 +2517,7 @@ class NexusSink:
                 transaction_owner=transaction_owner,
                 target_owner=target_owner,
                 lease=self._lease,
+                in_place=self._reopens_in_place,
             )
             self._writer = None
             writer = NexusRecordWriter(
@@ -3082,6 +3125,8 @@ class NexusSink:
             )
         if self._terminal_result is not None:
             return self._terminal_result
+        if getattr(result, "cancelled", False):
+            self._discard_unopened_in_place_epoch()
         self._apply_pending_extension()
         self._drain_pending_record_writes(force=True)
         writer = self._writer

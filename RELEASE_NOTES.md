@@ -2,6 +2,17 @@
 
 ## 1.2.5 (unreleased)
 
+### Changed
+
+- **Append adds new frames to the existing output in place:** xdart no longer
+  copies a scan's output, or reads it in full, before and after adding the new
+  frames; it opens the output and writes only the new frames. The same holds
+  between a Live run's batches. The trade-off: if xdart crashes, or the run
+  fails, while it is adding frames, that scan's output is left incomplete. The
+  next Append skips it and says to use Replace, which rebuilds it from the
+  images; if the output can no longer be opened at all, move or delete it, then
+  run again. Stop is not a failure: the frames added before it are kept.
+
 ### Fixes
 
 - **A directory Append skips scans it has already processed:** a scan whose output

@@ -67,7 +67,10 @@ candidate only after close and scientific validation.  STOP discards a partial
 candidate.  Run is not converted to that protocol: a hard crash may leave its
 public result or hidden backup unresolved, and automatic recovery is not
 guaranteed.  The raw/source artifact remains safe.  Append and Live follow their
-separate continuation contract.
+separate continuation contract: since 1.2.5 they write the existing output in
+place, with no backup or copy.  A crash or failure while frames are added leaves
+that output incomplete, and the next Append refuses it until Replace rebuilds it
+(an output that no longer opens must be moved or deleted first).
 
 Stable-slot publication belongs outside the hot integration and writer loop.
 It must leave Run's output-transaction loop unchanged and preserve the accepted

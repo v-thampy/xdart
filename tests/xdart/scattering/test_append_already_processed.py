@@ -221,3 +221,47 @@ def test_a_completed_scan_under_a_detector_ceiling_is_recognized_at_admission(tm
     assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"] and warnings == []
     assert seams.materialized == ["scanb_int1d.nexus"]
     assert not any(name.startswith("scana_") for name in captured), captured
+
+
+def test_a_growing_scan_appends_in_place_without_copying_or_hashing_its_output(tmp_path, monkeypatch):
+    """Maintainer, 2026-10-23, "Append in place": the processed frames are neither copied nor hashed again; only the
+    new frame is written, into the same file."""
+    import numpy as np
+    import xrd_tools.io.output_transaction as output_transaction
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _scan(raw, "scana", 3)
+    events, _catalog = _run(tmp_path, raw, 9111)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+    output = tmp_path / "processed" / "scana_int1d.nexus"
+    with h5py.File(output, "r") as handle:
+        processed = handle["entry/integrated_1d/intensity"][()]
+    inode = output.stat().st_ino
+    _scan(raw, "scana", 1, start=3)
+    touched = []
+    real_stage = output_transaction.OutputTransaction._stage_prior
+    real_copy = output_transaction.OutputTransaction._copy_stream_seed
+    real_hash = output_transaction._sha256_handle
+
+    def stage(transaction, *args, **kwargs):
+        touched.append(("stage", os.path.basename(transaction.admission.target)))
+        return real_stage(transaction, *args, **kwargs)
+
+    def copy(transaction, *args, **kwargs):
+        touched.append(("copy", os.path.basename(transaction.admission.target)))
+        return real_copy(transaction, *args, **kwargs)
+
+    def hashed(handle):
+        touched.append(("hash", os.fstat(handle.fileno()).st_ino))
+        return real_hash(handle)
+
+    monkeypatch.setattr(output_transaction.OutputTransaction, "_stage_prior", stage)
+    monkeypatch.setattr(output_transaction.OutputTransaction, "_copy_stream_seed", copy)
+    monkeypatch.setattr(output_transaction, "_sha256_handle", hashed)
+    events, _catalog = _run(tmp_path, raw, 9112)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+    assert touched == []  # the Run's only output transaction is scana's
+    assert output.stat().st_ino == inode and _labels(tmp_path, "scana") == (1, 2, 3, 4)
+    with h5py.File(output, "r") as handle:
+        np.testing.assert_array_equal(handle["entry/integrated_1d/intensity"][:3], processed)
+        assert handle["entry/integrated_1d/intensity"].shape[0] == 4

@@ -2247,6 +2247,8 @@ class NexusRecordWriter:
         self._append_written_labels: set[int] = set()
         self._lineage_dirty = False
         self._lineage_expected: str | None = None
+        # An in-place stream's pending lineage, staged at its first write.
+        self._deferred_lineage: AppendDecision | None = None
         self._checkpoint_rows = 0
         self._checkpoint_read_bytes = 0
         self._semantic_read_groups = {"checkpoint": 0, "close": 0}
@@ -2538,6 +2540,20 @@ class NexusRecordWriter:
             binding.attempt,
             lease=binding.lease,
         )
+        deferred, self._deferred_lineage = self._deferred_lineage, None
+        if deferred is not None:
+            self._stage_pending_lineage(deferred)
+
+    def _stage_pending_lineage(self, decision: AppendDecision) -> None:
+        stage_append_lineage(self._entry_group(), decision)
+        lineage = dict(decision.lineage or {})
+        lineage["state"] = "pending"
+        self._lineage_expected = json.dumps(
+            lineage,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._lineage_dirty = True
 
     def _vfd_descriptor(self) -> int:
         if self._h5 is None:
@@ -4607,18 +4623,15 @@ class NexusRecordWriter:
                         self._entry_group(), self.artifact_family,
                     )
                 if self._append_decision is not None:
-                    stage_append_lineage(
-                        self._entry_group(),
-                        self._append_decision,
-                    )
-                    lineage = dict(self._append_decision.lineage or {})
-                    lineage["state"] = "pending"
-                    self._lineage_expected = json.dumps(
-                        lineage,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    self._lineage_dirty = True
+                    if binding is not None and binding.transaction.stream_in_place:
+                        # In place the committed output is the canonical
+                        # file: its pending marker waits for the first new
+                        # write (every write is authorized first), so an
+                        # epoch that never writes -- an early Stop or a
+                        # failure -- leaves the committed output valid.
+                        self._deferred_lineage = self._append_decision
+                    else:
+                        self._stage_pending_lineage(self._append_decision)
                 if existing_cursors is not None:
                     self._row_cursors.update(existing_cursors)
                 else:

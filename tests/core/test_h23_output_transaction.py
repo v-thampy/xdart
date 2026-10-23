@@ -4990,7 +4990,7 @@ def test_in_place_abort_retains_the_existing_file_without_restoring_or_hashing(t
     assert sorted(path.name for path in tmp_path.iterdir()) == ["result.nexus"]
 
 
-def test_in_place_policy_binds_at_admission_and_needs_an_existing_output(tmp_path, monkeypatch):
+def test_in_place_policy_binds_at_admission_and_only_to_an_existing_output(tmp_path, monkeypatch):
     prepared = _prepared_in_place(tmp_path)
     api, target, _coordinator, transaction, *_rest, lease = prepared
     with pytest.raises(api.TransactionStateError, match="in-place"):
@@ -4999,7 +4999,154 @@ def test_in_place_policy_binds_at_admission_and_needs_an_existing_output(tmp_pat
     ordinary = _prepared(tmp_path / "copy")
     with pytest.raises(api.TransactionStateError, match="in-place"):
         _begin_in_place(ordinary)
+    # A missing output keeps the ordinary creation route.
     (tmp_path / "absent").mkdir()
     missing = _prepared_in_place(tmp_path / "absent", prior=None)
-    with pytest.raises(api.TransactionStateError, match="existing output"):
+    assert missing[3].in_place is False
+    with pytest.raises(api.TransactionStateError, match="in-place"):
         _begin_in_place(missing)
+    _begin_in_place(missing, "PRESERVE_BASE")
+
+
+def _committed_epoch(prepared, pool, payload: bytes = b"epoch-a"):
+    """A Live run's first, preserved epoch, committed."""
+    api, target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, lease = prepared
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=pool, file_lock=threading.RLock(),
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    target.write_bytes(payload)
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    transaction.commit_stream_epoch(attempt, lease=lease)
+    return attempt
+
+
+def _reopen(prepared, previous, *, in_place: bool = True, lease=None):
+    _api_module, _target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, own_lease = prepared
+    return transaction.begin_stream_epoch(
+        previous, admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner,
+        lease=own_lease if lease is None else lease, in_place=in_place,
+    )
+
+
+def _commit_in_place_rows(api, transaction, attempt, lease, target: Path, rows: bytes, close: bytes):
+    """Rows, their checkpoint, an HDF5-like close (no durable floor), the terminal and the epoch commit."""
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(rows)
+    _sealed_checkpoint(api, transaction, attempt, lease, target)
+    owner = transaction.begin_stream_close(attempt, lease=lease)
+    assert owner is not None  # an in-place attempt seals its close without a durable floor
+    with open(target, "ab") as stream:
+        stream.write(close)
+    transaction.seal_stream_close(attempt, owner, lease=lease)
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    return transaction.commit_stream_epoch(attempt, lease=lease)
+
+
+def test_in_place_epoch_reopen_keeps_one_exclusion_owner_without_stage_copy_or_hash(tmp_path, monkeypatch):
+    """The IN_PLACE counterpart of test_canonical_stream_epoch_extension_retries_under_one_exclusion_owner."""
+    prepared = _prepared(tmp_path, prior=b"prior")
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    pool = _DepthPool()
+    first = _committed_epoch(prepared, pool)
+    inode = os.stat(target).st_ino
+    staged: list[int] = []
+    copied: list[int] = []
+    monkeypatch.setattr(transaction, "_stage_prior", lambda: staged.append(1))
+    monkeypatch.setattr(transaction, "_copy_stream_seed", lambda **_kwargs: copied.append(1))
+    (tmp_path / "other").mkdir()
+    foreign = _prepared(tmp_path / "other")
+    hashes = _counted_hashes(api, monkeypatch)
+    with pytest.raises(api.OwnershipRefused):
+        _reopen(prepared, first, lease=foreign[-1])
+    second = _reopen(prepared, first)
+    assert second is not first and pool.depth == 1
+    with pytest.raises(api.TransactionStateError, match="committed epoch"):
+        _reopen(prepared, second)
+    with pytest.raises(api.OwnershipRefused):
+        transaction.authorize_stream_mutation(first, lease=lease)
+    _commit_in_place_rows(api, transaction, second, lease, target, b"-b", b"!")
+    third = _reopen(prepared, second)  # authorized by the in-place epoch's revision, not by a digest
+    assert os.stat(target).st_ino == inode and pool.depth == 1
+    assert staged == copied == hashes == []
+    result = transaction.abort_stream(third, lease=lease)
+    assert result.phase is api.TransactionPhase.ABORTED and pool.depth == 0
+    assert target.read_bytes() == b"epoch-a-b!" and staged == copied == hashes == []
+
+
+def test_in_place_reopen_refuses_a_changed_committed_epoch_and_keeps_it(tmp_path, monkeypatch):
+    prepared = _prepared(tmp_path, prior=b"prior")
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    first = _committed_epoch(prepared, _DepthPool())
+    hashes = _counted_hashes(api, monkeypatch)
+    with open(target, "ab") as stream:
+        stream.write(b"foreign")
+    with pytest.raises(api.TargetChanged, match="committed epoch changed"):
+        _reopen(prepared, first)
+    assert transaction.snapshot().phase is api.TransactionPhase.EPOCH_COMMITTED and hashes == []
+
+
+def test_in_place_transaction_reopens_its_epochs_only_in_place(tmp_path):
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    attempt = _begin_in_place(prepared)
+    _commit_in_place_rows(api, transaction, attempt, lease, target, b"-rows", b"!")
+    with pytest.raises(api.TransactionStateError, match="only in place"):
+        _reopen(prepared, attempt, in_place=False)
+    _reopen(prepared, attempt)
+
+
+@pytest.mark.parametrize("resume", ("resumes", "resume-fails-once"))
+def test_in_place_abort_settles_a_held_durable_floor_and_resumes_the_pool(tmp_path, monkeypatch, resume):
+    """An unsealed write after the floor holds integrity; the retained receipt still settles the abort."""
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, lease = prepared
+    pool = _Pool(fail_resume=1) if resume == "resume-fails-once" else _DepthPool()
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=pool, file_lock=threading.RLock(), seed_mode=api.StreamSeedMode.IN_PLACE,
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(b"-rows")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(b"-unsealed")
+    with pytest.raises(api.TargetChanged):
+        transaction.begin_stream_close(attempt, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    hashes = _counted_hashes(api, monkeypatch)
+    if resume == "resume-fails-once":
+        with pytest.raises(api.CleanupIncomplete):
+            transaction.abort_stream(attempt, lease=lease)
+        result = transaction.retry_cleanup(transaction.snapshot().cleanup_token)
+        assert len(pool.resumes) == 2
+    else:
+        result = transaction.abort_stream(attempt, lease=lease)
+        assert pool.depth == 0
+    assert result.phase is api.TransactionPhase.ABORTED and not result.pending_actions
+    assert hashes == [] and target.read_bytes() == b"prior-rows-unsealed"
+
+
+def test_in_place_abort_retries_a_failed_pool_resume_without_rollback_proof(tmp_path):
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, lease = prepared
+    pool = _Pool(fail_resume=1)
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=pool, file_lock=threading.RLock(), seed_mode=api.StreamSeedMode.IN_PLACE,
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(b"-partial")
+    with pytest.raises(api.CleanupIncomplete):
+        transaction.abort_stream(attempt, lease=lease)
+    snapshot = transaction.snapshot()
+    assert snapshot.pending_actions == (api.RetryAction.POOL_RESUME,)
+    result = transaction.retry_cleanup(snapshot.cleanup_token)
+    assert result.phase is api.TransactionPhase.ABORTED and not result.pending_actions
+    assert len(pool.resumes) == 2 and target.read_bytes() == b"prior-partial"

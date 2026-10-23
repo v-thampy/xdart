@@ -1119,9 +1119,32 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         return _decision(
             AppendDisposition.REFUSE,
-            reason=str(exc),
+            reason=_refusal_reason(target, intent.entry, exc),
             source_generation=intent.source.generation,
         )
+
+def _refusal_reason(target: Path, entry: str, error: BaseException) -> str:
+    """The refusal, with its remedy when an interrupted in-place Append left the output pending (Replace) or
+    unreadable (Replace's raw-target gate refuses a file it cannot recognize, so: move or delete it)."""
+    reason = str(error)
+    try:
+        with open(target, "rb"):
+            pass
+    except OSError:
+        return reason  # missing, or not readable at all (permissions, a sharing lock): no remedy to name
+    try:
+        with h5py.File(target, "r") as handle:
+            state = _read_lineage(handle[entry]).get("state")
+    except OSError:
+        return (
+            "the output is not a readable HDF5 file, possibly left by an interrupted Append; "
+            f"move or delete it, then run again ({reason})"
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return reason
+    if state == "pending":
+        return f"an earlier Append of this output did not finish; use Replace to rebuild it ({reason})"
+    return reason
 
 def prepare_append_preflight(
     target: str | Path,
@@ -1131,7 +1154,17 @@ def prepare_append_preflight(
     file_lock=None,
     refusal_mapper: Callable[[str, AppendDecision], BaseException] | None = None,
     before_admit: Callable[[], None] | None = None,
+    in_place: bool = False,
 ) -> AppendPreflight:
+    """Admit, lease and qualify one Append target under its file lock.
+
+    ``in_place`` binds the transaction, before admission, to write an existing
+    output in place (finite Append; maintainer, 2026-10-23): no whole-file hash
+    at admission, no backup and no copy.  A missing target keeps the ordinary
+    creation route.
+    """
+    if type(in_place) is not bool:
+        raise TypeError("in_place must be an exact bool")
     from .output_transaction import (
         LeaseOwner,
         OwnerToken,
@@ -1156,6 +1189,7 @@ def prepare_append_preflight(
                 normalized,
                 transaction_owner=transaction_owner,
                 target_owner=target_owner,
+                in_place=in_place,
             )
             lease = transaction.acquire_lease(
                 admission=transaction.admission,
