@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import namedtuple
 from dataclasses import replace
+import logging
 import os
 from pathlib import Path
 from threading import RLock, get_ident
@@ -66,6 +67,7 @@ from .state_machine import RunPhase
 from .shell_projection import ScientificPreferences
 from .shell_values import FrameNavigationProjection
 from .hydration_transport import HydrationTransport
+_LOG = logging.getLogger(__name__)
 _Viewer1DIntent = namedtuple(
     "_Viewer1DIntent",
     "paths current_path policy generation provider",
@@ -1859,7 +1861,11 @@ class ContextController:
             prepared = self._runtime.prepare_browse_adoption(
                 candidate, request,
             )
-        except BaseException:
+        except BaseException as error:
+            # Name the refusal: it used to leave Browse empty or pending with
+            # nothing in the log (Windows report, 2026-10-22).
+            _LOG.warning("Browse could not adopt %s: %s: %s", request.source_path,
+                         type(error).__name__, error, exc_info=True)
             self.cancel_reintegrate_successor_browse(request)
             self._runtime.finish_replacement(request)
             return None

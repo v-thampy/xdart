@@ -1,5 +1,16 @@
 # Release notes
 
+## 1.2.2 (unreleased)
+
+### Fixes
+
+- **Opening processed results on a mapped network drive:** on Windows, opening a
+  processed `.nexus` file through a mapped drive (for example `X:`) left the Data
+  Browser stuck at "Browse cleanup remains pending", while a local copy opened.
+  Browse resolved the drive to its network path for reading but compared it with
+  the path you chose, so the loaded result was refused. Browse now reads it under
+  the path you chose. A symlinked folder had the same effect on macOS and Linux.
+
 ## 1.2.1 (2026-10-22)
 
 ### Fixes

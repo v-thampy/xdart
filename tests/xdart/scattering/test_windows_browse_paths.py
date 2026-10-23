@@ -270,3 +270,43 @@ def test_processed_scan_from_another_os_browses_without_a_project_folder(tmp_pat
         np.testing.assert_array_equal(curves[0].yData, expected.intensity_1d)
     finally:
         close(laptop)
+
+
+def test_a_result_opened_through_a_rewritten_path_still_browses(tmp_path, monkeypatch):
+    """A mapped drive (X: -> its UNC share) or a symlinked folder makes resolve() differ from the path clicked.
+
+    Windows report, 2026-10-22: the loader built its scalar catalog under resolve(), the 1-D lane compared it
+    with the clicked path, refused the context, and Browse stayed pending. A directory symlink gives the same
+    split on every host that can create one.
+    """
+    import os
+
+    from tests.core.reintegrate_support import _seed_existing
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _close, _page
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    real = tmp_path / "real"
+    real.mkdir()
+    seed = _seed_existing(real)
+    mapped = tmp_path / "mapped"
+    try:
+        mapped.symlink_to(seed.target.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("this host cannot create a directory symlink")
+    clicked = mapped / seed.target.name
+    assert os.path.normcase(os.path.abspath(clicked)) != os.path.normcase(str(clicked.resolve()))
+    page, _store = _page(tmp_path, monkeypatch)
+    try:
+        page._select_scan(str(clicked))
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and (
+                page._context_controller.browse_pending or page._capture_current_loaded_browse() is None):
+            app.processEvents()
+            time.sleep(0.005)
+        capture = page._capture_current_loaded_browse()
+        assert capture is not None and not page._context_controller.browse_pending, page._notice_text
+        assert capture.request.source_path == os.path.normcase(os.path.abspath(clicked))
+        assert capture.context.scalar_catalog.artifact_path == capture.request.source_path
+        assert capture.labels
+    finally:
+        _close(page, app)

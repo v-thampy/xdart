@@ -972,10 +972,13 @@ class BrowseLoader:
                 return
             _timing[name] = max(0.0, ended - started)
 
-        path = Path(request.source_path).resolve()
-        # Windows resolve restores on-disk case; requests and hydration use
-        # normcase identities. Keep the scalar catalog in that same domain.
-        canonical_path = os.path.normcase(str(path))
+        # The request already holds the normcase/abspath identity that every
+        # Browse consumer compares: the catalog, the hydration lanes and the
+        # writer seal. Path.resolve() rewrote a mapped network drive to its UNC
+        # path (or followed a symlink), so the 1-D lane refused the context and
+        # Browse never settled (Windows report, 2026-10-22).
+        canonical_path = request.source_path
+        path = Path(canonical_path)
         if _timing is not None:
             _timing["canonical_path"] = canonical_path
         if cancelled.is_set():
