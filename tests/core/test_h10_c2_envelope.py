@@ -1062,3 +1062,20 @@ def test_c2_a_malformed_requested_workers_is_rejected_on_its_own():
                                  requested_workers=2, requests={"workers": 2},
                                  env={}).allocation
     assert a.workers <= 2
+
+
+@pytest.mark.parametrize(("windows_gib", "expected_gib"), ((64, 64 * 0.4), (8, 16), (None, 16)))
+def test_windows_ram_may_raise_the_default_memory_target_but_never_lowers_it(monkeypatch, windows_gib, expected_gib):
+    """Beamline 2026-10-23 (Windows, 64 GB): with no os.sysconf every Windows Run planned within 16 GiB, so its warm
+    tables (2.17 GB each, one per worker) did not fit and each series rebuilt one. Windows' own RAM figure now gives
+    40% of RAM when that is more; a smaller PC keeps the 16 GiB it planned with before."""
+    from xrd_tools.core import staging
+    p = _policy()
+
+    def sysconf(name):
+        raise AttributeError("sysconf is unavailable on Windows")
+
+    monkeypatch.setattr(p.os, "sysconf", sysconf, raising=False)
+    monkeypatch.setattr(staging, "windows_physical_ram_bytes",
+                        lambda: None if windows_gib is None else windows_gib * 1024**3)
+    assert p.default_envelope_bytes() == int(expected_gib * 1024**3)

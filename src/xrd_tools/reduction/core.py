@@ -5491,15 +5491,13 @@ class WarmIntegrators:
             return None
 
     def keep_for_next_run(self) -> None:
-        """A Run is over: keep one idle integrator under each role's most recently returned key, so the next Run's
-        first frames need no build when nothing changed (its series then fit the store to their own plan); drop the
-        rest."""
+        """A Run is over: keep the idle integrators under each role's most recently returned key, within the
+        allowance, so the next Run's first series needs no build when nothing changed (its series then fit the store
+        to their own plan); drop the rest."""
         with self._lock:
             latest = set(self._recent.values())
             for key in list(self._idle):
-                if key in latest:
-                    del self._idle[key][:-1]
-                else:
+                if key not in latest:
                     del self._idle[key]
             self._trim()
 

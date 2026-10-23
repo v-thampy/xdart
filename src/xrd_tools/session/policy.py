@@ -316,12 +316,16 @@ def _prefetch_queue_request(env) -> int:
 def default_envelope_bytes(env=None) -> int:
     """Advisory target: 40% of RAM, or 16 GiB when detection is unavailable.
 
-    Windows uses the fallback. Python/Qt/file handles are OUTSIDE the model.
+    Windows has no ``os.sysconf``; its own RAM figure (``windows_physical_ram_bytes``) may raise the target above the
+    16 GiB fallback, never lower it (beamline 2026-10-23: a 64 GB PC planned within 16 GiB, so a Run's warm tables
+    could not hold one per worker). Python/Qt/file handles are OUTSIDE the model.
     """
     try:
         total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (ValueError, OSError, AttributeError):
-        total = 0
+        from xrd_tools.core.staging import windows_physical_ram_bytes
+        windows = windows_physical_ram_bytes() or 0
+        return max(16 * _GIB, int(windows * DEFAULT_ENVELOPE_FRACTION))
     return int(total * DEFAULT_ENVELOPE_FRACTION) if total > 0 else 16 * _GIB
 
 
