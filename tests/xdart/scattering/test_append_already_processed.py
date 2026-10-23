@@ -156,6 +156,24 @@ def test_a_completed_scan_that_gained_frames_appends_them(tmp_path, monkeypatch)
     assert _labels(tmp_path, "scana") == (1, 2, 3, 4) and _labels(tmp_path, "scanb") == (1, 2)
 
 
+def test_a_completed_scan_does_not_capture_its_source_before_skipping(tmp_path, monkeypatch):
+    """The agreed early no-op includes admission, before deferred materialization."""
+    from xrd_tools.sources.execution_graph import SourceFileState
+
+    raw = _completed_and_new(tmp_path)
+    captured = []
+    real_capture = SourceFileState.capture
+
+    def capture(cls, path):
+        captured.append(os.path.basename(str(path)))
+        return real_capture(path)
+
+    monkeypatch.setattr(SourceFileState, "capture", classmethod(capture))
+    events, _catalog = _run(tmp_path, raw, 9105)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+    assert not any(name.startswith("scana_") for name in captured), captured
+
+
 @pytest.mark.parametrize("change", ("renamed", "raw-rewritten", "settings", "modes"))
 def test_what_is_not_already_processed_goes_the_full_way(tmp_path, monkeypatch, change):
     """Other files under the same count, a TIFF whose size or time changed, other processing settings or other modes
