@@ -209,3 +209,44 @@ def test_an_executor_keeps_a_runs_tables_for_its_next_run(tmp_path, builds):
         assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"], events[-1]
     assert len(builds) == 1, builds  # on the parent: one per Run
     assert len(executor._warm_tables) == 1
+
+
+@pytest.mark.parametrize(("frames", "warm", "table_bytes", "pixels", "expected"), (
+    (5, 1, 2171788924, 16_777_216, 1),   # the beamline's scans after the first: one built set, keep to it
+    (5, 4, 2171788924, 16_777_216, 4),   # four sets already built: use them all
+    (3, 0, 0, 16_777_216, 1),            # the first scan of a large detector, before any set is measured
+    (40, 1, 2171788924, 16_777_216, 3),  # a long scan repays two more builds
+    (5, 0, 100 << 20, 16_777_216, 4),    # cheap tables: every granted worker
+    (5, 0, 0, 1_000_000, 4),             # a small detector, unmeasured: every granted worker
+))
+def test_a_series_starts_the_workers_its_tables_can_repay(frames, warm, table_bytes, pixels, expected):
+    """Beamline 2026-10-23 (Windows, Rayonix, 3-5 frame scans): "i ran with 1,2,3 and 4 cores. 1, 2 and 3 cores all
+    took about 52-55s. 4 cores took 101s". Each worker builds its own 2.17 GB table set (~8 s on that PC, ~0.85 s a
+    frame), which a few frames never repay."""
+    from xdart.gui.tabs.scattering.adapters.dynamic_output import _series_workers
+    assert _series_workers(4, frames, warm, table_bytes, pixels) == expected
+
+
+def test_a_large_detectors_short_series_run_on_the_workers_with_built_tables(tmp_path, monkeypatch, builds):
+    """With Cores 4, three 5-frame scans of a large detector start one worker each and build one table set."""
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    monkeypatch.setattr(dynamic_output, "_LARGE_DETECTOR_PIXELS", 1, raising=False)  # TINY counts as large
+    monkeypatch.setattr(dynamic_output, "_LARGE_TABLE_BYTES", 1, raising=False)
+    executors = []
+    real_open = dynamic_output.open_headless_scan_session
+
+    def opening(*args, **kwargs):
+        executors.append(kwargs["executor"])
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(dynamic_output, "open_headless_scan_session", opening)
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True)
+    for stem in _STEMS:
+        sidecar = _Sidecar(raw, TINY, stem)
+        for number in range(1, 6):
+            sidecar.frame(number)
+    executor, identity, events = _run_to_terminal(_intent(tmp_path, raw, cores=4), request_value=9551)
+    executor.close(identity)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+    assert executors == [1, 1, 1] and len(builds) == 1, (executors, builds)

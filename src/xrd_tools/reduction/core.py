@@ -5490,6 +5490,15 @@ class WarmIntegrators:
             )
             return None
 
+    def idle_under_latest(self, role: str) -> tuple[int, int]:
+        """(Idle integrators under ``role``'s most recently returned key, that family's measured table bytes, or 0
+        when it has not been measured)."""
+        with self._lock:
+            key = self._recent.get(role)
+            if key is None:
+                return 0, 0
+            return len(self._idle.get(key, ())), self._sizes.get(key[:2], 0)
+
     def keep_for_next_run(self) -> None:
         """A Run is over: keep the idle integrators under each role's most recently returned key, within the
         allowance, so the next Run's first series needs no build when nothing changed (its series then fit the store

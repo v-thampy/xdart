@@ -735,6 +735,24 @@ def _writer_source_snapshots(
     )
 
 
+#: A large detector's tables take seconds to build per worker (beamline 2026-10-23, Rayonix 4096^2 at 1-D 2000 and
+#: 2-D 1000x500: 2.17 GB, ~8 s to build against ~0.85 s to integrate a frame on that PC), so a short series is faster
+#: and steadier on the workers whose tables are already built: Cores 1 beat Cores 4 on its 3-5 frame scans.
+_LARGE_TABLE_BYTES = 1 << 30
+_LARGE_DETECTOR_PIXELS = 8_000_000
+_FRAMES_PER_COLD_WORKER = 16
+
+
+def _series_workers(granted: int, frames: int, warm: int, table_bytes: int, pixels: int) -> int:
+    """Workers a Standard series starts: all it was granted when its tables are cheap; when they are large (measured,
+    or before that a large detector), the workers whose tables are built, at least one, plus one more per
+    ``_FRAMES_PER_COLD_WORKER`` frames, enough to repay another build within the series."""
+    large = table_bytes >= _LARGE_TABLE_BYTES if table_bytes else pixels >= _LARGE_DETECTOR_PIXELS
+    if not large:
+        return granted
+    return max(1, min(granted, max(1, warm) + frames // _FRAMES_PER_COLD_WORKER))
+
+
 class DynamicOutputAdapter:
     def __init__(self, configuration, integrator_reuse: WarmIntegrators | None = None) -> None:
         self.configuration = configuration
@@ -1431,12 +1449,24 @@ class DynamicOutputAdapter:
             self._integrator_reuse.fit(workers, warm_integrator_allowance(
                 None if policy is None else policy.allocation, workers,
                 total_physical_ram_bytes() or windows_physical_ram_bytes()))
+            series_workers = workers
+            if not self.configuration.gi.enabled:
+                warm, table_bytes = self._integrator_reuse.idle_under_latest("standard")
+                series_workers = _series_workers(
+                    workers, len(write_labels), warm, table_bytes,
+                    0 if policy is None else int(policy.allocation.requirements.pixels),
+                )
+                if series_workers != workers:
+                    logger.debug(
+                        "[AUTO-WORKERS] %s: %d of %d workers (%d frames, %d with built tables, %s B tables)",
+                        target.name, series_workers, workers, len(write_labels), warm, table_bytes or "unmeasured",
+                    )
             session = open_headless_scan_session(
                 session_scan,
                 plan,
                 ring_geometry=ring_geometry,
                 sink=sink,
-                executor=workers,
+                executor=series_workers,
                 inflight_max=inflight_max,
                 gi_freeze_mode=(
                     "scout_union" if self.configuration.gi.enabled else None
