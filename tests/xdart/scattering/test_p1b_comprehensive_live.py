@@ -926,8 +926,6 @@ def test_p1b_b11_nonmonotonic_revision_preserves_durable_prefix(
 ) -> None:
     """B11: shrink/rewrite refuses without changing the durable prefix."""
 
-    from xrd_tools.io.append import AppendRefused
-
     _bridge_legacy_expected_target_state(monkeypatch)
     outcomes = {}
     for offset, kind in enumerate(("container", "flat"), start=1):
@@ -989,40 +987,37 @@ def test_p1b_b11_nonmonotonic_revision_preserves_durable_prefix(
             _grow_stack(source, 1)
         else:
             _write_tiff(source, 9)
-        revised = _wait_revision_outcome(
+        # Since 2026-10-23 a refused Live Append stops that output growing (published frames kept) instead of
+        # failing the Run; Stop then lists the refusal.
+        revised = _drain_until(
             executor,
-            initial,
-            expected_frames=expected_initial + 1,
+            lambda values: any(
+                "stopped growing: its Append was refused" in (event.detail or "") for event in values
+            ) or any(event.kind in _TERMINAL for event in values),
             timeout=30.0,
         )
-        terminal = next(
-            (event for event in revised if event.kind in _TERMINAL),
-            None,
-        )
+        blocked = any("stopped growing: its Append was refused" in (event.detail or "") for event in revised)
+        settled = _finish_live(executor, identity, prior=(*initial, *revised))
+        terminal = next((event for event in reversed(settled) if event.kind in _TERMINAL), None)
         outcomes[kind] = (
+            blocked,
             terminal,
             target.read_bytes() == before,
             _file_facts(tuple(output.rglob("iq_*.xye"))) == xye_before,
             all(store.is_persisted(label) for label, store in stores.items()),
         )
-        if terminal is None:
-            _finish_live(executor, identity, prior=(*initial, *revised))
-        else:
-            _finish_live(executor, identity, prior=revised)
 
     for kind, (
+        blocked,
         terminal,
         bytes_preserved,
         xye_preserved,
         receipts_preserved,
     ) in outcomes.items():
-        assert terminal is not None, f"{kind}: nonmonotonic revision was deferred"
-        assert terminal.kind is StandardEventKind.FAILED, kind
-        assert terminal.primary is not None, kind
-        assert terminal.primary.type_qualname in {
-            AppendRefused.__qualname__,
-            "AppendSourceGraphRefused",
-        }, kind
+        assert blocked, f"{kind}: nonmonotonic revision was not refused"
+        assert terminal is not None and terminal.kind is StandardEventKind.STOPPED, kind
+        assert any("image-member history" in warning or "source" in warning
+                   for warning in terminal.warnings), (kind, terminal.warnings)
         assert bytes_preserved and xye_preserved and receipts_preserved, kind
 
 

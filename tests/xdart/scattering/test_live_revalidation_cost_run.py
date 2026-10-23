@@ -702,14 +702,16 @@ def test_r3b_a_published_spec_row_or_file_header_rewrite_stops_its_output(tmp_pa
     assert _said(events, 'stopped growing') and _counted(tmp_path, 'calibrant_scan001')[0] == (1, 2, 3)
 
 
-#: Today's exact outcomes, frozen from the parent run at 8f4a48a3 (draft run dev02; see CHECKPOINT.md).
+#: Today's exact outcomes, frozen from the parent run at 8f4a48a3 (draft run dev02; see CHECKPOINT.md). Since
+#: 2026-10-23 a refused Live Append no longer fails the Run (beamline: a rewritten first image ended Live): that
+#: output stops growing with its published frames kept, Live keeps watching, and the Run's end lists the refusal.
 R3C_PARENT = (['STOPPED'], (1, 2, 3, 4), (0.0, 1.0, 2.0, 3.0), False)
+_REFUSED = 'scan_int1d.nexus stopped growing: its Append was refused; published frames kept'
 R3D_PARENT = {
-    'raw_rewrite': (['FAILED'], (1, 2, 3), False, ['same-extent source identity changed']),
-    'leaf_symlink_to_hardlink': (['FAILED'], (1, 2, 3), False, ['same-extent source identity changed']),
-    'regular_to_symlink': (['FAILED'], (1, 2, 3), False, ['source does not extend exact image-member history']),
+    case: (['STOPPED'], (1, 2, 3), True, [f'Stopped · 3 processed · 1 skipped · 0 pending · 4 discovered · {_REFUSED}'])
+    for case in ('raw_rewrite', 'leaf_symlink_to_hardlink', 'regular_to_symlink')
 }
-R3E_PARENT = (['FAILED'], (0, 1, 2, 3), ['source does not extend exact external-member history'])
+R3E_PARENT = (['STOPPED'], (0, 1, 2, 3), [f'Stopped · 1 processed · 0 skipped · 0 pending · 1 discovered · {_REFUSED}'])
 
 
 def test_r3c_under_auto_a_competing_sidecar_keeps_todays_selection(tmp_path, monkeypatch):

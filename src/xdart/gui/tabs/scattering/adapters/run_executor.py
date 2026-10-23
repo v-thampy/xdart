@@ -1435,6 +1435,33 @@ class StandardRunExecutor:
         run.live_blocked[target_key] = reason
         logger.warning("[LIVE] %s", reason)
 
+    def _skip_live_append(
+        self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused, *, constructed: bool,
+    ) -> None:
+        """Leave one Live output as it is after its Append refused: later polls skip its frames, the status names
+        it, and the Run's end lists the reason. A refusal during construction closes the source it opened."""
+        if constructed:
+            source_owner = run.source
+            if source_owner is not None:
+                close = getattr(source_owner, "close", None)
+                if callable(close):
+                    close()
+            run.source = None
+            run.scan = None
+            run.records = None
+            run.frames_by_label.clear()
+            run.current_total = 0
+            run.current_completed = 0
+            run.current_published = 0
+            run.current_file_total = 0
+            run.current_files_incremental = False
+        reason = detach_exception(error, "append").message
+        run.append_skips.append((str(target), reason))
+        run.live_blocked[target_key] = (
+            f"{Path(target).name} stopped growing: its Append was refused; published frames kept"
+        )
+        logger.warning("[APPEND-SKIPPED] output=%s reason=%s", target, reason)
+
     def _settle_predecessor(self, run, output, predecessor) -> None:
         result = output.finish_predecessor(predecessor)
         self._finish_display_projection(run)
@@ -2150,6 +2177,7 @@ class StandardRunExecutor:
                             run.live_proofs[target_key] = _live_proof(
                                 configuration, retained.decision.item.graph, seen, registry)
                             continue
+                constructing = False
                 try:
                     with _run_effect(run):
                         reprobe = (
@@ -2240,6 +2268,7 @@ class StandardRunExecutor:
                         )
                         try:
                             run.live_admission_proof = attempt.proof
+                            constructing = True
                             self._construct(
                                 run,
                                 item=item,
@@ -2271,6 +2300,17 @@ class StandardRunExecutor:
                             )
                         run.total += len(output.write_labels)
                         publish(force=True)
+                except AppendRefused as error:
+                    # One scan's Append refusal skips that scan: Live keeps watching the others and the end of the
+                    # Run lists it, as a directory Run does (beamline 2026-10-23: a first image rewritten after it
+                    # was reduced failed the whole Live Run).
+                    self._skip_live_append(run, group.target, target_key, error, constructed=constructing)
+                    skipped_paths.update(
+                        path for path in group.physical_paths
+                        if path not in processed_paths
+                    )
+                    publish(force=True)
+                    continue
                 except RuntimeError as error:
                     if (
                         run.stop_requested

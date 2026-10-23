@@ -189,12 +189,13 @@ def test_r6_a_raw_rewrite_with_its_row_rewritten_while_a_frame_waits_fails_on_ra
         _image(raw, 1, 0)  # point 1's image replaced
         _replace(spec, '0.0 100\n', '0.0 105\n')  # and its row rewritten
         released.set()
-        _wait(executor, events, _terminal, 20.)
+        _wait(executor, events, _stopped_growing, 20.)
     finally:
         released.set()
         terminal = _stop(executor, identity, events)
-    assert _kinds(terminal) == ['FAILED'], terminal
-    assert 'image-member history' in terminal[0][1], terminal
+    # The raw history still decides; since 2026-10-23 its refusal stops that output growing instead of failing Live.
+    assert _kinds(terminal) == ['STOPPED'], terminal
+    assert 'stopped growing: its Append was refused' in terminal[0][1], terminal
 
 
 def _hold_inside_validation(monkeypatch, paths):

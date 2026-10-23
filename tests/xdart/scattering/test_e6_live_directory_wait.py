@@ -1118,19 +1118,26 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
         fabio.tifimage.TifImage(
             data=np.full((4, 4), 2, dtype=np.uint16)
         ).write(str(late))
+        # The refused Append no longer fails the Run (beamline 2026-10-23): this output stops growing with its
+        # published frame kept, Live keeps watching, and Stop lists the refusal.
+        refused = f"{Path(target).name} stopped growing: its Append was refused; published frames kept"
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             events.extend(executor.drain_events())
-            failed = [event for event in events
-                      if event.kind is StandardEventKind.FAILED]
-            if failed:
+            if any(refused in (event.detail or "") for event in events):
                 break
             time.sleep(0.01)
-        assert len(failed) == 1
-        assert failed[0].primary.type_qualname == "AppendRefused"
-        assert failed[0].primary.message.startswith(
-            "source does not extend exact image-member history: "
-        )
+        assert any(refused in (event.detail or "") for event in events)
+        assert not any(event.kind is StandardEventKind.FAILED for event in events)
+        executor.stop(identity)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not any(
+                event.kind is StandardEventKind.STOPPED for event in events):
+            events.extend(executor.drain_events())
+            time.sleep(0.01)
+        stopped, = (event for event in events if event.kind is StandardEventKind.STOPPED)
+        assert [warning.split(": ", 1)[1].split(": ", 1)[0] for warning in stopped.warnings] == [
+            "source does not extend exact image-member history"]
         assert processed == [(late, (1,))]
         assert executor.processed_live_revisions(identity) == (original,)
         assert ready_attempts[-1].decision.item.source_stamp != (
