@@ -12,6 +12,15 @@
   next Append skips it and says to use Replace, which rebuilds it from the
   images; if the output can no longer be opened at all, move or delete it, then
   run again. Stop is not a failure: the frames added before it are kept.
+- **A Run of many short series no longer rebuilds pyFAI's integration tables for
+  each one:** xdart builds them once per Run and reuses them for every series
+  with the same calibration, energy, mask and integration settings, in directory
+  and Live runs alike. Each series used to rebuild them, which for a large
+  detector took far longer than integrating the frame itself (a 4096 x 4096
+  Rayonix frame: 2.7 s to build, 0.13 s to integrate, on a fast Mac). Results
+  are identical. This covers standard integration only: grazing-incidence runs,
+  energy scans, and calibrations with the sensor parallax correction, a spline
+  or a detector flat field still build them for each series.
 
 ### Fixes
 

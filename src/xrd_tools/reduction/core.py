@@ -10,6 +10,8 @@ integration loops itself.
 from __future__ import annotations
 
 import copy
+import dataclasses
+import hashlib
 import logging
 import os
 import queue
@@ -3439,6 +3441,9 @@ class ReductionSession:
     batch_settlement_authority_cb: (
         Callable[[WriterBatchSettlementReceipt], None] | None
     ) = None
+    # The Run's WarmIntegrators, shared by its sessions: a session borrows worker integrators whose tables are built
+    # and gives them back when it finishes cleanly. None builds them per session.
+    integrator_reuse: WarmIntegrators | None = None
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -3552,6 +3557,12 @@ class ReductionSession:
         """Whether no timed-out writer can still invoke the sink."""
         return self._writer_thread is None or not self._writer_thread.is_alive()
 
+    def _fit_integrator_reuse(self) -> None:
+        """Bound the Run's idle integrators by this session's granted workers, before any worker borrows one."""
+        reuse = self._integrators.reuse
+        if reuse is not None and self._owns_worker and self._worker is not None:
+            reuse.fit(getattr(self._worker, "_max_workers", None) or 1)
+
     def _shutdown_worker(self, *, wait: bool = True) -> None:
         if self._owns_worker and self._worker is not None:
             _admission_trace("pool_shutdown_enter", wait=wait, owned=True)
@@ -3623,6 +3634,8 @@ class ReductionSession:
             fi=fi,
             initial_incident_angle=self._initial_incident_angle,
             support=_support_capture(self.angular_support),
+            # only a session that owns (and so joins) its worker pool can hand integrators back
+            reuse=self.integrator_reuse if _owns_its_pool(self.executor, self.execution) else None,
         )
         self.integrator_provider_builds = 1
         # Validate BEFORE acquiring resources: sink.begin() opens an h5 handle
@@ -3646,6 +3659,7 @@ class ReductionSession:
                 )
         try:
             self._worker, self._owns_worker = _coerce_executor(self.executor)
+            self._fit_integrator_reuse()
             self._sink.begin(self.scan, self.plan)
             self._bind_angular_support()
             self._started = True
@@ -3786,6 +3800,7 @@ class ReductionSession:
             from xrd_tools.core import reduction_worker_cap
             self._worker = ThreadPoolExecutor(max_workers=reduction_worker_cap())
             self._owns_worker = True
+            self._fit_integrator_reuse()
         n_workers = getattr(self._worker, "_max_workers", None) or 4
         bound = (
             self.inflight_max
@@ -4502,8 +4517,13 @@ class ReductionSession:
                         _admission_trace("sink_finish_end", on_failure=True)
         finally:
             # A timed-out writer can own stalled futures; never re-hang here.
+            joined = self._owns_worker and self._worker is not None and not _writer_timed_out
             self._shutdown_worker(wait=not _writer_timed_out)
             self._finished = True
+        if joined and self._current_failure() is None:
+            # compute shutdown succeeded (every worker joined, nothing failed; publication may still fail later, which
+            # stops the Run): the Run's next series may reuse their integrators
+            self._integrators.give_back()
 
         _emit(
             self.progress_cb,
@@ -5385,6 +5405,106 @@ def _on_energy_scan_grid(item: Any, grid: Mapping[str, Any] | None, key: str) ->
     return replace(item, radial_range=tuple(map(float, grid[key])))
 
 
+class WarmIntegrators:
+    """A Run's store of worker integrators whose Run mask is bound and whose pyFAI tables are built.
+
+    Each series builds a new integrator and each worker deep-copies it, and pyFAI's deepcopy drops the tables, so
+    without this store every worker of every series rebuilds them (seconds for a large detector, against a fraction
+    of a second to integrate a frame). A session lends one to a worker at a time and gives them back once its workers
+    have all stopped; the next series with the same key borrows them. It holds integrators for one key, at most
+    ``capacity`` (the Run's worker count).
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, int(limit))
+        self._lock = threading.Lock()
+        self._key: Any = None
+        self._free: list[Any] = []
+
+    def fit(self, limit: int) -> None:
+        """Keep at most ``limit`` (the current session's granted workers) idle integrators."""
+        with self._lock:
+            self._limit = max(1, int(limit))
+            del self._free[self._limit:]
+
+    def borrow(self, key: Any) -> Any:
+        """One integrator built under ``key`` (no longer in the store), or None. A different key first drops the
+        idle integrators, so they never coexist with the ones about to be built."""
+        with self._lock:
+            if self._key != key:
+                self._key, self._free = key, []
+            return self._free.pop() if self._free else None
+
+    def give_back(self, key: Any, integrator: Any) -> None:
+        """Keep ``integrator`` for the next borrower of ``key``; integrators of another key are dropped."""
+        with self._lock:
+            if self._key != key:
+                self._key, self._free = key, []
+            if len(self._free) < self._limit:
+                self._free.append(integrator)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._key, self._free = None, []
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._free)
+
+
+def _bound_detector_mask(detector_mask: Any, run_mask: np.ndarray | None) -> np.ndarray | None:
+    """The mask ``standard_with_run_mask`` binds into a worker integrator's detector."""
+    if detector_mask is not None:
+        detector_mask = np.asarray(detector_mask, dtype=bool)
+        return detector_mask if run_mask is None else np.logical_or(run_mask, detector_mask)
+    return None if run_mask is None else np.asarray(run_mask, dtype=bool)
+
+
+def _plain(value: Any) -> Any:
+    """``value`` as an exact, hashable key part; TypeError for an array or object a key cannot hold exactly."""
+    if value is None or isinstance(value, (bool, int, float, str, Enum)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (tuple, list)):
+        return tuple(_plain(item) for item in value)
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(name), _plain(item)) for name, item in value.items()))
+    raise TypeError(f"no exact key part for {type(value).__name__}")
+
+
+def _warm_integrator_key(
+    ai: Any, bound_mask: np.ndarray | None, shape: tuple[int, int], plan: ReductionPlan,
+) -> tuple[Any, ...] | None:
+    """What makes a bound worker integrator's tables reusable, all exact: the integrator's and its detector's own
+    state (pyFAI's ``_IMMUTABLE_ATTRS``: geometry, wavelength, chi discontinuity, solid-angle and transmission
+    settings; pixel size, binning, orientation, mask and correction checksums) and detector configuration, the image
+    shape, the mask bound into its detector, and the plan's integration settings. None (no reuse) for what the key
+    cannot hold: the sensor parallax correction, a spline, the detector's own flat field, dark current or pixel
+    corners, or a setting that is not a plain value."""
+    try:
+        detector = ai.detector
+        if (getattr(ai, "parallax", None) is not None or detector.spline is not None
+                or detector.flatfield is not None or detector.darkcurrent is not None
+                or detector._pixel_corners is not None):
+            return None
+        state = (
+            type(ai).__qualname__,
+            tuple((name, _plain(getattr(ai, name))) for name in type(ai)._IMMUTABLE_ATTRS),
+            type(detector).__qualname__,
+            tuple((name, _plain(getattr(detector, name))) for name in type(detector)._IMMUTABLE_ATTRS),
+            _plain(detector.get_config()),
+            tuple(None if item is None else tuple((part.name, _plain(getattr(item, part.name)))
+                                                   for part in dataclasses.fields(item))
+                  for item in (plan.integration_1d, plan.integration_2d)),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+    mask = None if bound_mask is None else hashlib.blake2b(
+        np.packbits(bound_mask).tobytes(), digest_size=16).hexdigest()
+    return (*state, shape, mask)
+
+
 class _ReductionIntegratorProvider:
     """Per-thread integrator cache for executor-backed reductions."""
 
@@ -5397,6 +5517,7 @@ class _ReductionIntegratorProvider:
         fi: Any,
         initial_incident_angle: float | None,
         support: Any = None,
+        reuse: WarmIntegrators | None = None,
     ) -> None:
         self.scan = scan
         self.plan = plan
@@ -5405,6 +5526,11 @@ class _ReductionIntegratorProvider:
         self.initial_incident_angle = initial_incident_angle
         #: The Run's angular support capture (one per Run, shared by every worker), or None.
         self.support = support
+        #: The Run's store of built worker integrators (``WarmIntegrators``), or None to build them per session.
+        self.reuse = reuse
+        self._bound: list[tuple[Any, Any]] = []  # (key, integrator): what this session gives back to ``reuse``
+        self._bound_lock = threading.Lock()
+        self._reuse_keys: dict[tuple[int, int], tuple[Any, Any]] = {}  # shape -> (Run mask, key)
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
         # An energy scan reduces each frame at its own wavelength on a private integrator;
@@ -5513,6 +5639,33 @@ class _ReductionIntegratorProvider:
             units.extend((two_d.unit, "chi_deg"))
         return tuple(dict.fromkeys(units))
 
+    def _reuse_key(self, run_mask: np.ndarray | None, shape: tuple[int, int]) -> tuple[Any, ...] | None:
+        """The key this session's bound worker integrators are kept under in the Run's store, or None (no reuse):
+        only for a standard integration at one wavelength, cloned from an accepted integrator. Computed once per
+        shape (a session's Run mask is one object per shape), under ``_PYFAI_COLD_GEOMETRY_LOCK`` (it reads the
+        accepted integrator's detector mask)."""
+        if self.reuse is None or self.ai is None or self._frame_wavelengths is not None:
+            return None
+        cached = self._reuse_keys.get(shape)
+        if cached is not None and cached[0] is run_mask:
+            return cached[1]
+        try:
+            bound_mask = _bound_detector_mask(self.ai.detector.mask, run_mask)
+        except (AttributeError, TypeError, ValueError):
+            key = None
+        else:
+            key = _warm_integrator_key(self.ai, bound_mask, shape, self.plan)
+        self._reuse_keys[shape] = (run_mask, key)
+        return key
+
+    def give_back(self) -> None:
+        """Hand this session's bound worker integrators to the Run's store, once its workers have all stopped."""
+        with self._bound_lock:
+            bound, self._bound = self._bound, []
+        if self.reuse is not None:
+            for key, ai in bound:
+                self.reuse.give_back(key, ai)
+
     def standard_with_run_mask(
         self,
         run_mask: np.ndarray | None,
@@ -5548,44 +5701,40 @@ class _ReductionIntegratorProvider:
             )
 
         with _PYFAI_COLD_GEOMETRY_LOCK:
+            key = self._reuse_key(run_mask, shape)
+            # one the Run already built (mask bound, tables in place) under this exact key, else a new one
+            ai = None if key is None else self.reuse.borrow(key)
             try:
-                ai = self._new_standard()
-                if not _stock_pyfai_detector_mask_semantics(ai, shape):
-                    unbound = ai if self.ai is None else self._unbound_standard()
-                    return self._retain_unbound_standard(unbound, run_mask, shape)
-                detector = ai.detector
-                detector_mask = detector.mask
-                if detector_mask is not None:
-                    detector_mask = np.asarray(detector_mask, dtype=bool)
-                    bound_mask = (
-                        detector_mask
-                        if run_mask is None
-                        else np.logical_or(run_mask, detector_mask)
-                    )
-                else:
-                    bound_mask = (
-                        None if run_mask is None else np.asarray(run_mask, dtype=bool)
-                    )
-                if run_mask is not None:
-                    detector.mask = bound_mask
-                ai.reset_engines(collect_garbage=False)
-                if run_mask is not None:
-                    admitted = np.asarray(detector.mask, dtype=bool)
-                    if (
-                        admitted.shape != shape
-                        or not np.array_equal(admitted, bound_mask)
-                    ):
-                        unbound = self._unbound_standard()
-                        return self._retain_unbound_standard(
-                            unbound,
-                            run_mask,
-                            shape,
-                        )
-                self._warm_standard_centers(ai, shape)
+                if ai is None:
+                    ai = self._new_standard()
+                    if not _stock_pyfai_detector_mask_semantics(ai, shape):
+                        unbound = ai if self.ai is None else self._unbound_standard()
+                        return self._retain_unbound_standard(unbound, run_mask, shape)
+                    detector = ai.detector
+                    bound_mask = _bound_detector_mask(detector.mask, run_mask)
+                    if run_mask is not None:
+                        detector.mask = bound_mask
+                    ai.reset_engines(collect_garbage=False)
+                    if run_mask is not None:
+                        admitted = np.asarray(detector.mask, dtype=bool)
+                        if (
+                            admitted.shape != shape
+                            or not np.array_equal(admitted, bound_mask)
+                        ):
+                            unbound = self._unbound_standard()
+                            return self._retain_unbound_standard(
+                                unbound,
+                                run_mask,
+                                shape,
+                            )
+                    self._warm_standard_centers(ai, shape)
             except (AttributeError, TypeError, ValueError):
                 unbound = self._unbound_standard()
                 return self._retain_unbound_standard(unbound, run_mask, shape)
 
+        if key is not None:
+            with self._bound_lock:
+                self._bound.append((key, ai))
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, True)
         self._local.alternate = None  # a new binding retires the previous alternate
@@ -5653,6 +5802,14 @@ class _ReductionIntegratorProvider:
                 )
             self._local.fi = fi
         return fi
+
+def _owns_its_pool(executor: Any | None, execution: str) -> bool:
+    """Whether a session with this ``executor`` builds (and so shuts down and joins) its own worker pool: a worker
+    count or True, or none at all for streaming, which then builds a default one."""
+    if executor is True or (isinstance(executor, int) and not isinstance(executor, bool)):
+        return True
+    return executor in (None, False) and execution == "streaming"
+
 
 def _coerce_executor(executor: Any | None):
     if executor is None or executor is False:

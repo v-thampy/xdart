@@ -31,7 +31,7 @@ from xrd_tools.reduction import (
     NexusSink,
     TransactionalXYESink,
 )
-from xrd_tools.reduction.core import result_1d_has_sigma
+from xrd_tools.reduction.core import WarmIntegrators, result_1d_has_sigma
 from xrd_tools.session import (
     DynamicAccountingLimits,
     DynamicFrameIdentity,
@@ -747,6 +747,8 @@ class DynamicOutputAdapter:
         self._activating = False
         self._stop_requested = False
         self.resource_facts: tuple[HeavyResidencyFact, ...] = ()
+        # the Run's built worker integrators, which its series borrow instead of rebuilding pyFAI's tables
+        self._integrator_reuse = WarmIntegrators(max(1, int(configuration.max_cores)))
 
     @staticmethod
     def _discard_identity(values: list[Any], owner: Any) -> None:
@@ -1444,6 +1446,7 @@ class DynamicOutputAdapter:
                     pipeline_v2.semantic_checkpoint_frame_cap
                     if pipeline_v2 is not None else None
                 ),
+                integrator_reuse=self._integrator_reuse,
             )
             if loaded_scout_frame is not None:
                 loaded_scout_frame.image = None
@@ -1717,6 +1720,12 @@ class DynamicOutputAdapter:
         return None if graph is None else self._finish_transition(graph, stopped=stopped)
 
     def finish_all(self, *, stopped: bool = False) -> tuple[object, ...]:
+        try:
+            return self._finish_all(stopped=stopped)
+        finally:
+            self._integrator_reuse.clear()  # the Run is over, even a failed one: release its built integrators
+
+    def _finish_all(self, *, stopped: bool) -> tuple[object, ...]:
         results = []
         primary = None
         try:
