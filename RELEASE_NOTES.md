@@ -10,6 +10,9 @@
   so that output's saved frames were numbered after the new frames rather than
   after every frame already shown. They now take the next free numbers; frames
   already shown keep theirs.
+- **Overlay keeps the curves when you narrow a selection:** in 1.2.2 and 1.2.3,
+  choosing fewer frames of the same processed file in Overlay could leave the plot
+  empty once a later repaint arrived. The remaining curves now stay drawn.
 - **Append refusal says what changed:** "same-extent source identity changed" now
   names the source details that differ from the processed file's record (for
   example a content digest or a modification time, with the difference). The

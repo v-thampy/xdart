@@ -661,6 +661,9 @@ class ScientificView(QtWidgets.QFrame):
         self._label_indices: dict[int, list[int]] = {}
         self._selector_operations = 0
         self._trace_history_scope: tuple[object, ...] | None = None
+        # The cross-file comparison key lives apart from the history scope, so
+        # a plain repaint after a comparison keeps the selected rows (1.2.4).
+        self._browse_comparison_scope: tuple[object, ...] | None = None
         self._trace_selection_keys: tuple[DisplayFrameKey, ...] = ()
         self._trace_history_keys: tuple[DisplayFrameKey, ...] = ()
         self._trace_row_count = 0
@@ -964,6 +967,7 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_history_by_identity.clear()
         self._trace_history_keys = ()
         self._trace_history_scope = None
+        self._browse_comparison_scope = None
         self.browse_comparison_notice = ""
         self._clear_trace_aggregate_fold()
 
@@ -2289,7 +2293,7 @@ class ScientificView(QtWidgets.QFrame):
             ("_curve_item_contracts", {}), ("_rendered_axis_labels", None),
             ("_trace_row_count", 0),
             ("_waterfall_y_values", ()), ("_waterfall_source_keys", ()), ("_label_indices", {}),
-            ("_heavy_available", frozenset()), ("_trace_history_scope", None), ("_pinned_trace_scope", None),
+            ("_heavy_available", frozenset()), ("_trace_history_scope", None), ("_browse_comparison_scope", None), ("_pinned_trace_scope", None),
             ("_rendered_plot_options", None), ("_rendered_overlay_step", None), ("_trace_history_by_identity", {}),
             ("_pinned_trace_by_id", {}), ("_rendered_plot_mode", ""), ("_bottom_waterfall_active", False),
             ("_rendered_browse_science_contract", None),
@@ -2865,7 +2869,7 @@ class ScientificView(QtWidgets.QFrame):
             logging.getLogger(__name__).warning(
                 "browse_comparison artifact=%r current_artifact=%r history_owner=%r snapshot=%s",
                 state.browse_artifact, getattr(navigation.current, "artifact", None),
-                self._trace_history_scope[0] if self._trace_history_scope else None,
+                self._browse_comparison_scope is not None,
                 browse_snapshot is not None,
             )
         comparison = bool(
@@ -2881,8 +2885,7 @@ class ScientificView(QtWidgets.QFrame):
             and not state.slice_enabled
         )
         if (comparison and browse_snapshot is None and not state.traces
-                and self._trace_history_scope is not None
-                and self._trace_history_scope[0] == "browse-comparison"):
+                and self._browse_comparison_scope is not None):
             # A new current file is loading. Only detached 1-D history survives;
             # the ordinary reconciliation above retires old raw/cake buffers.
             return
@@ -2988,6 +2991,7 @@ class ScientificView(QtWidgets.QFrame):
             source_keys = tuple(row_key for row_key, _trace in rows)
             render_contract = (
                 self._trace_history_scope,
+                self._browse_comparison_scope,
                 state.plot_options,
                 state.color_map,
                 state.norm_channel,
@@ -3484,7 +3488,7 @@ class ScientificView(QtWidgets.QFrame):
                  state.plot_options.waterfall_step)
         foreign = tuple(frame for frame in self._trace_history_keys
                         if frame.artifact != state.browse_artifact)
-        if self._trace_history_scope != scope:
+        if self._browse_comparison_scope != scope:
             foreign = ()
         retained = tuple(self._trace_history_by_identity[id(frame)] for frame in foreign
                          if id(frame) in self._trace_history_by_identity)
@@ -3532,7 +3536,8 @@ class ScientificView(QtWidgets.QFrame):
             wanted = {id(row[1].frame) for row in (*rows[:-1], current_row)}
             rows = tuple(row for row in all_rows if id(row[1].frame) in wanted)
         self._trace_history_by_identity = {id(trace.frame): trace for _, trace in rows}
-        self._trace_history_scope = scope
+        self._trace_history_scope = self._trace_history_base_scope(state)
+        self._browse_comparison_scope = scope
         self._trace_history_keys = logical
         self._trace_selection_keys = snapshot.logical_frames
         positions = {id(frame): index + 1 for index, frame in enumerate(logical)}
@@ -3543,14 +3548,9 @@ class ScientificView(QtWidgets.QFrame):
                        waterfall_active=waterfall_should_be_active(
                            state.plot_mode, len(logical), was_active=self._bottom_waterfall_active))
 
-    def _merge_trace_history(
-        self,
-        state: ScientificProjection,
-        navigation: FrameNavigationProjection,
-    ) -> tuple[TraceProjection, ...]:
-        """Merge exact selected identities into detached 1-D history."""
-
-        scope = (
+    @staticmethod
+    def _trace_history_base_scope(state: ScientificProjection) -> tuple[object, ...]:
+        return (
             # Plot mode changes only the presentation of these numeric trace
             # projections.  Keep the detached history warm across
             # Single/Overlay/Average/Sum switches.
@@ -3568,12 +3568,24 @@ class ScientificView(QtWidgets.QFrame):
                 state.norm_channel,
             ),
         )
+
+    def _merge_trace_history(
+        self,
+        state: ScientificProjection,
+        navigation: FrameNavigationProjection,
+    ) -> tuple[TraceProjection, ...]:
+        """Merge exact selected identities into detached 1-D history."""
+
+        scope = self._trace_history_base_scope(state)
         selected = navigation.selected
         viewer_single = (
             state.processing_mode == "1D Viewer"
             and state.plot_mode == "Single"
         )
         same_scope = scope == self._trace_history_scope
+        # An ordinary merge ends any cross-file comparison: its foreign rows are
+        # pruned below, and the loading shortcut must not outlive it.
+        self._browse_comparison_scope = None
         if not same_scope:
             self._trace_history_by_identity.clear()
             self._trace_aggregate_fold = None
