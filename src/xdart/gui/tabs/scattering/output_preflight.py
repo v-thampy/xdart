@@ -1395,6 +1395,39 @@ def materialize_live_directory_group(
     )
 
 
+def already_processed_append(receipt: AdmissionReceipt, entry: DeferredDirectoryEntry):
+    """A finite directory Append's scan that its output already holds, recognized from the Run's directory listing
+    and the output's committed record, without reading the scan again: its ``CommittedAppendCoverage``, or None to
+    send it the full way (maintainer, 2026-10-23: "If something has already been processed, it should be skipped
+    anyway"; Codex's design review DESIGN-append-smb-125). TIFF images only; Live, other formats, new or renamed
+    files and a file whose size or time changed all go the full way."""
+    configuration = receipt.candidate._configuration
+    if (
+        configuration is None
+        or configuration.output_mode != "Append"
+        or configuration.live_mode
+        or configuration.background.mode != "None"
+        or entry.skip_reason
+        or any(candidate.adapter_id != "image_file" for candidate in entry.candidates)
+    ):
+        return None
+    from xrd_tools.io.append import committed_append_coverage, science_fingerprint
+    from .adapters.dynamic_output import _mode_tokens, _science_projection
+    return committed_append_coverage(
+        entry.target,
+        entry="entry",
+        source_base=configuration.project_root or "",
+        science_fingerprint=science_fingerprint(
+            _science_projection(configuration, receipt.candidate.processing_mapping())
+        ),
+        modes=_mode_tokens(configuration),
+        members=tuple(
+            (candidate.path, candidate.size, candidate.mtime_ns)
+            for candidate in entry.candidates
+        ),
+    )
+
+
 def materialize_deferred_output(
     receipt: AdmissionReceipt,
     session: DirectoryIndexSession,

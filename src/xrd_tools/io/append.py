@@ -979,6 +979,61 @@ def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -
         lineage.get("science_fingerprint", ""), tuple(modes), source, labels,
     )
     return AppendCommittedPrefix(_normalize(handle.filename), intent, _json(lineage))
+@dataclass(frozen=True)
+class CommittedAppendCoverage:
+    """A committed Append output that already holds every frame of a scan: its committed labels and its recorded
+    wavelength in metres (None when it records none)."""
+    labels: tuple[int, ...]
+    wavelength_m: float | None
+
+
+def committed_append_coverage(
+    target: str | Path,
+    *,
+    entry: str,
+    source_base: str,
+    science_fingerprint: str,
+    modes: tuple[str, ...],
+    members: tuple[tuple[str | Path, int, int], ...],
+) -> CommittedAppendCoverage | None:
+    """Whether ``target``'s committed Append already holds a scan whose image files are ``members`` (path, size,
+    mtime_ns), under this entry, source base, science fingerprint and modes: the same files at the same sizes and
+    times, one committed frame for each, with every committed row present in every mode.
+
+    A small metadata read, with no source capture, intensity read or content hash (maintainer, 2026-10-23: "If
+    something has already been processed, it should be skipped anyway"; Codex's design review
+    DESIGN-append-smb-125). None sends the scan the full way: an absent, pending, dimension-replaced or unfamiliar
+    output; other files, sizes or times; point groups or external members; or another identity.
+    """
+    try:
+        with h5py.File(target, "r") as handle:
+            config = handle.get(f"{entry}/reduction/config")
+            if isinstance(config, h5py.Group) and any(
+                f"dimension_replacement_{dimension}" in config for dimension in ("1d", "2d")
+            ):
+                return None
+            prefix = decode_committed_append_prefix(handle, entry=entry)
+            from xrd_tools.io.browse_presentation import _monochromator_wavelength_m
+            wavelength_m = _monochromator_wavelength_m(handle[entry], entry, scalar_only=True)
+    except Exception:  # anything this reader cannot vouch for goes the full way
+        return None
+    intent = prefix.intent
+    expected = {_normalize(path): (int(size), int(mtime_ns)) for path, size, mtime_ns in members}
+    committed = {member.path: (int(member.size), int(member.mtime_ns)) for member in intent.source.image_members}
+    if (
+        intent.entry != entry
+        or intent.source_base != _normalize_base(source_base)
+        or intent.science_fingerprint != science_fingerprint
+        or tuple(intent.modes) != tuple(modes)
+        or intent.source.external_members
+        or len(expected) != len(members)
+        or committed != expected
+        or len(intent.labels) != len(members)
+    ):
+        return None
+    return CommittedAppendCoverage(tuple(intent.labels), wavelength_m)
+
+
 def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix: AppendCommittedPrefix | None = None) -> AppendDecision:
     target = Path(target)
     try:
@@ -1236,10 +1291,12 @@ __all__ = [
     "AppendRefused",
     "AppendSource",
     "AppendSourceGraphRefused",
+    "CommittedAppendCoverage",
     "LINEAGE_DATASET",
     "LINEAGE_VERSION",
     "begin_same_run_lineage",
     "commit_append_lineage",
+    "committed_append_coverage",
     "decode_committed_append_prefix",
     "decode_replacement_lineage",
     "extend_same_run_lineage",

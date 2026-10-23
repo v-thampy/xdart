@@ -350,11 +350,9 @@ def test_r10_a_saved_live_output_replays_unchanged_inputs_and_refuses_after_grow
     before = artifact.read_bytes()
     with pytest.raises(ValueError, match='REVISION'):
         _reintegrate(tmp_path, raw, artifact)
-    # A directory Append skips the scan it may not extend and finishes the rest (maintainer, 2026-10-23); the
-    # end of the run names the refusal, and the saved output is untouched.
+    # Its images unchanged, a directory Append takes the scan as already processed (maintainer, 2026-10-23: "If
+    # something has already been processed, it should be skipped anyway"): no warning, the saved output untouched.
     skipped = []
-    refused = _append(tmp_path, raw, 5212, warnings=skipped)
-    assert _kinds(refused) == ['FINISHED'] and ' skipped' in refused[0][1], refused
-    assert len(skipped) == 1 and artifact.name in skipped[0], skipped
-    assert 'same-extent source identity changed' in skipped[0], skipped
+    again = _append(tmp_path, raw, 5212, warnings=skipped)
+    assert _kinds(again) == ['FINISHED'] and skipped == [], (again, skipped)
     assert artifact.read_bytes() == before

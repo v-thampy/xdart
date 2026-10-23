@@ -84,7 +84,7 @@ from ..output_preflight import (
     _background_frame_fact, _merge_background_binding,
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
-    native_int_reduction_plan, materialize_deferred_output,
+    native_int_reduction_plan, materialize_deferred_output, already_processed_append,
     live_directory_groups, materialize_live_directory_group, observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
@@ -1632,8 +1632,8 @@ class StandardRunExecutor:
                 ),
                 None,
             )
-            run.display.configure(
-                partition_count=run.pending_partition_count,
+            self._configure_display(
+                run,
                 npt=npt,
                 frame_bytes=(
                     descriptor_bytes
@@ -1735,6 +1735,14 @@ class StandardRunExecutor:
                 run, owner, source_path=str(source_spec.uri)
             )
         return run
+
+    @staticmethod
+    def _configure_display(run: _StandardRun, *, npt: int, frame_bytes: int | None) -> None:
+        """The Run's one display configuration, at its first output: a constructed one, after its Background
+        qualification, or an already-processed scan's presentation, which has no Background."""
+        run.display.configure(
+            partition_count=run.pending_partition_count, npt=npt, frame_bytes=frame_bytes,
+        )
 
     @staticmethod
     def _seed_persisted_prefix_navigation(
@@ -2340,10 +2348,25 @@ class StandardRunExecutor:
             if run.stop_requested:
                 stopped = True
                 break
+            started = monotonic()
             try:
                 self._release_predecessor_before_target(
                     run, entry.target,
                 )
+                completed = already_processed_append(receipt, entry)
+                if completed is not None:
+                    stopped = self._present_already_processed(
+                        run, deferred, entry, completed, claimed_files,
+                        candidate_owners=candidate_owners,
+                        output_index=output_index,
+                    )
+                    logger.debug(
+                        "[APPEND-SCAN] output=%s already processed (%.0f ms)",
+                        entry.target, 1000 * (monotonic() - started),
+                    )
+                    if stopped:
+                        break
+                    continue
                 decision, _ready_files, skipped_files = (
                     materialize_deferred_output(
                         receipt,
@@ -2403,12 +2426,14 @@ class StandardRunExecutor:
             run.current_files_incremental = (
                 item.source_spec.kind is SourceKind.TIFF_SERIES
             )
+            admitted = monotonic()
             self._construct(
                 run,
                 item=item,
                 labels=decision.labels,
                 decision=decision,
             )
+            constructed = monotonic()
             run.completed += run.current_completed
             self._events.put(StandardRunEvent(
                 run.identity,
@@ -2422,6 +2447,11 @@ class StandardRunExecutor:
                 **_directory_event_fields(run),
             ))
             stopped = self._execute_current(run, construct=False) or stopped
+            logger.debug(
+                "[APPEND-SCAN] output=%s frames=%d admit=%.0f ms construct=%.0f ms run=%.0f ms",
+                item.target, len(decision.labels), 1000 * (admitted - started),
+                1000 * (constructed - admitted), 1000 * (monotonic() - constructed),
+            )
             if run.current_files_incremental:
                 run.files_processed += min(
                     run.current_file_total,
@@ -2450,6 +2480,95 @@ class StandardRunExecutor:
                 run.files_discovered - run.files_processed,
             )
         return stopped
+
+    def _present_already_processed(
+        self,
+        run: _StandardRun,
+        deferred: DeferredDirectoryPlan,
+        entry,
+        completed,
+        claimed_files: set[Path],
+        *,
+        candidate_owners: dict[str, int],
+        output_index: int,
+    ) -> bool:
+        """A scan its output already holds, shown as an Append no-op shows it (its saved frames in navigation, its
+        files counted processed) without reading the scan again: no source, graph, writer or warning
+        (``already_processed_append``). Returns whether Stop was requested."""
+        configuration = run.configuration
+        labels = tuple(completed.labels)
+        first = entry.candidates[0]
+        run.current_total = len(labels)
+        run.total += run.current_total
+        run.current_file_total = _claim_physical_files(
+            tuple(candidate.path for candidate in entry.candidates),
+            deferred.discovered_paths,
+            claimed_files,
+            candidate_owners=candidate_owners,
+            output_index=output_index,
+        )
+        run.current_files_incremental = True
+        run.artifact = entry.target
+        run.session = None  # as an Append no-op's dormant output leaves it
+        plan = native_int_reduction_plan(configuration, companion_modes_2d=True)
+        admission = None if run.resources is None else run.resources.admission
+        assets = None if admission is None else admission.scientific_assets
+        try:
+            npt = int(configuration.bai_1d_args.get("npt", 0))
+        except (TypeError, ValueError):
+            npt = 0
+        run.display.set_factories(FrameRecordStore, PublicationStore)
+        if not run.display.configured:
+            self._configure_display(run, npt=npt, frame_bytes=None)
+        owner = run.display.artifacts.get(str(entry.target))
+        newly_adopted_owner = owner is None
+        if owner is None:
+            from xrd_tools.sources.adapters import get_adapter
+            owner = run.display.add_artifact(
+                entry.target,
+                get_adapter(first.adapter_id).scan_name(first.path),
+                mask=None if assets is None else assets.mask,
+                mask_saturation=bool(getattr(plan, "mask_saturation", False)),
+                saturation=getattr(plan, "saturation", None),
+                threshold_min=plan.threshold_min,
+                threshold_max=plan.threshold_max,
+                measurement_mode="GI" if configuration.gi.enabled else "Standard",
+                gi_incidence_motor=configuration.gi.incidence_motor if configuration.gi.enabled else "",
+                gi_resolved_motor=configuration.gi.effective_motor if configuration.gi.enabled else "",
+                gi_mode_1d=configuration.gi.mode_1d if configuration.gi.enabled else "",
+                gi_mode_2d=configuration.gi.mode_2d if configuration.gi.enabled else "",
+                source_base=configuration.project_root or None,
+                wavelength_m=completed.wavelength_m,  # the output's own, as it was processed
+            )
+        run.records = owner.records
+        run.display.bind_checkpoint_hydration(owner)
+        run.current_completed = run.current_total
+        run.current_published = run.current_completed
+        run.current_epoch_published = 0
+        self._seed_persisted_prefix_navigation(run, owner, labels, newly_adopted=newly_adopted_owner)
+        self._adopt_acquisition_context(run, owner, source_path=str(first.path))
+        run.completed += run.current_completed
+        for finished in (False, True):
+            if finished:
+                if run.artifact not in run.artifacts:
+                    run.artifacts.append(run.artifact)
+                run.display.mark_hydration_closed(owner)
+                run.records = None
+                run.files_processed += min(run.current_file_total, run.current_completed)
+                run.current_file_total = 0
+                run.current_files_incremental = False
+            self._events.put(StandardRunEvent(
+                run.identity,
+                StandardEventKind.DISCOVERY,
+                completed=run.completed,
+                total=run.total,
+                artifact=str(entry.target),
+                detail=_directory_status(run),
+                artifact_completed=run.current_published,
+                artifact_total=run.current_total,
+                **_directory_event_fields(run),
+            ))
+        return bool(run.stop_requested)
 
     def _execute_current(
         self,

@@ -4,6 +4,13 @@
 
 ### Fixes
 
+- **A directory Append skips scans it has already processed:** a scan whose output
+  already holds every frame, from the same image files at the same sizes and times
+  and with the same settings, is now skipped at once. xdart no longer reads such a
+  scan again, and no longer warns "same-extent source identity changed" when only
+  its metadata files or the file server's bookkeeping changed. A scan with new
+  frames still checks its earlier files before adding the new ones, and a changed
+  image still warns. To reprocess a scan whose metadata you changed, use Replace.
 - **Append to an output on a network folder:** a run could stop with "writer begin
   incomplete: stream checkpoint failed identity verification" when the output's
   modification time moved a moment after xdart wrote it. Windows sets a file's
