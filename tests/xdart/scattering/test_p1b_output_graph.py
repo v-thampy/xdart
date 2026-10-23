@@ -1802,6 +1802,17 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
         custody_written.stat().st_mtime_ns,
     )
 
+    def committed(path: Path):
+        """The committed result: its file object, rows and lineage."""
+        with h5py.File(path, "r") as handle:
+            return (
+                path.stat().st_dev, path.stat().st_ino,
+                tuple(int(label) for label in handle["entry/integrated_1d/frame_index"][()]),
+                json.loads(handle["entry/reduction/config/append_lineage"][()].decode()),
+            )
+
+    custody_committed = committed(custody_written)
+
     def assert_custody_target_reacquirable(label: str) -> None:
         transaction_authority = OwnerToken(f"{label}-transaction")
         target_authority = OwnerToken(f"{label}-target")
@@ -1940,12 +1951,11 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
         begin_identity
     ).cleanup_status is CleanupStatus.CLEANED
     assert begin_owners[0].snapshot.state is AppendPreflightState.ABORTED
-    assert (
-        custody_written.read_bytes(),
-        custody_written.stat().st_dev,
-        custody_written.stat().st_ino,
-        custody_written.stat().st_mtime_ns,
-    ) == custody_before
+    # Append writes in place (maintainer, 2026-10-23): Nexus had begun, so its
+    # open refreshed the output's metadata, but no frame was written and the
+    # same file still holds the committed result.
+    assert committed(custody_written) == custody_committed
+    assert custody_committed[3]["state"] == "committed"
     assert_custody_target_reacquirable("p1b-later-begin-reacquire")
 
     # Durable display projection is acknowledged independently per graph and

@@ -2487,26 +2487,26 @@ class NexusSink:
         request keeps its preserved copy."""
         return self._transaction.in_place or not self.rollback_until_commit
 
-    def _discard_unopened_in_place_epoch(self) -> None:
-        """A Stop that arrives before a queued epoch opens keeps the committed
-        epochs exactly as they stand.
+    def _unopened_in_place_epoch(self) -> bool:
+        """Whether a queued epoch would reopen the committed output in place
+        with nothing yet to write.
 
         Opening an in-place epoch writes into the committed output itself (its
-        metadata at once), and there is no copy to restore; opening one only to
-        abort it would change that output and report the run aborted although
-        nothing was added.  A cancelled finish therefore drops the unopened
-        epoch, and the committed one is terminalized as usual.
+        metadata at once), and there is no copy to restore.  So only a write or
+        an epoch commit opens it: a flush has nothing to add, and a Stop drops
+        it (:meth:`finish`), leaving the committed epochs exactly as they stand
+        instead of changing that output and reporting the run aborted although
+        nothing was added.
         """
         writer = self._writer
-        if (
+        return bool(
             self._pending_append_decision is not None
             and not self._pending_record_writes
             and writer is not None and writer.phase.value == "finished"
             and self._transaction is not None
             and self._transaction.snapshot().phase is TransactionPhase.EPOCH_COMMITTED
             and self._reopens_in_place
-        ):
-            self._pending_append_decision = None
+        )
 
     def _open_owned_epoch(self, decision) -> None:
         transaction_owner, target_owner, _owners = self._transaction_owners
@@ -2938,7 +2938,8 @@ class NexusSink:
     def flush(self, *, force: bool = False) -> None:
         if self._writer is None:
             return
-        self._apply_pending_extension()
+        if not self._unopened_in_place_epoch():
+            self._apply_pending_extension()
         if self._writer.phase.value == "finished":
             return
         self._drain_pending_record_writes(force=force)
@@ -3125,8 +3126,8 @@ class NexusSink:
             )
         if self._terminal_result is not None:
             return self._terminal_result
-        if getattr(result, "cancelled", False):
-            self._discard_unopened_in_place_epoch()
+        if getattr(result, "cancelled", False) and self._unopened_in_place_epoch():
+            self._pending_append_decision = None
         self._apply_pending_extension()
         self._drain_pending_record_writes(force=True)
         writer = self._writer
