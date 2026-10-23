@@ -1471,6 +1471,7 @@ def test_slice_pins_survive_accumulating_mode_switch_and_clear_together() -> Non
     frame = state.navigation.frames[0]
     pin = SlicePin(frame, "Q", 0.0, 5.0)
     selected: list[tuple[object, tuple[object, ...]]] = []
+    cleared: list[bool] = []
     owner = _preference_owner(
         ScientificPreferences(
             plot_mode="Overlay",
@@ -1482,7 +1483,11 @@ def test_slice_pins_survive_accumulating_mode_switch_and_clear_together() -> Non
         _shell=SimpleNamespace(
             browser=SimpleNamespace(
                 cancel_pending_frame_selection=lambda: None,
-            )
+            ),
+            # Clear also drops the retained cross-file comparison curves (1.2.2).
+            scientific=SimpleNamespace(
+                clear_trace_history=lambda: cleared.append(True),
+            ),
         ),
         _context_controller=SimpleNamespace(
             navigation=state.navigation,
@@ -1497,12 +1502,14 @@ def test_slice_pins_survive_accumulating_mode_switch_and_clear_together() -> Non
         ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Waterfall"),
     )
     assert owner._preferences.slice_pins == (pin,)
+    assert cleared == []
     assert ScatteringWorkspace._edit_scientific_preference(
         owner,
         ShellCommand(ShellCommandKind.CLEAR_1D),
     )
     assert owner._preferences.slice_pins == ()
     assert selected == [(frame, (frame,))]
+    assert cleared == [True]
 
 
 def test_direct_plot_axis_change_retargets_compatible_pins_and_clears_others() -> None:

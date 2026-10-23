@@ -215,18 +215,26 @@ def test_successful_shell_apply_commits_exact_live_projection(
     projected: list[dict[str, object]] = []
     commits: list[tuple[object, ...]] = []
     presented = (object(), object())
+    # Retained cross-file comparison rows can name frames this run no longer owns;
+    # the page commits only owned keys (1.2.2), in rendered order.
+    foreign = object()
 
     def project_navigation(**kwargs):
         projected.append(kwargs)
         return ()
 
     def apply_state(_projection, *, preserve_display=False) -> None:
-        shell.scientific._trace_history_keys = presented
+        shell.scientific._trace_history_keys = (presented[0], foreign, presented[1])
 
     monkeypatch.setattr(
         page._context_controller,
         "project_navigation",
         project_navigation,
+    )
+    monkeypatch.setattr(
+        page._context_controller,
+        "owns_frame",
+        lambda frame: any(frame is key for key in presented),
     )
     monkeypatch.setattr(
         page._context_controller,

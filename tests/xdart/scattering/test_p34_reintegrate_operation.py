@@ -2510,31 +2510,38 @@ def test_terminal_browse_path_binding_does_not_resolve_on_gui_thread(
         page.close_workspace()
 
 
-def test_unsealed_browse_canonicalization_runs_only_on_browse_worker(
+def test_unsealed_browse_physical_validation_runs_only_on_browse_worker(
     tmp_path, monkeypatch, qapp,
 ):
+    # The loader no longer rewrites the requested path (Path.resolve split a mapped
+    # drive from its UNC spelling, 1.2.2); its physical snapshot work stays off the
+    # GUI thread and the context keeps the exact requested identity.
+    from xdart.gui.tabs.scattering.adapters import browse_loader
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
 
     seeded = _seed_existing(tmp_path)
     target = str(seeded.target.absolute())
     page, _store = _page(tmp_path, monkeypatch)
     main_ident = threading.get_ident()
-    resolve_threads = []
-    real_resolve = Path.resolve
+    snapshot_threads = []
+    real_capture = browse_loader.capture_target_snapshot
 
-    def tracked_resolve(path, *args, **kwargs):
-        resolve_threads.append(threading.get_ident())
-        return real_resolve(path, *args, **kwargs)
+    def tracked_capture(path, *args, **kwargs):
+        snapshot_threads.append(threading.get_ident())
+        return real_capture(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "resolve", tracked_resolve)
+    monkeypatch.setattr(browse_loader, "capture_target_snapshot", tracked_capture)
     try:
         request = page._context_controller.begin_browse(target)
-        assert resolve_threads == []
+        assert snapshot_threads == []
         outcome = _wait(page._context_controller.poll_browse)
         assert outcome.request is request
         assert outcome.status is BrowseLoadStatus.READY
-        assert resolve_threads
-        assert main_ident not in resolve_threads
+        assert snapshot_threads
+        assert main_ident not in snapshot_threads
+        context = page._context_controller.browse_context
+        assert request.source_path == os.path.normcase(os.path.abspath(target))
+        assert context.requested_path == context.scalar_catalog.artifact_path == request.source_path
     finally:
         page.close_workspace()
 
