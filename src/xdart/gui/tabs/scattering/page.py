@@ -6640,6 +6640,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             norm_aggregate=self._context_controller.norm_aggregate,
             presentation_background=self._background_owner.projection(),
         )
+        if (controller.selection is not None
+                and controller.selection.kind is ContextKind.BROWSE
+                and navigation.current is not None):
+            projection = replace(projection, scientific=replace(
+                projection.scientific, browse_artifact=navigation.current.artifact))
         if browse_slices and not skip_scientific_projection:
             science = projection.scientific
             cuts = self._context_controller.project_browse_slices(
@@ -6728,6 +6733,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         status=diagnostic,
                         retain_display=False,
                         browse_trace_snapshot=None,
+                        browse_artifact=(projection.scientific.browse_artifact
+                                         if cache_retry_needed and not cache_terminal_diagnostic else ""),
                     ),
                 )
         if cache_trace_snapshot is not None:
@@ -6807,6 +6814,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.scientific.expect_display_background(
                 self._background_owner.active_key)
             self._shell.apply_state(projection, **apply_options)
+            comparison_notice = self._shell.scientific.browse_comparison_notice
+            if comparison_notice and comparison_notice != self._notice_text:
+                self._notice(comparison_notice)
             viewer_loading = (
                 controller.viewer_1d_loading
                 if viewer_1d
@@ -6882,7 +6892,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if scientific.processing_mode == "Int 1D" and heavy is not None
                 and heavy.detector_source == "full" else scientific)
             self._context_controller.commit_navigation_projection(
-                self._shell.scientific.trace_history_keys
+                tuple(frame for frame in self._shell.scientific.trace_history_keys
+                      if self._context_controller.owns_frame(frame))
             )
             rendered_axis = self._shell.scientific.rendered_image_axis
             if rendered_axis is not None:
@@ -7531,6 +7542,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if viewer_1d or getattr(controller, "viewer_1d_owned", False):
                 return self._clear_viewer_1d_renderer(close=True)
             self._shell.browser.cancel_pending_frame_selection()
+            self._shell.scientific.clear_trace_history()
             current = self._context_controller.navigation.current
             self._context_controller.select_navigation(
                 current, () if current is None else (current,)
@@ -7550,6 +7562,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                      or updates.get("slice_pins", self._preferences.slice_pins)
                      != self._preferences.slice_pins)):
             self._release_display_background()
+        if (selection is not None and selection.kind is ContextKind.BROWSE
+                and any(key in updates and updates[key] != getattr(self._preferences, key)
+                        for key in ("norm_channel", "plot_axis", "slice_enabled",
+                                    "slice_center", "slice_width"))):
+            self._shell.scientific.clear_trace_history()
         self._preferences = replace(self._preferences, **updates)
         return True
 

@@ -665,6 +665,7 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_history_keys: tuple[DisplayFrameKey, ...] = ()
         self._trace_row_count = 0
         self._trace_history_by_identity: dict[int, TraceProjection] = {}
+        self.browse_comparison_notice = ""
         self._trace_aggregate_fold: _TraceAggregateCache | None = None
         self._pinned_trace_scope: tuple[object, ...] | None = None
         self._pinned_trace_by_id: dict[
@@ -957,6 +958,14 @@ class ScientificView(QtWidgets.QFrame):
         """Exact 1-D rows accepted by the last successful reconciliation."""
 
         return self._trace_history_keys
+
+    def clear_trace_history(self) -> None:
+        """Clear detached comparisons; the next projection seeds the current selection."""
+        self._trace_history_by_identity.clear()
+        self._trace_history_keys = ()
+        self._trace_history_scope = None
+        self.browse_comparison_notice = ""
+        self._clear_trace_aggregate_fold()
 
     @property
     def trace_history_projections(self) -> tuple[TraceProjection, ...]:
@@ -2097,7 +2106,7 @@ class ScientificView(QtWidgets.QFrame):
             self._autorange_slice_projection(self._share_link_on)
         if replace_presentation:
             self._rendered_slice_contract = slice_contract
-        self.status.setText(state.detector_diagnostic if state.detector_mode == "full" and not state.detector_pending and state.heavy is not None and state.heavy.detector_source != "full" else state.status or detail)
+        self.status.setText(self.browse_comparison_notice or (state.detector_diagnostic if state.detector_mode == "full" and not state.detector_pending and state.heavy is not None and state.heavy.detector_source != "full" else state.status or detail))
         self.progress.setText(f"{completed}/{total}")
         self._refresh_viewer_intensity()
         del blockers
@@ -2852,6 +2861,31 @@ class ScientificView(QtWidgets.QFrame):
         live_update: bool,
     ) -> None:
         browse_snapshot = state.browse_trace_snapshot
+        if os.environ.get("XDART_VIEWER_DEBUG") == "1":
+            logging.getLogger(__name__).warning(
+                "browse_comparison artifact=%r current_artifact=%r history_owner=%r snapshot=%s",
+                state.browse_artifact, getattr(navigation.current, "artifact", None),
+                self._trace_history_scope[0] if self._trace_history_scope else None,
+                browse_snapshot is not None,
+            )
+        comparison = bool(
+            state.browse_artifact
+            and navigation.current is not None
+            and navigation.current.artifact == state.browse_artifact
+            and all(frame.artifact == state.browse_artifact for frame in (
+                navigation.selected if browse_snapshot is None else browse_snapshot.logical_frames
+            ))
+            and all(trace.frame.artifact == state.browse_artifact for trace in state.traces)
+            and state.processing_mode in {"Int 1D", "Int 2D"}
+            and state.plot_mode in {"Overlay", "Waterfall"}
+            and not state.slice_enabled
+        )
+        if (comparison and browse_snapshot is None and not state.traces
+                and self._trace_history_scope is not None
+                and self._trace_history_scope[0] == "browse-comparison"):
+            # A new current file is loading. Only detached 1-D history survives;
+            # the ordinary reconciliation above retires old raw/cake buffers.
+            return
         if browse_snapshot is not None:
             owned_by_id = {id(frame): frame for frame in navigation.frames}
             if (
@@ -2880,7 +2914,8 @@ class ScientificView(QtWidgets.QFrame):
             # Stacked receipts are whole replacements.  A compatible Single
             # receipt reseeds semantic history but retains its one mounted item
             # so the normal setData path can update it in place.
-            self._trace_history_by_identity.clear()
+            if not comparison:
+                self._trace_history_by_identity.clear()
             self._trace_aggregate_fold = None
             if not compatible_single:
                 self._rendered_trace_keys = ()
@@ -2892,7 +2927,12 @@ class ScientificView(QtWidgets.QFrame):
         if state.replace_trace_history:
             self._trace_history_by_identity.clear()
             self._pinned_trace_by_id.clear()
-        live_traces = self._merge_trace_history(state, navigation)
+        if comparison and browse_snapshot is not None:
+            browse_snapshot = self._merge_browse_comparison(state, browse_snapshot, navigation.current)
+            live_traces = tuple(self._trace_history_by_identity.values())
+        else:
+            self.browse_comparison_notice = ""
+            live_traces = self._merge_trace_history(state, navigation)
         pinned = self._merge_pinned_trace_history(state)
         rows = (
             *((("pin", *pin_id), trace) for pin_id, trace in pinned),
@@ -3426,6 +3466,71 @@ class ScientificView(QtWidgets.QFrame):
         if prior is None or prior[2] != left_label:
             self.curve.setLabel("left", left_label)
         self._rendered_axis_labels = labels
+
+    def _merge_browse_comparison(self, state, snapshot, current):
+        """Extend the existing detached trace owner across compatible Browse files.
+
+        Neither an old context nor its raw/cake payload is retained. The input
+        snapshot remains current-file-only; this local presentation receipt
+        describes the combined bounded display, never hydration authority.
+        """
+        from . import browse_1d_display
+
+        scope = ("browse-comparison", state.processing_mode, state.measurement_mode,
+                 state.gi_mode_1d, state.plot_axis, state.slice_enabled,
+                 state.slice_center, state.slice_width,
+                 trace_normalization_scope(None, state.norm_channel)[1],
+                 state.plot_options.waterfall_start, state.plot_options.waterfall_stop,
+                 state.plot_options.waterfall_step)
+        foreign = tuple(frame for frame in self._trace_history_keys
+                        if frame.artifact != state.browse_artifact)
+        if self._trace_history_scope != scope:
+            foreign = ()
+        retained = tuple(self._trace_history_by_identity[id(frame)] for frame in foreign
+                         if id(frame) in self._trace_history_by_identity)
+        incoming = state.traces
+        self.browse_comparison_notice = ""
+        if retained:
+            first = retained[0]
+            axis_key = self._axis_key(first.axis) or (first.axis.label, first.axis.unit)
+            if any((self._axis_key(trace.axis) or (trace.axis.label, trace.axis.unit)) != axis_key
+                   or not same_grid(trace.axis.values, first.axis.values)
+                   for trace in (*retained, *incoming)):
+                foreign, retained = (), ()
+                self.browse_comparison_notice = "Started a new overlay: sampled axes do not match."
+
+        def root_bytes(traces):
+            roots = {}
+            for trace in traces:
+                for array in (trace.axis.values, trace.intensity):
+                    while isinstance(array.base, np.ndarray):
+                        array = array.base
+                    roots[id(array)] = array
+            return sum(array.nbytes for array in roots.values())
+
+        if root_bytes((*retained, *incoming)) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
+            foreign, retained = (), ()
+            self.browse_comparison_notice = "Started a new overlay: detached display budget reached."
+        if root_bytes(incoming) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
+            raise ValueError("Browse comparison display budget exceeded")
+        logical = (*foreign, *snapshot.logical_frames)
+        all_rows = tuple((("live", id(trace.frame)), trace) for trace in (*retained, *incoming))
+        rows = self._bounded_waterfall_rows(all_rows)
+        current_row = next((row for row in all_rows if row[1].frame is current), None)
+        if current_row is not None and not any(row[1].frame is current for row in rows):
+            wanted = {id(row[1].frame) for row in (*rows[:-1], current_row)}
+            rows = tuple(row for row in all_rows if id(row[1].frame) in wanted)
+        self._trace_history_by_identity = {id(trace.frame): trace for _, trace in rows}
+        self._trace_history_scope = scope
+        self._trace_history_keys = logical
+        self._trace_selection_keys = snapshot.logical_frames
+        positions = {id(frame): index + 1 for index, frame in enumerate(logical)}
+        return replace(snapshot, logical_frames=logical,
+                       display_frames=tuple(trace.frame for _, trace in rows),
+                       logical_positions=tuple(positions[id(trace.frame)] for _, trace in rows),
+                       logical_epochs=None if foreign else snapshot.logical_epochs,
+                       waterfall_active=waterfall_should_be_active(
+                           state.plot_mode, len(logical), was_active=self._bottom_waterfall_active))
 
     def _merge_trace_history(
         self,
