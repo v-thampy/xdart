@@ -1,5 +1,16 @@
 # Release notes
 
+## 1.2.3 (unreleased)
+
+### Fixes
+
+- **Make Mask on Windows network folders:** publish the checked mask by renaming
+  it into place, without hard-link probes that left undeletable names on the
+  reported share. Cleanup continues past a file it cannot delete and reports
+  the reason. A changed temporary-folder identity prevents rollback writes.
+- **Mask source-change diagnostics:** name the source or folder details that
+  changed, including modification-time differences, while preserving the checks.
+
 ## 1.2.2 (2026-10-22)
 
 ### Fixes

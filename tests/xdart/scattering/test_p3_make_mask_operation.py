@@ -863,12 +863,15 @@ def test_a_held_private_copy_keeps_the_saved_mask_and_names_the_reason(tmp_path,
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
     monkeypatch.setattr(authoring, "_WINDOWS", windows); monkeypatch.setattr(authoring.time, "sleep", lambda _seconds: None)
     clock = iter(range(1000)); monkeypatch.setattr(authoring, "_monotonic", lambda: next(clock) * 0.25)
-    _refuse(monkeypatch, "unlink", lambda path: path.parent.name.startswith(".xdart-mask-") and path.name.endswith("-mask.edf"), 32)
+    # POSIX keeps a private hard link of the published mask; Windows renames it, so its TIFF copy is what stays.
+    held = "chosen-mask.edf" if not windows else Path(request.source_path).name
+    _refuse(monkeypatch, "unlink", lambda path: path.parent.name.startswith(".xdart-mask-") and path.name == held, 32)
     terminal, _ = _direct(request); result = terminal.payload
     assert terminal.status is OperationTerminalStatus.RETURNED and not terminal.diagnostic and result.published
-    assert result.recovery_class == "qualified-private-candidate" and Path(result.recovery_path).exists()
+    assert result.recovery_class == ("unqualified-private-stage" if windows else "qualified-private-candidate")
+    assert Path(result.recovery_path).exists() and (Path(result.cwd) / held).exists()
     assert result.recovery_reason == (
-        f"cleanup could not delete {Path(result.recovery_path).name}: builtins.PermissionError: [Errno 13] held by another process")
+        f"cleanup could not delete {held}: builtins.PermissionError: [Errno 13] held by another process")
     assert authoring.mask_leftover_warning(result) == (
         f"The mask was saved and checked, but xdart could not delete its temporary folder:\n{result.cwd}\n\n"
         f"Reason: {result.recovery_reason}\n\nThe saved mask does not depend on those temporary files.")
@@ -900,14 +903,104 @@ def test_unsaved_mask_with_a_held_stage_still_fails_with_custody_and_reason(tmp_
         f"private mask custody relinquished (unqualified-private-stage): {result.cwd}; cleanup could not remove "
         "the private stage: builtins.PermissionError: [Errno 13] held by another process")
     assert authoring.mask_leftover_warning(result) == ""
-def test_windows_publication_outlasts_a_brief_lock_on_the_private_mask(tmp_path, monkeypatch) -> None:
+def test_windows_publication_outlasts_a_brief_lock_on_the_tiff_copy(tmp_path, monkeypatch) -> None:
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
     monkeypatch.setattr(authoring, "_WINDOWS", True); monkeypatch.setattr(authoring.time, "sleep", lambda _seconds: None)
-    attempts = _refuse(monkeypatch, "unlink", lambda path: path.parent.name.startswith(".xdart-mask-") and path.name.endswith("-mask.edf"), 32, 2)
+    copy = Path(request.source_path).name
+    attempts = _refuse(monkeypatch, "unlink", lambda path: path.parent.name.startswith(".xdart-mask-") and path.name == copy, 32, 2)
     terminal, _ = _direct(request); result = terminal.payload
     assert terminal.status is OperationTerminalStatus.RETURNED, terminal.diagnostic
     assert result.published and not result.recovery_path and len(attempts) == 2
     assert result.final_state == SourceFileState.capture(Path(request.final_path)) and not Path(result.cwd).exists()
+def test_cleanup_keeps_deleting_past_a_stubborn_name_and_reports_the_first(tmp_path, monkeypatch) -> None:
+    # Beamline share, 2026-10-22: a deleted hard-link probe name stayed listed and refused with WinError 6.
+    stage = tmp_path / ".xdart-mask-stage"; stage.mkdir(); status = stage.lstat()
+    names = tuple(stage / name for name in (".link-probe-source", "chosen.tiff", "chosen-mask.edf", "missing.edf"))
+    for path in names[:3]: path.write_bytes(b"x")
+    _refuse(monkeypatch, "unlink", lambda path: path.name == ".link-probe-source", 6)
+    recovery, reason = authoring._cleanup(stage, (status.st_dev, status.st_ino), names)
+    assert recovery == str(stage) and sorted(path.name for path in stage.iterdir()) == [".link-probe-source"]
+    assert reason == "cleanup could not delete .link-probe-source: builtins.PermissionError: [Errno 13] held by another process"
+    (stage / "chosen.tiff").write_bytes(b"x")
+    _refuse(monkeypatch, "unlink", lambda path: path.name == "chosen.tiff", 6)
+    recovery, reason = authoring._cleanup(stage, (status.st_dev, status.st_ino), names)
+    assert recovery == str(stage) and reason.endswith("held by another process (and 1 more)")
+def test_windows_publication_renames_into_place_without_hard_links(tmp_path, monkeypatch) -> None:
+    request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    monkeypatch.setattr(authoring, "_WINDOWS", True); linked = []
+    monkeypatch.setattr(authoring, "_link", lambda *args, **kwargs: linked.append(args))
+    terminal, _ = _direct(request); result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.RETURNED and result.published and not result.recovery_path
+    assert linked == [] and not Path(result.cwd).exists()
+    assert result.final_state == SourceFileState.capture(Path(request.final_path))
+    assert (result.final_state.device, result.final_state.inode) == (result.proof.state.device, result.proof.state.inode)
+def test_windows_unreconciled_rename_moves_the_mask_back_to_its_private_name(tmp_path, monkeypatch) -> None:
+    request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    monkeypatch.setattr(authoring, "_WINDOWS", True); monkeypatch.setattr(authoring.time, "sleep", lambda _seconds: None)
+    def refuse_reconciliation(*_args): raise ValueError("forced reconciliation refusal")
+    monkeypatch.setattr(authoring, "_publication_state", refuse_reconciliation)
+    # Keep the private name through cleanup, so the restored candidate is observable.
+    _refuse(monkeypatch, "unlink", lambda path: path.parent.name.startswith(".xdart-mask-") and path.name == "chosen-mask.edf", 5)
+    terminal, _ = _direct(request); result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.FAILED and not result.published and result.final_state is None
+    assert terminal.diagnostic.startswith("builtins.ValueError: forced reconciliation refusal")
+    assert not Path(request.final_path).exists()
+    assert result.recovery_class == "qualified-private-candidate" and result.recovery_path == result.private_path
+    assert authoring._mask_matches(result.proof, Path(result.recovery_path)) is not None
+@pytest.mark.parametrize("replacement", ("directory", "symlink"))
+def test_windows_failed_reconciliation_does_not_restore_into_a_replaced_stage(
+    tmp_path, monkeypatch, replacement,
+) -> None:
+    request = _request(tmp_path, monkeypatch)
+    _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    monkeypatch.setattr(authoring, "_WINDOWS", True)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "unrelated.txt").write_text("keep")
+    if replacement == "symlink":
+        probe = tmp_path / "symlink-probe"
+        try:
+            probe.symlink_to(foreign, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("directory symlinks are unavailable")
+        probe.unlink()
+
+    def refuse_reconciliation(*_args):
+        stage = next(path for path in tmp_path.glob(".xdart-mask-*")
+                     if not path.name.endswith("-original"))
+        stage.rename(stage.with_name(stage.name + "-original"))
+        if replacement == "symlink":
+            stage.symlink_to(foreign, target_is_directory=True)
+        else:
+            stage.mkdir()
+            (stage / "unrelated.txt").write_text("keep")
+        raise ValueError("forced reconciliation refusal")
+
+    monkeypatch.setattr(authoring, "_publication_state", refuse_reconciliation)
+    terminal, _ = _direct(request)
+    result = terminal.payload
+    assert terminal.status is OperationTerminalStatus.FAILED and not result.published
+    assert Path(request.final_path).is_file()
+    assert authoring._mask_matches(result.proof, Path(request.final_path)) is not None
+    assert not Path(result.private_path).exists()
+    assert (Path(result.cwd) / "unrelated.txt").read_text() == "keep"
+    assert sorted(path.name for path in foreign.iterdir()) == ["unrelated.txt"]
+
+
+@pytest.mark.parametrize("when", ("before launch", "during copy"))
+def test_a_changed_source_names_what_changed(tmp_path, monkeypatch, when) -> None:
+    request = _request(tmp_path, monkeypatch); calls = _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
+    source = Path(request.source_path); before = source.stat()
+    def touch(): os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 5_000_000_000))
+    if when == "before launch": touch()
+    else:
+        real_copy = authoring._copy_tiff
+        monkeypatch.setattr(authoring, "_copy_tiff", lambda *args: (touch(), real_copy(*args))[1])
+    terminal, _ = _direct(request)
+    assert terminal.status is OperationTerminalStatus.FAILED and calls == []
+    prefix = f"builtins.ValueError: mask source context changed {when}: source "
+    assert terminal.diagnostic.startswith(prefix + ("now: " if when == "before launch" else "at copy: ")), terminal.diagnostic
+    assert f"mtime_ns {before.st_mtime_ns} → {before.st_mtime_ns + 5_000_000_000} (+5.000 s)" in terminal.diagnostic
 def test_cancel_seal_and_platform_child_signals_are_exact(tmp_path, monkeypatch) -> None:
     request = _request(tmp_path, monkeypatch); _install_process(monkeypatch, np.ones((2, 4), dtype=np.uint8))
     terminal, _ = _direct(request, seal=lambda _identity: False)

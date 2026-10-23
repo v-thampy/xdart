@@ -1035,23 +1035,31 @@ def _delete_waiting(remove: Callable[[], None]) -> None:
             if (not _WINDOWS or getattr(error, "winerror", None) not in _WINDOWS_DELETE_ERRORS
                     or _monotonic() >= deadline): raise
         time.sleep(pause); pause = min(2 * pause, 0.2)
+def _cleanup_failure(step: str, error: OSError) -> str:
+    module, name, message = detached_exception_strings(error)
+    return f"cleanup could not {step}: {module}.{name}: {message}"
 def _cleanup(stage: Path | None, identity: tuple[int, int] | None, names: tuple[Path, ...]) -> tuple[str, str]:
-    """Remove the private stage; on refusal return its path and the reason."""
+    """Remove the private stage; on refusal return its path and the first reason.
+
+    One stubborn name does not stop the others (the TIFF copy still goes)."""
     if stage is None: return "", ""
     if identity is None: return str(stage), "private stage identity was never captured"
-    step = "inspect the private stage"
     try:
         current = stage.lstat(); observed = (current.st_dev, current.st_ino)
-        if observed != identity or not stat.S_ISDIR(current.st_mode):
-            return str(stage), f"private stage changed: identity {identity} became {observed}" + ("" if stat.S_ISDIR(current.st_mode) else ", not a directory")
-        for path in names:
+    except OSError as error: return str(stage), _cleanup_failure("inspect the private stage", error)[:4096]
+    if observed != identity or not stat.S_ISDIR(current.st_mode):
+        return str(stage), f"private stage changed: identity {identity} became {observed}" + ("" if stat.S_ISDIR(current.st_mode) else ", not a directory")
+    failures = []
+    for path in names:
+        try:
             if path.parent != stage or not os.path.lexists(path): continue
-            step = f"delete {path.name}"
             if not stat.S_ISDIR(path.lstat().st_mode): _delete_waiting(path.unlink)
-        step = "remove the private stage"; _delete_waiting(stage.rmdir); return "", ""
-    except OSError as error:
-        module, name, message = detached_exception_strings(error)
-        return str(stage), f"cleanup could not {step}: {module}.{name}: {message}"[:4096]
+        except OSError as error: failures.append(_cleanup_failure(f"delete {path.name}", error))
+    if not failures:
+        try: _delete_waiting(stage.rmdir); return "", ""
+        except OSError as error: failures.append(_cleanup_failure("remove the private stage", error))
+    more = f" (and {len(failures) - 1} more)" if len(failures) > 1 else ""
+    return str(stage), (failures[0][:4096 - len(more)] + more)
 def _read_calibration_save_report(path: Path, *, points_directory: str | None = None,
                                   source_path: str | None = None):
     if not path.exists():
@@ -1527,6 +1535,33 @@ def authoring_source_context_current(
                 and observed[2] == request.hdf_target_state)
     except (AttributeError, OSError, TypeError, ValueError):
         return False
+def _state_changes(recorded: SourceFileState, observed: SourceFileState) -> str:
+    def change(name: str) -> str:
+        before, after = getattr(recorded, name), getattr(observed, name)
+        delta = f" ({(after - before) / 1e9:+.3f} s)" if name.endswith("time_ns") else ""
+        return f"{name} {before} → {after}{delta}"
+    return ", ".join(change(name) for name in ("size", "mtime_ns", "ctime_ns", "device", "inode")
+                     if getattr(recorded, name) != getattr(observed, name))
+def _source_drift(request: MaskRequest, observed: SourceFileState | None = None) -> str:
+    """Name what differs from the request's recorded source facts; the refusal itself stays exact."""
+    changes = []
+    try:
+        source, directory = Path(request.source_path), Path(request.source_directory)
+        raw = source.lstat()
+        if source.parent != directory or stat.S_ISLNK(raw.st_mode) or not stat.S_ISREG(raw.st_mode):
+            return "the source is no longer a regular file in its folder"
+        for label, state in (("at copy", observed), ("now", SourceFileState.capture(source))):
+            if state is not None and (detail := _state_changes(request.source_state, state)):
+                changes.append(f"source {label}: {detail}")
+        if request.hdf_target_state is not None and (detail := _state_changes(
+                request.hdf_target_state, SourceFileState.capture(Path(request.hdf_target_path)))):
+            changes.append(f"HDF frame file now: {detail}")
+        folder = _directory_identity(directory)
+        if folder != request.directory_identity:
+            changes.append(f"folder identity {request.directory_identity} → {folder}")
+    except (OSError, TypeError, ValueError) as error:
+        changes.append(f"{type(error).__name__}: {error}")
+    return "; ".join(changes) or "no difference on a second reading; the folder may report file details inconsistently"
 def _asset_digest(path: Path, limit: int) -> tuple[str, int]:
     digest, count = hashlib.sha256(), 0
     with path.open("rb") as stream:
@@ -1821,6 +1856,26 @@ def _unlink_exact_publication(
         return False
 
 
+def _restore_renamed_publication(
+    final: Path, private: Path | None, proof: MaskProof,
+    stage_identity: tuple[int, int] | None,
+) -> bool:
+    """Rename an unreconciled Windows publication back to its private name."""
+    try:
+        if private is None or stage_identity is None:
+            return False
+        stage = private.parent.lstat()
+        if (not stat.S_ISDIR(stage.st_mode)
+                or (stage.st_dev, stage.st_ino) != stage_identity
+                or os.path.lexists(private)
+                or _mask_matches(proof, final) is None):
+            return False
+        os.replace(final, private)
+        return True
+    except OSError:
+        return False
+
+
 def _cleanup_at_admitted_parent(
     stage: Path | None, identity: tuple[int, int] | None,
     names: tuple[Path, ...], directory_fd: int | None,
@@ -1986,11 +2041,13 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
     publication_fd = None; publication_linked = False
     try:
         request.__post_init__(); source, final = Path(request.source_path), Path(request.final_path)
+        context_current = authoring_source_context_current(request)
         if (resolve_mask_executable(request.executable) != request.executable
                 or SourceFileState.capture(Path(request.executable))
                 != request.executable_state
-                or not authoring_source_context_current(request)):
-            raise ValueError("mask source context changed before launch")
+                or not context_current):
+            raise ValueError("mask source context changed before launch"
+                             + ("" if context_current else f": {_source_drift(request)}"))
         publication_fd = _open_admitted_directory(
             Path(request.source_directory), request.directory_identity,
         )
@@ -1998,7 +2055,7 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         stage = Path(tempfile.mkdtemp(prefix=".xdart-mask-", dir=final.parent)); created = stage.lstat(); stage_identity = (created.st_dev, created.st_ino)
         os.chmod(stage, 0o700); stage_stat = stage.lstat()
         if (stage_stat.st_dev, stage_stat.st_ino) != stage_identity or not stat.S_ISDIR(stage_stat.st_mode) or not _private_mode(stage_stat.st_mode, 0o700): raise OSError("private mask stage is not mode 0700")
-        _probe_links(stage)
+        if not _WINDOWS: _probe_links(stage)  # only the POSIX hard-link publication needs it
         private_source = stage / (
             source.name if request.exact_hdf_url is None
             else source.stem + ".tiff"
@@ -2018,13 +2075,12 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
             )
         if (source_state != request.source_state
                 or not authoring_source_context_current(request)):
-            raise ValueError("mask source context changed during copy")
-        if (not _mask_source_frame_current(
-                    request, source_state, source_sha, shape, source_dtype)
-                or not _unchanged(
-                    private_source, staged_state, staged_file_sha,
-                    _TIFF_LIMIT)):
-            raise ValueError("mask source changed before child launch")
+            raise ValueError(f"mask source context changed during copy: {_source_drift(request, source_state)}")
+        if not _mask_source_frame_current(
+                request, source_state, source_sha, shape, source_dtype):
+            raise ValueError(f"mask source changed before child launch: {_source_drift(request, source_state)}")
+        if not _unchanged(private_source, staged_state, staged_file_sha, _TIFF_LIMIT):
+            raise ValueError("mask source changed before child launch: the private copy changed")
         if cancelled.is_set(): raise _Cancelled("mask cancelled")
         publish("launch", 2, 4); argv = (request.executable, str(private_source))
         if (resolve_mask_executable(request.executable) != request.executable
@@ -2056,12 +2112,11 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
             if code != 0:
                 raise _nonzero_child_error(
                     "pyFAI-drawmask", code, child_diagnostic)
-        if (not _mask_source_frame_current(
-                    request, source_state, source_sha, shape, source_dtype)
-                or not _unchanged(
-                    private_source, staged_state, staged_file_sha,
-                    _TIFF_LIMIT)):
-            raise ValueError("mask source changed during child execution")
+        if not _mask_source_frame_current(
+                request, source_state, source_sha, shape, source_dtype):
+            raise ValueError(f"mask source changed during child execution: {_source_drift(request, source_state)}")
+        if not _unchanged(private_source, staged_state, staged_file_sha, _TIFF_LIMIT):
+            raise ValueError("mask source changed during child execution: the private copy changed")
         try:
             private_mask.lstat()
         except FileNotFoundError:
@@ -2072,13 +2127,14 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         if not seal(identity): raise _Cancelled("mask cancelled before publication")
         _tighten_qualified(private_mask, proof, _mask_matches)
         publish("publish", 4, 4); link_error = None
-        # Keep the old mask until the edited replacement is qualified. Retain
-        # the private proof file while atomically publishing a second link.
-        publication_alias = stage / ".publish-mask.edf"
+        # Keep the old mask until the edited replacement is qualified. POSIX
+        # retains the private proof file while atomically publishing a second
+        # link; Windows renames the qualified file into place, because a network
+        # share kept deleted hard-link names (WinError 6, 2026-10-22).
+        publication_alias = None if _WINDOWS else stage / ".publish-mask.edf"
         try:
             if _WINDOWS:
-                _link(private_mask, publication_alias)
-                os.replace(publication_alias, final)
+                os.replace(private_mask, final)
             else:
                 relative_alias = str(Path(stage.name) / publication_alias.name)
                 _link(
@@ -2095,15 +2151,16 @@ def run_mask(request: MaskRequest, identity: OperationIdentity, cancelled: objec
         ) if publication_linked else None)
         if (not authoring_source_context_current(request)
                 or final_state is None
-                or _mask_matches(proof, private_mask) is None):
+                or not _WINDOWS and _mask_matches(proof, private_mask) is None):
             raise RuntimeError("mask publication could not be reconciled") from link_error
         published = True
     except _Cancelled: status = OperationTerminalStatus.CANCELLED
     except BaseException as error:
         status = OperationTerminalStatus.FAILED; module, name, message = detached_exception_strings(error); diagnostic = f"{module}.{name}: {message}"
     if publication_linked and not published and proof is not None:
-        if _unlink_exact_publication(
-                publication_fd, Path(request.final_path), proof):
+        # Windows moves an unreconciled rename back, so the qualified candidate stays recoverable.
+        if (_restore_renamed_publication(Path(request.final_path), private_mask, proof, stage_identity) if _WINDOWS
+                else _unlink_exact_publication(publication_fd, Path(request.final_path), proof)):
             publication_linked = False
         final_state = None
     names = (() if stage is None else tuple(stage / name for name in (".link-probe-source", ".link-probe-linked", ".link-probe-occupied")))
