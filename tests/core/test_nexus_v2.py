@@ -533,3 +533,25 @@ def test_scan_data_string_columns_survive_roundtrip(tmp_path):
     ds2 = read_scan_metadata(p2)
     assert list(np.asarray(ds2["keith_I"].values)) == ["0V", "1V", "2V"]
     np.testing.assert_allclose(ds2["i0"].values, [1.0, 2.0, 3.0], rtol=1e-5)
+
+
+def test_scan_metadata_keeps_frame_times_at_full_precision(tmp_path):
+    """Maintainer, 2026-10-23: each frame's start time (a .txt/.pdi sidecar's "time:", stored as "epoch") belongs in
+    the output's metadata, comparable with its source's. float32 rounded today's 1.8e9 s to 128 s steps; epoch is now
+    float64 when written and when upserted, and other numeric columns stay float32."""
+    import h5py
+    import pandas as pd
+
+    from xrd_tools.io.nexus import upsert_scan_metadata, write_scan_metadata
+
+    first = pd.DataFrame({"epoch": [1792793187.0, 1792793514.0], "i0": [1.5, 2.5]}, index=[1, 2])
+    later = pd.DataFrame({"epoch": [1792793600.0], "i0": [3.5]}, index=[3])
+    with h5py.File(tmp_path / "times.nxs", "w") as handle:
+        entry = handle.create_group("entry")
+        write_scan_metadata(entry, first, [1, 2])
+        upsert_scan_metadata(entry, later, [3])
+        group = entry["scan_data"]
+        assert group["epoch"].dtype == np.float64 and group["i0"].dtype == np.float32
+        assert group["epoch"].attrs["ssrl_dtype"] == "float64"
+        np.testing.assert_array_equal(group["epoch"][()], [1792793187.0, 1792793514.0, 1792793600.0])
+        np.testing.assert_array_equal(group["frame_index"][()], [1, 2, 3])
