@@ -126,8 +126,11 @@ class AcquisitionRuntime:
                 self._gate.set()
                 self._live_condition.notify_all()
 
-    def adopt(self, run, artifact, source_path: str) -> AcquisitionContext:
+    def adopt(self, run, artifact, source_path: str, *,
+              saved_only: bool = False) -> AcquisitionContext:
+        """``saved_only``: an already-processed output, shown from its saved frames without reading its scan."""
         context = self.context
+        scan = None if saved_only else run.scan
         if context is None:
             configuration = run.configuration
             generation, fingerprint = configuration.identity
@@ -138,7 +141,7 @@ class AcquisitionRuntime:
                 config_fingerprint=fingerprint,
                 run_scan_key=artifact.source_scan,
                 source_path=source_path,
-                scan=run.scan,
+                scan=scan,
                 frame=None,
                 frame_ids=run.display.catalog,
                 frames=run.display.artifacts,
@@ -153,8 +156,9 @@ class AcquisitionRuntime:
             self.context = context
         elif (context.scan_key != artifact.source_scan
               or context.source != source_path
-              or context.current_display_scan is not run.scan):
-            context.rescope_to(artifact.source_scan, source_path, run.scan)
+              or context.current_display_scan is not scan):
+            context.rescope_to(artifact.source_scan, source_path, scan,
+                               saved_only=saved_only)
         return context
 
     def submit(self, session, frame, image=_NO_IMAGE) -> bool:

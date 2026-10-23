@@ -1786,7 +1786,8 @@ class StandardRunExecutor:
         run.display.seed_navigation_prefix_at_work_ordinals(rows)
 
     def _adopt_acquisition_context(
-        self, run: _StandardRun, owner: DisplayArtifact, *, source_path: str
+        self, run: _StandardRun, owner: DisplayArtifact, *, source_path: str,
+        saved_only: bool = False,
     ):
         created = run.context_runtime is None
         runtime = run.context_runtime or AcquisitionRuntime()
@@ -1796,10 +1797,10 @@ class StandardRunExecutor:
             if runtime.context is None
             else runtime.context.hydration_owner
         )
-        context = runtime.adopt(run, owner, source_path)
+        context = runtime.adopt(run, owner, source_path, saved_only=saved_only)
         # The native binder already resolved these values for this output.
         # Announce only after its acquisition context has actually been adopted.
-        selection = getattr(run.scan, "extra", {}).get("energy_selection", {})
+        selection = {} if saved_only else getattr(run.scan, "extra", {}).get("energy_selection", {})
         energy = ""
         if selection.get("disagreement") and not run.energy_notice_sent:
             energy = (f"Using the scan energy, {selection['source_energy_eV'] / 1000:.3f} keV; "
@@ -2545,7 +2546,7 @@ class StandardRunExecutor:
         run.current_published = run.current_completed
         run.current_epoch_published = 0
         self._seed_persisted_prefix_navigation(run, owner, labels, newly_adopted=newly_adopted_owner)
-        self._adopt_acquisition_context(run, owner, source_path=str(first.path))
+        self._adopt_acquisition_context(run, owner, source_path=str(first.path), saved_only=True)
         run.completed += run.current_completed
         for finished in (False, True):
             if finished:

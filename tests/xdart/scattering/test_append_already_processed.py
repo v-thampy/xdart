@@ -265,3 +265,30 @@ def test_a_growing_scan_appends_in_place_without_copying_or_hashing_its_output(t
     with h5py.File(output, "r") as handle:
         np.testing.assert_array_equal(handle["entry/integrated_1d/intensity"][:3], processed)
         assert handle["entry/integrated_1d/intensity"].shape[0] == 4
+
+
+@pytest.mark.parametrize("first_new", (False, True), ids=("completed-then-completed", "new-then-completed"))
+def test_an_already_processed_scan_after_another_scan_is_shown_from_its_saved_frames(tmp_path, monkeypatch, first_new):
+    """Beamline 2026-10-23 (dev 5ebc1307, Windows share, 35 of 68 scans already processed): the second scan an Append
+    found already processed failed the Run, "a sub-scan boundary needs a complete (scan key, source, display scan)
+    selection". It is never read again, so it has no scan to show, only its saved frames."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _scan(raw, "scanb", 2)
+    if not first_new:
+        _scan(raw, "scana", 3)
+    events, _catalog = _run(tmp_path, raw, 9201)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+    if first_new:
+        _scan(raw, "scana", 3)
+    _scan(raw, "scanc", 1)
+    seams = _Seams(monkeypatch)
+    events, catalog = _run(tmp_path, raw, 9202)
+    rows, warnings, navigation = _shown(events, catalog)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"], rows[-1]
+    assert rows[-1][4] == "Complete · 6 processed · 0 skipped · 0 pending · 6 discovered" and warnings == []
+    assert navigation == [("scana", 1, 1), ("scana", 2, 2), ("scana", 3, 3), ("scanb", 1, 4), ("scanb", 2, 5),
+                          ("scanc", 1, 6)]
+    assert seams.materialized == ["scana_int1d.nexus", "scanc_int1d.nexus"][(0 if first_new else 1):]
+    assert _labels(tmp_path, "scana") == (1, 2, 3) and _labels(tmp_path, "scanb") == (1, 2)
+    assert _labels(tmp_path, "scanc") == (1,)
