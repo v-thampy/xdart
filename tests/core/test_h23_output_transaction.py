@@ -5088,6 +5088,33 @@ def test_in_place_reopen_refuses_a_changed_committed_epoch_and_keeps_it(tmp_path
     assert transaction.snapshot().phase is api.TransactionPhase.EPOCH_COMMITTED and hashes == []
 
 
+@pytest.mark.parametrize("route", ("first-stream", "reopened-epoch"))
+def test_in_place_adoption_does_not_rebaseline_a_change_after_validation(tmp_path, monkeypatch, route):
+    prepared = _prepared_in_place(tmp_path) if route == "first-stream" else _prepared(tmp_path, prior=b"prior")
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    first = None if route == "first-stream" else _committed_epoch(prepared, _DepthPool())
+    real_seal = api._descriptor_stream_stat_receipt
+
+    def change_before_seal(descriptor, path, **kwargs):
+        if kwargs["role"] == "stream-in-place":
+            state = os.stat(path)
+            os.utime(path, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+        return real_seal(descriptor, path, **kwargs)
+
+    monkeypatch.setattr(api, "_descriptor_stream_stat_receipt", change_before_seal)
+    with pytest.raises(api.TargetChanged, match="changed after semantic verification"):
+        if first is None:
+            _begin_in_place(prepared)
+        else:
+            _reopen(prepared, first)
+    assert target.read_bytes() == (b"prior" if first is None else b"epoch-a")
+    if first is not None:
+        assert transaction.snapshot().phase not in {
+            api.TransactionPhase.COMMITTED, api.TransactionPhase.EPOCH_COMMITTED,
+        }
+        assert transaction._stream_attempt is first
+
+
 def test_in_place_transaction_reopens_its_epochs_only_in_place(tmp_path):
     prepared = _prepared_in_place(tmp_path)
     api, target, _coordinator, transaction, *_rest, lease = prepared

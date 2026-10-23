@@ -2970,6 +2970,7 @@ class OutputTransaction:
                 evidence_bytes=0,
                 ordinal=self._coordinator._next_ordinal(),
                 role="stream-in-place",
+                expected_stat=_descriptor_identity(state),
                 durable_fsync=False,
             )
         finally:
