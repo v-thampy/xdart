@@ -1,0 +1,177 @@
+"""Exact-object discriminators for GI reuse ownership and its byte allowance."""
+
+import threading
+
+import numpy as np
+import pytest
+
+from tests.core.test_warm_integrators_gi import SHAPE, _plan, _reduce, _scan
+import xrd_tools.reduction.core as core
+from xrd_tools.reduction import MemorySink, ReductionSession
+from xrd_tools.reduction.core import GIFreezeError, WarmIntegrators, _ReductionIntegratorProvider
+
+
+def test_an_oversized_real_integrator_is_not_retained_over_a_positive_allowance():
+    reuse = WarmIntegrators(1, allowance=1)
+    _reduce(_scan("oversized", (0.2,)), reuse=reuse)
+    retained = sum(size for entries in reuse._idle.values() for _ai, size in entries)
+    assert retained <= 1, f"idle table bytes {retained} exceed allowance 1"
+
+
+def test_a_failed_two_angle_scout_returns_neither_angles_tables():
+    reuse = WarmIntegrators(1, allowance=1 << 30)
+    scan = _scan("blank-two-angles", (0.1, 0.2))
+    for frame in scan.frames:
+        frame.image = np.zeros(SHAPE, dtype=np.float32)
+    plan = _plan(scan)
+    plan.mask[:] = True
+    with pytest.raises(GIFreezeError):
+        ReductionSession(
+            plan, scan, sink=MemorySink(), execution="streaming", executor=1,
+            integrator_reuse=reuse, gi_freeze_mode="scout_union",
+        )
+    assert len(reuse) == 0, f"failed scout returned idle keys {list(reuse._idle)}"
+    assert not reuse._lent
+
+
+def test_an_early_return_cannot_repopulate_a_discarded_and_cleared_run(monkeypatch):
+    reuse = WarmIntegrators(1, allowance=1 << 30)
+    scan = _scan("late-handback", (0.1, 0.2))
+    plan = _plan(scan)
+    provider = _ReductionIntegratorProvider(
+        scan=scan, plan=plan, ai=scan.integrator, fi=None,
+        initial_incident_angle=0.1, reuse=reuse,
+    )
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    real_return = reuse.give_back
+    errors = []
+
+    def delayed_return(key, integrator):
+        entered.set()
+        assert release.wait(5)
+        real_return(key, integrator)
+
+    monkeypatch.setattr(reuse, "give_back", delayed_return)
+
+    def work():
+        try:
+            masks = {}
+            for frame in scan.frames:
+                core._reduce_frame(frame, None, plan, provider, masks)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close():
+        provider.discard()
+        reuse.clear()
+        closed.set()
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    assert entered.wait(5)
+    closer = threading.Thread(target=close)
+    closer.start()
+    # Correct atomic transfer may keep discard waiting; release it either way.
+    closed.wait(0.1)
+    release.set()
+    worker.join(5)
+    closer.join(5)
+    assert not worker.is_alive() and not closer.is_alive()
+    assert not errors
+    assert len(reuse) == 0, "a late early-return repopulated the cleared Run store"
+    assert not reuse._lent
+
+
+def test_a_failed_fiber_is_not_reused_and_then_returned_by_a_later_frame(monkeypatch):
+    reuse = WarmIntegrators(1, allowance=1 << 30)
+    scan = _scan("failed-then-same-angle", (0.1, 0.1, 0.2))
+    plan = _plan(scan)
+    provider = _ReductionIntegratorProvider(
+        scan=scan, plan=plan, ai=scan.integrator, fi=None,
+        initial_incident_angle=0.1, reuse=reuse,
+    )
+    real_2d = core._run_gi_2d
+    failed = []
+
+    def fail_after_first_real_integration(image, integrator, *args, **kwargs):
+        result = real_2d(image, integrator, *args, **kwargs)
+        if not failed:
+            failed.append(integrator)
+            raise RuntimeError("first GI frame failed")
+        return result
+
+    monkeypatch.setattr(core, "_run_gi_2d", fail_after_first_real_integration)
+    masks = {}
+    try:
+        with pytest.raises(RuntimeError, match="first GI frame failed"):
+            core._reduce_frame(scan.frames[0], None, plan, provider, masks)
+        for frame in scan.frames[1:]:
+            core._reduce_frame(frame, None, plan, provider, masks)
+        assert all(ai is not failed[0] for entries in reuse._idle.values() for ai, _size in entries), (
+            "the failed GI integrator was reused and returned after a later frame"
+        )
+    finally:
+        provider.discard()
+        reuse.clear()
+
+
+def test_a_dynamic_mask_declines_this_providers_cache_before_building(monkeypatch):
+    reuse = WarmIntegrators(1, allowance=1 << 30)
+    _reduce(_scan("warm", (0.1,)), reuse=reuse)
+    assert len(reuse) == 1
+    scan = _scan("dynamic-mask", (0.1,))
+    scan.frames[0].mask = np.zeros(SHAPE, dtype=bool)
+    scan.frames[0].mask[0, 0] = True
+    plan = _plan(scan)
+    provider = _ReductionIntegratorProvider(
+        scan=scan, plan=plan, ai=scan.integrator, fi=None,
+        initial_incident_angle=0.1, reuse=reuse,
+    )
+    real_build = provider._new_fiber
+    idle_at_build = []
+
+    def build(gi):
+        idle_at_build.append(len(reuse))
+        return real_build(gi)
+
+    monkeypatch.setattr(provider, "_new_fiber", build)
+    core._reduce_frame(scan.frames[0], None, plan, provider, {})
+    provider.give_back()
+    assert idle_at_build == [0], "unaccounted dynamic-mask build kept the warm idle set"
+    assert len(reuse) == 0 and not reuse._lent
+
+
+def test_unmeasurable_tables_are_not_retained_with_a_positive_allowance():
+    reuse = WarmIntegrators(1, allowance=1 << 30)
+    scan = _scan("unmeasured", (0.1,))
+    key = core._warm_integrator_key("fiber", scan.integrator, None, SHAPE, _plan(scan), angle=0.1)
+    assert core._table_bytes(scan.integrator) == 0
+    assert reuse.borrow(key) is None
+    reuse.give_back(key, scan.integrator)
+    assert len(reuse) == 0 and not reuse._lent
+
+
+def test_companion_scout_recursion_and_reused_maps_match_fresh_results():
+    from tests.core.test_gi_companion_modes import _plan as companion_plan, _scan as companion_scan
+    from tests.core.test_warm_integrators_gi import _arrays, _same
+
+    def reduce(reuse):
+        scan = companion_scan()
+        session = ReductionSession(
+            companion_plan("qip_qoop", "q_chi"), scan, sink=MemorySink(),
+            execution="streaming", executor=1, integrator_reuse=reuse,
+            gi_freeze_mode="scout_union",
+        )
+        for frame in scan.frames:
+            session.submit(frame)
+        return session.finish()
+
+    reuse = WarmIntegrators(1, allowance=1 << 30)
+    reduce(reuse)
+    reused, fresh = reduce(reuse), reduce(None)
+    assert _same(_arrays(reused), _arrays(fresh))
+    for index, frame in reused.frames.items():
+        ours, theirs = frame.extra_results_2d["q_chi"], fresh.frames[index].extra_results_2d["q_chi"]
+        for name in ("radial", "azimuthal", "intensity", "sigma"):
+            a, b = getattr(ours, name), getattr(theirs, name)
+            assert (a is None and b is None) or np.array_equal(a, b, equal_nan=True)

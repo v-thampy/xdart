@@ -5220,6 +5220,10 @@ def _apply_gi_freeze_policy(
             )
     except BaseException:
         scout_integrators.discard()  # a failed scout or freeze: nothing it built goes back
+        if reuse is not None:
+            # Angle handbacks were provisional within this sequential scout phase.
+            # No worker starts before the entire freeze succeeds.
+            reuse.clear()
         raise
     scout_integrators.give_back()  # reduction and freeze both succeeded
     return out
@@ -5437,9 +5441,9 @@ class WarmIntegrators:
     by the largest tables measured for it; the angle is None outside GI. Least recently used first, the store drops
     idle integrators beyond
     ``KEYS_PER_ROLE`` keys per role, ``limit`` (the granted workers) per key, and table bytes, idle and in use, beyond
-    ``allowance`` (from the Run's memory plan, ``warm_integrator_allowance``). It keeps each role's most recently
-    returned key even so: one series' own integrators, whose memory the plan already funded while they worked. A
-    build of a family whose size is still unknown first drops every idle integrator.
+    ``allowance`` (from the Run's memory plan, ``warm_integrator_allowance``). With no extra allowance it keeps
+    only each role's most recently returned key; a positive byte allowance is strict for idle retention. A build
+    of a family whose size is still unknown first drops every idle integrator.
     """
 
     KEYS_PER_ROLE = 8
@@ -5487,6 +5491,8 @@ class WarmIntegrators:
         family = key[:2]
         with self._lock:
             self._release(family)
+            if not size and self._allowance:
+                return  # unmeasurable tables cannot spend a positive retention allowance
             if size:  # a size of 0 says nothing: the family stays unknown, so its builds still clear idle ones
                 self._sizes[family] = max(size, self._sizes.get(family, 0))
             entries = self._idle.pop(key, [])
@@ -5521,15 +5527,15 @@ class WarmIntegrators:
             self._lent.pop(family, None)
 
     def _trim(self, *, spare: bool = False) -> None:
-        """Drop least recently used idle integrators while idle and lent table bytes exceed the allowance; each
-        role's most recent key stays unless ``spare`` (a build is about to need the room)."""
+        """Drop idle integrators over the allowance. Only the zero-extra-allowance legacy path keeps each role's
+        most recent key, unless ``spare`` (a build is about to need the room)."""
         unknown = any(family not in self._sizes for family in self._lent)
         lent = sum(self._sizes.get(family, 0) * count for family, count in self._lent.items())
         idle = sum(size for entries in self._idle.values() for _, size in entries)
         for key in list(self._idle):
             if self._allowance and not unknown and idle + lent <= self._allowance:
                 return  # (with no allowance, only the most recent keys stay, and nothing stays for a build)
-            if not spare and self._recent.get(key[0]) == key:
+            if not self._allowance and not spare and self._recent.get(key[0]) == key:
                 continue
             idle -= sum(size for _, size in self._idle.pop(key))
 
@@ -5828,10 +5834,11 @@ class _ReductionIntegratorProvider:
             if index is None:
                 return
             del self._bound[index]
-        if done:
-            self.reuse.give_back(key, ai)
-        else:
-            self.reuse.release(key)
+            # Discard must not close/clear the Run between ownership removal and return.
+            if done:
+                self.reuse.give_back(key, ai)
+            else:
+                self.reuse.release(key)
 
     def _forget_thread(self) -> None:
         """Drop the calling thread's own references (the GI scout's setup thread) before its integrators move."""
@@ -5997,12 +6004,17 @@ class _ReductionIntegratorProvider:
         if (threading.get_ident() == self._owner_thread and self.fi is not None
                 and self._frame_wavelengths is None):
             return self.fi  # the scan's own accepted integrator: never lent to the store
+        if not static_mask and self.reuse is not None:
+            # This provider cannot price dynamic-mask builds: decline its loans for
+            # the rest of the series, including returns from other active workers.
+            self.discard()
+            self.reuse.clear()
         key = (self._fiber_key(incident_angle, run_mask, shape)
                if static_mask and incident_angle is not None and shape is not None else None)
         fi = getattr(self._local, "fi", None)
         held = getattr(self._local, "fi_key", None)
         if fi is not None:
-            if key == held:
+            if key == held and (held is None or getattr(self._local, "fi_done", False)):
                 self._local.fi_done = False
                 return fi
             self._local.fi = self._local.fi_key = None  # no longer this thread's before another worker can borrow it
