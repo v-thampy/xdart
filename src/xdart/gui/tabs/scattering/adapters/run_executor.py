@@ -18,6 +18,7 @@ from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.append import AppendRefused
 from xrd_tools.io.metadata import MetadataSourceChanged
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
+from xrd_tools.reduction.core import WarmIntegrators
 from xrd_tools.reduction.background import (
     _PreparedSeriesFrameBackground,
     _PreparedSingleFrameBackground,
@@ -781,6 +782,9 @@ class StandardRunExecutor:
         self._retirement: DisplayRetirementOwner | None = None
         self._max_display_items = max_display_items
         self._join_timeout = float(join_timeout)
+        # Built pyFAI tables kept from one Run to the next (beamline 2026-10-23: each Run's first frame rebuilt them,
+        # about 8 s for a Rayonix on that PC); each Run fits them to its own memory plan.
+        self._warm_tables = WarmIntegrators(1)
 
     def start(self, configuration, source: SourceCapture, run_identity: RunIdentity, admission: AdmissionReceipt):
         with self._lock:
@@ -1609,7 +1613,7 @@ class StandardRunExecutor:
             raise RuntimeError("dynamic output requires one admitted output")
         output = run.output
         if output is None:
-            output = DynamicOutputAdapter(configuration); run.output = output
+            output = DynamicOutputAdapter(configuration, self._warm_tables); run.output = output
         preparation = output.prepare_admission(
             run.scan, plan, item, decision, run.stop_signal,
             qualify=lambda policy, prior: _qualify_background_bindings(

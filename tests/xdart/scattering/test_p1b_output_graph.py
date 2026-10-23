@@ -1154,8 +1154,8 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     real_output_adapter = run_executor_module.DynamicOutputAdapter
     real_output_init = real_output_adapter.__init__
 
-    def observed_output_init(owner, configuration):
-        real_output_init(owner, configuration)
+    def observed_output_init(owner, configuration, *args, **kwargs):
+        real_output_init(owner, configuration, *args, **kwargs)
         output_adapters.append(owner)
 
     monkeypatch.setattr(

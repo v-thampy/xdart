@@ -736,7 +736,7 @@ def _writer_source_snapshots(
 
 
 class DynamicOutputAdapter:
-    def __init__(self, configuration) -> None:
+    def __init__(self, configuration, integrator_reuse: WarmIntegrators | None = None) -> None:
         self.configuration = configuration
         self._graphs: dict[str, dict[str, Any]] = {}
         self._pending_preflights: list[Any] = []
@@ -748,8 +748,13 @@ class DynamicOutputAdapter:
         self._activating = False
         self._stop_requested = False
         self.resource_facts: tuple[HeavyResidencyFact, ...] = ()
-        # the Run's built worker integrators, which its series borrow instead of rebuilding pyFAI's tables
-        self._integrator_reuse = WarmIntegrators(max(1, int(configuration.max_cores)))
+        # the Run's built worker integrators, which its series borrow instead of rebuilding pyFAI's tables; an
+        # executor's store outlives its Runs, so a Run's first frames start warm when nothing changed
+        self._shared_tables = integrator_reuse is not None
+        self._integrator_reuse = (
+            integrator_reuse if integrator_reuse is not None
+            else WarmIntegrators(max(1, int(configuration.max_cores)))
+        )
 
     @staticmethod
     def _discard_identity(values: list[Any], owner: Any) -> None:
@@ -1729,7 +1734,10 @@ class DynamicOutputAdapter:
         try:
             return self._finish_all(stopped=stopped)
         finally:
-            self._integrator_reuse.clear()  # the Run is over, even a failed one: release its built integrators
+            if self._shared_tables:  # the Run is over: its executor keeps each kind's latest tables for the next Run
+                self._integrator_reuse.keep_for_next_run()
+            else:  # the Run is over, even a failed one: release its built integrators
+                self._integrator_reuse.clear()
 
     def _finish_all(self, *, stopped: bool) -> tuple[object, ...]:
         results = []

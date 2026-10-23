@@ -256,3 +256,17 @@ def test_unsupported_series_releases_idle_tables_before_building(monkeypatch):
     monkeypatch.setattr(core._ReductionIntegratorProvider, "_new_standard", observe)
     result = _reduce(_scan("flat", flat=True), _plan(), reuse=reuse)
     assert not result.failed and len(reuse) == 0
+
+
+def test_a_run_end_keeps_one_integrator_under_each_roles_latest_key():
+    """The executor's store outlives its Runs (beamline 2026-10-23, each Run's first frame rebuilt pyFAI's tables):
+    at a Run's end it keeps one idle integrator under each role's most recently returned key."""
+    reuse = WarmIntegrators(4)
+    older, latest, fiber = ("standard", "family", 1, None), ("standard", "family", 2, None), ("fiber", "gi", 1, 0.1)
+    kept = [object() for _ in range(5)]
+    for key, integrator in zip((older, older, latest, latest, fiber), kept):
+        reuse.give_back(key, integrator)
+    reuse.keep_for_next_run()
+    assert len(reuse) == 2
+    assert reuse.borrow(fiber) is kept[4] and reuse.borrow(latest) is kept[3]
+    assert reuse.borrow(older) is None

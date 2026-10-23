@@ -192,3 +192,20 @@ def test_on_windows_a_runs_tables_are_kept_within_its_physical_ram(tmp_path, mon
     _directory_run(tmp_path, ("posa",), cores=4, request_value=9531)
     planned = [(limit, allowance) for limit, allowance in fits if allowance is not None]
     assert planned and all(allowance > limit * INTEGRATOR_RESERVE_BYTES for limit, allowance in planned), planned
+
+
+def test_an_executor_keeps_a_runs_tables_for_its_next_run(tmp_path, builds):
+    """Beamline 2026-10-23: "still slow for the first frame". Each Run emptied its store at its end, so every Run's
+    first frame rebuilt pyFAI's tables (about 8 s for a Rayonix on that PC). The page's executor keeps each kind's
+    latest tables, so a second Run with the same settings builds none."""
+    from tests.xdart.scattering.test_p1b_output_graph import _drain_until
+    executor = StandardRunExecutor(join_timeout=2.0)
+    for number, stem in enumerate(_STEMS[:2]):
+        run = tmp_path / f"run{number}"
+        _series(run / "raw", (stem,))
+        identity = _start(executor, _intent(run, run / "raw", cores=1), request_value=9541 + number)
+        events = _drain_until(executor, lambda values: any(event.kind in _TERMINAL for event in values))
+        executor.close(identity)
+        assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"], events[-1]
+    assert len(builds) == 1, builds  # on the parent: one per Run
+    assert len(executor._warm_tables) == 1

@@ -5490,6 +5490,19 @@ class WarmIntegrators:
             )
             return None
 
+    def keep_for_next_run(self) -> None:
+        """A Run is over: keep one idle integrator under each role's most recently returned key, so the next Run's
+        first frames need no build when nothing changed (its series then fit the store to their own plan); drop the
+        rest."""
+        with self._lock:
+            latest = set(self._recent.values())
+            for key in list(self._idle):
+                if key in latest:
+                    del self._idle[key][:-1]
+                else:
+                    del self._idle[key]
+            self._trim()
+
     def give_back(self, key: Any, integrator: Any) -> None:
         """Keep ``integrator``, borrowed or built under ``key``, for its next borrower, within the store's bounds."""
         size = _table_bytes(integrator)
