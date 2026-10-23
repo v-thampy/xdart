@@ -256,9 +256,12 @@ def test_browse_worker_disabled_gate_never_reads_clock(tmp_path) -> None:
     assert loader.release_context(context).cleanup_status.value == "cleaned"
 
 
-def test_terminal_browse_log_uses_worker_canonical_path_for_symlink_alias(
+def test_terminal_browse_log_keeps_the_requested_alias_without_gui_resolution(
     tmp_path, caplog, monkeypatch,
 ) -> None:
+    # Since 1.2.2 Browse keeps the requested normcase/abspath identity: resolving
+    # a mapped drive or symlink split it from its consumers (Windows hang). The
+    # log names that identity, and the GUI thread still resolves nothing.
     from xdart.gui.tabs.scattering.adapters import browse_loader as module
     from xdart.gui.tabs.scattering.browse_values import (
         BrowseLoadRequest,
@@ -274,9 +277,9 @@ def test_terminal_browse_log_uses_worker_canonical_path_for_symlink_alias(
     seeded = _seed_existing(tmp_path)
     alias = tmp_path / f"terminal-alias{seeded.target.suffix}"
     alias.symlink_to(seeded.target)
-    canonical = str(seeded.target.resolve())
+    resolved = str(seeded.target.resolve())
     request = BrowseLoadRequest("alias-terminal", 7, str(alias))
-    assert request.source_path != canonical
+    assert request.source_path != resolved
     loader = module.BrowseLoader(
         clock=_StepClock(range(16)),
         perf_enabled=lambda: True,
@@ -290,7 +293,7 @@ def test_terminal_browse_log_uses_worker_canonical_path_for_symlink_alias(
     assert outcome is not None
     assert outcome.status is BrowseLoadStatus.READY
     assert type(outcome.timing) is BrowseLoadTiming
-    assert outcome.timing.canonical_path == canonical
+    assert outcome.timing.canonical_path == request.source_path
     context = loader.consume(outcome)
     assert context is not None
     capture = _loaded_capture(request, context=context)
@@ -342,10 +345,10 @@ def test_terminal_browse_log_uses_worker_canonical_path_for_symlink_alias(
         assert len(records) == 1
         message = records[0].getMessage()
         assert (
-            f"source={canonical} token=alias-terminal generation=7"
+            f"source={request.source_path} token=alias-terminal generation=7"
             in message
         )
-        assert f"source={request.source_path} " not in message
+        assert f"source={resolved} " not in message
     finally:
         assert loader.release_context(context).cleanup_status.value == "cleaned"
         owner.begin_close()
