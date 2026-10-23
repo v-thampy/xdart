@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+from time import monotonic
 from typing import Any, Callable
 import numpy as np
 from xrd_tools.core.filters import compile_filter
@@ -522,6 +523,8 @@ def prepare_output(
     assets = _load_scientific_assets(intent, cancelled=cancelled)
     candidate = OutputCandidate.from_start_capture(capture, assets)
     source, choices, deferred = candidate.source, None, None
+    automatic = intent.threshold.mask_saturation and not intent.threshold.apply_threshold
+    saturation, signed = None, False
     directory_discovered_paths: tuple[Path, ...] = ()
     if cancelled():
         raise RuntimeError("admission cancelled")
@@ -564,6 +567,15 @@ def prepare_output(
             not intent.gi.enabled
             and not intent.live_mode
         ):
+            # A Directory run's ceiling is the detector's documented limit alone (no file is read), so the candidate
+            # is signed with it before planning: an Append's completed scans are recognized there, against the
+            # identity their outputs were written with.
+            saturation = _admitted_saturation(source, (), assets) if automatic else None
+            if saturation is not None:
+                candidate = OutputCandidate.from_start_capture(
+                    capture, assets, choices, saturation=saturation,
+                )
+            signed = True
             deferred = _deferred_directory_plan(
                 candidate,
                 bounded_plan,
@@ -592,13 +604,13 @@ def prepare_output(
             candidate = OutputCandidate.from_start_capture(
                 capture, assets, choices
             )
-    automatic = intent.threshold.mask_saturation and not intent.threshold.apply_threshold
-    saturation = _admitted_saturation(source, items, assets) if automatic else None
-    if saturation is not None:
-        # signed with the resolved ceiling before any Append inspection (decision 39)
-        candidate = OutputCandidate.from_start_capture(
-            capture, assets, choices, saturation=saturation,
-        )
+    if not signed:
+        saturation = _admitted_saturation(source, items, assets) if automatic else None
+        if saturation is not None:
+            # signed with the resolved ceiling before any Append inspection (decision 39)
+            candidate = OutputCandidate.from_start_capture(
+                capture, assets, choices, saturation=saturation,
+            )
     if deferred is None:
         _validate_targets(
             candidate,
@@ -860,6 +872,7 @@ def _deferred_directory_plan(
     """``prefix``: a live published graph proved this poll, whose members keep their admitted states."""
     if not plan.candidates:
         raise RuntimeError("source has no matching candidates")
+    started = monotonic()
     proven = proven_states(prefix)
     staged: list[
         tuple[
@@ -1030,6 +1043,11 @@ def _deferred_directory_plan(
             reason,
             _protected_topology=tuple(protected),
         ))
+    _LOG.debug(
+        "[APPEND-ADMIT] groups=%d already-processed=%d files=%d (%.0f ms)",
+        len(entries), sum(entry.completed is not None for entry in entries), len(plan.candidates),
+        1000 * (monotonic() - started),
+    )
     return DeferredDirectoryPlan(
         plan,
         tuple(entries),

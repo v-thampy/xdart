@@ -14,7 +14,7 @@ import h5py
 import pytest
 
 import xrd_tools.io.record_writer as record_writer
-from tests.xdart.scattering.test_live_revalidation_cost_run import TINY, _poni, _Sidecar, _tiff
+from tests.xdart.scattering.test_live_revalidation_cost_run import PILATUS, TINY, _poni, _Sidecar, _tiff
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_terminal
 from xdart.gui.tabs.scattering.adapters import dynamic_output, run_executor
 from xrd_tools.session.run_configuration import RunIntent
@@ -23,16 +23,16 @@ from xrd_tools.sources.selection import DirectorySourceSpec
 _ENERGY = "Using the scan energy, 16.000 keV; the PONI says 12.398 keV."
 
 
-def _intent(tmp_path, raw, *, mode="Append", npt=8, processing="Int 1D"):
+def _intent(tmp_path, raw, *, mode="Append", npt=8, processing="Int 1D", shape=TINY):
     return RunIntent(
         source_spec=DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format="txt"),
-        poni_file=str(_poni(tmp_path, TINY)), project_root=str(raw), save_path=str(tmp_path / "processed"),
+        poni_file=str(_poni(tmp_path, shape)), project_root=str(raw), save_path=str(tmp_path / "processed"),
         output_mode=mode, processing_mode=processing, live_mode=False, max_cores=1,
         bai_1d_args={"npt": npt, "method": "numpy"}, bai_2d_args={"npt_rad": 8, "npt_azim": 8, "method": "numpy"})
 
 
-def _scan(raw, stem, frames, start=0):
-    scan = _Sidecar(raw, TINY, stem)
+def _scan(raw, stem, frames, start=0, shape=TINY):
+    scan = _Sidecar(raw, shape, stem)
     for k in range(start, start + frames):
         scan.frame(k)
     return scan
@@ -88,13 +88,13 @@ class _Seams:
         monkeypatch.setattr(record_writer.NexusRecordWriter, "begin", begin)
 
 
-def _completed_and_new(tmp_path):
+def _completed_and_new(tmp_path, shape=TINY):
     raw = tmp_path / "raw"
     raw.mkdir()
-    _scan(raw, "scana", 3)
-    events, _catalog = _run(tmp_path, raw, 9101)
+    _scan(raw, "scana", 3, shape=shape)
+    events, _catalog = _run(tmp_path, raw, 9101, shape=shape)
     assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
-    _scan(raw, "scanb", 2)
+    _scan(raw, "scanb", 2, shape=shape)
     return raw
 
 
@@ -198,3 +198,26 @@ def test_what_is_not_already_processed_goes_the_full_way(tmp_path, monkeypatch, 
     if change in ("renamed", "raw-rewritten", "settings"):
         warnings = [warning for event in events if event.kind in _TERMINAL for warning in event.warnings]
         assert any("scana" in warning for warning in warnings), warnings
+
+
+def test_a_completed_scan_under_a_detector_ceiling_is_recognized_at_admission(tmp_path, monkeypatch):
+    """A Pilatus calibration documents a counter limit, so the Run resolves an automatic saturation ceiling (decision
+    39) and its outputs record that identity: admission signs the ceiling before recognizing completed scans, which
+    are then skipped without a capture, materialization or warning (R10's case, with TIFF + .txt)."""
+    from xrd_tools.sources.execution_graph import SourceFileState
+
+    raw = _completed_and_new(tmp_path, shape=PILATUS)
+    captured = []
+    real_capture = SourceFileState.capture
+
+    def capture(cls, path):
+        captured.append(os.path.basename(str(path)))
+        return real_capture(path)
+
+    monkeypatch.setattr(SourceFileState, "capture", classmethod(capture))
+    seams = _Seams(monkeypatch)
+    events, _catalog = _run(tmp_path, raw, 9106, shape=PILATUS)
+    warnings = [warning for event in events if event.kind in _TERMINAL for warning in event.warnings]
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"] and warnings == []
+    assert seams.materialized == ["scanb_int1d.nexus"]
+    assert not any(name.startswith("scana_") for name in captured), captured
