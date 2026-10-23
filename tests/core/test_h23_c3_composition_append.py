@@ -5215,3 +5215,27 @@ def test_in_place_append_ended_before_its_first_new_frame_keeps_the_output_valid
     assert resumed.finish(ReductionResult("in-place", {}, 3)).disposition is NexusTerminalDisposition.COMMITTED
     assert _readback(target)[0] == (0, 1, 2)
     assert qualify_append(target, _labels_intent(tmp_path, 3, generation=2)).disposition is AppendDisposition.SKIP
+
+
+def test_in_place_pending_lineage_stays_deferred_until_it_is_staged(tmp_path, monkeypatch):
+    """A failed staging keeps the marker deferred, so a retried write stages it before any row."""
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import FrameReduction
+    writer_module = importlib.import_module("xrd_tools.io.record_writer")
+    target = tmp_path / "in-place-staging-fault.nexus"
+    _finite_seed(target, tmp_path, 1)
+    sink = _finite_in_place_sink(target, tmp_path, 2)
+    writer = sink._writer
+    assert writer._deferred_lineage is not None and _readback(target)[2]["state"] == "committed"
+    real_stage = writer_module.stage_append_lineage
+
+    def fail_once(entry, decision):
+        monkeypatch.setattr(writer_module, "stage_append_lineage", real_stage)
+        raise OSError("lineage staging fault")
+
+    monkeypatch.setattr(writer_module, "stage_append_lineage", fail_once)
+    with pytest.raises(Exception, match="lineage staging fault"):
+        sink.write(ScanFrame(1), FrameReduction(1, result_1d=_r1(1)))
+    assert writer._deferred_lineage is not None
+    writer._authorize_transaction_mutation()
+    assert writer._deferred_lineage is None and writer._lineage_dirty

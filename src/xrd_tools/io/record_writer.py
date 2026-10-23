@@ -2540,9 +2540,10 @@ class NexusRecordWriter:
             binding.attempt,
             lease=binding.lease,
         )
-        deferred, self._deferred_lineage = self._deferred_lineage, None
+        deferred = self._deferred_lineage
         if deferred is not None:
             self._stage_pending_lineage(deferred)
+            self._deferred_lineage = None  # only once staged: a retried write stages it again
 
     def _stage_pending_lineage(self, decision: AppendDecision) -> None:
         stage_append_lineage(self._entry_group(), decision)
