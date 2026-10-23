@@ -22,14 +22,15 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def test_int2d_overlay_retains_selected_point_when_browsing_another_file(
-    tmp_path, monkeypatch, qapp,
+@pytest.mark.parametrize("mode", ("Int 1D", "Int 2D"))
+def test_int_overlay_retains_selected_point_when_browsing_another_file(
+    tmp_path, monkeypatch, qapp, mode,
 ):
     first, _ = _write_processed(tmp_path / "first", labels=(1, 2))
     second, _ = _write_processed(tmp_path / "second", labels=(1, 2))
     persisted = (get_1d(first, 2), get_1d(second, 1))
     store = RunIntentStore(RunIntent(
-        project_root=str(tmp_path), processing_mode="Int 2D",
+        project_root=str(tmp_path), processing_mode=mode,
     ))
     page, _ = _page(tmp_path, monkeypatch, store=store)
     controller, shell = page._context_controller, page._shell
@@ -49,7 +50,7 @@ def test_int2d_overlay_retains_selected_point_when_browsing_another_file(
             and any(trace.frame is frame for trace in state.traces)
             and frame in view.trace_history_keys
             and view.raw.canvas.displayed_image.size
-            and view.cake.canvas.displayed_image.size
+            and (mode == "Int 1D" or view.cake.canvas.displayed_image.size)
         ) else None
 
     def open_file(path):
