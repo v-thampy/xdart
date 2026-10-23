@@ -850,6 +850,8 @@ class ScientificProjection:
     detector_pending: bool = False
     detector_diagnostic: str = ""
     browse_trace_snapshot: BrowseTraceSnapshot | None = None
+    #: Current processed Browse artifact; only its detached 1-D rows may join Int comparisons.
+    browse_artifact: str = ""
     # Whole detached cut batches replace history, including empty/refused rows.
     # Acquisition's incremental trace publications keep their existing merge.
     replace_trace_history: bool = False
@@ -879,7 +881,8 @@ class ScientificProjection:
         if type(self.background_enabled) is not bool:
             raise TypeError("background availability must be boolean")
         if (
-            self.browse_trace_snapshot is not None
+            type(self.browse_artifact) is not str
+            or self.browse_trace_snapshot is not None
             and type(self.browse_trace_snapshot) is not BrowseTraceSnapshot
         ):
             raise TypeError("Browse trace snapshot must be exact")
