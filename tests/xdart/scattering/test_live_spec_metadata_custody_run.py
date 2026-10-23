@@ -301,11 +301,14 @@ def _intent(tmp_path, raw, *, live, mode):
         processing_mode='Int 1D', live_mode=live, max_cores=1, bai_1d_args={'npt': 8, 'method': 'numpy'})
 
 
-def _append(tmp_path, raw, request_value):
+def _append(tmp_path, raw, request_value, *, warnings=None):
     executor, identity, events = _run_to_terminal(_intent(tmp_path, raw, live=False, mode='Append'),
                                                   request_value=request_value)
     executor.close(identity)
-    return [(event.kind.name, event.detail) for event in events if event.kind in _TERMINAL]
+    terminal = [event for event in events if event.kind in _TERMINAL]
+    if warnings is not None:
+        warnings.extend(warning for event in terminal for warning in event.warnings)
+    return [(event.kind.name, event.detail) for event in terminal]
 
 
 def _reintegrate(tmp_path, raw, artifact):
@@ -347,6 +350,11 @@ def test_r10_a_saved_live_output_replays_unchanged_inputs_and_refuses_after_grow
     before = artifact.read_bytes()
     with pytest.raises(ValueError, match='REVISION'):
         _reintegrate(tmp_path, raw, artifact)
-    refused = _append(tmp_path, raw, 5212)
-    assert _kinds(refused) == ['FAILED'] and 'same-extent source identity changed' in refused[0][1], refused
+    # A directory Append skips the scan it may not extend and finishes the rest (maintainer, 2026-10-23); the
+    # end of the run names the refusal, and the saved output is untouched.
+    skipped = []
+    refused = _append(tmp_path, raw, 5212, warnings=skipped)
+    assert _kinds(refused) == ['FINISHED'] and ' skipped' in refused[0][1], refused
+    assert len(skipped) == 1 and artifact.name in skipped[0], skipped
+    assert 'same-extent source identity changed' in skipped[0], skipped
     assert artifact.read_bytes() == before

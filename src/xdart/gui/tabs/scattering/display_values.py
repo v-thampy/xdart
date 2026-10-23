@@ -219,6 +219,8 @@ class StandardRunEvent:
     files_discovered: int = 0
     terminal_timing: StandardTerminalTiming | None = None
     terminal_commit_identity: StreamTerminal | None = None
+    #: Terminal-only notes the run wants shown at its end, e.g. scans an Append skipped.
+    warnings: tuple[str, ...] = ()
 
 @dataclass(frozen=True, slots=True)
 class StandardDisplayPayload:
@@ -276,6 +278,10 @@ def standard_event_is_valid(value: object, identity: RunIdentity) -> bool:
                 and all(detached_diagnostic_is_valid(item) for item in value.cleanup_failures)
                 and type(value.artifacts) is tuple
                 and all(type(item) is str and item for item in value.artifacts)
+                and type(value.warnings) is tuple
+                and all(type(item) is str and item for item in value.warnings)
+                and (not value.warnings or value.kind in {
+                    StandardEventKind.FINISHED, StandardEventKind.STOPPED, StandardEventKind.FAILED})
                 and (
                     value.frame_key is None
                     or type(value.frame_key) is DisplayFrameKey

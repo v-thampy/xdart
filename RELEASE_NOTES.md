@@ -19,6 +19,11 @@
 - **Overlay keeps the curves when you narrow a selection:** in 1.2.2 and 1.2.3,
   choosing fewer frames of the same processed file in Overlay could leave the plot
   empty once a later repaint arrived. The remaining curves now stay drawn.
+- **A directory Append no longer stops at one changed scan:** when Append refuses
+  a scan (for example "same-extent source identity changed"), xdart now skips that
+  scan, writes the reason to the log, processes the remaining scans, and lists the
+  skipped scans in a message at the end of the run. The skipped scan's saved
+  result is left untouched; use Replace to reprocess it.
 - **Append refusal says what changed:** "same-extent source identity changed" now
   names the source details that differ from the processed file's record (for
   example a content digest or a modification time, with the difference). The

@@ -5377,7 +5377,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 ) == (EnergyScanRefused.__module__, EnergyScanRefused.__qualname__)
                 self._open_warning(
                     "Energy scan not processed" if energy_refused else "Run failed",
-                    primary.message if primary is not None else self._notice_text,
+                    (primary.message if primary is not None else self._notice_text)
+                    + ("\n\nSkipped before the failure:\n" + "\n".join(event.warnings)
+                       if event.warnings else ""),
                 )
             return
         ended = self._lifecycle.execution_ended(
@@ -5393,6 +5395,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             else ""
         )
+        if event.warnings:
+            # A directory Append skips a scan it may not extend and runs the rest
+            # (maintainer, 2026-10-23); say which, once, at the end of the run.
+            self._open_warning(
+                "Scans skipped",
+                "\n\n".join(event.warnings)
+                + "\n\nThe other scans were processed. Use Replace for a skipped scan to reprocess it.",
+            )
 
     def _processed_terminal_presentation_is_current(
         self, presentation: TerminalBrowsePresentation,

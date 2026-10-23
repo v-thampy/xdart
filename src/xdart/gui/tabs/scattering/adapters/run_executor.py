@@ -457,6 +457,8 @@ class _StandardRun:
     files_discovered: int = 0
     files_processed: int = 0
     files_skipped: int = 0
+    # Scans a directory Append skipped instead of failing the run: (output, reason).
+    append_skips: list[tuple[str, str]] = field(default_factory=list)
     processed_live_revisions: dict[str, LiveDirectoryAttempt] = field(
         default_factory=dict
     )
@@ -2357,7 +2359,15 @@ class StandardRunExecutor:
                 ):
                     stopped = True
                     break
-                raise
+                if not isinstance(error, AppendRefused):
+                    raise
+                # One scan's Append refusal skips that scan; the rest of the
+                # directory still runs and the end of the run lists it
+                # (maintainer, 2026-10-23). Nothing was constructed for it.
+                reason = detach_exception(error, "append").message
+                run.append_skips.append((str(entry.target), reason))
+                logger.warning("[APPEND-SKIPPED] output=%s reason=%s", entry.target, reason)
+                decision, skipped_files = None, 0
             if decision is None:
                 skipped_claims = _claim_physical_files(
                     tuple(
@@ -3123,6 +3133,12 @@ class StandardRunExecutor:
             if run.terminal_emitted:
                 return
             run.terminal_emitted = True
+        warnings = tuple(
+            f"Append skipped {Path(output).name}: {reason}"
+            for output, reason in run.append_skips
+        )
+        if warnings:
+            logger.warning("[RUN-SKIPPED] %d scan(s) skipped: %s", len(warnings), "; ".join(warnings))
         if receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING:
             logger.warning(
                 "[RUN-CLEANUP] output=%s retained=%s light_pending=%s failures=%s",
@@ -3246,6 +3262,7 @@ class StandardRunExecutor:
                 and receipt.cleanup_status is CleanupStatus.CLEANED
                 else None
             ),
+            warnings=warnings,
             **_directory_event_fields(
                 run,
                 in_flight_processed=_terminal_in_flight_files(run),
