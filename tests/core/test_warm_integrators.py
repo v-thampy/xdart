@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import threading
 import time
+import gc
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -214,3 +216,40 @@ def test_the_store_keeps_one_key_within_the_grant():
     store.give_back("a", second)
     store.clear()
     assert len(store) == 0
+
+
+@pytest.mark.parametrize("sink", [_FailingWrite, _FailingFinish, _SlowWrite])
+def test_failed_finish_does_not_retain_worker_integrators(monkeypatch, sink):
+    held = []
+    real = core._ReductionIntegratorProvider._new_standard
+
+    def observe(self):
+        ai = real(self)
+        held.append(weakref.ref(ai))
+        return ai
+
+    monkeypatch.setattr(core._ReductionIntegratorProvider, "_new_standard", observe)
+    session = _session(_scan("failed"), sink(), WarmIntegrators(1))
+    try:
+        session.finish(raise_on_failure=False, join_timeout=0.05 if sink is _SlowWrite else 5.0)
+    except OSError:
+        pass
+    if session._writer_thread is not None:
+        session._writer_thread.join(5.0)
+    gc.collect()
+    assert held and all(reference() is None for reference in held)
+
+
+def test_unsupported_series_releases_idle_tables_before_building(monkeypatch):
+    reuse = WarmIntegrators(1)
+    _reduce(_scan("first"), _plan(), reuse=reuse)
+    assert len(reuse) == 1
+    real = core._ReductionIntegratorProvider._new_standard
+
+    def observe(self):
+        assert len(reuse) == 0, "unsupported series retained the previous warm set"
+        return real(self)
+
+    monkeypatch.setattr(core._ReductionIntegratorProvider, "_new_standard", observe)
+    result = _reduce(_scan("flat", flat=True), _plan(), reuse=reuse)
+    assert not result.failed and len(reuse) == 0

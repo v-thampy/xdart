@@ -4483,6 +4483,7 @@ class ReductionSession:
                 "cancelled: %d attempts submitted, %d written, %d dropped in-flight",
                 self._submitted, self._written_attempts, dropped,
             )
+        sink_finished = False
         try:
             if self._started:
                 if _writer_timed_out:
@@ -4515,11 +4516,18 @@ class ReductionSession:
                         _admission_trace("sink_finish_begin", on_failure=True)
                         self._sink.finish(self.result)
                         _admission_trace("sink_finish_end", on_failure=True)
+            sink_finished = True
         finally:
             # A timed-out writer can own stalled futures; never re-hang here.
             joined = self._owns_worker and self._worker is not None and not _writer_timed_out
-            self._shutdown_worker(wait=not _writer_timed_out)
+            try:
+                self._shutdown_worker(wait=not _writer_timed_out)
+            except BaseException:
+                self._integrators.discard()
+                raise
             self._finished = True
+            if not sink_finished or not joined or self._current_failure() is not None:
+                self._integrators.discard()
         if joined and self._current_failure() is None:
             # compute shutdown succeeded (every worker joined, nothing failed; publication may still fail later, which
             # stops the Run): the Run's next series may reuse their integrators
@@ -5530,6 +5538,7 @@ class _ReductionIntegratorProvider:
         self.reuse = reuse
         self._bound: list[tuple[Any, Any]] = []  # (key, integrator): what this session gives back to ``reuse``
         self._bound_lock = threading.Lock()
+        self._reuse_closed = False
         self._reuse_keys: dict[tuple[int, int], tuple[Any, Any]] = {}  # shape -> (Run mask, key)
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
@@ -5540,6 +5549,8 @@ class _ReductionIntegratorProvider:
         if self._frame_wavelengths is not None:
             base = getattr(ai, "wavelength", None) or getattr(scan.poni, "wavelength", None)
             self._base_wavelength = None if base is None else float(base)
+        if reuse is not None and (plan.gi is not None or self._frame_wavelengths is not None or ai is None):
+            reuse.clear()
 
     def _new_standard(self) -> Any:
         """Build one private standard integrator from the accepted calibration."""
@@ -5644,7 +5655,7 @@ class _ReductionIntegratorProvider:
         only for a standard integration at one wavelength, cloned from an accepted integrator. Computed once per
         shape (a session's Run mask is one object per shape), under ``_PYFAI_COLD_GEOMETRY_LOCK`` (it reads the
         accepted integrator's detector mask)."""
-        if self.reuse is None or self.ai is None or self._frame_wavelengths is not None:
+        if self.reuse is None or self._reuse_closed or self.ai is None or self._frame_wavelengths is not None:
             return None
         cached = self._reuse_keys.get(shape)
         if cached is not None and cached[0] is run_mask:
@@ -5656,7 +5667,15 @@ class _ReductionIntegratorProvider:
         else:
             key = _warm_integrator_key(self.ai, bound_mask, shape, self.plan)
         self._reuse_keys[shape] = (run_mask, key)
+        if key is None:
+            self.reuse.clear()
         return key
+
+    def discard(self) -> None:
+        """Drop failed-session references, including any worker finishing after a timeout."""
+        with self._bound_lock:
+            self._reuse_closed = True
+            self._bound.clear()
 
     def give_back(self) -> None:
         """Hand this session's bound worker integrators to the Run's store, once its workers have all stopped."""
@@ -5694,6 +5713,8 @@ class _ReductionIntegratorProvider:
             self.ai,
             shape,
         ):
+            if self.reuse is not None:
+                self.reuse.clear()
             return self._retain_unbound_standard(
                 self._unbound_standard(),
                 run_mask,
@@ -5734,7 +5755,8 @@ class _ReductionIntegratorProvider:
 
         if key is not None:
             with self._bound_lock:
-                self._bound.append((key, ai))
+                if not self._reuse_closed:
+                    self._bound.append((key, ai))
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, True)
         self._local.alternate = None  # a new binding retires the previous alternate
