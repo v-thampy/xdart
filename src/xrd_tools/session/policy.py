@@ -333,7 +333,8 @@ def warm_integrator_allowance(allocation: "SessionResourceAllocation | None", wo
                               total_ram_bytes: int | None) -> int:
     """Bytes a Run's warm integrators (``WarmIntegrators``) may hold, in use and idle: the integrator reserve this
     plan funds for its granted workers, plus envelope headroom no category was granted, up to a quarter of physical
-    RAM. With RAM unknown (Windows today) the envelope is only a fallback, so the funded reserve alone."""
+    RAM. With RAM unknown the envelope is only a fallback, so the funded reserve alone (Windows passes
+    ``windows_physical_ram_bytes``)."""
     funded = max(1, int(workers)) * INTEGRATOR_RESERVE_BYTES
     if allocation is None or not total_ram_bytes:
         return funded

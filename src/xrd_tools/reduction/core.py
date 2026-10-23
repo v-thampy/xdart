@@ -5483,6 +5483,11 @@ class WarmIntegrators:
                 self._trim(spare=True)
             else:
                 self._idle.clear()
+            logger.debug(
+                "[WARM-TABLES] %s build: family size %s B, %d B idle after room is made, %d B allowed",
+                key[0], self._sizes.get(family), sum(size for entries in self._idle.values() for _, size in entries),
+                self._allowance,
+            )
             return None
 
     def give_back(self, key: Any, integrator: Any) -> None:

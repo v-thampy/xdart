@@ -166,3 +166,29 @@ def test_a_gi_live_run_reuses_its_integrators_from_one_series_to_the_next(tmp_pa
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
     assert len(promotions) <= 3, promotions  # on the parent: one or two per series
+
+
+def test_on_windows_a_runs_tables_are_kept_within_its_physical_ram(tmp_path, monkeypatch):
+    """Beamline 2026-10-23 (Windows, 64 GB): os.sysconf has no physical RAM there, so a Run kept only its funded
+    integrator reserve, Cores x 1 GiB. A Rayonix table set is about 2 GB, so every 2-frame scan's second worker rebuilt
+    one (about 8 s on that PC, against 1.2 s for a 1-frame scan). Windows' own RAM figure now lets the plan's unspent
+    envelope count, as everywhere else."""
+    import sys
+
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.core import staging
+    from xrd_tools.session.policy import INTEGRATOR_RESERVE_BYTES
+    assert (staging.windows_physical_ram_bytes() is None) is (sys.platform != "win32")
+    fits = []
+    real_fit = core.WarmIntegrators.fit
+
+    def fit(store, limit, allowance=None):
+        fits.append((limit, allowance))
+        return real_fit(store, limit, allowance)
+
+    monkeypatch.setattr(core.WarmIntegrators, "fit", fit)
+    monkeypatch.setattr(dynamic_output, "total_physical_ram_bytes", lambda: None)
+    monkeypatch.setattr(dynamic_output, "windows_physical_ram_bytes", lambda: 64 << 30, raising=False)
+    _directory_run(tmp_path, ("posa",), cores=4, request_value=9531)
+    planned = [(limit, allowance) for limit, allowance in fits if allowance is not None]
+    assert planned and all(allowance > limit * INTEGRATOR_RESERVE_BYTES for limit, allowance in planned), planned

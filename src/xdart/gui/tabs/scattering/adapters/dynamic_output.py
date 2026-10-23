@@ -58,6 +58,7 @@ from xrd_tools.core.staging import (
     browse_publication_max_items,
     heavy_window,
     total_physical_ram_bytes,
+    windows_physical_ram_bytes,
 )
 from xrd_tools.session.run_configuration import heavy_residency_choice
 from xrd_tools.session.display_logic import xye_prefix_for_unit
@@ -1423,7 +1424,8 @@ class DynamicOutputAdapter:
                        else policy.allocation.workers)
             # this series' memory plan bounds the Run's built integrators, before its scout or workers borrow
             self._integrator_reuse.fit(workers, warm_integrator_allowance(
-                None if policy is None else policy.allocation, workers, total_physical_ram_bytes()))
+                None if policy is None else policy.allocation, workers,
+                total_physical_ram_bytes() or windows_physical_ram_bytes()))
             session = open_headless_scan_session(
                 session_scan,
                 plan,
