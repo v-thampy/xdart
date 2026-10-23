@@ -10,6 +10,7 @@ from xrd_tools.session.readiness import (
 )
 
 from xdart.gui.widgets.controls_panel import ControlsPanel
+from xdart.gui.widgets.log_panel import mount_log_panel
 from xdart.gui.widgets.run_controls import RunControlsBar
 
 from .browser_view import BrowserView
@@ -62,6 +63,11 @@ class _HugWidthScrollArea(QtWidgets.QScrollArea):
             and event.type() == QtCore.QEvent.Type.LayoutRequest
         ):
             self.updateGeometry()
+            parent = self.parentWidget()
+            if parent is not None and parent.layout() is None:
+                # a parent without a layout (the log's splitter) does not
+                # pass the change on while it is hidden: tell its own parent
+                parent.updateGeometry()
         return handled
 
 
@@ -123,7 +129,9 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         )
         self.control_scroll.setWidget(self.controls)
         self.run_controls = RunControlsBar()
-        layout.addWidget(self.control_scroll, 1)
+        # Show log, below Reintegrate/Advanced, opens the log under the controls; its handle drags it taller
+        self.log_panel = mount_log_panel(self.controls, self.control_scroll)
+        layout.addWidget(self.log_panel.split, 1)
         layout.addWidget(self.run_controls, 0)
         return column
 

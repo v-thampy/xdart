@@ -93,6 +93,7 @@ def set_debug_logging(enabled: bool) -> None:
         logging.getLogger(name).setLevel(logging.DEBUG if enabled else logging.NOTSET)
     if _FILE_LOG_HANDLER is not None:
         _FILE_LOG_HANDLER.setLevel(level)
+    LOG_FEED.setLevel(level)  # the log panel (Show log) lists what the file gets
     for flag in DEBUG_LOGGING_FLAGS:
         if enabled:
             os.environ[flag] = "1"
@@ -115,8 +116,7 @@ def _install_file_log_handler():
         handler = RotatingFileHandler(
             path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
         handler.setLevel(logging.INFO)
-        handler.setFormatter(logging.Formatter(
-            '%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
         logging.getLogger().addHandler(handler)
         _FILE_LOG_HANDLER = handler
         LOG_FILE_PATH = path
@@ -267,6 +267,7 @@ from xdart.gui.themes.corners import (
     normalize_controls_card_corners,
     resolve_controls_card_corners,
 )
+from xdart.gui.widgets.log_panel import LOG_FEED, LOG_FORMAT, install_log_feed
 
 
 QMainWindow = QtWidgets.QMainWindow
@@ -1313,6 +1314,7 @@ def run():
     # faulthandler side-file fallback and any startup traceback — must land
     # in the rotating file, which exists for exactly this case.
     log_path = _install_file_log_handler()
+    install_log_feed()  # the log panel's copy of what the file gets (Show log)
     if log_path is not None:
         logger.info("xdart logging to %s", log_path)
     # Python traceback on bus error / segfault (+ the SIGUSR1 stack dump).

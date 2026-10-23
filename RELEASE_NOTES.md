@@ -7,6 +7,13 @@
 - **Config ▸ Debug ▸ Debug Logging:** writes detailed diagnostics to the log file
   (Help ▸ Open Log Location) from the moment you tick it, with no restart, and is
   remembered between sessions. Turn it on while reproducing a problem.
+- **Show log:** a button below Reintegrate/Advanced (Int, Stitch and RSM) opens the
+  log under the controls: the messages written to the log file, newest last. It
+  takes the free space above the Run controls, or a few lines where the controls
+  fill the column; drag its top edge to make it taller. Scroll up to read earlier
+  lines; new ones wait until you return to the bottom or press Latest. Select text
+  to copy it. Hidden, the panel does no work, and the log file is unaffected
+  either way. Detailed diagnostics appear only while Debug Logging is on.
 
 ### Fixes
 
