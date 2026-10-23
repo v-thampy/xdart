@@ -784,8 +784,11 @@ def test_r3d_a_published_raw_member_change_keeps_its_exact_outcome(tmp_path, mon
     stem = 'same-extent source identity changed: '
     named = [detail[len(stem):] for _kind, detail in terminal if detail.startswith(stem)]
     assert all(change.strip() for change in named), terminal
+    # ... and the image-member refusal names the first image that differs (2026-10-23).
+    member_stem = 'source does not extend exact image-member history: '
     outcome = ([kind for kind, _detail in terminal], _counted(tmp_path, 'scan')[0], _said(events, 'stopped growing'),
-               [stem[:-2] if detail.startswith(stem) else detail for _kind, detail in terminal])
+               [stem[:-2] if detail.startswith(stem) else member_stem[:-2] if detail.startswith(member_stem)
+                else detail for _kind, detail in terminal])
     assert outcome == R3D_PARENT[case], outcome
 
 

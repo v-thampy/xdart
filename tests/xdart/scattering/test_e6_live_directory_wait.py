@@ -1128,8 +1128,8 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
             time.sleep(0.01)
         assert len(failed) == 1
         assert failed[0].primary.type_qualname == "AppendRefused"
-        assert failed[0].primary.message == (
-            "source does not extend exact image-member history"
+        assert failed[0].primary.message.startswith(
+            "source does not extend exact image-member history: "
         )
         assert processed == [(late, (1,))]
         assert executor.processed_live_revisions(identity) == (original,)

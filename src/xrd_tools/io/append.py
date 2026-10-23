@@ -740,6 +740,20 @@ def _member_extends(
             return False
     return True
 
+def _first_member_difference(prior: list[dict[str, Any]], current: list[dict[str, Any]]) -> str:
+    """Name the first image the source no longer shows as the output recorded it (beamline 2026-10-23: a Live
+    Append refused with no hint of which file)."""
+    for index, old in enumerate(prior):
+        name = Path(str(old.get("path", ""))).name or f"image {index + 1}"
+        if index >= len(current):
+            return (f"the output holds {len(prior)} images, the source shows {len(current)}; "
+                    f"{name} (image {index + 1}) is not listed")
+        if current[index] != old:
+            return f"image {index + 1} ({name}): " + ("; ".join(_identity_changes(old, current[index])[:4])
+                                                      or "changed")
+    return "no single image differs"
+
+
 def _identity_changes(prior: Any, current: Any, at: str = "") -> list[str]:
     """Name each differing leaf of two source identities (generation aside); the refusal stays exact."""
     if isinstance(prior, Mapping) and isinstance(current, Mapping):
@@ -778,7 +792,8 @@ def _source_extends(
     prior_images = list(prior.get("image_members") or ())
     current_images = list(current.get("image_members") or ())
     if not _member_extends(prior_images, current_images, grow_last=False):
-        raise ValueError("source does not extend exact image-member history")
+        raise ValueError("source does not extend exact image-member history: "
+                         + _first_member_difference(prior_images, current_images))
     if not _member_extends(prior_external, current_external, grow_last=True):
         raise ValueError("source does not extend exact external-member history")
     if int(current.get("extent", -1)) == int(prior.get("extent", -1)):
