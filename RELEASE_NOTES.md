@@ -13,9 +13,10 @@
   image still warns. To reprocess a scan whose metadata you changed, use Replace.
 - **Append to an output on a network folder:** a run could stop with "writer begin
   incomplete: stream checkpoint failed identity verification" when the output's
-  modification time moved a moment after xdart wrote it. Windows sets a file's
-  final write time when the program closes it, on a network share slightly later;
-  xdart now records the file's state after that close.
+  modification time moved a moment after xdart wrote it. Windows can set a file's
+  final write time when the program closes it, and the reported failure fits that;
+  xdart now records the file's state after that close. Not yet confirmed on the
+  beamline share.
 
 ## 1.2.4 (2026-10-22)
 

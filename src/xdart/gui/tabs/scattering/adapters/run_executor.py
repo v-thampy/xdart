@@ -84,7 +84,7 @@ from ..output_preflight import (
     _background_frame_fact, _merge_background_binding,
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
-    native_int_reduction_plan, materialize_deferred_output, already_processed_append,
+    native_int_reduction_plan, materialize_deferred_output,
     live_directory_groups, materialize_live_directory_group, observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
@@ -2353,10 +2353,9 @@ class StandardRunExecutor:
                 self._release_predecessor_before_target(
                     run, entry.target,
                 )
-                completed = already_processed_append(receipt, entry)
-                if completed is not None:
+                if entry.completed is not None:  # admitted as already processed, its source never captured
                     stopped = self._present_already_processed(
-                        run, deferred, entry, completed, claimed_files,
+                        run, deferred, entry, entry.completed, claimed_files,
                         candidate_owners=candidate_owners,
                         output_index=output_index,
                     )
@@ -2494,7 +2493,7 @@ class StandardRunExecutor:
     ) -> bool:
         """A scan its output already holds, shown as an Append no-op shows it (its saved frames in navigation, its
         files counted processed) without reading the scan again: no source, graph, writer or warning
-        (``already_processed_append``). Returns whether Stop was requested."""
+        (``output_preflight._already_processed``). Returns whether Stop was requested."""
         configuration = run.configuration
         labels = tuple(completed.labels)
         first = entry.candidates[0]

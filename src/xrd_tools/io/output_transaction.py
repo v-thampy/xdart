@@ -2861,12 +2861,13 @@ class OutputTransaction:
     ) -> _StreamStatReceipt:
         """The seed's checkpoint, taken after its writing handle closed.
 
-        Windows finalizes a written file's timestamps when that handle
-        closes, on a network share a moment later (beamline 1.2.4: mtime
-        86.5 ms past a checkpoint sealed before the close).  A read-only
-        descriptor bound to the reserved file and its sealed size gives the
-        baseline; the seed was flushed before the close, and a read-only
-        fsync would reopen it writable on Windows, so none is requested.
+        Windows can finalize a written file's timestamps when that handle
+        closes.  The beamline 1.2.4 refusal on an SMB share (mtime 86.5 ms
+        past a checkpoint sealed before the close) fits that; it is not yet
+        confirmed natively.  A read-only descriptor bound to the reserved
+        file and its sealed size gives the baseline; the seed was flushed
+        before the close, and a read-only fsync would reopen it writable on
+        Windows, so none is requested.
         """
         descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         try:

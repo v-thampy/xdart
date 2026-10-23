@@ -20,6 +20,7 @@ from xrd_tools.integrate.calibration import (
     load_detector_calibration,
 )
 from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
+from xrd_tools.io.append import CommittedAppendCoverage
 from xrd_tools.io.image import read_detector_image_layout, read_image
 from xrd_tools.io.output_path import (
     FINITE_OPERATION_SLOTS,
@@ -191,10 +192,19 @@ class DeferredDirectoryEntry:
         repr=False,
         compare=False,
     )
+    #: An Append's scan that its output already holds (``_already_processed``): admitted without capturing its
+    #: source, so it carries no protected states and is skipped without materialization.
+    completed: CommittedAppendCoverage | None = None
 
     def __post_init__(self) -> None:
         if not (
-            type(self.candidates) is tuple
+            (self.completed is None or (
+                type(self.completed) is CommittedAppendCoverage
+                and not self.protected_states
+                and not self._protected_topology
+                and not self.skip_reason
+            ))
+            and type(self.candidates) is tuple
             and self.candidates
             and all(type(value) is Candidate for value in self.candidates)
             and isinstance(self.target, Path)
@@ -805,6 +815,40 @@ def _capture_exact_candidate_state(
     return state
 
 
+def _already_processed(
+    configuration: OutputCandidate,
+    group: tuple[Candidate, ...],
+    target: Path,
+) -> CommittedAppendCoverage | None:
+    """A finite directory Append's scan that its output already holds, recognized from this census (each image's
+    name, size and time) and the output's committed record, before any source capture: its coverage, or None to admit
+    it the full way. The maintainer, 2026-10-23: "If a frame has already been processed that means the image data as
+    well as the metadata if any were already verified. It seems wasteful to recheck that" (Codex's design review
+    DESIGN-append-smb-125). TIFF images without Background only; Live, other formats, new or renamed files, a file
+    whose size or time changed, and another identity all go the full way."""
+    frozen = configuration._configuration
+    if (
+        frozen is None
+        or frozen.output_mode != "Append"
+        or frozen.live_mode
+        or frozen.background.mode != "None"
+        or any(candidate.adapter_id != "image_file" for candidate in group)
+    ):
+        return None
+    from xrd_tools.io.append import committed_append_coverage, science_fingerprint
+    from .adapters.dynamic_output import _mode_tokens, _science_projection
+    return committed_append_coverage(
+        target,
+        entry="entry",
+        source_base=frozen.project_root or "",
+        science_fingerprint=science_fingerprint(
+            _science_projection(frozen, configuration.processing_mapping())
+        ),
+        modes=_mode_tokens(frozen),
+        members=tuple((candidate.path, candidate.size, candidate.mtime_ns) for candidate in group),
+    )
+
+
 def _deferred_directory_plan(
     configuration: OutputCandidate,
     plan: RunCandidatePlan,
@@ -825,11 +869,18 @@ def _deferred_directory_plan(
             tuple[Path, ...],
             tuple[_CapturedSourceTopology, ...],
             str,
+            CommittedAppendCoverage | None,
         ]
     ] = []
     for group, name in _output_groups(configuration, plan):
         if cancelled():
             raise RuntimeError("admission cancelled")
+        representative = group[0]
+        target = _directory_target(configuration, plan, representative, name)
+        completed = None if proven else _already_processed(configuration, group, target)
+        if completed is not None:  # already processed: no capture, no source fence
+            staged.append((group, (), target, (), (), "", completed))
+            continue
         captured_topologies: list[_CapturedSourceTopology] = []
         for source_candidate in group:
             if cancelled():
@@ -845,8 +896,6 @@ def _deferred_directory_plan(
             if cancelled():
                 raise RuntimeError("admission cancelled")
         candidate_states = tuple(captured_topologies)
-        representative = group[0]
-        target = _directory_target(configuration, plan, representative, name)
         # Directory admission remains name/stat-only. Exact container and
         # external-dependency inspection belongs to the one JIT materializer.
         external_paths = ()
@@ -860,6 +909,7 @@ def _deferred_directory_plan(
                 external_paths,
                 inventory_states,
                 skip_reason,
+                None,
             )
         )
 
@@ -875,6 +925,7 @@ def _deferred_directory_plan(
                 _external,
                 _states,
                 _reason,
+                _completed,
             ) in staged
         ),
         tuple(
@@ -886,6 +937,7 @@ def _deferred_directory_plan(
                 paths,
                 _states,
                 _reason,
+                _completed,
             ) in staged
             for path in paths
         ),
@@ -899,6 +951,7 @@ def _deferred_directory_plan(
         external_paths,
         inventory_states,
         skip_reason,
+        completed,
     ) in staged:
         keys = {
             os.path.normcase(os.path.abspath(path))
@@ -913,6 +966,11 @@ def _deferred_directory_plan(
             raise ValueError(
                 f"directory candidate escaped physical file census: {group[0].path}"
             )
+        if completed is not None:
+            entries.append(DeferredDirectoryEntry(
+                group, target, OutputFact(_path_state(target)), physical, (), completed=completed,
+            ))
+            continue
         protected: list[_CapturedSourceTopology] = []
         frozen = {
             _source_state_key(value.raw_path): value
@@ -1392,39 +1450,6 @@ def materialize_live_directory_group(
         decision=decision,
         partial=len(physical_paths) < len(group.physical_paths),
         proof=admitted[-1],
-    )
-
-
-def already_processed_append(receipt: AdmissionReceipt, entry: DeferredDirectoryEntry):
-    """A finite directory Append's scan that its output already holds, recognized from the Run's directory listing
-    and the output's committed record, without reading the scan again: its ``CommittedAppendCoverage``, or None to
-    send it the full way (maintainer, 2026-10-23: "If something has already been processed, it should be skipped
-    anyway"; Codex's design review DESIGN-append-smb-125). TIFF images only; Live, other formats, new or renamed
-    files and a file whose size or time changed all go the full way."""
-    configuration = receipt.candidate._configuration
-    if (
-        configuration is None
-        or configuration.output_mode != "Append"
-        or configuration.live_mode
-        or configuration.background.mode != "None"
-        or entry.skip_reason
-        or any(candidate.adapter_id != "image_file" for candidate in entry.candidates)
-    ):
-        return None
-    from xrd_tools.io.append import committed_append_coverage, science_fingerprint
-    from .adapters.dynamic_output import _mode_tokens, _science_projection
-    return committed_append_coverage(
-        entry.target,
-        entry="entry",
-        source_base=configuration.project_root or "",
-        science_fingerprint=science_fingerprint(
-            _science_projection(configuration, receipt.candidate.processing_mapping())
-        ),
-        modes=_mode_tokens(configuration),
-        members=tuple(
-            (candidate.path, candidate.size, candidate.mtime_ns)
-            for candidate in entry.candidates
-        ),
     )
 
 

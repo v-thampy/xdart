@@ -4872,3 +4872,34 @@ def test_stream_epoch_seed_baseline_is_taken_after_its_own_handle_closes(tmp_pat
     )
     transaction.authorize_stream_mutation(following, lease=lease)
     assert target.read_bytes() == b"epoch-a"
+
+
+def test_a_seed_that_changes_size_at_its_close_is_refused_and_the_prior_kept(tmp_path, monkeypatch):
+    """Only the seed's own timestamp may move at its close: a size change there refuses the stream, and the
+    rollback restores the prior output."""
+    api, target, _, transaction, tx_owner, target_owner, _, lease = _prepared(tmp_path, prior=b"prior")
+    real_open, real_close = os.open, os.close
+    creators: set[int] = set()
+
+    def opening(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_CREAT and flags & os.O_EXCL and Path(path) == target:
+            creators.add(descriptor)
+        return descriptor
+
+    def closing(descriptor):
+        real_close(descriptor)
+        if descriptor in creators:
+            creators.discard(descriptor)
+            with open(target, "ab") as stream:  # someone else's byte, at the seed's close
+                stream.write(b"x")
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "close", closing)
+    with pytest.raises(api.TargetChanged, match="changed when its writing handle closed"):
+        transaction.begin_stream(
+            admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+            pool=_DepthPool(), file_lock=threading.RLock(),
+        )
+    monkeypatch.undo()
+    assert target.read_bytes() == b"prior" and not transaction.backup.exists()
