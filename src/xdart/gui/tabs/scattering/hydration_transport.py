@@ -251,11 +251,14 @@ class HydrationTransport:
 
     __slots__ = ("_viewer_1d_claim", "__dict__")
 
-    def __init__(self, commit, derive, *, completion_sink=None) -> None:
+    def __init__(self, commit, derive, *, completion_sink=None, current=None) -> None:
         # commit/derive are owner-bound at construction, never queue-carried.
         self._commit = commit
         self._derive = derive
         self._completion_sink = completion_sink
+        # current(request): whether a read still hydrates its artifact's current
+        # stores; one for a replaced generation never starts reading the file.
+        self._current = current
         self._lock = RLock()
         self._viewer_1d_claim = object()
         self._active: _TransportEntry | None = None
@@ -692,6 +695,8 @@ class HydrationTransport:
         with self._lock:
             entry.committed_token = None
             entry.committed_ticket = None
+        if self._current is not None and not self._current(entry.request):
+            return HydrationOutcome.OWNER_MISMATCH, None
         try:
             preview = read_frame_preview(
                 entry.request.read_key,

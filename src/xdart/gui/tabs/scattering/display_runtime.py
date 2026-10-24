@@ -191,6 +191,7 @@ class RunDisplayState:
         self._transport = HydrationTransport(
             self.commit_preview, self._derive_target,
             completion_sink=self._complete_hydration,
+            current=self._reads_current_generation,
         )
         self._frame_mask_qualified: set[DisplayFrameKey] = set()
         self._detector_outcomes: dict[
@@ -370,9 +371,11 @@ class RunDisplayState:
         generation fails the exact-store check at commit, the writer's
         allocation binds an empty store, and its checkpoint authority governs
         hydration again.  Navigation and the per-artifact facts are kept.
-        Returns once no read of the closed generation remains, so none is
-        reading the file when its writer opens it (a read overlapping the
-        writer failed that writer's close verification).
+        Returns once no acquisition read of the closed generation is still
+        reading; one queued or admitted later never starts
+        (``_reads_current_generation``), so none reads the file once its writer
+        opens it (a read overlapping the writer failed that writer's close
+        verification).  Viewer reads are outside this barrier.
         """
         with self._light_admission_lock, self._lock:
             if self.artifacts.get(str(owner.artifact)) is not owner:
@@ -387,7 +390,11 @@ class RunDisplayState:
             )):
                 raise RuntimeError("closed display artifact still holds light-1D custody")
             retired = (owner.records, owner.publications)
-            owner.records, owner.publications = self._new_stores()
+            records, publications = self._new_stores()
+            # Bound before anything can see them: until the writer grants a
+            # checkpoint token, nothing hydrates into the new generation.
+            records._bind_checkpoint_hydration_lineage(str(owner.artifact), self.identity)
+            owner.records, owner.publications = records, publications
             owner.hydration_closed = False
             artifact = str(owner.artifact)
             for derived in (self.payloads, self._raw_lru, self._detector_outcomes):
@@ -406,6 +413,17 @@ class RunDisplayState:
             if monotonic() > deadline:
                 raise RuntimeError("a read of the closed display generation did not settle before its writer")
             sleep(0.005)
+
+    def _reads_current_generation(self, request) -> bool:
+        """The transport's check before a read starts: an acquisition read
+        (record and publication stores) still hydrates its artifact's current
+        stores.  Browse reads carry one store and are not this Run's."""
+        stores = getattr(request, "stores", ())
+        if len(stores) != 2:
+            return True
+        with self._lock:
+            art = self.artifacts.get(request.read_key.artifact_identity)
+            return art is not None and stores[0] is art.records and stores[1] is art.publications
 
     def bind_checkpoint_hydration(self, owner: DisplayArtifact) -> None:
         owner.records._bind_checkpoint_hydration_lineage(
@@ -1024,11 +1042,13 @@ class RunDisplayState:
             publication,
         )
         if needs_hydration and require_complete:
+            # The Run's own closed state: the request reads the artifact's with
+            # the stores it hydrates, not this earlier snapshot.
             self._request_preview(
                 artifact_owner,
                 key,
                 selection_generation,
-                effective_closed,
+                closed,
                 owner,
                 commit_gate,
             )
@@ -1165,7 +1185,12 @@ class RunDisplayState:
         with self._lock:
             if self.artifacts.get(str(art.artifact)) is not art:
                 return
+            # One generation's closed state, stores and checkpoint authority,
+            # read together (begin_active_generation swaps them under this lock).
             closed = bool(closed or art.hydration_closed)
+            stores = (art.records, art.publications)
+            required, checkpoint_token, checkpoint_gate = (
+                (False, None, None) if closed else self._checkpoint_authority(art))
         try:
             scope = HydrationScope(*owner.as_tuple())
             read_key = HydrationReadKey(
@@ -1175,8 +1200,6 @@ class RunDisplayState:
                 HydrationPurpose.PREVIEW,
             )
             token = HydrationToken(read_key, int(selection_generation))
-            required, checkpoint_token, checkpoint_gate = (
-                (False, None, None) if closed else self._checkpoint_authority(art))
             if required and checkpoint_token is None:
                 return
             request = HydrationRequest(
@@ -1184,7 +1207,7 @@ class RunDisplayState:
                 HydrationPurpose.PREVIEW,
                 int(selection_generation),
                 owner,
-                (art.records, art.publications),
+                stores,
                 commit_gate,
                 read_key=read_key,
                 token=token,

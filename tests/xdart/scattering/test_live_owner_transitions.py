@@ -275,3 +275,159 @@ def test_f2_a_read_from_the_closed_generation_never_lands_in_the_reopened_one(tm
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert landed is None and refused == 1, (landed, refused)
     assert _output(tmp_path, 'saved')[0] == (1, 2, 3)
+
+
+def test_f2_a_reopened_scan_takes_no_read_before_its_writer_binds_it(tmp_path, monkeypatch):
+    """Codex N-56ea524a (its discriminator test_review_generation_admission.py, 75ca5f2a...): between the new
+    generation's stores and the writer's allocation a page read hydrated the fresh store, and the allocation was
+    refused. The new generation answers to the writer's checkpoint authority from the start."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    _saved(tmp_path, raw, 'saved', 2, 8851)
+    rotated, resume, real_begin = threading.Event(), threading.Event(), RunDisplayState.begin_active_generation
+
+    def begin(self, owner, **kwargs):  # the window between the new stores and the writer's allocation, held open
+        real_begin(self, owner, **kwargs)
+        rotated.set()
+        assert resume.wait(30.), 'the window was never closed'
+    monkeypatch.setattr(RunDisplayState, 'begin_active_generation', begin)
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, raw, live=True), request_value=8852)
+    events = []
+    try:
+        _wait(executor, events, lambda values: _key(executor, identity, 'saved', 2) is not None or _terminal(values))
+        first, retired = _key(executor, identity, 'saved', 1), _owner(executor, identity, 'saved').records
+        _frame(raw, 'saved', 3, 'txt', 3.0)
+        _wait(executor, events, lambda values: rotated.is_set() or _terminal(values))
+        run, context, owner = executor._exact_run(identity), executor.acquisition_context(identity), \
+            _owner(executor, identity, 'saved')
+        before, deadline = run.display.transport.counters(), time.monotonic() + 1.
+        while time.monotonic() < deadline:  # the page keeps asking for that frame meanwhile
+            assert run.display.project(first, 1, closed=run.closed, owner=context.hydration_owner,
+                                       commit_gate=context.commit_gate) is None
+            _settle(executor, events, .05)
+        window = (owner.records is not retired, owner.records._checkpoint_hydration_required(),
+                  owner.publications.get(1), run.display.transport.counters() == before)
+        resume.set()
+        _wait(executor, events, lambda values: 3 in _labels(values, 'saved') or _terminal(values))
+        _settle(executor, events)
+    finally:
+        resume.set()
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert window == (True, True, None, True), window
+    assert _output(tmp_path, 'saved')[0] == (1, 2, 3)
+
+
+def test_f2_a_read_asked_for_across_the_reopen_follows_the_new_generation(tmp_path, monkeypatch):
+    """Codex N-56ea524a window 1: a page read that saw the closed generation but took its stores after the reopen
+    carried the closed authority into the new stores and committed there unchecked."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    _saved(tmp_path, raw, 'saved', 2, 8861)
+    asked, held, real_request = threading.Event(), {}, RunDisplayState._request_preview
+
+    def request(self, art, *args, **kwargs):  # the page's request, built only once the stores have changed
+        if held.pop('retired', None) is not None and art.source_scan == 'saved':
+            asked.set()
+            deadline = time.monotonic() + 30.
+            while art.records is retired and time.monotonic() < deadline:
+                time.sleep(.005)
+        return real_request(self, art, *args, **kwargs)
+    monkeypatch.setattr(RunDisplayState, '_request_preview', request)
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, raw, live=True), request_value=8862)
+    events = []
+    try:
+        _wait(executor, events, lambda values: _key(executor, identity, 'saved', 2) is not None or _terminal(values))
+        run, context = executor._exact_run(identity), executor.acquisition_context(identity)
+        first, owner = _key(executor, identity, 'saved', 1), _owner(executor, identity, 'saved')
+        retired = held['retired'] = owner.records
+        before = run.display.transport.counters()
+        page = threading.Thread(target=run.display.project, args=(first, 1), kwargs=dict(
+            closed=run.closed, owner=context.hydration_owner, commit_gate=context.commit_gate))
+        page.start()
+        assert asked.wait(10.), 'the page never asked'
+        _frame(raw, 'saved', 3, 'txt', 3.0)
+        page.join(30.)
+        _wait(executor, events, lambda values: 3 in _labels(values, 'saved') or _terminal(values))
+        _settle(executor, events)
+        landed = (owner.records is not retired, owner.publications.get(1), run.display.transport.counters() == before)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert landed == (True, None, True), landed
+    assert _output(tmp_path, 'saved')[0] == (1, 2, 3)
+
+
+def test_f2_a_read_admitted_behind_the_reopen_never_reads_the_new_writers_file(tmp_path, monkeypatch):
+    """Codex N-56ea524a window 2: with one read active and one queued, a page read of the closing scan was admitted
+    as a replacement, installed only after the reopen, missed by its settlement, and read the file the new writer
+    had opened."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    for stem in ('ascan', 'bscan'):
+        _frame(raw, stem, 1, 'txt', 1.0)
+    _saved(tmp_path, raw, 'saved', 2, 8871)
+    release, holding, reads, retired = threading.Event(), threading.Event(), [], {}
+    real_read, real_dispatch = hydration_transport.read_frame_preview, hydration_transport.HydrationTransport.dispatch_detached
+
+    def read(read_key, **kwargs):
+        name = os.path.basename(str(read_key.artifact_identity))
+        owner = retired.get('owner')
+        reads.append((name, read_key.frame_identity, owner is not None and owner.records is not retired['records']))
+        if name == 'ascan_int1d.nexus':  # the read already active
+            release.wait(30.)
+        return real_read(read_key, **kwargs)
+
+    def dispatch(self, mutation):  # the replacement is installed only after the reopen
+        entry = getattr(mutation, 'replacement', None)
+        owner = retired.get('owner')
+        if entry is not None and owner is not None and entry.request.stores[1] is retired['publications']:
+            holding.set()
+            deadline = time.monotonic() + 30.
+            while owner.records is retired['records'] and time.monotonic() < deadline:
+                time.sleep(.005)
+        return real_dispatch(self, mutation)
+    monkeypatch.setattr(hydration_transport, 'read_frame_preview', read)
+    monkeypatch.setattr(hydration_transport.HydrationTransport, 'dispatch_detached', dispatch)
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, raw, live=True), request_value=8872)
+    events, pages = [], []
+    try:
+        _wait(executor, events, lambda values: _key(executor, identity, 'saved', 2) is not None or _terminal(values))
+        run, context = executor._exact_run(identity), executor.acquisition_context(identity)
+        owner = _owner(executor, identity, 'saved')
+        retired.update(owner=owner, records=owner.records, publications=owner.publications)
+        for stem in ('ascan', 'bscan', 'saved'):  # active, queued, then the replacement
+            page = threading.Thread(target=run.display.project, args=(_key(executor, identity, stem, 1), 1),
+                                    kwargs=dict(closed=run.closed, owner=context.hydration_owner,
+                                                commit_gate=context.commit_gate))
+            page.start()
+            pages.append(page)
+            if stem == 'ascan':  # its read is the active one
+                assert _wait_for(lambda: any(row[0] == 'ascan_int1d.nexus' for row in reads))
+            elif stem == 'bscan':  # queued behind it
+                page.join(5.)
+        assert holding.wait(10.), 'the replacement was never admitted'
+        _frame(raw, 'saved', 3, 'txt', 3.0)
+        _wait(executor, events, lambda values: 3 in _labels(values, 'saved') or _terminal(values))
+        release.set()
+        for page in pages:
+            page.join(30.)
+        _settle(executor, events, 1.)
+    finally:
+        release.set()
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert not [row for row in reads if row[0] == 'saved_int1d.nexus' and row[2]], reads
+    assert _output(tmp_path, 'saved')[0] == (1, 2, 3)
+
+
+def _wait_for(predicate, timeout=10.):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(.005)
+    return True
