@@ -1218,6 +1218,7 @@ def test_stage_census_has_one_port_one_lane_and_no_new_queue_cache_or_store():
     allowed = {
         "_commit", "_derive", "_completion_sink", "_lock", "_active", "_queued",
         "_worker", "_retired", "_counters", "_completions",
+        "_current",  # the owner-bound pre-read check (Codex N-56ea524a F2), a callback like _derive
     }
     assert set(vars(transport)) == allowed
     assert [name for name, value in vars(transport).items()

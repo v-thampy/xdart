@@ -386,12 +386,8 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
 
     def open_cursor(*args, **kwargs):
         source_open_states.append(tuple(lease.state for lease in acquired))
-        return original_open(*args, **kwargs)
-
-    def materialize(*args, **kwargs):
-        materialization_states.append(tuple(
-            lease.state for lease in acquired
-        ))
+        # B opens its source only after A's graph is settled and dropped (Codex N-0243a1bb F1: the release
+        # waits until B is about to be constructed, no longer until B is merely qualified).
         if a_graph:
             graph = a_graph[0]
             first_effect.append((
@@ -403,6 +399,12 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
                 output_ref[0]._current is None,
                 run_ref[0].current_published,
             ))
+        return original_open(*args, **kwargs)
+
+    def materialize(*args, **kwargs):
+        materialization_states.append(tuple(
+            lease.state for lease in acquired
+        ))
         return original_materialize(*args, **kwargs)
 
     def drain(self, run, owner):
@@ -546,8 +548,9 @@ def test_p2_0_releases_a_before_b_open_reuses_local_zero_and_shared_hydration_la
         )]
         assert len(acquired) == 2
         assert predecessor_states[1] == (Light1DLeaseState.RELEASED,)
+        # A is still the current output while B qualifies (Codex N-0243a1bb F1).
         if materialization_states != [
-            (), (Light1DLeaseState.RELEASED,),
+            (), (Light1DLeaseState.ACTIVE,),
         ]:
             semantic_failures.append((
                 "deferred-pre-probe", materialization_states,
