@@ -1416,6 +1416,16 @@ class StandardRunExecutor:
             return
         self._settle_predecessor(run, output, predecessor)
 
+    def _retire_current_target(self, run: _StandardRun, target: Path) -> None:
+        """Settle ``target``'s output when it is the current one and stops growing, as a predecessor settles: its
+        writer finishes and its display closes now, not when another output starts or the Run ends."""
+        output = run.output
+        owner = None if output is None else output.current_owner_for_target(target)
+        if owner is None:
+            return
+        self._settle_predecessor(run, output, owner)
+        run.session = None
+
     def _block_live_target(
         self, run: _StandardRun, target: Path, target_key: str,
         drift: tuple[str, ...],
@@ -1427,7 +1437,7 @@ class StandardRunExecutor:
         still fails the Run.  The reason stays in every later status.
         """
 
-        self._release_predecessor_before_target(run, target)
+        self._retire_current_target(run, target)
         names = ", ".join(sorted({Path(path).name for path in drift}))
         reason = (
             f"{Path(target).name} stopped growing: {names} changed after "
@@ -1440,7 +1450,8 @@ class StandardRunExecutor:
         self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused, *, constructed: bool,
     ) -> None:
         """Leave one Live output as it is after its Append refused: later polls skip its frames, the status names
-        it, and the Run's end lists the reason. A refusal during construction closes the source it opened."""
+        it, and the Run's end lists the reason. A refusal during construction closes the source it opened; the
+        output, when it is the current one, is retired, and a failure there still fails the Run."""
         if constructed:
             source_owner = run.source
             if source_owner is not None:
@@ -1456,6 +1467,8 @@ class StandardRunExecutor:
             run.current_published = 0
             run.current_file_total = 0
             run.current_files_incremental = False
+        with _run_effect(run):
+            self._retire_current_target(run, target)
         reason = detach_exception(error, "append").message
         run.append_skips.append((str(target), reason))
         run.live_blocked[target_key] = (
@@ -1676,6 +1689,10 @@ class StandardRunExecutor:
         mask = None if assets is None else assets.mask
         owner = run.display.artifacts.get(str(artifact))
         newly_adopted_owner = owner is None
+        if owner is not None and owner.hydration_closed:
+            # An output this Run closed (shown from its saved record, or settled to admit another) grows again: its
+            # writer starts a new display generation (Codex N-0243a1bb F2: the closed store could not take its allocation).
+            run.display.begin_active_generation(owner, timeout=self._join_timeout)
         if owner is None:
             if configuration.live_mode and run.display.artifacts:
                 run.display.admit_additional_partition()
@@ -1783,14 +1800,17 @@ class StandardRunExecutor:
         labels: tuple[int, ...],
         *,
         newly_adopted: bool,
+        completed: int | None = None,
     ) -> None:
+        """``completed``: the output's completed frames, the Run's current output's when None (a saved output shown
+        while another is open passes its own)."""
         if type(newly_adopted) is not bool:
             raise TypeError("persisted-prefix adoption flag must be exact")
         if not newly_adopted:
             return
         if type(labels) is not tuple:
             raise TypeError("persisted prefix labels must be an exact tuple")
-        if len(labels) != run.current_completed:
+        if len(labels) != (run.current_completed if completed is None else completed):
             raise ValueError("persisted prefix cardinality changed")
         if any(type(label) is not int for label in labels):
             raise TypeError("persisted prefix labels must be exact integers")
@@ -1839,12 +1859,12 @@ class StandardRunExecutor:
                       f"the PONI says {selection['calibration_energy_eV'] / 1000:.3f} keV.")
             if isinstance(run.capture.source, DirectorySourceSpec):
                 energy = f"{run.artifact.name}: {energy}"
-        coverage = "" if run.coverage_notice_sent else _coverage_notice(run)
+        coverage = "" if saved_only or run.coverage_notice_sent else _coverage_notice(run)
         detail = " ".join(part for part in (energy, coverage) if part)
         if created or context.hydration_owner != previous or detail:
             self._events.put(StandardRunEvent(
                 run.identity, StandardEventKind.CONTEXT_READY,
-                artifact=str(run.artifact), detail=detail,
+                artifact=str(owner.artifact), detail=detail,
             ))
             run.energy_notice_sent |= bool(energy)
             run.coverage_notice_sent |= bool(coverage)
@@ -2217,9 +2237,6 @@ class StandardRunExecutor:
                             else len(retained.decision.item.source_stamp.members)
                         )
                         watched.extend(group.physical_paths[published:])
-                        self._release_predecessor_before_target(
-                            run, group.target,
-                        )
                         # The registrations this attempt is qualified under.
                         registry = registry_identity()
                         attempt = materialize_live_directory_group(
@@ -2286,6 +2303,10 @@ class StandardRunExecutor:
                             # Nothing beyond the published frames is ready yet.
                             # A raw rewrite must still reach the Append guard.
                             continue
+                        # Only an output that runs now takes over: a scan still waiting, refused or stopped above
+                        # leaves the current one open, and its next frame extends it in place (Codex N-0243a1bb F1:
+                        # settled to look at a neighbour, it failed that frame on its own repopulated display store).
+                        self._release_predecessor_before_target(run, group.target)
                         item = decision.item
                         run.current_file_total = len(group.physical_paths)
                         run.current_files_incremental = (
@@ -2572,6 +2593,7 @@ class StandardRunExecutor:
             output_index=output_index,
         )
         run.current_files_incremental = True
+        self._follow_saved_output(run, entry.target, completed)
         owner = self._present_saved_output(run, entry.target, entry.candidates[0], completed)
         for finished in (False, True):
             if finished:
@@ -2598,32 +2620,36 @@ class StandardRunExecutor:
     def _present_live_saved_output(self, run: _StandardRun, group: LiveDirectoryGroup, completed) -> None:
         """A Live Run's view of a scan its output already holds, as a directory Append shows it; the poll counts its
         files and publishes the status. The output a Live epoch holds open keeps its own session and progress: this
-        scan gets no writer, so nothing is settled."""
-        current = ("session", "artifact", "records", "current_total", "current_completed", "current_published",
-                   "current_epoch_published", "current_file_total", "current_files_incremental")
-        held = {name: getattr(run, name) for name in current} if run.output is not None and run.output.has_current \
-            else None
+        scan gets no writer, so nothing is settled, and its presentation changes none of that output's fields."""
+        idle = run.output is None or not run.output.has_current
+        if idle:
+            self._follow_saved_output(run, group.target, completed)
         owner = self._present_saved_output(run, group.target, group.plan.candidates[0], completed)
-        if run.artifact not in run.artifacts:
-            run.artifacts.append(run.artifact)
+        if group.target not in run.artifacts:
+            run.artifacts.append(group.target)
         run.display.mark_hydration_closed(owner)
-        run.records = None
-        run.current_file_total = 0
-        run.current_files_incremental = False
-        if held is not None:
-            for name, value in held.items():
-                setattr(run, name, value)
+        if idle:
+            run.records = None
+            run.current_file_total = 0
+            run.current_files_incremental = False
+
+    @staticmethod
+    def _follow_saved_output(run: _StandardRun, target: Path, completed) -> None:
+        """Point the Run's current-output fields at a saved output it shows while no other output is open, as an
+        Append no-op's dormant output leaves them."""
+        run.artifact, run.session = target, None
+        run.current_total = run.current_completed = run.current_published = len(completed.labels)
+        run.current_epoch_published = 0
 
     def _present_saved_output(self, run: _StandardRun, target: Path, first, completed):
         """Show an output's saved frames as an Append no-op shows them (navigation, display owner, acquisition
         context) from its committed record, without reading its scan again: no source, graph, writer or warning
-        (``output_preflight._already_processed``). Returns the display owner; the caller counts files."""
+        (``output_preflight._already_processed``). It sets none of the Run's current-output fields (the caller does,
+        when no other output is open); the Run's totals count its frames. Returns the display owner; the caller counts
+        files."""
         configuration = run.configuration
         labels = tuple(completed.labels)
-        run.current_total = len(labels)
-        run.total += run.current_total
-        run.artifact = target
-        run.session = None  # as an Append no-op's dormant output leaves it
+        run.total += len(labels)
         plan = native_int_reduction_plan(configuration, companion_modes_2d=True)
         admission = None if run.resources is None else run.resources.admission
         assets = None if admission is None else admission.scientific_assets
@@ -2656,14 +2682,11 @@ class StandardRunExecutor:
                 source_base=configuration.project_root or None,
                 wavelength_m=completed.wavelength_m,  # the output's own, as it was processed
             )
-        run.records = owner.records
         run.display.bind_checkpoint_hydration(owner)
-        run.current_completed = run.current_total
-        run.current_published = run.current_completed
-        run.current_epoch_published = 0
-        self._seed_persisted_prefix_navigation(run, owner, labels, newly_adopted=newly_adopted_owner)
+        self._seed_persisted_prefix_navigation(
+            run, owner, labels, newly_adopted=newly_adopted_owner, completed=len(labels))
         self._adopt_acquisition_context(run, owner, source_path=str(first.path), saved_only=True)
-        run.completed += run.current_completed
+        run.completed += len(labels)
         return owner
 
     def _execute_current(

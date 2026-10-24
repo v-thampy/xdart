@@ -109,6 +109,14 @@ class RunDisplayResidency:
             len(self._live),
         )
 
+    def forget(self, records: Any, publications: Any) -> None:
+        """Drop every key resident in these stores, which their artifact replaced for a new writer generation."""
+        for key in [key for key, stores in self._stores.items()
+                    if stores.records is records and stores.publications is publications]:
+            for values in (self._heavy, self._heavy_candidates, self._thumbnails, self._browse, self._live):
+                values.pop(key, None)
+            del self._stores[key]
+
     def retire_navigation(
         self, keys: tuple[DisplayFrameKey, ...]
     ) -> None:

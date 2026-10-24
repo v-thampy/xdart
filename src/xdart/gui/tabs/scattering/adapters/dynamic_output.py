@@ -944,6 +944,12 @@ class DynamicOutputAdapter:
         return (None if graph is None or graph.get("target") == _target_key(target)
                 else graph.get("display_owner"))
 
+    def current_owner_for_target(self, target: Path):
+        """The display owner of ``target``'s graph when it is the current one (to retire it), else None."""
+        graph = self._current
+        return (graph.get("display_owner") if graph is not None and graph.get("target") == _target_key(target)
+                else None)
+
     def drop_released_predecessor(self, owner: object) -> None:
         graph = self._current
         if graph is None or graph.get("display_owner") is not owner:
@@ -1165,6 +1171,8 @@ class DynamicOutputAdapter:
                 )
             if graph["policy"].allocation is not policy.allocation:
                 raise RuntimeError("prepared allocation identity changed")
+            if graph["record_store"] is not record_store:
+                raise RuntimeError("same target's display generation changed under its open graph")
             revision = self._revision(graph, item)
             intent = _append_intent(
                 self.configuration,
