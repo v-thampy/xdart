@@ -201,9 +201,14 @@ def test_what_is_not_already_processed_goes_the_full_way(tmp_path, monkeypatch, 
     seams = _Seams(monkeypatch)
     events, _catalog = _run(tmp_path, raw, 9104, **intent)
     assert "scana_int1d.nexus" in seams.materialized or "scana_int2d.nexus" in seams.materialized
-    if change in ("renamed", "raw-rewritten", "settings"):
-        warnings = [warning for event in events if event.kind in _TERMINAL for warning in event.warnings]
+    warnings = [warning for event in events if event.kind in _TERMINAL for warning in event.warnings]
+    if change in ("renamed", "settings"):
         assert any("scana" in warning for warning in warnings), warnings
+    elif change == "raw-rewritten":
+        # Policy change (maintainer 2026-10-23, Codex N-0243a1bb): the same size, and its sidecar still reads the
+        # acquisition time its frame recorded, so the rewritten TIFF counts as the same acquisition and is not
+        # reduced again. The rule's accepted blind spot: new pixels under an unchanged sidecar time pass as unchanged.
+        assert not any("scana" in warning for warning in warnings), warnings
 
 
 def test_a_completed_scan_under_a_detector_ceiling_is_recognized_at_admission(tmp_path, monkeypatch):

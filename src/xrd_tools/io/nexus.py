@@ -4279,9 +4279,10 @@ def _stringify_scan_value(value: Any) -> str:
     return str(value)
 
 
-#: Per-frame times, seconds since 1970 (the .txt/.pdi sidecar's "time:" or SPEC's Epoch): float32 would round today's
-#: 1.8e9 s to 128 s steps (maintainer, 2026-10-23: a frame's recorded start time is compared to its source's).
-_FULL_PRECISION_SCAN_COLUMNS = frozenset({"epoch"})
+#: Per-frame times, seconds since 1970 (the .txt/.pdi sidecar's "time:" or SPEC's Epoch; epoch_local, the .txt clock
+#: time with no zone applied): float32 would round today's 1.8e9 s to 128 s steps (maintainer, 2026-10-23: a frame's
+#: recorded start time is compared to its source's).
+_FULL_PRECISION_SCAN_COLUMNS = frozenset({"epoch", "epoch_local"})
 
 
 def _scan_data_column_payload(values: Any, name: str = "") -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:

@@ -724,6 +724,8 @@ def preview_append_decision(
             generation=1,
             science_identity=science_identity,
         ),
+        # a finite Append tells changed processed images from re-dated ones; Live keeps its exact image history
+        image_drift=not configuration.live_mode,
     )
 
 
@@ -1224,6 +1226,7 @@ class DynamicOutputAdapter:
                 preflight = prepare_append_preflight(
                     target, intent, file_lock=self._command_lock,
                     in_place=not self.configuration.live_mode,
+                    image_drift=not self.configuration.live_mode,
                 )
             except AppendPreflightCleanupError as error:
                 self._pending_preflights.append(error.owner)

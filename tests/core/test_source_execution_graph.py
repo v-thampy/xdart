@@ -440,7 +440,7 @@ def test_graph_bound_average_open_ignores_legacy_same_kind_factory(tmp_path, mon
     with graph.open_source_execution_graph(value) as window:
         np.testing.assert_array_equal(window.read_native(0), np.ones((2, 3), dtype=np.uint16))
         row = window.complete_metadata_for(0)
-        assert row["I0"] == 3.0 and set(row) == {"I0", "epoch"}
+        assert row["I0"] == 3.0 and set(row) == {"I0", "epoch", "epoch_local"}  # the .txt clock time, no zone (2026-10-24)
     from xrd_tools.io import metadata as metadata_io
     real_observed = metadata_io.read_image_metadata_observed
     def changed(*args, **kwargs):

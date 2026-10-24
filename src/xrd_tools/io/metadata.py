@@ -1,6 +1,7 @@
 """Metadata parsing: read_txt_metadata, read_pdi_metadata, read_image_metadata."""
 from __future__ import annotations
 
+import calendar
 import configparser
 import hashlib
 import logging
@@ -917,7 +918,9 @@ def read_txt_metadata(
     The file contains two single-line sections introduced by ``# Counters``
     and ``# Motors``, each with comma-or-equals-separated ``key = value``
     pairs.  An ``epoch`` timestamp is extracted from the ``time: <datetime>``
-    field.
+    field, in this host's time zone, and ``epoch_local`` is that same clock time
+    with no time zone applied (seconds as if it were UTC), so a host in another
+    zone reads the same value from the same line.
 
     Parameters
     ----------
@@ -927,8 +930,8 @@ def read_txt_metadata(
     Returns
     -------
     dict[str, float]
-        Flat mapping of counter/motor names and ``epoch`` to float values.
-        Returns ``{}`` on any parse failure.
+        Flat mapping of counter/motor names, ``epoch`` and ``epoch_local`` to
+        float values.  Returns ``{}`` on any parse failure.
     """
     path = Path(path)
     try:
@@ -946,7 +949,10 @@ def read_txt_metadata(
 
         time_str = data[data.index("time: ") + 5 : data.index("# Temp") - 2].strip()
         d = datetime.strptime(time_str, "%a %b %d %H:%M:%S %Y")
-        extras: dict[str, float] = {"epoch": time.mktime(d.timetuple())}
+        # epoch_local: what an Append compares to tell a re-copied image from a new one (maintainer, 2026-10-23),
+        # the same on every host, where the zone-dependent epoch is not (Codex N-0243a1bb).
+        extras: dict[str, float] = {"epoch": time.mktime(d.timetuple()),
+                                    "epoch_local": float(calendar.timegm(d.timetuple()))}
 
         return {**counters, **motors, **extras}
 

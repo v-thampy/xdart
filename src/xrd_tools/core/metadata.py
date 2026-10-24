@@ -138,8 +138,8 @@ def resolve_monitor_norm(metadata: Mapping[str, Any], key: str | None) -> float 
 #: start of the name, ignoring case (maintainer, 2026-09-30: "i0, i1, mon, monitor, bs, beamstop, pd,
 #: photod, etc. if in doubt, list it").
 _LIKELY_MONITOR = re.compile(r"^(i\d|io$|ic\d*$|ion|mon|bs|beam.?stop|pd|photo|diode|flux|norm)", re.IGNORECASE)
-#: Never a beam monitor: the time stamp and the reciprocal-space coordinates.
-_NOT_MONITORS = frozenset({"epoch", "h", "k", "l"})
+#: Never a beam monitor: the time stamps and the reciprocal-space coordinates.
+_NOT_MONITORS = frozenset({"epoch", "epoch_local", "h", "k", "l"})
 
 
 def monitor_candidates(names: Iterable[str], *, keep: Iterable[str] = ()) -> tuple[str, ...]:
