@@ -357,7 +357,8 @@ def test_unmeasured_projection_failure_omits_false_zero_timing(
         RuntimeError("projection failed"), "display_projection",
     )
     executor = StandardRunExecutor()
-    caplog.set_level(logging.INFO, logger=executor_module.__name__)
+    # a Run's diagnostics: DEBUG while performance monitoring is off (maintainer, 2026-10-24)
+    caplog.set_level(logging.DEBUG, logger=executor_module.__name__)
     executor._terminal_event(
         run,
         StandardEventKind.FAILED,

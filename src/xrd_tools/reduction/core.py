@@ -4539,7 +4539,7 @@ class ReductionSession:
         # diagnostic only; public projections stay distinct-label facts.
         dropped = int(self._dropped_attempts)
         if cancelled and dropped:
-            logger.info(
+            logger.debug(
                 "cancelled: %d attempts submitted, %d written, %d dropped in-flight",
                 self._submitted, self._written_attempts, dropped,
             )

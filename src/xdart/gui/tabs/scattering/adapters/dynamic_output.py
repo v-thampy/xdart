@@ -68,6 +68,7 @@ from xrd_tools.sources.execution_graph import (
     source_snapshots_projection,
     stable_lineage_projection,
 )
+from xdart.utils import log_events
 
 from ..contracts import AdmittedOutput, OutputDisposition, PlannedOutput, SourceExecutionStamp
 from ..output_preflight import (
@@ -1326,7 +1327,7 @@ class DynamicOutputAdapter:
                 )
                 self.resource_facts += (fact,)
                 if resource_fact_sink is not None: resource_fact_sink(fact)
-                logger.info("%s", fact.log_line("[RUN-RESOURCES]"))
+                log_events.diagnostic(logger, "%s", fact.log_line("[RUN-RESOURCES]"))
                 bind_source = getattr(source_owner, "bind_allocation", None)
                 if callable(bind_source):
                     bind_source(allocation)
@@ -1468,7 +1469,8 @@ class DynamicOutputAdapter:
             # One series' inputs and result together (Codex N-6418472d: which bound sets the allowance on a PC).
             envelope, assigned = (None, None) if allocation is None else (
                 int(allocation.envelope_bytes), int(allocation.assigned_bytes))
-            logger.info(
+            log_events.diagnostic(
+                logger,
                 "[WARM-TABLES] plan: RAM %s B, envelope %s B, assigned %s B, headroom %s B, %d workers funded %d B, "
                 "allowance %d B", ram, envelope, assigned, None if allocation is None else max(0, envelope - assigned),
                 workers, max(1, int(workers)) * INTEGRATOR_RESERVE_BYTES, allowance)
@@ -1574,7 +1576,8 @@ class DynamicOutputAdapter:
             if cancelled():
                 raise RuntimeError("admission cancelled")
             if pipeline_v2 is not None:
-                logger.info(
+                log_events.diagnostic(
+                    logger,
                     "[RUN-PIPELINE-V2] requested-settlement=%d "
                     "effective-settlement=%d requested-record=%d "
                     "effective-record=%d requested-inflight=%d "

@@ -102,17 +102,24 @@ logger = logging.getLogger(__name__)
 
 
 def _run_summary(configuration) -> str:
-    """A Run's banner line: processing, output mode, Live, cores, and its source."""
+    """A Run's banner line: processing, output mode, Live, cores, its source and where it writes."""
     try:
         spec = configuration.thaw_source_spec()
     except Exception:  # a legacy configuration has none to thaw
         spec = None
     source = (getattr(spec, "uri", None) or getattr(spec, "root", None)
               or getattr(configuration, "project_root", "") or "")
+    cores = getattr(configuration, "max_cores", None)
     mode = (f"{getattr(configuration, 'processing_mode', '?')}, {getattr(configuration, 'output_mode', '?')}"
             f"{', Live' if getattr(configuration, 'live_mode', False) else ''}, "
-            f"{getattr(configuration, 'max_cores', '?')} cores")
-    return f"{mode} · {source}" if source else mode
+            f"{_counted(cores, 'core') if type(cores) is int else '? cores'}")
+    output = getattr(configuration, "save_path", "") or ""
+    return " · ".join(filter(None, (mode, f"{source} → {output}" if source and output else source or output)))
+
+
+def _counted(count: int, noun: str) -> str:
+    """``1 frame``, ``2 frames``."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
 
 # Preserve the established test-injection seam while production remains strict.
 load_poni = load_detector_calibration
@@ -1559,7 +1566,7 @@ class StandardRunExecutor:
         """The log's ``New Scan`` banner for ``artifact``'s output (maintainer, 2026-10-24)."""
         name = Path(artifact).name
         run.open_scans[name] = monotonic()
-        log_events.banner(logger, "New Scan · %s%s", name, f" ({note})" if note else "", kind="open")
+        log_events.banner(logger, "New Scan · %s%s", name, f" ({note})" if note else "", kind="scan")
 
     def _close_scan(self, run: _StandardRun, artifact: Path, frames: int | None = None) -> None:
         """The log's ``End of Scan`` banner for ``artifact``'s output, with its frames and its time since it opened."""
@@ -1567,8 +1574,9 @@ class StandardRunExecutor:
         started = run.open_scans.pop(name, None)
         if started is None:
             return
-        counted = "" if frames is None else f" · {int(frames)} frames"
-        log_events.banner(logger, "End of Scan · %s%s · %.1f s", name, counted, monotonic() - started, kind="mark")
+        counted = "" if frames is None else f" · {_counted(int(frames), 'frame')}"
+        log_events.banner(logger, "End of Scan · %s%s · %.1f s", name, counted, monotonic() - started,
+                          kind="scan-end")
 
     def _settle_predecessor(self, run, output, predecessor) -> None:
         result = output.finish_predecessor(predecessor)
@@ -1986,7 +1994,7 @@ class StandardRunExecutor:
 
     def _run(self, run: _StandardRun) -> None:
         started_at = monotonic()
-        log_events.banner(logger, "New Run · %s", _run_summary(run.configuration), kind="open")
+        log_events.banner(logger, "New Run · %s", _run_summary(run.configuration), kind="run")
         if run.perf_quartiles_enabled:
             run.perf_started_at = started_at
         primary: DetachedDiagnostic | None = None
@@ -3072,7 +3080,7 @@ class StandardRunExecutor:
             fact = take() if callable(take) else None
             if fact is not None:
                 run.resource_facts.append(fact)
-                logger.info("%s", fact.log_line("[SOURCE-READ]"))
+                log_events.diagnostic(logger, "%s", fact.log_line("[SOURCE-READ]"), shown=run.perf_enabled)
 
         wanted = tuple(run.frames_by_label)
         if wanted != tuple(source.frame_indices):
@@ -3712,10 +3720,12 @@ class StandardRunExecutor:
         )
         for name in list(run.open_scans):  # the scans still open close with the Run, ahead of its totals
             self._close_scan(run, Path(name), run.current_completed if name == Path(str(run.artifact)).name else None)
-        logger.info("Total Frames Processed: %d", completed)
+        # End of Run below says it plainly; these are for diagnosis (maintainer, 2026-10-24)
+        log_events.diagnostic(logger, "Total Frames Processed: %d", completed, shown=run.perf_enabled)
         if elapsed is None:
-            logger.info("Total Time: unavailable")
-            logger.info(
+            log_events.diagnostic(logger, "Total Time: unavailable", shown=run.perf_enabled)
+            log_events.diagnostic(
+                logger,
                 "[PERF-SUMMARY] outcome=%s frames=%d/%d cores=%s | "
                 "total=unavailable | output=%s",
                 kind.value,
@@ -3723,10 +3733,12 @@ class StandardRunExecutor:
                 total,
                 core_count if core_count > 0 else "unknown",
                 run.artifact,
+                shown=run.perf_enabled,
             )
         else:
-            logger.info("Total Time: %.2fs", measured_elapsed)
-            logger.info(
+            log_events.diagnostic(logger, "Total Time: %.2fs", measured_elapsed, shown=run.perf_enabled)
+            log_events.diagnostic(
+                logger,
                 "[PERF-SUMMARY] outcome=%s frames=%d/%d cores=%s | "
                 "total=%.2fs work=%.2fs cleanup=%.2fs | "
                 "throughput=%.1f frames/s | output=%s",
@@ -3739,9 +3751,10 @@ class StandardRunExecutor:
                 cleanup_elapsed,
                 throughput,
                 run.artifact,
+                shown=run.perf_enabled,
             )
         for fact in run.resource_facts:
-            logger.info("%s", fact.log_line("[PERF-RESOURCES]"))
+            log_events.diagnostic(logger, "%s", fact.log_line("[PERF-RESOURCES]"), shown=run.perf_enabled)
         if run.perf_enabled:
             logger.info(
                 "[PERF-DETAIL] source-read=%.2fs submit/backpressure=%.2fs "
@@ -3822,9 +3835,9 @@ class StandardRunExecutor:
                     *values,
                 )
         log_events.banner(
-            logger, "End of Run · %s · %d frames%s · %.1f s", kind.value, completed,
-            f" · {run.files_processed} files processed, {run.files_skipped} skipped" if run.files_discovered else "",
-            measured_elapsed, kind="close")
+            logger, "End of Run · %s · %s%s · %.1f s", kind.value.capitalize(), _counted(completed, "frame"),
+            f" · {_counted(run.files_processed, 'file')} processed, {run.files_skipped} skipped"
+            if run.files_discovered else "", measured_elapsed, kind="run-end")
 
     def _exact_run(self, identity: RunIdentity) -> _StandardRun | None:
         with self._lock:

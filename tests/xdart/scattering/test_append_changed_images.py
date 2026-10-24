@@ -216,19 +216,25 @@ def test_the_log_frames_the_run_and_each_scan_and_says_plainly_what_it_reprocess
         _frame(raw, "scanb", k)
     _txt(raw, "scana", 1, second=59)
     _redate(raw / "scana_0001.tif")
+    for flag in ("XDART_PERF", "XDART_PERF_QUARTILES"):  # the regular log: performance monitoring off
+        monkeypatch.delenv(flag, raising=False)
     caplog.set_level(logging.INFO)
     caplog.clear()
     seen = _again(tmp_path, raw, monkeypatch, 9216)
     assert seen.terminals == ["FINISHED"]
     banners = [(getattr(record, log_events.BANNER), record.getMessage()) for record in caplog.records
                if getattr(record, log_events.BANNER, None)]
-    assert [kind for kind, _message in banners] == ["open", "open", "mark", "open", "mark", "close"], banners
-    assert banners[0][1].startswith("New Run · Int 1D, Append, 1 cores · ")
+    assert [kind for kind, _message in banners] == ["run", "scan", "scan-end", "scan", "scan-end", "run-end"], banners
+    assert banners[0][1].startswith("New Run · Int 1D, Append, 1 core · ") and " → " in banners[0][1]
     assert banners[1][1] == "New Scan · scana_int1d.nexus (reprocessed whole)"
     assert banners[2][1].startswith("End of Scan · scana_int1d.nexus · 3 frames · ") and banners[2][1].endswith(" s")
     assert banners[3][1] == "New Scan · scanb_int1d.nexus"
     assert banners[4][1].startswith("End of Scan · scanb_int1d.nexus · 2 frames · ")
-    assert banners[5][1].startswith("End of Run · finished · 5 frames · 5 files processed, 0 skipped · ")
+    assert banners[5][1].startswith("End of Run · Finished · 5 frames · 5 files processed, 0 skipped · ")
+    # diagnostics are not the regular log's (maintainer, 2026-10-24): Debug Logging or Performance Monitoring
+    assert not [record.getMessage() for record in caplog.records if record.getMessage().startswith((
+        "Total Frames Processed", "Total Time", "[PERF-SUMMARY]", "[PERF-RESOURCES]", "[RUN-RESOURCES]",
+        "[RUN-PIPELINE", "[SOURCE-READ]"))]
     [rebuilt] = [record for record in caplog.records if "[APPEND-REBUILD]" in record.getMessage()]
     assert getattr(rebuilt, log_events.EVENT, False) and rebuilt.getMessage().startswith(
         "scana_int1d.nexus: images it already processed changed on disk, so the whole scan is reprocessed and its "

@@ -9,6 +9,7 @@ import sys
 import gc
 import os
 import signal
+import time
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -48,6 +49,8 @@ logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
 # Suppress silx's "pyOpenCL has been imported but can't be used here"
 # warning — OpenCL is optional and the message has no user action.
 logging.getLogger('silx.opencl').setLevel(logging.ERROR)
+# Suppress numexpr's "NumExpr defaulting to N threads." at each launch.
+logging.getLogger('numexpr').setLevel(logging.WARNING)
 
 
 def _resolve_log_file():
@@ -100,6 +103,51 @@ def set_debug_logging(enabled: bool) -> None:
         else:
             os.environ.pop(flag, None)
     logging.getLogger(__name__).warning("Debug logging %s", "on" if enabled else "off")
+
+
+#: Config ▸ Debug ▸ Performance Monitoring's switches: xdart reads them at each use, and a Run's processing at its
+#: start. ``XDART_PERF_QUARTILES`` is Config ▸ Performance Diagnostics…'s within-run quartile timing.
+PERFORMANCE_FLAGS = ("XDART_PERF", "XDART_PERF_QUARTILES")
+
+
+def set_performance_monitoring(enabled: bool) -> None:
+    """Write timing and resource measurements (the [PERF] lines and each Run's diagnostics) to the log, and time
+    garbage collections; off stops them, the within-run quartile timing included (maintainer, 2026-10-24: "add an
+    option to turn on the perf monitoring in the config with debug as well")."""
+    if enabled:
+        os.environ["XDART_PERF"] = "1"
+    else:
+        for flag in PERFORMANCE_FLAGS:
+            os.environ.pop(flag, None)
+    if enabled and _time_garbage_collections not in gc.callbacks:
+        gc.callbacks.append(_time_garbage_collections)
+    elif not enabled and _time_garbage_collections in gc.callbacks:
+        gc.callbacks.remove(_time_garbage_collections)
+    logging.getLogger(__name__).warning("Performance monitoring %s", "on" if enabled else "off")
+
+
+_GC_STARTED = [0.0]
+
+
+def _time_garbage_collections(phase, info):
+    """PERF-3 diagnostic (performance monitoring only): time garbage collections. CPython 3.12 GC is
+    stop-the-world, so a gen-2 sweep over the large frame/publication graph could freeze the GUI -- a candidate for
+    the end-of-run ~3s recurring stalls the heartbeat catches. Logs each non-trivial collection's duration so ONE run
+    confirms or refutes GC (a STW pause is exactly what a stack sampler reads ambiguously)."""
+    try:
+        if phase == "start":
+            _GC_STARTED[0] = time.perf_counter()
+        elif phase == "stop":
+            dt_ms = (time.perf_counter() - _GC_STARTED[0]) * 1000.0
+            gen = info.get("generation", -1)
+            if dt_ms >= 100.0 or gen >= 2:
+                logger.info(
+                    "[PERF] gc: gen=%d elapsed=%.0fms collected=%d "
+                    "uncollectable=%d", gen, dt_ms,
+                    info.get("collected", 0),
+                    info.get("uncollectable", 0))
+    except Exception:
+        pass
 
 
 def _install_file_log_handler():
@@ -529,6 +577,16 @@ class Main(QMainWindow):
             set_debug_logging(True)
         self.actionDebugLogging.toggled.connect(self._set_debug_logging)
         self.debugMenu.addAction(self.actionDebugLogging)
+        self.actionPerformanceMonitoring = QtGui.QAction("Performance Monitoring", self)
+        self.actionPerformanceMonitoring.setCheckable(True)
+        self.actionPerformanceMonitoring.setToolTip(
+            "Write timing and resource measurements ([PERF] lines) to the log and xdart.log: display updates at "
+            "once, processing from the next Run. Remembered; it adds a little work, so turn it off when done.")
+        self.actionPerformanceMonitoring.setChecked(bool(os.environ.get("XDART_PERF")))  # run() applied the setting
+        self.actionPerformanceMonitoring.toggled.connect(self._set_performance_monitoring)
+        self.debugMenu.addAction(self.actionPerformanceMonitoring)
+        # Config ▸ Performance Diagnostics… turns monitoring on too: the menu shows what is on when it opens
+        self.debugMenu.aboutToShow.connect(self._show_performance_monitoring)
         self.actionCheckForUpdates = QtGui.QAction("Check for Updates…", self)
         self.actionCheckForUpdates.triggered.connect(self._check_for_updates)
         self.actionOpenLogLocation = QtGui.QAction("Open Log Location", self)
@@ -613,6 +671,16 @@ class Main(QMainWindow):
     def _set_debug_logging(self, enabled):
         set_debug_logging(bool(enabled))
         _app_settings().setValue("debug.logging", bool(enabled))
+
+    def _set_performance_monitoring(self, enabled):
+        set_performance_monitoring(bool(enabled))
+        _app_settings().setValue("debug.performance", bool(enabled))
+
+    def _show_performance_monitoring(self):
+        action = self.actionPerformanceMonitoring
+        blocked = action.blockSignals(True)
+        action.setChecked(bool(os.environ.get("XDART_PERF")))
+        action.blockSignals(blocked)
 
     def _open_log_location(self):
         """Help ▸ Open Log Location — reveal the rotating log file in the OS file
@@ -1332,33 +1400,10 @@ def run():
     matplotlib.use('QtAgg')
     argv = _apply_cli_session_args(sys.argv)
     app = QtWidgets.QApplication(argv)
-    # PERF-3 diagnostic (XDART_PERF only): time garbage collections.  CPython 3.12
-    # GC is stop-the-world, so a gen-2 sweep over the large frame/publication graph
-    # could freeze the GUI -- a candidate for the end-of-run ~3s recurring stalls
-    # the heartbeat catches.  Logs each non-trivial collection's duration so ONE
-    # run confirms or refutes GC (a STW pause is exactly what a stack sampler reads
-    # ambiguously).  Registered only in the real app, behind the flag.
-    if os.environ.get("XDART_PERF"):
-        import time as _time
-        _gc_t0 = [0.0]
-
-        def _gc_perf_probe(phase, info):
-            try:
-                if phase == "start":
-                    _gc_t0[0] = _time.perf_counter()
-                elif phase == "stop":
-                    dt_ms = (_time.perf_counter() - _gc_t0[0]) * 1000.0
-                    gen = info.get("generation", -1)
-                    if dt_ms >= 100.0 or gen >= 2:
-                        logger.info(
-                            "[PERF] gc: gen=%d elapsed=%.0fms collected=%d "
-                            "uncollectable=%d", gen, dt_ms,
-                            info.get("collected", 0),
-                            info.get("uncollectable", 0))
-            except Exception:
-                pass
-
-        gc.callbacks.append(_gc_perf_probe)
+    # Performance monitoring from launch: XDART_PERF, or Config ▸ Debug ▸ Performance Monitoring remembered on (its
+    # garbage-collection timing is registered only in the real app, and only while monitoring is on).
+    if os.environ.get("XDART_PERF") or _app_settings().value("debug.performance", False, type=bool):
+        set_performance_monitoring(True)
     # Install the keep-alive excepthook only when the GUI is actually launched —
     # never as an import-time side effect (importing this module must not hijack
     # the process-global sys.excepthook for tests / headless / embedding hosts).

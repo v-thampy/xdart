@@ -537,7 +537,7 @@ def test_auto_fact_survives_post_allocation_failure_and_reaches_terminal(
     def fail_bind(allocation):
         bound.append(allocation)
         raise RuntimeError("injected post-allocation failure")
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)  # the resource lines: DEBUG while performance monitoring is off
     adapter = dynamic_output.DynamicOutputAdapter(configuration)
     preparation = adapter.prepare_admission(
         scan,

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """The log panel: the messages written to xdart.log, under the controls of Int, Stitch and RSM (maintainer, 2026-10-23,
 for 1.2.4: a checkable "Show log" button below Reintegrate/Advanced reveals a read-only log in the free space between
-those buttons and the Run controls, hidden at start; "it can be dragged and made bigger, but the controls panels above
-should get higher priority").
+those buttons and the Run controls; "it can be dragged and made bigger, but the controls panels above should get
+higher priority"). Shown at start (maintainer, 2026-10-24: "toggle the show log in the main window on by default").
 
 ``LOG_FEED`` is a logging handler that ``_gui_main.run`` adds to the root logger beside the log file's handler, at
 that handler's level (Config ▸ Debug ▸ Debug Logging sets both), so it receives the records the file gets. A logging
@@ -101,7 +101,7 @@ def install_log_feed() -> LogFeed:
 
 
 class LogPanel(QtWidgets.QFrame):
-    """The recent log lines in a read-only pane (``pane``), hidden until its Show log button (``toggle``) is checked.
+    """The recent log lines in a read-only pane (``pane``), shown while its Show log button (``toggle``) is checked.
     ``bar`` holds that button and, while the log is shown, Latest (``latest``). ``split`` holds ``above`` (the
     controls' scroll area) over the log; its handle drags the log taller."""
 
@@ -153,7 +153,11 @@ class LogPanel(QtWidgets.QFrame):
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(_REFRESH_MS)
         self._timer.timeout.connect(self.refresh)
-        self._toggled(False)
+        self._sized = False  # given the free space under the controls when it is first laid out
+        self._balancing = False  # a re-balance waits for the event loop
+        if above.widget() is not None:  # the controls filling in, or a card opening, change the space they leave
+            above.widget().installEventFilter(self)
+        self.toggle.setChecked(True)  # shown at start
 
     def _toggled(self, shown: bool) -> None:
         self.toggle.setText("Hide log" if shown else "Show log")
@@ -161,29 +165,44 @@ class LogPanel(QtWidgets.QFrame):
             "Hide the log, so the GUI does no work for it. xdart.log keeps every message (Help ▸ Open Log "
             "Location)." if shown else
             "Show the messages written to xdart.log under these controls, newest last. Detailed diagnostics appear "
-            "only while Config ▸ Debug ▸ Debug Logging is on.")
+            "only while Config ▸ Debug ▸ Debug Logging or Performance Monitoring is on.")
         self.latest.setVisible(bool(shown))
-        self.setVisible(bool(shown))  # explicitly hidden at start, so a page shown later keeps it hidden
+        self.setVisible(bool(shown))  # explicitly hidden when unchecked, so a page shown later keeps it hidden
         if shown:  # once laid out
             QtCore.QTimer.singleShot(0, self, self._open_height)
 
     def _drag(self, _position: int, _index: int) -> None:
         self._dragged = True
 
-    def _open_height(self) -> None:
+    def eventFilter(self, watched, event) -> bool:
+        # the controls' own layout changed (a page filling in after the log is shown at start, a card opening or
+        # closing): until the user drags it, the log keeps only the space they leave
+        if (event.type() == QtCore.QEvent.Type.LayoutRequest and not self._dragged and not self._balancing
+                and self.isVisible()):
+            self._balancing = True
+            QtCore.QTimer.singleShot(0, self, self._balance)
+        return False
+
+    def _balance(self) -> None:
+        self._balancing = False
+        self._open_height(reveal=False)
+
+    def _open_height(self, reveal: bool = True) -> None:
         """The free space under the controls, or a few lines where they leave none; the controls keep the rest, and
-        Hide log stays in view. A height the user dragged to is kept."""
+        Hide log stays in view (``reveal``). A height the user dragged to is kept."""
         above = self.split.widget(0)
         controls = above.widget()
         if not self.isVisible() or controls is None:
             return
+        self._sized = True
         if not self._dragged:
             total, width = sum(self.split.sizes()), above.viewport().width()
             needed = controls.heightForWidth(width) if controls.hasHeightForWidth() else -1
             needed = (needed if needed > 0 else controls.sizeHint().height()) + 2 * above.frameWidth()
             log = max(self._lines_height(_PANEL_LINES), total - needed)
-            self.split.setSizes([total - log, log])
-        if controls.isAncestorOf(self.bar):
+            if self.split.sizes() != [total - log, log]:
+                self.split.setSizes([total - log, log])
+        if reveal and controls.isAncestorOf(self.bar):
             above.ensureWidgetVisible(self.bar, 0, 0)
 
     def _lines_height(self, lines: int) -> int:
@@ -207,6 +226,8 @@ class LogPanel(QtWidgets.QFrame):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        if not self._sized:  # shown at start, with its page: its height once laid out (the controls stay scrolled)
+            QtCore.QTimer.singleShot(0, self, self._balance)
         self.refresh()
         self._timer.start()
 

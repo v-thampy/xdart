@@ -2551,7 +2551,8 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
     monkeypatch.setattr(
         dynamic_output, "open_headless_scan_session", capture_session,
     )
-    caplog.set_level(logging.INFO, logger=dynamic_output.__name__)
+    # the pipeline line: DEBUG while performance monitoring is off (maintainer, 2026-10-24)
+    caplog.set_level(logging.DEBUG, logger=dynamic_output.__name__)
     executor, identity, events = _run_to_terminal(
         intent, request_value=1710,
     )
