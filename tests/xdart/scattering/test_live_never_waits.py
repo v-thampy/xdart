@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import logging
 import math
+from pathlib import Path
 
+import h5py
+import numpy as np
 import pytest
 
 from tests.xdart.scattering import test_live_spec_metadata_run as spec_rows
@@ -24,7 +27,9 @@ from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_term
 from xdart.gui.tabs.scattering import output_preflight
 from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+from xrd_tools.reduction.core import NexusSink
 from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.sources.image import TiffSeriesSource
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 
@@ -86,6 +91,77 @@ def test_a_frame_whose_txt_never_comes_is_noted_then_processed_without_it_and_th
     assert "Processed without their metadata (1): grow_0002.tif (grow_int1d.nexus) [LIVE]" in messages
     labels, i0, _epoch = _output(tmp_path, "grow")
     assert labels == (1, 2, 3) and (i0[0], i0[2]) == (1.0, 3.0) and math.isnan(i0[1]), (labels, i0)
+
+
+def test_a_sidecar_that_never_settles_skips_its_scan_from_that_frame_and_the_run_goes_on(
+        tmp_path, quick, monkeypatch, caplog):
+    """Codex N-69301b5f NW-R1, the rare-case branch (declared before the fix): a .txt present but still changing at
+    the limit is not read as the frame's metadata; the scan stops there, its earlier frames kept, no row for the frame,
+    the warning names the scan and the frame, and a later scan runs. The rewriting hook is Codex's."""
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    real_ready = output_preflight._live_metadata_ready
+
+    def ready(*args, **kwargs):
+        sidecar = raw / "grow_0002.txt"
+        if sidecar.exists():
+            sidecar.write_text(sidecar.read_text() + "# still being written\n")
+        return real_ready(*args, **kwargs)
+    monkeypatch.setattr(output_preflight, "_live_metadata_ready", ready)
+    executor, identity = _live(tmp_path, raw, 8907)
+    events = []
+    try:
+        _frame(raw, "grow", 1, "txt", 1.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "grow") or _ended(values))
+        _frame(raw, "grow", 2, "txt", 7.0)  # its .txt never holds still
+        _wait(executor, events, lambda values: _said(values, "grow_int1d.nexus stopped growing") or _ended(values),
+              timeout=15.)
+        _frame(raw, "next", 1, "txt", 5.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "next") or _ended(values), timeout=15.)
+        _settle(executor, events, .5)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert "grow_int1d.nexus stopped growing" in terminal[0][1], terminal
+    messages = _messages(caplog)
+    assert any(message.startswith("grow_int1d.nexus stops growing: it could not be processed")
+               and "the metadata of grow_0002.tif did not settle within 1 s" in message for message in messages)
+    assert not any("processed without it" in message for message in messages)
+    assert _output(tmp_path, "grow")[0] == (1,) and _output(tmp_path, "next")[0] == (1,)
+
+
+def test_a_given_up_frame_whose_txt_lands_later_stops_its_scan_and_the_run_goes_on(tmp_path, quick, caplog):
+    """A frame processed without its metadata keeps that: its .txt landing later is never read as its metadata, and
+    its scan stops growing, named; a later scan runs."""
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    executor, identity = _live(tmp_path, raw, 8908)
+    events = []
+    try:
+        _frame(raw, "grow", 1, "txt", 1.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "grow") or _ended(values))
+        _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)
+        _wait(executor, events, lambda values: 2 in _labels(values, "grow") or _ended(values), timeout=15.)
+        _frame(raw, "grow", 2, "txt", 7.0, image=False)  # its .txt, after the Run stopped waiting for it
+        _settle(executor, events, 1.)
+        _frame(raw, "grow", 3, "txt", 3.0)
+        _wait(executor, events, lambda values: _said(values, "grow_int1d.nexus stopped growing") or 3 in _labels(
+            values, "grow") or _ended(values), timeout=15.)
+        _frame(raw, "next", 1, "txt", 5.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "next") or _ended(values), timeout=15.)
+        _settle(executor, events, .5)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert "grow_int1d.nexus stopped growing" in terminal[0][1], terminal
+    assert any(message.startswith("grow_int1d.nexus stops growing: it could not be processed")
+               and "the metadata of grow_0002.tif arrived after the Run stopped waiting for it" in message
+               for message in _messages(caplog))
+    labels, i0, _epoch = _output(tmp_path, "grow")
+    assert labels == (1, 2) and i0[0] == 1.0 and math.isnan(i0[1]), (labels, i0)
+    assert _output(tmp_path, "next")[0] == (1,)
 
 
 def test_a_spec_point_whose_row_never_comes_skips_its_scan_from_there(tmp_path, quick, caplog):
@@ -194,6 +270,147 @@ def test_a_live_scan_whose_output_cannot_be_written_still_fails_the_run(tmp_path
     assert "No space left on device (injected)" in terminal[0][1], terminal
 
 
+def _deny(monkeypatch, image):
+    """``image`` unreadable while the Run reads it (Codex N-69301b5f's technique): the real decoder meets a real
+    PermissionError; nothing is fabricated."""
+    actual = TiffSeriesSource._read_path
+
+    def read(source, path):
+        if Path(path) != image:
+            return actual(source, path)
+        mode = image.stat().st_mode & 0o777
+        image.chmod(0)
+        try:
+            return actual(source, path)
+        finally:
+            image.chmod(mode)
+    monkeypatch.setattr(TiffSeriesSource, "_read_path", read)
+
+
+def test_a_live_frame_that_cannot_be_read_stops_its_scan_keeping_what_it_published(tmp_path, monkeypatch, caplog):
+    """Its second frame, read in a later epoch than its first (Codex N-69301b5f NW-R2, later decoding)."""
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _deny(monkeypatch, raw / "bad_0002.tif")
+    executor, identity = _live(tmp_path, raw, 8909)
+    events = []
+    try:
+        _frame(raw, "bad", 1, "txt", 1.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "bad") or _ended(values))
+        _frame(raw, "bad", 2, "txt", 2.0)
+        _wait(executor, events, lambda values: _said(values, "bad_int1d.nexus stopped growing") or _ended(values),
+              timeout=15.)
+        _frame(raw, "good", 1, "txt", 3.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "good") or _ended(values), timeout=15.)
+        _settle(executor, events, .5)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert any(message.startswith("bad_int1d.nexus stops growing: it could not be processed")
+               and "SourceReadError" in message and "bad_0002.tif" in message for message in _messages(caplog))
+    assert _output(tmp_path, "bad")[0] == (1,) and _output(tmp_path, "good")[0] == (1,)
+
+
+def test_a_directory_scan_whose_later_frame_cannot_be_read_is_skipped_and_the_others_run(
+        tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for stem, value in (("bad", 1.0), ("good", 2.0)):
+        for index in (1, 2):
+            _frame(raw, stem, index, "txt", value + index)
+    _deny(monkeypatch, raw / "bad_0002.tif")
+    executor, identity, events = _run_to_terminal(_intent(tmp_path, raw, live=False), request_value=8915)
+    executor.close(identity)
+    terminals = [event for event in events if event.kind in _TERMINAL]
+    assert [event.kind.name for event in terminals] == ["FINISHED"], terminals
+    assert any("bad_int1d.nexus" in warning and "SourceReadError" in warning for warning in terminals[0].warnings), \
+        terminals[0].warnings
+    assert any(message.startswith("bad_int1d.nexus skipped: it could not be processed; frames already saved are kept, "
+                                            "and the other scans continue")
+               for message in _messages(caplog))
+    assert _output(tmp_path, "bad") is None and _output(tmp_path, "good")[0] == (1, 2)
+
+
+def _stack(path, frames, corrupt=None):
+    """A NeXus stack whose frame ``corrupt``'s compressed chunk is overwritten on disk: reading it really fails."""
+    with h5py.File(path, "w") as handle:
+        dataset = handle.create_group("entry/instrument/detector").create_dataset(
+            "data", data=np.ones((frames, 195, 487), dtype=np.uint16), chunks=(1, 195, 487),
+            maxshape=(None, 195, 487), compression="gzip")
+        info = None if corrupt is None else dataset.id.get_chunk_info(corrupt)
+    if info is not None:
+        with open(path, "r+b") as raw:
+            raw.seek(info.byte_offset)
+            raw.write(b"\xff" * info.size)
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_a_container_frame_that_cannot_be_read_stops_its_scan_and_the_run_goes_on(tmp_path, caplog, live):
+    """A container's frames are read by the executor's producer (Codex N-69301b5f NW-R2): its third frame cannot be
+    decoded; the frames before it are kept, and the next container is processed."""
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _stack(raw / "bad.nxs", 3, corrupt=2)
+    _stack(raw / "good.nxs", 3)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    intent = RunIntent(
+        source_spec=DirectorySourceSpec(raw, suffixes=(".nxs",), metadata_format=None), poni_file=str(poni),
+        project_root=str(raw), save_path=str(tmp_path / "processed"), output_mode="Append",
+        processing_mode="Int 1D", live_mode=live, max_cores=1, bai_1d_args={"npt": 8, "method": "numpy"})
+    if live:
+        executor = StandardRunExecutor(join_timeout=2.)
+        identity, events = _start(executor, intent, request_value=8918), []
+        try:
+            _wait(executor, events, lambda values: 2 in _labels(values, "good") or _ended(values), timeout=20.)
+            _settle(executor, events, .5)
+        finally:
+            terminal = _stop(executor, identity, events)
+        assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+        assert "bad_int1d.nexus stopped growing" in terminal[0][1], terminal
+    else:
+        executor, identity, events = _run_to_terminal(intent, request_value=8919)
+        executor.close(identity)
+        terminal = [(event.kind.name, event.detail) for event in events if event.kind in _TERMINAL]
+        assert [kind for kind, _detail in terminal] == ["FINISHED"], terminal
+    assert any("bad_int1d.nexus" in message and "could not be processed" in message and "inflate() failed" in message
+               for message in _messages(caplog))
+    assert _output(tmp_path, "bad")[0] == (0, 1) and _output(tmp_path, "good")[0] == (0, 1, 2)
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_an_output_write_failure_while_frames_are_reduced_still_fails_the_run(tmp_path, monkeypatch, live):
+    """The sink-owner control (Codex N-69301b5f NW-R2): the NeXus record write of a real reduction fails."""
+    real = NexusSink._write_records
+
+    def write(self, writer, records):
+        if "bad_int1d" in str(self.path):
+            raise OSError(28, "No space left on device (injected)")
+        return real(self, writer, records)
+    monkeypatch.setattr(NexusSink, "_write_records", write)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for stem in ("bad", "good"):
+        for index in (1, 2):
+            _frame(raw, stem, index, "txt", float(index))
+    if live:
+        executor, identity = _live(tmp_path, raw, 8916)
+        events = []
+        try:
+            _wait(executor, events, _ended, timeout=20.)
+        finally:
+            terminal = _stop(executor, identity, events)
+    else:
+        executor, identity, events = _run_to_terminal(_intent(tmp_path, raw, live=False), request_value=8917)
+        executor.close(identity)
+        terminal = [(event.kind.name, event.detail) for event in events if event.kind in _TERMINAL]
+    assert [kind for kind, _detail in terminal] == ["FAILED"], terminal
+    assert "No space left on device (injected)" in terminal[0][1], terminal
+
+
 @pytest.mark.parametrize("stage", ["admission", "construction"])
 def test_a_directory_scan_that_fails_is_skipped_and_the_other_scans_run(tmp_path, monkeypatch, caplog, stage):
     caplog.set_level(logging.INFO)
@@ -218,6 +435,7 @@ def test_a_directory_scan_that_fails_is_skipped_and_the_other_scans_run(tmp_path
     assert [event.kind.name for event in terminals] == ["FINISHED"], terminals
     assert any("bad_int1d.nexus" in warning and "ValueError" in warning for warning in terminals[0].warnings), \
         terminals[0].warnings
-    assert any(message.startswith("bad_int1d.nexus skipped: it could not be processed; the other scans continue")
+    assert any(message.startswith("bad_int1d.nexus skipped: it could not be processed; frames already saved are kept, "
+                                            "and the other scans continue")
                for message in _messages(caplog))
     assert _output(tmp_path, "bad") is None and _output(tmp_path, "good")[0] == (1, 2)

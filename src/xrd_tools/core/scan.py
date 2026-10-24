@@ -144,6 +144,13 @@ class MaskSpec:
         return out.reshape(image_shape)
 
 
+class SourceReadError(OSError, ValueError):
+    """A frame's image could not be read from its source: a file unreadable, gone or undecodable. That is its scan's
+    problem, not the Run's: an executor skips the scan and goes on (maintainer, 2026-10-24: "if something fails, a live
+    run or a directory run shouldn't stop"; Codex N-69301b5f NW-R2). An OSError and a ValueError, as
+    ``io.UnsupportedOperation`` is, so every handler of either keeps its behaviour; an output write never raises one."""
+
+
 @dataclass(slots=True)
 class ScanFrame:
     """One detector frame plus enough provenance to load it lazily."""
@@ -198,18 +205,28 @@ class ScanFrame:
         return self.metadata_view.numeric
 
     def load_image(self) -> np.ndarray:
-        """Return this frame's image, loading from provenance if needed."""
+        """Return this frame's image, loading from provenance if needed; a read that fails is a SourceReadError."""
 
         if self.image is not None:
             return np.asarray(self.image)
-        if self.loader is not None:
-            self.image = np.asarray(self.loader(self))
-            return self.image
-        if self.source_path is None:
+        if self.loader is None and self.source_path is None:
             raise ValueError(
                 f"Frame {self.index} has no image, loader, or source_path."
             )
+        try:
+            self.image = self._read_image()
+        except (InterruptedError, SourceReadError):
+            raise
+        except (OSError, ValueError) as error:
+            raise SourceReadError(
+                f"the image of frame {self.index} could not be read"
+                f"{'' if self.source_path is None else f' from {self.source_path}'}: {type(error).__name__}: {error}"
+            ) from error
+        return self.image
 
+    def _read_image(self) -> np.ndarray:
+        if self.loader is not None:
+            return np.asarray(self.loader(self))
         path = Path(self.source_path)
         ext = path.suffix.lower()
         if ext in {".h5", ".hdf5", ".nxs"} and self.source_frame_index is not None:
@@ -219,12 +236,10 @@ class ScanFrame:
             from xrd_tools.io.nexus import open_nexus_image_stack
 
             with open_nexus_image_stack(path) as stack:
-                self.image = np.asarray(stack[int(self.source_frame_index)])
-        else:
-            from xrd_tools.io.image import read_image
+                return np.asarray(stack[int(self.source_frame_index)])
+        from xrd_tools.io.image import read_image
 
-            self.image = np.asarray(read_image(path))
-        return self.image
+        return np.asarray(read_image(path))
 
     @property
     def label(self) -> str:
@@ -437,6 +452,7 @@ __all__ = [
     "ScanFrame",
     "SourceCapabilities",
     "SourceKind",
+    "SourceReadError",
     "SourceSpec",
     "coerce_source_kind",
     "numeric_metadata",

@@ -937,7 +937,9 @@ class DynamicOutputAdapter:
         return (graph.get("display_owner") if graph is not None and graph.get("target") == _target_key(target)
                 else None)
 
-    def drop_released_predecessor(self, owner: object) -> None:
+    def drop_released_predecessor(self, owner: object, *, aborted: bool = False) -> None:
+        """``aborted``: the graph's session failed on its scan's own source read and was settled as it stood
+        (:meth:`settle_failed_current`), so its accounting may also be ABORTED."""
         graph = self._current
         if graph is None or graph.get("display_owner") is not owner:
             raise RuntimeError("dynamic predecessor identity changed")
@@ -949,6 +951,7 @@ class DynamicOutputAdapter:
             session.is_running
             or graph["accounting"].snapshot().state not in {
                 DynamicRunState.FINISHED, DynamicRunState.STOPPED,
+                *((DynamicRunState.ABORTED,) if aborted else ()),
             }
             or graph["transition"] is not None or graph["projection_pending"]
             or any(getattr(owner, name) is not None for name in (
@@ -959,6 +962,21 @@ class DynamicOutputAdapter:
             raise RuntimeError("dynamic predecessor graph is not terminal")
         self._graphs.pop(graph["target"], None)
         self._current = None
+
+    def settle_failed_current(self, owner: object):
+        """Finish the current graph after its scan's own source read failed (Codex N-69301b5f NW-R2): its session
+        finishes as it stands, an epoch that failure left pending is not committed (earlier epochs stay), and the
+        result comes back with the session's first failure for the caller to classify."""
+        graph = self._current
+        if graph is None or graph.get("display_owner") is not owner or graph.get("dormant"):
+            raise RuntimeError("dynamic predecessor identity changed")
+        if graph["stop_requested"] and graph["session"].is_running:  # a container read failed: stop it as it stands
+            graph["session"].stop()
+        result = graph["session"].finish(raise_on_failure=False)
+        with self._command_lock:
+            graph["transition"] = None
+            graph["projection_pending"] = True
+        return result, getattr(graph["session"], "primary_error", None)
 
     def finish_predecessor(self, owner: object):
         graph = self._current
@@ -1825,6 +1843,13 @@ class DynamicOutputAdapter:
         if primary is not None:
             raise primary
         return tuple(results)
+
+    def stop_current(self) -> None:
+        """Stop only the current graph taking frames, after its scan's own source read failed: the Run's later scans
+        still run (Codex N-69301b5f NW-R2); :meth:`stop` stops them all."""
+        with self._command_lock:
+            if self._current is not None:
+                self._current["stop_requested"] = True
 
     def stop(self) -> None:
         with self._command_lock:

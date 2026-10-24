@@ -385,10 +385,11 @@ class LiveDirectoryAttempt:
     # READY: the proof of what this poll admitted (the members after a prefix
     # proved in it), which construction re-checks instead of validating again.
     proof: LivePrefixProof | None = field(default=None, compare=False)
-    # (image, "sidecar" or "spec"): the member whose own metadata the group
-    # waits on, its per-image sidecar (an explicit .txt/.pdi/.metadata, or
-    # Auto's) missing, changing or unreadable, or its SPEC row not yet written.
-    # Never a container or a listing.
+    # (image, kind): the member whose own metadata the group waits on, its
+    # per-image sidecar (an explicit .txt/.pdi/.metadata, or Auto's) missing
+    # ("sidecar") or present but changing or unreadable ("settling"), its SPEC
+    # row not yet written ("spec"), or a sidecar that came for a frame the Run
+    # gave up waiting for ("late"). Never a container or a listing.
     waiting_metadata: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
@@ -1241,10 +1242,12 @@ def _live_metadata_ready(
     observation settles they must reach the published-metadata drift fence,
     rather than wait forever as if they were new frames.
     Also returns why the first member that is not ready waits and, when that
-    is its own metadata, (its image's name, "sidecar" or "spec"); None
-    otherwise. A member in ``given_up`` (by image name) whose own sidecar
-    holds it holds nothing: the Run waited long enough and processes it without
-    its metadata (a SPEC row is never given up on: its scan is skipped).
+    is its own metadata, (its image's name, kind): "sidecar" (none yet),
+    "settling" (present, not yet holding still) or "spec"; None otherwise. A
+    member in ``given_up`` (by image name) holds nothing while it has no
+    sidecar: the Run waited long enough and processes it without its metadata.
+    One that has a sidecar now is "late": it is never read as that frame's
+    metadata (a SPEC row is never given up on: its scan is skipped).
     """
 
     candidates = group.plan.candidates
@@ -1274,12 +1277,19 @@ def _live_metadata_ready(
         key = observation_key(image)
         previous = observations.get(key)
         observations[key] = seen
-        if ready == len(candidates) and image.name not in given_up and (
+        if ready < len(candidates):
+            continue
+        if image.name in given_up:
+            if seen:  # given up on, then a sidecar came: never read as this frame's metadata
+                ready, reason, waiting = index, (f"the metadata of {image.name} arrived after the Run stopped "
+                                                 "waiting for it"), (image.name, "late")
+        elif (
             previous != seen
             or any(revision is None for _path, revision in seen)
             or (meta_format != "auto" and not seen and index >= published_members)
         ):
-            ready, reason, waiting = index, f"waiting for the metadata of {image.name}", (image.name, "sidecar")
+            ready, reason, waiting = index, f"waiting for the metadata of {image.name}", (
+                image.name, "settling" if seen else "sidecar")
     return ready, reason, waiting
 
 

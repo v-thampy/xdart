@@ -1960,6 +1960,11 @@ class ScanSession:
         return self._session.is_running
 
     @property
+    def primary_error(self) -> BaseException | None:
+        """The first failure of this dynamic session (its terminal result carries it only as text), or None."""
+        return self._dynamic_primary_error
+
+    @property
     def is_paused(self) -> bool:
         return self._session.is_paused
 

@@ -15,7 +15,7 @@ from xdart.modules.frame_publication import (
     canonical_frame_source_identity,
     publication_from_frame_view,
 )
-from xrd_tools.core.scan import SourceKind
+from xrd_tools.core.scan import SourceKind, SourceReadError
 from xrd_tools.io.append import AppendRefused
 from xrd_tools.io.metadata import MetadataSourceChanged
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
@@ -864,6 +864,18 @@ def _eager_directory_file_counts(
     return counts, len(discovered_paths) - len(claimed)
 
 
+def _read_container(read, source, what: str):
+    """``read()``, one of a container's frame reads in the executor; its failure is that scan's SourceReadError, as a
+    frame's own image read is (Codex N-69301b5f NW-R2): the caller skips the scan and the Run goes on."""
+    try:
+        return read()
+    except (InterruptedError, SourceReadError):
+        raise
+    except (OSError, ValueError) as error:
+        raise SourceReadError(f"{what} of {Path(str(getattr(source, 'path', '') or 'its source')).name} could not be "
+                              f"read: {type(error).__name__}: {error}") from error
+
+
 class StandardRunExecutor:
 
     def __init__(self, *, max_display_items: int=2, join_timeout: float=5.0) -> None:
@@ -1519,6 +1531,27 @@ class StandardRunExecutor:
         self._settle_predecessor(run, output, owner)
         run.session = None
 
+    def _settle_failed_scan(self, run: _StandardRun, target: Path) -> None:
+        """Settle ``target``'s output, the current one, after its scan's own image could not be read during reduction
+        (a SourceReadError; Codex N-69301b5f NW-R2): its writer finishes as it stands, earlier epochs kept and the
+        failed one's frames never published; its display closes; the caller skips the scan and the Run goes on. A
+        failure of anything else there, the writer's own included, still fails the Run."""
+        output = run.output
+        owner = None if output is None else output.current_owner_for_target(target)
+        if owner is not None:
+            result, primary = output.settle_failed_current(owner)
+            self._close_scan(run, owner.artifact)
+            self._finish_display_projection(run)
+            self._project_new_durable(run, output)
+            if getattr(result, "failed", False) and not isinstance(primary, SourceReadError):
+                raise RuntimeError(result.error or "scan settlement failed")
+            run.display.mark_hydration_closed(owner)
+            if not run.display.release_light_1d(owner, reason="lineage-replaced"):
+                raise RuntimeError("prior light-1D lineage cleanup remains pending")
+            output.drop_released_predecessor(owner, aborted=True)
+        run.session = None
+        self._abandon_construction(run)
+
     def _block_live_target(
         self, run: _StandardRun, target: Path, target_key: str,
         drift: tuple[str, ...],
@@ -1567,8 +1600,8 @@ class StandardRunExecutor:
         stop. That scan/frame should be logged and skipped and the remaining scan processing should continue")."""
         reason = f"{type(error).__name__}: {error}"
         run.append_skips.append((str(target), reason))
-        log_events.event(logger, logging.WARNING, "%s skipped: it could not be processed; the other scans continue. "
-                         "Details: %s [SCAN-SKIPPED]", Path(target).name, reason)
+        log_events.event(logger, logging.WARNING, "%s skipped: it could not be processed; frames already saved are "
+                         "kept, and the other scans continue. Details: %s [SCAN-SKIPPED]", Path(target).name, reason)
 
     def _skip_live_append(
         self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused | None, *, constructed: bool,
@@ -1600,11 +1633,18 @@ class StandardRunExecutor:
     def _watch_metadata_wait(self, run: _StandardRun, target: Path | None, target_key: str,
                              waiting: tuple[str, str] | None, waits: dict[str, tuple[str, float, str]],
                              given_up: dict[str, set[str]]) -> bool:
-        """Time the frame an output waits on for its own metadata (``waiting``: (image, "sidecar" or "spec"); None:
-        it no longer waits, its scan is covered, or its files left the directory). After _METADATA_WAIT_NOTE_S the
-        log and the Live status say so; after the limit for its kind the frame is given up on, processed without its
-        metadata, or, for a SPEC row or when the Run normalizes by a monitor from it, its scan is skipped from that
-        frame on (True: the caller moves on)."""
+        """Time the frame an output waits on for its own metadata (``waiting``: (image, kind), as
+        ``LiveDirectoryAttempt.waiting_metadata``; None: it no longer waits, its scan is covered, or its files left the
+        directory). After _METADATA_WAIT_NOTE_S the log and the Live status say so; after the limit for its kind a frame
+        whose sidecar never came is given up on, processed without its metadata; a sidecar still changing, a SPEC row,
+        or a Run normalizing by a monitor from it skips the scan from that frame on, as does a sidecar that comes for a
+        frame given up on (Codex N-69301b5f NW-R1: never read unsettled; True: the caller moves on)."""
+        if waiting is not None and waiting[1] == "late":
+            run.live_waiting.pop(target_key, None)
+            waits.pop(target_key, None)
+            self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
+                f"the metadata of {waiting[0]} arrived after the Run stopped waiting for it"))
+            return True
         now, held = monotonic(), waits.get(target_key)
         if waiting is None or held is None or held[0] != waiting[0]:
             if run.live_waiting.pop(target_key, None) is not None and held is not None:
@@ -1615,7 +1655,8 @@ class StandardRunExecutor:
             else:
                 waits[target_key] = (waiting[0], now, Path(target).name)
             return False
-        (image, kind), name, limit = waiting, held[2], _METADATA_WAIT_LIMIT_S[waiting[1]]
+        (image, kind), name = waiting, held[2]
+        limit = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind]
         if now - held[1] < limit:
             if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
                 run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
@@ -1626,6 +1667,10 @@ class StandardRunExecutor:
         if kind == "spec":  # its row never came: a SPEC scan that stopped there (an aborted point)
             self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
                 f"the SPEC row of {image} did not arrive within {limit:g} s"))
+            return True
+        if kind == "settling":  # present but never holding still: the rare case, not read unsettled
+            self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
+                f"the metadata of {image} did not settle within {limit:g} s"))
             return True
         if any(str((args or {}).get("monitor") or "").strip()
                for args in (run.configuration.bai_1d_args, run.configuration.bai_2d_args)):
@@ -1722,11 +1767,18 @@ class StandardRunExecutor:
                     raise
             else:
                 run.source = open_source(source_spec)
-            if proof is not None and hasattr(run.source, 'retain_metadata'):
-                # The proved prefix's frames keep the values their admission read.
-                run.source.retain_metadata({label: values for label, source in enumerate(
-                    item.graph.stamp.metadata_sources[:proof.start], item.graph.stamp.first_label)
-                    if (values := source.read_values if source.spec_values is None else source.spec_values) is not None})
+            if item is not None and hasattr(run.source, 'retain_metadata'):
+                # The proved prefix's frames keep the values their admission read, and a live frame admitted without
+                # a metadata file (one the Run gave up waiting for) is reduced without one, whatever lands after
+                # (Codex N-69301b5f NW-R1: the saved row, the reduction and the admitted record agree).
+                stamp = item.graph.stamp
+                retained = {label: values for label, source in enumerate(
+                    stamp.metadata_sources[:0 if proof is None else proof.start], stamp.first_label)
+                    if (values := source.read_values if source.spec_values is None else source.spec_values) is not None}
+                retained.update((label, {}) for label, source in enumerate(stamp.metadata_sources, stamp.first_label)
+                                if source.metadata_file is None and source.read_values is not None)
+                if retained:
+                    run.source.retain_metadata(retained)
             admission = None if run.resources is None else run.resources.admission
             assets = None if admission is None else admission.scientific_assets
             calibration = (
@@ -2530,6 +2582,15 @@ class StandardRunExecutor:
                             raise RuntimeError(
                                 "Live output target changed after JIT"
                             )
+                        late = next((Path(source.source_path).name for source in decision.item.graph.stamp.metadata_sources
+                                     if source.metadata_file is not None
+                                     and Path(source.source_path).name in given_up.get(target_key, ())), None)
+                        if late is not None:  # its sidecar came between the look and admission's read
+                            self._watch_metadata_wait(run, group.target, target_key, (late, "late"), metadata_waits,
+                                                      given_up)
+                            skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
+                            publish(force=True)
+                            continue
                         drift = (
                             () if retained is None or retained.decision is None
                             else published_metadata_drift(
@@ -2643,7 +2704,7 @@ class StandardRunExecutor:
                     if isinstance(error, SourceRevisionChanged):
                         retry_revisions[target_key] = revision  # its files changed while it was read: again
                         continue
-                    if constructing and isinstance(error, OSError):
+                    if constructing and isinstance(error, OSError) and not isinstance(error, SourceReadError):
                         raise  # the output cannot be written: the Run fails (maintainer, 2026-10-24)
                     # One scan's own problem (a GI motor missing in a frame, an energy-scan refusal, a read error, an
                     # output collision, an unreadable image) skips that scan; the Run goes on (maintainer, 2026-10-24:
@@ -2697,12 +2758,24 @@ class StandardRunExecutor:
                     publish(force=True)
 
                 started = monotonic()
-                stopped = self._execute_current(
-                    run,
-                    construct=False,
-                    retain_session=True,
-                    settle=settle_live,
-                )
+                try:
+                    stopped = self._execute_current(
+                        run,
+                        construct=False,
+                        retain_session=True,
+                        settle=settle_live,
+                    )
+                except SourceReadError as error:
+                    # One scan's own image could not be read while it was reduced: that scan stops growing, what it
+                    # published before is kept, and the Run goes on (Codex N-69301b5f NW-R2).
+                    run.total -= max(0, run.current_total - run.current_completed)
+                    with _run_effect(run):
+                        self._settle_failed_scan(run, group.target)
+                    self._skip_live_append(run, group.target, target_key, None, constructed=False, failed=True,
+                                           reason=f"{type(error).__name__}: {error}")
+                    skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
+                    publish(force=True)
+                    continue
                 times.add("written", started)
                 if run.perf_enabled and not first_written and run.current_epoch_published:
                     first_written = True
@@ -2885,7 +2958,24 @@ class StandardRunExecutor:
                 artifact_total=run.current_total,
                 **_directory_event_fields(run),
             ))
-            stopped = self._execute_current(run, construct=False) or stopped
+            try:
+                stopped = self._execute_current(run, construct=False) or stopped
+            except SourceReadError as error:  # one scan's own image could not be read: it is skipped, the rest runs
+                planned, claimed = run.current_total - run.current_completed, run.current_file_total
+                with _run_effect(run):
+                    self._settle_failed_scan(run, item.target)
+                run.total -= max(0, planned)
+                run.files_skipped += claimed
+                self._skip_directory_scan(run, item.target, error)
+                self._events.put(StandardRunEvent(
+                    run.identity,
+                    StandardEventKind.DISCOVERY,
+                    completed=run.completed,
+                    total=run.total,
+                    detail=_directory_status(run),
+                    **_directory_event_fields(run),
+                ))
+                continue
             if run.pending_rebuild is not None:  # said at the end only when the scan was reduced again whole
                 if run.current_completed >= run.current_total:
                     run.append_rebuilds.append(run.pending_rebuild)
@@ -3165,6 +3255,8 @@ class StandardRunExecutor:
                     for key, elapsed in snapshot().items():
                         _perf_add(run, key, elapsed)
             if getattr(result, "failed", False):
+                if isinstance(primary := getattr(session, "primary_error", None), SourceReadError):
+                    raise primary  # one scan's own image could not be read: its caller skips that scan
                 raise RuntimeError(
                     result.error or "scattering reduction failed"
                 )
@@ -3249,7 +3341,7 @@ class StandardRunExecutor:
                     if run.stop_requested:
                         return
                     frame = run.frames_by_label[label]
-                    image = source.load_frame(label)
+                    image = _read_container(lambda: source.load_frame(label), source, f"frame {label}")
                     observed_fallbacks += 1
                     if not _background_ready(run, output, frame): break
                     runtime = run.context_runtime
@@ -3355,7 +3447,7 @@ class StandardRunExecutor:
             while accepting.is_set() and not run.stop_requested:
                 read_started = monotonic()
                 try:
-                    block, labels = next(chunks)
+                    block, labels = _read_container(lambda: next(chunks), source, "its next frames")
                 except StopIteration:
                     _perf_add(
                         run, "source_read", monotonic() - read_started
@@ -3383,7 +3475,9 @@ class StandardRunExecutor:
             accepting.clear()
             runtime = run.context_runtime
             try:
-                if runtime is None:
+                if isinstance(error, SourceReadError):  # that scan's own read: only its graph stops, the Run goes on
+                    output.stop_current()
+                elif runtime is None:
                     output.stop()
                 else:
                     runtime.request_stop(output)
