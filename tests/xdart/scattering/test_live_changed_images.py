@@ -9,6 +9,7 @@ growing it"), and the next Run finds it changed and rebuilds it. Every other ref
 Real Live Runs over real TIFF + .txt scans."""
 from __future__ import annotations
 
+import logging
 import os
 from collections import Counter
 
@@ -97,9 +98,10 @@ def test_live_rebuilds_a_finished_scan_whose_image_changed_once_then_extends_the
 
 @pytest.mark.parametrize("change", ["acquired again", "re-dated"])
 def test_a_scan_this_live_run_grows_stops_growing_when_a_reduced_image_changes_and_the_next_run_rebuilds_it(
-        tmp_path, change):
+        tmp_path, caplog, change):
     """Maintainer, 2026-10-24 ("Stop growing it"): its frames so far kept, its later frames skipped this Run and
     named; a later Run finds the scan changed and reduces it whole."""
+    caplog.set_level(logging.INFO)
     raw = tmp_path / "raw"
     raw.mkdir()
     executor, identity = _live(tmp_path, raw, 8703)
@@ -127,6 +129,10 @@ def test_a_scan_this_live_run_grows_stops_growing_when_a_reduced_image_changes_a
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
     assert "grow_int1d.nexus stopped growing: its Append was refused" in terminal[0][1], terminal
     assert _labels(events, "grow") == [1, 2] and _rebuilt(events) == []  # frame 3 skipped, nothing rebuilt
+    assert any(record.levelno == logging.WARNING and record.getMessage().startswith(
+        "grow_int1d.nexus stops growing: an image it already processed changed on disk; its frames so far are kept "
+        "and its later frames are skipped in this Run; the next Run reprocesses the whole scan. Details: ")
+        for record in caplog.records), [record.getMessage() for record in caplog.records][-10:]
     assert output.read_bytes() == kept and _lineage(output)[2][0] == [1, 2]
     executor, identity = _live(tmp_path, raw, 8707)  # the next Run: a changed scan it finds, rebuilt whole
     events = []

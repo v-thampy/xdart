@@ -9,6 +9,7 @@ from threading import Event, Lock, Thread, current_thread, get_ident
 from time import monotonic
 from typing import Any, Callable, Mapping
 import numpy as np
+from xdart.utils import log_events
 from xdart.modules.frame_publication import (
     PublicationStore,
     canonical_frame_source_identity,
@@ -98,6 +99,20 @@ from .target_reservation import (
 from .dynamic_output import DynamicOutputAdapter, HeavyResidencyFact
 
 logger = logging.getLogger(__name__)
+
+
+def _run_summary(configuration) -> str:
+    """A Run's banner line: processing, output mode, Live, cores, and its source."""
+    try:
+        spec = configuration.thaw_source_spec()
+    except Exception:  # a legacy configuration has none to thaw
+        spec = None
+    source = (getattr(spec, "uri", None) or getattr(spec, "root", None)
+              or getattr(configuration, "project_root", "") or "")
+    mode = (f"{getattr(configuration, 'processing_mode', '?')}, {getattr(configuration, 'output_mode', '?')}"
+            f"{', Live' if getattr(configuration, 'live_mode', False) else ''}, "
+            f"{getattr(configuration, 'max_cores', '?')} cores")
+    return f"{mode} · {source}" if source else mode
 
 # Preserve the established test-injection seam while production remains strict.
 load_poni = load_detector_calibration
@@ -465,6 +480,8 @@ class _StandardRun:
     # finished; the current output's while it runs.
     append_rebuilds: list[tuple[str, str]] = field(default_factory=list)
     pending_rebuild: tuple[str, str] | None = None
+    # The scans whose "New Scan" banner the log shows and whose "End of Scan" it has not yet: output name -> start.
+    open_scans: dict[str, float] = field(default_factory=dict)
     processed_live_revisions: dict[str, LiveDirectoryAttempt] = field(
         default_factory=dict
     )
@@ -1497,17 +1514,19 @@ class StandardRunExecutor:
             "its frame was reduced; published frames kept"
         )
         run.live_blocked[target_key] = reason
-        logger.warning("[LIVE] %s", reason)
+        log_events.event(
+            logger, logging.WARNING, "%s stops growing: the metadata of frames it already processed changed (%s); its "
+            "frames so far are kept and its later frames are skipped in this Run [LIVE]", Path(target).name, names)
 
     def _skip_live_append(
         self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused | None, *, constructed: bool,
-        reason: str | None = None,
+        reason: str | None = None, changed: bool = False,
     ) -> None:
         """Leave one Live output as it is after its Append refused: later polls skip its frames, the status names
         it, and the Run's end lists the reason. The output, when it is the current one, is retired first (with the
         Run's progress as it stands), and a failure there still fails the Run; a refusal during construction then
         closes the source it opened. ``reason`` stands for ``error``'s when there is none (a rebuild typed against an
-        output this Run grows)."""
+        output this Run grows, ``changed``: one of its processed images changed on disk)."""
         with _run_effect(run):
             self._retire_current_target(run, target)
         if constructed:
@@ -1530,10 +1549,30 @@ class StandardRunExecutor:
         run.live_blocked[target_key] = (
             f"{Path(target).name} stopped growing: its Append was refused; published frames kept"
         )
-        logger.warning("[APPEND-SKIPPED] output=%s reason=%s", target, reason)
+        log_events.event(
+            logger, logging.WARNING, "%s stops growing: %s; its frames so far are kept and its later frames are "
+            "skipped in this Run%s. Details: %s [APPEND-SKIPPED]", Path(target).name,
+            "an image it already processed changed on disk" if changed else "it can no longer be extended",
+            "; the next Run reprocesses the whole scan" if changed else "", reason)
+
+    def _open_scan(self, run: _StandardRun, artifact: Path, note: str = "") -> None:
+        """The log's ``New Scan`` banner for ``artifact``'s output (maintainer, 2026-10-24)."""
+        name = Path(artifact).name
+        run.open_scans[name] = monotonic()
+        log_events.banner(logger, "New Scan · %s%s", name, f" ({note})" if note else "", kind="open")
+
+    def _close_scan(self, run: _StandardRun, artifact: Path, frames: int | None = None) -> None:
+        """The log's ``End of Scan`` banner for ``artifact``'s output, with its frames and its time since it opened."""
+        name = Path(artifact).name
+        started = run.open_scans.pop(name, None)
+        if started is None:
+            return
+        counted = "" if frames is None else f" · {int(frames)} frames"
+        log_events.banner(logger, "End of Scan · %s%s · %.1f s", name, counted, monotonic() - started, kind="mark")
 
     def _settle_predecessor(self, run, output, predecessor) -> None:
         result = output.finish_predecessor(predecessor)
+        self._close_scan(run, predecessor.artifact, getattr(result, "n_processed", None))
         self._finish_display_projection(run)
         self._project_new_durable(run, output)
         if getattr(result, "failed", False):
@@ -1746,6 +1785,7 @@ class StandardRunExecutor:
         mask = None if assets is None else assets.mask
         owner = run.display.artifacts.get(str(artifact))
         newly_adopted_owner = owner is None
+        resumed = owner is not None and owner.hydration_closed
         if owner is not None and replaces:
             # Replaced whole (a Live Run showed it from its saved record, or finished it before another scan began,
             # then its images changed): its display was closed then, and its old frames leave navigation with the
@@ -1799,6 +1839,8 @@ class StandardRunExecutor:
                     else None
                 ),
             )
+        if newly_adopted_owner or resumed:
+            self._open_scan(run, artifact, "reprocessed whole" if replaces else "continued" if resumed else "")
         run.records = owner.records
         run.display.bind_checkpoint_hydration(owner)
         run_provenance = configuration.as_provenance()
@@ -1808,7 +1850,10 @@ class StandardRunExecutor:
         if replaces:  # the Run asked for Append; this output is replaced whole (Codex N-a8a6c887)
             run_provenance["append_replacement"] = {
                 "requested_output_mode": "Append", "effective_output_mode": "Overwrite", "reason": decision.reason}
-            logger.info("[APPEND-REBUILD] output=%s reason=%s", item.target, decision.reason)
+            log_events.event(
+                logger, logging.INFO, "%s: images it already processed changed on disk, so the whole scan is "
+                "reprocessed and its output replaced. Details: %s [APPEND-REBUILD]", Path(item.target).name,
+                decision.reason)
         if run.stop_requested:
             discard_source()
             raise RuntimeError("admission cancelled")
@@ -1941,6 +1986,7 @@ class StandardRunExecutor:
 
     def _run(self, run: _StandardRun) -> None:
         started_at = monotonic()
+        log_events.banner(logger, "New Run · %s", _run_summary(run.configuration), kind="open")
         if run.perf_quartiles_enabled:
             run.perf_started_at = started_at
         primary: DetachedDiagnostic | None = None
@@ -2401,7 +2447,7 @@ class StandardRunExecutor:
                             # its refusal always made it (maintainer, 2026-10-24: "Stop growing it"); a later Run
                             # finds it changed and rebuilds it whole.
                             self._skip_live_append(run, group.target, target_key, None, constructed=False,
-                                                   reason=decision.reason)
+                                                   reason=decision.reason, changed=True)
                             skipped_paths.update(
                                 path for path in group.physical_paths
                                 if path not in processed_paths
@@ -2607,7 +2653,10 @@ class StandardRunExecutor:
                 # (maintainer, 2026-10-23). Nothing was constructed for it.
                 reason = detach_exception(error, "append").message
                 run.append_skips.append((str(entry.target), reason))
-                logger.warning("[APPEND-SKIPPED] output=%s reason=%s", entry.target, reason)
+                log_events.event(
+                    logger, logging.WARNING, "%s skipped: it cannot be extended, so its existing results are left "
+                    "unchanged (Replace reprocesses it). Details: %s [APPEND-SKIPPED]", Path(entry.target).name,
+                    reason)
                 decision, skipped_files = None, 0
             if decision is None:
                 skipped_claims = _claim_physical_files(
@@ -3518,7 +3567,8 @@ class StandardRunExecutor:
             for output, reason in rebuilds
         )
         if warnings:
-            logger.warning("[RUN-SKIPPED] %d scan(s) skipped: %s", len(warnings), "; ".join(warnings))
+            log_events.event(logger, logging.WARNING, "Skipped in this Run (%d): %s [RUN-SKIPPED]", len(warnings),
+                             "; ".join(warnings))
         if receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING:
             logger.warning(
                 "[RUN-CLEANUP] output=%s retained=%s light_pending=%s failures=%s",
@@ -3655,6 +3705,8 @@ class StandardRunExecutor:
             if completed and measured_elapsed > 0.0
             else 0.0
         )
+        for name in list(run.open_scans):  # the scans still open close with the Run, ahead of its totals
+            self._close_scan(run, Path(name), run.current_completed if name == Path(str(run.artifact)).name else None)
         logger.info("Total Frames Processed: %d", completed)
         if elapsed is None:
             logger.info("Total Time: unavailable")
@@ -3764,6 +3816,10 @@ class StandardRunExecutor:
                     name,
                     *values,
                 )
+        log_events.banner(
+            logger, "End of Run · %s · %d frames%s · %.1f s", kind.value, completed,
+            f" · {run.files_processed} files processed, {run.files_skipped} skipped" if run.files_discovered else "",
+            measured_elapsed, kind="close")
 
     def _exact_run(self, identity: RunIdentity) -> _StandardRun | None:
         with self._lock:

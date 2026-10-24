@@ -116,7 +116,7 @@ def _install_file_log_handler():
         handler = RotatingFileHandler(
             path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
         handler.setLevel(logging.INFO)
-        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        handler.setFormatter(EventFormatter(LOG_FORMAT))  # Run and scan banners alone on their lines
         logging.getLogger().addHandler(handler)
         _FILE_LOG_HANDLER = handler
         LOG_FILE_PATH = path
@@ -268,6 +268,7 @@ from xdart.gui.themes.corners import (
     resolve_controls_card_corners,
 )
 from xdart.gui.widgets.log_panel import LOG_FEED, LOG_FORMAT, install_log_feed
+from xdart.utils.log_events import EventFormatter
 
 
 QMainWindow = QtWidgets.QMainWindow

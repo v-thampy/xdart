@@ -25,9 +25,12 @@ import threading
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from xdart.utils.log_events import EventFormatter
+
 from .read_only_text import ReadOnlyTextPane
 
-#: The log file's line format; the panel shows the time of day without the date.
+#: The log file's line format; the panel shows the time of day without the date, except on a Run's or scan's
+#: banner and a significant event (``xdart.utils.log_events``).
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 #: The lines the feed keeps, and so each panel.
 LOG_HISTORY_LINES = 5000
@@ -44,7 +47,7 @@ class LogFeed(logging.Handler):
 
     def __init__(self, capacity: int = LOG_HISTORY_LINES):
         super().__init__(logging.INFO)
-        self.setFormatter(logging.Formatter(LOG_FORMAT, "%H:%M:%S"))
+        self.setFormatter(EventFormatter(LOG_FORMAT, "%H:%M:%S"))
         self.capacity = int(capacity)
         self._lines: collections.deque[str] = collections.deque(maxlen=self.capacity)
         self._end = 0  # the lines ever fed: the next line's number

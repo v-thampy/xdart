@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import logging
 import os
 import shutil
 import time
@@ -37,6 +38,7 @@ from xrd_tools.core.metadata import monitor_candidates
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.append import AppendDisposition
 from xrd_tools.session.run_configuration import RunIntent
+from xdart.utils import log_events
 
 _REFUSED = "source does not extend exact image-member history"
 
@@ -206,6 +208,33 @@ def test_a_changed_image_reduces_its_scan_again_whole_into_the_same_output(tmp_p
     assert np.array_equal(rebuilt[1], expected[1]) and np.array_equal(rebuilt[2], expected[2])
 
 
+def test_the_log_frames_the_run_and_each_scan_and_says_plainly_what_it_reprocessed(tmp_path, monkeypatch, caplog):
+    """Maintainer, 2026-10-24: dated banners for the Run and each scan (frames and time on each scan's end), and
+    plain messages."""
+    raw, _output = _processed(tmp_path)
+    for k in range(2):
+        _frame(raw, "scanb", k)
+    _txt(raw, "scana", 1, second=59)
+    _redate(raw / "scana_0001.tif")
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+    seen = _again(tmp_path, raw, monkeypatch, 9216)
+    assert seen.terminals == ["FINISHED"]
+    banners = [(getattr(record, log_events.BANNER), record.getMessage()) for record in caplog.records
+               if getattr(record, log_events.BANNER, None)]
+    assert [kind for kind, _message in banners] == ["open", "open", "mark", "open", "mark", "close"], banners
+    assert banners[0][1].startswith("New Run · Int 1D, Append, 1 cores · ")
+    assert banners[1][1] == "New Scan · scana_int1d.nexus (reprocessed whole)"
+    assert banners[2][1].startswith("End of Scan · scana_int1d.nexus · 3 frames · ") and banners[2][1].endswith(" s")
+    assert banners[3][1] == "New Scan · scanb_int1d.nexus"
+    assert banners[4][1].startswith("End of Scan · scanb_int1d.nexus · 2 frames · ")
+    assert banners[5][1].startswith("End of Run · finished · 5 frames · 5 files processed, 0 skipped · ")
+    [rebuilt] = [record for record in caplog.records if "[APPEND-REBUILD]" in record.getMessage()]
+    assert getattr(rebuilt, log_events.EVENT, False) and rebuilt.getMessage().startswith(
+        "scana_int1d.nexus: images it already processed changed on disk, so the whole scan is reprocessed and its "
+        "output replaced. Details: ")
+
+
 @pytest.mark.parametrize("record", ["absent", "float32"])
 def test_without_a_full_precision_recorded_time_a_redated_image_is_a_change(tmp_path, monkeypatch, record):
     """An older output records no clock time, or (before 2026-10-23) times rounded to 128 s: no proof."""
@@ -231,7 +260,7 @@ def test_without_a_full_precision_recorded_time_a_redated_image_is_a_change(tmp_
 
 
 @pytest.mark.parametrize("other", ["an image removed", "other settings"])
-def test_a_moved_image_beside_another_difference_is_refused_as_before(tmp_path, monkeypatch, other):
+def test_a_moved_image_beside_another_difference_is_refused_as_before(tmp_path, monkeypatch, caplog, other):
     """Image drift never excuses another difference: the refusal stays untyped and the scan is skipped (Codex
     N-a8a6c887)."""
     raw, output = _processed(tmp_path)
@@ -240,8 +269,12 @@ def test_a_moved_image_beside_another_difference_is_refused_as_before(tmp_path, 
         (raw / "scana_0002.tif").unlink()
         (raw / "scana_0002.txt").unlink()
     before = output.read_bytes()
+    caplog.set_level(logging.INFO)
     seen = _again(tmp_path, raw, monkeypatch, 9208, **({"npt": 16} if other == "other settings" else {}))
     assert len(seen.warnings) == 1 and seen.rebuilt == [] and output.read_bytes() == before
+    assert any(record.getMessage().startswith("scana_int1d.nexus skipped: it cannot be extended, so its existing "
+                                              "results are left unchanged (Replace reprocesses it). Details: ")
+               for record in caplog.records)
     assert all(decision.disposition is AppendDisposition.REFUSE and not getattr(decision, "rebuild", False)
                for _name, decision in seen.decisions)
 
