@@ -2404,6 +2404,7 @@ class StandardRunExecutor:
                             ),
                             proof=run.live_proofs.get(target_key),
                             spec_cache=spec_cache,
+                            owned=run.output is not None and run.output.owns_target(group.target),
                         )
                         times.add("admission", started)
                         live_readiness_debug(

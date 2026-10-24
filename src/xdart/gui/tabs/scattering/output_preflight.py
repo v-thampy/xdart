@@ -21,7 +21,7 @@ from xrd_tools.integrate.calibration import (
     load_detector_calibration,
 )
 from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
-from xrd_tools.io.append import CommittedAppendCoverage
+from xrd_tools.io.append import CommittedAppendCoverage, committed_image_count
 from xrd_tools.io.image import read_detector_image_layout, read_image
 from xrd_tools.io.output_path import (
     FINITE_OPERATION_SLOTS,
@@ -1344,6 +1344,7 @@ def materialize_live_directory_group(
     published_graph: PreparedSourceExecutionGraph | None = None,
     proof: LivePrefixProof | None = None,
     spec_cache: dict | None = None,
+    owned: bool = False,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
@@ -1355,7 +1356,8 @@ def materialize_live_directory_group(
     earlier pending one, and such an attempt is ``partial``.  When nothing
     beyond the published frames is ready, the attempt waits without admission
     while ``published_graph`` (their admitted graph) still validates exactly;
-    any other outcome is admitted as before.
+    any other outcome is admitted as before. ``owned``: the Run is writing
+    this output now, so its file is never read here.
     """
 
     fresh = getattr(session, "fresh", frozenset())  # first seen by this poll's listing
@@ -1414,6 +1416,17 @@ def materialize_live_directory_group(
             # at whole once that settles (one found changed is reduced again),
             # never admitted as shorter than its output (Codex N-cdab3fe2).
             live_readiness_debug("live_readiness", **facts, decision="wait: published prefix held")
+            return LiveDirectoryAttempt(
+                group, ProbeState.IN_PROGRESS, reason=waiting,
+            )
+        # An output this Run has no graph of (an earlier Run's, or one it only showed from its saved record) knows
+        # its committed prefix from its own record: a member of it still waiting for its metadata holds the scan as a
+        # published one does, never admitted as shorter than the output (Codex N-f8157cee; ROOT-CAUSE-S3R1). An
+        # output this Run writes is never read here: its graph knows, and a read overlapping its writer is unsafe.
+        facts["committed"] = (None if published_graph is not None or owned or count >= len(group.plan.candidates)
+                              else committed_image_count(group.target, entry="entry"))
+        if facts["committed"] is not None and count < facts["committed"]:
+            live_readiness_debug("live_readiness", **facts, decision="wait: committed prefix held")
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting,
             )

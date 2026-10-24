@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 from collections import Counter
+from pathlib import Path
 
 import fabio
 import h5py
@@ -20,6 +21,7 @@ import numpy as np
 import pytest
 
 import xrd_tools.io.append as append
+import xrd_tools.io.metadata as metadata
 from tests.xdart.scattering.test_live_already_processed import _intent
 from tests.xdart.scattering.test_live_qualify_refusal_run import (
     _frame, _labels, _said, _settle, _stop, _terminals, _wait,
@@ -257,6 +259,37 @@ def test_a_finished_scan_whose_image_and_its_sidecar_were_acquired_again_is_rebu
     assert not _said(events, "stopped growing"), terminal
     assert len(_rebuilt(events)) == 1
     assert _lineage(tmp_path / "processed" / "first_int1d.nexus")[:2] == ("committed", [[1, 2]])
+
+
+def test_an_earlier_runs_changed_output_waits_for_its_reacquired_frames_sidecar_then_is_rebuilt(tmp_path, monkeypatch):
+    """Codex N-f8157cee: with no graph of its own in this Run, a found output's re-acquired frame whose sidecar changes
+    between the Run's first two looks is not a shorter scan to refuse; it waits, then is rebuilt whole."""
+    raw = _finished(tmp_path, "done", 2)
+    _reacquire(raw, "done", 2)
+    real, observed = metadata.live_sidecar_observation, []
+
+    def observation(image, *args, **kwargs):
+        if Path(image).name == "done_0002.tif":
+            observed.append(str(image))
+            if len(observed) == 2:  # its new acquisition clock lands between the first two looks
+                sidecar = Path(image).with_suffix(".txt")
+                sidecar.write_text(sidecar.read_text().replace("10:30:00", "10:31:00"))
+        return real(image, *args, **kwargs)
+
+    monkeypatch.setattr(metadata, "live_sidecar_observation", observation)
+    executor, identity = _live(tmp_path, raw, 8792)
+    events = []
+    try:
+        _wait(executor, events, lambda values: 2 in _labels(values, "done") or _said(values, "stopped growing") or any(
+            event.kind in _TERMINAL for event in values), timeout=15.)
+        _settle(executor, events, .5)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert len(observed) >= 2
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert not _said(events, "stopped growing"), terminal
+    assert len(_rebuilt(events)) == 1
+    assert _lineage(tmp_path / "processed" / "done_int1d.nexus")[:2] == ("committed", [[1, 2]])
 
 
 def test_live_rebuilds_a_finished_scan_whose_image_was_only_re_dated(tmp_path):

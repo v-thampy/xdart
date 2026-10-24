@@ -1137,6 +1137,19 @@ def committed_append_coverage(
     return CommittedAppendCoverage(tuple(intent.labels), wavelength_m)
 
 
+def committed_image_count(target: str | Path, *, entry: str) -> int | None:
+    """How many images ``target``'s committed Append record holds, as qualification decodes its committed prefix, or
+    None: no output, or none this reader can vouch for. A small metadata read, no image or sidecar."""
+    try:
+        with h5py.File(target, "r") as handle:
+            prefix = decode_committed_append_prefix(handle, entry=entry)
+    except MemoryError:
+        raise
+    except Exception:  # nothing to undercut: admission and qualification decide, as before
+        return None
+    return len(prefix.intent.source.image_members)
+
+
 def _extension(
     intent: AppendIntent, labels: tuple[int, ...], lineage: Mapping[str, Any], prior_source: Mapping[str, Any],
     compared: Mapping[str, Any], recorded_source: Mapping[str, Any],
@@ -1489,6 +1502,7 @@ __all__ = [
     "begin_same_run_lineage",
     "commit_append_lineage",
     "committed_append_coverage",
+    "committed_image_count",
     "decode_committed_append_prefix",
     "decode_replacement_lineage",
     "extend_same_run_lineage",
