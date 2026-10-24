@@ -194,3 +194,47 @@ def test_f3_an_output_that_changes_while_its_record_is_read_is_not_cached_as_cov
     else:
         assert not _labels(events, 'done') and len(covered) > 1 and catalog == [('done', 1), ('done', 2)], (
             covered, shown, catalog)
+
+
+
+def test_a_finished_scans_next_frame_waiting_for_its_sidecar_reads_the_output_once(tmp_path, monkeypatch):
+    """Claude cloud review of 4c28033b, finding 5: a scan this Run finished (another scan's output took over) whose
+    next frame waits for its sidecar read its output's committed record at every poll, ten a second; it is read
+    again only when its images or its output change."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    reads, real = [], run_executor.live_group_coverage
+
+    def coverage(receipt, group):
+        result = real(receipt, group)
+        reads.append((group.target.name, result is not None))
+        return result
+    monkeypatch.setattr(run_executor, 'live_group_coverage', coverage)
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, raw, live=True), request_value=8843)
+    events = []
+    try:
+        for index in (1, 2):
+            _frame(raw, 'first', index, 'txt', float(index))
+            _wait(executor, events, lambda values: index in _labels(values, 'first') or any(
+                event.kind in _TERMINAL for event in values))
+        _frame(raw, 'second', 1, 'txt', 1.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, 'second') or any(
+            event.kind in _TERMINAL for event in values))
+        _settle(executor, events, .5)
+        before = len(reads)
+        _frame(raw, 'first', 3, 'txt', 3.0, sidecar=False)  # explicit .txt: it waits for its sidecar
+        _wait(executor, events, lambda values: len(reads) > before or any(
+            event.kind in _TERMINAL for event in values), timeout=10.)
+        _settle(executor, events, 1.5)  # fifteen polls
+        waiting = reads[before:]
+        _frame(raw, 'first', 4, 'txt', 4.0, sidecar=False)  # its images change: read again, once
+        _wait(executor, events, lambda values: len(reads) > before + len(waiting) or any(
+            event.kind in _TERMINAL for event in values), timeout=10.)
+        _settle(executor, events, 1.)
+        again = reads[before + len(waiting):]
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert waiting == [('first_int1d.nexus', False)], waiting
+    assert again == [('first_int1d.nexus', False)], again

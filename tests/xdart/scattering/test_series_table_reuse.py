@@ -248,3 +248,60 @@ def test_a_large_detectors_short_series_run_on_the_workers_with_built_tables(tmp
     executor.close(identity)
     assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
     assert executors == [1, 1, 1] and len(builds) == 1, (executors, builds)
+
+
+class _Scan:
+    name = "scan"
+
+    def __init__(self, frames):
+        self.frames = frames
+
+    def __len__(self):
+        return len(self.frames)
+
+
+@pytest.mark.parametrize(("growing", "energies", "expected"), (
+    (False, None, 1),            # a short standard series of a large detector: the cap, as before
+    (True, None, 4),             # a Live scan: it grows past the frames its first poll found
+    (False, {1: 1.0e-10}, 4),    # an energy scan: each frame at its own wavelength builds its own tables
+))
+def test_an_energy_scan_or_a_live_scan_keeps_every_granted_worker(monkeypatch, growing, energies, expected):
+    """Claude cloud review of 4c28033b, findings 1-2: the large-table cap only slowed them (an energy scan on a
+    Rayonix 4096^2 fell from 4 workers to 1; a Live scan stayed on the one its first poll's frames chose)."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(core, "_LARGE_DETECTOR_PIXELS", 1)
+    session = SimpleNamespace(
+        executor=4, plan=SimpleNamespace(gi=None), growing=growing,
+        _integrators=SimpleNamespace(reuse=SimpleNamespace(idle_for=lambda key: (0, 0)), _frame_wavelengths=energies),
+        scan=_Scan([SimpleNamespace(image=np.zeros((4, 4)))] * 5), _standard_reuse_key=lambda shape, frame: ("key",))
+    assert core.ReductionSession._start_workers(session) == expected
+
+
+def test_a_live_scan_of_a_large_detector_keeps_every_granted_worker(tmp_path, monkeypatch, builds):
+    """The same in a real Live Run: its session opens on its first frame with Cores 4 and keeps four workers."""
+    from tests.xdart.scattering.test_live_qualify_refusal_run import _labels
+    monkeypatch.setattr(core, "_LARGE_DETECTOR_PIXELS", 1)  # TINY counts as large
+    monkeypatch.setattr(core, "_LARGE_TABLE_BYTES", 1)
+    executors = []
+    real_coerce = core._coerce_executor
+
+    def coerce(executor):
+        executors.append(executor)
+        return real_coerce(executor)
+
+    monkeypatch.setattr(core, "_coerce_executor", coerce)
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True)
+    sidecar = _Sidecar(raw, TINY, "posa")
+    sidecar.frame(1)
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, raw, cores=4, live=True, processing="Int 1D"), request_value=9561)
+    events = []
+    try:
+        _wait(executor, events, _count_labels("posa", 1))
+        sidecar.frame(2)
+        _wait(executor, events, _count_labels("posa", 2))
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert sorted(set(_labels(events, "posa"))) == [1, 2] and executors == [4], executors

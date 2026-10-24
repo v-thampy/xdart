@@ -844,7 +844,7 @@ def _already_processed(
     well as the metadata if any were already verified. It seems wasteful to recheck that" (Codex's design review
     DESIGN-append-smb-125). TIFF images without Background only; Live, other formats, new or renamed files, a file
     whose size or time changed, and another identity all go the full way. ``live``: a Live poll's census
-    (:func:`live_group_already_processed`)."""
+    (:func:`live_group_coverage`)."""
     frozen = configuration._configuration
     if (
         frozen is None
@@ -1144,11 +1144,6 @@ def live_group_coverage(receipt: AdmissionReceipt, group: "LiveDirectoryGroup") 
     should be skipped anyway"; Codex, DESIGN-append-image-reprocess-125: a watch, never a permanent skip, and never
     for the output a Live epoch owns)."""
     return _already_processed(receipt.candidate, group.plan.candidates, group.target, live=True)
-
-
-def live_group_already_processed(receipt: AdmissionReceipt, group: "LiveDirectoryGroup") -> bool:
-    """Whether :func:`live_group_coverage` holds."""
-    return live_group_coverage(receipt, group) is not None
 
 
 def live_directory_groups(

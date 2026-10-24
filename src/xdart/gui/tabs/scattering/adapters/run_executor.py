@@ -87,7 +87,7 @@ from ..output_preflight import (
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     native_int_reduction_plan, materialize_deferred_output,
-    live_directory_groups, live_group_already_processed, live_group_coverage, materialize_live_directory_group,
+    live_directory_groups, live_group_coverage, materialize_live_directory_group,
     observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
@@ -2199,6 +2199,9 @@ class StandardRunExecutor:
         # Outputs this Run has already settled once (admitted, presented or published): only these take the
         # already-processed census below; a first sight is admitted as before.
         seen_targets: set[str] = set()
+        # Outputs that did not cover their scan, by its images and the output's stat: no second read while neither
+        # changes (Claude cloud review of 4c28033b, finding 5: a scan still waiting opened its output every poll).
+        uncovered: dict[str, tuple[tuple[object, ...], tuple[int, int, int, int]]] = {}
         # SPEC readiness by SPEC file revision: no read while it is unchanged.
         spec_cache = run.live_spec_cache
         spec_cache.clear()
@@ -2335,10 +2338,12 @@ class StandardRunExecutor:
                     # Coverage counts only for the output its record was read from: the same output before and
                     # after the read (Codex N-770941b2: one deleted or replaced during the read stayed covered).
                     signature = _target_stat(group.target)
-                    if signature is not None:
+                    if signature is not None and uncovered.get(target_key) != (revision, signature):
                         completed = live_group_coverage(receipt, group)
                         if completed is not None and _target_stat(group.target) != signature:
                             completed = None
+                        if completed is None:
+                            uncovered[target_key] = (revision, signature)
                 times.add("coverage", started)
                 if completed is not None:
                     # A scan its output already holds, image for image: shown once from its committed record, as a

@@ -1500,6 +1500,7 @@ class DynamicOutputAdapter:
                     if pipeline_v2 is not None else None
                 ),
                 integrator_reuse=self._integrator_reuse,
+                growing=bool(self.configuration.live_mode),
             )
             if loaded_scout_frame is not None:
                 loaded_scout_frame.image = None

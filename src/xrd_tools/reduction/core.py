@@ -3457,6 +3457,8 @@ class ReductionSession:
     # The Run's WarmIntegrators, shared by its sessions: a session borrows worker integrators whose tables are built
     # and gives them back when it finishes cleanly. None builds them per session.
     integrator_reuse: WarmIntegrators | None = None
+    # A Live scan's session: it starts with the frames one poll found and grows, so it keeps every granted worker.
+    growing: bool = False
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -3575,10 +3577,13 @@ class ReductionSession:
         already built under its own exact key (at least one), plus one per ``_FRAMES_PER_COLD_WORKER`` frames, within
         the grant (Codex N-770941b2 F4: never another key's tables). The key is the one its workers compute, from its
         plan mask and first image's shape; without one (a frame mask, a chi profile, an unsafe mask cache, a custom
-        detector, energy steps) it has no warm tables and no measured cost, so the detector's size decides. GI keeps
-        the grant; nothing is built or read to decide."""
+        detector) it has no warm tables and no measured cost, so the detector's size decides. GI, energy steps (each
+        frame's own wavelength builds its own tables, so every worker shortens the series) and a Live scan's growing
+        series (its first poll's frames say nothing of its length) keep the grant (Claude cloud review of 4c28033b,
+        findings 1-2); nothing is built or read to decide."""
         granted, reuse = self.executor, self._integrators.reuse
-        if reuse is None or type(granted) is not int or granted <= 1 or self.plan.gi is not None or not self.scan.frames:
+        if (reuse is None or type(granted) is not int or granted <= 1 or self.plan.gi is not None or self.growing
+                or self._integrators._frame_wavelengths is not None or not self.scan.frames):
             return granted
         image = getattr(self.scan.frames[0], "image", None)
         if image is None or np.ndim(image) < 2:

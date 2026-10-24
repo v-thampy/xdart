@@ -347,10 +347,12 @@ def test_a_series_no_integrator_is_reused_for_starts_by_its_detector_size(monkey
         frame.mask = np.zeros(SHAPE, dtype=bool)  # a frame's own mask is never bound into a kept integrator
     _reduce(masked, _plan(), reuse=reuse, cores=4)
     energies = {"energy_selection": {"frame_labels": [0, 1, 2], "frame_energies_eV": [12000.0, 12100.0, 12200.0]}}
+    # each frame at its own wavelength builds its own tables: every granted worker shortens it (Claude cloud review of
+    # 4c28033b, finding 1)
     _reduce(_scan("energy", seed=2, frames=3), _plan(extra=energies), reuse=reuse, cores=4)
     flat = _scan("flat", seed=3, frames=3, flat=True)  # the detector's own flat field: no key holds it
     _reduce(flat, _plan(), reuse=reuse, cores=4)
-    assert started == [2, 1, 1, 1]
+    assert started == [2, 1, 4, 1]
 
 
 def test_a_mask_the_frames_reject_fails_them_as_before(started):

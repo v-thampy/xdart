@@ -147,9 +147,11 @@ def open_headless_scan_session(
     dynamic_nexus_checkpoint: bool = False,
     dynamic_nexus_checkpoint_threshold: int | None = None,
     integrator_reuse: Any = None,
+    growing: bool = False,
 ) -> ScanSession:
     """Open the accepted session graph over one exact non-empty ``Scan``. ``integrator_reuse`` is the Run's
-    ``WarmIntegrators``, so its series reuse built worker integrators."""
+    ``WarmIntegrators``, so its series reuse built worker integrators; ``growing``: a Live scan's, which keeps every
+    granted worker."""
     if type(scan) is not Scan:
         raise TypeError("headless session requires an exact Scan")
     if not scan.frames:
@@ -252,6 +254,7 @@ def open_headless_scan_session(
         dynamic_nexus_checkpoint_threshold=dynamic_nexus_checkpoint_threshold,
         strict=StrictPolicy.graceful(),
         integrator_reuse=integrator_reuse,
+        growing=growing,
     )
 
 
