@@ -3578,9 +3578,9 @@ class ReductionSession:
         the grant (Codex N-770941b2 F4: never another key's tables). The key is the one its workers compute, from its
         plan mask and first image's shape; without one (a frame mask, a chi profile, an unsafe mask cache, a custom
         detector) it has no warm tables and no measured cost, so the detector's size decides. GI, energy steps (each
-        frame's own wavelength builds its own tables, so every worker shortens the series) and a Live scan's growing
-        series (its first poll's frames say nothing of its length) keep the grant (Claude cloud review of 4c28033b,
-        findings 1-2); nothing is built or read to decide."""
+        worker's private integrator changes with its frame's wavelength, so stepped energies rebuild per frame and
+        every worker shortens the series) and a Live scan's growing series (its first poll's frames say nothing of its
+        length) keep the grant (Claude cloud review of 4c28033b, findings 1-2); nothing is built or read to decide."""
         granted, reuse = self.executor, self._integrators.reuse
         if (reuse is None or type(granted) is not int or granted <= 1 or self.plan.gi is not None or self.growing
                 or self._integrators._frame_wavelengths is not None or not self.scan.frames):

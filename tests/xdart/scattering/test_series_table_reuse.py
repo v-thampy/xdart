@@ -263,7 +263,7 @@ class _Scan:
 @pytest.mark.parametrize(("growing", "energies", "expected"), (
     (False, None, 1),            # a short standard series of a large detector: the cap, as before
     (True, None, 4),             # a Live scan: it grows past the frames its first poll found
-    (False, {1: 1.0e-10}, 4),    # an energy scan: each frame at its own wavelength builds its own tables
+    (False, {1: 1.0e-10}, 4),    # an energy scan: a worker's integrator changes with each frame's wavelength
 ))
 def test_an_energy_scan_or_a_live_scan_keeps_every_granted_worker(monkeypatch, growing, energies, expected):
     """Claude cloud review of 4c28033b, findings 1-2: the large-table cap only slowed them (an energy scan on a
