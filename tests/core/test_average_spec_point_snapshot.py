@@ -111,8 +111,9 @@ def test_actual_sto_scan43_average_preserves_mean_counts_and_metadata(tmp_path):
     # The persisted schema stores axes, intensity and numeric scan-data as float32.
     np.testing.assert_array_equal(actual.q, expected.radial.astype(np.float32))
     np.testing.assert_array_equal(actual.intensity, expected.intensity.astype(np.float32))
+    # ... except per-frame times, kept at float64 since 5d921d84 (float32 rounds them to 128 s steps).
     np.testing.assert_array_equal(get_metadata(result.target)["scan_data"]["Epoch"],
-                                  np.asarray([np.mean(columns["Epoch"])], np.float32))
+                                  np.asarray([np.mean(columns["Epoch"])], np.float64))
 
 
 def _images(root, name="experiment", count=2, scan=1):
