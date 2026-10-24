@@ -934,6 +934,11 @@ class DynamicOutputAdapter:
         graph = self._current
         return graph is not None and graph.get("target") == _target_key(target)
 
+    @property
+    def has_current(self) -> bool:
+        """Whether any output graph is current (open, pending or dormant)."""
+        return self._current is not None
+
     def predecessor_owner_for_target(self, target: Path):
         graph = self._current
         return (None if graph is None or graph.get("target") == _target_key(target)

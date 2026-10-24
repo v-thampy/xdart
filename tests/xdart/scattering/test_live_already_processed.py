@@ -61,10 +61,14 @@ def test_live_leaves_finished_scans_alone_while_another_scan_grows(tmp_path, mon
         _wait(executor, events, lambda values: 2 in _labels(values, 'grow') or any(
             event.kind in _TERMINAL for event in values))
         _settle(executor, events, .5)
+        catalog = executor.frame_catalog(identity).entries
     finally:
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     stopped = next(event for event in events if event.kind is StandardEventKind.STOPPED)
     assert stopped.warnings == () and not _said(events, 'stopped growing'), (stopped.warnings, _terminals(events))
-    assert 'done_int1d.nexus' not in admitted[before_touch:], admitted
+    # Shown at the first poll from its committed record (nothing written yet), never probed or admitted, even
+    # after its sidecar moved; its saved frames are in the Run's navigation ahead of the new scan's.
+    assert 'done_int1d.nexus' not in admitted and before_touch >= 1, admitted
     assert sorted(set(_labels(events, 'grow'))) == [1, 2]
+    assert [(key.source_scan, key.local_frame_label) for key in catalog][:2] == [('done', 1), ('done', 2)], catalog

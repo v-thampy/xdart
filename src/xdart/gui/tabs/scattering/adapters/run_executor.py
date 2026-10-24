@@ -86,7 +86,8 @@ from ..output_preflight import (
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     native_int_reduction_plan, materialize_deferred_output,
-    live_directory_groups, live_group_already_processed, materialize_live_directory_group, observe_live_members,
+    live_directory_groups, live_group_already_processed, live_group_coverage, materialize_live_directory_group,
+    observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
 )
@@ -2182,16 +2183,24 @@ class StandardRunExecutor:
                             run.live_proofs[target_key] = _live_proof(
                                 configuration, retained.decision.item.graph, seen, registry)
                             continue
-                if (target_key in seen_targets or target_key in run.processed_live_revisions) and not (
-                        run.output is not None and run.output.owns_target(group.target)) and (
-                        live_group_already_processed(receipt, group)):
-                    # A scan this Run settled before whose output still holds it image for image: a quiet no-op until
-                    # its images change, with nothing read, released or refused (beamline 2026-10-23: files the
-                    # beamline touched after a scan were refused one by one, and settling the scan still growing to
-                    # look at them failed it at its next frame, "cannot bind an allocation to a populated store").
+                completed = (
+                    None if run.output is not None and run.output.owns_target(group.target)
+                    else live_group_coverage(receipt, group)
+                )
+                if completed is not None:
+                    # A scan its output already holds, image for image: shown once from its committed record, as a
+                    # directory Append shows it, then a quiet no-op until its images change; nothing is probed, read,
+                    # released or refused (beamline 2026-10-23: each finished scan was probed and its sidecars read
+                    # over two listings, about 40 s on the share before the first frame; files the beamline touched
+                    # after a scan were refused one by one, and settling the scan still growing to look at them
+                    # failed it at its next frame, "cannot bind an allocation to a populated store").
+                    if target_key not in seen_targets and target_key not in run.processed_live_revisions:
+                        with _run_effect(run):
+                            self._present_live_saved_output(run, group, completed)
+                        seen_targets.add(target_key)
                     settled_revisions[target_key] = (revision, None)
                     processed_paths.update(group.physical_paths)
-                    publish()
+                    publish(force=True)
                     continue
                 constructing = False
                 try:
@@ -2555,11 +2564,6 @@ class StandardRunExecutor:
         """A scan its output already holds, shown as an Append no-op shows it (its saved frames in navigation, its
         files counted processed) without reading the scan again: no source, graph, writer or warning
         (``output_preflight._already_processed``). Returns whether Stop was requested."""
-        configuration = run.configuration
-        labels = tuple(completed.labels)
-        first = entry.candidates[0]
-        run.current_total = len(labels)
-        run.total += run.current_total
         run.current_file_total = _claim_physical_files(
             tuple(candidate.path for candidate in entry.candidates),
             deferred.discovered_paths,
@@ -2568,7 +2572,57 @@ class StandardRunExecutor:
             output_index=output_index,
         )
         run.current_files_incremental = True
-        run.artifact = entry.target
+        owner = self._present_saved_output(run, entry.target, entry.candidates[0], completed)
+        for finished in (False, True):
+            if finished:
+                if run.artifact not in run.artifacts:
+                    run.artifacts.append(run.artifact)
+                run.display.mark_hydration_closed(owner)
+                run.records = None
+                run.files_processed += min(run.current_file_total, run.current_completed)
+                run.current_file_total = 0
+                run.current_files_incremental = False
+            self._events.put(StandardRunEvent(
+                run.identity,
+                StandardEventKind.DISCOVERY,
+                completed=run.completed,
+                total=run.total,
+                artifact=str(entry.target),
+                detail=_directory_status(run),
+                artifact_completed=run.current_published,
+                artifact_total=run.current_total,
+                **_directory_event_fields(run),
+            ))
+        return bool(run.stop_requested)
+
+    def _present_live_saved_output(self, run: _StandardRun, group: LiveDirectoryGroup, completed) -> None:
+        """A Live Run's view of a scan its output already holds, as a directory Append shows it; the poll counts its
+        files and publishes the status. The output a Live epoch holds open keeps its own session and progress: this
+        scan gets no writer, so nothing is settled."""
+        current = ("session", "artifact", "records", "current_total", "current_completed", "current_published",
+                   "current_epoch_published", "current_file_total", "current_files_incremental")
+        held = {name: getattr(run, name) for name in current} if run.output is not None and run.output.has_current \
+            else None
+        owner = self._present_saved_output(run, group.target, group.plan.candidates[0], completed)
+        if run.artifact not in run.artifacts:
+            run.artifacts.append(run.artifact)
+        run.display.mark_hydration_closed(owner)
+        run.records = None
+        run.current_file_total = 0
+        run.current_files_incremental = False
+        if held is not None:
+            for name, value in held.items():
+                setattr(run, name, value)
+
+    def _present_saved_output(self, run: _StandardRun, target: Path, first, completed):
+        """Show an output's saved frames as an Append no-op shows them (navigation, display owner, acquisition
+        context) from its committed record, without reading its scan again: no source, graph, writer or warning
+        (``output_preflight._already_processed``). Returns the display owner; the caller counts files."""
+        configuration = run.configuration
+        labels = tuple(completed.labels)
+        run.current_total = len(labels)
+        run.total += run.current_total
+        run.artifact = target
         run.session = None  # as an Append no-op's dormant output leaves it
         plan = native_int_reduction_plan(configuration, companion_modes_2d=True)
         admission = None if run.resources is None else run.resources.admission
@@ -2580,12 +2634,14 @@ class StandardRunExecutor:
         run.display.set_factories(FrameRecordStore, PublicationStore)
         if not run.display.configured:
             self._configure_display(run, npt=npt, frame_bytes=None)
-        owner = run.display.artifacts.get(str(entry.target))
+        owner = run.display.artifacts.get(str(target))
         newly_adopted_owner = owner is None
         if owner is None:
             from xrd_tools.sources.adapters import get_adapter
+            if configuration.live_mode and run.display.artifacts:
+                run.display.admit_additional_partition()  # as a Live Run's construction admits each later output
             owner = run.display.add_artifact(
-                entry.target,
+                target,
                 get_adapter(first.adapter_id).scan_name(first.path),
                 mask=None if assets is None else assets.mask,
                 mask_saturation=bool(getattr(plan, "mask_saturation", False)),
@@ -2608,27 +2664,7 @@ class StandardRunExecutor:
         self._seed_persisted_prefix_navigation(run, owner, labels, newly_adopted=newly_adopted_owner)
         self._adopt_acquisition_context(run, owner, source_path=str(first.path), saved_only=True)
         run.completed += run.current_completed
-        for finished in (False, True):
-            if finished:
-                if run.artifact not in run.artifacts:
-                    run.artifacts.append(run.artifact)
-                run.display.mark_hydration_closed(owner)
-                run.records = None
-                run.files_processed += min(run.current_file_total, run.current_completed)
-                run.current_file_total = 0
-                run.current_files_incremental = False
-            self._events.put(StandardRunEvent(
-                run.identity,
-                StandardEventKind.DISCOVERY,
-                completed=run.completed,
-                total=run.total,
-                artifact=str(entry.target),
-                detail=_directory_status(run),
-                artifact_completed=run.current_published,
-                artifact_total=run.current_total,
-                **_directory_event_fields(run),
-            ))
-        return bool(run.stop_requested)
+        return owner
 
     def _execute_current(
         self,

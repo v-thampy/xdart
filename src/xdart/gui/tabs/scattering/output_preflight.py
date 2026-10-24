@@ -1133,13 +1133,18 @@ def _validate_deferred_targets(
         )
 
 
+def live_group_coverage(receipt: AdmissionReceipt, group: "LiveDirectoryGroup") -> CommittedAppendCoverage | None:
+    """A Live group's committed coverage when its output already holds exactly its images, each name, size and time
+    as the output's committed record has them: a quiet no-op until its files change. The census and the committed
+    record only; no image or sidecar is read (maintainer, 2026-10-23: "If something has already been processed, it
+    should be skipped anyway"; Codex, DESIGN-append-image-reprocess-125: a watch, never a permanent skip, and never
+    for the output a Live epoch owns)."""
+    return _already_processed(receipt.candidate, group.plan.candidates, group.target, live=True)
+
+
 def live_group_already_processed(receipt: AdmissionReceipt, group: "LiveDirectoryGroup") -> bool:
-    """Whether a Live group's output already holds exactly its images, each name, size and time as the output's
-    committed record has them: a quiet no-op until its files change. The census and the committed record only; no
-    image or sidecar is read (maintainer, 2026-10-23: "If something has already been processed, it should be skipped
-    anyway"; Codex, DESIGN-append-image-reprocess-125: a watch, never a permanent skip, and never for the output a
-    Live epoch owns)."""
-    return _already_processed(receipt.candidate, group.plan.candidates, group.target, live=True) is not None
+    """Whether :func:`live_group_coverage` holds."""
+    return live_group_coverage(receipt, group) is not None
 
 
 def live_directory_groups(
