@@ -3557,6 +3557,48 @@ class ReductionSession:
         """Whether no timed-out writer can still invoke the sink."""
         return self._writer_thread is None or not self._writer_thread.is_alive()
 
+    def _start_workers(self) -> Any:
+        """The pool this session builds: for a Standard series whose tables are large, the workers whose tables are
+        already built under its own exact key (at least one), plus one per ``_FRAMES_PER_COLD_WORKER`` frames, within
+        the grant (Codex N-770941b2 F4: never another key's tables). The key is the one its workers compute, from its
+        plan mask and first image's shape; without one (a frame mask, a chi profile, an unsafe mask cache, a custom
+        detector, energy steps) it has no warm tables and no measured cost, so the detector's size decides. GI keeps
+        the grant; nothing is built or read to decide."""
+        granted, reuse = self.executor, self._integrators.reuse
+        if reuse is None or type(granted) is not int or granted <= 1 or self.plan.gi is not None or not self.scan.frames:
+            return granted
+        image = getattr(self.scan.frames[0], "image", None)
+        if image is None or np.ndim(image) < 2:
+            return granted
+        shape = (int(np.shape(image)[0]), int(np.shape(image)[1]))
+        key = self._standard_reuse_key(shape, self.scan.frames[0])
+        warm, table_bytes = (0, 0) if key is None else reuse.idle_for(key)
+        workers = _series_workers(granted, len(self.scan), warm, table_bytes, shape[0] * shape[1])
+        if workers != granted:
+            logger.debug("[AUTO-WORKERS] %s: %d of %d workers (%d frames, %d with built tables, %s B tables)",
+                         self.scan.name, workers, granted, len(self.scan), warm, table_bytes or "unmeasured")
+        return workers
+
+    def _standard_reuse_key(self, shape: tuple[int, int], frame: Any) -> tuple[Any, ...] | None:
+        """The exact key this series' workers keep their integrators under, as ``_reduce_frame`` binds a run-constant
+        mask and the provider keys it, or None when its frames would not take a reused integrator."""
+        plan = self.plan
+        if (getattr(frame, "mask", None) is not None or standard_chi_profile(plan)
+                or any(item is not None and "safe" in item.extra and item.extra["safe"] is not True
+                       for item in (plan.integration_1d, plan.integration_2d))):
+            return None
+        provider = self._integrators
+        try:
+            if provider.ai is None or not _stock_pyfai_detector_mask_semantics(provider.ai, shape):
+                return None
+            run_mask = _cached_mask_for_shape(plan.mask, shape, "ReductionPlan.mask", self._plan_masks)
+            with _PYFAI_COLD_GEOMETRY_LOCK:
+                return provider._reuse_key(run_mask, shape)
+        except MemoryError:
+            raise
+        except Exception:  # the frame path reports it, as before; here it only leaves the detector's size to decide
+            return None
+
     def _fit_integrator_reuse(self) -> None:
         """Bound the Run's idle integrators by this session's granted workers, before any worker borrows one."""
         reuse = self._integrators.reuse
@@ -3658,7 +3700,7 @@ class ReductionSession:
                     "batch settlement authority requires exact accepted attempts"
                 )
         try:
-            self._worker, self._owns_worker = _coerce_executor(self.executor)
+            self._worker, self._owns_worker = _coerce_executor(self._start_workers())
             self._fit_integrator_reuse()
             self._sink.begin(self.scan, self.plan)
             self._bind_angular_support()
@@ -5427,6 +5469,24 @@ def _on_energy_scan_grid(item: Any, grid: Mapping[str, Any] | None, key: str) ->
     return replace(item, radial_range=tuple(map(float, grid[key])))
 
 
+#: A large detector's tables take seconds to build per worker (beamline 2026-10-23, Rayonix 4096^2 at 1-D 2000 and
+#: 2-D 1000x500: 2.17 GB, ~8 s to build against ~0.85 s to integrate a frame on that PC), so a short series is faster
+#: and steadier on the workers whose tables are already built: Cores 1 beat Cores 4 on its 3-5 frame scans.
+_LARGE_TABLE_BYTES = 1 << 30
+_LARGE_DETECTOR_PIXELS = 8_000_000
+_FRAMES_PER_COLD_WORKER = 16
+
+
+def _series_workers(granted: int, frames: int, warm: int, table_bytes: int, pixels: int) -> int:
+    """Workers a Standard series starts: all it was granted when its tables are cheap; when they are large (measured,
+    or before that a large detector), the workers whose tables are built, at least one, plus one more per
+    ``_FRAMES_PER_COLD_WORKER`` frames, enough to repay another build within the series."""
+    large = table_bytes >= _LARGE_TABLE_BYTES if table_bytes else pixels >= _LARGE_DETECTOR_PIXELS
+    if not large:
+        return granted
+    return max(1, min(granted, max(1, warm) + frames // _FRAMES_PER_COLD_WORKER))
+
+
 class WarmIntegrators:
     """A Run's store of worker integrators whose pyFAI tables are built.
 
@@ -5490,13 +5550,10 @@ class WarmIntegrators:
             )
             return None
 
-    def idle_under_latest(self, role: str) -> tuple[int, int]:
-        """(Idle integrators under ``role``'s most recently returned key, that family's measured table bytes, or 0
-        when it has not been measured)."""
+    def idle_for(self, key: Any) -> tuple[int, int]:
+        """(Idle integrators built under exactly ``key``, its family's measured table bytes, or 0 when it has not
+        been measured): what a series under that key starts warm, and what a cold start costs."""
         with self._lock:
-            key = self._recent.get(role)
-            if key is None:
-                return 0, 0
             return len(self._idle.get(key, ())), self._sizes.get(key[:2], 0)
 
     def keep_for_next_run(self) -> None:

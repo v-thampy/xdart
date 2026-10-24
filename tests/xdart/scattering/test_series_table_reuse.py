@@ -223,23 +223,21 @@ def test_a_series_starts_the_workers_its_tables_can_repay(frames, warm, table_by
     """Beamline 2026-10-23 (Windows, Rayonix, 3-5 frame scans): "i ran with 1,2,3 and 4 cores. 1, 2 and 3 cores all
     took about 52-55s. 4 cores took 101s". Each worker builds its own 2.17 GB table set (~8 s on that PC, ~0.85 s a
     frame), which a few frames never repay."""
-    from xdart.gui.tabs.scattering.adapters.dynamic_output import _series_workers
-    assert _series_workers(4, frames, warm, table_bytes, pixels) == expected
+    assert core._series_workers(4, frames, warm, table_bytes, pixels) == expected
 
 
 def test_a_large_detectors_short_series_run_on_the_workers_with_built_tables(tmp_path, monkeypatch, builds):
     """With Cores 4, three 5-frame scans of a large detector start one worker each and build one table set."""
-    from xdart.gui.tabs.scattering.adapters import dynamic_output
-    monkeypatch.setattr(dynamic_output, "_LARGE_DETECTOR_PIXELS", 1, raising=False)  # TINY counts as large
-    monkeypatch.setattr(dynamic_output, "_LARGE_TABLE_BYTES", 1, raising=False)
-    executors = []
-    real_open = dynamic_output.open_headless_scan_session
+    monkeypatch.setattr(core, "_LARGE_DETECTOR_PIXELS", 1)  # TINY counts as large
+    monkeypatch.setattr(core, "_LARGE_TABLE_BYTES", 1)
+    executors = []  # the pool each series' session starts (the session chooses it from its own key)
+    real_coerce = core._coerce_executor
 
-    def opening(*args, **kwargs):
-        executors.append(kwargs["executor"])
-        return real_open(*args, **kwargs)
+    def coerce(executor):
+        executors.append(executor)
+        return real_coerce(executor)
 
-    monkeypatch.setattr(dynamic_output, "open_headless_scan_session", opening)
+    monkeypatch.setattr(core, "_coerce_executor", coerce)
     raw = tmp_path / "raw"
     raw.mkdir(parents=True)
     for stem in _STEMS:

@@ -44,11 +44,12 @@ def _scan(name, *, seed=0, frames=1, wavelength=1e-10, shape=SHAPE, rot1=0.01, o
                 poni=poni, integrator=ai)
 
 
-def _plan(*, shape=SHAPE, mask_row=10, npt=100):
+def _plan(*, shape=SHAPE, mask_row=10, npt=100, radial_range=None, extra=None):
     mask = np.zeros(shape, dtype=bool)
     mask[mask_row:mask_row + 4, :] = True
-    return ReductionPlan(integration_1d=Integration1DPlan(npt=npt, error_model="poisson"),
-                         integration_2d=Integration2DPlan(npt_rad=50, npt_azim=36, error_model="poisson"), mask=mask)
+    return ReductionPlan(integration_1d=Integration1DPlan(npt=npt, error_model="poisson", radial_range=radial_range),
+                         integration_2d=Integration2DPlan(npt_rad=50, npt_azim=36, error_model="poisson"), mask=mask,
+                         extra=extra or {})
 
 
 def _reduce(scan, plan, *, reuse=None, cores=1):
@@ -101,7 +102,7 @@ _CHANGES = {
     "wavelength": (dict(wavelength=1.1e-10), {}), "geometry": (dict(rot1=0.02), {}),
     "orientation": (dict(orientation=2), {}), "chi discontinuity": (dict(chi_at_zero=True), {}),
     "mask": ({}, dict(mask_row=30)), "shape": (dict(shape=(60, 80)), dict(shape=(60, 80))),
-    "settings": ({}, dict(npt=120)),
+    "settings": ({}, dict(npt=120)), "range": ({}, dict(radial_range=(0.05, 0.25))),
 }
 
 
@@ -270,3 +271,90 @@ def test_a_run_end_keeps_the_integrators_under_each_roles_latest_key():
     assert len(reuse) == 3
     assert reuse.borrow(fiber) is kept[4] and reuse.borrow(latest) is kept[3] and reuse.borrow(latest) is kept[2]
     assert reuse.borrow(older) is None
+
+
+@pytest.fixture
+def started(monkeypatch):
+    """The workers each session starts, which it chooses from its own exact key (Codex N-770941b2 F4)."""
+    counts = []
+    real = core._coerce_executor
+
+    def recording(executor):
+        counts.append(executor)
+        return real(executor)
+
+    monkeypatch.setattr(core, "_coerce_executor", recording)
+    return counts
+
+
+def _two_built(monkeypatch, scan, plan, reuse):
+    """Reduce ``scan`` on two workers that each build an integrator (each waits until both hold one), so the store
+    then holds two under the series' key."""
+    barrier, waited = threading.Barrier(2, timeout=30), set()
+    real = core._ReductionIntegratorProvider.standard_with_run_mask
+
+    def both(self, run_mask, image_shape):
+        bound = real(self, run_mask, image_shape)
+        if threading.get_ident() not in waited:
+            waited.add(threading.get_ident())
+            barrier.wait()
+        return bound
+
+    with monkeypatch.context() as patch:
+        patch.setattr(core._ReductionIntegratorProvider, "standard_with_run_mask", both)
+        _reduce(scan, plan, reuse=reuse, cores=2)
+    assert len(reuse) == 2
+
+
+def test_a_short_series_of_large_tables_starts_the_workers_built_under_its_key(monkeypatch, builds, started):
+    reuse = WarmIntegrators(4)
+    _two_built(monkeypatch, _scan("first", seed=0, frames=2), _plan(), reuse)
+    monkeypatch.setattr(core, "_LARGE_TABLE_BYTES", 1)  # these measured tables count as large
+    second = _reduce(_scan("second", seed=1, frames=3), _plan(), reuse=reuse, cores=4)
+    assert started == [2, 2] and len(builds) == 2 and len(reuse) == 2  # three frames on the two built, none built
+    assert _same(_arrays(second), _arrays(_reduce(_scan("second", seed=1, frames=3), _plan())))
+
+
+def test_a_larger_detector_after_a_cheap_one_is_priced_by_its_own_size(monkeypatch, started):
+    monkeypatch.setattr(core, "_LARGE_DETECTOR_PIXELS", 10_000)  # between this detector (5120) and the next (20480)
+    reuse = WarmIntegrators(4)
+    _reduce(_scan("small", seed=0, frames=2), _plan(), reuse=reuse, cores=4)  # its tables measured, and cheap
+    large = (128, 160)
+    _reduce(_scan("large", seed=1, frames=3, shape=large), _plan(shape=large), reuse=reuse, cores=4)
+    assert started == [4, 1]  # its own family is not yet measured, so its pixels decide
+
+
+@pytest.mark.parametrize(("change", "expected"), (
+    ("chi discontinuity", 1), ("geometry", 1), ("mask", 1), ("orientation", 1), ("range", 1), ("wavelength", 1),
+    ("settings", 4), ("shape", 4),  # another family, not yet measured: this small detector's size decides
+))
+def test_a_changed_series_counts_no_tables_built_under_another_key(monkeypatch, started, change, expected):
+    scan_change, plan_change = _CHANGES[change]
+    reuse = WarmIntegrators(4)
+    _two_built(monkeypatch, _scan("first", seed=0, frames=2), _plan(), reuse)
+    monkeypatch.setattr(core, "_LARGE_TABLE_BYTES", 1)  # the family's measured tables count as large
+    _reduce(_scan("second", seed=1, frames=3, **scan_change), _plan(**plan_change), reuse=reuse, cores=4)
+    assert started == [2, expected]
+
+
+def test_a_series_no_integrator_is_reused_for_starts_by_its_detector_size(monkeypatch, started):
+    reuse = WarmIntegrators(4)
+    _two_built(monkeypatch, _scan("first", seed=0, frames=2), _plan(), reuse)
+    monkeypatch.setattr(core, "_LARGE_TABLE_BYTES", 1)
+    monkeypatch.setattr(core, "_LARGE_DETECTOR_PIXELS", 1)  # this detector counts as large
+    masked = _scan("masked", seed=1, frames=3)
+    for frame in masked.frames:
+        frame.mask = np.zeros(SHAPE, dtype=bool)  # a frame's own mask is never bound into a kept integrator
+    _reduce(masked, _plan(), reuse=reuse, cores=4)
+    energies = {"energy_selection": {"frame_labels": [0, 1, 2], "frame_energies_eV": [12000.0, 12100.0, 12200.0]}}
+    _reduce(_scan("energy", seed=2, frames=3), _plan(extra=energies), reuse=reuse, cores=4)
+    flat = _scan("flat", seed=3, frames=3, flat=True)  # the detector's own flat field: no key holds it
+    _reduce(flat, _plan(), reuse=reuse, cores=4)
+    assert started == [2, 1, 1, 1]
+
+
+def test_a_mask_the_frames_reject_fails_them_as_before(started):
+    wrong = ReductionPlan(integration_1d=Integration1DPlan(npt=100), mask=np.zeros((10, 10), dtype=bool))
+    with pytest.raises(ValueError, match="does not match image shape"):
+        _reduce(_scan("wrong", frames=2), wrong, reuse=WarmIntegrators(4), cores=4)
+    assert started == [4]  # no key: this small detector's size decides, and the frames report the mask
