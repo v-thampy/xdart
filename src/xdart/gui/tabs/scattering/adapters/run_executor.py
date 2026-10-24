@@ -129,6 +129,12 @@ _CONTAINER_READ_CHUNK_FRAMES = 8
 _SOURCE_PREFETCH_FRAMES = 4
 _DISPLAY_PROJECTION_FRAMES = 8
 _LIVE_DIRECTORY_POLL_S = 0.1
+# A frame whose own sidecar has been missing or changing this long is named, once, in the log and the Live status; it
+# keeps waiting (maintainer, 2026-10-24: "If it's only for txt files, a 10s timeout is plenty").
+_SIDECAR_WAIT_WARN_S = 10.0
+# A scan found changed is reduced again once its images and sidecars have held still this long: an acquisition can
+# write an image and its sidecar a moment later (maintainer, 2026-10-24: "Go ahead with your recommendation").
+_REBUILD_QUIET_S = 2.0
 
 _SOURCE_SUBMISSION_END = object()
 
@@ -502,6 +508,9 @@ class _StandardRun:
     # Live outputs that stopped growing because a published frame's metadata
     # changed: physical target key -> the reason every later status carries.
     live_blocked: dict[str, str] = field(default_factory=dict)
+    # Live outputs whose next frame has waited _SIDECAR_WAIT_WARN_S for its own
+    # sidecar: physical target key -> the note the status carries meanwhile.
+    live_waiting: dict[str, str] = field(default_factory=dict)
     current_file_total: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
@@ -675,7 +684,7 @@ def _directory_status(
         f"{state} · {processed} processed · {skipped} skipped · "
         f"{pending} pending · {discovered} discovered"
     )
-    return " · ".join((status, *run.live_blocked.values()))
+    return " · ".join((status, *run.live_blocked.values(), *run.live_waiting.values()))
 
 
 def _directory_counts(
@@ -1521,6 +1530,7 @@ class StandardRunExecutor:
             "its frame was reduced; published frames kept"
         )
         run.live_blocked[target_key] = reason
+        run.live_waiting.pop(target_key, None)
         log_events.event(
             logger, logging.WARNING, "%s stops growing: the metadata of frames it already processed changed (%s); its "
             "frames so far are kept and its later frames are skipped in this Run [LIVE]", Path(target).name, names)
@@ -1556,11 +1566,33 @@ class StandardRunExecutor:
         run.live_blocked[target_key] = (
             f"{Path(target).name} stopped growing: its Append was refused; published frames kept"
         )
+        run.live_waiting.pop(target_key, None)
         log_events.event(
             logger, logging.WARNING, "%s stops growing: %s; its frames so far are kept and its later frames are "
             "skipped in this Run%s. Details: %s [APPEND-SKIPPED]", Path(target).name,
             "an image it already processed changed on disk" if changed else "it can no longer be extended",
             "; the next Run reprocesses the whole scan" if changed else "", reason)
+
+    def _note_sidecar_wait(self, run: _StandardRun, target: Path, target_key: str, image: str | None,
+                           waits: dict[str, tuple[str, float]]) -> None:
+        """Name, once, in the log and the Live status, the image whose own sidecar an output's next frame has waited on
+        for _SIDECAR_WAIT_WARN_S (missing or changing); clear the note when that frame no longer waits on it."""
+        now, held = monotonic(), waits.get(target_key)
+        if image is not None and held is not None and held[0] == image:
+            if target_key not in run.live_waiting and now - held[1] >= _SIDECAR_WAIT_WARN_S:
+                run.live_waiting[target_key] = f"{Path(target).name} waits for the metadata of {image}"
+                log_events.event(
+                    logger, logging.WARNING, "%s is waiting for the metadata of %s: its sidecar has been missing or "
+                    "changing for over %g s; the frame is processed once its sidecar holds still [LIVE]",
+                    Path(target).name, image, _SIDECAR_WAIT_WARN_S)
+            return
+        if run.live_waiting.pop(target_key, None) is not None and held is not None:
+            log_events.event(logger, logging.INFO, "%s: the metadata of %s arrived; it continues [LIVE]",
+                             Path(target).name, held[0])
+        if image is None:
+            waits.pop(target_key, None)
+        else:
+            waits[target_key] = (image, now)
 
     def _open_scan(self, run: _StandardRun, artifact: Path, note: str = "") -> None:
         """The log's ``New Scan`` banner for ``artifact``'s output (maintainer, 2026-10-24)."""
@@ -2210,6 +2242,12 @@ class StandardRunExecutor:
         # Outputs that did not cover their scan, by its images and the output's stat: no second read while neither
         # changes (Claude cloud review of 4c28033b, finding 5: a scan still waiting opened its output every poll).
         uncovered: dict[str, tuple[tuple[object, ...], tuple[int, int, int, int]]] = {}
+        # A found output's committed image count by output file version, for its readiness waits.
+        committed_counts: dict[str, tuple[tuple[int, int, int, int], int | None]] = {}
+        # The image each output's next frame waits on for its sidecar, and since when.
+        sidecar_waits: dict[str, tuple[str, float]] = {}
+        # A scan found changed: its revision and when its rebuild may start (_REBUILD_QUIET_S).
+        rebuild_holds: dict[str, tuple[tuple[object, ...], float]] = {}
         # SPEC readiness by SPEC file revision: no read while it is unchanged.
         spec_cache = run.live_spec_cache
         spec_cache.clear()
@@ -2236,8 +2274,9 @@ class StandardRunExecutor:
                     - run.files_skipped,
                 ),
                 run.files_discovered,
-                # A newly stopped output is news even when no count moved.
+                # A newly stopped or waiting output is news even when no count moved.
                 tuple(run.live_blocked.values()),
+                tuple(run.live_waiting.values()),
             )
             if not force and projection == last_projection:
                 return
@@ -2340,6 +2379,9 @@ class StandardRunExecutor:
                             run.live_proofs[target_key] = _live_proof(
                                 configuration, retained.decision.item.graph, seen, registry)
                             continue
+                held = rebuild_holds.get(target_key)
+                if held is not None and held[0] == revision and monotonic() < held[1]:
+                    continue  # a scan found changed waits for its images and sidecars to hold still
                 started = monotonic()
                 completed = signature = None
                 if run.output is None or not run.output.owns_target(group.target):
@@ -2405,8 +2447,10 @@ class StandardRunExecutor:
                             proof=run.live_proofs.get(target_key),
                             spec_cache=spec_cache,
                             owned=run.output is not None and run.output.owns_target(group.target),
+                            committed_cache=committed_counts,
                         )
                         times.add("admission", started)
+                        self._note_sidecar_wait(run, group.target, target_key, attempt.waiting_sidecar, sidecar_waits)
                         live_readiness_debug(
                             "live_attempt", target=group.target.name,
                             owned=run.output is not None and run.output.owns_target(group.target),
@@ -2473,6 +2517,14 @@ class StandardRunExecutor:
                             )
                             publish(force=True)
                             continue
+                        if decision.disposition is OutputDisposition.REPLACE:
+                            # A scan found changed is reduced again only once its images and sidecars have held still
+                            # for _REBUILD_QUIET_S (an image can land before its sidecar); then the next attempt goes on.
+                            held = rebuild_holds.get(target_key)
+                            if held is None or held[0] != revision:
+                                rebuild_holds[target_key] = (revision, monotonic() + _REBUILD_QUIET_S)
+                                continue
+                            rebuild_holds.pop(target_key)
                         # Only an output that runs now takes over: a scan still waiting, refused or stopped above
                         # leaves the current one open, and its next frame extends it in place (Codex N-0243a1bb F1:
                         # settled to look at a neighbour, it failed that frame on its own repopulated display store).

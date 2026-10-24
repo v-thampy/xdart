@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -24,7 +25,7 @@ import xrd_tools.io.append as append
 import xrd_tools.io.metadata as metadata
 from tests.xdart.scattering.test_live_already_processed import _intent
 from tests.xdart.scattering.test_live_qualify_refusal_run import (
-    _frame, _labels, _said, _settle, _stop, _terminals, _wait,
+    SIDECARS, _frame, _labels, _output, _said, _settle, _stop, _terminals, _wait,
 )
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_terminal, _start
 from xrd_tools.sources.directory_session import DirectoryIndexSession
@@ -290,6 +291,95 @@ def test_an_earlier_runs_changed_output_waits_for_its_reacquired_frames_sidecar_
     assert not _said(events, "stopped growing"), terminal
     assert len(_rebuilt(events)) == 1
     assert _lineage(tmp_path / "processed" / "done_int1d.nexus")[:2] == ("committed", [[1, 2]])
+
+
+def test_a_found_scan_reacquired_image_first_then_sidecar_is_rebuilt_with_its_new_sidecar(tmp_path):
+    """An acquisition that writes the image and then its sidecar a moment later: the rebuild waits until both have held
+    still (maintainer, 2026-10-24: "Go ahead with your recommendation"), so it takes the new sidecar, not the old one
+    followed by a stop when the new one lands."""
+    raw = _finished(tmp_path, "done", 2)
+    executor, identity = _live(tmp_path, raw, 8795)
+    events = []
+    try:
+        _wait(executor, events, lambda values: _catalog(executor, identity, "done") == {1: 1, 2: 1} or any(
+            event.kind in _TERMINAL for event in values))
+        shown = len(_labels(events, "done"))
+        _reacquire(raw, "done", 2)
+        time.sleep(.8)  # its sidecar lands well after the image (several polls)
+        (raw / "done_0002.txt").write_text(SIDECARS["txt"](7.0))
+        _wait(executor, events, lambda values: len(_labels(values, "done")) >= shown + 2 or _said(
+            values, "stopped growing") or any(event.kind in _TERMINAL for event in values), timeout=30.)
+        _settle(executor, events, .5)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert not _said(events, "stopped growing") and len(_rebuilt(events)) == 1, _terminals(events)
+    assert _output(tmp_path, "done")[:2] == ((1, 2), (1.0, 7.0))
+
+
+def test_a_frame_whose_sidecar_does_not_hold_still_is_named_after_the_wait_threshold_then_processed(
+        tmp_path, monkeypatch, caplog):
+    """Maintainer, 2026-10-24 ("If it's only for txt files, a 10s timeout is plenty"): a per-image sidecar missing or
+    changing past the threshold is named once in the log and in the Live status; the frame keeps waiting, and when its
+    sidecar holds still it is processed and the note goes."""
+    from xdart.gui.tabs.scattering.adapters import run_executor
+    monkeypatch.setattr(run_executor, "_SIDECAR_WAIT_WARN_S", .5, raising=False)  # (absent before the note existed)
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    executor, identity = _live(tmp_path, raw, 8794)
+    events = []
+    try:
+        _frame(raw, "grow", 1, "txt", 1.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "grow") or any(
+            event.kind in _TERMINAL for event in values))
+        _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)  # its image; its .txt has not been written
+        _wait(executor, events, lambda values: _said(values, "waits for the metadata of grow_0002.tif") or any(
+            event.kind in _TERMINAL for event in values), timeout=15.)
+        (raw / "grow_0002.txt").write_text(SIDECARS["txt"](2.0))
+        _wait(executor, events, lambda values: 2 in _labels(values, "grow") or any(
+            event.kind in _TERMINAL for event in values), timeout=15.)
+        _settle(executor, events, .5)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert "waits for the metadata" not in terminal[0][1], terminal  # the note went when the frame arrived
+    named = [record for record in caplog.records if "is waiting for the metadata of grow_0002.tif" in record.getMessage()]
+    assert [record.levelno for record in named] == [logging.WARNING], [record.getMessage() for record in named]
+    assert any("the metadata of grow_0002.tif arrived" in record.getMessage() for record in caplog.records)
+
+
+def test_an_earlier_runs_output_waiting_on_a_sidecar_reads_its_committed_count_once(tmp_path, monkeypatch):
+    """Codex N-d4d79d9f's residual: while its frame's sidecar keeps changing, the output's committed record is read
+    once per version of the output file, not at every poll."""
+    from xdart.gui.tabs.scattering import output_preflight
+    raw = _finished(tmp_path, "done", 2)
+    _reacquire(raw, "done", 2)
+    real_observation, real_count, looks, reads = metadata.live_sidecar_observation, \
+        output_preflight.committed_image_count, [], []
+
+    def observation(image, *args, **kwargs):
+        if Path(image).name == "done_0002.tif":
+            looks.append(1)
+            if 2 <= len(looks) <= 6:  # its sidecar changes at five looks in a row
+                sidecar = Path(image).with_suffix(".txt")
+                sidecar.write_text(sidecar.read_text() + "# rewritten\n")
+        return real_observation(image, *args, **kwargs)
+
+    monkeypatch.setattr(metadata, "live_sidecar_observation", observation)
+    monkeypatch.setattr(output_preflight, "committed_image_count",
+                        lambda target, **kwargs: reads.append(Path(target).name) or real_count(target, **kwargs))
+    executor, identity = _live(tmp_path, raw, 8796)
+    events = []
+    try:
+        _wait(executor, events, lambda values: 2 in _labels(values, "done") or _said(values, "stopped growing") or any(
+            event.kind in _TERMINAL for event in values), timeout=30.)
+        _settle(executor, events, .5)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert len(looks) >= 7 and len(_rebuilt(events)) == 1 and not _said(events, "stopped growing")
+    assert reads == ["done_int1d.nexus"], reads
 
 
 def test_live_rebuilds_a_finished_scan_whose_image_was_only_re_dated(tmp_path):
