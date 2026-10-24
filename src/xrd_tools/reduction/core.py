@@ -1964,8 +1964,11 @@ class NexusSink:
                 path="run_configuration",
             )
         config = self._run_configuration or {}
+        # An Append's output replaced whole (its images changed on disk) is as regenerable as an Overwrite's.
+        replacement = config.get("append_replacement")
+        replaced = isinstance(replacement, Mapping) and replacement.get("effective_output_mode") == "Overwrite"
         self._fast_regenerable = bool(
-            self.overwrite and config.get("output_mode") == "Overwrite"
+            self.overwrite and (config.get("output_mode") == "Overwrite" or replaced)
             and config.get("live_mode") is False and not self.rollback_until_commit)
         # A finite Append writes its existing output in place (maintainer,
         # 2026-10-23); an explicit full-rollback request keeps the preserved copy.

@@ -5395,14 +5395,27 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             else ""
         )
+        notes = []
         if event.warnings:
             # A directory Append skips a scan it may not extend and runs the rest
             # (maintainer, 2026-10-23); say which, once, at the end of the run.
-            self._open_warning(
-                "Scans skipped",
+            notes.append(
                 "\n\n".join(event.warnings)
                 + "\n\nThe listed scans were skipped; their existing results were left unchanged. "
-                  "Use Replace to reprocess them.",
+                  "Use Replace to reprocess them."
+            )
+        if event.rebuilt:
+            # ... and reduces one whose processed images changed on disk again whole, into the same output.
+            notes.append(
+                "\n\n".join(event.rebuilt)
+                + "\n\nThese scans' processed images changed on disk since they were reduced, so each was "
+                  "reduced again whole and its output replaced."
+            )
+        if notes:
+            self._open_warning(
+                "Scans skipped" if not event.rebuilt
+                else "Scans reprocessed" if not event.warnings else "Scans skipped and reprocessed",
+                "\n\n".join(notes),
             )
 
     def _processed_terminal_presentation_is_current(

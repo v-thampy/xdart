@@ -69,7 +69,7 @@ from xrd_tools.sources.execution_graph import (
     stable_lineage_projection,
 )
 
-from ..contracts import AdmittedOutput, PlannedOutput, SourceExecutionStamp
+from ..contracts import AdmittedOutput, OutputDisposition, PlannedOutput, SourceExecutionStamp
 from ..output_preflight import (
     _background_resource_terms,
     _merge_background_binding,
@@ -1207,6 +1207,12 @@ class DynamicOutputAdapter:
         xye_only = self.configuration.processing_mode == "Int 1D (XYE)"
         if xye_only and self.configuration.output_mode == "Append":
             raise ValueError("XYE-only Append has no persisted lineage owner")
+        # A finite Append's scan whose processed images changed on disk replaces this one output whole: no Append
+        # preflight or persisted prefix, every label, the ordinary replacement sink (Codex N-a8a6c887 stage 2).
+        replaces = decision.disposition is OutputDisposition.REPLACE
+        if replaces and (self.configuration.output_mode != "Append" or self.configuration.live_mode):
+            raise ValueError("only a finite Append replaces an output whose images changed")
+        appends = self.configuration.output_mode == "Append" and not replaces
         coordinated = any(value is not None for value in mount_values)
         if coordinated and any(value is None for value in mount_values):
             raise TypeError("dynamic GUI light mount requires one exact graph")
@@ -1216,7 +1222,7 @@ class DynamicOutputAdapter:
 
         preflight = None
         persisted_prefix_labels: tuple[int, ...] = ()
-        if not xye_only and self.configuration.output_mode == "Append":
+        if not xye_only and appends:
             if cancelled():
                 raise RuntimeError("admission cancelled")
             try:
@@ -1364,7 +1370,7 @@ class DynamicOutputAdapter:
 
             if not xye_only:
                 sink_values = dict(
-                    overwrite=self.configuration.output_mode == "Overwrite",
+                    overwrite=self.configuration.output_mode == "Overwrite" or replaces,
                     flush_every=None,
                     atomic=False,
                     incremental_finalization=True,
@@ -1382,7 +1388,7 @@ class DynamicOutputAdapter:
                     ),
                     durable_fsync=output_diagnostics.durable_fsync,
                 )
-                if self.configuration.output_mode == "Append":
+                if appends:
                     nexus = NexusSink(
                         target, append_preflight=preflight,
                         file_lock=self._command_lock, **sink_values,

@@ -221,6 +221,8 @@ class StandardRunEvent:
     terminal_commit_identity: StreamTerminal | None = None
     #: Terminal-only notes the run wants shown at its end, e.g. scans an Append skipped.
     warnings: tuple[str, ...] = ()
+    #: Terminal-only: scans an Append reduced again whole because their processed images changed on disk.
+    rebuilt: tuple[str, ...] = ()
 
 @dataclass(frozen=True, slots=True)
 class StandardDisplayPayload:

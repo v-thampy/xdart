@@ -695,6 +695,10 @@ def inspect_output(
             configuration.processing_mapping(),
         )
         if append.disposition is AppendDisposition.REFUSE:
+            if append.rebuild and not frozen.live_mode and tuple(append.labels) == labels:
+                # Its processed images changed on disk (maintainer, 2026-10-23: "reprocess the new image and
+                # overwrite the old result"): the whole scan, into this same output, as its ordinary replacement.
+                return AdmittedOutput(item, OutputDisposition.REPLACE, labels, accepted, append.reason)
             raise AppendRefused(append)
         labels = tuple(append.write_labels)
     return AdmittedOutput(

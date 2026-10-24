@@ -461,6 +461,10 @@ class _StandardRun:
     files_skipped: int = 0
     # Scans a directory Append skipped instead of failing the run: (output, reason).
     append_skips: list[tuple[str, str]] = field(default_factory=list)
+    # Scans an Append reduced again whole, their processed images changed on disk: (output, reason), once each
+    # finished; the current output's while it runs.
+    append_rebuilds: list[tuple[str, str]] = field(default_factory=list)
+    pending_rebuild: tuple[str, str] | None = None
     processed_live_revisions: dict[str, LiveDirectoryAttempt] = field(
         default_factory=dict
     )
@@ -1710,7 +1714,8 @@ class StandardRunExecutor:
             qualify=lambda policy, prior: _qualify_background_bindings(
                 configuration, run.scan, item, decision, policy, prior,
                 run.stop_signal, run))
-        if configuration.output_mode == "Overwrite" and not target_state_matches(preparation.effective):
+        replaces = decision.disposition is OutputDisposition.REPLACE
+        if (configuration.output_mode == "Overwrite" or replaces) and not target_state_matches(preparation.effective):
             raise RuntimeError(f"output target changed after Background qualification: {item.target}")
         run.display.set_factories(FrameRecordStore, PublicationStore)
         if not run.display.configured:
@@ -1790,6 +1795,11 @@ class StandardRunExecutor:
         run_provenance = configuration.as_provenance()
         if admission is not None:
             run_provenance['scientific_signature'] = admission.candidate.processing_mapping()
+        run.pending_rebuild = (str(item.target), decision.reason) if replaces else None
+        if replaces:  # the Run asked for Append; this output is replaced whole (Codex N-a8a6c887)
+            run_provenance["append_replacement"] = {
+                "requested_output_mode": "Append", "effective_output_mode": "Overwrite", "reason": decision.reason}
+            logger.info("[APPEND-REBUILD] output=%s reason=%s", item.target, decision.reason)
         if run.stop_requested:
             discard_source()
             raise RuntimeError("admission cancelled")
@@ -2630,6 +2640,10 @@ class StandardRunExecutor:
                 **_directory_event_fields(run),
             ))
             stopped = self._execute_current(run, construct=False) or stopped
+            if run.pending_rebuild is not None:  # said at the end only when the scan was reduced again whole
+                if run.current_completed >= run.current_total:
+                    run.append_rebuilds.append(run.pending_rebuild)
+                run.pending_rebuild = None
             logger.debug(
                 "[APPEND-SCAN] output=%s frames=%d admit=%.0f ms construct=%.0f ms run=%.0f ms",
                 item.target, len(decision.labels), 1000 * (admitted - started),
@@ -3471,6 +3485,13 @@ class StandardRunExecutor:
             f"Append skipped {Path(output).name}: {reason}"
             for output, reason in run.append_skips
         )
+        rebuilds = list(run.append_rebuilds)
+        if run.pending_rebuild is not None and kind is StandardEventKind.FINISHED:  # a one-scan Run's output
+            rebuilds.append(run.pending_rebuild)
+        rebuilt = tuple(
+            f"Append reprocessed {Path(output).name} whole: {reason}"
+            for output, reason in rebuilds
+        )
         if warnings:
             logger.warning("[RUN-SKIPPED] %d scan(s) skipped: %s", len(warnings), "; ".join(warnings))
         if receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING:
@@ -3597,6 +3618,7 @@ class StandardRunExecutor:
                 else None
             ),
             warnings=warnings,
+            rebuilt=rebuilt,
             **_directory_event_fields(
                 run,
                 in_flight_processed=_terminal_in_flight_files(run),

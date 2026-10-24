@@ -1,19 +1,22 @@
-"""An Append tells a processed image that changed on disk from one that was only re-dated (Codex N-a8a6c887's
-changed-image design, amended N-0243a1bb to the maintainer's rule; stage 1, the headless classification).
+"""A finite Append reduces a scan again whole when a processed image changed on disk, and goes on when one was only
+re-dated (Codex N-a8a6c887's changed-image design, amended N-0243a1bb to the maintainer's rule; stages 1 and 2).
 
 Maintainer, 2026-10-23: a processed image overwritten on disk is reprocessed ("reprocess the new image and overwrite
 the old result"), and the start time its sidecar records tells a re-copied file from a new image. An image whose
 size moved, or whose time moved without its sidecar's recorded acquisition time, makes its scan's Append a refusal
-typed for a whole-scan rebuild (every current label); one whose time alone moved while its sidecar still records the
-frame's acquisition time is the same acquisition. The recorded value is the .txt "time:" clock time with no zone
-applied, so another host reads the same number. A workflow rule, not byte proof. Real directory Runs over real TIFF +
-.txt scans."""
+typed for a rebuild, which the Run carries out as an ordinary replacement of that one output (every current label,
+the same target); one whose time alone moved while its sidecar still records the frame's acquisition time is the
+same acquisition. The recorded value is the .txt "time:" clock time with no zone applied, so another host reads the
+same number. A workflow rule, not byte proof. Real directory Runs over real TIFF + .txt scans."""
 from __future__ import annotations
 
 import calendar
+import json
 import os
+import shutil
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import fabio
 import h5py
@@ -23,6 +26,8 @@ import pytest
 import xrd_tools.io.append as append
 import xrd_tools.io.metadata as metadata_io
 import xrd_tools.io.nexus as nexus
+import xrd_tools.io.output_transaction as output_transaction
+import xrd_tools.reduction.core as core
 from tests.xdart.scattering.test_append_already_processed import _labels, _run
 from tests.xdart.scattering.test_live_revalidation_cost_run import TINY, _tiff
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL
@@ -44,11 +49,14 @@ def _frame(raw, stem, k, second=None):
     _tiff(raw / f"{stem}_{k:04d}.tif", k, TINY)
 
 
-def _processed(tmp_path, frames=3):
+def _processed(tmp_path, frames=3, others=()):
     raw = tmp_path / "raw"
     raw.mkdir()
     for k in range(frames):
         _frame(raw, "scana", k)
+    for stem in others:  # scans left as they are
+        for k in range(2):
+            _frame(raw, stem, k)
     events, _catalog = _run(tmp_path, raw, 9201)
     assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
     return raw, tmp_path / "processed" / "scana_int1d.nexus"
@@ -60,30 +68,43 @@ def _redate(path, seconds=5):
     os.utime(path, ns=(state.st_atime_ns, state.st_mtime_ns + seconds * 1_000_000_000))
 
 
-intents = []
-
-
 def _again(tmp_path, raw, monkeypatch, request_value, **intent):
-    """Append again; the Run's Append decisions (output name, decision) and its sidecar reads for moved images
-    (``intents`` keeps each qualified (target, intent))."""
-    decisions, reads = [], []
-    preview = dynamic_output.preview_append_decision
+    """Append again: the Run's terminals, its Append decisions (output name, decision), each qualified (target,
+    intent), its sidecar reads for moved images, and its end-of-run notes."""
+    seen = SimpleNamespace(decisions=[], intents=[], reads=[])
+    preview, qualify = dynamic_output.preview_append_decision, dynamic_output.qualify_append
 
     def recording(configuration, item, signed):
         decision = preview(configuration, item, signed)
-        decisions.append((Path(str(item.target)).name, decision))
+        seen.decisions.append((Path(str(item.target)).name, decision))
         return decision
 
     monkeypatch.setattr(dynamic_output, "preview_append_decision", recording)
-    qualify = dynamic_output.qualify_append
-    monkeypatch.setattr(dynamic_output, "qualify_append", lambda target, intent, **kwargs: (
-        intents.append((target, intent)), qualify(target, intent, **kwargs))[1])
+    monkeypatch.setattr(dynamic_output, "qualify_append", lambda target, value, **kwargs: (
+        seen.intents.append((target, value)), qualify(target, value, **kwargs))[1])
     acquired = getattr(append, "_acquired", None)
-    monkeypatch.setattr(append, "_acquired", lambda path: (reads.append(Path(path).name), acquired(path))[1],
+    monkeypatch.setattr(append, "_acquired", lambda path: (seen.reads.append(Path(path).name), acquired(path))[1],
                         raising=False)
     events, _catalog = _run(tmp_path, raw, request_value, **intent)
-    warnings = [warning for event in events if event.kind in _TERMINAL for warning in event.warnings]
-    return decisions, reads, warnings
+    terminal = [event for event in events if event.kind in _TERMINAL]
+    seen.terminals = [event.kind.name for event in terminal]
+    seen.warnings = [warning for event in terminal for warning in event.warnings]
+    seen.rebuilt = [note for event in terminal for note in getattr(event, "rebuilt", ())]
+    return seen
+
+
+def _rows(output):
+    with h5py.File(output, "r") as handle:
+        group = handle["entry/integrated_1d"]
+        return group["frame_index"][()].tolist(), group["axis_1"][()], group["intensity"][()]
+
+
+def _lineage(output):
+    with h5py.File(output, "r") as handle:
+        lineage = append._read_lineage(handle["entry"])
+        value = handle["entry/reduction/config/run_configuration"][()]
+    provenance = json.loads(value.decode() if isinstance(value, bytes) else value)
+    return lineage["state"], [epoch["labels"] for epoch in lineage["epochs"]], provenance
 
 
 def test_a_txt_scan_records_each_frames_clock_time_at_full_precision(tmp_path):
@@ -100,15 +121,15 @@ def test_a_redated_image_whose_sidecar_records_the_same_acquisition_is_still_pro
     raw, output = _processed(tmp_path)
     _redate(raw / "scana_0001.tif")
     before = output.read_bytes()
-    decisions, reads, warnings = _again(tmp_path, raw, monkeypatch, 9202)
-    assert warnings == []
-    assert [(name, decision.disposition, getattr(decision, "rebuild", None)) for name, decision in decisions] == [
+    seen = _again(tmp_path, raw, monkeypatch, 9202)
+    assert seen.terminals == ["FINISHED"] and seen.warnings == [] and seen.rebuilt == []
+    assert [(name, decision.disposition, getattr(decision, "rebuild", None)) for name, decision in seen.decisions] == [
         ("scana_int1d.nexus", AppendDisposition.SKIP, False)]
-    assert reads and set(reads) == {"scana_0001.tif"}  # only the moved image's sidecar is read
+    assert seen.reads and set(seen.reads) == {"scana_0001.tif"}  # only the moved image's sidecar is read
     assert output.read_bytes() == before
-    # a Live Run (and a headless one) keeps the exact image history, so the same check without the finite opt-in
+    # a Live Run (and a headless one) keeps the exact image history: the same check without the finite opt-in
     # refuses as before
-    target, qualified = intents[-1]
+    target, qualified = seen.intents[-1]
     exact = append.qualify_append(target, qualified)
     assert exact.disposition is AppendDisposition.REFUSE and not getattr(exact, "rebuild", False)
     assert _REFUSED in exact.reason
@@ -119,23 +140,26 @@ def test_a_redated_image_beside_new_frames_appends_only_the_new_frames(tmp_path,
     committed = _labels(tmp_path, "scana")
     _redate(raw / "scana_0001.tif")
     _frame(raw, "scana", 3)
-    decisions, _reads, warnings = _again(tmp_path, raw, monkeypatch, 9203)
-    assert warnings == []
-    [(_name, decision)] = decisions
+    seen = _again(tmp_path, raw, monkeypatch, 9203)
+    assert seen.warnings == [] and seen.rebuilt == []
+    [(_name, decision)] = seen.decisions
     assert decision.disposition is AppendDisposition.WRITE and not getattr(decision, "rebuild", False)
     assert decision.labels == (committed[-1] + 1,) and _labels(tmp_path, "scana") == (*committed, committed[-1] + 1)
     # the new epoch records the moved image as it was reduced, so the next Append asks its sidecar again
     before = output.read_bytes()
-    decisions, reads, warnings = _again(tmp_path, raw, monkeypatch, 9204)
-    assert warnings == [] and set(reads) == {"scana_0001.tif"} and output.read_bytes() == before
-    assert [decision.disposition for _name, decision in decisions] == [AppendDisposition.SKIP]
+    seen = _again(tmp_path, raw, monkeypatch, 9204)
+    assert seen.warnings == [] and set(seen.reads) == {"scana_0001.tif"} and output.read_bytes() == before
+    assert [decision.disposition for _name, decision in seen.decisions] == [AppendDisposition.SKIP]
 
 
 @pytest.mark.parametrize("change", ["acquired again", "size", "acquired again with new frames",
                                     "first image smaller with new frames"])
-def test_a_changed_image_refuses_its_scan_as_a_whole_rebuild(tmp_path, monkeypatch, change):
-    raw, output = _processed(tmp_path)
+def test_a_changed_image_reduces_its_scan_again_whole_into_the_same_output(tmp_path, monkeypatch, change):
+    raw, output = _processed(tmp_path, others=("scanb",))
     committed = _labels(tmp_path, "scana")
+    processed = tmp_path / "processed"
+    untouched = {path: path.read_bytes() for path in sorted(processed.rglob("*scanb*")) if path.is_file()}
+    assert {path.suffix for path in untouched} == {".nexus", ".xye"}
     image = raw / "scana_0001.tif"
     if change == "size":
         fabio.tifimage.TifImage(data=np.full(TINY, 7, dtype=np.uint32)).write(str(image))  # same name, new size
@@ -143,20 +167,40 @@ def test_a_changed_image_refuses_its_scan_as_a_whole_rebuild(tmp_path, monkeypat
         fabio.tifimage.TifImage(data=np.full(TINY, 7, dtype=np.uint8)).write(str(raw / "scana_0000.tif"))
     else:
         _txt(raw, "scana", 1, second=59)  # a new acquisition time
+        _tiff(image, 99, TINY)  # and new pixels, same size
         _redate(image)
     current = committed
     if change.endswith("new frames"):
         _frame(raw, "scana", 3)
         current = (*committed, committed[-1] + 1)
-    before = output.read_bytes()
-    decisions, _reads, warnings = _again(tmp_path, raw, monkeypatch, 9205)
-    # the refusal reads as today's; its type says a rebuild may follow
-    today = "source size regressed" if change.startswith("first image") else f"{_REFUSED}: image 2 (scana_0001.tif)"
-    assert len(warnings) == 1 and today in warnings[0]
-    [(_name, decision)] = decisions
+    hashed, capture = [], output_transaction._capture_target
+    monkeypatch.setattr(output_transaction, "_capture_target", lambda target, *, hash_content=True: (
+        hashed.append(hash_content) if Path(target).name == output.name else None, capture(
+            target, hash_content=hash_content))[1])
+    seen = _again(tmp_path, raw, monkeypatch, 9205)
+    assert hashed and not any(hashed)  # an Overwrite's fast route: the old output is never hashed whole
+    [(_name, decision)] = seen.decisions
     assert decision.disposition is AppendDisposition.REFUSE and getattr(decision, "rebuild", None) is True
     assert decision.labels == current and decision.committed_labels == committed
-    assert output.read_bytes() == before  # stage 1 classifies; nothing consumes the rebuild yet
+    # the refusal's own text (today's) names what changed; the Run reduces the scan again instead of skipping it
+    today = "source size regressed" if change.startswith("first image") else f"{_REFUSED}: image 2 (scana_0001.tif)"
+    assert seen.terminals == ["FINISHED"] and seen.warnings == []
+    assert len(seen.rebuilt) == 1 and seen.rebuilt[0].startswith("Append reprocessed scana_int1d.nexus whole: ")
+    assert today in seen.rebuilt[0]
+    state, epochs, provenance = _lineage(output)
+    assert state == "committed" and epochs == [list(current)]  # one fresh epoch, every current label
+    assert provenance["output_mode"] == "Append" and provenance["append_replacement"] == {
+        "requested_output_mode": "Append", "effective_output_mode": "Overwrite", "reason": decision.reason}
+    rebuilt = _rows(output)
+    for label, row in zip(rebuilt[0], rebuilt[2]):  # every label's side output follows the new rows
+        xye = np.loadtxt(processed / "scana" / f"iq_scana_{label:04d}.xye")
+        assert np.allclose(xye[:, 1], row, rtol=1e-6, atol=0)
+    assert {path: path.read_bytes() for path in untouched} == untouched  # the other scan's outputs, as they were
+    fresh = _run(tmp_path, raw, 9206, mode="Overwrite")  # the same images, an ordinary Overwrite
+    assert [event.kind.name for event in fresh[0] if event.kind in _TERMINAL] == ["FINISHED"]
+    expected = _rows(output)
+    assert rebuilt[0] == expected[0] == list(current)
+    assert np.array_equal(rebuilt[1], expected[1]) and np.array_equal(rebuilt[2], expected[2])
 
 
 @pytest.mark.parametrize("record", ["absent", "float32"])
@@ -175,29 +219,75 @@ def test_without_a_full_precision_recorded_time_a_redated_image_is_a_change(tmp_
         assert ("epoch_local" in group) is (record == "float32")
         assert record == "absent" or group["epoch_local"].dtype == np.float32
     _redate(raw / "scana_0001.tif")
-    decisions, _reads, warnings = _again(tmp_path, raw, monkeypatch, 9206)
-    assert len(warnings) == 1 and _REFUSED in warnings[0]
-    [(_name, decision)] = decisions
+    seen = _again(tmp_path, raw, monkeypatch, 9207)
+    [(_name, decision)] = seen.decisions
     assert decision.disposition is AppendDisposition.REFUSE and getattr(decision, "rebuild", None) is True
+    assert seen.terminals == ["FINISHED"] and seen.warnings == [] and len(seen.rebuilt) == 1
+    with h5py.File(output, "r") as handle:  # the replacement records the clock time at full precision
+        assert handle["entry/scan_data/epoch_local"].dtype == np.float64
 
 
 @pytest.mark.parametrize("other", ["an image removed", "other settings"])
 def test_a_moved_image_beside_another_difference_is_refused_as_before(tmp_path, monkeypatch, other):
-    """Image drift never excuses another difference: the refusal stays untyped (Codex N-a8a6c887)."""
-    raw, _output = _processed(tmp_path)
+    """Image drift never excuses another difference: the refusal stays untyped and the scan is skipped (Codex
+    N-a8a6c887)."""
+    raw, output = _processed(tmp_path)
     _redate(raw / "scana_0001.tif")
     if other == "an image removed":
         (raw / "scana_0002.tif").unlink()
         (raw / "scana_0002.txt").unlink()
-    decisions, _reads, warnings = _again(tmp_path, raw, monkeypatch, 9207, **(
-        {"npt": 16} if other == "other settings" else {}))
-    assert len(warnings) == 1
+    before = output.read_bytes()
+    seen = _again(tmp_path, raw, monkeypatch, 9208, **({"npt": 16} if other == "other settings" else {}))
+    assert len(seen.warnings) == 1 and seen.rebuilt == [] and output.read_bytes() == before
     assert all(decision.disposition is AppendDisposition.REFUSE and not getattr(decision, "rebuild", False)
-               for _name, decision in decisions)
+               for _name, decision in seen.decisions)
+
+
+def test_a_rebuild_that_fails_leaves_the_old_output_as_an_ordinary_overwrite_does(tmp_path, monkeypatch):
+    raw, output = _processed(tmp_path)
+    before = output.read_bytes()
+    _txt(raw, "scana", 1, second=59)
+    _redate(raw / "scana_0001.tif")
+    real, calls = core.NexusSink._write_batch, []
+
+    def failing(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(core.NexusSink, "_write_batch", failing)
+    seen = _again(tmp_path, raw, monkeypatch, 9209)
+    assert seen.terminals == ["FAILED"] and seen.rebuilt == []
+    assert output.read_bytes() == before  # restored: the old result, its old epoch
+
+
+def test_an_output_substituted_after_admission_is_never_replaced(tmp_path, monkeypatch):
+    """The replacement takes the Overwrite target guard: an output that changed after its classification fails the
+    construction, and the file now there is left as it is (Codex N-a8a6c887: never overwrite a newly substituted
+    file because its old path was eligible)."""
+    raw, output = _processed(tmp_path)
+    _txt(raw, "scana", 1, second=59)
+    _redate(raw / "scana_0001.tif")
+    prepare = dynamic_output.DynamicOutputAdapter.prepare_admission
+    substitute, substituted = tmp_path / "substitute.nexus", []
+
+    def substituting(self, *args, **kwargs):
+        prepared = prepare(self, *args, **kwargs)
+        shutil.copyfile(output, substitute)
+        os.replace(substitute, output)  # another file at the same path, the same bytes
+        substituted.append((output.stat().st_dev, output.stat().st_ino))
+        return prepared
+
+    monkeypatch.setattr(dynamic_output.DynamicOutputAdapter, "prepare_admission", substituting)
+    before = output.read_bytes()
+    seen = _again(tmp_path, raw, monkeypatch, 9210)
+    assert seen.terminals == ["FAILED"] and seen.rebuilt == [] and len(substituted) == 1
+    assert output.read_bytes() == before and (output.stat().st_dev, output.stat().st_ino) == substituted[0]
 
 
 @pytest.mark.skipif(not hasattr(time, "tzset"), reason="POSIX time zones")
-def test_the_recorded_clock_time_reads_the_same_in_another_time_zone(tmp_path, monkeypatch):
+def test_the_recorded_clock_time_reads_the_same_in_another_time_zone(tmp_path):
     sidecar = tmp_path / "scan_0001.txt"
     sidecar.write_text("# Counters\nI0 = 1\n# Motors\nenergy = 16\nUser: energy, time: Mon Jan 15 10:30:11 2024  # Temp\n")
     zone = os.environ.get("TZ")
@@ -222,4 +312,3 @@ def test_the_recorded_clock_time_is_never_offered_as_a_monitor(tmp_path):
     with h5py.File(output, "r") as handle:
         columns = [name for name in handle["entry/scan_data"] if name != "frame_index"]
     assert "epoch_local" in columns and monitor_candidates(columns) == ("I0", "energy")
-

@@ -987,8 +987,10 @@ def test_live_restart_appends_two_saved_outputs_and_preserves_their_prefixes(tmp
             np.testing.assert_array_equal(frame.intensity_2d, profiles[target][1])
 
 
-def test_directory_append_skips_a_changed_scan_and_runs_the_next_with_a_summary(tmp_path):
-    """Real Run click, strict refusal, later output and actual nonblocking summary."""
+def test_directory_append_reprocesses_a_changed_scan_and_runs_the_next_with_a_summary(tmp_path):
+    """Real Run click, a changed processed image, later output and actual nonblocking summary. Policy change
+    (maintainer 2026-10-23, Codex N-a8a6c887): the scan whose image changed on disk is reduced again whole into its
+    output instead of being skipped (no sidecar records an acquisition time, so nothing proves it the same image)."""
     from pyqtgraph.Qt import QtWidgets
     from tests.xdart.scattering.test_browse_reference_rings_run import _page, _pump, _run
     from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
@@ -1021,13 +1023,14 @@ def test_directory_append_skips_a_changed_scan_and_runs_the_next_with_a_summary(
         assert _pump(qapp, controls.startButton.isEnabled), page._notice_text
         terminal = _run(qapp, page, observed)
         assert (terminal.files_processed, terminal.files_skipped,
-                terminal.files_discovered, terminal.files_pending) == (1, 1, 2, 0)
+                terminal.files_discovered, terminal.files_pending) == (2, 0, 2, 0)
         assert terminal.cleanup_status is CleanupStatus.CLEANED
-        assert len(terminal.warnings) == 1
-        assert targets[0].name in terminal.warnings[0]
-        assert "source does not extend exact image-member history" in terminal.warnings[0]
-        assert {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
-                for path in protected} == before
+        assert terminal.warnings == () and len(terminal.rebuilt) == 1
+        assert terminal.rebuilt[0].startswith(f"Append reprocessed {targets[0].name} whole: ")
+        assert "source does not extend exact image-member history" in terminal.rebuilt[0]
+        after = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in protected}
+        assert all(after[path][0] != before[path][0] for path in protected)  # replaced, side output too
+        assert _nexus_rows(targets[0]) == (1,)
         second = next(path for path in output.glob("*.nexus") if path != targets[0])
         assert _nexus_rows(second) == (1,)
         assert _pump(qapp, lambda: bool(page.findChildren(QtWidgets.QMessageBox)))
@@ -1035,9 +1038,9 @@ def test_directory_append_skips_a_changed_scan_and_runs_the_next_with_a_summary(
         assert len(dialogs) == 1
         dialog = dialogs[0]
         try:
-            assert dialog.text() == "Scans skipped"
-            assert terminal.warnings[0] in dialog.informativeText()
-            assert "existing results were left unchanged" in dialog.informativeText()
+            assert dialog.text() == "Scans reprocessed"
+            assert terminal.rebuilt[0] in dialog.informativeText()
+            assert "reduced again whole and its output replaced" in dialog.informativeText()
             qapp.processEvents()
             assert len(page.findChildren(QtWidgets.QMessageBox)) == 1
         finally:
