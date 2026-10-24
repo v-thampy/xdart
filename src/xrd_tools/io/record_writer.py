@@ -3969,7 +3969,10 @@ class NexusRecordWriter:
                 # that handle closes, on a share a moment later (beamline 2026-10-23, in-place Append: "held stream
                 # terminal (fast or in-place) lost its close checkpoint"), so flush through it, close it, and seal
                 # through a read-only descriptor bound to the verified file and size (as _seal_closed_stream_seed).
-                os.fsync(verification_descriptor)
+                # The flush follows the transaction's own fsync choice (Codex N-0243a1bb F6).
+                flushed = binding.transaction.durable_fsync
+                if flushed:
+                    os.fsync(verification_descriptor)
                 verification_stream.close()
                 verification_stream = None
                 os.close(verification_descriptor)
@@ -3990,7 +3993,7 @@ class NexusRecordWriter:
                         expected_stat=sealed,
                         evidence_digest=aggregate.hexdigest(),
                         evidence_bytes=read_bytes,
-                        flushed=True,
+                        flushed=flushed,
                     )
                 finally:
                     os.close(closed)

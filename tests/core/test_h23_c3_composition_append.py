@@ -116,7 +116,7 @@ def _r2(value: float) -> IntegrationResult2D:
     )
 
 
-def _transaction(tmp_path: Path, *, prior: bytes = b"prior"):
+def _transaction(tmp_path: Path, *, prior: bytes = b"prior", durable_fsync: bool = True):
     target = tmp_path / "out.nexus"
     if prior is not None:
         target.write_bytes(prior)
@@ -128,6 +128,7 @@ def _transaction(tmp_path: Path, *, prior: bytes = b"prior"):
         target,
         transaction_owner=transaction_owner,
         target_owner=target_owner,
+        durable_fsync=durable_fsync,
     )
     lease = transaction.acquire_lease(
         admission=transaction.admission,
@@ -152,11 +153,11 @@ def _release(transaction, lease, owners) -> None:
         transaction.release_lease_owner(lease, role, owners[role])
 
 
-def _bound_writer(tmp_path, *, prior=None, complete_record=False, facade_type=_Facade):
+def _bound_writer(tmp_path, *, prior=None, complete_record=False, facade_type=_Facade, durable_fsync=True):
     from xrd_tools.io.record_writer import NexusRecordWriter, WriterTransactionBinding
 
     (_coordinator, transaction, target, transaction_owner, target_owner,
-     owners, lease) = _transaction(tmp_path, prior=prior)
+     owners, lease) = _transaction(tmp_path, prior=prior, durable_fsync=durable_fsync)
     pool = _Pool()
     attempt = transaction.begin_stream(
         admission=transaction.admission, transaction_owner=transaction_owner,
@@ -5261,3 +5262,35 @@ def test_an_output_another_program_holds_is_refused_naming_that_program(tmp_path
     assert refused.disposition is AppendDisposition.REFUSE
     assert refused.reason.startswith("another program has the output open; close it, then run again (")
     assert "delete" not in refused.reason
+
+
+@pytest.mark.parametrize("durable", (True, False), ids=("fsync", "no-fsync"))
+def test_bound_close_flushes_its_last_writing_handle_only_as_the_transaction_says(tmp_path, monkeypatch, durable):
+    """Codex N-0243a1bb F6: the controlled close (de7447bb) flushed the file's last writing handle unconditionally,
+    so a transaction admitted with durable_fsync=False still fsynced at close."""
+    from xrd_tools.io.record_writer import RecordWrite
+
+    (writer, transaction, attempt, lease, owners, _pool, _facade, _target) = (
+        _bound_writer(tmp_path, complete_record=True, durable_fsync=durable)
+    )
+    # Frame records give the close its frame proofs, so it keeps and seals through the last writing handle.
+    writer.write_batch(RecordWrite(label=label, result_1d=_r1(label + 1), result_2d=_r2(label + 1))
+                       for label in (0, 1, 2))
+    writer.flush(force=True)
+    duplicated, flushed, real_dup, real_fsync = [], [], os.dup, os.fsync
+
+    def dup(descriptor):
+        duplicated.append(descriptor)
+        return real_dup(descriptor)
+
+    def fsync(descriptor):
+        flushed.append(descriptor)
+        return real_fsync(descriptor)
+    with monkeypatch.context() as closing:
+        closing.setattr(os, "dup", dup)
+        closing.setattr(os, "fsync", fsync)
+        writer.finish()
+    assert duplicated, "the close kept no last writing handle"
+    assert bool(flushed) is durable, flushed
+    assert transaction.commit_stream(attempt, lease=lease).phase is TransactionPhase.COMMITTED
+    _release(transaction, lease, owners)

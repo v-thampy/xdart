@@ -1488,6 +1488,11 @@ class OutputTransaction:
         return self._in_place
 
     @property
+    def durable_fsync(self) -> bool:
+        """Whether this transaction's writes and seals are fsynced (its explicit diagnostic choice)."""
+        return self._durable_fsync
+
+    @property
     def stream_in_place(self) -> bool:
         """Whether the current stream attempt writes the canonical output in place: every attempt of an
         in-place transaction, or a reopened Live epoch."""

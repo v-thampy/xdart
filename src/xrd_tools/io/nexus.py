@@ -4340,7 +4340,12 @@ def upsert_scan_metadata(
     )
     for col, attrs in attrs_by_col.items():
         if col in entry_grp["scan_data"]:
-            entry_grp["scan_data"][col].attrs.update(attrs)
+            dataset = entry_grp["scan_data"][col]
+            # An existing column keeps its physical dtype and says so: an older output's float32 epochs, appended
+            # to, stay rounded and labelled float32 (Codex N-0243a1bb F5).
+            if attrs.get(DTYPE_ATTR) in ("float32", "float64") and dataset.dtype.name != attrs[DTYPE_ATTR]:
+                attrs = {key: value for key, value in attrs.items() if key != DTYPE_ATTR}
+            dataset.attrs.update(attrs)
 
 
 def upsert_per_frame_geometry(

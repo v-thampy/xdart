@@ -555,3 +555,25 @@ def test_scan_metadata_keeps_frame_times_at_full_precision(tmp_path):
         assert group["epoch"].attrs["ssrl_dtype"] == "float64"
         np.testing.assert_array_equal(group["epoch"][()], [1792793187.0, 1792793514.0, 1792793600.0])
         np.testing.assert_array_equal(group["frame_index"][()], [1, 2, 3])
+
+
+def test_scan_metadata_appended_to_a_legacy_float32_epoch_column_still_says_float32(tmp_path, monkeypatch):
+    """Codex N-0243a1bb F5: an output written before epochs were float64 keeps them float32 when appended to (its
+    rounding cannot be undone), and its ssrl_dtype keeps saying float32, so nothing takes it for full precision."""
+    import h5py
+    import pandas as pd
+
+    import xrd_tools.io.nexus as nexus
+
+    first = pd.DataFrame({"epoch": [1792793187.0], "i0": [1.5]}, index=[1])
+    later = pd.DataFrame({"epoch": [1792793514.0], "i0": [2.5]}, index=[2])
+    with h5py.File(tmp_path / "legacy.nxs", "w") as handle:
+        entry = handle.create_group("entry")
+        with monkeypatch.context() as before:  # the writer before 5d921d84
+            before.setattr(nexus, "_FULL_PRECISION_SCAN_COLUMNS", frozenset())
+            nexus.write_scan_metadata(entry, first, [1])
+        nexus.upsert_scan_metadata(entry, later, [2])
+        group = entry["scan_data"]
+        assert group["epoch"].dtype == np.float32 and group["epoch"].attrs["ssrl_dtype"] == "float32"
+        np.testing.assert_array_equal(group["epoch"][()], np.float32([1792793187.0, 1792793514.0]))
+        assert group["i0"].attrs["ssrl_dtype"] == "float32"
