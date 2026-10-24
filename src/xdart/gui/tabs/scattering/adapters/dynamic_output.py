@@ -50,7 +50,7 @@ from xrd_tools.session import (
     required_result_modes,
     resolve_session_policy,
 )
-from xrd_tools.session.policy import requirements_from, warm_integrator_allowance
+from xrd_tools.session.policy import INTEGRATOR_RESERVE_BYTES, requirements_from, warm_integrator_allowance
 from xrd_tools.session.readiness import gi_companion_modes_2d
 from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.core.scan import SourceKind
@@ -1464,9 +1464,17 @@ class DynamicOutputAdapter:
             workers = (self.configuration.max_cores if policy is None
                        else policy.allocation.workers)
             # this series' memory plan bounds the Run's built integrators, before its scout or workers borrow
-            self._integrator_reuse.fit(workers, warm_integrator_allowance(
-                None if policy is None else policy.allocation, workers,
-                total_physical_ram_bytes() or windows_physical_ram_bytes()))
+            allocation, ram = (None if policy is None else policy.allocation,
+                               total_physical_ram_bytes() or windows_physical_ram_bytes())
+            allowance = warm_integrator_allowance(allocation, workers, ram)
+            self._integrator_reuse.fit(workers, allowance)
+            # One series' inputs and result together (Codex N-6418472d: which bound sets the allowance on a PC).
+            envelope, assigned = (None, None) if allocation is None else (
+                int(allocation.envelope_bytes), int(allocation.assigned_bytes))
+            logger.info(
+                "[WARM-TABLES] plan: RAM %s B, envelope %s B, assigned %s B, headroom %s B, %d workers funded %d B, "
+                "allowance %d B", ram, envelope, assigned, None if allocation is None else max(0, envelope - assigned),
+                workers, max(1, int(workers)) * INTEGRATOR_RESERVE_BYTES, allowance)
             series_workers = workers
             if not self.configuration.gi.enabled:
                 warm, table_bytes = self._integrator_reuse.idle_under_latest("standard")

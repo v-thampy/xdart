@@ -584,6 +584,59 @@ def _live_proof(configuration, graph, record, registry) -> LivePrefixProof:
                            record=record, registry=registry)
 
 
+def _target_stat(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+@dataclass(slots=True)
+class _CoveredOutput:
+    """A Live scan its output's committed record covers, watched by a cheap stat of that output and the adapter
+    registrations at most every LivePrefixProof.PERIOD_S (Codex N-0243a1bb F3): once the output is deleted, replaced or
+    rewritten while the scan's images are not, the scan is looked at again."""
+    target: Path
+    signature: tuple[int, int, int, int] | None
+    registry: tuple
+    checked_at: float
+
+    @classmethod
+    def of(cls, target: Path, registry: tuple) -> "_CoveredOutput":
+        return cls(target, _target_stat(target), registry, monotonic())
+
+    def holds(self, registry: tuple) -> bool:
+        if monotonic() - self.checked_at < LivePrefixProof.PERIOD_S:
+            return True
+        if registry != self.registry or _target_stat(self.target) != self.signature:
+            return False
+        self.checked_at = monotonic()
+        return True
+
+
+class _LivePollTimes:
+    """XDART_PERF: where one Live poll spent its time, by step, counted and summed (Codex N-0243a1bb: measure the
+    startup work before choosing another cache or reducing validation)."""
+
+    __slots__ = ("steps",)
+
+    def __init__(self) -> None:
+        self.steps: dict[str, list] = {}
+
+    def add(self, step: str, started: float) -> None:
+        tally = self.steps.setdefault(step, [0, 0.0])
+        tally[0] += 1
+        tally[1] += monotonic() - started
+
+    @property
+    def busy(self) -> bool:
+        return any(step not in ("listing", "key") for step in self.steps)
+
+    def line(self) -> str:
+        return ", ".join(f"{step} {count}× {seconds:.3f} s" for step, (count, seconds) in self.steps.items())
+
+
 def _directory_status(
     run: _StandardRun,
     *,
@@ -2134,7 +2187,9 @@ class StandardRunExecutor:
         # The last poll's groups, reused while the session returns the same
         # Snapshot object under the same adapter registrations.
         grouped: tuple[object, tuple[object, ...], tuple[object, ...]] | None = None
+        polls, loop_started, first_written = 0, monotonic(), False
         while not run.stop_requested:
+            times, poll_started = _LivePollTimes(), monotonic()
             with _run_effect(run):
                 observation = session.observe(refresh=True)
                 registry = registry_identity()
@@ -2144,13 +2199,16 @@ class StandardRunExecutor:
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
                 publish()
+            times.add("listing", poll_started)
 
             watched: list[Path] = []  # files the next poll must see change at once (D1)
             for group in groups:
                 if run.stop_requested:
                     return True
                 revision = tuple(group.revision)
+                started = monotonic()
                 target_key = _physical_file_key(group.target)
+                times.add("key", started)
                 if target_key in run.live_blocked:
                     # This output stopped growing; later frames are skipped.
                     skipped_paths.update(
@@ -2162,6 +2220,12 @@ class StandardRunExecutor:
                 settled = settled_revisions.get(target_key)
                 if settled is not None:
                     seen_targets.add(target_key)
+                    if settled[0] == revision and type(settled[1]) is _CoveredOutput:
+                        if settled[1].holds(registry):
+                            continue
+                        # Its output changed (deleted, replaced or rewritten) while its images did not: look again.
+                        settled_revisions.pop(target_key, None)
+                        settled = None
                 if settled is not None and settled[0] == revision:
                     settled_identity = settled[1]
                     if settled_identity is None:
@@ -2204,10 +2268,12 @@ class StandardRunExecutor:
                             run.live_proofs[target_key] = _live_proof(
                                 configuration, retained.decision.item.graph, seen, registry)
                             continue
+                started = monotonic()
                 completed = (
                     None if run.output is not None and run.output.owns_target(group.target)
                     else live_group_coverage(receipt, group)
                 )
+                times.add("coverage", started)
                 if completed is not None:
                     # A scan its output already holds, image for image: shown once from its committed record, as a
                     # directory Append shows it, then a quiet no-op until its images change; nothing is probed, read,
@@ -2216,10 +2282,12 @@ class StandardRunExecutor:
                     # after a scan were refused one by one, and settling the scan still growing to look at them
                     # failed it at its next frame, "cannot bind an allocation to a populated store").
                     if target_key not in seen_targets and target_key not in run.processed_live_revisions:
+                        started = monotonic()
                         with _run_effect(run):
                             self._present_live_saved_output(run, group, completed)
+                        times.add("shown", started)
                         seen_targets.add(target_key)
-                    settled_revisions[target_key] = (revision, None)
+                    settled_revisions[target_key] = (revision, _CoveredOutput.of(group.target, registry))
                     processed_paths.update(group.physical_paths)
                     publish(force=True)
                     continue
@@ -2240,6 +2308,7 @@ class StandardRunExecutor:
                         watched.extend(group.physical_paths[published:])
                         # The registrations this attempt is qualified under.
                         registry = registry_identity()
+                        started = monotonic()
                         attempt = materialize_live_directory_group(
                             receipt,
                             configuration,
@@ -2256,6 +2325,7 @@ class StandardRunExecutor:
                             proof=run.live_proofs.get(target_key),
                             spec_cache=spec_cache,
                         )
+                        times.add("admission", started)
                         if attempt.state is ProbeState.IN_PROGRESS:
                             if attempt.revision_changed:
                                 retry_revisions[target_key] = revision
@@ -2316,12 +2386,14 @@ class StandardRunExecutor:
                         try:
                             run.live_admission_proof = attempt.proof
                             constructing = True
+                            started = monotonic()
                             self._construct(
                                 run,
                                 item=item,
                                 labels=decision.labels,
                                 decision=decision,
                             )
+                            times.add("construct", started)
                         except SourceRevisionChanged:
                             source_owner = run.source
                             if source_owner is not None:
@@ -2392,18 +2464,28 @@ class StandardRunExecutor:
                     run.current_files_incremental = False
                     publish(force=True)
 
+                started = monotonic()
                 stopped = self._execute_current(
                     run,
                     construct=False,
                     retain_session=True,
                     settle=settle_live,
                 )
+                times.add("written", started)
+                if run.perf_enabled and not first_written and run.current_published:
+                    first_written = True
+                    logger.info("[LIVE-POLL] first frames written %.3f s after the Live Run started",
+                                monotonic() - loop_started)
                 if stopped or run.stop_requested:
                     return True
 
             with run.live_revision_lock:
                 containers = tuple(value.decision.item.source_stamp for value in run.processed_live_revisions.values()
                                    if value.decision is not None and value.decision.item.descriptor is not None)
+            if run.perf_enabled and (polls < 2 or times.busy):
+                logger.info("[LIVE-POLL] poll %d, %d groups, %.3f s: %s", polls, len(groups),
+                            monotonic() - poll_started, times.line())
+            polls += 1
             # Containers grow in place and their external chunks are never listed.
             session.defer_listing((*watched, *(Path(state.path) for stamp in containers for state in (
                 stamp.file, *(member.file for member in stamp.external_members), *stamp.dependency_files))))
