@@ -29,11 +29,13 @@ import xrd_tools.io.nexus as nexus
 import xrd_tools.io.output_transaction as output_transaction
 import xrd_tools.reduction.core as core
 from tests.xdart.scattering.test_append_already_processed import _labels, _run
-from tests.xdart.scattering.test_live_revalidation_cost_run import TINY, _tiff
-from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL
+from tests.xdart.scattering.test_live_revalidation_cost_run import TINY, _poni, _tiff
+from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_terminal
 from xdart.gui.tabs.scattering.adapters import dynamic_output
 from xrd_tools.core.metadata import monitor_candidates
+from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.append import AppendDisposition
+from xrd_tools.session.run_configuration import RunIntent
 
 _REFUSED = "source does not extend exact image-member history"
 
@@ -284,6 +286,37 @@ def test_an_output_substituted_after_admission_is_never_replaced(tmp_path, monke
     seen = _again(tmp_path, raw, monkeypatch, 9210)
     assert seen.terminals == ["FAILED"] and seen.rebuilt == [] and len(substituted) == 1
     assert output.read_bytes() == before and (output.stat().st_dev, output.stat().st_ino) == substituted[0]
+
+
+def test_a_one_scan_run_says_at_its_end_that_it_reduced_its_scan_again(tmp_path):
+    """A Run of one TIFF series, not a directory, reports its rebuild once it FINISHED."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for k in range(3):
+        _frame(raw, "scana", k)
+    files = tuple(str(raw / f"scana_{k:04d}.tif") for k in range(3))
+
+    def run(request_value):
+        intent = RunIntent(
+            source_spec=SourceSpec(Path(files[0]), SourceKind.TIFF_SERIES,
+                                   options={"files": files, "metadata_format": "txt"}),
+            poni_file=str(_poni(tmp_path, TINY)), project_root=str(raw), save_path=str(tmp_path / "processed"),
+            output_mode="Append", processing_mode="Int 1D", live_mode=False, max_cores=1,
+            bai_1d_args={"npt": 8, "method": "numpy"}, bai_2d_args={"npt_rad": 8, "npt_azim": 8, "method": "numpy"})
+        executor, identity, events = _run_to_terminal(intent, request_value=request_value)
+        executor.close(identity)
+        return [event for event in events if event.kind in _TERMINAL]
+
+    [first] = run(9211)
+    [output] = list((tmp_path / "processed").glob("*.nexus"))
+    assert first.kind.name == "FINISHED" and getattr(first, "rebuilt", ()) == ()
+    _txt(raw, "scana", 1, second=59)
+    _tiff(raw / "scana_0001.tif", 99, TINY)
+    [second] = run(9212)
+    assert second.kind.name == "FINISHED" and second.warnings == ()
+    assert len(getattr(second, "rebuilt", ())) == 1
+    assert second.rebuilt[0].startswith(f"Append reprocessed {output.name} whole: ")
+    assert _lineage(output)[:2] == ("committed", [[1, 2, 3]])
 
 
 @pytest.mark.skipif(not hasattr(time, "tzset"), reason="POSIX time zones")
