@@ -1674,6 +1674,10 @@ class NexusSink:
     durable_fsync: bool = True
     rollback_until_commit: bool = False
     create_new: bool = False
+    #: An automatic replacement's output as its Append classification read it (size, mtime_ns, ctime_ns, device,
+    #: inode): the transaction admits only that file, so one substituted since is never overwritten (Codex
+    #: N-d3ec12d9 R1). Compared as the admission snapshot compares, without ctime.
+    replacement_target_state: tuple[int, int, int, int, int] | None = None
     _writer: NexusRecordWriter | None = field(default=None, init=False, repr=False)
     _transaction: Any | None = field(default=None, init=False, repr=False)
     _lease: Any | None = field(default=None, init=False, repr=False)
@@ -2178,10 +2182,16 @@ class NexusSink:
             )
             self._transaction, self._lease = transaction, lease
             self._transaction_owners = (transaction_owner, target_owner, owners)
-            if self._replacement is not None:
+            if self._replacement is not None or self.replacement_target_state is not None:
                 try:
-                    if transaction.admission.snapshot != self._replacement[0]:
+                    snapshot = transaction.admission.snapshot
+                    if self._replacement is not None and snapshot != self._replacement[0]:
                         raise ValueError("TARGET_SNAPSHOT_CHANGED")
+                    if self.replacement_target_state is not None:
+                        size, mtime_ns, _ctime_ns, device, inode = self.replacement_target_state
+                        if (not snapshot.exists or (snapshot.size, snapshot.mtime_ns, snapshot.device, snapshot.inode)
+                                != (size, mtime_ns, device, inode)):
+                            raise ValueError("TARGET_CHANGED_SINCE_CLASSIFICATION")
                 except BaseException as primary:
                     try: self._settle_unstarted_transaction()
                     except BaseException as cleanup: raise primary from cleanup

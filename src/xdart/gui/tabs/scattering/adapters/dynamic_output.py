@@ -1396,7 +1396,10 @@ class DynamicOutputAdapter:
                 else:
                     nexus = NexusSink(
                         target, same_run_intent=intent,
-                        file_lock=self._command_lock, **sink_values,
+                        file_lock=self._command_lock,
+                        # a replacement admits only the output its classification read
+                        replacement_target_state=decision.fact.target_state if replaces else None,
+                        **sink_values,
                     )
                 if pipeline_v2 is not None:
                     nexus._configure_writer_batch_size(

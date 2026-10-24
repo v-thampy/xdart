@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -345,3 +346,81 @@ def test_the_recorded_clock_time_is_never_offered_as_a_monitor(tmp_path):
     with h5py.File(output, "r") as handle:
         columns = [name for name in handle["entry/scan_data"] if name != "frame_index"]
     assert "epoch_local" in columns and monitor_candidates(columns) == ("I0", "energy")
+
+
+def test_a_replacement_admits_only_the_output_its_classification_read(tmp_path, monkeypatch):
+    """Codex N-d3ec12d9 R1 (its reviewer regression, adopted): another file put at the output's path after the
+    executor's guard, as the adapter activates, is never overwritten; the replacement's transaction compares the
+    file it admits with the one classified."""
+    raw, output = _processed(tmp_path)
+    _txt(raw, "scana", 1, second=59)
+    _redate(raw / "scana_0001.tif")
+    activate, substitute, observed = dynamic_output.DynamicOutputAdapter.activate, tmp_path / "substitute.nexus", []
+
+    def substituting(self, preparation, *args, **kwargs):
+        assert preparation.effective.disposition.name == "REPLACE"
+        shutil.copyfile(output, substitute)
+        with h5py.File(substitute, "r+") as handle:
+            handle["entry"].attrs["substitute"] = "arrived after the executor guard"
+        os.replace(substitute, output)
+        observed.append((output.read_bytes(), output.stat().st_ino))
+        return activate(self, preparation, *args, **kwargs)
+
+    monkeypatch.setattr(dynamic_output.DynamicOutputAdapter, "activate", substituting)
+    seen = _again(tmp_path, raw, monkeypatch, 9213)
+    assert len(observed) == 1 and seen.terminals == ["FAILED"] and seen.rebuilt == []
+    assert output.read_bytes() == observed[0][0] and output.stat().st_ino == observed[0][1]
+
+
+@pytest.mark.parametrize(("clock", "unambiguous"), [
+    ((2026, 11, 1, 1, 30, 11), False),   # repeated by the US fall-back (and others that day)
+    ((2026, 10, 25, 2, 30, 0), False),   # repeated by the European fall-back
+    ((2026, 3, 8, 2, 30, 0), False),     # skipped by the US spring-forward
+    ((2026, 11, 1, 12, 0, 0), True),     # the same day, past every change
+    ((2024, 1, 15, 10, 30, 11), True),
+])
+def test_only_a_clock_time_that_names_one_instant_in_every_zone_is_recorded(tmp_path, clock, unambiguous):
+    """Codex N-d3ec12d9 R2: the .txt "time:" has no zone, so a time some zone's daylight-saving change repeats or
+    skips is no proof of an acquisition, wherever the review runs."""
+    when = datetime(*clock)
+    sidecar = tmp_path / "scan_0001.txt"
+    sidecar.write_text("# Counters\nI0 = 1\n# Motors\nenergy = 16\n"
+                       f"User: energy, time: {when.strftime('%a %b %d %H:%M:%S %Y')}  # Temp\n")
+    values = metadata_io.read_txt_metadata(sidecar)
+    assert "epoch" in values and ("epoch_local" in values) is unambiguous
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="POSIX time zones")
+def test_a_new_acquisition_at_a_repeated_clock_time_is_reduced_again(tmp_path, monkeypatch):
+    """Codex N-d3ec12d9 R2 (its reviewer regression, adopted): America/Los_Angeles, 2026-11-01 01:30:11 names two
+    instants an hour apart; a same-size TIFF with new pixels whose new sidecar repeats that clock time is a change."""
+    zone = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        repeated = lambda k: (raw / f"scana_{k:04d}.txt").write_text(
+            f"# Counters\nI0 = {float(k)}\n# Motors\nenergy = 16\n"
+            f"User: energy, time: Sun Nov 01 01:30:{10 + k:02d} 2026  # Temp\n")
+        for k in range(3):
+            repeated(k)
+            _tiff(raw / f"scana_{k:04d}.tif", k, TINY)
+        events, _catalog = _run(tmp_path, raw, 9214)
+        assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+        output = tmp_path / "processed" / "scana_int1d.nexus"
+        image = raw / "scana_0001.tif"
+        size = image.stat().st_size
+        _tiff(image, 99, TINY)
+        assert image.stat().st_size == size
+        _redate(image, seconds=3600)
+        repeated(1)
+        before = output.read_bytes()
+        seen = _again(tmp_path, raw, monkeypatch, 9215)
+        assert seen.terminals == ["FINISHED"] and len(seen.rebuilt) == 1 and output.read_bytes() != before
+    finally:
+        if zone is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = zone
+        time.tzset()
