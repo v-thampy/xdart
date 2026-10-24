@@ -995,7 +995,8 @@ def test_streaming_stop_flushes_completed_only(monkeypatch, caplog):
     )
     for fr in frames:
         session.submit(fr)
-    with caplog.at_level(logging.INFO, logger="xrd_tools.reduction.core"):
+    # the cancelled-attempt count is a DEBUG diagnostic (maintainer, 2026-10-24: not for the regular log)
+    with caplog.at_level(logging.DEBUG, logger="xrd_tools.reduction.core"):
         result = session.finish()
 
     assert result.cancelled is True

@@ -3089,7 +3089,7 @@ class StandardRunExecutor:
             fact = take() if callable(take) else None
             if fact is not None:
                 run.resource_facts.append(fact)
-                log_events.diagnostic(logger, "%s", fact.log_line("[SOURCE-READ]"), shown=run.perf_enabled)
+                log_events.diagnostic(logger, "%s", fact.log_line("[SOURCE-READ]"))
 
         wanted = tuple(run.frames_by_label)
         if wanted != tuple(source.frame_indices):

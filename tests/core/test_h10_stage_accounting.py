@@ -1067,7 +1067,8 @@ def test_correction_r2_double_write_then_cancel_logs_no_fictitious_drop(caplog):
     cancellation diagnostic must not fabricate a dropped in-flight item by
     subtracting a distinct-label total from an attempt total."""
     sess = _session(1)
-    with caplog.at_level(logging.INFO, logger="xrd_tools.reduction.core"):
+    # DEBUG: the cancelled-attempt count is a DEBUG diagnostic, and none may be claimed at any level
+    with caplog.at_level(logging.DEBUG, logger="xrd_tools.reduction.core"):
         assert sess.submit(_frames(1)[0]) is True
         assert sess.pause(timeout=GATE_TIMEOUT) is True    # write 1 landed
         sess.resume()
