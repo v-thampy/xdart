@@ -96,7 +96,7 @@ def test_f1_a_neighbour_that_waits_or_is_refused_leaves_the_growing_output_curre
     raw = tmp_path / 'raw'
     raw.mkdir()
     if neighbour == 'refuses':
-        _saved(tmp_path, raw, 'old', 1, 8811)
+        _saved(tmp_path, raw, 'old', 2, 8811)
     attempts, real = [], run_executor.materialize_live_directory_group
 
     def materialize(receipt, configuration, session, group, **kwargs):
@@ -112,10 +112,10 @@ def test_f1_a_neighbour_that_waits_or_is_refused_leaves_the_growing_output_curre
         if neighbour == 'waits':  # its image lands before its sidecar
             _frame(raw, 'wait', 1, 'txt', 1.0, sidecar=False)
             _wait(executor, events, lambda values: 'wait_int1d.nexus' in attempts or _terminal(values))
-        else:  # the beamline touches an image it reduced earlier: that scan's Append is refused
-            image = raw / 'old_0001.tif'
-            stat = image.stat()
-            os.utime(image, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+        else:  # an image the finished scan reduced is gone: its Append is refused (a changed or re-dated image is
+            # now a rebuild of that found output, Codex N-a8a6c887 stage 3, so the refusal is induced this way)
+            (raw / 'old_0002.tif').unlink()
+            (raw / 'old_0002.txt').unlink()
             _wait(executor, events, lambda values: _said(values, 'its Append was refused') or _terminal(values))
         # The page goes on showing the growing scan's frame meanwhile.
         shown = _show(executor, identity, events, _key(executor, identity, 'grow', 1))
@@ -131,7 +131,7 @@ def test_f1_a_neighbour_that_waits_or_is_refused_leaves_the_growing_output_curre
     if neighbour == 'waits':
         assert '1 pending' in terminal[0][1], terminal
     else:
-        assert _output(tmp_path, 'old')[0] == (1,)
+        assert _output(tmp_path, 'old')[0] == (1, 2)
         assert 'old_int1d.nexus' in str(next(event for event in events if event.kind is StandardEventKind.STOPPED)
                                         .warnings)
 

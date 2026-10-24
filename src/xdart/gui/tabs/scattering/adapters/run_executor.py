@@ -1500,12 +1500,14 @@ class StandardRunExecutor:
         logger.warning("[LIVE] %s", reason)
 
     def _skip_live_append(
-        self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused, *, constructed: bool,
+        self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused | None, *, constructed: bool,
+        reason: str | None = None,
     ) -> None:
         """Leave one Live output as it is after its Append refused: later polls skip its frames, the status names
         it, and the Run's end lists the reason. The output, when it is the current one, is retired first (with the
         Run's progress as it stands), and a failure there still fails the Run; a refusal during construction then
-        closes the source it opened."""
+        closes the source it opened. ``reason`` stands for ``error``'s when there is none (a rebuild typed against an
+        output this Run grows)."""
         with _run_effect(run):
             self._retire_current_target(run, target)
         if constructed:
@@ -1523,7 +1525,7 @@ class StandardRunExecutor:
             run.current_published = 0
             run.current_file_total = 0
             run.current_files_incremental = False
-        reason = detach_exception(error, "append").message
+        reason = detach_exception(error, "append").message if reason is None else reason
         run.append_skips.append((str(target), reason))
         run.live_blocked[target_key] = (
             f"{Path(target).name} stopped growing: its Append was refused; published frames kept"
@@ -1744,6 +1746,13 @@ class StandardRunExecutor:
         mask = None if assets is None else assets.mask
         owner = run.display.artifacts.get(str(artifact))
         newly_adopted_owner = owner is None
+        if owner is not None and replaces:
+            # Replaced whole (a Live Run showed it from its saved record, or finished it before another scan began,
+            # then its images changed): its display was closed then, and its old frames leave navigation with the
+            # replacement's first frame.
+            if not owner.hydration_closed:
+                raise RuntimeError(f"a replaced output's display is still open: {artifact}")
+            run.display.retire_artifact_navigation(str(artifact))
         if owner is not None and owner.hydration_closed:
             # An output this Run closed (shown from its saved record, or settled to admit another) grows again: its
             # writer starts a new display generation (Codex N-0243a1bb F2: the closed store could not take its allocation).
@@ -2386,6 +2395,19 @@ class StandardRunExecutor:
                             # Nothing beyond the published frames is ready yet.
                             # A raw rewrite must still reach the Append guard.
                             continue
+                        if (decision.disposition is OutputDisposition.REPLACE and run.output is not None
+                                and run.output.owns_target(group.target)):
+                            # An image of the scan this Run grows changed after it was reduced: it stops growing, as
+                            # its refusal always made it (maintainer, 2026-10-24: "Stop growing it"); a later Run
+                            # finds it changed and rebuilds it whole.
+                            self._skip_live_append(run, group.target, target_key, None, constructed=False,
+                                                   reason=decision.reason)
+                            skipped_paths.update(
+                                path for path in group.physical_paths
+                                if path not in processed_paths
+                            )
+                            publish(force=True)
+                            continue
                         # Only an output that runs now takes over: a scan still waiting, refused or stopped above
                         # leaves the current one open, and its next frame extends it in place (Codex N-0243a1bb F1:
                         # settled to look at a neighbour, it failed that frame on its own repopulated display store).
@@ -2472,6 +2494,9 @@ class StandardRunExecutor:
                                 revision,
                                 decision.item.source_stamp.execution_identity_v1,
                             )
+                        if run.pending_rebuild is not None:  # reduced again whole, so said at the Run's end
+                            run.append_rebuilds.append(run.pending_rebuild)
+                            run.pending_rebuild = None
                     run.current_file_total = 0
                     run.current_files_incremental = False
                     publish(force=True)

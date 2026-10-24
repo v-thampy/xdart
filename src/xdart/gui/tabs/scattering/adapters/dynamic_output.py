@@ -724,8 +724,10 @@ def preview_append_decision(
             generation=1,
             science_identity=science_identity,
         ),
-        # a finite Append tells changed processed images from re-dated ones; Live keeps its exact image history
-        image_drift=not configuration.live_mode,
+        # changed processed images type a rebuild; only a finite Append takes a re-dated image's sidecar time as
+        # proof of the same acquisition (a Live Run rebuilds it: Codex N-a8a6c887 stage 3)
+        image_drift=True,
+        acquisition_proof=not configuration.live_mode,
     )
 
 
@@ -1207,11 +1209,11 @@ class DynamicOutputAdapter:
         xye_only = self.configuration.processing_mode == "Int 1D (XYE)"
         if xye_only and self.configuration.output_mode == "Append":
             raise ValueError("XYE-only Append has no persisted lineage owner")
-        # A finite Append's scan whose processed images changed on disk replaces this one output whole: no Append
-        # preflight or persisted prefix, every label, the ordinary replacement sink (Codex N-a8a6c887 stage 2).
+        # An Append's scan whose processed images changed on disk replaces this one output whole: no Append
+        # preflight or persisted prefix, every label, the ordinary replacement sink (Codex N-a8a6c887 stages 2, 3).
         replaces = decision.disposition is OutputDisposition.REPLACE
-        if replaces and (self.configuration.output_mode != "Append" or self.configuration.live_mode):
-            raise ValueError("only a finite Append replaces an output whose images changed")
+        if replaces and self.configuration.output_mode != "Append":
+            raise ValueError("only an Append replaces an output whose images changed")
         appends = self.configuration.output_mode == "Append" and not replaces
         coordinated = any(value is not None for value in mount_values)
         if coordinated and any(value is None for value in mount_values):
@@ -1232,7 +1234,8 @@ class DynamicOutputAdapter:
                 preflight = prepare_append_preflight(
                     target, intent, file_lock=self._command_lock,
                     in_place=not self.configuration.live_mode,
-                    image_drift=not self.configuration.live_mode,
+                    image_drift=True,
+                    acquisition_proof=not self.configuration.live_mode,
                 )
             except AppendPreflightCleanupError as error:
                 self._pending_preflights.append(error.owner)

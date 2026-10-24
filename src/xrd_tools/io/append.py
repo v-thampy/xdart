@@ -842,12 +842,14 @@ def _acquired(image_path: str) -> float | None:
 
 def _any_changed(
     prior: Mapping[str, Any], current: Mapping[str, Any], positions: tuple[int, ...], labels: tuple[int, ...],
-    recorded: Mapping[int, float],
+    recorded: Mapping[int, float], *, proof: bool = True,
 ) -> bool:
     """Whether one of the moved images at ``positions`` changed: a new size, or a new time without proof of the same
     acquisition, its sidecar's acquisition time equal to the one recorded for its frame (maintainer, 2026-10-23: the
     start time tells a re-copied file from a new image). A workflow rule, not byte proof: an image overwritten while
-    its sidecar keeps the same time passes as unchanged."""
+    its sidecar keeps the same time passes as unchanged. Without ``proof`` (a Live Run's) every moved image is one."""
+    if not proof:
+        return bool(positions)
     return any(
         current["image_members"][index].get("size") != prior["image_members"][index].get("size")
         or recorded.get(int(labels[index])) is None
@@ -1180,11 +1182,14 @@ def _extension(
 
 
 def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix: AppendCommittedPrefix | None = None,
-                   image_drift: bool = False) -> AppendDecision:
-    """``image_drift``: a finite Append's choice to tell processed images that changed on disk from re-dated ones
-    (``AppendDecision.rebuild``); without it, and always for a Live Run's own prefix, image history stays exact."""
-    if type(image_drift) is not bool:
-        raise TypeError("image_drift must be an exact bool")
+                   image_drift: bool = False, acquisition_proof: bool = True) -> AppendDecision:
+    """``image_drift``: type the refusal of a scan whose processed images changed on disk for a rebuild
+    (``AppendDecision.rebuild``); without it, and always for a Live Run's own prefix, image history stays exact.
+    ``acquisition_proof``: a finite Append's acceptance of a re-dated image whose sidecar still reads its recorded
+    clock time as the same acquisition; a Live Run passes False, so every moved image is a change (its extensions
+    record each epoch's current images, which a re-dated image's committed facts would not extend)."""
+    if type(image_drift) is not bool or type(acquisition_proof) is not bool:
+        raise TypeError("image_drift and acquisition_proof must be exact bools")
     target = Path(target)
     try:
         normalized = _normalize(target)
@@ -1218,7 +1223,7 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
             # A Live Run's own committed prefix stays exact: drift there is that Run's to retire, not this check's.
             drifted = () if committed_prefix is not None or not image_drift else _drifted_members(
                 _source_dict(current.intent.source), _source_dict(intent.source), tuple(current.committed_labels))
-            recorded = _recorded_acquisitions(handle, intent.entry) if drifted else {}
+            recorded = _recorded_acquisitions(handle, intent.entry) if drifted and acquisition_proof else {}
         if committed_prefix is not None:
             observed_lineage = json.loads(committed_prefix.lineage_json)
             current_lineage = json.loads(current.lineage_json)
@@ -1244,7 +1249,7 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
                 decision = _extension(intent, labels, lineage, prior_source, comparable, comparable)
             except ValueError:
                 raise exact from None
-            if _any_changed(prior_source, current_source, drifted, labels, recorded):
+            if _any_changed(prior_source, current_source, drifted, labels, recorded, proof=acquisition_proof):
                 return _decision(
                     AppendDisposition.REFUSE,
                     intent.labels,
@@ -1303,18 +1308,19 @@ def prepare_append_preflight(
     before_admit: Callable[[], None] | None = None,
     in_place: bool = False,
     image_drift: bool = False,
+    acquisition_proof: bool = True,
 ) -> AppendPreflight:
     """Admit, lease and qualify one Append target under its file lock.
 
     ``in_place`` binds the transaction, before admission, to write an existing
     output in place (finite Append; maintainer, 2026-10-23): no whole-file hash
     at admission, no backup and no copy.  A missing target keeps the ordinary
-    creation route.  ``image_drift`` qualifies as :func:`qualify_append` does.
+    creation route.  ``image_drift`` and ``acquisition_proof`` qualify as :func:`qualify_append` does.
     """
     if type(in_place) is not bool:
         raise TypeError("in_place must be an exact bool")
-    if type(image_drift) is not bool:
-        raise TypeError("image_drift must be an exact bool")
+    if type(image_drift) is not bool or type(acquisition_proof) is not bool:
+        raise TypeError("image_drift and acquisition_proof must be exact bools")
     from .output_transaction import (
         LeaseOwner,
         OwnerToken,
@@ -1348,7 +1354,7 @@ def prepare_append_preflight(
                 owners=owners,
             )
             if committed_prefix is None and image_drift:
-                decision = qualify_append(normalized, intent, image_drift=True)
+                decision = qualify_append(normalized, intent, image_drift=True, acquisition_proof=acquisition_proof)
             elif committed_prefix is None:
                 decision = qualify_append(normalized, intent)
             else:

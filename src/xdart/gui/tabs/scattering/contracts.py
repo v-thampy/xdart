@@ -38,8 +38,8 @@ SourceSelection: TypeAlias = SourceSpec | DirectorySourceSpec
 
 class OutputDisposition(str, Enum):
     WRITE = "write"
-    #: A finite Append's scan whose processed images changed on disk, reduced again whole into its output as an
-    #: ordinary replacement of that one output (every label; Codex N-a8a6c887 stage 2).
+    #: An Append's scan whose processed images changed on disk, reduced again whole into its output as an ordinary
+    #: replacement of that one output (every label; Codex N-a8a6c887 stages 2 and 3).
     REPLACE = "replace"
 
 from xrd_tools.sources.execution_graph import (

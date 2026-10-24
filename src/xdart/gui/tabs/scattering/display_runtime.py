@@ -697,6 +697,12 @@ class RunDisplayState:
                 self._partition_index + 1,
             )
 
+    def retire_artifact_navigation(self, artifact: str) -> int:
+        """Take ``artifact``'s frames out of navigation before its output is replaced whole; the replacement's first
+        frame carries them as retired (``DisplayCatalogIndex.retire_artifact``)."""
+        with self._lock:
+            return self.catalog.retire_artifact(str(artifact))
+
     def append_navigation(
         self,
         source_scan: str,
