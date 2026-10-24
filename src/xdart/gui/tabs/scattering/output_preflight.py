@@ -1223,7 +1223,7 @@ def _live_metadata_ready(
     published_members: int = 0,
     observe_from: int = 0,
     spec_cache: dict | None = None,
-) -> tuple[int, str]:
+) -> tuple[int, str, str | None]:
     """How many leading members of a Live group have their metadata ready.
 
     A member is ready when its selected sidecar (an explicit format) or its

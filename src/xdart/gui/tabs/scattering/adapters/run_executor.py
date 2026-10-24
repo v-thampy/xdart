@@ -1573,26 +1573,26 @@ class StandardRunExecutor:
             "an image it already processed changed on disk" if changed else "it can no longer be extended",
             "; the next Run reprocesses the whole scan" if changed else "", reason)
 
-    def _note_sidecar_wait(self, run: _StandardRun, target: Path, target_key: str, image: str | None,
-                           waits: dict[str, tuple[str, float]]) -> None:
-        """Name, once, in the log and the Live status, the image whose own sidecar an output's next frame has waited on
-        for _SIDECAR_WAIT_WARN_S (missing or changing); clear the note when that frame no longer waits on it."""
+    def _note_sidecar_wait(self, run: _StandardRun, name: str, target_key: str, image: str | None,
+                           waits: dict[str, tuple[str, float, str]]) -> None:
+        """Name, once, in the log and the Live status, the image whose own sidecar output ``name``'s next frame has
+        waited on for _SIDECAR_WAIT_WARN_S (missing or changing); clear the note when that frame no longer waits on it
+        (``image`` None: its attempt went on, its scan is covered, or its files left the directory)."""
         now, held = monotonic(), waits.get(target_key)
         if image is not None and held is not None and held[0] == image:
             if target_key not in run.live_waiting and now - held[1] >= _SIDECAR_WAIT_WARN_S:
-                run.live_waiting[target_key] = f"{Path(target).name} waits for the metadata of {image}"
+                run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
                 log_events.event(
                     logger, logging.WARNING, "%s is waiting for the metadata of %s: its sidecar has been missing or "
                     "changing for over %g s; the frame is processed once its sidecar holds still [LIVE]",
-                    Path(target).name, image, _SIDECAR_WAIT_WARN_S)
+                    name, image, _SIDECAR_WAIT_WARN_S)
             return
         if run.live_waiting.pop(target_key, None) is not None and held is not None:
-            log_events.event(logger, logging.INFO, "%s: the metadata of %s arrived; it continues [LIVE]",
-                             Path(target).name, held[0])
+            log_events.event(logger, logging.INFO, "%s no longer waits for the metadata of %s [LIVE]", held[2], held[0])
         if image is None:
             waits.pop(target_key, None)
         else:
-            waits[target_key] = (image, now)
+            waits[target_key] = (image, now, name)
 
     def _open_scan(self, run: _StandardRun, artifact: Path, note: str = "") -> None:
         """The log's ``New Scan`` banner for ``artifact``'s output (maintainer, 2026-10-24)."""
@@ -2244,8 +2244,8 @@ class StandardRunExecutor:
         uncovered: dict[str, tuple[tuple[object, ...], tuple[int, int, int, int]]] = {}
         # A found output's committed image count by output file version, for its readiness waits.
         committed_counts: dict[str, tuple[tuple[int, int, int, int], int | None]] = {}
-        # The image each output's next frame waits on for its sidecar, and since when.
-        sidecar_waits: dict[str, tuple[str, float]] = {}
+        # The image each output's next frame waits on for its sidecar, since when, and the output's name.
+        sidecar_waits: dict[str, tuple[str, float, str]] = {}
         # A scan found changed: its revision and when its rebuild may start (_REBUILD_QUIET_S).
         rebuild_holds: dict[str, tuple[tuple[object, ...], float]] = {}
         # SPEC readiness by SPEC file revision: no read while it is unchanged.
@@ -2313,12 +2313,14 @@ class StandardRunExecutor:
             times.add("listing", poll_started)
 
             watched: list[Path] = []  # files the next poll must see change at once (D1)
+            polled: set[str] = set()  # this poll's outputs: a waiting note outlives none of them
             for group in groups:
                 if run.stop_requested:
                     return True
                 revision = tuple(group.revision)
                 started = monotonic()
                 target_key = _physical_file_key(group.target)
+                polled.add(target_key)
                 times.add("key", started)
                 if target_key in run.live_blocked:
                     # This output stopped growing; later frames are skipped.
@@ -2410,6 +2412,7 @@ class StandardRunExecutor:
                         seen_targets.add(target_key)
                     settled_revisions[target_key] = (
                         revision, _CoveredOutput(group.target, signature, registry, monotonic()))
+                    self._note_sidecar_wait(run, group.target.name, target_key, None, sidecar_waits)
                     processed_paths.update(group.physical_paths)
                     publish(force=True)
                     continue
@@ -2450,7 +2453,8 @@ class StandardRunExecutor:
                             committed_cache=committed_counts,
                         )
                         times.add("admission", started)
-                        self._note_sidecar_wait(run, group.target, target_key, attempt.waiting_sidecar, sidecar_waits)
+                        self._note_sidecar_wait(run, group.target.name, target_key, attempt.waiting_sidecar,
+                                                sidecar_waits)
                         live_readiness_debug(
                             "live_attempt", target=group.target.name,
                             owned=run.output is not None and run.output.owns_target(group.target),
@@ -2636,6 +2640,8 @@ class StandardRunExecutor:
                 if stopped or run.stop_requested:
                     return True
 
+            for key in [key for key in sidecar_waits if key not in polled]:  # its files left the directory
+                self._note_sidecar_wait(run, sidecar_waits[key][2], key, None, sidecar_waits)
             with run.live_revision_lock:
                 containers = tuple(value.decision.item.source_stamp for value in run.processed_live_revisions.values()
                                    if value.decision is not None and value.decision.item.descriptor is not None)
