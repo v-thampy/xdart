@@ -85,7 +85,7 @@ _FILE_LOG_HANDLER = None
 
 #: Diagnostic switches that xdart reads at each use, so Config ▸ Debug ▸
 #: Debug Logging takes effect mid-session without a restart.
-DEBUG_LOGGING_FLAGS = ("XDART_VIEWER_DEBUG", "XDART_METADATA_DEBUG", "XDART_DEBUG_PRERUN")
+DEBUG_LOGGING_FLAGS = ("XDART_VIEWER_DEBUG", "XDART_METADATA_DEBUG", "XDART_DEBUG_PRERUN", "XDART_LIVE_READINESS_DEBUG")
 
 
 def set_debug_logging(enabled: bool) -> None:

@@ -1324,6 +1324,13 @@ def _published_prefix_current(
     return True
 
 
+def live_readiness_debug(event: str, **fields: object) -> None:
+    """``XDART_LIVE_READINESS_DEBUG=1`` (Config ▸ Debug ▸ Debug Logging): one ``key=value`` line per Live readiness or
+    admission decision (AGENTS.md rule 1, Codex N-f8157cee: a readiness bug that survived two fixes)."""
+    if os.environ.get("XDART_LIVE_READINESS_DEBUG") == "1":
+        _LOG.warning("%s %s", event, " ".join(f"{key}={value!r}" for key, value in fields.items()))
+
+
 def materialize_live_directory_group(
     receipt: AdmissionReceipt,
     configuration: FrozenRunConfiguration,
@@ -1384,7 +1391,11 @@ def materialize_live_directory_group(
         if (cut := next((index for index, value in enumerate(group.plan.candidates[published_members:count],
                                                              published_members) if value.path in fresh), None)) is not None:
             count, waiting = cut, f"confirming {Path(group.plan.candidates[cut].path).name} in another listing"
+        facts = dict(target=group.target.name, candidates=len(group.plan.candidates), ready=count, waiting=waiting,
+                     published=published_members, covered=covered,
+                     published_graph=None if published_graph is None else len(published_graph.stamp.members))
         if count == 0:
+            live_readiness_debug("live_readiness", **facts, decision="wait: none ready")
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting,
             )
@@ -1402,9 +1413,11 @@ def materialize_live_directory_group(
             # whatever its images did, as a first one always has: it is looked
             # at whole once that settles (one found changed is reduced again),
             # never admitted as shorter than its output (Codex N-cdab3fe2).
+            live_readiness_debug("live_readiness", **facts, decision="wait: published prefix held")
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting,
             )
+        live_readiness_debug("live_readiness", **facts, decision="admit")
         observations = observations[:count]
         physical_paths = physical_paths[:count]
         if getattr(session, "listing_deferred", False):
@@ -2388,7 +2401,7 @@ __all__ = [
     "ValidatedSourceAliases",
     "execution_plan_values", "native_int_reduction_plan", "inspect_output",
     "materialize_deferred_output",
-    "live_directory_groups", "materialize_live_directory_group", "observe_live_members",
+    "live_directory_groups", "live_readiness_debug", "materialize_live_directory_group", "observe_live_members",
     "OutputFact", "prepare_output", "source_snapshots",
     "target_state_matches", "validate_admitted_receipt",
     "validate_planned_source", "validate_source_aliases",

@@ -87,7 +87,7 @@ from ..output_preflight import (
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     native_int_reduction_plan, materialize_deferred_output,
-    live_directory_groups, live_group_coverage, materialize_live_directory_group,
+    live_directory_groups, live_group_coverage, live_readiness_debug, materialize_live_directory_group,
     observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
@@ -2406,6 +2406,11 @@ class StandardRunExecutor:
                             spec_cache=spec_cache,
                         )
                         times.add("admission", started)
+                        live_readiness_debug(
+                            "live_attempt", target=group.target.name,
+                            owned=run.output is not None and run.output.owns_target(group.target),
+                            state=attempt.state.name, partial=attempt.partial, reason=attempt.reason,
+                            disposition=None if attempt.decision is None else attempt.decision.disposition.name)
                         if attempt.state is ProbeState.IN_PROGRESS:
                             if attempt.revision_changed:
                                 retry_revisions[target_key] = revision
@@ -2516,6 +2521,9 @@ class StandardRunExecutor:
                     # One scan's Append refusal skips that scan: Live keeps watching the others and the end of the
                     # Run lists it, as a directory Run does (beamline 2026-10-23: a first image rewritten after it
                     # was reduced failed the whole Live Run).
+                    live_readiness_debug(
+                        "live_refused", target=group.target.name, constructed=constructing,
+                        owned=run.output is not None and run.output.owns_target(group.target), reason=str(error))
                     self._skip_live_append(run, group.target, target_key, error, constructed=constructing)
                     skipped_paths.update(
                         path for path in group.physical_paths
