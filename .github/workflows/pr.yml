@@ -7,7 +7,8 @@ on:
 jobs:
   core:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 24-26 min on a usual runner; 30 cancelled d5f16de1's run (40084773031) with every test passed
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
