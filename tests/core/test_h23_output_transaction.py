@@ -4798,3 +4798,382 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
             and node.module == "xrd_tools.io.output_transaction"
             for alias in node.names} == {"TargetChanged",
                                          "revalidate_target_snapshot"}
+
+
+def _close_finalizes_seed_timestamps(monkeypatch, target: Path) -> list[int]:
+    """Windows finalizes a written file's timestamps when its writing handle closes (on a network share, a moment
+    later): each close of a descriptor that created ``target`` moves its mtime 86.5 ms on, size unchanged. Returns the
+    number of fsync calls made through ``os.fsync`` so a row can bound the durability work."""
+    real_open, real_close, real_fsync = os.open, os.close, os.fsync
+    creators: set[int] = set()
+    fsyncs = [0]
+
+    def opening(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_CREAT and flags & os.O_EXCL and Path(path) == target:
+            creators.add(descriptor)
+        return descriptor
+
+    def closing(descriptor):
+        real_close(descriptor)
+        if descriptor in creators:
+            creators.discard(descriptor)
+            state = os.stat(target)
+            os.utime(target, ns=(state.st_atime_ns, state.st_mtime_ns + 86_500_000))
+
+    def flushing(descriptor):
+        fsyncs[0] += 1
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "close", closing)
+    monkeypatch.setattr(os, "fsync", flushing)
+    return fsyncs
+
+
+@pytest.mark.parametrize(("prior", "seed"), (
+    (b"prior", "PRESERVE_BASE"), (None, "PRESERVE_BASE"), (b"prior", "EMPTY_REPLACEMENT"),
+))
+def test_stream_seed_baseline_is_taken_after_its_own_handle_closes(tmp_path, monkeypatch, prior, seed):
+    """Beamline 1.2.4, 2026-10-23 (Windows share): "stream checkpoint failed identity verification" with device,
+    file ID and size equal and mtime 86.5 ms later. The seed sealed its baseline while its writing handle was still
+    open; the close then finalized the timestamp. The baseline is taken after that close, with no extra flush; a
+    later change of timestamp, size or file still refuses."""
+    api, target, _, transaction, tx_owner, target_owner, _, lease = _prepared(tmp_path, prior=prior)
+    fsyncs = _close_finalizes_seed_timestamps(monkeypatch, target)
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=_DepthPool(), file_lock=threading.RLock(), seed_mode=getattr(api.StreamSeedMode, seed),
+    )
+    # one flush per written object, before its close: the staged prior (when copied) and the seed
+    assert fsyncs[0] == (2 if prior is not None and seed == "PRESERVE_BASE" else 1)
+    transaction.authorize_stream_mutation(attempt, lease=lease)  # the beamline refusal
+    state = os.stat(target)
+    os.utime(target, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))  # a later change of the open stream
+    transaction._stream_checkpoint_fresh = True
+    with pytest.raises(api.TargetChanged, match="stream checkpoint failed identity verification"):
+        transaction.authorize_stream_mutation(attempt, lease=lease)
+
+
+def test_stream_epoch_seed_baseline_is_taken_after_its_own_handle_closes(tmp_path, monkeypatch):
+    """The owned epoch extension seeds through the same copy: its baseline also follows the seed's own close."""
+    api, target, _, transaction, tx_owner, target_owner, _, lease = _prepared(tmp_path, prior=b"prior")
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=_DepthPool(), file_lock=threading.RLock(),
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    target.write_bytes(b"epoch-a")
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    assert transaction.commit_stream_epoch(attempt, lease=lease).phase is api.TransactionPhase.EPOCH_COMMITTED
+    _close_finalizes_seed_timestamps(monkeypatch, target)
+    following = transaction.begin_stream_epoch(
+        attempt, admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+    )
+    transaction.authorize_stream_mutation(following, lease=lease)
+    assert target.read_bytes() == b"epoch-a"
+
+
+def test_a_seed_that_changes_size_at_its_close_is_refused_and_the_prior_kept(tmp_path, monkeypatch):
+    """Only the seed's own timestamp may move at its close: a size change there refuses the stream, and the
+    rollback restores the prior output."""
+    api, target, _, transaction, tx_owner, target_owner, _, lease = _prepared(tmp_path, prior=b"prior")
+    real_open, real_close = os.open, os.close
+    creators: set[int] = set()
+
+    def opening(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_CREAT and flags & os.O_EXCL and Path(path) == target:
+            creators.add(descriptor)
+        return descriptor
+
+    def closing(descriptor):
+        real_close(descriptor)
+        if descriptor in creators:
+            creators.discard(descriptor)
+            with open(target, "ab") as stream:  # someone else's byte, at the seed's close
+                stream.write(b"x")
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "close", closing)
+    with pytest.raises(api.TargetChanged, match="changed when its writing handle closed"):
+        transaction.begin_stream(
+            admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+            pool=_DepthPool(), file_lock=threading.RLock(),
+        )
+    monkeypatch.undo()
+    assert target.read_bytes() == b"prior" and not transaction.backup.exists()
+
+
+# In-place Append (maintainer, 2026-10-23: "Append in place": "No copy and no hashes: open the existing output and add
+# only the new frames ... a crash mid-append can leave that output partly written or unreadable, and that scan then
+# needs Replace."). Codex's design review REVIEW-DESIGN-125: the policy binds at admission, keeps lease and checkpoint
+# evidence, and an abort retains the existing file without restoring, deleting or hashing it.
+
+def _prepared_in_place(tmp_path: Path, *, prior: bytes | None = b"prior"):
+    api = _api()
+    target = tmp_path / "result.nexus"
+    if prior is not None:
+        target.write_bytes(prior)
+    coordinator = api.OutputTransactionCoordinator()
+    transaction_owner, target_owner = api.OwnerToken("transaction"), api.OwnerToken("target")
+    transaction = coordinator.admit(
+        target, transaction_owner=transaction_owner, target_owner=target_owner, in_place=True,
+    )
+    owners = _owners(api)
+    lease = transaction.acquire_lease(
+        admission=transaction.admission, transaction_owner=transaction_owner, target_owner=target_owner,
+        owners=owners,
+    )
+    return api, target, coordinator, transaction, transaction_owner, target_owner, owners, lease
+
+
+def _counted_hashes(api, monkeypatch) -> list[int]:
+    calls: list[int] = []
+    real_hash = api._sha256_handle
+
+    def counted(handle):
+        calls.append(1)
+        return real_hash(handle)
+
+    monkeypatch.setattr(api, "_sha256_handle", counted)
+    return calls
+
+
+def _begin_in_place(prepared, seed: str = "IN_PLACE"):
+    api, _target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, lease = prepared
+    return transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=_DepthPool(), file_lock=threading.RLock(), seed_mode=getattr(api.StreamSeedMode, seed),
+    )
+
+
+def test_in_place_append_writes_the_existing_file_without_copy_backup_or_hash(tmp_path, monkeypatch):
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    hashes = _counted_hashes(api, monkeypatch)
+    before = os.stat(target)
+    assert transaction.in_place and transaction.admission.snapshot.digest is None
+    attempt = _begin_in_place(prepared)
+    assert os.stat(target).st_ino == before.st_ino
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["result.nexus"]
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(b"-new")
+    _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    assert transaction.commit_stream(attempt, lease=lease).phase is api.TransactionPhase.COMMITTED
+    assert target.read_bytes() == b"prior-new" and os.stat(target).st_ino == before.st_ino
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["result.nexus"] and hashes == []
+
+
+@pytest.mark.parametrize("stage", ("before-mutation", "after-mutation", "after-durable-floor"))
+def test_in_place_abort_retains_the_existing_file_without_restoring_or_hashing(tmp_path, monkeypatch, stage):
+    """No backup exists to restore: the canonical file stays as it stands, reported as retained and incomplete."""
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    hashes = _counted_hashes(api, monkeypatch)
+    attempt = _begin_in_place(prepared)
+    expected = b"prior"
+    if stage != "before-mutation":
+        transaction.authorize_stream_mutation(attempt, lease=lease)
+        with open(target, "ab") as stream:
+            stream.write(b"-partial")
+        expected = b"prior-partial"
+    if stage == "after-durable-floor":
+        checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+        transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    snapshot = transaction.abort_stream(attempt, lease=lease)
+    assert snapshot.phase is api.TransactionPhase.ABORTED and not snapshot.pending_actions
+    assert snapshot.partial_path == transaction.admission.target
+    assert target.read_bytes() == expected and hashes == []
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["result.nexus"]
+
+
+def test_in_place_policy_binds_at_admission_and_only_to_an_existing_output(tmp_path, monkeypatch):
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    with pytest.raises(api.TransactionStateError, match="in-place"):
+        _begin_in_place(prepared, "PRESERVE_BASE")
+    (tmp_path / "copy").mkdir()
+    ordinary = _prepared(tmp_path / "copy")
+    with pytest.raises(api.TransactionStateError, match="in-place"):
+        _begin_in_place(ordinary)
+    # A missing output keeps the ordinary creation route.
+    (tmp_path / "absent").mkdir()
+    missing = _prepared_in_place(tmp_path / "absent", prior=None)
+    assert missing[3].in_place is False
+    with pytest.raises(api.TransactionStateError, match="in-place"):
+        _begin_in_place(missing)
+    _begin_in_place(missing, "PRESERVE_BASE")
+
+
+def _committed_epoch(prepared, pool, payload: bytes = b"epoch-a"):
+    """A Live run's first, preserved epoch, committed."""
+    api, target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, lease = prepared
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=pool, file_lock=threading.RLock(),
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    target.write_bytes(payload)
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    transaction.commit_stream_epoch(attempt, lease=lease)
+    return attempt
+
+
+def _reopen(prepared, previous, *, in_place: bool = True, lease=None):
+    _api_module, _target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, own_lease = prepared
+    return transaction.begin_stream_epoch(
+        previous, admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner,
+        lease=own_lease if lease is None else lease, in_place=in_place,
+    )
+
+
+def _commit_in_place_rows(api, transaction, attempt, lease, target: Path, rows: bytes, close: bytes):
+    """Rows, their checkpoint, an HDF5-like close (no durable floor), the terminal and the epoch commit."""
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(rows)
+    _sealed_checkpoint(api, transaction, attempt, lease, target)
+    owner = transaction.begin_stream_close(attempt, lease=lease)
+    assert owner is not None  # an in-place attempt seals its close without a durable floor
+    with open(target, "ab") as stream:
+        stream.write(close)
+    transaction.seal_stream_close(attempt, owner, lease=lease)
+    transaction.seal_stream_terminal(attempt, lease=lease)
+    return transaction.commit_stream_epoch(attempt, lease=lease)
+
+
+def test_in_place_epoch_reopen_keeps_one_exclusion_owner_without_stage_copy_or_hash(tmp_path, monkeypatch):
+    """The IN_PLACE counterpart of test_canonical_stream_epoch_extension_retries_under_one_exclusion_owner."""
+    prepared = _prepared(tmp_path, prior=b"prior")
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    pool = _DepthPool()
+    first = _committed_epoch(prepared, pool)
+    inode = os.stat(target).st_ino
+    staged: list[int] = []
+    copied: list[int] = []
+    monkeypatch.setattr(transaction, "_stage_prior", lambda: staged.append(1))
+    monkeypatch.setattr(transaction, "_copy_stream_seed", lambda **_kwargs: copied.append(1))
+    (tmp_path / "other").mkdir()
+    foreign = _prepared(tmp_path / "other")
+    hashes = _counted_hashes(api, monkeypatch)
+    with pytest.raises(api.OwnershipRefused):
+        _reopen(prepared, first, lease=foreign[-1])
+    second = _reopen(prepared, first)
+    assert second is not first and pool.depth == 1
+    with pytest.raises(api.TransactionStateError, match="committed epoch"):
+        _reopen(prepared, second)
+    with pytest.raises(api.OwnershipRefused):
+        transaction.authorize_stream_mutation(first, lease=lease)
+    _commit_in_place_rows(api, transaction, second, lease, target, b"-b", b"!")
+    third = _reopen(prepared, second)  # authorized by the in-place epoch's revision, not by a digest
+    assert os.stat(target).st_ino == inode and pool.depth == 1
+    assert staged == copied == hashes == []
+    result = transaction.abort_stream(third, lease=lease)
+    assert result.phase is api.TransactionPhase.ABORTED and pool.depth == 0
+    assert target.read_bytes() == b"epoch-a-b!" and staged == copied == hashes == []
+
+
+def test_in_place_reopen_refuses_a_changed_committed_epoch_and_keeps_it(tmp_path, monkeypatch):
+    prepared = _prepared(tmp_path, prior=b"prior")
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    first = _committed_epoch(prepared, _DepthPool())
+    hashes = _counted_hashes(api, monkeypatch)
+    with open(target, "ab") as stream:
+        stream.write(b"foreign")
+    with pytest.raises(api.TargetChanged, match="committed epoch changed"):
+        _reopen(prepared, first)
+    assert transaction.snapshot().phase is api.TransactionPhase.EPOCH_COMMITTED and hashes == []
+
+
+@pytest.mark.parametrize("route", ("first-stream", "reopened-epoch"))
+def test_in_place_adoption_does_not_rebaseline_a_change_after_validation(tmp_path, monkeypatch, route):
+    prepared = _prepared_in_place(tmp_path) if route == "first-stream" else _prepared(tmp_path, prior=b"prior")
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    first = None if route == "first-stream" else _committed_epoch(prepared, _DepthPool())
+    real_seal = api._descriptor_stream_stat_receipt
+
+    def change_before_seal(descriptor, path, **kwargs):
+        if kwargs["role"] == "stream-in-place":
+            state = os.stat(path)
+            os.utime(path, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))
+        return real_seal(descriptor, path, **kwargs)
+
+    monkeypatch.setattr(api, "_descriptor_stream_stat_receipt", change_before_seal)
+    with pytest.raises(api.TargetChanged, match="changed after semantic verification"):
+        if first is None:
+            _begin_in_place(prepared)
+        else:
+            _reopen(prepared, first)
+    assert target.read_bytes() == (b"prior" if first is None else b"epoch-a")
+    if first is not None:
+        assert transaction.snapshot().phase not in {
+            api.TransactionPhase.COMMITTED, api.TransactionPhase.EPOCH_COMMITTED,
+        }
+        assert transaction._stream_attempt is first
+
+
+def test_in_place_transaction_reopens_its_epochs_only_in_place(tmp_path):
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, *_rest, lease = prepared
+    attempt = _begin_in_place(prepared)
+    _commit_in_place_rows(api, transaction, attempt, lease, target, b"-rows", b"!")
+    with pytest.raises(api.TransactionStateError, match="only in place"):
+        _reopen(prepared, attempt, in_place=False)
+    _reopen(prepared, attempt)
+
+
+@pytest.mark.parametrize("resume", ("resumes", "resume-fails-once"))
+def test_in_place_abort_settles_a_held_durable_floor_and_resumes_the_pool(tmp_path, monkeypatch, resume):
+    """An unsealed write after the floor holds integrity; the retained receipt still settles the abort."""
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, lease = prepared
+    pool = _Pool(fail_resume=1) if resume == "resume-fails-once" else _DepthPool()
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=pool, file_lock=threading.RLock(), seed_mode=api.StreamSeedMode.IN_PLACE,
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(b"-rows")
+    checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
+    transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(b"-unsealed")
+    with pytest.raises(api.TargetChanged):
+        transaction.begin_stream_close(attempt, lease=lease)
+    assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
+    hashes = _counted_hashes(api, monkeypatch)
+    if resume == "resume-fails-once":
+        with pytest.raises(api.CleanupIncomplete):
+            transaction.abort_stream(attempt, lease=lease)
+        result = transaction.retry_cleanup(transaction.snapshot().cleanup_token)
+        assert len(pool.resumes) == 2
+    else:
+        result = transaction.abort_stream(attempt, lease=lease)
+        assert pool.depth == 0
+    assert result.phase is api.TransactionPhase.ABORTED and not result.pending_actions
+    assert hashes == [] and target.read_bytes() == b"prior-rows-unsealed"
+
+
+def test_in_place_abort_retries_a_failed_pool_resume_without_rollback_proof(tmp_path):
+    prepared = _prepared_in_place(tmp_path)
+    api, target, _coordinator, transaction, tx_owner, target_owner, _owners_by_role, lease = prepared
+    pool = _Pool(fail_resume=1)
+    attempt = transaction.begin_stream(
+        admission=transaction.admission, transaction_owner=tx_owner, target_owner=target_owner, lease=lease,
+        pool=pool, file_lock=threading.RLock(), seed_mode=api.StreamSeedMode.IN_PLACE,
+    )
+    transaction.authorize_stream_mutation(attempt, lease=lease)
+    with open(target, "ab") as stream:
+        stream.write(b"-partial")
+    with pytest.raises(api.CleanupIncomplete):
+        transaction.abort_stream(attempt, lease=lease)
+    snapshot = transaction.snapshot()
+    assert snapshot.pending_actions == (api.RetryAction.POOL_RESUME,)
+    result = transaction.retry_cleanup(snapshot.cleanup_token)
+    assert result.phase is api.TransactionPhase.ABORTED and not result.pending_actions
+    assert len(pool.resumes) == 2 and target.read_bytes() == b"prior-partial"

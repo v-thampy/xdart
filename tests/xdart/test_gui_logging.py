@@ -106,3 +106,45 @@ def test_debug_logging_switch_writes_debug_records_mid_session(monkeypatch, tmp_
         assert "Debug logging on" in text and "Debug logging off" in text
     finally:
         _clear_file_handlers(_gui_main)
+
+
+def test_performance_monitoring_switch_logs_diagnostics_and_times_collections_while_on(monkeypatch, tmp_path):
+    """Config ▸ Debug ▸ Performance Monitoring (maintainer, 2026-10-24): XDART_PERF on at once, so a Run's
+    diagnostics reach the regular log, with garbage-collection timing; off clears it and the quartile timing."""
+    import gc
+    import os
+
+    from xdart import _gui_main
+    from xdart.utils import log_events
+    monkeypatch.delenv("XDART_LOG_FILE", raising=False)
+    monkeypatch.setenv("XDART_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(_gui_main, "LOG_FILE_PATH", None)
+    monkeypatch.setattr(_gui_main, "_FILE_LOG_HANDLER", None)
+    for flag in _gui_main.PERFORMANCE_FLAGS:
+        monkeypatch.delenv(flag, raising=False)
+    _clear_file_handlers(_gui_main)
+    root, previous = logging.getLogger(), logging.getLogger().level
+    root.setLevel(logging.INFO)  # the app's root level (basicConfig INFO); setLevel clears the loggers' caches
+    probe = logging.getLogger("xdart.gui.tabs.scattering.adapters.run_executor")
+    try:
+        path = _gui_main._install_file_log_handler()
+        log_events.diagnostic(probe, "[PERF-SUMMARY] before the switch")
+        _gui_main.set_performance_monitoring(True)
+        assert os.environ.get("XDART_PERF") == "1" and log_events.performance_monitoring()
+        assert gc.callbacks.count(_gui_main._time_garbage_collections) == 1
+        _gui_main.set_performance_monitoring(True)  # once registered, however often it is turned on
+        assert gc.callbacks.count(_gui_main._time_garbage_collections) == 1
+        log_events.diagnostic(probe, "[PERF-SUMMARY] while monitoring")
+        os.environ["XDART_PERF_QUARTILES"] = "1"  # Config ▸ Performance Diagnostics…'s quartile timing
+        _gui_main.set_performance_monitoring(False)
+        assert not any(flag in os.environ for flag in _gui_main.PERFORMANCE_FLAGS)
+        assert _gui_main._time_garbage_collections not in gc.callbacks
+        log_events.diagnostic(probe, "[PERF-SUMMARY] after the switch")
+        _gui_main._FILE_LOG_HANDLER.flush()
+        text = path.read_text(encoding="utf-8")
+        assert "while monitoring" in text and "before the switch" not in text and "after the switch" not in text
+        assert "Performance monitoring on" in text and "Performance monitoring off" in text
+    finally:
+        _gui_main.set_performance_monitoring(False)
+        root.setLevel(previous)
+        _clear_file_handlers(_gui_main)

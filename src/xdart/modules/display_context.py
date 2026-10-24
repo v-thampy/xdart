@@ -1163,13 +1163,18 @@ class AcquisitionContext(_WriteOnceIdentity):
             scope.commit_epoch,
         )
 
-    def rescope_to(self, scan_key, source, display_scan=_UNSET) -> None:
+    def rescope_to(self, scan_key, source, display_scan=_UNSET, *,
+                   saved_only=False) -> None:
         """Replace the sub-scan identity with one COMPLETE selection (§12.6 C).
 
         Key, source and display scan are validated BEFORE any is written, then
         advance under the same commit epoch.  Omitting ``display_scan`` keeps
         the existing scan for genuine within-scan callers; a caller that owns
         a new artifact passes its exact newly constructed scan.
+
+        ``saved_only`` selects an output shown only from its saved frames (an
+        Append's already-processed scan, never read again), which has no
+        display scan, as when a Run's first output is one.
 
         A genuine same-source rescope passes the current source explicitly —
         see :meth:`rescope_within_source`.
@@ -1178,9 +1183,10 @@ class AcquisitionContext(_WriteOnceIdentity):
         source = str(source or "")
         scope = self._current_scope
         display_scan = (
-            scope.display_scan if display_scan is _UNSET else display_scan
+            None if saved_only
+            else scope.display_scan if display_scan is _UNSET else display_scan
         )
-        if not scan_key or not source or display_scan is None:
+        if not scan_key or not source or (display_scan is None and not saved_only):
             raise DisplayContextError(
                 "a sub-scan boundary needs a complete "
                 "(scan key, source, display scan) selection")

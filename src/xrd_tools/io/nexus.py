@@ -4166,7 +4166,7 @@ def write_scan_metadata(
         chunks=(64,),
     )
     for col in scan_data.columns:
-        arr, create_kwargs, attrs = _scan_data_column_payload(scan_data[col].values)
+        arr, create_kwargs, attrs = _scan_data_column_payload(scan_data[col].values, str(col))
         ds = g.create_dataset(
             str(col),
             data=arr,
@@ -4279,7 +4279,21 @@ def _stringify_scan_value(value: Any) -> str:
     return str(value)
 
 
-def _scan_data_column_payload(values: Any) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+#: Per-frame times, seconds since 1970 (the .txt/.pdi sidecar's "time:" or SPEC's Epoch; epoch_local, the .txt clock
+#: time with no zone applied): float32 would round today's 1.8e9 s to 128 s steps (maintainer, 2026-10-23: a frame's
+#: recorded start time is compared to its source's).
+_FULL_PRECISION_SCAN_COLUMNS = frozenset({"epoch", "epoch_local"})
+
+
+def _scan_data_column_payload(values: Any, name: str = "") -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+    if name.casefold() in _FULL_PRECISION_SCAN_COLUMNS:
+        try:
+            return np.asarray(values, dtype=np.float64), {}, {
+                DTYPE_ATTR: "float64",
+                "description": "Per-frame time, seconds since 1970-01-01 (local clock of the recording)",
+            }
+        except (TypeError, ValueError):
+            pass
     try:
         arr = np.asarray(values, dtype=np.float32)
     except (TypeError, ValueError):
@@ -4310,7 +4324,7 @@ def upsert_scan_metadata(
     values: dict[str, np.ndarray] = {}
     attrs_by_col: dict[str, dict[str, Any]] = {}
     for col in scan_data.columns:
-        arr, _create_kwargs, attrs = _scan_data_column_payload(scan_data[col].values)
+        arr, _create_kwargs, attrs = _scan_data_column_payload(scan_data[col].values, str(col))
         values[str(col)] = arr
         attrs_by_col[str(col)] = attrs
     if not values:
@@ -4327,7 +4341,12 @@ def upsert_scan_metadata(
     )
     for col, attrs in attrs_by_col.items():
         if col in entry_grp["scan_data"]:
-            entry_grp["scan_data"][col].attrs.update(attrs)
+            dataset = entry_grp["scan_data"][col]
+            # An existing column keeps its physical dtype and says so: an older output's float32 epochs, appended
+            # to, stay rounded and labelled float32 (Codex N-0243a1bb F5).
+            if attrs.get(DTYPE_ATTR) in ("float32", "float64") and dataset.dtype.name != attrs[DTYPE_ATTR]:
+                attrs = {key: value for key, value in attrs.items() if key != DTYPE_ATTR}
+            dataset.attrs.update(attrs)
 
 
 def upsert_per_frame_geometry(

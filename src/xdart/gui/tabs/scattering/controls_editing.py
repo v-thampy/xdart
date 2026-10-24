@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import os
 from pathlib import Path
 
 from xrd_tools.analysis.angular_support import DEFAULT_RECORD_ANGULAR_SUPPORT
@@ -582,7 +583,8 @@ def reduce_control_edit(
         and str(parsed).strip()
         and (
             not str(intent.save_path or "").strip()
-            or str(intent.save_path) == prior_default_save_path
+            or bool(prior_default_save_path)
+            and _same_folder(str(intent.save_path), prior_default_save_path)
         )
     ):
         candidate.save_path = str(
@@ -594,6 +596,16 @@ def reduce_control_edit(
             was_enabled=intent.gi.enabled,
         )
     return candidate
+
+
+def _same_folder(left: str, right: str) -> bool:
+    """One folder however it is spelled: separators, a trailing separator, and case where the platform ignores it.
+    On Windows a folder dialog returns forward slashes while the default Save Path is built with backslashes, so an
+    exact comparison took the old Project's default for a separately chosen folder and left it behind (beamline
+    2026-10-23)."""
+    def spelled(value: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.expanduser(value)))
+    return spelled(left) == spelled(right)
 
 
 def _reduce_background_edit(

@@ -13,7 +13,7 @@ from typing import Mapping
 __all__ = ["FlushPolicy", "SessionPolicy", "SessionResourceRequirements",
            "SessionResourceAllocation", "SessionEnvelopeError", "floor_bytes",
            "resolve_session_policy", "requirements_from", "minimum_bytes",
-           "default_envelope_bytes"]
+           "default_envelope_bytes", "warm_integrator_allowance"]
 
 INTEGRATOR_RESERVE_BYTES = _GIB = 1024 ** 3   #: one worker's integrator copy
 MAX_MODES_1D, MAX_MODES_2D = 5, 3      #: the finite schema maxima
@@ -316,13 +316,34 @@ def _prefetch_queue_request(env) -> int:
 def default_envelope_bytes(env=None) -> int:
     """Advisory target: 40% of RAM, or 16 GiB when detection is unavailable.
 
-    Windows uses the fallback. Python/Qt/file handles are OUTSIDE the model.
+    Windows has no ``os.sysconf``; its own RAM figure (``windows_physical_ram_bytes``) may raise the target above the
+    16 GiB fallback, never lower it (beamline 2026-10-23: a 64 GB PC planned within 16 GiB, so a Run's warm tables
+    could not hold one per worker). Python/Qt/file handles are OUTSIDE the model.
     """
     try:
         total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (ValueError, OSError, AttributeError):
-        total = 0
+        from xrd_tools.core.staging import windows_physical_ram_bytes
+        windows = windows_physical_ram_bytes() or 0
+        return max(16 * _GIB, int(windows * DEFAULT_ENVELOPE_FRACTION))
     return int(total * DEFAULT_ENVELOPE_FRACTION) if total > 0 else 16 * _GIB
+
+
+#: The share of physical RAM a Run's warm integrators may reach above their funded reserve.
+WARM_INTEGRATOR_RAM_FRACTION = 0.25
+
+
+def warm_integrator_allowance(allocation: "SessionResourceAllocation | None", workers: int,
+                              total_ram_bytes: int | None) -> int:
+    """Bytes a Run's warm integrators (``WarmIntegrators``) may hold, in use and idle: the integrator reserve this
+    plan funds for its granted workers, plus envelope headroom no category was granted, up to a quarter of physical
+    RAM. With RAM unknown the envelope is only a fallback, so the funded reserve alone (Windows passes
+    ``windows_physical_ram_bytes``)."""
+    funded = max(1, int(workers)) * INTEGRATOR_RESERVE_BYTES
+    if allocation is None or not total_ram_bytes:
+        return funded
+    headroom = max(0, int(allocation.envelope_bytes) - int(allocation.assigned_bytes))
+    return funded + min(headroom, max(0, int(total_ram_bytes * WARM_INTEGRATOR_RAM_FRACTION) - funded))
 def _default_requests(req: SessionResourceRequirements, requested_workers,
                       env) -> dict:
     """These requests feed this ONE resolution; consumers receive grants."""

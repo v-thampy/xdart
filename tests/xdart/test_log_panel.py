@@ -1,7 +1,8 @@
 """The log panel (``widgets/log_panel.py``; maintainer, 2026-10-23, for 1.2.4): a checkable Show log button below
 Reintegrate/Advanced reveals the messages written to xdart.log in a read-only pane in the free space between those
-buttons and the Run controls, hidden at start, on Int, Stitch and RSM alike (hard rule 14: one shared component, its
-text box the shared ReadOnlyTextPane). "It can be dragged and made bigger, but the controls panels above should get
+buttons and the Run controls, on Int, Stitch and RSM alike (hard rule 14: one shared component, its text box the
+shared ReadOnlyTextPane), shown at start (maintainer, 2026-10-24: "toggle the show log in the main window on by
+default"). "It can be dragged and made bigger, but the controls panels above should get
 higher priority"; hidden, it does no GUI work.
 
 The feed is a real logging handler fed by real logger calls; the panels are the real pages' panels."""
@@ -152,8 +153,8 @@ def test_the_feed_numbers_a_bounded_history_that_logging_threads_append_to():
 def test_each_page_mounts_the_shared_log_under_its_controls(qapp, page_kind):
     """The same component on every page: its Show log row right after the Processing card (under
     Reintegrate/Advanced), in the controls' own layout; the log under the controls' scroll area in a split that takes
-    the scroll area's place over the Run controls. Hidden at start, each part with a tooltip, its one text box the
-    shared read-only pane."""
+    the scroll area's place over the Run controls. Shown at start (maintainer, 2026-10-24), each part with a tooltip,
+    its one text box the shared read-only pane."""
     from xdart.gui.pages.values import PageCleanup
     if page_kind == "int":
         from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
@@ -182,8 +183,8 @@ def test_each_page_mounts_the_shared_log_under_its_controls(qapp, page_kind):
         assert not split.childrenCollapsible()
         column = run_bar.parentWidget().layout()
         assert column.count() == 2 and column.itemAt(0).widget() is split and column.itemAt(1).widget() is run_bar
-        assert panel.isHidden() and panel.latest.isHidden() and not panel.toggle.isChecked()
-        assert panel.toggle.isCheckable() and panel.toggle.text() == "Show log"
+        assert not panel.isHidden() and not panel.latest.isHidden() and panel.toggle.isChecked()
+        assert panel.toggle.isCheckable() and panel.toggle.text() == "Hide log"
         for part in (panel.toggle, panel.latest, panel.pane, split.handle(1)):
             assert part.toolTip()
     finally:
@@ -199,10 +200,15 @@ def test_each_page_mounts_the_shared_log_under_its_controls(qapp, page_kind):
 def test_show_log_takes_only_the_free_space_and_hide_log_gives_it_back(qapp):
     """The maintainer's screenshot: free space between Reintegrate/Advanced and the Run controls. Shown, the log takes
     that space and no more; the controls keep their whole height (no scrolling), and the cards, the column widths and
-    the fixed Run controls are unchanged. Hidden, the space is the controls' again."""
+    the fixed Run controls are unchanged. Hidden, the space is the controls' again. Shown at start, it has that space
+    from the first layout."""
     shell = _shell(qapp, height=1600)
     try:
         controls, panel, run_bar, scroll = shell.controls, shell.log_panel, shell.run_controls, shell.control_scroll
+        assert panel.isVisible() and panel.toggle.isChecked() and panel._timer.isActive()
+        opened = panel.split.sizes()
+        QtTest.QTest.mouseClick(panel.toggle, QtCore.Qt.MouseButton.LeftButton)
+        _settle(qapp)
         cards, sizes, run_geometry = _cards(controls), shell.splitter.sizes(), run_bar.geometry()
         column = sum(panel.split.sizes())  # the controls' height while the log is hidden
         needed = controls.sizeHint().height() + 2 * scroll.frameWidth()
@@ -212,7 +218,7 @@ def test_show_log_takes_only_the_free_space_and_hide_log_gives_it_back(qapp):
         assert panel.isVisible() and panel.toggle.isChecked() and panel.toggle.text() == "Hide log"
         assert panel.latest.isVisible() and panel._timer.isActive()
         total = column - panel.split.handleWidth()
-        assert panel.split.sizes() == [needed, total - needed]
+        assert panel.split.sizes() == [needed, total - needed] == opened
         assert scroll.verticalScrollBar().maximum() == 0 and _bar_in_view(panel, scroll)
         assert _cards(controls) == cards and shell.splitter.sizes() == sizes and run_bar.geometry() == run_geometry
         assert scroll.horizontalScrollBar().maximum() == 0
@@ -238,12 +244,16 @@ def test_where_the_controls_fill_the_column_the_log_opens_small_and_drags_taller
     shell = _shell(qapp, height=1080)
     try:
         controls, panel, run_bar, scroll = shell.controls, shell.log_panel, shell.run_controls, shell.control_scroll
+        assert panel.isVisible() and panel.toggle.isChecked()  # shown at start
+        opened = panel.split.sizes()
+        panel.toggle.click()
+        _settle(qapp)
         run_geometry, column = run_bar.geometry(), sum(panel.split.sizes())
         assert column < controls.sizeHint().height() + 2 * scroll.frameWidth() + panel.sizeHint().height()
         panel.toggle.click()
         _settle(qapp)
         total, small = column - panel.split.handleWidth(), panel._lines_height(log_panel_module._PANEL_LINES)
-        assert panel.split.sizes() == [total - small, small] and panel.height() == small
+        assert panel.split.sizes() == [total - small, small] == opened and panel.height() == small
         assert _bar_in_view(panel, scroll) and run_bar.geometry() == run_geometry
         _drag(panel.split.handle(1), -120)
         _settle(qapp)

@@ -116,7 +116,7 @@ def _r2(value: float) -> IntegrationResult2D:
     )
 
 
-def _transaction(tmp_path: Path, *, prior: bytes = b"prior"):
+def _transaction(tmp_path: Path, *, prior: bytes = b"prior", durable_fsync: bool = True):
     target = tmp_path / "out.nexus"
     if prior is not None:
         target.write_bytes(prior)
@@ -128,6 +128,7 @@ def _transaction(tmp_path: Path, *, prior: bytes = b"prior"):
         target,
         transaction_owner=transaction_owner,
         target_owner=target_owner,
+        durable_fsync=durable_fsync,
     )
     lease = transaction.acquire_lease(
         admission=transaction.admission,
@@ -152,11 +153,11 @@ def _release(transaction, lease, owners) -> None:
         transaction.release_lease_owner(lease, role, owners[role])
 
 
-def _bound_writer(tmp_path, *, prior=None, complete_record=False, facade_type=_Facade):
+def _bound_writer(tmp_path, *, prior=None, complete_record=False, facade_type=_Facade, durable_fsync=True):
     from xrd_tools.io.record_writer import NexusRecordWriter, WriterTransactionBinding
 
     (_coordinator, transaction, target, transaction_owner, target_owner,
-     owners, lease) = _transaction(tmp_path, prior=prior)
+     owners, lease) = _transaction(tmp_path, prior=prior, durable_fsync=durable_fsync)
     pool = _Pool()
     attempt = transaction.begin_stream(
         admission=transaction.admission, transaction_owner=transaction_owner,
@@ -3508,9 +3509,11 @@ def test_committed_epoch_extension_rollback_restores_epoch_not_original(
         tmp_path, extent=1, labels=(0,), generation=0,
         modes=("1d:default",),
     )
+    # The preserved policy: an ordinary reopen writes in place instead
+    # (test_failed_in_place_epoch_stays_pending_until_replace).
     sink = NexusSink(
         target, overwrite=True, source_base=tmp_path,
-        same_run_intent=first, flush_every=None,
+        same_run_intent=first, flush_every=None, rollback_until_commit=True,
         run_configuration_provenance={
             "output_mode": "Overwrite", "live_mode": True,
         },
@@ -3638,9 +3641,10 @@ def test_sink_epoch_seed_fault_terminalizes_restored_epoch(tmp_path, monkeypatch
         tmp_path, extent=1, labels=(0,), generation=0,
         modes=("1d:default",),
     )
+    # The preserved policy's seed copy (an in-place reopen copies nothing).
     sink = NexusSink(
         target, overwrite=True, source_base=tmp_path,
-        same_run_intent=first, flush_every=None,
+        same_run_intent=first, flush_every=None, rollback_until_commit=True,
     )
     sink.begin(Scan("fault", []), ReductionPlan(integration_2d=None))
     sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(0)))
@@ -4867,3 +4871,426 @@ def test_same_extent_append_refusal_names_what_changed() -> None:
     assert "mtime_ns 1000000000 → 3500000000 (+2.500 s)" in message
     assert "generation" not in message
     _source_extends(prior, {**prior, "generation": 2})  # generation alone is not a change
+
+
+# In-place Append (maintainer, 2026-10-23: "Append in place", then "fold this in now" for Live): a finite Append and
+# every ordinary Live reopen write the existing output itself, with no stage, seed copy or whole-file hash.  A failure
+# after the writer changes the file leaves it pending, refused by the next Append until Replace.
+
+
+class _DeferredFacade(_Facade):
+    """The Live accounting boundary's shape: receipts stay pending until the epoch settles, so no durable floor."""
+
+    defer_epoch_durability = True
+
+
+def _whole_output_costs(monkeypatch) -> dict[str, int]:
+    module = importlib.import_module("xrd_tools.io.output_transaction")
+    costs = {"stage": 0, "copy": 0, "hash": 0}
+    real_stage = module.OutputTransaction._stage_prior
+    real_copy = module.OutputTransaction._copy_stream_seed
+    real_hash = module._sha256_handle
+
+    def counted(name, real):
+        def call(*args, **kwargs):
+            costs[name] += 1
+            return real(*args, **kwargs)
+        return call
+
+    monkeypatch.setattr(module.OutputTransaction, "_stage_prior", counted("stage", real_stage))
+    monkeypatch.setattr(module.OutputTransaction, "_copy_stream_seed", counted("copy", real_copy))
+    monkeypatch.setattr(module, "_sha256_handle", counted("hash", real_hash))
+    return costs
+
+
+def _readback(target: Path):
+    with h5py.File(target, "r") as handle:
+        labels = tuple(int(label) for label in handle["entry/integrated_1d/frame_index"][()])
+        intensity = handle["entry/integrated_1d/intensity"][()]
+        lineage = json.loads(handle["entry/reduction/config/append_lineage"][()].decode())
+    return labels, intensity, lineage
+
+
+def _private_names(directory: Path) -> list[str]:
+    return sorted(path.name for path in directory.iterdir() if path.name.startswith("."))
+
+
+def _live_sink(target: Path, tmp_path: Path, intent, *, facade=None):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    sink = NexusSink(
+        target, overwrite=True, source_base=tmp_path, same_run_intent=intent, flush_every=None,
+        run_configuration_provenance={"output_mode": "Overwrite", "live_mode": True},
+    )
+    if facade is not None:
+        sink.bind_session(facade)
+    sink.begin(Scan("in-place", []), ReductionPlan(integration_2d=None))
+    return sink
+
+
+def _labels_intent(tmp_path: Path, count: int, generation: int = 0):
+    return _intent(
+        tmp_path, extent=count, labels=tuple(range(count)), generation=generation, modes=("1d:default",),
+    )
+
+
+def _replace(target: Path, tmp_path: Path, count: int):
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.reduction import FrameReduction, NexusSink, ReductionPlan, ReductionResult
+    sink = NexusSink(
+        target, overwrite=True, source_base=tmp_path, same_run_intent=_labels_intent(tmp_path, count),
+        flush_every=None,
+    )
+    sink.begin(Scan("replace", []), ReductionPlan(integration_2d=None))
+    for label in range(count):
+        sink.write(ScanFrame(label), FrameReduction(label, result_1d=_r1(label)))
+    return sink.finish(ReductionResult("replace", {}, count))
+
+
+@pytest.mark.parametrize("facade", ("none", "durable", "deferred"))
+def test_in_place_epoch_reopens_add_only_the_suffix_on_the_same_inode(tmp_path, monkeypatch, facade):
+    """Two reopens: the second proves the committed epoch's revision (not a digest) authorizes the next one."""
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import FrameReduction, NexusTerminalDisposition, ReductionResult
+    target = tmp_path / "in-place-epochs.nexus"
+    bound = {"none": None, "durable": _Facade(target), "deferred": _DeferredFacade(target)}[facade]
+    sink = _live_sink(target, tmp_path, _labels_intent(tmp_path, 1), facade=bound)
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(0)))
+    sink.commit_epoch(ReductionResult("in-place", {}, 1))
+    inode = os.stat(target).st_ino
+    costs = _whole_output_costs(monkeypatch)
+    for label in (1, 2):
+        sink.extend_live(sink.extension_owner, _labels_intent(tmp_path, label + 1, generation=label))
+        sink.write(ScanFrame(label), FrameReduction(label, result_1d=_r1(label)))
+        sink.commit_epoch(ReductionResult("in-place", {}, label + 1))
+        assert os.stat(target).st_ino == inode
+    terminal = sink.finish(ReductionResult("in-place", {}, 3))
+    assert terminal.disposition is NexusTerminalDisposition.COMMITTED
+    assert costs == {"stage": 0, "copy": 0, "hash": 0}
+    assert os.stat(target).st_ino == inode and _private_names(tmp_path) == []
+    labels, intensity, lineage = _readback(target)
+    assert labels == (0, 1, 2)
+    np.testing.assert_array_equal(intensity, [_r1(label).intensity for label in range(3)])
+    assert lineage["state"] == "committed"
+    assert [epoch["labels"] for epoch in lineage["epochs"]] == [[0], [1], [2]]
+    _assert_lease_available(target)
+
+
+def _finite_seed(target: Path, tmp_path: Path, count: int) -> None:
+    from xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.reduction import FrameReduction, NexusSink, ReductionPlan, ReductionResult
+    sink = NexusSink(
+        target, overwrite=True, source_base=tmp_path, same_run_intent=_labels_intent(tmp_path, count),
+        flush_every=None,
+    )
+    sink.begin(Scan("in-place", []), ReductionPlan(integration_2d=None))
+    for label in range(count):
+        sink.write(ScanFrame(label), FrameReduction(label, result_1d=_r1(label)))
+    sink.finish(ReductionResult("in-place", {}, count))
+
+
+def _finite_in_place_sink(target: Path, tmp_path: Path, count: int, generation: int = 1):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.io import prepare_append_preflight
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    preflight = prepare_append_preflight(
+        target, _labels_intent(tmp_path, count, generation=generation), in_place=True,
+    )
+    assert preflight._transaction.in_place
+    sink = NexusSink(target, source_base=tmp_path, append_preflight=preflight, flush_every=None)
+    sink.begin(Scan("in-place", []), ReductionPlan(integration_2d=None))
+    return sink
+
+
+def test_in_place_finite_append_grows_the_same_inode_without_copy_or_hash(tmp_path, monkeypatch):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import FrameReduction, NexusTerminalDisposition, ReductionResult
+    target = tmp_path / "in-place-finite.nexus"
+    _finite_seed(target, tmp_path, 2)
+    inode = os.stat(target).st_ino
+    costs = _whole_output_costs(monkeypatch)
+    sink = _finite_in_place_sink(target, tmp_path, 4)
+    for label in (2, 3):
+        sink.write(ScanFrame(label), FrameReduction(label, result_1d=_r1(label)))
+    terminal = sink.finish(ReductionResult("in-place", {}, 4))
+    assert terminal.disposition is NexusTerminalDisposition.COMMITTED
+    assert costs == {"stage": 0, "copy": 0, "hash": 0}
+    assert os.stat(target).st_ino == inode and _private_names(tmp_path) == []
+    labels, intensity, lineage = _readback(target)
+    assert labels == (0, 1, 2, 3)
+    np.testing.assert_array_equal(intensity, [_r1(label).intensity for label in range(4)])
+    assert lineage["state"] == "committed"
+    assert [epoch["labels"] for epoch in lineage["epochs"]] == [[0, 1], [2, 3]]
+    _assert_lease_available(target)
+
+
+@pytest.mark.parametrize("route", ("live-reopen", "finite"))
+def test_failed_in_place_epoch_stays_pending_until_replace(tmp_path, monkeypatch, route):
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io import AppendDisposition, qualify_append
+    from xrd_tools.reduction import FrameReduction, NexusTerminalDisposition, ReductionResult
+    target = tmp_path / "in-place-failed.nexus"
+    if route == "live-reopen":
+        sink = _live_sink(target, tmp_path, _labels_intent(tmp_path, 1))
+        sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(0)))
+        sink.commit_epoch(ReductionResult("in-place", {}, 1))
+        inode = os.stat(target).st_ino
+        costs = _whole_output_costs(monkeypatch)
+        sink.extend_live(sink.extension_owner, _labels_intent(tmp_path, 2, generation=1))
+    else:
+        _finite_seed(target, tmp_path, 1)
+        inode = os.stat(target).st_ino
+        costs = _whole_output_costs(monkeypatch)
+        sink = _finite_in_place_sink(target, tmp_path, 2)
+    sink.write(ScanFrame(1), FrameReduction(1, result_1d=_r1(1)))
+    sink.flush(force=True)
+    terminal = sink.abort(ReductionResult("in-place", {}, 2, failed=True))
+    assert terminal.disposition is NexusTerminalDisposition.ABORTED
+    assert terminal.transaction.partial_path == str(target)
+    assert costs == {"stage": 0, "copy": 0, "hash": 0}
+    assert os.stat(target).st_ino == inode and _private_names(tmp_path) == []
+    assert _readback(target)[2]["state"] == "pending"
+    _assert_lease_available(target)
+    refused = qualify_append(target, _labels_intent(tmp_path, 3, generation=2))
+    assert refused.disposition is AppendDisposition.REFUSE
+    assert refused.reason.startswith("an earlier Append of this output did not finish; use Replace to rebuild it (")
+    assert _replace(target, tmp_path, 3).disposition is NexusTerminalDisposition.COMMITTED
+    labels, intensity, lineage = _readback(target)
+    assert labels == (0, 1, 2) and lineage["state"] == "committed"
+    np.testing.assert_array_equal(intensity, [_r1(label).intensity for label in range(3)])
+
+
+def test_in_place_epoch_adopt_fault_terminalizes_the_committed_epoch(tmp_path, monkeypatch):
+    """A reopen that fails before any write leaves the committed (in-place) epoch exactly as it was, unresealed."""
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import FrameReduction, ReductionResult
+    target = tmp_path / "in-place-adopt-fault.nexus"
+    sink = _live_sink(target, tmp_path, _labels_intent(tmp_path, 1))
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(0)))
+    sink.commit_epoch(ReductionResult("in-place", {}, 1))
+    sink.extend_live(sink.extension_owner, _labels_intent(tmp_path, 2, generation=1))
+    sink.write(ScanFrame(1), FrameReduction(1, result_1d=_r1(1)))
+    sink.commit_epoch(ReductionResult("in-place", {}, 2))
+    epoch_b = target.read_bytes()
+    sink.extend_live(sink.extension_owner, _labels_intent(tmp_path, 3, generation=2))
+    real_adopt = sink._transaction._adopt_in_place_target
+
+    def fail_after_adopt(*args):
+        real_adopt(*args)
+        raise OSError("epoch adopt fault")
+
+    costs = _whole_output_costs(monkeypatch)
+    monkeypatch.setattr(sink._transaction, "_adopt_in_place_target", fail_after_adopt)
+    with pytest.raises(OSError, match="epoch adopt fault"):
+        sink.write(ScanFrame(2), FrameReduction(2, result_1d=_r1(2)))
+    assert target.read_bytes() == epoch_b and costs == {"stage": 0, "copy": 0, "hash": 0}
+    assert sink._transaction.snapshot().phase is TransactionPhase.COMMITTED
+    assert sink._transaction_owners is None
+    _assert_lease_available(target)
+
+
+def test_headless_existing_append_binds_in_place_for_a_finite_run_only(tmp_path):
+    from xrd_tools.core.scan import Scan
+    from xrd_tools.io import prepare_append_preflight
+    from xrd_tools.reduction import NexusSink, ReductionPlan
+    target = tmp_path / "in-place-headless.nexus"
+    _finite_seed(target, tmp_path, 1)
+    policies = {}
+    for name, values in {
+        "finite": {"run_configuration_provenance": {"live_mode": False}},
+        "live": {"run_configuration_provenance": {"live_mode": True}},
+        "full-rollback": {"run_configuration_provenance": {"live_mode": False}, "rollback_until_commit": True},
+    }.items():
+        sink = NexusSink.for_existing_append(
+            target, _labels_intent(tmp_path, 2, generation=1), source_base=tmp_path, flush_every=None, **values,
+        )
+        sink.begin(Scan("headless", []), ReductionPlan(integration_2d=None))
+        policies[name] = sink._transaction.in_place
+        sink.abort(None)
+    assert policies == {"finite": True, "live": False, "full-rollback": False}
+    preflight = prepare_append_preflight(target, _labels_intent(tmp_path, 2, generation=1), in_place=True)
+    with pytest.raises(ValueError, match="full-rollback"):
+        NexusSink(target, source_base=tmp_path, append_preflight=preflight, rollback_until_commit=True)
+    preflight.abort()
+    _assert_lease_available(target)
+
+
+def test_stop_before_a_queued_in_place_epoch_opens_keeps_the_committed_output(tmp_path, monkeypatch):
+    """The queued epoch is never opened, so the committed output stays byte-identical and is committed as it is."""
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io import AppendDisposition, qualify_append
+    from xrd_tools.reduction import FrameReduction, NexusTerminalDisposition, ReductionResult
+    target = tmp_path / "in-place-stop.nexus"
+    sink = _live_sink(target, tmp_path, _labels_intent(tmp_path, 1))
+    sink.write(ScanFrame(0), FrameReduction(0, result_1d=_r1(0)))
+    sink.commit_epoch(ReductionResult("in-place", {}, 1))
+    epoch_a = target.read_bytes()
+    sink.extend_live(sink.extension_owner, _labels_intent(tmp_path, 2, generation=1))
+    opened = []
+    monkeypatch.setattr(type(sink), "_open_owned_epoch", lambda _sink, decision: opened.append(decision))
+    terminal = sink.finish(ReductionResult("in-place", {}, 1, cancelled=True))
+    assert opened == [] and terminal.disposition is NexusTerminalDisposition.COMMITTED
+    assert target.read_bytes() == epoch_a and _readback(target)[2]["state"] == "committed"
+    assert qualify_append(target, _labels_intent(tmp_path, 2, generation=1)).disposition is AppendDisposition.WRITE
+    _assert_lease_available(target)
+
+
+_CRASH_CHILD = """
+import os, sys
+from pathlib import Path
+from tests.core.test_h23_c3_composition_append import _finite_in_place_sink, _r1
+from xrd_tools.core.scan import ScanFrame
+from xrd_tools.reduction import FrameReduction
+target, base = Path(sys.argv[1]), Path(sys.argv[2])
+sink = _finite_in_place_sink(target, base, 3)
+sink.write(ScanFrame(1), FrameReduction(1, result_1d=_r1(1)))
+sink.flush(force=True)
+os._exit(17)
+"""
+
+
+def test_in_place_append_interrupted_in_a_fresh_process_is_refused_until_replace(tmp_path):
+    import subprocess
+    import sys
+    from xrd_tools.io import AppendDisposition, qualify_append
+    from xrd_tools.reduction import NexusTerminalDisposition
+    target = tmp_path / "in-place-crash.nexus"
+    _finite_seed(target, tmp_path, 1)
+    inode = os.stat(target).st_ino
+    child = subprocess.run(
+        [sys.executable, "-c", _CRASH_CHILD, str(target), str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=120,
+    )
+    assert child.returncode == 17, child.stderr
+    assert os.stat(target).st_ino == inode and _private_names(tmp_path) == []
+    refused = qualify_append(target, _labels_intent(tmp_path, 3, generation=2))
+    assert refused.disposition is AppendDisposition.REFUSE and "use Replace to rebuild it" in refused.reason
+    assert _replace(target, tmp_path, 3).disposition is NexusTerminalDisposition.COMMITTED
+    labels, _intensity, lineage = _readback(target)
+    assert labels == (0, 1, 2) and lineage["state"] == "committed"
+
+
+def test_an_unreadable_output_is_refused_with_its_remedy(tmp_path):
+    """Replace's raw-target gate refuses a file it cannot recognize, so the remedy is to move or delete it."""
+    from xrd_tools.io import AppendDisposition, qualify_append
+    from xrd_tools.reduction import NexusTerminalDisposition
+    target = tmp_path / "in-place-torn.nexus"
+    _finite_seed(target, tmp_path, 1)
+    target.write_bytes(target.read_bytes()[: target.stat().st_size // 2])
+    refused = qualify_append(target, _labels_intent(tmp_path, 2, generation=1))
+    assert refused.disposition is AppendDisposition.REFUSE
+    assert refused.reason.startswith(
+        "the output is not a readable HDF5 file, possibly left by an interrupted Append; move or delete it, then run "
+        "again (")
+    with pytest.raises(ValueError, match="refusing to replace"):
+        _replace(target, tmp_path, 2)
+    target.unlink()
+    assert _replace(target, tmp_path, 2).disposition is NexusTerminalDisposition.COMMITTED
+    assert _readback(target)[0] == (0, 1)
+
+
+@pytest.mark.parametrize("ending", ("stop", "failure"))
+def test_in_place_append_ended_before_its_first_new_frame_keeps_the_output_valid(tmp_path, monkeypatch, ending):
+    """The pending marker waits for the first write, so an early Stop or failure needs no Replace."""
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.io import AppendDisposition, qualify_append
+    from xrd_tools.reduction import FrameReduction, NexusTerminalDisposition, ReductionResult
+    target = tmp_path / "in-place-early-end.nexus"
+    _finite_seed(target, tmp_path, 2)
+    inode = os.stat(target).st_ino
+    costs = _whole_output_costs(monkeypatch)
+    sink = _finite_in_place_sink(target, tmp_path, 3)
+    if ending == "stop":
+        terminal = sink.finish(ReductionResult("in-place", {}, 2, cancelled=True))
+    else:
+        terminal = sink.abort(ReductionResult("in-place", {}, 2, failed=True))
+    assert terminal.disposition is NexusTerminalDisposition.ABORTED
+    assert costs == {"stage": 0, "copy": 0, "hash": 0}
+    assert os.stat(target).st_ino == inode and _private_names(tmp_path) == []
+    labels, intensity, lineage = _readback(target)
+    assert labels == (0, 1) and lineage["state"] == "committed"
+    np.testing.assert_array_equal(intensity, [_r1(label).intensity for label in range(2)])
+    _assert_lease_available(target)
+    resumed = _finite_in_place_sink(target, tmp_path, 3)
+    resumed.write(ScanFrame(2), FrameReduction(2, result_1d=_r1(2)))
+    assert resumed.finish(ReductionResult("in-place", {}, 3)).disposition is NexusTerminalDisposition.COMMITTED
+    assert _readback(target)[0] == (0, 1, 2)
+    assert qualify_append(target, _labels_intent(tmp_path, 3, generation=2)).disposition is AppendDisposition.SKIP
+
+
+def test_in_place_pending_lineage_stays_deferred_until_it_is_staged(tmp_path, monkeypatch):
+    """A failed staging keeps the marker deferred, so a retried write stages it before any row."""
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.reduction import FrameReduction
+    writer_module = importlib.import_module("xrd_tools.io.record_writer")
+    target = tmp_path / "in-place-staging-fault.nexus"
+    _finite_seed(target, tmp_path, 1)
+    sink = _finite_in_place_sink(target, tmp_path, 2)
+    writer = sink._writer
+    assert writer._deferred_lineage is not None and _readback(target)[2]["state"] == "committed"
+    real_stage = writer_module.stage_append_lineage
+
+    def fail_once(entry, decision):
+        monkeypatch.setattr(writer_module, "stage_append_lineage", real_stage)
+        raise OSError("lineage staging fault")
+
+    monkeypatch.setattr(writer_module, "stage_append_lineage", fail_once)
+    with pytest.raises(Exception, match="lineage staging fault"):
+        sink.write(ScanFrame(1), FrameReduction(1, result_1d=_r1(1)))
+    assert writer._deferred_lineage is not None
+    writer._authorize_transaction_mutation()
+    assert writer._deferred_lineage is None and writer._lineage_dirty
+
+
+def test_an_output_another_program_holds_is_refused_naming_that_program(tmp_path):
+    """HDF5 locks a file another process writes; that refusal must not advise deleting it."""
+    import subprocess
+    import sys
+    from xrd_tools.io import AppendDisposition, qualify_append
+    target = tmp_path / "in-place-held.nexus"
+    _finite_seed(target, tmp_path, 1)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "import h5py, sys; f = h5py.File(sys.argv[1], 'a'); print('held', flush=True); "
+         "sys.stdin.readline(); f.close()", str(target)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        refused = qualify_append(target, _labels_intent(tmp_path, 2, generation=1))
+    finally:
+        holder.communicate("\n", timeout=60)
+    assert refused.disposition is AppendDisposition.REFUSE
+    assert refused.reason.startswith("another program has the output open; close it, then run again (")
+    assert "delete" not in refused.reason
+
+
+@pytest.mark.parametrize("durable", (True, False), ids=("fsync", "no-fsync"))
+def test_bound_close_flushes_its_last_writing_handle_only_as_the_transaction_says(tmp_path, monkeypatch, durable):
+    """Codex N-0243a1bb F6: the controlled close (de7447bb) flushed the file's last writing handle unconditionally,
+    so a transaction admitted with durable_fsync=False still fsynced at close."""
+    from xrd_tools.io.record_writer import RecordWrite
+
+    (writer, transaction, attempt, lease, owners, _pool, _facade, _target) = (
+        _bound_writer(tmp_path, complete_record=True, durable_fsync=durable)
+    )
+    # Frame records give the close its frame proofs, so it keeps and seals through the last writing handle.
+    writer.write_batch(RecordWrite(label=label, result_1d=_r1(label + 1), result_2d=_r2(label + 1))
+                       for label in (0, 1, 2))
+    writer.flush(force=True)
+    duplicated, flushed, real_dup, real_fsync = [], [], os.dup, os.fsync
+
+    def dup(descriptor):
+        duplicated.append(descriptor)
+        return real_dup(descriptor)
+
+    def fsync(descriptor):
+        flushed.append(descriptor)
+        return real_fsync(descriptor)
+    with monkeypatch.context() as closing:
+        closing.setattr(os, "dup", dup)
+        closing.setattr(os, "fsync", fsync)
+        writer.finish()
+    assert duplicated, "the close kept no last writing handle"
+    assert bool(flushed) is durable, flushed
+    assert transaction.commit_stream(attempt, lease=lease).phase is TransactionPhase.COMMITTED
+    _release(transaction, lease, owners)

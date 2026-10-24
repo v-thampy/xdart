@@ -1,7 +1,9 @@
 """Metadata parsing: read_txt_metadata, read_pdi_metadata, read_image_metadata."""
 from __future__ import annotations
 
+import calendar
 import configparser
+import functools
 import hashlib
 import logging
 import os
@@ -10,7 +12,7 @@ import stat
 import tempfile
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -917,7 +919,10 @@ def read_txt_metadata(
     The file contains two single-line sections introduced by ``# Counters``
     and ``# Motors``, each with comma-or-equals-separated ``key = value``
     pairs.  An ``epoch`` timestamp is extracted from the ``time: <datetime>``
-    field.
+    field, in this host's time zone, and ``epoch_local`` is that same clock time
+    with no time zone applied (seconds as if it were UTC), so a host in another
+    zone reads the same value from the same line; it is given only when that clock
+    time names one instant in every zone (see ``_unambiguous_clock``).
 
     Parameters
     ----------
@@ -927,8 +932,8 @@ def read_txt_metadata(
     Returns
     -------
     dict[str, float]
-        Flat mapping of counter/motor names and ``epoch`` to float values.
-        Returns ``{}`` on any parse failure.
+        Flat mapping of counter/motor names, ``epoch`` and ``epoch_local`` to
+        float values.  Returns ``{}`` on any parse failure.
     """
     path = Path(path)
     try:
@@ -946,13 +951,46 @@ def read_txt_metadata(
 
         time_str = data[data.index("time: ") + 5 : data.index("# Temp") - 2].strip()
         d = datetime.strptime(time_str, "%a %b %d %H:%M:%S %Y")
+        # epoch_local: what an Append compares to tell a re-copied image from a new one (maintainer, 2026-10-23),
+        # the same on every host, where the zone-dependent epoch is not (Codex N-0243a1bb).
         extras: dict[str, float] = {"epoch": time.mktime(d.timetuple())}
+        if _unambiguous_clock(d):
+            extras["epoch_local"] = float(calendar.timegm(d.timetuple()))
 
         return {**counters, **motors, **extras}
 
     except Exception:
         logger.warning("read_txt_metadata: failed to parse %s", path, exc_info=True)
         return {}
+
+
+def _unambiguous_clock(clock: datetime) -> bool:
+    """Whether a zone-less clock time names one instant in every time zone: no daylight-saving change anywhere repeats
+    or skips it. The .txt "time:" carries no zone, so only such a time proves an acquisition by its clock (Codex
+    N-d3ec12d9 R2: a fall-back hour's repeated time is no proof). Without a time-zone database, no proof."""
+    if not _time_zones():
+        return False
+    day = clock.replace(hour=0, minute=0, second=0, microsecond=0)
+    return not any(clock.replace(tzinfo=zone, fold=0).utcoffset() != clock.replace(tzinfo=zone, fold=1).utcoffset()
+                   for zone in _zones_changing_on(day))
+
+
+@functools.lru_cache(maxsize=1)
+def _time_zones() -> tuple:
+    """Every zone of the time-zone database (loaded once, ~0.1 s), or () without one."""
+    try:
+        import zoneinfo
+        return tuple(zoneinfo.ZoneInfo(name) for name in sorted(zoneinfo.available_timezones()))
+    except Exception:  # no database, or one this host cannot read
+        return ()
+
+
+@functools.lru_cache(maxsize=1024)
+def _zones_changing_on(day: datetime) -> tuple:
+    """The zones whose UTC offset changes between ``day``'s local midnight and the next."""
+    end = day + timedelta(days=1)
+    return tuple(zone for zone in _time_zones()
+                 if day.replace(tzinfo=zone).utcoffset() != end.replace(tzinfo=zone).utcoffset())
 
 
 def read_pdi_metadata(

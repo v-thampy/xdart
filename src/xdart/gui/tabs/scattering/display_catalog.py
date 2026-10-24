@@ -34,6 +34,8 @@ class DisplayCatalogIndex:
         self._exact: dict[int, DisplayFrameKey] = {}
         self._by_value: dict[tuple[str, int], DisplayFrameKey] = {}
         self._work_ordinal = 0
+        # Keys taken out by retire_artifact, published as retired by the next append.
+        self._pending_retired: list[DisplayFrameKey] = []
 
     @property
     def entries(self) -> tuple[DisplayFrameKey, ...]:
@@ -75,7 +77,23 @@ class DisplayCatalogIndex:
             if len(self._entries) > self.max_items
             else ()
         )
+        if self._pending_retired:
+            retired, self._pending_retired = (*self._pending_retired, *retired), []
         return DisplayNavigationDelta(key, retired)
+
+    def retire_artifact(self, artifact: str) -> int:
+        """Take every key of ``artifact`` out of the catalog (its output is replaced whole: Codex N-a8a6c887 stage 3),
+        so none resolves; the next append carries them as retired, so each reader drops them then. The work
+        high-water never lowers. Returns how many."""
+        keys = [key for key in self._entries if key.artifact == artifact]
+        if keys:
+            self._entries = deque(key for key in self._entries if key.artifact != artifact)
+            for key in keys:
+                self._exact.pop(id(key), None)
+                if self._by_value.get((key.artifact, key.local_frame_label)) is key:
+                    self._by_value.pop((key.artifact, key.local_frame_label), None)
+            self._pending_retired.extend(keys)
+        return len(keys)
 
     def seed_at_work_ordinal(
         self,

@@ -151,7 +151,7 @@ def test_stitch_overlay_selection_stepping_and_read_back_live_in_ints_browser(qa
         assert page.browser.listed_results() == (paths[1],)
         assert page.browser.current_result() == paths[1] and page.browser.selected_results() == (paths[1],)
         assert len(page.curve.listDataItems()) == 1 and set(page._listed) == set(paths)
-        page.browser.filename_filter.clear()
+        page.browser.filename_filter.setText("*")
         assert set(page.browser.listed_results()) == set(paths)
         assert page.browser.current_result() == paths[1] and page.browser.selected_results() == (paths[1],)
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Single"))
@@ -176,7 +176,7 @@ def test_a_catalog_result_opens_through_the_native_stitch_reader(qapp, tmp_path)
             qapp.processEvents()
             time.sleep(.005)
         assert str(path) not in page.browser.listed_results()  # the fixture has a custom filename
-        page.browser.filename_filter.clear()  # All results retains explicit catalog loading
+        page.browser.filename_filter.setText("*")  # every result retains explicit catalog loading
         assert str(path) in page.browser.listed_results()
         assert page.browser.current_result() is None and not page._payloads
         page.browser.set_current_result(str(path), keep_selection=False)
@@ -288,8 +288,9 @@ def test_native_browser_filename_filter_refresh_navigation_and_time(qapp, tmp_pa
         os.utime(target, ns=(index * 1_000_000_000, index * 1_000_000_000))
     (tmp_path / "folder").mkdir()
     try:
-        assert not page.browser.date_sort.isHidden()
-        assert page.browser.filename_filter.text() == expected
+        assert not page.browser.date_sort.isHidden() and not page.browser.show_dirs.isHidden()
+        assert page.browser.filename_filter.text() == ""  # Auto, shown faded
+        assert page.browser.filename_filter.placeholderText() == f"Auto: {expected}"
         page._result_browser.set_directory(str(tmp_path))
         deadline = time.monotonic() + 5
         while page._result_browser.busy and time.monotonic() < deadline:
@@ -298,7 +299,7 @@ def test_native_browser_filename_filter_refresh_navigation_and_time(qapp, tmp_pa
         assert [Path(path).name for path in page.browser.listed_results()] == [
             "a_stitch1d.nexus" if kind == "stitch" else "b_rsm.nexus"]
         catalog = page._result_browser._owner.catalog
-        page.browser.filename_filter.clear()
+        page.browser.filename_filter.setText("*")
         assert [Path(path).name for path in page.browser.listed_results()] == [
             "a_stitch1d.nexus", "b_rsm.nexus", "c_int1d.nexus"]
         page.browser.date_sort.click()
@@ -314,7 +315,7 @@ def test_native_browser_filename_filter_refresh_navigation_and_time(qapp, tmp_pa
         while page._result_browser.busy and time.monotonic() < deadline:
             qapp.processEvents()
             time.sleep(.005)
-        assert page.browser.filename_filter.text() == ""
+        assert page.browser.filename_filter.text() == "*"
         assert {entry.artifact for entry in catalog} == {
             entry.artifact for entry in page._result_browser._owner.catalog}
         page.browser.filename_filter.setText("INT1D")

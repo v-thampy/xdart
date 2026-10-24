@@ -251,11 +251,14 @@ class HydrationTransport:
 
     __slots__ = ("_viewer_1d_claim", "__dict__")
 
-    def __init__(self, commit, derive, *, completion_sink=None) -> None:
+    def __init__(self, commit, derive, *, completion_sink=None, current=None) -> None:
         # commit/derive are owner-bound at construction, never queue-carried.
         self._commit = commit
         self._derive = derive
         self._completion_sink = completion_sink
+        # current(request): whether a read still hydrates its artifact's current
+        # stores; one for a replaced generation never starts reading the file.
+        self._current = current
         self._lock = RLock()
         self._viewer_1d_claim = object()
         self._active: _TransportEntry | None = None
@@ -496,6 +499,25 @@ class HydrationTransport:
                 for entry in (self._active, self._queued)
             )
 
+    def cancel_stores_detached(self, stores):
+        """Drop the queued read of exactly *stores*, whose artifact replaced them; an active read finishes."""
+        with self._lock:
+            if any(entry is not None and entry.state is _EntryState.DELIVERY_PENDING
+                   for entry in (self._active, self._queued)):
+                return DetachedHydrationMutation()
+            queued = self._queued
+            if queued is not None and _reads_stores(queued.request, stores):
+                return DetachedHydrationMutation(deliveries=(self._capture_locked(
+                    queued, queued.token, HydrationOutcome.CANCELLED,
+                    queued.ticket, clear=True),))
+            return DetachedHydrationMutation()
+
+    def reads_stores(self, stores) -> bool:
+        """Whether an admitted request still reads into exactly *stores*."""
+        with self._lock:
+            return any(entry is not None and _reads_stores(entry.request, stores)
+                       for entry in (self._active, self._queued))
+
     def retire(self, *, join_timeout: float) -> bool:
         """Cancel the queued reference and join or report the exact worker."""
         with self._lock:
@@ -673,6 +695,8 @@ class HydrationTransport:
         with self._lock:
             entry.committed_token = None
             entry.committed_ticket = None
+        if self._current is not None and not self._current(entry.request):
+            return HydrationOutcome.OWNER_MISMATCH, None
         try:
             preview = read_frame_preview(
                 entry.request.read_key,
@@ -1052,6 +1076,12 @@ class HydrationTransport:
 
 def _diagnostic(error: BaseException) -> str:
     return str(error) or type(error).__name__
+
+
+def _reads_stores(request, stores) -> bool:
+    carried = getattr(request, "stores", None) if type(request) is HydrationRequest else None
+    return (carried is not None and len(carried) == len(stores)
+            and all(held is store for held, store in zip(carried, stores)))
 
 
 def _viewer_1d_diagnostic(error: BaseException) -> str:

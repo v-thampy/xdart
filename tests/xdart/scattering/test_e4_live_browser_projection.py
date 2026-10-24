@@ -537,7 +537,7 @@ def test_auto_fact_survives_post_allocation_failure_and_reaches_terminal(
     def fail_bind(allocation):
         bound.append(allocation)
         raise RuntimeError("injected post-allocation failure")
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)  # the resource lines: DEBUG while performance monitoring is off
     adapter = dynamic_output.DynamicOutputAdapter(configuration)
     preparation = adapter.prepare_admission(
         scan,
@@ -1447,7 +1447,7 @@ def test_open_folder_and_refresh_publish_processed_catalog(
     )
     shell = page.findChild(ScatteringWorkspaceShell)
     assert shell is not None
-    shell.browser.set_filename_filter("")  # arbitrary fixture names: All results (the mode defaults are tested in test_browser_results_profile)
+    shell.browser.set_filename_filter("*")  # arbitrary fixture names: every result (the mode defaults are tested in test_browser_results_profile)
 
     def wait_for(predicate) -> None:
         deadline = time.monotonic() + 5.0
@@ -1680,7 +1680,7 @@ def test_published_artifact_auto_follows_until_user_opens_folder(
     )
     shell = page.findChild(ScatteringWorkspaceShell)
     assert shell is not None
-    shell.browser.set_filename_filter("")  # arbitrary fixture names: All results (the mode defaults are tested in test_browser_results_profile)
+    shell.browser.set_filename_filter("*")  # arbitrary fixture names: every result (the mode defaults are tested in test_browser_results_profile)
 
     def wait_for(predicate) -> None:
         deadline = time.monotonic() + 5.0

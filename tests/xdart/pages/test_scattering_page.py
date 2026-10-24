@@ -544,7 +544,7 @@ def test_mode_switch_keeps_current_browser_folder(qapp, isolated_settings, tmp_p
     try:
         integration = window.main_widget
         # the folder, not the mode's results, carries across pages: each page lists All results
-        integration._shell.browser.set_filename_filter("")
+        integration._shell.browser.set_filename_filter("*")
         integration._shell.run_controls.modeCombo.setCurrentText("Int 2D")
         integration._set_browser_directory(str(selected), explicit=True)
         wait_for(lambda: str(selected / "scan.nexus") in paths(integration._shell.browser))
@@ -552,7 +552,7 @@ def test_mode_switch_keeps_current_browser_folder(qapp, isolated_settings, tmp_p
         prior_intent = integration._intents.snapshot()
         integration._shell.run_controls.modeCombo.setCurrentText("Stitch 2D")
         stitch = window.main_widget
-        stitch.browser.set_filename_filter("")
+        stitch.browser.set_filename_filter("*")
         wait_for(lambda: stitch.browser.directory_label._path == str(selected)
                  and paths(stitch.browser) == expected)
         assert not stitch.browser.directory_label.isHidden()
@@ -568,7 +568,7 @@ def test_mode_switch_keeps_current_browser_folder(qapp, isolated_settings, tmp_p
         expected_nested = paths(stitch.browser)
         stitch.run_bar.modeCombo.setCurrentText("RSM")
         rsm = window.main_widget
-        rsm.browser.set_filename_filter("")
+        rsm.browser.set_filename_filter("*")
         wait_for(lambda: rsm.browser.directory_label._path == str(nested)
                  and paths(rsm.browser) == expected_nested)
         assert not rsm.browser.directory_label.isHidden()

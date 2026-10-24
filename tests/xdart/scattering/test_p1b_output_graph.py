@@ -987,8 +987,10 @@ def test_live_restart_appends_two_saved_outputs_and_preserves_their_prefixes(tmp
             np.testing.assert_array_equal(frame.intensity_2d, profiles[target][1])
 
 
-def test_directory_append_skips_a_changed_scan_and_runs_the_next_with_a_summary(tmp_path):
-    """Real Run click, strict refusal, later output and actual nonblocking summary."""
+def test_directory_append_reprocesses_a_changed_scan_and_runs_the_next_with_a_summary(tmp_path):
+    """Real Run click, a changed processed image, later output and actual nonblocking summary. Policy change
+    (maintainer 2026-10-23, Codex N-a8a6c887): the scan whose image changed on disk is reduced again whole into its
+    output instead of being skipped (no sidecar records an acquisition time, so nothing proves it the same image)."""
     from pyqtgraph.Qt import QtWidgets
     from tests.xdart.scattering.test_browse_reference_rings_run import _page, _pump, _run
     from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
@@ -1021,13 +1023,14 @@ def test_directory_append_skips_a_changed_scan_and_runs_the_next_with_a_summary(
         assert _pump(qapp, controls.startButton.isEnabled), page._notice_text
         terminal = _run(qapp, page, observed)
         assert (terminal.files_processed, terminal.files_skipped,
-                terminal.files_discovered, terminal.files_pending) == (1, 1, 2, 0)
+                terminal.files_discovered, terminal.files_pending) == (2, 0, 2, 0)
         assert terminal.cleanup_status is CleanupStatus.CLEANED
-        assert len(terminal.warnings) == 1
-        assert targets[0].name in terminal.warnings[0]
-        assert "source does not extend exact image-member history" in terminal.warnings[0]
-        assert {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
-                for path in protected} == before
+        assert terminal.warnings == () and len(terminal.rebuilt) == 1
+        assert terminal.rebuilt[0].startswith(f"Append reprocessed {targets[0].name} whole: ")
+        assert "source does not extend exact image-member history" in terminal.rebuilt[0]
+        after = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in protected}
+        assert all(after[path][0] != before[path][0] for path in protected)  # replaced, side output too
+        assert _nexus_rows(targets[0]) == (1,)
         second = next(path for path in output.glob("*.nexus") if path != targets[0])
         assert _nexus_rows(second) == (1,)
         assert _pump(qapp, lambda: bool(page.findChildren(QtWidgets.QMessageBox)))
@@ -1035,9 +1038,9 @@ def test_directory_append_skips_a_changed_scan_and_runs_the_next_with_a_summary(
         assert len(dialogs) == 1
         dialog = dialogs[0]
         try:
-            assert dialog.text() == "Scans skipped"
-            assert terminal.warnings[0] in dialog.informativeText()
-            assert "existing results were left unchanged" in dialog.informativeText()
+            assert dialog.text() == "Scans reprocessed"
+            assert terminal.rebuilt[0] in dialog.informativeText()
+            assert "reduced again whole and its output replaced" in dialog.informativeText()
             qapp.processEvents()
             assert len(page.findChildren(QtWidgets.QMessageBox)) == 1
         finally:
@@ -1154,8 +1157,8 @@ def test_p1b_b03_native_cross_run_append_missing_only(
     real_output_adapter = run_executor_module.DynamicOutputAdapter
     real_output_init = real_output_adapter.__init__
 
-    def observed_output_init(owner, configuration):
-        real_output_init(owner, configuration)
+    def observed_output_init(owner, configuration, *args, **kwargs):
+        real_output_init(owner, configuration, *args, **kwargs)
         output_adapters.append(owner)
 
     monkeypatch.setattr(
@@ -1802,6 +1805,17 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
         custody_written.stat().st_mtime_ns,
     )
 
+    def committed(path: Path):
+        """The committed result: its file object, rows and lineage."""
+        with h5py.File(path, "r") as handle:
+            return (
+                path.stat().st_dev, path.stat().st_ino,
+                tuple(int(label) for label in handle["entry/integrated_1d/frame_index"][()]),
+                json.loads(handle["entry/reduction/config/append_lineage"][()].decode()),
+            )
+
+    custody_committed = committed(custody_written)
+
     def assert_custody_target_reacquirable(label: str) -> None:
         transaction_authority = OwnerToken(f"{label}-transaction")
         target_authority = OwnerToken(f"{label}-target")
@@ -1940,12 +1954,11 @@ def test_p1b_b17_collision_custody_and_xye_append_refuse_typed(
         begin_identity
     ).cleanup_status is CleanupStatus.CLEANED
     assert begin_owners[0].snapshot.state is AppendPreflightState.ABORTED
-    assert (
-        custody_written.read_bytes(),
-        custody_written.stat().st_dev,
-        custody_written.stat().st_ino,
-        custody_written.stat().st_mtime_ns,
-    ) == custody_before
+    # Append writes in place (maintainer, 2026-10-23): Nexus had begun, so its
+    # open refreshed the output's metadata, but no frame was written and the
+    # same file still holds the committed result.
+    assert committed(custody_written) == custody_committed
+    assert custody_committed[3]["state"] == "committed"
     assert_custody_target_reacquirable("p1b-later-begin-reacquire")
 
     # Durable display projection is acknowledged independently per graph and
@@ -2538,7 +2551,8 @@ def test_post_g2_pipeline_option_and_absent_defaults_plumb_exact_owned_values(
     monkeypatch.setattr(
         dynamic_output, "open_headless_scan_session", capture_session,
     )
-    caplog.set_level(logging.INFO, logger=dynamic_output.__name__)
+    # the pipeline line: DEBUG while performance monitoring is off (maintainer, 2026-10-24)
+    caplog.set_level(logging.DEBUG, logger=dynamic_output.__name__)
     executor, identity, events = _run_to_terminal(
         intent, request_value=1710,
     )

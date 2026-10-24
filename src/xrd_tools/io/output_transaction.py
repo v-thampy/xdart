@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import errno
 import hashlib
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -24,6 +25,7 @@ from typing import Callable, Mapping, Protocol, TypeVar, runtime_checkable
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.session import get_pool
 
+logger = logging.getLogger(__name__)
 
 _BACKUP_SUFFIX = ".xdart-replacing"
 _HASH_CHUNK_BYTES = 1024 * 1024
@@ -244,6 +246,13 @@ class StreamSeedMode(str, Enum):
 
     PRESERVE_BASE = "preserve-base"
     EMPTY_REPLACEMENT = "empty-replacement"
+    #: The existing output itself, with no staged backup or seed copy (finite Append; maintainer, 2026-10-23:
+    #: "Append in place"). Only an in-place transaction streams this way, and it streams no other way.
+    IN_PLACE = "in-place"
+
+
+#: An in-place stream's opening evidence: no bytes proven yet (the existing file is adopted, not hashed).
+_IN_PLACE_EVIDENCE = hashlib.sha256(b"xrd-tools-in-place-append-baseline-v1\0").hexdigest()
 
 
 class RetryAction(str, Enum):
@@ -1209,8 +1218,11 @@ class OutputTransactionCoordinator:
         target_owner: OwnerToken,
         durable_fsync: bool = True,
         fast_regenerable: bool = False,
+        in_place: bool = False,
     ) -> "OutputTransaction":
-        """Bind one exact transaction and target owner to a stable snapshot."""
+        """Bind one exact transaction and target owner to a stable snapshot. ``in_place`` (finite Append) admits
+        an existing output by its stat alone and binds the transaction to stream into it in place; a missing
+        output keeps the ordinary creation route."""
         if not isinstance(transaction_owner, OwnerToken):
             raise TypeError("transaction_owner must be an OwnerToken")
         if not isinstance(target_owner, OwnerToken):
@@ -1219,10 +1231,12 @@ class OutputTransactionCoordinator:
             raise TypeError("durable_fsync must be an exact bool")
         if type(fast_regenerable) is not bool:
             raise TypeError("fast_regenerable must be an exact bool")
+        if type(in_place) is not bool:
+            raise TypeError("in_place must be an exact bool")
         normalized = _normalize_target(target)
         admission = TargetAdmission(
             normalized,
-            _capture_target(normalized, hash_content=not fast_regenerable),
+            _capture_target(normalized, hash_content=not (fast_regenerable or in_place)),
             self._next_ordinal(),
         )
         return OutputTransaction(
@@ -1232,6 +1246,7 @@ class OutputTransactionCoordinator:
             target_owner=target_owner,
             durable_fsync=durable_fsync,
             fast_regenerable=fast_regenerable,
+            in_place=in_place and admission.snapshot.exists,
         )
 
     def hold_target(self, target, *, label: str) -> TargetHold:
@@ -1378,17 +1393,21 @@ class OutputTransaction:
         target_owner: OwnerToken,
         durable_fsync: bool = True,
         fast_regenerable: bool = False,
+        in_place: bool = False,
     ):
         if type(durable_fsync) is not bool:
             raise TypeError("durable_fsync must be an exact bool")
         if type(fast_regenerable) is not bool:
             raise TypeError("fast_regenerable must be an exact bool")
+        if type(in_place) is not bool:
+            raise TypeError("in_place must be an exact bool")
         self._coordinator = coordinator
         self._admission = admission
         self._transaction_owner = transaction_owner
         self._target_owner = target_owner
         self._durable_fsync = durable_fsync
         self._fast_regenerable = fast_regenerable
+        self._in_place = in_place
         self._lease: TargetLease | None = None
         self._phase = TransactionPhase.ADMITTED
         self._pending: set[RetryAction] = set()
@@ -1445,10 +1464,13 @@ class OutputTransaction:
         self._stream_partial_cleanup: _ObjectReceipt | None = None
         self._stream_preserved_partial: str | None = None
         self._stream_retain_partial = False
+        # Whether the current stream attempt writes the canonical output in
+        # place: every attempt of an in-place transaction, or a reopened epoch.
+        self._stream_in_place = False
 
     def _capture(self, path: Path | str) -> TargetSnapshot:
         return _capture_target(
-            str(path), hash_content=not self._fast_regenerable,
+            str(path), hash_content=not (self._fast_regenerable or self._in_place),
         )
 
     @property
@@ -1459,6 +1481,22 @@ class OutputTransaction:
     def fast_regenerable(self) -> bool:
         """Whether this transaction admitted the finite regenerable route."""
         return self._fast_regenerable
+
+    @property
+    def in_place(self) -> bool:
+        """Whether this transaction streams into its existing output in place (finite Append)."""
+        return self._in_place
+
+    @property
+    def durable_fsync(self) -> bool:
+        """Whether this transaction's writes and seals are fsynced (its explicit diagnostic choice)."""
+        return self._durable_fsync
+
+    @property
+    def stream_in_place(self) -> bool:
+        """Whether the current stream attempt writes the canonical output in place: every attempt of an
+        in-place transaction, or a reopened Live epoch."""
+        return self._stream_in_place
 
     @property
     def stream_base_snapshot(self) -> TargetSnapshot:
@@ -1644,6 +1682,7 @@ class OutputTransaction:
             and self._stream_durable_floor is not None
             and not self._published
             and not self._has_terminal_receipt("durable-floor-preserved")
+            and not self._has_terminal_receipt("in-place-retained")
         ):
             return
         if RetryAction.ROLLBACK in self._pending:
@@ -1652,9 +1691,9 @@ class OutputTransaction:
             self._phase = TransactionPhase.CLEANUP_PENDING
         elif self._published and self._has_terminal_receipt("committed-result"):
             self._phase = TransactionPhase.COMMITTED
-        elif (
-            not self._published
-            and self._has_terminal_receipt("durable-floor-preserved")
+        elif not self._published and (
+            self._has_terminal_receipt("durable-floor-preserved")
+            or self._has_terminal_receipt("in-place-retained")
         ):
             self._phase = TransactionPhase.ABORTED
         elif not self._published and self._has_terminal_receipt("rollback-ready"):
@@ -2757,6 +2796,7 @@ class OutputTransaction:
             and self._stream_durable_floor is not None
             and not self._published
             and not self._has_terminal_receipt("durable-floor-preserved")
+            and not self._has_terminal_receipt("in-place-retained")
         ):
             return True
         if (
@@ -2841,6 +2881,8 @@ class OutputTransaction:
                     target,
                     "stream-seed",
                 )
+                if self._durable_fsync:
+                    _fsync_descriptor(destination, target)
             else:
                 receipt = _descriptor_content_receipt(
                     destination,
@@ -2848,20 +2890,136 @@ class OutputTransaction:
                     "stream-seed",
                     durable_fsync=self._durable_fsync,
                 )
-            checkpoint = _descriptor_stream_stat_receipt(
-                destination,
+        finally:
+            if source_descriptor is not None:
+                os.close(source_descriptor)
+            os.close(destination)
+        return receipt, self._seal_closed_stream_seed(target, receipt)
+
+    def _seal_closed_stream_seed(
+        self, target: Path, receipt: _ObjectReceipt,
+    ) -> _StreamStatReceipt:
+        """The seed's checkpoint, taken after its writing handle closed.
+
+        Windows can finalize a written file's timestamps when that handle
+        closes.  The beamline 1.2.4 refusal on an SMB share (mtime 86.5 ms
+        past a checkpoint sealed before the close) fits that; it is not yet
+        confirmed natively.  A read-only descriptor bound to the reserved
+        file and its sealed size gives the baseline; the seed was flushed
+        before the close, and a read-only fsync would reopen it writable on
+        Windows, so none is requested.
+        """
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            state = os.fstat(descriptor)
+            if (
+                _FileIdentity(int(state.st_dev), int(state.st_ino))
+                != receipt.identity
+                or int(state.st_size) != int(receipt.snapshot.size or 0)
+            ):
+                raise TargetChanged(
+                    f"stream seed changed when its writing handle closed: {target}"
+                )
+            return _descriptor_stream_stat_receipt(
+                descriptor,
                 target,
                 evidence_digest=str(receipt.snapshot.digest),
                 evidence_bytes=int(receipt.snapshot.size or 0),
                 ordinal=self._coordinator._next_ordinal(),
                 role="stream-seed",
-                durable_fsync=self._durable_fsync,
+                durable_fsync=False,
             )
         finally:
-            if source_descriptor is not None:
-                os.close(source_descriptor)
-            os.close(destination)
-        return receipt, checkpoint
+            os.close(descriptor)
+
+    def _adopt_in_place_target(
+        self, sealed: _StreamStatReceipt | None = None,
+    ) -> tuple[_ObjectReceipt, _StreamStatReceipt]:
+        """The existing output adopted as an in-place stream's reservation.
+
+        A read-only descriptor binds the file as it was admitted (its size and
+        time) or, for a reopened epoch, to *sealed*, the committed epoch's exact
+        terminal revision; no backup is staged, nothing is copied and no content
+        is read.  Its opening checkpoint proves no bytes: the writer's own
+        checkpoints carry the evidence of the rows it adds.
+        """
+        target = Path(self._admission.target)
+        base = self.stream_base_snapshot
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            state = os.fstat(descriptor)
+            if sealed is not None:
+                mismatch = _stream_revision_mismatch(target, sealed, descriptor=descriptor)
+                if mismatch is not None:
+                    raise TargetChanged(
+                        f"in-place epoch target changed after its committed epoch: {mismatch}"
+                    )
+            elif (
+                int(state.st_dev), int(state.st_ino), int(state.st_size), int(state.st_mtime_ns),
+            ) != (base.device, base.inode, base.size, base.mtime_ns):
+                raise TargetChanged(f"in-place Append target changed after admission: {target}")
+            reservation = _ObjectReceipt(
+                _normalize_target(target),
+                _FileIdentity(int(state.st_dev), int(state.st_ino)),
+                base,
+                "stream-in-place",
+            )
+            logger.debug(
+                "[APPEND-INPLACE] output=%s %s size=%d", target,
+                "reopened epoch" if sealed is not None else "first stream", int(state.st_size),
+            )
+            checkpoint = _descriptor_stream_stat_receipt(
+                descriptor,
+                target,
+                evidence_digest=_IN_PLACE_EVIDENCE,
+                evidence_bytes=0,
+                ordinal=self._coordinator._next_ordinal(),
+                role="stream-in-place",
+                expected_stat=_descriptor_identity(state),
+                durable_fsync=False,
+            )
+        finally:
+            os.close(descriptor)
+        return reservation, checkpoint
+
+    def _abort_in_place(self) -> TransactionSnapshot:
+        """An in-place stream's abort: the canonical output stays as it stands.
+
+        There is no backup to restore and nothing is renamed, deleted or read.
+        A failure before any write leaves the old committed result; after one,
+        the output is incomplete (its lineage pending) and the next Append
+        refuses it until Replace (the maintainer's accepted trade-off).  The
+        result is reported as retained, never as a rollback or a success.
+        """
+        failures: list[BaseException] = []
+        with (
+            nullcontext() if self._stream_file_lock is None else self._stream_file_lock
+        ):
+            target = _capture_target(self._admission.target, hash_content=False)
+            reservation = self._stream_reservation
+            if reservation is None or not target.exists or not _same_identity(target, reservation):
+                self._phase = TransactionPhase.INTEGRITY_HOLD
+                raise TargetChanged(
+                    f"in-place Append output is no longer the adopted file: {self._admission.target}"
+                )
+            self._terminal_receipt = _TerminalReceipt(
+                self._admission.target, target, target, "in-place-retained",
+            )
+            self._stream_preserved_partial = self._admission.target
+            self._pending.discard(RetryAction.ROLLBACK)
+        if not self._target_transition_pending():
+            pool = self._resume_pool
+            if pool is not None:
+                failure = self._attempt_pool_resume(pool)
+                if failure is not None:
+                    failures.append(failure)
+        self._refresh_phase()
+        if failures:
+            raise CleanupIncomplete(self.snapshot()) from failures[0]
+        if self._pending:
+            raise CleanupIncomplete(self.snapshot())
+        self._phase = TransactionPhase.ABORTED
+        return self.snapshot()
 
     def _require_stream(
         self,
@@ -2893,6 +3051,12 @@ class OutputTransaction:
                 target_owner=target_owner,
             )
             self._require_lease(lease)
+            if (seed_mode is StreamSeedMode.IN_PLACE) is not self._in_place:
+                raise TransactionStateError(
+                    "an in-place transaction streams only in place, and only it may"
+                )
+            if self._in_place and not self.stream_base_snapshot.exists:
+                raise TransactionStateError("in-place Append needs an existing output")
             if self._stream_attempt is not None:
                 raise TransactionStateError("streaming attempt already exists")
             if self._phase not in {
@@ -2937,24 +3101,28 @@ class OutputTransaction:
                 with (nullcontext() if file_lock is None else file_lock):
                     self._validate_target()
                     self._ensure_cleanup_token()
-                    self._pending.add(RetryAction.ROLLBACK)
-                    if self.stream_base_snapshot.exists:
-                        self._stage_prior()
+                    if not self._in_place:
+                        self._pending.add(RetryAction.ROLLBACK)
+                        if self.stream_base_snapshot.exists:
+                            self._stage_prior()
                     attempt = StreamAttempt(
                         self._admission.target,
                         self._coordinator._next_ordinal(),
                     )
-                    reservation, checkpoint = self._copy_stream_seed(
-                        seed_mode=seed_mode,
+                    reservation, checkpoint = (
+                        self._adopt_in_place_target() if self._in_place
+                        else self._copy_stream_seed(seed_mode=seed_mode)
                     )
                     self._stream_attempt = attempt
                     self._stream_reservation = reservation
                     self._stream_checkpoint = checkpoint
                     self._stream_checkpoint_fresh = True
+                    self._stream_in_place = self._in_place
                     return attempt
             except BaseException as exc:
                 primary = exc
-                if self._stream_reservation is not None:
+                # An in-place reservation is the canonical output itself: never retired (renamed) or rolled back.
+                if self._stream_reservation is not None and not self._in_place:
                     failure = self._attempt_stream_retire()
                     if failure is not None:
                         cleanup.append(failure)
@@ -3093,7 +3261,7 @@ class OutputTransaction:
                 )
             if (
                 self._stream_durable_floor is None
-                and not self._fast_regenerable
+                and not (self._fast_regenerable or self._stream_in_place)
             ):
                 return None
             if self._stream_close_owner is not None:
@@ -3137,8 +3305,13 @@ class OutputTransaction:
         expected_stat: tuple[int, int, int, int, int] | None = None,
         evidence_digest: str | None = None,
         evidence_bytes: int | None = None,
+        flushed: bool = False,
     ) -> StreamCheckpoint:
-        """Resolve a successful controlled close to a new exact durable floor."""
+        """Resolve a successful controlled close to a new exact durable floor.
+
+        ``flushed``: the writer flushed the file through its own writing handle before closing it, so the seal
+        requests no flush (on Windows a read-only descriptor's flush reopens the file writable).
+        """
         with self._lock:
             self._require_stream(attempt, lease)
             owner = self._stream_close_owner
@@ -3185,7 +3358,7 @@ class OutputTransaction:
                         ordinal=self._coordinator._next_ordinal(),
                         role="stream-close",
                         expected_stat=expected_stat,
-                        durable_fsync=self._durable_fsync,
+                        durable_fsync=self._durable_fsync and not flushed,
                     )
                 except TargetChanged:
                     self._phase = TransactionPhase.INTEGRITY_HOLD
@@ -3302,17 +3475,20 @@ class OutputTransaction:
                     raise TargetChanged(
                         "stream terminal descriptor changed during fsync"
                     )
-                checkpoint = self._stream_checkpoint if self._fast_regenerable else None
-                # The fast terminal reuses the checkpoint's evidence digest
-                # without rehashing, so the descriptor is held to the
-                # checkpoint's recorded revision exactly, not to the seamed
-                # identity a pathname compare would settle for.
-                if self._fast_regenerable and (
+                held = self._fast_regenerable or self._stream_in_place
+                checkpoint = self._stream_checkpoint if held else None
+                # The fast and in-place terminals reuse the checkpoint's
+                # evidence digest without rehashing, so the descriptor is held
+                # to the checkpoint's recorded revision exactly, not to the
+                # seamed identity a pathname compare would settle for.
+                if held and (
                     checkpoint is None or not self._stream_checkpoint_fresh
                     or _descriptor_identity(flushed)
                     != _stream_receipt_revision(checkpoint)
                 ):
-                    raise TargetChanged("fast stream terminal lost its close checkpoint")
+                    raise TargetChanged(
+                        "held stream terminal (fast or in-place) lost its close checkpoint"
+                    )
                 receipt = _descriptor_content_receipt(
                     descriptor, Path(self._admission.target), "stream-terminal",
                     durable_fsync=False,
@@ -3426,7 +3602,18 @@ class OutputTransaction:
         transaction_owner: OwnerToken,
         target_owner: OwnerToken,
         lease: TargetLease,
+        in_place: bool = False,
     ) -> StreamAttempt:
+        """Reopen the committed output for the next owned epoch.
+
+        ``in_place`` (an ordinary Live reopen; maintainer, 2026-10-23, "fold
+        this in now") writes the committed file itself: no stage, no seed copy
+        and no whole-file hash.  The committed epoch's exact terminal revision
+        is held until the new attempt starts; a failure after the writer
+        changes the file leaves it as it stands (see :meth:`_abort_in_place`).
+        """
+        if type(in_place) is not bool:
+            raise TypeError("in_place must be an exact bool")
         with self._lock:
             self._require_admission_owners(
                 admission=admission,
@@ -3442,7 +3629,22 @@ class OutputTransaction:
                 raise TransactionStateError(
                     "epoch cleanup must finish before extension"
                 )
-            self._validate_target()
+            if self._in_place and not in_place:
+                raise TransactionStateError(
+                    "an in-place transaction reopens its epochs only in place"
+                )
+            sealed = self._stream_terminal_stat
+            if in_place:
+                mismatch = (
+                    "the committed epoch has no terminal revision" if sealed is None
+                    else _stream_revision_mismatch(self._admission.target, sealed)
+                )
+                if mismatch is not None:
+                    raise TargetChanged(
+                        "committed epoch changed before its in-place reopen: " + mismatch
+                    )
+            else:
+                self._validate_target()
             if self.backup.exists() or self._candidate.exists():
                 raise TransactionStateError(
                     "private transaction path blocks owned epoch extension"
@@ -3454,7 +3656,7 @@ class OutputTransaction:
                 self._stream_close_owner, self._stream_close_checkpoint,
                 self._stream_terminal_receipt, self._stream_terminal_stat,
                 self._stream_committed, self._stream_preserved_partial,
-                self._stream_retain_partial,
+                self._stream_retain_partial, self._stream_in_place,
             )
             self._stream_attempt = None
             self._stream_reservation = None
@@ -3473,13 +3675,17 @@ class OutputTransaction:
                     if self._stream_file_lock is None
                     else self._stream_file_lock
                 ):
-                    self._pending.add(RetryAction.ROLLBACK)
-                    self._stage_prior()
+                    if not in_place:
+                        self._pending.add(RetryAction.ROLLBACK)
+                        self._stage_prior()
                     attempt = StreamAttempt(
                         self._admission.target,
                         self._coordinator._next_ordinal(),
                     )
-                    reservation, checkpoint = self._copy_stream_seed()
+                    reservation, checkpoint = (
+                        self._adopt_in_place_target(sealed) if in_place
+                        else self._copy_stream_seed()
+                    )
                     self._stream_attempt = attempt
                     self._stream_reservation = reservation
                     self._stream_checkpoint = checkpoint
@@ -3488,13 +3694,17 @@ class OutputTransaction:
                     self._stream_terminal_receipt = None
                     self._stream_terminal_stat = None
                     self._stream_committed = False
+                    self._stream_in_place = in_place
                     self._terminal_receipt = None
                     return attempt
             except BaseException as primary:
                 failures = []
                 with (nullcontext() if self._stream_file_lock is None
                       else self._stream_file_lock):
-                    if self._stream_reservation is not None:
+                    # An in-place reopen fails before any write, and its
+                    # reservation is the committed output itself: nothing to
+                    # retire or roll back.
+                    if self._stream_reservation is not None and not in_place:
                         failure = self._attempt_stream_retire()
                         if failure is not None:
                             failures.append(failure)
@@ -3513,14 +3723,22 @@ class OutputTransaction:
                      self._stream_close_owner, self._stream_close_checkpoint,
                      self._stream_terminal_receipt, self._stream_terminal_stat,
                      self._stream_committed, self._stream_preserved_partial,
-                     self._stream_retain_partial) = prior_stream
+                     self._stream_retain_partial,
+                     self._stream_in_place) = prior_stream
                     try:
-                        self._phase = TransactionPhase.EXECUTING
-                        self.seal_stream_terminal(previous, lease=lease)
-                        self._install_terminal_receipt(
-                            expected=self.stream_base_snapshot,
-                            role="epoch-committed",
-                        )
+                        if in_place:
+                            # The committed epoch stands only while its exact
+                            # sealed revision still holds; it is never resealed.
+                            failure = self._verify_stream_terminal(role="epoch-committed")
+                            if failure is not None:
+                                raise failure
+                        else:
+                            self._phase = TransactionPhase.EXECUTING
+                            self.seal_stream_terminal(previous, lease=lease)
+                            self._install_terminal_receipt(
+                                expected=self.stream_base_snapshot,
+                                role="epoch-committed",
+                            )
                     except BaseException as failure:
                         failures.append(failure)
                 if failures:
@@ -3633,7 +3851,7 @@ class OutputTransaction:
             or terminal_stat.identity != reservation.identity
             or snapshot != sealed
             or (
-                not self._fast_regenerable
+                not (self._fast_regenerable or self._stream_in_place)
                 and terminal_stat.evidence_bytes != terminal_stat.size
             )
         ):
@@ -3713,6 +3931,8 @@ class OutputTransaction:
                 raise TransactionStateError("committed stream cannot be aborted")
             if self._phase is TransactionPhase.ABORTED:
                 return self.snapshot()
+            if self._stream_in_place:
+                return self._abort_in_place()
             failures: list[BaseException] = []
             with (
                 nullcontext()
@@ -4140,6 +4360,7 @@ class OutputTransaction:
                 and self._stream_epoch_receipt is None
                 and self._stream_durable_floor is None
                 and not self._has_terminal_receipt("rollback-ready")
+                and not self._has_terminal_receipt("in-place-retained")
             ):
                 try:
                     self._install_terminal_receipt(

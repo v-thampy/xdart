@@ -2358,7 +2358,12 @@ def test_dynamic_targetless_completion_without_written_cannot_finish(tmp_path):
     boundary.epoch_aborted(session, owner, "negative targetless oracle")
 
 
-def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize("policy", ("preserved", "in-place"))
+def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monkeypatch, policy):
+    """The preserved policy restores the committed epoch; an in-place reopen (maintainer, 2026-10-23) keeps the
+    failed epoch in the output, pending, and the next Append refuses it until Replace."""
+    import json
+    from xrd_tools.io import AppendDisposition, qualify_append
     from xrd_tools.session import open_headless_scan_session
     from xrd_tools.reduction import Frame, NexusSink
     from xrd_tools.session import DynamicFrameIdentity
@@ -2378,7 +2383,7 @@ def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monk
     _key0, token0 = _armed_submission(accounting)
     nexus = NexusSink(
         target, overwrite=True, atomic=False, flush_every=None,
-        same_run_intent=first_intent,
+        same_run_intent=first_intent, rollback_until_commit=policy == "preserved",
     )
     session = open_headless_scan_session(
         _exact_scan((live,)), plan, sink=nexus, accounting=accounting, executor=1,
@@ -2387,6 +2392,7 @@ def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monk
     assert session.submit(session.scan.frames[0], attempt_token=token0)
     session.commit_epoch()
     epoch_a = target.read_bytes()
+    inode = target.stat().st_ino
     session.extend_live(second_intent)
 
     key1 = DynamicFrameIdentity("c2-final-source", 1)
@@ -2410,8 +2416,19 @@ def test_scan_session_extend_live_refuses_recorded_writer_failure(tmp_path, monk
     assert accounting.snapshot() == before
     result = session.finish(raise_on_failure=False)
     assert result.failed is True
-    assert target.read_bytes() == epoch_a
-    assert _rows(target) == (0,)
+    if policy == "preserved":
+        assert target.read_bytes() == epoch_a
+        assert _rows(target) == (0,)
+    else:
+        assert target.stat().st_ino == inode
+        with h5py.File(target, "r") as handle:
+            lineage = json.loads(handle["entry/reduction/config/append_lineage"][()].decode())
+        assert lineage["state"] == "pending"
+        refused = qualify_append(target, append_intent(
+            tmp_path, extent=3, labels=(0, 1, 2), generation=2, source_identity=source_identity,
+        ))
+        assert refused.disposition is AppendDisposition.REFUSE
+        assert refused.reason.startswith("an earlier Append of this output did not finish; use Replace")
     assert accounting.snapshot().state.value == "aborted"
 
 

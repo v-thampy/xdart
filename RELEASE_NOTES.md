@@ -1,5 +1,50 @@
 # Release notes
 
+## 1.2.5 (unreleased)
+
+### Changed
+
+- **Append adds new frames to the existing output in place:** xdart no longer
+  copies a scan's output, or reads it in full, before and after adding the new
+  frames; it opens the output and writes only the new frames. The same holds
+  between a Live run's batches. The trade-off: if xdart crashes, or the run
+  fails, while it is adding frames, that scan's output is left incomplete. The
+  next Append skips it and says to use Replace, which rebuilds it from the
+  images; if the output can no longer be opened at all, move or delete it, then
+  run again. Stop is not a failure: the frames added before it are kept.
+- **A Run of many short series no longer rebuilds pyFAI's integration tables for
+  each one:** xdart builds them once per Run and reuses them for every series
+  with the same calibration, energy, mask and integration settings, in directory
+  and Live runs alike. Each series used to rebuild them, which for a large
+  detector took far longer than integrating the frame itself (a 4096 x 4096
+  Rayonix frame: 2.7 s to build, 0.13 s to integrate, on a fast Mac). Results
+  are identical. Grazing incidence keeps a set per incident angle, so positions
+  measured at a few repeated angles build each angle once per Run (Rayonix, three
+  angles: 1.8 s per series before, 0.7 s once every angle is cached); the sensor
+  parallax correction is reused too. Kept sets stay within the memory the Run is
+  planned for, and at most 8 per kind. Energy scans and calibrations with a
+  spline or a detector flat field still build them for each series.
+
+### Fixes
+
+- **A directory Append skips scans it has already processed:** a scan whose output
+  already holds every frame, from the same image files at the same sizes and times
+  and with the same settings, is now skipped at once. xdart no longer reads such a
+  scan again, and no longer warns "same-extent source identity changed" when only
+  its metadata files or the file server's bookkeeping changed. A scan with new
+  frames still checks its earlier files before adding the new ones, and a changed
+  image still warns. To reprocess a scan whose metadata you changed, use Replace.
+- **Append to an output on a network folder:** a run could stop with "writer begin
+  incomplete: stream checkpoint failed identity verification" when the output's
+  modification time moved a moment after xdart wrote it. Windows can set a file's
+  final write time when the program closes it, and the reported failure fits that;
+  xdart now records the file's state after that close. Not yet confirmed on the
+  beamline share.
+- **The controls are no longer cut off at their right edge:** since 1.2.4's Show
+  log, a window narrow enough to leave the controls column at its minimum width
+  cut two pixels off the controls' right edge (Int, Stitch and RSM), and Int showed
+  a thin horizontal scrollbar under them.
+
 ## 1.2.4 (2026-10-22)
 
 ### Added

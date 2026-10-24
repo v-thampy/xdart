@@ -10,6 +10,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.themes.spacing import current_spacing_tokens
 from xdart.utils.throttle import Coalescer
+from xrd_tools.core.filters import GRAMMAR_HELP, compile_filter
 
 from .browser_catalog import BrowserCatalogEntry
 from .browser_model import FrameListModel
@@ -531,6 +532,8 @@ class BrowserView(QtWidgets.QFrame):
         self._results: tuple[BrowserResult, ...] = ()
         self._filename_mode = ""
         self._filename_custom = False
+        self._auto_suffixes: tuple[str, ...] = ()
+        self._typed_filter = ("", None)
         self._source_results = None
         self._source_projection = None
         self._projected_filename_terms = None
@@ -849,6 +852,12 @@ class BrowserView(QtWidgets.QFrame):
         self.heading = title
         if not self.profile.heading:
             title.hide()
+        self.show_dirs = QtWidgets.QPushButton("Dirs")
+        self.show_dirs.setObjectName("e3BrowserCompactButton")
+        self.show_dirs.setCheckable(True)
+        self.show_dirs.setChecked(True)
+        self.show_dirs.setToolTip("List folders; turn off to list results only (.. stays, to go up).")
+        self.show_dirs.setAccessibleName("Show folders")
         self.date_sort = QtWidgets.QPushButton("Time")
         self.date_sort.setObjectName("e3BrowserCompactButton")
         self.date_sort.setCheckable(True)
@@ -860,10 +869,8 @@ class BrowserView(QtWidgets.QFrame):
         self.filename_filter.setClearButtonEnabled(True)
         self.filename_filter.setMinimumWidth(60)
         self.filename_filter.setToolTip(
-            "Filter filenames by literal text, ignoring case. Separate alternatives with commas. "
-            "The untouched default matches operation suffixes before the extension; edited text matches "
-            "anywhere in the filename. Clear to show all results. Folders, and the results being viewed, "
-            "always remain listed.")
+            f"Filename filter. {GRAMMAR_HELP} Empty: Auto, this mode's own results (shown faded). * lists every "
+            "result. Folders, and the results being viewed, always remain listed.")
         self.filename_filter.setAccessibleName("Filter result filenames")
         self.filename_filter.hide()  # only scientific processing modes opt in
         self.filename_filter.textChanged.connect(self._filename_edited)
@@ -881,10 +888,13 @@ class BrowserView(QtWidgets.QFrame):
         )
         row.addWidget(title, 1)
         row.addWidget(self.filename_filter, 1)
+        row.addWidget(self.show_dirs)
         row.addWidget(self.date_sort)
         row.addWidget(self.refresh)
         if not self.profile.date_sort:
+            self.show_dirs.hide()
             self.date_sort.hide()
+        self.show_dirs.toggled.connect(lambda _checked: self._refilter())
         if not self.profile.refresh:
             self.refresh.hide()
         self.date_sort.toggled.connect(
@@ -898,12 +908,12 @@ class BrowserView(QtWidgets.QFrame):
         return row
 
     def set_filename_mode(self, mode: str) -> None:
-        """Untouched defaults follow the processing mode; an explicit edit (including empty) wins."""
+        """An empty filter is Auto, the mode's own results, shown faded as Auto is in the threshold fields
+        (maintainer, 2026-10-23); typed text keeps its filter across modes."""
         from xrd_tools.io.output_path import FINITE_OPERATION_SLOTS
         tokens = {
-            "Int 1D": ("int-1d", "int-2d", "reintegrate-1d", "average"),
-            "Int 2D": ("int-2d", "reintegrate-2d", "average"),
-            # Stitch 1D shows a Stitch 2D record's I(q), as Int 1D shows an Int 2D record's
+            # Int 1D shows an Int 2D record's I(q), as Stitch 1D shows a Stitch 2D record's
+            "Int 1D": ("int-1d", "int-2d"), "Int 2D": ("int-2d",),
             "Stitch 1D": ("stitch-1d", "stitch-2d"), "Stitch 2D": ("stitch-2d",), "RSM": ("rsm",),
         }.get(mode, ())
         enabled = bool(tokens) and self.profile.heading
@@ -911,15 +921,14 @@ class BrowserView(QtWidgets.QFrame):
         if mode == self._filename_mode:
             return
         self._filename_mode = mode
-        if not self._filename_custom:
-            blocker = QtCore.QSignalBlocker(self.filename_filter)
-            self.filename_filter.setText(", ".join(FINITE_OPERATION_SLOTS[token] for token in tokens))
-            del blocker
+        suffixes = tuple(FINITE_OPERATION_SLOTS[token] for token in tokens)
+        self._auto_suffixes = tuple(suffix.casefold() for suffix in suffixes)
+        self.filename_filter.setPlaceholderText(f"Auto: {', '.join(suffixes)}" if suffixes else "All results")
         self._refilter()
 
     def set_filename_filter(self, text: str) -> None:
-        """The filter as a person types it (empty: All results); mode defaults no longer replace it."""
-        self._filename_custom = True
+        """The filter as a person types it (empty: Auto, the mode's own results)."""
+        self._filename_custom = bool(text.strip())
         if self.filename_filter.text() != text:
             self.filename_filter.setText(text)  # textChanged refilters
         else:
@@ -938,17 +947,29 @@ class BrowserView(QtWidgets.QFrame):
     def _filename_matches(self, name: str, terms: tuple[str, ...]) -> bool:
         if not terms:
             return True
-        folded = name.casefold()
-        if self._filename_custom:
-            return any(term in folded for term in terms)
-        return os.path.splitext(folded)[0].endswith(terms)
+        if terms[0] == "auto":  # the mode's own operation suffixes, before the extension
+            return os.path.splitext(name.casefold())[0].endswith(terms[1:])
+        expression, predicate = self._typed_filter
+        if expression != terms[1]:
+            try:
+                predicate = compile_filter(terms[1])
+            except ValueError:  # mid-typing ("scan |"): hide nothing until it parses
+                predicate = None
+            self._typed_filter = terms[1], predicate
+        return predicate is None or predicate(name)
 
     def _filename_terms(self) -> tuple[str, ...]:
-        return (() if self.filename_filter.isHidden() else tuple(
-            term.strip().casefold() for term in self.filename_filter.text().split(",") if term.strip()))
+        """The active filter, () for every result: ("auto", suffixes...) for an empty field, else ("typed", text) in
+        the Filter grammar the control panel's Filter field uses (``compile_filter``)."""
+        if self.filename_filter.isHidden():
+            return ()
+        text = self.filename_filter.text().strip()
+        if not text:
+            return ("auto", *self._auto_suffixes) if self._auto_suffixes else ()
+        return () if text == "*" else ("typed", text)
 
-    def _filename_edited(self, _text) -> None:
-        self._filename_custom = True
+    def _filename_edited(self, text) -> None:
+        self._filename_custom = bool(str(text).strip())
         self._refilter()
 
     def _refilter(self) -> None:
@@ -976,11 +997,13 @@ class BrowserView(QtWidgets.QFrame):
             raise TypeError("results must be exact BrowserResult entries")
         self._source_results = entries, current
         terms = self._filename_terms()
-        if terms:
+        dirs = self.show_dirs.isChecked()
+        if terms or not dirs:
             # The results being viewed stay listed: the filter narrows the others, never what is shown.
-            pinned = {current, *(item.data(_USER_ROLE) for item in self.scans.selectedItems())}
-            entries = tuple(entry for entry in entries if entry.is_directory or entry.identifier in pinned
-                            or self._filename_matches(entry.label, terms))
+            pinned = {current, *(item.data(_USER_ROLE) for item in self.scans.selectedItems())} if terms else set()
+            entries = tuple(entry for entry in entries if (
+                (dirs or entry.label == "..") if entry.is_directory
+                else not terms or entry.identifier in pinned or self._filename_matches(entry.label, terms)))
         blocker = QtCore.QSignalBlocker(self.scans)
         selected = {item.data(_USER_ROLE) for item in self.scans.selectedItems()}
         previous = self.current_result()
@@ -1198,12 +1221,14 @@ class BrowserView(QtWidgets.QFrame):
         # The scans being viewed stay listed: the filter narrows the others, never what is shown, so the
         # list, its frames and the plot cannot disagree.
         pinned = frozenset((state.selected_scan, *state.selected_artifacts)) if terms else frozenset()
-        policy = terms, self._filename_custom, pinned
+        dirs = self.show_dirs.isChecked()
+        policy = terms, self._filename_custom, pinned, dirs
         if prior is not None and prior[0].scans is state.scans and policy == self._projected_filename_terms:
             scans = self._scans
-        elif terms:
-            scans = tuple(scan for scan in state.scans if scan.is_directory or scan.identifier in pinned
-                          or self._filename_matches(scan.label, terms))
+        elif terms or not dirs:
+            scans = tuple(scan for scan in state.scans if (
+                (dirs or scan.label == "..") if scan.is_directory
+                else not terms or scan.identifier in pinned or self._filename_matches(scan.label, terms)))
             if len(scans) == len(state.scans):
                 scans = state.scans
         else:

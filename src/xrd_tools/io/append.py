@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from enum import Enum
 import hashlib
 import json
@@ -276,6 +276,10 @@ class AppendDecision:
     reason: str
     lineage_json: str | None
     source_generation: int = 0
+    #: A refusal whose only cause is that processed images changed on disk (an image's size, or its time without its
+    #: sidecar's same recorded acquisition time): the scan may be reduced again whole into the same output, and
+    #: ``labels`` then holds every current label. A caller that does not rebuild treats it as the refusal it is.
+    rebuild: bool = False
     @property
     def skip_labels(self) -> tuple[int, ...]:
         return self.committed_labels
@@ -600,6 +604,7 @@ def _decision(
     reason: str = "",
     lineage: Mapping[str, Any] | None = None,
     source_generation: int = 0,
+    rebuild: bool = False,
 ) -> AppendDecision:
     return AppendDecision(
         disposition,
@@ -608,6 +613,7 @@ def _decision(
         str(reason),
         None if lineage is None else _json(lineage),
         int(source_generation),
+        bool(rebuild),
     )
 
 def _require_contiguous(labels: tuple[int, ...], role: str) -> None:
@@ -740,6 +746,20 @@ def _member_extends(
             return False
     return True
 
+def _first_member_difference(prior: list[dict[str, Any]], current: list[dict[str, Any]]) -> str:
+    """Name the first image the source no longer shows as the output recorded it (beamline 2026-10-23: a Live
+    Append refused with no hint of which file)."""
+    for index, old in enumerate(prior):
+        name = Path(str(old.get("path", ""))).name or f"image {index + 1}"
+        if index >= len(current):
+            return (f"the output holds {len(prior)} images, the source shows {len(current)}; "
+                    f"{name} (image {index + 1}) is not listed")
+        if current[index] != old:
+            return f"image {index + 1} ({name}): " + ("; ".join(_identity_changes(old, current[index])[:4])
+                                                      or "changed")
+    return "no single image differs"
+
+
 def _identity_changes(prior: Any, current: Any, at: str = "") -> list[str]:
     """Name each differing leaf of two source identities (generation aside); the refusal stays exact."""
     if isinstance(prior, Mapping) and isinstance(current, Mapping):
@@ -753,6 +773,88 @@ def _identity_changes(prior: Any, current: Any, at: str = "") -> list[str]:
     delta = (f" ({(current - prior) / 1e9:+.3f} s)" if at.endswith("mtime_ns")
              and type(prior) is int and type(current) is int else "")
     return [f"{at} {repr(prior)[:160]} → {repr(current)[:160]}{delta}"]
+
+
+def _drifted_members(prior: Mapping[str, Any], current: Mapping[str, Any], labels: tuple[int, ...]) -> tuple[int, ...]:
+    """The committed images whose size or modified time moved, by position, when the source is an ordinary image
+    series of one image per committed frame whose committed images all keep their names and places; () otherwise,
+    and the exact comparison decides (Codex N-a8a6c887: image drift never excuses another difference)."""
+    if prior.get("external_members") or current.get("external_members"):
+        return ()
+    old_members = list(prior.get("image_members") or ())
+    new_members = list(current.get("image_members") or ())
+    if not old_members or len(new_members) < len(old_members) or len(labels) != len(old_members):
+        return ()
+    drifted = []
+    for index, old in enumerate(old_members):
+        new = new_members[index]
+        if any(new.get(key) != old.get(key) for key in ("path", "source_start", "source_stop", "ordinal")):
+            return ()
+        if (new.get("size"), new.get("mtime_ns")) != (old.get("size"), old.get("mtime_ns")):
+            drifted.append(index)
+    return tuple(drifted)
+
+
+def _with_committed_facts(
+    prior: Mapping[str, Any], current: Mapping[str, Any], positions: tuple[int, ...],
+) -> dict[str, Any]:
+    """``current`` with the images at ``positions`` as the output committed them, and the source's own facts those
+    images moved: its size and time (its first image's) when that image is one of them or the extent is the same, its
+    digest at the same extent. What the exact comparison must still accept, and what a new epoch records for images
+    it did not reduce again (each epoch extends the one before it exactly)."""
+    comparable = dict(current)
+    members = [dict(member) for member in current.get("image_members") or ()]
+    for index in positions:
+        members[index] = dict(prior["image_members"][index])
+    comparable["image_members"] = members
+    same_extent = int(current.get("extent", -1)) == int(prior.get("extent", -1))
+    if same_extent or any(current["image_members"][index].get("path") == current.get("path") for index in positions):
+        comparable["size"], comparable["mtime_ns"] = prior.get("size"), prior.get("mtime_ns")
+    if same_extent:
+        comparable["digest"] = prior.get("digest")
+    return comparable
+
+
+def _recorded_acquisitions(handle: h5py.File, entry: str) -> dict[int, float]:
+    """Each committed frame's acquisition time as its .txt sidecar's "time:" reads with no zone applied (scan_data
+    "epoch_local"), by label, where the output stores it at full precision; an older output records none."""
+    group = handle.get(f"{entry}/scan_data")
+    if not isinstance(group, h5py.Group):
+        return {}
+    labels, values = group.get("frame_index"), group.get("epoch_local")
+    if (not isinstance(labels, h5py.Dataset) or not isinstance(values, h5py.Dataset) or values.ndim != 1
+            or labels.shape != values.shape or values.dtype != np.dtype(np.float64)):
+        return {}
+    return {int(label): float(value) for label, value in zip(labels[()], values[()]) if np.isfinite(value)}
+
+
+def _acquired(image_path: str) -> float | None:
+    """An image's acquisition time as its .txt sidecar reads now, through the reader the reduction used, or None."""
+    from xrd_tools.io.metadata import read_image_metadata
+    try:
+        value = read_image_metadata(image_path, meta_format="txt").get("epoch_local")
+    except MemoryError:
+        raise
+    except Exception:  # no sidecar the reader can take: no proof
+        return None
+    return float(value) if isinstance(value, float) and np.isfinite(value) else None
+
+
+def _any_changed(
+    prior: Mapping[str, Any], current: Mapping[str, Any], positions: tuple[int, ...], labels: tuple[int, ...],
+    recorded: Mapping[int, float], *, proof: bool = True,
+) -> bool:
+    """Whether one of the moved images at ``positions`` changed: a new size, or a new time without proof of the same
+    acquisition, its sidecar's acquisition time equal to the one recorded for its frame (maintainer, 2026-10-23: the
+    start time tells a re-copied file from a new image). A workflow rule, not byte proof: an image overwritten while
+    its sidecar keeps the same time passes as unchanged. Without ``proof`` (a Live Run's) every moved image is one."""
+    if not proof:
+        return bool(positions)
+    return any(
+        current["image_members"][index].get("size") != prior["image_members"][index].get("size")
+        or recorded.get(int(labels[index])) is None
+        or _acquired(str(current["image_members"][index].get("path"))) != recorded[int(labels[index])]
+        for index in positions)  # stops at the first changed image: no further sidecar is read
 
 
 def _source_extends(
@@ -778,7 +880,8 @@ def _source_extends(
     prior_images = list(prior.get("image_members") or ())
     current_images = list(current.get("image_members") or ())
     if not _member_extends(prior_images, current_images, grow_last=False):
-        raise ValueError("source does not extend exact image-member history")
+        raise ValueError("source does not extend exact image-member history: "
+                         + _first_member_difference(prior_images, current_images))
     if not _member_extends(prior_external, current_external, grow_last=True):
         raise ValueError("source does not extend exact external-member history")
     if int(current.get("extent", -1)) == int(prior.get("extent", -1)):
@@ -979,7 +1082,127 @@ def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -
         lineage.get("science_fingerprint", ""), tuple(modes), source, labels,
     )
     return AppendCommittedPrefix(_normalize(handle.filename), intent, _json(lineage))
-def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix: AppendCommittedPrefix | None = None) -> AppendDecision:
+@dataclass(frozen=True)
+class CommittedAppendCoverage:
+    """A committed Append output that already holds every frame of a scan: its committed labels and its recorded
+    wavelength in metres (None when it records none)."""
+    labels: tuple[int, ...]
+    wavelength_m: float | None
+
+
+def committed_append_coverage(
+    target: str | Path,
+    *,
+    entry: str,
+    source_base: str,
+    science_fingerprint: str,
+    modes: tuple[str, ...],
+    members: tuple[tuple[str | Path, int, int], ...],
+) -> CommittedAppendCoverage | None:
+    """Whether ``target``'s committed Append already holds a scan whose image files are ``members`` (path, size,
+    mtime_ns), under this entry, source base, science fingerprint and modes: the same files at the same sizes and
+    times, one committed frame for each, with every committed row present in every mode.
+
+    A small metadata read, with no source capture, intensity read or content hash (maintainer, 2026-10-23: "If
+    something has already been processed, it should be skipped anyway"; Codex's design review
+    DESIGN-append-smb-125). None sends the scan the full way: an absent, pending, dimension-replaced or unfamiliar
+    output; other files, sizes or times; point groups or external members; or another identity.
+    """
+    try:
+        with h5py.File(target, "r") as handle:
+            config = handle.get(f"{entry}/reduction/config")
+            if isinstance(config, h5py.Group) and any(
+                f"dimension_replacement_{dimension}" in config for dimension in ("1d", "2d")
+            ):
+                return None
+            prefix = decode_committed_append_prefix(handle, entry=entry)
+            from xrd_tools.io.browse_presentation import _monochromator_wavelength_m
+            wavelength_m = _monochromator_wavelength_m(handle[entry], entry, scalar_only=True)
+    except Exception:  # anything this reader cannot vouch for goes the full way
+        return None
+    intent = prefix.intent
+    expected = {_normalize(path): (int(size), int(mtime_ns)) for path, size, mtime_ns in members}
+    committed = {member.path: (int(member.size), int(member.mtime_ns)) for member in intent.source.image_members}
+    if (
+        intent.entry != entry
+        or intent.source_base != _normalize_base(source_base)
+        or intent.science_fingerprint != science_fingerprint
+        or tuple(intent.modes) != tuple(modes)
+        or intent.source.external_members
+        or len(expected) != len(members)
+        or committed != expected
+        or len(intent.labels) != len(members)
+    ):
+        return None
+    return CommittedAppendCoverage(tuple(intent.labels), wavelength_m)
+
+
+def committed_image_count(target: str | Path, *, entry: str) -> int | None:
+    """How many images ``target``'s committed Append record holds, as qualification decodes its committed prefix, or
+    None: no output, or none this reader can vouch for. A small metadata read, no image or sidecar."""
+    try:
+        with h5py.File(target, "r") as handle:
+            prefix = decode_committed_append_prefix(handle, entry=entry)
+    except MemoryError:
+        raise
+    except Exception:  # nothing to undercut: admission and qualification decide, as before
+        return None
+    return len(prefix.intent.source.image_members)
+
+
+def _extension(
+    intent: AppendIntent, labels: tuple[int, ...], lineage: Mapping[str, Any], prior_source: Mapping[str, Any],
+    compared: Mapping[str, Any], recorded_source: Mapping[str, Any],
+) -> AppendDecision:
+    """SKIP or WRITE ``intent`` over the committed ``labels`` when the source, as ``compared``, extends the committed
+    one exactly, else raise the refusal; a WRITE's pending epoch records ``recorded_source``."""
+    _source_extends(
+        prior_source,
+        compared,
+    )
+    prior_extent = int(prior_source.get("extent", -1))
+    if intent.labels[:len(labels)] != labels:
+        raise ValueError("requested labels do not preserve the committed prefix")
+    suffix = intent.labels[len(labels):]
+    if int(intent.source.extent) == prior_extent:
+        if suffix:
+            raise ValueError("same-extent source proposed new labels")
+        return _decision(
+            AppendDisposition.SKIP,
+            committed_labels=labels,
+            reason="exact source already committed",
+            source_generation=intent.source.generation,
+        )
+    if not suffix:
+        raise ValueError("growing source supplied no new labels")
+    expected_start = labels[-1] + 1 if labels else suffix[0]
+    if suffix[0] != expected_start:
+        raise ValueError("new labels overlap or gap committed rows")
+    if int(intent.source.extent) - prior_extent != len(suffix):
+        raise ValueError("source extent growth does not match selected labels")
+    pending = dict(lineage)
+    pending["state"] = "pending"
+    pending["epochs"] = list(lineage["epochs"]) + [
+        {"source": dict(recorded_source), "labels": list(suffix)}
+    ]
+    return _decision(
+        AppendDisposition.WRITE,
+        suffix,
+        labels,
+        lineage=pending,
+        source_generation=intent.source.generation,
+    )
+
+
+def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix: AppendCommittedPrefix | None = None,
+                   image_drift: bool = False, acquisition_proof: bool = True) -> AppendDecision:
+    """``image_drift``: type the refusal of a scan whose processed images changed on disk for a rebuild
+    (``AppendDecision.rebuild``); without it, and always for a Live Run's own prefix, image history stays exact.
+    ``acquisition_proof``: a finite Append's acceptance of a re-dated image whose sidecar still reads its recorded
+    clock time as the same acquisition; a Live Run passes False, so every moved image is a change (its extensions
+    record each epoch's current images, which a re-dated image's committed facts would not extend)."""
+    if type(image_drift) is not bool or type(acquisition_proof) is not bool:
+        raise TypeError("image_drift and acquisition_proof must be exact bools")
     target = Path(target)
     try:
         normalized = _normalize(target)
@@ -1010,6 +1233,10 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
             ):
                 raise ValueError("DIMENSION_REPLACEMENT_APPEND_UNSUPPORTED")
             current = decode_committed_append_prefix(handle, entry=intent.entry)
+            # A Live Run's own committed prefix stays exact: drift there is that Run's to retire, not this check's.
+            drifted = () if committed_prefix is not None or not image_drift else _drifted_members(
+                _source_dict(current.intent.source), _source_dict(intent.source), tuple(current.committed_labels))
+            recorded = _recorded_acquisitions(handle, intent.entry) if drifted and acquisition_proof else {}
         if committed_prefix is not None:
             observed_lineage = json.loads(committed_prefix.lineage_json)
             current_lineage = json.loads(current.lineage_json)
@@ -1025,48 +1252,64 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
         labels = current.committed_labels; lineage = json.loads(current.lineage_json)
         prior_source = _source_dict(current.intent.source)
         current_source = _source_dict(intent.source)
-        _source_extends(
-            prior_source,
-            current_source,
-        )
-        prior_extent = int(prior_source.get("extent", -1))
-        if intent.labels[:len(labels)] != labels:
-            raise ValueError("requested labels do not preserve the committed prefix")
-        suffix = intent.labels[len(labels):]
-        if int(intent.source.extent) == prior_extent:
-            if suffix:
-                raise ValueError("same-extent source proposed new labels")
-            return _decision(
-                AppendDisposition.SKIP,
-                committed_labels=labels,
-                reason="exact source already committed",
-                source_generation=intent.source.generation,
-            )
-        if not suffix:
-            raise ValueError("growing source supplied no new labels")
-        expected_start = labels[-1] + 1 if labels else suffix[0]
-        if suffix[0] != expected_start:
-            raise ValueError("new labels overlap or gap committed rows")
-        if int(intent.source.extent) - prior_extent != len(suffix):
-            raise ValueError("source extent growth does not match selected labels")
-        pending = dict(lineage)
-        pending["state"] = "pending"
-        pending["epochs"] = list(lineage["epochs"]) + [
-            {"source": current_source, "labels": list(suffix)}
-        ]
-        return _decision(
-            AppendDisposition.WRITE,
-            suffix,
-            labels,
-            lineage=pending,
-            source_generation=intent.source.generation,
-        )
+        try:
+            return _extension(intent, labels, lineage, prior_source, current_source, current_source)
+        except ValueError as exact:
+            if not drifted:
+                raise
+            comparable = _with_committed_facts(prior_source, current_source, drifted)
+            try:  # again with the moved images as committed: every other difference still refuses, as above
+                decision = _extension(intent, labels, lineage, prior_source, comparable, comparable)
+            except ValueError:
+                raise exact from None
+            if _any_changed(prior_source, current_source, drifted, labels, recorded, proof=acquisition_proof):
+                return _decision(
+                    AppendDisposition.REFUSE,
+                    intent.labels,
+                    labels,
+                    reason=_refusal_reason(target, intent.entry, exact),
+                    source_generation=intent.source.generation,
+                    rebuild=True,
+                )
+            if decision.disposition is AppendDisposition.SKIP:
+                return replace(decision, reason=f"source already committed ({len(drifted)} image(s) with new file "
+                                                "times, each still the acquisition its frame recorded)")
+            return decision
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         return _decision(
             AppendDisposition.REFUSE,
-            reason=str(exc),
+            reason=_refusal_reason(target, intent.entry, exc),
             source_generation=intent.source.generation,
         )
+
+def _refusal_reason(target: Path, entry: str, error: BaseException) -> str:
+    """The refusal, with its remedy when an interrupted in-place Append left the output pending (Replace) or torn
+    (Replace's raw-target gate refuses a file it cannot recognize, so: move or delete it), or when another program
+    holds it (close that program)."""
+    reason = str(error)
+    try:
+        with open(target, "rb"):
+            pass
+    except OSError:
+        return reason  # missing, or not readable at all (permissions, a sharing lock): no remedy to name
+    try:
+        with h5py.File(target, "r") as handle:
+            state = _read_lineage(handle[entry]).get("state")
+    except OSError as opened:
+        text = str(opened)
+        if "unable to lock file" in text:
+            return f"another program has the output open; close it, then run again ({reason})"
+        if "truncated file" in text or "file signature not found" in text:
+            return (
+                "the output is not a readable HDF5 file, possibly left by an interrupted Append; "
+                f"move or delete it, then run again ({reason})"
+            )
+        return reason
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return reason
+    if state == "pending":
+        return f"an earlier Append of this output did not finish; use Replace to rebuild it ({reason})"
+    return reason
 
 def prepare_append_preflight(
     target: str | Path,
@@ -1076,7 +1319,21 @@ def prepare_append_preflight(
     file_lock=None,
     refusal_mapper: Callable[[str, AppendDecision], BaseException] | None = None,
     before_admit: Callable[[], None] | None = None,
+    in_place: bool = False,
+    image_drift: bool = False,
+    acquisition_proof: bool = True,
 ) -> AppendPreflight:
+    """Admit, lease and qualify one Append target under its file lock.
+
+    ``in_place`` binds the transaction, before admission, to write an existing
+    output in place (finite Append; maintainer, 2026-10-23): no whole-file hash
+    at admission, no backup and no copy.  A missing target keeps the ordinary
+    creation route.  ``image_drift`` and ``acquisition_proof`` qualify as :func:`qualify_append` does.
+    """
+    if type(in_place) is not bool:
+        raise TypeError("in_place must be an exact bool")
+    if type(image_drift) is not bool or type(acquisition_proof) is not bool:
+        raise TypeError("image_drift and acquisition_proof must be exact bools")
     from .output_transaction import (
         LeaseOwner,
         OwnerToken,
@@ -1101,6 +1358,7 @@ def prepare_append_preflight(
                 normalized,
                 transaction_owner=transaction_owner,
                 target_owner=target_owner,
+                in_place=in_place,
             )
             lease = transaction.acquire_lease(
                 admission=transaction.admission,
@@ -1108,7 +1366,9 @@ def prepare_append_preflight(
                 target_owner=target_owner,
                 owners=owners,
             )
-            if committed_prefix is None:
+            if committed_prefix is None and image_drift:
+                decision = qualify_append(normalized, intent, image_drift=True, acquisition_proof=acquisition_proof)
+            elif committed_prefix is None:
                 decision = qualify_append(normalized, intent)
             else:
                 decision = qualify_append(normalized, intent, committed_prefix=committed_prefix)
@@ -1236,10 +1496,13 @@ __all__ = [
     "AppendRefused",
     "AppendSource",
     "AppendSourceGraphRefused",
+    "CommittedAppendCoverage",
     "LINEAGE_DATASET",
     "LINEAGE_VERSION",
     "begin_same_run_lineage",
     "commit_append_lineage",
+    "committed_append_coverage",
+    "committed_image_count",
     "decode_committed_append_prefix",
     "decode_replacement_lineage",
     "extend_same_run_lineage",

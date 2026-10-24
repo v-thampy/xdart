@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from threading import Lock, RLock, Thread
+from time import monotonic, sleep
 from typing import Callable
 
 import numpy as np
@@ -82,7 +83,7 @@ from .display_residency import (
 )
 from .browse_values import canonical_browse_source_identity
 from .events import RunIdentity
-from .hydration_transport import HydrationTransport, PreparedHydrationCommit
+from .hydration_transport import DetachedHydrationMutation, HydrationTransport, PreparedHydrationCommit
 
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,7 @@ class RunDisplayState:
         self._transport = HydrationTransport(
             self.commit_preview, self._derive_target,
             completion_sink=self._complete_hydration,
+            current=self._reads_current_generation,
         )
         self._frame_mask_qualified: set[DisplayFrameKey] = set()
         self._detector_outcomes: dict[
@@ -316,18 +318,7 @@ class RunDisplayState:
             )
         if self._partition_index >= self._partition_count:
             raise RuntimeError("display received more artifacts than admitted")
-        records = self._record_store_factory(
-            max_items=None,
-            max_heavy_items=None,
-        )
-        publications = self._publication_store_factory(
-            max_items=None,
-            max_heavy_items=None,
-            max_thumbnail_items=None,
-        )
-        publications.set_evictable_probe(records.can_release_record)
-        publications.set_heavy_evictable_probe(records.can_release_heavy)
-        publications.set_thumbnail_evictable_probe(records.can_release_thumbnail)
+        records, publications = self._new_stores()
         frozen_mask = None if mask is None else np.asarray(mask, dtype=bool)
         if frozen_mask is not None:
             frozen_mask.setflags(write=False)
@@ -354,6 +345,85 @@ class RunDisplayState:
         self.artifacts[str(artifact)] = owner
         self._partition_index += 1
         return owner
+
+    def _new_stores(self) -> tuple[FrameRecordStore, PublicationStore]:
+        records = self._record_store_factory(
+            max_items=None,
+            max_heavy_items=None,
+        )
+        publications = self._publication_store_factory(
+            max_items=None,
+            max_heavy_items=None,
+            max_thumbnail_items=None,
+        )
+        publications.set_evictable_probe(records.can_release_record)
+        publications.set_heavy_evictable_probe(records.can_release_heavy)
+        publications.set_thumbnail_evictable_probe(records.can_release_thumbnail)
+        return records, publications
+
+    def begin_active_generation(self, owner: DisplayArtifact, *, timeout: float) -> None:
+        """Give one closed artifact fresh stores for a new writer generation.
+
+        A Live Run can write again to an output it closed: one it showed from
+        its saved record, or one it settled to admit another, that grows.
+        Closed hydration is monotonic within its generation, so the stores are
+        replaced, not reopened: a read still in flight for the closed
+        generation fails the exact-store check at commit, the writer's
+        allocation binds an empty store, and its checkpoint authority governs
+        hydration again.  Navigation and the per-artifact facts are kept.
+        Returns once no acquisition read of the closed generation is still
+        reading; one queued or admitted later never starts
+        (``_reads_current_generation``), so none reads the file once its writer
+        opens it (a read overlapping the writer failed that writer's close
+        verification).  Viewer reads are outside this barrier.
+        """
+        with self._light_admission_lock, self._lock:
+            if self.artifacts.get(str(owner.artifact)) is not owner:
+                raise ValueError("display hydration owner is foreign")
+            if not owner.hydration_closed:
+                raise RuntimeError("an open display artifact cannot begin another generation")
+            if any(value is not None for value in (
+                owner.light_lease, owner.light_slot, owner.light_hooks,
+                owner.light_retry_token, owner.light_release_reason,
+                owner.light_unsubscribe, owner.publications.allocation,
+                owner.publications._light_1d,
+            )):
+                raise RuntimeError("closed display artifact still holds light-1D custody")
+            retired = (owner.records, owner.publications)
+            records, publications = self._new_stores()
+            # Bound before anything can see them: until the writer grants a
+            # checkpoint token, nothing hydrates into the new generation.
+            records._bind_checkpoint_hydration_lineage(str(owner.artifact), self.identity)
+            owner.records, owner.publications = records, publications
+            owner.hydration_closed = False
+            artifact = str(owner.artifact)
+            for derived in (self.payloads, self._raw_lru, self._detector_outcomes):
+                for key in [key for key in derived if key.artifact == artifact]:
+                    del derived[key]
+            if self._full_demand is not None and self._full_demand[3].artifact == artifact:
+                self._full_demand = None
+                self._full_pending = False
+                self._full_diagnostic = None
+            self._residency.forget(*retired)
+        deadline = monotonic() + max(0.0, float(timeout))
+        while True:
+            self._transport.dispatch_detached(self._transport.cancel_stores_detached(retired))
+            if not self._transport.reads_stores(retired):
+                return
+            if monotonic() > deadline:
+                raise RuntimeError("a read of the closed display generation did not settle before its writer")
+            sleep(0.005)
+
+    def _reads_current_generation(self, request) -> bool:
+        """The transport's check before a read starts: an acquisition read
+        (record and publication stores) still hydrates its artifact's current
+        stores.  Browse reads carry one store and are not this Run's."""
+        stores = getattr(request, "stores", ())
+        if len(stores) != 2:
+            return True
+        with self._lock:
+            art = self.artifacts.get(request.read_key.artifact_identity)
+            return art is not None and stores[0] is art.records and stores[1] is art.publications
 
     def bind_checkpoint_hydration(self, owner: DisplayArtifact) -> None:
         owner.records._bind_checkpoint_hydration_lineage(
@@ -627,6 +697,12 @@ class RunDisplayState:
                 self._partition_index + 1,
             )
 
+    def retire_artifact_navigation(self, artifact: str) -> int:
+        """Take ``artifact``'s frames out of navigation before its output is replaced whole; the replacement's first
+        frame carries them as retired (``DisplayCatalogIndex.retire_artifact``)."""
+        with self._lock:
+            return self.catalog.retire_artifact(str(artifact))
+
     def append_navigation(
         self,
         source_scan: str,
@@ -856,7 +932,10 @@ class RunDisplayState:
                 return token
             self._full_pending = True
         with self._light_admission_lock:
-            mutation = self._transport.submit_detached(request, closed=closed)
+            if art.records is not request.stores[0] or art.publications is not request.stores[1]:
+                mutation = DetachedHydrationMutation()  # the artifact began another generation meanwhile
+            else:
+                mutation = self._transport.submit_detached(request, closed=closed)
         if mutation.token is None:
             with self._lock:
                 if self._full_demand is not None and self._full_demand[1] is token: self._full_demand = None; self._full_pending = False
@@ -969,11 +1048,13 @@ class RunDisplayState:
             publication,
         )
         if needs_hydration and require_complete:
+            # The Run's own closed state: the request reads the artifact's with
+            # the stores it hydrates, not this earlier snapshot.
             self._request_preview(
                 artifact_owner,
                 key,
                 selection_generation,
-                effective_closed,
+                closed,
                 owner,
                 commit_gate,
             )
@@ -1110,7 +1191,12 @@ class RunDisplayState:
         with self._lock:
             if self.artifacts.get(str(art.artifact)) is not art:
                 return
+            # One generation's closed state, stores and checkpoint authority,
+            # read together (begin_active_generation swaps them under this lock).
             closed = bool(closed or art.hydration_closed)
+            stores = (art.records, art.publications)
+            required, checkpoint_token, checkpoint_gate = (
+                (False, None, None) if closed else self._checkpoint_authority(art))
         try:
             scope = HydrationScope(*owner.as_tuple())
             read_key = HydrationReadKey(
@@ -1120,8 +1206,6 @@ class RunDisplayState:
                 HydrationPurpose.PREVIEW,
             )
             token = HydrationToken(read_key, int(selection_generation))
-            required, checkpoint_token, checkpoint_gate = (
-                (False, None, None) if closed else self._checkpoint_authority(art))
             if required and checkpoint_token is None:
                 return
             request = HydrationRequest(
@@ -1129,7 +1213,7 @@ class RunDisplayState:
                 HydrationPurpose.PREVIEW,
                 int(selection_generation),
                 owner,
-                (art.records, art.publications),
+                stores,
                 commit_gate,
                 read_key=read_key,
                 token=token,

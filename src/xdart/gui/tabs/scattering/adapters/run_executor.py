@@ -9,6 +9,7 @@ from threading import Event, Lock, Thread, current_thread, get_ident
 from time import monotonic
 from typing import Any, Callable, Mapping
 import numpy as np
+from xdart.utils import log_events
 from xdart.modules.frame_publication import (
     PublicationStore,
     canonical_frame_source_identity,
@@ -18,6 +19,7 @@ from xrd_tools.core.scan import SourceKind
 from xrd_tools.io.append import AppendRefused
 from xrd_tools.io.metadata import MetadataSourceChanged
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
+from xrd_tools.reduction.core import WarmIntegrators
 from xrd_tools.reduction.background import (
     _PreparedSeriesFrameBackground,
     _PreparedSingleFrameBackground,
@@ -85,7 +87,8 @@ from ..output_preflight import (
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     native_int_reduction_plan, materialize_deferred_output,
-    live_directory_groups, materialize_live_directory_group, observe_live_members,
+    live_directory_groups, live_group_coverage, live_readiness_debug, materialize_live_directory_group,
+    observe_live_members,
     prepare_output as build_admission_receipt, source_snapshots,
     target_state_matches, validate_admitted_receipt, validate_planned_source,
 )
@@ -97,6 +100,27 @@ from .dynamic_output import DynamicOutputAdapter, HeavyResidencyFact
 
 logger = logging.getLogger(__name__)
 
+
+def _run_summary(configuration) -> str:
+    """A Run's banner line: processing, output mode, Live, cores, its source and where it writes."""
+    try:
+        spec = configuration.thaw_source_spec()
+    except Exception:  # a legacy configuration has none to thaw
+        spec = None
+    source = (getattr(spec, "uri", None) or getattr(spec, "root", None)
+              or getattr(configuration, "project_root", "") or "")
+    cores = getattr(configuration, "max_cores", None)
+    mode = (f"{getattr(configuration, 'processing_mode', '?')}, {getattr(configuration, 'output_mode', '?')}"
+            f"{', Live' if getattr(configuration, 'live_mode', False) else ''}, "
+            f"{_counted(cores, 'core') if type(cores) is int else '? cores'}")
+    output = getattr(configuration, "save_path", "") or ""
+    return " · ".join(filter(None, (mode, f"{source} → {output}" if source and output else source or output)))
+
+
+def _counted(count: int, noun: str) -> str:
+    """``1 frame``, ``2 frames``."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
 # Preserve the established test-injection seam while production remains strict.
 load_poni = load_detector_calibration
 poni_to_integrator = detector_calibration_to_integrator
@@ -105,6 +129,12 @@ _CONTAINER_READ_CHUNK_FRAMES = 8
 _SOURCE_PREFETCH_FRAMES = 4
 _DISPLAY_PROJECTION_FRAMES = 8
 _LIVE_DIRECTORY_POLL_S = 0.1
+# A frame whose own sidecar has been missing or changing this long is named, once, in the log and the Live status; it
+# keeps waiting (maintainer, 2026-10-24: "If it's only for txt files, a 10s timeout is plenty").
+_SIDECAR_WAIT_WARN_S = 10.0
+# A scan found changed is reduced again once its images and sidecars have held still this long: an acquisition can
+# write an image and its sidecar a moment later (maintainer, 2026-10-24: "Go ahead with your recommendation").
+_REBUILD_QUIET_S = 2.0
 
 _SOURCE_SUBMISSION_END = object()
 
@@ -459,6 +489,12 @@ class _StandardRun:
     files_skipped: int = 0
     # Scans a directory Append skipped instead of failing the run: (output, reason).
     append_skips: list[tuple[str, str]] = field(default_factory=list)
+    # Scans an Append reduced again whole, their processed images changed on disk: (output, reason), once each
+    # finished; the current output's while it runs.
+    append_rebuilds: list[tuple[str, str]] = field(default_factory=list)
+    pending_rebuild: tuple[str, str] | None = None
+    # The scans whose "New Scan" banner the log shows and whose "End of Scan" it has not yet: output name -> start.
+    open_scans: dict[str, float] = field(default_factory=dict)
     processed_live_revisions: dict[str, LiveDirectoryAttempt] = field(
         default_factory=dict
     )
@@ -472,6 +508,9 @@ class _StandardRun:
     # Live outputs that stopped growing because a published frame's metadata
     # changed: physical target key -> the reason every later status carries.
     live_blocked: dict[str, str] = field(default_factory=dict)
+    # Live outputs whose next frame has waited _SIDECAR_WAIT_WARN_S for its own
+    # sidecar: physical target key -> the note the status carries meanwhile.
+    live_waiting: dict[str, str] = field(default_factory=dict)
     current_file_total: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
@@ -582,6 +621,55 @@ def _live_proof(configuration, graph, record, registry) -> LivePrefixProof:
                            record=record, registry=registry)
 
 
+def _target_stat(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+@dataclass(slots=True)
+class _CoveredOutput:
+    """A Live scan its output's committed record covers, watched by a cheap stat of that output and the adapter
+    registrations at most every LivePrefixProof.PERIOD_S (Codex N-0243a1bb F3): once the output is deleted, replaced or
+    rewritten while the scan's images are not, the scan is looked at again."""
+    target: Path
+    signature: tuple[int, int, int, int]  # the output as its record was read (unchanged across that read)
+    registry: tuple
+    checked_at: float
+
+    def holds(self, registry: tuple) -> bool:
+        if monotonic() - self.checked_at < LivePrefixProof.PERIOD_S:
+            return True
+        if registry != self.registry or _target_stat(self.target) != self.signature:
+            return False
+        self.checked_at = monotonic()
+        return True
+
+
+class _LivePollTimes:
+    """XDART_PERF: where one Live poll spent its time, by step, counted and summed (Codex N-0243a1bb: measure the
+    startup work before choosing another cache or reducing validation)."""
+
+    __slots__ = ("steps",)
+
+    def __init__(self) -> None:
+        self.steps: dict[str, list] = {}
+
+    def add(self, step: str, started: float) -> None:
+        tally = self.steps.setdefault(step, [0, 0.0])
+        tally[0] += 1
+        tally[1] += monotonic() - started
+
+    @property
+    def busy(self) -> bool:
+        return any(step not in ("listing", "key") for step in self.steps)
+
+    def line(self) -> str:
+        return ", ".join(f"{step} {count}× {seconds:.3f} s" for step, (count, seconds) in self.steps.items())
+
+
 def _directory_status(
     run: _StandardRun,
     *,
@@ -596,7 +684,7 @@ def _directory_status(
         f"{state} · {processed} processed · {skipped} skipped · "
         f"{pending} pending · {discovered} discovered"
     )
-    return " · ".join((status, *run.live_blocked.values()))
+    return " · ".join((status, *run.live_blocked.values(), *run.live_waiting.values()))
 
 
 def _directory_counts(
@@ -781,6 +869,9 @@ class StandardRunExecutor:
         self._retirement: DisplayRetirementOwner | None = None
         self._max_display_items = max_display_items
         self._join_timeout = float(join_timeout)
+        # Built pyFAI tables kept from one Run to the next (beamline 2026-10-23: each Run's first frame rebuilt them,
+        # about 8 s for a Rayonix on that PC); each Run fits them to its own memory plan.
+        self._warm_tables = WarmIntegrators(1)
 
     def start(self, configuration, source: SourceCapture, run_identity: RunIdentity, admission: AdmissionReceipt):
         with self._lock:
@@ -1411,6 +1502,16 @@ class StandardRunExecutor:
             return
         self._settle_predecessor(run, output, predecessor)
 
+    def _retire_current_target(self, run: _StandardRun, target: Path) -> None:
+        """Settle ``target``'s output when it is the current one and stops growing, as a predecessor settles: its
+        writer finishes and its display closes now, not when another output starts or the Run ends."""
+        output = run.output
+        owner = None if output is None else output.current_owner_for_target(target)
+        if owner is None:
+            return
+        self._settle_predecessor(run, output, owner)
+        run.session = None
+
     def _block_live_target(
         self, run: _StandardRun, target: Path, target_key: str,
         drift: tuple[str, ...],
@@ -1422,17 +1523,96 @@ class StandardRunExecutor:
         still fails the Run.  The reason stays in every later status.
         """
 
-        self._release_predecessor_before_target(run, target)
+        self._retire_current_target(run, target)
         names = ", ".join(sorted({Path(path).name for path in drift}))
         reason = (
             f"{Path(target).name} stopped growing: {names} changed after "
             "its frame was reduced; published frames kept"
         )
         run.live_blocked[target_key] = reason
-        logger.warning("[LIVE] %s", reason)
+        run.live_waiting.pop(target_key, None)
+        log_events.event(
+            logger, logging.WARNING, "%s stops growing: the metadata of frames it already processed changed (%s); its "
+            "frames so far are kept and its later frames are skipped in this Run [LIVE]", Path(target).name, names)
+
+    def _skip_live_append(
+        self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused | None, *, constructed: bool,
+        reason: str | None = None, changed: bool = False,
+    ) -> None:
+        """Leave one Live output as it is after its Append refused: later polls skip its frames, the status names
+        it, and the Run's end lists the reason. The output, when it is the current one, is retired first (with the
+        Run's progress as it stands), and a failure there still fails the Run; a refusal during construction then
+        closes the source it opened. ``reason`` stands for ``error``'s when there is none (a rebuild typed against an
+        output this Run grows, ``changed``: one of its processed images changed on disk)."""
+        with _run_effect(run):
+            self._retire_current_target(run, target)
+        if constructed:
+            source_owner = run.source
+            if source_owner is not None:
+                close = getattr(source_owner, "close", None)
+                if callable(close):
+                    close()
+            run.source = None
+            run.scan = None
+            run.records = None
+            run.frames_by_label.clear()
+            run.current_total = 0
+            run.current_completed = 0
+            run.current_published = 0
+            run.current_file_total = 0
+            run.current_files_incremental = False
+        reason = detach_exception(error, "append").message if reason is None else reason
+        run.append_skips.append((str(target), reason))
+        run.live_blocked[target_key] = (
+            f"{Path(target).name} stopped growing: its Append was refused; published frames kept"
+        )
+        run.live_waiting.pop(target_key, None)
+        log_events.event(
+            logger, logging.WARNING, "%s stops growing: %s; its frames so far are kept and its later frames are "
+            "skipped in this Run%s. Details: %s [APPEND-SKIPPED]", Path(target).name,
+            "an image it already processed changed on disk" if changed else "it can no longer be extended",
+            "; the next Run reprocesses the whole scan" if changed else "", reason)
+
+    def _note_sidecar_wait(self, run: _StandardRun, name: str, target_key: str, image: str | None,
+                           waits: dict[str, tuple[str, float, str]]) -> None:
+        """Name, once, in the log and the Live status, the image whose own sidecar output ``name``'s next frame has
+        waited on for _SIDECAR_WAIT_WARN_S (missing or changing); clear the note when that frame no longer waits on it
+        (``image`` None: its attempt went on, its scan is covered, or its files left the directory)."""
+        now, held = monotonic(), waits.get(target_key)
+        if image is not None and held is not None and held[0] == image:
+            if target_key not in run.live_waiting and now - held[1] >= _SIDECAR_WAIT_WARN_S:
+                run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
+                log_events.event(
+                    logger, logging.WARNING, "%s is waiting for the metadata of %s: its sidecar has been missing or "
+                    "changing for over %g s; the frame is processed once its sidecar holds still [LIVE]",
+                    name, image, _SIDECAR_WAIT_WARN_S)
+            return
+        if run.live_waiting.pop(target_key, None) is not None and held is not None:
+            log_events.event(logger, logging.INFO, "%s no longer waits for the metadata of %s [LIVE]", held[2], held[0])
+        if image is None:
+            waits.pop(target_key, None)
+        else:
+            waits[target_key] = (image, now, name)
+
+    def _open_scan(self, run: _StandardRun, artifact: Path, note: str = "") -> None:
+        """The log's ``New Scan`` banner for ``artifact``'s output (maintainer, 2026-10-24)."""
+        name = Path(artifact).name
+        run.open_scans[name] = monotonic()
+        log_events.banner(logger, "New Scan · %s%s", name, f" ({note})" if note else "", kind="scan")
+
+    def _close_scan(self, run: _StandardRun, artifact: Path, frames: int | None = None) -> None:
+        """The log's ``End of Scan`` banner for ``artifact``'s output, with its frames and its time since it opened."""
+        name = Path(artifact).name
+        started = run.open_scans.pop(name, None)
+        if started is None:
+            return
+        counted = "" if frames is None else f" · {_counted(int(frames), 'frame')}"
+        log_events.banner(logger, "End of Scan · %s%s · %.1f s", name, counted, monotonic() - started,
+                          kind="scan-end")
 
     def _settle_predecessor(self, run, output, predecessor) -> None:
         result = output.finish_predecessor(predecessor)
+        self._close_scan(run, predecessor.artifact, getattr(result, "n_processed", None))
         self._finish_display_projection(run)
         self._project_new_durable(run, output)
         if getattr(result, "failed", False):
@@ -1609,13 +1789,14 @@ class StandardRunExecutor:
             raise RuntimeError("dynamic output requires one admitted output")
         output = run.output
         if output is None:
-            output = DynamicOutputAdapter(configuration); run.output = output
+            output = DynamicOutputAdapter(configuration, self._warm_tables); run.output = output
         preparation = output.prepare_admission(
             run.scan, plan, item, decision, run.stop_signal,
             qualify=lambda policy, prior: _qualify_background_bindings(
                 configuration, run.scan, item, decision, policy, prior,
                 run.stop_signal, run))
-        if configuration.output_mode == "Overwrite" and not target_state_matches(preparation.effective):
+        replaces = decision.disposition is OutputDisposition.REPLACE
+        if (configuration.output_mode == "Overwrite" or replaces) and not target_state_matches(preparation.effective):
             raise RuntimeError(f"output target changed after Background qualification: {item.target}")
         run.display.set_factories(FrameRecordStore, PublicationStore)
         if not run.display.configured:
@@ -1632,8 +1813,8 @@ class StandardRunExecutor:
                 ),
                 None,
             )
-            run.display.configure(
-                partition_count=run.pending_partition_count,
+            self._configure_display(
+                run,
                 npt=npt,
                 frame_bytes=(
                     descriptor_bytes
@@ -1644,6 +1825,18 @@ class StandardRunExecutor:
         mask = None if assets is None else assets.mask
         owner = run.display.artifacts.get(str(artifact))
         newly_adopted_owner = owner is None
+        resumed = owner is not None and owner.hydration_closed
+        if owner is not None and replaces:
+            # Replaced whole (a Live Run showed it from its saved record, or finished it before another scan began,
+            # then its images changed): its display was closed then, and its old frames leave navigation with the
+            # replacement's first frame.
+            if not owner.hydration_closed:
+                raise RuntimeError(f"a replaced output's display is still open: {artifact}")
+            run.display.retire_artifact_navigation(str(artifact))
+        if owner is not None and owner.hydration_closed:
+            # An output this Run closed (shown from its saved record, or settled to admit another) grows again: its
+            # writer starts a new display generation (Codex N-0243a1bb F2: the closed store could not take its allocation).
+            run.display.begin_active_generation(owner, timeout=self._join_timeout)
         if owner is None:
             if configuration.live_mode and run.display.artifacts:
                 run.display.admit_additional_partition()
@@ -1686,11 +1879,21 @@ class StandardRunExecutor:
                     else None
                 ),
             )
+        if newly_adopted_owner or resumed:
+            self._open_scan(run, artifact, "reprocessed whole" if replaces else "continued" if resumed else "")
         run.records = owner.records
         run.display.bind_checkpoint_hydration(owner)
         run_provenance = configuration.as_provenance()
         if admission is not None:
             run_provenance['scientific_signature'] = admission.candidate.processing_mapping()
+        run.pending_rebuild = (str(item.target), decision.reason) if replaces else None
+        if replaces:  # the Run asked for Append; this output is replaced whole (Codex N-a8a6c887)
+            run_provenance["append_replacement"] = {
+                "requested_output_mode": "Append", "effective_output_mode": "Overwrite", "reason": decision.reason}
+            log_events.event(
+                logger, logging.INFO, "%s: images it already processed changed on disk, so the whole scan is "
+                "reprocessed and its output replaced. Details: %s [APPEND-REBUILD]", Path(item.target).name,
+                decision.reason)
         if run.stop_requested:
             discard_source()
             raise RuntimeError("admission cancelled")
@@ -1737,20 +1940,31 @@ class StandardRunExecutor:
         return run
 
     @staticmethod
+    def _configure_display(run: _StandardRun, *, npt: int, frame_bytes: int | None) -> None:
+        """The Run's one display configuration, at its first output: a constructed one, after its Background
+        qualification, or an already-processed scan's presentation, which has no Background."""
+        run.display.configure(
+            partition_count=run.pending_partition_count, npt=npt, frame_bytes=frame_bytes,
+        )
+
+    @staticmethod
     def _seed_persisted_prefix_navigation(
         run: _StandardRun,
         owner: DisplayArtifact,
         labels: tuple[int, ...],
         *,
         newly_adopted: bool,
+        completed: int | None = None,
     ) -> None:
+        """``completed``: the output's completed frames, the Run's current output's when None (a saved output shown
+        while another is open passes its own)."""
         if type(newly_adopted) is not bool:
             raise TypeError("persisted-prefix adoption flag must be exact")
         if not newly_adopted:
             return
         if type(labels) is not tuple:
             raise TypeError("persisted prefix labels must be an exact tuple")
-        if len(labels) != run.current_completed:
+        if len(labels) != (run.current_completed if completed is None else completed):
             raise ValueError("persisted prefix cardinality changed")
         if any(type(label) is not int for label in labels):
             raise TypeError("persisted prefix labels must be exact integers")
@@ -1778,7 +1992,8 @@ class StandardRunExecutor:
         run.display.seed_navigation_prefix_at_work_ordinals(rows)
 
     def _adopt_acquisition_context(
-        self, run: _StandardRun, owner: DisplayArtifact, *, source_path: str
+        self, run: _StandardRun, owner: DisplayArtifact, *, source_path: str,
+        saved_only: bool = False,
     ):
         created = run.context_runtime is None
         runtime = run.context_runtime or AcquisitionRuntime()
@@ -1788,22 +2003,22 @@ class StandardRunExecutor:
             if runtime.context is None
             else runtime.context.hydration_owner
         )
-        context = runtime.adopt(run, owner, source_path)
+        context = runtime.adopt(run, owner, source_path, saved_only=saved_only)
         # The native binder already resolved these values for this output.
         # Announce only after its acquisition context has actually been adopted.
-        selection = getattr(run.scan, "extra", {}).get("energy_selection", {})
+        selection = {} if saved_only else getattr(run.scan, "extra", {}).get("energy_selection", {})
         energy = ""
         if selection.get("disagreement") and not run.energy_notice_sent:
             energy = (f"Using the scan energy, {selection['source_energy_eV'] / 1000:.3f} keV; "
                       f"the PONI says {selection['calibration_energy_eV'] / 1000:.3f} keV.")
             if isinstance(run.capture.source, DirectorySourceSpec):
                 energy = f"{run.artifact.name}: {energy}"
-        coverage = "" if run.coverage_notice_sent else _coverage_notice(run)
+        coverage = "" if saved_only or run.coverage_notice_sent else _coverage_notice(run)
         detail = " ".join(part for part in (energy, coverage) if part)
         if created or context.hydration_owner != previous or detail:
             self._events.put(StandardRunEvent(
                 run.identity, StandardEventKind.CONTEXT_READY,
-                artifact=str(run.artifact), detail=detail,
+                artifact=str(owner.artifact), detail=detail,
             ))
             run.energy_notice_sent |= bool(energy)
             run.coverage_notice_sent |= bool(coverage)
@@ -1811,6 +2026,7 @@ class StandardRunExecutor:
 
     def _run(self, run: _StandardRun) -> None:
         started_at = monotonic()
+        log_events.banner(logger, "New Run · %s", _run_summary(run.configuration), kind="run")
         if run.perf_quartiles_enabled:
             run.perf_started_at = started_at
         primary: DetachedDiagnostic | None = None
@@ -2020,6 +2236,18 @@ class StandardRunExecutor:
             tuple[tuple[object, ...], SourceExecutionIdentityV1 | None],
         ] = {}
         retry_revisions: dict[str, tuple[object, ...]] = {}
+        # Outputs this Run has already settled once (admitted, presented or published): only these take the
+        # already-processed census below; a first sight is admitted as before.
+        seen_targets: set[str] = set()
+        # Outputs that did not cover their scan, by its images and the output's stat: no second read while neither
+        # changes (Claude cloud review of 4c28033b, finding 5: a scan still waiting opened its output every poll).
+        uncovered: dict[str, tuple[tuple[object, ...], tuple[int, int, int, int]]] = {}
+        # A found output's committed image count by output file version, for its readiness waits.
+        committed_counts: dict[str, tuple[tuple[int, int, int, int], int | None]] = {}
+        # The image each output's next frame waits on for its sidecar, since when, and the output's name.
+        sidecar_waits: dict[str, tuple[str, float, str]] = {}
+        # A scan found changed: its revision and when its rebuild may start (_REBUILD_QUIET_S).
+        rebuild_holds: dict[str, tuple[tuple[object, ...], float]] = {}
         # SPEC readiness by SPEC file revision: no read while it is unchanged.
         spec_cache = run.live_spec_cache
         spec_cache.clear()
@@ -2046,8 +2274,9 @@ class StandardRunExecutor:
                     - run.files_skipped,
                 ),
                 run.files_discovered,
-                # A newly stopped output is news even when no count moved.
+                # A newly stopped or waiting output is news even when no count moved.
                 tuple(run.live_blocked.values()),
+                tuple(run.live_waiting.values()),
             )
             if not force and projection == last_projection:
                 return
@@ -2069,7 +2298,9 @@ class StandardRunExecutor:
         # The last poll's groups, reused while the session returns the same
         # Snapshot object under the same adapter registrations.
         grouped: tuple[object, tuple[object, ...], tuple[object, ...]] | None = None
+        polls, loop_started, first_written = 0, monotonic(), False
         while not run.stop_requested:
+            times, poll_started = _LivePollTimes(), monotonic()
             with _run_effect(run):
                 observation = session.observe(refresh=True)
                 registry = registry_identity()
@@ -2079,13 +2310,18 @@ class StandardRunExecutor:
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
                 publish()
+            times.add("listing", poll_started)
 
             watched: list[Path] = []  # files the next poll must see change at once (D1)
+            polled: set[str] = set()  # this poll's outputs: a waiting note outlives none of them
             for group in groups:
                 if run.stop_requested:
                     return True
                 revision = tuple(group.revision)
+                started = monotonic()
                 target_key = _physical_file_key(group.target)
+                polled.add(target_key)
+                times.add("key", started)
                 if target_key in run.live_blocked:
                     # This output stopped growing; later frames are skipped.
                     skipped_paths.update(
@@ -2095,6 +2331,14 @@ class StandardRunExecutor:
                     publish()
                     continue
                 settled = settled_revisions.get(target_key)
+                if settled is not None:
+                    seen_targets.add(target_key)
+                    if settled[0] == revision and type(settled[1]) is _CoveredOutput:
+                        if settled[1].holds(registry):
+                            continue
+                        # Its output changed (deleted, replaced or rewritten) while its images did not: look again.
+                        settled_revisions.pop(target_key, None)
+                        settled = None
                 if settled is not None and settled[0] == revision:
                     settled_identity = settled[1]
                     if settled_identity is None:
@@ -2137,6 +2381,42 @@ class StandardRunExecutor:
                             run.live_proofs[target_key] = _live_proof(
                                 configuration, retained.decision.item.graph, seen, registry)
                             continue
+                held = rebuild_holds.get(target_key)
+                if held is not None and held[0] == revision and monotonic() < held[1]:
+                    continue  # a scan found changed waits for its images and sidecars to hold still
+                started = monotonic()
+                completed = signature = None
+                if run.output is None or not run.output.owns_target(group.target):
+                    # Coverage counts only for the output its record was read from: the same output before and
+                    # after the read (Codex N-770941b2: one deleted or replaced during the read stayed covered).
+                    signature = _target_stat(group.target)
+                    if signature is not None and uncovered.get(target_key) != (revision, signature):
+                        completed = live_group_coverage(receipt, group)
+                        if completed is not None and _target_stat(group.target) != signature:
+                            completed = None
+                        if completed is None:
+                            uncovered[target_key] = (revision, signature)
+                times.add("coverage", started)
+                if completed is not None:
+                    # A scan its output already holds, image for image: shown once from its committed record, as a
+                    # directory Append shows it, then a quiet no-op until its images change; nothing is probed, read,
+                    # released or refused (beamline 2026-10-23: each finished scan was probed and its sidecars read
+                    # over two listings, about 40 s on the share before the first frame; files the beamline touched
+                    # after a scan were refused one by one, and settling the scan still growing to look at them
+                    # failed it at its next frame, "cannot bind an allocation to a populated store").
+                    if target_key not in seen_targets and target_key not in run.processed_live_revisions:
+                        started = monotonic()
+                        with _run_effect(run):
+                            self._present_live_saved_output(run, group, completed)
+                        times.add("shown", started)
+                        seen_targets.add(target_key)
+                    settled_revisions[target_key] = (
+                        revision, _CoveredOutput(group.target, signature, registry, monotonic()))
+                    self._note_sidecar_wait(run, group.target.name, target_key, None, sidecar_waits)
+                    processed_paths.update(group.physical_paths)
+                    publish(force=True)
+                    continue
+                constructing = False
                 try:
                     with _run_effect(run):
                         reprobe = (
@@ -2151,11 +2431,9 @@ class StandardRunExecutor:
                             else len(retained.decision.item.source_stamp.members)
                         )
                         watched.extend(group.physical_paths[published:])
-                        self._release_predecessor_before_target(
-                            run, group.target,
-                        )
                         # The registrations this attempt is qualified under.
                         registry = registry_identity()
+                        started = monotonic()
                         attempt = materialize_live_directory_group(
                             receipt,
                             configuration,
@@ -2171,7 +2449,17 @@ class StandardRunExecutor:
                             ),
                             proof=run.live_proofs.get(target_key),
                             spec_cache=spec_cache,
+                            owned=run.output is not None and run.output.owns_target(group.target),
+                            committed_cache=committed_counts,
                         )
+                        times.add("admission", started)
+                        self._note_sidecar_wait(run, group.target.name, target_key, attempt.waiting_sidecar,
+                                                sidecar_waits)
+                        live_readiness_debug(
+                            "live_attempt", target=group.target.name,
+                            owned=run.output is not None and run.output.owns_target(group.target),
+                            state=attempt.state.name, partial=attempt.partial, reason=attempt.reason,
+                            disposition=None if attempt.decision is None else attempt.decision.disposition.name)
                         if attempt.state is ProbeState.IN_PROGRESS:
                             if attempt.revision_changed:
                                 retry_revisions[target_key] = revision
@@ -2220,6 +2508,31 @@ class StandardRunExecutor:
                             # Nothing beyond the published frames is ready yet.
                             # A raw rewrite must still reach the Append guard.
                             continue
+                        if (decision.disposition is OutputDisposition.REPLACE and run.output is not None
+                                and run.output.owns_target(group.target)):
+                            # An image of the scan this Run grows changed after it was reduced: it stops growing, as
+                            # its refusal always made it (maintainer, 2026-10-24: "Stop growing it"); a later Run
+                            # finds it changed and rebuilds it whole.
+                            self._skip_live_append(run, group.target, target_key, None, constructed=False,
+                                                   reason=decision.reason, changed=True)
+                            skipped_paths.update(
+                                path for path in group.physical_paths
+                                if path not in processed_paths
+                            )
+                            publish(force=True)
+                            continue
+                        if decision.disposition is OutputDisposition.REPLACE:
+                            # A scan found changed is reduced again only once its images and sidecars have held still
+                            # for _REBUILD_QUIET_S (an image can land before its sidecar); then the next attempt goes on.
+                            held = rebuild_holds.get(target_key)
+                            if held is None or held[0] != revision:
+                                rebuild_holds[target_key] = (revision, monotonic() + _REBUILD_QUIET_S)
+                                continue
+                            rebuild_holds.pop(target_key)
+                        # Only an output that runs now takes over: a scan still waiting, refused or stopped above
+                        # leaves the current one open, and its next frame extends it in place (Codex N-0243a1bb F1:
+                        # settled to look at a neighbour, it failed that frame on its own repopulated display store).
+                        self._release_predecessor_before_target(run, group.target)
                         item = decision.item
                         run.current_file_total = len(group.physical_paths)
                         run.current_files_incremental = (
@@ -2227,12 +2540,15 @@ class StandardRunExecutor:
                         )
                         try:
                             run.live_admission_proof = attempt.proof
+                            constructing = True
+                            started = monotonic()
                             self._construct(
                                 run,
                                 item=item,
                                 labels=decision.labels,
                                 decision=decision,
                             )
+                            times.add("construct", started)
                         except SourceRevisionChanged:
                             source_owner = run.source
                             if source_owner is not None:
@@ -2258,6 +2574,20 @@ class StandardRunExecutor:
                             )
                         run.total += len(output.write_labels)
                         publish(force=True)
+                except AppendRefused as error:
+                    # One scan's Append refusal skips that scan: Live keeps watching the others and the end of the
+                    # Run lists it, as a directory Run does (beamline 2026-10-23: a first image rewritten after it
+                    # was reduced failed the whole Live Run).
+                    live_readiness_debug(
+                        "live_refused", target=group.target.name, constructed=constructing,
+                        owned=run.output is not None and run.output.owns_target(group.target), reason=str(error))
+                    self._skip_live_append(run, group.target, target_key, error, constructed=constructing)
+                    skipped_paths.update(
+                        path for path in group.physical_paths
+                        if path not in processed_paths
+                    )
+                    publish(force=True)
+                    continue
                 except RuntimeError as error:
                     if (
                         run.stop_requested
@@ -2288,22 +2618,37 @@ class StandardRunExecutor:
                                 revision,
                                 decision.item.source_stamp.execution_identity_v1,
                             )
+                        if run.pending_rebuild is not None:  # reduced again whole, so said at the Run's end
+                            run.append_rebuilds.append(run.pending_rebuild)
+                            run.pending_rebuild = None
                     run.current_file_total = 0
                     run.current_files_incremental = False
                     publish(force=True)
 
+                started = monotonic()
                 stopped = self._execute_current(
                     run,
                     construct=False,
                     retain_session=True,
                     settle=settle_live,
                 )
+                times.add("written", started)
+                if run.perf_enabled and not first_written and run.current_epoch_published:
+                    first_written = True
+                    logger.info("[LIVE-POLL] first epoch with new frames finished %.3f s after the first poll "
+                                "began (admission and checks before it not included)", monotonic() - loop_started)
                 if stopped or run.stop_requested:
                     return True
 
+            for key in [key for key in sidecar_waits if key not in polled]:  # its files left the directory
+                self._note_sidecar_wait(run, sidecar_waits[key][2], key, None, sidecar_waits)
             with run.live_revision_lock:
                 containers = tuple(value.decision.item.source_stamp for value in run.processed_live_revisions.values()
                                    if value.decision is not None and value.decision.item.descriptor is not None)
+            if run.perf_enabled and (polls < 2 or times.busy):
+                logger.info("[LIVE-POLL] poll %d, %d groups, %.3f s: %s", polls, len(groups),
+                            monotonic() - poll_started, times.line())
+            polls += 1
             # Containers grow in place and their external chunks are never listed.
             session.defer_listing((*watched, *(Path(state.path) for stamp in containers for state in (
                 stamp.file, *(member.file for member in stamp.external_members), *stamp.dependency_files))))
@@ -2327,6 +2672,14 @@ class StandardRunExecutor:
         candidate_owners = _candidate_file_owners(tuple(
             entry.physical_paths for entry in deferred.entries
         ))
+        # Files admission already found processed count as processed from the start, not pending until each scan is
+        # shown (maintainer, 2026-10-23: "it says there are 24 images or so remaining and then goes through them in a
+        # couple of seconds"); claimed here, their presentation counts nothing again.
+        for output_index, entry in enumerate(deferred.entries):
+            if entry.completed is not None:
+                run.files_processed += min(len(entry.completed.labels), _claim_physical_files(
+                    tuple(candidate.path for candidate in entry.candidates), deferred.discovered_paths,
+                    claimed_files, candidate_owners=candidate_owners, output_index=output_index))
         self._events.put(StandardRunEvent(
             run.identity,
             StandardEventKind.DISCOVERY,
@@ -2340,10 +2693,24 @@ class StandardRunExecutor:
             if run.stop_requested:
                 stopped = True
                 break
+            started = monotonic()
             try:
                 self._release_predecessor_before_target(
                     run, entry.target,
                 )
+                if entry.completed is not None:  # admitted as already processed, its source never captured
+                    stopped = self._present_already_processed(
+                        run, deferred, entry, entry.completed, claimed_files,
+                        candidate_owners=candidate_owners,
+                        output_index=output_index,
+                    )
+                    logger.debug(
+                        "[APPEND-SCAN] output=%s already processed (%.0f ms)",
+                        entry.target, 1000 * (monotonic() - started),
+                    )
+                    if stopped:
+                        break
+                    continue
                 decision, _ready_files, skipped_files = (
                     materialize_deferred_output(
                         receipt,
@@ -2366,7 +2733,10 @@ class StandardRunExecutor:
                 # (maintainer, 2026-10-23). Nothing was constructed for it.
                 reason = detach_exception(error, "append").message
                 run.append_skips.append((str(entry.target), reason))
-                logger.warning("[APPEND-SKIPPED] output=%s reason=%s", entry.target, reason)
+                log_events.event(
+                    logger, logging.WARNING, "%s skipped: it cannot be extended, so its existing results are left "
+                    "unchanged (Replace reprocesses it). Details: %s [APPEND-SKIPPED]", Path(entry.target).name,
+                    reason)
                 decision, skipped_files = None, 0
             if decision is None:
                 skipped_claims = _claim_physical_files(
@@ -2403,12 +2773,14 @@ class StandardRunExecutor:
             run.current_files_incremental = (
                 item.source_spec.kind is SourceKind.TIFF_SERIES
             )
+            admitted = monotonic()
             self._construct(
                 run,
                 item=item,
                 labels=decision.labels,
                 decision=decision,
             )
+            constructed = monotonic()
             run.completed += run.current_completed
             self._events.put(StandardRunEvent(
                 run.identity,
@@ -2422,6 +2794,15 @@ class StandardRunExecutor:
                 **_directory_event_fields(run),
             ))
             stopped = self._execute_current(run, construct=False) or stopped
+            if run.pending_rebuild is not None:  # said at the end only when the scan was reduced again whole
+                if run.current_completed >= run.current_total:
+                    run.append_rebuilds.append(run.pending_rebuild)
+                run.pending_rebuild = None
+            logger.debug(
+                "[APPEND-SCAN] output=%s frames=%d admit=%.0f ms construct=%.0f ms run=%.0f ms",
+                item.target, len(decision.labels), 1000 * (admitted - started),
+                1000 * (constructed - admitted), 1000 * (monotonic() - constructed),
+            )
             if run.current_files_incremental:
                 run.files_processed += min(
                     run.current_file_total,
@@ -2450,6 +2831,127 @@ class StandardRunExecutor:
                 run.files_discovered - run.files_processed,
             )
         return stopped
+
+    def _present_already_processed(
+        self,
+        run: _StandardRun,
+        deferred: DeferredDirectoryPlan,
+        entry,
+        completed,
+        claimed_files: set[Path],
+        *,
+        candidate_owners: dict[str, int],
+        output_index: int,
+    ) -> bool:
+        """A scan its output already holds, shown as an Append no-op shows it (its saved frames in navigation, its
+        files counted processed) without reading the scan again: no source, graph, writer or warning
+        (``output_preflight._already_processed``). Returns whether Stop was requested."""
+        run.current_file_total = _claim_physical_files(
+            tuple(candidate.path for candidate in entry.candidates),
+            deferred.discovered_paths,
+            claimed_files,
+            candidate_owners=candidate_owners,
+            output_index=output_index,
+        )
+        run.current_files_incremental = True
+        self._follow_saved_output(run, entry.target, completed)
+        owner = self._present_saved_output(run, entry.target, entry.candidates[0], completed)
+        for finished in (False, True):
+            if finished:
+                if run.artifact not in run.artifacts:
+                    run.artifacts.append(run.artifact)
+                run.display.mark_hydration_closed(owner)
+                run.records = None
+                run.files_processed += min(run.current_file_total, run.current_completed)
+                run.current_file_total = 0
+                run.current_files_incremental = False
+            self._events.put(StandardRunEvent(
+                run.identity,
+                StandardEventKind.DISCOVERY,
+                completed=run.completed,
+                total=run.total,
+                artifact=str(entry.target),
+                detail=_directory_status(run),
+                artifact_completed=run.current_published,
+                artifact_total=run.current_total,
+                **_directory_event_fields(run),
+            ))
+        return bool(run.stop_requested)
+
+    def _present_live_saved_output(self, run: _StandardRun, group: LiveDirectoryGroup, completed) -> None:
+        """A Live Run's view of a scan its output already holds, as a directory Append shows it; the poll counts its
+        files and publishes the status. The output a Live epoch holds open keeps its own session and progress: this
+        scan gets no writer, so nothing is settled, and its presentation changes none of that output's fields."""
+        idle = run.output is None or not run.output.has_current
+        if idle:
+            self._follow_saved_output(run, group.target, completed)
+        owner = self._present_saved_output(run, group.target, group.plan.candidates[0], completed)
+        if group.target not in run.artifacts:
+            run.artifacts.append(group.target)
+        run.display.mark_hydration_closed(owner)
+        if idle:
+            run.records = None
+            run.current_file_total = 0
+            run.current_files_incremental = False
+
+    @staticmethod
+    def _follow_saved_output(run: _StandardRun, target: Path, completed) -> None:
+        """Point the Run's current-output fields at a saved output it shows while no other output is open, as an
+        Append no-op's dormant output leaves them. It has no stream commit in this Run, so a terminal event naming it
+        carries none (the last written output's commit made the page drop a finite Append's FINISHED event: no Browse,
+        no plot)."""
+        run.artifact, run.session = target, None
+        run.current_total = run.current_completed = run.current_published = len(completed.labels)
+        run.current_epoch_published = 0
+        run.terminal_commit_identity = None
+
+    def _present_saved_output(self, run: _StandardRun, target: Path, first, completed):
+        """Show an output's saved frames as an Append no-op shows them (navigation, display owner, acquisition
+        context) from its committed record, without reading its scan again: no source, graph, writer or warning
+        (``output_preflight._already_processed``). It sets none of the Run's current-output fields (the caller does,
+        when no other output is open); the Run's totals count its frames. Returns the display owner; the caller counts
+        files."""
+        configuration = run.configuration
+        labels = tuple(completed.labels)
+        run.total += len(labels)
+        plan = native_int_reduction_plan(configuration, companion_modes_2d=True)
+        admission = None if run.resources is None else run.resources.admission
+        assets = None if admission is None else admission.scientific_assets
+        try:
+            npt = int(configuration.bai_1d_args.get("npt", 0))
+        except (TypeError, ValueError):
+            npt = 0
+        run.display.set_factories(FrameRecordStore, PublicationStore)
+        if not run.display.configured:
+            self._configure_display(run, npt=npt, frame_bytes=None)
+        owner = run.display.artifacts.get(str(target))
+        newly_adopted_owner = owner is None
+        if owner is None:
+            from xrd_tools.sources.adapters import get_adapter
+            if configuration.live_mode and run.display.artifacts:
+                run.display.admit_additional_partition()  # as a Live Run's construction admits each later output
+            owner = run.display.add_artifact(
+                target,
+                get_adapter(first.adapter_id).scan_name(first.path),
+                mask=None if assets is None else assets.mask,
+                mask_saturation=bool(getattr(plan, "mask_saturation", False)),
+                saturation=getattr(plan, "saturation", None),
+                threshold_min=plan.threshold_min,
+                threshold_max=plan.threshold_max,
+                measurement_mode="GI" if configuration.gi.enabled else "Standard",
+                gi_incidence_motor=configuration.gi.incidence_motor if configuration.gi.enabled else "",
+                gi_resolved_motor=configuration.gi.effective_motor if configuration.gi.enabled else "",
+                gi_mode_1d=configuration.gi.mode_1d if configuration.gi.enabled else "",
+                gi_mode_2d=configuration.gi.mode_2d if configuration.gi.enabled else "",
+                source_base=configuration.project_root or None,
+                wavelength_m=completed.wavelength_m,  # the output's own, as it was processed
+            )
+        run.display.bind_checkpoint_hydration(owner)
+        self._seed_persisted_prefix_navigation(
+            run, owner, labels, newly_adopted=newly_adopted_owner, completed=len(labels))
+        self._adopt_acquisition_context(run, owner, source_path=str(first.path), saved_only=True)
+        run.completed += len(labels)
+        return owner
 
     def _execute_current(
         self,
@@ -2645,7 +3147,7 @@ class StandardRunExecutor:
             fact = take() if callable(take) else None
             if fact is not None:
                 run.resource_facts.append(fact)
-                logger.info("%s", fact.log_line("[SOURCE-READ]"))
+                log_events.diagnostic(logger, "%s", fact.log_line("[SOURCE-READ]"))
 
         wanted = tuple(run.frames_by_label)
         if wanted != tuple(source.frame_indices):
@@ -3137,8 +3639,16 @@ class StandardRunExecutor:
             f"Append skipped {Path(output).name}: {reason}"
             for output, reason in run.append_skips
         )
+        rebuilds = list(run.append_rebuilds)
+        if run.pending_rebuild is not None and kind is StandardEventKind.FINISHED:  # a one-scan Run's output
+            rebuilds.append(run.pending_rebuild)
+        rebuilt = tuple(
+            f"Append reprocessed {Path(output).name} whole: {reason}"
+            for output, reason in rebuilds
+        )
         if warnings:
-            logger.warning("[RUN-SKIPPED] %d scan(s) skipped: %s", len(warnings), "; ".join(warnings))
+            log_events.event(logger, logging.WARNING, "Skipped in this Run (%d): %s [RUN-SKIPPED]", len(warnings),
+                             "; ".join(warnings))
         if receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING:
             logger.warning(
                 "[RUN-CLEANUP] output=%s retained=%s light_pending=%s failures=%s",
@@ -3263,6 +3773,7 @@ class StandardRunExecutor:
                 else None
             ),
             warnings=warnings,
+            rebuilt=rebuilt,
             **_directory_event_fields(
                 run,
                 in_flight_processed=_terminal_in_flight_files(run),
@@ -3274,10 +3785,14 @@ class StandardRunExecutor:
             if completed and measured_elapsed > 0.0
             else 0.0
         )
-        logger.info("Total Frames Processed: %d", completed)
+        for name in list(run.open_scans):  # the scans still open close with the Run, ahead of its totals
+            self._close_scan(run, Path(name), run.current_completed if name == Path(str(run.artifact)).name else None)
+        # End of Run below says it plainly; these are for diagnosis (maintainer, 2026-10-24)
+        log_events.diagnostic(logger, "Total Frames Processed: %d", completed, shown=run.perf_enabled)
         if elapsed is None:
-            logger.info("Total Time: unavailable")
-            logger.info(
+            log_events.diagnostic(logger, "Total Time: unavailable", shown=run.perf_enabled)
+            log_events.diagnostic(
+                logger,
                 "[PERF-SUMMARY] outcome=%s frames=%d/%d cores=%s | "
                 "total=unavailable | output=%s",
                 kind.value,
@@ -3285,10 +3800,12 @@ class StandardRunExecutor:
                 total,
                 core_count if core_count > 0 else "unknown",
                 run.artifact,
+                shown=run.perf_enabled,
             )
         else:
-            logger.info("Total Time: %.2fs", measured_elapsed)
-            logger.info(
+            log_events.diagnostic(logger, "Total Time: %.2fs", measured_elapsed, shown=run.perf_enabled)
+            log_events.diagnostic(
+                logger,
                 "[PERF-SUMMARY] outcome=%s frames=%d/%d cores=%s | "
                 "total=%.2fs work=%.2fs cleanup=%.2fs | "
                 "throughput=%.1f frames/s | output=%s",
@@ -3301,9 +3818,10 @@ class StandardRunExecutor:
                 cleanup_elapsed,
                 throughput,
                 run.artifact,
+                shown=run.perf_enabled,
             )
         for fact in run.resource_facts:
-            logger.info("%s", fact.log_line("[PERF-RESOURCES]"))
+            log_events.diagnostic(logger, "%s", fact.log_line("[PERF-RESOURCES]"), shown=run.perf_enabled)
         if run.perf_enabled:
             logger.info(
                 "[PERF-DETAIL] source-read=%.2fs submit/backpressure=%.2fs "
@@ -3383,6 +3901,10 @@ class StandardRunExecutor:
                     name,
                     *values,
                 )
+        log_events.banner(
+            logger, "End of Run · %s · %s%s · %.1f s", kind.value.capitalize(), _counted(completed, "frame"),
+            f" · {_counted(run.files_processed, 'file')} processed, {run.files_skipped} skipped"
+            if run.files_discovered else "", measured_elapsed, kind="run-end")
 
     def _exact_run(self, identity: RunIdentity) -> _StandardRun | None:
         with self._lock:

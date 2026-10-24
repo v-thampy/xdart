@@ -31,7 +31,7 @@ from xrd_tools.reduction import (
     NexusSink,
     TransactionalXYESink,
 )
-from xrd_tools.reduction.core import result_1d_has_sigma
+from xrd_tools.reduction.core import WarmIntegrators, result_1d_has_sigma
 from xrd_tools.session import (
     DynamicAccountingLimits,
     DynamicFrameIdentity,
@@ -50,7 +50,7 @@ from xrd_tools.session import (
     required_result_modes,
     resolve_session_policy,
 )
-from xrd_tools.session.policy import requirements_from
+from xrd_tools.session.policy import INTEGRATOR_RESERVE_BYTES, requirements_from, warm_integrator_allowance
 from xrd_tools.session.readiness import gi_companion_modes_2d
 from xrd_tools.core import DEFAULT_MODE_KEY
 from xrd_tools.core.scan import SourceKind
@@ -58,6 +58,7 @@ from xrd_tools.core.staging import (
     browse_publication_max_items,
     heavy_window,
     total_physical_ram_bytes,
+    windows_physical_ram_bytes,
 )
 from xrd_tools.session.run_configuration import heavy_residency_choice
 from xrd_tools.session.display_logic import xye_prefix_for_unit
@@ -67,8 +68,9 @@ from xrd_tools.sources.execution_graph import (
     source_snapshots_projection,
     stable_lineage_projection,
 )
+from xdart.utils import log_events
 
-from ..contracts import AdmittedOutput, PlannedOutput, SourceExecutionStamp
+from ..contracts import AdmittedOutput, OutputDisposition, PlannedOutput, SourceExecutionStamp
 from ..output_preflight import (
     _background_resource_terms,
     _merge_background_binding,
@@ -723,6 +725,10 @@ def preview_append_decision(
             generation=1,
             science_identity=science_identity,
         ),
+        # changed processed images type a rebuild; only a finite Append takes a re-dated image's sidecar time as
+        # proof of the same acquisition (a Live Run rebuilds it: Codex N-a8a6c887 stage 3)
+        image_drift=True,
+        acquisition_proof=not configuration.live_mode,
     )
 
 
@@ -735,7 +741,7 @@ def _writer_source_snapshots(
 
 
 class DynamicOutputAdapter:
-    def __init__(self, configuration) -> None:
+    def __init__(self, configuration, integrator_reuse: WarmIntegrators | None = None) -> None:
         self.configuration = configuration
         self._graphs: dict[str, dict[str, Any]] = {}
         self._pending_preflights: list[Any] = []
@@ -747,6 +753,13 @@ class DynamicOutputAdapter:
         self._activating = False
         self._stop_requested = False
         self.resource_facts: tuple[HeavyResidencyFact, ...] = ()
+        # the Run's built worker integrators, which its series borrow instead of rebuilding pyFAI's tables; an
+        # executor's store outlives its Runs, so a Run's first frames start warm when nothing changed
+        self._shared_tables = integrator_reuse is not None
+        self._integrator_reuse = (
+            integrator_reuse if integrator_reuse is not None
+            else WarmIntegrators(max(1, int(configuration.max_cores)))
+        )
 
     @staticmethod
     def _discard_identity(values: list[Any], owner: Any) -> None:
@@ -903,10 +916,26 @@ class DynamicOutputAdapter:
             return None
         return graph["display_owner"]
 
+    def owns_target(self, target: Path) -> bool:
+        """Whether the Run's current output graph (open, pending or dormant) is ``target``'s."""
+        graph = self._current
+        return graph is not None and graph.get("target") == _target_key(target)
+
+    @property
+    def has_current(self) -> bool:
+        """Whether any output graph is current (open, pending or dormant)."""
+        return self._current is not None
+
     def predecessor_owner_for_target(self, target: Path):
         graph = self._current
         return (None if graph is None or graph.get("target") == _target_key(target)
                 else graph.get("display_owner"))
+
+    def current_owner_for_target(self, target: Path):
+        """The display owner of ``target``'s graph when it is the current one (to retire it), else None."""
+        graph = self._current
+        return (graph.get("display_owner") if graph is not None and graph.get("target") == _target_key(target)
+                else None)
 
     def drop_released_predecessor(self, owner: object) -> None:
         graph = self._current
@@ -1129,6 +1158,8 @@ class DynamicOutputAdapter:
                 )
             if graph["policy"].allocation is not policy.allocation:
                 raise RuntimeError("prepared allocation identity changed")
+            if graph["record_store"] is not record_store:
+                raise RuntimeError("same target's display generation changed under its open graph")
             revision = self._revision(graph, item)
             intent = _append_intent(
                 self.configuration,
@@ -1179,6 +1210,12 @@ class DynamicOutputAdapter:
         xye_only = self.configuration.processing_mode == "Int 1D (XYE)"
         if xye_only and self.configuration.output_mode == "Append":
             raise ValueError("XYE-only Append has no persisted lineage owner")
+        # An Append's scan whose processed images changed on disk replaces this one output whole: no Append
+        # preflight or persisted prefix, every label, the ordinary replacement sink (Codex N-a8a6c887 stages 2, 3).
+        replaces = decision.disposition is OutputDisposition.REPLACE
+        if replaces and self.configuration.output_mode != "Append":
+            raise ValueError("only an Append replaces an output whose images changed")
+        appends = self.configuration.output_mode == "Append" and not replaces
         coordinated = any(value is not None for value in mount_values)
         if coordinated and any(value is None for value in mount_values):
             raise TypeError("dynamic GUI light mount requires one exact graph")
@@ -1188,12 +1225,18 @@ class DynamicOutputAdapter:
 
         preflight = None
         persisted_prefix_labels: tuple[int, ...] = ()
-        if not xye_only and self.configuration.output_mode == "Append":
+        if not xye_only and appends:
             if cancelled():
                 raise RuntimeError("admission cancelled")
             try:
+                # A finite Append writes its existing output in place
+                # (maintainer, 2026-10-23); a Live run's first stream keeps its
+                # preserved seed and reopens its later epochs in place.
                 preflight = prepare_append_preflight(
                     target, intent, file_lock=self._command_lock,
+                    in_place=not self.configuration.live_mode,
+                    image_drift=True,
+                    acquisition_proof=not self.configuration.live_mode,
                 )
             except AppendPreflightCleanupError as error:
                 self._pending_preflights.append(error.owner)
@@ -1284,7 +1327,7 @@ class DynamicOutputAdapter:
                 )
                 self.resource_facts += (fact,)
                 if resource_fact_sink is not None: resource_fact_sink(fact)
-                logger.info("%s", fact.log_line("[RUN-RESOURCES]"))
+                log_events.diagnostic(logger, "%s", fact.log_line("[RUN-RESOURCES]"))
                 bind_source = getattr(source_owner, "bind_allocation", None)
                 if callable(bind_source):
                     bind_source(allocation)
@@ -1331,7 +1374,7 @@ class DynamicOutputAdapter:
 
             if not xye_only:
                 sink_values = dict(
-                    overwrite=self.configuration.output_mode == "Overwrite",
+                    overwrite=self.configuration.output_mode == "Overwrite" or replaces,
                     flush_every=None,
                     atomic=False,
                     incremental_finalization=True,
@@ -1349,7 +1392,7 @@ class DynamicOutputAdapter:
                     ),
                     durable_fsync=output_diagnostics.durable_fsync,
                 )
-                if self.configuration.output_mode == "Append":
+                if appends:
                     nexus = NexusSink(
                         target, append_preflight=preflight,
                         file_lock=self._command_lock, **sink_values,
@@ -1357,7 +1400,10 @@ class DynamicOutputAdapter:
                 else:
                     nexus = NexusSink(
                         target, same_run_intent=intent,
-                        file_lock=self._command_lock, **sink_values,
+                        file_lock=self._command_lock,
+                        # a replacement admits only the output its classification read
+                        replacement_target_state=decision.fact.target_state if replaces else None,
+                        **sink_values,
                     )
                 if pipeline_v2 is not None:
                     nexus._configure_writer_batch_size(
@@ -1413,13 +1459,28 @@ class DynamicOutputAdapter:
                 and xye_lineage.disposition is not AppendDisposition.WRITE
             ):
                 raise AppendRefused(xye_lineage)
+            workers = (self.configuration.max_cores if policy is None
+                       else policy.allocation.workers)
+            # this series' memory plan bounds the Run's built integrators, before its scout or workers borrow
+            allocation, ram = (None if policy is None else policy.allocation,
+                               total_physical_ram_bytes() or windows_physical_ram_bytes())
+            allowance = warm_integrator_allowance(allocation, workers, ram)
+            self._integrator_reuse.fit(workers, allowance)
+            # One series' inputs and result together (Codex N-6418472d: which bound sets the allowance on a PC).
+            envelope, assigned = (None, None) if allocation is None else (
+                int(allocation.envelope_bytes), int(allocation.assigned_bytes))
+            log_events.diagnostic(
+                logger,
+                "[WARM-TABLES] plan: RAM %s B, envelope %s B, assigned %s B, headroom %s B, %d workers funded %d B, "
+                "allowance %d B", ram, envelope, assigned, None if allocation is None else max(0, envelope - assigned),
+                workers, max(1, int(workers)) * INTEGRATOR_RESERVE_BYTES, allowance)
             session = open_headless_scan_session(
                 session_scan,
                 plan,
                 ring_geometry=ring_geometry,
                 sink=sink,
-                executor=(self.configuration.max_cores if policy is None
-                          else policy.allocation.workers),
+                # the session starts the workers its own tables repay (WarmIntegrators, exact key)
+                executor=workers,
                 inflight_max=inflight_max,
                 gi_freeze_mode=(
                     "scout_union" if self.configuration.gi.enabled else None
@@ -1440,6 +1501,8 @@ class DynamicOutputAdapter:
                     pipeline_v2.semantic_checkpoint_frame_cap
                     if pipeline_v2 is not None else None
                 ),
+                integrator_reuse=self._integrator_reuse,
+                growing=bool(self.configuration.live_mode),
             )
             if loaded_scout_frame is not None:
                 loaded_scout_frame.image = None
@@ -1513,7 +1576,8 @@ class DynamicOutputAdapter:
             if cancelled():
                 raise RuntimeError("admission cancelled")
             if pipeline_v2 is not None:
-                logger.info(
+                log_events.diagnostic(
+                    logger,
                     "[RUN-PIPELINE-V2] requested-settlement=%d "
                     "effective-settlement=%d requested-record=%d "
                     "effective-record=%d requested-inflight=%d "
@@ -1713,6 +1777,15 @@ class DynamicOutputAdapter:
         return None if graph is None else self._finish_transition(graph, stopped=stopped)
 
     def finish_all(self, *, stopped: bool = False) -> tuple[object, ...]:
+        try:
+            return self._finish_all(stopped=stopped)
+        finally:
+            if self._shared_tables:  # the Run is over: its executor keeps each kind's latest tables for the next Run
+                self._integrator_reuse.keep_for_next_run()
+            else:  # the Run is over, even a failed one: release its built integrators
+                self._integrator_reuse.clear()
+
+    def _finish_all(self, *, stopped: bool) -> tuple[object, ...]:
         results = []
         primary = None
         try:

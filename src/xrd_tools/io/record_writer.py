@@ -2247,6 +2247,8 @@ class NexusRecordWriter:
         self._append_written_labels: set[int] = set()
         self._lineage_dirty = False
         self._lineage_expected: str | None = None
+        # An in-place stream's pending lineage, staged at its first write.
+        self._deferred_lineage: AppendDecision | None = None
         self._checkpoint_rows = 0
         self._checkpoint_read_bytes = 0
         self._semantic_read_groups = {"checkpoint": 0, "close": 0}
@@ -2538,6 +2540,21 @@ class NexusRecordWriter:
             binding.attempt,
             lease=binding.lease,
         )
+        deferred = self._deferred_lineage
+        if deferred is not None:
+            self._stage_pending_lineage(deferred)
+            self._deferred_lineage = None  # only once staged: a retried write stages it again
+
+    def _stage_pending_lineage(self, decision: AppendDecision) -> None:
+        stage_append_lineage(self._entry_group(), decision)
+        lineage = dict(decision.lineage or {})
+        lineage["state"] = "pending"
+        self._lineage_expected = json.dumps(
+            lineage,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._lineage_dirty = True
 
     def _vfd_descriptor(self) -> int:
         if self._h5 is None:
@@ -3937,7 +3954,7 @@ class NexusRecordWriter:
                     raise WriterStateError(
                         "durable rows changed during post-close verification"
                     )
-                if seal_transaction:
+                if seal_transaction and verification_descriptor is None:
                     binding.transaction.seal_stream_close(
                         binding.attempt,
                         self._stream_close_attempt,
@@ -3947,6 +3964,39 @@ class NexusRecordWriter:
                         evidence_digest=aggregate.hexdigest(),
                         evidence_bytes=read_bytes,
                     )
+            if seal_transaction and verification_descriptor is not None:
+                # The duplicate is the file's last writing handle. Windows finalizes a written file's timestamps when
+                # that handle closes, on a share a moment later (beamline 2026-10-23, in-place Append: "held stream
+                # terminal (fast or in-place) lost its close checkpoint"), so flush through it, close it, and seal
+                # through a read-only descriptor bound to the verified file and size (as _seal_closed_stream_seed).
+                # The flush follows the transaction's own fsync choice (Codex N-0243a1bb F6).
+                flushed = binding.transaction.durable_fsync
+                if flushed:
+                    os.fsync(verification_descriptor)
+                verification_stream.close()
+                verification_stream = None
+                os.close(verification_descriptor)
+                verification_descriptor = None
+                self._close_verification_descriptor = None
+                closed = os.open(self._active_path or self.target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                try:
+                    sealed = self._descriptor_stat_tuple(closed)
+                    if sealed[:3] != after[:3]:
+                        raise WriterStateError(
+                            "durable rows changed when the writing handle closed"
+                        )
+                    binding.transaction.seal_stream_close(
+                        binding.attempt,
+                        self._stream_close_attempt,
+                        lease=binding.lease,
+                        descriptor=closed,
+                        expected_stat=sealed,
+                        evidence_digest=aggregate.hexdigest(),
+                        evidence_bytes=read_bytes,
+                        flushed=flushed,
+                    )
+                finally:
+                    os.close(closed)
         except BaseException:
             if seal_transaction:
                 binding.transaction.hold_stream_close(
@@ -4607,18 +4657,15 @@ class NexusRecordWriter:
                         self._entry_group(), self.artifact_family,
                     )
                 if self._append_decision is not None:
-                    stage_append_lineage(
-                        self._entry_group(),
-                        self._append_decision,
-                    )
-                    lineage = dict(self._append_decision.lineage or {})
-                    lineage["state"] = "pending"
-                    self._lineage_expected = json.dumps(
-                        lineage,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    self._lineage_dirty = True
+                    if binding is not None and binding.transaction.stream_in_place:
+                        # In place the committed output is the canonical
+                        # file: its pending marker waits for the first new
+                        # write (every write is authorized first), so an
+                        # epoch that never writes -- an early Stop or a
+                        # failure -- leaves the committed output valid.
+                        self._deferred_lineage = self._append_decision
+                    else:
+                        self._stage_pending_lineage(self._append_decision)
                 if existing_cursors is not None:
                     self._row_cursors.update(existing_cursors)
                 else:

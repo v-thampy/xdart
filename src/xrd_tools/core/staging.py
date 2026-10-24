@@ -15,6 +15,7 @@ Pure + headless: only stdlib ``os`` (RAM detection), no numpy / Qt.
 from __future__ import annotations
 
 import os
+import sys
 
 #: today's behavior + the clamp bounds for the computed window.
 DEFAULT_WINDOW = 64
@@ -63,6 +64,30 @@ def total_physical_ram_bytes() -> int | None:
     if pages <= 0 or page_size <= 0:
         return None
     return pages * page_size
+
+
+def windows_physical_ram_bytes() -> int | None:
+    """Total physical RAM on Windows, where ``os.sysconf`` has none (``GlobalMemoryStatusEx``); ``None`` elsewhere or
+    if it can't be read. Only the warm integrator allowance uses it so far; the staging policies above still fall back
+    on Windows."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+
+    class _MemoryStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+            (name, ctypes.c_ulonglong) for name in (
+                "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+
+    status = _MemoryStatus()
+    status.dwLength = ctypes.sizeof(_MemoryStatus)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return int(status.ullTotalPhys) or None
 
 
 def heavy_window(

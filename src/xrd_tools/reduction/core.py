@@ -10,6 +10,8 @@ integration loops itself.
 from __future__ import annotations
 
 import copy
+import dataclasses
+import hashlib
 import logging
 import os
 import queue
@@ -1672,6 +1674,10 @@ class NexusSink:
     durable_fsync: bool = True
     rollback_until_commit: bool = False
     create_new: bool = False
+    #: An automatic replacement's output as its Append classification read it (size, mtime_ns, ctime_ns, device,
+    #: inode): the transaction admits only that file, so one substituted since is never overwritten (Codex
+    #: N-d3ec12d9 R1). Compared as the admission snapshot compares, without ctime.
+    replacement_target_state: tuple[int, int, int, int, int] | None = None
     _writer: NexusRecordWriter | None = field(default=None, init=False, repr=False)
     _transaction: Any | None = field(default=None, init=False, repr=False)
     _lease: Any | None = field(default=None, init=False, repr=False)
@@ -1696,6 +1702,7 @@ class NexusSink:
         default=None, init=False, repr=False,
     )
     _fast_regenerable: bool = field(default=False, init=False, repr=False)
+    _in_place_append: bool = field(default=False, init=False, repr=False)
     _source_execution: dict[str, Any] | None = field(
         default=None, init=False, repr=False,
     )
@@ -1940,6 +1947,9 @@ class NexusSink:
             )
         if self.overwrite and self.append_preflight is not None:
             raise ValueError("Overwrite cannot consume an Append preflight")
+        if (self.rollback_until_commit and self.append_preflight is not None
+                and self.append_preflight._transaction.in_place):
+            raise ValueError("an explicit full-rollback sink cannot write its Append in place")
         if self.same_run_intent is not None and self.append_preflight is not None:
             raise ValueError("same-run creation and cross-run Append are distinct policies")
         if self.allow_unbound_same_run and (
@@ -1958,9 +1968,17 @@ class NexusSink:
                 path="run_configuration",
             )
         config = self._run_configuration or {}
+        # An Append's output replaced whole (its images changed on disk) is as regenerable as an Overwrite's.
+        replacement = config.get("append_replacement")
+        replaced = isinstance(replacement, Mapping) and replacement.get("effective_output_mode") == "Overwrite"
         self._fast_regenerable = bool(
-            self.overwrite and config.get("output_mode") == "Overwrite"
+            self.overwrite and (config.get("output_mode") == "Overwrite" or replaced)
             and config.get("live_mode") is False and not self.rollback_until_commit)
+        # A finite Append writes its existing output in place (maintainer,
+        # 2026-10-23); an explicit full-rollback request keeps the preserved copy.
+        self._in_place_append = bool(
+            not self.overwrite and config.get("live_mode") is False
+            and not self.rollback_until_commit)
         if self.source_execution_provenance is not None:
             self._source_execution = jsonable_run_value(
                 self.source_execution_provenance,
@@ -2095,6 +2113,7 @@ class NexusSink:
                     committed_prefix=self._existing_append_prefix,
                     file_lock=self.file_lock,
                     before_admit=self._require_current_append_target,
+                    in_place=self._in_place_append,
                 )
             except AppendPreflightCleanupError as error:
                 self.append_preflight = error.owner
@@ -2124,7 +2143,11 @@ class NexusSink:
                     target_owner=binding.target_owner,
                     lease=binding.lease,
                     file_lock=self.file_lock,
-                    seed_mode=StreamSeedMode.PRESERVE_BASE,
+                    seed_mode=(
+                        StreamSeedMode.IN_PLACE
+                        if binding.transaction.in_place
+                        else StreamSeedMode.PRESERVE_BASE
+                    ),
                 )
             except BaseException as primary:
                 try:
@@ -2159,10 +2182,16 @@ class NexusSink:
             )
             self._transaction, self._lease = transaction, lease
             self._transaction_owners = (transaction_owner, target_owner, owners)
-            if self._replacement is not None:
+            if self._replacement is not None or self.replacement_target_state is not None:
                 try:
-                    if transaction.admission.snapshot != self._replacement[0]:
+                    snapshot = transaction.admission.snapshot
+                    if self._replacement is not None and snapshot != self._replacement[0]:
                         raise ValueError("TARGET_SNAPSHOT_CHANGED")
+                    if self.replacement_target_state is not None:
+                        size, mtime_ns, _ctime_ns, device, inode = self.replacement_target_state
+                        if (not snapshot.exists or (snapshot.size, snapshot.mtime_ns, snapshot.device, snapshot.inode)
+                                != (size, mtime_ns, device, inode)):
+                            raise ValueError("TARGET_CHANGED_SINCE_CLASSIFICATION")
                 except BaseException as primary:
                     try: self._settle_unstarted_transaction()
                     except BaseException as cleanup: raise primary from cleanup
@@ -2466,6 +2495,34 @@ class NexusSink:
         if self._pending_append_decision is decision:
             self._pending_append_decision = None
 
+    @property
+    def _reopens_in_place(self) -> bool:
+        """Whether a reopened epoch writes the committed output in place: every
+        ordinary reopen (maintainer, 2026-10-23); an explicit full-rollback
+        request keeps its preserved copy."""
+        return self._transaction.in_place or not self.rollback_until_commit
+
+    def _unopened_in_place_epoch(self) -> bool:
+        """Whether a queued epoch would reopen the committed output in place
+        with nothing yet to write.
+
+        Opening an in-place epoch writes into the committed output itself (its
+        metadata at once), and there is no copy to restore.  So only a write or
+        an epoch commit opens it: a flush has nothing to add, and a Stop drops
+        it (:meth:`finish`), leaving the committed epochs exactly as they stand
+        instead of changing that output and reporting the run aborted although
+        nothing was added.
+        """
+        writer = self._writer
+        return bool(
+            self._pending_append_decision is not None
+            and not self._pending_record_writes
+            and writer is not None and writer.phase.value == "finished"
+            and self._transaction is not None
+            and self._transaction.snapshot().phase is TransactionPhase.EPOCH_COMMITTED
+            and self._reopens_in_place
+        )
+
     def _open_owned_epoch(self, decision) -> None:
         transaction_owner, target_owner, _owners = self._transaction_owners
         try:
@@ -2475,6 +2532,7 @@ class NexusSink:
                 transaction_owner=transaction_owner,
                 target_owner=target_owner,
                 lease=self._lease,
+                in_place=self._reopens_in_place,
             )
             self._writer = None
             writer = NexusRecordWriter(
@@ -2895,7 +2953,8 @@ class NexusSink:
     def flush(self, *, force: bool = False) -> None:
         if self._writer is None:
             return
-        self._apply_pending_extension()
+        if not self._unopened_in_place_epoch():
+            self._apply_pending_extension()
         if self._writer.phase.value == "finished":
             return
         self._drain_pending_record_writes(force=force)
@@ -3082,6 +3141,8 @@ class NexusSink:
             )
         if self._terminal_result is not None:
             return self._terminal_result
+        if getattr(result, "cancelled", False) and self._unopened_in_place_epoch():
+            self._pending_append_decision = None
         self._apply_pending_extension()
         self._drain_pending_record_writes(force=True)
         writer = self._writer
@@ -3393,6 +3454,11 @@ class ReductionSession:
     batch_settlement_authority_cb: (
         Callable[[WriterBatchSettlementReceipt], None] | None
     ) = None
+    # The Run's WarmIntegrators, shared by its sessions: a session borrows worker integrators whose tables are built
+    # and gives them back when it finishes cleanly. None builds them per session.
+    integrator_reuse: WarmIntegrators | None = None
+    # A Live scan's session: it starts with the frames one poll found and grows, so it keeps every granted worker.
+    growing: bool = False
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -3506,6 +3572,57 @@ class ReductionSession:
         """Whether no timed-out writer can still invoke the sink."""
         return self._writer_thread is None or not self._writer_thread.is_alive()
 
+    def _start_workers(self) -> Any:
+        """The pool this session builds: for a Standard series whose tables are large, the workers whose tables are
+        already built under its own exact key (at least one), plus one per ``_FRAMES_PER_COLD_WORKER`` frames, within
+        the grant (Codex N-770941b2 F4: never another key's tables). The key is the one its workers compute, from its
+        plan mask and first image's shape; without one (a frame mask, a chi profile, an unsafe mask cache, a custom
+        detector) it has no warm tables and no measured cost, so the detector's size decides. GI, energy steps (each
+        worker's private integrator changes with its frame's wavelength, so stepped energies rebuild per frame and
+        every worker shortens the series) and a Live scan's growing series (its first poll's frames say nothing of its
+        length) keep the grant (Claude cloud review of 4c28033b, findings 1-2); nothing is built or read to decide."""
+        granted, reuse = self.executor, self._integrators.reuse
+        if (reuse is None or type(granted) is not int or granted <= 1 or self.plan.gi is not None or self.growing
+                or self._integrators._frame_wavelengths is not None or not self.scan.frames):
+            return granted
+        image = getattr(self.scan.frames[0], "image", None)
+        if image is None or np.ndim(image) < 2:
+            return granted
+        shape = (int(np.shape(image)[0]), int(np.shape(image)[1]))
+        key = self._standard_reuse_key(shape, self.scan.frames[0])
+        warm, table_bytes = (0, 0) if key is None else reuse.idle_for(key)
+        workers = _series_workers(granted, len(self.scan), warm, table_bytes, shape[0] * shape[1])
+        if workers != granted:
+            logger.debug("[AUTO-WORKERS] %s: %d of %d workers (%d frames, %d with built tables, %s B tables)",
+                         self.scan.name, workers, granted, len(self.scan), warm, table_bytes or "unmeasured")
+        return workers
+
+    def _standard_reuse_key(self, shape: tuple[int, int], frame: Any) -> tuple[Any, ...] | None:
+        """The exact key this series' workers keep their integrators under, as ``_reduce_frame`` binds a run-constant
+        mask and the provider keys it, or None when its frames would not take a reused integrator."""
+        plan = self.plan
+        if (getattr(frame, "mask", None) is not None or standard_chi_profile(plan)
+                or any(item is not None and "safe" in item.extra and item.extra["safe"] is not True
+                       for item in (plan.integration_1d, plan.integration_2d))):
+            return None
+        provider = self._integrators
+        try:
+            if provider.ai is None or not _stock_pyfai_detector_mask_semantics(provider.ai, shape):
+                return None
+            run_mask = _cached_mask_for_shape(plan.mask, shape, "ReductionPlan.mask", self._plan_masks)
+            with _PYFAI_COLD_GEOMETRY_LOCK:
+                return provider._reuse_key(run_mask, shape)
+        except MemoryError:
+            raise
+        except Exception:  # the frame path reports it, as before; here it only leaves the detector's size to decide
+            return None
+
+    def _fit_integrator_reuse(self) -> None:
+        """Bound the Run's idle integrators by this session's granted workers, before any worker borrows one."""
+        reuse = self._integrators.reuse
+        if reuse is not None and self._owns_worker and self._worker is not None:
+            reuse.fit(getattr(self._worker, "_max_workers", None) or 1)
+
     def _shutdown_worker(self, *, wait: bool = True) -> None:
         if self._owns_worker and self._worker is not None:
             _admission_trace("pool_shutdown_enter", wait=wait, owned=True)
@@ -3577,6 +3694,8 @@ class ReductionSession:
             fi=fi,
             initial_incident_angle=self._initial_incident_angle,
             support=_support_capture(self.angular_support),
+            # only a session that owns (and so joins) its worker pool can hand integrators back
+            reuse=self.integrator_reuse if _owns_its_pool(self.executor, self.execution) else None,
         )
         self.integrator_provider_builds = 1
         # Validate BEFORE acquiring resources: sink.begin() opens an h5 handle
@@ -3599,7 +3718,8 @@ class ReductionSession:
                     "batch settlement authority requires exact accepted attempts"
                 )
         try:
-            self._worker, self._owns_worker = _coerce_executor(self.executor)
+            self._worker, self._owns_worker = _coerce_executor(self._start_workers())
+            self._fit_integrator_reuse()
             self._sink.begin(self.scan, self.plan)
             self._bind_angular_support()
             self._started = True
@@ -3740,6 +3860,7 @@ class ReductionSession:
             from xrd_tools.core import reduction_worker_cap
             self._worker = ThreadPoolExecutor(max_workers=reduction_worker_cap())
             self._owns_worker = True
+            self._fit_integrator_reuse()
         n_workers = getattr(self._worker, "_max_workers", None) or 4
         bound = (
             self.inflight_max
@@ -4418,10 +4539,11 @@ class ReductionSession:
         # diagnostic only; public projections stay distinct-label facts.
         dropped = int(self._dropped_attempts)
         if cancelled and dropped:
-            logger.info(
+            logger.debug(
                 "cancelled: %d attempts submitted, %d written, %d dropped in-flight",
                 self._submitted, self._written_attempts, dropped,
             )
+        sink_finished = False
         try:
             if self._started:
                 if _writer_timed_out:
@@ -4454,10 +4576,22 @@ class ReductionSession:
                         _admission_trace("sink_finish_begin", on_failure=True)
                         self._sink.finish(self.result)
                         _admission_trace("sink_finish_end", on_failure=True)
+            sink_finished = True
         finally:
             # A timed-out writer can own stalled futures; never re-hang here.
-            self._shutdown_worker(wait=not _writer_timed_out)
+            joined = self._owns_worker and self._worker is not None and not _writer_timed_out
+            try:
+                self._shutdown_worker(wait=not _writer_timed_out)
+            except BaseException:
+                self._integrators.discard()
+                raise
             self._finished = True
+            if not sink_finished or not joined or self._current_failure() is not None:
+                self._integrators.discard()
+        if joined and self._current_failure() is None:
+            # compute shutdown succeeded (every worker joined, nothing failed; publication may still fail later, which
+            # stops the Run): the Run's next series may reuse their integrators
+            self._integrators.give_back()
 
         _emit(
             self.progress_cb,
@@ -4478,6 +4612,9 @@ class ReductionSession:
     def _apply_gi_freeze(self, freeze_policy: str) -> None:
         if self._gi_freeze_applied or self.plan.gi is None:
             return
+        reuse = self.integrator_reuse if _owns_its_pool(self.executor, self.execution) else None
+        if reuse is not None:
+            reuse.fit(_planned_workers(self.executor))  # the grant bounds the store before the scout borrows
         self.plan = _apply_gi_freeze_policy(
             self.plan,
             self.scan,
@@ -4485,6 +4622,7 @@ class ReductionSession:
             fi=_accepted_reintegrate_fi(self.scan),
             initial_incident_angle=self._initial_incident_angle,
             warned_monitor_keys=self._warned_monitor_keys,
+            reuse=reuse,
         )
         self._gi_freeze_applied = True
 
@@ -5012,6 +5150,7 @@ def _apply_gi_freeze_policy(
     fi: Any,
     initial_incident_angle: float | None,
     warned_monitor_keys: set[str] | None = None,
+    reuse: WarmIntegrators | None = None,
 ) -> ReductionPlan:
     """Return a copy of *plan* with missing GI output ranges frozen.
 
@@ -5036,14 +5175,14 @@ def _apply_gi_freeze_policy(
                                  if k != "enabled_modes_2d"}),
             scan, freeze_policy=freeze_policy, fi=fi,
             initial_incident_angle=initial_incident_angle,
-            warned_monitor_keys=warned_monitor_keys,
+            warned_monitor_keys=warned_monitor_keys, reuse=reuse,
         )
         frozen = dict(plan.extra.get(COMPANION_RANGES_2D) or {})
         for mode in companions:
             single = _apply_gi_freeze_policy(
                 _companion_plan(plan, mode), scan, freeze_policy=freeze_policy,
                 fi=fi, initial_incident_angle=initial_incident_angle,
-                warned_monitor_keys=warned_monitor_keys,
+                warned_monitor_keys=warned_monitor_keys, reuse=reuse,
             ).integration_2d
             keys = (("x_range", "y_range") if mode == GI2DMode.QIP_QOOP.value
                     else ("radial_range", "azimuth_range"))
@@ -5073,72 +5212,81 @@ def _apply_gi_freeze_policy(
         ai=scan.integrator,
         fi=fi,
         initial_incident_angle=initial_incident_angle,
+        reuse=reuse,
+        role="scout",
     )
-    scout_results_1d: list[IntegrationResult1D] = []
-    scout_results_2d: list[IntegrationResult2D] = []
-    masks: dict[tuple[int, int], np.ndarray | None] = {}
-    for idx in scout_indices:
-        frame = scan._frame_by_index[int(idx)]
-        was_empty = frame.image is None
-        reduction = _reduce_frame(frame, None, plan, scout_integrators, masks,
-                                  warned_monitor_keys=warned_monitor_keys)
-        if reduction.result_1d is not None:
-            scout_results_1d.append(reduction.result_1d)
-        if reduction.result_2d is not None:
-            if _is_all_dummy_2d(reduction.result_2d, signed=_signed_point_difference(reduction.metadata)):
-                continue
-            scout_results_2d.append(reduction.result_2d)
-        if was_empty:
-            frame.image = None; frame.point_variance = None
+    try:
+        scout_results_1d: list[IntegrationResult1D] = []
+        scout_results_2d: list[IntegrationResult2D] = []
+        masks: dict[tuple[int, int], np.ndarray | None] = {}
+        for idx in scout_indices:
+            frame = scan._frame_by_index[int(idx)]
+            was_empty = frame.image is None
+            reduction = _reduce_frame(frame, None, plan, scout_integrators, masks,
+                                      warned_monitor_keys=warned_monitor_keys)
+            if reduction.result_1d is not None:
+                scout_results_1d.append(reduction.result_1d)
+            if reduction.result_2d is not None:
+                if _is_all_dummy_2d(reduction.result_2d, signed=_signed_point_difference(reduction.metadata)):
+                    continue
+                scout_results_2d.append(reduction.result_2d)
+            if was_empty:
+                frame.image = None; frame.point_variance = None
 
-    out = plan
-    if needs_1d is not None and scout_results_1d:
-        from xrd_tools.integrate.gid import freeze_common_axis
+        out = plan
+        if needs_1d is not None and scout_results_1d:
+            from xrd_tools.integrate.gid import freeze_common_axis
 
-        key, rng = freeze_common_axis(
-            scout_results_1d,
-            gi_mode_1d=out.gi.mode_1d.value,
-        )
-        if rng is not None and key == needs_1d:
-            out = _replace_integration_1d_range(out, key, rng)
-        elif key == needs_1d:
-            # Mirror the 2D branch's fail-loud: a degenerate scout (blank /
-            # all-masked / collapsed span -> rng None) silently skipped the
-            # 1D freeze, leaving per-frame auto axes that the writer's
-            # uniform-axes validator rejects MID-RUN, frames already on disk
-            # and far from the root cause.
-            raise GIFreezeError(
-                "GI 1D freeze scout produced a degenerate axis range; "
-                "check the incident angle / mask / threshold."
+            key, rng = freeze_common_axis(
+                scout_results_1d,
+                gi_mode_1d=out.gi.mode_1d.value,
             )
-    elif needs_1d is not None:
-        raise GIFreezeError(
-            "GI 1D freeze scout produced no usable 1D results; "
-            "check the incident angle / incidence motor."
-        )
-    if needs_2d and scout_results_2d:
-        from xrd_tools.integrate.gid import freeze_common_axes_2d
+            if rng is not None and key == needs_1d:
+                out = _replace_integration_1d_range(out, key, rng)
+            elif key == needs_1d:
+                # Mirror the 2D branch's fail-loud: a degenerate scout (blank /
+                # all-masked / collapsed span -> rng None) silently skipped the
+                # 1D freeze, leaving per-frame auto axes that the writer's
+                # uniform-axes validator rejects MID-RUN, frames already on disk
+                # and far from the root cause.
+                raise GIFreezeError(
+                    "GI 1D freeze scout produced a degenerate axis range; "
+                    "check the incident angle / mask / threshold."
+                )
+        elif needs_1d is not None:
+            raise GIFreezeError(
+                "GI 1D freeze scout produced no usable 1D results; "
+                "check the incident angle / incidence motor."
+            )
+        if needs_2d and scout_results_2d:
+            from xrd_tools.integrate.gid import freeze_common_axes_2d
 
-        ranges = freeze_common_axes_2d(
-            scout_results_2d,
-            gi_mode_2d=out.gi.mode_2d.value,
-        )
-        out = _replace_integration_2d_ranges(
-            out,
-            {
-                key: value
-                for key, value in ranges.items()
-                if key in needs_2d
-            },
-        )
-    elif needs_2d:
-        raise GIFreezeError(
-            "GI 2D freeze scout produced no non-dummy 2D results; "
-            "check the incident angle / incidence motor."
-        )
+            ranges = freeze_common_axes_2d(
+                scout_results_2d,
+                gi_mode_2d=out.gi.mode_2d.value,
+            )
+            out = _replace_integration_2d_ranges(
+                out,
+                {
+                    key: value
+                    for key, value in ranges.items()
+                    if key in needs_2d
+                },
+            )
+        elif needs_2d:
+            raise GIFreezeError(
+                "GI 2D freeze scout produced no non-dummy 2D results; "
+                "check the incident angle / incidence motor."
+            )
+    except BaseException:
+        scout_integrators.discard()  # a failed scout or freeze: nothing it built goes back
+        if reuse is not None:
+            # Angle handbacks were provisional within this sequential scout phase.
+            # No worker starts before the entire freeze succeeds.
+            reuse.clear()
+        raise
+    scout_integrators.give_back()  # reduction and freeze both succeeded
     return out
-
-
 def _signed_point_difference(metadata: Mapping[str, Any]) -> bool:
     point = metadata.get("point_images", metadata.get("average_point_images"))
     return isinstance(point, Mapping) and point.get("operation") == "difference"
@@ -5339,6 +5487,263 @@ def _on_energy_scan_grid(item: Any, grid: Mapping[str, Any] | None, key: str) ->
     return replace(item, radial_range=tuple(map(float, grid[key])))
 
 
+#: A large detector's tables take seconds to build per worker (beamline 2026-10-23, Rayonix 4096^2 at 1-D 2000 and
+#: 2-D 1000x500: 2.17 GB, ~8 s to build against ~0.85 s to integrate a frame on that PC), so a short series is faster
+#: and steadier on the workers whose tables are already built: Cores 1 beat Cores 4 on its 3-5 frame scans.
+_LARGE_TABLE_BYTES = 1 << 30
+_LARGE_DETECTOR_PIXELS = 8_000_000
+_FRAMES_PER_COLD_WORKER = 16
+
+
+def _series_workers(granted: int, frames: int, warm: int, table_bytes: int, pixels: int) -> int:
+    """Workers a Standard series starts: all it was granted when its tables are cheap; when they are large (measured,
+    or before that a large detector), the workers whose tables are built, at least one, plus one more per
+    ``_FRAMES_PER_COLD_WORKER`` frames, enough to repay another build within the series."""
+    large = table_bytes >= _LARGE_TABLE_BYTES if table_bytes else pixels >= _LARGE_DETECTOR_PIXELS
+    if not large:
+        return granted
+    return max(1, min(granted, max(1, warm) + frames // _FRAMES_PER_COLD_WORKER))
+
+
+class WarmIntegrators:
+    """A Run's store of worker integrators whose pyFAI tables are built.
+
+    Each series builds a new integrator and each worker deep-copies it, and pyFAI's deepcopy drops the tables, so
+    without this store every worker of every series rebuilds them (seconds for a large detector, against a fraction
+    of a second to integrate a frame). A worker borrows one under an exact key and gives it back once its session's
+    workers have all stopped, or (GI) as soon as its next frame needs another incident angle; a borrowed integrator is
+    never in the store, so no two workers share one.
+
+    A key is (role, size family, exact state, incident angle): the role is "standard", "fiber", or "scout" for the GI
+    freeze; the size family (detector, image shape, methods and point counts, but no ranges or angle) prices a build
+    by the largest tables measured for it; the angle is None outside GI. Least recently used first, the store drops
+    idle integrators beyond
+    ``KEYS_PER_ROLE`` keys per role, ``limit`` (the granted workers) per key, and table bytes, idle and in use, beyond
+    ``allowance`` (from the Run's memory plan, ``warm_integrator_allowance``). With no extra allowance it keeps
+    only each role's most recently returned key; a positive byte allowance is strict for idle retention. A build
+    of a family whose size is still unknown first drops every idle integrator.
+    """
+
+    KEYS_PER_ROLE = 8
+
+    def __init__(self, limit: int, allowance: int = 0) -> None:
+        self._limit = max(1, int(limit))
+        self._allowance = max(0, int(allowance))
+        self._lock = threading.Lock()
+        self._idle: dict[Any, list[tuple[Any, int]]] = {}  # key -> [(integrator, table bytes)], least recent first
+        self._recent: dict[Any, Any] = {}  # role -> its most recently returned key
+        self._sizes: dict[Any, int] = {}  # family -> the largest table bytes measured for it
+        self._lent: dict[Any, int] = {}  # family -> integrators lent or being built
+
+    def fit(self, limit: int, allowance: int | None = None) -> None:
+        """Bound the store by the current session's granted workers and, from the Run's memory plan, its bytes."""
+        with self._lock:
+            self._limit = max(1, int(limit))
+            if allowance is not None:
+                self._allowance = max(0, int(allowance))
+            for entries in self._idle.values():
+                del entries[: max(0, len(entries) - self._limit)]
+            self._trim()
+
+    def borrow(self, key: Any) -> Any:
+        """One integrator built under ``key``, no longer in the store, or None to build one: idle integrators then
+        make room for its family's measured size, or all go when that size is not yet known."""
+        family = key[:2]
+        with self._lock:
+            self._lent[family] = self._lent.get(family, 0) + 1
+            entries = self._idle.get(key)
+            if entries:
+                integrator, _size = entries.pop()
+                if not entries:
+                    del self._idle[key]
+                return integrator
+            if family in self._sizes:
+                self._trim(spare=True)
+            else:
+                self._idle.clear()
+            logger.debug(
+                "[WARM-TABLES] %s build: family size %s B, %d B idle after room is made, %d B allowed",
+                key[0], self._sizes.get(family), sum(size for entries in self._idle.values() for _, size in entries),
+                self._allowance,
+            )
+            return None
+
+    def idle_for(self, key: Any) -> tuple[int, int]:
+        """(Idle integrators built under exactly ``key``, its family's measured table bytes, or 0 when it has not
+        been measured): what a series under that key starts warm, and what a cold start costs."""
+        with self._lock:
+            return len(self._idle.get(key, ())), self._sizes.get(key[:2], 0)
+
+    def keep_for_next_run(self) -> None:
+        """A Run is over: keep the idle integrators under each role's most recently returned key, within the
+        allowance, so the next Run's first series needs no build when nothing changed (its series then fit the store
+        to their own plan); drop the rest."""
+        with self._lock:
+            latest = set(self._recent.values())
+            for key in list(self._idle):
+                if key not in latest:
+                    del self._idle[key]
+            self._trim()
+
+    def give_back(self, key: Any, integrator: Any) -> None:
+        """Keep ``integrator``, borrowed or built under ``key``, for its next borrower, within the store's bounds."""
+        size = _table_bytes(integrator)
+        family = key[:2]
+        with self._lock:
+            self._release(family)
+            if not size and self._allowance:
+                return  # unmeasurable tables cannot spend a positive retention allowance
+            if size:  # a size of 0 says nothing: the family stays unknown, so its builds still clear idle ones
+                self._sizes[family] = max(size, self._sizes.get(family, 0))
+            entries = self._idle.pop(key, [])
+            if len(entries) < self._limit:
+                entries.append((integrator, size))
+            self._idle[key] = entries  # now the most recently used key
+            self._recent[key[0]] = key
+            keys = [item for item in self._idle if item[0] == key[0]]
+            for stale in keys[: max(0, len(keys) - self.KEYS_PER_ROLE)]:
+                del self._idle[stale]
+            self._trim()
+
+    def release(self, key: Any) -> None:
+        """An integrator borrowed or built under ``key`` will not come back (its session failed or stopped early)."""
+        with self._lock:
+            self._release(key[:2])
+
+    def clear(self) -> None:
+        with self._lock:
+            self._idle.clear()
+            self._recent.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return sum(len(entries) for entries in self._idle.values())
+
+    def _release(self, family: Any) -> None:
+        count = self._lent.get(family, 0) - 1
+        if count > 0:
+            self._lent[family] = count
+        else:
+            self._lent.pop(family, None)
+
+    def _trim(self, *, spare: bool = False) -> None:
+        """Drop idle integrators over the allowance. Only the zero-extra-allowance legacy path keeps each role's
+        most recent key, unless ``spare`` (a build is about to need the room)."""
+        unknown = any(family not in self._sizes for family in self._lent)
+        lent = sum(self._sizes.get(family, 0) * count for family, count in self._lent.items())
+        idle = sum(size for entries in self._idle.values() for _, size in entries)
+        for key in list(self._idle):
+            if self._allowance and not unknown and idle + lent <= self._allowance:
+                return  # (with no allowance, only the most recent keys stay, and nothing stays for a build)
+            if not self._allowance and not spare and self._recent.get(key[0]) == key:
+                continue
+            idle -= sum(size for _, size in self._idle.pop(key))
+
+
+def _table_bytes(integrator: Any) -> int:
+    """Bytes of the arrays a pyFAI integrator holds in its engines (CSR data, indices and pointers included) and in
+    its geometry caches, each backing buffer counted once. Measured against RSS: a GI histogram integrator within 7%,
+    a CSR one about 17% over."""
+    seen: set[int] = set()
+    total = 0
+
+    def walk(value: Any, depth: int) -> None:
+        nonlocal total
+        if depth > 6 or id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, np.ndarray):
+            base = value
+            while isinstance(base.base, np.ndarray):
+                base = base.base
+            if id(base) not in seen or base is value:
+                seen.add(id(base))
+                total += base.nbytes
+            return
+        if isinstance(value, Mapping):
+            items = value.values()
+        elif isinstance(value, (list, tuple)):
+            items = value
+        else:
+            items = list(getattr(value, "__dict__", {}).values())
+            for name in ("data", "indices", "indptr", "lut", "_data", "_indices", "_indptr", "_lut"):
+                try:
+                    items.append(getattr(value, name))
+                except Exception:
+                    pass
+        for item in items:
+            walk(item, depth + 1)
+
+    walk(getattr(integrator, "engines", {}), 0)
+    walk(getattr(integrator, "_cached_array", {}), 0)
+    return total
+
+
+def _bound_detector_mask(detector_mask: Any, run_mask: np.ndarray | None) -> np.ndarray | None:
+    """The mask ``standard_with_run_mask`` binds into a worker integrator's detector."""
+    if detector_mask is not None:
+        detector_mask = np.asarray(detector_mask, dtype=bool)
+        return detector_mask if run_mask is None else np.logical_or(run_mask, detector_mask)
+    return None if run_mask is None else np.asarray(run_mask, dtype=bool)
+
+
+def _plain(value: Any) -> Any:
+    """``value`` as an exact, hashable key part; TypeError for an array or object a key cannot hold exactly."""
+    if value is None or isinstance(value, (bool, int, float, str, Enum)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (tuple, list)):
+        return tuple(_plain(item) for item in value)
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(name), _plain(item)) for name, item in value.items()))
+    raise TypeError(f"no exact key part for {type(value).__name__}")
+
+
+def _plain_fields(item: Any, *, skip: frozenset[str] = frozenset()) -> tuple[Any, ...] | None:
+    return None if item is None else tuple((part.name, _plain(getattr(item, part.name)))
+                                           for part in dataclasses.fields(item) if part.name not in skip)
+
+
+#: Settings that change which bins a table maps to, not how large it is: a build's size family leaves them out.
+_RANGE_SETTINGS = frozenset(("radial_range", "azimuth_range", "azimuth_offset", "extra", "incident_angle"))
+
+
+def _warm_integrator_key(
+    role: str, ai: Any, bound_mask: np.ndarray | None, shape: tuple[int, ...], plan: ReductionPlan,
+    *, angle: float | None = None,
+) -> tuple[Any, ...] | None:
+    """What makes a worker integrator's tables reusable, all exact: its role, the integrator's and its detector's
+    own state (pyFAI's ``_IMMUTABLE_ATTRS``: geometry, wavelength, chi discontinuity, solid-angle and transmission
+    settings; pixel size, binning, orientation, mask and correction checksums), the detector configuration (its sensor
+    included) and the sensor parallax configuration, the image shape, the run-constant mask, the plan's integration
+    and GI settings, and last the GI incident angle. None (no reuse) for what the key cannot hold: a spline, the
+    detector's own flat field, dark current or pixel corners, or a setting that is not a plain value."""
+    try:
+        detector = ai.detector
+        if (detector.spline is not None or detector.flatfield is not None or detector.darkcurrent is not None
+                or detector._pixel_corners is not None):
+            return None
+        parallax = getattr(ai, "parallax", None)
+        state = (
+            role,
+            type(ai).__qualname__,
+            tuple((name, _plain(getattr(ai, name))) for name in type(ai)._IMMUTABLE_ATTRS),
+            type(detector).__qualname__,
+            tuple((name, _plain(getattr(detector, name))) for name in type(detector)._IMMUTABLE_ATTRS),
+            _plain(detector.get_config()),
+            None if parallax is None else _plain(parallax.get_config()),
+            tuple(_plain_fields(item) for item in (plan.integration_1d, plan.integration_2d, plan.gi)),
+        )
+        size_family = (type(detector).__qualname__, shape, tuple(
+            _plain_fields(item, skip=_RANGE_SETTINGS) for item in (plan.integration_1d, plan.integration_2d, plan.gi)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    mask = None if bound_mask is None else hashlib.blake2b(
+        np.packbits(bound_mask).tobytes(), digest_size=16).hexdigest()
+    return (role, size_family, (*state, shape, mask), None if angle is None else float(angle))
+
+
 class _ReductionIntegratorProvider:
     """Per-thread integrator cache for executor-backed reductions."""
 
@@ -5351,6 +5756,8 @@ class _ReductionIntegratorProvider:
         fi: Any,
         initial_incident_angle: float | None,
         support: Any = None,
+        reuse: WarmIntegrators | None = None,
+        role: str = "fiber",
     ) -> None:
         self.scan = scan
         self.plan = plan
@@ -5359,6 +5766,14 @@ class _ReductionIntegratorProvider:
         self.initial_incident_angle = initial_incident_angle
         #: The Run's angular support capture (one per Run, shared by every worker), or None.
         self.support = support
+        #: The Run's store of built worker integrators (``WarmIntegrators``), or None to build them per session.
+        self.reuse = reuse
+        self._bound: list[tuple[Any, Any]] = []  # (key, integrator): what this session gives back to ``reuse``
+        self._bound_lock = threading.Lock()
+        self._reuse_closed = False
+        self._reuse_keys: dict[tuple[int, int], tuple[Any, Any]] = {}  # shape -> (Run mask, key)
+        self._fiber_role = role  # "fiber" for a session's workers, "scout" for the GI freeze's own integrators
+        self._fiber_keys: dict[tuple[int, ...], tuple[Any, Any]] = {}  # shape -> (Run mask, key without its angle)
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
         # An energy scan reduces each frame at its own wavelength on a private integrator;
@@ -5368,6 +5783,8 @@ class _ReductionIntegratorProvider:
         if self._frame_wavelengths is not None:
             base = getattr(ai, "wavelength", None) or getattr(scan.poni, "wavelength", None)
             self._base_wavelength = None if base is None else float(base)
+        if reuse is not None and (self._frame_wavelengths is not None or ai is None):
+            reuse.clear()
 
     def _new_standard(self) -> Any:
         """Build one private standard integrator from the accepted calibration."""
@@ -5467,6 +5884,76 @@ class _ReductionIntegratorProvider:
             units.extend((two_d.unit, "chi_deg"))
         return tuple(dict.fromkeys(units))
 
+    def _reuse_key(self, run_mask: np.ndarray | None, shape: tuple[int, int]) -> tuple[Any, ...] | None:
+        """The key this session's bound worker integrators are kept under in the Run's store, or None (no reuse):
+        only for a standard integration at one wavelength, cloned from an accepted integrator. Computed once per
+        shape (a session's Run mask is one object per shape), under ``_PYFAI_COLD_GEOMETRY_LOCK`` (it reads the
+        accepted integrator's detector mask)."""
+        if self.reuse is None or self._reuse_closed or self.ai is None or self._frame_wavelengths is not None:
+            return None
+        cached = self._reuse_keys.get(shape)
+        if cached is not None and cached[0] is run_mask:
+            return cached[1]
+        try:
+            bound_mask = _bound_detector_mask(self.ai.detector.mask, run_mask)
+        except (AttributeError, TypeError, ValueError):
+            key = None
+        else:
+            key = _warm_integrator_key("standard", self.ai, bound_mask, shape, self.plan)
+        self._reuse_keys[shape] = (run_mask, key)
+        if key is None:
+            self.reuse.clear()
+        return key
+
+    def discard(self) -> None:
+        """Drop failed-session references, including any worker finishing after a timeout; their reservations in the
+        Run's store end with them."""
+        self._forget_thread()
+        with self._bound_lock:
+            self._reuse_closed = True
+            bound, self._bound = self._bound, []
+        if self.reuse is not None:
+            for key, _ai in bound:
+                self.reuse.release(key)
+
+    def _track(self, key: Any, ai: Any) -> bool:
+        """Record ``ai``, borrowed or built under ``key``, for give-back; False (its reservation released) once this
+        session was discarded."""
+        with self._bound_lock:
+            if not self._reuse_closed:
+                self._bound.append((key, ai))
+                return True
+        self.reuse.release(key)
+        return False
+
+    def _settle_early(self, key: Any, ai: Any, *, done: bool) -> None:
+        """One worker's GI integrator before it takes another angle's: back to the store if its frame succeeded,
+        else dropped. Nothing if this session was discarded meanwhile (its reservation already released)."""
+        with self._bound_lock:
+            index = next((at for at, (_key, held) in enumerate(self._bound) if held is ai), None)
+            if index is None:
+                return
+            del self._bound[index]
+            # Discard must not close/clear the Run between ownership removal and return.
+            if done:
+                self.reuse.give_back(key, ai)
+            else:
+                self.reuse.release(key)
+
+    def _forget_thread(self) -> None:
+        """Drop the calling thread's own references (the GI scout's setup thread) before its integrators move."""
+        for name in ("ai", "fi", "fi_key", "fi_done", "run_mask_binding", "alternate"):
+            self._local.__dict__.pop(name, None)
+
+    def give_back(self) -> None:
+        """Hand this session's bound worker integrators to the Run's store, once its workers have all stopped."""
+        self._forget_thread()
+        with self._bound_lock:
+            bound, self._bound = self._bound, []
+        if self.reuse is not None:
+            for key, ai in bound:
+                self.reuse.give_back(key, ai)
+
     def standard_with_run_mask(
         self,
         run_mask: np.ndarray | None,
@@ -5495,6 +5982,8 @@ class _ReductionIntegratorProvider:
             self.ai,
             shape,
         ):
+            if self.reuse is not None:
+                self.reuse.clear()
             return self._retain_unbound_standard(
                 self._unbound_standard(),
                 run_mask,
@@ -5502,44 +5991,44 @@ class _ReductionIntegratorProvider:
             )
 
         with _PYFAI_COLD_GEOMETRY_LOCK:
+            key = self._reuse_key(run_mask, shape)
+            # one the Run already built (mask bound, tables in place) under this exact key, else a new one
+            ai = None if key is None else self.reuse.borrow(key)
+            settled = ai is not None or key is None  # a borrowed integrator, or no reservation to return
             try:
-                ai = self._new_standard()
-                if not _stock_pyfai_detector_mask_semantics(ai, shape):
-                    unbound = ai if self.ai is None else self._unbound_standard()
-                    return self._retain_unbound_standard(unbound, run_mask, shape)
-                detector = ai.detector
-                detector_mask = detector.mask
-                if detector_mask is not None:
-                    detector_mask = np.asarray(detector_mask, dtype=bool)
-                    bound_mask = (
-                        detector_mask
-                        if run_mask is None
-                        else np.logical_or(run_mask, detector_mask)
-                    )
-                else:
-                    bound_mask = (
-                        None if run_mask is None else np.asarray(run_mask, dtype=bool)
-                    )
-                if run_mask is not None:
-                    detector.mask = bound_mask
-                ai.reset_engines(collect_garbage=False)
-                if run_mask is not None:
-                    admitted = np.asarray(detector.mask, dtype=bool)
-                    if (
-                        admitted.shape != shape
-                        or not np.array_equal(admitted, bound_mask)
-                    ):
-                        unbound = self._unbound_standard()
-                        return self._retain_unbound_standard(
-                            unbound,
-                            run_mask,
-                            shape,
-                        )
-                self._warm_standard_centers(ai, shape)
+                if ai is None:
+                    ai = self._new_standard()
+                    if not _stock_pyfai_detector_mask_semantics(ai, shape):
+                        unbound = ai if self.ai is None else self._unbound_standard()
+                        return self._retain_unbound_standard(unbound, run_mask, shape)
+                    detector = ai.detector
+                    bound_mask = _bound_detector_mask(detector.mask, run_mask)
+                    if run_mask is not None:
+                        detector.mask = bound_mask
+                    ai.reset_engines(collect_garbage=False)
+                    if run_mask is not None:
+                        admitted = np.asarray(detector.mask, dtype=bool)
+                        if (
+                            admitted.shape != shape
+                            or not np.array_equal(admitted, bound_mask)
+                        ):
+                            unbound = self._unbound_standard()
+                            return self._retain_unbound_standard(
+                                unbound,
+                                run_mask,
+                                shape,
+                            )
+                    self._warm_standard_centers(ai, shape)
+                settled = True
             except (AttributeError, TypeError, ValueError):
                 unbound = self._unbound_standard()
                 return self._retain_unbound_standard(unbound, run_mask, shape)
+            finally:
+                if not settled:
+                    self.reuse.release(key)  # the build failed or fell back to the unbound path
 
+        if key is not None:
+            self._track(key, ai)
         self._local.ai = ai
         self._local.run_mask_binding = (run_mask, shape, True)
         self._local.alternate = None  # a new binding retires the previous alternate
@@ -5574,39 +6063,119 @@ class _ReductionIntegratorProvider:
                                if item is not None and item.polarization_factor is not None}:
                     integrator.polarization(frame_shape, factor, with_checksum=True)
 
-    def fiber(self) -> Any:
+    def _fiber_key(self, angle: float, run_mask: np.ndarray | None, shape: tuple[int, ...]) -> tuple[Any, ...] | None:
+        """The key of this thread's GI integrator for a frame at ``angle``, or None (no reuse): an energy scan, a
+        caller's accepted fiber integrator, or what the key cannot hold. All but the angle is computed once per shape,
+        under ``_PYFAI_COLD_GEOMETRY_LOCK`` (it reads the accepted integrator's detector mask)."""
+        if (self.reuse is None or self._reuse_closed or self._frame_wavelengths is not None or self.fi is not None
+                or self.ai is None):
+            return None
+        cached = self._fiber_keys.get(shape)
+        if cached is None or cached[0] is not run_mask:
+            with _PYFAI_COLD_GEOMETRY_LOCK:
+                try:
+                    bound_mask = _bound_detector_mask(self.ai.detector.mask, run_mask)
+                except (AttributeError, TypeError, ValueError):
+                    base = None
+                else:
+                    base = _warm_integrator_key(self._fiber_role, self.ai, bound_mask, shape, self.plan)
+            cached = self._fiber_keys[shape] = (run_mask, base)
+            if base is None:
+                self.reuse.clear()  # a build whose size the store cannot know: nothing idle stays beside it
+        return None if cached[1] is None else (*cached[1][:-1], float(angle))
+
+    def fiber_done(self) -> None:
+        """This thread's frame finished every GI integration: its integrator may go back to the store."""
+        self._local.fi_done = True
+
+    def fiber(
+        self,
+        incident_angle: float | None = None,
+        run_mask: np.ndarray | None = None,
+        shape: tuple[int, ...] | None = None,
+        *,
+        static_mask: bool = True,
+    ) -> Any:
+        """This thread's GI integrator for a frame at ``incident_angle``. With the Run's store, each angle keeps its
+        own: a worker whose next frame needs another angle gives its current one back (if that frame succeeded,
+        ``fiber_done``) and borrows that angle's. Without it, one per thread, and pyFAI rebuilds on an angle change."""
         if self.scan.poni is None:
             return self.fi
         if (threading.get_ident() == self._owner_thread and self.fi is not None
                 and self._frame_wavelengths is None):
-            return self.fi
+            return self.fi  # the scan's own accepted integrator: never lent to the store
+        if not static_mask and self.reuse is not None:
+            # This provider cannot price dynamic-mask builds: decline its loans for
+            # the rest of the series, including returns from other active workers.
+            self.discard()
+            self.reuse.clear()
+        key = (self._fiber_key(incident_angle, run_mask, shape)
+               if static_mask and incident_angle is not None and shape is not None else None)
         fi = getattr(self._local, "fi", None)
+        held = getattr(self._local, "fi_key", None)
+        if fi is not None:
+            if key == held and (held is None or getattr(self._local, "fi_done", False)):
+                self._local.fi_done = False
+                return fi
+            self._local.fi = self._local.fi_key = None  # no longer this thread's before another worker can borrow it
+            if held is not None:
+                self._settle_early(held, fi, done=getattr(self._local, "fi_done", False))
+        fi = None if key is None else self.reuse.borrow(key)
         if fi is None:
             gi = self.plan.gi
             if gi is None:
+                if key is not None:
+                    self.reuse.release(key)
                 return None
-            accepted = self.fi if self.fi is not None else self.ai
-            if accepted is not None:
-                # pyFAI Geometry.promote/deepcopy does not copy _parallax.
-                # Use the checked project promotion so each worker preserves
-                # the accepted detector config, sensor, wavelength, and exact
-                # enabled/disabled parallax state.
-                from xrd_tools.integrate.gid import _fiber_from_integrator
-                fi = _fiber_from_integrator(
-                    accepted,
-                    incident_angle=float(self.initial_incident_angle or 0.0),
-                    tilt_angle=float(gi.tilt_angle),
-                    sample_orientation=int(gi.sample_orientation),
-                )
-            else:
-                fi = poni_to_fiber_integrator(
-                    self.scan.poni,
-                    incident_angle=float(self.initial_incident_angle or 0.0),
-                    tilt_angle=float(gi.tilt_angle),
-                    sample_orientation=int(gi.sample_orientation),
-                )
-            self._local.fi = fi
+            try:
+                fi = self._new_fiber(gi)
+            except BaseException:
+                if key is not None:
+                    self.reuse.release(key)  # the build failed: its reservation goes with it
+                raise
+        if key is not None and not self._track(key, fi):
+            key = None
+        self._local.fi, self._local.fi_key, self._local.fi_done = fi, key, False
         return fi
+
+    def _new_fiber(self, gi: Any) -> Any:
+        """Build one private GI integrator from the accepted calibration."""
+        accepted = self.fi if self.fi is not None else self.ai
+        if accepted is not None:
+            # pyFAI Geometry.promote/deepcopy does not copy _parallax.
+            # Use the checked project promotion so each worker preserves
+            # the accepted detector config, sensor, wavelength, and exact
+            # enabled/disabled parallax state.
+            from xrd_tools.integrate.gid import _fiber_from_integrator
+            return _fiber_from_integrator(
+                accepted,
+                incident_angle=float(self.initial_incident_angle or 0.0),
+                tilt_angle=float(gi.tilt_angle),
+                sample_orientation=int(gi.sample_orientation),
+            )
+        return poni_to_fiber_integrator(
+            self.scan.poni,
+            incident_angle=float(self.initial_incident_angle or 0.0),
+            tilt_angle=float(gi.tilt_angle),
+            sample_orientation=int(gi.sample_orientation),
+        )
+
+
+def _planned_workers(executor: Any | None) -> int:
+    """The worker count of the pool a session that owns it will build (``_coerce_executor``, streaming default)."""
+    if isinstance(executor, int) and not isinstance(executor, bool):
+        return max(1, executor)
+    from xrd_tools.core import reduction_worker_cap
+    return reduction_worker_cap()
+
+
+def _owns_its_pool(executor: Any | None, execution: str) -> bool:
+    """Whether a session with this ``executor`` builds (and so shuts down and joins) its own worker pool: a worker
+    count or True, or none at all for streaming, which then builds a default one."""
+    if executor is True or (isinstance(executor, int) and not isinstance(executor, bool)):
+        return True
+    return executor in (None, False) and execution == "streaming"
+
 
 def _coerce_executor(executor: Any | None):
     if executor is None or executor is False:
@@ -6050,11 +6619,12 @@ def _reduce_frame(
             if frame_mask is None
             else plan_mask | frame_mask
         )
-        fi = integrators.fiber()
+        # the frame's own angle first: with the Run's store, each angle keeps its own integrator
+        incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
+        fi = integrators.fiber(incident_angle, plan_mask, image.shape, static_mask=frame_mask is None)
         at_energy = getattr(integrators, "at_frame_energy", None)
         if at_energy is not None:
             at_energy(fi, frame, image.shape, warm=False)
-        incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
         r1d = (
             _run_gi_1d(
                 image,
@@ -6104,6 +6674,9 @@ def _reduce_frame(
                 flat=plan.flat,
                 dark=plan.dark,
             )
+        done = getattr(integrators, "fiber_done", None)
+        if done is not None:
+            done()  # every GI integration of this frame succeeded: its integrator may go back to the store
     else:
         p1 = p1_frame
         chi_mode = standard_chi_profile(plan)

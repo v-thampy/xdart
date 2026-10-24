@@ -137,7 +137,7 @@ def test_visiting_a_pinned_scan_keeps_the_custom_filename_filter(tmp_path, monke
     page, _store, _seeded, _context = _loaded_page(tmp_path, monkeypatch, qapp, seed=seeded)
     browser = page._shell.browser
     try:
-        browser.set_filename_filter("")  # fixture names do not choose the processing mode
+        browser.set_filename_filter("*")  # fixture names do not choose the processing mode
         page._set_browser_directory(str(seeded.target.parent), explicit=True)
         page._refresh_shell()
 

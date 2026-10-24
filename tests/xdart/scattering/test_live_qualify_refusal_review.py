@@ -71,8 +71,11 @@ def test_raw_member_rewrite_with_metadata_drift_keeps_the_raw_validator_terminal
     finally:
         released.set()
         terminal = _stop(executor, identity, events)
-    assert [kind for kind, _detail in terminal] == ['FAILED'], terminal
-    assert 'image-member history' in terminal[0][1], terminal
+    # The raw validator still decides, ahead of the metadata drift; since 2026-10-23 its refusal stops that output
+    # growing (published frames kept) instead of failing the Live Run, and Stop lists the reason.
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert 'stopped growing: its Append was refused' in terminal[0][1], terminal
+    assert 'changed after its frame was reduced' not in terminal[0][1], terminal
 
 
 def test_stop_inside_a_live_admission_metadata_read_ends_stopped(tmp_path, monkeypatch):
