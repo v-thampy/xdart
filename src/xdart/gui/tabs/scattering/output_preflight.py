@@ -385,10 +385,11 @@ class LiveDirectoryAttempt:
     # READY: the proof of what this poll admitted (the members after a prefix
     # proved in it), which construction re-checks instead of validating again.
     proof: LivePrefixProof | None = field(default=None, compare=False)
-    # The image whose own sidecar (an explicit .txt/.pdi/.metadata, or Auto's)
-    # the group waits on: missing, changing or unreadable. Not a SPEC row, a
-    # container or a listing: those never wait on a per-image sidecar.
-    waiting_sidecar: str | None = None
+    # (image, "sidecar" or "spec"): the member whose own metadata the group
+    # waits on, its per-image sidecar (an explicit .txt/.pdi/.metadata, or
+    # Auto's) missing, changing or unreadable, or its SPEC row not yet written.
+    # Never a container or a listing.
+    waiting_metadata: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not (
@@ -1223,7 +1224,8 @@ def _live_metadata_ready(
     published_members: int = 0,
     observe_from: int = 0,
     spec_cache: dict | None = None,
-) -> tuple[int, str, str | None]:
+    given_up: frozenset[str] = frozenset(),
+) -> tuple[int, str, tuple[str, str] | None]:
     """How many leading members of a Live group have their metadata ready.
 
     A member is ready when its selected sidecar (an explicit format) or its
@@ -1239,7 +1241,10 @@ def _live_metadata_ready(
     observation settles they must reach the published-metadata drift fence,
     rather than wait forever as if they were new frames.
     Also returns why the first member that is not ready waits and, when that
-    is its own per-image sidecar, the image's name (None otherwise).
+    is its own metadata, (its image's name, "sidecar" or "spec"); None
+    otherwise. A member in ``given_up`` (by image name) whose own sidecar
+    holds it holds nothing: the Run waited long enough and processes it without
+    its metadata (a SPEC row is never given up on: its scan is skipped).
     """
 
     candidates = group.plan.candidates
@@ -1254,7 +1259,8 @@ def _live_metadata_ready(
                                          cache=spec_cache)
         if ready == len(candidates):
             return ready, "", None
-        return ready, f"waiting for the SPEC row of {Path(candidates[ready].path).name}", None
+        name = Path(candidates[ready].path).name
+        return ready, f"waiting for the SPEC row of {name}", (name, "spec")
     if SourceKind.IMAGE_FILE not in getattr(get_adapter(candidates[0].adapter_id), "kinds", (SourceKind.IMAGE_FILE,)):
         return len(candidates), "", None  # a container's own metadata: sidecars are an image policy
     from xrd_tools.io.metadata import live_sidecar_observation
@@ -1268,12 +1274,12 @@ def _live_metadata_ready(
         key = observation_key(image)
         previous = observations.get(key)
         observations[key] = seen
-        if ready == len(candidates) and (
+        if ready == len(candidates) and image.name not in given_up and (
             previous != seen
             or any(revision is None for _path, revision in seen)
             or (meta_format != "auto" and not seen and index >= published_members)
         ):
-            ready, reason, waiting = index, f"waiting for the metadata of {image.name}", image.name
+            ready, reason, waiting = index, f"waiting for the metadata of {image.name}", (image.name, "sidecar")
     return ready, reason, waiting
 
 
@@ -1368,6 +1374,7 @@ def materialize_live_directory_group(
     spec_cache: dict | None = None,
     owned: bool = False,
     committed_cache: dict | None = None,
+    given_up: frozenset[str] = frozenset(),
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
@@ -1382,6 +1389,7 @@ def materialize_live_directory_group(
     any other outcome is admitted as before. ``owned``: the Run is writing
     this output now, so its file is never read here. ``committed_cache``: the
     Run's committed counts by output file version (:func:`_committed_images`).
+    ``given_up``: images whose metadata the Run stopped waiting for.
     """
 
     fresh = getattr(session, "fresh", frozenset())  # first seen by this poll's listing
@@ -1405,13 +1413,14 @@ def materialize_live_directory_group(
         count, waiting, sidecar = _live_metadata_ready(
             configuration, group, sidecar_observations,
             published_members=published_members,
-            observe_from=covered, spec_cache=spec_cache,
+            observe_from=covered, spec_cache=spec_cache, given_up=given_up,
         )
         if covered and count > covered and proof.verified_at == checked and not proof.holds(cancelled=cancelled):
             # A publication proves its prefix in its own poll; one that changed
             # is looked at again in full, as an uncovered poll would.
             covered, (count, waiting, sidecar) = 0, _live_metadata_ready(
-                configuration, group, sidecar_observations, published_members=published_members, spec_cache=spec_cache)
+                configuration, group, sidecar_observations, published_members=published_members, spec_cache=spec_cache,
+                given_up=given_up)
         # A file only this listing has seen waits for another: one that ran during writes can show
         # a later file and miss an earlier one, and frame labels follow the members' order.
         if (cut := next((index for index, value in enumerate(group.plan.candidates[published_members:count],
@@ -1423,7 +1432,7 @@ def materialize_live_directory_group(
         if count == 0:
             live_readiness_debug("live_readiness", **facts, decision="wait: none ready")
             return LiveDirectoryAttempt(
-                group, ProbeState.IN_PROGRESS, reason=waiting, waiting_sidecar=sidecar,
+                group, ProbeState.IN_PROGRESS, reason=waiting, waiting_metadata=sidecar,
             )
         if (
             published_graph is not None
@@ -1441,7 +1450,7 @@ def materialize_live_directory_group(
             # never admitted as shorter than its output (Codex N-cdab3fe2).
             live_readiness_debug("live_readiness", **facts, decision="wait: published prefix held")
             return LiveDirectoryAttempt(
-                group, ProbeState.IN_PROGRESS, reason=waiting, waiting_sidecar=sidecar,
+                group, ProbeState.IN_PROGRESS, reason=waiting, waiting_metadata=sidecar,
             )
         # An output this Run has no graph of (an earlier Run's, or one it only showed from its saved record) knows
         # its committed prefix from its own record: a member of it still waiting for its metadata holds the scan as a
@@ -1452,7 +1461,7 @@ def materialize_live_directory_group(
         if facts["committed"] is not None and count < facts["committed"]:
             live_readiness_debug("live_readiness", **facts, decision="wait: committed prefix held")
             return LiveDirectoryAttempt(
-                group, ProbeState.IN_PROGRESS, reason=waiting, waiting_sidecar=sidecar,
+                group, ProbeState.IN_PROGRESS, reason=waiting, waiting_metadata=sidecar,
             )
         live_readiness_debug("live_readiness", **facts, decision="admit")
         observations = observations[:count]
@@ -1517,11 +1526,15 @@ def materialize_live_directory_group(
             raise
         raise RuntimeError("admission cancelled") from error
     except SourceRevisionChanged as error:
+        from xrd_tools.io.metadata import SpecRowPending
+        pending = error.__cause__ if isinstance(error.__cause__, SpecRowPending) else None
         return LiveDirectoryAttempt(
             group,
             ProbeState.IN_PROGRESS,
             reason=str(error),
             revision_changed=True,
+            # qualification's own look at a SPEC row not yet written: timed as the readiness wait is
+            waiting_metadata=None if pending is None or pending.image is None else (pending.image, "spec"),
         )
     if decision is None:
         return LiveDirectoryAttempt(
@@ -1540,7 +1553,7 @@ def materialize_live_directory_group(
         decision=decision,
         partial=partial,
         proof=admitted[-1],
-        waiting_sidecar=sidecar if partial else None,
+        waiting_metadata=sidecar if partial else None,
     )
 
 

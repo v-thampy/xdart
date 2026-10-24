@@ -602,7 +602,7 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
             events.extend(executor.drain_events())
             if len(attempts) >= 2 and (
                 len(processed) > 1 or any(event.kind is StandardEventKind.FAILED
-                                          for event in events)
+                                          or "stopped growing" in str(event.detail) for event in events)
             ):
                 break
             time.sleep(0.01)
@@ -615,10 +615,10 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
             first.decision.item.source_stamp.execution_identity_v1
             != revised.decision.item.source_stamp.execution_identity_v1
         )
-        failed = [event for event in events if event.kind is StandardEventKind.FAILED]
-        assert len(failed) == 1
-        assert failed[0].primary.type_qualname == "ValueError"
-        assert failed[0].primary.message == "same target cannot change its exact output lineage"
+        # the scan is skipped and named; the Run goes on (maintainer, 2026-10-24)
+        assert not [event for event in events if event.kind is StandardEventKind.FAILED]
+        assert [reason for _target, reason in executor._exact_run(identity).append_skips] == [
+            "ValueError: same target cannot change its exact output lineage"]
         assert processed == [selected]
         assert executor.processed_live_revisions(identity) == original
     finally:

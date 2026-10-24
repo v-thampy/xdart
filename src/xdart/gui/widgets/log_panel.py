@@ -3,6 +3,9 @@
 for 1.2.4: a checkable "Show log" button below Reintegrate/Advanced reveals a read-only log in the free space between
 those buttons and the Run controls; "it can be dragged and made bigger, but the controls panels above should get
 higher priority"). Shown at start (maintainer, 2026-10-24: "toggle the show log in the main window on by default").
+Beside Show log, Warnings shows only the warnings, errors and skipped scans or frames, with each Run's start and end
+(maintainer, 2026-10-24: "have another button next to the show log button ... show errors/warnings or maybe "show
+skipped""; his pick "Filter the log pane").
 
 ``LOG_FEED`` is a logging handler that ``_gui_main.run`` adds to the root logger beside the log file's handler, at
 that handler's level (Config ▸ Debug ▸ Debug Logging sets both), so it receives the records the file gets. A logging
@@ -25,6 +28,7 @@ import threading
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
+from xdart.utils import log_events
 from xdart.utils.log_events import EventFormatter
 
 from .read_only_text import ReadOnlyTextPane
@@ -43,14 +47,16 @@ _APPEND_LINES = 200
 
 
 class LogFeed(logging.Handler):
-    """The log's records as text lines, newest last, numbered so that each panel reads only what it has not shown."""
+    """The log's records as text lines, newest last, numbered so that each panel reads only what it has not shown; each
+    line knows whether it is a warning or worse, or a Run's start or end (what Warnings shows)."""
 
     def __init__(self, capacity: int = LOG_HISTORY_LINES):
         super().__init__(logging.INFO)
         self.setFormatter(EventFormatter(LOG_FORMAT, "%H:%M:%S"))
         self.capacity = int(capacity)
-        self._lines: collections.deque[str] = collections.deque(maxlen=self.capacity)
+        self._lines: collections.deque[tuple[str, str]] = collections.deque(maxlen=self.capacity)  # (line, kind)
         self._end = 0  # the lines ever fed: the next line's number
+        self._warnings = 0  # the held lines that are warnings or worse
         self._guard = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -59,9 +65,19 @@ class LogFeed(logging.Handler):
         except Exception:
             self.handleError(record)
             return
+        kind = ("warning" if record.levelno >= logging.WARNING else
+                "run" if getattr(record, log_events.BANNER, None) in ("run", "run-end") else "")
         with self._guard:
-            self._lines.append(line)
+            if len(self._lines) == self.capacity and self._lines[0][1] == "warning":
+                self._warnings -= 1  # the oldest line leaves the history
+            self._lines.append((line, kind))
+            self._warnings += kind == "warning"
             self._end += 1
+
+    @property
+    def warnings(self) -> int:
+        """The held lines that are warnings or worse."""
+        return self._warnings
 
     @property
     def end(self) -> int:
@@ -74,18 +90,18 @@ class LogFeed(logging.Handler):
         with self._guard:
             return self._end - len(self._lines)
 
-    def since(self, number: int) -> tuple[list[str], int, int]:
-        """The held lines from ``number`` on, the number to read from next, and how many lines from ``number`` on
-        the history no longer holds."""
+    def since(self, number: int, *, flagged: bool = False) -> tuple[list[str], int, int]:
+        """The held lines from ``number`` on (``flagged``: only the warnings and Runs' starts and ends), the number to
+        read from next, and how many lines from ``number`` on the history no longer holds."""
         with self._guard:
             end, first = self._end, self._end - len(self._lines)
             lines = list(self._lines)[max(number, first) - first:] if number < end else []
-        return lines, end, max(0, first - number)
+        return [line for line, kind in lines if kind or not flagged], end, max(0, first - number)
 
-    def held(self) -> tuple[list[str], int]:
-        """Every held line, oldest first, and the number to read from next."""
+    def held(self, *, flagged: bool = False) -> tuple[list[str], int]:
+        """Every held line, oldest first (``flagged``: as :meth:`since`), and the number to read from next."""
         with self._guard:
-            return list(self._lines), self._end
+            return [line for line, kind in self._lines if kind or not flagged], self._end
 
 
 #: The one feed, beside the log file's handler on the root logger once ``install_log_feed`` has run.
@@ -121,11 +137,18 @@ class LogPanel(QtWidgets.QFrame):
         self.toggle.setObjectName("controlsActionButton")
         self.toggle.setCheckable(True)
         self.toggle.toggled.connect(self._toggled)
+        self.warnings = QtWidgets.QPushButton("Warnings")
+        self.warnings.setObjectName("controlsActionButton")
+        self.warnings.setCheckable(True)
+        self.warnings.setToolTip("Show only the warnings, errors and skipped scans or frames, with each Run's start and "
+                                 "end; press again for the whole log.")
+        self.warnings.toggled.connect(self._filter)
         self.latest = QtWidgets.QPushButton("Latest")
         self.latest.setObjectName("controlsActionButton")
         self.latest.setToolTip("Scroll the log to the newest message and follow new ones again.")
         self.latest.clicked.connect(self.show_latest)
         row.addWidget(self.toggle, 1)
+        row.addWidget(self.warnings, 1)
         row.addWidget(self.latest, 1)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -173,6 +196,14 @@ class LogPanel(QtWidgets.QFrame):
 
     def _drag(self, _position: int, _index: int) -> None:
         self._dragged = True
+
+    def _filter(self, flagged: bool) -> None:
+        """Warnings: the pane holds only the warnings and Runs' starts and ends, or again every line."""
+        if flagged and not self.toggle.isChecked():
+            self.toggle.setChecked(True)  # pressed with the log hidden: show it
+        lines, self._next = self._feed.held(flagged=flagged)
+        self.pane.set_text("\n".join(lines))
+        self.show_latest()
 
     def eventFilter(self, watched, event) -> bool:
         # the controls' own layout changed (a page filling in after the log is shown at start, a card opening or
@@ -243,10 +274,13 @@ class LogPanel(QtWidgets.QFrame):
         if not self._at_end:
             self._show_waiting(self._feed.end - self._next, True)
             return
-        lines, end, missed = self._feed.since(self._next)
+        flagged = self.warnings.isChecked()
+        count = self._feed.warnings
+        self.warnings.setText(f"Warnings ({count})" if count else "Warnings")
+        lines, end, missed = self._feed.since(self._next, flagged=flagged)
         if missed or len(lines) > _APPEND_LINES:
-            lines, end = self._feed.held()
-            missed = max(0, end - len(lines) - self._next)  # lines the history moved past before this panel showed them
+            lines, end = self._feed.held(flagged=flagged)
+            missed = max(0, self._feed.first - self._next)  # lines the history moved past before this panel showed them
             self.pane.set_text("\n".join([f"… {missed} earlier lines are only in xdart.log"] * bool(missed) + lines))
         elif lines:
             self.pane.appendPlainText("\n".join(lines))

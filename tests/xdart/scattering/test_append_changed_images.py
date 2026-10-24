@@ -407,7 +407,9 @@ def test_a_replacement_admits_only_the_output_its_classification_read(tmp_path, 
 
     monkeypatch.setattr(dynamic_output.DynamicOutputAdapter, "activate", substituting)
     seen = _again(tmp_path, raw, monkeypatch, 9213)
-    assert len(observed) == 1 and seen.terminals == ["FAILED"] and seen.rebuilt == []
+    # the scan is skipped and named; the Run finishes (maintainer, 2026-10-24: "a directory run shouldn't stop")
+    assert len(observed) == 1 and seen.terminals == ["FINISHED"] and seen.rebuilt == []
+    assert [warning for warning in seen.warnings if "scana_int1d.nexus" in warning], seen.warnings
     assert output.read_bytes() == observed[0][0] and output.stat().st_ino == observed[0][1]
 
 

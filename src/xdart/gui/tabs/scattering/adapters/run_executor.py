@@ -129,9 +129,14 @@ _CONTAINER_READ_CHUNK_FRAMES = 8
 _SOURCE_PREFETCH_FRAMES = 4
 _DISPLAY_PROJECTION_FRAMES = 8
 _LIVE_DIRECTORY_POLL_S = 0.1
-# A frame whose own sidecar has been missing or changing this long is named, once, in the log and the Live status; it
-# keeps waiting (maintainer, 2026-10-24: "If it's only for txt files, a 10s timeout is plenty").
-_SIDECAR_WAIT_WARN_S = 10.0
+# A Live Run never waits forever (maintainer, 2026-10-24: "I don't want a live run to stop or be waiting forever"): a
+# frame waiting this long for its own metadata (its sidecar, or its SPEC row) is noted in the log and the Live status
+# ("When waiting for the sidecar the log output should show it is waiting"), and after the limit for its kind ("10 s
+# for .txt, 30 s for SPEC") it is processed without it; a SPEC row that never comes (an aborted point), or a Run that
+# normalizes by a monitor from it, skips its scan from that frame on instead ("it is fine to skip the entire scan
+# altogether").
+_METADATA_WAIT_NOTE_S = 2.0
+_METADATA_WAIT_LIMIT_S = {"sidecar": 10.0, "spec": 30.0}
 # A scan found changed is reduced again once its images and sidecars have held still this long: an acquisition can
 # write an image and its sidecar a moment later (maintainer, 2026-10-24: "Go ahead with your recommendation").
 _REBUILD_QUIET_S = 2.0
@@ -508,9 +513,11 @@ class _StandardRun:
     # Live outputs that stopped growing because a published frame's metadata
     # changed: physical target key -> the reason every later status carries.
     live_blocked: dict[str, str] = field(default_factory=dict)
-    # Live outputs whose next frame has waited _SIDECAR_WAIT_WARN_S for its own
-    # sidecar: physical target key -> the note the status carries meanwhile.
+    # Live outputs whose next frame has waited _METADATA_WAIT_NOTE_S for its own
+    # metadata: physical target key -> the note the status carries meanwhile.
     live_waiting: dict[str, str] = field(default_factory=dict)
+    # Frames a Live Run processed without their metadata: "image (output)".
+    metadata_given_up: list[str] = field(default_factory=list)
     current_file_total: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
@@ -1535,9 +1542,37 @@ class StandardRunExecutor:
             logger, logging.WARNING, "%s stops growing: the metadata of frames it already processed changed (%s); its "
             "frames so far are kept and its later frames are skipped in this Run [LIVE]", Path(target).name, names)
 
+    @staticmethod
+    def _abandon_construction(run: _StandardRun) -> None:
+        """Close the source a scan's construction opened and forget its frames, after that construction refused."""
+        source_owner = run.source
+        if source_owner is not None:
+            close = getattr(source_owner, "close", None)
+            if callable(close):
+                close()
+        run.source = None
+        run.scan = None
+        run.records = None
+        run.frames_by_label.clear()
+        run.current_total = 0
+        run.current_completed = 0
+        run.current_published = 0
+        run.current_file_total = 0
+        run.current_files_incremental = False
+        run.pending_rebuild = None  # a refused construction reduced nothing again
+
+    def _skip_directory_scan(self, run: _StandardRun, target: Path, error: BaseException) -> None:
+        """One scan of a directory Run that could not be processed: skipped, named, and listed at the Run's end; the
+        other scans still run (maintainer, 2026-10-24: "if something fails, a live run or a directory run shouldn't
+        stop. That scan/frame should be logged and skipped and the remaining scan processing should continue")."""
+        reason = f"{type(error).__name__}: {error}"
+        run.append_skips.append((str(target), reason))
+        log_events.event(logger, logging.WARNING, "%s skipped: it could not be processed; the other scans continue. "
+                         "Details: %s [SCAN-SKIPPED]", Path(target).name, reason)
+
     def _skip_live_append(
         self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused | None, *, constructed: bool,
-        reason: str | None = None, changed: bool = False,
+        reason: str | None = None, changed: bool = False, failed: bool = False,
     ) -> None:
         """Leave one Live output as it is after its Append refused: later polls skip its frames, the status names
         it, and the Run's end lists the reason. The output, when it is the current one, is retired first (with the
@@ -1547,52 +1582,62 @@ class StandardRunExecutor:
         with _run_effect(run):
             self._retire_current_target(run, target)
         if constructed:
-            source_owner = run.source
-            if source_owner is not None:
-                close = getattr(source_owner, "close", None)
-                if callable(close):
-                    close()
-            run.source = None
-            run.scan = None
-            run.records = None
-            run.frames_by_label.clear()
-            run.current_total = 0
-            run.current_completed = 0
-            run.current_published = 0
-            run.current_file_total = 0
-            run.current_files_incremental = False
+            self._abandon_construction(run)
         reason = detach_exception(error, "append").message if reason is None else reason
         run.append_skips.append((str(target), reason))
         run.live_blocked[target_key] = (
-            f"{Path(target).name} stopped growing: its Append was refused; published frames kept"
+            f"{Path(target).name} stopped growing: "
+            f"{'it could not be processed' if failed else 'its Append was refused'}; published frames kept"
         )
         run.live_waiting.pop(target_key, None)
         log_events.event(
             logger, logging.WARNING, "%s stops growing: %s; its frames so far are kept and its later frames are "
             "skipped in this Run%s. Details: %s [APPEND-SKIPPED]", Path(target).name,
-            "an image it already processed changed on disk" if changed else "it can no longer be extended",
+            "an image it already processed changed on disk" if changed else "it could not be processed" if failed
+            else "it can no longer be extended",
             "; the next Run reprocesses the whole scan" if changed else "", reason)
 
-    def _note_sidecar_wait(self, run: _StandardRun, name: str, target_key: str, image: str | None,
-                           waits: dict[str, tuple[str, float, str]]) -> None:
-        """Name, once, in the log and the Live status, the image whose own sidecar output ``name``'s next frame has
-        waited on for _SIDECAR_WAIT_WARN_S (missing or changing); clear the note when that frame no longer waits on it
-        (``image`` None: its attempt went on, its scan is covered, or its files left the directory)."""
+    def _watch_metadata_wait(self, run: _StandardRun, target: Path | None, target_key: str,
+                             waiting: tuple[str, str] | None, waits: dict[str, tuple[str, float, str]],
+                             given_up: dict[str, set[str]]) -> bool:
+        """Time the frame an output waits on for its own metadata (``waiting``: (image, "sidecar" or "spec"); None:
+        it no longer waits, its scan is covered, or its files left the directory). After _METADATA_WAIT_NOTE_S the
+        log and the Live status say so; after the limit for its kind the frame is given up on, processed without its
+        metadata, or, for a SPEC row or when the Run normalizes by a monitor from it, its scan is skipped from that
+        frame on (True: the caller moves on)."""
         now, held = monotonic(), waits.get(target_key)
-        if image is not None and held is not None and held[0] == image:
-            if target_key not in run.live_waiting and now - held[1] >= _SIDECAR_WAIT_WARN_S:
+        if waiting is None or held is None or held[0] != waiting[0]:
+            if run.live_waiting.pop(target_key, None) is not None and held is not None:
+                log_events.event(logger, logging.INFO, "%s no longer waits for the metadata of %s [LIVE]",
+                                 held[2], held[0])
+            if waiting is None:
+                waits.pop(target_key, None)
+            else:
+                waits[target_key] = (waiting[0], now, Path(target).name)
+            return False
+        (image, kind), name, limit = waiting, held[2], _METADATA_WAIT_LIMIT_S[waiting[1]]
+        if now - held[1] < limit:
+            if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
                 run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
-                log_events.event(
-                    logger, logging.WARNING, "%s is waiting for the metadata of %s: its sidecar has been missing or "
-                    "changing for over %g s; the frame is processed once its sidecar holds still [LIVE]",
-                    name, image, _SIDECAR_WAIT_WARN_S)
-            return
-        if run.live_waiting.pop(target_key, None) is not None and held is not None:
-            log_events.event(logger, logging.INFO, "%s no longer waits for the metadata of %s [LIVE]", held[2], held[0])
-        if image is None:
-            waits.pop(target_key, None)
-        else:
-            waits[target_key] = (image, now, name)
+                log_events.event(logger, logging.INFO, "%s is waiting for the metadata of %s [LIVE]", name, image)
+            return False
+        run.live_waiting.pop(target_key, None)
+        waits.pop(target_key, None)
+        if kind == "spec":  # its row never came: a SPEC scan that stopped there (an aborted point)
+            self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
+                f"the SPEC row of {image} did not arrive within {limit:g} s"))
+            return True
+        if any(str((args or {}).get("monitor") or "").strip()
+               for args in (run.configuration.bai_1d_args, run.configuration.bai_2d_args)):
+            self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
+                f"the metadata of {image} did not arrive within {limit:g} s, and this Run normalizes by a monitor "
+                "from it"))
+            return True
+        given_up.setdefault(target_key, set()).add(image)
+        run.metadata_given_up.append(f"{image} ({name})")
+        log_events.event(logger, logging.WARNING, "%s: the metadata of %s did not arrive within %g s; the frame is "
+                         "processed without it [LIVE]", name, image, limit)
+        return False
 
     def _open_scan(self, run: _StandardRun, artifact: Path, note: str = "") -> None:
         """The log's ``New Scan`` banner for ``artifact``'s output (maintainer, 2026-10-24)."""
@@ -2244,8 +2289,10 @@ class StandardRunExecutor:
         uncovered: dict[str, tuple[tuple[object, ...], tuple[int, int, int, int]]] = {}
         # A found output's committed image count by output file version, for its readiness waits.
         committed_counts: dict[str, tuple[tuple[int, int, int, int], int | None]] = {}
-        # The image each output's next frame waits on for its sidecar, since when, and the output's name.
-        sidecar_waits: dict[str, tuple[str, float, str]] = {}
+        # The image each output's next frame waits on for its metadata, since when, and the output's name; and the
+        # images each output stopped waiting for.
+        metadata_waits: dict[str, tuple[str, float, str]] = {}
+        given_up: dict[str, set[str]] = {}
         # A scan found changed: its revision and when its rebuild may start (_REBUILD_QUIET_S).
         rebuild_holds: dict[str, tuple[tuple[object, ...], float]] = {}
         # SPEC readiness by SPEC file revision: no read while it is unchanged.
@@ -2412,7 +2459,7 @@ class StandardRunExecutor:
                         seen_targets.add(target_key)
                     settled_revisions[target_key] = (
                         revision, _CoveredOutput(group.target, signature, registry, monotonic()))
-                    self._note_sidecar_wait(run, group.target.name, target_key, None, sidecar_waits)
+                    self._watch_metadata_wait(run, group.target, target_key, None, metadata_waits, given_up)
                     processed_paths.update(group.physical_paths)
                     publish(force=True)
                     continue
@@ -2451,10 +2498,14 @@ class StandardRunExecutor:
                             spec_cache=spec_cache,
                             owned=run.output is not None and run.output.owns_target(group.target),
                             committed_cache=committed_counts,
+                            given_up=frozenset(given_up.get(target_key, ())),
                         )
                         times.add("admission", started)
-                        self._note_sidecar_wait(run, group.target.name, target_key, attempt.waiting_sidecar,
-                                                sidecar_waits)
+                        if self._watch_metadata_wait(run, group.target, target_key, attempt.waiting_metadata,
+                                                     metadata_waits, given_up):
+                            skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
+                            publish(force=True)
+                            continue
                         live_readiness_debug(
                             "live_attempt", target=group.target.name,
                             owned=run.output is not None and run.output.owns_target(group.target),
@@ -2588,6 +2639,26 @@ class StandardRunExecutor:
                     )
                     publish(force=True)
                     continue
+                except (ValueError, OSError) as error:
+                    if isinstance(error, SourceRevisionChanged):
+                        retry_revisions[target_key] = revision  # its files changed while it was read: again
+                        continue
+                    if constructing and isinstance(error, OSError):
+                        raise  # the output cannot be written: the Run fails (maintainer, 2026-10-24)
+                    # One scan's own problem (a GI motor missing in a frame, an energy-scan refusal, a read error, an
+                    # output collision, an unreadable image) skips that scan; the Run goes on (maintainer, 2026-10-24:
+                    # "Skip that scan, keep the Run").
+                    live_readiness_debug(
+                        "live_refused", target=group.target.name, constructed=constructing,
+                        owned=run.output is not None and run.output.owns_target(group.target), reason=str(error))
+                    self._skip_live_append(run, group.target, target_key, None, constructed=constructing,
+                                           reason=f"{type(error).__name__}: {error}", failed=True)
+                    skipped_paths.update(
+                        path for path in group.physical_paths
+                        if path not in processed_paths
+                    )
+                    publish(force=True)
+                    continue
                 except RuntimeError as error:
                     if (
                         run.stop_requested
@@ -2640,8 +2711,8 @@ class StandardRunExecutor:
                 if stopped or run.stop_requested:
                     return True
 
-            for key in [key for key in sidecar_waits if key not in polled]:  # its files left the directory
-                self._note_sidecar_wait(run, sidecar_waits[key][2], key, None, sidecar_waits)
+            for key in [key for key in metadata_waits if key not in polled]:  # its files left the directory
+                self._watch_metadata_wait(run, None, key, None, metadata_waits, given_up)
             with run.live_revision_lock:
                 containers = tuple(value.decision.item.source_stamp for value in run.processed_live_revisions.values()
                                    if value.decision is not None and value.decision.item.descriptor is not None)
@@ -2738,6 +2809,9 @@ class StandardRunExecutor:
                     "unchanged (Replace reprocesses it). Details: %s [APPEND-SKIPPED]", Path(entry.target).name,
                     reason)
                 decision, skipped_files = None, 0
+            except (ValueError, OSError) as error:  # one scan's own problem: that scan is skipped, the rest still runs
+                self._skip_directory_scan(run, entry.target, error)
+                decision, skipped_files = None, 0
             if decision is None:
                 skipped_claims = _claim_physical_files(
                     tuple(
@@ -2774,12 +2848,30 @@ class StandardRunExecutor:
                 item.source_spec.kind is SourceKind.TIFF_SERIES
             )
             admitted = monotonic()
-            self._construct(
-                run,
-                item=item,
-                labels=decision.labels,
-                decision=decision,
-            )
+            try:
+                self._construct(
+                    run,
+                    item=item,
+                    labels=decision.labels,
+                    decision=decision,
+                )
+            except ValueError as error:  # (an OSError: its output cannot be written, and the Run fails)
+                planned, claimed = run.current_total, run.current_file_total
+                with _run_effect(run):
+                    self._retire_current_target(run, item.target)
+                self._abandon_construction(run)
+                run.total -= planned
+                run.files_skipped += claimed
+                self._skip_directory_scan(run, item.target, error)
+                self._events.put(StandardRunEvent(
+                    run.identity,
+                    StandardEventKind.DISCOVERY,
+                    completed=run.completed,
+                    total=run.total,
+                    detail=_directory_status(run),
+                    **_directory_event_fields(run),
+                ))
+                continue
             constructed = monotonic()
             run.completed += run.current_completed
             self._events.put(StandardRunEvent(
@@ -3649,6 +3741,9 @@ class StandardRunExecutor:
         if warnings:
             log_events.event(logger, logging.WARNING, "Skipped in this Run (%d): %s [RUN-SKIPPED]", len(warnings),
                              "; ".join(warnings))
+        if run.metadata_given_up:
+            log_events.event(logger, logging.WARNING, "Processed without their metadata (%d): %s [LIVE]",
+                             len(run.metadata_given_up), ", ".join(run.metadata_given_up))
         if receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING:
             logger.warning(
                 "[RUN-CLEANUP] output=%s retained=%s light_pending=%s failures=%s",

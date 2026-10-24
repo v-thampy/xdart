@@ -1539,7 +1539,11 @@ _SPEC_SCAN_LINE = re.compile(rb"#S[ \t]+(\d+)(?=\s|$)")
 
 
 class SpecRowPending(Exception):
-    """A live image's own SPEC row is not there yet: its SPEC file, scan or row is missing."""
+    """A live image's own SPEC row is not there yet: its SPEC file, scan or row is missing (``image``: its name)."""
+
+    def __init__(self, message: str, image: str | None = None) -> None:
+        super().__init__(message)
+        self.image = image
 
 
 class SpecRowInvalid(ValueError):
@@ -1947,7 +1951,7 @@ def read_spec_points(image_paths: Sequence[Path | str], meta_dir: Path | str | N
             if number is not None and number >= valid and valid < rows:
                 raise SpecRowInvalid(_not_a_row(spec_path, scan_number, scan, valid))
             if number is None or number >= valid:
-                raise SpecRowPending(f"waiting for the SPEC row of {path.name}")
+                raise SpecRowPending(f"waiting for the SPEC row of {path.name}", path.name)
     own = [tuple(float(token) for token in scan.lines[scan.rows[number]].split()) for number in numbers]
     _spec_cancelled(cancelled)
     try:

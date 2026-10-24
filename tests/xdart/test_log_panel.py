@@ -546,3 +546,45 @@ def test_debug_logging_and_the_log_panel_are_independent(qapp, monkeypatch, tmp_
         for handler in [h for h in root.handlers if isinstance(h, _gui_main.RotatingFileHandler)]:
             root.removeHandler(handler)
             handler.close()
+
+
+def test_warnings_shows_only_warnings_errors_and_each_runs_start_and_end(qapp):
+    """Maintainer, 2026-10-24: "have another button next to the show log button ... show errors/warnings or maybe
+    "show skipped"" (his pick "Filter the log pane"): Warnings filters the same pane and counts the warnings; pressed
+    with the log hidden, it shows the log."""
+    from xdart.utils import log_events
+    feed = LogFeed(capacity=300)
+    log = _fed_logger("xdart.test.log_warnings", feed)
+    panel = LogPanel(QtWidgets.QScrollArea(), feed)
+    panel.split.resize(320, 400)
+    panel.split.show()
+    try:
+        _settle(qapp)
+        log_events.banner(log, "New Run · Int 1D", kind="run")
+        log_events.banner(log, "New Scan · grow_int1d.nexus", kind="scan")
+        log.info("routine")
+        log.warning("grow_int1d.nexus stops growing")
+        log.error("a failure")
+        log_events.banner(log, "End of Run · Stopped", kind="run-end")
+        panel.refresh()
+        assert "routine" in panel.pane.toPlainText() and panel.warnings.text() == "Warnings (2)"
+        assert panel.warnings.isCheckable() and panel.warnings.toolTip() and panel.warnings.parent() is panel.bar
+        panel.warnings.click()
+        shown = panel.pane.toPlainText()
+        assert "routine" not in shown and "New Scan" not in shown, shown
+        assert all(text in shown for text in ("New Run", "stops growing", "a failure", "End of Run")), shown
+        log.info("later routine")
+        log.warning("later warning")
+        panel.refresh()  # new lines follow the filter
+        shown = panel.pane.toPlainText()
+        assert "later warning" in shown and "later routine" not in shown and panel.warnings.text() == "Warnings (3)"
+        panel.warnings.click()
+        assert "later routine" in panel.pane.toPlainText()
+        panel.toggle.setChecked(False)  # hidden; Warnings shows it, filtered
+        panel.warnings.click()
+        assert panel.toggle.isChecked() and panel.isVisibleTo(panel.split) and "routine" not in panel.pane.toPlainText()
+    finally:
+        log.handlers[:] = []
+        panel.bar.deleteLater()
+        panel.split.deleteLater()
+        qapp.processEvents()

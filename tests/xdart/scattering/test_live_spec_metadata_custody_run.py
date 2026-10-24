@@ -85,7 +85,7 @@ def test_r1_a_row_removed_after_readiness_waits_then_publishes_its_own_values(tm
     assert _output(tmp_path) == ((1, 2), (100.0, 101.0))
 
 
-def test_r2_a_complete_line_that_is_not_a_row_fails_the_run_naming_it(tmp_path):
+def test_r2_a_complete_line_that_is_not_a_row_skips_its_scan_naming_it(tmp_path):
     raw, spec = _acquisition(tmp_path)
     executor, identity = _run(tmp_path, raw, 5202)
     events = []
@@ -94,13 +94,15 @@ def test_r2_a_complete_line_that_is_not_a_row_fails_the_run_naming_it(tmp_path):
         with spec.open('a') as stream:
             stream.write('0.1\n')  # point 2's row, one number short, newline-terminated
         _image(raw, 1, 1)
-        _wait(executor, events, lambda values: 2 in _labels(values, SCAN1) or _terminal(values), 20.)
+        _wait(executor, events, lambda values: 2 in _labels(values, SCAN1) or _terminal(values) or any(
+            'stopped growing' in str(event.detail) for event in values), 20.)
         _settle(executor, events)
     finally:
         terminal = _stop(executor, identity, events)
-    assert _kinds(terminal) == ['FAILED'], terminal
-    detail = terminal[0][1]
-    assert 'calibrant' in detail and 'scan 1' in detail and 'row 2' in detail, terminal
+    # the Run goes on; the scan is skipped and named (maintainer, 2026-10-24)
+    assert _kinds(terminal) == ['STOPPED'] and 'could not be processed' in terminal[0][1], terminal
+    detail = ' '.join(warning for event in events for warning in getattr(event, 'warnings', ()))
+    assert 'calibrant' in detail and 'scan 1' in detail and 'row 2' in detail, detail
     assert _output(tmp_path) == ((1,), (100.0,))
 
 

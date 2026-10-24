@@ -317,43 +317,11 @@ def test_a_found_scan_reacquired_image_first_then_sidecar_is_rebuilt_with_its_ne
     assert _output(tmp_path, "done")[:2] == ((1, 2), (1.0, 7.0))
 
 
-def test_a_frame_whose_sidecar_does_not_hold_still_is_named_after_the_wait_threshold_then_processed(
-        tmp_path, monkeypatch, caplog):
-    """Maintainer, 2026-10-24 ("If it's only for txt files, a 10s timeout is plenty"): a per-image sidecar missing or
-    changing past the threshold is named once in the log and in the Live status; the frame keeps waiting, and when its
-    sidecar holds still it is processed and the note goes."""
-    from xdart.gui.tabs.scattering.adapters import run_executor
-    monkeypatch.setattr(run_executor, "_SIDECAR_WAIT_WARN_S", .5, raising=False)  # (absent before the note existed)
-    caplog.set_level(logging.INFO)
-    raw = tmp_path / "raw"
-    raw.mkdir()
-    executor, identity = _live(tmp_path, raw, 8794)
-    events = []
-    try:
-        _frame(raw, "grow", 1, "txt", 1.0)
-        _wait(executor, events, lambda values: 1 in _labels(values, "grow") or any(
-            event.kind in _TERMINAL for event in values))
-        _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)  # its image; its .txt has not been written
-        _wait(executor, events, lambda values: _said(values, "waits for the metadata of grow_0002.tif") or any(
-            event.kind in _TERMINAL for event in values), timeout=15.)
-        (raw / "grow_0002.txt").write_text(SIDECARS["txt"](2.0))
-        _wait(executor, events, lambda values: 2 in _labels(values, "grow") or any(
-            event.kind in _TERMINAL for event in values), timeout=15.)
-        _settle(executor, events, .5)
-    finally:
-        terminal = _stop(executor, identity, events)
-    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
-    assert "waits for the metadata" not in terminal[0][1], terminal  # the note went when the frame arrived
-    named = [record for record in caplog.records if "is waiting for the metadata of grow_0002.tif" in record.getMessage()]
-    assert [record.levelno for record in named] == [logging.WARNING], [record.getMessage() for record in named]
-    assert any("grow_int1d.nexus no longer waits for the metadata of grow_0002.tif" in record.getMessage()
-               for record in caplog.records)
-
-
 def test_a_waiting_note_goes_when_the_frame_it_names_leaves_the_directory(tmp_path, monkeypatch):
     """Codex N-1af271b0: a note for a frame whose files are removed no longer stays in the status."""
     from xdart.gui.tabs.scattering.adapters import run_executor
-    monkeypatch.setattr(run_executor, "_SIDECAR_WAIT_WARN_S", .5, raising=False)
+    monkeypatch.setattr(run_executor, "_METADATA_WAIT_NOTE_S", .2, raising=False)
+    monkeypatch.setattr(run_executor, "_METADATA_WAIT_LIMIT_S", {"sidecar": 60., "spec": 60.}, raising=False)
     raw = tmp_path / "raw"
     raw.mkdir()
     executor, identity = _live(tmp_path, raw, 8797)

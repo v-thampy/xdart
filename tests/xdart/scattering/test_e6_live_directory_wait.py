@@ -622,7 +622,7 @@ def test_live_construct_source_revision_drift_reprobes_and_retries(
     )
 
 
-def test_live_stable_construct_value_error_is_terminal_not_retried(
+def test_live_stable_construct_value_error_skips_its_scan_and_is_not_retried(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -670,27 +670,22 @@ def test_live_stable_construct_value_error_is_terminal_not_retried(
         receipt,
     )) is ExecutorAccepted
 
+    # The scan is skipped and named; the Run goes on (maintainer, 2026-10-24: "a live run ... shouldn't stop").
     events = []
     deadline = time.monotonic() + 10.0
-    terminal = None
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and not any(
+            "stopped growing" in str(event.detail) for event in events):
         events.extend(executor.drain_events())
-        terminal = next(
-            (
-                event
-                for event in reversed(events)
-                if event.kind is StandardEventKind.FAILED
-            ),
-            None,
-        )
-        if terminal is not None:
-            break
         time.sleep(0.01)
+    time.sleep(0.5)  # polls go on; the refused construction is not tried again
+    events.extend(executor.drain_events())
+    run = executor._exact_run(identity)
     assert construct_calls == 1
-    assert terminal is not None
-    assert terminal.primary is not None
-    assert terminal.primary.message == "stable construction invalid"
-    assert terminal.cleanup_status is CleanupStatus.CLEANED
+    assert [reason for _target, reason in run.append_skips] == ["ValueError: stable construction invalid"]
+    assert not [event for event in events if event.kind is StandardEventKind.FAILED]
+    executor.stop(identity)
+    closed = executor.close(identity)
+    assert closed.cleanup_status is CleanupStatus.CLEANED
 
 
 def test_live_external_member_growth_during_jit_is_typed_pending(

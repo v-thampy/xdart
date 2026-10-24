@@ -937,11 +937,13 @@ def test_r4c_a_complete_malformed_spec_row_for_a_new_frame_fails_loudly(tmp_path
         with spec.path.open('a') as stream:
             stream.write('0.3 103 not-a-number\n')
         spec.image(1, 3)
-        _wait(executor, events, _terminal, 30.)
+        _wait(executor, events, lambda values: _terminal(values) or _said(values, 'stopped growing'), 30.)
     finally:
         terminal = _stop(executor, identity, events)
-    assert [kind for kind, _detail in terminal][-1:] == ['FAILED'], terminal
-    assert 'row 4' in str(terminal) and _counted(tmp_path, 'calibrant_scan001')[0] == (1, 2, 3)
+    # loudly, but the Run goes on (maintainer, 2026-10-24: "That scan/frame should be logged and skipped")
+    assert [kind for kind, _detail in terminal] == ['STOPPED'] and 'could not be processed' in str(terminal), terminal
+    assert any('row 4' in warning for event in events for warning in getattr(event, 'warnings', ()))
+    assert _counted(tmp_path, 'calibrant_scan001')[0] == (1, 2, 3)
 
 
 def test_r4d_a_new_spec_member_waits_for_a_second_real_listing(tmp_path, monkeypatch):
@@ -1147,10 +1149,9 @@ def test_r5b_spec_with_an_eiger_master_binds_each_frame_to_its_own_row(tmp_path,
     finally:
         terminal = closed[3] if closed is not None else _stop(executor, identity, events)
     labels, record = _counted(tmp_path, stem)
-    if case == 'malformed':
-        assert [kind for kind, _detail in terminal][-1:] == ['FAILED'] and 'row 5' in str(terminal), terminal
-    else:
-        assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal  # a malformed row skips that scan, loudly
+    assert case != 'malformed' or any('row 5' in warning for event in events for warning in getattr(
+        event, 'warnings', ())), terminal
     assert closed is None or closed[2] <= 1., closed
     assert labels == tuple(range(4 if case in ('malformed', 'drift', 'stop') else 5)), labels
     assert case != 'drift' or _said(events, 'stopped growing')
