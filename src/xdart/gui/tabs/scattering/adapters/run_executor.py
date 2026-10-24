@@ -2509,6 +2509,14 @@ class StandardRunExecutor:
         candidate_owners = _candidate_file_owners(tuple(
             entry.physical_paths for entry in deferred.entries
         ))
+        # Files admission already found processed count as processed from the start, not pending until each scan is
+        # shown (maintainer, 2026-10-23: "it says there are 24 images or so remaining and then goes through them in a
+        # couple of seconds"); claimed here, their presentation counts nothing again.
+        for output_index, entry in enumerate(deferred.entries):
+            if entry.completed is not None:
+                run.files_processed += min(len(entry.completed.labels), _claim_physical_files(
+                    tuple(candidate.path for candidate in entry.candidates), deferred.discovered_paths,
+                    claimed_files, candidate_owners=candidate_owners, output_index=output_index))
         self._events.put(StandardRunEvent(
             run.identity,
             StandardEventKind.DISCOVERY,

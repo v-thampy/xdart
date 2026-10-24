@@ -139,6 +139,12 @@ def test_a_completed_scan_is_skipped_as_before_without_reading_it_again(tmp_path
     rows, warnings, navigation = _shown(events, catalog)
     expected = [list(row) for row in _PARENT_ROWS]
     expected[1][4], expected[4][4] = "", f"scanb_int1d.nexus: {_ENERGY}"
+    # Status contract change (maintainer 2026-10-23: "it says there are 24 images or so remaining and then goes
+    # through them in a couple of seconds"): files admission already found processed count from the first status
+    # on, and showing their scan adds nothing again.
+    for row in (0, 2):
+        expected[row][4] = "Running · 3 processed · 0 skipped · 2 pending · 5 discovered"
+        expected[row][7], expected[row][9] = 3, 2
     assert rows == [tuple(row) for row in expected]
     assert warnings == [] and navigation == _PARENT_NAVIGATION
     assert seams.materialized == ["scanb_int1d.nexus"] and seams.preflighted == ["scanb_int1d.nexus"]
