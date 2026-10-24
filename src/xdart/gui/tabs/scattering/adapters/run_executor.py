@@ -598,13 +598,9 @@ class _CoveredOutput:
     registrations at most every LivePrefixProof.PERIOD_S (Codex N-0243a1bb F3): once the output is deleted, replaced or
     rewritten while the scan's images are not, the scan is looked at again."""
     target: Path
-    signature: tuple[int, int, int, int] | None
+    signature: tuple[int, int, int, int]  # the output as its record was read (unchanged across that read)
     registry: tuple
     checked_at: float
-
-    @classmethod
-    def of(cls, target: Path, registry: tuple) -> "_CoveredOutput":
-        return cls(target, _target_stat(target), registry, monotonic())
 
     def holds(self, registry: tuple) -> bool:
         if monotonic() - self.checked_at < LivePrefixProof.PERIOD_S:
@@ -2269,10 +2265,15 @@ class StandardRunExecutor:
                                 configuration, retained.decision.item.graph, seen, registry)
                             continue
                 started = monotonic()
-                completed = (
-                    None if run.output is not None and run.output.owns_target(group.target)
-                    else live_group_coverage(receipt, group)
-                )
+                completed = signature = None
+                if run.output is None or not run.output.owns_target(group.target):
+                    # Coverage counts only for the output its record was read from: the same output before and
+                    # after the read (Codex N-770941b2: one deleted or replaced during the read stayed covered).
+                    signature = _target_stat(group.target)
+                    if signature is not None:
+                        completed = live_group_coverage(receipt, group)
+                        if completed is not None and _target_stat(group.target) != signature:
+                            completed = None
                 times.add("coverage", started)
                 if completed is not None:
                     # A scan its output already holds, image for image: shown once from its committed record, as a
@@ -2287,7 +2288,8 @@ class StandardRunExecutor:
                             self._present_live_saved_output(run, group, completed)
                         times.add("shown", started)
                         seen_targets.add(target_key)
-                    settled_revisions[target_key] = (revision, _CoveredOutput.of(group.target, registry))
+                    settled_revisions[target_key] = (
+                        revision, _CoveredOutput(group.target, signature, registry, monotonic()))
                     processed_paths.update(group.physical_paths)
                     publish(force=True)
                     continue
@@ -2472,10 +2474,10 @@ class StandardRunExecutor:
                     settle=settle_live,
                 )
                 times.add("written", started)
-                if run.perf_enabled and not first_written and run.current_published:
+                if run.perf_enabled and not first_written and run.current_epoch_published:
                     first_written = True
-                    logger.info("[LIVE-POLL] first frames written %.3f s after the Live Run started",
-                                monotonic() - loop_started)
+                    logger.info("[LIVE-POLL] first epoch with new frames finished %.3f s after the first poll "
+                                "began (admission and checks before it not included)", monotonic() - loop_started)
                 if stopped or run.stop_requested:
                     return True
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from tests.xdart.scattering.test_live_qualify_refusal_run import (
     SIDECARS, _frame, _labels, _said, _settle, _stop, _terminals, _wait,
 )
@@ -141,6 +143,7 @@ def test_f3_a_finished_scan_whose_output_is_replaced_is_covered_again_without_sh
     events = []
     try:
         _wait(executor, events, lambda values: shown or any(event.kind in _TERMINAL for event in values))
+        _settle(executor, events, 1.)  # several polls: its watch is established
         copy = output.with_suffix('.copy')
         copy.write_bytes(output.read_bytes())
         os.replace(copy, output)  # same records, another file
@@ -152,3 +155,42 @@ def test_f3_a_finished_scan_whose_output_is_replaced_is_covered_again_without_sh
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert covered == [('done_int1d.nexus', True)] * 2 and shown == ['done_int1d.nexus'], (covered, shown)
     assert not _labels(events, 'done')
+
+
+@pytest.mark.parametrize('change', ['deleted', 'replaced'])
+def test_f3_an_output_that_changes_while_its_record_is_read_is_not_cached_as_covered(tmp_path, monkeypatch, change):
+    """Codex N-770941b2 (its discriminator test_review_coverage_binding.py, d2e9cc11...): the watch was taken after the
+    coverage read, so an output deleted or replaced in between stayed covered for the Run. Deleted, the scan is
+    reduced again; replaced, it is looked at again and nothing is written."""
+    real_coverage, changed = run_executor.live_group_coverage, []
+
+    def coverage(receipt, group):  # the output changes just after its record was read
+        result = real_coverage(receipt, group)
+        if result is not None and not changed:
+            if change == 'deleted':
+                group.target.unlink()
+            else:
+                copy = group.target.with_suffix('.copy')
+                copy.write_bytes(group.target.read_bytes())
+                os.replace(copy, group.target)
+            changed.append(group.target.name)
+        return result
+    monkeypatch.setattr(run_executor, 'live_group_coverage', coverage)
+    _raw, executor, identity, covered, shown, _stats = _covered_run(
+        tmp_path, monkeypatch, 8921 if change == 'deleted' else 8931)
+    output = tmp_path / 'processed' / 'done_int1d.nexus'
+    events = []
+    try:
+        _wait(executor, events, lambda values: (2 in _labels(values, 'done') if change == 'deleted' else len(covered) > 1)
+              or any(event.kind in _TERMINAL for event in values), timeout=20.)
+        _settle(executor, events, 1.)
+        catalog = [(key.source_scan, key.local_frame_label) for key in executor.frame_catalog(identity).entries]
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert changed == ['done_int1d.nexus'] and output.exists()
+    if change == 'deleted':
+        assert sorted(set(_labels(events, 'done'))) == [1, 2]
+    else:
+        assert not _labels(events, 'done') and len(covered) > 1 and catalog == [('done', 1), ('done', 2)], (
+            covered, shown, catalog)
