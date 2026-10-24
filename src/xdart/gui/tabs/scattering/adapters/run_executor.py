@@ -1450,8 +1450,11 @@ class StandardRunExecutor:
         self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused, *, constructed: bool,
     ) -> None:
         """Leave one Live output as it is after its Append refused: later polls skip its frames, the status names
-        it, and the Run's end lists the reason. A refusal during construction closes the source it opened; the
-        output, when it is the current one, is retired, and a failure there still fails the Run."""
+        it, and the Run's end lists the reason. The output, when it is the current one, is retired first (with the
+        Run's progress as it stands), and a failure there still fails the Run; a refusal during construction then
+        closes the source it opened."""
+        with _run_effect(run):
+            self._retire_current_target(run, target)
         if constructed:
             source_owner = run.source
             if source_owner is not None:
@@ -1467,8 +1470,6 @@ class StandardRunExecutor:
             run.current_published = 0
             run.current_file_total = 0
             run.current_files_incremental = False
-        with _run_effect(run):
-            self._retire_current_target(run, target)
         reason = detach_exception(error, "append").message
         run.append_skips.append((str(target), reason))
         run.live_blocked[target_key] = (
