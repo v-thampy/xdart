@@ -5838,9 +5838,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             for label in handoff.selected_labels
             if label in by_label
         )
-        if self._processed_browser.auto_last and navigation.frames:
+        if self._processed_browser.auto_last and navigation.frames and selected:
             self._context_controller.select_navigation(
                 navigation.frames[-1], selected
+            )
+        elif self._processed_browser.auto_last and navigation.frames:
+            # None of the Run's chosen frames is in this output (a finite Append that ended on a scan it showed from
+            # its saved record): Auto Last's own rule, not an empty selection (beamline 2026-10-23: "Refused: Browse
+            # 1-D navigation is incomplete", every plot empty).
+            self._context_controller.select_latest_navigation(
+                plot_mode=self._preferences.plot_mode
             )
         elif current is not None:
             self._context_controller.select_navigation(current, selected)

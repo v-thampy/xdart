@@ -2637,10 +2637,13 @@ class StandardRunExecutor:
     @staticmethod
     def _follow_saved_output(run: _StandardRun, target: Path, completed) -> None:
         """Point the Run's current-output fields at a saved output it shows while no other output is open, as an
-        Append no-op's dormant output leaves them."""
+        Append no-op's dormant output leaves them. It has no stream commit in this Run, so a terminal event naming it
+        carries none (the last written output's commit made the page drop a finite Append's FINISHED event: no Browse,
+        no plot)."""
         run.artifact, run.session = target, None
         run.current_total = run.current_completed = run.current_published = len(completed.labels)
         run.current_epoch_published = 0
+        run.terminal_commit_identity = None
 
     def _present_saved_output(self, run: _StandardRun, target: Path, first, completed):
         """Show an output's saved frames as an Append no-op shows them (navigation, display owner, acquisition
