@@ -1397,11 +1397,16 @@ def materialize_live_directory_group(
             published_graph is not None
             and count < len(group.plan.candidates)
             and count <= len(published_graph.stamp.members)
-            and (covered or _prefix_current_rebased(configuration, published_graph, proof, cancelled))
+            and (count < len(published_graph.stamp.members) or covered
+                 or _prefix_current_rebased(configuration, published_graph, proof, cancelled))
         ):
             # A frame waits and the published frames are exactly as admitted:
             # re-admitting them would only repeat their admission (and, in
             # Append mode, its same-extent preview against a grown SPEC file).
+            # A published frame whose metadata is still settling holds the scan
+            # whatever its images did, as a first one always has: it is looked
+            # at whole once that settles (one found changed is reduced again),
+            # never admitted as shorter than its output (Codex N-cdab3fe2).
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting,
             )

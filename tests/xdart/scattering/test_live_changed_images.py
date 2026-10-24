@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections import Counter
 
 import fabio
@@ -24,6 +25,7 @@ from tests.xdart.scattering.test_live_qualify_refusal_run import (
     _frame, _labels, _said, _settle, _stop, _terminals, _wait,
 )
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_terminal, _start
+from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 
 
@@ -32,6 +34,33 @@ def _reacquire(raw, stem, index, value=99):
     target, partial = raw / f"{stem}_{index:04d}.tif", raw / f"{stem}_{index:04d}.part"
     fabio.tifimage.TifImage(data=np.full((195, 487), value, dtype=np.uint16)).write(str(partial))
     partial.replace(target)
+
+
+def _held_poll(monkeypatch):
+    """Once armed, the Live loop's next listing waits for ``released``: what changes meanwhile, one poll sees."""
+    armed, inside, released = threading.Event(), threading.Event(), threading.Event()
+    real = DirectoryIndexSession.observe
+
+    def observe(self, *, refresh=True):
+        if armed.is_set() and not inside.is_set() and threading.current_thread() is not threading.main_thread():
+            inside.set()
+            released.wait(30.)
+        return real(self, refresh=refresh)
+    monkeypatch.setattr(DirectoryIndexSession, "observe", observe)
+    return armed, inside, released
+
+
+def _acquired_again_with_its_sidecar(raw, stem, index, held, then=None):
+    """A new image and a new acquisition time in its sidecar (and ``then``), all seen by one poll."""
+    armed, inside, released = held
+    armed.set()
+    assert inside.wait(30.), "the Live loop waits at its next listing"
+    _reacquire(raw, stem, index)
+    sidecar = raw / f"{stem}_{index:04d}.txt"
+    sidecar.write_text(sidecar.read_text().replace("10:30:00", "10:31:00"))
+    if then is not None:
+        then()
+    released.set()
 
 
 def _finished(tmp_path, stem, frames):
@@ -96,14 +125,15 @@ def test_live_rebuilds_a_finished_scan_whose_image_changed_once_then_extends_the
     assert catalog == {1: 1, 2: 1, 3: 1}, catalog
 
 
-@pytest.mark.parametrize("change", ["acquired again", "re-dated"])
+@pytest.mark.parametrize("change", ["acquired again", "re-dated", "acquired again with its sidecar"])
 def test_a_scan_this_live_run_grows_stops_growing_when_a_reduced_image_changes_and_the_next_run_rebuilds_it(
-        tmp_path, caplog, change):
+        tmp_path, caplog, monkeypatch, change):
     """Maintainer, 2026-10-24 ("Stop growing it"): its frames so far kept, its later frames skipped this Run and
     named; a later Run finds the scan changed and reduces it whole."""
     caplog.set_level(logging.INFO)
     raw = tmp_path / "raw"
     raw.mkdir()
+    held = _held_poll(monkeypatch)
     executor, identity = _live(tmp_path, raw, 8703)
     output = tmp_path / "processed" / "grow_int1d.nexus"
     events = []
@@ -117,14 +147,18 @@ def test_a_scan_this_live_run_grows_stops_growing_when_a_reduced_image_changes_a
             image = raw / "grow_0001.tif"
             state = image.stat()
             os.utime(image, ns=(state.st_atime_ns, state.st_mtime_ns + 5_000_000_000))
-        else:
+        elif change == "acquired again":
             _reacquire(raw, "grow", 1)  # a reduced image changes while the Run grows its scan
-        _frame(raw, "grow", 3, "txt", 3.0)
+        if change != "acquired again with its sidecar":
+            _frame(raw, "grow", 3, "txt", 3.0)
+        else:  # its second, with the next frame: while that sidecar settles the scan is not one frame long (S3-R1)
+            _acquired_again_with_its_sidecar(raw, "grow", 2, held, then=lambda: _frame(raw, "grow", 3, "txt", 3.0))
         _wait(executor, events, lambda values: _said(values, "stopped growing") or any(
             event.kind in _TERMINAL for event in values), timeout=30.)
         _settle(executor, events, .5)
         kept = output.read_bytes()
     finally:
+        held[2].set()
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
     assert "grow_int1d.nexus stopped growing: its Append was refused" in terminal[0][1], terminal
@@ -193,6 +227,36 @@ def test_a_scan_this_live_run_finished_before_the_next_began_is_rebuilt_when_an_
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
     assert not _said(events, "stopped growing") and len(_rebuilt(events)) == 1
     assert _lineage(output)[:2] == ("committed", [[1, 2]]) and catalog == {1: 1, 2: 1}, catalog
+
+
+def test_a_finished_scan_whose_image_and_its_sidecar_were_acquired_again_is_rebuilt_once_its_sidecar_settles(
+        tmp_path, monkeypatch):
+    """Codex N-cdab3fe2 S3-R1: a sidecar still settling holds the scan; it is not a shorter scan to refuse."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    held = _held_poll(monkeypatch)
+    executor, identity = _live(tmp_path, raw, 8791)
+    events = []
+    try:
+        for index in (1, 2):
+            _frame(raw, "first", index, "txt", float(index))
+            _wait(executor, events, lambda values: index in _labels(values, "first") or any(
+                event.kind in _TERMINAL for event in values))
+        _frame(raw, "second", 1, "txt", 1.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "second") or any(
+            event.kind in _TERMINAL for event in values))
+        _settle(executor, events, .5)
+        _acquired_again_with_its_sidecar(raw, "first", 2, held)
+        _wait(executor, events, lambda values: _labels(values, "first").count(2) >= 2 or _said(
+            values, "stopped growing") or any(event.kind in _TERMINAL for event in values), timeout=15.)
+        _settle(executor, events, .5)
+    finally:
+        held[2].set()
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert not _said(events, "stopped growing"), terminal
+    assert len(_rebuilt(events)) == 1
+    assert _lineage(tmp_path / "processed" / "first_int1d.nexus")[:2] == ("committed", [[1, 2]])
 
 
 def test_live_rebuilds_a_finished_scan_whose_image_was_only_re_dated(tmp_path):
