@@ -68,14 +68,15 @@ class RunControlsBar(QtWidgets.QWidget):
     readinessSummaryClicked = QtCore.Signal()
     writeModeChanged = QtCore.Signal(str)    # 'Append' / 'Overwrite' (output mode)
 
-    # Phase-B action-button morph table (text, runPhase property, enabled).
-    # Idle reads "Run" (the run trigger); the running/paused phases keep the
-    # Pause/Resume morph.
+    # Phase-B action-button morph table (text, runPhase property, enabled, tooltip).
+    # Idle reads "Run" (the run trigger); a running Run offers a yellow Pause and a paused one an orange Resume, each
+    # with its own symbol (maintainer, 2026-10-25: "the color for the run button for pause and resume should be
+    # different ... Resume should be a half pause and play symbol like |>").
     _PHASES = {
-        'idle':    ('▶ Run',      'idle',   True),
-        'running': ('❚❚ Pause',    'active', True),
-        'pausing': ('❚❚ Pausing…', 'active', False),
-        'paused':  ('▶ Resume',   'active', True),
+        'idle':    ('▶ Run',      'idle',   True, 'Start the Run with the settings above.'),
+        'running': ('❚❚ Pause',    'pause',  True, 'Pause the Run. Its frames so far are saved; Resume continues it.'),
+        'pausing': ('❚❚ Pausing…', 'pause',  False, 'Pausing: the frame in progress is finished and saved.'),
+        'paused':  ('❚▶ Resume',   'resume', True, 'Resume the paused Run from where it stopped.'),
     }
 
     def __init__(self, parent=None):
@@ -181,11 +182,12 @@ class RunControlsBar(QtWidgets.QWidget):
         self.liveButton.setMaximumWidth(50)
 
         # objectName 'startButton' + the runPhase property are what the dark
-        # theme keys the green/orange Run/Pause styling on.  Text comes from
-        # _PHASES (▶ Run / ❚❚ Pause / ▶ Resume) via set_action_phase.
+        # theme keys the green Run, yellow Pause and orange Resume styling on.  Text comes from
+        # _PHASES (▶ Run / ❚❚ Pause / ❚▶ Resume) via set_action_phase.
         self.startButton = QtWidgets.QPushButton('▶ Run')
         self.startButton.setObjectName('startButton')
         self.startButton.setProperty('runPhase', 'idle')
+        self.startButton.setToolTip(self._PHASES['idle'][3])
 
         self.stopButton = QtWidgets.QPushButton('■')
         self.stopButton.setObjectName('stopButton')
@@ -220,13 +222,14 @@ class RunControlsBar(QtWidgets.QWidget):
 
     # ── action-button morph (the wrangler drives this via its back-ref) ──
     def set_action_phase(self, phase):
-        """Morph the single action button: text + the green/orange runPhase
+        """Morph the single action button: text, tooltip + the green/yellow/orange runPhase
         property.  ``pausing`` is the transient disabled state.  Mirror of the
         old per-wrangler ``_set_action_button`` so the visual contract is
         identical."""
-        label, prop, enabled = self._PHASES.get(phase, self._PHASES['idle'])
+        label, prop, enabled, tooltip = self._PHASES.get(phase, self._PHASES['idle'])
         self._run_phase = phase if phase in self._PHASES else 'idle'
         self.startButton.setText(label)
+        self.startButton.setToolTip(tooltip)
         self.startButton.setEnabled(enabled)
         if self.startButton.property('runPhase') != prop:
             self.startButton.setProperty('runPhase', prop)

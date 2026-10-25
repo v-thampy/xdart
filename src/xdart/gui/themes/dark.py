@@ -164,8 +164,8 @@ def _contrast_text(color):
     return "#1a1a1a" if dark_ratio >= light_ratio else "#ffffff"
 
 
-_ACTIVE = {"active": "#ffb86c", "active_border": "#e0a050",
-           "active_hover": "#ffc987", "active_muted": "#5a4a35"}
+#: The action button while a Run is running (Pause, yellow) and while it is paused (Resume, orange).
+_RUN_PHASE_COLORS = {"pause": "#f2c94c", "resume": "#ff8c42"}
 
 
 def _resolve(
@@ -199,7 +199,12 @@ def _resolve(
     p["selection_accent_on_text"] = _contrast_text(selection)
     p["selection_accent_hover"] = _shade(selection, 0.12)
     p["selection_accent_muted"] = _blend(selection, base["field"], 0.6)
-    p.update(_ACTIVE)
+    for name, color in _RUN_PHASE_COLORS.items():
+        p[name] = color
+        p[f"{name}_text"] = _contrast_text(color)
+        p[f"{name}_border"] = _shade(color, -0.16)
+        p[f"{name}_hover"] = _shade(color, 0.14)
+        p[f"{name}_muted"] = _blend(color, base["field"], 0.6)
     # Rule 4 of the font contract: the dense Controls tokens are a presentation
     # density variant of the ONE application tier, not a second setting.
     font_scale = normalize_font_scale(font_scale)
@@ -541,28 +546,43 @@ QPushButton#startButton:disabled {
     border-color: $start_muted;
 }
 
-/* Phase B: the single action button morphs to ORANGE while a run is active
-   (Pause / Resume), keyed on a dynamic ``runPhase`` property the wrangler sets
-   (idle/unset -> the green rules above; "active" -> orange here).  The attribute
-   selector outranks the plain #startButton rules, and these come later, so the
-   orange state wins while active.  Live/Batch keep their purple :checked styling
-   (those are checkable toggles; startButton is not, so no collision). */
-QPushButton#startButton[runPhase="active"] {
-    background-color: $active;
-    color: $start_text;
+/* Phase B: the single action button turns YELLOW while a Run is running (Pause) and ORANGE while it is
+   paused (Resume), keyed on a dynamic ``runPhase`` property RunControlsBar sets (idle/unset -> the green rules
+   above).  The attribute selectors outrank the plain #startButton rules, and these come later, so they win.
+   Live/Batch keep their purple :checked styling (checkable toggles; startButton is not, so no collision). */
+QPushButton#startButton[runPhase="pause"] {
+    background-color: $pause;
+    color: $pause_text;
     font-weight: bold;
-    border: 1px solid $active_border;
+    border: 1px solid $pause_border;
 }
-QPushButton#startButton[runPhase="active"]:hover {
-    background-color: $active_hover;
+QPushButton#startButton[runPhase="pause"]:hover {
+    background-color: $pause_hover;
 }
-QPushButton#startButton[runPhase="active"]:pressed {
-    background-color: $active_border;
+QPushButton#startButton[runPhase="pause"]:pressed {
+    background-color: $pause_border;
 }
-QPushButton#startButton[runPhase="active"]:disabled {
-    background-color: $active_muted;
+QPushButton#startButton[runPhase="pause"]:disabled {
+    background-color: $pause_muted;
     color: $text_muted;
-    border-color: $active_muted;
+    border-color: $pause_muted;
+}
+QPushButton#startButton[runPhase="resume"] {
+    background-color: $resume;
+    color: $resume_text;
+    font-weight: bold;
+    border: 1px solid $resume_border;
+}
+QPushButton#startButton[runPhase="resume"]:hover {
+    background-color: $resume_hover;
+}
+QPushButton#startButton[runPhase="resume"]:pressed {
+    background-color: $resume_border;
+}
+QPushButton#startButton[runPhase="resume"]:disabled {
+    background-color: $resume_muted;
+    color: $text_muted;
+    border-color: $resume_muted;
 }
 
 QPushButton#stopButton {

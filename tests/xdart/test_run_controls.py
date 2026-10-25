@@ -32,20 +32,37 @@ def test_action_phase_morph_cycles(qapp):
 
     c.set_action_phase('running')
     assert c.startButton.text() == '❚❚ Pause'
-    assert c.startButton.property('runPhase') == 'active'
+    assert c.startButton.property('runPhase') == 'pause'             # yellow
+    assert 'Pause the Run' in c.startButton.toolTip()
 
     c.set_action_phase('pausing')
     assert 'Pausing' in c.startButton.text()
     assert not c.startButton.isEnabled()           # transient, disabled
 
     c.set_action_phase('paused')
-    assert c.startButton.text() == '▶ Resume'
-    assert c.startButton.property('runPhase') == 'active'
+    assert c.startButton.text() == '❚▶ Resume'                     # half pause, half play
+    assert c.startButton.property('runPhase') == 'resume'            # orange
+    assert 'Resume the paused Run' in c.startButton.toolTip()
     assert c.action_phase() == 'paused'
 
     c.set_action_phase('idle')                      # morph back to green
     assert c.startButton.text() == '▶ Run'
     assert c.startButton.property('runPhase') == 'idle'
+    assert c.startButton.toolTip() == 'Start the Run with the settings above.'
+
+
+def test_pause_and_resume_have_their_own_colours(qapp):
+    """Maintainer, 2026-10-25: "the color for the run button for pause and resume should be different. Maybe yellow
+    and orange": the theme styles the two runPhase values apart, each with readable text."""
+    from xdart.gui.themes import dark
+    for name, (base, is_light) in dark._THEMES.items():
+        palette = dark._resolve(base, is_light=is_light)
+        assert palette['pause'] != palette['resume'], name
+        assert palette['pause_text'] == palette['resume_text'] == '#1a1a1a', name   # dark text reads on both
+        sheet = dark.render_qss(name)
+        for phase in ('pause', 'resume'):
+            rule = sheet.split(f'QPushButton#startButton[runPhase="{phase}"] {{', 1)[1].split('}', 1)[0]
+            assert f"background-color: {palette[phase]};" in rule and "color: #1a1a1a;" in rule, (name, rule)
 
 
 def test_signals_emit_on_user_actions(qapp):
