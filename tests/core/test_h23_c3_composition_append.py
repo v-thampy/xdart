@@ -601,7 +601,7 @@ def test_stream_attempt_keeps_one_lease_through_open_flush_and_commit(tmp_path):
     _release(transaction, lease, owners)
 
 
-def test_checkpoint_rejects_same_stat_changed_bytes(tmp_path):
+def test_checkpoint_rejects_changed_size_with_old_mtime(tmp_path):
     (_coordinator, transaction, target, transaction_owner, target_owner,
      _owners, lease) = _transaction(tmp_path)
     attempt = transaction.begin_stream(
@@ -626,7 +626,7 @@ def test_checkpoint_rejects_same_stat_changed_bytes(tmp_path):
     finally:
         os.close(descriptor)
     accepted = target.stat()
-    target.write_bytes(b"BBBB")
+    target.write_bytes(b"BBBBB")
     os.utime(target, ns=(accepted.st_atime_ns, accepted.st_mtime_ns))
 
     with pytest.raises(TargetChanged, match="checkpoint"):
@@ -704,12 +704,12 @@ def test_stream_terminal_commit_transfers_one_full_seal_under_exact_exclusion(
     _release(transaction, lease, owners)
 
 
-def test_stream_terminal_commit_rejects_stat_or_identity_drift_without_rehash(
+def test_stream_terminal_commit_rejects_size_or_identity_drift_without_rehash(
     tmp_path, monkeypatch,
 ):
     module = importlib.import_module("xrd_tools.io.output_transaction")
 
-    for drift in ("stat", "identity"):
+    for drift in ("size", "identity"):
         root = tmp_path / drift
         root.mkdir()
         (_coordinator, transaction, target, transaction_owner, target_owner,
@@ -725,12 +725,10 @@ def test_stream_terminal_commit_rejects_stat_or_identity_drift_without_rehash(
         transaction.authorize_stream_mutation(attempt, lease=lease)
         target.write_bytes(b"AAAA")
         transaction.seal_stream_terminal(attempt, lease=lease)
-        if drift == "stat":
+        if drift == "size":
             accepted = target.stat()
-            os.utime(
-                target,
-                ns=(accepted.st_atime_ns, accepted.st_mtime_ns + 1_000_000_000),
-            )
+            target.write_bytes(b"AAAAA")
+            os.utime(target, ns=(accepted.st_atime_ns, accepted.st_mtime_ns))
         else:
             replacement = root / "replacement.nexus"
             replacement.write_bytes(b"AAAA")
