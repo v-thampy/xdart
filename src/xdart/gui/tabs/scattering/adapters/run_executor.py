@@ -820,6 +820,21 @@ def _candidate_file_owners(
     return owners
 
 
+def _remaining_tiff_candidates(deferred: DeferredDirectoryPlan, start_index: int) -> int:
+    """Count frozen TIFF frame candidates from this output through the finite Run."""
+    remaining = 0
+    for index, entry in enumerate(deferred.entries[start_index:], start_index):
+        if entry.completed is not None or entry.skip_reason:
+            continue
+        # The directory snapshot owns image files individually; tiff_series is
+        # the source kind of the grouped output, not a per-file candidate owner.
+        count = sum(candidate.adapter_id == "image_file" for candidate in entry.candidates)
+        if index == start_index and entry.committed_prefix is not None:
+            count = max(0, count - len(entry.committed_prefix.stamp.members))
+        remaining += count
+    return remaining
+
+
 def _claim_physical_files(
     member_paths: tuple[Path, ...],
     discovered_paths: tuple[Path, ...],
@@ -1820,7 +1835,7 @@ class StandardRunExecutor:
             raise RuntimeError("prior light-1D lineage cleanup remains pending")
         output.drop_released_predecessor(predecessor)
 
-    def _construct(self, run: _StandardRun, *, item: PlannedOutput | None=None, labels: tuple[int, ...] | None=None, decision: AdmittedOutput | None=None) -> _StandardRun:
+    def _construct(self, run: _StandardRun, *, item: PlannedOutput | None=None, labels: tuple[int, ...] | None=None, decision: AdmittedOutput | None=None, remaining_frames: int | None=None) -> _StandardRun:
         proof = getattr(run, 'live_admission_proof', None)
         if proof is not None:
             run.live_admission_proof = None
@@ -2154,6 +2169,7 @@ class StandardRunExecutor:
             on_frame_completed=lambda event: self._frame_ready(run, event),
             on_checkpoint_recoverable=lambda event: self._checkpoint_ready(run, event),
             resource_fact_sink=run.resource_facts.append,
+            remaining_frames=remaining_frames,
         )
         run.sink = output
         write_labels = set(output.write_labels)
@@ -3141,6 +3157,10 @@ class StandardRunExecutor:
             run.current_files_incremental = (
                 item.source_spec.kind is SourceKind.TIFF_SERIES
             )
+            remaining_frames = (
+                _remaining_tiff_candidates(deferred, output_index)
+                if item.source_spec.kind is SourceKind.TIFF_SERIES else None
+            )
             admitted = monotonic()
             try:
                 # The proof of what was admitted: construction re-checks it instead of validating the scan again.
@@ -3153,6 +3173,7 @@ class StandardRunExecutor:
                         item=item,
                         labels=decision.labels,
                         decision=decision,
+                        remaining_frames=remaining_frames,
                     )
                 except EnergyGridWidened as widened:
                     # Its new frames widen the q grid its energy scan was reduced on: the whole scan is reduced again
@@ -3161,7 +3182,8 @@ class StandardRunExecutor:
                     decision = self._widened_rebuild(run, receipt, session, entry, str(widened))
                     item = decision.item
                     run.rebuild_widened = True
-                    self._construct(run, item=item, labels=decision.labels, decision=decision)
+                    self._construct(run, item=item, labels=decision.labels, decision=decision,
+                                    remaining_frames=remaining_frames)
             except ValueError as error:  # (an OSError: its output cannot be written, and the Run fails)
                 if isinstance(error, SourceRevisionChanged):  # its files changed while they were read: once more
                     if output_index not in retried:

@@ -148,6 +148,7 @@ def open_headless_scan_session(
     dynamic_nexus_checkpoint_threshold: int | None = None,
     integrator_reuse: Any = None,
     growing: bool = False,
+    remaining_frames: int | None = None,
 ) -> ScanSession:
     """Open the accepted session graph over one exact non-empty ``Scan``. ``integrator_reuse`` is the Run's
     ``WarmIntegrators``, so its series reuse built worker integrators; ``growing``: a Live scan's, which keeps every
@@ -255,6 +256,7 @@ def open_headless_scan_session(
         strict=StrictPolicy.graceful(),
         integrator_reuse=integrator_reuse,
         growing=growing,
+        remaining_frames=remaining_frames,
     )
 
 

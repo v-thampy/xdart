@@ -3459,6 +3459,8 @@ class ReductionSession:
     integrator_reuse: WarmIntegrators | None = None
     # A Live scan's session: it starts with the frames one poll found and grows, so it keeps every granted worker.
     growing: bool = False
+    # Frozen finite-Run candidate estimate; None when the caller has no Run-level census.
+    remaining_frames: int | None = None
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -3591,7 +3593,10 @@ class ReductionSession:
         shape = (int(np.shape(image)[0]), int(np.shape(image)[1]))
         key = self._standard_reuse_key(shape, self.scan.frames[0])
         warm, table_bytes = (0, 0) if key is None else reuse.idle_for(key)
-        workers = _series_workers(granted, len(self.scan), warm, table_bytes, shape[0] * shape[1])
+        workers = _series_workers(
+            granted, len(self.scan), warm, table_bytes, shape[0] * shape[1],
+            remaining=self.remaining_frames,
+        )
         if workers != granted:
             logger.debug("[AUTO-WORKERS] %s: %d of %d workers (%d frames, %d with built tables, %s B tables)",
                          self.scan.name, workers, granted, len(self.scan), warm, table_bytes or "unmeasured")
@@ -5513,14 +5518,18 @@ _LARGE_DETECTOR_PIXELS = 8_000_000
 _FRAMES_PER_COLD_WORKER = 16
 
 
-def _series_workers(granted: int, frames: int, warm: int, table_bytes: int, pixels: int) -> int:
+def _series_workers(granted: int, frames: int, warm: int, table_bytes: int, pixels: int,
+                    remaining: int | None = None) -> int:
     """Workers a Standard series starts: all it was granted when its tables are cheap; when they are large (measured,
     or before that a large detector), the workers whose tables are built, at least one, plus one more per
-    ``_FRAMES_PER_COLD_WORKER`` frames, enough to repay another build within the series."""
+    ``_FRAMES_PER_COLD_WORKER`` frames. A finite Run census may fund one extra cold worker across short series."""
     large = table_bytes >= _LARGE_TABLE_BYTES if table_bytes else pixels >= _LARGE_DETECTOR_PIXELS
     if not large:
         return granted
-    return max(1, min(granted, max(1, warm) + frames // _FRAMES_PER_COLD_WORKER))
+    workers = max(1, min(granted, max(1, warm) + frames // _FRAMES_PER_COLD_WORKER))
+    if type(remaining) is int and remaining >= _FRAMES_PER_COLD_WORKER and warm < granted:
+        workers = min(granted, workers + 1)
+    return workers
 
 
 class WarmIntegrators:

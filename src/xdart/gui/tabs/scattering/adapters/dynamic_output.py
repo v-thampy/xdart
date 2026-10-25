@@ -1103,6 +1103,7 @@ class DynamicOutputAdapter:
         on_frame_completed=None,
         on_checkpoint_recoverable=None,
         resource_fact_sink=None,
+        remaining_frames=None,
     ):
         if type(preparation) is not _PreparedAdmission or preparation.owner is not self \
                 or preparation.identity is not preparation or preparation.consumed or preparation.stop_signal.is_set():
@@ -1522,6 +1523,7 @@ class DynamicOutputAdapter:
                 ),
                 integrator_reuse=self._integrator_reuse,
                 growing=bool(self.configuration.live_mode),
+                remaining_frames=remaining_frames,
             )
             if loaded_scout_frame is not None:
                 loaded_scout_frame.image = None

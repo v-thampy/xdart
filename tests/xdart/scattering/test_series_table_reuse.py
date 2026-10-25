@@ -14,6 +14,7 @@ from tests.xdart.scattering.test_live_qualify_refusal_run import _stop, _wait
 from tests.xdart.scattering.test_live_revalidation_cost_run import TINY, _count_labels, _poni, _Sidecar
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_terminal, _start
 from xdart.gui.tabs.scattering.adapters.dynamic_output import DynamicOutputAdapter
+import xdart.gui.tabs.scattering.adapters.run_executor as run_executor
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
@@ -226,6 +227,46 @@ def test_a_series_starts_the_workers_its_tables_can_repay(frames, warm, table_by
     assert core._series_workers(4, frames, warm, table_bytes, pixels) == expected
 
 
+def test_a_series_can_repay_one_cold_worker_from_the_finite_run_remainder():
+    assert core._series_workers(4, 5, 1, 2171788924, 16_777_216, remaining=16) == 2
+    assert core._series_workers(4, 5, 1, 2171788924, 16_777_216, remaining=15) == 1
+    assert core._series_workers(4, 5, 4, 2171788924, 16_777_216, remaining=16) == 4
+
+
+def test_a_finite_run_remainder_warms_one_more_worker_across_short_series(tmp_path, monkeypatch, builds):
+    monkeypatch.setattr(core, "_LARGE_DETECTOR_PIXELS", 1)
+    monkeypatch.setattr(core, "_LARGE_TABLE_BYTES", 1)
+    executors = []
+    real_coerce = core._coerce_executor
+
+    def coerce(executor):
+        executors.append(executor)
+        return real_coerce(executor)
+
+    monkeypatch.setattr(core, "_coerce_executor", coerce)
+    remaining_values = []
+    real_remaining = run_executor._remaining_tiff_candidates
+
+    def count_remaining(deferred, start_index):
+        value = real_remaining(deferred, start_index)
+        remaining_values.append(value)
+        return value
+
+    monkeypatch.setattr(run_executor, "_remaining_tiff_candidates", count_remaining)
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True)
+    for stem in ("posa", "posb", "posc", "posd"):
+        sidecar = _Sidecar(raw, TINY, stem)
+        for frame in range(1, 6):
+            sidecar.frame(frame)
+    executor, identity, events = _run_to_terminal(
+        _intent(tmp_path, raw, cores=4), request_value=9571)
+    executor.close(identity)
+    assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+    assert remaining_values == [20, 15, 10, 5], remaining_values
+    assert executors == [2, 2, 2, 2], executors
+
+
 def test_a_large_detectors_short_series_run_on_the_workers_with_built_tables(tmp_path, monkeypatch, builds):
     """With Cores 4, three 5-frame scans of a large detector start one worker each and build one table set."""
     monkeypatch.setattr(core, "_LARGE_DETECTOR_PIXELS", 1)  # TINY counts as large
@@ -271,7 +312,7 @@ def test_an_energy_scan_or_a_live_scan_keeps_every_granted_worker(monkeypatch, g
     from types import SimpleNamespace
     monkeypatch.setattr(core, "_LARGE_DETECTOR_PIXELS", 1)
     session = SimpleNamespace(
-        executor=4, plan=SimpleNamespace(gi=None), growing=growing,
+        executor=4, plan=SimpleNamespace(gi=None), growing=growing, remaining_frames=None,
         _integrators=SimpleNamespace(reuse=SimpleNamespace(idle_for=lambda key: (0, 0)), _frame_wavelengths=energies),
         scan=_Scan([SimpleNamespace(image=np.zeros((4, 4)))] * 5), _standard_reuse_key=lambda shape, frame: ("key",))
     assert core.ReductionSession._start_workers(session) == expected

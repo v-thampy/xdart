@@ -437,6 +437,7 @@ class ScanSession:
         executor_workers: int | None = None,
         integrator_reuse: Any = None,
         growing: bool = False,
+        remaining_frames: int | None = None,
         _dynamic_batch_settlement_authority_cb: (
             Callable[[DynamicBatchSettlementReceipt], None] | None
         ) = None,
@@ -723,6 +724,7 @@ class ScanSession:
                 ),
                 integrator_reuse=integrator_reuse,
                 growing=growing,
+                remaining_frames=remaining_frames,
             )
         except BaseException as primary:
             try:
