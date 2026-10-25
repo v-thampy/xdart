@@ -1623,6 +1623,38 @@ def test_a_failed_queued_rsm_is_reported_and_the_next_rsm_runs(qapp, tmp_path, m
         _close(page, qapp)
 
 
+def test_a_failed_queued_rsm_does_not_continue_a_queue_whose_form_changed(qapp, tmp_path, monkeypatch):
+    """A failure continues the queue only on the same inputs, as a committed RSM does (Claude review of 805a9f96):
+    once the form was edited under the queue, the prepared requests are for the inputs before the edit."""
+    _counting_grids(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        targets = [str(form.output_path) for form in page.build_forms()]
+        assert len(targets) == 2
+        calls, running = [], threading.Event()
+
+        def fail(self, **kwargs):
+            calls.append(str(self.request.module.output.target))
+            running.set()
+            time.sleep(.3)  # the form is edited while this RSM runs
+            raise RuntimeError("first RSM output failed")
+
+        monkeypatch.setattr(RSMOperationExecutionV2, "run", fail)
+        page.begin_run()
+        _wait(page, qapp, running.is_set)
+        page._edited()
+        _wait(page, qapp, lambda: not page.active())
+        shown = label.full_text()
+        assert calls == targets[:1], calls
+        assert "first RSM output failed" in shown, shown
+        assert not page._jobs
+    finally:
+        _close(page, qapp)
+
+
 def test_a_returned_failed_queued_rsm_is_reported_and_the_next_rsm_runs(qapp, tmp_path, monkeypatch):
     """A domain FAILED result is a queue-local failure, and the shared owner runs the next RSM."""
     grids = _counting_grids(monkeypatch)

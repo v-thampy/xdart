@@ -2418,7 +2418,7 @@ class StitchPage(QtWidgets.QWidget):
                 failure = update.failure_message or update.failure_type
                 if update.action is StitchOwnerAction.RUN and self._job_total:
                     self._job_failures.append((Path(self._job_target).name, failure))
-                    self._finish_failed_job()
+                    self._finish_failed_job(update)
                 else:
                     self._queued_jobs.clear()
                     self._status((f"Could not reload {Path(reloading).name}: " if update.action is StitchOwnerAction.REOPEN
@@ -2546,7 +2546,7 @@ class StitchPage(QtWidgets.QWidget):
                     notice = terminal.code + (f": {terminal.diagnostic}" if terminal.diagnostic else "")
                 if terminal.disposition is ModuleDisposition.FAILED and self._job_total:
                     self._job_failures.append((Path(result.request.module.output.target).name, notice))
-                    self._finish_failed_job()
+                    self._finish_failed_job(update)
                 else:
                     self._queued_jobs.clear()
                     self._status(f"{terminal.disposition.value}: {notice}", ready=False)
@@ -2554,11 +2554,13 @@ class StitchPage(QtWidgets.QWidget):
             self._queued_jobs.clear()
             self._status(outcome.finalization_message or "Output retained · finalization retry required", ready=False)
 
-    def _finish_failed_job(self):
-        """Keep a failed Run's output visible and move to the next exact prepared request."""
-        if self._queued_jobs and not self._closing:
+    def _finish_failed_job(self, update):
+        """Keep a failed Run's output visible and move to the next exact prepared request, as a committed one does:
+        not once the form changed under the queue (the requests were prepared for the inputs before the edit)."""
+        if self._queued_jobs and not self._closing and not update.stale and self._action_revision == self._revision:
             self._run_next_job()
             return
+        self._queued_jobs.clear()
         elapsed = time.monotonic() - (self._batch_started or self._started)
         details = "; ".join(f"{name}: {message}" for name, message in self._job_failures)
         self._status(f"Complete · {self._job_completed} of {self._job_total} outputs · {elapsed:.2f} s · "

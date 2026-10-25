@@ -2183,7 +2183,9 @@ class RSMPage(QtWidgets.QWidget):
             return
         if update.terminal_status is OperationTerminalStatus.FAILED:
             failure = update.failure_message or update.failure_type
-            if update.action is RSMOwnerAction.RUN and self._job_form is not None:
+            if (update.action is RSMOwnerAction.RUN and self._job_form is not None
+                    and not update.stale and self._active_revision == self._form_revision):
+                # the queue's next RSM, on the same inputs (as a committed one continues it)
                 self._job_failures.append((Path(self._job_form.output_path).name, failure))
                 self._next_job()
             else:
@@ -2276,7 +2278,9 @@ class RSMPage(QtWidgets.QWidget):
         if terminal.disposition is ModuleDisposition.CANCELLED:
             self._clear_jobs()
             self._notice("RSM stopped" + (f" · {terminal.diagnostic}" if terminal.diagnostic else ""))
-        elif terminal.disposition is ModuleDisposition.FAILED and self._job_form is not None:
+        elif (terminal.disposition is ModuleDisposition.FAILED and self._job_form is not None
+                and not update.stale and self._active_revision == self._form_revision):
+            # the queue's next RSM, on the same inputs (as a committed one continues it)
             self._job_failures.append((Path(result.request.module.output.target).name,
                                        terminal.code + (f": {terminal.diagnostic}" if terminal.diagnostic else "")))
             self._next_job()
