@@ -85,6 +85,7 @@ def build_browser_projection(
     current_artifact: str = "",
     multi_artifact_selection: bool = False,
     show_all_frames: bool = False,
+    scans_locked: str = "",
 ) -> BrowserProjection:
     if (
         transient_frame is not None
@@ -174,6 +175,7 @@ def build_browser_projection(
             seen_artifacts.get(normcase(path), path) for path in selected_artifacts
         ),
         multi_artifact_selection=multi_artifact_selection,
+        scans_locked=scans_locked,
     )
 
 

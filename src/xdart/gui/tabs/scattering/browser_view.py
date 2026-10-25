@@ -536,6 +536,8 @@ class BrowserView(QtWidgets.QFrame):
         self._typed_filter = ("", None)
         self._source_results = None
         self._source_projection = None
+        self._scans_locked = ""  # why the scan list is grayed out now (_lock_scans)
+        self._scan_lock_tooltips: dict = {}
         self._projected_filename_terms = None
         #: a row the filter kept only while it was viewed goes once the view moves on; deferred, so the list is
         #: never rebuilt inside its own selection signal
@@ -907,6 +909,17 @@ class BrowserView(QtWidgets.QFrame):
         )
         return row
 
+    def _lock_scans(self, reason: str) -> None:
+        """Gray out the scan list and its catalog controls with ``reason`` as their tooltip, or open them again with
+        their own tooltips; the frame list stays live."""
+        if reason == self._scans_locked:
+            return
+        self._scans_locked = reason
+        for widget in (self.scans, self.show_dirs, self.date_sort, self.refresh, self.filename_filter):
+            own = self._scan_lock_tooltips.setdefault(widget, widget.toolTip())
+            widget.setEnabled(not reason)
+            widget.setToolTip(reason or own)
+
     def set_filename_mode(self, mode: str) -> None:
         """An empty filter is Auto, the mode's own results, shown faded as Auto is in the threshold fields
         (maintainer, 2026-10-23); typed text keeps its filter across modes."""
@@ -1216,6 +1229,7 @@ class BrowserView(QtWidgets.QFrame):
         *,
         plot_mode: str,
     ) -> None:
+        self._lock_scans(state.scans_locked)
         prior = self._source_projection
         terms = self._filename_terms()
         # The scans being viewed stay listed: the filter narrows the others, never what is shown, so the

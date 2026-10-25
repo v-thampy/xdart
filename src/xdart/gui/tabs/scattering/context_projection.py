@@ -52,6 +52,17 @@ from .state_machine import RunPhase
 from .scientific_waterfall_policy import waterfall_should_be_active
 
 
+#: The phases a Run keeps Browse shut in (context_controller admits Browse idle, paused, or failed and resettable):
+#: the scan list is grayed out with this tooltip, so the refusal is visible before a click (maintainer, 2026-10-25:
+#: "make it explicit by disabling and graying out the data browser ... until paused"; his pick "Scan list only").
+_BROWSE_SHUT_PHASES = frozenset({
+    RunPhase.PREPARING, RunPhase.STARTING, RunPhase.RUNNING, RunPhase.PAUSING, RunPhase.RESUMING,
+    RunPhase.STOPPING, RunPhase.FINALIZING,
+})
+_SCANS_LOCKED = ("Other scans open while the Run is paused or after it stops. The running scan's frames stay "
+                 "available below.")
+
+
 def _scientific_presentation_mode(processing_mode: str) -> str:
     """Map an output mode onto its existing scientific center layout."""
 
@@ -564,6 +575,7 @@ class ContextProjection:
                 ),
                 multi_artifact_selection=viewer_1d_selected or tool is Tool.XYE_VIEWER,
                 show_all_frames=viewer_selected,
+                scans_locked=_SCANS_LOCKED if phase in _BROWSE_SHUT_PHASES else "",
             ),
             scientific,
             viewer_navigation if viewer_selected else navigation,

@@ -296,8 +296,12 @@ class BrowserProjection:
     frames: tuple[DisplayFrameKey, ...] = ()
     selected_artifacts: tuple[str, ...] = ()
     multi_artifact_selection: bool = False
+    #: Why the scan list is closed now, as its tooltip ("" while it is open): a running Run keeps other scans shut.
+    scans_locked: str = ""
 
     def __post_init__(self) -> None:
+        if type(self.scans_locked) is not str:
+            raise TypeError("browser scan-list lock reason must be text")
         if (
             type(self.frames) is not tuple
             or not all(
