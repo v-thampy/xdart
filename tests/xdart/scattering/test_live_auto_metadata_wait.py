@@ -105,6 +105,30 @@ def test_under_auto_a_folder_without_any_sidecar_holds_its_first_frame_two_secon
     assert 'Processed without their metadata (1): scan_0001.tif (scan_int1d.nexus) [LIVE]' in messages
 
 
+def test_under_auto_a_folder_known_to_have_no_sidecars_admits_a_burst_of_frames_together(tmp_path):
+    """Once the Run has given up on the first frame of a sidecar-less folder, the frames that follow are admitted
+    together in one look, as they were before the folder waited for sidecars at all (Claude review of 805a9f96: each
+    frame without a sidecar was listed as waiting on one poll, given up on at the next and admitted at the third, so a
+    burst of frames came through one frame per two polls, five a second at most)."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    executor, identity = _run(tmp_path, raw, 'auto', 3405)
+    events = []
+    try:
+        _frame(raw, 'scan', 1, 'txt', 1.0, sidecar=False)
+        _frame_ready(executor, events, 1)  # given up on after two seconds: the folder is known to have no sidecars
+        for index in range(2, 14):
+            _frame(raw, 'scan', index, 'txt', float(index), sidecar=False)
+        burst = _frame_ready(executor, events, 13)
+        _settle(executor, events)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert burst < 1.5, f'twelve frames of a folder known to have no sidecars took {burst:.2f} s: one per two polls'
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    labels, i0, _epoch = _output(tmp_path)
+    assert labels == tuple(range(1, 14)) and i0 is None, (labels, i0)
+
+
 def test_under_auto_a_folder_whose_earlier_scans_have_sidecars_is_known_to_have_them_before_its_first_admission(
         tmp_path, monkeypatch):
     raw = tmp_path / 'raw'

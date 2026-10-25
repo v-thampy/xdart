@@ -2528,6 +2528,8 @@ class StandardRunExecutor:
         run.live_proofs.clear()
         # Each image's sidecar as last seen; admission waits until it holds still.
         sidecar_observations: dict[str, tuple[tuple[str, object], ...]] = {}
+        # Under Auto the folder's first listing says whether sidecars are expected at all (run.sidecars_seen).
+        meta_auto = live_metadata_format(configuration.thaw_source_spec()) == "auto"
         discovered_paths: set[Path] = set(deferred.discovered_paths)
         processed_paths: set[Path] = set()
         skipped_paths: set[Path] = set()
@@ -2581,7 +2583,7 @@ class StandardRunExecutor:
                 if grouped is None or grouped[0] is not observation.discovered_snapshot or grouped[1] != registry:
                     grouped = (observation.discovered_snapshot, registry, live_directory_groups(receipt, observation))
                 groups = grouped[2]
-                if polls == 0 and live_metadata_format(configuration.thaw_source_spec()) == "auto":
+                if polls == 0 and meta_auto:
                     # What the folder holds at the Run's start: a sidecar beside any image means each frame waits for
                     # its own as it lands; none means a frame waits only _METADATA_WAIT_NOTE_S, once.
                     run.sidecars_seen = any_auto_sidecar(path for group in groups for path in group.physical_paths)
@@ -2733,6 +2735,9 @@ class StandardRunExecutor:
                             owned=owned,
                             committed_cache=committed_counts,
                             given_up=frozenset(given_up.get(target_key, ())),
+                            # The folder is known to have no sidecars (one frame given up on after the note period):
+                            # its frames are admitted together, not one given up on per poll.
+                            sidecar_optional=meta_auto and not run.sidecars_seen and bool(run.metadata_given_up),
                         )
                         times.add("admission", started)
                         if not run.sidecars_seen and (

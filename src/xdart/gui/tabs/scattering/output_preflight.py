@@ -1331,6 +1331,7 @@ def _live_metadata_ready(
     observe_from: int = 0,
     spec_cache: dict | None = None,
     given_up: frozenset[str] = frozenset(),
+    sidecar_optional: bool = False,
 ) -> tuple[int, str, tuple[str, str] | None]:
     """How many leading members of a Live group have their metadata ready.
 
@@ -1340,7 +1341,11 @@ def _live_metadata_ready(
     about to land: under Auto too, since an image can be readable well before
     its sidecar is listed (the Run's wait for it ends in the executor, which
     gives up on a frame whose sidecar never comes, sooner when the Run has seen
-    no sidecar at all).  Under SPEC a new member is ready once its own
+    no sidecar at all).  ``sidecar_optional``: the Run has found its folder
+    has none (Auto, no sidecar seen, one frame already given up on), so a
+    member without one is ready once its observation holds still, all the
+    leading ones together, instead of each being given up on in its own poll.
+    Under SPEC a new member is ready once its own
     SPEC row is complete: a row is final once written, so one look suffices
     (qualification then proves it), and no other point's row is ever borrowed;
     published members are not re-gated.  Metadata-off Runs do not wait.
@@ -1393,7 +1398,7 @@ def _live_metadata_ready(
         elif (
             previous != seen
             or any(revision is None for _path, revision in seen)
-            or (not seen and index >= published_members)
+            or (not seen and index >= published_members and not sidecar_optional)
         ):
             ready, reason, waiting = index, f"waiting for the metadata of {image.name}", (
                 image.name, "settling" if seen else "sidecar")
@@ -1492,6 +1497,7 @@ def materialize_live_directory_group(
     owned: bool = False,
     committed_cache: dict | None = None,
     given_up: frozenset[str] = frozenset(),
+    sidecar_optional: bool = False,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
@@ -1506,7 +1512,8 @@ def materialize_live_directory_group(
     any other outcome is admitted as before. ``owned``: the Run is writing
     this output now, so its file is never read here. ``committed_cache``: the
     Run's committed counts by output file version (:func:`_committed_images`).
-    ``given_up``: images whose metadata the Run stopped waiting for.
+    ``given_up``: images whose metadata the Run stopped waiting for;
+    ``sidecar_optional``: the Run knows the folder has none (:func:`_live_metadata_ready`).
     """
 
     fresh = getattr(session, "fresh", frozenset())  # first seen by this poll's listing
@@ -1530,14 +1537,14 @@ def materialize_live_directory_group(
         count, waiting, sidecar = _live_metadata_ready(
             configuration, group, sidecar_observations,
             published_members=published_members,
-            observe_from=covered, spec_cache=spec_cache, given_up=given_up,
+            observe_from=covered, spec_cache=spec_cache, given_up=given_up, sidecar_optional=sidecar_optional,
         )
         if covered and count > covered and proof.verified_at == checked and not proof.holds(cancelled=cancelled):
             # A publication proves its prefix in its own poll; one that changed
             # is looked at again in full, as an uncovered poll would.
             covered, (count, waiting, sidecar) = 0, _live_metadata_ready(
                 configuration, group, sidecar_observations, published_members=published_members, spec_cache=spec_cache,
-                given_up=given_up)
+                given_up=given_up, sidecar_optional=sidecar_optional)
         # A file only this listing has seen waits for another: one that ran during writes can show
         # a later file and miss an earlier one, and frame labels follow the members' order.
         if (cut := next((index for index, value in enumerate(group.plan.candidates[published_members:count],
