@@ -2067,10 +2067,10 @@ class RSMPage(QtWidgets.QWidget):
                     f" · {skipped} already gridded with these settings, skipped" if skipped else "")
                 if failures:
                     message += " · Failed: " + "; ".join(f"{name}: {reason}" for name, reason in failures)
-                if not gridded:
+                if not gridded and not failures:
                     self.reopen(last_form.output_path, completion_message=message)
                 else:
-                    self._status(message, ready=True)
+                    self._status(message, ready=not failures)
             return
         self._job_form = self._jobs.pop(0)
         self._begin_preflight(run=self._job_action == "run", form=self._job_form)

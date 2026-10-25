@@ -1658,6 +1658,31 @@ def test_a_returned_failed_queued_rsm_is_reported_and_the_next_rsm_runs(qapp, tm
         _close(page, qapp)
 
 
+def test_an_all_failed_rsm_queue_keeps_its_summary_without_reopening(qapp, tmp_path, monkeypatch):
+    """Pre-existing zero-success handling must not reopen an output that the failed queue never wrote."""
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        targets = [str(form.output_path) for form in page.build_forms()]
+        calls = []
+
+        def fail(self, **kwargs):
+            calls.append(str(self.request.module.output.target))
+            raise RuntimeError("RSM output failed")
+
+        monkeypatch.setattr(RSMOperationExecutionV2, "run", fail)
+        page.begin_run()
+        _wait(page, qapp, lambda: not page.active())
+        shown = page.run_bar.readinessLabel.full_text()
+        assert calls == targets
+        assert "Saved 0 of 2 RSMs" in shown and "RSM output failed" in shown
+        assert all(Path(target).name in shown for target in targets)
+        assert page._reading is None and not page._jobs
+    finally:
+        _close(page, qapp)
+
+
 def test_preview_refuses_a_foreign_file_at_an_output_before_any_gridding(qapp, tmp_path, monkeypatch):
     """G8c (Codex's RSM stage-2 review, question 1): the file at an RSM's output is checked at Preview as its
     run's Replace checks it, from the header: a foreign file is refused there, left untouched, and nothing is
