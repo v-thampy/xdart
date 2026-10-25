@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import logging
 from pathlib import Path
 from threading import Event
 import time
@@ -217,6 +218,41 @@ def test_failed_repreview_revokes_same_form_authority(prepared_rsm_tool):
     assert failed.failure_type == "RuntimeError"
     assert owner.begin_run() is None
     assert owner.close().status is PageCleanup.CLEAN
+
+
+def test_domain_failed_run_is_logged_once_through_the_shared_worker(monkeypatch, prepared_rsm_tool):
+    from xdart.gui.widgets.log_panel import LogFeed
+
+    feed = LogFeed(capacity=20)
+    logger = logging.getLogger("xdart.gui.tools.rsm_owner")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(feed)
+
+    def failed_run(self, **_kwargs):
+        return RSMOperationResult(self.request, ModuleTerminalResult(
+            self.request.module, ModuleDisposition.FAILED, "GRID_FAILED", diagnostic="verification failed"))
+
+    monkeypatch.setattr(RSMOperationExecution, "run", failed_run)
+    owner = _prepare_owner(prepared_rsm_tool)
+    try:
+        lines, _cursor = feed.held()
+        assert not any("New Run" in line or "End of Run" in line for line in lines)
+        identity = owner.begin_run()
+        assert identity is not None
+        update = _poll_terminal(owner)
+        assert update.outcome.result.terminal.disposition is ModuleDisposition.FAILED
+        lines, _cursor = feed.held()
+        target = str(prepared_rsm_tool.request.module.output.target)
+        assert len([line for line in lines if f"New Run · RSM · {target}" in line]) == 1
+        assert len([line for line in lines if "End of Run · RSM · failed" in line]) == 1
+        assert len([line for line in lines if f"RSM failed · {target}: GRID_FAILED: verification failed" in line]) == 1
+        assert feed.warnings == 1
+        assert owner.poll() is None
+        assert feed.warnings == 1
+    finally:
+        assert owner.close().status is PageCleanup.CLEAN
+        logger.removeHandler(feed)
 
 
 def test_preview_and_science_are_cooperatively_cancellable(

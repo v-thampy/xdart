@@ -5,16 +5,19 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+import logging
 from threading import Lock
 
 from xdart.gui.pages.operation_owner import (
     OperationCancelled,
     OperationIdentity,
     OperationProgress,
+    OperationRunLog,
     OperationTerminalStatus,
     SingleWorkerOwner,
 )
 from xdart.gui.pages.values import CloseReceipt, PageCleanup
+from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.rsm_operation import (
     RSMOperationCleanupPending,
     RSMOperationCleanupPendingV2,
@@ -25,6 +28,7 @@ from xrd_tools.analysis.rsm_operation import (
     RSMOperationVerificationError,
     RSMOperationVerificationErrorV2,
 )
+from xdart.utils import log_events
 
 from .rsm_values import (
     RSMToolForm,
@@ -41,6 +45,18 @@ _RSMForm = RSMToolForm | RSMToolFormV2
 _RSMPreflight = RSMToolPreflight | RSMToolPreflightV2
 _RSMExecution = RSMOperationExecution | RSMOperationExecutionV2
 _RSMResult = RSMOperationResult | RSMOperationResultV2
+
+_LOG = logging.getLogger(__name__)
+
+
+def _run_log_start(label: str, target: str) -> None:
+    log_events.banner(_LOG, "New Run · %s · %s", label, target, kind="run")
+
+
+def _run_log_finish(label: str, target: str, status: str, warning: str | None) -> None:
+    if warning:
+        log_events.event(_LOG, logging.WARNING, "%s failed · %s: %s", label, target, warning)
+    log_events.banner(_LOG, "End of Run · %s · %s", label, status, kind="run-end")
 
 
 def _profile_types(generation: int):
@@ -406,12 +422,30 @@ class RSMToolOwner:
     ) -> OperationIdentity | None:
         if (self._closing and not allow_closing) or self._active_identity is not None:
             return None
-        identity = self._worker.begin(command)
+        if command.action is RSMOwnerAction.RUN:
+            request = command.execution.request
+            identity = self._worker.begin(
+                command,
+                run_log=OperationRunLog("RSM", str(request.module.output.target), _run_log_start,
+                                        _run_log_finish, self._run_failure_message),
+            )
+        else:
+            identity = self._worker.begin(command)
         if identity is None:
             return None
         self._active_identity = identity
         self._active_action = command.action
         return identity
+
+    @staticmethod
+    def _run_failure_message(update) -> str | None:
+        terminal = update.terminal
+        outcome = None if terminal is None else terminal.payload
+        if (type(outcome) is not RSMOwnerOutcome or outcome.kind is not RSMOwnerOutcomeKind.RESULT
+                or outcome.result is None or outcome.result.terminal.disposition is not ModuleDisposition.FAILED):
+            return None
+        result_terminal = outcome.result.terminal
+        return result_terminal.code + (f": {result_terminal.diagnostic}" if result_terminal.diagnostic else "")
 
     def begin_preflight(self) -> OperationIdentity | None:
         with self._lock:

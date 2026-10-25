@@ -10,11 +10,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import logging
 import math
 from threading import Event, Lock, Thread, TIMEOUT_MAX
 from typing import Callable
 
 from .values import CloseReceipt, PageCleanup
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class OperationTerminalStatus(str, Enum):
@@ -126,6 +130,23 @@ class OperationUpdate:
             raise TypeError("operation update is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class OperationRunLog:
+    """The explicit run label, target and log adapters for one accepted operation."""
+
+    label: str
+    target: str
+    start: Callable[[str, str], None]
+    finish: Callable[[str, str, str, str | None], None]
+    failure: Callable[[OperationUpdate], str | None] | None = None
+
+    def __post_init__(self) -> None:
+        if (type(self.label) is not str or not self.label.strip() or type(self.target) is not str
+                or not self.target.strip() or not callable(self.start) or not callable(self.finish)
+                or (self.failure is not None and not callable(self.failure))):
+            raise TypeError("operation Run log context is invalid")
+
+
 Runner = Callable[[object, Event, Callable[[str, int, int], bool]], object]
 
 
@@ -166,6 +187,7 @@ class SingleWorkerOwner:
         self._progress_delivered_revision = 0
         self._progress_total: int | None = None
         self._terminal: OperationTerminal | None = None
+        self._run_context: OperationRunLog | None = None
         self._closing = False
         self._clean_receipt: CloseReceipt | None = None
 
@@ -185,7 +207,9 @@ class SingleWorkerOwner:
         with self._lock:
             return self._identity
 
-    def begin(self, request: object) -> OperationIdentity | None:
+    def begin(self, request: object, *, run_log: OperationRunLog | None = None) -> OperationIdentity | None:
+        if run_log is not None and type(run_log) is not OperationRunLog:
+            raise TypeError("Run logging requires an exact OperationRunLog")
         with self._lock:
             if self._closing or self._identity is not None:
                 return None
@@ -208,6 +232,9 @@ class SingleWorkerOwner:
             self._progress_delivered_revision = 0
             self._progress_total = None
             self._terminal = None
+            self._run_context = run_log
+        if run_log is not None:
+            self._safe_call(run_log.start, run_log.label, run_log.target)
         try:
             worker.start()
         except BaseException as error:
@@ -349,6 +376,7 @@ class SingleWorkerOwner:
             return True
 
     def _retire_locked(self) -> None:
+        self._log_run_terminal_locked()
         self._identity = None
         self._worker = None
         self._starting = False
@@ -359,6 +387,36 @@ class SingleWorkerOwner:
         self._progress_delivered_revision = 0
         self._progress_total = None
         self._terminal = None
+        self._run_context = None
+
+    @staticmethod
+    def _safe_call(writer, *args) -> None:
+        try:
+            writer(*args)
+        except Exception:
+            _LOG.exception("operation log event could not be written")
+
+    def _log_run_terminal_locked(self) -> None:
+        context, terminal = self._run_context, self._terminal
+        if context is None or terminal is None:
+            return
+        label, target = context.label, context.target
+        status = terminal.status.value
+        warning = None
+        if terminal.status is OperationTerminalStatus.FAILED:
+            warning = f"{terminal.failure_type}: {terminal.failure_message}".strip(": ")
+        elif terminal.status is OperationTerminalStatus.RETURNED and context.failure is not None:
+            try:
+                warning = context.failure(OperationUpdate(terminal.identity, terminal=terminal))
+            except Exception:
+                _LOG.exception("operation Run failure classifier could not inspect its result")
+        if warning:
+            status = "failed"
+        elif terminal.status is OperationTerminalStatus.RETURNED:
+            status = "complete"
+        elif terminal.status is OperationTerminalStatus.CANCELLED:
+            status = "cancelled"
+        self._safe_call(context.finish, label, target, status, warning)
 
     def close(self) -> CloseReceipt:
         with self._lock:
@@ -402,6 +460,7 @@ __all__ = [
     "OperationCancelled",
     "OperationIdentity",
     "OperationProgress",
+    "OperationRunLog",
     "OperationTerminal",
     "OperationTerminalStatus",
     "OperationUpdate",

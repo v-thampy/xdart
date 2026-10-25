@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
+import logging
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 from xdart.gui.pages.operation_owner import (
     OperationIdentity,
     OperationProgress,
+    OperationRunLog,
     OperationTerminalStatus,
     SingleWorkerOwner,
 )
@@ -35,12 +37,26 @@ from xrd_tools.io.frame_view import read_contributing_frame_view
 from xrd_tools.analysis.stitch_metadata import StitchMetadataTable, read_stitch_metadata
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.io.export import write_stitch_xye
+from xdart.utils import log_events
 
 from .stitch_values import (
     StitchToolForm,
     StitchToolPreflight,
     prepare_stitch_tool,
 )
+
+
+_LOG = logging.getLogger(__name__)
+
+
+def _run_log_start(label: str, target: str) -> None:
+    log_events.banner(_LOG, "New Run · %s · %s", label, target, kind="run")
+
+
+def _run_log_finish(label: str, target: str, status: str, warning: str | None) -> None:
+    if warning:
+        log_events.event(_LOG, logging.WARNING, "%s failed · %s: %s", label, target, warning)
+    log_events.banner(_LOG, "End of Run · %s · %s", label, status, kind="run-end")
 
 
 class StitchOwnerAction(str, Enum):
@@ -421,12 +437,30 @@ class StitchToolOwner:
             or self._active_identity is not None
         ):
             return None
-        identity = self._worker.begin(command)
+        if command.action is StitchOwnerAction.RUN:
+            request = command.execution.request
+            identity = self._worker.begin(
+                command,
+                run_log=OperationRunLog("Stitch", str(request.module.output.target), _run_log_start,
+                                        _run_log_finish, self._run_failure_message),
+            )
+        else:
+            identity = self._worker.begin(command)
         if identity is None:
             return None
         self._active_identity = identity
         self._active_action = command.action
         return identity
+
+    @staticmethod
+    def _run_failure_message(update) -> str | None:
+        terminal = update.terminal
+        outcome = None if terminal is None else terminal.payload
+        if (type(outcome) is not StitchOwnerOutcome or outcome.kind is not StitchOwnerOutcomeKind.RESULT
+                or outcome.result is None or outcome.result.terminal.disposition is not ModuleDisposition.FAILED):
+            return None
+        result_terminal = outcome.result.terminal
+        return result_terminal.code + (f": {result_terminal.diagnostic}" if result_terminal.diagnostic else "")
 
     def begin_preflight(self) -> OperationIdentity | None:
         with self._lock:

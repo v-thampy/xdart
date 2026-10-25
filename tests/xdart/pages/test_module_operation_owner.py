@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import logging
 from pathlib import Path
 from threading import Event
 import threading
@@ -27,6 +28,22 @@ def _poll_until(owner, identity, *, timeout=2.0):
             return update
         time.sleep(0.001)
     raise AssertionError("operation update did not arrive")
+
+
+def _run_log_context(label, target, failure=None):
+    from xdart.utils import log_events
+
+    logger = logging.getLogger(owner_api.__name__)
+
+    def start(name, path):
+        log_events.banner(logger, "New Run · %s · %s", name, path, kind="run")
+
+    def finish(name, path, status, warning):
+        if warning:
+            log_events.event(logger, logging.WARNING, "%s failed · %s: %s", name, path, warning)
+        log_events.banner(logger, "End of Run · %s · %s", name, status, kind="run-end")
+
+    return owner_api.OperationRunLog(label, target, start, finish, failure)
 
 
 def test_owner_is_stdlib_only_and_page_architecture_safe():
@@ -163,6 +180,71 @@ def test_cooperative_cancel_and_failures_are_detached_terminals():
     assert failing.close().status is PageCleanup.CLEAN
 
 
+def test_run_log_boundaries_follow_accepted_owner_and_terminal_once():
+    from xdart.gui.widgets.log_panel import LogFeed
+
+    feed = LogFeed(capacity=20)
+    logger = logging.getLogger(owner_api.__name__)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(feed)
+    try:
+        def failed(_request, _cancel, _publish):
+            raise RuntimeError("execution failed")
+
+        owner = SingleWorkerOwner(failed)
+        identity = owner.begin(object(), run_log=_run_log_context("Stitch", "/results/a.nexus"))
+        assert type(identity) is OperationIdentity
+        assert owner.begin(object(), run_log=_run_log_context("RSM", "/results/b.nxs")) is None
+        lines, cursor = feed.held()
+        assert len([line for line in lines if "New Run · Stitch · /results/a.nexus" in line]) == 1
+        assert not any("New Run · RSM" in line for line in lines)
+
+        terminal = _poll_until(owner, identity).terminal
+        assert terminal.status is OperationTerminalStatus.FAILED
+        assert owner.poll(identity) is None
+        lines, next_cursor = feed.held()
+        assert next_cursor > cursor
+        assert len([line for line in lines if "New Run · Stitch · /results/a.nexus" in line]) == 1
+        assert len([line for line in lines if "End of Run · Stitch · failed" in line]) == 1
+        warnings = [line for line in lines if "Stitch failed · /results/a.nexus: RuntimeError: execution failed" in line]
+        assert len(warnings) == 1
+        assert feed.warnings == 1
+        assert owner.close().status is PageCleanup.CLEAN
+    finally:
+        logger.removeHandler(feed)
+
+
+def test_run_log_warns_for_a_returned_domain_failure_once():
+    from xdart.gui.widgets.log_panel import LogFeed
+
+    feed = LogFeed(capacity=20)
+    logger = logging.getLogger(owner_api.__name__)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(feed)
+    try:
+        owner = SingleWorkerOwner(lambda *_args: "domain-failed")
+
+        def domain_failure(update):
+            return "OUTPUT_RETAINED: could not verify" if update.terminal.payload == "domain-failed" else None
+
+        identity = owner.begin(object(), run_log=_run_log_context("RSM", "/results/a.nxs", domain_failure))
+        terminal = _poll_until(owner, identity).terminal
+        assert terminal.status is OperationTerminalStatus.RETURNED
+        assert terminal.payload == "domain-failed"
+        assert owner.poll(identity) is None
+        lines, _cursor = feed.held()
+        assert len([line for line in lines if "New Run · RSM · /results/a.nxs" in line]) == 1
+        assert len([line for line in lines if "End of Run · RSM · failed" in line]) == 1
+        warnings = [line for line in lines if "RSM failed · /results/a.nxs: OUTPUT_RETAINED: could not verify" in line]
+        assert len(warnings) == 1
+        assert feed.warnings == 1
+        assert owner.close().status is PageCleanup.CLEAN
+    finally:
+        logger.removeHandler(feed)
+
+
 def test_close_is_retryable_join_and_seals_polling():
     entered = Event()
     release = Event()
@@ -241,19 +323,35 @@ def test_close_during_thread_start_cannot_hand_back_an_unowned_worker(
 def test_thread_start_failure_delivers_one_failed_terminal_and_closes(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from xdart.gui.widgets.log_panel import LogFeed
+
     class FailingStartThread(threading.Thread):
         def start(self):
             raise RuntimeError("start refused")
 
     monkeypatch.setattr(owner_api, "Thread", FailingStartThread)
+    feed = LogFeed(capacity=20)
+    logger = logging.getLogger(owner_api.__name__)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(feed)
     owner = SingleWorkerOwner(lambda *_args: object())
-    identity = owner.begin(object())
-    terminal = owner.poll(identity).terminal
-    assert terminal.status is OperationTerminalStatus.FAILED
-    assert terminal.failure_type == "RuntimeError"
-    assert terminal.failure_message == "start refused"
-    assert owner.poll(identity) is None
-    assert owner.close().status is PageCleanup.CLEAN
+    try:
+        identity = owner.begin(object(), run_log=_run_log_context("RSM", "/results/start.nxs"))
+        terminal = owner.poll(identity).terminal
+        assert terminal.status is OperationTerminalStatus.FAILED
+        assert terminal.failure_type == "RuntimeError"
+        assert terminal.failure_message == "start refused"
+        assert owner.poll(identity) is None
+        lines, _cursor = feed.held()
+        assert len([line for line in lines if "New Run · RSM · /results/start.nxs" in line]) == 1
+        assert len([line for line in lines if "End of Run · RSM · failed" in line]) == 1
+        warnings = [line for line in lines if "RSM failed · /results/start.nxs: RuntimeError: start refused" in line]
+        assert len(warnings) == 1
+        assert feed.warnings == 1
+        assert owner.close().status is PageCleanup.CLEAN
+    finally:
+        logger.removeHandler(feed)
 
 
 def test_thread_start_then_raise_retains_and_joins_the_live_worker(
