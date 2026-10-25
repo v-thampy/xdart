@@ -18,6 +18,13 @@ revalidators hand out a recorded digest without rereading the bytes and
 lets a hash bracketed by two descriptor views refuse a same-size
 same-mtime rewrite inside its window, on win32 too.  Receipts therefore
 always record the descriptor's observed ctime, never a pathname stat's.
+
+Source-file identity (``execution_graph.SourceFileState``) compares pathname
+views across time, as a Live Run re-proves the frames it published every ten
+seconds.  On a Windows share the creation time a pathname stat reports can
+settle milliseconds to a third of a second after the file is written
+(beamline 2026-10-25), so that slot goes through the seam as well.  On win32
+it never caught an in-place edit; size and mtime still do.
 """
 
 from __future__ import annotations
