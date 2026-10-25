@@ -510,6 +510,8 @@ class _StandardRun:
     # Live reuse: physical target key -> the proof of its published prefix,
     # and SPEC readiness by (SPEC file, scan).  Run-owned; cleared with the loop.
     live_proofs: dict[str, Any] = field(default_factory=dict)
+    live_key_snapshot: Any = None
+    live_target_keys: dict[str, str] = field(default_factory=dict)
     live_spec_cache: dict[Any, Any] = field(default_factory=dict)
     # The proof of what the Live poll admitted, for the construction it calls.
     live_admission_proof: Any = None
@@ -766,6 +768,19 @@ def _planned_physical_file_count(item: PlannedOutput) -> int:
 
 def _physical_file_key(path: Path | str) -> str:
     return os.path.normcase(os.path.realpath(path))
+
+
+def _live_physical_file_key(run: _StandardRun, snapshot: object, path: Path | str) -> str:
+    """Cache one Live target's physical identity for the current directory listing."""
+    if run.live_key_snapshot is not snapshot:
+        run.live_key_snapshot = snapshot
+        run.live_target_keys.clear()
+    lexical = str(path)
+    key = run.live_target_keys.get(lexical)
+    if key is None:
+        key = _physical_file_key(lexical)
+        run.live_target_keys[lexical] = key
+    return key
 
 
 @contextmanager
@@ -2566,7 +2581,9 @@ class StandardRunExecutor:
                     return True
                 revision = tuple(group.revision)
                 started = monotonic()
-                target_key = _physical_file_key(group.target)
+                target_key = _live_physical_file_key(
+                    run, observation.discovered_snapshot, group.target,
+                )
                 polled.add(target_key)
                 times.add("key", started)
                 if target_key in run.live_blocked:
@@ -2631,9 +2648,10 @@ class StandardRunExecutor:
                 held = rebuild_holds.get(target_key)
                 if held is not None and held[0] == revision and monotonic() < held[1]:
                     continue  # a scan found changed waits for its images and sidecars to hold still
+                owned = run.output is not None and run.output.owns_target(group.target)
                 started = monotonic()
                 completed = signature = None
-                if run.output is None or not run.output.owns_target(group.target):
+                if not owned:
                     # Coverage counts only for the output its record was read from: the same output before and
                     # after the read (Codex N-770941b2: one deleted or replaced during the read stayed covered).
                     signature = _target_stat(group.target)
@@ -2696,7 +2714,7 @@ class StandardRunExecutor:
                             ),
                             proof=run.live_proofs.get(target_key),
                             spec_cache=spec_cache,
-                            owned=run.output is not None and run.output.owns_target(group.target),
+                            owned=owned,
                             committed_cache=committed_counts,
                             given_up=frozenset(given_up.get(target_key, ())),
                         )
@@ -2717,7 +2735,7 @@ class StandardRunExecutor:
                             continue
                         live_readiness_debug(
                             "live_attempt", target=group.target.name,
-                            owned=run.output is not None and run.output.owns_target(group.target),
+                            owned=owned,
                             state=attempt.state.name, partial=attempt.partial, reason=attempt.reason,
                             disposition=None if attempt.decision is None else attempt.decision.disposition.name)
                         if attempt.state is ProbeState.IN_PROGRESS:
@@ -2735,7 +2753,8 @@ class StandardRunExecutor:
                             raise RuntimeError(
                                 "READY Live attempt lost its output"
                             )
-                        if target_key != _physical_file_key(decision.item.target):
+                        if target_key != _live_physical_file_key(
+                                run, observation.discovered_snapshot, decision.item.target):
                             raise RuntimeError(
                                 "Live output target changed after JIT"
                             )
@@ -2778,7 +2797,7 @@ class StandardRunExecutor:
                             # A raw rewrite must still reach the Append guard.
                             continue
                         if (decision.disposition is OutputDisposition.REPLACE and run.output is not None
-                                and run.output.owns_target(group.target)):
+                                and owned):
                             # An image of the scan this Run grows changed after it was reduced: it stops growing, as
                             # its refusal always made it (maintainer, 2026-10-24: "Stop growing it"); a later Run
                             # finds it changed and rebuilds it whole.
@@ -2845,7 +2864,7 @@ class StandardRunExecutor:
                     # was reduced failed the whole Live Run).
                     live_readiness_debug(
                         "live_refused", target=group.target.name, constructed=constructing,
-                        owned=run.output is not None and run.output.owns_target(group.target), reason=str(error))
+                        owned=owned, reason=str(error))
                     self._skip_live_append(run, group.target, target_key, error, constructed=constructing)
                     skipped_paths.update(
                         path for path in group.physical_paths
@@ -2864,7 +2883,7 @@ class StandardRunExecutor:
                     # "Skip that scan, keep the Run").
                     live_readiness_debug(
                         "live_refused", target=group.target.name, constructed=constructing,
-                        owned=run.output is not None and run.output.owns_target(group.target), reason=str(error))
+                        owned=owned, reason=str(error))
                     self._skip_live_append(run, group.target, target_key, None, constructed=constructing,
                                            reason=f"{type(error).__name__}: {error}", failed=True)
                     skipped_paths.update(

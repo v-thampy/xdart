@@ -35,7 +35,7 @@ from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering.adapters.dynamic_output import DynamicOutputAdapter
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
-from xdart.gui.tabs.scattering.events import CleanupStatus, ExecutorClosed
+from xdart.gui.tabs.scattering.events import CleanupStatus, ExecutorClosed, RunIdentity
 from xrd_tools.core.provenance import read_provenance
 from xrd_tools.io.nexus import read_scan_metadata
 from xrd_tools.reduction.core import ReductionSession
@@ -426,6 +426,31 @@ def _images(raw):
 
 def _count_labels(stem, count):
     return lambda values: len(set(_labels(values, stem))) >= count or _terminal(values)
+
+
+def test_live_target_key_is_cached_until_directory_snapshot_changes(tmp_path, monkeypatch):
+    run = run_executor._StandardRun(
+        None, RunIdentity(1, "physical-key-cache"), None, None, None, None,
+        tmp_path / "output",
+    )
+    target = tmp_path / "scan_int1d.nexus"
+    realpath = os.path.realpath
+    calls = []
+
+    def count_target_realpath(path, *args, **kwargs):
+        if os.fspath(path) == os.fspath(target):
+            calls.append(os.fspath(path))
+        return realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(run_executor.os.path, "realpath", count_target_realpath)
+    snapshot = object()
+    key = run_executor._live_physical_file_key(run, snapshot, target)
+    assert run_executor._live_physical_file_key(run, snapshot, target) == key
+    assert calls == [os.fspath(target)]
+
+    next_snapshot = object()
+    assert run_executor._live_physical_file_key(run, next_snapshot, target) == key
+    assert calls == [os.fspath(target), os.fspath(target)]
 
 
 # --- R1: one lifecycle per source family (idle, pending, 1 and k arrivals) --------------------------------------
