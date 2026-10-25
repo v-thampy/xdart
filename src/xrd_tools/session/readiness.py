@@ -1288,8 +1288,13 @@ def ring_basis_for_record(path, *, entry='entry', labels):
         unreadable=record.unreadable)
 
 
+class PriorEnergyUnsettled(Exception):
+    """A saved energy selection that does not settle a grown scan's energy without its earlier frames' own values
+    (:func:`~xrd_tools.core.energy.extend_acquisition_energy`): the caller reads them and binds again."""
+
+
 def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=None,
-                                  metadata_energy_eV=()):
+                                  metadata_energy_eV=(), prior=None):
     """Bind already-read source metadata to a new Int scan, without loading pixels.
 
     Explicitly called by new Run/replay only; persisted and Reintegrate scans retain
@@ -1301,26 +1306,41 @@ def bind_native_int_source_energy(scan, calibration, *, metadata_wavelength_A=No
     frame's own energy (``frame_labels`` and ``frame_energies_eV``); an enabled sensor parallax
     correction, computed at one energy, cannot follow it. Such a scan, and one whose per-frame
     energies would not fit the run's saved settings, raise :class:`EnergyScanRefused`.
+
+    ``prior``: (the energy selection its output saved, how many leading frames it covers), for
+    an Append over a scan that grew: those frames' metadata is not read, and the saved selection
+    is extended by the later frames' own energies when it settles the result exactly, else
+    :class:`PriorEnergyUnsettled`.
     """
     from dataclasses import replace
     from xrd_tools.core.energy import resolve_acquisition_energy, metadata_energy_values, WavelengthUnit
     from xrd_tools.integrate.calibration import detector_calibration_to_integrator
-    labels, recorded = [], []
-    for frame in scan.frames:
+    start = 0 if prior is None else int(prior[1])
+    labels = [int(frame.index) for frame in scan.frames]
+    recorded = []
+    for frame in scan.frames[start:]:
         values = metadata_energy_values(frame.metadata, energy_is_eV=frame.metadata_energy_is_eV)
         if len(values) > 1:
             resolve_acquisition_energy(None, values)  # a row's energy and wavelengths must agree
-        labels.append(int(frame.index))
         recorded.append(values[0] if values else None)
-    per_frame = any(value is not None for value in recorded)
-    if per_frame:
-        energies = recorded
+    if prior is not None:
+        from xrd_tools.core.energy import extend_acquisition_energy
+        saved = prior[0]
+        selection = (None if not isinstance(saved, dict) or not 0 < start < len(labels)
+                     or "frame_labels" in saved and list(saved["frame_labels"]) != labels[:start]
+                     else extend_acquisition_energy(saved, recorded, calibration.poni.wavelength))
+        if selection is None:
+            raise PriorEnergyUnsettled("the saved energy selection does not settle this scan's energy")
     else:
-        energies = list(metadata_energy_eV)
-        if metadata_wavelength_A is not None:
-            energies.extend(metadata_energy_values({}, wavelength=metadata_wavelength_A,
-                                                  wavelength_unit=WavelengthUnit.ANGSTROM))
-    selection = resolve_acquisition_energy(calibration.poni.wavelength, energies, allow_energy_scan=per_frame)
+        per_frame = any(value is not None for value in recorded)
+        if per_frame:
+            energies = recorded
+        else:
+            energies = list(metadata_energy_eV)
+            if metadata_wavelength_A is not None:
+                energies.extend(metadata_energy_values({}, wavelength=metadata_wavelength_A,
+                                                      wavelength_unit=WavelengthUnit.ANGSTROM))
+        selection = resolve_acquisition_energy(calibration.poni.wavelength, energies, allow_energy_scan=per_frame)
     if 'frame_energies_eV' in selection:
         # enabled parallax only, as the conversion owner applies it: an explicit False (a sensor-equipped PONI v3, or
         # Advanced's override with Enable parallax cleared) reduces each frame at its energy (LT-SMALL-FIXES S1)

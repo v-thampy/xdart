@@ -1145,11 +1145,11 @@ def committed_append_execution(
     science_fingerprint: str,
     modes: tuple[str, ...],
     members: tuple[tuple[str | Path, int, int], ...],
-) -> tuple[int, dict[str, Any]] | None:
+) -> tuple[int, dict[str, Any], dict[str, Any] | None] | None:
     """For a scan that grew: how many of its leading image files ``members`` (path, size, mtime_ns) ``target``'s
     committed Append already holds, as :func:`committed_append_coverage` matches them (the same files at the same
-    sizes and times, under this entry, source base, science fingerprint and modes), with the source execution it
-    recorded for them, or None. One small metadata read; no source capture, image or sidecar (maintainer,
+    sizes and times, under this entry, source base, science fingerprint and modes), with the source execution and
+    the energy selection (None when it saved none) it recorded for them, or None. One small metadata read; no source capture, image or sidecar (maintainer,
     2026-10-23: "If a frame has already been processed that means the image data as well as the metadata if any
     were already verified"). None sends the scan the full way: no prefix, the whole scan, other files, sizes or
     times, point groups, external members, admitted motor values, another identity or a record it cannot vouch for.
@@ -1163,6 +1163,8 @@ def committed_append_execution(
                 return None
             prefix = decode_committed_append_prefix(handle, entry=entry)
             execution = json.loads(config["source_execution"][()])
+            pending = json.loads(config["append_lineage"][()]).get("state") == "pending"
+            energy = json.loads(config["energy_selection"][()]) if "energy_selection" in config else None
     except Exception:  # anything this reader cannot vouch for goes the full way
         return None
     intent = prefix.intent
@@ -1171,7 +1173,9 @@ def committed_append_execution(
     count = len(committed)
     stamps = execution.get("member_stamps") if type(execution) is dict else None
     if (
-        intent.entry != entry
+        pending
+        or energy is not None and type(energy) is not dict
+        or intent.entry != entry
         or intent.source_base != _normalize_base(source_base)
         or intent.science_fingerprint != science_fingerprint
         or tuple(intent.modes) != tuple(modes)
@@ -1191,7 +1195,7 @@ def committed_append_execution(
         != [stamp.get("path") for stamp in stamps]
     ):
         return None
-    return count, execution
+    return count, execution, energy
 
 
 def committed_image_count(target: str | Path, *, entry: str) -> int | None:

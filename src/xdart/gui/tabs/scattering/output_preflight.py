@@ -199,6 +199,9 @@ class DeferredDirectoryEntry:
     #: A finite Append's scan that grew: the graph of the frames its output already holds, from its committed record
     #: (``_committed_prefix``); they are not captured, probed or read again.
     committed_prefix: PreparedSourceExecutionGraph | None = None
+    #: The energy selection that record saved for them (``bind_native_int_source_energy``'s ``prior``): their metadata
+    #: is not read again either; None when it saved none.
+    committed_energy_selection: dict | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not (
@@ -918,7 +921,7 @@ def _committed_prefix(
     group: tuple[Candidate, ...],
     name: str,
     target: Path,
-) -> PreparedSourceExecutionGraph | None:
+) -> tuple[PreparedSourceExecutionGraph, dict | None] | None:
     """A finite directory Append's scan that grew: the graph of the leading frames its output already holds, recognized
     from this census (each image's name, size and time) and the output's committed record, as ``_already_processed``
     recognizes a whole scan, and built from that record (``record_prefix_graph``); None to admit it the full way.
@@ -955,7 +958,7 @@ def _committed_prefix(
     try:
         return record_prefix_graph(
             found[1], directory=group[0].path.parent, selected_file=group[0].path, scan_name=name,
-            metadata_format="auto" if watch is None else watch.metadata_format)
+            metadata_format="auto" if watch is None else watch.metadata_format), found[2]
     except (KeyError, TypeError, ValueError):  # a record this reader cannot vouch for goes the full way
         return None
 
@@ -985,7 +988,7 @@ def _deferred_directory_plan(
             PreparedSourceExecutionGraph | None,
         ]
     ] = []
-    every_proven = dict(proven)
+    every_proven, committed_energies = dict(proven), {}
     for group, name in _output_groups(configuration, plan):
         if cancelled():
             raise RuntimeError("admission cancelled")
@@ -996,7 +999,9 @@ def _deferred_directory_plan(
             staged.append((group, (), target, (), (), "", completed, None))
             continue
         # A scan that grew: the frames its output holds keep the states its record wrote (no capture).
-        committed = None if proven else _committed_prefix(configuration, group, name, target)
+        found = None if proven else _committed_prefix(configuration, group, name, target)
+        committed = None if found is None else found[0]
+        committed_energies[str(target)] = None if found is None else found[1]
         group_proven = {**proven, **proven_states(committed)}
         every_proven.update(group_proven)
         captured_topologies: list[_CapturedSourceTopology] = []
@@ -1153,6 +1158,7 @@ def _deferred_directory_plan(
             reason,
             _protected_topology=tuple(protected),
             committed_prefix=committed,
+            committed_energy_selection=committed_energies.get(str(target)),
         ))
     _LOG.debug(
         "[APPEND-ADMIT] groups=%d already-processed=%d grown=%d files=%d (%.0f ms)",

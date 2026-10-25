@@ -34,6 +34,7 @@ __all__ = [
     "calibration_recorded_energy_eV",
     "check_energy_consistency",
     "resolve_acquisition_energy",
+    "extend_acquisition_energy",
     "metadata_energy_values",
     # X1 Slice 3a0 (R3-P1): the one headless wavelength vocabulary.
     "WavelengthUnit",
@@ -287,6 +288,38 @@ def resolve_acquisition_energy(calibration_wavelength_m, metadata_energy_eV=(), 
             frames.append(energy)
         selection["frame_energies_eV"] = tuple(frames)
     return selection
+
+
+def extend_acquisition_energy(saved, metadata_energy_eV, calibration_wavelength_m) -> dict | None:
+    """What :func:`resolve_acquisition_energy` (no fitted energy, energy scans allowed) gives a scan whose earlier
+    frames gave ``saved`` (that result, as their Run saved it) and whose later frames record ``metadata_energy_eV``,
+    when ``saved`` settles it without the earlier frames' own values; else None, and they are read again.
+
+    Settled: no earlier valid energy and none later (the calibration's, unchanged); an earlier common energy that every
+    later valid one stays within 0.1 % of (``first`` is still the earlier one, so every field is unchanged); an energy
+    scan, which stays one (each later frame takes its own valid energy, a glitched one the previous frame's). A common
+    energy that now varies, a first valid energy only now recorded, a fitted offset or another calibration are not."""
+    if not isinstance(saved, dict) or saved.get("fitted_energy_offset_eV") != 0.0:
+        return None
+    wavelength = canonical_wavelength_m(calibration_wavelength_m, WavelengthUnit.METRE)
+    if saved.get("calibration_energy_eV") != (None if wavelength is None else wavelength_m_to_energy_eV(wavelength)):
+        return None
+    later = [_possible_energy(value) for value in metadata_energy_eV]
+    frames = saved.get("frame_energies_eV")
+    if saved.get("source") == "calibration":
+        return None if frames is not None or any(value is not None for value in later) else dict(saved)
+    first = _possible_energy(saved.get("source_energy_eV"))
+    if saved.get("source") != "metadata" or first is None:
+        return None
+    if frames is None:
+        return None if any(value is not None and abs(value - first) > .001 * first for value in later) else dict(saved)
+    if not isinstance(frames, (list, tuple)) or not frames:
+        return None
+    extended, previous = [float(value) for value in frames], float(frames[-1])
+    for value in later:
+        previous = previous if value is None else value
+        extended.append(previous)
+    return {**saved, "frame_energies_eV": tuple(extended)}
 
 
 def calibration_recorded_energy_eV(record) -> float | None:

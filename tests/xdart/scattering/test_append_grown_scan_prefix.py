@@ -3,15 +3,19 @@ to quickly skip over already processed scans/frames ... If a frame has already b
 as well as the metadata if any were already verified. It seems wasteful to recheck that").
 
 The frames its output already holds are recognized from the directory listing and the output's committed record, and
-their graph is the one that record wrote: they are not probed, captured or qualified again (the scan's construction still
-reads each frame's metadata once). Real Runs over real TIFF + .txt scans."""
+their graph is the one that record wrote: they are not probed, captured, qualified or read again; their energy is the
+selection the output saved, extended by the new frames when it settles the result exactly, else they are read as before.
+Real Runs over real TIFF + .txt scans."""
 from __future__ import annotations
 
 import json
 from collections import Counter
 from pathlib import Path
 
+import fabio
 import h5py
+import numpy as np
+import pytest
 
 import xrd_tools.io.metadata as metadata
 import xrd_tools.sources.registry as registry
@@ -77,9 +81,9 @@ def test_a_grown_scans_processed_frames_are_not_probed_captured_or_qualified_aga
     terminals = _run(tmp_path, raw, 9802)
     monkeypatch.undo()
     assert [event.kind.name for event in terminals] == ["FINISHED"], terminals
-    assert len(grown) == 1 and grown[0] is not None and len(grown[0].stamp.members) == N
-    # Each processed frame: no probe, no capture, one metadata read (the scan's construction), not seven.
-    assert (probes["probe"], captures["capture"], reads["read"]) == (0, 0, N), (probes, captures, reads)
+    assert len(grown) == 1 and grown[0] is not None and len(grown[0][0].stamp.members) == N
+    # Each processed frame: no probe, no capture, no metadata read (were seven).
+    assert (probes["probe"], captures["capture"], reads["read"]) == (0, 0, 0), (probes, captures, reads)
     labels, i0, _epoch = _output(tmp_path, "grow")
     assert labels == tuple(range(1, N + 2)) and i0 == tuple(float(index) for index in range(1, N + 2)), (labels, i0)
     # What it recorded is what the full way records for unchanged files: every member's and sidecar's exact state.
@@ -115,3 +119,59 @@ def test_a_grown_scan_whose_processed_image_changed_goes_the_full_way(tmp_path, 
     assert grown == [None], grown
     assert [event.kind.name for event in terminals] == ["FINISHED"], terminals
     assert _output(tmp_path, "grow")[0] == tuple(range(1, N + 2))
+
+
+def _txt_frame(raw, index, i0, energy):
+    """One frame: its .txt (``energy`` in keV, none when None), then its image renamed into place whole."""
+    motors = "" if energy is None else f"# Motors\nenergy = {energy!r}\n"
+    raw.joinpath(f"grow_{index:04d}.txt").write_text(
+        f"# Counters\nI0 = {i0}\n{motors}User: energy, time: Mon Jan 15 10:30:00 2024  # Temp\n")
+    partial = raw / f"grow_{index:04d}.part"
+    fabio.tifimage.TifImage(data=np.full((195, 487), index, dtype=np.uint16)).write(str(partial))
+    partial.replace(raw / f"grow_{index:04d}.tif")
+
+
+def _grown_energy(tmp_path, monkeypatch, before, after, *, prefix):
+    """(terminal kinds, reads of the processed frames' metadata, the saved energy selection) after a scan of
+    ``before`` energies grows by ``after`` ones; ``prefix`` False sends it the full way."""
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True)
+    for index, energy in enumerate(before, 1):
+        _txt_frame(raw, index, float(index), energy)
+    assert [event.kind.name for event in _run(tmp_path, raw, 9811)] == ["FINISHED"]
+    for index, energy in enumerate(after, len(before) + 1):
+        _txt_frame(raw, index, float(index), energy)
+    reads, real_read = Counter(), metadata._read_image_metadata_observed_once
+
+    def read(path, *args, **kwargs):
+        if int(Path(str(path)).name[5:9]) <= len(before):
+            reads["read"] += 1
+        return real_read(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(metadata, "_read_image_metadata_observed_once", read)
+        if not prefix:
+            patch.setattr(output_preflight, "_committed_prefix", lambda *_args, **_kwargs: None)
+        terminals = _run(tmp_path, raw, 9812)
+    with h5py.File(tmp_path / "processed" / "grow_int1d.nexus", "r") as handle:
+        selection = json.loads(handle["entry/reduction/config/energy_selection"][()])
+    return [event.kind.name for event in terminals], reads["read"], selection
+
+
+@pytest.mark.parametrize("case, before, after, reads", [
+    ("fixed", [16.0] * 6, [16.0], 0),
+    ("energy scan", [16.0, 16.1, 16.2, 16.3, 16.4, 16.5], [16.6, 16.7], 0),
+    ("energy scan, a glitched new frame", [16.0, 16.1, 16.2, 16.3, 16.4, 16.5], [0.0, 16.7], 0),
+    ("no energy recorded", [None] * 6, [None], 0),
+    ("a common energy that now varies", [16.0] * 6, [16.2], 6),  # read again: the saved selection cannot settle it
+])
+def test_a_grown_scans_energy_is_the_full_ways_without_reading_its_processed_frames(
+        tmp_path, monkeypatch, case, before, after, reads):
+    """The Run ends as the full way's does, with the same saved energy selection, and its processed frames' .txt are read
+    only when the saved selection cannot settle it. (An energy scan's Append fails at the writer either way, a separate
+    defect found here, so the energy-scan extension itself is checked directly in tests/core/test_energy_extension.py.)"""
+    kinds, read, selection = _grown_energy(tmp_path / "grown", monkeypatch, before, after, prefix=True)
+    full_kinds, _full_read, full = _grown_energy(tmp_path / "full", monkeypatch, before, after, prefix=False)
+    assert kinds == full_kinds, (case, kinds, full_kinds)
+    assert kinds == ["FINISHED"] or case.startswith("energy scan") or case.endswith("varies"), (case, kinds)
+    assert read == reads, (case, read)
+    assert selection == full, (case, selection, full)

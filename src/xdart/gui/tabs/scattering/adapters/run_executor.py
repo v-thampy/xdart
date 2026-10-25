@@ -510,6 +510,8 @@ class _StandardRun:
     live_spec_cache: dict[Any, Any] = field(default_factory=dict)
     # The proof of what the Live poll admitted, for the construction it calls.
     live_admission_proof: Any = None
+    # A finite Append's grown scan: the energy selection its output saved for the frames it holds (_construct's prior).
+    prior_energy_selection: Any = None
     # Live outputs that stopped growing because a published frame's metadata
     # changed: physical target key -> the reason every later status carries.
     live_blocked: dict[str, str] = field(default_factory=dict)
@@ -1765,6 +1767,11 @@ class StandardRunExecutor:
         if proof is not None:
             run.live_admission_proof = None
             proof = proof if item is not None and proof.graph is item.graph else None
+        prior_energy, run.prior_energy_selection = getattr(run, 'prior_energy_selection', None), None
+        # A finite Append's scan that grew, with the energy selection its output saved: the frames it holds are not
+        # read here either (only that selection used their metadata); the binding extends it, or they are read.
+        grown = (prior_energy if proof is not None and item.graph.infers_point_images
+                 and type(prior_energy) is dict else None)
         configuration, capture = (run.configuration, run.capture)
         if configuration is None or capture is None:
             raise RuntimeError('run construction shell is incomplete')
@@ -1823,6 +1830,8 @@ class StandardRunExecutor:
                     if (values := source.read_values if source.spec_values is None else source.spec_values) is not None}
                 retained.update((label, {}) for label, source in enumerate(stamp.metadata_sources, stamp.first_label)
                                 if source.metadata_file is None and source.read_values is not None)
+                if grown is not None:
+                    retained.update((label, {}) for label in range(stamp.first_label, stamp.first_label + proof.start))
                 if retained:
                     run.source.retain_metadata(retained)
             admission = None if run.resources is None else run.resources.admission
@@ -1850,10 +1859,19 @@ class StandardRunExecutor:
                     {int(frame.index): frame.metadata for frame in run.scan.frames},
                     start=0 if proof is None else proof.start,
                 )
-            calibration = bind_native_int_source_energy(run.scan, calibration,
-                metadata_wavelength_A=(None if item is None or item.descriptor is None
-                                       else item.descriptor.wavelength),
-                metadata_energy_eV=source_metadata_energy_eV(run.source))
+            from xrd_tools.session.readiness import PriorEnergyUnsettled
+
+            def bind(prior):
+                return bind_native_int_source_energy(run.scan, calibration,
+                    metadata_wavelength_A=(None if item is None or item.descriptor is None
+                                           else item.descriptor.wavelength),
+                    metadata_energy_eV=source_metadata_energy_eV(run.source), prior=prior)
+            try:
+                calibration = bind(None if grown is None else (dict(grown), proof.start))
+            except PriorEnergyUnsettled:  # its energy needs the frames the output holds: read them, as before
+                run.source.retain_metadata({})
+                run.scan = run.source.to_scan(output_path=artifact, cancelled=cancelled)
+                calibration = bind(None)
             integrator = run.scan.integrator
             poni = run.scan.poni
             if calibration.parallax is not None:
@@ -3006,6 +3024,8 @@ class StandardRunExecutor:
             try:
                 # The proof of what was admitted: construction re-checks it instead of validating the scan again.
                 run.live_admission_proof = proofs[-1] if proofs else None
+                run.prior_energy_selection = None if committed is None else getattr(
+                    entry, "committed_energy_selection", None)
                 self._construct(
                     run,
                     item=item,
