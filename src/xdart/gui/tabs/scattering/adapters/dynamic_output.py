@@ -1247,12 +1247,12 @@ class DynamicOutputAdapter:
             if cancelled():
                 raise RuntimeError("admission cancelled")
             try:
-                # A finite Append writes its existing output in place
-                # (maintainer, 2026-10-23); a Live run's first stream keeps its
-                # preserved seed and reopens its later epochs in place.
+                # Both finite and Live Append adopt the existing output. A
+                # failed epoch remains pending and needs Replace; no copy or
+                # whole-file hash is needed before its first new frame.
                 preflight = prepare_append_preflight(
                     target, intent, file_lock=self._command_lock,
-                    in_place=not self.configuration.live_mode,
+                    in_place=True,
                     image_drift=True,
                     acquisition_proof=not self.configuration.live_mode,
                 )
