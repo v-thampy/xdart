@@ -2416,6 +2416,13 @@ def test_v2_replace_regenerates_its_own_result_and_append_knows_a_current_one(tm
     assert target == Path(committed.request.module.output.target)
     reread = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.RSM)
     assert reread.result_fingerprint == replaced.payload.result_fingerprint
+    image = Path(member.image_dir) / "member0_0000.tif"
+    before = image.stat()
+    image.write_bytes(image.read_bytes() + b"revision drift")
+    os.utime(image, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    changed = image.stat()
+    assert changed.st_size != before.st_size and changed.st_mtime_ns != before.st_mtime_ns
+    assert prepare_rsm_tool_v2(form).output_current is False
 
 
 def test_v2_replace_refuses_a_foreign_or_other_kind_file(tmp_path, monkeypatch):

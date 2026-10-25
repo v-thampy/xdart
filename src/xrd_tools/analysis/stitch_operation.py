@@ -3896,6 +3896,41 @@ def _without_revisions(value, keys=_REVISION_KEYS):
     return value
 
 
+def _manifest_currency_projection(value, keys=_REVISION_KEYS):
+    """Ignore source revisions except those for files that supply selected image frames."""
+    if type(value) is list:
+        return [_manifest_currency_projection(item, keys) for item in value]
+    if type(value) is not dict:
+        return value
+    file_key = next((key for key in ("files", "dependency_files") if type(value.get(key)) is list), None)
+    image_files = set()
+    if file_key is not None:
+        for contribution in value.get("contributions", ()):
+            if type(contribution) is not dict:
+                continue
+            ordinal = contribution.get("file_ordinal")
+            if type(ordinal) is int:
+                image_files.add(ordinal)
+            for field in ("constituents", "point_raw_locators"):
+                locators = contribution.get(field, ())
+                for locator in (locators if type(locators) is list else ()):
+                    if type(locator) is dict and type(locator.get("file_ordinal")) is int:
+                        image_files.add(locator["file_ordinal"])
+    projected = {}
+    for key, item in value.items():
+        if key in keys:
+            continue
+        if key == file_key:
+            projected[key] = [
+                (_without_revisions(file, keys - {"revision"}) if index in image_files
+                 else _without_revisions(file, keys))
+                for index, file in enumerate(item)
+            ]
+        else:
+            projected[key] = _manifest_currency_projection(item, keys)
+    return projected
+
+
 def stitch_output_current(request: StitchOperationRequest) -> bool:
     """Whether ``request``'s output already holds its stitch: the same settings (the plan) over the
     same frames (sources, scans, images and motor readings). A Run in Append mode skips such an output
@@ -3923,7 +3958,7 @@ def stitch_output_current(request: StitchOperationRequest) -> bool:
     except (ValueError, KeyError, TypeError, AttributeError):
         return False
     return (plan_fingerprint == request.module.plan_fingerprint
-            and _without_revisions(stored) == _without_revisions(planned)
+            and _manifest_currency_projection(stored) == _manifest_currency_projection(planned)
             and conditioning[0] == conditioning[1])
 
 

@@ -6759,7 +6759,7 @@ def rsm_output_current(request: RSMOperationRequestV2) -> bool:
     (``rsm_record_identity``); a missing, unreadable or foreign file is not current.
     """
 
-    from xrd_tools.analysis.stitch_operation import _REVISION_KEYS, _without_revisions
+    from xrd_tools.analysis.stitch_operation import _REVISION_KEYS, _manifest_currency_projection
 
     if type(request) is not RSMOperationRequestV2:
         raise TypeError("RSM v2 output currency requires an exact request")
@@ -6774,9 +6774,9 @@ def rsm_output_current(request: RSMOperationRequestV2) -> bool:
         planned = json.loads(json.dumps(request.provenance["members"]))
     except (ValueError, KeyError, TypeError):
         return False
-    return plan_fingerprint == request.plan.fingerprint and _without_revisions(
+    return plan_fingerprint == request.plan.fingerprint and _manifest_currency_projection(
         stored, keys
-    ) == _without_revisions(planned, keys)
+    ) == _manifest_currency_projection(planned, keys)
 
 
 __all__ = [

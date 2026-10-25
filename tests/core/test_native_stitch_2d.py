@@ -8,6 +8,7 @@ the artifact projection; I(q) is native Stitch 1D's for the same inputs. The map
 """
 import copy
 from dataclasses import replace
+import os
 
 import numpy as np
 
@@ -106,6 +107,21 @@ def test_a_native_stitch_2d_record_is_an_int_2d_record(tmp_path):
     np.testing.assert_array_equal(view.intensity_1d, payload.profile.intensity)
     np.testing.assert_array_equal(view.axis_1d.values, payload.profile.axes[0][1])
     assert stitch_output_current(native)  # Append skips it
+    image = tmp_path / "source" / "scan_0001.tif"
+    before = image.stat()
+    image.write_bytes(image.read_bytes() + b"revision drift")
+    os.utime(image, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    changed = image.stat()
+    assert changed.st_size != before.st_size and changed.st_mtime_ns != before.st_mtime_ns
+    from xrd_tools.analysis.module_transaction import ModuleSourceReceipt
+    from xrd_tools.analysis.scan_operations import MetadataTablePlan, run_metadata_table
+    table = run_metadata_table(MetadataTablePlan(native.module.source.analysis.source_spec))
+    source = ModuleSourceReceipt.from_metadata_table(
+        table, kind=native.module.source.kind, selected_labels=native.module.source.selected_labels,
+        resolved_selectors=native.module.source.resolved_selectors,
+    )
+    refreshed = prepare_stitch_operation(source, native.module.output, native.plan, project_root=tmp_path)
+    assert not stitch_output_current(refreshed)
     with h5py.File(target, "r+") as handle:
         del handle["entry/stitch/map"]
     with pytest.raises(AnalysisArtifactInvalid):
