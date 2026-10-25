@@ -158,6 +158,75 @@ def test_recursive_flag_controls_subdirectory_descent(tmp_path):
     assert {c.path.name for c in deep} == {"top.nxs", "nested.nxs"}
 
 
+def test_recursive_candidates_reuse_scandir_file_state_once(tmp_path, monkeypatch):
+    import os
+    import pathlib
+    import xrd_tools.sources.discover as discover_module
+
+    root = tmp_path / "recursive"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    top = _touch(root / "top.nxs")
+    child = _touch(nested / "child.nxs")
+    _touch(nested / "notes.txt")
+    alias = root / "alias.nxs"
+    alias.symlink_to(top)
+    linked_directory = root / "linked-directory"
+    linked_directory.symlink_to(nested, target_is_directory=True)
+
+    real_scandir = os.scandir
+    entry_stats = []
+    path_stats = []
+
+    class Entry:
+        def __init__(self, entry):
+            self.entry = entry
+
+        def stat(self, *args, **kwargs):
+            entry_stats.append(Path(self.entry.path))
+            return self.entry.stat(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.entry, name)
+
+    class Scan:
+        def __init__(self, path):
+            self.scan = real_scandir(path)
+
+        def __enter__(self):
+            self.scan.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self.scan.__exit__(*exc)
+
+        def __iter__(self):
+            return (Entry(entry) for entry in self.scan)
+
+        def close(self):
+            return self.scan.close()
+
+    def counted_scandir(path):
+        return Scan(path) if Path(path).is_relative_to(root) else real_scandir(path)
+
+    real_path_stat = pathlib.Path.stat
+
+    def counted_path_stat(path, *args, **kwargs):
+        if path.is_relative_to(root) and path != root:
+            path_stats.append(path)
+        return real_path_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(discover_module.os, "scandir", counted_scandir)
+    monkeypatch.setattr(pathlib.Path, "stat", counted_path_stat)
+
+    candidates = discover_module.collect_candidates(root, recursive=True)
+
+    assert {candidate.path for candidate in candidates} == {top, child, alias}
+    assert len(entry_stats) == len(candidates), entry_stats
+    assert set(entry_stats) == {top, child, alias}
+    assert path_stats == [], path_stats
+
+
 # ---- natural ordering ------------------------------------------------------
 
 

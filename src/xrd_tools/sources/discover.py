@@ -39,14 +39,41 @@ def _walk_files(directory: Path, recursive: bool) -> list[Path]:
     return list(os_sorted(_iter_files_unordered(directory, recursive)))
 
 
+def _iter_file_entries_unordered(directory: Path, recursive: bool):
+    """Yield regular-file ``DirEntry`` objects in filesystem DFS order."""
+    def read_entries(path: Path):
+        with os.scandir(path) as entries:
+            return list(entries)
+
+    pending = [iter(read_entries(directory))]
+    while pending:
+        try:
+            entry = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        try:
+            if recursive and entry.is_dir(follow_symlinks=False):
+                try:
+                    pending.append(iter(read_entries(Path(entry.path))))
+                except OSError as error:
+                    if error.errno not in _NOT_A_FILE_ERRNOS:
+                        raise
+                continue
+            if entry.is_file():
+                yield entry
+        except OSError as error:
+            if error.errno not in _NOT_A_FILE_ERRNOS:
+                raise
+
+
 def _iter_files_unordered(directory: Path, recursive: bool) -> list[Path]:
     """Regular files under *directory* in raw filesystem-enumeration order —
     no natural sort.  The sort is the expensive part of a poll; splitting it
     out lets :class:`~xrd_tools.sources.directory_index.DirectoryIndex` detect
     an unchanged directory (order-independent map comparison) and skip the
     sort entirely (R1-R5)."""
-    it = directory.rglob("*") if recursive else directory.iterdir()
-    return [p for p in it if p.is_file()]
+    return [Path(entry.path) for entry in _iter_file_entries_unordered(directory, recursive)]
 
 
 def discover_scans(directory, kind, *, recursive: bool = False,
@@ -191,14 +218,15 @@ def collect_candidates(directory, *, recursive: bool = False,
     from xrd_tools.sources.adapters import candidate_owner
 
     out: list[Candidate] = []
-    for f in _iter_files_unordered(directory, recursive):
-        if not name_ok(f.name):
+    for entry in _iter_file_entries_unordered(directory, recursive):
+        f = Path(entry.path)
+        if not name_ok(entry.name):
             continue
         owner = candidate_owner(f)
         if owner is None:
             continue
         try:
-            stat = f.stat()
+            stat = entry.stat()
         except OSError:
             continue  # vanished mid-walk; not a candidate this poll
         out.append(Candidate(f, owner.id, stat.st_size, stat.st_mtime_ns))
@@ -247,7 +275,8 @@ def collect_owned_candidates(directory, *, recursive: bool = False, name_filter:
     memo = {} if memo is None else memo
     owners = memo.get("owners", {}) if pure and memo.get("registry") == registry else {}
     previous = memo.get("candidates", {})
-    listed = (((str(f), f.name, f.stat) for f in _iter_files_unordered(directory, True))
+    listed = (((entry.path, entry.name, entry.stat)
+               for entry in _iter_file_entries_unordered(directory, True))
               if recursive else _scandir_files(directory))
     kept_owners: dict = {}
     kept: dict[str, Candidate] = {}
