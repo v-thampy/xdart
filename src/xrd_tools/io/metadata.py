@@ -172,11 +172,15 @@ def _metadata_discovery_revisions(
         image_path, meta_format, meta_dir,
     ))
     if meta_format == "auto":
-        paths.extend(
-            candidate
-            for candidate, _convention, _suffix
-            in _iter_auto_sidecar_candidates(image_path)
-        )
+        cached = _auto_sidecar_from_cache(image_path)
+        if cached is not None:
+            paths.append(cached)
+        else:
+            paths.extend(
+                candidate
+                for candidate, _convention, _suffix
+                in _iter_auto_sidecar_candidates(image_path)
+            )
     ordered: list[tuple[Path, MetadataSourceRevision | None]] = []
     seen: set[Path] = set()
     for candidate in paths:
@@ -461,7 +465,12 @@ def _dir_listing_lower(directory: Path) -> dict[str, Path]:
     if cached is not None and cached[0] == mtime:
         return cached[1]
     try:
-        listing = {p.name.lower(): p for p in directory.iterdir() if p.is_file()}
+        with os.scandir(directory) as entries:
+            listing = {
+                entry.name.lower(): Path(entry.path)
+                for entry in entries
+                if entry.is_file()
+            }
     except OSError:
         listing = {}
     _DIR_LISTING_CACHE[directory] = (mtime, listing)

@@ -134,6 +134,39 @@ def test_auto_discovery_lists_directory_at_most_once_s20(tmp_path, monkeypatch):
     assert calls["n"] <= 1, f"expected <=1 directory listing, got {calls['n']}"
 
 
+def test_locked_auto_sidecar_avoids_resweep_after_directory_change(tmp_path, monkeypatch):
+    import pathlib
+
+    image = _image(tmp_path)
+    (tmp_path / "scan_0001.tif.metadata").write_text("i0=1\nth=2\nchi=3\n")
+    assert read_image_metadata(image, meta_format="auto") == {"i0": 1, "th": 2, "chi": 3}
+    for index in range(300):
+        (tmp_path / f"unrelated-{index:04d}.bin").touch()
+
+    real_stat = pathlib.Path.stat
+    child_stats = []
+
+    def count_child_stat(path, *args, **kwargs):
+        if path.parent == tmp_path and path != tmp_path:
+            child_stats.append(path)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "stat", count_child_stat)
+    assert read_image_metadata(image, meta_format="auto") == {"i0": 1, "th": 2, "chi": 3}
+    assert len(child_stats) < 50, f"cached convention touched {len(child_stats)} directory entries"
+
+
+def test_locked_auto_sidecar_keeps_case_insensitive_lookup(tmp_path):
+    image = _image(tmp_path)
+    sidecar = tmp_path / "scan_0001.tif.METADATA"
+    sidecar.write_text("i0=1\nth=2\nchi=3\n")
+    metadata._AUTO_SIDECAR_CACHE[(tmp_path, ".tif")] = ("append", ".metadata")
+
+    assert read_image_metadata(image, meta_format="auto") == {"i0": 1, "th": 2, "chi": 3}
+    cached = metadata._auto_sidecar_from_cache(image)
+    assert cached is not None and cached.is_file()
+
+
 def test_junk_pdi_is_rejected_not_fabricated_bw(tmp_path):
     # BW / .pdi junk-latch: a junk .pdi (no recognizable section) must return {}
     # -- the old last-resort fabricated {TwoTheta:0.0, Theta:0.0}, so a junk .pdi
