@@ -9,6 +9,7 @@ settled to admit another, that grows again starts a new display generation under
 a read still in flight from the closed generation never lands in the new one."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -275,6 +276,98 @@ def test_f2_a_read_from_the_closed_generation_never_lands_in_the_reopened_one(tm
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert landed is None and refused == 1, (landed, refused)
     assert _output(tmp_path, 'saved')[0] == (1, 2, 3)
+
+
+def _held_read_of_the_saved_frames(monkeypatch):
+    """A read of the saved scan's first frame that stays in flight until ``release`` is set, and the event that
+    says its scan's reopen has begun."""
+    entered, release, real_read = threading.Event(), threading.Event(), hydration_transport.read_frame_preview
+
+    def read(read_key, **kwargs):
+        if not entered.is_set() and read_key.frame_identity == 1:
+            entered.set()
+            release.wait(30.)
+        return real_read(read_key, **kwargs)
+    monkeypatch.setattr(hydration_transport, 'read_frame_preview', read)
+    reopening, real_begin = threading.Event(), RunDisplayState.begin_active_generation
+
+    def begin(self, *args, **kwargs):
+        reopening.set()
+        return real_begin(self, *args, **kwargs)
+    monkeypatch.setattr(RunDisplayState, 'begin_active_generation', begin)
+    return entered, release, reopening
+
+
+def test_d1_a_slow_read_of_the_saved_frames_is_waited_for_at_the_reopen_not_failed(tmp_path, monkeypatch):
+    """Claude review of 03af89cc, D1: the reopen of a presented scan waited the executor's join timeout (5 s) for a
+    read of its saved frames and then failed the Live Run; a read over a share can outlast any fixed bound, and the
+    wait itself is needed (the writer cannot open the file under the read). Here the read outlasts the join timeout
+    tenfold."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    _saved(tmp_path, raw, 'saved', 2, 8843)
+    entered, release, reopening = _held_read_of_the_saved_frames(monkeypatch)
+    executor = StandardRunExecutor(join_timeout=.05)
+    identity = _start(executor, _intent(tmp_path, raw, live=True), request_value=8844)
+    events = []
+    try:
+        _wait(executor, events, lambda values: _key(executor, identity, 'saved', 2) is not None or _terminal(values))
+        run, context = executor._exact_run(identity), executor.acquisition_context(identity)
+        first = _key(executor, identity, 'saved', 1)
+        assert run.display.project(first, 1, closed=run.closed, owner=context.hydration_owner,
+                                   commit_gate=context.commit_gate) is None
+        assert entered.wait(10.), 'the saved frame was never read'
+        _frame(raw, 'saved', 3, 'txt', 3.0)  # the scan grows while that read is in flight
+        _wait(executor, events, lambda values: reopening.is_set() or _terminal(values))
+        _settle(executor, events, .5)  # the read is still held, ten times the join timeout after the reopen began
+        waiting = not _terminal(events)
+        release.set()
+        _wait(executor, events, lambda values: 3 in _labels(values, 'saved') or _terminal(values))
+        _settle(executor, events)
+    finally:
+        release.set()
+        terminal = _stop(executor, identity, events)
+    assert waiting, f'the reopen gave up on the read: {_terminals(events)}'
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert _output(tmp_path, 'saved')[0] == (1, 2, 3)
+
+
+def test_d1_a_stop_during_the_wait_for_a_read_ends_the_run_stopped(tmp_path, monkeypatch, caplog):
+    """The wait has no bound of its own, so Stop is what ends it: the Run is STOPPED, not FAILED, the scan keeps
+    the frames it had, and the log says once why the scan waits."""
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    _saved(tmp_path, raw, 'saved', 2, 8845)
+    entered, release, reopening = _held_read_of_the_saved_frames(monkeypatch)
+    executor = StandardRunExecutor(join_timeout=.05)
+    identity = _start(executor, _intent(tmp_path, raw, live=True), request_value=8846)
+    events = []
+
+    def noted(_values):
+        return sum('waiting for a read of its saved frames to finish' in record.getMessage()
+                   for record in caplog.records)
+    try:
+        _wait(executor, events, lambda values: _key(executor, identity, 'saved', 2) is not None or _terminal(values))
+        run, context = executor._exact_run(identity), executor.acquisition_context(identity)
+        first = _key(executor, identity, 'saved', 1)
+        assert run.display.project(first, 1, closed=run.closed, owner=context.hydration_owner,
+                                   commit_gate=context.commit_gate) is None
+        assert entered.wait(10.), 'the saved frame was never read'
+        _frame(raw, 'saved', 3, 'txt', 3.0)
+        _wait(executor, events, lambda values: noted(values) or _terminal(values), timeout=20.)
+        waiting = not _terminal(events)
+        executor.stop(identity)  # the read is still held
+        _wait(executor, events, _terminal)
+    finally:
+        release.set()
+        terminal = _stop(executor, identity, events)
+    assert waiting, f'the reopen gave up on the read: {_terminals(events)}'
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert noted(None) == 1, [record.getMessage() for record in caplog.records]
+    assert 'saved_int1d.nexus is waiting for a read of its saved frames to finish [LIVE]' in [
+        record.getMessage() for record in caplog.records]
+    assert _output(tmp_path, 'saved')[0] == (1, 2)
 
 
 def test_f2_a_reopened_scan_takes_no_read_before_its_writer_binds_it(tmp_path, monkeypatch):

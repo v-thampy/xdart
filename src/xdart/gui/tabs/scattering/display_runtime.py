@@ -28,6 +28,7 @@ from xdart.modules.frame_publication import (
     canonical_frame_source_identity,
     publication_from_frame_view,
 )
+from xdart.utils import log_events
 from xrd_tools.core import FrameRecord, FrameView
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
 from xrd_tools.core.invalid import (
@@ -89,6 +90,8 @@ from .hydration_transport import DetachedHydrationMutation, HydrationTransport, 
 logger = logging.getLogger(__name__)
 
 THUMBNAIL_MAX_ITEMS = 512
+#: How long the reopen of a closed output waits for a read of its saved frames before the log says why it waits.
+_READ_WAIT_NOTE_S = 2.0
 
 
 class DetectorHydrationOutcome(str, Enum):
@@ -361,7 +364,7 @@ class RunDisplayState:
         publications.set_thumbnail_evictable_probe(records.can_release_thumbnail)
         return records, publications
 
-    def begin_active_generation(self, owner: DisplayArtifact, *, timeout: float) -> None:
+    def begin_active_generation(self, owner: DisplayArtifact, *, cancelled: Callable[[], bool]) -> None:
         """Give one closed artifact fresh stores for a new writer generation.
 
         A Live Run can write again to an output it closed: one it showed from
@@ -376,6 +379,13 @@ class RunDisplayState:
         (``_reads_current_generation``), so none reads the file once its writer
         opens it (a read overlapping the writer failed that writer's close
         verification).  Viewer reads are outside this barrier.
+
+        The wait has no bound of its own: a read of saved frames over a slow
+        share can outlast any fixed one, and the writer cannot open the file
+        beneath it.  It ends with the read, with ``cancelled()`` (the Run is
+        stopping: ``RuntimeError("admission cancelled")``, which the loops treat
+        as Stop), or when the transport's read worker is gone (nothing reads
+        then); after ``_READ_WAIT_NOTE_S`` the log says why the scan waits.
         """
         with self._light_admission_lock, self._lock:
             if self.artifacts.get(str(owner.artifact)) is not owner:
@@ -405,13 +415,20 @@ class RunDisplayState:
                 self._full_pending = False
                 self._full_diagnostic = None
             self._residency.forget(*retired)
-        deadline = monotonic() + max(0.0, float(timeout))
+        waiting_since, noted = monotonic(), False
         while True:
             self._transport.dispatch_detached(self._transport.cancel_stores_detached(retired))
             if not self._transport.reads_stores(retired):
                 return
-            if monotonic() > deadline:
-                raise RuntimeError("a read of the closed display generation did not settle before its writer")
+            if cancelled():
+                raise RuntimeError("admission cancelled")
+            worker = self._transport.worker
+            if worker is None or not worker.is_alive():
+                return
+            if not noted and monotonic() - waiting_since > _READ_WAIT_NOTE_S:
+                noted = True
+                log_events.event(logger, logging.INFO, "%s is waiting for a read of its saved frames to finish [LIVE]",
+                                 Path(owner.artifact).name)
             sleep(0.005)
 
     def _reads_current_generation(self, request) -> bool:

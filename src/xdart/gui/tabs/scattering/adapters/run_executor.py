@@ -2040,7 +2040,7 @@ class StandardRunExecutor:
         if owner is not None and owner.hydration_closed:
             # An output this Run closed (shown from its saved record, or settled to admit another) grows again: its
             # writer starts a new display generation (Codex N-0243a1bb F2: the closed store could not take its allocation).
-            run.display.begin_active_generation(owner, timeout=self._join_timeout)
+            run.display.begin_active_generation(owner, cancelled=cancelled)
         if owner is None:
             if configuration.live_mode and run.display.artifacts:
                 run.display.admit_additional_partition()
