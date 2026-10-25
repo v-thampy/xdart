@@ -1396,6 +1396,7 @@ def prepare_append_preflight(
     in_place: bool = False,
     image_drift: bool = False,
     acquisition_proof: bool = True,
+    durable_fsync: bool = True,
 ) -> AppendPreflight:
     """Admit, lease and qualify one Append target under its file lock.
 
@@ -1433,6 +1434,7 @@ def prepare_append_preflight(
                 transaction_owner=transaction_owner,
                 target_owner=target_owner,
                 in_place=in_place,
+                durable_fsync=durable_fsync,
             )
             lease = transaction.acquire_lease(
                 admission=transaction.admission,

@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Directory and Live outputs now use buffered writes by default, avoiding
+  repeated disk flushes over a share. Checkpoint and lineage checks remain;
+  a power loss can leave the newest output incomplete and require Replace.
+  An explicitly enabled durable flush runs once per owned epoch checkpoint.
 - **Append adds new frames to the existing output in place:** xdart no longer
   copies a scan's output, or reads it in full, before and after adding the new
   frames; it opens the output and writes only the new frames. The same holds

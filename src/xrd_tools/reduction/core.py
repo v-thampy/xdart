@@ -1769,8 +1769,6 @@ class NexusSink:
         sink = cls(path, **sink_values)
         if sink.overwrite:
             raise ValueError("existing Append cannot overwrite its target")
-        if not sink.durable_fsync:
-            raise ValueError("diagnostic no-fsync is unavailable for Append")
         sink._existing_append_intent = intent
         sink._existing_append_prefix = committed_prefix
         sink._existing_append_pending = True
@@ -1941,9 +1939,10 @@ class NexusSink:
             raise TypeError("Nexus create_new must be an exact bool")
         if self.create_new and self.append_preflight is not None:
             raise ValueError("create-new output cannot consume an Append preflight")
-        if not self.durable_fsync and self.append_preflight is not None:
+        if (self.append_preflight is not None
+                and self.durable_fsync != self.append_preflight._transaction.durable_fsync):
             raise ValueError(
-                "diagnostic no-fsync is unavailable for Append"
+                "Append fsync policy differs from its admitted preflight"
             )
         if self.overwrite and self.append_preflight is not None:
             raise ValueError("Overwrite cannot consume an Append preflight")
@@ -2114,6 +2113,7 @@ class NexusSink:
                     file_lock=self.file_lock,
                     before_admit=self._require_current_append_target,
                     in_place=self._in_place_append,
+                    durable_fsync=self.durable_fsync,
                 )
             except AppendPreflightCleanupError as error:
                 self.append_preflight = error.owner

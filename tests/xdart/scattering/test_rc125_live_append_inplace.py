@@ -17,6 +17,13 @@ def test_first_live_append_epoch_keeps_prior_rows_without_backup_copy_or_hash(tm
     target = tmp_path / "processed" / "scan_int1d.nexus"
     before = os.stat(target)
     costs = _whole_output_costs(monkeypatch)  # transparent spies on actual transaction operations
+    flushes, real_fsync = [], os.fsync
+
+    def fsync(descriptor):
+        flushes.append(descriptor)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
     _frame(raw, "scan", 3, "txt", 3.0)
     executor = StandardRunExecutor()
     identity = _start(executor, _intent(tmp_path, raw, live=True), request_value=125102)
@@ -28,4 +35,5 @@ def test_first_live_append_epoch_keeps_prior_rows_without_backup_copy_or_hash(tm
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
     assert _output(tmp_path)[:2] == ((1, 2, 3), (1.0, 2.0, 3.0))
     assert costs == {"stage": 0, "copy": 0, "hash": 0}
+    assert flushes == []  # dynamic Live sinks default to buffered writes
     assert os.stat(target).st_ino == before.st_ino

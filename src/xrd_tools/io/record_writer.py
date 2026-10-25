@@ -2257,6 +2257,7 @@ class NexusRecordWriter:
         self._stream_close_attempt = None
         self._stream_terminal: StreamTerminal | None = None
         self._close_verification_descriptor = None
+        self._stream_close_flushed = False
         self._durable_mode_proofs: dict[
             tuple[str, int], _DurableModeProof
         ] = {}
@@ -3971,8 +3972,8 @@ class NexusRecordWriter:
                 # through a read-only descriptor bound to the verified file and size (as _seal_closed_stream_seed).
                 # The flush follows the transaction's own fsync choice (Codex N-0243a1bb F6).
                 flushed = binding.transaction.durable_fsync
-                if flushed:
-                    os.fsync(verification_descriptor)
+                # begin_stream_close licensed this fresh checkpoint, already
+                # flushed through the writer's handle under the same policy.
                 verification_stream.close()
                 verification_stream = None
                 os.close(verification_descriptor)
@@ -5879,7 +5880,10 @@ class NexusRecordWriter:
                     evidence_bytes=(
                         None if fast_evidence is None else fast_evidence[1]
                     ),
+                    flushed=binding.transaction.durable_fsync,
                 )
+            self._stream_close_flushed = (self._stream_close_attempt is not None
+                                          and binding.transaction.durable_fsync)
             self._stream_close_attempt = None
 
     def _resume_pool(self) -> None:
@@ -6515,6 +6519,7 @@ class NexusRecordWriter:
                     def seal_terminal() -> None:
                         terminal = binding.transaction.seal_stream_terminal(
                             binding.attempt, lease=binding.lease,
+                            flushed=self._stream_close_flushed,
                         )
                         if (
                             self._stream_terminal is not None

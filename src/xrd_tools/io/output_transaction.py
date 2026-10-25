@@ -3473,7 +3473,10 @@ class OutputTransaction:
         attempt: StreamAttempt,
         *,
         lease: TargetLease,
+        flushed: bool = False,
     ) -> StreamTerminal:
+        if type(flushed) is not bool:
+            raise TypeError("flushed must be an exact bool")
         with self._lock:
             self._require_stream(attempt, lease)
             if self._phase is not TransactionPhase.EXECUTING:
@@ -3489,7 +3492,10 @@ class OutputTransaction:
                 descriptor = os.open(self._admission.target, os.O_RDONLY)
                 opened = os.fstat(descriptor)
                 expected_stat = _descriptor_identity(opened)
-                if self._durable_fsync:
+                close_flushed = (flushed and self._stream_checkpoint_fresh
+                                 and self._stream_close_checkpoint is not None
+                                 and self._stream_close_checkpoint is self._stream_checkpoint_token)
+                if self._durable_fsync and not close_flushed:
                     _fsync_descriptor(descriptor, Path(self._admission.target))
                 flushed = os.fstat(descriptor)
                 # Two views of one descriptor: exact, ctime included.

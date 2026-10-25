@@ -429,7 +429,7 @@ def test_post_g2_output_diagnostics_are_exact_private_v2_values():
         RunIntent().freeze(),
         pipeline_v2=None,
     )
-    assert (defaults.save_xye, defaults.durable_fsync) == (True, True)
+    assert (defaults.save_xye, defaults.durable_fsync) == (True, False)
     assert defaults.explicit is False
 
     for value in (

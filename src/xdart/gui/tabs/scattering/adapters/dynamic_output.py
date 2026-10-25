@@ -118,7 +118,7 @@ class _PostG2PipelineV2Choice:
 @dataclass(frozen=True, slots=True)
 class _PostG2OutputDiagnosticsChoice:
     save_xye: bool = True
-    durable_fsync: bool = True
+    durable_fsync: bool = False
     explicit: bool = False
 
 
@@ -1255,6 +1255,7 @@ class DynamicOutputAdapter:
                     in_place=True,
                     image_drift=True,
                     acquisition_proof=not self.configuration.live_mode,
+                    durable_fsync=output_diagnostics.durable_fsync,
                 )
             except AppendPreflightCleanupError as error:
                 self._pending_preflights.append(error.owner)
@@ -1648,7 +1649,7 @@ class DynamicOutputAdapter:
                     (
                         "DURABLE"
                         if output_diagnostics.durable_fsync
-                        else "UNSAFE_SIMULATED"
+                        else "BUFFERED"
                     ),
                 )
             return session, True

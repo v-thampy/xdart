@@ -3968,7 +3968,7 @@ def test_post_g2_output_diagnostics_disable_only_xye_and_fsync(
         ] == [
             f"[RUN-OUTPUT-DIAGNOSTICS] save-xye={'on' if save_xye else 'off'} "
             f"durable-fsync={'on' if durable_fsync else 'off'} "
-            f"durability={'DURABLE' if durable_fsync else 'UNSAFE_SIMULATED'}"
+            f"durability={'DURABLE' if durable_fsync else 'BUFFERED'}"
         ]
     finally:
         executor.close(identity)
