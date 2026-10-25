@@ -1204,7 +1204,9 @@ def saved_energy_selection(target: str | Path) -> dict[str, Any] | None:
         with h5py.File(target, "r") as handle:
             node = handle.get("entry/reduction/config/energy_selection")
             value = None if node is None else json.loads(node[()])
-    except (OSError, ValueError, TypeError, KeyError):
+    except MemoryError:
+        raise
+    except Exception:  # an output this reader cannot read (h5py raises RuntimeError on some damage) saved none
         return None
     return value if type(value) is dict else None
 
