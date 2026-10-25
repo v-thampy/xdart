@@ -852,7 +852,7 @@ def test_an_xu_preview_registers_no_edit_of_its_own(qapp, tmp_path):
 def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qapp, tmp_path, backend):
     form = _form(tmp_path, backend)
     spec = Path(form.spec_path)
-    spec.write_text(spec.read_text().replace("17000.018", "12398.41984") +
+    spec.write_text(spec.read_text() +
         "\n#S 2 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
         "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n"
         "\n#S 3 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
@@ -919,7 +919,7 @@ def test_native_group_queue_continues_after_a_worker_failure(qapp, tmp_path, mon
     """A failed output is named in the Run summary and the next prepared output still runs through the owner."""
     form = _form(tmp_path, "multigeometry")
     spec = Path(form.spec_path)
-    spec.write_text(spec.read_text() +
+    spec.write_text(spec.read_text().replace("17000.018", "12398.41984") +
         "\n#S 2 ascan del 14 15 1 1\n#D today\n#P0 14 -10 12398.41984\n"
         "#N 3\n#L del  nu  energy\n14 -10 12398.41984\n15 -10 12398.41984\n")
     for source in Path(form.image_dir).glob("sample_scan1_*.raw"):
