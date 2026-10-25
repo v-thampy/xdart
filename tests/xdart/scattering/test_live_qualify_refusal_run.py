@@ -20,7 +20,7 @@ import pytest
 import xrd_tools.io.metadata as metadata
 import xrd_tools.sources.registry  # noqa: F401  # register built-in readers
 from tests.xdart.scattering._e2sd_support import write_poni
-from tests.xdart.scattering.test_live_metadata_race_run import _construct_strictly, _reregister_image_adapter
+from tests.xdart.scattering.test_live_metadata_race_run import _reregister_image_adapter
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _start
 from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
@@ -514,7 +514,7 @@ def test_q9_the_reason_arrives_with_unchanged_counts_and_survives_other_progress
     assert 'scan_0001.txt' in terminal[0][1], terminal
 
 
-def test_p1_a_change_inside_the_construct_recheck_is_still_rescued(tmp_path, monkeypatch):
+def test_p1_a_change_inside_an_expired_construct_recheck_is_still_rescued(tmp_path, monkeypatch):
     raw = tmp_path / 'raw'
     raw.mkdir()
     _frame(raw, 'scan', 1, 'txt', 1.0)
@@ -530,6 +530,15 @@ def test_p1_a_change_inside_the_construct_recheck_is_still_rescued(tmp_path, mon
         finally:
             state.construct = False
 
+    real_construct = StandardRunExecutor._construct
+
+    def expired_construct(executor, run, **kwargs):
+        if kwargs.get('item') is not None and len(kwargs['item'].source_stamp.members) == 2 and not calls:
+            from xrd_tools.sources.execution_graph import LivePrefixProof
+            time.sleep(LivePrefixProof.PERIOD_S)
+            _reregister_image_adapter(monkeypatch, raw / 'scan_0001.tif')
+        return real_construct(executor, run, **kwargs)
+
     def read(path, *args, **kwargs):
         if getattr(state, 'construct', False) and not fired and Path(path).name == 'scan_0002.txt':
             fired.append(Path(path).name)
@@ -538,7 +547,7 @@ def test_p1_a_change_inside_the_construct_recheck_is_still_rescued(tmp_path, mon
         return real_read(path, *args, **kwargs)
     monkeypatch.setattr(run_executor, 'validate_planned_source', validate)
     monkeypatch.setattr(metadata, 'read_txt_metadata', read)
-    _construct_strictly(monkeypatch, raw / 'scan_0001.tif', 2)
+    monkeypatch.setattr(StandardRunExecutor, '_construct', expired_construct)
     executor, identity = _run(tmp_path, raw, 'txt', 3200)
     events = []
     try:

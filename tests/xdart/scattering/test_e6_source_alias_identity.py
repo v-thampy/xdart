@@ -596,7 +596,11 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
         replacement = raw / "replacement.tif"
         replacement.symlink_to(hardlink)
         replacement.replace(selected)
-        deadline = time.monotonic() + 10.0
+        from xrd_tools.sources.directory_session import DirectoryIndexSession
+        # The drift sweep detects the alias, then admission requests a fresh
+        # listing before returning its revised attempt and settling the scan.
+        deadline = (time.monotonic() + source_graph.LivePrefixProof.PERIOD_S
+                    + DirectoryIndexSession.LISTING_AGE_S + 2 * executor_module._LIVE_DIRECTORY_POLL_S)
         events = []
         while time.monotonic() < deadline:
             events.extend(executor.drain_events())
@@ -618,7 +622,7 @@ def test_live_pending_identity_revalidates_before_equal_candidate_skip(
         # the scan is skipped and named; the Run goes on (maintainer, 2026-10-24)
         assert not [event for event in events if event.kind is StandardEventKind.FAILED]
         assert [reason for _target, kind, reason in executor._exact_run(identity).append_skips
-                if kind == "append"] == [
+                if kind == "scan"] == [
             "ValueError: same target cannot change its exact output lineage"]
         assert processed == [selected]
         assert executor.processed_live_revisions(identity) == original

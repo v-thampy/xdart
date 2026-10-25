@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Live rechecks settled input prefixes every ten seconds to reduce polling cost.
+  A change to an already processed input can remain unnoticed within that window.
 - Directory and Live outputs now use buffered writes by default, avoiding
   repeated disk flushes over a share. Checkpoint and lineage checks remain;
   a power loss can leave the newest output incomplete and require Replace.

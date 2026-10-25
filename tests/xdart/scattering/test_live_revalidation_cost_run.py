@@ -650,7 +650,7 @@ def test_r2b_every_settled_output_is_swept_for_drift_within_ten_seconds(tmp_path
 
 def _settle_reuse(executor, identity, work, events, frames, deadline):
     _settled(executor, identity, frames, deadline)
-    work.await_polls(time.monotonic(), 14, deadline)  # one full drift sweep and ten idle polls
+    work.await_polls(time.monotonic(), 14, deadline)  # establish quiet reuse; a full drift sweep may take ten seconds
     _settle(executor, events, .2)
 
 
@@ -825,7 +825,8 @@ def test_r3d_a_published_raw_member_change_keeps_its_exact_outcome(tmp_path, mon
             copy.write_bytes(member.read_bytes())
             member.unlink()
             member.symlink_to(copy)
-        _settle(executor, events, 1.5)
+        _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values),
+              execution_graph.LivePrefixProof.PERIOD_S + 2 * POLL)
         cars.frame(3)
         _wait(executor, events, lambda values: len(set(_labels(values, 'scan'))) >= 4 or _terminal(values)
               or _said(values, 'stopped growing'), 20.)
@@ -873,8 +874,10 @@ def test_r3f_a_discovery_or_registry_change_is_proved_strictly_again(tmp_path, m
             entry = source_adapters._ADAPTERS[owner.id]
             monkeypatch.setitem(source_adapters._ADAPTERS, owner.id, source_adapters._Entry(
                 replace(entry.adapter), entry.builtin, entry.seq + 100000))
-        _settle(executor, events, 1.5)
         member = str(raw / 'scan_0001.tif')
+        _wait(executor, events, lambda values: _terminal(values) or any(
+            detail == member for _at, detail in work.times('qualify_read', changed)),
+            execution_graph.LivePrefixProof.PERIOD_S + 2 * POLL)
         reproved = [detail for _at, detail in work.times('qualify_read', changed) if detail == member]
         cars.frame(3)
         _wait(executor, events, lambda values: len(set(_labels(values, 'scan'))) >= 4 or _terminal(values)
@@ -1163,6 +1166,9 @@ def test_r5b_spec_with_an_eiger_master_binds_each_frame_to_its_own_row(tmp_path,
 
     def rewritten(executor, run, **kwargs):  # the new row changes as its construction starts
         monkeypatch.setattr(StandardRunExecutor, '_construct', construct)
+        # Fresh in-poll proofs are reused. Exercise the real expired-proof
+        # fallback, which must still re-read a row changed before construction.
+        time.sleep(execution_graph.LivePrefixProof.PERIOD_S)
         _same_size_rewrite(spec.path, '0.4 104 ', '0.4 904 ')
         return construct(executor, run, **kwargs)
     executor = StandardRunExecutor(join_timeout=2.)
