@@ -1605,14 +1605,41 @@ class StandardRunExecutor:
         run.current_files_incremental = False
         run.pending_rebuild = None  # a refused construction reduced nothing again
 
-    def _skip_directory_scan(self, run: _StandardRun, target: Path, error: BaseException) -> None:
+    def _skip_directory_scan(self, run: _StandardRun, target: Path, error: BaseException | str) -> None:
         """One scan of a directory Run that could not be processed: skipped, named, and listed at the Run's end; the
         other scans still run (maintainer, 2026-10-24: "if something fails, a live run or a directory run shouldn't
-        stop. That scan/frame should be logged and skipped and the remaining scan processing should continue")."""
-        reason = f"{type(error).__name__}: {error}"
+        stop. That scan/frame should be logged and skipped and the remaining scan processing should continue").
+        ``error`` may already be its reason."""
+        reason = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
         run.append_skips.append((str(target), reason))
         log_events.event(logger, logging.WARNING, "%s skipped: it could not be processed; frames already saved are "
                          "kept, and the other scans continue. Details: %s [SCAN-SKIPPED]", Path(target).name, reason)
+
+    def _skip_failed_directory_scan(self, run: _StandardRun, target: Path, error: BaseException, *,
+                                    constructed: bool) -> None:
+        """A directory Run's scan whose construction refused (``constructed`` False) or whose image could not be read
+        while it was reduced (a SourceReadError): its output settled as it stands, its unfinished frames out of the
+        totals, its files skipped, the scan named; the Run goes on."""
+        claimed = run.current_file_total
+        if constructed:
+            with _run_effect(run):
+                self._settle_failed_scan(run, target)
+        else:
+            planned = run.current_total
+            with _run_effect(run):
+                self._retire_current_target(run, target)
+            self._abandon_construction(run)
+            run.total -= planned
+        run.files_skipped += claimed
+        self._skip_directory_scan(run, target, error)
+        self._events.put(StandardRunEvent(
+            run.identity,
+            StandardEventKind.DISCOVERY,
+            completed=run.completed,
+            total=run.total,
+            detail=_directory_status(run),
+            **_directory_event_fields(run),
+        ))
 
     def _skip_live_append(
         self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused | None, *, constructed: bool,
@@ -2270,6 +2297,14 @@ class StandardRunExecutor:
         )
         if run.files_discovered:
             run.files_skipped = unowned_files
+        for target, kind, reason in getattr(receipt, "skipped_outputs", ()):  # scans its admission skipped (GI)
+            if kind == "scan":
+                self._skip_directory_scan(run, Path(target), reason)
+                continue
+            run.append_skips.append((target, reason))
+            log_events.event(
+                logger, logging.WARNING, "%s skipped: it cannot be extended, so its existing results are left "
+                "unchanged (Replace reprocesses it). Details: %s [APPEND-SKIPPED]", Path(target).name, reason)
         self._events.put(StandardRunEvent(
             run.identity,
             StandardEventKind.DISCOVERY,
@@ -2299,9 +2334,21 @@ class StandardRunExecutor:
                 bool(run.current_file_total)
                 and item.source_spec.kind is SourceKind.TIFF_SERIES
             )
-            self._construct(run, item=item, labels=decision.labels, decision=decision)
+            try:
+                self._construct(run, item=item, labels=decision.labels, decision=decision)
+            except ValueError as error:  # a directory Run's scan (GI admits them all first): skipped, the rest run
+                if not run.files_discovered or isinstance(error, SourceRevisionChanged):  # its admitted files changed
+                    raise
+                self._skip_failed_directory_scan(run, item.target, error, constructed=False)
+                continue
             run.completed += run.current_completed
-            stopped = self._execute_current(run, construct=False) or stopped
+            try:
+                stopped = self._execute_current(run, construct=False) or stopped
+            except SourceReadError as error:
+                if not run.files_discovered:
+                    raise
+                self._skip_failed_directory_scan(run, item.target, error, constructed=True)
+                continue
             if run.current_files_incremental:
                 run.files_processed += min(
                     run.current_file_total,
@@ -2949,21 +2996,7 @@ class StandardRunExecutor:
                     decision=decision,
                 )
             except ValueError as error:  # (an OSError: its output cannot be written, and the Run fails)
-                planned, claimed = run.current_total, run.current_file_total
-                with _run_effect(run):
-                    self._retire_current_target(run, item.target)
-                self._abandon_construction(run)
-                run.total -= planned
-                run.files_skipped += claimed
-                self._skip_directory_scan(run, item.target, error)
-                self._events.put(StandardRunEvent(
-                    run.identity,
-                    StandardEventKind.DISCOVERY,
-                    completed=run.completed,
-                    total=run.total,
-                    detail=_directory_status(run),
-                    **_directory_event_fields(run),
-                ))
+                self._skip_failed_directory_scan(run, item.target, error, constructed=False)
                 continue
             constructed = monotonic()
             run.completed += run.current_completed
@@ -2981,19 +3014,7 @@ class StandardRunExecutor:
             try:
                 stopped = self._execute_current(run, construct=False) or stopped
             except SourceReadError as error:  # one scan's own image could not be read: it is skipped, the rest runs
-                claimed = run.current_file_total
-                with _run_effect(run):
-                    self._settle_failed_scan(run, item.target)
-                run.files_skipped += claimed
-                self._skip_directory_scan(run, item.target, error)
-                self._events.put(StandardRunEvent(
-                    run.identity,
-                    StandardEventKind.DISCOVERY,
-                    completed=run.completed,
-                    total=run.total,
-                    detail=_directory_status(run),
-                    **_directory_event_fields(run),
-                ))
+                self._skip_failed_directory_scan(run, item.target, error, constructed=True)
                 continue
             if run.pending_rebuild is not None:  # said at the end only when the scan was reduced again whole
                 if run.current_completed >= run.current_total:

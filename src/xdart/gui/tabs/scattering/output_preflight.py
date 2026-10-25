@@ -529,6 +529,9 @@ def prepare_output(
     assets = _load_scientific_assets(intent, cancelled=cancelled)
     candidate = OutputCandidate.from_start_capture(capture, assets)
     source, choices, deferred = candidate.source, None, None
+    # A directory Run's scans skipped at admission, each (target, "scan" or "append", reason), when this admission
+    # skips one rather than failing (per_scan).
+    per_scan, skipped = False, []
     automatic = intent.threshold.mask_saturation and not intent.threshold.apply_threshold
     saturation, signed = None, False
     directory_discovered_paths: tuple[Path, ...] = ()
@@ -596,8 +599,24 @@ def prepare_output(
                     raise RuntimeError("admission cancelled")
                 observation = session.observe(refresh=False)
             plan = RunCandidatePlan.from_observation(observation)
-            items = _directory_items(candidate, plan, cancelled=cancelled)
-            _validate_exact_tiff_gi_motor(intent, items)
+            # A GI directory Run admits every scan before it starts: one that cannot be admitted (a GI motor missing
+            # in a frame, a qualification error) is skipped and named, and the others run (maintainer, 2026-10-24:
+            # "a live run or a directory run shouldn't stop").
+            per_scan, collected = True, []
+            for group, name in _output_groups(candidate, plan):
+                try:
+                    group_items = _directory_items(candidate, RunCandidatePlan(
+                        plan.generation, group, plan.root, plan.recursive, plan.name_filter,
+                        tuple(plan.descriptor_for(value) for value in group)), cancelled=cancelled)
+                    _validate_exact_tiff_gi_motor(intent, group_items)
+                except (ValueError, OSError) as error:
+                    if isinstance(error, (SourceRevisionChanged, PointImagesRequired, InterruptedError)):
+                        raise
+                    skipped.append((str(_directory_target(candidate, plan, group[0], name)), "scan",
+                                    f"{type(error).__name__}: {error}"))
+                    continue
+                collected.extend(group_items)
+            items = tuple(collected)
             choices = _motor_choices(items)
             candidate = OutputCandidate.from_start_capture(
                 capture, assets, choices
@@ -632,8 +651,16 @@ def prepare_output(
         )
         if targets:
             targets_owner(targets)
-    outputs = tuple(inspect_output(item, candidate) for item in items)
-    if cancelled() or not outputs and deferred is None:
+    outputs = []
+    for item in items:
+        try:
+            outputs.append(inspect_output(item, candidate))
+        except AppendRefused as error:  # that scan cannot be extended: its results are left as they are
+            if not per_scan:
+                raise
+            skipped.append((str(item.target), "append", str(error)))
+    outputs = tuple(outputs)
+    if cancelled() or not outputs and deferred is None and not skipped:
         raise RuntimeError(
             "admission cancelled" if cancelled()
             else "source has no READY candidates"
@@ -645,6 +672,7 @@ def prepare_output(
         directory_discovered_file_count=len(directory_discovered_paths),
         directory_discovered_paths=directory_discovered_paths,
         saturation=saturation,
+        skipped_outputs=tuple(skipped),
     )
 
 
@@ -1816,11 +1844,22 @@ def validate_admitted_receipt(
         if is_cancelled():
             raise RuntimeError("admission cancelled")
         observation = session.observe(refresh=False)
-    current_items = _directory_items(
-        receipt.candidate,
-        RunCandidatePlan.from_observation(observation),
-        cancelled=is_cancelled,
-    )
+    plan = RunCandidatePlan.from_observation(observation)
+    skipped = {target for target, _kind, _reason in receipt.skipped_outputs}
+    if skipped:  # a GI directory Run's admission skipped these scans: they are left out again, the others checked
+        collected = []
+        for group, name in _output_groups(receipt.candidate, plan):
+            if str(_directory_target(receipt.candidate, plan, group[0], name)) not in skipped:
+                collected.extend(_directory_items(receipt.candidate, RunCandidatePlan(
+                    plan.generation, group, plan.root, plan.recursive, plan.name_filter,
+                    tuple(plan.descriptor_for(value) for value in group)), cancelled=is_cancelled))
+        current_items = tuple(collected)
+    else:
+        current_items = _directory_items(
+            receipt.candidate,
+            plan,
+            cancelled=is_cancelled,
+        )
     accepted = _groups(output.item for output in outputs)
     current = _groups(current_items)
     _validate_motor_knowledge(receipt, current_items)

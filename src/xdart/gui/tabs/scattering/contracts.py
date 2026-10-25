@@ -309,6 +309,10 @@ class AdmissionReceipt:
     #: The resolved automatic ceiling admission bound into the candidate
     #: (decision 39); the run's own freeze takes the same value.
     saturation: int | None = None
+    #: A directory Run's scans skipped at admission, each (target, "scan" or
+    #: "append", reason): the Run lists them and goes on (GI admits every scan
+    #: before it starts).
+    skipped_outputs: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         from .output_preflight import (
@@ -345,6 +349,11 @@ class AdmissionReceipt:
                       and all(type(value) is str for value in choices))
                  and (self.saturation is None or type(self.saturation) is int
                       and self.saturation > 0)
+                 and type(self.skipped_outputs) is tuple
+                 and all(type(value) is tuple and len(value) == 3
+                         and all(type(part) is str for part in value)
+                         and value[1] in ("scan", "append")
+                         for value in self.skipped_outputs)
                  and self.saturation == (
                      None if self.candidate._configuration is None
                      else self.candidate._configuration.threshold.saturation)

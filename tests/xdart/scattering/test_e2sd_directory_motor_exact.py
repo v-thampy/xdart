@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from threading import Event, Thread
 import os
+import re
 import subprocess
 import sys
 import time
@@ -2337,17 +2338,18 @@ def test_mixed_tiff_metadata_rejects_missing_selected_gi_motor_but_manual_is_exa
 
     sessions: list[object] = []
     try:
-        with pytest.raises(
-            ValueError,
-            match=(
-                "GI metadata motor 'th'.*finite value in every admitted TIFF"
-            ),
-        ):
-            prepare_output(
-                _tiff_directory_start(tmp_path),
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-            )
+        # Its scan is skipped and named, no longer the whole Run (maintainer, 2026-10-24: "a live run or a directory
+        # run shouldn't stop").
+        receipt = prepare_output(
+            _tiff_directory_start(tmp_path),
+            cancelled=lambda: False,
+            session_owner=sessions.append,
+        )
+        assert receipt.outputs == ()
+        [(_target, kind, reason)] = receipt.skipped_outputs
+        assert kind == "scan" and re.search(
+            "GI metadata motor 'th'.*finite value in every admitted TIFF", reason,
+        ), receipt.skipped_outputs
     finally:
         for session in sessions:
             session.close()

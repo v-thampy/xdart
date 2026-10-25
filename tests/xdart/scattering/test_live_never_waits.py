@@ -29,7 +29,7 @@ from xdart.gui.tabs.scattering import output_preflight
 from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xrd_tools.reduction.core import NexusSink
-from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.session.run_configuration import GIIntent, RunIntent
 from xrd_tools.sources.image import TiffSeriesSource
 from xrd_tools.sources.selection import DirectorySourceSpec
 
@@ -427,6 +427,42 @@ def test_an_output_write_failure_while_frames_are_reduced_still_fails_the_run(tm
         terminal = [(event.kind.name, event.detail) for event in events if event.kind in _TERMINAL]
     assert [kind for kind, _detail in terminal] == ["FAILED"], terminal
     assert "No space left on device (injected)" in terminal[0][1], terminal
+
+
+def _gi_frame(raw, stem, index, i0, th=None):
+    """One GI frame: its .txt (with the incidence motor ``th`` unless None), then its image."""
+    motors = "energy = 16" if th is None else f"th = {th:.2f}, energy = 16"
+    raw.joinpath(f"{stem}_{index:04d}.txt").write_text(
+        f"# Counters\nI0 = {i0}\n# Motors\n{motors}\nUser: energy, time: Mon Jan 15 10:30:00 2024  # Temp\n")
+    _frame(raw, stem, index, "txt", i0, sidecar=False)
+
+
+def test_a_gi_directory_scan_missing_its_motor_is_skipped_and_the_other_scans_run(tmp_path, caplog):
+    """A GI directory Run admits every scan before it starts: one whose frame lacks the incidence motor is skipped and
+    named (it failed the whole Run before), the others run."""
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _gi_frame(raw, "bad", 1, 1.0, th=0.1)
+    _gi_frame(raw, "bad", 2, 2.0)  # no th
+    _gi_frame(raw, "good", 1, 3.0, th=0.1)
+    _gi_frame(raw, "good", 2, 4.0, th=0.2)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    intent = RunIntent(
+        source_spec=DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format="txt"), poni_file=str(poni),
+        project_root=str(raw), save_path=str(tmp_path / "processed"), output_mode="Append",
+        processing_mode="Int 1D", live_mode=False, max_cores=1, bai_1d_args={"npt": 8, "method": "numpy"},
+        gi=GIIntent(enabled=True, incidence_motor="th"))
+    executor, identity, events = _run_to_terminal(intent, request_value=8921)
+    executor.close(identity)
+    terminals = [event for event in events if event.kind in _TERMINAL]
+    assert [event.kind.name for event in terminals] == ["FINISHED"], terminals
+    assert any("bad_gi_int1d.nexus" in warning and "GI metadata motor 'th'" in warning
+               for warning in terminals[0].warnings), terminals[0].warnings
+    assert any(message.startswith("bad_gi_int1d.nexus skipped: it could not be processed") for message in
+               _messages(caplog))
+    assert _output(tmp_path, "bad_gi") is None and _output(tmp_path, "good_gi")[0] == (1, 2)
 
 
 @pytest.mark.parametrize("stage", ["admission", "construction"])
