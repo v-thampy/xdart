@@ -214,3 +214,13 @@ def test_the_save_path_follows_the_project_folder_however_its_default_is_spelled
     assert candidate.save_path == str(new / "xdart_processed_data")
     chosen = RunIntentStore(RunIntent(project_root=str(old), save_path=str(tmp_path / "elsewhere")))
     assert reduce_control_edit(chosen.snapshot(), PROJECT_ROOT, str(new)).save_path == str(tmp_path / "elsewhere")
+
+
+def test_output_path_equivalence_normalizes_its_folder_but_keeps_its_filename(tmp_path):
+    from xdart.gui.tabs.scattering.controls_editing import _same_output_path
+
+    target = tmp_path / "outputs" / "result_rsm.nexus"
+    equivalent = tmp_path / "other" / ".." / "outputs" / "result_rsm.nexus"
+    assert _same_output_path(str(equivalent), str(target))
+    assert _same_output_path("outputs/result_rsm.nexus", str(target), root=str(tmp_path))
+    assert not _same_output_path(str(target), str(target.with_name("custom_rsm.nexus")))

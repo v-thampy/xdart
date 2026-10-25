@@ -3,6 +3,7 @@ branch while codex reviews and I test". The RSM dialog's workflow in the main wo
 Controls panel, run bar and scientific panes, over the one RSM v2 owner."""
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import threading
 import time
@@ -284,6 +285,32 @@ def test_rsm_source_counts_match_stitch_and_follow_the_selected_scan(qapp, tmp_p
         page.resolve_source()
         assert "2 frames" in page.controls.source_card.status.text()
         assert "2 frames" in page.run_bar.readinessLabel.full_text()
+    finally:
+        _close(page, qapp)
+
+
+def test_suggested_output_comparison_normalizes_folder_spelling_and_keeps_custom_name(qapp, tmp_path):
+    from xdart.gui.tabs.rsm.page import suggested_family
+
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        suggested = Path(page._value("output_path"))
+        alias = str(suggested.parent / "temporary" / ".." / suggested.name)
+        page._fields["output_path"] = replace(page._fields["output_path"], value=alias)
+        page._rows["output_path"].apply_field(page._fields["output_path"])
+        page._output_suggested = True
+        assert page._apply_suggestion() is False
+        assert page._value("output_path") == alias
+        expected_family = suggested_family(tmp_path, page._group_members())
+        assert page.build_form().output_family == expected_family
+
+        custom = str(suggested.with_name("custom_rsm.nexus"))
+        page.set_field("output_path", custom)
+        assert not page._output_suggested
+        assert page.build_form().output_family is None
+        assert page._value("output_path") == custom
     finally:
         _close(page, qapp)
 

@@ -608,6 +608,22 @@ def _same_folder(left: str, right: str) -> bool:
     return spelled(left) == spelled(right)
 
 
+def _same_output_path(left: str, right: str, *, root: str = "") -> bool:
+    """One output file however its folder is spelled, but only when its filename also matches."""
+    def parts(value: str) -> tuple[str, str]:
+        spelling = os.path.expanduser(str(value).strip())
+        if root and spelling and not os.path.isabs(spelling):
+            spelling = os.path.join(root, spelling)
+        spelling = os.path.normpath(spelling)
+        return os.path.dirname(spelling), os.path.basename(spelling)
+
+    if not str(left).strip() or not str(right).strip():
+        return False
+    left_folder, left_name = parts(left)
+    right_folder, right_name = parts(right)
+    return _same_folder(left_folder, right_folder) and os.path.normcase(left_name) == os.path.normcase(right_name)
+
+
 def _reduce_background_edit(
     snapshot: RunIntentSnapshot, path: tuple[str, ...], value: object,
 ) -> EditResult:

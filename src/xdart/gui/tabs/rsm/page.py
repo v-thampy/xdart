@@ -47,6 +47,7 @@ from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindo
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView, ResultDirectoryBrowser
 from xdart.gui.tabs.scattering.context_projection import apply_keyed_presentation_background
+from xdart.gui.tabs.scattering.controls_editing import _same_output_path
 from xdart.gui.tabs.scattering.operation_values import OperationContextStamp
 from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
@@ -1322,7 +1323,7 @@ class RSMPage(QtWidgets.QWidget):
         if not (self._output_suggested and project):
             return False
         suggestion = suggested_output(project, self._suggestion_members(Path(project).expanduser()))
-        if suggestion == self._value("output_path"):
+        if _same_output_path(str(self._value("output_path")), suggestion, root=project):
             return False
         self._fields["output_path"] = replace(self._fields["output_path"], value=suggestion)
         self._rows["output_path"].apply_field(self._fields["output_path"])
@@ -1396,7 +1397,7 @@ class RSMPage(QtWidgets.QWidget):
         output = self._inside(project, str(self._value("output_path")).strip(), "output path")
         # the suggested output is its family's stable slot, and the result records that family
         family = (suggested_family(project, members)
-                  if str(output) == suggested_output(project, members) else None)
+                  if _same_output_path(str(output), suggested_output(project, members), root=str(project)) else None)
         return self._form_for(project, members, output, family)
 
     def build_forms(self):
