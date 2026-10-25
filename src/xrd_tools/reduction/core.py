@@ -5643,7 +5643,7 @@ class WarmIntegrators:
             if family not in self._sizes:
                 return False
             self._lent[family] = self._lent.get(family, 0) + max(1, int(workers))
-            self._trim()
+            self._trim(spare=True)
             return True
 
     def release_reservation(self, family: Any, workers: int) -> None:

@@ -244,20 +244,19 @@ def test_failed_finish_does_not_retain_worker_integrators(monkeypatch, sink):
     assert held and all(reference() is None for reference in held)
 
 
-def test_unsupported_series_reserves_known_family_before_building(monkeypatch):
+def test_unsupported_series_releases_idle_tables_before_building(monkeypatch):
     reuse = WarmIntegrators(1)
     _reduce(_scan("first"), _plan(), reuse=reuse)
     assert len(reuse) == 1
     real = core._ReductionIntegratorProvider._new_standard
 
     def observe(self):
-        assert len(reuse) == 1, "the known family has room for its idle table"
-        assert sum(reuse._lent.values()) == 1, "the active unkeyed worker must be reserved first"
+        assert len(reuse) == 0, "unsupported series retained the previous warm set"
         return real(self)
 
     monkeypatch.setattr(core._ReductionIntegratorProvider, "_new_standard", observe)
     result = _reduce(_scan("flat", flat=True), _plan(), reuse=reuse)
-    assert not result.failed and len(reuse) == 1 and not reuse._lent
+    assert not result.failed and len(reuse) == 0
 
 
 def test_a_run_end_keeps_the_integrators_under_each_roles_latest_key():
