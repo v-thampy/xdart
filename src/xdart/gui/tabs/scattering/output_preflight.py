@@ -1478,7 +1478,7 @@ def live_readiness_debug(event: str, **fields: object) -> None:
     """``XDART_LIVE_READINESS_DEBUG=1`` (Config ▸ Debug ▸ Debug Logging): one ``key=value`` line per Live readiness or
     admission decision (AGENTS.md rule 1, Codex N-f8157cee: a readiness bug that survived two fixes)."""
     if os.environ.get("XDART_LIVE_READINESS_DEBUG") == "1":
-        _LOG.warning("%s %s", event, " ".join(f"{key}={value!r}" for key, value in fields.items()))
+        _LOG.debug("%s %s", event, " ".join(f"{key}={value!r}" for key, value in fields.items()))
 
 
 def materialize_live_directory_group(

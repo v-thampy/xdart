@@ -140,8 +140,7 @@ class LogPanel(QtWidgets.QFrame):
         self.warnings = QtWidgets.QPushButton("Warnings")
         self.warnings.setObjectName("controlsActionButton")
         self.warnings.setCheckable(True)
-        self.warnings.setToolTip("Show only the warnings, errors and skipped scans or frames, with each Run's start and "
-                                 "end; press again for the whole log.")
+        self._label_warnings()
         self.warnings.toggled.connect(self._filter)
         self.latest = QtWidgets.QPushButton("Latest")
         self.latest.setObjectName("controlsActionButton")
@@ -203,7 +202,21 @@ class LogPanel(QtWidgets.QFrame):
             self.toggle.setChecked(True)  # pressed with the log hidden: show it
         lines, self._next = self._feed.held(flagged=flagged)
         self.pane.set_text("\n".join(lines))
+        self._label_warnings()
         self.show_latest()
+
+    def _label_warnings(self) -> None:
+        """Warnings names what pressing it shows: Full Log while the pane holds only the warnings (maintainer,
+        2026-10-25: "it just says Warnings and it's not clear what you're looking at"), else the warnings so far."""
+        count = self._feed.warnings
+        if self.warnings.isChecked():
+            self.warnings.setText("Full Log")
+            self.warnings.setToolTip(f"The log shows only the warnings, errors and skipped scans or frames ({count} so "
+                                     "far), with each Run's start and end. Press to show every message again.")
+        else:
+            self.warnings.setText(f"Warnings ({count})" if count else "Warnings")
+            self.warnings.setToolTip("Show only the warnings, errors and skipped scans or frames, with each Run's "
+                                     "start and end; the button then reads Full Log, to show every message again.")
 
     def eventFilter(self, watched, event) -> bool:
         # the controls' own layout changed (a page filling in after the log is shown at start, a card opening or
@@ -275,8 +288,7 @@ class LogPanel(QtWidgets.QFrame):
             self._show_waiting(self._feed.end - self._next, True)
             return
         flagged = self.warnings.isChecked()
-        count = self._feed.warnings
-        self.warnings.setText(f"Warnings ({count})" if count else "Warnings")
+        self._label_warnings()
         lines, end, missed = self._feed.since(self._next, flagged=flagged)
         if missed or len(lines) > _APPEND_LINES:
             lines, end = self._feed.held(flagged=flagged)

@@ -587,8 +587,8 @@ def _bounded_metadata_snapshot(
         )
     if len(payload) > limit:
         if os.environ.get("XDART_METADATA_DEBUG") == "1":
-            logger.warning("metadata_snapshot_refused path=%s limit_bytes=%d",
-                           path, limit, stack_info=True)
+            logger.debug("metadata_snapshot_refused path=%s limit_bytes=%d",
+                         path, limit, stack_info=True)
         raise MetadataInputTooLarge(f"metadata input exceeds {limit} bytes: {path}")
     if _with_revision:
         # A descriptor view: comparable with the pathname revisions above

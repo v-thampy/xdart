@@ -2866,7 +2866,7 @@ class ScientificView(QtWidgets.QFrame):
     ) -> None:
         browse_snapshot = state.browse_trace_snapshot
         if os.environ.get("XDART_VIEWER_DEBUG") == "1":
-            logging.getLogger(__name__).warning(
+            logging.getLogger(__name__).debug(
                 "browse_comparison artifact=%r current_artifact=%r history_owner=%r snapshot=%s",
                 state.browse_artifact, getattr(navigation.current, "artifact", None),
                 self._browse_comparison_scope is not None,

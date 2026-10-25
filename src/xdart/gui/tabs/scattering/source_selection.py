@@ -496,7 +496,7 @@ class SourceSelectionOwner:
         intent = snapshot.thaw()
         motor = intent.gi.incidence_motor
         if os.environ.get("XDART_DEBUG_PRERUN") == "1":
-            logging.getLogger(__name__).warning(
+            logging.getLogger(__name__).debug(
                 "prerun.auto_capture revision=%s enabled=%s motor=%r marker=%r source=%r",
                 snapshot.revision, intent.gi.enabled, motor,
                 self._automatic_motor, intent.source_spec,
@@ -520,7 +520,7 @@ class SourceSelectionOwner:
     ) -> None:
         source = snapshot.thaw().source_spec
         if os.environ.get("XDART_DEBUG_PRERUN") == "1":
-            logging.getLogger(__name__).warning(
+            logging.getLogger(__name__).debug(
                 "prerun.motor_edit revision=%s automatic=%s value=%r source=%r",
                 snapshot.revision, automatic, value, source,
             )

@@ -548,6 +548,30 @@ def test_debug_logging_and_the_log_panel_are_independent(qapp, monkeypatch, tmp_
             handler.close()
 
 
+def test_debug_logging_diagnostics_are_debug_lines_never_warnings(qapp, monkeypatch, root_feed):
+    """Maintainer, 2026-10-25: "why do i have so many warning?" Config ▸ Debug ▸ Debug Logging's own diagnostics (a Live
+    readiness decision here) are DEBUG records: listed while it is on, never counted in Warnings, gone when off."""
+    from xdart import _gui_main
+    from xdart.gui.tabs.scattering.output_preflight import live_readiness_debug
+    for flag in _gui_main.DEBUG_LOGGING_FLAGS:
+        monkeypatch.delenv(flag, raising=False)
+    for name in ("xdart", "xrd_tools"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.getLogger(name).level)
+    monkeypatch.setattr(root_feed, "level", root_feed.level)
+    monkeypatch.setattr(_gui_main, "_FILE_LOG_HANDLER", None)
+    start, warnings = root_feed.end, root_feed.warnings
+    try:
+        _gui_main.set_debug_logging(True)
+        live_readiness_debug("live_readiness", target="scan_int2d.nexus", decision="admit")
+    finally:
+        _gui_main.set_debug_logging(False)
+    live_readiness_debug("live_readiness", target="after_int2d.nexus", decision="admit")
+    lines = [line for line in root_feed.since(start)[0] if "live_readiness" in line]
+    assert len(lines) == 1 and "DEBUG" in lines[0] and "scan_int2d.nexus" in lines[0], lines
+    # Only the two mode notices are warnings.
+    assert root_feed.warnings - warnings == 2
+
+
 def test_warnings_shows_only_warnings_errors_and_each_runs_start_and_end(qapp):
     """Maintainer, 2026-10-24: "have another button next to the show log button ... show errors/warnings or maybe
     "show skipped"" (his pick "Filter the log pane"): Warnings filters the same pane and counts the warnings; pressed
@@ -570,6 +594,9 @@ def test_warnings_shows_only_warnings_errors_and_each_runs_start_and_end(qapp):
         assert "routine" in panel.pane.toPlainText() and panel.warnings.text() == "Warnings (2)"
         assert panel.warnings.isCheckable() and panel.warnings.toolTip() and panel.warnings.parent() is panel.bar
         panel.warnings.click()
+        # Pressed, it names what pressing it again shows (maintainer, 2026-10-25: "it just says Warnings and it's not
+        # clear what you're looking at").
+        assert panel.warnings.text() == "Full Log" and "show every message again" in panel.warnings.toolTip()
         shown = panel.pane.toPlainText()
         assert "routine" not in shown and "New Scan" not in shown, shown
         assert all(text in shown for text in ("New Run", "stops growing", "a failure", "End of Run")), shown
@@ -577,9 +604,11 @@ def test_warnings_shows_only_warnings_errors_and_each_runs_start_and_end(qapp):
         log.warning("later warning")
         panel.refresh()  # new lines follow the filter
         shown = panel.pane.toPlainText()
-        assert "later warning" in shown and "later routine" not in shown and panel.warnings.text() == "Warnings (3)"
+        assert "later warning" in shown and "later routine" not in shown and panel.warnings.text() == "Full Log"
+        assert "(3 so far)" in panel.warnings.toolTip()
         panel.warnings.click()
-        assert "later routine" in panel.pane.toPlainText()
+        assert "later routine" in panel.pane.toPlainText() and panel.warnings.text() == "Warnings (3)"
+        assert "reads Full Log" in panel.warnings.toolTip()
         panel.toggle.setChecked(False)  # hidden; Warnings shows it, filtered
         panel.warnings.click()
         assert panel.toggle.isChecked() and panel.isVisibleTo(panel.split) and "routine" not in panel.pane.toPlainText()
