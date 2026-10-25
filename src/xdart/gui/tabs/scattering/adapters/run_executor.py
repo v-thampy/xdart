@@ -496,7 +496,7 @@ class _StandardRun:
     files_processed: int = 0
     files_skipped: int = 0
     # Scans a directory Append skipped instead of failing the run: (output, reason).
-    append_skips: list[tuple[str, str]] = field(default_factory=list)
+    append_skips: list[tuple[str, str, str]] = field(default_factory=list)
     # Scans an Append reduced again whole, their processed images changed on disk: (output, reason), once each
     # finished; the current output's while it runs.
     append_rebuilds: list[tuple[str, str]] = field(default_factory=list)
@@ -1631,7 +1631,7 @@ class StandardRunExecutor:
         stop. That scan/frame should be logged and skipped and the remaining scan processing should continue").
         ``error`` may already be its reason."""
         reason = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
-        run.append_skips.append((str(target), reason))
+        run.append_skips.append((str(target), "scan", reason))
         log_events.event(logger, logging.WARNING, "%s skipped: it could not be processed; frames already saved are "
                          "kept, and the other scans continue. Details: %s [SCAN-SKIPPED]", Path(target).name, reason)
 
@@ -1688,7 +1688,7 @@ class StandardRunExecutor:
         if constructed:
             self._abandon_construction(run)
         reason = detach_exception(error, "append").message if reason is None else reason
-        run.append_skips.append((str(target), reason))
+        run.append_skips.append((str(target), "append", reason))
         run.live_blocked[target_key] = (
             f"{Path(target).name} stopped growing: "
             f"{'its energy span widened' if widened else 'it could not be processed' if failed else 'its Append was refused'}"
@@ -2378,7 +2378,7 @@ class StandardRunExecutor:
             if kind == "scan":
                 self._skip_directory_scan(run, Path(target), reason)
                 continue
-            run.append_skips.append((target, reason))
+            run.append_skips.append((target, "append", reason))
             log_events.event(
                 logger, logging.WARNING, "%s skipped: it cannot be extended, so its existing results are left "
                 "unchanged (Replace reprocesses it). Details: %s [APPEND-SKIPPED]", Path(target).name, reason)
@@ -3047,7 +3047,7 @@ class StandardRunExecutor:
                 # directory still runs and the end of the run lists it
                 # (maintainer, 2026-10-23). Nothing was constructed for it.
                 reason = detach_exception(error, "append").message
-                run.append_skips.append((str(entry.target), reason))
+                run.append_skips.append((str(entry.target), "append", reason))
                 log_events.event(
                     logger, logging.WARNING, "%s skipped: it cannot be extended, so its existing results are left "
                     "unchanged (Replace reprocesses it). Details: %s [APPEND-SKIPPED]", Path(entry.target).name,
@@ -3997,8 +3997,9 @@ class StandardRunExecutor:
                 return
             run.terminal_emitted = True
         warnings = tuple(
-            f"Append skipped {Path(output).name}: {reason}"
-            for output, reason in run.append_skips
+            f"Skipped {Path(output).name}: {reason}" if kind == "scan"
+            else f"Append skipped {Path(output).name}: {reason}"
+            for output, kind, reason in run.append_skips
         )
         rebuilds = list(run.append_rebuilds)
         if run.pending_rebuild is not None and kind is StandardEventKind.FINISHED:  # a one-scan Run's output

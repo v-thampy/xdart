@@ -9,9 +9,12 @@ import time
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
+from tests.xdart.scattering._e2sd_support import write_poni
+from tests.xdart.scattering.test_live_qualify_refusal_run import _frame
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
-from xrd_tools.sources.selection import image_series_spec
+from xrd_tools.sources.image import TiffSeriesSource
+from xrd_tools.sources.selection import DirectorySourceSpec, image_series_spec
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
@@ -112,6 +115,58 @@ def test_stop_click_reports_stopped_not_false_normal_finish(
         terminal_status = shell.scientific.status.text().lower()
         assert "stopped" in terminal_status
         assert "finished" not in terminal_status
+    finally:
+        page.close_workspace()
+
+
+def test_overwrite_skipped_scan_page_warning_offers_retry_not_replace(
+    qapp: QtWidgets.QApplication, tmp_path: Path, monkeypatch,
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    unreadable = _frame(raw, "bad", 1, "txt", 1.0)
+    _frame(raw, "good", 1, "txt", 2.0)
+    actual_read = TiffSeriesSource._read_path
+    attempts = []
+
+    def read(source, path):
+        if Path(path) != unreadable:
+            return actual_read(source, path)
+        attempts.append(str(path))
+        mode = unreadable.stat().st_mode & 0o777
+        unreadable.chmod(0)
+        try:
+            return actual_read(source, path)
+        finally:
+            unreadable.chmod(mode)
+
+    monkeypatch.setattr(TiffSeriesSource, "_read_path", read)
+    poni = tmp_path / "cal.poni"
+    write_poni(poni)
+    lifecycle = ScatteringCoordinator()
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(
+            source_spec=DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format="txt"),
+            poni_file=str(poni), project_root=str(raw), save_path=str(tmp_path / "processed"),
+            output_mode="Overwrite", processing_mode="Int 1D", live_mode=False, max_cores=1,
+            bai_1d_args={"npt": 8, "method": "numpy"},
+        )),
+        lifecycle=lifecycle, sources=FilesystemSourceAdapter(), executor=StandardRunExecutor(),
+    )
+    warnings = []
+    monkeypatch.setattr(page, "_open_warning", lambda title, detail: warnings.append((title, detail)))
+    try:
+        _shell(page).run_controls.startButton.click()
+        assert _wait(qapp, lambda: lifecycle.phase is RunPhase.RUNNING)
+        assert _wait(qapp, lambda: lifecycle.phase is RunPhase.IDLE)
+        assert attempts, "the real source decoder must be reached"
+        assert (tmp_path / "processed" / "good_int1d.nexus").is_file()
+        assert not (tmp_path / "processed" / "bad_int1d.nexus").exists()
+        [(title, detail)] = warnings
+        assert title == "Scans skipped", warnings
+        assert "Skipped bad_int1d.nexus:" in detail, detail
+        assert "The listed scans could not be processed in this Run; run again to retry." in detail, detail
+        assert "Use Replace" not in detail
     finally:
         page.close_workspace()
 

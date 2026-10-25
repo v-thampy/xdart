@@ -5397,13 +5397,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         notes = []
         if event.warnings:
-            # A directory Append skips a scan it may not extend and runs the rest
-            # (maintainer, 2026-10-23); say which, once, at the end of the run.
-            notes.append(
-                "\n\n".join(event.warnings)
-                + "\n\nThe listed scans were skipped; their existing results were left unchanged. "
-                  "Use Replace to reprocess them."
-            )
+            # Keep remedies tied to the kind of output that was skipped: a terminal scan failure can be retried,
+            # while an Append refusal can be reprocessed with Replace.
+            remedies = []
+            if any(warning.startswith("Skipped ") for warning in event.warnings):
+                remedies.append("The listed scans could not be processed in this Run; run again to retry.")
+            if any(warning.startswith("Append skipped ") for warning in event.warnings):
+                remedies.append("The listed scans were skipped; their existing results were left unchanged. "
+                                "Use Replace to reprocess them.")
+            notes.append("\n\n".join((*event.warnings, *remedies)))
         if event.rebuilt:
             # ... and reduces one whose processed images changed on disk again whole, into the same output.
             notes.append(
