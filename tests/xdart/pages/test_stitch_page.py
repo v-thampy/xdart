@@ -1483,3 +1483,37 @@ def test_stitch_opens_the_shared_calibration_window_with_its_context(qapp, tmp_p
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()
         qapp.processEvents()
+
+
+@pytest.mark.parametrize("spelling", ("trailing-separator", "windows-dialog"))
+def test_stitch_project_change_moves_only_the_default_save_path(qapp, tmp_path, monkeypatch, spelling):
+    """The default processed-data folder follows Project edits across normalized folder spellings; a chosen
+    Save Path remains attached to its explicit folder."""
+    import ntpath
+    import os
+    from types import SimpleNamespace
+
+    from xdart.gui.tabs.scattering import controls_editing
+
+    page = StitchPage(empty_host_services(_Status()))
+    old, new, later = tmp_path / "old-project", tmp_path / "new-project", tmp_path / "later-project"
+    try:
+        page.set_field("project_root", str(old))
+        old_default = str(old / "xdart_processed_data")
+        if spelling == "trailing-separator":
+            old_default += os.sep
+        else:
+            monkeypatch.setattr(controls_editing, "os", SimpleNamespace(path=ntpath))
+            old_default = old_default.replace(os.sep, "\\").upper()
+        page.set_field("output_path", old_default)
+        page.set_field("project_root", str(new))
+        assert page._value("output_path") == str(new / "xdart_processed_data")
+
+        chosen = str(new / "chosen-output")
+        page.set_field("output_path", chosen)
+        page.set_field("project_root", str(later))
+        assert page._value("output_path") == chosen
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()

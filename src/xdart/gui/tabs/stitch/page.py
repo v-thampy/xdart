@@ -44,6 +44,7 @@ from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+from xdart.gui.tabs.scattering.controls_editing import _same_output_path
 from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_widgets import foldable
@@ -1432,6 +1433,16 @@ class StitchPage(QtWidgets.QWidget):
         self._render_ranges()
 
     def set_field(self, key, value):
+        prior_project = str(self._value("project_root") or "") if key == "project_root" else ""
+        prior_output = str(self._value("output_path") or "") if key == "project_root" else ""
+        output_follows_project = key == "project_root" and (
+            not prior_output.strip()
+            or _same_output_path(
+                prior_output,
+                str(Path(prior_project) / "xdart_processed_data"),
+                root=prior_project,
+            )
+        )
         if key in self._range_keys:
             self._range_edited(self._fields[key].path, value)
             return
@@ -1479,7 +1490,7 @@ class StitchPage(QtWidgets.QWidget):
             self._source_committed()
         elif key in {"unit", "map_axis"}:
             self._processing_axis_changed()
-        elif key == "project_root" and not self._value("output_path"):
+        elif key == "project_root" and output_follows_project:
             self.set_field("output_path", str(Path(value) / "xdart_processed_data"))
         if key in {"geometry_path", "project_root"}:
             self._refresh_xu_geometry()
