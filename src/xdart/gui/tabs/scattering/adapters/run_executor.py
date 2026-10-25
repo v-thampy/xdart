@@ -1558,6 +1558,8 @@ class StandardRunExecutor:
             if not run.display.release_light_1d(owner, reason="lineage-replaced"):
                 raise RuntimeError("prior light-1D lineage cleanup remains pending")
             output.drop_released_predecessor(owner, aborted=True)
+        # Settlement can make submitted container frames durable. Count those before dropping only the unsaved work.
+        run.total -= max(0, run.current_total - run.current_completed)
         run.session = None
         self._abandon_construction(run)
 
@@ -2777,7 +2779,6 @@ class StandardRunExecutor:
                 except SourceReadError as error:
                     # One scan's own image could not be read while it was reduced: that scan stops growing, what it
                     # published before is kept, and the Run goes on (Codex N-69301b5f NW-R2).
-                    run.total -= max(0, run.current_total - run.current_completed)
                     with _run_effect(run):
                         self._settle_failed_scan(run, group.target)
                     self._skip_live_append(run, group.target, target_key, None, constructed=False, failed=True,
@@ -2970,10 +2971,9 @@ class StandardRunExecutor:
             try:
                 stopped = self._execute_current(run, construct=False) or stopped
             except SourceReadError as error:  # one scan's own image could not be read: it is skipped, the rest runs
-                planned, claimed = run.current_total - run.current_completed, run.current_file_total
+                claimed = run.current_file_total
                 with _run_effect(run):
                     self._settle_failed_scan(run, item.target)
-                run.total -= max(0, planned)
                 run.files_skipped += claimed
                 self._skip_directory_scan(run, item.target, error)
                 self._events.put(StandardRunEvent(
