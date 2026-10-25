@@ -3046,6 +3046,28 @@ class StandardRunExecutor:
                             graph, record=record, registry=registry, start=start,
                             metadata_format=live_metadata_format(run.configuration.thaw_source_spec())))
                         return proofs[-1].holds(cancelled=lambda: run.stop_requested)
+                elif all(Path(value.path).suffix.lower() in {".tif", ".tiff"}
+                         for value in entry.candidates):
+                    # A finite new TIFF scan has the same qualification proof
+                    # available to construction as a Live admission.  The
+                    # proof is made after its JIT graph exists, then _construct
+                    # reuses it instead of validating the graph a second time.
+                    registry, record = registry_identity(), observe_live_members(
+                        run.configuration, [value.path for value in entry.candidates])
+
+                    def recheck(graph, *, record=record, registry=registry, proofs=proofs):
+                        # The inexpensive LivePrefixProof below protects the
+                        # interval from materialization through construction;
+                        # it does not qualify the graph's detector metadata.
+                        # Finite NEW scans therefore perform the same full
+                        # graph validation as the ordinary path exactly once.
+                        from xrd_tools.sources.execution_graph import validate_source_execution_graph
+                        validate_source_execution_graph(
+                            graph, cancelled=lambda: run.stop_requested)
+                        proofs.append(LivePrefixProof(
+                            graph, record=record, registry=registry,
+                            metadata_format=live_metadata_format(run.configuration.thaw_source_spec())))
+                        return proofs[-1].holds(cancelled=lambda: run.stop_requested)
                 decision, _ready_files, skipped_files = (
                     materialize_deferred_output(
                         receipt,

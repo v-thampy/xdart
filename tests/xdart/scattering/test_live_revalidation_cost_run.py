@@ -339,11 +339,11 @@ class _Eiger:
 
 
 def _intent(tmp_path, raw, shape, *, suffix='.tif', fmt='spec', mode='Overwrite', gi=None, source=None,
-            processing='Int 1D', one=None, two=None):
+            processing='Int 1D', one=None, two=None, live=True):
     return RunIntent(
         source_spec=source or DirectorySourceSpec(raw, suffixes=(suffix,), metadata_format=fmt),
         poni_file=str(_poni(tmp_path, shape)), project_root=str(raw), save_path=str(tmp_path / 'processed'),
-        output_mode=mode, processing_mode=processing, live_mode=True, max_cores=1,
+        output_mode=mode, processing_mode=processing, live_mode=live, max_cores=1,
         bai_1d_args=one or {'npt': 8, 'method': 'numpy'}, **({} if gi is None else {'gi': gi}),
         **({} if two is None else {'bai_2d_args': two}))
 
@@ -667,6 +667,31 @@ def _sidecar_run(tmp_path, monkeypatch, request_value, frames=3):
     _wait(executor, events, _count_labels('scan', frames), 60.)
     _settle_reuse(executor, identity, work, events, frames, time.monotonic() + 60.)
     return raw, cars, executor, identity, events
+
+
+def test_e4_finite_new_tiff_graph_is_validated_once(tmp_path, monkeypatch):
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    cars = _Sidecar(raw, PILATUS)
+    for k in range(3):
+        cars.frame(k)
+    work = _Work(monkeypatch)
+    executor = StandardRunExecutor(join_timeout=2.)
+    source = DirectorySourceSpec(raw, suffixes=('.tif',), metadata_format='txt')
+    identity = _start(
+        executor, _intent(tmp_path, raw, PILATUS, fmt='txt', source=source, live=False),
+        request_value=7190,
+    )
+    events = []
+    try:
+        _wait(executor, events, _terminal, 60.)
+    finally:
+        terminal = _stop(executor, identity, events)
+    validations = work.times('graph_validation')
+    assert len(validations) == 1, (
+        f'finite new TIFF graph validated {len(validations)} times: {validations}; calls={work.calls}'
+    )
+    assert terminal, terminal
 
 
 def _same_size_rewrite(path, old, new):
