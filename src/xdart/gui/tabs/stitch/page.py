@@ -445,6 +445,9 @@ class StitchPage(QtWidgets.QWidget):
         self._auto_threshold_max = None
         self._queued_jobs = []
         self._job_total = 0
+        self._job_completed = 0
+        self._job_failures = []
+        self._job_target = ""
         self._batch_started = None
         self._raw_revision = 0
         self._raw_request_revision = None
@@ -2333,6 +2336,8 @@ class StitchPage(QtWidgets.QWidget):
             return
         self._skip_note = f" · {len(kept)} already stitched, skipped" if kept else ""
         self._job_total = len(self._queued_jobs)
+        self._job_completed = 0
+        self._job_failures = []
         self._batch_started = time.monotonic()
         self._run_next_job()
 
@@ -2341,6 +2346,7 @@ class StitchPage(QtWidgets.QWidget):
             return
         index = self._queued_jobs.pop(0)
         position = self._job_total - len(self._queued_jobs)
+        self._job_target = str(self._owner.prepared.requests[index].module.output.target)
         if not self._start(f"Running · {self._mode} · {position}/{self._job_total}{self._skip_note}{self._prepared_notes}",
                            lambda: self._owner.begin_run(job_index=index, workers=self.run_bar.get_cores(),
                                export_paths=self._kept_export_paths if position == 1 else (),
@@ -2396,12 +2402,16 @@ class StitchPage(QtWidgets.QWidget):
                 p = update.progress
                 self._status(_progress_text(p.stage, p.completed, p.total))
             elif update.terminal_status is OperationTerminalStatus.FAILED:
-                self._queued_jobs.clear()
                 self._after_prepare = None
                 reloading, self._reloading = self._reloading, None
-                self._status((f"Could not reload {Path(reloading).name}: " if update.action is StitchOwnerAction.REOPEN
-                              and reloading is not None else "") + (update.failure_message or update.failure_type),
-                             ready=False)
+                failure = update.failure_message or update.failure_type
+                if update.action is StitchOwnerAction.RUN and self._job_total:
+                    self._job_failures.append((Path(self._job_target).name, failure))
+                    self._finish_failed_job()
+                else:
+                    self._queued_jobs.clear()
+                    self._status((f"Could not reload {Path(reloading).name}: " if update.action is StitchOwnerAction.REOPEN
+                                  and reloading is not None else "") + failure, ready=False)
                 if update.action is StitchOwnerAction.METADATA and self._metadata_current():
                     self._metadata_dialog.status.setText(update.failure_message or update.failure_type)
                 if update.action is StitchOwnerAction.FRAME_READ and self._raw_request_revision == self._raw_revision:
@@ -2500,6 +2510,7 @@ class StitchPage(QtWidgets.QWidget):
         elif outcome.kind is StitchOwnerOutcomeKind.RESULT:
             result = outcome.result
             if result.terminal.disposition is ModuleDisposition.COMMITTED:
+                self._job_completed += 1
                 if not update.stale and self._action_revision == self._revision and not self._closing:
                     self._mount_payload(result.request.module.output.target, result.payload)
                 elapsed = time.monotonic() - (self._batch_started or self._started)
@@ -2507,21 +2518,40 @@ class StitchPage(QtWidgets.QWidget):
                 note = frame_screen_note(result.frame_screen)
                 if outcome.finalization_message:
                     self._prepared_notes += f" · {outcome.finalization_message}"
-                self._status(f"Complete · {count} frames · {elapsed:.2f} s" + (f" · {note}" if note else "")
-                             + self._skip_note + self._prepared_notes,
-                             ready="XYE_EXPORT_FAILED" not in self._prepared_notes)
+                if self._job_failures:
+                    failures = "; ".join(f"{name}: {message}" for name, message in self._job_failures)
+                    self._status(f"Complete · {self._job_completed} of {self._job_total} outputs · {elapsed:.2f} s · "
+                                 f"Failed: {failures}", ready=False)
+                else:
+                    self._status(f"Complete · {count} frames · {elapsed:.2f} s" + (f" · {note}" if note else "")
+                                 + self._skip_note + self._prepared_notes,
+                                 ready="XYE_EXPORT_FAILED" not in self._prepared_notes)
                 if self._queued_jobs and not update.stale and self._action_revision == self._revision:
                     self._run_next_job()
             else:
-                self._queued_jobs.clear()
                 terminal = result.terminal
                 notice = terminal.diagnostic or terminal.code
                 if terminal.disposition is not ModuleDisposition.CANCELLED:  # "CODE: reason", as RSM's (D5)
                     notice = terminal.code + (f": {terminal.diagnostic}" if terminal.diagnostic else "")
-                self._status(f"{terminal.disposition.value}: {notice}", ready=False)
+                if terminal.disposition is ModuleDisposition.FAILED and self._job_total:
+                    self._job_failures.append((Path(result.request.module.output.target).name, notice))
+                    self._finish_failed_job()
+                else:
+                    self._queued_jobs.clear()
+                    self._status(f"{terminal.disposition.value}: {notice}", ready=False)
         else:
             self._queued_jobs.clear()
             self._status(outcome.finalization_message or "Output retained · finalization retry required", ready=False)
+
+    def _finish_failed_job(self):
+        """Keep a failed Run's output visible and move to the next exact prepared request."""
+        if self._queued_jobs and not self._closing:
+            self._run_next_job()
+            return
+        elapsed = time.monotonic() - (self._batch_started or self._started)
+        details = "; ".join(f"{name}: {message}" for name, message in self._job_failures)
+        self._status(f"Complete · {self._job_completed} of {self._job_total} outputs · {elapsed:.2f} s · "
+                     f"Failed: {details}", ready=False)
 
     @property
     def results(self):

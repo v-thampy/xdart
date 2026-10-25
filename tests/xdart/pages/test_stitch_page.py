@@ -17,7 +17,9 @@ from xdart.gui.tools.stitch_values import (
     StitchFrameSelector, StitchSourceSelection, StitchToolForm, prepare_stitch_tool,
 )
 from xrd_tools.analysis.module_transaction import ModuleDisposition
-from xrd_tools.analysis.stitch_operation import StitchGeometryKind, run_stitch_operation
+from xrd_tools.analysis.stitch_operation import (
+    StitchGeometryKind, StitchOperationExecution, run_stitch_operation,
+)
 from xrd_tools.analysis.xu_stitch_calibration import canonical_surface_resource_bytes
 from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
 from xrd_tools.integrate.stitch_conditioning import StitchConditioning
@@ -850,7 +852,7 @@ def test_an_xu_preview_registers_no_edit_of_its_own(qapp, tmp_path):
 def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qapp, tmp_path, backend):
     form = _form(tmp_path, backend)
     spec = Path(form.spec_path)
-    spec.write_text(spec.read_text() +
+    spec.write_text(spec.read_text().replace("17000.018", "12398.41984") +
         "\n#S 2 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
         "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n"
         "\n#S 3 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
@@ -907,6 +909,53 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         _wait(page, qapp)
         assert not page._queued_jobs
         assert not second_target.exists()
+    finally:
+        assert page.shutdown().status is PageCleanup.CLEAN
+        page.deleteLater()
+        qapp.processEvents()
+
+
+def test_native_group_queue_continues_after_a_worker_failure(qapp, tmp_path, monkeypatch):
+    """A failed output is named in the Run summary and the next prepared output still runs through the owner."""
+    form = _form(tmp_path, "multigeometry")
+    spec = Path(form.spec_path)
+    spec.write_text(spec.read_text() +
+        "\n#S 2 ascan del 14 15 1 1\n#D today\n#P0 14 -10 12398.41984\n"
+        "#N 3\n#L del  nu  energy\n14 -10 12398.41984\n15 -10 12398.41984\n")
+    for source in Path(form.image_dir).glob("sample_scan1_*.raw"):
+        (Path(form.image_dir) / source.name.replace("scan1", "scan2")).write_bytes(source.read_bytes())
+
+    attempts, completed = [], []
+    real_run = StitchOperationExecution.run
+
+    def fail_first(self, **kwargs):
+        target = str(self.request.module.output.target)
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise RuntimeError("first Stitch output failed")
+        result = real_run(self, **kwargs)
+        completed.append(target)
+        return result
+
+    monkeypatch.setattr(StitchOperationExecution, "run", fail_first)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        _fill_native(page, form)
+        page.set_field("image_stem", "sample_scan{scan}_")
+        page.set_field("scan", "1,2")
+        page.set_field("output_family", "failed;continued")
+        page.begin_preview()
+        _wait(page, qapp)
+        assert page._owner.prepared is not None, page.run_bar.readinessLabel.full_text()
+        targets = [str(item.module.output.target) for item in page._owner.prepared.requests]
+        assert len(targets) == 2
+        page.begin_run()
+        _wait(page, qapp, timeout=60)
+        status = page.run_bar.readinessLabel.full_text()
+        assert attempts == targets
+        assert completed == targets[1:]
+        assert Path(targets[0]).name in status and "first Stitch output failed" in status
+        assert not page._queued_jobs
     finally:
         assert page.shutdown().status is PageCleanup.CLEAN
         page.deleteLater()

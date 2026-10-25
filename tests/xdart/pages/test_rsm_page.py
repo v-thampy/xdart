@@ -1565,6 +1565,37 @@ def test_a_comma_selection_previews_every_rsm_and_grids_each_in_turn(qapp, tmp_p
         _close(page, qapp)
 
 
+def test_a_failed_queued_rsm_is_reported_and_the_next_rsm_runs(qapp, tmp_path, monkeypatch):
+    """The page records a failed target but continues through its real owner to the next queued RSM."""
+    _counting_grids(monkeypatch)
+    page = _page(qapp)
+    label = page.run_bar.readinessLabel
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1,2")
+        targets = [str(form.output_path) for form in page.build_forms()]
+        assert len(targets) == 2
+        real_run = RSMOperationExecutionV2.run
+        calls = []
+
+        def fail_first(self, **kwargs):
+            calls.append(str(self.request.module.output.target))
+            if len(calls) == 1:
+                raise RuntimeError("first RSM output failed")
+            return real_run(self, **kwargs)
+
+        monkeypatch.setattr(RSMOperationExecutionV2, "run", fail_first)
+        page.begin_run()
+        _wait(page, qapp, lambda: not page.active())
+        shown = label.full_text()
+        assert calls == targets
+        assert Path(targets[0]).name in shown and "first RSM output failed" in shown
+        assert "Saved 1 of 2 RSMs" in shown
+        assert not page._jobs
+    finally:
+        _close(page, qapp)
+
+
 def test_preview_refuses_a_foreign_file_at_an_output_before_any_gridding(qapp, tmp_path, monkeypatch):
     """G8c (Codex's RSM stage-2 review, question 1): the file at an RSM's output is checked at Preview as its
     run's Replace checks it, from the header: a foreign file is refused there, left untouched, and nothing is

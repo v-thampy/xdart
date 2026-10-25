@@ -372,6 +372,7 @@ class RSMPage(QtWidgets.QWidget):
         self._job_action = None
         self._job_form = None  # the queued form being prepared or gridded now
         self._job_total = 0
+        self._job_failures = []
         self._job_lines = []  # the Preview's lines, every RSM's
         self._job_skipped = 0  # Append's up-to-date RSMs, skipped
         self._form_revision = 0
@@ -2012,6 +2013,7 @@ class RSMPage(QtWidgets.QWidget):
             if action == "run" and not self._queue_outputs_writable(forms):
                 return
             self._jobs, self._job_action, self._job_total = list(forms), action, len(forms)
+            self._job_failures = []
             self._job_lines, self._job_skipped, self._job_warnings = [], 0, {}
             self._next_job()
             return
@@ -2047,6 +2049,7 @@ class RSMPage(QtWidgets.QWidget):
             done, total, skipped = self._job_form is not None, self._job_total, self._job_skipped
             last_form = self._job_form
             action, lines, warned = self._job_action, self._job_lines, len(self._job_warnings)
+            failures = tuple(self._job_failures)
             self._clear_jobs()
             if not done:
                 return
@@ -2058,9 +2061,11 @@ class RSMPage(QtWidgets.QWidget):
                     ready=True)
                 self.preview_dialog.show()
             else:
-                gridded = total - skipped
+                gridded = total - skipped - len(failures)
                 message = f"Saved {gridded} of {total} RSMs" + (
                     f" · {skipped} already gridded with these settings, skipped" if skipped else "")
+                if failures:
+                    message += " · Failed: " + "; ".join(f"{name}: {reason}" for name, reason in failures)
                 if not gridded:
                     self.reopen(last_form.output_path, completion_message=message)
                 else:
@@ -2084,7 +2089,7 @@ class RSMPage(QtWidgets.QWidget):
 
     def _clear_jobs(self):
         self._jobs, self._job_action, self._job_form = [], None, None
-        self._job_total, self._job_lines, self._job_skipped, self._job_warnings = 0, [], 0, {}
+        self._job_total, self._job_failures, self._job_lines, self._job_skipped, self._job_warnings = 0, [], [], 0, {}
 
     def _begin_preflight(self, *, run, form=None):
         if self._owner.busy:  # a running result keeps its form
@@ -2176,8 +2181,13 @@ class RSMPage(QtWidgets.QWidget):
             self._status(_progress_text(progress.stage, progress.completed, progress.total))
             return
         if update.terminal_status is OperationTerminalStatus.FAILED:
-            self._clear_jobs()
-            self._notice(f"RSM {update.action.value} failed: {update.failure_message or update.failure_type}")
+            failure = update.failure_message or update.failure_type
+            if update.action is RSMOwnerAction.RUN and self._job_form is not None:
+                self._job_failures.append((Path(self._job_form.output_path).name, failure))
+                self._next_job()
+            else:
+                self._clear_jobs()
+                self._notice(f"RSM {update.action.value} failed: {failure}")
             return
         if update.terminal_status is OperationTerminalStatus.CANCELLED:
             self._clear_jobs()
@@ -2265,6 +2275,10 @@ class RSMPage(QtWidgets.QWidget):
         self._clear_jobs()
         if terminal.disposition is ModuleDisposition.CANCELLED:
             self._notice("RSM stopped" + (f" · {terminal.diagnostic}" if terminal.diagnostic else ""))
+        elif terminal.disposition is ModuleDisposition.FAILED and self._job_form is not None:
+            self._job_failures.append((Path(result.request.module.output.target).name,
+                                       terminal.code + (f": {terminal.diagnostic}" if terminal.diagnostic else "")))
+            self._next_job()
         else:  # "CODE: reason", as Stitch's and both pages' preflight messages (D5)
             self._notice(f"RSM {terminal.disposition.value}: {terminal.code}"
                          + (f": {terminal.diagnostic}" if terminal.diagnostic else ""))
