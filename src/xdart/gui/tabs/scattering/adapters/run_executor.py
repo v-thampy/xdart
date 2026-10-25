@@ -864,14 +864,23 @@ def _eager_directory_file_counts(
     return counts, len(discovered_paths) - len(claimed)
 
 
-def _read_container(read, source, what: str):
-    """``read()``, one of a container's frame reads in the executor; its failure is that scan's SourceReadError, as a
-    frame's own image read is (Codex N-69301b5f NW-R2): the caller skips the scan and the Run goes on."""
+def _skips_failed_scans(run: _StandardRun) -> bool:
+    """Whether ``run`` is a directory Run (Live or not), whose loops skip a scan that fails and go on."""
+    admission = getattr(getattr(run, "resources", None), "admission", None)  # a run double may carry no resources
+    return type(getattr(admission, "deferred_directory", None)) is DeferredDirectoryPlan
+
+
+def _read_container(read, source, what: str, *, typed: bool):
+    """``read()``, one of a container's frame reads in the executor. In a directory Run (``typed``) its failure is that
+    scan's SourceReadError, as a frame's own image read is (Codex N-69301b5f NW-R2): the loop skips the scan and the
+    Run goes on; a single-source Run fails with the error itself, as before."""
     try:
         return read()
     except (InterruptedError, SourceReadError):
         raise
     except (OSError, ValueError) as error:
+        if not typed:
+            raise
         raise SourceReadError(f"{what} of {Path(str(getattr(source, 'path', '') or 'its source')).name} could not be "
                               f"read: {type(error).__name__}: {error}") from error
 
@@ -3325,6 +3334,7 @@ class StandardRunExecutor:
         source = run.source
         if not isinstance(source, (NexusStackSource, PointImageSource)):
             raise TypeError("container submission requires NexusStackSource")
+        typed = _skips_failed_scans(run)
 
         def publish_direct_fact() -> None:
             take = getattr(source, "take_direct_chunk_fact", None)
@@ -3341,7 +3351,7 @@ class StandardRunExecutor:
                     if run.stop_requested:
                         return
                     frame = run.frames_by_label[label]
-                    image = _read_container(lambda: source.load_frame(label), source, f"frame {label}")
+                    image = _read_container(lambda: source.load_frame(label), source, f"frame {label}", typed=typed)
                     observed_fallbacks += 1
                     if not _background_ready(run, output, frame): break
                     runtime = run.context_runtime
@@ -3447,7 +3457,7 @@ class StandardRunExecutor:
             while accepting.is_set() and not run.stop_requested:
                 read_started = monotonic()
                 try:
-                    block, labels = _read_container(lambda: next(chunks), source, "its next frames")
+                    block, labels = _read_container(lambda: next(chunks), source, "its next frames", typed=typed)
                 except StopIteration:
                     _perf_add(
                         run, "source_read", monotonic() - read_started
