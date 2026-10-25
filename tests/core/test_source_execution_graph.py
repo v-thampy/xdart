@@ -2867,3 +2867,46 @@ def test_a_selected_motor_recorded_unsupported_is_refused_with_its_reason(tmp_pa
     with pytest.raises(ValueError, match=r"'x' is not in acquisition\.nxs's supported scan metadata "
                                          r"\(x: units 'mm' are not an angle\); choose Manual"):
         graph.qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="x")
+
+
+def _stat_fails_once_while(monkeypatch, name: str, function: str) -> list[str]:
+    """A PermissionError (a share's hiccup) from the first stat of ``name`` that a file-state capture makes while
+    ``function`` is running; the names it fired for."""
+    fired, real_stat = [], Path.stat
+
+    def stat(self, *args, **kwargs):
+        frame = sys._getframe(1)
+        if not fired and self.name == name and frame.f_code.co_name == "capture":
+            while frame is not None:
+                if frame.f_code.co_name == function:
+                    fired.append(str(self))
+                    raise PermissionError(13, "permission denied (injected)", str(self))
+                frame = frame.f_back
+        return real_stat(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "stat", stat)
+    return fired
+
+
+def test_a_transient_oserror_while_a_tiff_member_is_qualified_is_a_changed_revision(tmp_path, monkeypatch) -> None:
+    """Claude review of 03af89cc, C2: a file state captured during qualification that fails with an OSError is a
+    revision that changed while it was read (the Live loop retries those at its next poll)."""
+    source = _tiffs(tmp_path)
+    assert graph.qualify_source_execution_graph(source).stamp.frame_count == 2
+    fired = _stat_fails_once_while(monkeypatch, "scan_0002.tif", "_qualify_tiff")
+    with pytest.raises(graph.SourceRevisionChanged, match=r"scan_0002\.tif: PermissionError: .*permission denied") as caught:
+        graph.qualify_source_execution_graph(source)
+    assert fired and isinstance(caught.value.__cause__, PermissionError)
+    assert graph.qualify_source_execution_graph(source).stamp.frame_count == 2  # the next look finds it fine
+
+
+def test_a_transient_oserror_while_a_spec_scan_is_qualified_is_a_changed_revision(tmp_path, monkeypatch) -> None:
+    (tmp_path / "beam").write_text("#F beam\n#O0 del nu\n#S 1 ascan del 0 0 0 1\n#P0 0 0\n#N 2\n#L del  nu\n0 0\n")
+    np.zeros((195, 487), dtype="<i4").tofile(tmp_path / "beam_scan1_0000.raw")
+    source = SourceSpec(tmp_path / "beam", SourceKind.SPEC, options={
+        "scan": "1", "image_dir": str(tmp_path), "read_image_kwargs": {"detector_shape": (195, 487), "raw_dtype": "int32"}})
+    assert graph.qualify_source_execution_graph(source).stamp.frame_count == 1
+    fired = _stat_fails_once_while(monkeypatch, "beam_scan1_0000.raw", "_qualify_spec")
+    with pytest.raises(graph.SourceRevisionChanged, match=r"beam_scan1_0000\.raw: PermissionError: ") as caught:
+        graph.qualify_source_execution_graph(source)
+    assert fired and isinstance(caught.value.__cause__, PermissionError)
+    assert graph.qualify_source_execution_graph(source).stamp.frame_count == 1

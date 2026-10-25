@@ -873,6 +873,14 @@ def _read_member_metadata(path: str | Path, metadata_format: str, **kwargs: Any)
     except MetadataSourceChanged as error:
         raise MetadataRevisionChanged(str(error), image_path=path,
                                       metadata_path=error.metadata_path) from error
+def _capture_state(path: Path) -> SourceFileState:
+    """:meth:`SourceFileState.capture` for a qualification: a file that cannot be read at this moment (a share's
+    hiccup, a file renamed into place) is a revision that changed while it was read, so a live Run looks again at its
+    next poll instead of stopping the scan on an ``OSError`` no loop retries."""
+    try:
+        return SourceFileState.capture(path)
+    except OSError as error:
+        raise SourceRevisionChanged(f"{path}: {type(error).__name__}: {error}") from error
 def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_binding: str | None,
                    cancelled: Callable[[], bool] | None,
                    expected: PreparedSourceExecutionGraph | None = None,
@@ -952,7 +960,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
             raise SourceRevisionChanged(str(error)) from error
         if spec_points is not None and spec_points.extent is not None:
             _cancelled(cancelled)
-            spec_state = SourceFileState.capture(spec_points.path)
+            spec_state = _capture_state(spec_points.path)
             if not spec_extent_holds(spec_points.extent):
                 raise MetadataRevisionChanged(
                     f"TIFF metadata source changed during admission: {spec_points.path}",
@@ -969,7 +977,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                 spec_values=source_value.spec_values))
             if selected_motor_complete: motor_rows.append(prefix.stamp.admitted_motor_values[index])
             continue
-        _cancelled(cancelled); path = Path(value); before = SourceFileState.capture(path)
+        _cancelled(cancelled); path = Path(value); before = _capture_state(path)
         current = None
         if compact or grouped_source is not None:
             current = read_detector_image_layout(path,
@@ -989,7 +997,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                     spec_point_snapshot=bool(reader_binding)))
         _cancelled(cancelled)
         first_state = (spec_state if spec_points is not None else
-                       None if first.source_path is None else SourceFileState.capture(first.source_path))
+                       None if first.source_path is None else _capture_state(first.source_path))
         _cancelled(cancelled)
         second = (ImageMetadataRead({}, None) if metadata_format is None else
                   spec_points.reads[index - known] if spec_points is not None else
@@ -1002,7 +1010,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
             second = ImageMetadataRead(dict(grouped_source.metadata_for(point)), second.source_path)
         _cancelled(cancelled)
         second_state = (spec_state if spec_points is not None else
-                        None if second.source_path is None else SourceFileState.capture(second.source_path))
+                        None if second.source_path is None else _capture_state(second.source_path))
         _cancelled(cancelled)
         if ((first.source_path is None) != (second.source_path is None)
                 or first.source_path is not None and _path_key(_absolute(str(first.source_path)))
@@ -1023,7 +1031,7 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                 selected_motor_complete = False
             else:
                 motor = AdmittedMotorValue(before.path, selected_motor, float(motors[selected_motor]))
-        after = SourceFileState.capture(path)
+        after = _capture_state(path)
         _cancelled(cancelled)
         if before != after or _path_key(_resolved(before)) != _path_key(_resolved(after)):
             raise SourceRevisionChanged("TIFF source changed during qualification")
@@ -1270,7 +1278,7 @@ def _qualify_container(source: SourceSpec, *, selected_motor: str | None, reader
         return complete()
 def _qualify_spec(source, *, selected_motor=None, cancelled=None):
     from xrd_tools.sources import open_source
-    before = SourceFileState.capture(Path(source.uri))
+    before = _capture_state(Path(source.uri))
     opened = open_source(source)
     files = tuple(path for path, _frame in opened._frame_map)
     if not files:
@@ -1280,7 +1288,7 @@ def _qualify_spec(source, *, selected_motor=None, cancelled=None):
     count = 1 if policy is None else policy.images_per_point
     for ordinal, path in enumerate(files):
         _cancelled(cancelled)
-        state = SourceFileState.capture(path)
+        state = _capture_state(path)
         current = read_detector_image_layout(path, **{key: value for key, value in dict(source.options.get("read_image_kwargs") or {}).items() if key in {"detector_shape", "detector", "raw_dtype", "raw_header_skip"}})
         if current.frame_count != 1 or layout is not None and (current.shape, current.dtype) != (layout.shape, layout.dtype):
             raise ValueError("Int SPEC native image layouts differ")
@@ -1292,8 +1300,8 @@ def _qualify_spec(source, *, selected_motor=None, cancelled=None):
             if selected_motor not in values:
                 raise ValueError("selected SPEC motor is absent")
             rows.append(AdmittedMotorValue(state.path, selected_motor, values[selected_motor]))
-        _same(SourceFileState.capture(path), state, "SPEC detector image changed during admission")
-    _same(SourceFileState.capture(Path(source.uri)), before, "SPEC metadata changed during admission")
+        _same(_capture_state(path), state, "SPEC detector image changed during admission")
+    _same(_capture_state(Path(source.uri)), before, "SPEC metadata changed during admission")
     return freeze_source_execution_graph(source, source, source_path=files[0], group_key=opened.name,
         file=members[0], adapter_id="tiff_series", frame_count=len(members), first_label=0,
         detector_shape=tuple(layout.shape), native_dtype=layout.dtype,
