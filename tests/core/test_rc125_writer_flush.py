@@ -1,4 +1,5 @@
-"""An owned epoch flushes once at its checkpoint, with no duplicate close flush."""
+"""An owned epoch flushes at its checkpoint and once more after its HDF5 close (the close itself rewrites bytes after
+the last flush: superblock and metadata); the terminal seal adds no third flush. Buffered: none at all."""
 import os
 
 import pytest
@@ -10,7 +11,8 @@ from xrd_tools.reduction import FrameReduction, NexusSink, NexusTerminalDisposit
 
 
 @pytest.mark.parametrize("durable", (True, False))
-def test_in_place_epoch_fsync_follows_its_admitted_policy_once(tmp_path, monkeypatch, durable):
+def test_in_place_epoch_fsyncs_at_its_checkpoint_and_after_its_close_under_its_admitted_policy(
+        tmp_path, monkeypatch, durable):
     target = tmp_path / "flush.nexus"
     _finite_seed(target, tmp_path, 1)
     preflight = prepare_append_preflight(target, _labels_intent(tmp_path, 2, generation=1),
@@ -28,6 +30,6 @@ def test_in_place_epoch_fsync_follows_its_admitted_policy_once(tmp_path, monkeyp
     sink.write(ScanFrame(1), FrameReduction(1, result_1d=_r1(1)))
     terminal = sink.finish(ReductionResult("flush", {}, 2))
     assert terminal.disposition is NexusTerminalDisposition.COMMITTED
-    assert len(calls) == int(durable), calls
+    assert len(calls) == (2 if durable else 0), calls  # the checkpoint, then the closed file; no terminal flush
     assert _readback(target)[0] == (0, 1)
     assert _readback(target)[2]["state"] == "committed"

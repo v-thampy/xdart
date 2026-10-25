@@ -3976,8 +3976,11 @@ class NexusRecordWriter:
                 # through a read-only descriptor bound to the verified file and size (as _seal_closed_stream_seed).
                 # The flush follows the transaction's own fsync choice (Codex N-0243a1bb F6).
                 flushed = binding.transaction.durable_fsync
-                # begin_stream_close licensed this fresh checkpoint, already
-                # flushed through the writer's handle under the same policy.
+                if flushed:
+                    # The checkpoint flushed the rows through this handle, but the HDF5 close that followed rewrote
+                    # bytes after it (superblock and metadata, with every libver): the closed file is flushed once
+                    # more here, and the terminal seal then adds no flush of its own.
+                    os.fsync(verification_descriptor)
                 verification_stream.close()
                 verification_stream = None
                 os.close(verification_descriptor)
@@ -4034,6 +4037,11 @@ class NexusRecordWriter:
         try:
             if descriptor is None:
                 descriptor = os.open(self._active_path or self.target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            elif binding.transaction.durable_fsync:
+                # The last writing handle: the HDF5 close rewrote bytes after the checkpoint's flush (superblock and
+                # metadata, with every libver), so a durable close flushes the closed file once more through it; the
+                # close seal and the terminal seal then add no flush of their own.
+                os.fsync(descriptor)
             before = self._descriptor_stat_tuple(descriptor)
             aggregate = _EvidenceBuilder()
             aggregate.text("checkpoint", self._last_checkpoint_digest, self._last_checkpoint_digest)
