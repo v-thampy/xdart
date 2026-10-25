@@ -5971,23 +5971,28 @@ class _ReductionIntegratorProvider:
             return
         size_family = _warm_integrator_size_family(self.ai, shape, self.plan)
         family = None if size_family is None else (role, size_family)
-        if family is None or family in self._unpriceable_reserves:
+        with self._bound_lock:
+            if self._reuse_closed:
+                return
             if family is None:
                 self.reuse.clear()
-            return
-        workers = self.reuse._limit
-        if self.reuse.reserve_unpriceable(family, workers):
-            self._unpriceable_reserves[family] = workers
-        else:
-            self.reuse.clear()
+                return
+            if family in self._unpriceable_reserves:
+                return
+            workers = self.reuse._limit
+            if self.reuse.reserve_unpriceable(family, workers):
+                self._unpriceable_reserves[family] = workers
+            else:
+                self.reuse.clear()
 
     def _release_unpriceable_reserves(self) -> None:
-        if self.reuse is None:
-            self._unpriceable_reserves.clear()
-            return
-        for family, workers in self._unpriceable_reserves.items():
-            self.reuse.release_reservation(family, workers)
-        self._unpriceable_reserves.clear()
+        with self._bound_lock:
+            if self.reuse is None:
+                self._unpriceable_reserves.clear()
+                return
+            reserves, self._unpriceable_reserves = tuple(self._unpriceable_reserves.items()), {}
+            for family, workers in reserves:
+                self.reuse.release_reservation(family, workers)
 
     def _decline_reuse(self) -> None:
         """Stop admitting loans while keeping any active-family reserve until final provider cleanup."""

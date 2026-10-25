@@ -198,6 +198,72 @@ def test_unpriceable_provider_without_a_known_family_keeps_conservative_clear():
     assert len(reuse) == 0 and not reuse._lent
 
 
+def test_discard_serializes_with_a_real_provider_family_reservation(monkeypatch):
+    from tests.core.test_warm_integrators import _plan as standard_plan, _reduce as reduce_standard
+    from tests.core.test_warm_integrators import _scan as standard_scan
+
+    reuse = WarmIntegrators(2, allowance=1 << 30)
+    reduce_standard(standard_scan("priced-for-race", frames=1), standard_plan(), reuse=reuse)
+    key = next(iter(reuse._idle))
+    family = key[:2]
+    price = reuse._sizes[family]
+    reuse.fit(2, allowance=3 * price)
+    unpriceable = standard_scan("flatfield-reserve-race", flat=True)
+    provider = _ReductionIntegratorProvider(
+        scan=unpriceable, plan=standard_plan(), ai=unpriceable.integrator, fi=None,
+        initial_incident_angle=None, reuse=reuse,
+    )
+
+    reserve_entered, allow_reserve = threading.Event(), threading.Event()
+    reserve_released = threading.Event()
+    real_reserve = reuse.reserve_unpriceable
+    real_release = provider._release_unpriceable_reserves
+
+    def delayed_reserve(reserve_family, workers):
+        reserve_entered.set()
+        assert allow_reserve.wait(5), "test did not release the real reserve operation"
+        return real_reserve(reserve_family, workers)
+
+    def observed_release():
+        reserve_released.set()
+        return real_release()
+
+    monkeypatch.setattr(reuse, "reserve_unpriceable", delayed_reserve)
+    monkeypatch.setattr(provider, "_release_unpriceable_reserves", observed_release)
+    errors = []
+
+    def reserve_family():
+        try:
+            provider._preserve_known_family_or_clear("standard", SHAPE)
+        except BaseException as error:
+            errors.append(error)
+
+    def discard_provider():
+        try:
+            provider.discard()
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=reserve_family)
+    worker.start()
+    assert reserve_entered.wait(5), "real provider did not reach its known-family reserve"
+    discard = threading.Thread(target=discard_provider)
+    discard.start()
+    try:
+        # A correct provider holds _bound_lock from the closed check through
+        # reserve installation, so discard cannot release an empty map.
+        assert not reserve_released.wait(0.05), "discard passed an in-flight family reservation"
+    finally:
+        allow_reserve.set()
+        worker.join(5)
+        discard.join(5)
+
+    assert not worker.is_alive() and not discard.is_alive()
+    assert not errors, errors
+    assert not provider._unpriceable_reserves
+    assert not reuse._lent
+
+
 def test_companion_scout_recursion_and_reused_maps_match_fresh_results():
     from tests.core.test_gi_companion_modes import _plan as companion_plan, _scan as companion_scan
     from tests.core.test_warm_integrators_gi import _arrays, _same
