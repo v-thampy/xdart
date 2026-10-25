@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -162,6 +163,23 @@ def test_a_given_up_frame_whose_txt_lands_later_stops_its_scan_and_the_run_goes_
     labels, i0, _epoch = _output(tmp_path, "grow")
     assert labels == (1, 2) and i0[0] == 1.0 and math.isnan(i0[1]), (labels, i0)
     assert _output(tmp_path, "next")[0] == (1,)
+
+
+def test_a_waited_frame_keeps_its_one_deadline_until_it_is_admitted(monkeypatch):
+    """The wait owner (Codex N-0c4e4237): an attempt that neither admits nor names the waited frame (a retried read, a
+    listing due, a READY admission a fresh listing cut before it) keeps its deadline and kind; admitting it, or a wait
+    that ended (its scan covered, its files gone), clears it."""
+    monkeypatch.setattr(run_executor, "monotonic", lambda: 100.5)
+    watch, run = StandardRunExecutor(join_timeout=2.)._watch_metadata_wait, SimpleNamespace(live_waiting={})
+    target, held = Path("grow_int1d.nexus"), ("grow_0002.tif", 100.0, "grow_int1d.nexus", "settling")
+    waits, given_up = {"k": held}, {}
+    assert not watch(run, target, "k", None, waits, given_up, retried=True) and waits["k"] == held
+    assert not watch(run, target, "k", None, waits, given_up, admitted=frozenset({"grow_0001.tif"}))
+    assert waits["k"] == held
+    assert not watch(run, target, "k", None, waits, given_up, admitted=frozenset({"grow_0001.tif", "grow_0002.tif"}))
+    assert "k" not in waits
+    waits["k"] = held
+    assert not watch(run, target, "k", None, waits, given_up) and "k" not in waits  # covered, or its files left
 
 
 def test_a_spec_point_whose_row_never_comes_skips_its_scan_from_there(tmp_path, quick, caplog):

@@ -1642,14 +1642,18 @@ class StandardRunExecutor:
             "; the next Run reprocesses the whole scan" if changed else "", reason)
 
     def _watch_metadata_wait(self, run: _StandardRun, target: Path | None, target_key: str,
-                             waiting: tuple[str, str] | None, waits: dict[str, tuple[str, float, str]],
-                             given_up: dict[str, set[str]]) -> bool:
+                             waiting: tuple[str, str] | None, waits: dict[str, tuple[str, float, str, str]],
+                             given_up: dict[str, set[str]], *, retried: bool = False,
+                             admitted: frozenset[str] | None = None) -> bool:
         """Time the frame an output waits on for its own metadata (``waiting``: (image, kind), as
         ``LiveDirectoryAttempt.waiting_metadata``; None: it no longer waits, its scan is covered, or its files left the
         directory). After _METADATA_WAIT_NOTE_S the log and the Live status say so; after the limit for its kind a frame
         whose sidecar never came is given up on, processed without its metadata; a sidecar still changing, a SPEC row,
         or a Run normalizing by a monitor from it skips the scan from that frame on, as does a sidecar that comes for a
-        frame given up on (Codex N-69301b5f NW-R1: never read unsettled; True: the caller moves on)."""
+        frame given up on (Codex N-69301b5f NW-R1: never read unsettled; True: the caller moves on). ``retried``: the
+        attempt did not admit the frame, nor name it (its guarded read met the file changing, a listing was due, a
+        candidate went stale), or a READY attempt's ``admitted`` images leave it out (a fresh listing cut before it):
+        the same frame still waits, with its one deadline (Codex N-0c4e4237)."""
         if waiting is not None and waiting[1] == "late":
             run.live_waiting.pop(target_key, None)
             waits.pop(target_key, None)
@@ -1657,6 +1661,8 @@ class StandardRunExecutor:
                 f"the metadata of {waiting[0]} arrived after the Run stopped waiting for it"))
             return True
         now, held = monotonic(), waits.get(target_key)
+        if waiting is None and held is not None and (retried or admitted is not None and held[0] not in admitted):
+            waiting = (held[0], held[3])  # not admitted: it still waits, as it was last seen
         if waiting is None or held is None or held[0] != waiting[0]:
             if run.live_waiting.pop(target_key, None) is not None and held is not None:
                 log_events.event(logger, logging.INFO, "%s no longer waits for the metadata of %s [LIVE]",
@@ -1664,8 +1670,9 @@ class StandardRunExecutor:
             if waiting is None:
                 waits.pop(target_key, None)
             else:
-                waits[target_key] = (waiting[0], now, Path(target).name)
+                waits[target_key] = (waiting[0], now, Path(target).name, waiting[1])
             return False
+        waits[target_key] = (*held[:3], waiting[1])  # its latest kind
         (image, kind), name = waiting, held[2]
         limit = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind]
         if now - held[1] < limit:
@@ -2352,9 +2359,9 @@ class StandardRunExecutor:
         uncovered: dict[str, tuple[tuple[object, ...], tuple[int, int, int, int]]] = {}
         # A found output's committed image count by output file version, for its readiness waits.
         committed_counts: dict[str, tuple[tuple[int, int, int, int], int | None]] = {}
-        # The image each output's next frame waits on for its metadata, since when, and the output's name; and the
-        # images each output stopped waiting for.
-        metadata_waits: dict[str, tuple[str, float, str]] = {}
+        # The image each output's next frame waits on for its metadata, since when, the output's name and the wait's
+        # latest kind; and the images each output stopped waiting for.
+        metadata_waits: dict[str, tuple[str, float, str, str]] = {}
         given_up: dict[str, set[str]] = {}
         # A scan found changed: its revision and when its rebuild may start (_REBUILD_QUIET_S).
         rebuild_holds: dict[str, tuple[tuple[object, ...], float]] = {}
@@ -2564,8 +2571,11 @@ class StandardRunExecutor:
                             given_up=frozenset(given_up.get(target_key, ())),
                         )
                         times.add("admission", started)
-                        if self._watch_metadata_wait(run, group.target, target_key, attempt.waiting_metadata,
-                                                     metadata_waits, given_up):
+                        if self._watch_metadata_wait(
+                                run, group.target, target_key, attempt.waiting_metadata, metadata_waits, given_up,
+                                retried=attempt.state is ProbeState.IN_PROGRESS,
+                                admitted=None if attempt.decision is None else frozenset(
+                                    Path(member.path).name for member in attempt.decision.item.source_stamp.members)):
                             skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
                             publish(force=True)
                             continue
