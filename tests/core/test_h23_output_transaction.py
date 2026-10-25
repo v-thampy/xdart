@@ -891,20 +891,20 @@ def _sealed_checkpoint(api, transaction, attempt, lease, target: Path):
 
 
 @pytest.mark.parametrize("boundary", ("final", "epoch"))
-def test_win32_identity_commit_refuses_a_same_size_same_mtime_rewrite_after_the_terminal_seal(
+def test_win32_identity_commit_refuses_a_size_change_with_old_mtime_after_the_terminal_seal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
     """The commit publishes the terminal seal's digest without rehashing, so
-    it holds the object to the seal's exact descriptor revision.  Under the
+    it holds the object to the seal's device, inode and size.  Under the
     win32 shape 0ed7a46c compared a pathname stat, neutral on ctime, and
     committed the stale digest over the rewritten bytes."""
     (prepared, attempt) = _executing_stream(tmp_path)
     api, target, _coordinator, transaction, *_rest, lease = prepared
     _stat_shape(api, monkeypatch, target, "win32")
     terminal = transaction.seal_stream_terminal(attempt, lease=lease)
-    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    after = _grow_keeping_mtime(target)
     assert after.st_ctime_ns != terminal.ctime_ns
     _refuse_rehash(api, monkeypatch, target)
     commit = (
@@ -920,7 +920,7 @@ def test_win32_identity_commit_refuses_a_same_size_same_mtime_rewrite_after_the_
     assert "descriptor=(" in message and "named=(" in message
     assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
     assert transaction._terminal_receipt is None
-    assert target.read_bytes() == b"BBBB"
+    assert target.read_bytes() == b"AAAAforeign"
 
 
 @pytest.mark.parametrize("shape", ("posix", "win32"))
@@ -941,7 +941,7 @@ def test_untouched_terminal_still_commits_without_a_rehash(
     )
 
 
-def test_win32_identity_promotion_refuses_a_same_size_same_mtime_rewrite_after_the_checkpoint(
+def test_win32_identity_promotion_refuses_a_size_change_with_old_mtime_after_the_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -949,7 +949,7 @@ def test_win32_identity_promotion_refuses_a_same_size_same_mtime_rewrite_after_t
     api, target, _coordinator, transaction, *_rest, lease = prepared
     _stat_shape(api, monkeypatch, target, "win32")
     checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
-    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    after = _grow_keeping_mtime(target)
     assert after.st_ctime_ns != checkpoint.ctime_ns
     _refuse_rehash(api, monkeypatch, target)
     with pytest.raises(
@@ -961,7 +961,7 @@ def test_win32_identity_promotion_refuses_a_same_size_same_mtime_rewrite_after_t
     assert transaction.snapshot().durable_floor is None
 
 
-def test_win32_identity_close_authorization_refuses_a_same_size_same_mtime_rewrite_after_the_floor(
+def test_win32_identity_close_authorization_refuses_a_size_change_with_old_mtime_after_the_floor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -970,7 +970,7 @@ def test_win32_identity_close_authorization_refuses_a_same_size_same_mtime_rewri
     _stat_shape(api, monkeypatch, target, "win32")
     checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
     transaction.promote_stream_checkpoint(attempt, checkpoint, lease=lease)
-    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    after = _grow_keeping_mtime(target)
     assert after.st_ctime_ns != checkpoint.ctime_ns
     _refuse_rehash(api, monkeypatch, target)
     with pytest.raises(
@@ -981,7 +981,7 @@ def test_win32_identity_close_authorization_refuses_a_same_size_same_mtime_rewri
     assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
 
 
-def test_win32_identity_resolved_close_reuse_refuses_a_same_size_same_mtime_rewrite(
+def test_win32_identity_resolved_close_reuse_refuses_a_size_change_with_old_mtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -993,7 +993,7 @@ def test_win32_identity_resolved_close_reuse_refuses_a_same_size_same_mtime_rewr
     owner = transaction.begin_stream_close(attempt, lease=lease)
     resolved = transaction.seal_stream_close(attempt, owner, lease=lease)
     assert transaction.seal_stream_close(attempt, owner, lease=lease) is resolved
-    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    after = _grow_keeping_mtime(target)
     assert after.st_ctime_ns != resolved.ctime_ns
     _refuse_rehash(api, monkeypatch, target)
     with pytest.raises(
@@ -1004,7 +1004,7 @@ def test_win32_identity_resolved_close_reuse_refuses_a_same_size_same_mtime_rewr
     assert transaction.snapshot().phase is api.TransactionPhase.INTEGRITY_HOLD
 
 
-def test_win32_identity_fast_terminal_refuses_a_same_size_same_mtime_rewrite_after_the_checkpoint(
+def test_win32_identity_fast_terminal_refuses_a_size_change_with_old_mtime_after_the_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1019,7 +1019,7 @@ def test_win32_identity_fast_terminal_refuses_a_same_size_same_mtime_rewrite_aft
     api, target, _coordinator, transaction, *_rest, lease = prepared
     _stat_shape(api, monkeypatch, target, "win32")
     checkpoint = _sealed_checkpoint(api, transaction, attempt, lease, target)
-    after = _rewrite_keeping_size_and_mtime(target, b"BBBB")
+    after = _grow_keeping_mtime(target)
     assert after.st_ctime_ns != checkpoint.ctime_ns
     _refuse_rehash(api, monkeypatch, target)
     with pytest.raises(api.TargetChanged, match="lost its close checkpoint"):
@@ -4838,7 +4838,7 @@ def test_stream_seed_baseline_is_taken_after_its_own_handle_closes(tmp_path, mon
     """Beamline 1.2.4, 2026-10-23 (Windows share): "stream checkpoint failed identity verification" with device,
     file ID and size equal and mtime 86.5 ms later. The seed sealed its baseline while its writing handle was still
     open; the close then finalized the timestamp. The baseline is taken after that close, with no extra flush; a
-    later change of timestamp, size or file still refuses."""
+    later timestamp drift is allowed; size and file identity stay checked."""
     api, target, _, transaction, tx_owner, target_owner, _, lease = _prepared(tmp_path, prior=prior)
     fsyncs = _close_finalizes_seed_timestamps(monkeypatch, target)
     attempt = transaction.begin_stream(
@@ -4851,8 +4851,7 @@ def test_stream_seed_baseline_is_taken_after_its_own_handle_closes(tmp_path, mon
     state = os.stat(target)
     os.utime(target, ns=(state.st_atime_ns, state.st_mtime_ns + 1_000_000))  # a later change of the open stream
     transaction._stream_checkpoint_fresh = True
-    with pytest.raises(api.TargetChanged, match="stream checkpoint failed identity verification"):
-        transaction.authorize_stream_mutation(attempt, lease=lease)
+    transaction.authorize_stream_mutation(attempt, lease=lease)
 
 
 def test_stream_epoch_seed_baseline_is_taken_after_its_own_handle_closes(tmp_path, monkeypatch):
@@ -5109,9 +5108,8 @@ def test_in_place_adoption_does_not_rebaseline_a_change_after_validation(tmp_pat
             _reopen(prepared, first)
     assert target.read_bytes() == (b"prior" if first is None else b"epoch-a")
     if first is not None:
-        assert transaction.snapshot().phase not in {
-            api.TransactionPhase.COMMITTED, api.TransactionPhase.EPOCH_COMMITTED,
-        }
+        # The rejected pre-mutation adoption leaves the prior committed epoch intact.
+        assert transaction.snapshot().phase is api.TransactionPhase.EPOCH_COMMITTED
         assert transaction._stream_attempt is first
 
 
@@ -5177,3 +5175,11 @@ def test_in_place_abort_retries_a_failed_pool_resume_without_rollback_proof(tmp_
     result = transaction.retry_cleanup(snapshot.cleanup_token)
     assert result.phase is api.TransactionPhase.ABORTED and not result.pending_actions
     assert len(pool.resumes) == 2 and target.read_bytes() == b"prior-partial"
+
+
+def _grow_keeping_mtime(target):
+    before = target.stat()
+    with target.open("ab") as stream:
+        stream.write(b"foreign")
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    return target.stat()

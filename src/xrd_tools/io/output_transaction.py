@@ -1118,14 +1118,29 @@ def _stream_receipt_revision(
     )
 
 
+def _writer_identity_holds(expected, *observed, path=None) -> bool:
+    """Bind the writer's own file by dev/ino/size while server times settle.
+
+    This never authorizes Browse to reuse a digest; those revalidators retain
+    their exact timestamp checks. Same-descriptor sealing also stays exact.
+    """
+    if expected is None or any(value[:3] != expected[:3] for value in observed):
+        return False
+    if any(value[3:] != expected[3:] for value in observed):
+        logger.debug("writer output timestamps changed: %s sealed=%s observed=%s", path, expected, observed)
+    return True
+
+
 def _stream_revision_mismatch(
     path: Path | str,
     receipt: _StreamStatReceipt,
     *,
     descriptor: int | None = None,
+    writer_owned: bool = False,
 ) -> str | None:
     """``None`` while *path* still names the exact object *receipt* sealed;
-    otherwise the views that disagree.
+    otherwise the views that disagree. Only explicit writer-owned calls permit
+    timestamp drift; the default digest-revalidation contract remains exact.
 
     Every reuse of a sealed receipt's digest without rereading the bytes
     goes through here, the way ``revalidate_stream_terminal`` does: two
@@ -1161,7 +1176,12 @@ def _stream_revision_mismatch(
     finally:
         if owned:
             os.close(descriptor)
-    if _revision_holds(revision, before, named, after):
+    holds = (
+        _writer_identity_holds(revision, _descriptor_identity(before), _stat_identity(named),
+                               _descriptor_identity(after), path=path)
+        if writer_owned else _revision_holds(revision, before, named, after)
+    )
+    if holds:
         return None
     return (
         f"{path}: sealed={revision} descriptor={_descriptor_identity(before)} "
@@ -2937,9 +2957,9 @@ class OutputTransaction:
     ) -> tuple[_ObjectReceipt, _StreamStatReceipt]:
         """The existing output adopted as an in-place stream's reservation.
 
-        A read-only descriptor binds the file as it was admitted (its size and
-        time) or, for a reopened epoch, to *sealed*, the committed epoch's exact
-        terminal revision; no backup is staged, nothing is copied and no content
+        A read-only descriptor binds the file's device, inode and size as
+        admitted or, for a reopened epoch, as *sealed*. Late server timestamps
+        are diagnostic; no backup is staged, nothing is copied and no content
         is read.  Its opening checkpoint proves no bytes: the writer's own
         checkpoints carry the evidence of the rows it adds.
         """
@@ -2949,14 +2969,15 @@ class OutputTransaction:
         try:
             state = os.fstat(descriptor)
             if sealed is not None:
-                mismatch = _stream_revision_mismatch(target, sealed, descriptor=descriptor)
+                mismatch = _stream_revision_mismatch(target, sealed, descriptor=descriptor, writer_owned=True)
                 if mismatch is not None:
                     raise TargetChanged(
                         f"in-place epoch target changed after its committed epoch: {mismatch}"
                     )
-            elif (
-                int(state.st_dev), int(state.st_ino), int(state.st_size), int(state.st_mtime_ns),
-            ) != (base.device, base.inode, base.size, base.mtime_ns):
+            elif not _writer_identity_holds(
+                (base.device, base.inode, base.size, base.mtime_ns, base.ctime_ns),
+                _descriptor_identity(state), path=target,
+            ):
                 raise TargetChanged(f"in-place Append target changed after admission: {target}")
             reservation = _ObjectReceipt(
                 _normalize_target(target),
@@ -3175,7 +3196,7 @@ class OutputTransaction:
                     None if checkpoint is None
                     else _stream_receipt_identity(checkpoint)
                 )
-                if observed != sealed:
+                if not _writer_identity_holds(sealed, observed, path=self._admission.target):
                     self._phase = TransactionPhase.INTEGRITY_HOLD
                     # Name both (dev, ino, size, mtime_ns, ctime_ns) views:
                     # this refusal is the only evidence a live run leaves.
@@ -3279,7 +3300,7 @@ class OutputTransaction:
                     or self._stream_checkpoint_token is not floor
                     or checkpoint is None
                 )
-                else _stream_revision_mismatch(self._admission.target, checkpoint)
+                else _stream_revision_mismatch(self._admission.target, checkpoint, writer_owned=True)
             )
             if mismatch is not None:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
@@ -3323,6 +3344,7 @@ class OutputTransaction:
                     "no sealed checkpoint" if receipt is None
                     else _stream_revision_mismatch(
                         self._admission.target, receipt, descriptor=descriptor,
+                        writer_owned=True,
                     )
                 )
                 if mismatch is not None:
@@ -3434,7 +3456,7 @@ class OutputTransaction:
             receipt = self._stream_checkpoint
             mismatch = (
                 "no sealed checkpoint" if receipt is None
-                else _stream_revision_mismatch(self._admission.target, receipt)
+                else _stream_revision_mismatch(self._admission.target, receipt, writer_owned=True)
             )
             if mismatch is not None:
                 self._phase = TransactionPhase.INTEGRITY_HOLD
@@ -3483,8 +3505,8 @@ class OutputTransaction:
                 # seamed identity a pathname compare would settle for.
                 if held and (
                     checkpoint is None or not self._stream_checkpoint_fresh
-                    or _descriptor_identity(flushed)
-                    != _stream_receipt_revision(checkpoint)
+                    or not _writer_identity_holds(_stream_receipt_revision(checkpoint),
+                                                  _descriptor_identity(flushed), path=self._admission.target)
                 ):
                     raise TargetChanged(
                         "held stream terminal (fast or in-place) lost its close checkpoint"
@@ -3637,7 +3659,7 @@ class OutputTransaction:
             if in_place:
                 mismatch = (
                     "the committed epoch has no terminal revision" if sealed is None
-                    else _stream_revision_mismatch(self._admission.target, sealed)
+                    else _stream_revision_mismatch(self._admission.target, sealed, writer_owned=True)
                 )
                 if mismatch is not None:
                     raise TargetChanged(
@@ -3857,9 +3879,9 @@ class OutputTransaction:
         ):
             self._terminal_receipt = None
             return TargetChanged("stream terminal seal changed before commit")
-        # The commit publishes the sealed digest without rereading the bytes:
-        # the object is held to the seal's exact descriptor revision.
-        mismatch = _stream_revision_mismatch(target, terminal_stat)
+        # The writer commits its own file by device/inode/size. Browse has a
+        # separate exact revision check before reusing this digest.
+        mismatch = _stream_revision_mismatch(target, terminal_stat, writer_owned=True)
         if mismatch is not None:
             self._terminal_receipt = None
             return TargetChanged(
