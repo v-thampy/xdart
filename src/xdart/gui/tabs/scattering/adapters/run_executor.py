@@ -17,7 +17,7 @@ from xdart.modules.frame_publication import (
 )
 from xrd_tools.core.scan import SourceKind, SourceReadError
 from xrd_tools.io.append import AppendRefused, saved_energy_selection
-from xrd_tools.io.metadata import MetadataSourceChanged
+from xrd_tools.io.metadata import MetadataSourceChanged, any_auto_sidecar
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import EnergyGridWidened, WarmIntegrators, energy_scan_grid_changes
 from xrd_tools.reduction.background import (
@@ -525,6 +525,9 @@ class _StandardRun:
     live_waiting: dict[str, str] = field(default_factory=dict)
     # Frames a Live Run processed without their metadata: "image (output)".
     metadata_given_up: list[str] = field(default_factory=list)
+    # Under Auto: whether the Run has seen a sidecar beside any image (its first listing shows one, or an admission
+    # read or waited on one). A folder with none does not hold each frame for the sidecar limit.
+    sidecars_seen: bool = False
     current_file_total: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
@@ -1734,7 +1737,14 @@ class StandardRunExecutor:
             return False
         waits[target_key] = (*held[:3], waiting[1])  # its latest kind
         (image, kind), name = waiting, held[2]
-        limit = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind]
+        limit, quiet = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind], False
+        if kind == "sidecar" and not run.sidecars_seen and live_metadata_format(
+                run.configuration.thaw_source_spec()) == "auto":
+            # Auto, and no sidecar beside any image so far: a folder without any is not held for the explicit
+            # limit. The first frame waits the note period; once the Run has given up on one, the folder is known to
+            # have none and later frames go on at once, without a warning each.
+            quiet = bool(run.metadata_given_up)
+            limit = 0.0 if quiet else _METADATA_WAIT_NOTE_S
         if now - held[1] < limit:
             if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
                 run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
@@ -1757,9 +1767,10 @@ class StandardRunExecutor:
                 "from it"))
             return True
         given_up.setdefault(target_key, set()).add(image)
-        run.metadata_given_up.append(f"{image} ({name})")
-        log_events.event(logger, logging.WARNING, "%s: the metadata of %s did not arrive within %g s; the frame is "
-                         "processed without it [LIVE]", name, image, limit)
+        if not quiet:
+            run.metadata_given_up.append(f"{image} ({name})")
+            log_events.event(logger, logging.WARNING, "%s: the metadata of %s did not arrive within %g s; the frame "
+                             "is processed without it [LIVE]", name, image, limit)
         return False
 
     def _open_scan(self, run: _StandardRun, artifact: Path, note: str = "") -> None:
@@ -2537,6 +2548,10 @@ class StandardRunExecutor:
                 if grouped is None or grouped[0] is not observation.discovered_snapshot or grouped[1] != registry:
                     grouped = (observation.discovered_snapshot, registry, live_directory_groups(receipt, observation))
                 groups = grouped[2]
+                if polls == 0 and live_metadata_format(configuration.thaw_source_spec()) == "auto":
+                    # What the folder holds at the Run's start: a sidecar beside any image means each frame waits for
+                    # its own as it lands; none means a frame waits only _METADATA_WAIT_NOTE_S, once.
+                    run.sidecars_seen = any_auto_sidecar(path for group in groups for path in group.physical_paths)
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
                 publish()
@@ -2684,6 +2699,12 @@ class StandardRunExecutor:
                             given_up=frozenset(given_up.get(target_key, ())),
                         )
                         times.add("admission", started)
+                        if not run.sidecars_seen and (
+                                attempt.waiting_metadata is not None and attempt.waiting_metadata[1] == "settling"
+                                or attempt.decision is not None and any(
+                                    source.metadata_file is not None
+                                    for source in attempt.decision.item.graph.stamp.metadata_sources)):
+                            run.sidecars_seen = True  # one is there: the frames after it wait for theirs
                         if self._watch_metadata_wait(
                                 run, group.target, target_key, attempt.waiting_metadata, metadata_waits, given_up,
                                 retried=attempt.state is ProbeState.IN_PROGRESS,

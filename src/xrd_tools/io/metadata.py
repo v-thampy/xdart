@@ -1158,6 +1158,20 @@ def live_sidecar_observation(
     return tuple((str(path), _metadata_path_revision(path)) for path in found)
 
 
+def any_auto_sidecar(image_paths) -> bool:
+    """Whether any of ``image_paths`` has an Auto sidecar file beside it now: an allow-listed extension, append-form
+    (``image.tif.txt``) or replace-form (``image.txt``), named by its folder's one fresh listing.  Nothing is opened
+    or parsed: a live Run asks once, from its first listing, whether the folder it watches has sidecars at all."""
+
+    listings: dict = {}
+    for path in image_paths:
+        image = _lexical_absolute(path)
+        _names, lower = _fresh_listing(image.parent, listings)
+        if any(f"{name}.{ext}".lower() in lower for ext in _AUTO_SIDECAR_EXTENSIONS for name in (image.name, image.stem)):
+            return True
+    return False
+
+
 #: Pauses in seconds before reading again when only a listed directory
 #: changed during a read (MetadataDiscoveryChanged): a live acquisition
 #: writes beside the image at any time.  Five reads in all.

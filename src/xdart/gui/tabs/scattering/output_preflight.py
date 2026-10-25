@@ -1335,10 +1335,12 @@ def _live_metadata_ready(
     """How many leading members of a Live group have their metadata ready.
 
     A member is ready when its selected sidecar (an explicit format) or its
-    Auto candidates look the same on two observations a poll apart, and an
-    explicit sidecar exists, so a new frame waits for a sidecar still being
-    written or about to land.  Under Auto, no sidecar on both observations
-    still means no metadata.  Under SPEC a new member is ready once its own
+    Auto candidates look the same on two observations a poll apart, and a
+    sidecar exists, so a new frame waits for a sidecar still being written or
+    about to land: under Auto too, since an image can be readable well before
+    its sidecar is listed (the Run's wait for it ends in the executor, which
+    gives up on a frame whose sidecar never comes, sooner when the Run has seen
+    no sidecar at all).  Under SPEC a new member is ready once its own
     SPEC row is complete: a row is final once written, so one look suffices
     (qualification then proves it), and no other point's row is ever borrowed;
     published members are not re-gated.  Metadata-off Runs do not wait.
@@ -1391,7 +1393,7 @@ def _live_metadata_ready(
         elif (
             previous != seen
             or any(revision is None for _path, revision in seen)
-            or (meta_format != "auto" and not seen and index >= published_members)
+            or (not seen and index >= published_members)
         ):
             ready, reason, waiting = index, f"waiting for the metadata of {image.name}", (
                 image.name, "settling" if seen else "sidecar")

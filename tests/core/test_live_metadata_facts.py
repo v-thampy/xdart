@@ -9,7 +9,7 @@ import numpy as np
 import tifffile
 
 from tests.core.test_p36_average import _txt
-from xrd_tools.io.metadata import live_sidecar_observation
+from xrd_tools.io.metadata import any_auto_sidecar, live_sidecar_observation
 from xrd_tools.sources.execution_graph import published_metadata_drift, qualify_source_execution_graph
 from xrd_tools.sources.selection import image_series_spec
 
@@ -49,3 +49,18 @@ def test_live_sidecar_observation_names_the_selected_file_or_the_auto_candidates
     assert Path(selected[0]).name == "scan_0001.txt" and selected[1] is not None
     assert live_sidecar_observation(image, "auto") == (selected,)
     assert live_sidecar_observation(image, "pdi") == ()
+
+
+def test_any_auto_sidecar_asks_one_listing_per_folder_whether_an_image_has_a_sidecar_beside_it(tmp_path):
+    """Claude review of 03af89cc, C1: a live Run asks once whether its folder has any sidecar at all."""
+    images = [tmp_path / f"scan_{index:04d}.tif" for index in (1, 2)]
+    for image in images:
+        tifffile.imwrite(image, np.ones((2, 2), dtype=np.uint16))
+    (tmp_path / "notes.txt").write_text("nothing to do with an image")
+    (tmp_path / "scan_0001.tif.log").write_text("a companion Auto never takes")
+    assert not any_auto_sidecar(images) and not any_auto_sidecar(())
+    (tmp_path / "scan_0002.TXT").write_text("I0 = 1")  # replace-form, any case, beside the second image only
+    assert any_auto_sidecar(images) and any_auto_sidecar(images[1:]) and not any_auto_sidecar(images[:1])
+    (tmp_path / "scan_0002.TXT").unlink()
+    (tmp_path / "scan_0001.tif.pdi").write_text("All Counters\nI0 = 1\n")  # append-form
+    assert any_auto_sidecar(images) and any_auto_sidecar(images[:1]) and not any_auto_sidecar(images[1:])

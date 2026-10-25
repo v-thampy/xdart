@@ -331,7 +331,10 @@ def test_q3e_under_auto_a_sidecar_landing_just_after_its_image_is_picked_up(tmp_
     assert (labels, i0) == ((1, 2), (1.0, 2.0))
 
 
-def test_q3f_under_auto_a_frame_without_any_sidecar_is_still_reduced_without_metadata(tmp_path):
+def test_q3f_under_auto_a_frame_without_any_sidecar_is_still_reduced_without_metadata(tmp_path, monkeypatch):
+    """Under Auto a frame without a sidecar waits as an explicit format's does (the sidecar limit, here shortened:
+    C1 of the 03af89cc review), then is reduced without metadata."""
+    monkeypatch.setattr(run_executor, '_METADATA_WAIT_LIMIT_S', {'sidecar': 1., 'spec': 1.})
     raw = tmp_path / 'raw'
     raw.mkdir()
     _frame(raw, 'scan', 1, 'txt', 1.0)
@@ -410,7 +413,11 @@ def test_q4b_a_published_sidecar_change_arriving_with_the_next_image_is_still_fe
     assert (labels, i0) == ((1,), (7.0,))
 
 
-def test_q4c_under_auto_a_sidecar_appearing_after_its_frame_was_published_stops_that_output(tmp_path):
+def test_q4c_under_auto_a_sidecar_appearing_after_its_frame_was_published_stops_that_output(tmp_path, monkeypatch):
+    """Frame 2 waited for its sidecar (the sidecar limit, here shortened: C1 of the 03af89cc review) and was
+    published without it; the sidecar landing after the Run stopped waiting stops the output, named for the late
+    metadata."""
+    monkeypatch.setattr(run_executor, '_METADATA_WAIT_LIMIT_S', {'sidecar': 1., 'spec': 1.})
     raw = tmp_path / 'raw'
     raw.mkdir()
     _frame(raw, 'scan', 1, 'txt', 1.0)
@@ -422,12 +429,12 @@ def test_q4c_under_auto_a_sidecar_appearing_after_its_frame_was_published_stops_
         _wait(executor, events, lambda values: 2 in _labels(values) or _terminal(values))
         digest, published = _published(executor, identity, members=2)
         (raw / 'scan_0002.txt').write_text(SIDECARS['txt'](2.0))  # appears after frame 2 was published
-        _wait(executor, events, lambda values: _said(values, 'scan_0002.txt') or _terminal(values))
+        _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values))
         _settle(executor, events)
     finally:
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
-    assert 'scan_0002.txt' in terminal[0][1], terminal
+    assert 'scan_int1d.nexus stopped growing' in terminal[0][1], terminal
     labels, i0, epoch = _output(tmp_path)
     assert labels == (1, 2) and i0[0] == 1.0 and np.isnan(i0[1]), (labels, i0)
     assert (epoch['digest'], epoch['extent']) == (digest, published)
