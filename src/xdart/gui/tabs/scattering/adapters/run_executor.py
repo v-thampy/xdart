@@ -1688,7 +1688,8 @@ class StandardRunExecutor:
         if constructed:
             self._abandon_construction(run)
         reason = detach_exception(error, "append").message if reason is None else reason
-        run.append_skips.append((str(target), "append", reason))
+        skip_kind = "scan" if failed or widened else "append"
+        run.append_skips.append((str(target), skip_kind, reason))
         run.live_blocked[target_key] = (
             f"{Path(target).name} stopped growing: "
             f"{'its energy span widened' if widened else 'it could not be processed' if failed else 'its Append was refused'}"
@@ -1697,12 +1698,13 @@ class StandardRunExecutor:
         run.live_waiting.pop(target_key, None)
         log_events.event(
             logger, logging.WARNING, "%s stops growing: %s; its frames so far are kept and its later frames are "
-            "skipped in this Run%s. Details: %s [APPEND-SKIPPED]", Path(target).name,
+            "skipped in this Run%s. Details: %s [%s]", Path(target).name,
             "its new frames' energies widen the q grid it was reduced on" if widened
             else "an image it already processed changed on disk" if changed else "it could not be processed" if failed
             else "it can no longer be extended",
             "; a directory Run reprocesses the whole scan" if widened
-            else "; the next Run reprocesses the whole scan" if changed else "", reason)
+            else "; the next Run reprocesses the whole scan" if changed else "", reason,
+            "SCAN-SKIPPED" if skip_kind == "scan" else "APPEND-SKIPPED")
 
     def _watch_metadata_wait(self, run: _StandardRun, target: Path | None, target_key: str,
                              waiting: tuple[str, str] | None, waits: dict[str, tuple[str, float, str, str]],

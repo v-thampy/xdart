@@ -681,10 +681,20 @@ def test_live_stable_construct_value_error_skips_its_scan_and_is_not_retried(
     events.extend(executor.drain_events())
     run = executor._exact_run(identity)
     assert construct_calls == 1
-    assert [reason for _target, kind, reason in run.append_skips if kind == "append"] == [
-        "ValueError: stable construction invalid"]
+    assert [(kind, reason) for _target, kind, reason in run.append_skips] == [
+        ("scan", "ValueError: stable construction invalid")]
     assert not [event for event in events if event.kind is StandardEventKind.FAILED]
     executor.stop(identity)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not any(
+            event.kind is StandardEventKind.STOPPED for event in events):
+        events.extend(executor.drain_events())
+        time.sleep(0.01)
+    stopped, = [event for event in events if event.kind is StandardEventKind.STOPPED]
+    [(target, kind, reason)] = run.append_skips
+    assert kind == "scan" and stopped.warnings == (
+        f"Skipped {Path(target).name}: {reason}",
+    ), stopped.warnings
     closed = executor.close(identity)
     assert closed.cleanup_status is CleanupStatus.CLEANED
 
