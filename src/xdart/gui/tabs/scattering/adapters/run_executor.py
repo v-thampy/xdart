@@ -2826,20 +2826,7 @@ class StandardRunExecutor:
                             publish(force=True)
                             continue
                         except SourceRevisionChanged:
-                            source_owner = run.source
-                            if source_owner is not None:
-                                close = getattr(source_owner, "close", None)
-                                if callable(close):
-                                    close()
-                            run.source = None
-                            run.scan = None
-                            run.records = None
-                            run.frames_by_label.clear()
-                            run.current_total = 0
-                            run.current_completed = 0
-                            run.current_published = 0
-                            run.current_file_total = 0
-                            run.current_files_incremental = False
+                            self._abandon_construction(run)
                             retry_revisions[target_key] = revision
                             publish(force=True)
                             continue
