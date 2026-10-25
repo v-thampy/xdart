@@ -5944,7 +5944,9 @@ class NexusRecordWriter:
                     evidence_bytes=(
                         None if fast_evidence is None else fast_evidence[1]
                     ),
-                    flushed=binding.transaction.durable_fsync,
+                    # The fast route has no writing handle left to flush through: the close seal flushes the closed
+                    # file once itself under the transaction's policy (the HDF5 close rewrote bytes after the last
+                    # checkpoint's flush); the terminal seal then adds none.
                 )
             self._stream_close_flushed = (self._stream_close_attempt is not None
                                           and binding.transaction.durable_fsync)
