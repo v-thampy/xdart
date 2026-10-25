@@ -16,7 +16,7 @@ from xdart.modules.frame_publication import (
     publication_from_frame_view,
 )
 from xrd_tools.core.scan import SourceKind, SourceReadError
-from xrd_tools.io.append import AppendRefused
+from xrd_tools.io.append import AppendRefused, saved_energy_selection
 from xrd_tools.io.metadata import MetadataSourceChanged
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import EnergyGridWidened, WarmIntegrators, energy_scan_grid_changes
@@ -884,20 +884,6 @@ def _energy_span(selection: Any) -> str:
         return f"{min(energies):.1f}-{max(energies):.1f} eV"
     energy = selection.get("energy_eV") if isinstance(selection, dict) else None
     return "one energy" if energy is None else f"one energy, {energy:.1f} eV"
-
-
-def _saved_energy_selection(target: Path) -> dict | None:
-    """The energy selection ``target``'s output saved (its reduction config), or None: none, or none readable."""
-    import json
-
-    import h5py
-    try:
-        with h5py.File(target, "r") as handle:
-            node = handle.get("entry/reduction/config/energy_selection")
-            value = None if node is None else json.loads(node[()])
-    except (OSError, ValueError, TypeError, KeyError):
-        return None
-    return value if type(value) is dict else None
 
 
 def _read_container(read, source, what: str, *, typed: bool):
@@ -2000,7 +1986,7 @@ class StandardRunExecutor:
             # An energy scan in q has one common grid, from its lowest to its highest energy; frames that widen the
             # one its rows were reduced on cannot join its stack (maintainer, 2026-10-25: "Rebuild it whole").
             baseline = (run.energy_baselines.get(key, run) if owned else
-                        prior_energy if type(prior_energy) is dict else _saved_energy_selection(item.target))
+                        prior_energy if type(prior_energy) is dict else saved_energy_selection(item.target))
             if baseline is not run and energy_scan_grid_changes(plan, baseline, integrator, poni):
                 discard_source()
                 raise EnergyGridWidened(f"its frames' energies now span {_energy_span(plan.extra.get('energy_selection'))}"

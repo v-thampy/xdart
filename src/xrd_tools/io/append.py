@@ -1198,6 +1198,17 @@ def committed_append_execution(
     return count, execution, energy
 
 
+def saved_energy_selection(target: str | Path) -> dict[str, Any] | None:
+    """The energy selection ``target``'s output saved (its reduction config), or None: none, or none readable."""
+    try:
+        with h5py.File(target, "r") as handle:
+            node = handle.get("entry/reduction/config/energy_selection")
+            value = None if node is None else json.loads(node[()])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    return value if type(value) is dict else None
+
+
 def committed_image_count(target: str | Path, *, entry: str) -> int | None:
     """How many images ``target``'s committed Append record holds, as qualification decodes its committed prefix, or
     None: no output, or none this reader can vouch for. A small metadata read, no image or sidecar."""
