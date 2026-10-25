@@ -66,4 +66,3 @@ def test_a_transient_oserror_while_a_live_frame_is_qualified_is_retried_at_the_n
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     labels, i0, _epoch = _output(tmp_path)
     assert (labels, i0) == ((1, 2), (1.0, 2.0))
-
