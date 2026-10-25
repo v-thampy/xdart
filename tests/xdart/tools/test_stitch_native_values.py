@@ -32,7 +32,9 @@ def test_a_preflight_marks_the_outputs_already_stitched_from_the_same_frames_wit
         tmp_path, backend, monkeypatch):
     """What a Run in Append mode skips (maintainer, 2026-09-29: "skip if something has already been
     processed with the same settings as before, else overwrite"): the same settings over the same
-    frames, whatever the source files' revisions."""
+    frames. A later SPEC scan leaves an earlier scan's stitch standing, but an image that was already
+    stitched and then changed on disk (its size or mtime) is stitched again, as Int rebuilds a scan
+    whose processed image changed (maintainer, 2026-10-24; Stitch/RSM parity 0b646d49, 50bc9568)."""
     import os
     import time
     from xrd_tools.analysis.stitch_operation import run_stitch_operation
@@ -51,14 +53,18 @@ def test_a_preflight_marks_the_outputs_already_stitched_from_the_same_frames_wit
     monkeypatch.undo()
     spec = Path(form.spec_path)  # the SPEC file grows by a later scan: its revision changes
     spec.write_text(spec.read_text() + "\n#S 9 ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n#L del  nu\n14 -10\n15 -10\n")
+    grown = prepare_stitch_tool(form)
+    assert grown.requests[0].module.fingerprint != first.module.fingerprint  # the SPEC revision differs ...
+    assert grown.unchanged == (0,)  # ... and the earlier scan's stitch stands
     image = next(Path(form.image_dir).glob("sample_scan1_0000*"))
     data = image.read_bytes()
     time.sleep(.01)
-    image.write_bytes(data)  # the same bytes under a new revision
+    image.write_bytes(data)  # the same bytes under a new mtime: a re-copied image
     os.utime(image, ns=(time.time_ns() + 10**9,) * 2)
     again = prepare_stitch_tool(form)
-    assert again.requests[0].module.fingerprint != first.module.fingerprint  # the revisions differ
-    assert again.unchanged == (0,)
+    assert again.unchanged == ()  # an image already stitched changed on disk: that output is stitched again
+    assert run_stitch_operation(again.requests[0]).terminal.disposition is ModuleDisposition.COMMITTED
+    assert prepare_stitch_tool(form).unchanged == (0,)
     assert run_stitch_operation(again.requests[1]).terminal.disposition is ModuleDisposition.COMMITTED
     assert prepare_stitch_tool(form).unchanged == (0, 1)
     assert prepare_stitch_tool(replace(form, npt_1d=80)).unchanged == ()  # another setting
