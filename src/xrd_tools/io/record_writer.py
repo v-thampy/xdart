@@ -4066,7 +4066,9 @@ class NexusRecordWriter:
                 binding.attempt, self._stream_close_attempt, lease=binding.lease,
                 descriptor=descriptor, expected_stat=after,
                 evidence_digest=aggregate.hexdigest(), evidence_bytes=0,
-                flushed=binding.transaction.durable_fsync,
+                # Flushed through the writing handle above only when this close still held one; otherwise the close
+                # seal flushes the file it opened, under the transaction's policy.
+                flushed=writing and binding.transaction.durable_fsync,
             )
         except BaseException:
             binding.transaction.hold_stream_close(binding.attempt, self._stream_close_attempt, lease=binding.lease)
