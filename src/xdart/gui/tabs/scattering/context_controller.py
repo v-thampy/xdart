@@ -2017,6 +2017,10 @@ class ContextController:
         identity = self._lifecycle.active_run_identity
         return identity if type(identity) is RunIdentity else self._runtime.require_identity()
 
+    def browse_lifecycle_admissible(self) -> bool:
+        """Whether the Run's phase lets Browse open a scan now (idle, paused, or failed and resettable)."""
+        return self._browse_lifecycle_admissible()
+
     def _browse_lifecycle_admissible(self) -> bool:
         phase = self._lifecycle.phase
         return (

@@ -1171,6 +1171,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return None
         if disposition is not MetadataDisposition.READY:
             self._metadata_operations.drop(captured)
+            self._explain_metadata_held(captured.dialog)
             return None
         identity = self._start_metadata_request(captured)
         if identity is not None:
@@ -1183,10 +1184,27 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             is not MetadataDisposition.TRANSIENT
         ):
             self._metadata_operations.drop(captured)
+            self._explain_metadata_held(captured.dialog)
         else:
             self._notice("Metadata queued…")
             self._ensure_timer()
         return None
+
+    #: A Run in these phases keeps the metadata table unread: it is read from the Run's own output.
+    _METADATA_HELD_PHASES = frozenset({
+        RunPhase.PREPARING, RunPhase.STARTING, RunPhase.RUNNING, RunPhase.PAUSING, RunPhase.PAUSED,
+        RunPhase.RESUMING, RunPhase.STOPPING, RunPhase.FINALIZING,
+    })
+    _METADATA_HELD = "Metadata is available after the Run stops; then press Metadata again."
+
+    def _metadata_held_by_run(self) -> bool:
+        return self._lifecycle.phase in self._METADATA_HELD_PHASES
+
+    def _explain_metadata_held(self, identity: object) -> None:
+        """A request a Run holds leaves the window empty; say why (maintainer, 2026-10-25: "i also got this blank meta
+        data when i paused a live run ... say why it's empty for now, but i want to revisit this")."""
+        if self._metadata_held_by_run():
+            self._set_metadata_dialog_status(identity, self._METADATA_HELD)
 
     def _dispatch_deferred_metadata(self) -> WorkspaceRefreshEffect:
         captured = self._metadata_operations.deferred
@@ -1195,12 +1213,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         disposition = self._classify_metadata_request(captured)
         if disposition is MetadataDisposition.TRANSIENT:
             return WorkspaceRefreshEffect.NONE
+        held = self._METADATA_HELD if self._metadata_held_by_run() else "Metadata request is no longer current."
         if disposition is not MetadataDisposition.READY:
             self._metadata_operations.drop(captured)
-            return self._finish_metadata_refresh(
-                captured.dialog,
-                "Metadata request is no longer current.",
-            )
+            return self._finish_metadata_refresh(captured.dialog, held)
         identity = self._start_metadata_request(captured)
         if identity is not None:
             return WorkspaceRefreshEffect.DIALOG
@@ -1209,10 +1225,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             is not MetadataDisposition.TRANSIENT
         ):
             self._metadata_operations.drop(captured)
-            return self._finish_metadata_refresh(
-                captured.dialog,
-                "Metadata request is no longer current.",
-            )
+            return self._finish_metadata_refresh(captured.dialog, held)
         self._ensure_timer()
         return WorkspaceRefreshEffect.NONE
 
@@ -4586,7 +4599,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 ),
             )
         except Exception as error:
-            self._error_notice("Browse refused", error)
+            if self._context_controller.browse_lifecycle_admissible():
+                self._error_notice("Browse refused", error)
+            else:
+                # A Run that is running keeps Browse closed: say so, without a traceback, and keep the row the
+                # Browser shows (beamline 2026-10-25: a click during Live logged "Browse refused" with one).
+                self._notice("Browse is unavailable while a Run is running; pause or stop it to open another scan.")
+                self._refresh_shell(preserve_scientific=True)
             if self._context_controller.browse_pending:
                 self._ensure_timer()
             return
