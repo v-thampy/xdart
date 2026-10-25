@@ -5480,6 +5480,24 @@ def _freeze_energy_scan_q_grid(plan: ReductionPlan, integrator: Any, poni: Any =
     })
 
 
+class EnergyGridWidened(Exception):
+    """An Append's new frames widen the common q grid its energy scan was reduced on (``energy_scan_grid_changes``):
+    they cannot extend its one stack, whose axis is that grid."""
+
+
+def energy_scan_grid_changes(plan: ReductionPlan, previous_selection: Any, integrator: Any = None,
+                             poni: Any = None) -> bool:
+    """Whether ``plan`` reduces its energy scan on a common q grid other than the one frames reduced under
+    ``previous_selection`` (an output's saved energy selection) were: the grid spans the lowest and highest energies
+    the selection lists (``_freeze_energy_scan_q_grid``), so a frame beyond the earlier span, or an output reduced at
+    one energy, needs another; 2θ, GI or a range the user set never does."""
+    current = (_freeze_energy_scan_q_grid(plan, integrator, poni).extra or {}).get(ENERGY_SCAN_Q_RANGES)
+    if current is None:
+        return False
+    earlier = replace(plan, extra={**(plan.extra or {}), "energy_selection": previous_selection})
+    return (_freeze_energy_scan_q_grid(earlier, integrator, poni).extra or {}).get(ENERGY_SCAN_Q_RANGES) != current
+
+
 def _on_energy_scan_grid(item: Any, grid: Mapping[str, Any] | None, key: str) -> Any:
     """One integration on its energy scan's common q range (``_freeze_energy_scan_q_grid``)."""
     if not grid or item is None or key not in grid:

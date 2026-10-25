@@ -157,21 +157,19 @@ def _grown_energy(tmp_path, monkeypatch, before, after, *, prefix):
     return [event.kind.name for event in terminals], reads["read"], selection
 
 
-@pytest.mark.parametrize("case, before, after, reads", [
-    ("fixed", [16.0] * 6, [16.0], 0),
-    ("energy scan", [16.0, 16.1, 16.2, 16.3, 16.4, 16.5], [16.6, 16.7], 0),
-    ("energy scan, a glitched new frame", [16.0, 16.1, 16.2, 16.3, 16.4, 16.5], [0.0, 16.7], 0),
-    ("no energy recorded", [None] * 6, [None], 0),
-    ("a common energy that now varies", [16.0] * 6, [16.2], 6),  # read again: the saved selection cannot settle it
+@pytest.mark.parametrize("case, before, after, settled", [
+    ("fixed", [16.0] * 6, [16.0], True),
+    ("energy scan", [16.0, 16.1, 16.2, 16.3, 16.4, 16.5], [16.2, 16.4], True),  # within its span: no wider grid
+    ("energy scan, a glitched new frame", [16.0, 16.1, 16.2, 16.3, 16.4, 16.5], [0.0, 16.3], True),
+    ("no energy recorded", [None] * 6, [None], True),
+    ("a common energy that now varies", [16.0] * 6, [16.2], False),  # read again, then reduced whole on its grid
 ])
 def test_a_grown_scans_energy_is_the_full_ways_without_reading_its_processed_frames(
-        tmp_path, monkeypatch, case, before, after, reads):
-    """The Run ends as the full way's does, with the same saved energy selection, and its processed frames' .txt are read
-    only when the saved selection cannot settle it. (An energy scan's Append fails at the writer either way, a separate
-    defect found here, so the energy-scan extension itself is checked directly in tests/core/test_energy_extension.py.)"""
+        tmp_path, monkeypatch, case, before, after, settled):
+    """The Run ends as the full way's does, with the same saved energy selection; its processed frames' .txt are read
+    only when the saved selection cannot settle it (test_energy_scan_append_grid.py pins the wider-grid rebuild)."""
     kinds, read, selection = _grown_energy(tmp_path / "grown", monkeypatch, before, after, prefix=True)
     full_kinds, _full_read, full = _grown_energy(tmp_path / "full", monkeypatch, before, after, prefix=False)
-    assert kinds == full_kinds, (case, kinds, full_kinds)
-    assert kinds == ["FINISHED"] or case.startswith("energy scan") or case.endswith("varies"), (case, kinds)
-    assert read == reads, (case, read)
+    assert kinds == full_kinds == ["FINISHED"], (case, kinds, full_kinds)
+    assert (read == 0) is settled, (case, read)
     assert selection == full, (case, selection, full)

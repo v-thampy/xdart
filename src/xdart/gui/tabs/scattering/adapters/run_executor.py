@@ -19,7 +19,7 @@ from xrd_tools.core.scan import SourceKind, SourceReadError
 from xrd_tools.io.append import AppendRefused
 from xrd_tools.io.metadata import MetadataSourceChanged
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
-from xrd_tools.reduction.core import WarmIntegrators
+from xrd_tools.reduction.core import EnergyGridWidened, WarmIntegrators, energy_scan_grid_changes
 from xrd_tools.reduction.background import (
     _PreparedSeriesFrameBackground,
     _PreparedSingleFrameBackground,
@@ -512,6 +512,10 @@ class _StandardRun:
     live_admission_proof: Any = None
     # A finite Append's grown scan: the energy selection its output saved for the frames it holds (_construct's prior).
     prior_energy_selection: Any = None
+    # The energy selection each output this Run writes was first reduced under here: its session keeps that q grid.
+    energy_baselines: dict[str, Any] = field(default_factory=dict)
+    # The next construction reduces a scan whole again because its new frames widened its energy grid.
+    rebuild_widened: bool = False
     # Live outputs that stopped growing because a published frame's metadata
     # changed: physical target key -> the reason every later status carries.
     live_blocked: dict[str, str] = field(default_factory=dict)
@@ -871,6 +875,29 @@ def _skips_failed_scans(run: _StandardRun) -> bool:
     admission = getattr(getattr(run, "resources", None), "admission", None)  # a run double may carry no resources
     return (type(getattr(admission, "deferred_directory", None)) is DeferredDirectoryPlan
             or bool(getattr(admission, "directory_discovered_file_count", 0)))
+
+
+def _energy_span(selection: Any) -> str:
+    """An energy selection's span, for a message: its frames' lowest to highest energy, or its one energy."""
+    energies = (selection or {}).get("frame_energies_eV") or () if isinstance(selection, dict) else ()
+    if energies:
+        return f"{min(energies):.1f}-{max(energies):.1f} eV"
+    energy = selection.get("energy_eV") if isinstance(selection, dict) else None
+    return "one energy" if energy is None else f"one energy, {energy:.1f} eV"
+
+
+def _saved_energy_selection(target: Path) -> dict | None:
+    """The energy selection ``target``'s output saved (its reduction config), or None: none, or none readable."""
+    import json
+
+    import h5py
+    try:
+        with h5py.File(target, "r") as handle:
+            node = handle.get("entry/reduction/config/energy_selection")
+            value = None if node is None else json.loads(node[()])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    return value if type(value) is dict else None
 
 
 def _read_container(read, source, what: str, *, typed: bool):
@@ -1618,6 +1645,19 @@ class StandardRunExecutor:
         log_events.event(logger, logging.WARNING, "%s skipped: it could not be processed; frames already saved are "
                          "kept, and the other scans continue. Details: %s [SCAN-SKIPPED]", Path(target).name, reason)
 
+    @staticmethod
+    def _widened_rebuild(run: _StandardRun, receipt: AdmissionReceipt, session: Any, entry: DeferredDirectoryEntry,
+                         reason: str) -> AdmittedOutput:
+        """The admission that reduces ``entry``'s scan again whole into its output (a REPLACE, every frame qualified
+        afresh, none taken from its record): its new frames widened its energy scan's q grid."""
+        decision, _ready, _skipped = materialize_deferred_output(
+            receipt, session, entry, cancelled=lambda: run.stop_requested)
+        if decision is None:
+            raise ValueError("its scan has no READY frames left to reduce again")
+        stamp = decision.item.source_stamp
+        labels = tuple(range(stamp.first_label, stamp.first_label + stamp.frame_count))
+        return AdmittedOutput(decision.item, OutputDisposition.REPLACE, labels, decision.fact, reason)
+
     def _skip_failed_directory_scan(self, run: _StandardRun, target: Path, error: BaseException, *,
                                     constructed: bool) -> None:
         """A directory Run's scan whose construction refused (``constructed`` False) or whose image could not be read
@@ -1646,7 +1686,7 @@ class StandardRunExecutor:
 
     def _skip_live_append(
         self, run: _StandardRun, target: Path, target_key: str, error: AppendRefused | None, *, constructed: bool,
-        reason: str | None = None, changed: bool = False, failed: bool = False,
+        reason: str | None = None, changed: bool = False, failed: bool = False, widened: bool = False,
     ) -> None:
         """Leave one Live output as it is after its Append refused: later polls skip its frames, the status names
         it, and the Run's end lists the reason. The output, when it is the current one, is retired first (with the
@@ -1661,15 +1701,18 @@ class StandardRunExecutor:
         run.append_skips.append((str(target), reason))
         run.live_blocked[target_key] = (
             f"{Path(target).name} stopped growing: "
-            f"{'it could not be processed' if failed else 'its Append was refused'}; published frames kept"
+            f"{'its energy span widened' if widened else 'it could not be processed' if failed else 'its Append was refused'}"
+            "; published frames kept"
         )
         run.live_waiting.pop(target_key, None)
         log_events.event(
             logger, logging.WARNING, "%s stops growing: %s; its frames so far are kept and its later frames are "
             "skipped in this Run%s. Details: %s [APPEND-SKIPPED]", Path(target).name,
-            "an image it already processed changed on disk" if changed else "it could not be processed" if failed
+            "its new frames' energies widen the q grid it was reduced on" if widened
+            else "an image it already processed changed on disk" if changed else "it could not be processed" if failed
             else "it can no longer be extended",
-            "; the next Run reprocesses the whole scan" if changed else "", reason)
+            "; a directory Run reprocesses the whole scan" if widened
+            else "; the next Run reprocesses the whole scan" if changed else "", reason)
 
     def _watch_metadata_wait(self, run: _StandardRun, target: Path | None, target_key: str,
                              waiting: tuple[str, str] | None, waits: dict[str, tuple[str, float, str, str]],
@@ -1768,6 +1811,7 @@ class StandardRunExecutor:
             run.live_admission_proof = None
             proof = proof if item is not None and proof.graph is item.graph else None
         prior_energy, run.prior_energy_selection = getattr(run, 'prior_energy_selection', None), None
+        widened_rebuild, run.rebuild_widened = getattr(run, 'rebuild_widened', False), False
         # A finite Append's scan that grew, with the energy selection its output saved: the frames it holds are not
         # read here either (only that selection used their metadata); the binding extends it, or they are read.
         grown = (prior_energy if proof is not None and item.graph.infers_point_images
@@ -1949,6 +1993,18 @@ class StandardRunExecutor:
         if item is None or decision is None:
             raise RuntimeError("dynamic output requires one admitted output")
         output = run.output
+        key, owned = _physical_file_key(item.target), output is not None and output.owns_target(item.target)
+        if (configuration.output_mode == "Append" and decision.disposition is OutputDisposition.WRITE
+                and len(decision.labels) < item.source_stamp.frame_count
+                and (plan.extra.get("energy_selection") or {}).get("frame_energies_eV")):
+            # An energy scan in q has one common grid, from its lowest to its highest energy; frames that widen the
+            # one its rows were reduced on cannot join its stack (maintainer, 2026-10-25: "Rebuild it whole").
+            baseline = (run.energy_baselines.get(key, run) if owned else
+                        prior_energy if type(prior_energy) is dict else _saved_energy_selection(item.target))
+            if baseline is not run and energy_scan_grid_changes(plan, baseline, integrator, poni):
+                discard_source()
+                raise EnergyGridWidened(f"its frames' energies now span {_energy_span(plan.extra.get('energy_selection'))}"
+                                        f"; its saved rows were reduced over {_energy_span(baseline)}")
         if output is None:
             output = DynamicOutputAdapter(configuration, self._warm_tables); run.output = output
         preparation = output.prepare_admission(
@@ -1959,6 +2015,8 @@ class StandardRunExecutor:
         replaces = decision.disposition is OutputDisposition.REPLACE
         if (configuration.output_mode == "Overwrite" or replaces) and not target_state_matches(preparation.effective):
             raise RuntimeError(f"output target changed after Background qualification: {item.target}")
+        if not owned or replaces:  # a new graph and session for it: their grid is this selection's
+            run.energy_baselines[key] = plan.extra.get("energy_selection")
         run.display.set_factories(FrameRecordStore, PublicationStore)
         if not run.display.configured:
             descriptor_bytes = (
@@ -2052,9 +2110,10 @@ class StandardRunExecutor:
             run_provenance["append_replacement"] = {
                 "requested_output_mode": "Append", "effective_output_mode": "Overwrite", "reason": decision.reason}
             log_events.event(
-                logger, logging.INFO, "%s: images it already processed changed on disk, so the whole scan is "
-                "reprocessed and its output replaced. Details: %s [APPEND-REBUILD]", Path(item.target).name,
-                decision.reason)
+                logger, logging.INFO, "%s: %s, so the whole scan is reprocessed and its output replaced. Details: %s "
+                "[APPEND-REBUILD]", Path(item.target).name,
+                "its new frames' energies widen the q grid its frames were reduced on" if widened_rebuild
+                else "images it already processed changed on disk", decision.reason)
         if run.stop_requested:
             discard_source()
             raise RuntimeError("admission cancelled")
@@ -2748,6 +2807,14 @@ class StandardRunExecutor:
                                 decision=decision,
                             )
                             times.add("construct", started)
+                        except EnergyGridWidened as widened:
+                            # Its new frames widen the q grid its energy scan was reduced on: it stops growing, named;
+                            # a directory Run reduces it again whole (maintainer, 2026-10-25: "Rebuild it whole").
+                            self._skip_live_append(run, group.target, target_key, None, constructed=True,
+                                                   reason=str(widened), widened=True)
+                            skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
+                            publish(force=True)
+                            continue
                         except SourceRevisionChanged:
                             source_owner = run.source
                             if source_owner is not None:
@@ -3026,12 +3093,21 @@ class StandardRunExecutor:
                 run.live_admission_proof = proofs[-1] if proofs else None
                 run.prior_energy_selection = None if committed is None else getattr(
                     entry, "committed_energy_selection", None)
-                self._construct(
-                    run,
-                    item=item,
-                    labels=decision.labels,
-                    decision=decision,
-                )
+                try:
+                    self._construct(
+                        run,
+                        item=item,
+                        labels=decision.labels,
+                        decision=decision,
+                    )
+                except EnergyGridWidened as widened:
+                    # Its new frames widen the q grid its energy scan was reduced on: the whole scan is reduced again
+                    # on the wider one, into its output (maintainer, 2026-10-25: "Rebuild it whole"). Construction
+                    # refused before it changed anything but its source, which it closed.
+                    decision = self._widened_rebuild(run, receipt, session, entry, str(widened))
+                    item = decision.item
+                    run.rebuild_widened = True
+                    self._construct(run, item=item, labels=decision.labels, decision=decision)
             except ValueError as error:  # (an OSError: its output cannot be written, and the Run fails)
                 self._skip_failed_directory_scan(run, item.target, error, constructed=False)
                 continue
