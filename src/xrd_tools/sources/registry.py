@@ -261,6 +261,7 @@ _TIFF_MAX_IFDS = 4096
 _TIFF_MAX_TOTAL_IFD_ENTRIES = 65536
 _TIFF_MAX_PAYLOAD_PARTS = 1_000_000
 _TIFF_MAX_TOTAL_TAG_BYTES = 8 << 20
+_TIFF_PAYLOAD_COMPLETE = object()
 
 
 def _cbf_incomplete_reason(path: Path) -> str | None:
@@ -287,8 +288,8 @@ def _cbf_incomplete_reason(path: Path) -> str | None:
     return None
 
 
-def _tiff_header_incomplete_reason(stream: Any, captured_size: int) -> str | None:
-    """Prove a recognized TIFF's declared pixel payload extends beyond EOF.
+def _tiff_header_incomplete_reason(stream: Any, captured_size: int) -> str | object | None:
+    """Return a truncation reason, the complete sentinel, or None when layout is unknown.
 
     This is deliberately a small, bounded classic/BigTIFF IFD reader, not an
     image decoder.  It reads only directory entries and the integer arrays
@@ -335,10 +336,11 @@ def _tiff_header_incomplete_reason(stream: Any, captured_size: int) -> str | Non
     }
     total_entries = 0
     total_tag_bytes = 0
+    proven_page = False
 
     for _page in range(_TIFF_MAX_IFDS):
         if ifd_offset == 0:
-            return None
+            return _TIFF_PAYLOAD_COMPLETE if proven_page else None
         if ifd_offset in seen_ifds:
             return None
         seen_ifds.add(ifd_offset)
@@ -418,6 +420,7 @@ def _tiff_header_incomplete_reason(stream: Any, captured_size: int) -> str | Non
             if offset > captured_size or byte_count > captured_size - offset:
                 return "TIFF pixel payload is still incomplete"
 
+        proven_page = True
         ifd_offset = struct.unpack(endian + offset_format, raw_next)[0]
 
     # More IFDs than the explicit ceiling is outside this fast structural
@@ -425,7 +428,7 @@ def _tiff_header_incomplete_reason(stream: Any, captured_size: int) -> str | Non
     return None
 
 
-def _tiff_incomplete_reason(path: Path) -> str | None:
+def _tiff_incomplete_reason(path: Path) -> str | object | None:
     try:
         before = path.stat()
         captured = (
@@ -498,9 +501,15 @@ def _image_probe(path: Path) -> Any:
                 ProbeState.IN_PROGRESS, reason=reason, kind=SourceKind.IMAGE_FILE)
     if path.suffix.lower() in {".tif", ".tiff"}:
         reason = _tiff_incomplete_reason(path)
-        if reason is not None:
+        if isinstance(reason, str):
             return ProbeResult(
                 ProbeState.IN_PROGRESS, reason=reason, kind=SourceKind.IMAGE_FILE)
+        if reason is _TIFF_PAYLOAD_COMPLETE:
+            return ProbeResult(
+                ProbeState.READY,
+                reason="TIFF strip/tile payloads are within the file",
+                kind=SourceKind.IMAGE_FILE,
+            )
     import fabio
     try:
         with fabio.open(str(path)) as f:

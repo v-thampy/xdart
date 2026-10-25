@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import io
 import struct
 from pathlib import Path
 from types import SimpleNamespace
@@ -100,8 +101,7 @@ def test_partial_tiff_payload_stays_provisional_without_entering_fabio(
             assert decoder_calls == []
 
             # Grow the exact same filesystem object.  The size stamp wakes the
-            # session immediately and the first complete probe enters Fabio
-            # exactly once.
+            # session immediately and the complete header proof makes it ready.
             with source.open("ab") as stream:
                 stream.write(payload[payload_offset:])
             assert source.stat().st_ino == initial_inode
@@ -110,7 +110,7 @@ def test_partial_tiff_payload_stays_provisional_without_entering_fabio(
             assert ready.result_for(source).state is ProbeState.READY
             assert ready.pending_count == 0
             assert ready.content_opens == 1
-            assert decoder_calls == [source]
+            assert decoder_calls == []
         finally:
             session.close()
 
@@ -257,7 +257,65 @@ def test_complete_strip_and_tile_tiffs_remain_ready(
 
     source.write_bytes(payload)
     assert _probe(source).state is ProbeState.READY
-    assert decoder_calls == [source]
+    assert decoder_calls == []
+
+
+def test_complete_tiff_probe_uses_only_header_reads(tmp_path, monkeypatch):
+    import fabio
+
+    tifffile = pytest.importorskip("tifffile")
+    source = tmp_path / "large-complete.tif"
+    tifffile.imwrite(
+        source,
+        np.arange(1024 * 1024, dtype=np.uint16).reshape(1024, 1024),
+        compression=None,
+        metadata=None,
+    )
+    payload_size = source.stat().st_size
+    decoder_calls = []
+    real_fabio_open = fabio.open
+
+    def observed_fabio_open(filename, *args, **kwargs):
+        decoder_calls.append(Path(filename))
+        return real_fabio_open(filename, *args, **kwargs)
+
+    real_io_open = io.open
+    bytes_read = []
+
+    class CountedReader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.stream.__exit__(*exc)
+
+        def read(self, *args):
+            value = self.stream.read(*args)
+            bytes_read.append(len(value))
+            return value
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+    def observed_io_open(file, *args, **kwargs):
+        stream = real_io_open(file, *args, **kwargs)
+        try:
+            selected = Path(file) == source
+        except (TypeError, ValueError):
+            selected = False
+        if selected and "r" in (args[0] if args else kwargs.get("mode", "r")):
+            return CountedReader(stream)
+        return stream
+
+    monkeypatch.setattr(fabio, "open", observed_fabio_open)
+    monkeypatch.setattr(io, "open", observed_io_open)
+
+    assert _probe(source).state is ProbeState.READY
+    assert decoder_calls == []
+    assert sum(bytes_read) < payload_size // 100, (sum(bytes_read), payload_size)
 
 
 def test_non_tiff_format_remains_decoder_owned(
