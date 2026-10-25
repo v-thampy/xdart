@@ -1977,13 +1977,13 @@ class StandardRunExecutor:
         if item is None or decision is None:
             raise RuntimeError("dynamic output requires one admitted output")
         output = run.output
-        owned = output is not None and output.owns_target(item.target)
+        keeps_session = output is not None and output.owns_target(item.target) and output.session is not None
         if (configuration.output_mode == "Append" and decision.disposition is OutputDisposition.WRITE
-                and not owned and len(decision.labels) < item.source_stamp.frame_count
+                and not keeps_session and len(decision.labels) < item.source_stamp.frame_count
                 and (plan.extra.get("energy_selection") or {}).get("frame_energies_eV")):
             # An energy scan in q has one common grid, from its lowest to its highest energy; frames that widen the
             # one an earlier Run's rows were reduced on cannot join its stack (maintainer, 2026-10-25: "Rebuild it
-            # whole"). The output a Live Run grows is not checked: its session keeps its first grid and energies,
+            # whole"). An output with an existing session is not checked: it keeps its first grid and energies,
             # dropping the points beyond, and a frame they do not list takes the first point's (maintainer,
             # 2026-10-25: "it is fine to drop the points that don't lie on the initial grid rather than stopping";
             # "It's fine to stick with the energy of the first point if the scan parameters are not known").
