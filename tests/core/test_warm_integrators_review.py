@@ -131,14 +131,16 @@ def test_a_dynamic_mask_declines_this_providers_cache_before_building(monkeypatc
     idle_at_build = []
 
     def build(gi):
-        idle_at_build.append(len(reuse))
+        idle_at_build.append((len(reuse), dict(reuse._lent)))
         return real_build(gi)
 
     monkeypatch.setattr(provider, "_new_fiber", build)
     core._reduce_frame(scan.frames[0], None, plan, provider, {})
     provider.give_back()
-    assert idle_at_build == [0], "unaccounted dynamic-mask build kept the warm idle set"
-    assert len(reuse) == 0 and not reuse._lent
+    assert idle_at_build == [(1, {next(iter(reuse._sizes)): 1})], (
+        "the active unpriceable worker must be reserved while the known warm table remains idle"
+    )
+    assert len(reuse) == 1 and not reuse._lent
 
 
 def test_unmeasurable_tables_are_not_retained_with_a_positive_allowance():
@@ -148,6 +150,51 @@ def test_unmeasurable_tables_are_not_retained_with_a_positive_allowance():
     assert core._table_bytes(scan.integrator) == 0
     assert reuse.borrow(key) is None
     reuse.give_back(key, scan.integrator)
+    assert len(reuse) == 0 and not reuse._lent
+
+
+def test_unpriceable_provider_reserves_known_family_and_keeps_cross_run_tables():
+    from tests.core.test_warm_integrators import _plan as standard_plan, _reduce as reduce_standard
+    from tests.core.test_warm_integrators import _scan as standard_scan
+
+    reuse = WarmIntegrators(2, allowance=1 << 30)
+    reduce_standard(standard_scan("priced", frames=1), standard_plan(), reuse=reuse)
+    assert len(reuse) == 1
+    key = next(iter(reuse._idle))
+    family = key[:2]
+    price = reuse._sizes[family]
+    reuse.fit(2, allowance=3 * price)
+
+    unpriceable = standard_scan("flatfield", flat=True)
+    plan = standard_plan()
+    provider = _ReductionIntegratorProvider(
+        scan=unpriceable, plan=plan, ai=unpriceable.integrator, fi=None,
+        initial_incident_angle=None, reuse=reuse,
+    )
+    assert provider._reuse_key(None, SHAPE) is None
+
+    lent_price = sum(reuse._sizes[item] * count for item, count in reuse._lent.items())
+    idle_price = sum(size for entries in reuse._idle.values() for _ai, size in entries)
+    assert reuse._lent.get(family) == reuse._limit
+    assert idle_price == price, "known cross-Run standard tables should remain inside the residual allowance"
+    assert idle_price + lent_price <= reuse._allowance
+    provider.give_back()
+    assert len(reuse) == 1 and not reuse._lent
+
+
+def test_unpriceable_provider_without_a_known_family_keeps_conservative_clear():
+    from tests.core.test_warm_integrators import _plan as standard_plan, _reduce as reduce_standard
+    from tests.core.test_warm_integrators import _scan as standard_scan
+
+    reuse = WarmIntegrators(1, allowance=1 << 30)
+    reduce_standard(standard_scan("priced", frames=1), standard_plan(), reuse=reuse)
+    assert len(reuse) == 1
+    unknown = standard_scan("unpriced-flatfield", flat=True, shape=(60, 80))
+    provider = _ReductionIntegratorProvider(
+        scan=unknown, plan=standard_plan(shape=(60, 80)), ai=unknown.integrator, fi=None,
+        initial_incident_angle=None, reuse=reuse,
+    )
+    assert provider._reuse_key(None, (60, 80)) is None
     assert len(reuse) == 0 and not reuse._lent
 
 

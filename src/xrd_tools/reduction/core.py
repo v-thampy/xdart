@@ -5628,6 +5628,26 @@ class WarmIntegrators:
         with self._lock:
             self._release(key[:2])
 
+    def reserve_unpriceable(self, family: Any, workers: int) -> bool:
+        """Reserve a previously measured family price while unkeyed workers are active."""
+        with self._lock:
+            if family not in self._sizes:
+                return False
+            self._lent[family] = self._lent.get(family, 0) + max(1, int(workers))
+            self._trim()
+            return True
+
+    def release_reservation(self, family: Any, workers: int) -> None:
+        """Release an unpriceable worker reserve when its provider has stopped."""
+        with self._lock:
+            count = max(1, int(workers))
+            lent = self._lent.get(family, 0)
+            if lent > count:
+                self._lent[family] = lent - count
+            else:
+                self._lent.pop(family, None)
+            self._trim()
+
     def clear(self) -> None:
         with self._lock:
             self._idle.clear()
@@ -5727,6 +5747,17 @@ def _plain_fields(item: Any, *, skip: frozenset[str] = frozenset()) -> tuple[Any
 _RANGE_SETTINGS = frozenset(("radial_range", "azimuth_range", "azimuth_offset", "extra", "incident_angle"))
 
 
+def _warm_integrator_size_family(ai: Any, shape: tuple[int, ...], plan: ReductionPlan) -> tuple[Any, ...] | None:
+    """Existing conservative table-price family, independent of exact reuse eligibility."""
+    try:
+        detector = ai.detector
+        return (type(detector).__qualname__, shape,
+                tuple(_plain_fields(item, skip=_RANGE_SETTINGS)
+                      for item in (plan.integration_1d, plan.integration_2d, plan.gi)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _warm_integrator_key(
     role: str, ai: Any, bound_mask: np.ndarray | None, shape: tuple[int, ...], plan: ReductionPlan,
     *, angle: float | None = None,
@@ -5753,8 +5784,9 @@ def _warm_integrator_key(
             None if parallax is None else _plain(parallax.get_config()),
             tuple(_plain_fields(item) for item in (plan.integration_1d, plan.integration_2d, plan.gi)),
         )
-        size_family = (type(detector).__qualname__, shape, tuple(
-            _plain_fields(item, skip=_RANGE_SETTINGS) for item in (plan.integration_1d, plan.integration_2d, plan.gi)))
+        size_family = _warm_integrator_size_family(ai, shape, plan)
+        if size_family is None:
+            return None
     except (AttributeError, TypeError, ValueError):
         return None
     mask = None if bound_mask is None else hashlib.blake2b(
@@ -5792,6 +5824,7 @@ class _ReductionIntegratorProvider:
         self._reuse_keys: dict[tuple[int, int], tuple[Any, Any]] = {}  # shape -> (Run mask, key)
         self._fiber_role = role  # "fiber" for a session's workers, "scout" for the GI freeze's own integrators
         self._fiber_keys: dict[tuple[int, ...], tuple[Any, Any]] = {}  # shape -> (Run mask, key without its angle)
+        self._unpriceable_reserves: dict[Any, int] = {}
         self._local = threading.local()
         self._owner_thread = threading.get_ident()
         # An energy scan reduces each frame at its own wavelength on a private integrator;
@@ -5920,12 +5953,35 @@ class _ReductionIntegratorProvider:
             key = _warm_integrator_key("standard", self.ai, bound_mask, shape, self.plan)
         self._reuse_keys[shape] = (run_mask, key)
         if key is None:
-            self.reuse.clear()
+            self._preserve_known_family_or_clear("standard", shape)
         return key
 
-    def discard(self) -> None:
-        """Drop failed-session references, including any worker finishing after a timeout; their reservations in the
-        Run's store end with them."""
+    def _preserve_known_family_or_clear(self, role: str, shape: tuple[int, ...]) -> None:
+        """Keep priced idle tables only after reserving this provider's active unkeyed workers."""
+        if self.reuse is None:
+            return
+        size_family = _warm_integrator_size_family(self.ai, shape, self.plan)
+        family = None if size_family is None else (role, size_family)
+        if family is None or family in self._unpriceable_reserves:
+            if family is None:
+                self.reuse.clear()
+            return
+        workers = self.reuse._limit
+        if self.reuse.reserve_unpriceable(family, workers):
+            self._unpriceable_reserves[family] = workers
+        else:
+            self.reuse.clear()
+
+    def _release_unpriceable_reserves(self) -> None:
+        if self.reuse is None:
+            self._unpriceable_reserves.clear()
+            return
+        for family, workers in self._unpriceable_reserves.items():
+            self.reuse.release_reservation(family, workers)
+        self._unpriceable_reserves.clear()
+
+    def _decline_reuse(self) -> None:
+        """Stop admitting loans while keeping any active-family reserve until final provider cleanup."""
         self._forget_thread()
         with self._bound_lock:
             self._reuse_closed = True
@@ -5933,6 +5989,12 @@ class _ReductionIntegratorProvider:
         if self.reuse is not None:
             for key, _ai in bound:
                 self.reuse.release(key)
+
+    def discard(self) -> None:
+        """Drop failed-session references, including any worker finishing after a timeout; their reservations in the
+        Run's store end with them."""
+        self._decline_reuse()
+        self._release_unpriceable_reserves()
 
     def _track(self, key: Any, ai: Any) -> bool:
         """Record ``ai``, borrowed or built under ``key``, for give-back; False (its reservation released) once this
@@ -5971,6 +6033,7 @@ class _ReductionIntegratorProvider:
         if self.reuse is not None:
             for key, ai in bound:
                 self.reuse.give_back(key, ai)
+        self._release_unpriceable_reserves()
 
     def standard_with_run_mask(
         self,
@@ -6001,7 +6064,7 @@ class _ReductionIntegratorProvider:
             shape,
         ):
             if self.reuse is not None:
-                self.reuse.clear()
+                self._preserve_known_family_or_clear("standard", shape)
             return self._retain_unbound_standard(
                 self._unbound_standard(),
                 run_mask,
@@ -6099,7 +6162,7 @@ class _ReductionIntegratorProvider:
                     base = _warm_integrator_key(self._fiber_role, self.ai, bound_mask, shape, self.plan)
             cached = self._fiber_keys[shape] = (run_mask, base)
             if base is None:
-                self.reuse.clear()  # a build whose size the store cannot know: nothing idle stays beside it
+                self._preserve_known_family_or_clear(self._fiber_role, shape)
         return None if cached[1] is None else (*cached[1][:-1], float(angle))
 
     def fiber_done(self) -> None:
@@ -6125,8 +6188,11 @@ class _ReductionIntegratorProvider:
         if not static_mask and self.reuse is not None:
             # This provider cannot price dynamic-mask builds: decline its loans for
             # the rest of the series, including returns from other active workers.
-            self.discard()
-            self.reuse.clear()
+            if shape is not None:
+                self._preserve_known_family_or_clear(self._fiber_role, shape)
+            else:
+                self.reuse.clear()
+            self._decline_reuse()
         key = (self._fiber_key(incident_angle, run_mask, shape)
                if static_mask and incident_angle is not None and shape is not None else None)
         fi = getattr(self._local, "fi", None)
