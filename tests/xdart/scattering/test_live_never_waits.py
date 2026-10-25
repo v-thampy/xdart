@@ -394,7 +394,8 @@ def test_a_container_frame_that_cannot_be_read_stops_its_scan_and_the_run_goes_o
         executor.close(identity)
         terminal = [(event.kind.name, event.detail) for event in events if event.kind in _TERMINAL]
         assert [kind for kind, _detail in terminal] == ["FINISHED"], terminal
-    assert any("bad_int1d.nexus" in message and "could not be processed" in message and "inflate() failed" in message
+    assert any("bad_int1d.nexus" in message and "could not be processed" in message  # HDF5's own words vary by OS
+               and "SourceReadError: its next frames of bad.nxs could not be read: OSError" in message
                for message in _messages(caplog))
     assert _output(tmp_path, "bad")[0] == (0, 1) and _output(tmp_path, "good")[0] == (0, 1, 2)
 
