@@ -867,7 +867,8 @@ def _eager_directory_file_counts(
 def _skips_failed_scans(run: _StandardRun) -> bool:
     """Whether ``run`` is a directory Run (Live or not), whose loops skip a scan that fails and go on."""
     admission = getattr(getattr(run, "resources", None), "admission", None)  # a run double may carry no resources
-    return type(getattr(admission, "deferred_directory", None)) is DeferredDirectoryPlan
+    return (type(getattr(admission, "deferred_directory", None)) is DeferredDirectoryPlan
+            or bool(getattr(admission, "directory_discovered_file_count", 0)))
 
 
 def _read_container(read, source, what: str, *, typed: bool):

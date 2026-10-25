@@ -668,6 +668,9 @@ def prepare_output(
                 raise
             skipped.append((str(item.target), "append", str(error)))
     outputs = tuple(outputs)
+    if per_scan:
+        # Revalidation sees only surviving outputs; their motor intersection is the receipt's authority too.
+        choices = _motor_choices(tuple(output.item for output in outputs))
     if cancelled() or not outputs and deferred is None and not skipped:
         raise RuntimeError(
             "admission cancelled" if cancelled()
