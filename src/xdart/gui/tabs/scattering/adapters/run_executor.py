@@ -2015,7 +2015,7 @@ class StandardRunExecutor:
                 run.stop_signal, run))
         replaces = decision.disposition is OutputDisposition.REPLACE
         if (configuration.output_mode == "Overwrite" or replaces) and not target_state_matches(preparation.effective):
-            raise RuntimeError(f"output target changed after Background qualification: {item.target}")
+            raise ValueError(f"output target changed after Background qualification: {item.target}")
         run.display.set_factories(FrameRecordStore, PublicationStore)
         if not run.display.configured:
             descriptor_bytes = (

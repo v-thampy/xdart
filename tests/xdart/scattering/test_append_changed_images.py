@@ -324,7 +324,8 @@ def test_an_output_substituted_after_admission_is_never_replaced(tmp_path, monke
     monkeypatch.setattr(dynamic_output.DynamicOutputAdapter, "prepare_admission", substituting)
     before = output.read_bytes()
     seen = _again(tmp_path, raw, monkeypatch, 9210)
-    assert seen.terminals == ["FAILED"] and seen.rebuilt == [] and len(substituted) == 1
+    assert seen.terminals == ["FINISHED"] and len(seen.warnings) == 1 and seen.rebuilt == [] and len(substituted) == 1
+    assert seen.warnings[0].startswith("Skipped scana_int1d.nexus: ValueError: output target changed after Background")
     assert output.read_bytes() == before and (output.stat().st_dev, output.stat().st_ino) == substituted[0]
 
 
