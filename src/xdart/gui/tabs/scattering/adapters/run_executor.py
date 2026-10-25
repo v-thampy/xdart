@@ -512,8 +512,6 @@ class _StandardRun:
     live_admission_proof: Any = None
     # A finite Append's grown scan: the energy selection its output saved for the frames it holds (_construct's prior).
     prior_energy_selection: Any = None
-    # The energy selection each output this Run writes was first reduced under here: its session keeps that q grid.
-    energy_baselines: dict[str, Any] = field(default_factory=dict)
     # The next construction reduces a scan whole again because its new frames widened its energy grid.
     rebuild_widened: bool = False
     # Live outputs that stopped growing because a published frame's metadata
@@ -1979,15 +1977,18 @@ class StandardRunExecutor:
         if item is None or decision is None:
             raise RuntimeError("dynamic output requires one admitted output")
         output = run.output
-        key, owned = _physical_file_key(item.target), output is not None and output.owns_target(item.target)
+        owned = output is not None and output.owns_target(item.target)
         if (configuration.output_mode == "Append" and decision.disposition is OutputDisposition.WRITE
-                and len(decision.labels) < item.source_stamp.frame_count
+                and not owned and len(decision.labels) < item.source_stamp.frame_count
                 and (plan.extra.get("energy_selection") or {}).get("frame_energies_eV")):
             # An energy scan in q has one common grid, from its lowest to its highest energy; frames that widen the
-            # one its rows were reduced on cannot join its stack (maintainer, 2026-10-25: "Rebuild it whole").
-            baseline = (run.energy_baselines.get(key, run) if owned else
-                        prior_energy if type(prior_energy) is dict else saved_energy_selection(item.target))
-            if baseline is not run and energy_scan_grid_changes(plan, baseline, integrator, poni):
+            # one an earlier Run's rows were reduced on cannot join its stack (maintainer, 2026-10-25: "Rebuild it
+            # whole"). The output a Live Run grows is not checked: its session keeps its first grid and energies,
+            # dropping the points beyond, and a frame they do not list takes the first point's (maintainer,
+            # 2026-10-25: "it is fine to drop the points that don't lie on the initial grid rather than stopping";
+            # "It's fine to stick with the energy of the first point if the scan parameters are not known").
+            baseline = prior_energy if type(prior_energy) is dict else saved_energy_selection(item.target)
+            if energy_scan_grid_changes(plan, baseline, integrator, poni):
                 discard_source()
                 raise EnergyGridWidened(f"its frames' energies now span {_energy_span(plan.extra.get('energy_selection'))}"
                                         f"; its saved rows were reduced over {_energy_span(baseline)}")
@@ -2001,8 +2002,6 @@ class StandardRunExecutor:
         replaces = decision.disposition is OutputDisposition.REPLACE
         if (configuration.output_mode == "Overwrite" or replaces) and not target_state_matches(preparation.effective):
             raise RuntimeError(f"output target changed after Background qualification: {item.target}")
-        if not owned or replaces:  # a new graph and session for it: their grid is this selection's
-            run.energy_baselines[key] = plan.extra.get("energy_selection")
         run.display.set_factories(FrameRecordStore, PublicationStore)
         if not run.display.configured:
             descriptor_bytes = (
@@ -2794,8 +2793,9 @@ class StandardRunExecutor:
                             )
                             times.add("construct", started)
                         except EnergyGridWidened as widened:
-                            # Its new frames widen the q grid its energy scan was reduced on: it stops growing, named;
-                            # a directory Run reduces it again whole (maintainer, 2026-10-25: "Rebuild it whole").
+                            # An earlier Run's output whose new frames widen the q grid it was reduced on (the output
+                            # this Run grows is never checked): it stops growing, named; a directory Run reduces it
+                            # again whole (maintainer, 2026-10-25: "Rebuild it whole").
                             self._skip_live_append(run, group.target, target_key, None, constructed=True,
                                                    reason=str(widened), widened=True)
                             skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
