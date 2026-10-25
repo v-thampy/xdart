@@ -634,9 +634,8 @@ class LivePrefixProof:
     registrations and sidecar discovery (fresh listings).  ``start``: only later members are proved.
     """
 
-    #: A settled or waiting output is proved again at least this often: within
-    #: one second with a poll and its work to spare.
-    PERIOD_S = 0.75
+    #: A settled or waiting output is re-proved at least every ten seconds.
+    PERIOD_S = 10.0
 
     def current(self, *, cancelled: Callable[[], bool] | None = None) -> bool:
         """``holds()``, unless it already held within :attr:`PERIOD_S`."""
@@ -671,21 +670,20 @@ class LivePrefixProof:
             return False
         stamp, bindings = self.graph.stamp, self.bindings
         targets, grown, moved = stamp.canonical_targets, _spec_extents(stamp), {}
-        for _sweep in range(2):
-            parents = _resolve_parents(bindings)
-            for index, binding in enumerate(bindings):
-                if cancelled is not None and not index % 256 and cancelled():
-                    raise RuntimeError("admission cancelled")
-                now, expected = _alias_now(binding, parents), targets[binding.target_id]
-                if now is None or now[0] != binding.resolved_path and _path_key(now[0]) != _path_key(binding.resolved_path):
-                    return False
-                if now[1] != _revision(expected.state):
-                    key = _path_key(expected.resolved_path)
-                    if expected.roles != ("image_metadata",) or not grown.get(key):
-                        return False
-                    moved[key] = (expected.resolved_path, now[1])
-            if _resolve_parents(bindings) != parents:
+        parents = _resolve_parents(bindings)
+        for index, binding in enumerate(bindings):
+            if cancelled is not None and not index % 256 and cancelled():
+                raise RuntimeError("admission cancelled")
+            now, expected = _alias_now(binding, parents), targets[binding.target_id]
+            if now is None or now[0] != binding.resolved_path and _path_key(now[0]) != _path_key(binding.resolved_path):
                 return False
+            if now[1] != _revision(expected.state):
+                key = _path_key(expected.resolved_path)
+                if expected.roles != ("image_metadata",) or not grown.get(key):
+                    return False
+                moved[key] = (expected.resolved_path, now[1])
+        if _resolve_parents(bindings) != parents:
+            return False
         if not name_pure_registry() and any(
                 binding.candidate_owner_id is not None
                 and _candidate_owner_id(binding.raw_path) != binding.candidate_owner_id

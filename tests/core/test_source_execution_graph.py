@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
-import hashlib, subprocess, sys
+import hashlib, os, subprocess, sys
 import json
 from pathlib import Path
 import time
@@ -29,6 +29,33 @@ def _tiffs(tmp_path: Path, names=("scan_0001.tif", "scan_0002.tif")) -> SourceSp
     for index, name in enumerate(names):
         tifffile.imwrite(tmp_path / name, np.full((2, 3), index + 1, dtype=np.uint16))
     return image_series_spec(tmp_path / names[0], metadata_format=None)
+
+
+def test_live_prefix_proof_quiet_window_and_single_alias_sweep(tmp_path, monkeypatch):
+    """A quiet Live prefix is cached for ten seconds and a due proof stats each raw leaf once."""
+    names = tuple(f"scan_{index:04d}.tif" for index in range(1, 501))
+    source = _tiffs(tmp_path, names)
+    prepared = graph.qualify_source_execution_graph(source)
+    clock = [100.0]
+    monkeypatch.setattr(graph.time, "monotonic", lambda: clock[0])
+    proof = graph.LivePrefixProof(prepared, metadata_format=None)
+    real_lstat = graph.os.lstat
+    leaf_paths = {str(tmp_path / name) for name in names}
+    observed = []
+
+    def count_lstat(path, *args, **kwargs):
+        if os.fspath(path) in leaf_paths:
+            observed.append(os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(graph.os, "lstat", count_lstat)
+    assert proof.PERIOD_S == 10.0
+    clock[0] = 109.999
+    assert proof.current()
+    assert observed == []
+    clock[0] = 110.0
+    assert proof.current()
+    assert len(observed) == len(names), len(observed)
 
 
 def _container(path: Path, *, entry="entry", extent=3, detector="image", bluesky=True):

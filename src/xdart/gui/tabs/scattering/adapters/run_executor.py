@@ -1848,7 +1848,7 @@ class StandardRunExecutor:
         try:
             # A Live item re-checks the proof of what its poll admitted; only a
             # failed proof validates the whole graph again.
-            if item is not None and (proof is None or not proof.holds(cancelled=cancelled)):
+            if item is not None and (proof is None or not proof.current(cancelled=cancelled)):
                 validate_planned_source(item, cancelled=cancelled)
             if item is not None and item.candidate is not None and (item.descriptor is not None) and (item.descriptor.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}):
                 cursor = open_container_cursor(item.source_path, entry=item.source_spec.entry or 'entry', candidate=item.candidate)
