@@ -2258,6 +2258,7 @@ class NexusRecordWriter:
         self._stream_terminal: StreamTerminal | None = None
         self._close_verification_descriptor = None
         self._stream_close_flushed = False
+        self._last_checkpoint_digest = None
         self._durable_mode_proofs: dict[
             tuple[str, int], _DurableModeProof
         ] = {}
@@ -3868,6 +3869,9 @@ class NexusRecordWriter:
             raise WriterStateError(
                 "durable close has no retained mode-row or absence proof"
             )
+        if seal_transaction and binding.transaction.stream_in_place:
+            self._seal_retained_checkpoint_close(binding, verification_descriptor)
+            return
         previous = self._h5
         if verification_descriptor is None:
             verification_descriptor = self._close_verification_descriptor
@@ -4012,6 +4016,57 @@ class NexusRecordWriter:
                 verification_stream.close()
             if verification_descriptor is not None:
                 os.close(verification_descriptor)
+                self._close_verification_descriptor = None
+
+    def _seal_retained_checkpoint_close(self, binding, descriptor=None) -> None:
+        """Seal an in-place close from checkpoint proofs, without rereading rows.
+
+        Checkpoints still validate every newly written row. The in-place
+        terminal is an opaque token; post-checkpoint corruption is left to
+        strict readers rather than rescanning this regenerable output here.
+        Rollback-capable streams keep their existing post-close readback.
+        """
+        if self._last_checkpoint_digest is None:
+            raise WriterStateError("in-place close has no retained checkpoint proof")
+        if descriptor is None:
+            descriptor = self._close_verification_descriptor
+        writing = descriptor is not None
+        try:
+            if descriptor is None:
+                descriptor = os.open(self._active_path or self.target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            before = self._descriptor_stat_tuple(descriptor)
+            aggregate = _EvidenceBuilder()
+            aggregate.text("checkpoint", self._last_checkpoint_digest, self._last_checkpoint_digest)
+            for key, proof in sorted(self._durable_mode_proofs.items()):
+                aggregate.text(f"mode:{key}", proof.digest, proof.digest)
+            for label, proof in sorted(self._durable_frame_proofs.items()):
+                aggregate.text(f"frame:{label}", proof.digest, proof.digest)
+                if isinstance(proof, _DurableAverageFrameProof):
+                    aggregate.text(f"average-counts:{label}", proof.count_digest, proof.count_digest)
+            after = self._descriptor_stat_tuple(descriptor)
+            if after != before:
+                raise WriterStateError("output changed while sealing retained checkpoint proofs")
+            if writing:
+                os.close(descriptor)
+                descriptor = None
+                self._close_verification_descriptor = None
+                descriptor = os.open(self._active_path or self.target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                after = self._descriptor_stat_tuple(descriptor)
+                if after[:3] != before[:3]:
+                    raise WriterStateError("output changed when the writing handle closed")
+            binding.transaction.seal_stream_close(
+                binding.attempt, self._stream_close_attempt, lease=binding.lease,
+                descriptor=descriptor, expected_stat=after,
+                evidence_digest=aggregate.hexdigest(), evidence_bytes=0,
+                flushed=binding.transaction.durable_fsync,
+            )
+        except BaseException:
+            binding.transaction.hold_stream_close(binding.attempt, self._stream_close_attempt, lease=binding.lease)
+            raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if writing:
                 self._close_verification_descriptor = None
 
     def _verify_fast_mode_inventory(
@@ -5689,6 +5744,7 @@ class NexusRecordWriter:
                 evidence_digest=digest,
                 evidence_bytes=read_bytes,
             )
+            self._last_checkpoint_digest = checkpoint.evidence_digest
             if batch:
                 self._durable_mode_proofs.update(mode_proofs)
             self._durable_frame_proofs.update(frame_proofs)
