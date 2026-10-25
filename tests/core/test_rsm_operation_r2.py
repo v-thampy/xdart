@@ -2387,9 +2387,7 @@ def test_v2_a_folder_swapped_for_a_link_after_preview_is_refused(tmp_path, monke
 
 def test_v2_replace_regenerates_its_own_result_and_append_knows_a_current_one(tmp_path, monkeypatch):
     """Replace grids again and replaces the same-kind result at the same path (new data, read back from the
-    file). The Append check (rsm_output_current, Stitch's stitch_output_current for RSM) finds a result
-    current for the same plan over the same frames, also after the SPEC file grows by a later scan (probe
-    2: only revisions change), and stale for another plan."""
+    file). Append ignores SPEC growth and an image recopy with unchanged size/mtime, but detects image drift."""
     from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
 
     _runnable(monkeypatch, level=10)
@@ -2418,6 +2416,15 @@ def test_v2_replace_regenerates_its_own_result_and_append_knows_a_current_one(tm
     assert reread.result_fingerprint == replaced.payload.result_fingerprint
     image = Path(member.image_dir) / "member0_0000.tif"
     before = image.stat()
+    recopy = image.with_name("member0_0000-recopy.tif")
+    recopy.write_bytes(image.read_bytes())
+    os.utime(recopy, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert recopy.stat().st_size == before.st_size and recopy.stat().st_mtime_ns == before.st_mtime_ns
+    os.replace(recopy, image)
+    recopied = image.stat()
+    assert recopied.st_size == before.st_size and recopied.st_mtime_ns == before.st_mtime_ns
+    assert (recopied.st_ino, recopied.st_ctime_ns) != (before.st_ino, before.st_ctime_ns)
+    assert prepare_rsm_tool_v2(form).output_current is True
     image.write_bytes(image.read_bytes() + b"revision drift")
     os.utime(image, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
     changed = image.stat()

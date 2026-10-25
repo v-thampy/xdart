@@ -3921,11 +3921,17 @@ def _manifest_currency_projection(value, keys=_REVISION_KEYS):
         if key in keys:
             continue
         if key == file_key:
-            projected[key] = [
-                (_without_revisions(file, keys - {"revision"}) if index in image_files
-                 else _without_revisions(file, keys))
-                for index, file in enumerate(item)
-            ]
+            files = []
+            for index, file in enumerate(item):
+                if index not in image_files:
+                    files.append(_without_revisions(file, keys))
+                    continue
+                projected_file = _without_revisions(file, keys - {"revision"})
+                revision = file.get("revision") if type(file) is dict else None
+                if type(revision) in (list, tuple) and len(revision) >= 5:
+                    projected_file["revision"] = list(revision[3:5])
+                files.append(projected_file)
+            projected[key] = files
         else:
             projected[key] = _manifest_currency_projection(item, keys)
     return projected
