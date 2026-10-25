@@ -196,10 +196,18 @@ class DeferredDirectoryEntry:
     #: An Append's scan that its output already holds (``_already_processed``): admitted without capturing its
     #: source, so it carries no protected states and is skipped without materialization.
     completed: CommittedAppendCoverage | None = None
+    #: A finite Append's scan that grew: the graph of the frames its output already holds, from its committed record
+    #: (``_committed_prefix``); they are not captured, probed or read again.
+    committed_prefix: PreparedSourceExecutionGraph | None = None
 
     def __post_init__(self) -> None:
         if not (
-            (self.completed is None or (
+            (self.committed_prefix is None or (
+                type(self.committed_prefix) is PreparedSourceExecutionGraph
+                and self.completed is None
+                and len(self.committed_prefix.stamp.members) < len(self.candidates)
+            ))
+            and (self.completed is None or (
                 type(self.completed) is CommittedAppendCoverage
                 and not self.protected_states
                 and not self._protected_topology
@@ -902,6 +910,53 @@ def _already_processed(
     )
 
 
+def _committed_prefix(
+    configuration: OutputCandidate,
+    group: tuple[Candidate, ...],
+    name: str,
+    target: Path,
+) -> PreparedSourceExecutionGraph | None:
+    """A finite directory Append's scan that grew: the graph of the leading frames its output already holds, recognized
+    from this census (each image's name, size and time) and the output's committed record, as ``_already_processed``
+    recognizes a whole scan, and built from that record (``record_prefix_graph``); None to admit it the full way.
+    Those frames are not captured, probed or read again (maintainer, 2026-10-23: "the idea of append is to quickly skip
+    over already processed scans/frames"). TIFF images without Background or GI only; Live has its own prefix."""
+    frozen = configuration._configuration
+    if (
+        frozen is None
+        or frozen.output_mode != "Append"
+        or frozen.live_mode
+        or frozen.gi.enabled
+        or frozen.background.mode != "None"
+        or any(candidate.adapter_id != "image_file" for candidate in group)
+    ):
+        return None
+    from xrd_tools.io.append import committed_append_execution, science_fingerprint
+    from xrd_tools.sources.execution_graph import record_prefix_graph
+    from .adapters.dynamic_output import _mode_tokens, _science_projection
+    found = committed_append_execution(
+        target,
+        entry="entry",
+        source_base=frozen.project_root or "",
+        science_fingerprint=science_fingerprint(
+            _science_projection(frozen, configuration.processing_mapping())
+        ),
+        modes=_mode_tokens(frozen),
+        members=tuple((candidate.path, candidate.size, candidate.mtime_ns) for candidate in group),
+    )
+    if found is None:
+        return None
+    watch = live_selection(configuration.source)
+    if watch is not None and watch.metadata_format == "spec":  # its rows' extents are not in the record
+        return None
+    try:
+        return record_prefix_graph(
+            found[1], directory=group[0].path.parent, selected_file=group[0].path, scan_name=name,
+            metadata_format="auto" if watch is None else watch.metadata_format)
+    except (KeyError, TypeError, ValueError):  # a record this reader cannot vouch for goes the full way
+        return None
+
+
 def _deferred_directory_plan(
     configuration: OutputCandidate,
     plan: RunCandidatePlan,
@@ -924,8 +979,10 @@ def _deferred_directory_plan(
             tuple[_CapturedSourceTopology, ...],
             str,
             CommittedAppendCoverage | None,
+            PreparedSourceExecutionGraph | None,
         ]
     ] = []
+    every_proven = dict(proven)
     for group, name in _output_groups(configuration, plan):
         if cancelled():
             raise RuntimeError("admission cancelled")
@@ -933,13 +990,17 @@ def _deferred_directory_plan(
         target = _directory_target(configuration, plan, representative, name)
         completed = None if proven else _already_processed(configuration, group, target)
         if completed is not None:  # already processed: no capture, no source fence
-            staged.append((group, (), target, (), (), "", completed))
+            staged.append((group, (), target, (), (), "", completed, None))
             continue
+        # A scan that grew: the frames its output holds keep the states its record wrote (no capture).
+        committed = None if proven else _committed_prefix(configuration, group, name, target)
+        group_proven = {**proven, **proven_states(committed)}
+        every_proven.update(group_proven)
         captured_topologies: list[_CapturedSourceTopology] = []
         for source_candidate in group:
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            state = proven.get(str(source_candidate.path))
+            state = group_proven.get(str(source_candidate.path))
             if state is None or (state.size, state.mtime_ns) != source_candidate.version_stamp:
                 state = _capture_exact_candidate_state(source_candidate)
             captured_topologies.append(
@@ -964,6 +1025,7 @@ def _deferred_directory_plan(
                 inventory_states,
                 skip_reason,
                 None,
+                committed,
             )
         )
 
@@ -980,6 +1042,7 @@ def _deferred_directory_plan(
                 _states,
                 _reason,
                 _completed,
+                _committed,
             ) in staged
         ),
         tuple(
@@ -992,10 +1055,11 @@ def _deferred_directory_plan(
                 _states,
                 _reason,
                 _completed,
+                _committed,
             ) in staged
             for path in paths
         ),
-        proven,
+        every_proven,
     )
     entries: list[DeferredDirectoryEntry] = []
     for (
@@ -1006,6 +1070,7 @@ def _deferred_directory_plan(
         inventory_states,
         skip_reason,
         completed,
+        committed,
     ) in staged:
         keys = {
             os.path.normcase(os.path.abspath(path))
@@ -1031,6 +1096,7 @@ def _deferred_directory_plan(
             for value in inventory_states
         }
         reason = skip_reason
+        group_proven = {**proven, **proven_states(committed)}
         for source_candidate, topology in zip(
             group,
             candidate_states,
@@ -1038,7 +1104,7 @@ def _deferred_directory_plan(
         ):
             if cancelled():
                 raise RuntimeError("admission cancelled")
-            if proven.get(str(source_candidate.path)) is not topology.followed_state:
+            if group_proven.get(str(source_candidate.path)) is not topology.followed_state:
                 _validate_exact_candidate_state(source_candidate, topology.followed_state)
             if cancelled():
                 raise RuntimeError("admission cancelled")
@@ -1072,7 +1138,7 @@ def _deferred_directory_plan(
         protected_map = {
             _source_state_key(value.raw_path): value
             for value in protected
-            if proven.get(value.followed_state.path) is not value.followed_state
+            if group_proven.get(value.followed_state.path) is not value.followed_state
         }
         _verify_source_states(protected_map, cancelled=cancelled)
         entries.append(DeferredDirectoryEntry(
@@ -1083,10 +1149,12 @@ def _deferred_directory_plan(
             tuple(value.followed_state for value in protected),
             reason,
             _protected_topology=tuple(protected),
+            committed_prefix=committed,
         ))
     _LOG.debug(
-        "[APPEND-ADMIT] groups=%d already-processed=%d files=%d (%.0f ms)",
-        len(entries), sum(entry.completed is not None for entry in entries), len(plan.candidates),
+        "[APPEND-ADMIT] groups=%d already-processed=%d grown=%d files=%d (%.0f ms)",
+        len(entries), sum(entry.completed is not None for entry in entries),
+        sum(entry.committed_prefix is not None for entry in entries), len(plan.candidates),
         1000 * (monotonic() - started),
     )
     return DeferredDirectoryPlan(
@@ -1606,7 +1674,9 @@ def materialize_deferred_output(
     recheck: Callable[[PreparedSourceExecutionGraph], bool] | None = None,
 ) -> tuple[AdmittedOutput | None, int, int]:
     """``recheck`` (a live admission's in-poll proof) is a TIFF series' second look, instead of a
-    second validation (a container keeps it); ``prefix``/``spec_cache``: as in _directory_items."""
+    second validation (a container keeps it); ``prefix``/``spec_cache``: as in _directory_items. With
+    ``prefix`` the entry's committed prefix (a finite Append's scan that grew), its frames are READY
+    as their record says: they are not probed again."""
     deferred = receipt.deferred_directory
     if (
         type(deferred) is not DeferredDirectoryPlan
@@ -1619,15 +1689,17 @@ def materialize_deferred_output(
     if entry.skip_reason:
         return None, 0, len(entry.physical_paths)
 
-    ready: list[Candidate] = []
-    descriptors: list[ContainerDescriptor | None] = []
+    known = (() if prefix is None or prefix is not entry.committed_prefix
+             else entry.candidates[:len(prefix.stamp.members)])
+    ready: list[Candidate] = list(known)
+    descriptors: list[ContainerDescriptor | None] = [None] * len(known)
     skipped = 0
     # ``validate_admitted_receipt`` refreshes and reconciles the complete
     # name/stat snapshot once before execution.  Refreshing again here would
     # rescan the whole directory for every member (O(N^2)); each exact probe
     # revalidates its candidate, all on one owner call.
     for observed in session.probe_candidates(
-        entry.candidates, refresh=False, stop_unready=False, cancelled=cancelled,
+        entry.candidates[len(known):], refresh=False, stop_unready=False, cancelled=cancelled,
     ):
         descriptor = observed.descriptor
         if observed.result.state is ProbeState.READY and (
@@ -1812,6 +1884,7 @@ def validate_admitted_receipt(
             _validate_deferred_entry_states(
                 entry,
                 cancelled=is_cancelled,
+                proven=proven_states(getattr(entry, "committed_prefix", None)),  # frames its output holds: as recorded
             )
             if _path_state(entry.target) != entry.fact.target_state:
                 raise RuntimeError(

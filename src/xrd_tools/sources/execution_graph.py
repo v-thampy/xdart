@@ -809,6 +809,34 @@ def freeze_source_execution_graph(selection: SourceSpec, execution_source: Sourc
         descriptor, str(group_key), motor_names, scanned_motor_names, paths,
         detector_shape, None if native_dtype is None else np.dtype(native_dtype).str,
         reader_binding, infers_point_images)
+def record_prefix_graph(execution: Mapping[str, Any], *, directory: str | Path, selected_file: str | Path,
+                        scan_name: str, metadata_format: str | None) -> PreparedSourceExecutionGraph:
+    """The graph of a TIFF scan's frames that a finite directory Append's output already holds, from the source
+    execution its committed record wrote (``execution``, as ``SourceExecutionStamp.as_dict``) alone: the frames are
+    not captured, probed or read again, and qualification reuses it as a live Run reuses its published prefix
+    (maintainer, 2026-10-23: processed frames' "image data as well as the metadata if any were already verified").
+    Its options are those a directory Run's qualification gives the scan; it keeps no motor names (a finite
+    directory Run without GI uses none). Each file resolves as its directory does (one look per directory, none per
+    frame): a recorded file that is itself a link keeps its directory's resolution."""
+    directories: dict[str, str] = {}
+
+    def state(value: Mapping[str, Any]) -> SourceFileState:
+        raw = str(value["path"])
+        parent = os.path.dirname(raw)
+        if parent not in directories:
+            directories[parent] = os.path.realpath(parent)
+        result = SourceFileState(raw, *(int(value[key]) for key in ("size", "mtime_ns", "ctime_ns", "device", "inode")))
+        object.__setattr__(result, "_resolved_path_at_capture", os.path.join(directories[parent], os.path.basename(raw)))
+        return result
+    members = tuple(state(value) for value in execution["member_stamps"])
+    sources = tuple(AdmittedMetadataSource(str(value["source_path"]), None if value["metadata_file"] is None
+                                           else state(value["metadata_file"])) for value in execution["metadata_sources"])
+    options = {"selected_file": str(selected_file), "scan_name": scan_name, "metadata_format": metadata_format,
+               "files": tuple(member.path for member in members), "admitted_motor_values": ()}
+    source = SourceSpec(Path(directory), SourceKind.TIFF_SERIES, options=options)
+    return freeze_source_execution_graph(source, source, source_path=selected_file, group_key=scan_name,
+        file=members[0], adapter_id="tiff_series", frame_count=len(members), first_label=1, detector_shape=None,
+        native_dtype=None, members=members, metadata_sources=sources, motor_names=())
 def _cancelled(cancelled: Callable[[], bool] | None) -> None:
     if cancelled is not None and cancelled(): raise InterruptedError("source qualification cancelled")
 def _same(actual: Any, expected: Any, message: str) -> None:
@@ -895,8 +923,10 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     # A live Run's published members whose proof just held (``prefix``) keep
     # their admitted facts; only later members are read, into the graph a
     # full qualification gives (shared SPEC facts re-based on this read).
-    old = () if prefix is None or expected is not None or infer_point_images or compact or reader_binding \
-        or grouped_source is not None else tuple(member.path for member in prefix.stamp.members)
+    # A finite directory Append's prefix (its output's record, record_prefix_graph) is reused the same way: point
+    # images were looked for above, and its graph infers them as this one does.
+    old = () if prefix is None or expected is not None or infer_point_images is not prefix.infers_point_images \
+        or compact or reader_binding or grouped_source is not None else tuple(member.path for member in prefix.stamp.members)
     known = len(old) if 0 < len(old) < len(files) and old == files[:len(old)] and _source_policy(SourceSpec(
         source.uri, SourceKind.TIFF_SERIES, metadata_uri=source.metadata_uri, entry=source.entry), qualified) \
         == _source_policy(prefix.execution_source, dict(prefix.execution_source.options)) else 0

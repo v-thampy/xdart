@@ -1137,6 +1137,63 @@ def committed_append_coverage(
     return CommittedAppendCoverage(tuple(intent.labels), wavelength_m)
 
 
+def committed_append_execution(
+    target: str | Path,
+    *,
+    entry: str,
+    source_base: str,
+    science_fingerprint: str,
+    modes: tuple[str, ...],
+    members: tuple[tuple[str | Path, int, int], ...],
+) -> tuple[int, dict[str, Any]] | None:
+    """For a scan that grew: how many of its leading image files ``members`` (path, size, mtime_ns) ``target``'s
+    committed Append already holds, as :func:`committed_append_coverage` matches them (the same files at the same
+    sizes and times, under this entry, source base, science fingerprint and modes), with the source execution it
+    recorded for them, or None. One small metadata read; no source capture, image or sidecar (maintainer,
+    2026-10-23: "If a frame has already been processed that means the image data as well as the metadata if any
+    were already verified"). None sends the scan the full way: no prefix, the whole scan, other files, sizes or
+    times, point groups, external members, admitted motor values, another identity or a record it cannot vouch for.
+    """
+    try:
+        with h5py.File(target, "r") as handle:
+            config = handle.get(f"{entry}/reduction/config")
+            if not isinstance(config, h5py.Group) or any(
+                f"dimension_replacement_{dimension}" in config for dimension in ("1d", "2d")
+            ):
+                return None
+            prefix = decode_committed_append_prefix(handle, entry=entry)
+            execution = json.loads(config["source_execution"][()])
+    except Exception:  # anything this reader cannot vouch for goes the full way
+        return None
+    intent = prefix.intent
+    committed = tuple((member.path, int(member.size), int(member.mtime_ns)) for member in intent.source.image_members)
+    expected = tuple((_normalize(path), int(size), int(mtime_ns)) for path, size, mtime_ns in members)
+    count = len(committed)
+    stamps = execution.get("member_stamps") if type(execution) is dict else None
+    if (
+        intent.entry != entry
+        or intent.source_base != _normalize_base(source_base)
+        or intent.science_fingerprint != science_fingerprint
+        or tuple(intent.modes) != tuple(modes)
+        or intent.source.external_members
+        or not 0 < count < len(expected)
+        or committed != expected[:count]
+        or tuple(intent.labels) != tuple(range(1, count + 1))
+        or execution.get("adapter_id") != "tiff_series"
+        or execution.get("frame_count") != count
+        or execution.get("first_label") != 1
+        or execution.get("external_members") or execution.get("dependency_files")
+        or execution.get("admitted_motor_values")
+        or type(stamps) is not list
+        or tuple((_normalize(stamp.get("path", "")), stamp.get("size"), stamp.get("mtime_ns")) for stamp in stamps)
+        != committed
+        or [source.get("source_path") for source in execution.get("metadata_sources") or ()]
+        != [stamp.get("path") for stamp in stamps]
+    ):
+        return None
+    return count, execution
+
+
 def committed_image_count(target: str | Path, *, entry: str) -> int | None:
     """How many images ``target``'s committed Append record holds, as qualification decodes its committed prefix, or
     None: no output, or none this reader can vouch for. A small metadata read, no image or sidecar."""

@@ -2922,12 +2922,26 @@ class StandardRunExecutor:
                     if stopped:
                         break
                     continue
+                # A scan that grew keeps the frames its output holds as their record says: only the frames after
+                # them are probed, read and proved (once, here), as a Live Run's published prefix is.
+                committed, proofs, recheck = getattr(entry, "committed_prefix", None), [], None  # (doubles: none)
+                if committed is not None:
+                    start, registry = len(committed.stamp.members), registry_identity()
+                    record = observe_live_members(
+                        run.configuration, [value.path for value in entry.candidates[start:]])
+
+                    def recheck(graph, *, start=start, record=record, registry=registry, proofs=proofs):
+                        proofs.append(LivePrefixProof(
+                            graph, record=record, registry=registry, start=start,
+                            metadata_format=live_metadata_format(run.configuration.thaw_source_spec())))
+                        return proofs[-1].holds(cancelled=lambda: run.stop_requested)
                 decision, _ready_files, skipped_files = (
                     materialize_deferred_output(
                         receipt,
                         session,
                         entry,
                         cancelled=lambda: run.stop_requested,
+                        prefix=committed, recheck=recheck,
                     )
                 )
             except RuntimeError as error:
@@ -2989,6 +3003,8 @@ class StandardRunExecutor:
             )
             admitted = monotonic()
             try:
+                # The proof of what was admitted: construction re-checks it instead of validating the scan again.
+                run.live_admission_proof = proofs[-1] if proofs else None
                 self._construct(
                     run,
                     item=item,
