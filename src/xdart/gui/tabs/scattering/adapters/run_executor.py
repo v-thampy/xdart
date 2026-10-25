@@ -140,6 +140,9 @@ _METADATA_WAIT_LIMIT_S = {"sidecar": 10.0, "spec": 30.0}
 # A scan found changed is reduced again once its images and sidecars have held still this long: an acquisition can
 # write an image and its sidecar a moment later (maintainer, 2026-10-24: "Go ahead with your recommendation").
 _REBUILD_QUIET_S = 2.0
+# Why a directory Run skips a scan whose files changed while they were read, once and then once more (not an Append
+# refusal: nothing was left unchanged, and Replace would only read the same files again).
+_CHANGED_WHILE_READ = "its files changed while they were read; run Append again"
 
 _SOURCE_SUBMISSION_END = object()
 
@@ -1642,7 +1645,7 @@ class StandardRunExecutor:
         labels = tuple(range(stamp.first_label, stamp.first_label + stamp.frame_count))
         return AdmittedOutput(decision.item, OutputDisposition.REPLACE, labels, decision.fact, reason)
 
-    def _skip_failed_directory_scan(self, run: _StandardRun, target: Path, error: BaseException, *,
+    def _skip_failed_directory_scan(self, run: _StandardRun, target: Path, error: BaseException | str, *,
                                     constructed: bool) -> None:
         """A directory Run's scan whose construction refused (``constructed`` False) or whose image could not be read
         while it was reduced (a SourceReadError): its output settled as it stands, its unfinished frames out of the
@@ -2972,7 +2975,14 @@ class StandardRunExecutor:
             **_directory_event_fields(run),
         ))
         stopped = False
-        for output_index, entry in enumerate(deferred.entries):
+        # An entry whose files changed while they were read (a scan still being written) is taken once more; the
+        # files it had claimed stay claimed.
+        retried: set[int] = set()
+        reclaimed: dict[int, int] = {}
+        position = 0
+        while position < len(deferred.entries):
+            output_index, entry = position, deferred.entries[position]
+            position += 1
             if run.stop_requested:
                 stopped = True
                 break
@@ -3036,6 +3046,12 @@ class StandardRunExecutor:
                     reason)
                 decision, skipped_files = None, 0
             except (ValueError, OSError) as error:  # one scan's own problem: that scan is skipped, the rest still runs
+                if isinstance(error, SourceRevisionChanged):  # its files changed while they were read: once more
+                    if output_index not in retried:
+                        retried.add(output_index)
+                        position -= 1
+                        continue
+                    error = _CHANGED_WHILE_READ
                 self._skip_directory_scan(run, entry.target, error)
                 decision, skipped_files = None, 0
             if decision is None:
@@ -3063,13 +3079,14 @@ class StandardRunExecutor:
             item = decision.item
             run.current_total = item.source_stamp.frame_count
             run.total += run.current_total
-            run.current_file_total = _claim_output_physical_files(
-                item,
-                deferred.discovered_paths,
-                claimed_files,
-                candidate_owners=candidate_owners,
-                output_index=output_index,
-            )
+            run.current_file_total = reclaimed.pop(output_index) if output_index in reclaimed else (
+                _claim_output_physical_files(
+                    item,
+                    deferred.discovered_paths,
+                    claimed_files,
+                    candidate_owners=candidate_owners,
+                    output_index=output_index,
+                ))
             run.current_files_incremental = (
                 item.source_spec.kind is SourceKind.TIFF_SERIES
             )
@@ -3095,6 +3112,16 @@ class StandardRunExecutor:
                     run.rebuild_widened = True
                     self._construct(run, item=item, labels=decision.labels, decision=decision)
             except ValueError as error:  # (an OSError: its output cannot be written, and the Run fails)
+                if isinstance(error, SourceRevisionChanged):  # its files changed while they were read: once more
+                    if output_index not in retried:
+                        retried.add(output_index)
+                        reclaimed[output_index] = run.current_file_total
+                        run.total -= run.current_total
+                        run.files_skipped -= skipped_files
+                        self._abandon_construction(run)
+                        position -= 1
+                        continue
+                    error = _CHANGED_WHILE_READ
                 self._skip_failed_directory_scan(run, item.target, error, constructed=False)
                 continue
             constructed = monotonic()
