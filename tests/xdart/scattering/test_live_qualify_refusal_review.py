@@ -10,6 +10,7 @@ from tests.xdart.scattering.test_live_qualify_refusal_run import (
     _stop, _terminal, _wait, _worker,
 )
 from xrd_tools.sources.directory_session import DirectoryIndexSession
+from xrd_tools.sources.execution_graph import LivePrefixProof
 from xdart.gui.tabs.scattering.adapters import run_executor
 from xdart.gui.tabs.scattering import output_preflight
 
@@ -64,10 +65,10 @@ def test_raw_member_rewrite_with_metadata_drift_keeps_the_raw_validator_terminal
         _frame(raw, 'scan', 1, 'txt', 9.0)
         _frame(raw, 'scan', 2, 'txt', 2.0, sidecar=next_ready)
         released.set()
-        if next_ready:
-            _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values))
-        else:
-            _settle(executor, events, 1.)
+        # With the next frame's sidecar missing, nothing admits the group until the published prefix is proved again:
+        # within LivePrefixProof.PERIOD_S (ten seconds, the accepted trade), not at the next poll.
+        _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values),
+              timeout=15. if next_ready else 2. * LivePrefixProof.PERIOD_S)
     finally:
         released.set()
         terminal = _stop(executor, identity, events)
