@@ -3943,10 +3943,10 @@ def stitch_output_current(request: StitchOperationRequest) -> bool:
     (maintainer, 2026-09-29: "skip if something has already been processed with the same settings as
     before, else overwrite").
 
-    File revisions are left out, so a SPEC file that grew by later scans leaves an earlier scan's
-    stitch standing; so does an image rewritten under the same name, which this does not detect. It
-    reads the file's envelope only (``stitch_record_identity``): a processed file can always be stitched
-    again, with Replace. A missing, unreadable or foreign file at the target is not current.
+    Selected image sizes and mtimes must match; other file revisions are left out, so later SPEC
+    scans leave an earlier scan's stitch standing. Same-size, same-mtime image rewrites are not
+    detected. It reads the output's envelope only (``stitch_record_identity``); a missing, unreadable
+    or foreign file at the target is not current.
 
     The recorded threshold policy must also match: it holds each member's resolved automatic ceiling
     (decision 39), which the plan does not, so an output made under the data-type rule is redone."""

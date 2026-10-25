@@ -628,8 +628,8 @@ def _alias_now(binding: SourceAliasBinding, parents: dict[str, str | None]):
 
 
 class LivePrefixProof:
-    """What a Live Run proved about one admitted graph, re-checked cheaply: :meth:`holds` repeats
-    validate_source_aliases' two sweeps (distinct parents resolved before and after, a no-follow stat
+    """What a Live Run proved about one admitted graph, re-checked cheaply: :meth:`holds` performs
+    one alias sweep (distinct parents resolved before and after, a no-follow stat
     per regular leaf), checks a grown SPEC file's extents once per revision, and requires unchanged
     registrations and sidecar discovery (fresh listings).  ``start``: only later members are proved.
     """

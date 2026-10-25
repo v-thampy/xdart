@@ -6752,10 +6752,10 @@ def rsm_output_current(request: RSMOperationRequestV2) -> bool:
     (sources, scans, images and motor readings). A Run in Append mode skips such an
     output, as Stitch's skips one (``stitch_output_current``, AUD-9 stage 2).
 
-    File revisions are left out as Stitch leaves them out, and with them the
-    metadata table's fingerprint, which carries its SPEC file's revision (probe 2:
-    a SPEC file grown by a later scan changes it and nothing else of the member):
-    an earlier scan's RSM stays standing. The file's envelope alone is read
+    Selected image sizes and mtimes must match, as in Stitch. Other file revisions
+    and the metadata table's SPEC revision fingerprint are left out, so later SPEC
+    scans leave an earlier scan's RSM standing. Same-size, same-mtime image rewrites
+    are not detected. The file's envelope alone is read
     (``rsm_record_identity``); a missing, unreadable or foreign file is not current.
     """
 
