@@ -93,10 +93,13 @@ def test_stopped_deferred_skip_counts_known_unowned_sidecar(
     master = tmp_path / "master.h5"
     linked_candidate = tmp_path / "linked.h5"
     sidecar = tmp_path / "master_data.h5"
+    # Each entry carries its candidates, as a DeferredEntry does: the loop looks at their suffixes to decide whether a
+    # finite TIFF scan gets its admission proof (d6f20095); containers do not.
     first = SimpleNamespace(
         target=tmp_path / "master.nexus",
         completed=None,
         physical_paths=(master,),
+        candidates=(SimpleNamespace(path=str(master)),),
         protected_states=(
             SimpleNamespace(path=str(master)),
             SimpleNamespace(path=str(sidecar)),
@@ -106,6 +109,7 @@ def test_stopped_deferred_skip_counts_known_unowned_sidecar(
         target=tmp_path / "linked.nexus",
         completed=None,
         physical_paths=(linked_candidate,),
+        candidates=(SimpleNamespace(path=str(linked_candidate)),),
         protected_states=(SimpleNamespace(path=str(linked_candidate)),),
     )
     deferred = SimpleNamespace(
