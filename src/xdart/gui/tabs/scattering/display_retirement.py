@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import os
 from threading import Lock, Thread
 from typing import Callable
 
@@ -12,6 +14,8 @@ from .events import (
     RunIdentity,
     detach_exception,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,11 +108,14 @@ class DisplayRetirementOwner:
             self.run_identity, receipt.cleanup_status, receipt.quarantined
         )
 
-    def quarantine(self, receipt: ExecutorClosed) -> bool:
+    def quarantine(self, receipt: ExecutorClosed, *, observed: ExecutorClosed | None = None) -> bool:
         """Acknowledge explicit abandonment without replacing an in-flight retirement or claiming cleanup."""
         with self._lock:
+            if os.environ.get("XDART_CLEANUP_DEBUG"):
+                logger.debug("[RUN-CLEANUP-QUARANTINE] identity=%s in_flight=%s", self.run_identity, self._in_flight)
             if (
                 self._in_flight
+                or (observed is not None and self._receipt is not observed)
                 or not _receipt_is_exact(receipt, self.run_identity)
                 or not receipt.quarantined
             ):

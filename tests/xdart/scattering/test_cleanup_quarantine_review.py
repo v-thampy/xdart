@@ -7,7 +7,6 @@ import sys
 import os
 import textwrap
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -24,17 +23,41 @@ from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.adapters.target_reservation import AdmissionOperation
 
 
-def test_quarantined_proof_cannot_authorize_admission_over_another_active_run():
-    old, current = RunIdentity(1, "old"), RunIdentity(2, "current")
-    owner = DisplayRetirementOwner(old, lambda: pytest.fail("quarantine must not retry"))
-    assert owner.quarantine(ExecutorClosed(old, CleanupStatus.CLEANUP_PENDING, quarantined=True))
-    executor = StandardRunExecutor()
-    executor._active = SimpleNamespace(identity=current, closed=False)
-    # Capture is opaque to retirement; the real owner and admission command are exercised.
-    operation = AdmissionOperation(AdmissionToken(RequestId(1), 0), None, retirement_owner=owner)
-    proof = executor._retire_display(operation)
-    assert not proof.released_for_admission
-    assert operation.retirement_receipt is proof
+def test_expired_cleanup_gets_an_idle_opportunity_before_the_next_retry(
+        qapp, tmp_path, older_output, stuck_cleanup, monkeypatch, caplog):
+    original = StandardRunExecutor._close_run
+
+    def delayed_close(executor, identity):
+        result = original(executor, identity)
+        time.sleep(.12)  # the real failed retry is still in flight when the page observes its return
+        return result
+
+    monkeypatch.setenv("XDART_CLEANUP_DEBUG", "1")
+    caplog.set_level("DEBUG", logger="xdart.gui.tabs.scattering.display_retirement")
+    monkeypatch.setattr(StandardRunExecutor, "_close_run", delayed_close)
+    monkeypatch.setattr(page_module, "_FAILED_CLEANUP_RETRY_S", .05)
+    monkeypatch.setattr(page_module, "_FAILED_CLEANUP_GIVE_UP_S", .6)
+    with _page(qapp, _intent(tmp_path)) as (page, _view, observed):
+        _failed_run(qapp, page, older_output, observed)
+        assert _pump(qapp, lambda: page._lifecycle.reset_permitted, 3.), caplog.text
+
+
+def test_quarantined_proof_cannot_authorize_admission_over_another_active_run(
+        qapp, tmp_path, older_output, stuck_cleanup, monkeypatch):
+    monkeypatch.setattr(page_module, "_FAILED_CLEANUP_GIVE_UP_S", 30.)
+    with _page(qapp, _intent(tmp_path)) as (page, _view, observed):
+        _failed_run(qapp, page, older_output, observed)
+        executor = page._run_executor
+        current = page._lifecycle.attempt_run_identity
+        assert executor._exact_run(current) is executor._active
+        old = RunIdentity(1, "old")
+        owner = DisplayRetirementOwner(old, lambda: pytest.fail("quarantine must not retry"))
+        assert owner.quarantine(ExecutorClosed(old, CleanupStatus.CLEANUP_PENDING, quarantined=True))
+        # Capture is opaque to retirement; active state comes from the real failed Run.
+        operation = AdmissionOperation(AdmissionToken(RequestId(1), 0), None, retirement_owner=owner)
+        proof = executor._retire_display(operation)
+        assert not proof.released_for_admission
+        assert operation.retirement_receipt is proof
 
 
 def test_cancelled_admission_forgets_a_consumed_quarantined_retirement():

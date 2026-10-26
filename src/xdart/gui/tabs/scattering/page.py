@@ -4011,17 +4011,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not self._failed_cleanup_pending() or executor is None or pipeline is None:
             return False
         self._failed_cleanup_retried_at = time.monotonic()
-        try:
-            receipt = executor.close(identity, background=True)
-        except Exception as error:
-            self._error_notice("Standard cleanup failed", error)
-            receipt = ExecutorClosed(identity, CleanupStatus.CLEANUP_PENDING,
-                                     primary=detach_exception(error, "executor.close"))
-        given_up = None
-        if not executor_closed_is_valid(receipt, identity) or receipt.cleanup_status is not CleanupStatus.CLEANED:
-            given_up = self._give_up_failed_cleanup(identity, executor, receipt)
-            if given_up is None:
-                return False
+        peek = getattr(executor, "cleanup_receipt", None)
+        prior = None if peek is None else peek(identity)
+        given_up = (self._give_up_failed_cleanup(identity, executor, prior)
+                    if executor_closed_is_valid(prior, identity)
+                    and prior.cleanup_status is CleanupStatus.CLEANUP_PENDING else None)
+        if given_up is None:
+            try:
+                receipt = executor.close(identity, background=True)
+            except Exception as error:
+                self._error_notice("Standard cleanup failed", error)
+                receipt = ExecutorClosed(identity, CleanupStatus.CLEANUP_PENDING,
+                                         primary=detach_exception(error, "executor.close"))
+            if not executor_closed_is_valid(receipt, identity) or receipt.cleanup_status is not CleanupStatus.CLEANED:
+                given_up = self._give_up_failed_cleanup(identity, executor, receipt)
+                if given_up is None:
+                    return False
         self._failed_cleanup_since = None
         pipeline.owners_closed(OwnersClosed(identity))
         if given_up is not None:
@@ -4043,7 +4048,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._failed_cleanup_since = (identity, signature, now)
             return None
         give_up = getattr(executor, "give_up", None)
-        held = None if now - since[2] < _FAILED_CLEANUP_GIVE_UP_S or give_up is None else give_up(identity)
+        held = (None if now - since[2] < _FAILED_CLEANUP_GIVE_UP_S or give_up is None
+                else give_up(identity, observed=receipt))
         if held is None:
             return None
         lead = f"Run unlocked: the failed Run's cleanup did not finish in {_FAILED_CLEANUP_GIVE_UP_S:.0f} s"

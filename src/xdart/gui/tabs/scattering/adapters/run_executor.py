@@ -1400,7 +1400,13 @@ class StandardRunExecutor:
             raise RuntimeError("acquisition context is not ready")
         runtime.resume(run.session)
 
-    def give_up(self, run_identity: RunIdentity) -> tuple[str, ...] | None:
+    def cleanup_receipt(self, run_identity: RunIdentity) -> ExecutorClosed | None:
+        """Observe the exact cached close result without dispatching another retry."""
+        with self._lock:
+            owner = self._retirement
+        return owner.receipt if owner is not None and owner.run_identity is run_identity else None
+
+    def give_up(self, run_identity: RunIdentity, *, observed: ExecutorClosed | None = None) -> tuple[str, ...] | None:
         """Stop waiting for the cleanup of a failed Run that keeps failing (the page's time limit; maintainer's pick
         2026-10-26, "Add the time limit"): it leaves the executor, so a new Run can start, and what it still holds
         stays held, as the failure left it, until xdart exits (a later Run skips such an output: LeaseUnavailable). The
@@ -1416,7 +1422,7 @@ class StandardRunExecutor:
                 owner = DisplayRetirementOwner(run_identity, lambda: self._close_run(run_identity))
             receipt = ExecutorClosed(run_identity, CleanupStatus.CLEANUP_PENDING, run.primary,
                                      tuple(run.cleanup_failures), quarantined=True)
-            if not owner.quarantine(receipt):
+            if not owner.quarantine(receipt, observed=observed):
                 return None
             self._active = None
             self._given_up.append(run)
