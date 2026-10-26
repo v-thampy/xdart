@@ -141,3 +141,26 @@ def test_older_history_leaves_whole_past_the_budget_between_run_and_browse(qapp,
         assert view.browse_comparison_notice == "Started a new overlay: detached display budget reached."
     finally:
         view.close()
+
+
+def test_a_kept_curve_stays_until_the_runs_own_spelling_of_its_frame_is_drawn(qapp):
+    """Codex N-85413c4d's persistence observation (XDART_OVERLAY_DEBUG: held b_int1d:2 left once the next Run selected
+    its own b:2, though b:2 had no curve yet): a frame drawn once in Browse's spelling and selected again in a Run's
+    stays drawn, once, until the Run's own curve for it arrives."""
+    browse = RunIdentity(46, "review-overlay")
+    run = RunIdentity(47, "review-overlay")
+    b1, b2 = (_trace(browse, "b_int1d", "/out/b.nexus", label) for label in (1, 2))
+    run_b2, run_c1 = _trace(run, "b", "/out/b.nexus", 2), _trace(run, "c", "/out/c.nexus", 1)
+    view = ScientificView()
+    try:
+        view.reconcile(*_browse((b1, b2), "/out/b.nexus"), completed=2, total=2, detail="")
+        assert view.trace_history_keys == (b1.frame, b2.frame)
+        state, navigation = _state((run_b2, run_c1))
+        view.reconcile(replace(state, traces=(run_c1,)), navigation, completed=2, total=2, detail="")
+        assert view.trace_history_keys == (b1.frame, b2.frame, run_c1.frame)
+        assert len(view.curve.listDataItems()) == 3
+        view.reconcile(state, navigation, completed=2, total=2, detail="")
+        assert view.trace_history_keys == (b1.frame, run_b2.frame, run_c1.frame)
+        assert len(view.curve.listDataItems()) == 3
+    finally:
+        view.close()

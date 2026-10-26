@@ -141,6 +141,9 @@ class _ContextRuntime:
         self._display_generation = 0
         self._committed_trace_scope: tuple[object, ...] | None = None
         self._committed_trace_selection: tuple[DisplayFrameKey, ...] = ()
+        # Selected identities an Overlay or Waterfall comparison left out, unpainted: not projected again while a
+        # comparison mode holds; Sum, Average or Single projects them again, as every selected input (OV-R4).
+        self._committed_trace_exclusions: tuple[DisplayFrameKey, ...] = ()
         self._pending_trace_projection: _PendingTraceProjection | None = None
         self._browse_pass: _BrowseProjectionPass | None = None
         self._norm_aggregate: ScanNormAggregate | NormCoverage | None = None
@@ -1084,6 +1087,10 @@ class _ContextRuntime:
             committed_ids = {
                 id(frame) for frame in self._committed_trace_selection
             }
+            if getattr(preferences, "plot_mode", None) in {"Overlay", "Waterfall"}:
+                committed_ids.update(
+                    id(frame) for frame in self._committed_trace_exclusions
+                )
             planned = (
                 selected
                 if reseed
@@ -1423,8 +1430,10 @@ class _ContextRuntime:
         """Acknowledge the exact selected identities accepted by the shell.
 
         ``excluded``: selected identities the shell received and left out, unpainted (an Overlay's other grid, or
-        older history past its display budget). They are acknowledged too, so the same result is not projected again
-        each refresh; a changed scope reseeds every selected frame as before (Codex N-f3f77127 OV-R2)."""
+        older history past its display budget). They are kept apart from the presented ones: while the plot mode is
+        Overlay or Waterfall they are not projected again each refresh (Codex N-f3f77127 OV-R2); any other mode
+        projects them again on its first refresh, as every selected input (Codex N-85413c4d OV-R4). A changed
+        scope reseeds every selected frame as before."""
 
         pending = self._pending_trace_projection
         if pending is None or type(presented_frames) is not tuple or type(excluded) is not tuple:
@@ -1437,8 +1446,8 @@ class _ContextRuntime:
         ):
             return False
         presented_ids = {id(frame) for frame in presented_frames}
-        presented_ids.update(id(frame) for frame in excluded
-                             if type(frame) is DisplayFrameKey and target_by_id.get(id(frame)) is frame)
+        excluded_ids = {id(frame) for frame in excluded
+                        if type(frame) is DisplayFrameKey and target_by_id.get(id(frame)) is frame}
         committed = tuple(
             frame
             for frame in pending.target
@@ -1446,6 +1455,10 @@ class _ContextRuntime:
         )
         self._committed_trace_scope = pending.scope
         self._committed_trace_selection = committed
+        self._committed_trace_exclusions = tuple(
+            frame for frame in pending.target
+            if id(frame) in excluded_ids and id(frame) not in presented_ids
+        )
         self._pending_trace_projection = None
         return True
 
@@ -1486,6 +1499,7 @@ class _ContextRuntime:
             preferences, processing_mode,
         )
         self._committed_trace_selection = selected
+        self._committed_trace_exclusions = ()
         self._pending_trace_projection = None
         return True
 
@@ -1860,4 +1874,5 @@ class _ContextRuntime:
     def _reset_trace_projection(self) -> None:
         self._committed_trace_scope = None
         self._committed_trace_selection = ()
+        self._committed_trace_exclusions = ()
         self._pending_trace_projection = None

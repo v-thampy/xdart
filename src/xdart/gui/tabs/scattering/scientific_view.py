@@ -95,6 +95,17 @@ from .shell_values import (
 )
 
 
+def _overlay_debug(event: str, **facts: object) -> None:
+    """XDART_OVERLAY_DEBUG=1 (Config ▸ Debug ▸ Debug Logging): one structured DEBUG line per Overlay history decision,
+    each frame as scan:label (AGENTS rule 1, Codex N-85413c4d's persistence observation)."""
+    if os.environ.get("XDART_OVERLAY_DEBUG") == "1":
+        logging.getLogger(__name__).debug("overlay %s %s", event, " ".join(f"{name}={value}" for name, value in facts.items()))
+
+
+def _frames_text(frames) -> str:
+    return ",".join(f"{frame.source_scan}:{frame.local_frame_label}" for frame in frames) or "-"
+
+
 def _detached_root_bytes(traces) -> int:
     """The bytes ``traces`` hold, each backing allocation counted once (their x, y and angular-support roots)."""
     roots = {}
@@ -985,6 +996,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def clear_trace_history(self) -> None:
         """Clear detached comparisons; the next projection seeds the current selection."""
+        _overlay_debug("clear", history=_frames_text(self._trace_history_keys))
         self._trace_history_by_identity.clear()
         self._trace_history_keys = ()
         self._trace_history_scope = None
@@ -2925,6 +2937,7 @@ class ScientificView(QtWidgets.QFrame):
                 and self._browse_comparison_scope is not None):
             # A new current file is loading. Only detached 1-D history survives;
             # the ordinary reconciliation above retires old raw/cake buffers.
+            _overlay_debug("loading-keeps", history=_frames_text(self._trace_history_keys))
             return
         if browse_snapshot is not None:
             owned_by_id = {id(frame): frame for frame in navigation.frames}
@@ -2955,6 +2968,8 @@ class ScientificView(QtWidgets.QFrame):
             # receipt reseeds semantic history but retains its one mounted item
             # so the normal setData path can update it in place.
             if not comparison:
+                _overlay_debug("snapshot-replaces", history=_frames_text(self._trace_history_keys),
+                               snapshot=_frames_text(browse_snapshot.logical_frames))
                 self._trace_history_by_identity.clear()
                 self._browse_comparison_scope = None
                 self._reset_comparison_admission()
@@ -3570,6 +3585,9 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_history_keys = logical
         self._trace_selection_keys = snapshot.logical_frames
         positions = {id(frame): index + 1 for index, frame in enumerate(logical)}
+        _overlay_debug("browse-merge", foreign=_frames_text(foreign), logical=_frames_text(logical),
+                       drawn=_frames_text(trace.frame for _, trace in rows),
+                       refused=_frames_text(self._comparison_refused.values()))
         return replace(snapshot, logical_frames=logical,
                        display_frames=tuple(trace.frame for _, trace in rows),
                        logical_positions=tuple(positions[id(trace.frame)] for _, trace in rows),
@@ -3644,7 +3662,6 @@ class ScientificView(QtWidgets.QFrame):
 
         refused.pop(id(on_show.frame), None)  # the curve on show is drawn, whatever left it out before
         retained, current = admit(retained), admit(current)
-        self._comparison_verdicts = kept_verdicts
         if _detached_root_bytes((*retained, *current)) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
             shown = self._trace_row(on_show.frame)[0]
             older = [trace for trace in (*retained, *current) if self._trace_row(trace.frame)[0] != shown]
@@ -3654,6 +3671,16 @@ class ScientificView(QtWidgets.QFrame):
                 retained = tuple(trace for trace in retained if self._trace_row(trace.frame)[0] == shown)
                 current = tuple(trace for trace in current if self._trace_row(trace.frame)[0] == shown)
                 notice = "Started a new overlay: detached display budget reached."
+        # The admission holds no array the kept curves do not (Codex N-85413c4d OV-R5): its verdicts only for their
+        # sampled values, and its grid on a kept curve's own values; the shown curve, always kept and on the grid,
+        # carries it when the curve that set it has left.
+        kept_values = {id(trace.axis.values) for trace in (*retained, *current)}
+        self._comparison_verdicts = {
+            identity: verdict for identity, verdict in kept_verdicts.items() if identity in kept_values
+        }
+        if id(grid[1]) not in kept_values:
+            self._comparison_grid = (key, on_show.axis.values)
+            self._comparison_verdicts = {}
         if notice:
             self.browse_comparison_notice = notice
             logging.getLogger(__name__).info("%s (%d curves kept)", notice, len(retained) + len(current))
@@ -3780,9 +3807,12 @@ class ScientificView(QtWidgets.QFrame):
                     continue
                 self._trace_history_by_identity[id(frame)] = trace
         if held:
-            # A selected frame of the same file and label is that curve now (the end-of-Run Browse's own frames).
-            selected_rows = {self._trace_row(frame) for frame in selected}
-            held = tuple(frame for frame in held if self._trace_row(frame) not in selected_rows)
+            # A selected frame of the same file and label is that curve, once it has its own: a kept Browse curve
+            # stays until the Run's spelling of its frame is drawn, so a saved frame still loading leaves no gap
+            # (XDART_OVERLAY_DEBUG, Codex N-85413c4d's persistence observation).
+            drawn_rows = {self._trace_row(frame) for frame in selected
+                          if self._trace_history_by_identity.get(id(frame)) is not None}
+            held = tuple(frame for frame in held if self._trace_row(frame) not in drawn_rows)
         kept = {id(frame) for frame in held}
         self._trace_history_by_identity = {
             identity: trace
@@ -3812,6 +3842,11 @@ class ScientificView(QtWidgets.QFrame):
                 }
         traces = (*retained, *current)
         self._trace_history_keys = tuple(trace.frame for trace in traces)
+        _overlay_debug("merge", same_scope=same_scope, comparison=comparison is not None,
+                       incoming=_frames_text(trace.frame for trace in state.traces),
+                       selected=_frames_text(selected), held=_frames_text(held),
+                       refused=_frames_text(self._comparison_refused.values()),
+                       history=_frames_text(self._trace_history_keys))
         return traces
 
     def _merge_pinned_trace_history(
