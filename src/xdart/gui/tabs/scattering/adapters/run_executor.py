@@ -132,12 +132,13 @@ _DISPLAY_PROJECTION_FRAMES = 8
 _LIVE_DIRECTORY_POLL_S = 0.1
 # A Live Run never waits forever (maintainer, 2026-10-24: "I don't want a live run to stop or be waiting forever"): a
 # frame waiting this long for its own metadata (its sidecar, or its SPEC row) is noted in the log and the Live status
-# ("When waiting for the sidecar the log output should show it is waiting"), and after the limit for its kind ("10 s
-# for .txt, 30 s for SPEC") it is processed without it; a SPEC row that never comes (an aborted point), or a Run that
-# normalizes by a monitor from it, skips its scan from that frame on instead ("it is fine to skip the entire scan
-# altogether").
+# ("When waiting for the sidecar the log output should show it is waiting"), and after the limit for its kind it is
+# processed without it; a SPEC row that never comes (an aborted point), or a Run that normalizes by a monitor from it,
+# skips its scan from that frame on instead ("it is fine to skip the entire scan altogether"). The limits were "10 s
+# for .txt, 30 s for SPEC"; a .txt now waits 150 s (maintainer, 2026-10-26: "exposures can be as long as 120s", his
+# pick "150 s"). It is only the most a frame waits: one whose .txt holds still and reads cleanly goes on at once.
 _METADATA_WAIT_NOTE_S = 2.0
-_METADATA_WAIT_LIMIT_S = {"sidecar": 10.0, "spec": 30.0}
+_METADATA_WAIT_LIMIT_S = {"sidecar": 150.0, "spec": 30.0}
 # A scan found changed is reduced again once its images and sidecars have held still this long: an acquisition can
 # write an image and its sidecar a moment later (maintainer, 2026-10-24: "Go ahead with your recommendation").
 _REBUILD_QUIET_S = 2.0
