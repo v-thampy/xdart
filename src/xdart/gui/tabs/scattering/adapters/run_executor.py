@@ -1755,7 +1755,8 @@ class StandardRunExecutor:
             "SCAN-SKIPPED" if skip_kind == "scan" else "APPEND-SKIPPED")
 
     def _watch_metadata_wait(self, run: _StandardRun, target: Path | None, target_key: str,
-                             waiting: tuple[str, str] | None, waits: dict[str, tuple[str, float, str, str]],
+                             waiting: tuple[str, str] | None,
+                             waits: dict[str, tuple[str, float, str, str, float | None]],
                              given_up: dict[str, set[str]], *, retried: bool = False,
                              admitted: frozenset[str] | None = None) -> bool:
         """Time the frame an output waits on for its own metadata (``waiting``: (image, kind), as
