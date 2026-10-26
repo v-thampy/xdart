@@ -88,6 +88,10 @@ def older_output(tmp_path, monkeypatch):
 
 def test_a_live_run_that_fails_on_its_last_scan_ends_clean_and_leaves_run_and_the_scans_open(
         qapp, tmp_path, older_output):  # noqa: F811
+    """Its cleanup settles the released lease (703753b1). A preview read still in flight when the failed output let go
+    of its curves leaves that one release pending at the Run's end ("shared hydration gate remains retained": 1 of 20
+    local runs, and hosted run 40303254364); the page's background retry then settles it, so Run and the scans open
+    either way."""
     with _page(qapp, _intent(tmp_path)) as (page, _view, observed):
         terminal = _failed_run(qapp, page, older_output, observed)
         assert terminal.kind is StandardEventKind.FAILED and "epoch_local" in terminal.detail, terminal.detail
@@ -104,7 +108,12 @@ def test_a_live_run_that_fails_on_its_last_scan_ends_clean_and_leaves_run_and_th
                   if getattr(run, name) is not None),
             tuple(f"{error.operation}: {error.message}" for error in run.cleanup_failures),
             run.display.light_1d_cleanup_unresolved())
-        assert terminal.cleanup_status is CleanupStatus.CLEANED, (terminal.cleanup_status, owners, retained)
+        if terminal.cleanup_status is not CleanupStatus.CLEANED:  # a read was in flight: the page's retry settles it
+            assert terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING, (terminal.cleanup_status, owners, retained)
+            assert retained is not None and not retained[0] and retained[1] == (
+                "dynamic_output.finish: light-1D cleanup remains pending: shared hydration gate remains retained",
+            ), (owners, retained)
+            assert _pump(qapp, lambda: page._lifecycle.reset_permitted, 10.), (owners, retained)
         assert page._lifecycle.reset_permitted and page._start_permitted() == (True, "")
         assert page._context_controller.browse_lifecycle_admissible(), "the browser's scans stay locked"
         assert page._shell.browser.scans.isEnabled()
