@@ -38,8 +38,9 @@ from xrd_tools.sources.selection import DirectorySourceSpec
 
 @pytest.fixture
 def quick(monkeypatch):
-    """The note after 0.2 s and the limit after 1 s, for every kind."""
+    """The note after 0.2 s (a debug line), the regular log's after 0.6 s, and the limit after 1 s, for every kind."""
     monkeypatch.setattr(run_executor, "_METADATA_WAIT_NOTE_S", .2)
+    monkeypatch.setattr(run_executor, "_METADATA_WAIT_INFO_S", .6)
     monkeypatch.setattr(run_executor, "_METADATA_WAIT_LIMIT_S", {"sidecar": 1., "spec": 1.})
 
 
@@ -94,7 +95,8 @@ def test_a_frame_whose_txt_never_comes_waits_and_is_left_out_once_a_later_frame_
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
     assert not _said(events, "stopped growing"), terminal
     messages = _messages(caplog)
-    assert "grow_int1d.nexus is waiting for the metadata of grow_0002.tif [LIVE]" in messages
+    assert ("grow_int1d.nexus has waited over 0.6 s for the metadata of grow_0002.tif; it is processed once its "
+            "metadata arrives [LIVE]") in messages
     assert ("grow_int1d.nexus: grow_0002.tif is left out; its metadata did not arrive and a later frame's did "
             "[LIVE]") in messages
     assert "Left out without their metadata (1): grow_0002.tif (grow_int1d.nexus) [LIVE]" in messages
@@ -185,7 +187,8 @@ def test_a_frame_whose_txt_lands_late_is_processed_with_it_and_its_scan_goes_on(
     assert not held, "a frame was processed without its .txt"
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
     assert not _said(events, "stopped growing"), terminal
-    assert "grow_int1d.nexus no longer waits for the metadata of grow_0002.tif [LIVE]" in _messages(caplog)
+    assert any(message.startswith("grow_int1d.nexus no longer waits for the metadata of grow_0002.tif, after ")
+               and message.endswith(" s [LIVE]") for message in _messages(caplog)), _messages(caplog)
     assert _output(tmp_path, "grow")[:2] == ((1, 2, 3), (1.0, 7.0, 3.0))
 
 
@@ -526,3 +529,31 @@ def test_a_directory_scan_that_fails_is_skipped_and_the_other_scans_run(tmp_path
                                             "and the other scans continue")
                for message in _messages(caplog))
     assert _output(tmp_path, "bad") is None and _output(tmp_path, "good")[0] == (1, 2)
+
+
+def test_a_short_wait_for_a_txt_is_told_only_in_the_debug_log(tmp_path, quick, monkeypatch, caplog):
+    """At the beamline every .txt lands 5-8 s after its image, so each frame waited, noted at 2 s, and two INFO lines
+    told it (maintainer, 2026-10-26: "perhaps better to fold this in debug?", his pick "Normal log only after 30 s"):
+    a wait shorter than _METADATA_WAIT_INFO_S writes debug lines only."""
+    monkeypatch.setattr(run_executor, "_METADATA_WAIT_INFO_S", 30.)
+    caplog.set_level(logging.DEBUG, logger=run_executor.__name__)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    executor, identity = _live(tmp_path, raw, 8911)
+    events = []
+    try:
+        _frame(raw, "grow", 1, "txt", 1.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "grow") or _ended(values))
+        _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)
+        _wait(executor, events, lambda values: _said(values, "waits for the metadata of grow_0002.tif") or _ended(
+            values), timeout=15.)
+        _frame(raw, "grow", 2, "txt", 7.0, image=False)  # its .txt, a moment later
+        _wait(executor, events, lambda values: 2 in _labels(values, "grow") or _ended(values), timeout=15.)
+        _settle(executor, events, .5)
+    finally:
+        _stop(executor, identity, events)
+    told = [(record.levelno, record.getMessage()) for record in caplog.records if "metadata of grow_0002" in
+            record.getMessage()]
+    assert (logging.DEBUG, "grow_int1d.nexus is waiting for the metadata of grow_0002.tif [LIVE]") in told, told
+    assert (logging.DEBUG, "grow_int1d.nexus no longer waits for the metadata of grow_0002.tif [LIVE]") in told, told
+    assert all(level == logging.DEBUG for level, _message in told), told

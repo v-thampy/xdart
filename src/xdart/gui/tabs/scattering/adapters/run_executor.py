@@ -142,13 +142,18 @@ _SOURCE_PREFETCH_FRAMES = 4
 _DISPLAY_PROJECTION_FRAMES = 8
 _LIVE_DIRECTORY_POLL_S = 0.1
 # A Live Run never stops for one frame (maintainer, 2026-10-24: "I don't want a live run to stop or be waiting
-# forever"): a frame waiting this long for its own metadata (its sidecar, or its SPEC row) is noted in the log and the
-# Live status ("When waiting for the sidecar the log output should show it is waiting") while the other scans and
+# forever"): a frame waiting this long for its own metadata (its sidecar, or its SPEC row) is noted in the Live status
+# and the debug log ("When waiting for the sidecar the log output should show it is waiting") while the other scans and
 # folders go on. A frame without its sidecar waits for it, or for its series' next frame (_watch_metadata_wait); a SPEC
 # row that never comes (an aborted point, 30 s) or a sidecar that never holds still (150 s from its first sighting)
 # skips its scan from that frame on ("it is fine to skip the entire scan altogether"). The sidecar limit, 150 s
 # (maintainer, 2026-10-26: "exposures can be as long as 120s", his pick "150 s"), also bounds Auto's question.
 _METADATA_WAIT_NOTE_S = 2.0
+# The note above is a debug line; a frame still waiting for its sidecar this long is told in the regular log, once, and
+# so is the end of that wait (maintainer, 2026-10-26, of the note and its "no longer waits" line at every frame whose
+# .txt lands 5-8 s after its image: "i'm wondering if it needs to be there. perhaps better to fold this in debug?", his
+# pick "Normal log only after 30 s"): a long wait is the one a user can act on, and the status no longer counts pending.
+_METADATA_WAIT_INFO_S = 30.0
 # One scan's own failures: its image could not be read, or its output predates its new frames' metadata columns. The
 # scan is skipped and named, the Run goes on (maintainer, 2026-10-24: "That scan/frame should be logged and skipped and
 # the remaining scan processing should continue"; 2026-10-26, for an output written before epoch_local: his pick "Skip
@@ -555,6 +560,8 @@ class _StandardRun:
     # Live outputs whose next frame has waited _METADATA_WAIT_NOTE_S for its own
     # metadata: physical target key -> the note the status carries meanwhile.
     live_waiting: dict[str, str] = field(default_factory=dict)
+    # ... of which those waiting _METADATA_WAIT_INFO_S for their sidecar, told in the regular log: key -> the image.
+    live_waiting_long: dict[str, str] = field(default_factory=dict)
     # The Run's metadata type, for every folder (maintainer, 2026-10-26: "in a live or directory run, it can be assumed
     # that the moment a metadata sidecar is found, that type applies universally for all data in all folders for that
     # run"): "sidecar" from an explicit sidecar format or the first sidecar Auto finds anywhere, "none" once the Run
@@ -1719,7 +1726,7 @@ class StandardRunExecutor:
             "its frame was reduced; published frames kept"
         )
         run.live_blocked[target_key] = reason
-        run.live_waiting.pop(target_key, None)
+        run.live_waiting.pop(target_key, None); run.live_waiting_long.pop(target_key, None)
         log_events.event(
             logger, logging.WARNING, "%s stops growing: the metadata of frames it already processed changed (%s); its "
             "frames so far are kept and its later frames are skipped in this Run [LIVE]", Path(target).name, names)
@@ -1813,7 +1820,7 @@ class StandardRunExecutor:
             f"{'its energy span widened' if widened else 'it could not be processed' if failed else 'its Append was refused'}"
             "; published frames kept"
         )
-        run.live_waiting.pop(target_key, None)
+        run.live_waiting.pop(target_key, None); run.live_waiting_long.pop(target_key, None)
         log_events.event(
             logger, logging.WARNING, "%s stops growing: %s; its frames so far are kept and its later frames are "
             "skipped in this Run%s. Details: %s [%s]", Path(target).name,
@@ -1849,7 +1856,7 @@ class StandardRunExecutor:
         now, held = monotonic(), waits.get(target_key)
         if waiting is not None and waiting[1] == "superseded":
             image, name = waiting[0], Path(target).name
-            run.live_waiting.pop(target_key, None)
+            run.live_waiting.pop(target_key, None); run.live_waiting_long.pop(target_key, None)
             waits.pop(target_key, None)
             run.left_out.update(str(Path(path)) for path in paths if Path(path).name == image)
             run.metadata_left_out.append(f"{image} ({name})")
@@ -1860,8 +1867,11 @@ class StandardRunExecutor:
             waiting = (held[0], held[3])  # not admitted: it still waits, as it was last seen
         if waiting is None or held is None or held[0] != waiting[0]:
             if run.live_waiting.pop(target_key, None) is not None and held is not None:
-                log_events.event(logger, logging.INFO, "%s no longer waits for the metadata of %s [LIVE]",
-                                 held[2], held[0])
+                if run.live_waiting_long.pop(target_key, None) == held[0]:
+                    log_events.event(logger, logging.INFO, "%s no longer waits for the metadata of %s, after %.0f s "
+                                     "[LIVE]", held[2], held[0], now - held[1])
+                else:
+                    logger.debug("%s no longer waits for the metadata of %s [LIVE]", held[2], held[0])
             if waiting is None:
                 waits.pop(target_key, None)
             else:
@@ -1875,13 +1885,18 @@ class StandardRunExecutor:
             self._settle_metadata_kind(run, image, name, now)
         if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
             run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
-            log_events.event(logger, logging.INFO, "%s is waiting for the metadata of %s [LIVE]", name, image)
+            logger.debug("%s is waiting for the metadata of %s [LIVE]", name, image)
+        if (kind == "sidecar" and run.live_waiting_long.get(target_key) != image
+                and now - held[1] >= _METADATA_WAIT_INFO_S):
+            run.live_waiting_long[target_key] = image
+            log_events.event(logger, logging.INFO, "%s has waited over %g s for the metadata of %s; it is processed "
+                             "once its metadata arrives [LIVE]", name, _METADATA_WAIT_INFO_S, image)
         if kind == "sidecar":
             return False  # it waits for its sidecar, its series' next frame's, or the Run's answer
         limit = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind]
         if now - (sighted if kind == "settling" else held[1]) < limit:
             return False
-        run.live_waiting.pop(target_key, None)
+        run.live_waiting.pop(target_key, None); run.live_waiting_long.pop(target_key, None)
         waits.pop(target_key, None)
         if kind == "spec":  # its row never came: a SPEC scan that stopped there (an aborted point)
             self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
