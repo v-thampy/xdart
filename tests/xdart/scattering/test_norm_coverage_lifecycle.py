@@ -1,4 +1,6 @@
 """Normalization coverage across anchor changes and saved-output replacement."""
+import pytest
+
 from tests.xdart.scattering.test_e6_norm_consumers import _acquisition_parts, _add_artifact, _retain
 from tests.xdart.scattering.test_live_already_processed import _intent
 from tests.xdart.scattering.test_live_changed_images import _catalog, _live, _reacquire
@@ -10,6 +12,37 @@ from xdart.gui.tabs.scattering import context_runtime
 from xdart.gui.tabs.scattering.scientific_axes import NormCoverage
 from xrd_tools.session.scan_norm import channel_is_partial
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+from xdart.gui.tabs.scattering.adapters import run_executor
+
+
+@pytest.mark.parametrize("chosen", [False, True])
+def test_saved_scalar_rows_are_read_only_with_display_normalization(tmp_path, monkeypatch, chosen):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for label in (1, 2):
+        _frame(raw, "done", label, "txt", float(label))
+    seed, seed_id, seeded = _run_to_terminal(_intent(tmp_path, raw, live=False), request_value=9790)
+    seed.close(seed_id)
+    assert [event.kind.name for event in seeded if event.kind in _TERMINAL] == ["FINISHED"]
+    actual, reads = run_executor.read_frame_scalar_catalog, []
+
+    def read(path):
+        reads.append(path)
+        return actual(path)
+
+    monkeypatch.setattr(run_executor, "read_frame_scalar_catalog", read)
+    monkeypatch.setattr(StandardRunExecutor, "display_normalization", chosen)
+    executor, identity, events = _run_to_terminal(_intent(tmp_path, raw, live=False), request_value=9791)
+    try:
+        assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"]
+        assert len(reads) == int(chosen)
+        frame = executor.frame_catalog(identity).entries[-1]
+        aggregate = executor._exact_run(identity).display.frame_norm_aggregate(frame)
+        assert (aggregate is not None) == chosen
+        if chosen:
+            assert aggregate.row_count == 2 and aggregate.channels["i0"] == (3., 2)
+    finally:
+        executor.close(identity)
 
 
 def test_anchor_change_keeps_each_scans_accepted_gate_predecessor(monkeypatch):

@@ -279,9 +279,44 @@ def test_phase_lines_on_q_and_2theta_axes_in_int_and_stitch(qapp, tmp_path):
         keys = tuple(controller.frame_keys)
         for key in keys:
             select(qapp, page, key)
+        # Capture the phase reference with this frame's known energy before
+        # selecting both energies (whose Q-phase intensity filter can differ).
+        assert controller.select_navigation(keys[-1], (keys[-1],))
+        page._refresh_shell(); qapp.processEvents(); _settle(qapp, view)
+        q_positions = tuple(sorted(_markers(view, entry)))
+        assert q_positions
         assert controller.select_navigation(keys[-1], keys)
-        page._refresh_shell(); qapp.processEvents()
+        page._refresh_shell(); qapp.processEvents(); _settle(qapp, view)
         _command(page, ShellCommandKind.SET_PLOT_AXIS, '2theta'); _settle(qapp, view)
+        # Each frame converts its common-Q grid with its own wavelength. The
+        # strict Overlay grid owner keeps only the current 2theta curve, whose
+        # energy can now authorize reference lines.
+        assert view.trace_history_keys == (keys[-1],)
+        assert len(view.curve.listDataItems()) == 1
+        payload = controller.project(keys[-1])
+        wavelength = payload.view.geometry.poni['wavelength'] * 1e10
+        positions = tuple(sorted(_markers(view, entry)))
+        expected = 2. * np.rad2deg(np.arcsin(np.asarray(q_positions)*wavelength/(4.*np.pi)))
+        np.testing.assert_allclose(positions, expected, atol=1e-10)
+
+        # Different energies may have compatible displayed 2theta samples.
+        # When both curves actually remain drawn, phases must still fail
+        # closed rather than choosing either frame's energy.
+        from tests.xdart.scattering.test_overlay_admission_contract import _trace, _state
+        from xdart.gui.tabs.scattering.events import RunIdentity
+        identity = RunIdentity(49, 'phase-displayed-energy-control')
+        first = _trace(identity, 'energy', '/out/energy.nexus', 1,
+                       wavelength=7.75e-11, axis='2theta')
+        last = _trace(identity, 'energy', '/out/energy.nexus', 2,
+                      wavelength=7.29e-11, axis='2theta', scale=7.75/7.29)
+        np.testing.assert_allclose(first.axis.values, last.axis.values, rtol=1e-12)
+        state, navigation = _state((first, last), axis='2theta')
+        state = replace(state, plot_options=page._last_scientific_projection.plot_options)
+        view.clear_trace_history()
+        view.reconcile(state, navigation, completed=2, total=2, detail='')
+        _settle(qapp, view)
+        assert view.trace_history_keys == (first.frame, last.frame)
+        assert len(view.curve.listDataItems()) == 2
         assert not _markers(view, entry)
         assert 'ener' in view.phase_families[entry.id].reason.lower()
 

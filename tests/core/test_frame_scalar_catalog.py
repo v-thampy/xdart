@@ -156,6 +156,18 @@ def _assert_array_free(value: object) -> None:
     raise AssertionError(f"unexpected catalog object: {type(value)!r}")
 
 
+@pytest.mark.parametrize("stored, expected", [("Sample", "Sample"), (None, None), (42, None)])
+def test_scalar_catalog_scan_family_is_an_optional_display_label(tmp_path, stored, expected):
+    path = tmp_path / "sample_int1d.nexus"
+    _catalog_file(path)
+    if stored is not None:
+        with h5py.File(path, "r+") as handle:
+            handle["entry"].attrs["artifact_family_v1"] = stored
+    catalog = module.read_frame_scalar_catalog(path)
+    assert catalog.artifact_family == expected
+    assert catalog.labels == (2, 5, 9)
+
+
 def test_scalar_catalog_entry_point_returns_detached_rows_and_closes_its_reader(tmp_path):
     path = tmp_path / "catalog.nexus"
     _catalog_file(path)

@@ -46,6 +46,8 @@ def saved(tmp_path, request):
     q, chi = np.array([0.1, 0.2, 0.3]), np.array([-2.0, 0.0, 2.0])
     with h5py.File(path, "w") as handle:
         entry = handle.create_group("entry")
+        if getattr(request, "param", None) == "named":
+            entry.attrs["artifact_family_v1"] = "Sample"
         entry.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
         entry.attrs["ssrl_schema_version"] = 3
         write_integrated_stack(
@@ -137,6 +139,16 @@ def test_saved_selected_cuts_use_half_width_nanmean_and_row_normalization(saved,
     for trace in result.traces:
         n = trace.frame.local_frame_label
         np.testing.assert_allclose(trace.intensity, (np.array([1.5, 11.5, 21.]) + n) / n)
+
+
+@pytest.mark.parametrize("saved", ["named"], indirect=True)
+def test_saved_cuts_label_the_persisted_scan_family(saved):
+    result = _project(saved, ScientificPreferences(plot_mode="Overlay", slice_enabled=True,
+                                                 slice_center=0., slice_width=.1))
+    assert result.diagnostic == ""
+    assert len(result.traces) == 3
+    for trace in result.traces:
+        assert trace.title.startswith(f"Sample_{trace.frame.local_frame_label}"), trace.title
 
 
 def test_pin_absorption_unselected_reuse_axis_conversion_and_native_rows(saved, monkeypatch):

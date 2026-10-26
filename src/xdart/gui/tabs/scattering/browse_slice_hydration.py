@@ -275,6 +275,7 @@ class BrowseSliceLane:
                 payload = StandardDisplayPayload(
                     request.selection.display_generation, frame, "", view,
                     status="browse", wavelength_m=self._wavelength, averaged=row.averaged,
+                    legend_scan=self._catalog.artifact_family or "",
                 )
                 if shown == DERIVED_Q_CHI and row.active_mode_2d == "qip_qoop":
                     payload = present_gi_map(replace(
