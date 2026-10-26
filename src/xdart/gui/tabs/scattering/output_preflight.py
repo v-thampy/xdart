@@ -1544,16 +1544,7 @@ def materialize_live_directory_group(
     """
 
     fresh = getattr(session, "fresh", frozenset())  # first seen by this poll's listing
-    try:
-        observations = list(session.probe_candidates(
-            group.plan.candidates, refresh=False, reprobe=reprobe, cancelled=cancelled))
-    except StaleCandidateError as error:
-        return LiveDirectoryAttempt(group, ProbeState.IN_PROGRESS, reason=str(error))
-    if cancelled():
-        raise RuntimeError("admission cancelled")
-    if observations and observations[-1].result.state is not ProbeState.READY:
-        return LiveDirectoryAttempt(group, observations[-1].result.state, reason=observations[-1].result.reason)
-    physical_paths = group.physical_paths
+    physical_paths, count = group.physical_paths, len(group.plan.candidates)
     prefix, sidecar = None, None
     if sidecar_observations is not None:
         # A current proof covers the published members (each output is proved
@@ -1614,16 +1605,28 @@ def materialize_live_directory_group(
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting, waiting_metadata=sidecar,
             )
-        live_readiness_debug("live_readiness", **facts, decision="admit")
-        observations = observations[:count]
         physical_paths = physical_paths[:count]
         if getattr(session, "listing_deferred", False):
             # An admission needs a real listing in its own poll (D1): the next one.
+            live_readiness_debug("live_readiness", **facts, decision="wait: listing due")
             session.force_listing()
             return LiveDirectoryAttempt(group, ProbeState.IN_PROGRESS, reason="listing the directory before admission")
+        live_readiness_debug("live_readiness", **facts, decision="admit")
         # The prefix proved in this poll: only the members after it are read,
         # captured and proved strictly.
         prefix = published_graph if covered else None
+    # Only the members admission takes are probed, after their metadata is ready: a scan still waiting for its
+    # sidecars costs no image read (beamline 2026-10-26: a Live Run's first poll probed the images of all 148 scans,
+    # 32 s on the share, then admitted none, each sidecar seen once; the first frame came 52 s after the Run began).
+    try:
+        observations = list(session.probe_candidates(
+            group.plan.candidates[:count], refresh=False, reprobe=reprobe, cancelled=cancelled))
+    except StaleCandidateError as error:
+        return LiveDirectoryAttempt(group, ProbeState.IN_PROGRESS, reason=str(error))
+    if cancelled():
+        raise RuntimeError("admission cancelled")
+    if observations and observations[-1].result.state is not ProbeState.READY:
+        return LiveDirectoryAttempt(group, observations[-1].result.state, reason=observations[-1].result.reason)
 
     ready = RunCandidatePlan(
         group.plan.generation,
