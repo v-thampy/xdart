@@ -6312,6 +6312,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> None:
         explicit_preserve_display = preserve_display
         explicit_preserve_scientific = preserve_scientific
+        # A Run reads an already-processed output's scalar rows only while the display divides by a Norm Channel.
+        executor = getattr(self, "_run_executor", None)
+        if executor is not None:
+            executor.display_normalization = (
+                self._preferences.norm_channel.strip() not in {"", "None", "Norm Channel"})
         allow_batch_terminal_paint = bool(
             allow_batch_terminal_paint
             and self._batch_ready_to_paint() is not None

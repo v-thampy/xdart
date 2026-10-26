@@ -960,6 +960,11 @@ def _read_container(read, source, what: str, *, typed: bool):
 
 class StandardRunExecutor:
 
+    #: Whether the display divides by a Norm Channel; the page keeps it current. Only then does a Run read the scalar
+    #: rows of an already-processed output it shows (maintainer, 2026-10-26: "this must be avoided!", then his pick
+    #: "Only with a Norm Channel"): a Run without one opens no saved output for normalization.
+    display_normalization = False
+
     def __init__(self, *, max_display_items: int=2, join_timeout: float=5.0) -> None:
         if type(max_display_items) is not int or max_display_items < 1:
             raise ValueError('max_display_items must be a positive integer')
@@ -3428,9 +3433,10 @@ class StandardRunExecutor:
                 wavelength_m=completed.wavelength_m,  # the output's own, as it was processed
             )
         run.display.bind_checkpoint_hydration(owner)
-        if newly_adopted_owner:
+        if newly_adopted_owner and self.display_normalization:
             # Its own normalization record, from its committed scalar rows as Browse folds them: a Norm Channel
-            # then covers its frames in an Overlay across the Run's scans (Codex N-f3f77127).
+            # then covers its frames in an Overlay across the Run's scans (Codex N-f3f77127). Without a Norm Channel
+            # nothing is read.
             try:
                 catalog = read_frame_scalar_catalog(target)
             except Exception:

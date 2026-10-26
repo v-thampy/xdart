@@ -9,6 +9,7 @@ from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_term
 from xdart.gui.tabs.scattering import context_runtime
 from xdart.gui.tabs.scattering.scientific_axes import NormCoverage
 from xrd_tools.session.scan_norm import channel_is_partial
+from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 
 
 def test_anchor_change_keeps_each_scans_accepted_gate_predecessor(monkeypatch):
@@ -36,7 +37,9 @@ def test_anchor_change_keeps_each_scans_accepted_gate_predecessor(monkeypatch):
         assert held is accepted[expected], "an anchor change must not erase the scan's accepted predecessor"
 
 
-def test_saved_scan_whole_replacement_rebuilds_its_norm_rows(tmp_path):
+def test_saved_scan_whole_replacement_rebuilds_its_norm_rows(tmp_path, monkeypatch):
+    # A Norm Channel is chosen: only then does a Run read a saved output's scalar rows.
+    monkeypatch.setattr(StandardRunExecutor, "display_normalization", True)
     raw = tmp_path / "raw"
     raw.mkdir()
     for label in (1, 2):
@@ -95,7 +98,9 @@ def test_replacement_norm_revision_is_accepted_after_the_old_rows_leave():
     assert not channel_is_partial(replacement, "mon")
 
 
-def test_saved_scan_extension_keeps_its_prefix_norm_rows(tmp_path):
+def test_saved_scan_extension_keeps_its_prefix_norm_rows(tmp_path, monkeypatch):
+    # A Norm Channel is chosen: only then does a Run read a saved output's scalar rows.
+    monkeypatch.setattr(StandardRunExecutor, "display_normalization", True)
     raw = tmp_path / "raw"
     raw.mkdir()
     for label in (1, 2):
