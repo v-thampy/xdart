@@ -7317,6 +7317,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             candidate, expected_revision=snapshot.revision
         )
         self._reconcile_snapshot(snapshot, result.snapshot)
+        if kind is ShellCommandKind.SET_LIVE:
+            # Maintainer, 2026-10-26: "a little message when live mode is toggled saying that the run should be
+            # paused/stopped to browse already processed scans".
+            if result.snapshot.thaw().live_mode:
+                self._notice(_LIVE_BROWSE_NOTE)
+            elif self._notice_text == _LIVE_BROWSE_NOTE:
+                self._notice("")
         if (viewer_source is not None
                 and result.snapshot.thaw().processing_mode == candidate.processing_mode):
             self._open_viewer_2d_path(viewer_source)
@@ -8503,6 +8510,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if not self._closed:
             self._refresh_shell()
+
+
+#: Shown when Live is switched on: a running Run keeps the Browser's other scans closed.
+_LIVE_BROWSE_NOTE = "Live is on: pause or stop the Run to browse the scans it has already processed."
 
 
 def _source_label(source: SourceSelection | None) -> str:
