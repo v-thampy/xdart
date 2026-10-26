@@ -114,6 +114,7 @@ class _Executor(ImmediateAdmission):
         self.start_calls = 0
         self.last_identity: RunIdentity | None = None
         self.last_configuration = None
+        self.close_status = CleanupStatus.CLEANED
 
     def begin_admission(self, capture):
         token = super().begin_admission(capture)
@@ -141,7 +142,7 @@ class _Executor(ImmediateAdmission):
             raise self.stop_error
 
     def close(self, run_identity):
-        return ExecutorClosed(run_identity, CleanupStatus.CLEANED)
+        return ExecutorClosed(run_identity, self.close_status)
 
     def pause(self, _run_identity) -> None:
         return None
@@ -660,6 +661,7 @@ def test_pending_failure_cannot_reset_or_launch(
     qapp: QtWidgets.QApplication,
 ) -> None:
     executor = _Executor()
+    executor.close_status = CleanupStatus.CLEANUP_PENDING  # closing it again still leaves its cleanup pending
     page, lifecycle, identity = _active_page(executor)
     executor.events.append(StandardRunEvent(identity, StandardEventKind.FAILED,
                                              cleanup_status=CleanupStatus.CLEANUP_PENDING))
@@ -681,6 +683,10 @@ def test_pending_failure_cannot_reset_or_launch(
             shell.run_controls.readinessLabel.text()
             == "Standard cleanup remains pending"
         )
+        executor.close_status = CleanupStatus.CLEANED  # its cleanup finished: Run closes it again and launches
+        page._begin_run()
+        page._drain_executor()
+        assert executor.start_calls == 1
     finally:
         _dispose(page, qapp)
 
