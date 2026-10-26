@@ -189,6 +189,7 @@ def build_scientific_projection(
     *,
     processing_mode: str = "Int 2D",
     norm_aggregate: object = None,
+    names_output: bool = False,
 ) -> ScientificProjection:
     frame_by_id = {id(frame): frame for frame in navigation.frames}
     selected_ids = {id(frame) for frame in navigation.selected}
@@ -385,7 +386,7 @@ def build_scientific_projection(
     status = notice
     if current_payload is not None:
         title = _source_member_label(current_payload)
-        status = notice or title
+        status = notice or (_with_output_name(title, current_payload) if names_output else title)
     # Payload projection and residency are two bounded reads.  A live commit
     # can land between them, making the current frame resident in the second
     # read while its payload was absent from the first.  Treat that split-view
@@ -438,6 +439,16 @@ def build_scientific_projection(
             RunPhase.STOPPING,
         },
     )
+
+
+def _with_output_name(label: str, payload: StandardDisplayPayload) -> str:
+    """The footer's status: the image shown, then the NeXus file its frame belongs to, by file name only
+    (maintainer, 2026-10-26: "in the bottom status bar where the file name is shown as it is processed also add
+    [Output: <nexus file name>]"; "just the name of the nexus file"). A frame of no NeXus file names none."""
+    name = os.path.basename(str(payload.frame_key.artifact or ""))
+    if not name.casefold().endswith((".nexus", ".nxs")):
+        return label
+    return f"{label} [Output: {name}]"
 
 
 def _source_member_label(payload: StandardDisplayPayload) -> str:

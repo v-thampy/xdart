@@ -878,6 +878,10 @@ class ScientificView(QtWidgets.QFrame):
             0,
             0,
         )
+        # The status names an image and its output file, so its text never widens the view (a long one is cut at
+        # the right edge), as the Run status label (run_controls._ElidingLabel) does.
+        self.status.setMinimumWidth(0)
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
         self.progress = QtWidgets.QLabel("0/0")
         self.progress.setObjectName("e3GlobalProgress")
         self.footer.addWidget(self.status, 1)

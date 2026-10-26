@@ -534,7 +534,9 @@ class ContextProjection:
                 processing_mode=_scientific_presentation_mode(
                     intent.processing_mode
                 ),
-                norm_aggregate=norm_aggregate))
+                norm_aggregate=norm_aggregate,
+                # an Int 1D (XYE) Run writes .xye files, no NeXus output to name
+                names_output=intent.processing_mode != "Int 1D (XYE)"))
         scientific = apply_presentation_background(
             scientific, presentation_background)
         scientific = replace(scientific, acquisition_selected=(

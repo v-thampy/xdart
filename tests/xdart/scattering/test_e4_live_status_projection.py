@@ -66,9 +66,9 @@ def test_image_member_name_owns_live_status_and_plot_title(
         notice="",
     )
 
-    assert projected.scientific.status == "Combi4_scan_0016.tif"
+    # The footer also names the output NeXus file, by name (maintainer, 2026-10-26); the plot title does not.
+    assert projected.scientific.status == "Combi4_scan_0016.tif [Output: result.nxs]"
     assert projected.scientific.title == "Combi4_scan_0016.tif"
-    assert frame.artifact not in projected.scientific.status
 
 
 @pytest.mark.parametrize(
@@ -143,7 +143,7 @@ def test_container_member_name_includes_exact_source_frame(
         notice="",
     )
 
-    assert projected.scientific.status == expected
+    assert projected.scientific.status == f"{expected} [Output: result.nxs]"
     assert projected.scientific.title == expected
 
 
