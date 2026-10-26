@@ -42,7 +42,10 @@ def test_a_live_run_that_processed_all_it_found_says_it_waits_for_new_images(qap
         assert _pump(qapp, lambda: UP_TO_DATE in label.full_text(), 30.), label.full_text()
         assert label.full_text() == ("Running · Up to date, waiting for new images · 1 processed · 0 skipped · "
                                      "1 discovered"), label.full_text()
-        assert label.text().startswith("Running · Up to date, waiting for new images")  # leads, however it elides
+        # It leads, however it elides: the label keeps the head of the text, cut where its width ends (hosted 40320041462
+        # showed "Running · Up to date, waiting for new imag…").
+        shown = label.text()
+        assert shown.startswith("Running · Up to date") and label.full_text().startswith(shown.rstrip("…")), shown
         _frame(raw, "scan", 2, "txt", 2.0, sidecar=False)  # a new image, its .txt not yet there: pending again
         assert _pump(qapp, lambda: "1 pending" in label.full_text(), 30.), label.full_text()
         assert UP_TO_DATE not in label.full_text()
