@@ -879,9 +879,10 @@ class ScientificView(QtWidgets.QFrame):
             0,
         )
         # The status names an image and its output file, so its text never widens the view (a long one is cut at
-        # the right edge), as the Run status label (run_controls._ElidingLabel) does.
+        # the right edge), as the Run status label (run_controls._ElidingLabel) does. Its tooltip keeps the full text.
         self.status.setMinimumWidth(0)
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        self._set_status_text("")
         self.progress = QtWidgets.QLabel("0/0")
         self.progress.setObjectName("e3GlobalProgress")
         self.footer.addWidget(self.status, 1)
@@ -961,12 +962,17 @@ class ScientificView(QtWidgets.QFrame):
         self.status.hide()
         return key
 
+    def _set_status_text(self, text: str) -> None:
+        self.status.setText(text)
+        purpose = "Current image, output NeXus file, or display status."
+        self.status.setToolTip(f"{purpose}\n\n{text}" if text else purpose)
+
     def reconcile_operation_status(self, status: object) -> bool:
         """Replace only the scalar scientific-footer status text."""
 
         if type(status) is not str or not status:
             return False
-        self.status.setText(status)
+        self._set_status_text(status)
         return True
 
     @property
@@ -1904,7 +1910,7 @@ class ScientificView(QtWidgets.QFrame):
                 elif not ScientificView.clear_viewer_2d(self, None, failure=True):
                     raise RuntimeError("2D Viewer render failed.") from None
                 self.title.setText(state.title)
-                self.status.setText(state.status)
+                self._set_status_text(state.status)
                 self.progress.setText("0/0")
                 return
             try:
@@ -1950,7 +1956,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._viewer_2d_shape = heavy.raw.shape
                 self._viewer_2d_known_empty = False
                 self.title.setText(state.title)
-                self.status.setText(state.status)
+                self._set_status_text(state.status)
                 self.progress.setText(f"{completed}/{total}")
                 current = next((index for index, item in enumerate(navigation.frames)
                                 if item is frame), None)
@@ -2162,7 +2168,7 @@ class ScientificView(QtWidgets.QFrame):
             self._autorange_slice_projection(self._share_link_on)
         if replace_presentation:
             self._rendered_slice_contract = slice_contract
-        self.status.setText(self.browse_comparison_notice or (state.detector_diagnostic if state.detector_mode == "full" and not state.detector_pending and state.heavy is not None and state.heavy.detector_source != "full" else state.status or detail))
+        self._set_status_text(self.browse_comparison_notice or (state.detector_diagnostic if state.detector_mode == "full" and not state.detector_pending and state.heavy is not None and state.heavy.detector_source != "full" else state.status or detail))
         self.progress.setText(f"{completed}/{total}")
         self._refresh_viewer_intensity()
         del blockers
@@ -2392,7 +2398,7 @@ class ScientificView(QtWidgets.QFrame):
         try:
             if not keep_chrome:
                 self.title.setText("1D Viewer · Render failed" if failure else "Current")
-                self.status.setText(
+                self._set_status_text(
                     "1D Viewer · Render failed; retry available." if failure else "")
             cleared = bool(cleared and not self.curve.listDataItems()
                            and not self._trace_history_by_identity
@@ -2418,7 +2424,7 @@ class ScientificView(QtWidgets.QFrame):
             if self.raw_popup_dialog is not None:
                 self.raw_popup_dialog.close()
             self.title.setText("Current")
-            self.status.setText("")
+            self._set_status_text("")
         except Exception:
             return False
         return bool(cleared)
@@ -4380,7 +4386,7 @@ class ScientificView(QtWidgets.QFrame):
             widgets.clear()
         if self._layout_mode == "keyed":
             self.title.setText("")
-            self.status.setText(str(detail))
+            self._set_status_text(str(detail))
             self._refresh_keyed_intensity()
         self._keyed_shown = None
 
@@ -4409,7 +4415,7 @@ class ScientificView(QtWidgets.QFrame):
         # the background drawn now, which ``release_display_background`` lets go of (as ``reconcile`` does)
         self._rendered_background_key = self._expected_background_key if state.background_set else None
         self.title.setText(state.title)
-        self.status.setText(state.status)
+        self._set_status_text(state.status)
         self._keyed_coordinates = self._keyed_axes(state)
         self.share_axis.setEnabled(bool(self._keyed_coordinates))
         self._set_share_link(state.share_axis)

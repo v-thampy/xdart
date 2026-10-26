@@ -988,8 +988,7 @@ class DirectoryFileProgress:
         all it found (his pick "Lead with it")."""
         skipped = f" · {self.skipped} skipped" if self.skipped else ""
         new = new_frames_note(self.new)
-        counts = (f"{self.processed}/{self.discovered} processed" if self.discovered
-                  else f"{self.processed} processed")
+        counts = f"{self.processed}/{self.discovered} processed"
         if watching and not self.pending:
             return f"{state} · Waiting for new images · {counts}{new}{skipped}"
         return f"{state} · {counts}{new}{skipped}"

@@ -77,3 +77,18 @@ def test_a_long_footer_status_never_widens_the_view(qapp):  # noqa: F811
     finally:
         view.close()
         view.deleteLater()
+
+
+def test_a_clipped_footer_exposes_its_current_full_text_in_the_tooltip(qapp):
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
+
+    view = ScientificView()
+    try:
+        text = f"{IMAGE} [Output: LaB6_4deg_300mm_15s_10261256_int2d.nexus]"
+        assert view.reconcile_operation_status(text)
+        assert text in view.status.toolTip()
+        assert view.reconcile_operation_status("Replacement committed")
+        assert "Replacement committed" in view.status.toolTip() and IMAGE not in view.status.toolTip()
+    finally:
+        view.close()
+        view.deleteLater()

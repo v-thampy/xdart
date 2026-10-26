@@ -24,6 +24,7 @@ from xrd_tools.session.hydration import (
 )
 from xrd_tools.session.readiness import ControlsProjection, Tool, tool_from_mode_text
 from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.sources.selection import DirectorySourceSpec
 
 from .browser_catalog import BrowserCatalogEntry
 from .context_values import (
@@ -44,7 +45,7 @@ from .shell_projection import (
     build_run_strip_projection, build_scientific_projection,
 )
 from .shell_values import (
-    AxisProjection, BrowserScanIndex, FrameNavigationProjection, HeavyProjection,
+    AxisProjection, BrowserScanIndex, DirectoryFileProgress, FrameNavigationProjection, HeavyProjection,
     KeyedImageProjection, KeyedPanelsProjection, ProgressProjection, ScientificProjection,
     ShellProjection, TraceProjection,
 )
@@ -472,10 +473,17 @@ class ContextProjection:
         if viewer_requested:
             run = replace(run, mode=("1D Viewer" if tool is Tool.XYE_VIEWER else "2D Viewer"))
         progress_detail = progress.detail
-        if progress.directory_files is not None and (
+        files = progress.directory_files
+        if (files is None and type(intent.source_spec) is DirectorySourceSpec and intent.live_mode
+                and phase not in {RunPhase.IDLE, RunPhase.CLOSED} and progress.detail
+                and progress.completed == progress.total == 0):
+            # Zero event counters are also used by single sources; the known directory intent identifies
+            # an empty Live Run without inventing file progress for those other events.
+            files = DirectoryFileProgress(0, 0, 0, 0)
+        if files is not None and (
             not progress.terminal or phase is RunPhase.FAILED
         ):
-            progress_detail = progress.directory_files.text(
+            progress_detail = files.text(
                 "Failed"
                 if progress.terminal
                 else {

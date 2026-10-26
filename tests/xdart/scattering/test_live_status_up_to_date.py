@@ -31,6 +31,24 @@ def test_the_status_leads_with_waiting_only_while_a_running_live_run_has_nothing
     assert caught_up.text("Paused") == "Paused · 561/561 processed (561 new)"
 
 
+def test_zero_directory_totals_stay_visible_in_every_status():
+    empty = DirectoryFileProgress(0, 0, 0, 0)
+    for state in ("Starting", "Running", "Paused", "Failed"):
+        assert empty.text(state) == f"{state} · 0/0 processed"
+
+
+def test_an_empty_live_directory_uses_the_compact_waiting_status(qapp, tmp_path):
+    from tests.xdart.scattering.test_browse_reference_rings_run import _directory
+
+    with _page(qapp, _directory(tmp_path, live=True)) as (page, _view, observed):
+        page._shell.run_controls.startButton.click()
+        assert _pump(qapp, lambda: any(event.kind is StandardEventKind.DISCOVERY for event in observed), 30.)
+        assert page._shell.run_controls.readinessLabel.full_text() == (
+            "Running · Waiting for new images · 0/0 processed")
+        page._shell.run_controls.stopButton.click()
+        _terminal(qapp, page, observed, StandardEventKind.STOPPED)
+
+
 def test_a_live_run_that_processed_all_it_found_says_it_waits_for_new_images(qapp, tmp_path):  # noqa: F811
     raw = tmp_path / "raw"
     raw.mkdir()
