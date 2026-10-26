@@ -121,6 +121,42 @@ def _run_summary(configuration) -> str:
     return " · ".join(filter(None, (mode, f"{source} → {output}" if source and output else source or output)))
 
 
+# An Append refusal said plainly for the log's warning and the end-of-Run list; its technical text goes to the debug
+# log (maintainer, 2026-10-26: "terms like foreign append identity are not very helpful for most users. these are good
+# for debugging but user facing warnings and info should be simpler and more direct"; "you can just say integration
+# settings different from earlier ones or something like that ... if it is obvious where the mismatch is that can be
+# specified"). (technical text it begins with or contains, plain words); the first match wins.
+_PLAIN_APPEND_REASONS = (
+    ("foreign Append identity: integration settings", "it was made with different integration settings"),
+    ("foreign Append identity: results", "it holds different results (1-D, 2-D or GI maps) than this Run makes"),
+    ("foreign Append identity: Project folder", "it was made under a different Project folder"),
+    ("foreign Append identity: source", "it was made from a different source (another folder, path spelling or file "
+                                        "type)"),
+    ("foreign Append identity", "it was made with different settings"),
+    ("DIMENSION_REPLACEMENT_APPEND_UNSUPPORTED", "it was reintegrated, and Append cannot add to a reintegrated output"),
+    ("source does not extend exact image-member history", "the images it was made from changed"),
+    ("same-extent source identity changed", "its images or their metadata changed since it was made"),
+    ("regressed", "the scan now has fewer images than its output holds"),
+    ("an earlier Append of this output did not finish", "an earlier Append of it did not finish"),
+    ("another program has the output open", "another program has it open; close that program, then run again"),
+    ("not a readable HDF5 file", "it is not a readable file, possibly left by an interrupted Append; move or delete "
+                                 "it, then run again"),
+    ("committed Append lineage", "it was not saved in a form Append can continue"),
+    ("no committed Append epoch", "it was not saved in a form Append can continue"),
+)
+
+
+def _plain_append_reason(reason: str) -> str:
+    """``reason`` (an Append refusal's technical text) in plain words, keeping a refusal's own named difference (the
+    first image that differs); the reason itself when no plain words are known."""
+    for technical, plain in _PLAIN_APPEND_REASONS:
+        if technical in reason:
+            detail = reason.split(": ", 1)[1].strip() if technical == "source does not extend exact image-member " \
+                "history" and ": " in reason else ""
+            return f"{plain} ({detail})" if detail else plain
+    return reason
+
+
 def _scan_failure_reason(error: BaseException) -> str:
     """The reason a scan skipped for one of its own failures (_SCAN_FAILURES) gives in the log and at the Run's end."""
     if isinstance(error, MetadataColumnsAbsent):
@@ -1843,15 +1879,20 @@ class StandardRunExecutor:
             "; published frames kept"
         )
         run.live_waiting.pop(target_key, None); run.live_waiting_long.pop(target_key, None)
+        plain = None if (failed or widened or changed) else _plain_append_reason(reason)
         log_events.event(
             logger, logging.WARNING, "%s stops growing: %s; its frames so far are kept and its later frames are "
-            "skipped in this Run%s. Details: %s [%s]", Path(target).name,
+            "skipped in this Run%s%s [%s]", Path(target).name,
             "its new frames' energies widen the q grid it was reduced on" if widened
             else "an image it already processed changed on disk" if changed else "it could not be processed" if failed
-            else "it can no longer be extended",
+            else plain,
             "; a directory Run reprocesses the whole scan" if widened
-            else "; the next Run reprocesses the whole scan" if changed else "", reason,
+            else "; the next Run reprocesses the whole scan" if changed else " (Replace reprocesses it)" if plain
+            else "", f". Details: {reason}" if failed else ".",
             "SCAN-SKIPPED" if skip_kind == "scan" else "APPEND-SKIPPED")
+        logger.debug("%s stopped growing; refusal detail: %s [APPEND-DETAIL]", Path(target).name, reason)
+        if plain:
+            run.append_skips[-1] = (str(target), skip_kind, plain)
 
     def _watch_metadata_wait(self, run: _StandardRun, target: Path | None, target_key: str,
                              waiting: tuple[str, str] | None,
@@ -2591,10 +2632,11 @@ class StandardRunExecutor:
             if kind == "scan":
                 self._skip_directory_scan(run, Path(target), reason)
                 continue
-            run.append_skips.append((target, "append", reason))
+            run.append_skips.append((target, "append", _plain_append_reason(reason)))
             log_events.event(
-                logger, logging.WARNING, "%s skipped: it cannot be extended, so its existing results are left "
-                "unchanged (Replace reprocesses it). Details: %s [APPEND-SKIPPED]", Path(target).name, reason)
+                logger, logging.WARNING, "%s skipped: %s; its existing results are left unchanged (Replace reprocesses "
+                "it). [APPEND-SKIPPED]", Path(target).name, _plain_append_reason(reason))
+            logger.debug("%s skipped; refusal detail: %s [APPEND-DETAIL]", Path(target).name, reason)
         self._events.put(StandardRunEvent(
             run.identity,
             StandardEventKind.DISCOVERY,
@@ -3398,11 +3440,11 @@ class StandardRunExecutor:
                 # directory still runs and the end of the run lists it
                 # (maintainer, 2026-10-23). Nothing was constructed for it.
                 reason = detach_exception(error, "append").message
-                run.append_skips.append((str(entry.target), "append", reason))
+                run.append_skips.append((str(entry.target), "append", _plain_append_reason(reason)))
                 log_events.event(
-                    logger, logging.WARNING, "%s skipped: it cannot be extended, so its existing results are left "
-                    "unchanged (Replace reprocesses it). Details: %s [APPEND-SKIPPED]", Path(entry.target).name,
-                    reason)
+                    logger, logging.WARNING, "%s skipped: %s; its existing results are left unchanged (Replace "
+                    "reprocesses it). [APPEND-SKIPPED]", Path(entry.target).name, _plain_append_reason(reason))
+                logger.debug("%s skipped; refusal detail: %s [APPEND-DETAIL]", Path(entry.target).name, reason)
                 decision, skipped_files = None, 0
             except (ValueError, OSError) as error:  # one scan's own problem: that scan is skipped, the rest still runs
                 if isinstance(error, SourceRevisionChanged):  # its files changed while they were read: once more

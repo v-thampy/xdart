@@ -278,9 +278,14 @@ def test_a_moved_image_beside_another_difference_is_refused_as_before(tmp_path, 
     caplog.set_level(logging.INFO)
     seen = _again(tmp_path, raw, monkeypatch, 9208, **({"npt": 16} if other == "other settings" else {}))
     assert len(seen.warnings) == 1 and seen.rebuilt == [] and output.read_bytes() == before
-    assert any(record.getMessage().startswith("scana_int1d.nexus skipped: it cannot be extended, so its existing "
-                                              "results are left unchanged (Replace reprocesses it). Details: ")
-               for record in caplog.records)
+    # Said plainly (maintainer, 2026-10-26: "user facing warnings and info should be simpler and more direct"); the
+    # technical refusal is a debug line.
+    plain = ("it was made with different integration settings" if other == "other settings"
+             else "the scan now has fewer images than its output holds")
+    assert any(record.getMessage().startswith(f"scana_int1d.nexus skipped: {plain}")
+               and record.getMessage().endswith("its existing results are left unchanged (Replace reprocesses it). "
+                                                "[APPEND-SKIPPED]")
+               for record in caplog.records), [record.getMessage() for record in caplog.records][-6:]
     assert all(decision.disposition is AppendDisposition.REFUSE and not getattr(decision, "rebuild", False)
                for _name, decision in seen.decisions)
 

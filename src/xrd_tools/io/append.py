@@ -568,6 +568,21 @@ def _source_dict(source: AppendSource) -> dict[str, Any]:
         "generation": int(source.generation),
     }
 
+def _identity_difference(recorded: AppendIntent, current: AppendIntent) -> str:
+    """Which part of an output's recorded Append identity this Run's differs in, the most telling first, so a refusal
+    can say it plainly (maintainer, 2026-10-26: "terms like foreign append identity are not very helpful for most
+    users"; "you can just say integration settings different from earlier ones or something like that")."""
+    if recorded.science_fingerprint != current.science_fingerprint:
+        return "integration settings"
+    if recorded.modes != current.modes:
+        return "results"
+    if recorded.source_base != current.source_base:
+        return "Project folder"
+    if recorded.source_identity != current.source_identity:
+        return "source"
+    return "entry"
+
+
 def _intent_identity(intent: AppendIntent) -> tuple[Any, ...]:
     return (intent.entry, intent.source_base, intent.source_identity, intent.science_fingerprint, intent.modes)
 def _source_from_dict(raw_source: Mapping[str, Any]) -> AppendSource:
@@ -1340,7 +1355,7 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
                     != _json({"epochs": observed_epochs}):
                 raise ValueError("committed Append epochs diverged from observed prefix")
         if _intent_identity(current.intent) != _intent_identity(intent):
-            raise ValueError("foreign Append identity")
+            raise ValueError(f"foreign Append identity: {_identity_difference(current.intent, intent)}")
         labels = current.committed_labels; lineage = json.loads(current.lineage_json)
         prior_source = _source_dict(current.intent.source)
         current_source = _source_dict(intent.source)
