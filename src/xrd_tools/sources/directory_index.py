@@ -176,10 +176,13 @@ class DirectoryIndex:
     def __init__(self, root: str | Path, *, recursive: bool = False,
                  name_filter: str | None = None,
                  clock: Callable[[], float] = time.monotonic,
-                 retry_deadline: float = DEFAULT_RETRY_DEADLINE) -> None:
+                 retry_deadline: float = DEFAULT_RETRY_DEADLINE,
+                 skip: tuple[str, ...] = ()) -> None:
         self._root = Path(root)
         self._recursive = bool(recursive)
         self._name_filter = name_filter
+        #: Folders a recursive poll does not enter (a Run's Save Path, ``output_safety.scan_skip_dirs``).
+        self._skip = tuple(skip)
         self._clock = clock
         self._retry_deadline = float(retry_deadline)
         self._snapshot = Snapshot(0, (), self._root, self._recursive, self._name_filter)
@@ -211,6 +214,10 @@ class DirectoryIndex:
     @property
     def root(self) -> Path:
         return self._root
+
+    @property
+    def skip(self) -> tuple[str, ...]:
+        return self._skip
 
     @property
     def recursive(self) -> bool:
@@ -269,7 +276,8 @@ class DirectoryIndex:
         is cleared, since the tracked file no longer matches what is on disk.
         """
         fresh_list = collect_owned_candidates(
-            self._root, recursive=self._recursive, name_filter=self._name_filter, memo=self._discovery)
+            self._root, recursive=self._recursive, name_filter=self._name_filter, memo=self._discovery,
+            skip=self._skip)
         fresh_by_path = {c.path: c for c in fresh_list}
         prior = self._snapshot
         prior_by_path = prior.by_path()

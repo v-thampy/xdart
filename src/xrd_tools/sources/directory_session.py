@@ -40,13 +40,14 @@ class DirectorySessionConfig:
     name_filter: str | None = None
     suffixes: tuple[str, ...] = ()
     series: SeriesBound | None = None  # a Live Image Series: only its members
+    skip: tuple[str, ...] = ()  # folders a recursive scan leaves out: a Run's Save Path (output_safety.scan_skip_dirs)
 
     @classmethod
-    def build(cls, root, *, recursive=False, name_filter=None, suffixes=(), series=None):
+    def build(cls, root, *, recursive=False, name_filter=None, suffixes=(), series=None, skip=()):
         normalized = tuple(str(item).lower() for item in suffixes if item)
         return cls(
             Path(root).expanduser(), bool(recursive), name_filter or None,
-            normalized, series)
+            normalized, series, tuple(skip))
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,11 +189,11 @@ class DirectoryIndexSession:
             return self._desired
 
     def configure(
-        self, root, *, recursive=False, name_filter=None, suffixes=(), series=None,
+        self, root, *, recursive=False, name_filter=None, suffixes=(), series=None, skip=(),
     ) -> int:
         config = DirectorySessionConfig.build(
             root, recursive=recursive, name_filter=name_filter,
-            suffixes=suffixes, series=series)
+            suffixes=suffixes, series=series, skip=skip)
         with self._lock:
             if self._closed:
                 raise RuntimeError("directory index session is closed")
@@ -305,6 +306,7 @@ class DirectoryIndexSession:
                 config.root,
                 recursive=config.recursive,
                 name_filter=None,
+                skip=config.skip,
                 **kwargs,
             )
             self._active = config
@@ -573,8 +575,9 @@ class DirectoryIndexSession:
         if not index.snapshot.recursive:
             return (index.root,)
         try:
-            with os.scandir(index.root) as entries:
-                return (index.root, *sorted(entry.path for entry in entries if entry.is_dir()))
+            with os.scandir(index.root) as entries:  # the Save Path's writes do not force a listing
+                return (index.root, *sorted(entry.path for entry in entries if entry.is_dir()
+                                            and os.path.normcase(os.path.abspath(entry.path)) not in index.skip))
         except OSError:
             return (index.root,)
 

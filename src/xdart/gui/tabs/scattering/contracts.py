@@ -408,10 +408,15 @@ class SourceObservationRequest:
     observation_id: int
     intent_revision: int
     source: SourceSelection
+    #: The Save Path's folder a recursive Folder's count leaves out, as a Run's scans do
+    #: (``output_safety.scan_skip_dirs``).
+    skip: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.observation_id) is not int or self.observation_id <= 0:
             raise ValueError("observation_id must be a positive integer")
+        if type(self.skip) is not tuple or not all(type(value) is str and value for value in self.skip):
+            raise TypeError("skip must be a tuple of folder paths")
         if type(self.intent_revision) is not int or self.intent_revision < 0:
             raise ValueError("intent_revision must be a non-negative integer")
         object.__setattr__(self, "source", _copy_source(self.source))

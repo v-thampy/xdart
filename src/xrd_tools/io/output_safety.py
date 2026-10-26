@@ -91,6 +91,25 @@ def path_within_dir(child: "os.PathLike[str] | str",
     return c == p or p in c.parents
 
 
+def scan_skip_dirs(root: "os.PathLike[str] | str", save_path: "os.PathLike[str] | str | None") -> tuple[str, ...]:
+    """The folder a recursive scan of *root* skips for this Save Path: the Save Path as that scan meets it (the root's
+    own spelling joined with its resolved relative path, case-folded where the platform folds case), when it is a
+    folder strictly inside *root*; ``()`` otherwise. A Run never takes its own outputs as raw input, so the scans that
+    find a Run's files leave its Save Path out (maintainer, 2026-10-25: "there is no ambiguity in the save path as it
+    is explicit, and it shouldn't be included in the processing when using Run"). A Save Path that is *root* itself
+    cannot be skipped."""
+    if not root or not save_path:
+        return ()
+    saved = Path(os.fspath(save_path)).expanduser()
+    if saved.suffix and not saved.is_dir():
+        return ()  # a file Save Path names one output, not a folder
+    resolved_root, resolved_save = Path(_norm(root)), Path(_norm(saved))
+    if resolved_root not in resolved_save.parents:
+        return ()
+    relative = os.path.relpath(resolved_save, resolved_root)
+    return (os.path.normcase(os.path.abspath(os.path.join(os.fspath(Path(os.fspath(root)).expanduser()), relative))),)
+
+
 def check_output_not_source(
     output_path: "os.PathLike[str] | str",
     *,
@@ -98,6 +117,7 @@ def check_output_not_source(
     watched_dirs: Iterable["os.PathLike[str] | str"] = (),
     recursive: bool = False,
     container_directory_mode: bool = False,
+    skipped_dirs: Iterable["os.PathLike[str] | str"] = (),
 ) -> None:
     """Raise :class:`OutputCollisionError` if *output_path* is unsafe to write.
 
@@ -120,11 +140,16 @@ def check_output_not_source(
         per-container output keeps the source stem and can overwrite or be
         re-ingested.  The directory-policy checks apply only in this mode; the
         exact-file check always applies.
+    skipped_dirs
+        Folders the recursive scan leaves out (:func:`scan_skip_dirs`): an
+        output inside one cannot be re-discovered, so it is not refused for
+        lying inside the watched tree.
 
     Returns ``None`` when the output is safe.
     """
     out = os.fspath(output_path)
     out_dir = os.path.dirname(os.path.abspath(out))
+    skipped_dirs = tuple(skipped_dirs)
 
     # 1) Exact-file collision with any known input file (always checked).
     for src in input_files:
@@ -152,7 +177,8 @@ def check_output_not_source(
                     "overwrite or be re-ingested as a raw input. Choose a "
                     "separate Save Path, then re-run."
                 )
-            if recursive and path_within_dir(out, root):
+            if recursive and path_within_dir(out, root) and not any(
+                    path_within_dir(out, skipped) for skipped in skipped_dirs):
                 raise OutputCollisionError(
                     f"Save Path '{out_dir}' is inside the recursively-watched "
                     f"source directory '{os.fspath(root)}'; the processed output "

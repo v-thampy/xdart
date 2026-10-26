@@ -4,6 +4,7 @@ import copy
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 from threading import Lock
 from typing import Callable
@@ -33,6 +34,11 @@ from ..source_metadata import (
     ordered_motor_intersection,
     read_image_motor_metadata,
 )
+
+
+def _skipped(path: Path, skip: tuple[str, ...]) -> bool:
+    """Whether *path* is the Save Path's folder a recursive Folder's count leaves out (``request.skip``)."""
+    return bool(skip) and os.path.normcase(os.path.abspath(path)) in skip
 
 class FilesystemSourceAdapter:
     _MOTOR_PREVIEW_LIMIT = 32
@@ -207,6 +213,7 @@ class FilesystemSourceAdapter:
                 recursive=source.recursive,
                 name_filter=source.name_filter,
                 suffixes=source.suffixes,
+                skip=request.skip,
             )
             observation = session.observe(refresh=True)
             if self._is_cancelled(request.observation_id):
@@ -440,6 +447,7 @@ class FilesystemSourceAdapter:
             members = self._one_level_tiff_members(
                 source,
                 cancelled=cancelled,
+                skip=request.skip,
             )
             if members is None:
                 return self._unavailable(
@@ -675,7 +683,7 @@ class FilesystemSourceAdapter:
                     # pathlib's recursive discovery does not descend through
                     # directory symlinks.  Keep readiness/counting on that
                     # same exact candidate universe and do not escape root.
-                    if child.is_symlink() or not child.is_dir():
+                    if child.is_symlink() or not child.is_dir() or _skipped(child, request.skip):
                         continue
                     for member in child.iterdir():
                         if self._is_cancelled(request.observation_id):
@@ -773,6 +781,7 @@ class FilesystemSourceAdapter:
         source: DirectorySourceSpec,
         *,
         cancelled: Callable[[], bool],
+        skip: tuple[str, ...] = (),
     ) -> tuple[Path, ...] | None:
         root = Path(source.root)
         children: list[Path] = []
@@ -789,7 +798,7 @@ class FilesystemSourceAdapter:
             if child.is_file() and include(child.name):
                 direct.append(child)
                 continue
-            if child.is_symlink() or not child.is_dir():
+            if child.is_symlink() or not child.is_dir() or _skipped(child, skip):
                 continue
             for member in child.iterdir():
                 if cancelled():

@@ -63,6 +63,16 @@ _LIVE_SOURCE_REFRESH_PHASES = frozenset({
 })
 
 
+
+def _count_skip(snapshot: RunIntentSnapshot) -> tuple[str, ...]:
+    """The Save Path's folder a recursive Folder's Source count leaves out, as the Run's scans leave it out."""
+    from xrd_tools.io.output_safety import scan_skip_dirs
+    intent = snapshot.thaw()
+    source = intent.source_spec
+    if type(source) is not DirectorySourceSpec or not source.recursive:
+        return ()
+    return scan_skip_dirs(source.root, intent.save_path or None)
+
 class SourceRefreshEffect(Enum):
     """Smallest shell repaint required by one source transition."""
 
@@ -639,7 +649,7 @@ class SourceSelectionOwner:
         ):
             self._current_observation = None
         request = SourceObservationRequest(
-            self._token, snapshot.revision, source
+            self._token, snapshot.revision, source, _count_skip(snapshot)
         )
         self._submit(request)
         return SourceSelectionTransition(
@@ -741,7 +751,7 @@ class SourceSelectionOwner:
             return
         self._token += 1
         pending = SourceObservationRequest(
-            self._token, snapshot.revision, source
+            self._token, snapshot.revision, source, _count_skip(snapshot)
         )
         if not self._live_refresh_is_current(
             identity,

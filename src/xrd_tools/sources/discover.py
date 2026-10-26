@@ -39,8 +39,10 @@ def _walk_files(directory: Path, recursive: bool) -> list[Path]:
     return list(os_sorted(_iter_files_unordered(directory, recursive)))
 
 
-def _iter_file_entries_unordered(directory: Path, recursive: bool):
-    """Yield regular-file ``DirEntry`` objects in filesystem DFS order."""
+def _iter_file_entries_unordered(directory: Path, recursive: bool, skip: frozenset[str] = frozenset()):
+    """Yield regular-file ``DirEntry`` objects in filesystem DFS order. ``skip``: folders (case-folded as
+    ``os.path.normcase`` folds them, spelled from *directory*) a recursive walk does not enter, a Run's Save Path
+    (``output_safety.scan_skip_dirs``)."""
     def read_entries(path: Path):
         with os.scandir(path) as entries:
             return list(entries)
@@ -54,6 +56,8 @@ def _iter_file_entries_unordered(directory: Path, recursive: bool):
             continue
         try:
             if recursive and entry.is_dir(follow_symlinks=False):
+                if skip and os.path.normcase(os.path.abspath(entry.path)) in skip:
+                    continue
                 try:
                     pending.append(iter(read_entries(Path(entry.path))))
                 except OSError as error:
@@ -252,7 +256,7 @@ def _scandir_files(directory: Path):
 
 
 def collect_owned_candidates(directory, *, recursive: bool = False, name_filter: str | None = None,
-                             memo: dict | None = None) -> list[Candidate]:
+                             memo: dict | None = None, skip: tuple[str, ...] = ()) -> list[Candidate]:
     """:func:`collect_candidates` for one DirectoryIndex poll, against one registry copy.
 
     ``memo`` (the index's) keeps each listed path's owner while only name-pure
@@ -276,7 +280,7 @@ def collect_owned_candidates(directory, *, recursive: bool = False, name_filter:
     owners = memo.get("owners", {}) if pure and memo.get("registry") == registry else {}
     previous = memo.get("candidates", {})
     listed = (((entry.path, entry.name, entry.stat)
-               for entry in _iter_file_entries_unordered(directory, True))
+               for entry in _iter_file_entries_unordered(directory, True, frozenset(skip)))
               if recursive else _scandir_files(directory))
     kept_owners: dict = {}
     kept: dict[str, Candidate] = {}

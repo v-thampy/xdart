@@ -162,6 +162,12 @@ def is_single_image_spec(source: object) -> bool:
 _CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs", ".nexus", ".cxi"})
 
 
+def holds_containers(suffixes) -> bool:
+    """Whether a Folder whose File Type is *suffixes* can hold HDF5/NeXus containers (an empty File Type can): the
+    folders whose Run outputs could be read back as raw input if they landed among them."""
+    return not suffixes or any(str(value).lower() in _CONTAINER_SUFFIXES for value in suffixes)
+
+
 @dataclass(frozen=True, slots=True)
 class SeriesBound:
     """One selected Image Series' members, by :func:`image_series_spec`'s rule: with a ``stem``, the folder's files

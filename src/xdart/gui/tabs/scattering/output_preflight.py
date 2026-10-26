@@ -33,6 +33,7 @@ from xrd_tools.io.output_path import (
 from xrd_tools.io.output_safety import (
     OutputCollisionError,
     check_output_not_source,
+    scan_skip_dirs,
 )
 from xrd_tools.session.intent_store import RunIntentSnapshot
 from xrd_tools.session.run_configuration import FrozenRunConfiguration, RunIntent
@@ -44,7 +45,7 @@ from xrd_tools.sources.directory_index import StaleCandidateError
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.run_plan import RunCandidatePlan
-from xrd_tools.sources.selection import DirectorySourceSpec, live_metadata_format, live_selection
+from xrd_tools.sources.selection import DirectorySourceSpec, holds_containers, live_metadata_format, live_selection
 from xrd_tools.sources.point_images import PointImagePolicy, PointImagesRequired, inspect_point_images
 from xrd_tools.sources.execution_graph import (
     _CapturedSourceTopology,
@@ -463,8 +464,9 @@ def _directory_matching_paths(
     source: DirectorySourceSpec,
     *,
     cancelled: Callable[[], bool],
+    skip: tuple[str, ...] = (),
 ) -> tuple[Path, ...]:
-    """Freeze the physical suffix/filter universe shown by Run counters."""
+    """Freeze the physical suffix/filter universe shown by Run counters, the Save Path's folder (``skip``) left out."""
 
     root = Path(source.root).expanduser().absolute()
     suffixes = tuple(str(value).casefold() for value in source.suffixes)
@@ -481,6 +483,8 @@ def _directory_matching_paths(
                 continue
         except ValueError:
             continue
+        if skip and _under_skipped(path, skip):
+            continue
         low = path.name.casefold()
         suffix = next(
             (value for value in suffixes if low.endswith(value)),
@@ -492,6 +496,19 @@ def _directory_matching_paths(
         if name_ok(stem):
             paths.append(path.absolute())
     return tuple(sorted(dict.fromkeys(paths)))
+
+
+def _under_skipped(path: Path, skip: tuple[str, ...]) -> bool:
+    spelled = os.path.normcase(os.path.abspath(path))
+    return any(spelled.startswith(folder + os.sep) for folder in skip)
+
+
+def _run_scan_skip(source: object, configuration: object) -> tuple[str, ...]:
+    """The Save Path's folder a Folder Run's recursive scans leave out (``output_safety.scan_skip_dirs``)."""
+    if type(source) is not DirectorySourceSpec or not source.recursive:
+        return ()
+    save_path = configuration.save_path
+    return scan_skip_dirs(source.root, None if save_path in (None, "") else str(save_path))
 
 
 def _bounded_directory_plan(plan: RunCandidatePlan) -> RunCandidatePlan:
@@ -556,7 +573,8 @@ def prepare_output(
         )
         session_owner(session)
         session.configure(watch.root, recursive=watch.recursive, name_filter=watch.name_filter,
-                          suffixes=watch.suffixes, series=watch.series)
+                          suffixes=watch.suffixes, series=watch.series,
+                          skip=_run_scan_skip(source, intent))
         observation = session.observe(refresh=True)
         discovered = observation.discovered_snapshot
         complete_plan = RunCandidatePlan.from_snapshot(discovered)
@@ -582,6 +600,7 @@ def prepare_output(
             directory_discovered_paths = _directory_matching_paths(
                 source,
                 cancelled=cancelled,
+                skip=_run_scan_skip(source, intent),
             )
         if (
             not intent.gi.enabled
@@ -1244,7 +1263,11 @@ def _validate_deferred_targets(
             input_files=protected,
             watched_dirs=(source.root,),
             recursive=source.recursive,
-            container_directory_mode=source.series is None,  # a series' bound already keeps outputs out
+            # A series' bound already keeps outputs out; a Folder whose File Type holds no containers never lists an
+            # output (maintainer, 2026-10-25, "Skip the Save Path": its scans leave the Save Path out, and a Save
+            # Path that is the Folder itself stays refused for HDF5 folders only).
+            container_directory_mode=source.series is None and holds_containers(source.suffixes),
+            skipped_dirs=_run_scan_skip(configuration.source, configuration),
         )
 
 
@@ -2549,7 +2572,8 @@ def _validate_targets(
             item.target, input_files=(*raw, *protected),
             watched_dirs=(source.root,) if type(source) is DirectorySourceSpec else (),
             recursive=bool(getattr(source, "recursive", False)),
-            container_directory_mode=type(source) is DirectorySourceSpec,
+            container_directory_mode=type(source) is DirectorySourceSpec and holds_containers(source.suffixes),
+            skipped_dirs=_run_scan_skip(source, configuration),
         )
 def _load_scientific_assets(intent, *, cancelled=_not_cancelled):
     # Preserve this public preflight seam, including traced calibration loaders.
