@@ -503,6 +503,8 @@ class _StandardRun:
     # A Live Run's output name for each (folder, scan) so far: a scan keeps its output's name (flat outputs,
     # output_preflight._name_output_groups).
     live_output_names: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Each constructed output's family, as its planned output named it (StandardRunEvent.artifact_families).
+    artifact_families: dict[str, str] = field(default_factory=dict)
     # Scans a directory Append skipped instead of failing the run: (output, reason).
     append_skips: list[tuple[str, str, str]] = field(default_factory=list)
     # Scans an Append reduced again whole, their processed images changed on disk: (output, reason), once each
@@ -1879,6 +1881,8 @@ class StandardRunExecutor:
         # later construction seam must be reported against this artifact, not
         # the previously completed one.
         run.artifact = artifact
+        if family := getattr(item, "artifact_family", ""):
+            run.artifact_families[str(artifact)] = family
         cancelled = lambda: run.stop_requested
 
         def discard_source() -> None:
@@ -4227,6 +4231,10 @@ class StandardRunExecutor:
             ),
             warnings=warnings,
             rebuilt=rebuilt,
+            artifact_families=tuple(
+                (str(item), run.artifact_families[str(item)])
+                for item in run.artifacts if str(item) in run.artifact_families
+            ),
             **_directory_event_fields(
                 run,
                 in_flight_processed=_terminal_in_flight_files(run),

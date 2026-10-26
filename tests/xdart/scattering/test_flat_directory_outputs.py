@@ -5,11 +5,18 @@ mode ... it makes it much easier to navigate through processed outputs"; his pic
 A scan name found in more than one folder names each subfolder's output after its folder; a root-level scan keeps
 its own. A Live Run never renames a scan it has already written: a same-named scan that appears later in another
 folder is the one named after its folder. Names are compared ignoring case, as a Windows Save Path compares them, and
-no two scans share an output. Real Runs over real TIFF + .txt scans."""
+no two scans share an output, and a folder whose name is no legal start of an output name, or is long, still names a
+legal one (Codex N-978a0cde FLAT-R1). The XYE viewer at a Run's end opens the file the Run wrote for a renamed
+container (FLAT-R2). Real Runs over real TIFF + .txt scans and real containers."""
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
+import pytest
+
+from tests.xdart.scattering.test_browse_reference_rings_run import _page, _pump, _run
+from tests.xdart.scattering.test_e2sd_directory_motor_exact import _recursive_container_start
 from tests.xdart.scattering.test_live_already_processed import _intent
 from tests.xdart.scattering.test_live_qualify_refusal_run import _frame, _labels, _settle, _stop, _wait
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_terminal, _start
@@ -18,6 +25,12 @@ from xdart.gui.tabs.scattering.output_preflight import _name_output_groups
 from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.run_plan import RunCandidatePlan
 from xrd_tools.sources.selection import DirectorySourceSpec
+
+
+@pytest.fixture
+def qapp(_xdart_qt_harness):
+    from pyqtgraph.Qt import QtWidgets
+    return QtWidgets.QApplication.instance()
 
 
 def _recursive(tmp_path, raw, *, live):
@@ -99,3 +112,40 @@ def test_a_live_newcomer_whose_name_differs_only_in_case_is_named_after_its_fold
                         (".", "Lab6"): "Baniecki_Oct2026_Lab6"}
     assert named.output_names == ((".", "Lab6", "Baniecki_Oct2026_Lab6"), ("sampleA", "LAB6", "sampleA_LAB6"))
     assert _name_output_groups(named, dict(assigned)).output_names == named.output_names  # the next poll agrees
+
+
+@pytest.mark.parametrize(("folder", "scan", "expected"), [
+    ("_calibration", "lab6", ["calibration_lab6_int1d.nexus", "sample_lab6_int1d.nexus"]),
+    ("calibration" * 6, "sample" * 6, [f"{('calibration' * 6)[:40]}_{'sample' * 6}_int1d.nexus",
+                                       f"sample_{'sample' * 6}_int1d.nexus"]),
+])
+def test_legal_folder_names_never_make_clashing_scans_unprocessable(tmp_path, folder, scan, expected) -> None:
+    # A leading "_" is dropped; a long folder name gives way so the name stays within a family's 80 characters with
+    # room for a GI Run's "_gi" (Codex N-978a0cde FLAT-R1 discriminator).
+    raw = tmp_path / "raw"
+    for name in (folder, "sample"):
+        (raw / name).mkdir(parents=True)
+        _frame(raw / name, scan, 1, "txt", 1.0)
+    executor, identity, events = _run_to_terminal(_recursive(tmp_path, raw, live=False), request_value=10301)
+    executor.close(identity)
+    terminal = [event for event in events if event.kind in _TERMINAL]
+    assert [event.kind.name for event in terminal] == ["FINISHED"] and terminal[0].files_processed == 2
+    assert _written(tmp_path / "processed") == expected
+
+
+def test_renamed_containers_open_the_xye_file_the_run_actually_wrote(qapp, tmp_path) -> None:
+    # Two scan_0001 containers under data/ and live_test/: their scans keep their own names while their outputs are
+    # named after their folders (Codex N-978a0cde FLAT-R2 discriminator, the real page Run-click path).
+    start, _raw, output = _recursive_container_start(tmp_path)
+    intent = replace(start.intent_snapshot.thaw(), processing_mode="Int 1D (XYE)", max_cores=1,
+                     bai_1d_args={"npt": 8, "method": "numpy"})
+    with _page(qapp, intent) as (page, _scientific, events):
+        terminal = _run(qapp, page, events)
+        assert terminal.completed == 2
+        generated = set(output.rglob("*.xye"))
+        assert len(generated) == 2
+        controller = page._context_controller
+        ready = _pump(qapp, lambda: controller.viewer_1d_context is not None
+                      and controller.viewer_1d_context.state.value == "ready", 15.)
+        assert ready, (sorted(map(str, generated)), page._notice_text)
+        assert Path(controller.viewer_1d_context.current_path) in generated

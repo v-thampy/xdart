@@ -233,6 +233,10 @@ class StandardRunEvent:
     #: An Append Run's frames reduced and saved in this Run so far, apart from those its outputs already held;
     #: None for a Run that is not an Append.
     frames_new: int | None = None
+    #: Terminal-only: (artifact, family) for each output this Run constructed, the family its planned output was
+    #: named with (PlannedOutput.artifact_family), which its XYE folder and files are named after. A renamed scan's
+    #: source keeps its own name, so the family is never re-derived from it (Codex N-978a0cde FLAT-R2).
+    artifact_families: tuple[tuple[str, str], ...] = ()
 
 @dataclass(frozen=True, slots=True)
 class StandardDisplayPayload:

@@ -224,7 +224,7 @@ from .start_outcomes import (
     executor_closed_is_valid,
 )
 from .start_pipeline import StartPipeline
-from .output_preflight import native_int_reduction_plan, _run_artifact_family
+from .output_preflight import native_int_reduction_plan
 from xrd_tools.session.readiness import GI_COMPANION_MODES_2D_ARG
 from .state_machine import RunPhase
 from .source_selection import (
@@ -5489,13 +5489,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                           and item.artifact in event.artifacts), None)
         if frame is None:
             return False
-        plan = native_int_reduction_plan(acquisition.run_configuration)
-        prefix = xye_prefix_for_unit(plan.integration_1d.unit)
         # The event artifacts are planned NeXus slots, not written files in
         # XYE-only mode. Match TransactionalXYESink's output family/index naming for
         # the terminal row; the other generated files remain folder-browsable.
         # Do not turn completion into a multi-file Viewer admission/overlay.
-        family = _run_artifact_family(acquisition.run_configuration, frame.source_scan)
+        # The family is the one the Run's planned output was named with, carried
+        # on the terminal event: a renamed container's scan keeps its own name
+        # (Codex N-978a0cde FLAT-R2).
+        family = dict(event.artifact_families).get(frame.artifact)
+        if family is None:
+            return False
+        plan = native_int_reduction_plan(acquisition.run_configuration)
+        prefix = xye_prefix_for_unit(plan.integration_1d.unit)
         current_path = str(Path(frame.artifact).parent / family /
                            f"{prefix}_{family}_{frame.local_frame_label:04d}.xye")
         # This viewer handoff replaces the terminal batch paint itself.

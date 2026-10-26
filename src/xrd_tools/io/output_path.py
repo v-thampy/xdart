@@ -64,6 +64,8 @@ __all__ = [
     "automatic_artifact_family",
     "scan_family",
     "GI_FAMILY_MARKER",
+    "ARTIFACT_FAMILY_MAX_LENGTH",
+    "family_prefix",
     "is_artifact_family",
     "resolve_finite_output_target",
     "FINITE_OPERATION_SLOTS",
@@ -90,8 +92,10 @@ _FAMILY_FORBIDDEN = r'\x00-\x1f\x7f/\\:*?"<>|'
 #: starts with `.` `-` `_` or whitespace (hidden files, option-looking names, a
 #: bare-slot look-alike, and leading blanks) nor ends with a space or dot, which
 #: Windows silently strips.
+ARTIFACT_FAMILY_MAX_LENGTH = 80
 _ARTIFACT_FAMILY = re.compile(
-    rf"[^{_FAMILY_FORBIDDEN}.\-_\s][^{_FAMILY_FORBIDDEN}]{{0,78}}[^{_FAMILY_FORBIDDEN}\s.]\Z"
+    rf"[^{_FAMILY_FORBIDDEN}.\-_\s][^{_FAMILY_FORBIDDEN}]{{0,{ARTIFACT_FAMILY_MAX_LENGTH - 2}}}"
+    rf"[^{_FAMILY_FORBIDDEN}\s.]\Z"
     rf"|[^{_FAMILY_FORBIDDEN}.\-_\s]\Z",
     re.UNICODE,
 )
@@ -198,6 +202,16 @@ def is_artifact_family(value: object) -> bool:
     rather than let a run finish and strand its own artifact.
     """
     return type(value) is str and _ARTIFACT_FAMILY.fullmatch(value) is not None
+
+
+def family_prefix(text: str) -> str:
+    """*text* made usable at the START of a family, as a folder's name begins a
+    scan's output name in a flat Save Path: each character a family may not
+    contain becomes ``_``, and the leading ``.`` ``-`` ``_`` and blanks a family
+    may not start with are dropped.  The result may be empty, and the family it
+    begins is still the caller's to fit within :data:`ARTIFACT_FAMILY_MAX_LENGTH`.
+    """
+    return re.sub(r"^[.\-_\s]+", "", re.sub(rf"[{_FAMILY_FORBIDDEN}]", "_", text))
 
 
 def generated_artifact_family(scan_name: str, *, grazing_incidence: bool) -> str:
