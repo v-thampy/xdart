@@ -487,7 +487,8 @@ class ContextProjection:
                     RunPhase.RESUMING: "Resuming",
                     RunPhase.STOPPING: "Stopping",
                     RunPhase.FINALIZING: "Finalizing",
-                }.get(phase, "Running")
+                }.get(phase, "Running"),
+                watching=intent.live_mode and phase is RunPhase.RUNNING,
             )
         if (not viewer_selected and
             (

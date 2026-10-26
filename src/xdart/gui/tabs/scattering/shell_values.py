@@ -980,7 +980,15 @@ class DirectoryFileProgress:
         ):
             raise ValueError("directory file progress is invalid")
 
-    def text(self, state: str) -> str:
+    def text(self, state: str, *, watching: bool = False) -> str:
+        """The Run's status. ``watching``: a running Live Run, which says so once it has processed all it found
+        (maintainer, 2026-10-26: "make it clear in the status when all scans/frames have been processed in a live run
+        with a brief message implying that xdart is waiting for new frames", his pick "Lead with it")."""
+        if watching and not self.pending:
+            return (
+                f"{state} · Up to date, waiting for new images · {self.processed} processed"
+                f"{new_frames_note(self.new)} · {self.skipped} skipped · {self.discovered} discovered"
+            )
         return (
             f"{state} · {self.processed} processed{new_frames_note(self.new)} · "
             f"{self.skipped} skipped · {self.pending} pending · "
