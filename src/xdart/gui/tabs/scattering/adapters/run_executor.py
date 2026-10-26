@@ -1765,7 +1765,10 @@ class StandardRunExecutor:
         frame given up on (Codex N-69301b5f NW-R1: never read unsettled; True: the caller moves on). ``retried``: the
         attempt did not admit the frame, nor name it (its guarded read met the file changing, a listing was due, a
         candidate went stale), or a READY attempt's ``admitted`` images leave it out (a fresh listing cut before it):
-        the same frame still waits, with its one deadline (Codex N-0c4e4237)."""
+        the same frame still waits, with its one deadline (Codex N-0c4e4237). A sidecar settles within the limit
+        from its first sighting, not from its image's: one first seen near the limit is looked at again, not skipped
+        at the look that found it (beamline 2026-10-25, four scans skipped "did not settle within 10 s" a moment after
+        their sidecars appeared); the first sighting is kept, so the whole wait stays bounded."""
         if waiting is not None and waiting[1] == "late":
             run.live_waiting.pop(target_key, None)
             waits.pop(target_key, None)
@@ -1782,9 +1785,11 @@ class StandardRunExecutor:
             if waiting is None:
                 waits.pop(target_key, None)
             else:
-                waits[target_key] = (waiting[0], now, Path(target).name, waiting[1])
+                waits[target_key] = (waiting[0], now, Path(target).name, waiting[1],
+                                     now if waiting[1] == "settling" else None)
             return False
-        waits[target_key] = (*held[:3], waiting[1])  # its latest kind
+        sighted = held[4] if held[4] is not None else (now if waiting[1] == "settling" else None)
+        waits[target_key] = (*held[:3], waiting[1], sighted)  # its latest kind, and its sidecar's first sighting
         (image, kind), name = waiting, held[2]
         limit, quiet = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind], False
         if kind == "sidecar" and not run.sidecars_seen and live_metadata_format(
@@ -1794,7 +1799,7 @@ class StandardRunExecutor:
             # have none and later frames go on at once, without a warning each.
             quiet = bool(run.metadata_given_up)
             limit = 0.0 if quiet else _METADATA_WAIT_NOTE_S
-        if now - held[1] < limit:
+        if now - (sighted if kind == "settling" else held[1]) < limit:
             if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
                 run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
                 log_events.event(logger, logging.INFO, "%s is waiting for the metadata of %s [LIVE]", name, image)
@@ -2535,9 +2540,9 @@ class StandardRunExecutor:
         uncovered: dict[str, tuple[tuple[object, ...], tuple[int, int, int, int]]] = {}
         # A found output's committed image count by output file version, for its readiness waits.
         committed_counts: dict[str, tuple[tuple[int, int, int, int], int | None]] = {}
-        # The image each output's next frame waits on for its metadata, since when, the output's name and the wait's
-        # latest kind; and the images each output stopped waiting for.
-        metadata_waits: dict[str, tuple[str, float, str, str]] = {}
+        # The image each output's next frame waits on for its metadata, since when, the output's name, the wait's
+        # latest kind and when its sidecar was first seen; and the images each output stopped waiting for.
+        metadata_waits: dict[str, tuple[str, float, str, str, float | None]] = {}
         given_up: dict[str, set[str]] = {}
         # A scan found changed: its revision and when its rebuild may start (_REBUILD_QUIET_S).
         rebuild_holds: dict[str, tuple[tuple[object, ...], float]] = {}

@@ -167,11 +167,11 @@ def test_a_given_up_frame_whose_txt_lands_later_stops_its_scan_and_the_run_goes_
 
 def test_a_waited_frame_keeps_its_one_deadline_until_it_is_admitted(monkeypatch):
     """The wait owner (Codex N-0c4e4237): an attempt that neither admits nor names the waited frame (a retried read, a
-    listing due, a READY admission a fresh listing cut before it) keeps its deadline and kind; admitting it, or a wait
-    that ended (its scan covered, its files gone), clears it."""
+    listing due, a READY admission a fresh listing cut before it) keeps its deadline, kind and its sidecar's first
+    sighting; admitting it, or a wait that ended (its scan covered, its files gone), clears it."""
     monkeypatch.setattr(run_executor, "monotonic", lambda: 100.5)
     watch, run = StandardRunExecutor(join_timeout=2.)._watch_metadata_wait, SimpleNamespace(live_waiting={})
-    target, held = Path("grow_int1d.nexus"), ("grow_0002.tif", 100.0, "grow_int1d.nexus", "settling")
+    target, held = Path("grow_int1d.nexus"), ("grow_0002.tif", 100.0, "grow_int1d.nexus", "settling", 100.0)
     waits, given_up = {"k": held}, {}
     assert not watch(run, target, "k", None, waits, given_up, retried=True) and waits["k"] == held
     assert not watch(run, target, "k", None, waits, given_up, admitted=frozenset({"grow_0001.tif"}))
