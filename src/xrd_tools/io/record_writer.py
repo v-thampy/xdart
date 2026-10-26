@@ -6488,6 +6488,16 @@ class NexusRecordWriter:
         """Whether finish has taken custody of the frozen terminal steps."""
         return self._finish_step >= 0
 
+    @property
+    def integrity_hold_retryable(self) -> bool:
+        """Only an unresolved controlled close can recover a held transaction at its retained finish cursor."""
+        binding = self._transaction_binding
+        close = self._stream_close_attempt
+        return (
+            self._pending_owner == "close" and binding is not None and close is not None
+            and binding.transaction.can_retry_stream_close(binding.attempt, close, lease=binding.lease)
+        )
+
     def _replace_target(self) -> None:
         if self._active_path == self.target:
             return

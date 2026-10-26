@@ -3409,6 +3409,18 @@ class OutputTransaction:
             self._phase = TransactionPhase.EXECUTING
             return checkpoint
 
+    def can_retry_stream_close(
+        self, attempt: StreamAttempt, close_owner: _StreamCloseAttempt, *, lease: TargetLease,
+    ) -> bool:
+        """Whether this exact unresolved close can restore EXECUTING after an integrity hold."""
+        with self._lock:
+            self._require_stream(attempt, lease)
+            return (
+                self._phase is TransactionPhase.INTEGRITY_HOLD
+                and close_owner is self._stream_close_owner
+                and self._stream_close_checkpoint is None
+            )
+
     def hold_stream_close(
         self,
         attempt: StreamAttempt,

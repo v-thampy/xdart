@@ -1018,19 +1018,19 @@ class ScanSession:
         return self._dynamic_frozen_result
 
     def _dynamic_integrity_hold(self) -> BaseException | None:
-        """The reason to settle as failed when the dynamic NeXus output's transaction is in integrity-hold before its
-        finalization began (a checkpoint or seal refused mid-stream): the flush a finish would make next requires
-        EXECUTING, so it can never succeed, and finish takes the failed route, whose sink abort closes the file,
-        instead of flushing at every cleanup retry (beamline 2026-10-26: "writer flush incomplete: checkpoint requires
-        EXECUTING, got integrity-hold" at each retry kept the failed Run's cleanup pending, Run disabled and xdart
-        unable to close). A hold met after finalization began keeps its retry: the terminal proof can still succeed
-        (test_no_xye_terminal_verification_failure_preserves_terminal_truth). None otherwise."""
+        """Settle a held dynamic output as failed unless its exact unresolved close can restore execution.
+
+        Active and terminal checkpoint/terminal-seal retries require EXECUTING and cannot leave a hold themselves.
+        A retained controlled close can still finish its proof and restore EXECUTING; preserve that retry instead.
+        """
         sink = self._dynamic_nexus_sink
         transaction = None if sink is None else getattr(sink, "_transaction", None)
-        if transaction is None or sink.finalization_started:
+        if transaction is None:
             return None
         phase = getattr(transaction.snapshot(), "phase", None)
         if getattr(phase, "value", phase) != "integrity-hold":
+            return None
+        if sink.integrity_hold_retryable:
             return None
         return self._dynamic_primary_error or RuntimeError("the output transaction is in integrity-hold")
 

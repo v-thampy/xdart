@@ -1911,6 +1911,11 @@ class NexusSink:
             and self._writer.finalization_started
         )
 
+    @property
+    def integrity_hold_retryable(self) -> bool:
+        """Whether the current writer owns a recoverable close rather than a refused checkpoint/terminal seal."""
+        return self.finalization_started and self._writer.integrity_hold_retryable
+
     def _configure_writer_batch_size(self, value: int) -> None:
         if type(value) is not int or not 1 <= value <= 16:
             raise TypeError("Nexus writer batch size must be an exact int in [1, 16]")

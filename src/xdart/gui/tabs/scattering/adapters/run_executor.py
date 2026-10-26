@@ -125,7 +125,7 @@ def _run_summary(configuration) -> str:
 # log (maintainer, 2026-10-26: "terms like foreign append identity are not very helpful for most users. these are good
 # for debugging but user facing warnings and info should be simpler and more direct"; "you can just say integration
 # settings different from earlier ones or something like that ... if it is obvious where the mismatch is that can be
-# specified"). (technical text it begins with or contains, plain words); the first match wins, so the remedies
+# specified"). (technical prefix, plain words); the first match wins, so the remedies
 # append._refusal_reason wraps around any refusal come first.
 _CHANGED_IMAGES = "the images it was made from changed"
 _FEWER_IMAGES = "the scan now has fewer images than its output holds"
@@ -135,7 +135,7 @@ _MEMBER_HISTORY = "source does not extend exact image-member history"
 _PLAIN_APPEND_REASONS = (
     ("an earlier Append of this output did not finish", "an earlier Append of it did not finish"),
     ("another program has the output open", "another program has it open; close that program, then run again"),
-    ("not a readable HDF5 file", "it is not a readable file, possibly left by an interrupted Append; move or delete "
+    ("the output is not a readable HDF5 file", "it is not a readable file, possibly left by an interrupted Append; move or delete "
                                  "it, then run again"),
     ("foreign Append identity: integration settings", "it was made with different integration settings"),
     ("foreign Append identity: results", "it holds different results (1-D, 2-D or GI maps) than this Run makes"),
@@ -154,10 +154,10 @@ _PLAIN_APPEND_REASONS = (
     ("source size regressed", _CHANGED_IMAGES),  # the series' first image (or the file) rewritten
     ("source mtime_ns regressed", _CHANGED_IMAGES),
     ("live source extension remapped", _CHANGED_IMAGES),  # a Live source's frames renumbered or removed
-    ("remap the committed Append prefix", _CHANGED_IMAGES),
-    ("do not preserve the committed prefix", _CHANGED_IMAGES),
-    ("committed Append lineage", _NOT_CONTINUABLE),
-    ("no committed Append epoch", _NOT_CONTINUABLE),
+    ("requested labels remap the committed Append prefix", _CHANGED_IMAGES),
+    ("requested labels do not preserve the committed prefix", _CHANGED_IMAGES),
+    ("missing or malformed committed Append lineage", _NOT_CONTINUABLE),
+    ("existing target has no committed Append epoch", _NOT_CONTINUABLE),
 )
 
 
@@ -165,7 +165,7 @@ def _plain_append_reason(reason: str) -> str:
     """``reason`` (an Append refusal's technical text) in plain words, naming the first image that differs when the
     refusal names one (its changed fields are the debug line's); the reason itself when no plain words are known."""
     for technical, plain in _PLAIN_APPEND_REASONS:
-        if technical in reason:
+        if reason.startswith(technical):
             detail = reason.split(f"{_MEMBER_HISTORY}: ", 1)[1].strip() if (
                 technical == _MEMBER_HISTORY and f"{_MEMBER_HISTORY}: " in reason) else ""
             image, named, _changes = detail.partition("): ")  # "image 2 (scan_0001.tif): mtime_ns … → …"
@@ -635,6 +635,8 @@ class _StandardRun:
     left_out: set[str] = field(default_factory=set)
     metadata_left_out: list[str] = field(default_factory=list)
     current_file_total: int = 0
+    # Current output's physical files already included in the Run's durable file census before this fold.
+    current_files_accounted: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
     display: RunDisplayState = field(init=False)
@@ -841,7 +843,7 @@ def _shown_files(run: _StandardRun) -> int:
     (11/11)"). Display only: files_processed stays the durable count."""
     if run.showing_saved or run.current_file_total <= 0 or not run.current_files_incremental:
         return 0
-    return min(run.current_file_total, run.current_published)
+    return max(0, min(run.current_file_total, run.current_published) - run.current_files_accounted)
 
 
 def _shown_new_frames(run: _StandardRun) -> int:
@@ -1825,6 +1827,7 @@ class StandardRunExecutor:
         run.current_completed = 0
         run.current_published = 0
         run.current_file_total = 0
+        run.current_files_accounted = 0
         run.current_files_incremental = False
         run.pending_rebuild = None  # a refused construction reduced nothing again
 
@@ -3102,6 +3105,7 @@ class StandardRunExecutor:
                         self._release_predecessor_before_target(run, group.target)
                         item = decision.item
                         run.current_file_total = len(group.physical_paths)
+                        run.current_files_accounted = sum(path in processed_paths for path in group.physical_paths)
                         run.current_files_incremental = (
                             item.source_spec.kind is SourceKind.TIFF_SERIES
                         )

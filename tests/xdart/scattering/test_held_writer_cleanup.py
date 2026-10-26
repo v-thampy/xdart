@@ -13,7 +13,7 @@ pytest.importorskip("pyqtgraph")
 
 from tests.xdart.scattering.test_browse_reference_rings_run import _page, _poni, _pump
 from tests.xdart.scattering.test_live_qualify_refusal_run import _frame, _settle, _stop, _wait
-from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _start
+from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _start, _run_to_terminal
 from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F401
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
@@ -134,3 +134,44 @@ def test_the_held_output_is_left_as_an_unfinished_append_that_names_replace(tmp_
     assert any("old_int1d.nexus" in record.getMessage() and "an earlier Append of it did not finish" in
                record.getMessage() and "Replace reprocesses it" in record.getMessage()
                for record in caplog.records), [record.getMessage() for record in caplog.records][-8:]
+
+
+@pytest.mark.parametrize("save_xye", [False, True])
+@pytest.mark.parametrize("seal_role", ["stream-checkpoint", "stream-terminal"])
+def test_a_checkpoint_refused_inside_finalization_also_settles_failed(
+        tmp_path, monkeypatch, save_xye, seal_role):
+    from xrd_tools.io.record_writer import NexusRecordWriter
+
+    finish, seal = NexusRecordWriter.finish, output_transaction._descriptor_stream_stat_receipt
+    finishing, refused = set(), []
+
+    def finishing_writer(writer, *args, **kwargs):
+        finishing.add(id(writer))
+        try:
+            return finish(writer, *args, **kwargs)
+        finally:
+            finishing.remove(id(writer))
+
+    def refuse_once(descriptor, path, **kwargs):
+        if finishing and kwargs.get("role") == seal_role and not refused:
+            refused.append(str(path))
+            raise output_transaction.TargetChanged("terminal checkpoint pathname view disagrees")
+        return seal(descriptor, path, **kwargs)
+
+    monkeypatch.setattr(NexusRecordWriter, "finish", finishing_writer)
+    monkeypatch.setattr(output_transaction, "_descriptor_stream_stat_receipt", refuse_once)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _poni(tmp_path)
+    _frame(raw, "old", 1, "txt", 1.0)
+    intent = _intent(tmp_path)
+    intent.live_mode, intent.output_mode, intent.max_cores = False, "Overwrite", 4
+    intent.run_options["_post_g2_pipeline_v2"] = {
+        "writer_settlement_batch_size": 1, "nexus_record_batch_size": 8, "reduction_inflight": 8,
+        "semantic_checkpoint_frame_cap": 16, "staging_frame_cap": 64,
+    }
+    intent.run_options["_post_g2_output_diagnostics_v1"] = {"save_xye": save_xye, "durable_fsync": True}
+    executor, identity, events = _run_to_terminal(intent, request_value=7746 + int(save_xye))
+    assert refused, "the real finalization checkpoint fault was not exercised"
+    receipt = executor.close(identity)
+    assert receipt.cleanup_status is CleanupStatus.CLEANED, receipt

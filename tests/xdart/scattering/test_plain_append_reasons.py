@@ -48,6 +48,10 @@ from xdart.gui.tabs.scattering.adapters.run_executor import _plain_append_reason
     # a path is never read as a refusal's words
     ("[Errno 13] Permission denied: '/data/regressed_remapped/scan_int1d.nexus'",
      "[Errno 13] Permission denied: '/data/regressed_remapped/scan_int1d.nexus'"),
+    ("[Errno 13] Permission denied: '/data/source size regressed/scan.nexus'",
+     "[Errno 13] Permission denied: '/data/source size regressed/scan.nexus'"),
+    ("[Errno 13] Permission denied: '/data/foreign Append identity: integration settings/scan.nexus'",
+     "[Errno 13] Permission denied: '/data/foreign Append identity: integration settings/scan.nexus'"),
 ])
 def test_an_append_refusal_reads_plainly(technical, plain):
     assert _plain_append_reason(technical) == plain

@@ -80,3 +80,24 @@ def test_an_append_onto_a_grown_scan_never_counts_its_saved_frames_twice(tmp_pat
     assert counts, "the grown frame was never shown"
     assert all(row[0] <= row[1] == 6 for row in counts), counts
     assert counts[-1][0] == 6 and counts[-1][2] == 1, counts  # all six processed, one of them new
+
+
+def test_a_reopened_prefix_does_not_count_against_other_pending_files(tmp_path, scan_on_disk):
+    _run(tmp_path, "Overwrite", 7754)
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, "Append"), request_value=7755)
+    events = []
+    try:
+        _wait(executor, events, lambda values: any(e.files_processed == 5 for e in values), 30.)
+        _frame(scan_on_disk, "scan", 6, "txt", 6.0)
+        _frame(scan_on_disk, "waiting", 1, "txt", 1.0, sidecar=False)
+        _wait(executor, events, lambda values: bool(_counts(values)) or any(e.kind in _TERMINAL for e in values), 30.)
+        before = [e for e in events if e.kind is StandardEventKind.DISCOVERY
+                  and e.artifact.endswith("scan_int1d.nexus") and e.artifact_total == 6
+                  and e.artifact_completed == 5]
+        assert before, "the reopened scan was not announced before its tail was reduced"
+        assert all(_directory_file_progress(e).processed == 5 for e in before), [
+            (e.files_processed, e.files_shown, e.files_pending) for e in before]
+        assert all(row[0] == 6 and row[2] == 1 for row in _counts(events)), _counts(events)
+    finally:
+        _stop(executor, identity, events)
