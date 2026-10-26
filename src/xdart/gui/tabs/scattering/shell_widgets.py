@@ -1288,6 +1288,13 @@ def same_grid(values: np.ndarray, reference: np.ndarray) -> bool:
         np.array_equal(values, reference) or np.allclose(values, reference, rtol=1e-9, atol=0.0))
 
 
+def overlay_grid_compatible(values: np.ndarray, reference: np.ndarray) -> bool:
+    """Curves one Overlay may draw together: the same points to floating jitter (canonical_grid_overlay.md, with
+    OV-6's tolerance). Looser than ``same_grid``, which folds Average and Sum: a saved output keeps its radial axis
+    in float32, so a scan's saved curve and its Run curve sit up to about 6e-8 apart and are still one grid."""
+    return values.shape == reference.shape and bool(np.allclose(values, reference, rtol=1e-5, atol=1e-8))
+
+
 def _on_one_grid(traces: tuple[TraceProjection, ...]) -> bool:
     """The traces share the first's grid (``same_grid``)."""
     first = traces[0].axis.values

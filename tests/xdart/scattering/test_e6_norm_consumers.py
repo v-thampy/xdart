@@ -1297,7 +1297,7 @@ def test_runtime_delta_scope_uses_identity_and_channel_not_revision():
 
 
 @pytest.mark.parametrize("changed", ("identity", "channel"))
-def test_view_history_scope_reseeds_on_identity_and_channel(
+def test_view_history_scope_reseeds_on_channel_not_identity(
     qapp: QtWidgets.QApplication,
     changed: str,
 ) -> None:
@@ -1324,17 +1324,25 @@ def test_view_history_scope_reseeds_on_identity_and_channel(
             first, parts.navigation, completed=0, total=0, detail=""
         )
         assert view.trace_history_keys == parts.frames
-        # The delta names only the second frame: a changed normalization
-        # fact must clear detached history rather than mix regimes.
+        # The delta names only the second frame. A changed channel is
+        # another regime: detached history clears rather than mix them. A
+        # changed aggregate identity is not: each trace divides by its own
+        # frame's metadata, and every scan, Browse file and Run has its own
+        # identity, so keying on it wiped Overlay at each of them
+        # (canonical_grid_overlay.md acceptance 3; maintainer 2026-10-26: "it
+        # shouldn't clear at all when in the same run or different runs").
+        expected = (
+            parts.frames if changed == "identity" else (parts.frames[1],)
+        )
         view.reconcile(
             second, parts.navigation, completed=0, total=0, detail=""
         )
-        assert view.trace_history_keys == (parts.frames[1],)
-        # An equal replay retains the reseeded row without churn.
+        assert view.trace_history_keys == expected
+        # An equal replay retains the rows without churn.
         view.reconcile(
             second, parts.navigation, completed=0, total=0, detail=""
         )
-        assert view.trace_history_keys == (parts.frames[1],)
+        assert view.trace_history_keys == expected
     finally:
         view.close()
 

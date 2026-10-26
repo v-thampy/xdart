@@ -70,6 +70,7 @@ from .shell_widgets import (
     ContentFitComboBox,
     frame_caption,
     log_toggle,
+    overlay_grid_compatible,
     same_grid,
     ScientificImagePane,
     scrollable_toolbar,
@@ -92,6 +93,20 @@ from .shell_values import (
     ShellCommandKind,
     TraceProjection,
 )
+
+
+def _detached_root_bytes(traces) -> int:
+    """The bytes ``traces`` hold, each backing allocation counted once (their x, y and angular-support roots)."""
+    roots = {}
+    for trace in traces:
+        arrays = [trace.axis.values, trace.intensity]
+        if trace.angular_support is not None and trace.angular_support.supported_deg is not None:
+            arrays.append(trace.angular_support.supported_deg)
+        for array in arrays:
+            while isinstance(array.base, np.ndarray):
+                array = array.base
+            roots[id(array)] = array
+    return sum(array.nbytes for array in roots.values())
 
 
 PLOT_TOOLBAR_INTRA_GROUP_GAP = 3
@@ -2919,6 +2934,7 @@ class ScientificView(QtWidgets.QFrame):
             # so the normal setData path can update it in place.
             if not comparison:
                 self._trace_history_by_identity.clear()
+                self._browse_comparison_scope = None
             self._trace_aggregate_fold = None
             if not compatible_single:
                 self._rendered_trace_keys = ()
@@ -2955,9 +2971,14 @@ class ScientificView(QtWidgets.QFrame):
                 id(trace.frame): trace.frame
                 for _row_key, trace in rows
             }
+            selected_ids = {id(frame) for frame in navigation.selected}
             self._trace_history_keys = tuple(
                 frame
-                for frame in navigation.selected
+                for frame in (
+                    # Curves kept from frames this view no longer holds, then its own.
+                    *(trace.frame for trace in live_traces if id(trace.frame) not in selected_ids),
+                    *navigation.selected,
+                )
                 if presented_by_id.get(id(frame)) is frame
             )
         else:
@@ -3480,18 +3501,16 @@ class ScientificView(QtWidgets.QFrame):
         """
         from . import browse_1d_display
 
-        scope = ("browse-comparison", state.processing_mode, state.measurement_mode,
-                 state.gi_mode_1d, state.plot_axis, state.slice_enabled,
-                 state.slice_center, state.slice_width,
-                 trace_normalization_scope(None, state.norm_channel)[1],
-                 state.plot_options.waterfall_start, state.plot_options.waterfall_stop,
-                 state.plot_options.waterfall_step)
+        scope = self._comparison_scope(state)
+        # Another file's curves, kept: the same file's are the snapshot's own, though an acquisition view spelled its
+        # path in another case (the terminal handoff on Windows).
+        browse_file = os.path.normcase(str(state.browse_artifact))
         foreign = tuple(frame for frame in self._trace_history_keys
-                        if frame.artifact != state.browse_artifact)
+                        if self._trace_row(frame)[0] != browse_file
+                        and id(frame) in self._trace_history_by_identity)
         if self._browse_comparison_scope != scope:
             foreign = ()
-        retained = tuple(self._trace_history_by_identity[id(frame)] for frame in foreign
-                         if id(frame) in self._trace_history_by_identity)
+        retained = tuple(self._trace_history_by_identity[id(frame)] for frame in foreign)
         incoming = []
         for trace in state.traces:
             support = trace.angular_support
@@ -3502,31 +3521,11 @@ class ScientificView(QtWidgets.QFrame):
             incoming.append(trace)
         incoming = tuple(incoming)
         self.browse_comparison_notice = ""
-        if retained:
-            first = retained[0]
-            axis_key = self._axis_key(first.axis) or (first.axis.label, first.axis.unit)
-            if any((self._axis_key(trace.axis) or (trace.axis.label, trace.axis.unit)) != axis_key
-                   or not same_grid(trace.axis.values, first.axis.values)
-                   for trace in (*retained, *incoming)):
-                foreign, retained = (), ()
-                self.browse_comparison_notice = "Started a new overlay: sampled axes do not match."
-
-        def root_bytes(traces):
-            roots = {}
-            for trace in traces:
-                arrays = [trace.axis.values, trace.intensity]
-                if trace.angular_support is not None and trace.angular_support.supported_deg is not None:
-                    arrays.append(trace.angular_support.supported_deg)
-                for array in arrays:
-                    while isinstance(array.base, np.ndarray):
-                        array = array.base
-                    roots[id(array)] = array
-            return sum(array.nbytes for array in roots.values())
-
-        if root_bytes((*retained, *incoming)) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
-            foreign, retained = (), ()
-            self.browse_comparison_notice = "Started a new overlay: detached display budget reached."
-        if root_bytes(incoming) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
+        on_show = next((trace for trace in incoming if trace.frame is current), incoming[0] if incoming else None)
+        retained, _ = self._admit_comparison(retained, incoming, on_show)
+        kept = {id(trace.frame) for trace in retained}
+        foreign = tuple(frame for frame in foreign if id(frame) in kept)
+        if _detached_root_bytes(incoming) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
             raise ValueError("Browse comparison display budget exceeded")
         logical = (*foreign, *snapshot.logical_frames)
         all_rows = tuple((("live", id(trace.frame)), trace) for trace in (*retained, *incoming))
@@ -3549,6 +3548,61 @@ class ScientificView(QtWidgets.QFrame):
                            state.plot_mode, len(logical), was_active=self._bottom_waterfall_active))
 
     @staticmethod
+    def _trace_row(frame: DisplayFrameKey) -> tuple[str, int]:
+        """A curve's row in any context: its file, case-folded as Windows compares it, and its frame label."""
+        return os.path.normcase(str(frame.artifact)), int(frame.local_frame_label)
+
+    @staticmethod
+    def _comparison_scope(state: ScientificProjection) -> tuple[object, ...] | None:
+        """The science kept curves of other files, scans or Runs share with the current ones; None when the mode
+        keeps none (canonical_grid_overlay.md: Overlay and Waterfall persist; Single and slicing do not)."""
+        if (state.processing_mode not in {"Int 1D", "Int 2D"} or state.plot_mode not in {"Overlay", "Waterfall"}
+                or state.slice_enabled):
+            return None
+        return ("comparison", state.processing_mode, state.measurement_mode,
+                state.gi_mode_1d, state.plot_axis, state.slice_enabled,
+                state.slice_center, state.slice_width,
+                trace_normalization_scope(None, state.norm_channel)[1],
+                state.plot_options.waterfall_start, state.plot_options.waterfall_stop,
+                state.plot_options.waterfall_step)
+
+    def _admit_comparison(
+        self,
+        retained: tuple[TraceProjection, ...],
+        current: tuple[TraceProjection, ...],
+        on_show: TraceProjection | None,
+    ) -> tuple[tuple[TraceProjection, ...], tuple[TraceProjection, ...]]:
+        """The curves an Overlay draws with ``on_show``, as (retained, current): those of its axis kind and unit on
+        its sampled grid to floating jitter (canonical_grid_overlay.md), and the retained ones of other files, scans
+        or Runs while they fit the detached display budget (October 22). The notice says when any is left out; an
+        unattended Run never stops for it: a new overlay starts."""
+        from . import browse_1d_display
+
+        notice, count = "", len(retained) + len(current)
+        if on_show is not None:
+            key = self._axis_key(on_show.axis) or (on_show.axis.label, on_show.axis.unit)
+            verdicts: dict[str, bool] = {}
+
+            def fits(trace: TraceProjection) -> bool:
+                # A file's frames share its one grid: one comparison a file, not a curve, each live tick.
+                verdict = verdicts.get(trace.frame.artifact)
+                if verdict is None:
+                    verdict = verdicts[trace.frame.artifact] = (
+                        (self._axis_key(trace.axis) or (trace.axis.label, trace.axis.unit)) == key
+                        and overlay_grid_compatible(trace.axis.values, on_show.axis.values))
+                return verdict
+
+            retained, current = tuple(filter(fits, retained)), tuple(filter(fits, current))
+            if len(retained) + len(current) < count:
+                notice = "Started a new overlay: sampled axes do not match."
+        if retained and _detached_root_bytes((*retained, *current)) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
+            notice, retained = "Started a new overlay: detached display budget reached.", ()
+        if notice:
+            self.browse_comparison_notice = notice
+            logging.getLogger(__name__).info("%s (%d of %d curves kept)", notice, len(retained) + len(current), count)
+        return retained, current
+
+    @staticmethod
     def _trace_history_base_scope(state: ScientificProjection) -> tuple[object, ...]:
         return (
             # Plot mode changes only the presentation of these numeric trace
@@ -3562,9 +3616,13 @@ class ScientificView(QtWidgets.QFrame):
             tuple(pin.projection_id for pin in state.slice_pins),
             # Aggregate revision remains visible provenance but does not
             # change an earlier trace's per-frame metadata divisor.  Only the
-            # semantic normalization regime reseeds detached history.
+            # semantic normalization regime reseeds detached history: the
+            # effective channel, not the aggregate's identity, which is each
+            # context's own (a Run, a Browse file), so keying on it wiped a
+            # compatible Overlay at every scan, Browse and Run boundary
+            # (canonical_grid_overlay.md; Codex N-068bf509 diagnosis request).
             *trace_normalization_scope(
-                state.norm_identity,
+                None,
                 state.norm_channel,
             ),
         )
@@ -3583,9 +3641,29 @@ class ScientificView(QtWidgets.QFrame):
             and state.plot_mode == "Single"
         )
         same_scope = scope == self._trace_history_scope
-        # An ordinary merge ends any cross-file comparison: its foreign rows are
-        # pruned below, and the loading shortcut must not outlive it.
-        self._browse_comparison_scope = None
+        # Curves of frames the current view no longer holds (another file, scan or Run) stay while the comparison
+        # holds (canonical_grid_overlay.md: selection changes, scan boundaries and run finalization preserve
+        # compatible history; maintainer, 2026-10-26: "the whole idea of overlay is persistence so scans and frames
+        # can be compared unless chosen otherwise"). A frame this view holds follows its selection: deselecting it
+        # removes its curve. Only Int's own science compares: its acquisition's, or the current Browse file's (as
+        # browse_artifact says), never another page's results or a display no Browse custody covers.
+        comparison = (
+            self._comparison_scope(state)
+            if state.acquisition_selected or state.browse_artifact and all(
+                frame.artifact == state.browse_artifact
+                for frame in (*navigation.selected, *(trace.frame for trace in state.traces)))
+            else None
+        )
+        if comparison is not None and not state.traces and self._browse_comparison_scope is not None:
+            # A state without curves has no payload to name its measurement and GI modes (a GI Run's first, empty
+            # state reads as Standard): it says nothing new about the science, so the comparison it found holds.
+            comparison = self._browse_comparison_scope
+        owned = {id(frame) for frame in navigation.frames}
+        held = tuple(
+            frame for frame in self._trace_history_keys
+            if id(frame) not in owned and id(frame) in self._trace_history_by_identity
+        ) if same_scope and comparison is not None and comparison == self._browse_comparison_scope else ()
+        self._browse_comparison_scope = comparison
         if not same_scope:
             self._trace_history_by_identity.clear()
             self._trace_aggregate_fold = None
@@ -3642,18 +3720,38 @@ class ScientificView(QtWidgets.QFrame):
                     # the aggregate prefix below.
                     continue
                 self._trace_history_by_identity[id(frame)] = trace
+        if held:
+            # A selected frame of the same file and label is that curve now (the end-of-Run Browse's own frames).
+            selected_rows = {self._trace_row(frame) for frame in selected}
+            held = tuple(frame for frame in held if self._trace_row(frame) not in selected_rows)
+        kept = {id(frame) for frame in held}
         self._trace_history_by_identity = {
             identity: trace
             for identity, trace in self._trace_history_by_identity.items()
-            if selected_by_id.get(identity) is trace.frame
+            if selected_by_id.get(identity) is trace.frame or identity in kept
         }
         self._trace_history_scope = scope
         self._trace_selection_keys = selected
-        traces = tuple(
+        current = tuple(
             self._trace_history_by_identity[id(frame)]
             for frame in selected
             if id(frame) in self._trace_history_by_identity
         )
+        retained = tuple(self._trace_history_by_identity[id(frame)] for frame in held)
+        if comparison is not None:
+            # A Run's scans share an Overlay only on one grid: automatic ranges can differ by scan.
+            on_show = next((trace for trace in current if trace.frame is navigation.current),
+                           current[-1] if current else None)
+            count = len(retained) + len(current)
+            retained, current = self._admit_comparison(retained, current, on_show)
+            if len(retained) + len(current) < count:
+                kept = {id(trace.frame) for trace in (*retained, *current)}
+                self._trace_history_by_identity = {
+                    identity: trace
+                    for identity, trace in self._trace_history_by_identity.items()
+                    if identity in kept
+                }
+        traces = (*retained, *current)
         self._trace_history_keys = tuple(trace.frame for trace in traces)
         return traces
 
