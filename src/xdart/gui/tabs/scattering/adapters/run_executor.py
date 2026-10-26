@@ -61,6 +61,7 @@ from ..contracts import (
 )
 from ..acquisition_runtime import AcquisitionRuntime, TerminalPauseFailure
 from ..display_values import (
+    new_frames_note,
     DisplayFrameCatalog,
     DisplayFrameKey,
     StandardDisplayPayload,
@@ -495,6 +496,10 @@ class _StandardRun:
     files_discovered: int = 0
     files_processed: int = 0
     files_skipped: int = 0
+    # Frames this Run reduced and saved (made durable); an Append's outputs' earlier frames are not among them.
+    frames_new: int = 0
+    # An Append Run, which reports frames_new; kept here because cleanup drops the configuration before the end.
+    appends: bool = False
     # Scans a directory Append skipped instead of failing the run: (output, reason).
     append_skips: list[tuple[str, str, str]] = field(default_factory=list)
     # Scans an Append reduced again whole, their processed images changed on disk: (output, reason), once each
@@ -700,7 +705,7 @@ def _directory_status(
         in_flight_processed=in_flight_processed,
     )
     status = (
-        f"{state} · {processed} processed · {skipped} skipped · "
+        f"{state} · {processed} processed{new_frames_note(_frames_new(run))} · {skipped} skipped · "
         f"{pending} pending · {discovered} discovered"
     )
     return " · ".join((status, *run.live_blocked.values(), *run.live_waiting.values()))
@@ -738,7 +743,13 @@ def _directory_event_fields(
         "files_skipped": skipped,
         "files_pending": pending,
         "files_discovered": discovered,
+        "frames_new": _frames_new(run),
     }
+
+
+def _frames_new(run: _StandardRun) -> int | None:
+    """An Append Run's frames saved in this Run; None for any other Run."""
+    return run.frames_new if run.appends else None
 
 
 def _terminal_in_flight_files(run: _StandardRun) -> int:
@@ -990,6 +1001,7 @@ class StandardRunExecutor:
             max_display_items=self._max_display_items,
             capture=source,
             resources=resources,
+            appends=configuration.output_mode == "Append",
         )
         run.display.set_factories(FrameRecordStore, PublicationStore)
         run.display.bind_transport(event_sink=self._events.put)
@@ -3539,6 +3551,7 @@ class StandardRunExecutor:
                 )
             run.display.mark_durable(owner, durable_labels)
             run.completed += len(new_labels)
+            run.frames_new += len(new_labels)
             path = Path(artifact)
             if path == run.artifact:
                 run.current_completed = min(
@@ -4336,9 +4349,11 @@ class StandardRunExecutor:
                     name,
                     *values,
                 )
+        new = new_frames_note(_frames_new(run))
         log_events.banner(
-            logger, "End of Run · %s · %s%s · %.1f s", kind.value.capitalize(), _counted(completed, "frame"),
-            f" · {_counted(run.files_processed, 'file')} processed, {run.files_skipped} skipped"
+            logger, "End of Run · %s · %s%s · %.1f s", kind.value.capitalize(),
+            _counted(completed, "frame") + ("" if run.files_discovered else new),
+            f" · {_counted(run.files_processed, 'file')} processed{new}, {run.files_skipped} skipped"
             if run.files_discovered else "", measured_elapsed, kind="run-end")
 
     def _exact_run(self, identity: RunIdentity) -> _StandardRun | None:

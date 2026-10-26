@@ -18,7 +18,7 @@ from xrd_tools.session.readiness import ControlsProjection
 
 from .browser_catalog import BrowserCatalogEntry, natural_name_key
 from .controls_readiness import ControlsReadinessProjection
-from .display_values import DisplayFrameKey, StandardTerminalTiming
+from .display_values import DisplayFrameKey, StandardTerminalTiming, new_frames_note
 from .external_tools import (
     ExternalToolsProjection,
     unavailable_external_tools,
@@ -961,8 +961,12 @@ class DirectoryFileProgress:
     skipped: int
     pending: int
     discovered: int
+    #: An Append Run's frames saved in this Run, shown as "N processed (M new)"; None for any other Run.
+    new: int | None = None
 
     def __post_init__(self) -> None:
+        if self.new is not None and (type(self.new) is not int or self.new < 0):
+            raise ValueError("directory file progress is invalid")
         values = (
             self.processed,
             self.skipped,
@@ -978,7 +982,7 @@ class DirectoryFileProgress:
 
     def text(self, state: str) -> str:
         return (
-            f"{state} · {self.processed} processed · "
+            f"{state} · {self.processed} processed{new_frames_note(self.new)} · "
             f"{self.skipped} skipped · {self.pending} pending · "
             f"{self.discovered} discovered"
         )

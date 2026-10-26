@@ -230,7 +230,7 @@ def test_the_log_frames_the_run_and_each_scan_and_says_plainly_what_it_reprocess
     assert banners[2][1].startswith("End of Scan · scana_int1d.nexus · 3 frames · ") and banners[2][1].endswith(" s")
     assert banners[3][1] == "New Scan · scanb_int1d.nexus"
     assert banners[4][1].startswith("End of Scan · scanb_int1d.nexus · 2 frames · ")
-    assert banners[5][1].startswith("End of Run · Finished · 5 frames · 5 files processed, 0 skipped · ")
+    assert banners[5][1].startswith("End of Run · Finished · 5 frames · 5 files processed (5 new), 0 skipped · ")
     # diagnostics are not the regular log's (maintainer, 2026-10-24): Debug Logging or Performance Monitoring
     assert not [record.getMessage() for record in caplog.records if record.getMessage().startswith((
         "Total Frames Processed", "Total Time", "[PERF-SUMMARY]", "[PERF-RESOURCES]", "[RUN-RESOURCES]",

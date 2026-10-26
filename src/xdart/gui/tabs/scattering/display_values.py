@@ -196,6 +196,13 @@ class StandardTerminalTiming:
             raise TypeError("terminal timing is invalid")
 
 
+def new_frames_note(new: int | None) -> str:
+    """`` (M new)`` after an Append Run's processed count (maintainer, 2026-10-25: "append the new frames processed
+    in brackets ... it will be good to know how many of these were newly processed immediately in the readiness
+    status as well"); nothing for another Run."""
+    return "" if new is None else f" ({new} new)"
+
+
 @dataclass(frozen=True, slots=True)
 class StandardRunEvent:
     run_identity: RunIdentity
@@ -223,6 +230,9 @@ class StandardRunEvent:
     warnings: tuple[str, ...] = ()
     #: Terminal-only: scans an Append reduced again whole because their processed images changed on disk.
     rebuilt: tuple[str, ...] = ()
+    #: An Append Run's frames reduced and saved in this Run so far, apart from those its outputs already held;
+    #: None for a Run that is not an Append.
+    frames_new: int | None = None
 
 @dataclass(frozen=True, slots=True)
 class StandardDisplayPayload:

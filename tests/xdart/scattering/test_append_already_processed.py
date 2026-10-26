@@ -145,6 +145,10 @@ def test_a_completed_scan_is_skipped_as_before_without_reading_it_again(tmp_path
     for row in (0, 2):
         expected[row][4] = "Running · 3 processed · 0 skipped · 2 pending · 5 discovered"
         expected[row][7], expected[row][9] = 3, 2
+    # An Append counts its new frames (maintainer, 2026-10-25): none until scanb's two are saved.
+    for row in expected:
+        if " processed · " in row[4]:
+            row[4] = row[4].replace(" processed · ", f" processed ({2 if row[7] == 5 else 0} new) · ", 1)
     assert rows == [tuple(row) for row in expected]
     assert warnings == [] and navigation == _PARENT_NAVIGATION
     assert seams.materialized == ["scanb_int1d.nexus"] and seams.preflighted == ["scanb_int1d.nexus"]
@@ -297,7 +301,9 @@ def test_an_already_processed_scan_after_another_scan_is_shown_from_its_saved_fr
     events, catalog = _run(tmp_path, raw, 9202)
     rows, warnings, navigation = _shown(events, catalog)
     assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"], rows[-1]
-    assert rows[-1][4] == "Complete · 6 processed · 0 skipped · 0 pending · 6 discovered" and warnings == []
+    new = 4 if first_new else 1  # scana's three (when the first Run did not have them) and scanc's one
+    assert rows[-1][4] == f"Complete · 6 processed ({new} new) · 0 skipped · 0 pending · 6 discovered"
+    assert warnings == []
     assert navigation == [("scana", 1, 1), ("scana", 2, 2), ("scana", 3, 3), ("scanb", 1, 4), ("scanb", 2, 5),
                           ("scanc", 1, 6)]
     assert seams.materialized == ["scana_int1d.nexus", "scanc_int1d.nexus"][(0 if first_new else 1):]

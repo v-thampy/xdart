@@ -180,6 +180,7 @@ from .scientific_preferences import scientific_preference_updates
 from .shell_values import (
     ArtifactProgress,
     DirectoryFileProgress,
+    new_frames_note,
     FrameNavigationProjection,
     FrameSelectionIntent,
     ProgressProjection,
@@ -367,6 +368,7 @@ def _directory_file_progress(
         event.files_skipped,
         event.files_pending,
         event.files_discovered,
+        event.frames_new,
     )
 
 
@@ -5358,7 +5360,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         frame_label = "Frame" if event.completed == 1 else "Frames"
         terminal_detail = (
-            f"{terminal_state} · {event.completed} {frame_label} · "
+            f"{terminal_state} · {event.completed} {frame_label}{new_frames_note(event.frames_new)} · "
             f"{timing.elapsed_seconds:.2f} s"
             if timing is not None
             else event.detail
