@@ -418,6 +418,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
     controller.viewer_2d_context = context
     controller.__dict__.update(
         synchronize_acquisition_scope=lambda: None,
+        browse_lifecycle_admissible=lambda: True,  # idle: the scan list is not locked (39fb9886 asks it)
         capture_norm_aggregate_for_refresh=lambda: None,
         cancel_browse_slices=lambda: None,
         viewer_2d_cleanup_pending=False,

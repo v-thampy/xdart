@@ -4610,7 +4610,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 # A Run that is running keeps Browse closed: say so, without a traceback, and keep the row the
                 # Browser shows (beamline 2026-10-25: a click during Live logged "Browse refused" with one).
                 self._notice("Browse is unavailable while a Run is running; pause or stop it to open another scan.")
-                self._refresh_shell(preserve_scientific=True)
+                if not self._closed:
+                    self._refresh_shell()  # as _error_notice replays the Browser after any other refusal
             if self._context_controller.browse_pending:
                 self._ensure_timer()
             return
