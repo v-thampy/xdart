@@ -197,7 +197,7 @@ def test_a_waited_frame_keeps_its_one_deadline_until_it_is_admitted(monkeypatch)
     listing due, a READY admission a fresh listing cut before it) keeps its deadline, kind and its sidecar's first
     sighting; admitting it, or a wait that ended (its scan covered, its files gone), clears it."""
     monkeypatch.setattr(run_executor, "monotonic", lambda: 100.5)
-    watch, run = StandardRunExecutor(join_timeout=2.)._watch_metadata_wait, SimpleNamespace(live_waiting={})
+    watch, run = StandardRunExecutor(join_timeout=2.)._watch_metadata_wait, SimpleNamespace(live_waiting={}, live_waiting_long={})
     target, held = Path("grow_int1d.nexus"), ("grow_0002.tif", 100.0, "grow_int1d.nexus", "settling", 100.0)
     waits = {"k": held}
     assert not watch(run, target, "k", None, waits, retried=True) and waits["k"] == held

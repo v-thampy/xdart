@@ -25,7 +25,7 @@ def _watcher(monkeypatch):
     monkeypatch.setattr(run_executor, "_METADATA_WAIT_LIMIT_S", {"sidecar": 10.0, "spec": 30.0})
     executor = StandardRunExecutor(join_timeout=1.)
     monkeypatch.setattr(executor, "_skip_live_append", lambda *args, **kwargs: skipped.append(kwargs["reason"]))
-    run = SimpleNamespace(live_waiting={}, metadata_kind="sidecar")
+    run = SimpleNamespace(live_waiting={}, live_waiting_long={}, metadata_kind="sidecar")
     waits = {}
 
     def look(at, waiting, **kwargs):
