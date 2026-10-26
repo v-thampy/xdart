@@ -3,7 +3,9 @@ epoch_local, "dirty metadata adds columns absent on disk: ['epoch_local']"; the 
 browser are totally unresponsive", "the run button however remains disabled and also the data browser (scans
 column)"). The failed scan's output released its light-1D lease as it closed while its display owner still named it,
 so the Run's cleanup stayed pending and nothing retried it. The real page, executor and Live Run over real TIFF + .txt
-files: the Run has shown a covered scan and grown a new one before the older output fails it."""
+files: the Run has shown a covered scan and grown a new one before the older output fails it. That refusal now skips
+its scan (MetadataColumnsAbsent, the maintainer's pick "Skip that scan"), so these rows turn it back into a plain
+writer refusal, which still fails the Run, as any write that fails otherwise does."""
 from __future__ import annotations
 
 import types
@@ -53,8 +55,18 @@ def _failed_run(qapp, page, raw, observed):  # noqa: F811
 
 
 @pytest.fixture
-def older_output(tmp_path):
-    """A covered scan and an older output, written by a first Run; the older one's scan_data lacks epoch_local."""
+def older_output(tmp_path, monkeypatch):
+    """A covered scan and an older output, written by a first Run; the older one's scan_data lacks epoch_local, and
+    its writer's refusal fails the Run."""
+    from xrd_tools.io import record_writer
+    validate = record_writer.NexusRecordWriter._validate_records
+
+    def refuse(self, *args, **kwargs):
+        try:
+            return validate(self, *args, **kwargs)
+        except record_writer.MetadataColumnsAbsent as error:
+            raise ValueError(str(error)) from None  # a write refusal of no scan's own
+    monkeypatch.setattr(record_writer.NexusRecordWriter, "_validate_records", refuse)
     raw = tmp_path / "raw"
     raw.mkdir()
     _poni(tmp_path)
@@ -76,7 +88,15 @@ def test_a_live_run_that_fails_on_its_last_scan_ends_clean_and_leaves_run_and_th
     with _page(qapp, _intent(tmp_path)) as (page, _view, observed):
         terminal = _failed_run(qapp, page, older_output, observed)
         assert terminal.kind is StandardEventKind.FAILED and "epoch_local" in terminal.detail, terminal.detail
-        assert terminal.cleanup_status is CleanupStatus.CLEANED, terminal.cleanup_status
+        run = page._run_executor._exact_run(terminal.run_identity)
+        owners = None if run is None else {
+            str(key).rsplit("/", 1)[-1]: (None if owner.light_lease is None else owner.light_lease.state.name,
+                                          None if owner.light_slot is None else owner.light_slot.state.name,
+                                          owner.light_hooks is not None, owner.light_retry_token is not None,
+                                          owner.light_unsubscribe is not None, owner.publications.allocation is not None,
+                                          owner.publications._light_1d is not None)
+            for key, owner in run.display.artifacts.items()}
+        assert terminal.cleanup_status is CleanupStatus.CLEANED, (terminal.cleanup_status, owners)
         assert page._lifecycle.reset_permitted and page._start_permitted() == (True, "")
         assert page._context_controller.browse_lifecycle_admissible(), "the browser's scans stay locked"
         assert page._shell.browser.scans.isEnabled()

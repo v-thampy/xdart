@@ -674,6 +674,16 @@ class WriterStateError(RuntimeError):
     pass
 
 
+class MetadataColumnsAbsent(ValueError):
+    """An existing output's scan_data has no column for metadata its new frames carry: an output written before the
+    column existed (epoch_local, before 2026-10-24) cannot be extended with them. A Run skips that scan (maintainer,
+    2026-10-26: his pick "Skip that scan"); Overwrite reprocesses it."""
+
+    def __init__(self, columns) -> None:
+        self.columns = tuple(sorted(str(column) for column in columns))
+        super().__init__(f"dirty metadata adds columns absent on disk: {list(self.columns)}")
+
+
 class ReplacementManifestTargetChanged(WriterStateError):
     """Manifest preparation lost the exact named source object."""
 
@@ -5343,9 +5353,7 @@ class NexusRecordWriter:
             if existing_columns is not None:
                 unexpected = set(map(str, record.metadata)) - existing_columns
                 if unexpected:
-                    raise ValueError(
-                        f"dirty metadata adds columns absent on disk: {sorted(unexpected)}"
-                    )
+                    raise MetadataColumnsAbsent(unexpected)
         return prepared_thumbnails
 
     @staticmethod
@@ -6713,7 +6721,7 @@ class NexusRecordWriter:
 
 
 __all__ = [
-    "NexusRecordWriter", "RecordWrite", "WriterFinalization",
+    "MetadataColumnsAbsent", "NexusRecordWriter", "RecordWrite", "WriterFinalization",
     "ReplacementManifestTargetChanged",
     "WriterIncomplete", "WriterOperationVector", "WriterOutcome",
     "WriterPhase", "WriterStateError", "WriterTransactionBinding",

@@ -19,6 +19,7 @@ from xrd_tools.core.scan import SourceKind, SourceReadError
 from xrd_tools.io.append import AppendRefused, saved_energy_selection
 from xrd_tools.io.frame_view import read_frame_scalar_catalog
 from xrd_tools.io.metadata import MetadataSourceChanged, any_auto_sidecar
+from xrd_tools.io.record_writer import MetadataColumnsAbsent
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import EnergyGridWidened, WarmIntegrators, energy_scan_grid_changes
 from xrd_tools.reduction.background import (
@@ -120,6 +121,14 @@ def _run_summary(configuration) -> str:
     return " · ".join(filter(None, (mode, f"{source} → {output}" if source and output else source or output)))
 
 
+def _scan_failure_reason(error: BaseException) -> str:
+    """The reason a scan skipped for one of its own failures (_SCAN_FAILURES) gives in the log and at the Run's end."""
+    if isinstance(error, MetadataColumnsAbsent):
+        return (f"its saved metadata has no {', '.join(error.columns)} column, which its new frames carry (an output "
+                "written by an earlier xdart); Overwrite reprocesses it")
+    return f"{type(error).__name__}: {error}"
+
+
 def _counted(count: int, noun: str) -> str:
     """``1 frame``, ``2 frames``."""
     return f"{count} {noun}{'' if count == 1 else 's'}"
@@ -140,6 +149,11 @@ _LIVE_DIRECTORY_POLL_S = 0.1
 # skips its scan from that frame on ("it is fine to skip the entire scan altogether"). The sidecar limit, 150 s
 # (maintainer, 2026-10-26: "exposures can be as long as 120s", his pick "150 s"), also bounds Auto's question.
 _METADATA_WAIT_NOTE_S = 2.0
+# One scan's own failures: its image could not be read, or its output predates its new frames' metadata columns. The
+# scan is skipped and named, the Run goes on (maintainer, 2026-10-24: "That scan/frame should be logged and skipped and
+# the remaining scan processing should continue"; 2026-10-26, for an output written before epoch_local: his pick "Skip
+# that scan"). A write that fails otherwise still fails the Run.
+_SCAN_FAILURES = (SourceReadError, MetadataColumnsAbsent)
 _METADATA_WAIT_LIMIT_S = {"sidecar": 150.0, "spec": 30.0}
 # Auto asks whether the Run expects sidecars once its first frame has waited this long for one: a .txt can land seconds
 # after its image (5.1 s on the share, beamline 2026-10-26), so one on its way raises no question.
@@ -1646,7 +1660,7 @@ class StandardRunExecutor:
             self._close_scan(run, owner.artifact)
             self._finish_display_projection(run)
             self._project_new_durable(run, output)
-            if getattr(result, "failed", False) and not isinstance(primary, SourceReadError):
+            if getattr(result, "failed", False) and not isinstance(primary, _SCAN_FAILURES):
                 raise RuntimeError(result.error or "scan settlement failed")
             commit = _session_terminal_commit_identity(session, owner.artifact) if own else None
             if commit is not None and getattr(result, "n_processed", 0) and run.current_completed:
@@ -2551,10 +2565,10 @@ class StandardRunExecutor:
             run.completed += run.current_completed
             try:
                 stopped = self._execute_current(run, construct=False) or stopped
-            except SourceReadError as error:
+            except _SCAN_FAILURES as error:
                 if not run.files_discovered:
                     raise
-                self._skip_failed_directory_scan(run, item.target, error, constructed=True)
+                self._skip_failed_directory_scan(run, item.target, _scan_failure_reason(error), constructed=True)
                 continue
             if run.current_files_incremental:
                 run.files_processed += min(
@@ -3056,13 +3070,13 @@ class StandardRunExecutor:
                         retain_session=True,
                         settle=settle_live,
                     )
-                except SourceReadError as error:
-                    # One scan's own image could not be read while it was reduced: that scan stops growing, what it
-                    # published before is kept, and the Run goes on (Codex N-69301b5f NW-R2).
+                except _SCAN_FAILURES as error:
+                    # One scan's own failure while it was reduced: that scan stops growing, what it published before
+                    # is kept, and the Run goes on (Codex N-69301b5f NW-R2).
                     with _run_effect(run):
                         self._settle_failed_scan(run, group.target)
                     self._skip_live_append(run, group.target, target_key, None, constructed=False, failed=True,
-                                           reason=f"{type(error).__name__}: {error}")
+                                           reason=_scan_failure_reason(error))
                     skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
                     publish(force=True)
                     continue
@@ -3317,8 +3331,8 @@ class StandardRunExecutor:
             ))
             try:
                 stopped = self._execute_current(run, construct=False) or stopped
-            except SourceReadError as error:  # one scan's own image could not be read: it is skipped, the rest runs
-                self._skip_failed_directory_scan(run, item.target, error, constructed=True)
+            except _SCAN_FAILURES as error:  # one scan's own failure: it is skipped, the rest runs
+                self._skip_failed_directory_scan(run, item.target, _scan_failure_reason(error), constructed=True)
                 continue
             if run.pending_rebuild is not None:  # said at the end only when the scan was reduced again whole
                 if run.current_completed >= run.current_total:
@@ -3609,8 +3623,8 @@ class StandardRunExecutor:
                     for key, elapsed in snapshot().items():
                         _perf_add(run, key, elapsed)
             if getattr(result, "failed", False):
-                if isinstance(primary := getattr(session, "primary_error", None), SourceReadError):
-                    raise primary  # one scan's own image could not be read: its caller skips that scan
+                if isinstance(primary := getattr(session, "primary_error", None), _SCAN_FAILURES):
+                    raise primary  # one scan's own failure (_SCAN_FAILURES): its caller skips that scan
                 raise RuntimeError(
                     result.error or "scattering reduction failed"
                 )
