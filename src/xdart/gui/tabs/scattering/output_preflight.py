@@ -1365,11 +1365,12 @@ def _live_metadata_ready(
     sidecar exists, so a new frame waits for a sidecar still being written or
     about to land: under Auto too, since an image can be readable well before
     its sidecar is listed (the Run's wait for it ends in the executor, which
-    gives up on a frame whose sidecar never comes, sooner when the Run has seen
-    no sidecar at all).  ``sidecar_optional``: the Run has found its folder
-    has none (Auto, no sidecar seen, one frame already given up on), so a
-    member without one is ready once its observation holds still, all the
-    leading ones together, instead of each being given up on in its own poll.
+    gives up on a frame whose sidecar never comes, after the same limit when
+    the Run has seen no sidecar at all).  ``sidecar_optional``: the Run has
+    found its folder has none (Auto, no sidecar seen, one frame already given
+    up on), so a member without one is ready once its observation holds
+    still, all the leading ones together, instead of each being given up on
+    in its own poll.
     Under SPEC a new member is ready once its own
     SPEC row is complete: a row is final once written, so one look suffices
     (qualification then proves it), and no other point's row is ever borrowed;

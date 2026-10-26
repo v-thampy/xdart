@@ -1854,12 +1854,21 @@ class StandardRunExecutor:
                           kind="scan-end")
 
     def _settle_predecessor(self, run, output, predecessor) -> None:
+        own = (not run.showing_saved and os.path.normcase(os.path.abspath(str(run.artifact)))
+               == os.path.normcase(os.path.abspath(str(predecessor.artifact))))
+        session = run.session if own else None
         result = output.finish_predecessor(predecessor)
         self._close_scan(run, predecessor.artifact, getattr(result, "n_processed", None))
         self._finish_display_projection(run)
         self._project_new_durable(run, output)
         if getattr(result, "failed", False):
             raise RuntimeError(result.error or "predecessor settlement failed")
+        if own and getattr(result, "n_processed", 0):
+            # A writer that committed frames in this Run and closes before it ends (a Live output that stops
+            # growing, or one another output takes over from): the end of a Run that then shows a saved scan shows
+            # this one (Codex N-d7f95ae0 TT-R1). A dormant no-op commits none and is not "last written".
+            run.last_written = (Path(str(predecessor.artifact)), run.current_completed, run.current_total,
+                                _session_terminal_commit_identity(session, predecessor.artifact))
         run.display.mark_hydration_closed(predecessor)
         if not run.display.release_light_1d(
             predecessor, reason="lineage-replaced",
@@ -2771,7 +2780,7 @@ class StandardRunExecutor:
                             owned=owned,
                             committed_cache=committed_counts,
                             given_up=frozenset(given_up.get(target_key, ())),
-                            # The folder is known to have no sidecars (one frame given up on after the note period):
+                            # The folder is known to have no sidecars (its first frame given up on after the limit):
                             # its frames are admitted together, not one given up on per poll.
                             sidecar_optional=meta_auto and not run.sidecars_seen and bool(run.metadata_given_up),
                         )
