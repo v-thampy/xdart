@@ -845,40 +845,54 @@ def test_r3d_a_published_raw_member_change_keeps_its_exact_outcome(tmp_path, mon
     assert outcome == R3D_PARENT[case], outcome
 
 
-@pytest.mark.parametrize('case', ['auto_rejected_becomes_plausible', 'same_id_adapter_replacement'])
+@pytest.mark.parametrize('case', ['unselected_txt_becomes_plausible', 'preferred_txt_appears',
+                                 'same_id_adapter_replacement'])
 def test_r3f_a_discovery_or_registry_change_is_proved_strictly_again(tmp_path, monkeypatch, case):
-    """No outcome changes today, but the next proof must not reuse: the member is read strictly again."""
+    """A bound reader ignores unselected content; selected discovery/registry changes require strict proof."""
     from dataclasses import replace
 
     from xrd_tools.sources import adapters as source_adapters
     raw = tmp_path / 'raw'
     raw.mkdir()
     cars = _Sidecar(raw, PILATUS)
-    if case == 'auto_rejected_becomes_plausible':  # an append-form candidate Auto rejects (one pair)
+    if case == 'unselected_txt_becomes_plausible':  # TXT binding prefers the existing replace form
         (raw / 'scan_0001.tif.txt').write_text('note = 1\n')
     for k in range(3):
         cars.frame(k)
+    if case == 'preferred_txt_appears':
+        (raw / 'scan_0001.txt').rename(raw / 'scan_0001.tif.txt')
     work = _Work(monkeypatch)
     executor = StandardRunExecutor(join_timeout=2.)
-    fmt = 'auto' if case == 'auto_rejected_becomes_plausible' else 'txt'
+    fmt = 'txt' if case == 'same_id_adapter_replacement' else 'auto'
     identity = _start(executor, _intent(tmp_path, raw, PILATUS, fmt=fmt), request_value=7129 + (fmt == 'txt') * 10)
     events = []
     try:
         _wait(executor, events, _count_labels('scan', 3), 60.)
         _settle_reuse(executor, identity, work, events, 3, time.monotonic() + 60.)
+        run = executor._exact_run(identity)
+        assert run.metadata_format == 'txt'
         changed = time.monotonic()
-        if case == 'auto_rejected_becomes_plausible':
+        if case == 'unselected_txt_becomes_plausible':
             (raw / 'scan_0001.tif.txt').write_text(SIDECARS['txt'](41.))
+        elif case == 'preferred_txt_appears':
+            cars.sidecar(1)  # identical values, but the bound parser now selects this new dependency
         else:
             owner = source_adapters.candidate_owner(raw / 'scan_0000.tif')
             entry = source_adapters._ADAPTERS[owner.id]
             monkeypatch.setitem(source_adapters._ADAPTERS, owner.id, source_adapters._Entry(
                 replace(entry.adapter), entry.builtin, entry.seq + 100000))
         member = str(raw / 'scan_0001.tif')
-        _wait(executor, events, lambda values: _terminal(values) or any(
-            detail == member for _at, detail in work.times('qualify_read', changed)),
-            execution_graph.LivePrefixProof.PERIOD_S + 2 * POLL)
+        if case == 'unselected_txt_becomes_plausible':
+            _wait(executor, events, lambda values: any(
+                proof.verified_at >= changed for proof in tuple(run.live_proofs.values())),
+                execution_graph.LivePrefixProof.PERIOD_S + 2 * POLL)
+        else:
+            _wait(executor, events, lambda values: _terminal(values) or any(
+                detail == member for _at, detail in work.times('qualify_read', changed)),
+                execution_graph.LivePrefixProof.PERIOD_S + 2 * POLL)
         reproved = [detail for _at, detail in work.times('qualify_read', changed) if detail == member]
+        if case == 'preferred_txt_appears':
+            _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values), 20.)
         cars.frame(3)
         _wait(executor, events, lambda values: len(set(_labels(values, 'scan'))) >= 4 or _terminal(values)
               or _said(values, 'stopped growing'), 20.)
@@ -887,7 +901,9 @@ def test_r3f_a_discovery_or_registry_change_is_proved_strictly_again(tmp_path, m
         terminal = _stop(executor, identity, events)
     labels, record = _counted(tmp_path, 'scan')
     outcome = ([kind for kind, _detail in terminal], labels, _column(record, 'I0'), _said(events, 'stopped growing'))
-    assert (outcome, bool(reproved)) == ((['STOPPED'], (1, 2, 3, 4), (0., 1., 2., 3.), False), True), (
+    expected = ((['STOPPED'], (1, 2, 3), (0., 1., 2.), True) if case == 'preferred_txt_appears'
+                else (['STOPPED'], (1, 2, 3, 4), (0., 1., 2., 3.), False))
+    assert (outcome, bool(reproved)) == (expected, case != 'unselected_txt_becomes_plausible'), (
         outcome, len(reproved))
 
 
