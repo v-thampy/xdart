@@ -95,6 +95,11 @@ def test_overlay_keeps_every_scan_through_the_run_its_end_and_the_next_run(qapp,
         # The end-of-Run Browse of scan b keeps scan a's curves beside its own, each once.
         assert _rows(page) == [a1, a2, b1, b2]
         assert _curves(page, plot_mode) == 4
+        if plot_mode == "Overlay":
+            # Run and Browse name a scan's curves alike, by the scan, never by its output's slot (maintainer,
+            # 2026-10-26: "int1d should never be part of the legend in a 1d plot. It is totally redundant").
+            names = [item.opts.get("name") for item in page._shell.scientific.curve.listDataItems()]
+            assert names == ["a_1", "a_2", "b_1", "b_2"], names
         second = _live_run(qapp, page, events, tmp_path / "raw", [("c", 1)], suffix)
         # The next Run keeps them all, the Run's and Browse's spelling of one frame drawn once.
         assert sorted(second[-1]) == [a1, a2, b1, b2, c1]

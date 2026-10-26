@@ -259,8 +259,15 @@ class StandardDisplayPayload:
     #: True only on a PRESENTED payload whose 2-D map was re-binned from the
     #: q_ip–q_oop cake for display (never a stored or direct ``q_chi`` result).
     derived_2d: bool = False
+    #: The scan's name a curve of this frame is labelled by, when it is not ``frame_key.source_scan``: a processed
+    #: output Browses under its file's name (``sample_int1d``) and labels its curves by the family it persists
+    #: (``sample``), as a Run labels the same scan's (maintainer, 2026-10-26: "int1d should never be part of the legend
+    #: in a 1d plot. It is totally redundant"). Empty: the frame's own scan name.
+    legend_scan: str = ""
 
     def __post_init__(self) -> None:
+        if type(self.legend_scan) is not str:
+            raise TypeError("legend_scan must be text")
         # Ordinary Run publications carry the already-bound, per-frame
         # wavelength. File views have no transient PONI and keep the existing
         # artifact fallback; consumers never reconstruct energy from a source.

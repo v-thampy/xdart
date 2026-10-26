@@ -323,6 +323,9 @@ class FrameScalarCatalog:
     rows: tuple[FrameScalarRow, ...]
     axes_1d: tuple[tuple[str, str, str, bool], ...] = ()
     source_base: str | None = None
+    #: The root family the output persists (``entry/@artifact_family_v1``): its scan's name without the operation
+    #: slot, read as stamped, never parsed out of the file name. None on an output that records none.
+    artifact_family: str | None = None
     labels: tuple[int, ...] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -336,6 +339,10 @@ class FrameScalarCatalog:
             type(self.source_base) is not str or not self.source_base
         ):
             raise TypeError("source_base must be nonempty text or None")
+        if self.artifact_family is not None and (
+            type(self.artifact_family) is not str or not self.artifact_family
+        ):
+            raise TypeError("artifact_family must be nonempty text or None")
         labels: list[int] = []
         previous = -1
         for row in self.rows:
@@ -1772,6 +1779,7 @@ class FrameViewReader:
             raise TypeError("target_frame must be an exact nonnegative integer")
         self.target_frame = target_frame
         self._source_base: str | None = None
+        self._artifact_family: str | None = None
         self._h5: h5py.File | None = None
         self._entry: h5py.Group | None = None
         self._g1: h5py.Group | None = None
@@ -1974,6 +1982,14 @@ class FrameViewReader:
             # attribute is never rewritten.
             if not isabs(source_base):
                 source_base = None
+        # The persisted root family names the scan for display (a legend says
+        # "sample", not "sample_int1d"). It is a label only: an unreadable one
+        # leaves the record readable and names nothing.
+        try:
+            artifact_family = _bounded_text_attr(
+                entry, "artifact_family_v1", role=f"{entry.name} artifact family")
+        except ValueError:
+            artifact_family = None
         # Admission binds canonical-or-complete-shadow groups and the complete
         # owned mode inventory once; downstream readers do not rediscover it.
         g1 = processed.integrated_1d
@@ -2124,6 +2140,7 @@ class FrameViewReader:
         # are validated and committed.
         self._entry = entry
         self._source_base = source_base
+        self._artifact_family = artifact_family or None
         self._g1, self._g2 = g1, g2
         self._geom, self._scan_data, self._frames = geom, scan_data, frames
         self._map_1d, self._map_2d = map_1d, map_2d
@@ -2453,6 +2470,7 @@ class FrameViewReader:
                 rows=tuple(rows),
                 axes_1d=axes_1d,
                 source_base=self._source_base,
+                artifact_family=self._artifact_family,
             )
             checkpoint()
             bundle.finish()
@@ -3505,6 +3523,7 @@ class FrameViewReader:
         self._entry = self._g1 = self._g2 = None
         self._geom = self._scan_data = self._frames = None
         self._source_base = None
+        self._artifact_family = None
         self._map_1d = self._map_2d = self._map_geom = self._map_scan_data = {}
         self._axis_1d = self._axis_2d_x = self._axis_2d_y = None
         self._two_d_kind = TwoDKind.Q_CHI

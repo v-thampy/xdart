@@ -615,6 +615,7 @@ def _payload(
         gi_mode_1d=(scalar_row.active_mode_1d or "") if gi else "",
         gi_mode_2d=(scalar_row.active_mode_2d or "") if gi else "",
         averaged=scalar_row.averaged,
+        legend_scan=getattr(getattr(scope.context, "scalar_catalog", None), "artifact_family", None) or "",
         # The current frame's other direct maps ride with its heavy view; the
         # publication was ownership-checked by ``_current_heavy`` just above.
         extra_views_2d=(

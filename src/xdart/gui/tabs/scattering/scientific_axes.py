@@ -324,9 +324,10 @@ def trace_projection(
             else frame.local_frame_label
         )
         member_label = "[averaged]" if payload.averaged else str(frame_label)
+        scan_name = payload.legend_scan or frame.source_scan
         title = (
-            f"{frame.source_scan}_{member_label}"
-            if frame.source_scan and frame.source_scan != "null_main"
+            f"{scan_name}_{member_label}"
+            if scan_name and scan_name != "null_main"
             else member_label
         )
         if selected_from_cake and payload.derived_2d:

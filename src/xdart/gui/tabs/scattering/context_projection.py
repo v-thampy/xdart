@@ -823,6 +823,7 @@ def _browse_payload(
         f"Browse · {context.scan_key} · frame {label}",
         view,
         "browse",
+        legend_scan=getattr(getattr(context, "scalar_catalog", None), "artifact_family", None) or "",
         measurement_mode=measurement,
         gi_incidence_motor=motor,
         gi_resolved_motor=motor,
