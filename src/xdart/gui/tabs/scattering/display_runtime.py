@@ -883,6 +883,26 @@ class RunDisplayState:
                 owner.records, owner.publications, labels)
             self._residency.enforce(protected=self._raw_lru)
 
+    def adopt_saved_scalar_rows(self, owner: DisplayArtifact, rows) -> None:
+        """The second fold site (E6-NORM-N1's ``retain_frame`` folds what a Run publishes): a saved output's
+        committed scalar rows (each one's ``metadata_numeric``), folded once into its owner's aggregate as Browse's
+        ``_read_context`` folds them. A Run showing a scan it did not process (an Append's already-processed scan)
+        then covers that scan's frames with a Norm Channel too (Codex N-f3f77127). An owner that already holds an
+        aggregate keeps it."""
+        with self._lock:
+            if owner.norm_aggregate is not None:
+                return
+            draft = empty_norm_aggregate((
+                self.identity.generation,
+                self.identity.fingerprint,
+                str(owner.artifact),
+                owner.source_scan,
+            ))
+            for metadata in rows:
+                draft = fold_norm_metadata(draft, metadata)
+            if draft.row_count:
+                owner.norm_aggregate = next_norm_revision(draft)
+
     def frame_norm_aggregate(
         self, key: DisplayFrameKey
     ) -> ScanNormAggregate | None:

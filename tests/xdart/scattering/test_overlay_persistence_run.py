@@ -155,3 +155,41 @@ def test_a_gi_overlay_keeps_its_curves_through_a_new_runs_first_empty_state(qapp
         assert len(view.curve.listDataItems()) == 3
     finally:
         view.close()
+
+
+def _divided(page, suffix):
+    """Each drawn curve against its own saved frame divided by that frame's own I0 (its .txt)."""
+    from pathlib import Path
+
+    from xrd_tools.io import FrameViewReader
+
+    view = page._shell.scientific
+    items = view.curve.listDataItems()
+    assert len(items) == len(view.trace_history_keys)
+    for item, frame in zip(items, view.trace_history_keys, strict=True):
+        with FrameViewReader(Path(str(frame.artifact))) as reader:
+            saved = reader.read(frame.local_frame_label)
+        i0 = {key.lower(): value for key, value in saved.metadata_numeric.items()}["i0"]
+        np.testing.assert_allclose(item.yData, np.asarray(saved.intensity_1d) / i0, rtol=1e-5)
+
+
+def test_overlay_with_a_norm_channel_keeps_every_scan_each_divided_by_its_own_i0(qapp, tmp_path):
+    """Codex N-f3f77127: a monitor-selected Overlay through scan b, the end-of-Run Browse and the next Run keeps every
+    curve, each divided by its own frame's I0, the channel never switching off while the selection spans scans."""
+    a1, a2, b1, b2, c1 = ((f"{scan}_int1d.nexus", index)
+                          for scan, index in (("a", 1), ("a", 2), ("b", 1), ("b", 2), ("c", 1)))
+    intent = _directory(tmp_path, live=True, output_mode="Append", mode="Int 1D")
+    with _page(qapp, intent) as (page, _scientific, events):
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 0.0, ("overlay", "offset")))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_NORM_CHANNEL, "i0"))
+        shown = _notices(page)
+        first = _live_run(qapp, page, events, tmp_path / "raw", [("a", 1), ("a", 2), ("b", 1), ("b", 2)], "int1d")
+        assert first == [[a1], [a1, a2], [a1, a2, b1], [a1, a2, b1, b2]]
+        assert page._last_scientific_projection.norm_channel == "i0"
+        _divided(page, "int1d")
+        _live_run(qapp, page, events, tmp_path / "raw", [("c", 1)], "int1d")
+        assert sorted(_rows(page)) == [a1, a2, b1, b2, c1]
+        assert page._last_scientific_projection.norm_channel == "i0"
+        _divided(page, "int1d")
+        assert not [text for text in shown if "new overlay" in text.lower()]

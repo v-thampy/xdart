@@ -843,9 +843,12 @@ def test_census_single_fold_sites_one_browse_pass_no_forbidden_routes():
     browse_tree = ast.parse(sources["browse_loader"])
     display_folds = _fold_calls(display_tree)
     browse_folds = _fold_calls(browse_tree)
-    assert len(display_folds) == 1
+    # A Run's publications fold in retain_frame; a saved output a Run shows
+    # without processing it folds its committed scalar rows once, as Browse's
+    # _read_context does (Codex N-f3f77127 normalization follow-up).
+    assert len(display_folds) == 2
     assert _enclosing_functions(display_tree, display_folds) == [
-        "retain_frame"
+        "retain_frame", "adopt_saved_scalar_rows",
     ]
     assert len(browse_folds) == 1
     assert _enclosing_functions(browse_tree, browse_folds) == [
@@ -866,7 +869,7 @@ def test_census_single_fold_sites_one_browse_pass_no_forbidden_routes():
                 and isinstance(node.ctx, ast.Load)
             )
         ]
-        assert len(fold_symbol_loads) == 1
+        assert len(fold_symbol_loads) == (2 if tree is display_tree else 1)
     assert "fold_norm_metadata" not in sources["run_executor"]
     assert "norm_aggregate" not in sources["run_executor"]
     assert "metadata_numeric" in sources["display_runtime"]

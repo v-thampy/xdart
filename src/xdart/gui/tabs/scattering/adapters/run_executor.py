@@ -17,6 +17,7 @@ from xdart.modules.frame_publication import (
 )
 from xrd_tools.core.scan import SourceKind, SourceReadError
 from xrd_tools.io.append import AppendRefused, saved_energy_selection
+from xrd_tools.io.frame_view import FrameViewReader
 from xrd_tools.io.metadata import MetadataSourceChanged, any_auto_sidecar
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import EnergyGridWidened, WarmIntegrators, energy_scan_grid_changes
@@ -3418,6 +3419,16 @@ class StandardRunExecutor:
                 wavelength_m=completed.wavelength_m,  # the output's own, as it was processed
             )
         run.display.bind_checkpoint_hydration(owner)
+        if newly_adopted_owner:
+            # Its own normalization record, from its committed scalar rows as Browse folds them: a Norm Channel
+            # then covers its frames in an Overlay across the Run's scans (Codex N-f3f77127).
+            try:
+                with FrameViewReader(target, resolve_source=False) as reader:
+                    catalog = reader.read_scalar_catalog()
+            except Exception:
+                logger.debug("no scalar catalog for the saved output %s", target, exc_info=True)
+            else:
+                run.display.adopt_saved_scalar_rows(owner, (row.metadata_numeric for row in catalog.rows))
         self._seed_persisted_prefix_navigation(
             run, owner, labels, newly_adopted=newly_adopted_owner, completed=len(labels))
         self._adopt_acquisition_context(run, owner, source_path=str(first.path), saved_only=True)

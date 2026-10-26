@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import os
 import threading
 
@@ -744,6 +744,25 @@ def _frame_owns_norm_identity(identity, frame: DisplayFrameKey) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class NormCoverage:
+    """The current frame's accepted aggregate and each other selected scan's own (Codex N-f3f77127): a Run's
+    Overlay across its scans normalizes while every scan's own aggregate proves the channel complete for its own
+    frames. One scan's aggregate never speaks for another's frames. Provenance (identity, revision, choices) stays
+    the current one's."""
+
+    current: ScanNormAggregate
+    others: tuple[ScanNormAggregate, ...]
+
+    @property
+    def identity(self) -> tuple:
+        return self.current.identity
+
+    @property
+    def revision(self) -> int:
+        return self.current.revision
+
+
 #: §25.3 (amended by §27): the display placeholder is a RESERVED sentinel
 #: case-insensitively.  A metadata channel canonicalizing to it is neither
 #: offered nor effective — default preferences must never silently divide.
@@ -769,6 +788,9 @@ def resolve_norm_presentation(
     case-insensitively names a complete, non-reserved channel.
     """
 
+    others: tuple[ScanNormAggregate, ...] = ()
+    if type(aggregate) is NormCoverage:
+        aggregate, others = aggregate.current, aggregate.others
     if type(aggregate) is not ScanNormAggregate:
         return None, 0, "", ("Norm Channel",)
     accepted: ScanNormAggregate = aggregate
@@ -787,21 +809,37 @@ def resolve_norm_presentation(
         ),
     )
     effective = ""
-    if (
-        type(saved_channel) is str
-        and frames
-        and all(
+    if type(saved_channel) is str and frames:
+        key = saved_channel.lower()
+
+        def complete(owner: ScanNormAggregate) -> bool:
+            return (
+                owner.revision >= 1
+                and key != _RESERVED_NORM_SENTINEL
+                and key in owner.channels
+                and not channel_is_partial(owner, key)
+            )
+
+        if all(
             _frame_owns_norm_identity(accepted.identity, frame)
             for frame in frames
-        )
-    ):
-        key = saved_channel.lower()
-        if (
-            key != _RESERVED_NORM_SENTINEL
-            and key in accepted.channels
-            and not channel_is_partial(accepted, key)
         ):
-            effective = key
+            effective = key if complete(accepted) else ""
+        elif others and complete(accepted):
+            # A selection across a Run's scans: each frame's own scan's
+            # aggregate must prove the channel; one missing fails closed.
+            owners = {owner.identity: owner for owner in (accepted, *others)}
+            if all(
+                (owner := owners.get((
+                    frame.run_identity.generation,
+                    frame.run_identity.fingerprint,
+                    str(frame.artifact),
+                    frame.source_scan,
+                ))) is not None
+                and complete(owner)
+                for frame in frames
+            ):
+                effective = key
     return accepted.identity, accepted.revision, effective, choices
 
 

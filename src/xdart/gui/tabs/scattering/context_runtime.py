@@ -49,6 +49,7 @@ from .display_values import (
 from .events import CleanupStatus, RunIdentity
 from .processed_browser import TerminalRebindAuthorization
 from .scientific_axes import (
+    NormCoverage,
     resolve_norm_presentation,
     trace_normalization_scope,
 )
@@ -142,12 +143,15 @@ class _ContextRuntime:
         self._committed_trace_selection: tuple[DisplayFrameKey, ...] = ()
         self._pending_trace_projection: _PendingTraceProjection | None = None
         self._browse_pass: _BrowseProjectionPass | None = None
-        self._norm_aggregate: ScanNormAggregate | None = None
+        self._norm_aggregate: ScanNormAggregate | NormCoverage | None = None
+        # Each other selected scan's own accepted aggregate, by identity (NormCoverage).
+        self._norm_partitions: dict[tuple, ScanNormAggregate] = {}
         self._norm_capture_scope: tuple[object, object, object] | None = None
 
     @property
-    def norm_aggregate(self) -> ScanNormAggregate | None:
-        """The one §25.3 runtime-held snapshot, borrowed per refresh."""
+    def norm_aggregate(self) -> ScanNormAggregate | NormCoverage | None:
+        """The one §25.3 runtime-held snapshot, borrowed per refresh: the current frame's aggregate, or with a
+        selection across a Run's scans, it and each other scan's own (NormCoverage)."""
         return self._norm_aggregate
 
     @property
@@ -933,6 +937,8 @@ class _ContextRuntime:
         selection = self._selection
         expected = None
         candidate = None
+        store = None
+        reads: list[tuple[object, tuple | None]] = []
         if selection is not None and selection.kind is ContextKind.BROWSE:
             browse = self._browse
             if browse is not None:
@@ -963,6 +969,7 @@ class _ContextRuntime:
                     browse.requested_path,
                 )
                 candidate = browse.norm_aggregate
+                reads = [(None, expected)]
         elif selection is not None and selection.kind in {
                 ContextKind.VIEWER_1D, ContextKind.VIEWER_2D}:
             self._norm_aggregate = None
@@ -990,27 +997,55 @@ class _ContextRuntime:
                     str(current.artifact),
                     current.source_scan,
                 )
-                try:
-                    candidate = (
-                        context.publication_store.frame_norm_aggregate(
-                            current
-                        )
+                # The current frame's scan first, then each other selected
+                # scan of this Run, each read by its own frame: a scan's
+                # aggregate speaks for its own frames only (NormCoverage).
+                reads = [(current, expected)]
+                seen = {expected}
+                for frame in self.navigation.selected:
+                    key = (
+                        identity.generation,
+                        identity.fingerprint,
+                        str(frame.artifact),
+                        frame.source_scan,
                     )
-                except Exception:
-                    candidate = None
+                    if frame.run_identity is identity and key not in seen:
+                        seen.add(key)
+                        reads.append((frame, key))
+                store = context.publication_store
         held = self._norm_aggregate
+        if type(held) is NormCoverage:
+            held = held.current
         if held is not None and (
             expected is None or held.identity != expected
         ):
             held = None
-        if (
-            expected is not None
-            and type(candidate) is ScanNormAggregate
-            and candidate.revision > 0
-            and accepts_norm_aggregate(held, candidate, expected)
-        ):
-            held = candidate
-        self._norm_aggregate = held
+        prior = {**self._norm_partitions, expected: held}
+        admitted: dict[tuple, ScanNormAggregate] = {}
+        for frame, key in reads:
+            if store is not None:
+                try:
+                    candidate = store.frame_norm_aggregate(frame)
+                except Exception:
+                    candidate = None
+            kept = prior.get(key)
+            if (
+                key is not None
+                and type(candidate) is ScanNormAggregate
+                and candidate.revision > 0
+                and accepts_norm_aggregate(kept, candidate, key)
+            ):
+                kept = candidate
+            if kept is not None:
+                admitted[key] = kept
+        held = admitted.pop(expected, None) if expected is not None else None
+        # A scan without its own accepted aggregate is left out, so its frames
+        # cannot normalize: another scan's never authorizes them.
+        self._norm_partitions = admitted if held is not None else {}
+        self._norm_aggregate = (
+            NormCoverage(held, tuple(admitted.values()))
+            if held is not None and admitted else held
+        )
 
     def project_navigation(
         self,

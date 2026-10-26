@@ -66,6 +66,7 @@ from xdart.gui.tabs.scattering.events import (
     PreflightAccepted,
     RunIdentity,
 )
+from xdart.gui.tabs.scattering.scientific_axes import NormCoverage, resolve_norm_presentation
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_projection import (
     ScientificPreferences,
@@ -965,7 +966,10 @@ def test_acquisition_rescope_refusal_keeps_the_owned_acquisition_hold():
     assert state.norm_channel == "mon"
 
 
-def test_same_channel_foreign_artifact_cannot_cross_and_span_falls_back():
+def test_each_scan_of_a_selection_normalizes_by_its_own_aggregate_and_none_crosses():
+    """A selection across a Run's scans normalizes while every scan's own aggregate proves the channel, each frame by
+    its own row (Codex N-f3f77127, canonical_grid_overlay.md acceptance 3: an Overlay across scans keeps its
+    normalization); one scan's aggregate never authorizes another's frames."""
     parts = _acquisition_parts([(1, 1.0, {"mon": 2.0})], partitions=2)
     owner_b = _add_artifact(parts.display, "/out/b.nxs", "run.b")
     _, delta_b = _retain(
@@ -1002,36 +1006,44 @@ def test_same_channel_foreign_artifact_cannot_cross_and_span_falls_back():
     )
     frames = parts.runtime.navigation.frames
     prefs = _prefs(plot_mode="Overlay", norm_channel="mon")
-    # Same-identity selection with the foreign frame as the CURRENT anchor:
-    # the captured aggregate is the current frame's, the selected set is
-    # foreign to it, and the same channel key buys no division.
+    # The foreign frame as the CURRENT anchor, the other scan's frames
+    # selected: the captured aggregate is the current frame's, with that
+    # scan's own beside it, and each frame divides by its own row.
     assert parts.runtime.select_navigation(frames[2], frames[:2])
     payloads = _project(parts, prefs)
     captured = parts.runtime.norm_aggregate
-    assert captured is not None
+    assert type(captured) is NormCoverage
     assert captured.identity == (
         parts.identity.generation,
         parts.identity.fingerprint,
         "/out/b.nxs",
         "run.b",
     )
+    assert [other.identity for other in captured.others] == [(
+        parts.identity.generation, parts.identity.fingerprint,
+        ARTIFACT, SCAN,
+    )]
     state = _build(payloads, parts.runtime.navigation, prefs, captured)
-    assert state.norm_channel == PLACEHOLDER
+    assert state.norm_channel == "mon"
     values = _trace_by_label(state)
-    np.testing.assert_array_equal(values[1], np.array([1.0, 2.0]))
-    np.testing.assert_array_equal(values[2], np.array([2.0, 3.0]))
-    # A multi-artifact selected set is the same global fallback.
+    np.testing.assert_allclose(values[1], np.array([1.0, 2.0]) / 2.0)
+    np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 4.0)
+    # Without its own scan's aggregate, the current one buys no division.
+    assert resolve_norm_presentation(
+        NormCoverage(captured.current, ()), "mon", frames[:2],
+    )[2] == ""
+    # A selection over both scans: each by its own.
     assert parts.runtime.select_navigation(frames[2], frames)
     payloads = _project(parts, prefs)
     state = _build(
         payloads, parts.runtime.navigation, prefs,
         parts.runtime.norm_aggregate,
     )
-    assert state.norm_channel == PLACEHOLDER
+    assert state.norm_channel == "mon"
     values = _trace_by_label(state)
-    np.testing.assert_array_equal(values[1], np.array([1.0, 2.0]))
-    np.testing.assert_array_equal(values[2], np.array([2.0, 3.0]))
-    np.testing.assert_array_equal(values[9], np.array([5.0, 6.0]))
+    np.testing.assert_allclose(values[1], np.array([1.0, 2.0]) / 2.0)
+    np.testing.assert_allclose(values[2], np.array([2.0, 3.0]) / 4.0)
+    np.testing.assert_allclose(values[9], np.array([5.0, 6.0]) / 8.0)
     # An exact same-identity selection normalizes by each payload's OWN row.
     assert parts.runtime.select_navigation(frames[1], frames[:2])
     payloads = _project(parts, prefs)
