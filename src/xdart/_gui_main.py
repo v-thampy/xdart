@@ -391,6 +391,11 @@ class _StatusBarPresenter:
         self._window.statusBar().showMessage(text, timeout_ms)
 
 
+#: Closing waits at most this long for a page or tool whose cleanup stays pending, then closes anyway (maintainer's
+#: pick 2026-10-26, "Add the time limit": closing xdart had retried a failed Run's cleanup until it was killed).
+_CLOSE_PENDING_LIMIT_S = 10.0
+
+
 class Main(QMainWindow):
     def __init__(
         self,
@@ -408,6 +413,11 @@ class Main(QMainWindow):
         self._menus_initialized = False
         self._close_retry_scheduled = False
         self._process_exit_requested = False
+        # Since when closing has found a page or tool cleanup pending (closeEvent's _CLOSE_PENDING_LIMIT_S), and
+        # whether this window's close ends the process once it outlasts that (the real app's, set by run()).
+        self._close_pending_since = None
+        self._ends_process = False
+        self._close_accepted = False  # a retry scheduled before the window closed does nothing after
         self._tool_handles = {}
         self._tool_actions = {}
         self._page_handles = {}
@@ -1272,21 +1282,41 @@ class Main(QMainWindow):
 
     def closeEvent(self, event):
         receipts = self._close_page_and_tools()
-        if any(receipt.status is PageCleanup.PENDING for receipt in receipts):
-            event.ignore()
-            if not self._close_retry_scheduled:
-                self._close_retry_scheduled = True
-                QtCore.QTimer.singleShot(50, self._retry_close)
-            return
+        pending = [receipt for receipt in receipts if receipt.status is PageCleanup.PENDING]
+        if pending:
+            now = time.monotonic()
+            if self._close_pending_since is None:
+                self._close_pending_since = now
+            if now - self._close_pending_since < _CLOSE_PENDING_LIMIT_S:
+                event.ignore()
+                self._close_accepted = False
+                if not self._close_retry_scheduled:
+                    self._close_retry_scheduled = True
+                    QtCore.QTimer.singleShot(50, self._retry_close)
+                return
+            logger.warning("Closing although cleanup is still pending after %.0f s: %s", _CLOSE_PENDING_LIMIT_S,
+                           "; ".join(str(receipt.detail) for receipt in pending))
         self._close_retry_scheduled = False
+        self._close_pending_since = None
+        self._close_accepted = True
         self._help_owner.shutdown()
         event.accept()
-        if self._process_exit_requested:
+        if pending and self._ends_process:
+            QtCore.QTimer.singleShot(0, self._end_process)
+        elif self._process_exit_requested:
             QtCore.QTimer.singleShot(0, self._terminate_process)
+
+    @staticmethod
+    def _end_process():
+        """Quitting outlasted a pending cleanup: what it still holds could keep a normal exit waiting (a file on a
+        share, a thread), so the logs are flushed and the process ends now."""
+        logging.shutdown()
+        os._exit(0)
 
     def _retry_close(self):
         self._close_retry_scheduled = False
-        self.close()
+        if not self._close_accepted:
+            self.close()
 
     def _terminate_process(self):
         gc.collect()
@@ -1409,7 +1439,7 @@ def run():
     # never as an import-time side effect (importing this module must not hijack
     # the process-global sys.excepthook for tests / headless / embedding hosts).
     sys.excepthook = _xdart_excepthook
-    _start_gui(app)
+    _start_gui(app)._ends_process = True  # only the real app ends its process at the close time limit
     app.exec()
 
 

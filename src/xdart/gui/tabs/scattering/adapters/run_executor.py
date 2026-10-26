@@ -39,6 +39,7 @@ from xrd_tools.integrate.calibration import (
 from xrd_tools.session import Light1DLeaseState
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.io.output_transaction import (
+    LeaseUnavailable,
     StreamTerminal,
     stream_terminal_object_revision,
 )
@@ -178,10 +179,14 @@ def _plain_append_reason(reason: str) -> str:
 
 
 def _scan_failure_reason(error: BaseException) -> str:
-    """The reason a scan skipped for one of its own failures (_SCAN_FAILURES) gives in the log and at the Run's end."""
+    """The reason a scan skipped for one of its own failures (_SCAN_FAILURES, or its construction's) gives in the log
+    and at the Run's end."""
     if isinstance(error, MetadataColumnsAbsent):
         return (f"its saved metadata has no {', '.join(error.columns)} column, which its new frames carry (an output "
                 "written by an earlier xdart); Replace reprocesses it")
+    if isinstance(error, LeaseUnavailable):  # as a Run given up on (give_up) holds its unfinished output
+        return ("it is still held by another Run or operation of this xdart; if a Run's cleanup could not finish, "
+                "restart xdart to write it again")
     return f"{type(error).__name__}: {error}"
 
 
@@ -1102,6 +1107,8 @@ class StandardRunExecutor:
         self._lock = Lock()
         self._events: SimpleQueue[StandardRunEvent] = SimpleQueue()
         self._active: _StandardRun | None = None
+        # Failed Runs whose cleanup was given up (give_up): kept, with what they still hold, until xdart exits.
+        self._given_up: list[_StandardRun] = []
         self._admission: _AdmissionOperation | None = None
         self._retirement: DisplayRetirementOwner | None = None
         self._max_display_items = max_display_items
@@ -1392,7 +1399,32 @@ class StandardRunExecutor:
             raise RuntimeError("acquisition context is not ready")
         runtime.resume(run.session)
 
+    def give_up(self, run_identity: RunIdentity) -> tuple[str, ...] | None:
+        """Stop waiting for the cleanup of a failed Run that keeps failing (the page's time limit; maintainer's pick
+        2026-10-26, "Add the time limit"): it leaves the executor, so a new Run can start, and what it still holds
+        stays held, as the failure left it, until xdart exits (a later Run skips such an output: LeaseUnavailable). The
+        outputs it still holds; None when it is not this executor's Run, has closed, or a thread still runs for it."""
+        with self._lock:
+            run = self._active
+            worker = None if run is None else run.worker
+            if (run is None or run.identity is not run_identity or run.closed
+                    or (worker is not None and worker.is_alive())):
+                return None
+            self._active = None
+            self._given_up.append(run)
+            # As a closed Run's owner does, this one proves the next admission retired its display (close answers).
+            self._retirement = DisplayRetirementOwner(run_identity, lambda: self.close(run_identity))
+        held = () if run.output is None or run.artifact is None else (str(run.artifact),)
+        logger.warning("[RUN-CLEANUP] gave up the failed Run's cleanup; held=%s failures=%s", held,
+                       tuple(f"{failure.operation}: {failure.message}" for failure in run.cleanup_failures[-3:]))
+        return held
+
     def close(self, run_identity: RunIdentity, *, background: bool = False) -> ExecutorClosed:
+        with self._lock:
+            given_up = next((run for run in self._given_up if run.identity is run_identity), None)
+        if given_up is not None:  # nothing more to close here: what it holds stays held until xdart exits
+            return ExecutorClosed(run_identity, CleanupStatus.CLEANED, given_up.primary,
+                                  tuple(given_up.cleanup_failures))
         with self._lock:
             owner = self._retirement
             active = self._active
@@ -1836,7 +1868,7 @@ class StandardRunExecutor:
         other scans still run (maintainer, 2026-10-24: "if something fails, a live run or a directory run shouldn't
         stop. That scan/frame should be logged and skipped and the remaining scan processing should continue").
         ``error`` may already be its reason."""
-        reason = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        reason = error if isinstance(error, str) else _scan_failure_reason(error)
         run.append_skips.append((str(target), "scan", reason))
         log_events.event(logger, logging.WARNING, "%s skipped: it could not be processed; frames already saved are "
                          "kept, and the other scans continue. Details: %s [SCAN-SKIPPED]", Path(target).name, reason)
@@ -2694,7 +2726,7 @@ class StandardRunExecutor:
             )
             try:
                 self._construct(run, item=item, labels=decision.labels, decision=decision)
-            except ValueError as error:  # a directory Run's scan (GI admits them all first): skipped, the rest run
+            except (ValueError, LeaseUnavailable) as error:  # a directory Run's scan (GI admits all first): skipped
                 if not run.files_discovered or isinstance(error, SourceRevisionChanged):  # its admitted files changed
                     raise
                 self._skip_failed_directory_scan(run, item.target, error, constructed=False)
@@ -3155,7 +3187,7 @@ class StandardRunExecutor:
                     )
                     publish(force=True)
                     continue
-                except (ValueError, OSError) as error:
+                except (ValueError, OSError, LeaseUnavailable) as error:
                     if isinstance(error, SourceRevisionChanged):
                         retry_revisions[target_key] = revision  # its files changed while it was read: again
                         continue
@@ -3168,7 +3200,7 @@ class StandardRunExecutor:
                         "live_refused", target=group.target.name, constructed=constructing,
                         owned=owned, reason=str(error))
                     self._skip_live_append(run, group.target, target_key, None, constructed=constructing,
-                                           reason=f"{type(error).__name__}: {error}", failed=True)
+                                           reason=_scan_failure_reason(error), failed=True)
                     skipped_paths.update(
                         path for path in group.physical_paths
                         if path not in processed_paths
@@ -3546,7 +3578,7 @@ class StandardRunExecutor:
                     run.rebuild_widened = True
                     self._construct(run, item=item, labels=decision.labels, decision=decision,
                                     remaining_frames=remaining_frames)
-            except ValueError as error:  # (an OSError: its output cannot be written, and the Run fails)
+            except (ValueError, LeaseUnavailable) as error:  # (an OSError: its output cannot be written: Run fails)
                 if isinstance(error, SourceRevisionChanged):  # its files changed while they were read: once more
                     if output_index not in retried:
                         retried.add(output_index)

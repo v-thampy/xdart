@@ -617,3 +617,42 @@ def test_absent_activity_allows_check_only_but_blocks_update_on_exit(qapp, tmp_p
         assert window._run_active(require_known=True) is True
     finally:
         window.close()
+
+
+@pytest.mark.parametrize("real_app", [False, True])
+def test_closing_waits_at_most_the_limit_for_a_cleanup_that_stays_pending(qapp, tmp_path, monkeypatch, real_app):
+    """Maintainer's pick 2026-10-26, "Add the time limit": closing xdart had retried a failed Run's cleanup until it
+    was killed. Past the limit the window closes; the real app's process ends (Main._end_process), a test window's
+    never does."""
+    import time
+
+    from pyqtgraph.Qt import QtCore
+
+    from xdart import _gui_main
+
+    monkeypatch.setenv("XDART_SETTINGS_FILE", str(tmp_path / "settings.ini"))
+    monkeypatch.setattr(_gui_main, "_CLOSE_PENDING_LIMIT_S", 0.3, raising=False)
+    ended = []
+    monkeypatch.setattr(_gui_main.Main, "_end_process", staticmethod(lambda: ended.append(True)), raising=False)
+    calls = []
+    page = _descriptor("stuck-page", [], calls=calls, receipts=[CloseReceipt(PageCleanup.PENDING, "worker")])
+    window = _gui_main.Main(page_descriptors=(page,), host_services=_services([]))
+    window._ends_process = real_app
+    try:
+        first = QtGui.QCloseEvent()
+        window.closeEvent(first)
+        assert not first.isAccepted()
+        time.sleep(0.35)
+        second = QtGui.QCloseEvent()
+        window.closeEvent(second)
+        assert second.isAccepted() and [call[0] for call in calls] == ["close", "close"]
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and ended != [True] * real_app:
+            QtCore.QCoreApplication.processEvents()
+        assert ended == [True] * real_app
+        deadline = time.monotonic() + 0.3  # the retry the first attempt scheduled fires: the closed window does nothing
+        while time.monotonic() < deadline:
+            QtCore.QCoreApplication.processEvents()
+        assert [call[0] for call in calls] == ["close", "close"] and ended == [True] * real_app
+    finally:  # the session's teardown closes this window again: it must never end the test process
+        window._ends_process = False

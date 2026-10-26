@@ -274,8 +274,10 @@ _NEXUS_ONLY_PERFORMANCE_KEYS = (
 )
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _DEFERRED_DELETE_RETRY_INTERVAL_MS = 25
-# A failed Run whose cleanup was still pending at its end is closed again this often (_settle_failed_cleanup).
+# A failed Run whose cleanup was still pending at its end is closed again this often (_settle_failed_cleanup), and
+# given up once its retries have failed this long (_give_up_failed_cleanup).
 _FAILED_CLEANUP_RETRY_S = 1.0
+_FAILED_CLEANUP_GIVE_UP_S = 10.0
 # A Run's end waits for the view to draw the frames it selected but had not drawn (_hold_terminal_for_paint): it goes
 # on once all are drawn or refused, once a second passes in which none was drawn, or after the ceiling.
 _TERMINAL_PAINT_STALL_S = 1.0
@@ -752,8 +754,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         # Live Auto's one question whether its Run expects metadata sidecars (_sync_metadata_question).
         self._metadata_question_dialog = None
         self._metadata_question_shown_for = None
-        # When the drain last retried a failed Run's pending cleanup (_settle_failed_cleanup).
+        # When the drain last retried a failed Run's pending cleanup (_settle_failed_cleanup), and since when (with
+        # that Run's identity) its retries have failed.
         self._failed_cleanup_retried_at = float("-inf")
+        self._failed_cleanup_since: tuple[RunIdentity, float] | None = None
         # A Run's end held while the view draws the frames it fell behind on (_hold_terminal_for_paint): the held
         # events, the frames still undrawn, when the hold began and when a frame was last drawn; and the end released.
         self._terminal_hold: tuple[tuple[StandardRunEvent, ...], int, float, float] | None = None
@@ -3990,11 +3994,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return (self._lifecycle.phase is RunPhase.FAILED and not self._lifecycle.reset_permitted
                 and self._lifecycle.attempt_run_identity is not None)
 
-    def _settle_failed_cleanup(self) -> bool:
+    def _settle_failed_cleanup(self) -> bool | str:
         """A failed Run whose cleanup was still pending at its end: close it again, and once that is clean the page can
         reset; True when its owners closed now (beamline 2026-10-26: after a Live Run failed, Run and the browser's
-        scans stayed locked on "Standard cleanup remains pending", with nothing to retry it). The drain retries it
-        about once a second (_FAILED_CLEANUP_RETRY_S), and Run once more."""
+        scans stayed locked on "Standard cleanup remains pending", with nothing to retry it), or the notice when it was
+        given up (_give_up_failed_cleanup). The drain retries it about once a second (_FAILED_CLEANUP_RETRY_S), and Run
+        once more."""
         identity, executor, pipeline = self._lifecycle.attempt_run_identity, self._run_executor, self._pipeline
         if not self._failed_cleanup_pending() or executor is None or pipeline is None:
             return False
@@ -4004,10 +4009,34 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         except Exception as error:
             self._error_notice("Standard cleanup failed", error)
             return False
+        given_up = None
         if not executor_closed_is_valid(receipt, identity) or receipt.cleanup_status is not CleanupStatus.CLEANED:
-            return False
+            given_up = self._give_up_failed_cleanup(identity, executor)
+            if given_up is None:
+                return False
+        self._failed_cleanup_since = None
         pipeline.owners_closed(OwnersClosed(identity))
-        return self._lifecycle.reset_permitted
+        if given_up is not None:
+            _LOG.warning("%s [RUN-CLEANUP]", given_up)
+        return (given_up or True) if self._lifecycle.reset_permitted else False
+
+    def _give_up_failed_cleanup(self, identity: RunIdentity, executor) -> str | None:
+        """Once a failed Run's cleanup retries have failed for _FAILED_CLEANUP_GIVE_UP_S, the executor gives it up, so
+        Run and the scans unlock, and the notice names the outputs it still holds (maintainer's pick 2026-10-26, "Add
+        the time limit"); None until then, or while the executor keeps it (a thread still runs for it)."""
+        now, since = time.monotonic(), self._failed_cleanup_since
+        if since is None or since[0] is not identity:
+            self._failed_cleanup_since = (identity, now)
+            return None
+        give_up = getattr(executor, "give_up", None)
+        held = None if now - since[1] < _FAILED_CLEANUP_GIVE_UP_S or give_up is None else give_up(identity)
+        if held is None:
+            return None
+        lead = f"Run unlocked: the failed Run's cleanup did not finish in {_FAILED_CLEANUP_GIVE_UP_S:.0f} s"
+        if not held:
+            return f"{lead}; if a later Run cannot write one of its outputs, restart xdart."
+        return (f"{lead}. {', '.join(Path(path).name for path in held)} stays as the failure left it (Replace rebuilds "
+                "it); until xdart restarts, a new Run skips it.")
 
     def _begin_admission(self, capture: StartCapture) -> None:
         pipeline = self._pipeline
@@ -5006,8 +5035,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._sync_metadata_question(executor)
             if (self._failed_cleanup_pending()
                     and time.monotonic() - self._failed_cleanup_retried_at >= _FAILED_CLEANUP_RETRY_S
-                    and self._settle_failed_cleanup()):
-                self._notice("Standard cleanup finished.")
+                    and (settled := self._settle_failed_cleanup())):
+                self._notice("Standard cleanup finished." if settled is True else settled)
                 changed = True
             if type(candidate) is tuple:
                 events = candidate
