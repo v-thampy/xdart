@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Lock, Thread, current_thread, get_ident
-from time import monotonic
+from time import monotonic, time as wall_time
 from typing import Any, Callable, Mapping
 import numpy as np
 from xdart.utils import log_events
@@ -870,6 +870,21 @@ def _candidate_file_owners(
                     f"{path}"
                 )
     return owners
+
+
+def _receipt_with_entry(receipt: AdmissionReceipt, deferred: DeferredDirectoryPlan, original, replacement):
+    """``receipt`` with its directory plan holding ``replacement`` (``original`` without frames it left out) in
+    ``original``'s place, and its candidates without them: the receipt materialize_deferred_output admits it from, every
+    other output still its target."""
+    dropped = {value.path for value in original.candidates} - {value.path for value in replacement.candidates}
+    plan = deferred.candidates
+    kept = [(value, descriptor) for value, descriptor in zip(plan.candidates, plan.descriptors)
+            if value.path not in dropped]
+    return replace(receipt, deferred_directory=replace(
+        deferred,
+        candidates=replace(plan, candidates=tuple(value for value, _ in kept),
+                           descriptors=tuple(descriptor for _, descriptor in kept)),
+        entries=tuple(replacement if value is original else value for value in deferred.entries)))
 
 
 def _remaining_tiff_candidates(deferred: DeferredDirectoryPlan, start_index: int) -> int:
@@ -3129,6 +3144,58 @@ class StandardRunExecutor:
             run.stop_signal.wait(_LIVE_DIRECTORY_POLL_S)
         return True
 
+    def _without_unsidecarred(self, run: _StandardRun, entry: DeferredDirectoryEntry,
+                              sidecar_format: str) -> DeferredDirectoryEntry | None:
+        """A directory Run's scan without its new frames that have no sidecar of their own (maintainer, 2026-10-26:
+        "If I have chosen txt as the metadata type, then any frame without the txt sidecar should be skipped"; "The
+        only time the 150s wait should come in is when the frame in question is the last or only frame to be processed
+        in a directory or series"; his pick "Only if recent": the last frame waits for its sidecar only while its image
+        is under the sidecar limit old, so reprocessing old data never waits). Each frame left out is logged, counted
+        skipped and listed at the Run's end; the frames its output already holds are never left out. None when no new
+        frame keeps a sidecar; the entry itself when none is missing."""
+        from xrd_tools.io.metadata import live_sidecar_observation
+
+        candidates = entry.candidates
+        if not all(Path(value.path).suffix.lower() in {".tif", ".tiff"} for value in candidates):
+            return entry  # a container's own metadata: sidecars are an image policy
+        committed = getattr(entry, "committed_prefix", None)
+        start = 0 if committed is None else len(committed.stamp.members)
+        limit = _METADATA_WAIT_LIMIT_S["sidecar"]
+
+        def missing() -> set[int]:
+            listings: dict = {}
+            return {index for index in range(start, len(candidates))
+                    if not live_sidecar_observation(candidates[index].path, sidecar_format, listings=listings)}
+
+        absent = missing()
+        last = len(candidates) - 1
+        written = int(getattr(candidates[last], "mtime_ns", 0) or 0) / 1e9
+        if last in absent and wall_time() - written < limit:
+            log_events.event(logger, logging.INFO, "%s is waiting for the metadata of %s [SCAN]",
+                             Path(entry.target).name, Path(candidates[last].path).name)
+            while last in absent and wall_time() - written < limit and not run.stop_requested:
+                run.stop_signal.wait(0.5)
+                absent = missing()
+        if not absent:
+            return entry
+        name = Path(entry.target).name
+        for index in sorted(absent):
+            image = Path(candidates[index].path).name
+            run.metadata_left_out.append(f"{image} ({name})")
+            log_events.event(logger, logging.WARNING, "%s: %s is left out; it has no metadata sidecar of its own "
+                             "[SCAN]", name, image)
+        left_out = {Path(candidates[index].path) for index in absent}
+        run.files_skipped += len(absent)
+        kept = tuple(value for index, value in enumerate(candidates) if index not in absent)
+        if len(kept) <= start:
+            return None
+        return replace(
+            entry, candidates=kept,
+            physical_paths=tuple(path for path in entry.physical_paths if Path(path) not in left_out),
+            protected_states=tuple(state for state in entry.protected_states if Path(state.path) not in left_out),
+            _protected_topology=tuple(value for value in entry._protected_topology
+                                      if Path(value.followed_state.path) not in left_out))
+
     def _execute_deferred_directory(
         self,
         run: _StandardRun,
@@ -3163,6 +3230,13 @@ class StandardRunExecutor:
             **_directory_event_fields(run),
         ))
         stopped = False
+        # The Run's sidecar type, for every folder (maintainer, 2026-10-26, as for Live): an explicit sidecar format,
+        # or under Auto the first one this listing holds; a frame without its own is left out (_without_unsidecarred).
+        sidecar_format = live_metadata_format(run.configuration.thaw_source_spec())
+        if sidecar_format == "auto":
+            sidecar_format = auto_sidecar_format(path for value in deferred.entries for path in value.physical_paths)
+        elif sidecar_format == "spec":
+            sidecar_format = None
         # An entry whose files changed while they were read (a scan still being written) is taken once more; the
         # files it had claimed stay claimed.
         retried: set[int] = set()
@@ -3192,6 +3266,13 @@ class StandardRunExecutor:
                     if stopped:
                         break
                     continue
+                admitted_by = receipt
+                if sidecar_format is not None:
+                    filtered = self._without_unsidecarred(run, entry, sidecar_format)
+                    if filtered is None:  # nothing new left of it that has its own sidecar
+                        continue
+                    if filtered is not entry:
+                        admitted_by, entry = _receipt_with_entry(receipt, deferred, entry, filtered), filtered
                 # A scan that grew keeps the frames its output holds as their record says: only the frames after
                 # them are probed, read and proved (once, here), as a Live Run's published prefix is.
                 committed, proofs, recheck = getattr(entry, "committed_prefix", None), [], None  # (doubles: none)
@@ -3229,7 +3310,7 @@ class StandardRunExecutor:
                         return proofs[-1].holds(cancelled=lambda: run.stop_requested)
                 decision, _ready_files, skipped_files = (
                     materialize_deferred_output(
-                        receipt,
+                        admitted_by,
                         session,
                         entry,
                         cancelled=lambda: run.stop_requested,
