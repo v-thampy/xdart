@@ -1967,7 +1967,10 @@ def resolve_stack_compression(default: "str | None" = "lz4") -> "str | None":
         global _lz4_default_warned
         if not _lz4_default_warned:
             _lz4_default_warned = True
-            logger.warning(
+            # The default, documented in docs/INSTALLATION.md ("Reading compressed output"): a debug line, not a
+            # warning at each session's first write (maintainer, 2026-10-26: "i think this warning can be suppressed
+            # as well. i think this dependency is there in the readme and doesn't need to be repeated every run").
+            logger.debug(
                 "integrated stacks are lz4-compressed (fast; reader needs "
                 "hdf5plugin, a base dep of xrd-tools).  Reading them OUTSIDE "
                 "xrd-tools requires hdf5plugin; set XDART_INTEGRATED_COMPRESSION="

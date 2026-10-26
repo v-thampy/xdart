@@ -1527,3 +1527,22 @@ class TestRequireUniformAxesGuard:
         with h5py.File(tmp_path / "frozen.h5", "r") as f:
             assert list(f["entry/integrated_1d/frame_index"][()]) == [0, 1]
             assert list(f["entry/integrated_2d/frame_index"][()]) == [0, 1]
+
+
+def test_the_lz4_default_is_a_debug_line_not_a_warning(monkeypatch, caplog):
+    """The default compression is documented (docs/INSTALLATION.md, "Reading compressed output"); its note is a debug
+    line once per process (maintainer, 2026-10-26: "i think this warning can be suppressed as well"), while the
+    unusual choices (disabled, lz4 unavailable, an unknown value) still warn."""
+    import logging
+
+    monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: False)
+    monkeypatch.setattr(_nexus_io, "_lz4_default_warned", False)
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "lz4")
+    caplog.set_level(logging.DEBUG, logger=_nexus_io.__name__)
+    assert resolve_stack_compression() == "lz4"
+    told = [(record.levelno, record.getMessage()) for record in caplog.records if "lz4-compressed" in record.getMessage()]
+    assert [level for level, _message in told] == [logging.DEBUG], told
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "none")
+    caplog.clear()
+    assert resolve_stack_compression() is None
+    assert any(record.levelno == logging.WARNING and "DISABLED" in record.getMessage() for record in caplog.records)
