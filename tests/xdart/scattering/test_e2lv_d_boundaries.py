@@ -320,7 +320,9 @@ def test_failed_b_cannot_overwrite_cleanly_retired_a(
         assert controller.acquisition_context is None
 
         terminal = page.close_workspace()
-        assert executor.close_calls == [first, second]
+        # A is closed once, before B starts. B is closed by the pipeline when it failed to start, and again by the
+        # page settling the cleanup that left pending (703753b1: a failed Run's page no longer stays locked).
+        assert executor.close_calls[0] == first and set(executor.close_calls[1:]) == {second}
         assert terminal.cleanup_status is CleanupStatus.CLEANED
         assert terminal.cleanup_identity is second
         assert lifecycle.phase.value == "closed"

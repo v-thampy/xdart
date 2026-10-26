@@ -244,7 +244,9 @@ def test_where_the_controls_fill_the_column_the_log_opens_small_and_drags_taller
     """No free space (this window): the log opens a few lines tall and the controls keep the rest, Hide log under the
     log. The handle drags the log taller; hidden and shown again, it keeps the dragged height. A projection rebuild or
     Stitch's/RSM's run lock leaves the button, its state and its wiring."""
-    shell = _shell(qapp, height=1080)
+    # The controls fill the column, now that the Show log row is not among them (hosted run 40298084144: at 1080 the
+    # column had 3 px to spare).
+    shell = _shell(qapp, height=1000)
     try:
         controls, panel, run_bar, scroll = shell.controls, shell.log_panel, shell.run_controls, shell.control_scroll
         assert panel.isVisible() and panel.toggle.isChecked()  # shown at start
