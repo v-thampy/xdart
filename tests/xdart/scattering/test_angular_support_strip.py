@@ -119,7 +119,9 @@ def test_d1_option_and_real_int_run(qapp, tmp_path, mode, unit):
         _run(qapp, page, observed)
         _browsing(qapp, page)
         _enable(qapp, view)
-        _wait(qapp, lambda: bool(_curves(view)))
+        # Browse's Int 2D curve is a saved cake cut, its own asynchronous slice: the strip can paint first
+        # (hosted run 40289672559: strip {'escan_2'}, traces empty).
+        _wait(qapp, lambda: bool(_curves(view)) and bool(page._last_scientific_projection.traces))
         assert view.angular_support_plot.isVisible()
         curves = _curves(view)
         traces = page._last_scientific_projection.traces
