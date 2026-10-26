@@ -126,9 +126,11 @@ def test_the_held_output_is_left_as_an_unfinished_append_that_names_replace(tmp_
     later = []
     try:
         _frame(written, "old", 3, "txt", 3.0)
-        _wait(again, later, lambda values: any("use Replace" in record.getMessage() for record in caplog.records)
+        _wait(again, later, lambda values: any("[APPEND-SKIPPED]" in record.getMessage() for record in caplog.records)
               or any(e.kind in _TERMINAL for e in values), 30.)
     finally:
         _stop(again, second, later)
-    assert any("old_int1d.nexus" in record.getMessage() and "use Replace" in record.getMessage()
+    # Said plainly since 1bc424d2: "... an earlier Append of it did not finish; ... (Replace reprocesses it)."
+    assert any("old_int1d.nexus" in record.getMessage() and "an earlier Append of it did not finish" in
+               record.getMessage() and "Replace reprocesses it" in record.getMessage()
                for record in caplog.records), [record.getMessage() for record in caplog.records][-8:]
