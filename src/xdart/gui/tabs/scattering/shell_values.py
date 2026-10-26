@@ -981,19 +981,18 @@ class DirectoryFileProgress:
             raise ValueError("directory file progress is invalid")
 
     def text(self, state: str, *, watching: bool = False) -> str:
-        """The Run's status. ``watching``: a running Live Run, which says so once it has processed all it found
-        (maintainer, 2026-10-26: "make it clear in the status when all scans/frames have been processed in a live run
-        with a brief message implying that xdart is waiting for new frames", his pick "Lead with it")."""
+        """The Run's status, compact: processed of discovered, and skipped only when some were (maintainer,
+        2026-10-26: "this status is very long and can be shrunk. maybe remove "up to date"", his pick "Fraction":
+        "Running · 40/65 processed (10 new) · 2 skipped"; "yes for the total visible in all states to make it look
+        the same"). ``watching``: a running Live Run, which leads with "Waiting for new images" once it has processed
+        all it found (his pick "Lead with it")."""
+        skipped = f" · {self.skipped} skipped" if self.skipped else ""
+        new = new_frames_note(self.new)
+        counts = (f"{self.processed}/{self.discovered} processed" if self.discovered
+                  else f"{self.processed} processed")
         if watching and not self.pending:
-            return (
-                f"{state} · Up to date, waiting for new images · {self.processed} processed"
-                f"{new_frames_note(self.new)} · {self.skipped} skipped · {self.discovered} discovered"
-            )
-        return (
-            f"{state} · {self.processed} processed{new_frames_note(self.new)} · "
-            f"{self.skipped} skipped · {self.pending} pending · "
-            f"{self.discovered} discovered"
-        )
+            return f"{state} · Waiting for new images · {counts}{new}{skipped}"
+        return f"{state} · {counts}{new}{skipped}"
 
 
 @dataclass(frozen=True, slots=True)

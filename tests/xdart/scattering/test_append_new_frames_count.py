@@ -38,7 +38,7 @@ def test_an_append_run_counts_the_frames_it_saved_apart_from_those_its_outputs_h
     first = _terminal(intent, 9901)
     assert (first.files_processed, first.frames_new) == (3, 3)
     assert "3 files processed (3 new), 0 skipped" in _end_of_run(caplog)
-    assert _directory_file_progress(first).text("Complete").startswith("Complete · 3 processed (3 new) · ")
+    assert _directory_file_progress(first).text("Complete") == "Complete · 3/3 processed (3 new)"
 
     _frame(raw, "grow", 4, "txt", 4.0)
     grown = _terminal(intent, 9902)

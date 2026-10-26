@@ -1,7 +1,9 @@
 """A running Live Run that has processed everything it found says so (maintainer, 2026-10-26: "make it clear in the
 status when all scans/frames have been processed in a live run with a brief message implying that xdart is waiting for
-new frames", his pick "Lead with it": "Running · Up to date, waiting for new images · 561 processed (561 new) · 0
-skipped · 561 discovered"). The real page, executor and Live Run over real TIFF + .txt files."""
+new frames", his pick "Lead with it"), compacted the same day ("this status is very long and can be shrunk. maybe
+remove "up to date"", his pick "Fraction", keeping the new-frame count, and "yes for the total visible in all
+states"): "Running · Waiting for new images · 561/561 processed (561 new)". The real page, executor and Live Run over
+real TIFF + .txt files."""
 from __future__ import annotations
 
 import pytest
@@ -16,15 +18,17 @@ from xdart.gui.tabs.scattering.shell_values import DirectoryFileProgress
 from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
 
-UP_TO_DATE = "Up to date, waiting for new images"
+UP_TO_DATE = "Waiting for new images"
 
 
-def test_the_status_leads_with_up_to_date_only_while_a_running_live_run_has_nothing_pending():
-    caught_up, behind = DirectoryFileProgress(561, 0, 0, 561, 561), DirectoryFileProgress(537, 0, 24, 561, 537)
+def test_the_status_leads_with_waiting_only_while_a_running_live_run_has_nothing_pending():
+    caught_up, behind = DirectoryFileProgress(561, 0, 0, 561, 561), DirectoryFileProgress(537, 2, 22, 561, 537)
     assert caught_up.text("Running", watching=True) == (
-        "Running · Up to date, waiting for new images · 561 processed (561 new) · 0 skipped · 561 discovered")
-    assert behind.text("Running", watching=True) == behind.text("Running")
+        "Running · Waiting for new images · 561/561 processed (561 new)")
+    assert behind.text("Running", watching=True) == behind.text("Running") == (
+        "Running · 537/561 processed (537 new) · 2 skipped")  # skipped only when some were
     assert UP_TO_DATE not in caught_up.text("Paused")  # only a running Live Run watches
+    assert caught_up.text("Paused") == "Paused · 561/561 processed (561 new)"
 
 
 def test_a_live_run_that_processed_all_it_found_says_it_waits_for_new_images(qapp, tmp_path):  # noqa: F811
@@ -40,14 +44,13 @@ def test_a_live_run_that_processed_all_it_found_says_it_waits_for_new_images(qap
         label = page._shell.run_controls.readinessLabel
         page._shell.run_controls.startButton.click()
         assert _pump(qapp, lambda: UP_TO_DATE in label.full_text(), 30.), label.full_text()
-        assert label.full_text() == ("Running · Up to date, waiting for new images · 1 processed · 0 skipped · "
-                                     "1 discovered"), label.full_text()
+        assert label.full_text() == "Running · Waiting for new images · 1/1 processed", label.full_text()
         # It leads, however it elides: the label keeps the head of the text, cut where its width ends (hosted 40320041462
-        # showed "Running · Up to date, waiting for new imag…").
+        # showed the longer earlier text cut as "Running · Up to date, waiting for new imag…").
         shown = label.text()
-        assert shown.startswith("Running · Up to date") and label.full_text().startswith(shown.rstrip("…")), shown
+        assert shown.startswith("Running · Waiting") and label.full_text().startswith(shown.rstrip("…")), shown
         _frame(raw, "scan", 2, "txt", 2.0, sidecar=False)  # a new image, its .txt not yet there: pending again
-        assert _pump(qapp, lambda: "1 pending" in label.full_text(), 30.), label.full_text()
+        assert _pump(qapp, lambda: "1/2 processed" in label.full_text(), 30.), label.full_text()
         assert UP_TO_DATE not in label.full_text()
         page._shell.run_controls.stopButton.click()
         _terminal(qapp, page, observed, StandardEventKind.STOPPED)

@@ -198,12 +198,8 @@ def test_directory_strip_qualifies_paused_and_failed_file_progress() -> None:
         start_blocker="Cleanup remains pending",
     )
 
-    assert paused.run.readiness == (
-        "Paused · 2 processed · 1 skipped · 3 pending · 6 discovered"
-    )
-    assert failed.run.readiness == (
-        "Failed · 2 processed · 1 skipped · 3 pending · 6 discovered"
-    )
+    assert paused.run.readiness == "Paused · 2/6 processed · 1 skipped"
+    assert failed.run.readiness == "Failed · 2/6 processed · 1 skipped"
     assert cleanup_blocked.run.readiness == "Cleanup remains pending"
 
 
