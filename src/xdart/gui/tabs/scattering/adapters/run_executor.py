@@ -567,6 +567,11 @@ class _StandardRun:
     resource_facts: list[Any] = field(default_factory=list)
     pending_partition_count: int = 1
     terminal_commit_identity: StreamTerminal | None = None
+    # The last output this Run finished writing (its path, completed and total frames, commit), and whether the Run's
+    # current output is a saved one it only shows: a Run that ends showing one ends on the last frame it processed
+    # (maintainer, 2026-10-26: "Last frame processed"; Codex N-068bf509).
+    last_written: tuple[Path, int, int, StreamTerminal | None] | None = None
+    showing_saved: bool = False
     background_capsule: _PreparedSingleFrameBackground | _PreparedSeriesFrameBackground | None = None
     energy_notice_sent: bool = False
     coverage_notice_sent: bool = False
@@ -1890,7 +1895,7 @@ class StandardRunExecutor:
         # Establish the item identity before validation/open.  A failure at any
         # later construction seam must be reported against this artifact, not
         # the previously completed one.
-        run.artifact = artifact
+        run.artifact, run.showing_saved = artifact, False
         if family := getattr(item, "artifact_family", ""):
             run.artifact_families[str(artifact)] = family
         cancelled = lambda: run.stop_requested
@@ -3357,7 +3362,7 @@ class StandardRunExecutor:
         Append no-op's dormant output leaves them. It has no stream commit in this Run, so a terminal event naming it
         carries none (the last written output's commit made the page drop a finite Append's FINISHED event: no Browse,
         no plot)."""
-        run.artifact, run.session = target, None
+        run.artifact, run.session, run.showing_saved = target, None, True
         run.current_total = run.current_completed = run.current_published = len(completed.labels)
         run.current_epoch_published = 0
         run.terminal_commit_identity = None
@@ -3546,6 +3551,9 @@ class StandardRunExecutor:
             run.current_published = max(
                 run.current_published, run.current_completed,
             )
+            if finished_current:
+                run.last_written = (run.artifact, run.current_completed, run.current_total,
+                                    run.terminal_commit_identity)
             close = getattr(run.source, "close", None)
             if callable(close):
                 close()
@@ -4220,22 +4228,27 @@ class StandardRunExecutor:
                 quartile_timing,
             )
         )
+        shown = (run.artifact, run.current_completed, run.current_total, run.terminal_commit_identity)
+        if run.showing_saved and run.last_written is not None:
+            # It ended showing a saved scan it did not change: its end shows the last output it wrote, with that
+            # output's own commit (a saved scan has none in this Run).
+            shown = run.last_written
         self._events.put(StandardRunEvent(
             run.identity,
             kind,
             completed=completed,
             total=total,
-            artifact=str(run.artifact),
+            artifact=str(shown[0]),
             detail=detail,
             cleanup_status=receipt.cleanup_status,
             primary=receipt.primary,
             cleanup_failures=receipt.cleanup_failures,
             artifacts=tuple(str(item) for item in run.artifacts),
-            artifact_completed=run.current_completed,
-            artifact_total=run.current_total,
+            artifact_completed=shown[1],
+            artifact_total=shown[2],
             terminal_timing=timing,
             terminal_commit_identity=(
-                run.terminal_commit_identity
+                shown[3]
                 if kind is StandardEventKind.FINISHED
                 and receipt.cleanup_status is CleanupStatus.CLEANED
                 else None

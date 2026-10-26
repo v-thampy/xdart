@@ -4,7 +4,9 @@ N-0243a1bb, third priority).
 
 Beamline 2026-10-23 (dev 305d77fb and 4c28033b, Windows share, no typed filter): an Append that showed saved scans,
 reduced new ones, then showed a last saved scan ended with every plot empty and "Refused: Browse 1-D navigation is
-incomplete", Auto Last on that last scan. Real page, real Run click, real files."""
+incomplete", Auto Last on that last scan. It now ends on the last scan it reduced; a saved scan it only showed after
+that one does not displace it (maintainer, 2026-10-26, asked which: "Last frame processed"). Real page, real Run
+click, real files."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,7 +20,12 @@ from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL
 from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F401
 from xrd_tools.io import FrameViewReader
 
-_SAVED = {"saved-new-saved": ("scana", "scanc"), "only-saved": ("scana", "scanb", "scanc"), "only-new": ()}
+_SAVED = {"saved-new-saved": ("scana", "scanc"), "only-saved": ("scana", "scanb", "scanc"), "only-new": (),
+          "grown-then-saved": ("scana", "scanb", "scanc")}
+#: The scan each shape ends on, and its last frame: the last one the Append reduced, or the last one shown when it
+#: reduced none. "grown-then-saved": scanb gains a third frame after the seed (Codex N-068bf509's B4, then saved C).
+_ENDS_ON = {"saved-new-saved": ("scanb", 2), "only-saved": ("scanc", 2), "only-new": ("scanc", 2),
+            "grown-then-saved": ("scanb", 3)}
 
 
 @pytest.mark.parametrize("shape", tuple(_SAVED))
@@ -33,6 +40,8 @@ def test_a_finite_append_ends_showing_its_last_scan(qapp, tmp_path, shape):
     for stem in ("scana", "scanb", "scanc"):
         if stem not in _SAVED[shape]:
             _scan(raw, stem, 2)
+    if shape == "grown-then-saved":
+        _scan(raw, "scanb", 1, start=2)
     with _page(qapp, _intent(tmp_path, raw)) as (page, scientific, observed):
         terminal = _run(qapp, page, observed)
         controller = page._context_controller
@@ -50,9 +59,11 @@ def test_a_finite_append_ends_showing_its_last_scan(qapp, tmp_path, shape):
             and controller.browse_context.loaded, facts()
         browse = _browsing(qapp, page)
         navigation = controller.navigation
-        assert Path(str(browse.requested_path)).name == "scanc_int1d.nexus", facts()
+        stem, last = _ENDS_ON[shape]
+        assert Path(str(browse.requested_path)).name == f"{stem}_int1d.nexus", facts()
         assert navigation.current is not None and navigation.selected, facts()
         current = navigation.current
+        assert current.local_frame_label == last, facts()  # that scan's last frame
         with FrameViewReader(Path(str(browse.requested_path))) as reader:
             saved = reader.read(current.local_frame_label)
         assert _pump(qapp, lambda: (
