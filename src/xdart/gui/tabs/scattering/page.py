@@ -274,6 +274,8 @@ _NEXUS_ONLY_PERFORMANCE_KEYS = (
 )
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _DEFERRED_DELETE_RETRY_INTERVAL_MS = 25
+# A failed Run whose cleanup was still pending at its end is closed again this often (_settle_failed_cleanup).
+_FAILED_CLEANUP_RETRY_S = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,6 +745,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._peak_dialog = self._phase_dialog = None
         # Live Auto's one question whether its Run expects metadata sidecars (_sync_metadata_question).
         self._metadata_question_dialog = None
+        # When the drain last retried a failed Run's pending cleanup (_settle_failed_cleanup).
+        self._failed_cleanup_retried_at = float("-inf")
         self._scan_roi_generation = 0
         self._peak_generation = self._phase_generation = 0
         self._analysis_identity = None; self._analysis_kind = None
@@ -3926,6 +3930,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._refresh_shell()
                 return
         if self._lifecycle.phase is RunPhase.FAILED:
+            self._settle_failed_cleanup()
             reset = self._lifecycle.reset()
             if reset.phase is not RunPhase.IDLE:
                 self._notice("Standard cleanup remains pending.")
@@ -3940,6 +3945,30 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._render_start_outcome(capture)
             return
         self._begin_admission(capture)
+
+    def _failed_cleanup_pending(self) -> bool:
+        """A failed Run whose owners have not closed: its cleanup was still pending at its end."""
+        return (self._lifecycle.phase is RunPhase.FAILED and not self._lifecycle.reset_permitted
+                and self._lifecycle.attempt_run_identity is not None)
+
+    def _settle_failed_cleanup(self) -> bool:
+        """A failed Run whose cleanup was still pending at its end: close it again, and once that is clean the page can
+        reset; True when its owners closed now (beamline 2026-10-26: after a Live Run failed, Run and the browser's
+        scans stayed locked on "Standard cleanup remains pending", with nothing to retry it). The drain retries it
+        about once a second (_FAILED_CLEANUP_RETRY_S), and Run once more."""
+        identity, executor, pipeline = self._lifecycle.attempt_run_identity, self._run_executor, self._pipeline
+        if not self._failed_cleanup_pending() or executor is None or pipeline is None:
+            return False
+        self._failed_cleanup_retried_at = time.monotonic()
+        try:
+            receipt = executor.close(identity)
+        except Exception as error:
+            self._error_notice("Standard cleanup failed", error)
+            return False
+        if not executor_closed_is_valid(receipt, identity) or receipt.cleanup_status is not CleanupStatus.CLEANED:
+            return False
+        pipeline.owners_closed(OwnersClosed(identity))
+        return self._lifecycle.reset_permitted
 
     def _begin_admission(self, capture: StartCapture) -> None:
         pipeline = self._pipeline
@@ -4931,6 +4960,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
                 candidate = ()
             self._sync_metadata_question(executor)
+            if (self._failed_cleanup_pending()
+                    and time.monotonic() - self._failed_cleanup_retried_at >= _FAILED_CLEANUP_RETRY_S
+                    and self._settle_failed_cleanup()):
+                self._notice("Standard cleanup finished.")
+                changed = True
             if type(candidate) is tuple:
                 events = candidate
             else:
@@ -6161,7 +6195,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or self._scientific_repaint_pending
         ):
             return True
-        if self._batch_terminal.needs_polling:
+        if self._batch_terminal.needs_polling or self._failed_cleanup_pending():
             return True
         if self._lifecycle.phase not in {
             RunPhase.IDLE,

@@ -35,6 +35,7 @@ from xrd_tools.integrate.calibration import (
     detector_calibration_to_integrator,
     load_detector_calibration,
 )
+from xrd_tools.session import Light1DLeaseState
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
@@ -4147,6 +4148,15 @@ class StandardRunExecutor:
                         except Exception as error:
                             run.cleanup_failures.append(detach_exception(
                                 error, 'display_subscription.cancel'))
+                    elif owner.light_lease.state is Light1DLeaseState.RELEASED:
+                        # A failed scan's output released its lease as it closed while its owner still names it: the
+                        # release is settled here, as the display's retirement would settle it, and the Run's other
+                        # frames stay on show (beamline 2026-10-26: a Live Run that failed on its last scan stayed
+                        # "Standard cleanup remains pending", its Run button and the browser's scans locked).
+                        try:
+                            run.display.release_light_1d(owner, reason=owner.light_release_reason or "run-close")
+                        except Exception as error:
+                            run.cleanup_failures.append(detach_exception(error, 'display_light_1d.release'))
             cleaned = (
                 non_display_clean
                 and display_clean

@@ -1,0 +1,100 @@
+"""A Live Run that fails leaves the page usable (beamline 2026-10-26: a Live Append failed on an output written before
+epoch_local, "dirty metadata adds columns absent on disk: ['epoch_local']"; the maintainer: "the run/stop buttons and
+browser are totally unresponsive", "the run button however remains disabled and also the data browser (scans
+column)"). The failed scan's output released its light-1D lease as it closed while its display owner still named it,
+so the Run's cleanup stayed pending and nothing retried it. The real page, executor and Live Run over real TIFF + .txt
+files: the Run has shown a covered scan and grown a new one before the older output fails it."""
+from __future__ import annotations
+
+import types
+
+import h5py
+import pytest
+
+pytest.importorskip("pyqtgraph")
+
+from tests.xdart.scattering.test_browse_reference_rings_run import _page, _poni, _pump
+from tests.xdart.scattering.test_live_qualify_refusal_run import _frame, _settle, _stop, _wait
+from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _start
+from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F401
+from xdart.gui.tabs.scattering.adapters import run_executor
+from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+from xdart.gui.tabs.scattering.display_values import StandardEventKind
+from xdart.gui.tabs.scattering.events import CleanupStatus
+from xdart.gui.tabs.scattering.state_machine import RunPhase
+from xrd_tools.session.run_configuration import RunIntent
+from xrd_tools.sources.selection import DirectorySourceSpec
+
+
+def _intent(root):
+    raw = root / "raw"
+    return RunIntent(source_spec=DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format="txt"),
+                     poni_file=str(root / "cal.poni"), project_root=str(raw), save_path=str(root / "processed"),
+                     output_mode="Append", processing_mode="Int 1D", live_mode=True, max_cores=1,
+                     bai_1d_args={"npt": 8, "method": "numpy"})
+
+
+def _frames(events):
+    return sum(1 for event in events if event.kind is StandardEventKind.FRAME_READY)
+
+
+def _failed_run(qapp, page, raw, observed):  # noqa: F811
+    """The page's Live Run grows a new scan, then the older output's next frame fails it: its terminal."""
+    page._shell.run_controls.startButton.click()
+    assert _pump(qapp, lambda: page._lifecycle.active_run_identity is not None, 30.)
+    for index in (1, 2, 3):
+        _frame(raw, "fresh", index, "txt", float(index))
+        _pump(qapp, lambda: False, .3)
+    assert _pump(qapp, lambda: _frames(observed) >= 3, 60.), "the new scan was never processed"
+    _frame(raw, "old", 2, "txt", 2.0)
+    assert _pump(qapp, lambda: any(event.kind in _TERMINAL for event in observed), 60.), "the Run never ended"
+    _pump(qapp, lambda: False, 1.)
+    return [event for event in observed if event.kind in _TERMINAL][-1]
+
+
+@pytest.fixture
+def older_output(tmp_path):
+    """A covered scan and an older output, written by a first Run; the older one's scan_data lacks epoch_local."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _poni(tmp_path)
+    for stem in ("done", "old"):
+        _frame(raw, stem, 1, "txt", 1.0)
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path), request_value=7731)
+    events = []
+    _wait(executor, events, lambda values: _frames(values) >= 2 or any(e.kind in _TERMINAL for e in values))
+    _settle(executor, events, .5)
+    _stop(executor, identity, events)
+    with h5py.File(tmp_path / "processed" / "old_int1d.nexus", "r+") as handle:
+        del handle["entry/scan_data/epoch_local"]  # as an output written before f6efad03 (2026-10-24)
+    return raw
+
+
+def test_a_live_run_that_fails_on_its_last_scan_ends_clean_and_leaves_run_and_the_scans_open(
+        qapp, tmp_path, older_output):  # noqa: F811
+    with _page(qapp, _intent(tmp_path)) as (page, _view, observed):
+        terminal = _failed_run(qapp, page, older_output, observed)
+        assert terminal.kind is StandardEventKind.FAILED and "epoch_local" in terminal.detail, terminal.detail
+        assert terminal.cleanup_status is CleanupStatus.CLEANED, terminal.cleanup_status
+        assert page._lifecycle.reset_permitted and page._start_permitted() == (True, "")
+        assert page._context_controller.browse_lifecycle_admissible(), "the browser's scans stay locked"
+        assert page._shell.browser.scans.isEnabled()
+
+
+def test_a_failed_run_whose_cleanup_was_left_pending_is_settled_by_the_page_and_run_starts_again(
+        qapp, tmp_path, older_output, monkeypatch):  # noqa: F811
+    """The page's own recovery, for a cleanup still pending at the Run's end (the executor's settling of a released
+    lease held off here, which is the beamline's state): the page closes the failed Run again on its own, Run and the
+    scans open, and a new Run starts."""
+    monkeypatch.setattr(run_executor, "Light1DLeaseState", types.SimpleNamespace(RELEASED=object()), raising=False)
+    with _page(qapp, _intent(tmp_path)) as (page, _view, observed):
+        terminal = _failed_run(qapp, page, older_output, observed)
+        assert terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING, terminal.cleanup_status
+        assert _pump(qapp, lambda: page._start_permitted() == (True, ""), 10.), page._start_permitted()
+        assert page._shell.browser.scans.isEnabled() and page._shell.run_controls.startButton.isEnabled()
+        observed.clear()
+        page._shell.run_controls.startButton.click()
+        assert _pump(qapp, lambda: page._lifecycle.phase is RunPhase.RUNNING, 30.), page._lifecycle.phase
+        page._shell.run_controls.stopButton.click()
+        assert _pump(qapp, lambda: any(event.kind in _TERMINAL for event in observed), 60.)
