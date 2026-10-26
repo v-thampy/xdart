@@ -141,7 +141,7 @@ class _Executor(ImmediateAdmission):
         if self.stop_error is not None:
             raise self.stop_error
 
-    def close(self, run_identity):
+    def close(self, run_identity, *, background=False):  # the page's failed-cleanup retry closes in the background
         return ExecutorClosed(run_identity, self.close_status)
 
     def pause(self, _run_identity) -> None:
