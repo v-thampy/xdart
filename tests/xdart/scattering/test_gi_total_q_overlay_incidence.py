@@ -28,7 +28,9 @@ def test_gi_total_q_overlay_keeps_frames_with_different_incidence_angles(qapp, t
         first, last = (item.getData() for item in view.curve.listDataItems())
         np.testing.assert_allclose(first[0], last[0], rtol=1e-9)
         # Compare scientific intensities before the view's configured vertical
-        # Overlay offset is applied to the second drawn curve.
-        native = page._last_scientific_projection.traces
+        # Overlay offset is applied to the second drawn curve: the view's own
+        # rows. The last projection is only the latest incremental input; when
+        # the terminal Browse reuses the Run's drawn curves it projects neither.
+        native = view.trace_history_projections
         assert len(native) == 2
         np.testing.assert_allclose(native[0].intensity, native[1].intensity, rtol=1e-9, equal_nan=True)
