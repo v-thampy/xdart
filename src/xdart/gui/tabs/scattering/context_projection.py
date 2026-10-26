@@ -479,7 +479,7 @@ class ContextProjection:
                 and progress.completed == progress.total == 0):
             # Zero event counters are also used by single sources; the known directory intent identifies
             # an empty Live Run without inventing file progress for those other events.
-            files = DirectoryFileProgress(0, 0, 0, 0)
+            files = DirectoryFileProgress(0, 0, 0, 0, 0 if intent.output_mode == "Append" else None)
         if files is not None and (
             not progress.terminal or phase is RunPhase.FAILED
         ):

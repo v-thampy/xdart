@@ -37,14 +37,16 @@ def test_zero_directory_totals_stay_visible_in_every_status():
         assert empty.text(state) == f"{state} · 0/0 processed"
 
 
-def test_an_empty_live_directory_uses_the_compact_waiting_status(qapp, tmp_path):
+@pytest.mark.parametrize("output_mode", ("Overwrite", "Append"))
+def test_an_empty_live_directory_uses_the_compact_waiting_status(qapp, tmp_path, output_mode):
     from tests.xdart.scattering.test_browse_reference_rings_run import _directory
 
-    with _page(qapp, _directory(tmp_path, live=True)) as (page, _view, observed):
+    with _page(qapp, _directory(tmp_path, live=True, output_mode=output_mode)) as (page, _view, observed):
         page._shell.run_controls.startButton.click()
         assert _pump(qapp, lambda: any(event.kind is StandardEventKind.DISCOVERY for event in observed), 30.)
+        new = " (0 new)" if output_mode == "Append" else ""
         assert page._shell.run_controls.readinessLabel.full_text() == (
-            "Running · Waiting for new images · 0/0 processed")
+            f"Running · Waiting for new images · 0/0 processed{new}")
         page._shell.run_controls.stopButton.click()
         _terminal(qapp, page, observed, StandardEventKind.STOPPED)
 
