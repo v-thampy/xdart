@@ -180,7 +180,7 @@ def test_multi_output_gi_repeated_labels_keep_distinct_catalog_entries(
         assert shell.scientific.progress.text() == "1/1"
         # The footer presents a one-based member number while the exact
         # zero-based container label remains in the catalog key.
-        assert shell.scientific.status.text() == "second.nxs · frame 1"
+        assert shell.scientific.status.text() == "second.nxs · frame 1 [Output: second_gi_int2d.nexus]"
         assert shell.scientific.title.text() == "second.nxs · frame 1"
 
         first = catalog.entries[0]
@@ -288,7 +288,7 @@ def test_directory_grouped_image_footer_is_current_series_and_progress_counts_fi
         selector = shell.scientific.frame_selector
         assert selector.count() == 3
         assert shell.scientific.progress.text() == "3/3"
-        assert shell.scientific.status.text() == "beta_0003.edf"
+        assert shell.scientific.status.text() == "beta_0003.edf [Output: beta_int2d.nexus]"
         assert page._progress.directory_files == DirectoryFileProgress(7, 1, 0, 8)
         assert shell.run_controls.readinessLabel.full_text().startswith("Complete · 7 Frames · ")
 
