@@ -255,7 +255,10 @@ def _exercise(tmp_path, *, gi, stop, monkeypatch=None):
                 next(button for value, button in segment._segments if value is enabled).click()
                 app.processEvents()
                 assert page._intents.snapshot().thaw().gi.enabled is enabled
-                assert _wait(app, lambda: bool(shell.scientific.curve.listDataItems())), (
+                # The raw image is read again from the saved output, asynchronously: a slower machine can show
+                # the curve first (hosted runs 40293959972, 40294962178: raw shape (0,) at the comparison).
+                assert _wait(app, lambda: bool(shell.scientific.curve.listDataItems())
+                             and shell.scientific.raw.canvas.raw_image.size > 0), (
                     page._notice_text, page._last_scientific_projection,
                 )
                 shown = shell.scientific.curve.listDataItems()[0]
