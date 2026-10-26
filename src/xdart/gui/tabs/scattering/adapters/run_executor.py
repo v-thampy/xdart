@@ -125,7 +125,7 @@ def _scan_failure_reason(error: BaseException) -> str:
     """The reason a scan skipped for one of its own failures (_SCAN_FAILURES) gives in the log and at the Run's end."""
     if isinstance(error, MetadataColumnsAbsent):
         return (f"its saved metadata has no {', '.join(error.columns)} column, which its new frames carry (an output "
-                "written by an earlier xdart); Overwrite reprocesses it")
+                "written by an earlier xdart); Replace reprocesses it")
     return f"{type(error).__name__}: {error}"
 
 

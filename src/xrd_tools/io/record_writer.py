@@ -677,7 +677,7 @@ class WriterStateError(RuntimeError):
 class MetadataColumnsAbsent(ValueError):
     """An existing output's scan_data has no column for metadata its new frames carry: an output written before the
     column existed (epoch_local, before 2026-10-24) cannot be extended with them. A Run skips that scan (maintainer,
-    2026-10-26: his pick "Skip that scan"); Overwrite reprocesses it."""
+    2026-10-26: his pick "Skip that scan"); Replace (an Overwrite Run) reprocesses it."""
 
     def __init__(self, columns) -> None:
         self.columns = tuple(sorted(str(column) for column in columns))

@@ -18,7 +18,7 @@ from xrd_tools.session.run_configuration import RunIntent
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 REASON = ("its saved metadata has no epoch_local column, which its new frames carry (an output written by an earlier "
-          "xdart); Overwrite reprocesses it")
+          "xdart); Replace reprocesses it")
 
 
 def _intent(tmp_path, *, live):
