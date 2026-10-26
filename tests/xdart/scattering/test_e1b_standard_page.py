@@ -76,11 +76,14 @@ def test_real_run_click_projects_standard_values_without_page_io(
         assert shell.scientific.raw.image.image is not None
         assert shell.scientific.cake.image.image is not None
         assert shell.scientific.curve.listDataItems()
-        member = shell.scientific.status.text()
+        # The footer: the image's own name, then its output's (ac4492ad: "[Output: <nexus file name>]").
+        status = shell.scientific.status.text()
+        member, _sep, output = status.partition(" [Output: ")
         assert member == shell.scientific.title.text()
         assert Path(member).name == member
         assert member.lower().endswith((".tif", ".tiff"))
-        assert "page-standard.nxs" not in member
+        assert output == "page-standard_int2d.nexus]", status
+        assert "page-standard.nxs" not in status
     finally:
         page.close_workspace()
 

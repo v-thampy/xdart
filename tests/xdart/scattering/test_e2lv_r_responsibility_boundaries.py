@@ -380,19 +380,23 @@ def test_delayed_frame_event_routes_its_exact_artifact_key(
         # and neither is selector acceptance: the status follows the selection
         # on every apply, the title only once the replacement presentation
         # lands, so a slow host can show the new status under the old title.
+        # The footer is the title and the frame's output file by name (ac4492ad, maintainer 2026-10-26: "also add
+        # [Output: <nexus file name>]"; "just the name of the nexus file").
+        def footer():
+            return f"{shell.scientific.title.text()} [Output: {Path(delayed.artifact).name}]"
+
         _wait(
             qapp,
             lambda: (
                 shell.scientific.frame_selector.currentData() is delayed
-                and shell.scientific.title.text()
-                == shell.scientific.status.text()
+                and shell.scientific.status.text() == footer()
             ),
             page=page,
             lifecycle=_lifecycle,
         )
         assert shell.scientific.frame_selector.currentData() is delayed
         status = shell.scientific.status.text()
-        assert status == shell.scientific.title.text()
+        assert status == footer()
         assert "first.nxs" in status
         assert "second.nxs" not in status
         assert delayed.artifact not in status
