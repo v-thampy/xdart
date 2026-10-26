@@ -125,34 +125,54 @@ def _run_summary(configuration) -> str:
 # log (maintainer, 2026-10-26: "terms like foreign append identity are not very helpful for most users. these are good
 # for debugging but user facing warnings and info should be simpler and more direct"; "you can just say integration
 # settings different from earlier ones or something like that ... if it is obvious where the mismatch is that can be
-# specified"). (technical text it begins with or contains, plain words); the first match wins.
+# specified"). (technical text it begins with or contains, plain words); the first match wins, so the remedies
+# append._refusal_reason wraps around any refusal come first.
+_CHANGED_IMAGES = "the images it was made from changed"
+_FEWER_IMAGES = "the scan now has fewer images than its output holds"
+_OTHER_SOURCE = "it was made from a different source (another folder, path spelling or file type)"
+_NOT_CONTINUABLE = "it was not saved in a form Append can continue"
+_MEMBER_HISTORY = "source does not extend exact image-member history"
 _PLAIN_APPEND_REASONS = (
-    ("foreign Append identity: integration settings", "it was made with different integration settings"),
-    ("foreign Append identity: results", "it holds different results (1-D, 2-D or GI maps) than this Run makes"),
-    ("foreign Append identity: Project folder", "it was made under a different Project folder"),
-    ("foreign Append identity: source", "it was made from a different source (another folder, path spelling or file "
-                                        "type)"),
-    ("foreign Append identity", "it was made with different settings"),
-    ("DIMENSION_REPLACEMENT_APPEND_UNSUPPORTED", "it was reintegrated, and Append cannot add to a reintegrated output"),
-    ("source does not extend exact image-member history", "the images it was made from changed"),
-    ("same-extent source identity changed", "its images or their metadata changed since it was made"),
-    ("regressed", "the scan now has fewer images than its output holds"),
     ("an earlier Append of this output did not finish", "an earlier Append of it did not finish"),
     ("another program has the output open", "another program has it open; close that program, then run again"),
     ("not a readable HDF5 file", "it is not a readable file, possibly left by an interrupted Append; move or delete "
                                  "it, then run again"),
-    ("committed Append lineage", "it was not saved in a form Append can continue"),
-    ("no committed Append epoch", "it was not saved in a form Append can continue"),
+    ("foreign Append identity: integration settings", "it was made with different integration settings"),
+    ("foreign Append identity: results", "it holds different results (1-D, 2-D or GI maps) than this Run makes"),
+    ("foreign Append identity: Project folder", "it was made under a different Project folder"),
+    ("foreign Append identity: source", _OTHER_SOURCE),
+    ("foreign Append identity", "it was made with different settings"),
+    ("live source extension changed Append identity", "it was made with different settings"),
+    ("DIMENSION_REPLACEMENT_APPEND_UNSUPPORTED", "it was reintegrated, and Append cannot add to a reintegrated output"),
+    (_MEMBER_HISTORY, _CHANGED_IMAGES),
+    ("source does not extend exact path", _OTHER_SOURCE),
+    ("source does not extend exact adapter_id", _OTHER_SOURCE),
+    ("source does not extend exact", _CHANGED_IMAGES),  # its dataset paths or external members
+    ("same-extent source identity changed", "its images or their metadata changed since it was made"),
+    ("source extent regressed", _FEWER_IMAGES),  # an image removed
+    ("labels exceed source extent", _FEWER_IMAGES),
+    ("source size regressed", _CHANGED_IMAGES),  # the series' first image (or the file) rewritten
+    ("source mtime_ns regressed", _CHANGED_IMAGES),
+    ("live source extension remapped", _CHANGED_IMAGES),  # a Live source's frames renumbered or removed
+    ("remap the committed Append prefix", _CHANGED_IMAGES),
+    ("do not preserve the committed prefix", _CHANGED_IMAGES),
+    ("committed Append lineage", _NOT_CONTINUABLE),
+    ("no committed Append epoch", _NOT_CONTINUABLE),
 )
 
 
 def _plain_append_reason(reason: str) -> str:
-    """``reason`` (an Append refusal's technical text) in plain words, keeping a refusal's own named difference (the
-    first image that differs); the reason itself when no plain words are known."""
+    """``reason`` (an Append refusal's technical text) in plain words, naming the first image that differs when the
+    refusal names one (its changed fields are the debug line's); the reason itself when no plain words are known."""
     for technical, plain in _PLAIN_APPEND_REASONS:
         if technical in reason:
-            detail = reason.split(": ", 1)[1].strip() if technical == "source does not extend exact image-member " \
-                "history" and ": " in reason else ""
+            detail = reason.split(f"{_MEMBER_HISTORY}: ", 1)[1].strip() if (
+                technical == _MEMBER_HISTORY and f"{_MEMBER_HISTORY}: " in reason) else ""
+            image, named, _changes = detail.partition("): ")  # "image 2 (scan_0001.tif): mtime_ns … → …"
+            if named and image.startswith("image ") and " (" in image:
+                detail = ", ".join(image.split(" (", 1))
+            elif detail == "no single image differs":
+                detail = ""
             return f"{plain} ({detail})" if detail else plain
     return reason
 
@@ -2362,10 +2382,13 @@ class StandardRunExecutor:
             run_provenance["append_replacement"] = {
                 "requested_output_mode": "Append", "effective_output_mode": "Overwrite", "reason": decision.reason}
             log_events.event(
-                logger, logging.INFO, "%s: %s, so the whole scan is reprocessed and its output replaced. Details: %s "
+                logger, logging.INFO, "%s: %s, so the whole scan is reprocessed and its output replaced.%s "
                 "[APPEND-REBUILD]", Path(item.target).name,
                 "its new frames' energies widen the q grid its frames were reduced on" if widened_rebuild
-                else "images it already processed changed on disk", decision.reason)
+                else "images it already processed changed on disk",
+                f" Details: {decision.reason}" if widened_rebuild else "")  # the widened reason is plain: its energies
+            logger.debug("%s reprocessed whole; refusal detail: %s [APPEND-DETAIL]", Path(item.target).name,
+                         decision.reason)
         if run.stop_requested:
             discard_source()
             raise RuntimeError("admission cancelled")
@@ -4429,7 +4452,7 @@ class StandardRunExecutor:
         if run.pending_rebuild is not None and kind is StandardEventKind.FINISHED:  # a one-scan Run's output
             rebuilds.append(run.pending_rebuild)
         rebuilt = tuple(
-            f"Append reprocessed {Path(output).name} whole: {reason}"
+            f"Append reprocessed {Path(output).name} whole: {_plain_append_reason(reason)}"
             for output, reason in rebuilds
         )
         if warnings:

@@ -1016,8 +1016,10 @@ def test_p1b_b11_nonmonotonic_revision_preserves_durable_prefix(
     ) in outcomes.items():
         assert blocked, f"{kind}: nonmonotonic revision was not refused"
         assert terminal is not None and terminal.kind is StandardEventKind.STOPPED, kind
-        assert any("image-member history" in warning or "source" in warning
-                   for warning in terminal.warnings), (kind, terminal.warnings)
+        # Said plainly since 1bc424d2: the stack that shrank, and the image rewritten by name.
+        assert {"container": "Append skipped shrinking_int1d.nexus: the images it was made from changed",
+                "flat": "Append skipped mutating_int1d.nexus: the images it was made from changed (image 1, "
+                        "mutating_0001.tif)"}[kind] in terminal.warnings, (kind, terminal.warnings)
         assert bytes_preserved and xye_preserved and receipts_preserved, kind
 
 

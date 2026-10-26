@@ -187,11 +187,13 @@ def test_a_changed_image_reduces_its_scan_again_whole_into_the_same_output(tmp_p
     [(_name, decision)] = seen.decisions
     assert decision.disposition is AppendDisposition.REFUSE and getattr(decision, "rebuild", None) is True
     assert decision.labels == current and decision.committed_labels == committed
-    # the refusal's own text (today's) names what changed; the Run reduces the scan again instead of skipping it
+    # the refusal's own text (today's) names what changed, the Run's end plainly (since 1bc424d2); the Run reduces the
+    # scan again instead of skipping it
     today = "source size regressed" if change.startswith("first image") else f"{_REFUSED}: image 2 (scana_0001.tif)"
+    assert today in decision.reason, decision.reason
+    named = "" if change.startswith("first image") else " (image 2, scana_0001.tif)"
     assert seen.terminals == ["FINISHED"] and seen.warnings == []
-    assert len(seen.rebuilt) == 1 and seen.rebuilt[0].startswith("Append reprocessed scana_int1d.nexus whole: ")
-    assert today in seen.rebuilt[0]
+    assert seen.rebuilt == [f"Append reprocessed scana_int1d.nexus whole: the images it was made from changed{named}"]
     state, epochs, provenance = _lineage(output)
     assert state == "committed" and epochs == [list(current)]  # one fresh epoch, every current label
     assert provenance["output_mode"] == "Append" and provenance["append_replacement"] == {
@@ -235,10 +237,11 @@ def test_the_log_frames_the_run_and_each_scan_and_says_plainly_what_it_reprocess
     assert not [record.getMessage() for record in caplog.records if record.getMessage().startswith((
         "Total Frames Processed", "Total Time", "[PERF-SUMMARY]", "[PERF-RESOURCES]", "[RUN-RESOURCES]",
         "[RUN-PIPELINE", "[SOURCE-READ]"))]
+    # ... plainly: the refusal's technical text is a debug line (maintainer, 2026-10-26)
     [rebuilt] = [record for record in caplog.records if "[APPEND-REBUILD]" in record.getMessage()]
-    assert getattr(rebuilt, log_events.EVENT, False) and rebuilt.getMessage().startswith(
+    assert getattr(rebuilt, log_events.EVENT, False) and rebuilt.getMessage() == (
         "scana_int1d.nexus: images it already processed changed on disk, so the whole scan is reprocessed and its "
-        "output replaced. Details: ")
+        "output replaced. [APPEND-REBUILD]")
 
 
 @pytest.mark.parametrize("record", ["absent", "float32"])

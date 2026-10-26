@@ -1142,8 +1142,9 @@ def test_empty_directory_live_waits_for_one_stable_late_group_until_stop(
             events.extend(executor.drain_events())
             time.sleep(0.01)
         stopped, = (event for event in events if event.kind is StandardEventKind.STOPPED)
-        assert [warning.split(": ", 1)[1].split(": ", 1)[0] for warning in stopped.warnings] == [
-            "source does not extend exact image-member history"]
+        # Said plainly since 1bc424d2, naming the image that changed.
+        assert [warning.split(": ", 1)[1] for warning in stopped.warnings] == [
+            "the images it was made from changed (image 1, late_0001.tif)"]
         assert processed == [(late, (1,))]
         assert executor.processed_live_revisions(identity) == (original,)
         assert ready_attempts[-1].decision.item.source_stamp != (

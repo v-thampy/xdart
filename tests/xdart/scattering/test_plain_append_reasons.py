@@ -21,11 +21,33 @@ from xdart.gui.tabs.scattering.adapters.run_executor import _plain_append_reason
      "scan_0005.tif (image 5) is not listed",
      "the images it was made from changed (the output holds 5 images, the source shows 4; scan_0005.tif (image 5) is "
      "not listed)"),
-    ("source extent regressed", "the scan now has fewer images than its output holds"),
+    # the first image that differs by name; the fields that changed are the debug line's
+    ("source does not extend exact image-member history: image 2 (scan_0001.tif): mtime_ns 1793054071866776687 → "
+     "1793054071975305268 (+0.109 s); size 708 → 1220", "the images it was made from changed (image 2, scan_0001.tif)"),
+    ("source does not extend exact image-member history: no single image differs",
+     "the images it was made from changed"),
+    ("source extent regressed", "the scan now has fewer images than its output holds"),  # an image removed
+    ("source size regressed", "the images it was made from changed"),  # the series' first image rewritten
+    ("source mtime_ns regressed", "the images it was made from changed"),
+    # a Live Append's own refusals (a shrunken NeXus stack said "live source extension remapped requested labels")
+    ("live source extension remapped requested labels", "the images it was made from changed"),
+    ("live source extension remapped committed prefix", "the images it was made from changed"),
+    ("live source extension changed Append identity", "it was made with different settings"),
+    ("source does not extend exact external-member history", "the images it was made from changed"),
+    ("source does not extend exact path",
+     "it was made from a different source (another folder, path spelling or file type)"),
     ("an earlier Append of this output did not finish; use Replace to rebuild it (committed Append prefix lineage is "
      "not committed)", "an earlier Append of it did not finish"),
+    # a remedy wrapped around another refusal is what is said: it names what to do
+    ("an earlier Append of this output did not finish; use Replace to rebuild it (source does not extend exact "
+     "image-member history: image 2 (scan_0001.tif): size 708 → 1220)", "an earlier Append of it did not finish"),
+    ("another program has the output open; close it, then run again (foreign Append identity: integration settings)",
+     "another program has it open; close that program, then run again"),
     ("DIMENSION_REPLACEMENT_APPEND_UNSUPPORTED", "it was reintegrated, and Append cannot add to a reintegrated output"),
     ("something new and unforeseen", "something new and unforeseen"),
+    # a path is never read as a refusal's words
+    ("[Errno 13] Permission denied: '/data/regressed_remapped/scan_int1d.nexus'",
+     "[Errno 13] Permission denied: '/data/regressed_remapped/scan_int1d.nexus'"),
 ])
 def test_an_append_refusal_reads_plainly(technical, plain):
     assert _plain_append_reason(technical) == plain

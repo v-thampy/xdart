@@ -1026,8 +1026,9 @@ def test_directory_append_reprocesses_a_changed_scan_and_runs_the_next_with_a_su
                 terminal.files_discovered, terminal.files_pending) == (2, 0, 2, 0)
         assert terminal.cleanup_status is CleanupStatus.CLEANED
         assert terminal.warnings == () and len(terminal.rebuilt) == 1
-        assert terminal.rebuilt[0].startswith(f"Append reprocessed {targets[0].name} whole: ")
-        assert "source does not extend exact image-member history" in terminal.rebuilt[0]
+        assert terminal.rebuilt == (  # said plainly since 1bc424d2
+            f"Append reprocessed {targets[0].name} whole: the images it was made from changed (image 1, "
+            "first_0001.tif)",)
         after = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in protected}
         assert all(after[path][0] != before[path][0] for path in protected)  # replaced, side output too
         assert _nexus_rows(targets[0]) == (1,)
