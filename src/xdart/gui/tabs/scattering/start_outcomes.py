@@ -109,6 +109,7 @@ class StartClosed:
     primary: DetachedDiagnostic | None = None
     cleanup_failures: tuple[DetachedDiagnostic, ...] = ()
     cleanup_identity: RunIdentity | None = None
+    quarantined: bool = False
 
 
 def exception_detail(value: Exception) -> ExceptionDetail:
@@ -200,6 +201,8 @@ def executor_closed_is_valid(value: object, expected: RunIdentity) -> bool:
                 and type(value.cleanup_status) is CleanupStatus and value.cleanup_status is not CleanupStatus.NOT_STARTED
                 and (value.primary is None or detached_diagnostic_is_valid(value.primary))
                 and type(value.cleanup_failures) is tuple
+                and type(value.quarantined) is bool
+                and (not value.quarantined or value.cleanup_status is CleanupStatus.CLEANUP_PENDING)
                 and all(detached_diagnostic_is_valid(item) and bool(item.operation) for item in value.cleanup_failures))
     except Exception:
         return False

@@ -1279,8 +1279,7 @@ class StandardRunExecutor:
                 self._admission = None
             if (
                 operation.retirement_owner is self._retirement
-                and operation.retirement_receipt.cleanup_status
-                is CleanupStatus.CLEANED
+                and operation.retirement_receipt.released_for_admission
             ):
                 self._retirement = None
 
@@ -1288,7 +1287,7 @@ class StandardRunExecutor:
         result: AdmissionReceipt | AdmissionFailure | None = None
         try:
             proof = self._retire_display(operation)
-            if proof.cleanup_status is not CleanupStatus.CLEANED:
+            if not proof.released_for_admission:
                 result = AdmissionFailure(
                     operation.token,
                     "Historical display cleanup remains pending.",
@@ -1325,7 +1324,7 @@ class StandardRunExecutor:
         owner.attempt()
         proof = owner.proof
         operation.retirement_receipt = proof
-        if proof.cleanup_status is not CleanupStatus.CLEANED:
+        if not proof.released_for_admission:
             return proof
         with self._lock:
             active = self._active
@@ -1336,10 +1335,12 @@ class StandardRunExecutor:
                     or not active.closed
                 )
             ):
-                return replace(
+                operation.retirement_receipt = replace(
                     proof,
                     cleanup_status=CleanupStatus.CLEANUP_PENDING,
+                    quarantined=False,
                 )
+                return operation.retirement_receipt
             if active is not None:
                 self._active = None
         return proof
@@ -1403,17 +1404,23 @@ class StandardRunExecutor:
         """Stop waiting for the cleanup of a failed Run that keeps failing (the page's time limit; maintainer's pick
         2026-10-26, "Add the time limit"): it leaves the executor, so a new Run can start, and what it still holds
         stays held, as the failure left it, until xdart exits (a later Run skips such an output: LeaseUnavailable). The
-        outputs it still holds; None when it is not this executor's Run, has closed, or a thread still runs for it."""
+        outputs it still holds; None when it is not this executor's Run or a thread still runs for it."""
         with self._lock:
             run = self._active
             worker = None if run is None else run.worker
-            if (run is None or run.identity is not run_identity or run.closed
+            if (run is None or run.identity is not run_identity
                     or (worker is not None and worker.is_alive())):
+                return None
+            owner = self._retirement
+            if owner is None or owner.run_identity is not run_identity:
+                owner = DisplayRetirementOwner(run_identity, lambda: self._close_run(run_identity))
+            receipt = ExecutorClosed(run_identity, CleanupStatus.CLEANUP_PENDING, run.primary,
+                                     tuple(run.cleanup_failures), quarantined=True)
+            if not owner.quarantine(receipt):
                 return None
             self._active = None
             self._given_up.append(run)
-            # As a closed Run's owner does, this one proves the next admission retired its display (close answers).
-            self._retirement = DisplayRetirementOwner(run_identity, lambda: self.close(run_identity))
+            self._retirement = owner
         held = () if run.output is None or run.artifact is None else (str(run.artifact),)
         logger.warning("[RUN-CLEANUP] gave up the failed Run's cleanup; held=%s failures=%s", held,
                        tuple(f"{failure.operation}: {failure.message}" for failure in run.cleanup_failures[-3:]))
@@ -1423,8 +1430,8 @@ class StandardRunExecutor:
         with self._lock:
             given_up = next((run for run in self._given_up if run.identity is run_identity), None)
         if given_up is not None:  # nothing more to close here: what it holds stays held until xdart exits
-            return ExecutorClosed(run_identity, CleanupStatus.CLEANED, given_up.primary,
-                                  tuple(given_up.cleanup_failures))
+            return ExecutorClosed(run_identity, CleanupStatus.CLEANUP_PENDING, given_up.primary,
+                                  tuple(given_up.cleanup_failures), quarantined=True)
         with self._lock:
             owner = self._retirement
             active = self._active

@@ -10,6 +10,7 @@ import gc
 import os
 import signal
 import time
+from threading import Event, Thread
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -418,6 +419,7 @@ class Main(QMainWindow):
         self._close_pending_since = None
         self._ends_process = False
         self._close_accepted = False  # a retry scheduled before the window closed does nothing after
+        self._close_deadline_thread = None
         self._tool_handles = {}
         self._tool_actions = {}
         self._page_handles = {}
@@ -1281,6 +1283,16 @@ class Main(QMainWindow):
         return receipts
 
     def closeEvent(self, event):
+        if self._close_pending_since is None:
+            self._close_pending_since = time.monotonic()
+        if self._ends_process and self._close_deadline_thread is None:
+            # Arm before any page/tool callback or logging: the GUI loop itself can be blocked by one.
+            end_process, limit = self._end_process, _CLOSE_PENDING_LIMIT_S
+            def expire():
+                Event().wait(limit)
+                end_process()
+            self._close_deadline_thread = Thread(target=expire, name="xdart-close-deadline", daemon=True)
+            self._close_deadline_thread.start()
         receipts = self._close_page_and_tools()
         pending = [receipt for receipt in receipts if receipt.status is PageCleanup.PENDING]
         if pending:
@@ -1301,16 +1313,13 @@ class Main(QMainWindow):
         self._close_accepted = True
         self._help_owner.shutdown()
         event.accept()
-        if pending and self._ends_process:
-            QtCore.QTimer.singleShot(0, self._end_process)
-        elif self._process_exit_requested:
+        if self._process_exit_requested and not (pending and self._ends_process):
             QtCore.QTimer.singleShot(0, self._terminate_process)
 
     @staticmethod
     def _end_process():
         """Quitting outlasted a pending cleanup: what it still holds could keep a normal exit waiting (a file on a
-        share, a thread), so the logs are flushed and the process ends now."""
-        logging.shutdown()
+        share, a thread). Logging locks and stream flushes may be the blocked owner, so this path cannot wait on them."""
         os._exit(0)
 
     def _retry_close(self):

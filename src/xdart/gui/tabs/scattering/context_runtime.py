@@ -654,7 +654,7 @@ class _ContextRuntime:
     def retirement_matches(self, receipt: DisplayRetirementReceipt) -> bool:
         return (
             type(receipt) is DisplayRetirementReceipt
-            and receipt.cleanup_status is CleanupStatus.CLEANED
+            and receipt.released_for_admission
             and receipt.run_identity is self._run_identity
         )
 

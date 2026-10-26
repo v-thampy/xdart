@@ -69,10 +69,12 @@ def test_a_failed_run_whose_cleanup_keeps_failing_is_given_up_and_run_and_the_sc
             "it (Replace rebuilds it); until xdart restarts, a new Run skips it."), unlocked
         assert executor._exact_run(terminal.run_identity) is None  # it left the executor ...
         closed = executor.close(terminal.run_identity)  # ... and closing it again answers at once, kept as it was
-        assert closed.cleanup_status is CleanupStatus.CLEANED and any(
+        assert closed.cleanup_status is CleanupStatus.CLEANUP_PENDING and closed.quarantined and any(
             _STUCK in failure.message for failure in closed.cleanup_failures), closed
         # Quitting does not wait for it again (the app's close polls the page's).
-        assert _pump(qapp, lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED, 5.)
+        closed_page = page.close_workspace()
+        assert page._closed and closed_page.quarantined
+        assert closed_page.cleanup_status is CleanupStatus.CLEANUP_PENDING
 
 
 @pytest.mark.parametrize("mode", ["Overwrite", "Append"])

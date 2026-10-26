@@ -151,6 +151,7 @@ from .events import (
     LifecycleResult,
     OwnersClosed,
     RunIdentity,
+    detach_exception,
     detached_exception_strings,
 )
 from .experiment_authoring import (
@@ -757,7 +758,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         # When the drain last retried a failed Run's pending cleanup (_settle_failed_cleanup), and since when (with
         # that Run's identity) its retries have failed.
         self._failed_cleanup_retried_at = float("-inf")
-        self._failed_cleanup_since: tuple[RunIdentity, float] | None = None
+        self._failed_cleanup_since: tuple[RunIdentity, tuple[str, str, str, str], float] | None = None
         # A Run's end held while the view draws the frames it fell behind on (_hold_terminal_for_paint): the held
         # events, the frames still undrawn, when the hold began and when a frame was last drawn; and the end released.
         self._terminal_hold: tuple[tuple[StandardRunEvent, ...], int, float, float] | None = None
@@ -3112,6 +3113,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 base.cleanup_status,
                 base.primary,
                 base.cleanup_failures,
+                quarantined=base.quarantined,
             )
         elif identity is not None and (
             executor_receipt is None
@@ -3131,8 +3133,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             identity is None
             or (
                 executor_receipt is not None
-                and executor_receipt.cleanup_status
-                is CleanupStatus.CLEANED
+                and (
+                    executor_receipt.cleanup_status is CleanupStatus.CLEANED
+                    or executor_receipt.quarantined
+                )
             )
         )
         components_clean = (
@@ -3190,12 +3194,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._close_recovery_failures,
             (
                 CleanupStatus.CLEANED
-                if all_clean
+                if all_clean and not (
+                    executor_receipt is not None and executor_receipt.quarantined
+                )
                 else CleanupStatus.CLEANUP_PENDING
             ),
             primary,
             cleanup_failures,
             identity,
+            quarantined=all_clean and executor_receipt is not None and executor_receipt.quarantined,
         )
         if not all_clean:
             return receipt
@@ -4008,10 +4015,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             receipt = executor.close(identity, background=True)
         except Exception as error:
             self._error_notice("Standard cleanup failed", error)
-            return False
+            receipt = ExecutorClosed(identity, CleanupStatus.CLEANUP_PENDING,
+                                     primary=detach_exception(error, "executor.close"))
         given_up = None
         if not executor_closed_is_valid(receipt, identity) or receipt.cleanup_status is not CleanupStatus.CLEANED:
-            given_up = self._give_up_failed_cleanup(identity, executor)
+            given_up = self._give_up_failed_cleanup(identity, executor, receipt)
             if given_up is None:
                 return False
         self._failed_cleanup_since = None
@@ -4020,16 +4028,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             _LOG.warning("%s [RUN-CLEANUP]", given_up)
         return (given_up or True) if self._lifecycle.reset_permitted else False
 
-    def _give_up_failed_cleanup(self, identity: RunIdentity, executor) -> str | None:
+    def _give_up_failed_cleanup(self, identity: RunIdentity, executor, receipt: ExecutorClosed) -> str | None:
         """Once a failed Run's cleanup retries have failed for _FAILED_CLEANUP_GIVE_UP_S, the executor gives it up, so
         Run and the scans unlock, and the notice names the outputs it still holds (maintainer's pick 2026-10-26, "Add
         the time limit"); None until then, or while the executor keeps it (a thread still runs for it)."""
+        if not executor_closed_is_valid(receipt, identity):
+            return None
+        failure = receipt.cleanup_failures[-1] if receipt.cleanup_failures else receipt.primary
+        if failure is None:  # an in-flight retry is not another failure and must not replace its clock
+            return None
+        signature = (failure.operation, failure.type_module, failure.type_qualname, failure.message)
         now, since = time.monotonic(), self._failed_cleanup_since
-        if since is None or since[0] is not identity:
-            self._failed_cleanup_since = (identity, now)
+        if since is None or since[0] is not identity or since[1] != signature:
+            self._failed_cleanup_since = (identity, signature, now)
             return None
         give_up = getattr(executor, "give_up", None)
-        held = None if now - since[1] < _FAILED_CLEANUP_GIVE_UP_S or give_up is None else give_up(identity)
+        held = None if now - since[2] < _FAILED_CLEANUP_GIVE_UP_S or give_up is None else give_up(identity)
         if held is None:
             return None
         lead = f"Run unlocked: the failed Run's cleanup did not finish in {_FAILED_CLEANUP_GIVE_UP_S:.0f} s"
@@ -8720,7 +8734,7 @@ def _retirement_receipt_is_current(
     current: RunIdentity | None,
 ) -> bool:
     return (
-        receipt.cleanup_status is CleanupStatus.CLEANED
+        receipt.released_for_admission
         and receipt.run_identity is current
     )
 

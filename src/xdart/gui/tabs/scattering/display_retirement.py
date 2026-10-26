@@ -16,10 +16,11 @@ from .events import (
 
 @dataclass(frozen=True, slots=True)
 class DisplayRetirementReceipt:
-    """Values-only proof that one prior display was absent or retired."""
+    """Exact prior display disposition: absent, retired, or explicitly quarantined with resources still pending."""
 
     run_identity: RunIdentity | None
     cleanup_status: CleanupStatus
+    quarantined: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -29,11 +30,21 @@ class DisplayRetirementReceipt:
             raise TypeError("display retirement identity is invalid")
         if type(self.cleanup_status) is not CleanupStatus:
             raise TypeError("display retirement status is invalid")
+        if type(self.quarantined) is not bool or (
+            self.quarantined
+            and (self.run_identity is None or self.cleanup_status is not CleanupStatus.CLEANUP_PENDING)
+        ):
+            raise ValueError("display quarantine is invalid")
+
         if (
             self.run_identity is None
             and self.cleanup_status is not CleanupStatus.CLEANED
         ):
             raise ValueError("an absent display must be clean")
+
+    @property
+    def released_for_admission(self) -> bool:
+        return self.cleanup_status is CleanupStatus.CLEANED or self.quarantined
 
 
 NO_DISPLAY_RETIREMENT = DisplayRetirementReceipt(
@@ -45,12 +56,12 @@ def apply_display_retirement(
     value: object,
     current: RunIdentity | None,
 ) -> tuple[bool, RunIdentity | None]:
-    """Consume only exact clean proof for the page's current display."""
+    """Consume only the exact retired or explicitly quarantined disposition for the current display."""
 
     try:
         accepted = (
             type(value) is DisplayRetirementReceipt
-            and value.cleanup_status is CleanupStatus.CLEANED
+            and value.released_for_admission
             and value.run_identity is current
         )
     except Exception:
@@ -90,15 +101,27 @@ class DisplayRetirementOwner:
     def proof(self) -> DisplayRetirementReceipt:
         receipt = self.receipt
         return DisplayRetirementReceipt(
-            self.run_identity, receipt.cleanup_status
+            self.run_identity, receipt.cleanup_status, receipt.quarantined
         )
+
+    def quarantine(self, receipt: ExecutorClosed) -> bool:
+        """Acknowledge explicit abandonment without replacing an in-flight retirement or claiming cleanup."""
+        with self._lock:
+            if (
+                self._in_flight
+                or not _receipt_is_exact(receipt, self.run_identity)
+                or not receipt.quarantined
+            ):
+                return False
+            self._receipt = receipt
+            return True
 
     def attempt(self, *, background: bool = False) -> ExecutorClosed:
         with self._lock:
             receipt = self._receipt
             if (
                 receipt is not None
-                and receipt.cleanup_status is CleanupStatus.CLEANED
+                and (receipt.cleanup_status is CleanupStatus.CLEANED or receipt.quarantined)
             ):
                 return receipt
             if self._in_flight:
@@ -148,6 +171,8 @@ def _receipt_is_exact(
             and value.run_identity is expected
             and type(value.cleanup_status) is CleanupStatus
             and value.cleanup_status is not CleanupStatus.NOT_STARTED
+            and type(value.quarantined) is bool
+            and (not value.quarantined or value.cleanup_status is CleanupStatus.CLEANUP_PENDING)
         )
     except Exception:
         return False

@@ -690,7 +690,7 @@ class StartPipeline:
                 cleanup_identity=identity,
             )
         return StartClosed(result, tuple(failures), receipt.cleanup_status,
-                           receipt.primary, receipt.cleanup_failures, identity)
+                           receipt.primary, receipt.cleanup_failures, identity, quarantined=receipt.quarantined)
 
 
 __all__ = ["StartPipeline"]

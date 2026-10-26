@@ -359,8 +359,7 @@ class AdmissionReceipt:
                      else self.candidate._configuration.threshold.saturation)
                  and type(self.display_retirement)
                  is DisplayRetirementReceipt
-                 and self.display_retirement.cleanup_status
-                 is CleanupStatus.CLEANED)
+                 and self.display_retirement.released_for_admission)
         if not valid:
             raise TypeError("admission values are invalid")
 

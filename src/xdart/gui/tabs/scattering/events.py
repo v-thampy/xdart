@@ -120,6 +120,8 @@ class ExecutorClosed:
     cleanup_status: CleanupStatus
     primary: DetachedDiagnostic | None = None
     cleanup_failures: tuple[DetachedDiagnostic, ...] = ()
+    #: UI ownership was explicitly abandoned; resources remain held and cleanup_status stays pending.
+    quarantined: bool = False
 
 
 @dataclass(frozen=True, slots=True)
