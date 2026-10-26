@@ -103,9 +103,10 @@ def _cards(controls):
                                          controls.processing_card)]
 
 
-def _bar_in_view(panel, scroll):
-    top = panel.bar.mapTo(scroll.viewport(), QtCore.QPoint(0, 0)).y()
-    return 0 <= top and top + panel.bar.height() <= scroll.viewport().height()
+def _bar_below_log(panel):
+    """The Show log row is shown at the bottom of the log, under the split (maintainer, 2026-10-26: "put the show log/
+    warnings/ hide log buttons at the bottom of the log panel instead of the top as they are now")."""
+    return panel.bar.isVisible() and panel.bar.y() >= panel.split.y() + panel.split.height()
 
 
 def _drag(handle, dy):
@@ -151,10 +152,11 @@ def test_the_feed_numbers_a_bounded_history_that_logging_threads_append_to():
 
 @pytest.mark.parametrize("page_kind", ("int", "stitch", "rsm"))
 def test_each_page_mounts_the_shared_log_under_its_controls(qapp, page_kind):
-    """The same component on every page: its Show log row right after the Processing card (under
-    Reintegrate/Advanced), in the controls' own layout; the log under the controls' scroll area in a split that takes
-    the scroll area's place over the Run controls. Shown at start (maintainer, 2026-10-24), each part with a tooltip,
-    its one text box the shared read-only pane."""
+    """The same component on every page: the log under the controls' scroll area in a split, and its Show log row under
+    the split (maintainer, 2026-10-26: "put the show log/ warnings/ hide log buttons at the bottom of the log panel"),
+    the two in one column that takes the scroll area's place over the Run controls; the controls end at their
+    Processing card. Shown at start (maintainer, 2026-10-24), each part with a tooltip, its one text box the shared
+    read-only pane."""
     from xdart.gui.pages.values import PageCleanup
     if page_kind == "int":
         from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
@@ -171,18 +173,18 @@ def test_each_page_mounts_the_shared_log_under_its_controls(qapp, page_kind):
         panel = page.log_panel
         assert type(panel) is LogPanel and type(panel.pane) is ReadOnlyTextPane and panel.pane.isReadOnly()
         assert panel.findChildren(QtWidgets.QPlainTextEdit) == [panel.pane]
-        root = controls._root_layout
-        assert panel.bar.parent() is controls and panel.toggle.parent() is panel.bar
+        stack, root = panel.column.layout(), controls._root_layout
+        assert panel.bar.parent() is panel.column and panel.toggle.parent() is panel.bar
         assert panel.latest.parent() is panel.bar
-        processing = root.indexOf(controls.processing_card)
-        assert root.indexOf(panel.bar) == processing + 1 and root.count() == processing + 3
+        assert stack.count() == 2 and stack.itemAt(0).widget() is panel.split and stack.itemAt(1).widget() is panel.bar
+        assert root.indexOf(controls.processing_card) == root.count() - 2
         assert root.itemAt(root.count() - 1).spacerItem() is not None
         split = panel.split
         assert type(split) is QtWidgets.QSplitter and split.orientation() is QtCore.Qt.Orientation.Vertical
         assert split.count() == 2 and split.widget(0).widget() is controls and split.widget(1) is panel
         assert not split.childrenCollapsible()
         column = run_bar.parentWidget().layout()
-        assert column.count() == 2 and column.itemAt(0).widget() is split and column.itemAt(1).widget() is run_bar
+        assert column.count() == 2 and column.itemAt(0).widget() is panel.column and column.itemAt(1).widget() is run_bar
         assert not panel.isHidden() and not panel.latest.isHidden() and panel.toggle.isChecked()
         assert panel.toggle.isCheckable() and panel.toggle.text() == "Hide log"
         for part in (panel.toggle, panel.latest, panel.pane, split.handle(1)):
@@ -219,7 +221,7 @@ def test_show_log_takes_only_the_free_space_and_hide_log_gives_it_back(qapp):
         assert panel.latest.isVisible() and panel._timer.isActive()
         total = column - panel.split.handleWidth()
         assert panel.split.sizes() == [needed, total - needed] == opened
-        assert scroll.verticalScrollBar().maximum() == 0 and _bar_in_view(panel, scroll)
+        assert scroll.verticalScrollBar().maximum() == 0 and _bar_below_log(panel)
         assert _cards(controls) == cards and shell.splitter.sizes() == sizes and run_bar.geometry() == run_geometry
         assert scroll.horizontalScrollBar().maximum() == 0
         shell.resize(1488, 1400)  # the controls keep priority: a smaller window takes from the log
@@ -233,14 +235,15 @@ def test_show_log_takes_only_the_free_space_and_hide_log_gives_it_back(qapp):
         assert panel.isHidden() and panel.latest.isHidden() and panel.toggle.text() == "Show log"
         assert not panel._timer.isActive() and panel.split.sizes() == [column, 0]
         assert _cards(controls) == cards and run_bar.geometry() == run_geometry
+        assert panel.bar.isVisible() and panel.bar.y() + panel.bar.height() <= run_bar.y()  # right over the Run controls
     finally:
         _dispose(shell, qapp)
 
 
 def test_where_the_controls_fill_the_column_the_log_opens_small_and_drags_taller(qapp):
-    """No free space (this window): the log opens a few lines tall and the controls keep the rest, scrolled so that
-    Hide log stays in view. The handle drags the log taller; hidden and shown again, it keeps the dragged height. A
-    projection rebuild or Stitch's/RSM's run lock leaves the button, its state and its wiring."""
+    """No free space (this window): the log opens a few lines tall and the controls keep the rest, Hide log under the
+    log. The handle drags the log taller; hidden and shown again, it keeps the dragged height. A projection rebuild or
+    Stitch's/RSM's run lock leaves the button, its state and its wiring."""
     shell = _shell(qapp, height=1080)
     try:
         controls, panel, run_bar, scroll = shell.controls, shell.log_panel, shell.run_controls, shell.control_scroll
@@ -254,7 +257,7 @@ def test_where_the_controls_fill_the_column_the_log_opens_small_and_drags_taller
         _settle(qapp)
         total, small = column - panel.split.handleWidth(), panel._lines_height(log_panel_module._PANEL_LINES)
         assert panel.split.sizes() == [total - small, small] == opened and panel.height() == small
-        assert _bar_in_view(panel, scroll) and run_bar.geometry() == run_geometry
+        assert _bar_below_log(panel) and run_bar.geometry() == run_geometry
         _drag(panel.split.handle(1), -120)
         _settle(qapp)
         assert panel.split.sizes() == [total - small - 120, small + 120]
@@ -271,8 +274,7 @@ def test_where_the_controls_fill_the_column_the_log_opens_small_and_drags_taller
         actions = dict(projection.section_actions)
         actions[SectionId.PROCESSING] = actions[SectionId.PROCESSING][:-1]
         assert controls.reconcile(replace(projection, section_actions=actions)) is False
-        root = controls._root_layout
-        assert root.indexOf(panel.bar) == root.indexOf(controls.processing_card) + 1
+        assert panel.column.layout().indexOf(panel.bar) == 1
         assert panel.toggle.isChecked() and panel.isVisible()
         QtTest.QTest.mouseClick(panel.toggle, QtCore.Qt.MouseButton.LeftButton)
         assert panel.isHidden() and panel.toggle.text() == "Show log" and run_bar.geometry() == run_geometry
@@ -284,8 +286,8 @@ def test_the_panel_follows_the_newest_line_and_holds_a_scrolled_back_view(qapp):
     feed = LogFeed(capacity=300)
     log = _fed_logger("xdart.test.log_follow", feed)
     panel = LogPanel(QtWidgets.QScrollArea(), feed)
-    panel.split.resize(320, 400)
-    panel.split.show()
+    panel.column.resize(320, 400)
+    panel.column.show()
     try:
         panel.toggle.setChecked(True)
         _settle(qapp)
@@ -316,12 +318,12 @@ def test_the_panel_follows_the_newest_line_and_holds_a_scrolled_back_view(qapp):
         bar.setValue(0)
         panel.refresh()
         assert panel.latest.isEnabled()
-        panel.split.resize(320, 4000)
+        panel.column.resize(320, 4000)
         _settle(qapp)
         assert bar.value() == bar.maximum() == 0
         panel.latest.click()
         assert not panel.latest.isEnabled()
-        panel.split.resize(320, 400)
+        panel.column.resize(320, 400)
         _settle(qapp)
 
         for index in range(250):  # more at once than an append should trim: the pane is rebuilt, still bounded
@@ -341,8 +343,7 @@ def test_the_panel_follows_the_newest_line_and_holds_a_scrolled_back_view(qapp):
         assert pane.document().lastBlock().text().endswith("fourth 399") and bar.value() == bar.maximum()
     finally:
         log.handlers[:] = []
-        panel.bar.deleteLater()
-        panel.split.deleteLater()
+        panel.column.deleteLater()
         qapp.processEvents()
 
 
@@ -540,8 +541,7 @@ def test_debug_logging_and_the_log_panel_are_independent(qapp, monkeypatch, tmp_
                    if " xrd_tools.io.metadata: " in line]
         assert written == listed
     finally:
-        panel.bar.deleteLater()
-        panel.split.deleteLater()
+        panel.column.deleteLater()
         qapp.processEvents()
         for handler in [h for h in root.handlers if isinstance(h, _gui_main.RotatingFileHandler)]:
             root.removeHandler(handler)
@@ -580,8 +580,8 @@ def test_warnings_shows_only_warnings_errors_and_each_runs_start_and_end(qapp):
     feed = LogFeed(capacity=300)
     log = _fed_logger("xdart.test.log_warnings", feed)
     panel = LogPanel(QtWidgets.QScrollArea(), feed)
-    panel.split.resize(320, 400)
-    panel.split.show()
+    panel.column.resize(320, 400)
+    panel.column.show()
     try:
         _settle(qapp)
         log_events.banner(log, "New Run · Int 1D", kind="run")
@@ -614,6 +614,5 @@ def test_warnings_shows_only_warnings_errors_and_each_runs_start_and_end(qapp):
         assert panel.toggle.isChecked() and panel.isVisibleTo(panel.split) and "routine" not in panel.pane.toPlainText()
     finally:
         log.handlers[:] = []
-        panel.bar.deleteLater()
-        panel.split.deleteLater()
+        panel.column.deleteLater()
         qapp.processEvents()

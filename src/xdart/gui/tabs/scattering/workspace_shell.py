@@ -129,9 +129,9 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         )
         self.control_scroll.setWidget(self.controls)
         self.run_controls = RunControlsBar()
-        # Show log, below Reintegrate/Advanced, opens the log under the controls; its handle drags it taller
-        self.log_panel = mount_log_panel(self.controls, self.control_scroll)
-        layout.addWidget(self.log_panel.split, 1)
+        # The log under the controls, its handle dragging it taller, and its Show log row below it
+        self.log_panel = mount_log_panel(self.control_scroll)
+        layout.addWidget(self.log_panel.column, 1)
         layout.addWidget(self.run_controls, 0)
         return column
 

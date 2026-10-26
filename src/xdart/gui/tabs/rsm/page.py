@@ -489,8 +489,8 @@ class RSMPage(QtWidgets.QWidget):
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(self.controls)
         from xdart.gui.widgets.log_panel import mount_log_panel
-        self.log_panel = mount_log_panel(self.controls, scroll)  # Int's Show log, and the log under the controls
-        right_layout.addWidget(self.log_panel.split, 1)
+        self.log_panel = mount_log_panel(scroll)  # Int's log under the controls, and its Show log row
+        right_layout.addWidget(self.log_panel.column, 1)
         self._build_controls()
         self.run_bar = RunControlsBar()
         from xdart.gui.tabs.scattering.run_mode_projection import (

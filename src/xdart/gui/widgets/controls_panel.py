@@ -1737,15 +1737,6 @@ class ControlsPanel(QtWidgets.QWidget):
             number = ""
         return SectionCard(title, number=number, accent=accent)
 
-    def add_footer_widget(self, widget: QtWidgets.QWidget) -> None:
-        """Mount a shared control below the Processing card, under its
-        Reintegrate/Advanced row and after any mounted before it (the log
-        panel's Show log row). It sits in the panel's own layout, so a
-        projection rebuild, which clears the cards' rows, and
-        ``set_editors_enabled`` leave it alone."""
-        layout = self._root_layout
-        layout.insertWidget(layout.count() - 1, widget)
-
     def set_processing_widget(
         self,
         widget: QtWidgets.QWidget | None,

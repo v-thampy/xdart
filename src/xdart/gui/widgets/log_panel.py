@@ -17,8 +17,10 @@ Scrolled back, the view, the text and any selection are left alone (an append th
 them) until the user returns to the bottom or presses Latest. Hidden, it does no GUI work: hiding it is what keeps
 text handling off the GUI thread.
 
-``mount_log_panel`` mounts the Show log row below the controls' Processing card, and the log under the controls'
-scroll area in a split whose handle drags it taller.
+``mount_log_panel`` puts the log under the controls' scroll area in a split whose handle drags it taller, and the
+Show log row under the split: at the log's bottom while it is shown, just above the Run controls while it is hidden
+(maintainer, 2026-10-26: "put the show log/ warnings/ hide log buttons at the bottom of the log panel instead of the
+top as they are now").
 """
 from __future__ import annotations
 
@@ -119,7 +121,8 @@ def install_log_feed() -> LogFeed:
 class LogPanel(QtWidgets.QFrame):
     """The recent log lines in a read-only pane (``pane``), shown while its Show log button (``toggle``) is checked.
     ``bar`` holds that button and, while the log is shown, Latest (``latest``). ``split`` holds ``above`` (the
-    controls' scroll area) over the log; its handle drags the log taller."""
+    controls' scroll area) over the log; its handle drags the log taller. ``column``, what a page mounts over its Run
+    controls, holds the split over ``bar``."""
 
     def __init__(self, above: QtWidgets.QScrollArea, feed: LogFeed = LOG_FEED):
         super().__init__()
@@ -170,6 +173,13 @@ class LogPanel(QtWidgets.QFrame):
         self.split.setStretchFactor(0, 0)  # a taller window gives the log the room; the controls keep theirs
         self.split.setStretchFactor(1, 1)
         self.split.handle(1).setToolTip("Drag to make the log taller or shorter; the controls above keep the rest.")
+        self.column = QtWidgets.QWidget()
+        self.column.setObjectName("logPanelColumn")
+        stack = QtWidgets.QVBoxLayout(self.column)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(2)  # the controls column's spacing
+        stack.addWidget(self.split, 1)
+        stack.addWidget(self.bar, 0)
         self._dragged = False  # a height the user dragged the log to is kept
         self.split.splitterMoved.connect(self._drag)
         self._timer = QtCore.QTimer(self)
@@ -229,11 +239,11 @@ class LogPanel(QtWidgets.QFrame):
 
     def _balance(self) -> None:
         self._balancing = False
-        self._open_height(reveal=False)
+        self._open_height()
 
-    def _open_height(self, reveal: bool = True) -> None:
-        """The free space under the controls, or a few lines where they leave none; the controls keep the rest, and
-        Hide log stays in view (``reveal``). A height the user dragged to is kept."""
+    def _open_height(self) -> None:
+        """The free space under the controls, or a few lines where they leave none; the controls keep the rest. A
+        height the user dragged to is kept."""
         above = self.split.widget(0)
         controls = above.widget()
         if not self.isVisible() or controls is None:
@@ -246,8 +256,6 @@ class LogPanel(QtWidgets.QFrame):
             log = max(self._lines_height(_PANEL_LINES), total - needed)
             if self.split.sizes() != [total - log, log]:
                 self.split.setSizes([total - log, log])
-        if reveal and controls.isAncestorOf(self.bar):
-            above.ensureWidgetVisible(self.bar, 0, 0)
 
     def _lines_height(self, lines: int) -> int:
         pane = self.pane
@@ -312,13 +320,10 @@ class LogPanel(QtWidgets.QFrame):
         self.refresh()
 
 
-def mount_log_panel(controls, above: QtWidgets.QScrollArea) -> LogPanel:
-    """Int's, Stitch's or RSM's log: the Show log row below the controls' Processing card (under its
-    Reintegrate/Advanced row), and the log under ``above``, the controls' scroll area. The page puts the panel's
-    ``split`` where it would have put ``above``, over its Run controls."""
-    panel = LogPanel(above)
-    controls.add_footer_widget(panel.bar)
-    return panel
+def mount_log_panel(above: QtWidgets.QScrollArea) -> LogPanel:
+    """Int's, Stitch's or RSM's log under ``above``, the controls' scroll area, with its Show log row below it. The
+    page puts the panel's ``column`` where it would have put ``above``, over its Run controls."""
+    return LogPanel(above)
 
 
 __all__ = ["LOG_FEED", "LOG_FORMAT", "LOG_HISTORY_LINES", "LogFeed", "LogPanel", "install_log_feed",
