@@ -99,7 +99,12 @@ def test_a_live_run_that_fails_on_its_last_scan_ends_clean_and_leaves_run_and_th
                                           owner.light_unsubscribe is not None, owner.publications.allocation is not None,
                                           owner.publications._light_1d is not None)
             for key, owner in run.display.artifacts.items()}
-        assert terminal.cleanup_status is CleanupStatus.CLEANED, (terminal.cleanup_status, owners)
+        retained = None if run is None else (
+            tuple(name for name in ("session", "sink", "output", "source", "resources")
+                  if getattr(run, name) is not None),
+            tuple(f"{error.operation}: {error.message}" for error in run.cleanup_failures),
+            run.display.light_1d_cleanup_unresolved())
+        assert terminal.cleanup_status is CleanupStatus.CLEANED, (terminal.cleanup_status, owners, retained)
         assert page._lifecycle.reset_permitted and page._start_permitted() == (True, "")
         assert page._context_controller.browse_lifecycle_admissible(), "the browser's scans stay locked"
         assert page._shell.browser.scans.isEnabled()
