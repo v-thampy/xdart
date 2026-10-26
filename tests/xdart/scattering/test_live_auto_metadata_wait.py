@@ -2,8 +2,10 @@
 admitted a frame after one 0.1 s look found no sidecar, so on a share where an image is readable before its sidecar
 is listed the frame was reduced without metadata, and the sidecar landing after that stopped its whole scan).
 
-A sidecar-less directory is not held for it: while the Run has seen no sidecar at all, a frame waits two seconds (the
-note period), and the Run then knows its folder has none, so later frames do not wait. Real Live Runs over real
+While the Run has seen no sidecar at all (an empty folder at its start, or images without any), its first frame waits
+the full limit too: on the beamline share a .txt lands 5.1 s after its image (2026-10-26), and the two seconds it
+once waited processed every frame without its .txt (maintainer: "shouldn't this be 150s like the other case then to be
+safe?"). Once given up on, the Run knows its folder has none, so later frames do not wait. Real Live Runs over real
 TIFF + .txt files under Auto; nothing about admission or readiness is replaced."""
 import logging
 import sys
@@ -78,8 +80,30 @@ def test_under_auto_the_first_frame_of_a_fresh_folder_gets_its_sidecar_too(tmp_p
     assert _output(tmp_path)[:2] == ((1, 2), (1.0, 2.0))
 
 
-def test_under_auto_a_folder_without_any_sidecar_holds_its_first_frame_two_seconds_and_no_later_one(tmp_path, caplog):
+def test_under_auto_a_fresh_folder_whose_sidecars_land_seconds_after_their_images_keeps_their_metadata(tmp_path):
+    """The beamline's shape: Live started on an empty folder, each .txt landing seconds after its image, longer than
+    the two seconds a first frame once waited."""
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    executor, identity = _run(tmp_path, raw, 'auto', 3406)
+    events = []
+    try:
+        for index in (1, 2):
+            _frame(raw, 'scan', index, 'txt', float(index), sidecar=False)
+            _settle(executor, events, 3.)
+            _frame(raw, 'scan', index, 'txt', float(index), image=False)
+            _frame_ready(executor, events, index)
+        _settle(executor, events)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert _output(tmp_path)[:2] == ((1, 2), (1.0, 2.0))  # each frame read its own .txt
+
+
+def test_under_auto_a_folder_without_any_sidecar_holds_its_first_frame_the_limit_and_no_later_one(
+        tmp_path, caplog, monkeypatch):
     caplog.set_level(logging.INFO)
+    monkeypatch.setitem(run_executor._METADATA_WAIT_LIMIT_S, 'sidecar', 3.)  # 150 s by default
     raw = tmp_path / 'raw'
     raw.mkdir()
     executor, identity = _run(tmp_path, raw, 'auto', 3403)
@@ -93,30 +117,31 @@ def test_under_auto_a_folder_without_any_sidecar_holds_its_first_frame_two_secon
         _settle(executor, events)
     finally:
         terminal = _stop(executor, identity, events)
-    assert 1.5 < first < 8., f'the first frame waited its two seconds, not the ten of an explicit format: {first:.2f} s'
+    assert 2.5 < first < 9., f'the first frame waited the limit: {first:.2f} s'
     assert max(later) < 1.5, f'later frames of a folder known to have no sidecars wait: {later}'
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     labels, i0, _epoch = _output(tmp_path)
     assert labels == (1, 2, 3) and i0 is None, (labels, i0)  # no frame has any metadata
     messages = [record.getMessage() for record in caplog.records]
-    assert messages.count('scan_int1d.nexus: the metadata of scan_0001.tif did not arrive within 2 s; the frame is '
+    assert messages.count('scan_int1d.nexus: the metadata of scan_0001.tif did not arrive within 3 s; the frame is '
                           'processed without it [LIVE]') == 1, messages
     assert not [message for message in messages if 'did not arrive' in message and 'scan_0002' in message], messages
     assert 'Processed without their metadata (1): scan_0001.tif (scan_int1d.nexus) [LIVE]' in messages
 
 
-def test_under_auto_a_folder_known_to_have_no_sidecars_admits_a_burst_of_frames_together(tmp_path):
+def test_under_auto_a_folder_known_to_have_no_sidecars_admits_a_burst_of_frames_together(tmp_path, monkeypatch):
     """Once the Run has given up on the first frame of a sidecar-less folder, the frames that follow are admitted
     together in one look, as they were before the folder waited for sidecars at all (Claude review of 805a9f96: each
     frame without a sidecar was listed as waiting on one poll, given up on at the next and admitted at the third, so a
     burst of frames came through one frame per two polls, five a second at most)."""
+    monkeypatch.setitem(run_executor._METADATA_WAIT_LIMIT_S, 'sidecar', 3.)  # 150 s by default
     raw = tmp_path / 'raw'
     raw.mkdir()
     executor, identity = _run(tmp_path, raw, 'auto', 3405)
     events = []
     try:
         _frame(raw, 'scan', 1, 'txt', 1.0, sidecar=False)
-        _frame_ready(executor, events, 1)  # given up on after two seconds: the folder is known to have no sidecars
+        _frame_ready(executor, events, 1)  # given up on after the limit: the folder is known to have no sidecars
         for index in range(2, 14):
             _frame(raw, 'scan', index, 'txt', float(index), sidecar=False)
         burst = _frame_ready(executor, events, 13)

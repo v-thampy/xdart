@@ -1796,11 +1796,14 @@ class StandardRunExecutor:
         limit, quiet = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind], False
         if kind == "sidecar" and not run.sidecars_seen and live_metadata_format(
                 run.configuration.thaw_source_spec()) == "auto":
-            # Auto, and no sidecar beside any image so far: a folder without any is not held for the explicit
-            # limit. The first frame waits the note period; once the Run has given up on one, the folder is known to
-            # have none and later frames go on at once, without a warning each.
+            # Auto, and no sidecar beside any image so far (an empty folder at the Run's start, or one whose images
+            # have none). The first frame waits the full limit, as any other does: a .txt can land seconds after its
+            # image (beamline 2026-10-26: 5.1 s on the share), and a frame given up on is processed without it, as are
+            # all later ones (maintainer, 2026-10-26: "shouldn't this be 150s like the other case then to be safe?").
+            # Once the Run has given up on one, the folder is known to have none and later frames go on at once,
+            # without a warning each.
             quiet = bool(run.metadata_given_up)
-            limit = 0.0 if quiet else _METADATA_WAIT_NOTE_S
+            limit = 0.0 if quiet else limit
         if now - (sighted if kind == "settling" else held[1]) < limit:
             if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
                 run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
@@ -2612,7 +2615,8 @@ class StandardRunExecutor:
                 groups = grouped[2]
                 if polls == 0 and meta_auto:
                     # What the folder holds at the Run's start: a sidecar beside any image means each frame waits for
-                    # its own as it lands; none means a frame waits only _METADATA_WAIT_NOTE_S, once.
+                    # its own as it lands; none means the first frame waits for its own, and once the Run has given
+                    # up on it the folder is known to have none.
                     run.sidecars_seen = any_auto_sidecar(path for group in groups for path in group.physical_paths)
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
