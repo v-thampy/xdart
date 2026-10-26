@@ -1677,6 +1677,7 @@ class StandardRunExecutor:
                 # written (Codex N-85413c4d TT-R2). A pending or aborted epoch supplies no commit and is not recorded.
                 run.last_written = (Path(str(owner.artifact)), run.current_completed, run.current_total, commit)
             run.display.mark_hydration_closed(owner)
+            run.display.keep_released_1d(owner)  # its frames so far keep their curves for the Run's view
             if not run.display.release_light_1d(owner, reason="lineage-replaced"):
                 raise RuntimeError("prior light-1D lineage cleanup remains pending")
             output.drop_released_predecessor(owner, aborted=True)
@@ -1948,6 +1949,7 @@ class StandardRunExecutor:
             run.last_written = (Path(str(predecessor.artifact)), run.current_completed, run.current_total,
                                 _session_terminal_commit_identity(session, predecessor.artifact))
         run.display.mark_hydration_closed(predecessor)
+        run.display.keep_released_1d(predecessor)  # its curves stay for the Run's view, as it lags (fast Runs)
         if not run.display.release_light_1d(
             predecessor, reason="lineage-replaced",
         ):

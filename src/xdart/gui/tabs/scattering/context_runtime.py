@@ -1051,6 +1051,11 @@ class _ContextRuntime:
             if held is not None and admitted else held
         )
 
+    def unpainted_trace_frames(self) -> tuple[DisplayFrameKey, ...]:
+        """The selected frames the view has neither drawn nor refused, by the painting ledger."""
+        done = {id(frame) for frame in (*self._committed_trace_selection, *self._committed_trace_exclusions)}
+        return tuple(frame for frame in self.navigation.selected if id(frame) not in done)
+
     def project_navigation(
         self,
         projection: ContextProjection,

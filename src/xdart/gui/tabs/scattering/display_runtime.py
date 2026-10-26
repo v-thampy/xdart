@@ -163,6 +163,9 @@ class RunDisplayState:
         self.payloads: OrderedDict[
             DisplayFrameKey, StandardDisplayPayload
         ] = OrderedDict()
+        # The 1-D curves of the outputs this Run released, oldest first, for the rest of the Run (keep_released_1d).
+        self._released_1d: OrderedDict[DisplayFrameKey, StandardDisplayPayload] = OrderedDict()
+        self._released_1d_bytes = 0
         self.artifacts: OrderedDict[str, DisplayArtifact] = OrderedDict()
         self._catalog_capacity_explicit = catalog_max_items is not None
         self.catalog = DisplayCatalogIndex(
@@ -719,6 +722,7 @@ class RunDisplayState:
         frame carries them as retired (``DisplayCatalogIndex.retire_artifact``). Its normalization rows leave too,
         while the producer revision remains monotonic for this same artifact identity."""
         with self._lock:
+            self._drop_released_1d_locked(str(artifact))
             owner = self.artifacts.get(str(artifact))
             if owner is not None and owner.norm_aggregate is not None:
                 owner.norm_aggregate = replace(owner.norm_aggregate, row_count=0, channels={})
@@ -738,6 +742,7 @@ class RunDisplayState:
                 self._frame_mask_qualified.discard(retired)
                 self._detector_outcomes.pop(retired, None)
                 self._evict_raw_key_locked(retired)
+                self._forget_released_1d_locked(retired)
             self._residency.retire_navigation(delta.retired)
         return delta
 
@@ -1060,6 +1065,7 @@ class RunDisplayState:
             if key is None:
                 return None
             payload = self.payloads.get(key)
+            released = self._released_1d.get(key)
             artifact_owner = self.artifacts.get(key.artifact)
             publication = (
                 None
@@ -1102,7 +1108,7 @@ class RunDisplayState:
             return None
         if publication is None:
             return self._qualified_payload(
-                payload,
+                payload if released is None else released,
                 key,
                 selection_generation,
             )
@@ -1141,10 +1147,53 @@ class RunDisplayState:
             while len(self.payloads) > self.max_payload_items:
                 self.payloads.popitem(last=False)
 
+    def keep_released_1d(self, owner: DisplayArtifact) -> int:
+        """Keep the 1-D curves of ``owner``'s frames, as the view is given them, before its output releases its
+        light-1D lineage (the Run moves on to another output, or this one failed): ``project`` then gives a frame of
+        it its curve for the rest of the Run, and the painting ledger draws the frames the view had not reached
+        (maintainer, 2026-10-26: "1d traces are so cheap that they can easily be kept in memory for an entire run";
+        "the painting can lag if a norm channel is chosen, but it shouldn't skip frames at the end of the run"). Only
+        the 1-D values, metadata and support are kept, never the raw or 2-D arrays; the oldest output leaves whole once
+        the curves pass the detached display budget. A live publication always comes first. Returns how many."""
+        from .browse_1d_display import MAX_BROWSE_1D_DETACHED_BYTES
+
+        with self._lock:
+            if self._retired or self.artifacts.get(str(owner.artifact)) is not owner:
+                return 0
+            self._drop_released_1d_locked(str(owner.artifact))
+            kept = 0
+            for key in self.catalog.snapshot().entries:
+                if key.artifact != str(owner.artifact):
+                    continue
+                publication = owner.publications.get(key.local_frame_label)
+                if publication is None or publication.view.intensity_1d is None:
+                    continue
+                payload = self._payload_from_publication(owner, key, publication, closed=True)
+                view = _detached_light_1d_view(payload.view)  # its own arrays, whatever the lease holds
+                payload = replace(payload, view=replace(
+                    view, raw=None, thumbnail=None, intensity_2d=None, sigma_2d=None), extra_views_2d={})
+                self._released_1d[key] = payload
+                self._released_1d_bytes += _light_payload_bytes(payload)
+                kept += 1
+            while self._released_1d_bytes > MAX_BROWSE_1D_DETACHED_BYTES and self._released_1d:
+                self._drop_released_1d_locked(next(iter(self._released_1d)).artifact)
+            return kept
+
+    def _drop_released_1d_locked(self, artifact: str) -> None:
+        for key in [key for key in self._released_1d if key.artifact == artifact]:
+            self._forget_released_1d_locked(key)
+
+    def _forget_released_1d_locked(self, key: DisplayFrameKey) -> None:
+        payload = self._released_1d.pop(key, None)
+        if payload is not None:
+            self._released_1d_bytes -= _light_payload_bytes(payload)
+
     def retire(self, *, join_timeout: float) -> bool:
         with self._lock:
             self._retired = True
             self.invalidate_full_demand(clear_raw=True)
+            self._released_1d.clear()
+            self._released_1d_bytes = 0
         if not self._transport.retire(join_timeout=join_timeout):
             return False
         clean = True
@@ -1673,6 +1722,14 @@ def _projection_masks_values(
         or projection.apply_threshold
         or (projection.mask_available and projection.mask_bytes)
     )
+
+
+def _light_payload_bytes(payload: StandardDisplayPayload) -> int:
+    """The bytes of a kept curve's 1-D arrays."""
+    view = payload.view
+    axis = None if view.axis_1d is None else view.axis_1d.values
+    return sum(int(np.asarray(values).nbytes) for values in (axis, view.intensity_1d, view.sigma_1d)
+               if values is not None)
 
 
 def _detached_light_1d_view(view: FrameView) -> FrameView:

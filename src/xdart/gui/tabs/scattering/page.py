@@ -276,6 +276,10 @@ _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _DEFERRED_DELETE_RETRY_INTERVAL_MS = 25
 # A failed Run whose cleanup was still pending at its end is closed again this often (_settle_failed_cleanup).
 _FAILED_CLEANUP_RETRY_S = 1.0
+# A Run's end waits for the view to draw the frames it selected but had not drawn (_hold_terminal_for_paint): it goes
+# on once all are drawn or refused, once a second passes in which none was drawn, or after the ceiling.
+_TERMINAL_PAINT_STALL_S = 1.0
+_TERMINAL_PAINT_HOLD_S = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -748,6 +752,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._metadata_question_shown_for = None
         # When the drain last retried a failed Run's pending cleanup (_settle_failed_cleanup).
         self._failed_cleanup_retried_at = float("-inf")
+        # A Run's end held while the view draws the frames it fell behind on (_hold_terminal_for_paint): the held
+        # events, the frames still undrawn, when the hold began and when a frame was last drawn; and the end released.
+        self._terminal_hold: tuple[tuple[StandardRunEvent, ...], int, float, float] | None = None
+        self._terminal_released: StandardRunEvent | None = None
         self._scan_roi_generation = 0
         self._peak_generation = self._phase_generation = 0
         self._analysis_identity = None; self._analysis_kind = None
@@ -3947,6 +3955,25 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         self._begin_admission(capture)
 
+    def _hold_terminal_for_paint(self, event: StandardRunEvent, held: tuple[StandardRunEvent, ...]) -> bool:
+        """Hold a Run's end, and the events after it, while the view has frames to draw that it selected but had not
+        drawn: a fast Run outruns the paint, and the end's Browse keeps only the curves already drawn (maintainer,
+        2026-10-26: "the painting can lag if a norm channel is chosen, but it shouldn't skip frames at the end of the
+        run"). Its kept curves (RunDisplayState.keep_released_1d) let the next refreshes draw them; the drain lets the
+        end go on as _TERMINAL_PAINT_STALL_S and _TERMINAL_PAINT_HOLD_S say. True when held."""
+        if (event is self._terminal_released or event.kind is StandardEventKind.FAILED
+                or self._batch_terminal.active
+                or self._preferences.plot_mode not in {"Overlay", "Waterfall", "Average", "Sum"}):
+            return False
+        undrawn = len(self._context_controller.unpainted_trace_frames())
+        if not undrawn:
+            return False
+        now = time.monotonic()
+        self._terminal_hold = (tuple(held), undrawn, now, now)
+        self._scientific_repaint_pending = True
+        self._ensure_timer()
+        return True
+
     def _failed_cleanup_pending(self) -> bool:
         """A failed Run whose owners have not closed: its cleanup was still pending at its end."""
         return (self._lifecycle.phase is RunPhase.FAILED and not self._lifecycle.reset_permitted
@@ -4977,7 +5004,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice(
                     "Standard event drain returned an invalid result."
                 )
-        for event in events:
+        hold = self._terminal_hold
+        if hold is not None:
+            held, undrawn, began, drawn_at = hold
+            now, remaining = time.monotonic(), len(self._context_controller.unpainted_trace_frames())
+            drawn_at = now if remaining < undrawn else drawn_at
+            if remaining and now - drawn_at < _TERMINAL_PAINT_STALL_S and now - began < _TERMINAL_PAINT_HOLD_S:
+                self._terminal_hold = (held, remaining, began, drawn_at)
+                changed = force_scientific = True
+            else:  # all drawn or refused, nothing more drawn for a while, or the ceiling: the Run ends now
+                self._terminal_hold, self._terminal_released = None, held[0]
+                events = (*held, *events)
+        for event_index, event in enumerate(events):
             expected = (
                 self._context_controller.run_identity
                 or self._lifecycle.active_run_identity
@@ -5114,6 +5152,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 StandardEventKind.FAILED,
             }:
                 force_scientific = True
+                if self._hold_terminal_for_paint(event, events[event_index:]):
+                    changed = True
+                    break
                 was_batch = self._batch_terminal.active
                 if was_batch:
                     self._advance_batch_terminal(event)
@@ -6201,7 +6242,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or self._scientific_repaint_pending
         ):
             return True
-        if self._batch_terminal.needs_polling or self._failed_cleanup_pending():
+        if self._batch_terminal.needs_polling or self._failed_cleanup_pending() or self._terminal_hold is not None:
             return True
         if self._lifecycle.phase not in {
             RunPhase.IDLE,

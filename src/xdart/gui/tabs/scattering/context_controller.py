@@ -915,6 +915,10 @@ class ContextController:
         if not self._closed:
             self._runtime.reseed_background_projection()
 
+    def unpainted_trace_frames(self) -> tuple[DisplayFrameKey, ...]:
+        """The selected frames the view has neither drawn nor refused (the painting ledger)."""
+        return () if self._closed else self._runtime.unpainted_trace_frames()
+
     def commit_navigation_projection(
         self,
         presented_frames: tuple[DisplayFrameKey, ...],
