@@ -3956,11 +3956,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._begin_admission(capture)
 
     def _hold_terminal_for_paint(self, event: StandardRunEvent, held: tuple[StandardRunEvent, ...]) -> bool:
-        """Hold a Run's end, and the events after it, while the view has frames to draw that it selected but had not
-        drawn: a fast Run outruns the paint, and the end's Browse keeps only the curves already drawn (maintainer,
-        2026-10-26: "the painting can lag if a norm channel is chosen, but it shouldn't skip frames at the end of the
-        run"). Its kept curves (RunDisplayState.keep_released_1d) let the next refreshes draw them; the drain lets the
-        end go on as _TERMINAL_PAINT_STALL_S and _TERMINAL_PAINT_HOLD_S say. True when held."""
+        """Hold a Run's end, and the events after it, while the view has yet to draw frames whose curves the Run kept
+        after their output was released (_undrawn_elsewhere): a fast Run outruns the paint, and of the outputs other
+        than the one it shows, the end's Browse keeps only the curves already drawn (maintainer, 2026-10-26: "the
+        painting can lag if a norm channel is chosen, but it shouldn't skip frames at the end of the run"). The kept
+        curves (RunDisplayState.keep_released_1d) let the next refreshes draw them; the drain lets the end go on as
+        _TERMINAL_PAINT_STALL_S and _TERMINAL_PAINT_HOLD_S say. True when held."""
         if (event is self._terminal_released or event.kind is StandardEventKind.FAILED
                 or self._batch_terminal.active
                 or self._preferences.plot_mode not in {"Overlay", "Waterfall", "Average", "Sum"}):
