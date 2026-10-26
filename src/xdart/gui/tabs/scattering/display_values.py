@@ -224,6 +224,8 @@ class StandardRunEvent:
     files_skipped: int = 0
     files_pending: int = 0
     files_discovered: int = 0
+    #: Display only: pending files whose frames are reduced and shown but not yet durable; the status counts them.
+    files_shown: int = 0
     terminal_timing: StandardTerminalTiming | None = None
     terminal_commit_identity: StreamTerminal | None = None
     #: Terminal-only notes the run wants shown at its end, e.g. scans an Append skipped.
@@ -233,6 +235,8 @@ class StandardRunEvent:
     #: An Append Run's frames reduced and saved in this Run so far, apart from those its outputs already held;
     #: None for a Run that is not an Append.
     frames_new: int | None = None
+    #: Display only: an Append's shown frames not yet durable, so not yet in frames_new; the status counts them new.
+    frames_new_shown: int = 0
     #: Current per-output wait/stop notes, separate from the diagnostic detail and file counts.
     directory_notes: tuple[str, ...] = ()
     #: Terminal-only: (artifact, family) for each output this Run constructed, the family its planned output was
@@ -330,6 +334,9 @@ def standard_event_is_valid(value: object, identity: RunIdentity) -> bool:
                 + value.files_skipped
                 + value.files_pending
                 == value.files_discovered
+                and _nonnegative_int(value.files_shown)
+                and value.files_shown <= value.files_pending
+                and _nonnegative_int(value.frames_new_shown)
                 and type(value.directory_notes) is tuple
                 and all(type(note) is str for note in value.directory_notes)
                 and (

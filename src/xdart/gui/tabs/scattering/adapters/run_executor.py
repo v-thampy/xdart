@@ -777,10 +777,29 @@ def _directory_counts(
     return processed, skipped, pending, discovered
 
 
+def _shown_files(run: _StandardRun) -> int:
+    """The current output's files whose frames were reduced and shown in this Run but are not yet counted processed
+    (its fold is durable at its end), where one file is one frame: the status counts them as they go (maintainer,
+    2026-10-26: "if a scan with 10 frames already exists on disk, the status shows (0/10) processed till all 10 are
+    processed. but as new frames come in for a scan and it's all caught up, then it says (10/11) while processing and
+    (11/11)"). Display only: files_processed stays the durable count."""
+    if run.showing_saved or run.current_file_total <= 0 or not run.current_files_incremental:
+        return 0
+    return min(run.current_file_total, run.current_published)
+
+
+def _shown_new_frames(run: _StandardRun) -> int:
+    """An Append's frames of the current output shown but not yet durable, so not yet in its new count."""
+    if not run.appends or not _shown_files(run):
+        return 0
+    return max(0, run.current_published - run.current_completed)
+
+
 def _directory_event_fields(
     run: _StandardRun,
     *,
     in_flight_processed: int = 0,
+    shown: bool = True,
 ) -> dict[str, int | None | tuple[str, ...]]:
     processed, skipped, pending, discovered = _directory_counts(
         run,
@@ -791,7 +810,9 @@ def _directory_event_fields(
         "files_skipped": skipped,
         "files_pending": pending,
         "files_discovered": discovered,
+        "files_shown": min(pending, max(0, _shown_files(run) - in_flight_processed)) if shown else 0,
         "frames_new": _frames_new(run),
+        "frames_new_shown": _shown_new_frames(run) if shown else 0,
         "directory_notes": (*run.live_blocked.values(), *run.live_waiting.values()),
     }
 
@@ -4515,6 +4536,7 @@ class StandardRunExecutor:
             **_directory_event_fields(
                 run,
                 in_flight_processed=_terminal_in_flight_files(run),
+                shown=False,
             ),
         ))
         measured_elapsed = 0.0 if elapsed is None else elapsed

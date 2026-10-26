@@ -369,12 +369,13 @@ def _directory_file_progress(
 ) -> DirectoryFileProgress | None:
     if event.files_discovered <= 0:
         return None
+    shown = event.files_shown  # reduced and shown, not yet durable: processed for the status, as frames go
     return DirectoryFileProgress(
-        event.files_processed,
+        event.files_processed + shown,
         event.files_skipped,
-        event.files_pending,
+        event.files_pending - shown,
         event.files_discovered,
-        event.frames_new,
+        None if event.frames_new is None else event.frames_new + event.frames_new_shown,
         event.directory_notes,
     )
 
